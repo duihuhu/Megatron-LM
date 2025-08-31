@@ -1994,7 +1994,7 @@ def checkpoint_and_decide_exit(
             print_datetime('exiting program after receiving SIGTERM.')
 
             return True
-
+    
     # Regular save (persistent and non-persistent).
     if args.save and args.save_interval and iteration % args.save_interval == 0:
         save_checkpoint_and_time(

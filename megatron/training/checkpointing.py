@@ -359,7 +359,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     """
     start_ckpt = time()
     args = get_args()
-
+    
     if args.async_save and not is_empty_async_queue():
         print_rank_0('WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.')
 
@@ -533,9 +533,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     state_dict, algo=algo, cached_metadata=cached_metadata,
                     parallelization_group=mpu.get_data_parallel_group(with_context_parallel=True)
                 )
+                print("------------------------------")
+                print("start in save checkpoint")
+                print("start in save checkpoint")
+                t1 = time()
                 async_save_request = checkpointing_context['local_checkpoint_manager'].save(
                     state_dict_for_save, iteration, is_async=bool(args.async_save)
                 )
+                t2 = time()
+                print(f"takes {t2 - t1} to save")
                 checkpointing_context['local_checkpoint_cache'] = cacheable_metadata
             else:
                 assert ckpt_type == CheckpointType.LEGACY

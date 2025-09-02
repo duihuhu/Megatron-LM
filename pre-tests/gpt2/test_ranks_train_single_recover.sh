@@ -19,9 +19,7 @@ else
     export NCCL_SOCKET_IFNAME=ens37f0
     export GLOO_SOCKET_IFNAME=ens37f0
 fi
-
 MASTER_PORT=6000
-
 NNODES=1
 NODE_RANK=$1
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
@@ -34,11 +32,14 @@ TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
 CHECKPOINT_PATH="/workspace/models/gpt2-345m-0" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
+SHM_PKT="/dev/shm/shm_pkt"
 
 if [ "$NODE_RANK" -eq 0 ]; then
     export CUDA_VISIBLE_DEVICES=0
 fi
 
+# export NCCL_SOCKET_IFNAME=ens37f0
+# export GLOO_SOCKET_IFNAME=ens37f0
 
 
 TEST_NUM=${2:-0}
@@ -75,7 +76,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
     --lr 0.00015 
-    --train-iters 20
+    --train-iters 30
     --lr-decay-iters 320000 
     --lr-decay-style cosine 
     --min-lr 1.0e-5 
@@ -96,7 +97,11 @@ GPT_ARGS=(
 MODEL_PARALLEL_ARGS=(
 	--tensor-model-parallel-size 1
 	--pipeline-model-parallel-size 1
-    # --replication 
+    --replication
+    --replication-jump 1
+    --replication-factor 1
+    --non-persistent-ckpt-type local
+    --non-persistent-local-ckpt-dir $SHM_PKT
 )
 #use -- save to save gpu replia, and load to reuse gpu replia
 EVAL_AND_LOGGING_ARGS=(
@@ -105,8 +110,11 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-interval 1
     --save $CHECKPOINT_PATH 
     --load $CHECKPOINT_PATH 
+    # --load $SHM_PKT 
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
+    --non-persistent-save-interval 7
+
 )
 
 

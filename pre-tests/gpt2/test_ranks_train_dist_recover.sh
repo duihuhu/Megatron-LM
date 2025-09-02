@@ -20,8 +20,8 @@ NODE_RANK=$1
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 
-VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/gpt2-vocab.json"
-MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/gpt2-merges.txt"
+VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
+MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 LOCAL_PKT="/workspace/models/local_pkt"
 
@@ -83,7 +83,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
     --lr 0.00015 
-    --train-iters 13
+    --train-iters 30
     --lr-decay-iters 320000 
     --lr-decay-style cosine 
     --min-lr 1.0e-5 
@@ -96,6 +96,8 @@ GPT_ARGS=(
     --transformer-impl transformer_engine 
     --no-scatter-gather-tensors-in-pipeline 
     --num-layers 12  
+    --optimizer adam
+    --loss-scale 8192
 )
 
 #replication-factor是副本数量
@@ -110,19 +112,19 @@ MODEL_PARALLEL_ARGS=(
     # --non-persistent-local-ckpt-dir $SHM_PKT
 
     # --use-persistent-ckpt-worker
-    --async-save 
-    --ckpt-format torch_dist
+    # no use for replication
+    # --async-save 
+    # --ckpt-format torch_dist
 )
 
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 4
     # --non-persistent-save-interval 7
-    --eval-interval 10 
+    --eval-interval 1
     --save $SHM_CHECKPOINT_PATH
-    # --save $CHECKPOINT_PATH 
-    # --load $CHECKPOINT_PATH 
-    --eval-iters 10
+    --load $SHM_CHECKPOINT_PATH 
+    --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --logging-level 4
 )

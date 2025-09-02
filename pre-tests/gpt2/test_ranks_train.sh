@@ -17,8 +17,8 @@ NODE_RANK=$1
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 
-VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/gpt2-vocab.json"
-MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/gpt2-merges.txt"
+VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
+MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 if [ "$NODE_RANK" -eq 0 ]; then
     TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>

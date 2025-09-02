@@ -10,7 +10,15 @@ export NCCL_DEBUG_SUBSYS=ALL
 
 GPUS_PER_NODE=1
 # Change for multinode config
-MASTER_ADDR=10.156.154.36
+if [ "$2" == "a800" ]; then
+    MASTER_ADDR=10.0.0.62
+    export NCCL_SOCKET_IFNAME=bond0
+    export GLOO_SOCKET_IFNAME=bond0
+else 
+    MASTER_ADDR=10.156.154.36
+    export NCCL_SOCKET_IFNAME=ens37f0
+    export GLOO_SOCKET_IFNAME=ens37f0
+fi
 MASTER_PORT=6000
 NNODES=4
 NODE_RANK=$1
@@ -27,8 +35,8 @@ elif [ "$NODE_RANK" -eq 3 ]; then
 fi
 
 # if [ "$NODE_RANK" -eq 0 ]; then
-export NCCL_SOCKET_IFNAME=ens37f0
-export GLOO_SOCKET_IFNAME=ens37f0
+# export NCCL_SOCKET_IFNAME=ens37f0
+# export GLOO_SOCKET_IFNAME=ens37f0
 # else
 #     export NCCL_SOCKET_IFNAME=ens37f0
 #     export GLOO_SOCKET_IFNAME=ens37f0
@@ -46,8 +54,8 @@ MICRO_BATCH_SIZE=4
 GLOBAL_BATCH_SIZE=16
 
 
-VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/gpt2-vocab.json"
-MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/gpt2-merges.txt"
+VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
+MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 
 DISTRIBUTED_ARGS=(

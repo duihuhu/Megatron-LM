@@ -2202,6 +2202,12 @@ def _add_checkpointing_args(parser):
     group.add_argument('--async-save', action='store_true', default=None,
                        help='Apply async checkpointing save. Currently works only with'
                             '`torch_dist` distributed checkpoint format.')
+    # pipeline checkpointing
+    group.add_argument('--enable-pipeline-checkpoint', action='store_true', default=None,
+                       help='Enable pipeline checkpointing.')
+    group.add_argument('--num-tensor-groups', type=int, default=2,
+                       help='Number of tensor groups for pipeline checkpointing.')
+    
     group.add_argument('--ckpt-fully-parallel-load', action='store_true',
                        help='Apply full load parallelization across DP for'
                             ' distributed checkpoints.')

@@ -661,8 +661,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         thread_count: int = 2,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
-        enable_pipeline: bool = False,
-        num_tensor_groups: int = 2,
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -677,10 +675,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 gathering local metadata every checkpointing invocation
             separation_hint(str, optional): If provided, all tensors whose keys have this
                 prefix will be saved to a separate file.
-            enable_pipeline (bool, optional): Enable pipeline checkpoint functionality.
-                Default is False.
-            num_tensor_groups (int, optional): Number of tensor groups for pipeline processing.
-                Default is 2.
         """
         super().__init__(backend, version)
         self.keep_only_main_replica = keep_only_main_replica
@@ -702,8 +696,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.use_cached_ckpt_structure: bool = cached_metadata
 
         self.separation_hint = separation_hint
-        self.enable_pipeline = enable_pipeline
-        self.num_tensor_groups = num_tensor_groups
 
         self.validated_loaded_metadata_reuse = False
 
@@ -731,8 +723,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
-            enable_pipeline=self.enable_pipeline,
-            num_tensor_groups=self.num_tensor_groups,
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0

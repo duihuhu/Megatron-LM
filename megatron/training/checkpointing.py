@@ -493,7 +493,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                                          async_sharded_save=args.async_save,
                                                          validate_access_integrity=validate_sharding_integrity,
                                                          preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
-                                                         content_metadata=sharded_sd_metadata)
+                                                         content_metadata=sharded_sd_metadata,
+                                                         enable_pipeline=getattr(args, 'enable_pipeline_checkpoint', False),
+                                                         num_tensor_groups=getattr(args, 'num_tensor_groups', 2))
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))

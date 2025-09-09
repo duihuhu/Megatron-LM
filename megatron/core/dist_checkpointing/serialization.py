@@ -318,6 +318,8 @@ def save(
         Callable[[CommonStateDict], StateDict]
     ] = None,
     content_metadata: Optional[dict] = None,
+    enable_pipeline: bool = False,
+    num_tensor_groups: int = 2,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
@@ -363,6 +365,10 @@ def save(
             modify the original state dict
         content_metadata (dict, optional): metadata to identify the checkpoint content.
             Useful for framework specific versioning.
+        enable_pipeline (bool, optional): Enable pipeline checkpoint functionality.
+            Default is False.
+        num_tensor_groups (int, optional): Number of tensor groups for pipeline processing.
+            Default is 2.
 
     Returns:
         AsyncRequest (optional): if `async_sharded_save` is True, returns
@@ -390,6 +396,11 @@ def save(
     if not isinstance(sharded_strategy, SaveShardedStrategy):
         assert isinstance(sharded_strategy, tuple), type(sharded_strategy)
         sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, *sharded_strategy)
+    
+    # Pass pipeline parameters to strategy if it supports them
+    if hasattr(sharded_strategy, 'enable_pipeline'):
+        sharded_strategy.enable_pipeline = enable_pipeline
+        sharded_strategy.num_tensor_groups = num_tensor_groups
 
     if common_strategy is None:
         common_strategy = get_default_save_common_strategy()

@@ -78,7 +78,7 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
             return (
                 partial(self.write_preloaded_data_multiproc_pipeline, transform_list, self.use_msc),
                 partial(self.preload_tensors_pipeline, self.write_buckets, True, self.num_tensor_groups),
-                [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+                [torch.distributed.get_rank(), self.write_buckets, self.results_queue, self.num_tensor_groups],
             )
         else:
             # Return standard functions (existing behavior)
@@ -210,6 +210,7 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
         write_buckets: List[WriteBucket],
         global_results_queue: mp.Queue,
         num_groups: int = 2,
+        preload_fn: Optional[Callable] = None,
     ) -> None:
         """
         CORRECTED Pipeline-enabled multiprocess data writing with proper stage sequencing.
@@ -229,6 +230,9 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
             global_results_queue: Queue for collecting results
             num_groups: Number of groups for pipeline processing
         """
+        # print("write_preloaded_data_multiproc_pipeline ", preload_fn)
+        # print("write_buckets ", write_buckets)
+        write_buckets = preload_fn()
         logger = logging.getLogger(__name__)
         start_time = time()
         logger.debug(f"rank: {rank}, starting CORRECTED pipeline multiprocess write")

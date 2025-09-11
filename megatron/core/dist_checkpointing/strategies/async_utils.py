@@ -180,6 +180,8 @@ class TemporalAsyncCaller(AsyncCaller):
             async_req (AsyncRequest): `AsyncRequest` object containing to
                                        start async process
         """
+        from megatron.training.global_vars import get_args
+        args  = get_args()
         if async_req.async_fn is None:
             return  # nothing to do
 
@@ -188,7 +190,10 @@ class TemporalAsyncCaller(AsyncCaller):
             # If there's a preload_fn in `async_req`, we call this func
             # to do the defined action in `async_req.preload_fn` to
             # stage GPU tensors to its defined destination
-            async_fn_args[1] = async_req.preload_fn()
+            if args.enable_pipeline_checkpoint:
+                async_fn_args[1] = async_req.preload_fn()
+            else:
+                async_fn_args.append(async_req.preload_fn)
             
         rank = torch.distributed.get_rank()
         start_sync = time()
@@ -196,7 +201,11 @@ class TemporalAsyncCaller(AsyncCaller):
         end_sync = time()
         logger.debug(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")
 
-        ctx = mp.get_context('fork')
+        if args.enable_pipeline_checkpoint:
+            ctx = mp.get_context('spawn')
+        else:
+            ctx = mp.get_context('fork')
+            
         self.start_time = time()
         self.process = ctx.Process(
             target=async_req.async_fn, args=async_fn_args, kwargs=async_req.async_fn_kwargs

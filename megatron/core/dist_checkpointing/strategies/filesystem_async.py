@@ -260,6 +260,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 (or an Exception) from parallel write processes to the main training process
         Returns: None
         """
+        print("write_buckets ", write_buckets)
         logger = logging.getLogger(__name__)
         w_start = time()
         write_results_or_exc: Union[dict, Exception] = dict()

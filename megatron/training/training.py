@@ -2079,6 +2079,12 @@ def train(
     checkpointing_context,
     non_loss_data_func,
 ):
+    import inspect
+    stack = inspect.stack()
+    caller = stack[1]
+    print(f"调用者函数名: {caller.function}")
+    print(f"所在文件: {caller.filename}")
+    print(f"所在行号: {caller.lineno}")
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()

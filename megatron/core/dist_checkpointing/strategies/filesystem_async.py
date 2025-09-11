@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-"""Enhanced Storage writer for PyT Distributed format allowing asynchronous save with pipeline support."""
+"""Storage writer for PyT Distributed format allowing asynchronous save."""
 
 import dataclasses
 import inspect
@@ -8,8 +8,6 @@ import logging
 import os
 import pickle
 import queue
-import threading
-import math
 from functools import partial
 from heapq import heappop, heappush
 from itertools import chain
@@ -39,10 +37,6 @@ logger = logging.getLogger(__name__)
 
 WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
 
-# Type definitions for grouped pipeline functionality
-TensorGroup = List[WriteBucket]
-GroupedWriteBuckets = List[TensorGroup]
-
 try:
     import psutil
 
@@ -56,32 +50,14 @@ _results_queue = None
 def _get_write_results_queue():
     global _results_queue
     if _results_queue is None:
-        _results_queue = mp.Queue()
+        ctx = mp.get_context("spawn")
+        _results_queue = ctx.Manager().Queue()
     return _results_queue
-
-
-def _process_memory():
-    """Get current process memory usage in MB."""
-    if HAVE_PSUTIL:
-        return psutil.Process().memory_info().rss / 1024 / 1024
-    return 0
-
-
-class PipelineStage:
-    """Represents a pipeline stage for checkpoint data transfer with correct sequencing."""
-    
-    def __init__(self, stage_id: int, group_data: TensorGroup):
-        self.stage_id = stage_id
-        self.group_data = group_data
-        self.gpu_to_cpu_done = threading.Event()
-        self.cpu_to_disk_done = threading.Event()
-        self.preloaded_data: Optional[List[WriteBucket]] = None
-        self.error: Optional[Exception] = None
 
 
 class FileSystemWriterAsync(FileSystemWriter):
     """
-    Enhanced Async-enabled implementation of FileSystemWriter using file I/O with pipeline support.
+    Async-enabled implementation of FileSystemWriter using file I/O.
 
     This class does not spawn the async process itself but relies on an external async mechanism.
 
@@ -98,14 +74,6 @@ class FileSystemWriterAsync(FileSystemWriter):
 
     Currently, it is assumed that a separate writer is created for each ckpt save
     (intermediate state is stored as writer attributes).
-    
-    **Pipeline Support:**
-    
-    When enable_pipeline=True, this class supports:
-    1. Grouping checkpoint parameters into multiple tensor groups
-    2. Sequential GPU to CPU transfer between groups (Stage N waits for Stage N-1)
-    3. Pipeline CPU->disk write of Stage N overlaps with GPU->CPU transfer of Stage N+1
-    4. CPU->disk write of Stage N waits for CPU->disk write of Stage N-1 to complete
     """
 
     def __init__(
@@ -114,14 +82,10 @@ class FileSystemWriterAsync(FileSystemWriter):
         *args,
         separation_hint: Optional[str] = None,
         use_msc: bool = False,
-        enable_pipeline: bool = False,
-        num_tensor_groups: int = 2,
         **kwargs,
     ):
         self.checkpoint_dir = path
         self.use_msc = use_msc
-        self.enable_pipeline = enable_pipeline
-        self.num_tensor_groups = max(2, num_tensor_groups) if enable_pipeline else 2
 
         super().__init__(path, *args, **kwargs)
         if not self.single_file_per_rank:
@@ -154,9 +118,10 @@ class FileSystemWriterAsync(FileSystemWriter):
                 self.thread_count > 1
             ), "thread_count must be at least 2 if separation_hint is provided"
         bins = self.thread_count // 2 if self.separation_hint is not None else self.thread_count
+        #bins is the length of item_buckets, balance the number of plan items in each bucket
         item_buckets = _split_by_size_and_type(bins, plan.items)
         logger.debug(f"bucket_prep, time: {time() - start}")
-
+        print("item_buckets ", len(item_buckets))
         start = time()
         # move tensors from GPU to CPU before starting async writing
         # We do D2H synchronously for now
@@ -185,154 +150,68 @@ class FileSystemWriterAsync(FileSystemWriter):
             is_view = ten.untyped_storage().size() != ten.numel() * ten.itemsize
             return ten.clone() if is_view else ten
 
-        def _create_write_bucket(items: List[WriteItem]) -> WriteBucket:
-            bytes_data = []
-            tensor_data = []
-            file_name = gen_file()
+        # Prepare bytes / tensor data in each bucket, which will be assigned to each writer process
+        self.write_buckets = []
+        for group_name, group_buckets in _split_by_separation_hint(
+            item_buckets, self.separation_hint
+        ).items():
+            for bucket in group_buckets:
+                bytes_data = [
+                    (item, planner.resolve_data(item))
+                    for item in bucket
+                    if item.type == WriteItemType.BYTE_IO
+                ]
+                tensor_data = [
+                    (item, _clone_if_needed(planner.resolve_data(item)))
+                    for item in bucket
+                    if item.type != WriteItemType.BYTE_IO
+                ]
+                if len(bytes_data) > 0 or len(tensor_data) > 0:
+                    file_name = gen_file(prefix=group_name)
+                    self.write_buckets.append(
+                        (  # type: ignore[arg-type]
+                            os.path.join(self.checkpoint_dir, file_name),
+                            file_name,
+                            (bytes_data, tensor_data),
+                        )
+                    )
 
-            for item in items:
-                if item.type == WriteItemType.BYTE_IO:
-                    bytes_data.append((item.fqn, planner.resolve_data(item)))
-                else:
-                    tensor_data.append((item.fqn, _clone_if_needed(planner.resolve_tensor(item))))
-
-            return (Path(file_name), storage_plan.prefix, (bytes_data, tensor_data))
-
-        self.write_buckets = [_create_write_bucket(bucket) for bucket in item_buckets]
-        logger.debug(f"write_buckets_prep, time: {time() - start}")
+        # Check if there is anything to write on this rank
+        if len(self.write_buckets) > 0:
+            assert len(self.write_buckets) <= self.thread_count, (
+                len(self.write_buckets),
+                self.thread_count,
+            )
+            self.results_queue = _get_write_results_queue()
+        else:
+            self.results_queue = None
+        end = time()
+        logger.debug(f"D2H and push, time: {end - start}")
 
     def get_save_function_and_args(self) -> Tuple[Optional[Callable], Optional[Callable], List]:
         """
-        Enhanced version that returns pipeline or standard functions based on enable_pipeline flag.
-        
-        Returns: None (if nothing to write) or tuple of:
-            1) the function that saves the data (pipeline or standard)
-            2) the function that stages GPU tensors (pipeline or standard) 
-            3) arguments to the save function
+        Get function that saves the data to storage along with its arguments.
+        Allows the external caller to apply the save function synchronously or asynchronously.
+
+        Returns: None (if there is nothing to write on this rank) or a tuple of:
+            1) the function that saves the data.
+            2) the function that stages the GPU tensors to a destination for async checkpointing.
+               This function should be self-contained.
+            3) arguments to that function in 1).
         """
         if not self.write_buckets:
             return None, None, []
-            
         transform_list = [self.transforms] if hasattr(self, "transforms") else []
-        
-        if self.enable_pipeline:
-            # Return pipeline-enabled functions
-            return (
-                partial(self.write_preloaded_data_multiproc_pipeline, transform_list, self.use_msc),
-                partial(self.preload_tensors_pipeline, self.write_buckets, True, self.num_tensor_groups),
-                [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
-            )
-        else:
-            # Return standard functions (existing behavior)
-            return (
-                partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
-                partial(self.preload_tensors, self.write_buckets, True),
-                [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
-            )
-
-    @staticmethod
-    def group_write_buckets_by_size(write_buckets: List[WriteBucket], num_groups: int) -> GroupedWriteBuckets:
-        """
-        Group write buckets into multiple groups based on tensor sizes for optimal pipeline processing.
-        
-        Args:
-            write_buckets: List of WriteBucket objects to group
-            num_groups: Number of groups to create
-            
-        Returns:
-            List of tensor groups, each containing a subset of write buckets
-        """
-        if num_groups <= 1:
-            return [write_buckets]
-            
-        if len(write_buckets) <= num_groups:
-            # If we have fewer buckets than groups, put each bucket in its own group
-            return [[bucket] for bucket in write_buckets]
-        
-        # Calculate total tensor size for each bucket
-        bucket_sizes = []
-        for bucket in write_buckets:
-            file_name, storage_key, (bytes_data, tensor_data) = bucket
-            total_size = 0
-            
-            # Calculate size of tensor data
-            for item, tensor in tensor_data:
-                if hasattr(tensor, 'numel') and hasattr(tensor, 'element_size'):
-                    total_size += tensor.numel() * tensor.element_size()
-                elif hasattr(tensor, 'nbytes'):
-                    total_size += tensor.nbytes
-                    
-            bucket_sizes.append((bucket, total_size))
-        
-        # Sort buckets by size (largest first) for better load balancing
-        bucket_sizes.sort(key=lambda x: x[1], reverse=True)
-        
-        # Distribute buckets across groups using a greedy algorithm
-        groups = [[] for _ in range(num_groups)]
-        group_sizes = [0] * num_groups
-        
-        for bucket, size in bucket_sizes:
-            # Find the group with minimum current size
-            min_group_idx = min(range(num_groups), key=lambda i: group_sizes[i])
-            groups[min_group_idx].append(bucket)
-            group_sizes[min_group_idx] += size
-            
-        # Filter out empty groups
-        return [group for group in groups if group]
-
-    @staticmethod
-    def preload_tensors_pipeline(
-        write_buckets: List[WriteBucket], 
-        non_blocking: bool = True, 
-        num_groups: int = 2
-    ) -> List[WriteBucket]:
-        """
-        Pipeline-enabled tensor preloading with grouped sequential GPU->CPU transfer.
-        
-        This function groups tensors and performs sequential GPU->CPU transfer within each group,
-        which is then used in the pipeline with CPU->disk writing.
-        
-        Args:
-            write_buckets: List of WriteBucket objects
-            non_blocking: Whether to use non-blocking GPU->CPU transfer
-            num_groups: Number of groups to split tensors into
-            
-        Returns:
-            List of WriteBucket objects with tensors moved to CPU
-        """
-        if not write_buckets:
-            return []
-            
-        # Group write buckets for pipeline processing
-        grouped_buckets = FileSystemWriterAsync.group_write_buckets_by_size(write_buckets, num_groups)
-        
-        logger.info(f"Pipeline preload: Processing {len(write_buckets)} buckets in {len(grouped_buckets)} groups")
-        
-        result = []
-        
-        # Process each group sequentially (this is the key constraint)
-        for group_idx, group_buckets in enumerate(grouped_buckets):
-            logger.debug(f"Processing group {group_idx + 1}/{len(grouped_buckets)} with {len(group_buckets)} buckets")
-            
-            # Process all buckets in this group
-            for bucket in group_buckets:
-                file_name, storage_key, (bytes_data, tensor_data) = bucket
-                tensor_data = [
-                    (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
-                ]
-                result.append((file_name, storage_key, (bytes_data, tensor_data)))
-            
-            # Synchronize after each group to ensure proper sequencing
-            if non_blocking:
-                torch.cuda.synchronize()
-                
-        logger.info(f"Pipeline preload completed: {len(result)} buckets processed")
-        return result
+        return (
+            partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
+            partial(self.preload_tensors, self.write_buckets, True),
+            [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+        )
 
     @staticmethod
     def preload_tensors(write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
         """
-        Standard tensor preloading (original implementation).
+        Preloads tensors in `state_dict` to host memory via CPU memory.
 
         Args:
             write_buckets (List): List of `WriteBucket` objects that define what to
@@ -353,50 +232,6 @@ class FileSystemWriterAsync(FileSystemWriter):
 
     @staticmethod
     @_disable_gc()
-    def write_preloaded_data_multiproc_pipeline(
-        transform_list: List[_StorageWriterTransforms],
-        use_msc: bool,
-        rank: int,
-        write_buckets: List[WriteBucket],
-        global_results_queue: mp.Queue,
-    ) -> None:
-        """
-        Pipeline-enabled multiprocess data writing with correct stage sequencing.
-        
-        This function implements the corrected pipeline logic where:
-        1. GPU->CPU transfers are sequential across stages
-        2. CPU->disk writes are sequential across stages  
-        3. Stage N's CPU->disk write overlaps with Stage N+1's GPU->CPU transfer
-        
-        Args:
-            transform_list: List of storage writer transforms
-            use_msc: Whether to use MSC (Multi-Storage Client)
-            rank: Current process rank
-            write_buckets: List of WriteBucket objects to process
-            global_results_queue: Queue for collecting results
-        """
-        if not write_buckets:
-            return
-            
-        # Group write buckets for pipeline processing
-        grouped_buckets = FileSystemWriterAsync.group_write_buckets_by_size(write_buckets, 2)  # Use 2 groups for pipeline
-        
-        logger.info(f"Pipeline multiproc: Processing {len(write_buckets)} buckets in {len(grouped_buckets)} groups")
-        
-        # Create pipeline stages
-        stages = []
-        for stage_id, group_buckets in enumerate(grouped_buckets):
-            stage = PipelineStage(stage_id, group_buckets)
-            stages.append(stage)
-        
-        # Create orchestrator for pipeline execution
-        orchestrator = _PipelineOrchestrator(stages, transform_list, use_msc, rank, global_results_queue)
-        
-        # Start pipeline execution
-        orchestrator.execute_pipeline()
-
-    @staticmethod
-    @_disable_gc()
     def write_preloaded_data_multiproc(
         transform_list: List[_StorageWriterTransforms],
         use_msc: bool,
@@ -405,7 +240,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         global_results_queue: mp.Queue,
     ) -> None:
         """
-        Performs saving data to storage with multiple processes (original implementation).
+        Performs saving data to storage with multiple processes.
 
         Starts predefined number of processes and uses 2 queues to make sure the results
         are complete:
@@ -414,235 +249,396 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         Using just one queue disallowed proper exception handling.
 
+        This method is meant to be run in a forked subprocess.
+        Triggering GC during execution leads to CUDA errors
+        (cleaning up tensors owned by the parent process).
+        To prevent this, we disable the GC explicitly for this function with _disable_gc.
+
         Args:
-            transform_list: List of storage writer transforms
-            use_msc: Whether to use MSC (Multi-Storage Client)
-            rank: Current process rank
-            write_buckets: List of WriteBucket objects to process
-            global_results_queue: Queue for collecting results
+            write_buckets (List[WriteBucket]): write plan
+            global_results_queue (mp.Queue): mp.Queue to collect Dict[List[WriteResults]]
+                (or an Exception) from parallel write processes to the main training process
+        Returns: None
         """
-        if not write_buckets:
-            return
-
-        local_results_queue = mp.Queue()
-        count_queue = mp.Queue()
-
-        processes = []
-        for bucket in write_buckets:
-            p = mp.Process(
-                target=FileSystemWriterAsync.write_preloaded_data,
-                args=(transform_list, use_msc, bucket, local_results_queue, count_queue),
-            )
-            p.start()
-            processes.append(p)
-
-        # Collect results
-        completed = 0
-        total = len(write_buckets)
-        while completed < total:
+        logger = logging.getLogger(__name__)
+        w_start = time()
+        write_results_or_exc: Union[dict, Exception] = dict()
+        ctx = mp.get_context("fork")
+        local_results_queue = ctx.Queue()
+        count_queue = ctx.JoinableQueue()
+        p_list = []
+        for i, write_bucket in enumerate(write_buckets):
             try:
-                result = local_results_queue.get(timeout=1)
-                global_results_queue.put(result)
-                completed += 1
-            except queue.Empty:
-                # Check if any process has died
-                for p in processes:
-                    if not p.is_alive():
-                        p.join()
-                        raise RuntimeError(f"Process {p.pid} died unexpectedly")
+                count_queue.put(i)
 
-        # Wait for all processes to complete
-        for p in processes:
-            p.join()
+                kwargs = {
+                    "local_proc_idx": i,
+                    "write_bucket": write_bucket,
+                    "results_queue": local_results_queue,
+                    "count_queue": count_queue,
+                    "use_fsync": True,
+                }
+
+                if use_msc:
+                    import inspect
+
+                    # Remove the inspect after the test_async_save.py is fixed.
+                    signature = inspect.signature(FileSystemWriterAsync.write_preloaded_data)
+                    if len(signature.parameters) > 6:
+                        kwargs["use_msc"] = use_msc
+
+                p_list.append(
+                    ctx.Process(
+                        target=partial(FileSystemWriterAsync.write_preloaded_data, transform_list),
+                        kwargs=kwargs,
+                    )
+                )
+            except Exception as e:
+                err_msg = f"An error is caught while a proc {i} is created, error: {e}"
+                logger.error(err_msg)
+                write_results_or_exc = RuntimeError(err_msg)
+
+        if not isinstance(write_results_or_exc, Exception):
+            for p in p_list:
+                p.start()
+
+            logger.debug("FileSystemWriterAsync: collecting worker results...")
+
+            # To make sure all nodes are completed
+            count_queue.join()
+            # At this point, all workers completed, so the queue should have exactly
+            # `len(write_buckets)` items
+            for proc_idx in range(len(write_buckets)):
+                try:
+                    local_proc_idx, local_results_or_exc = local_results_queue.get()
+                except queue.Empty:
+                    write_results_or_exc = RuntimeError(
+                        "Unexpected empty `local_results_queue`"
+                        f" (got only {proc_idx}/{len(write_buckets)} items)"
+                    )
+                    break
+                else:
+                    if isinstance(local_results_or_exc, Exception):
+                        err_msg = (
+                            f"Local process {local_proc_idx} encountered"
+                            f" an error: {local_results_or_exc}"
+                        )
+                        logger.error(err_msg)
+                        write_results_or_exc = local_results_or_exc
+                        break
+                    assert isinstance(local_results_or_exc, list), type(local_results_or_exc)
+                    write_results_or_exc[local_proc_idx] = local_results_or_exc
+                    p_list[local_proc_idx].join()
+
+            logger.debug("FileSystemWriterAsync: collected worker results successfully")
+
+        global_results_queue.put(write_results_or_exc)
+
+        w_end = time()
+        logger.debug(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
 
     @staticmethod
+    @_disable_gc()
     def write_preloaded_data(
         transform_list: List[_StorageWriterTransforms],
-        use_msc: bool,
-        bucket: WriteBucket,
-        local_results_queue: mp.Queue,
-        count_queue: mp.Queue,
+        local_proc_idx: int,
+        write_bucket: WriteBucket,
+        results_queue: mp.SimpleQueue,
+        count_queue: mp.JoinableQueue,
+        use_fsync: bool,
+        **kwargs,
     ) -> None:
         """
-        Writes preloaded data for a single bucket (original implementation).
+        Performs actual data saving to storage.
 
         Args:
-            transform_list: List of storage writer transforms
-            use_msc: Whether to use MSC (Multi-Storage Client)
-            bucket: WriteBucket to process
-            local_results_queue: Queue for results
-            count_queue: Queue for completion count
+            local_proc_idx (int): index of a local process that performs writing
+            write_bucket (WriteBucket): data to write to storage
+            results_queue (mp.Queue): queue to return the write results
+                to the proxy checkpoint process.
+            count_queue (mp.JoinableQueue): queue to marks worker task as completed
+            use_fsync (bool): if True, calls os.fsync at the end of saving
+
+        Returns: None, the write result are put into the `queue`
         """
+        logger = logging.getLogger(__name__)
+        logger.debug(f"{local_proc_idx} started")
+        mem_before = _process_memory()
+        use_msc = kwargs.get("use_msc", False)
+
+        local_results = []
         try:
-            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            file_name, storage_key, (bytes_data, tensor_data) = write_bucket
+            extra_kwargs = {}
+            if "serialization_format" in inspect.signature(_write_item).parameters:
+                from torch.distributed.checkpoint.filesystem import SerializationFormat
 
-            # Apply transforms
-            for transform in transform_list:
-                bytes_data, tensor_data = transform(bytes_data, tensor_data)
-
-            # Write the data
+                extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
             if use_msc:
-                from megatron.core.msc_utils import MultiStorageClientFeature
+                import multistorageclient as msc
 
-                with MultiStorageClientFeature.open_file(file_name, "wb") as f:
-                    _write_item(f, bytes_data, tensor_data)
+                open_file = msc.open
             else:
-                with open(file_name, "wb") as f:
-                    _write_item(f, bytes_data, tensor_data)
-
-            # Put result in queue
-            local_results_queue.put(WriteResult(index=storage_key, size=0))
-            count_queue.put(1)
-
-        except Exception as e:
-            logger.error(f"Error writing bucket {bucket[0]}: {e}")
-            local_results_queue.put(WriteResult(index=bucket[1], size=0, exception=e))
-            count_queue.put(1)
-
-
-class _PipelineOrchestrator:
-    """Orchestrates the pipeline execution with correct stage sequencing."""
-    
-    def __init__(self, stages: List[PipelineStage], transform_list: List[_StorageWriterTransforms], 
-                 use_msc: bool, rank: int, global_results_queue: mp.Queue):
-        self.stages = stages
-        self.transform_list = transform_list
-        self.use_msc = use_msc
-        self.rank = rank
-        self.global_results_queue = global_results_queue
-        
-    def execute_pipeline(self):
-        """Execute the pipeline with correct stage sequencing."""
-        # Start GPU->CPU transfer for all stages (sequential)
-        gpu_to_cpu_threads = []
-        for stage in self.stages:
-            thread = threading.Thread(target=self.gpu_to_cpu_worker, args=(stage,))
-            thread.start()
-            gpu_to_cpu_threads.append(thread)
-        
-        # Start CPU->disk write for all stages (sequential, with proper dependencies)
-        cpu_to_disk_threads = []
-        for stage in self.stages:
-            thread = threading.Thread(target=self.cpu_to_disk_worker, args=(stage,))
-            thread.start()
-            cpu_to_disk_threads.append(thread)
-        
-        # Wait for all threads to complete
-        for thread in gpu_to_cpu_threads + cpu_to_disk_threads:
-            thread.join()
-    
-    def gpu_to_cpu_worker(self, stage: PipelineStage):
-        """Worker for GPU->CPU transfer with sequential dependencies."""
-        try:
-            # CRITICAL: Wait for previous stage's GPU->CPU to complete
-            if stage.stage_id > 0:
-                prev_stage = self.stages[stage.stage_id - 1]
-                prev_stage.gpu_to_cpu_done.wait()
-            
-            logger.debug(f"Stage {stage.stage_id}: Starting GPU->CPU transfer for {len(stage.group_data)} buckets")
-            
-            # Perform GPU->CPU transfer for this stage
-            stage.preloaded_data = []
-            for bucket in stage.group_data:
-                file_name, storage_key, (bytes_data, tensor_data) = bucket
-                tensor_data = [
-                    (item, tensor.to("cpu", non_blocking=True)) for item, tensor in tensor_data
-                ]
-                stage.preloaded_data.append((file_name, storage_key, (bytes_data, tensor_data)))
-            
-            # Synchronize after this stage
-            torch.cuda.synchronize()
-            
-            # Signal completion
-            stage.gpu_to_cpu_done.set()
-            logger.debug(f"Stage {stage.stage_id}: GPU->CPU transfer completed")
-            
-        except Exception as e:
-            logger.error(f"Stage {stage.stage_id}: GPU->CPU transfer failed: {e}")
-            stage.error = e
-            stage.gpu_to_cpu_done.set()
-    
-    def cpu_to_disk_worker(self, stage: PipelineStage):
-        """Worker for CPU->disk write with sequential dependencies."""
-        try:
-            # 1. Wait for current stage's GPU->CPU transfer to complete
-            stage.gpu_to_cpu_done.wait()
-            
-            # 2. CRITICAL: Wait for previous stage's CPU->disk write to complete
-            if stage.stage_id > 0:
-                prev_stage = self.stages[stage.stage_id - 1]
-                prev_stage.cpu_to_disk_done.wait()
-            
-            logger.debug(f"Stage {stage.stage_id}: Starting CPU->disk write for {len(stage.preloaded_data)} buckets")
-            
-            # Perform CPU->disk write for this stage
-            if stage.preloaded_data:
-                local_results_queue = mp.Queue()
-                count_queue = mp.Queue()
-                
-                processes = []
-                for bucket in stage.preloaded_data:
-                    p = mp.Process(
-                        target=FileSystemWriterAsync.write_preloaded_data,
-                        args=(self.transform_list, self.use_msc, bucket, local_results_queue, count_queue),
+                open_file = open
+            with open_file(file_name, "wb") as stream:
+                for write_item, data in bytes_data:
+                    local_results.append(
+                        _write_item(
+                            *transform_list, stream, data, write_item, storage_key, **extra_kwargs
+                        )
                     )
-                    p.start()
-                    processes.append(p)
-                
-                # Collect results
-                completed = 0
-                total = len(stage.preloaded_data)
-                while completed < total:
-                    try:
-                        result = local_results_queue.get(timeout=1)
-                        self.global_results_queue.put(result)
-                        completed += 1
-                    except queue.Empty:
-                        # Check if any process has died
-                        for p in processes:
-                            if not p.is_alive():
-                                p.join()
-                                raise RuntimeError(f"Process {p.pid} died unexpectedly")
-                
-                # Wait for all processes to complete
-                for p in processes:
-                    p.join()
-            
-            # Signal completion
-            stage.cpu_to_disk_done.set()
-            logger.debug(f"Stage {stage.stage_id}: CPU->disk write completed")
-            
+
+                for write_item, tensor in tensor_data:
+                    assert tensor.is_cpu
+                    local_results.append(
+                        _write_item(
+                            *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
+                        )
+                    )
+
+                if use_fsync:
+                    if use_msc:
+                        stream.fsync()
+                    else:
+                        os.fsync(stream.fileno())
+            local_output = (local_proc_idx, local_results)
         except Exception as e:
-            logger.error(f"Stage {stage.stage_id}: CPU->disk write failed: {e}")
-            stage.error = e
-            stage.cpu_to_disk_done.set()
+            logger.debug(f"{local_proc_idx} failed")
+            local_output = (local_proc_idx, e)  # type: ignore[assignment]
+
+        results_queue.put(local_output)
+        # Signal this process is done.
+        count_queue.get()
+        count_queue.task_done()
+
+        mem_after = _process_memory()
+        logger.debug(
+            f"{local_proc_idx} consumed: {mem_after - mem_before},"
+            f" before: {mem_before}, after: {mem_after}"
+        )
+
+    def write_data(self, plan: SavePlan, planner: SavePlanner) -> Future[List[WriteResult]]:
+        """Write all items from ``plan``."""
+        raise NotImplementedError("write_data not implemented for FileSystemWriterAsync")
+
+    def retrieve_write_results(self) -> List[WriteResult]:
+        """
+        Turn the latest dict including write results from `self.results_queue`
+            into a single results lists. Includes error check.
+
+        Returns (List[WriteResult]): the list of write results
+            from all local processes performing the save.
+
+        """
+        assert self.write_buckets is not None
+
+        if self.results_queue is None:
+            write_results_or_exc = {}
+        else:
+            try:
+                write_results_or_exc = self.results_queue.get_nowait()
+            except queue.Empty:
+                raise RuntimeError("results_queue should not be empty")
+
+        if isinstance(write_results_or_exc, Exception):
+            raise RuntimeError(f"Worker failure: {write_results_or_exc}") from write_results_or_exc
+        write_results: dict = write_results_or_exc
+        if len(write_results) != len(self.write_buckets):
+            raise RuntimeError(
+                f"Incomplete worker results (expected {len(self.write_buckets)},"
+                f" got {len(write_results)}. This probably indicates a worker failure."
+            )
+        return list(chain.from_iterable(write_results.values()))
+
+    def prepare_decentralized_global_plan(self, local_plan: SavePlan) -> SavePlan:
+        """Instead of assigning indices by plan order, uses PyT rank (same outcome).
+
+        Args:
+            local_plan (SavePlan): local plan to turn to a global plan
+                (without interactions with other ranks)
+
+        Returns:
+            SavePlan - locally transformed plan equivalent to the plan that would be
+                created by the coordinator
+        """
+        return dataclasses.replace(
+            local_plan, storage_data=_StoragePrefix(f"__{torch.distributed.get_rank()}_")
+        )
+
+    def finish(self, metadata: Metadata, results: List[List[WriteResult]]) -> None:
+        """
+        Finish the checkpointing process.
+
+        Args:
+            metadata (Metadata): metadata to save
+            results (List[List[WriteResult]]): results to save
+        """
+        if self.use_msc:
+            import multistorageclient as msc
+
+            storage_md = dict()
+            for wr_list in results:
+                storage_md.update({wr.index: wr.storage_data for wr in wr_list})
+
+            metadata.storage_data = storage_md
+            metadata.storage_meta = self.storage_meta()
+
+            path = os.path.join(self.checkpoint_dir, ".metadata")
+
+            with msc.open(path, "wb") as metadata_file:
+                pickle.dump(metadata, metadata_file)
+        else:
+            # try:
+            super().finish(metadata, results)
+            #     print("results ", results)
+            # except AttributeError as e:
+            #     print("error in finish ", e)
+            #     print("results ", results)
+            #     raise
+
+    def prepare_local_plan(self, plan: SavePlan) -> SavePlan:
+        """
+        Prepare the local plan for the checkpointing process.
+        """
+        if self.use_msc:
+            import multistorageclient as msc
+
+            msc.os.makedirs(str(self.checkpoint_dir), exist_ok=True)
+        else:
+            super().prepare_local_plan(plan)
+
+        return plan
+
+    @property
+    def checkpoint_id(self) -> Union[str, os.PathLike]:
+        """
+        return the checkpoint_id that will be used to save the checkpoint.
+        """
+        return str(self.checkpoint_dir)
+
+    @classmethod
+    def validate_checkpoint_id(cls, checkpoint_id: Union[str, os.PathLike]) -> bool:
+        """
+        Validate the checkpoint_id that will be used to save the checkpoint.
+
+        This method is available in PyTorch 2.3 and above.
+        """
+        if checkpoint_id.startswith("msc://"):
+            return True
+
+        if hasattr(FileSystemWriter, "validate_checkpoint_id"):
+            return FileSystemWriter.validate_checkpoint_id(checkpoint_id)
+
+        return False
 
 
 def _split_by_size_and_type(bins: int, items: List[WriteItem]) -> List[List[WriteItem]]:
-    """Split items into bins based on size and type for load balancing."""
-    if bins <= 1:
+    """
+    Splits write items according to item size into close to uniform bins.
+
+    Same as torch.distributed.checkpoint.filesystem._split_by_size_and_type,
+    but with a fixed _item_size function.
+
+    Args:
+        bins (int): numbers of bins to split to
+        items (List[WriteItem]): list of write items
+
+    Returns (List[List[WriteItem]]): write items split to bins
+    """
+    if bins == 1:
         return [items]
-    
-    # Calculate size for each item
-    item_sizes = []
-    for item in items:
-        if item.type == WriteItemType.BYTE_IO:
-            size = item.storage_data.bytes_data_size
-        else:
-            size = item.storage_data.tensor_data_size
-        item_sizes.append((item, size))
-    
-    # Sort by size (largest first)
-    item_sizes.sort(key=lambda x: x[1], reverse=True)
-    
-    # Distribute across bins using greedy algorithm
-    bins_list = [[] for _ in range(bins)]
-    bin_sizes = [0] * bins
-    
-    for item, size in item_sizes:
-        # Find bin with minimum current size
-        min_bin_idx = min(range(bins), key=lambda i: bin_sizes[i])
-        bins_list[min_bin_idx].append(item)
-        bin_sizes[min_bin_idx] += size
-    
-    return bins_list
+
+    bytes_items: List[WriteItem] = []
+    tensor_items: List[WriteItem] = []
+    for wi in items:
+        container = bytes_items if wi.type == WriteItemType.BYTE_IO else tensor_items
+        container.append(wi)
+
+    buckets: List[List[WriteItem]] = [[] for _ in range(bins)]
+    bucket_sizes = [0 for _ in range(bins)]
+
+    # Assign bytes with a simple round-robin
+    for i, item in enumerate(bytes_items):
+        buckets[i % bins].append(item)
+
+    # Sort tensor items by size in decreasing order once and store the size with item
+    sized_tensors = [(item, _item_size(item)) for item in tensor_items]
+    sized_tensors.sort(key=itemgetter(1), reverse=True)
+
+    # Use a min heap for bin assignment
+    # Store (total_size_of_bin, bin_index) tuples
+    heap: List[Tuple[int, int]] = [(0, i) for i in range(bins)]
+
+    # Assign tensors using heap
+    for item, size in sized_tensors:
+        total_bin_size, bin_idx = heappop(heap)
+        buckets[bin_idx].append(item)
+        heappush(heap, (total_bin_size + size, bin_idx))
+
+    return buckets
+
+
+def _split_by_separation_hint(
+    buckets: List[List[WriteItem]], separation_hint: Optional[str] = None
+) -> Dict[str, List[List[WriteItem]]]:
+    """
+    Splits buckets into those whose keys begin with the separation_hint and those whose keys do not
+
+    Args:
+        buckets (List[List[WriteItem]]): buckets to split
+        separation_hint (Optional[str]): optional prefix to split on
+
+    Returns (Dict[str, List[List[WriteItem]]]): a dictionary
+        mapping the prefix to the relevant buckets
+    """
+    bins = len(buckets)
+    buckets_with_separation_hint = {}
+    if separation_hint is not None:
+        buckets_default = [[] for _ in range(bins)]
+        buckets_hint = [[] for _ in range(bins)]
+        for i in range(bins):
+            for item in buckets[i]:
+                if item.index.fqn.startswith(separation_hint):
+                    buckets_hint[i].append(item)
+                else:
+                    buckets_default[i].append(item)
+        buckets_with_separation_hint[""] = buckets_default
+        buckets_with_separation_hint[separation_hint] = buckets_hint
+    else:
+        buckets_with_separation_hint[""] = buckets
+    return buckets_with_separation_hint
+
+
+def _item_size(item: WriteItem) -> int:
+    """
+    Calculates size (in bytes) of a single write item.
+
+    Same as torch.distributed.checkpoint.filesystem._item_size,
+    but fixes computing chunk size (with item.tensor_data.chunk.sizes)
+
+    Args:
+        item (WriteItem): write item to compute the size of
+
+    Returns (int): size of an item in bytes
+    """
+    size = 1
+    assert item.tensor_data is not None
+    # can't use math.prod as PT needs to support older python
+    for s in item.tensor_data.chunk.sizes:
+        size *= s
+
+    dtype = item.tensor_data.properties.dtype
+    return size * torch._utils._element_size(dtype)
+
+
+def _process_memory() -> int:
+    """
+    Get memory used by current process.
+
+    Returns (int): memory used by current process
+    """
+    if not HAVE_PSUTIL:
+        raise RuntimeError("psutil is not installed, please install it with `pip install psutil`")
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    return mem_info.rss

@@ -57,7 +57,9 @@ from .base import (
     register_default_strategy,
 )
 from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
-from .filesystem_async import FileSystemWriterAsync
+# from .filesystem_async import FileSystemWriterAsync
+from .filesystem_async_pipeline import FileSystemWriterAsyncPipeline as FileSystemWriterAsync
+
 from .resharding import (
     TensorReformulationMetadata,
     apply_nd_flattened_tensors_reformulation,
@@ -726,6 +728,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
         # Use PyT saving mechanism
+        print("FileSystemWriterAsync ", self.enable_pipeline)
         writer = FileSystemWriterAsync(
             checkpoint_dir,
             separation_hint=self.separation_hint,
@@ -806,11 +809,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
     def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret) -> AsyncRequest:
         save_fn_args = writer.get_save_function_and_args()
         save_fn, preload_fn, save_args = save_fn_args
-
         def finalize_fn():
             save_state_dict_async_finalize(*save_state_dict_ret)
             torch.distributed.barrier()
-
         return AsyncRequest(save_fn, save_args, [finalize_fn], preload_fn=preload_fn)
 
     def can_handle_sharded_objects(self):

@@ -72,7 +72,7 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
             return None, None, []
             
         transform_list = [self.transforms] if hasattr(self, "transforms") else []
-        
+
         if self.enable_pipeline:
             # Return pipeline-enabled functions
             return (
@@ -98,7 +98,7 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
         """
         if num_groups <= 1:
             return [write_buckets]
-            
+
         if len(write_buckets) <= num_groups:
             # If we have fewer buckets than groups, put each bucket in its own group
             return [[bucket] for bucket in write_buckets]
@@ -124,7 +124,6 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
         # Distribute buckets across groups using a greedy algorithm
         groups = [[] for _ in range(num_groups)]
         group_sizes = [0] * num_groups
-        
         for bucket, size in bucket_sizes:
             # Find the group with minimum current size
             min_group_idx = min(range(num_groups), key=lambda i: group_sizes[i])
@@ -164,7 +163,7 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
         )
         
         logger.debug(f"rank: {rank}, created {len(grouped_buckets)} groups for pipeline processing")
-        
+                
         result = []
         
         # Process each group sequentially for GPU->CPU transfer
@@ -255,6 +254,7 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
                 
                 # CORRECTED: Wait for previous stage's GPU->CPU transfer to complete
                 if stage.stage_id > 0:
+                    print(f"rank: {rank}, stage {stage.stage_id} waiting for stage {stage.stage_id - 1} GPU->CPU")
                     prev_stage = stages[stage.stage_id - 1]
                     logger.debug(f"rank: {rank}, stage {stage.stage_id} waiting for stage {stage.stage_id - 1} GPU->CPU")
                     prev_stage.gpu_to_cpu_done.wait()
@@ -372,8 +372,24 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
             logger.error(f"rank: {rank}, pipeline execution failed: {e}")
             write_results_or_exc = e
         
-        # Put final results in global queue
-        global_results_queue.put(write_results_or_exc)
+        # Flatten results to match standard format before putting in queue
+        flattened_results = {}
+        if isinstance(write_results_or_exc, dict):
+            for stage_key, stage_results in write_results_or_exc.items():
+                if isinstance(stage_results, dict):
+                    # Flatten stage results into global results
+                    for proc_idx, proc_results in stage_results.items():
+                        flattened_results[len(flattened_results)] = proc_results
+                else:
+                    # Handle error case
+                    flattened_results = write_results_or_exc
+                    break
+        else:
+            # Handle error case
+            flattened_results = write_results_or_exc
+            
+        # Put final results in global queue (same format as standard method)
+        global_results_queue.put(flattened_results)
         
         end_time = time()
         logger.debug(f"rank: {rank}, CORRECTED pipeline multiprocess write completed in {end_time - start_time:.3f}s")

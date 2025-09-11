@@ -220,6 +220,8 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         """Each async strategy can be trivially used as a sync strategy."""
+
+        
         async_request = self.async_save(sharded_state_dict, checkpoint_dir)
         # multiprocessing routines  may cause issue when called on parent process
         # We keep this verbose call for now

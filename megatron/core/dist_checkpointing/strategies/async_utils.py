@@ -189,7 +189,7 @@ class TemporalAsyncCaller(AsyncCaller):
             # to do the defined action in `async_req.preload_fn` to
             # stage GPU tensors to its defined destination
             async_fn_args[1] = async_req.preload_fn()
-
+            
         rank = torch.distributed.get_rank()
         start_sync = time()
         torch.cuda.synchronize()
@@ -507,6 +507,7 @@ class AsyncCallsQueue:
             int: index of the async call that was started.
                 This can help the user keep track of the async calls.
         """
+
         self.call_idx += 1
         async_caller = self._get_async_caller()
         # Backward compatibility for local checkpointing built with the old AsyncRequest

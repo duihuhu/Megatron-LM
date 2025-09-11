@@ -358,7 +358,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     """
     start_ckpt = time()
     args = get_args()
-    
+
     if args.async_save and not is_empty_async_queue():
         print_rank_0('WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.')
 
@@ -392,6 +392,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             save_dir = checkpointing_context['local_checkpoint_manager'].local_ckpt_dir
         else:
             raise NotImplementedError(f"Please use local or global non-persistent checkpoints (got: {args.non_persistent_ckpt_type})")
+
 
     ckpt_format = args.ckpt_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
     print_rank_0('saving checkpoint at iteration {:7d} to {} in {} format'.format(
@@ -471,6 +472,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             else:
                 validate_sharding_integrity = True
                 save_strategy = get_default_save_sharded_strategy(args.ckpt_format)
+                if args.enable_pipeline_checkpoint:
+                    save_strategy.enable_pipeline =  args.enable_pipeline_checkpoint
+                    save_strategy.num_tensor_groups = args.num_tensor_groups
+
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
                     if checkpointing_context is not None and 'load_strategy' in checkpointing_context:
@@ -485,7 +490,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
                                                                      args.ckpt_assume_constant_structure)
             # Store save strategy for future checkpoint saves
-            if checkpointing_context is not None:
+            if checkpointing_context is not None:    
                 checkpointing_context['save_strategy'] = save_strategy
             end_ckpt = time()
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")

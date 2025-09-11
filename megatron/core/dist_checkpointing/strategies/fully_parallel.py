@@ -84,7 +84,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         self.do_cache_distribution = do_cache_distribution
 
         self.cached_distribution: Optional[ShardDistribution] = None
-
+        
     def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         if not isinstance(self.base_strategy, AsyncSaveShardedStrategy):
             raise CheckpointingException(

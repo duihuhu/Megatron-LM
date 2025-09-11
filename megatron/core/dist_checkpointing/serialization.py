@@ -398,10 +398,7 @@ def save(
         sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, *sharded_strategy)
     
     # Pass pipeline parameters to strategy if it supports them
-    if hasattr(sharded_strategy, 'enable_pipeline'):
-        sharded_strategy.enable_pipeline = enable_pipeline
-        sharded_strategy.num_tensor_groups = num_tensor_groups
-
+    
     if common_strategy is None:
         common_strategy = get_default_save_common_strategy()
     if not isinstance(common_strategy, SaveCommonStrategy):
@@ -431,7 +428,7 @@ def save(
                 checkpoint_dir,
             )
         torch.distributed.barrier()
-
+        
     if not async_sharded_save:
         sharded_strategy.save(sharded_state_dict, checkpoint_dir)
         metadata_finalize_fn()

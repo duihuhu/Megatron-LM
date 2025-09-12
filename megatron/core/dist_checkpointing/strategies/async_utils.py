@@ -190,10 +190,9 @@ class TemporalAsyncCaller(AsyncCaller):
             # If there's a preload_fn in `async_req`, we call this func
             # to do the defined action in `async_req.preload_fn` to
             # stage GPU tensors to its defined destination
-            if args.enable_pipeline_checkpoint:
+            if not args.enable_pipeline_checkpoint:
                 async_fn_args[1] = async_req.preload_fn()
-            else:
-                async_fn_args.append(async_req.preload_fn)
+                
             
         rank = torch.distributed.get_rank()
         start_sync = time()

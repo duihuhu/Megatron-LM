@@ -121,7 +121,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         #bins is the length of item_buckets, balance the number of plan items in each bucket
         item_buckets = _split_by_size_and_type(bins, plan.items)
         logger.debug(f"bucket_prep, time: {time() - start}")
-        print("item_buckets ", len(item_buckets))
+        print("item_buckets ", len(item_buckets), len(item_buckets[0]), len(item_buckets[1]))
         start = time()
         # move tensors from GPU to CPU before starting async writing
         # We do D2H synchronously for now
@@ -175,7 +175,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                             (bytes_data, tensor_data),
                         )
                     )
-
+        print("self write_buckets ", len(self.write_buckets), len(self.write_buckets[0][2][0]), len(self.write_buckets[0][2][1]), len(self.write_buckets[1][2][0]), len(self.write_buckets[1][2][1]))
+                    
         # Check if there is anything to write on this rank
         if len(self.write_buckets) > 0:
             assert len(self.write_buckets) <= self.thread_count, (
@@ -260,7 +261,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 (or an Exception) from parallel write processes to the main training process
         Returns: None
         """
-        print("write_buckets ", write_buckets)
+        # print("write_buckets ", write_buckets)
         logger = logging.getLogger(__name__)
         w_start = time()
         write_results_or_exc: Union[dict, Exception] = dict()
@@ -332,7 +333,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     p_list[local_proc_idx].join()
 
             logger.debug("FileSystemWriterAsync: collected worker results successfully")
-
+        print("write_results_or_exc ", write_results_or_exc)
         global_results_queue.put(write_results_or_exc)
 
         w_end = time()

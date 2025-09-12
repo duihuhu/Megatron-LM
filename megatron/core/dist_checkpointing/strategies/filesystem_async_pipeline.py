@@ -87,51 +87,145 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
     @staticmethod
     def group_write_buckets_by_size(write_buckets: List[WriteBucket], num_groups: int) -> GroupedWriteBuckets:
         """
-        Group write buckets into multiple groups based on tensor sizes for optimal pipeline processing.
-        
-        Args:
-            write_buckets: List of WriteBucket objects to group
-            num_groups: Number of groups to create
-            
-        Returns:
-            List of tensor groups, each containing a subset of write buckets
+        Group write buckets into multiple groups based on data paths and tensor sizes for optimal pipeline processing.
         """
         if num_groups <= 1:
             return [write_buckets]
 
-        if len(write_buckets) <= num_groups:
-            # If we have fewer buckets than groups, put each bucket in its own group
-            return [[bucket] for bucket in write_buckets]
+        print(f"DEBUG: num_groups={num_groups}, write_buckets_count={len(write_buckets)}")
         
-        # Calculate total tensor size for each bucket
-        bucket_sizes = []
+        # 按数据路径分组，并合并相同路径的bytes_data和tensor_data
+        path_data = {}
         for bucket in write_buckets:
-            file_name, storage_key, (bytes_data, tensor_data) = bucket
-            total_size = 0
+            file_path, file_name, (bytes_data, tensor_data) = bucket
+            if file_path not in path_data:
+                path_data[file_path] = {
+                    'file_path': file_path,
+                    'file_name': file_name,
+                    'bytes_data': [],
+                    'tensor_data': [],
+                    'total_size': 0
+                }
             
-            # Calculate size of tensor data
+            # 合并bytes_data
+            path_data[file_path]['bytes_data'].extend(bytes_data)
+            
+            # 合并tensor_data
+            path_data[file_path]['tensor_data'].extend(tensor_data)
+            
+            # 计算这个bucket的数据量
+            bucket_size = 0
+            for item, data in bytes_data:
+                if isinstance(data, bytes):
+                    bucket_size += len(data)
+                else:
+                    bucket_size += 1
             for item, tensor in tensor_data:
                 if hasattr(tensor, 'numel') and hasattr(tensor, 'element_size'):
-                    total_size += tensor.numel() * tensor.element_size()
+                    bucket_size += tensor.numel() * tensor.element_size()
                 elif hasattr(tensor, 'nbytes'):
-                    total_size += tensor.nbytes
-                    
-            bucket_sizes.append((bucket, total_size))
+                    bucket_size += tensor.nbytes
+                else:
+                    bucket_size += 1
+            
+            path_data[file_path]['total_size'] += bucket_size
         
-        # Sort buckets by size (largest first) for better load balancing
-        bucket_sizes.sort(key=lambda x: x[1], reverse=True)
+        print(f"DEBUG: found {len(path_data)} unique paths: {list(path_data.keys())}")
         
-        # Distribute buckets across groups using a greedy algorithm
+        # 按路径数据量排序（最大的在前）
+        sorted_paths = sorted(path_data.items(), key=lambda x: x[1]['total_size'], reverse=True)
+        
+        # 计算每个路径应该分配多少个组
+        total_data_size = sum(data['total_size'] for data in path_data.values())
         groups = [[] for _ in range(num_groups)]
         group_sizes = [0] * num_groups
-        for bucket, size in bucket_sizes:
-            # Find the group with minimum current size
-            min_group_idx = min(range(num_groups), key=lambda i: group_sizes[i])
-            groups[min_group_idx].append(bucket)
-            group_sizes[min_group_idx] += size
+        
+        for path, data in sorted_paths:
+            path_size = data['total_size']
+            # 计算这个路径应该分配多少个组
+            path_groups_count = max(1, round((path_size / total_data_size) * num_groups))
             
-        # Filter out empty groups
-        return [group for group in groups if group]
+            print(f"DEBUG: path={path}, size={path_size}, allocated_groups={path_groups_count}")
+            
+            # 如果该路径只需要1个组，直接分配到最小的组
+            if path_groups_count == 1:
+                min_group_idx = min(range(num_groups), key=lambda i: group_sizes[i])
+                # 创建一个新的WriteBucket，包含合并后的数据
+                merged_bucket = (
+                    data['file_path'],
+                    data['file_name'],
+                    (data['bytes_data'], data['tensor_data'])
+                )
+                groups[min_group_idx].append(merged_bucket)
+                group_sizes[min_group_idx] += path_size
+                print(f"DEBUG: path={path} -> group[{min_group_idx}], added_size={path_size}")
+            else:
+                # 如果该路径需要多个组，将数据项分配到多个组
+                # 创建所有数据项的列表，按大小排序
+                all_items = []
+                
+                # 添加bytes_data项
+                for item, data_item in data['bytes_data']:
+                    item_size = len(data_item) if isinstance(data_item, bytes) else 1
+                    all_items.append(('bytes', item, data_item, item_size))
+                
+                # 添加tensor_data项
+                for item, tensor in data['tensor_data']:
+                    if hasattr(tensor, 'numel') and hasattr(tensor, 'element_size'):
+                        item_size = tensor.numel() * tensor.element_size()
+                    elif hasattr(tensor, 'nbytes'):
+                        item_size = tensor.nbytes
+                    else:
+                        item_size = 1
+                    all_items.append(('tensor', item, tensor, item_size))
+                
+                # 按大小排序（最大的在前）
+                all_items.sort(key=lambda x: x[3], reverse=True)
+                
+                # 使用贪心算法分配数据项到各组
+                group_items = [[] for _ in range(path_groups_count)]
+                group_sizes_temp = [0] * path_groups_count
+                
+                for item_type, item, data_item, item_size in all_items:
+                    # 找到当前总大小最小的组
+                    min_group_idx = min(range(path_groups_count), key=lambda i: group_sizes_temp[i])
+                    group_items[min_group_idx].append((item_type, item, data_item, item_size))
+                    group_sizes_temp[min_group_idx] += item_size
+                
+                # 将分配好的数据项转换为WriteBucket并分配到实际组中
+                for i, items in enumerate(group_items):
+                    if items:  # 如果这个组有数据项
+                        # 找到当前总大小最小的实际组
+                        min_group_idx = min(range(num_groups), key=lambda i: group_sizes[i])
+                        
+                        # 分离bytes_data和tensor_data
+                        group_bytes_data = []
+                        group_tensor_data = []
+                        group_size = 0
+                        
+                        for item_type, item, data_item, item_size in items:
+                            if item_type == 'bytes':
+                                group_bytes_data.append((item, data_item))
+                            else:  # tensor
+                                group_tensor_data.append((item, data_item))
+                            group_size += item_size
+                        
+                        # 创建新的WriteBucket
+                        merged_bucket = (
+                            data['file_path'],
+                            data['file_name'],
+                            (group_bytes_data, group_tensor_data)
+                        )
+                        groups[min_group_idx].append(merged_bucket)
+                        group_sizes[min_group_idx] += group_size
+                        
+                        print(f"DEBUG: path={path}, group_items={len(items)} -> group[{min_group_idx}], added_size={group_size}")
+        
+        print(f"DEBUG: final groups={[len(group) for group in groups]}")
+        print(f"DEBUG: final group_sizes={group_sizes}")
+        
+        # 返回所有组
+        return groups
 
     @staticmethod
     def preload_tensors_pipeline(
@@ -214,25 +308,7 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
     ) -> None:
         """
         CORRECTED Pipeline-enabled multiprocess data writing with proper stage sequencing.
-        
-        This function implements the corrected pipeline where:
-        1. Stage N's GPU->CPU transfer waits for Stage N-1's GPU->CPU transfer to complete
-        2. Stage N's CPU->disk write waits for:
-           - Stage N's GPU->CPU transfer to complete
-           - Stage N-1's CPU->disk write to complete
-        3. This creates proper pipeline overlap while maintaining data order
-        
-        Args:
-            transform_list: List of storage writer transforms
-            use_msc: Whether to use multi-storage client
-            rank: Distributed rank
-            write_buckets: List of WriteBucket objects (pre-grouped and preloaded)
-            global_results_queue: Queue for collecting results
-            num_groups: Number of groups for pipeline processing
         """
-        # print("write_preloaded_data_multiproc_pipeline ", preload_fn)
-        # print("write_buckets ", write_buckets)
-        write_buckets = preload_fn()
         logger = logging.getLogger(__name__)
         start_time = time()
         logger.debug(f"rank: {rank}, starting CORRECTED pipeline multiprocess write")
@@ -241,6 +317,17 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
         grouped_buckets = FileSystemWriterAsyncPipeline.group_write_buckets_by_size(
             write_buckets, num_groups
         )
+        print("grouped_buckets ", len(grouped_buckets))
+        
+        # 记录原始路径到结果的映射关系
+        original_path_mapping = {}
+        for i, bucket in enumerate(write_buckets):
+            file_path, file_name, (bytes_data, tensor_data) = bucket
+            if file_path not in original_path_mapping:
+                original_path_mapping[file_path] = []
+            original_path_mapping[file_path].append(i)
+        
+        print(f"DEBUG: original_path_mapping={original_path_mapping}")
         
         # Initialize pipeline stages
         stages = []
@@ -258,19 +345,34 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
                 
                 # CORRECTED: Wait for previous stage's GPU->CPU transfer to complete
                 if stage.stage_id > 0:
-                    print(f"rank: {rank}, stage {stage.stage_id} waiting for stage {stage.stage_id - 1} GPU->CPU")
                     prev_stage = stages[stage.stage_id - 1]
-                    logger.debug(f"rank: {rank}, stage {stage.stage_id} waiting for stage {stage.stage_id - 1} GPU->CPU")
                     prev_stage.gpu_to_cpu_done.wait()
-                    logger.debug(f"rank: {rank}, stage {stage.stage_id} stage {stage.stage_id - 1} GPU->CPU completed")
                 
-                # Note: In the actual implementation, this would perform GPU->CPU transfer
-                # For now, we simulate the timing since data is already preloaded
-                stage.preloaded_data = stage.group_data  # Data already preloaded
+                print(f"rank: {rank}, stage {stage.stage_id} start for GPU->CPU", time())
+                # 在子进程中执行GPU->CPU转换（合并preload_tensors_pipeline的功能）
+                stage.preloaded_data = []
+                for bucket in stage.group_data:
+                    file_name, storage_key, (bytes_data, tensor_data) = bucket
+                    
+                    # Transfer tensor data from GPU to CPU
+                    transferred_tensor_data = []
+                    for item, tensor in tensor_data:
+                        if tensor.device.type != "cpu":
+                            cpu_tensor = tensor.to("cpu", non_blocking=True)
+                            transferred_tensor_data.append((item, cpu_tensor))
+                        else:
+                            transferred_tensor_data.append((item, tensor))
+                            
+                    stage.preloaded_data.append((file_name, storage_key, (bytes_data, transferred_tensor_data)))
+                
+                # Synchronize GPU operations for this stage
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    
                 stage.gpu_to_cpu_done.set()
                 
                 stage_end = time()
-                logger.debug(f"rank: {rank}, stage {stage.stage_id} GPU->CPU completed in {stage_end - stage_start:.3f}s")
+                print(f"rank: {rank}, stage {stage.stage_id} GPU->CPU completed in {stage_end - stage_start:.3f}s", time())
                 
             except Exception as e:
                 stage.error = e
@@ -282,7 +384,6 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
             try:
                 # Wait for current stage's GPU->CPU transfer to complete
                 stage.gpu_to_cpu_done.wait()
-                logger.debug(f"rank: {rank}, stage {stage.stage_id} current stage GPU->CPU completed")
                 
                 # CORRECTED: Wait for previous stage's CPU->disk write to complete
                 if stage.stage_id > 0:
@@ -290,7 +391,9 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
                     logger.debug(f"rank: {rank}, stage {stage.stage_id} waiting for stage {stage.stage_id - 1} CPU->disk")
                     prev_stage.cpu_to_disk_done.wait()
                     logger.debug(f"rank: {rank}, stage {stage.stage_id} stage {stage.stage_id - 1} CPU->disk completed")
-                
+            
+                print(f"rank: {rank}, stage {stage.stage_id} start for CPU->Disk ", time())
+
                 stage_start = time()
                 
                 # Use the existing write_preloaded_data function for actual disk writing
@@ -339,6 +442,7 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
                 
                 stage_end = time()
                 logger.debug(f"rank: {rank}, stage {stage.stage_id} CPU->disk completed in {stage_end - stage_start:.3f}s")
+                print(f"rank: {rank}, stage {stage.stage_id} CPU->disk completed in {stage_end - stage_start:.3f}s", time())
                 
             except Exception as e:
                 stage.error = e
@@ -376,76 +480,52 @@ class FileSystemWriterAsyncPipeline(FileSystemWriterAsync):
             logger.error(f"rank: {rank}, pipeline execution failed: {e}")
             write_results_or_exc = e
         
-        # Flatten results to match standard format before putting in queue
-        flattened_results = {}
+        # 修改：按相同路径合并结果
         if isinstance(write_results_or_exc, dict):
+            # 按路径收集结果
+            path_results = {}
+            
             for stage_key, stage_results in write_results_or_exc.items():
                 if isinstance(stage_results, dict):
-                    # Flatten stage results into global results
                     for proc_idx, proc_results in stage_results.items():
-                        flattened_results[len(flattened_results)] = proc_results
-                else:
-                    # Handle error case
-                    flattened_results = write_results_or_exc
-                    break
-        else:
-            # Handle error case
-            flattened_results = write_results_or_exc
+                        # 从stage_data中获取对应的bucket信息
+                        stage_idx = int(stage_key.split('_')[1])
+                        stage_data = stages[stage_idx].group_data
+                        
+                        # 正确解析proc_idx
+                        if isinstance(proc_idx, str) and '_' in proc_idx:
+                            # proc_idx格式为 "stage_idx_bucket_idx"
+                            bucket_idx = int(proc_idx.split('_')[1])
+                        else:
+                            # 如果proc_idx是整数，直接使用
+                            bucket_idx = int(proc_idx)
+                        
+                        if bucket_idx < len(stage_data):
+                            bucket = stage_data[bucket_idx]
+                            file_path, file_name, (bytes_data, tensor_data) = bucket
+                            
+                            if file_path not in path_results:
+                                path_results[file_path] = []
+                            path_results[file_path].extend(proc_results)
             
+            print(f"DEBUG: path_results={list(path_results.keys())}")
+            
+            # 将结果映射回原始write_buckets格式
+            remapped_results = {}
+            for path, results in path_results.items():
+                if path in original_path_mapping:
+                    # 将结果分配给该路径对应的所有原始bucket索引
+                    for bucket_idx in original_path_mapping[path]:
+                        remapped_results[bucket_idx] = results
+            
+            print(f"DEBUG: remapped_results keys={list(remapped_results.keys())}")
+            write_results_or_exc = remapped_results
+        
         # Put final results in global queue (same format as standard method)
-        global_results_queue.put(flattened_results)
+        global_results_queue.put(write_results_or_exc)
         
         end_time = time()
         logger.debug(f"rank: {rank}, CORRECTED pipeline multiprocess write completed in {end_time - start_time:.3f}s")
-
-
-# Utility functions for integrating with existing async_utils.py
-
-def create_pipeline_async_request(
-    write_buckets: List[WriteBucket],
-    enable_pipeline: bool = True,
-    num_groups: int = 2,
-    **kwargs
-) -> AsyncRequest:
-    """
-    Create an AsyncRequest object configured for pipeline or standard processing.
-    
-    This function serves as a factory to create AsyncRequest objects with the appropriate
-    preload_fn and async_fn based on whether pipeline mode is enabled.
-    
-    Args:
-        write_buckets: List of WriteBucket objects to process
-        enable_pipeline: Whether to use pipeline functionality
-        num_groups: Number of groups for pipeline processing
-        **kwargs: Additional arguments for AsyncRequest
-        
-    Returns:
-        AsyncRequest object configured for pipeline or standard processing
-    """
-    
-    if enable_pipeline:
-        # Use pipeline functions
-        preload_fn = partial(
-            FileSystemWriterAsyncPipeline.preload_tensors_pipeline,
-            write_buckets,
-            True,  # non_blocking
-            num_groups
-        )
-        async_fn = FileSystemWriterAsyncPipeline.write_preloaded_data_multiproc_pipeline
-    else:
-        # Use standard functions  
-        preload_fn = partial(
-            FileSystemWriterAsync.preload_tensors,
-            write_buckets,
-            True  # non_blocking
-        )
-        async_fn = FileSystemWriterAsync.write_preloaded_data_multiproc
-    
-    return AsyncRequest(
-        async_fn=async_fn,
-        preload_fn=preload_fn,
-        **kwargs
-    )
 
 
 # Integration marker functions for backward compatibility
@@ -465,19 +545,4 @@ def is_pipeline_enabled(writer_or_request) -> bool:
     if hasattr(writer_or_request, 'enable_pipeline'):
         return writer_or_request.enable_pipeline
     return False
-
-
-def get_pipeline_marker_attribute(obj) -> Optional[str]:
-    """
-    Get the pipeline marker attribute from an object to distinguish functionality.
-    
-    Args:
-        obj: Object to check for pipeline markers
-        
-    Returns:
-        String indicating pipeline mode or None if standard mode
-    """
-    if hasattr(obj, 'enable_pipeline') and obj.enable_pipeline:
-        return "pipeline_enabled"
-    return None
 

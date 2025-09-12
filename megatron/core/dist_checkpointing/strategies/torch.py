@@ -57,8 +57,12 @@ from .base import (
     register_default_strategy,
 )
 from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
-# from .filesystem_async import FileSystemWriterAsync
-from .filesystem_async_pipeline import FileSystemWriterAsyncPipeline as FileSystemWriterAsync
+from megatron.training.global_vars import get_args
+args = get_args()
+if args.enable_pipeline_checkpoint:
+    from .filesystem_async_pipeline import FileSystemWriterAsyncPipeline as FileSystemWriterAsync
+else:
+    from .filesystem_async import FileSystemWriterAsync
 
 from .resharding import (
     TensorReformulationMetadata,
@@ -729,14 +733,22 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
         # Use PyT saving mechanism
         print("FileSystemWriterAsync ", self.enable_pipeline)
-        writer = FileSystemWriterAsync(
-            checkpoint_dir,
-            separation_hint=self.separation_hint,
-            thread_count=self.thread_count,
-            use_msc=MultiStorageClientFeature.is_enabled(),
-            enable_pipeline=self.enable_pipeline,
-            num_tensor_groups=self.num_tensor_groups,
-        )
+        if args.enable_pipeline_checkpoint:
+            writer = FileSystemWriterAsync(
+                checkpoint_dir,
+                separation_hint=self.separation_hint,
+                thread_count=self.thread_count,
+                use_msc=MultiStorageClientFeature.is_enabled(),
+                enable_pipeline=self.enable_pipeline,
+                num_tensor_groups=self.num_tensor_groups,
+            )
+        else:
+            writer = FileSystemWriterAsync(
+                checkpoint_dir,
+                separation_hint=self.separation_hint,
+                thread_count=self.thread_count,
+                use_msc=MultiStorageClientFeature.is_enabled(),
+            )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
         # Try twice to validate the generated `central_plan` is the same across iterations

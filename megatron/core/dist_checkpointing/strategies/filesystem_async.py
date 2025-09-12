@@ -333,7 +333,6 @@ class FileSystemWriterAsync(FileSystemWriter):
                     p_list[local_proc_idx].join()
 
             logger.debug("FileSystemWriterAsync: collected worker results successfully")
-        print("write_results_or_exc ", write_results_or_exc)
         global_results_queue.put(write_results_or_exc)
 
         w_end = time()

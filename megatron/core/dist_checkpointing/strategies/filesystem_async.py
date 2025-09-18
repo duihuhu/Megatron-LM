@@ -15,6 +15,7 @@ from operator import itemgetter
 from pathlib import Path
 from time import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import io
 
 import torch
 from torch import multiprocessing as mp
@@ -643,3 +644,44 @@ def _process_memory() -> int:
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info()
     return mem_info.rss
+
+
+def serialize_bucket_to_bytes(
+    transform_list: List[_StorageWriterTransforms],
+    bucket_data: Tuple[list, list],
+    storage_key: str,
+) -> Tuple[bytes, int]:
+    """
+    Serialize a write-bucket (bytes_data, tensor_data) into a bytes object suitable for
+    async writing. This re-uses the internal `_write_item` logic but writes into an in-memory
+    buffer instead of a file stream.
+
+    Returns:
+        (bytes, size)
+    """
+    bytes_data, tensor_data = bucket_data
+    buf = io.BytesIO()
+
+    extra_kwargs = {}
+    try:
+        if "serialization_format" in inspect.signature(_write_item).parameters:
+            from torch.distributed.checkpoint.filesystem import SerializationFormat
+
+            extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
+    except Exception:
+        # If signature inspection fails, proceed without extra kwargs
+        pass
+
+    # Write bytes_data
+    for write_item, data in bytes_data:
+        _write_item(*transform_list, buf, data, write_item, storage_key, **extra_kwargs)
+
+    # Write tensor_data (expect CPU tensors)
+    for write_item, tensor in tensor_data:
+        if not tensor.device.type == "cpu":
+            # Defensive: move to CPU if still on GPU
+            tensor = tensor.to("cpu")
+        _write_item(*transform_list, buf, tensor, write_item, storage_key, **extra_kwargs)
+
+    data_bytes = buf.getvalue()
+    return data_bytes, len(data_bytes)

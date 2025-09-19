@@ -116,8 +116,8 @@ EVAL_AND_LOGGING_ARGS=(
     # --non-persistent-save-interval 7
     # --ckpt-format torch
     --use-pipeline-ckpt-worker
-    --pipeline-async-workers 4
-    --async-save
+    --pipeline-async-workers 2
+    # --async-save
 )
 
 

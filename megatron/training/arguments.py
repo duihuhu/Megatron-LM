@@ -1061,13 +1061,13 @@ def validate_args(args, defaults={}):
         assert not args.overlap_grad_reduce, \
             "Delaying wgrad compute is not supported with overlap_grad_reduce"
 
-    # Async checkpoint worker validation
+    # Checkpoint worker validation
     if args.use_pipeline_ckpt_worker and args.use_persistent_ckpt_worker:
         raise ValueError("Cannot use both --use-pipeline-ckpt-worker and --use-persistent-ckpt-worker. "
-                        "Please choose one async checkpoint worker type.")
+                        "Please choose one checkpoint worker type.")
     
-    # if args.use_pipeline_ckpt_worker and not args.async_save:
-        # raise ValueError("--use-pipeline-ckpt-worker requires --async-save to be enabled.")
+    # Pipeline worker can be used with or without --async-save
+    # In sync mode, it provides pipeline benefits but waits for completion
     
     if args.use_persistent_ckpt_worker and not args.async_save:
         raise ValueError("--use-persistent-ckpt-worker requires --async-save to be enabled.")
@@ -2189,10 +2189,11 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-persistent-ckpt-worker', action='store_true',
                        help='Enables a persitent checkpoint worker for async save')
     group.add_argument('--use-pipeline-ckpt-worker', action='store_true',
-                       help='Enables a pipeline checkpoint worker pool for pipeline save. '
+                       help='Enables a pipeline checkpoint worker pool for optimized checkpointing. '
                             'Uses pre-created worker processes with pipeline execution: '
                             'GPU->CPU transfers happen sequentially to avoid bandwidth competition, '
-                            'while disk writes can overlap with subsequent GPU->CPU transfers.')
+                            'while disk writes can overlap with subsequent GPU->CPU transfers. '
+                            'Works in both async (with --async-save) and sync modes.')
     group.add_argument('--pipeline-async-workers', type=int, default=None,
                        help='Number of worker processes for pipeline async checkpointing. '
                             'Defaults to thread_count if available, otherwise 2-4 based on world size. '

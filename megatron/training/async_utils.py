@@ -32,7 +32,6 @@ def init_pipeline_async_worker(num_workers: int = 4):
                                    If None, will use a default value based on system.
     """
     global _async_calls_queue
-    print("init_pipeline_async_worker init_pipeline_async_worker "  )
     _async_calls_queue = AsyncCallsQueue(pipeline=True, num_workers=num_workers)
 
 
@@ -56,16 +55,19 @@ def maybe_finalize_async_save(blocking: bool = False, terminate=False):
                 be closed as the last action of this function.
     """
     args = get_args()
-    if not args.async_save:
-        return
+    
+    # For pipeline mode, we need to finalize even in sync mode to ensure proper cleanup
+    queue_info = get_async_queue_info()
+    if queue_info['queue_type'] == 'pipeline' or args.async_save:
+        if blocking and not is_empty_async_queue():
+            print_rank_0('Unfinalized checkpoint operations. Finalizing them synchronously now.')
 
-    if blocking and not is_empty_async_queue():
-        print_rank_0('Unfinalized async checkpoint saves. Finalizing them synchronously now.')
+        _async_calls_queue.maybe_finalize_async_calls(blocking, no_dist=False)
 
-    _async_calls_queue.maybe_finalize_async_calls(blocking, no_dist=False)
-
-    if terminate:
-        _async_calls_queue.close()
+        if terminate:
+            print_rank_0('Closing async checkpoint workers...')
+            _async_calls_queue.close()
+            print_rank_0('Async checkpoint workers closed.')
 
 
 def is_empty_async_queue() -> bool:
@@ -75,6 +77,16 @@ def is_empty_async_queue() -> bool:
         bool: True if there is any ongoing async call.
     """
     return _async_calls_queue.get_num_unfinalized_calls() == 0
+
+
+def get_async_calls_queue():
+    """Get the configured AsyncCallsQueue instance.
+    
+    Returns:
+        AsyncCallsQueue: The currently configured async calls queue instance
+    """
+    global _async_calls_queue
+    return _async_calls_queue
 
 
 def get_async_queue_info() -> dict:

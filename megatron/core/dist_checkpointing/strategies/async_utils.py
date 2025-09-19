@@ -402,8 +402,61 @@ class PersistentAsyncCaller(AsyncCaller):
             self.process.join()
             self.process = None
 
+    def execute_sync(self, async_req: AsyncRequest) -> None:
+        """Execute async request synchronously using pipeline workers.
+        
+        This method provides the same pipeline benefits (parallel GPU->CPU transfer
+        and pipelined execution) but waits for completion before returning.
+        This allows using pipeline optimization even without --async-save.
+        
+        Args:
+            async_req (AsyncRequest): async request to execute synchronously
+        """
+        if async_req.async_fn is None:
+            return
+        
+        # Schedule the async call
+        self.schedule_async_call(async_req)
+        
+        # Wait for completion (blocking) with timeout
+        logger.debug("PipelineAsyncCaller: Waiting for synchronous completion...")
+        max_wait_time = 600  # 10 minutes timeout for sync execution
+        wait_count = 0
+        
+        while not self.is_current_async_call_done(blocking=False, no_dist=True):
+            import time
+            time.sleep(0.1)  # Small sleep to avoid busy waiting
+            wait_count += 1
+            
+            if wait_count >= max_wait_time * 10:  # 0.1s * 10 * 600 = 600s
+                logger.error("PipelineAsyncCaller: Timeout in synchronous execution")
+                # Try to force completion by checking one more time with blocking=True
+                try:
+                    self.is_current_async_call_done(blocking=True, no_dist=True)
+                except Exception as e:
+                    logger.error(f"Failed to force completion: {e}")
+                break
+            
+            if wait_count % 100 == 0:  # Log every 10 seconds
+                logger.debug(f"PipelineAsyncCaller: Still waiting for completion ({wait_count/10:.1f}s elapsed)")
+        
+        # Execute finalization functions
+        try:
+            torch.distributed.barrier()
+            for finalize_fn in async_req.finalize_fns:
+                finalize_fn()
+            logger.debug("PipelineAsyncCaller: Synchronous execution completed")
+        except Exception as e:
+            logger.error(f"Error in finalization: {e}")
+            raise
+
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception as e:
+            # Avoid exceptions in __del__ which can cause issues
+            import sys
+            print(f"Warning: Error in PipelineAsyncCaller.__del__: {e}", file=sys.stderr)
 
     @staticmethod
     @_disable_gc()
@@ -527,6 +580,24 @@ class AsyncCallsQueue:
         self.async_calls.append(_ActiveAsyncRequest(self.call_idx, async_caller, async_request))
         return self.call_idx
 
+    def execute_sync_request(self, async_request: AsyncRequest) -> None:
+        """Execute async request synchronously using pipeline workers.
+        
+        This method provides pipeline benefits but waits for completion.
+        Useful for sync checkpointing with pipeline optimization.
+
+        Args:
+            async_request (AsyncRequest): async request to execute synchronously
+        """
+        async_caller = self._get_async_caller()
+        
+        # For pipeline caller, use the execute_sync method
+        if isinstance(async_caller, PipelineAsyncCaller):
+            async_caller.execute_sync(async_request)
+        else:
+            # For other callers, fall back to the standard sync execution
+            async_request.execute_sync()
+
     def maybe_finalize_async_calls(self, blocking=False, no_dist=False) -> List[int]:
         """Finalizes all available calls.
 
@@ -646,8 +717,9 @@ class PipelineAsyncCaller(AsyncCaller):
         
         while True:
             try:
-                task = task_queue.get()
+                task = task_queue.get()  # Add timeout to allow periodic checks
                 if task is None:  # Shutdown signal
+                    logger.info(f"Worker {worker_id}: Received shutdown signal")
                     break
                 
                 task_type, call_id, data = task
@@ -656,37 +728,80 @@ class PipelineAsyncCaller(AsyncCaller):
                     # Execute preload and write in true pipeline fashion
                     async_req, write_buckets_slice, total_workers = data
                     
+                    logger.debug(f"Worker {worker_id}: Processing call {call_id} with {len(write_buckets_slice)} buckets")
+                    
+                    # Handle empty bucket slice case
+                    if not write_buckets_slice:
+                        logger.debug(f"Worker {worker_id}: No buckets to process for call {call_id}, completing immediately")
+                        completion_queue.put((call_id, worker_id, "completed", []))
+                        continue
+                    
                     # Step 1: Wait for turn to do GPU to CPU transfer
                     logger.debug(f"Worker {worker_id}: Waiting for GPU->CPU turn for call {call_id}")
-                    PipelineAsyncCaller._wait_for_gpu_transfer_turn(
-                        worker_id, call_id, stage_sync_queue, total_workers, logger
-                    )
+                    try:
+                        PipelineAsyncCaller._wait_for_gpu_transfer_turn(
+                            worker_id, call_id, stage_sync_queue, total_workers, logger
+                        )
+                    except RuntimeError as e:
+                        if "Shutdown signal received" in str(e):
+                            logger.info(f"Worker {worker_id}: Exiting due to shutdown signal")
+                            break  # Exit the main loop
+                        else:
+                            logger.error(f"Worker {worker_id}: Error waiting for GPU transfer turn: {e}")
+                            raise  # Re-raise other RuntimeErrors
                     
                     # Step 2: GPU to CPU transfer (preload) - only this worker does it now
                     logger.debug(f"Worker {worker_id}: Starting GPU->CPU transfer for call {call_id}")
-                    preloaded_buckets = PipelineAsyncCaller._preload_bucket_slice(
-                        write_buckets_slice, non_blocking=True
-                    )
+                    try:
+                        preloaded_buckets = PipelineAsyncCaller._preload_bucket_slice(
+                            write_buckets_slice, non_blocking=True
+                        )
+                        logger.debug(f"Worker {worker_id}: GPU->CPU transfer completed for call {call_id}")
+                    except Exception as e:
+                        logger.error(f"Worker {worker_id}: Error in GPU->CPU transfer for call {call_id}: {e}")
+                        raise
                     
                     # Step 3: Signal that GPU->CPU is done, next worker can start
-                    logger.debug(f"Worker {worker_id}: Finished GPU->CPU, signaling next worker for call {call_id}")
-                    PipelineAsyncCaller._signal_gpu_transfer_done(
-                        worker_id, call_id, stage_sync_queue, logger
-                    )
+                    logger.debug(f"Worker {worker_id}: Signaling GPU->CPU completion for call {call_id}")
+                    try:
+                        PipelineAsyncCaller._signal_gpu_transfer_done(
+                            worker_id, call_id, stage_sync_queue, logger
+                        )
+                    except Exception as e:
+                        logger.error(f"Worker {worker_id}: Error signaling completion for call {call_id}: {e}")
+                        raise
                     
                     # Step 4: Write to disk (can overlap with next worker's GPU->CPU transfer)
                     logger.debug(f"Worker {worker_id}: Starting disk write for call {call_id}")
-                    write_results = PipelineAsyncCaller._write_bucket_slice(
-                        worker_id, preloaded_buckets, async_req
-                    )
+                    try:
+                        write_results = PipelineAsyncCaller._write_bucket_slice(
+                            worker_id, preloaded_buckets, async_req
+                        )
+                        logger.debug(f"Worker {worker_id}: Disk write completed for call {call_id}, {len(write_results)} results")
+                    except Exception as e:
+                        logger.error(f"Worker {worker_id}: Error in disk write for call {call_id}: {e}")
+                        raise
                     
                     # Step 5: Notify completion with write results
                     completion_queue.put((call_id, worker_id, "completed", write_results))
-                    logger.debug(f"Worker {worker_id}: Completed call {call_id}")
+                    logger.debug(f"Worker {worker_id}: Completed call {call_id} successfully")
                 
             except Exception as e:
-                logger.error(f"Worker {worker_id} error: {e}")
-                completion_queue.put((call_id, worker_id, f"error: {e}", []))
+                if "timeout" in str(e).lower() or "Empty" in str(e):
+                    # Timeout waiting for task, continue loop to check for shutdown
+                    continue
+                else:
+                    # Log detailed error information
+                    import traceback
+                    error_details = f"Worker {worker_id} error: {e}\nTraceback: {traceback.format_exc()}"
+                    logger.error(error_details)
+                    
+                    # Only put error in completion_queue if we have a valid call_id
+                    if 'call_id' in locals():
+                        completion_queue.put((call_id, worker_id, f"error: {e}", []))
+                    else:
+                        # Error occurred outside of task processing (e.g., during initialization)
+                        logger.error(f"Worker {worker_id}: Error outside task processing: {e}")
         
         logger.info(f"Worker {worker_id} for rank {rank} terminated")
 
@@ -700,18 +815,33 @@ class PipelineAsyncCaller(AsyncCaller):
             # First worker can start immediately
             return
         
-        # Wait for previous worker to signal completion
+        # Wait for previous worker to signal completion with timeout
         expected_signal = f"gpu_done_{call_id}_{worker_id - 1}"
+        max_wait_time = 300  # 5 minutes timeout
+        wait_count = 0
+        
         while True:
             try:
                 signal = stage_sync_queue.get(timeout=1.0)
                 if signal == expected_signal:
+                    logger.debug(f"Worker {worker_id}: Received expected signal {signal}")
                     break
+                elif signal == "SHUTDOWN":
+                    # Shutdown signal received
+                    logger.info(f"Worker {worker_id}: Received shutdown signal, exiting wait")
+                    raise RuntimeError("Shutdown signal received")
                 else:
                     # Put back unexpected signal for other workers
                     stage_sync_queue.put(signal)
-            except:
-                # Timeout, continue waiting
+                    logger.debug(f"Worker {worker_id}: Received unexpected signal {signal}, putting back")
+            except Exception as e:
+                # Timeout or other error
+                wait_count += 1
+                if wait_count >= max_wait_time:
+                    logger.error(f"Worker {worker_id}: Timeout waiting for signal {expected_signal} after {max_wait_time}s")
+                    raise RuntimeError(f"Timeout waiting for GPU transfer turn: {expected_signal}")
+                if wait_count % 30 == 0:  # Log every 30 seconds
+                    logger.warning(f"Worker {worker_id}: Still waiting for signal {expected_signal} ({wait_count}s elapsed)")
                 continue
 
     @staticmethod
@@ -770,6 +900,7 @@ class PipelineAsyncCaller(AsyncCaller):
             else:
                 open_file = open
             # Write data to file
+            t1 = time()
             with open_file(file_name, "wb") as stream:
                 for write_item, data in bytes_data:
                     write_result = _write_item(
@@ -789,7 +920,8 @@ class PipelineAsyncCaller(AsyncCaller):
                     stream.fsync()
                 else:
                     os.fsync(stream.fileno())
-
+            t2 = time()
+            print(f"Worker {worker_id}: Write data to file {t2 - t1} seconds")
         return local_results
 
     def _split_write_buckets(self, write_buckets: List) -> List[List]:
@@ -861,6 +993,17 @@ class PipelineAsyncCaller(AsyncCaller):
                 task = ("pipeline_preload_and_write", call_id, (worker_async_req, bucket_slice, self.num_workers))
                 self.task_queues[worker_idx].put(task)
                 active_workers += 1
+        
+        # If no workers were assigned (empty buckets), immediately mark as completed
+        if active_workers == 0:
+            logger.debug(f"No active workers for call {call_id}, marking as completed")
+            # Put a dummy completion result
+            if len(async_req.async_fn_args) >= 3:
+                rank, write_buckets, results_queue = async_req.async_fn_args
+                if results_queue is not None:
+                    results_queue.put({})  # Empty results
+            # Mark as completed
+            self.active_requests.pop(call_id, None)
         
         logger.debug(f"Scheduled pipeline call {call_id} across {active_workers} workers")
 
@@ -982,21 +1125,93 @@ class PipelineAsyncCaller(AsyncCaller):
             results_queue.put(combined_results)
             logger.debug(f"Finalized results for call {call_id} with {len(combined_results)} workers")
 
+    def execute_sync(self, async_req: AsyncRequest) -> None:
+        """Execute async request synchronously using pipeline workers.
+        
+        This method provides the same pipeline benefits (parallel GPU->CPU transfer
+        and pipelined execution) but waits for completion before returning.
+        This allows using pipeline optimization even without --async-save.
+        
+        Args:
+            async_req (AsyncRequest): async request to execute synchronously
+        """
+        if async_req.async_fn is None:
+            return
+        
+        # Schedule the async call
+        self.schedule_async_call(async_req)
+        
+        # Wait for completion (blocking)
+        logger.debug("PipelineAsyncCaller: Waiting for synchronous completion...")
+        while not self.is_current_async_call_done(blocking=True, no_dist=True):
+            import time
+            time.sleep(0.01)  # Small sleep to avoid busy waiting
+        
+        # Execute finalization functions
+        torch.distributed.barrier()
+        for finalize_fn in async_req.finalize_fns:
+            finalize_fn()
+        
+        logger.debug("PipelineAsyncCaller: Synchronous execution completed")
+
     def close(self):
         """Shutdown the worker pool."""
         logger.info(f"PipelineAsyncCaller: Shutting down {self.num_workers} workers")
         
-        # Send shutdown signal to all workers
+        # Send shutdown signal to stage_sync_queue to unblock waiting workers
+        if self.stage_sync_queue is not None:
+            for _ in range(self.num_workers * 2):  # Send multiple signals to ensure all workers get it
+                self.stage_sync_queue.put("SHUTDOWN")
+        
+        # Send shutdown signal to all task queues
         for task_queue in self.task_queues:
             task_queue.put(None)
         
-        # Wait for workers to terminate
-        for worker in self.workers:
-            worker.join()
+        # Wait for workers to terminate with timeout
+        for i, worker in enumerate(self.workers):
+            try:
+                worker.join(timeout=10.0)  # 10 second timeout
+                if worker.is_alive():
+                    logger.warning(f"Worker {i} did not terminate gracefully, forcing termination")
+                    worker.terminate()
+                    worker.join(timeout=5.0)  # Give it 5 more seconds
+                    if worker.is_alive():
+                        logger.error(f"Worker {i} could not be terminated, may become zombie process")
+                else:
+                    logger.debug(f"Worker {i} terminated successfully")
+            except Exception as e:
+                logger.error(f"Error terminating worker {i}: {e}")
+                try:
+                    worker.terminate()
+                except:
+                    pass
+        
+        # Clear all queues to ensure no hanging references
+        try:
+            # Drain queues to prevent blocking
+            while not self.completion_queue.empty():
+                self.completion_queue.get_nowait()
+        except:
+            pass
+        
+        try:
+            while not self.stage_sync_queue.empty():
+                self.stage_sync_queue.get_nowait()
+        except:
+            pass
+        
+        for task_queue in self.task_queues:
+            try:
+                while not task_queue.empty():
+                    task_queue.get_nowait()
+            except:
+                pass
         
         self.workers.clear()
         self.task_queues.clear()
         self.result_queues.clear()
+        
+        logger.info("PipelineAsyncCaller: All workers shut down")
 
     def __del__(self):
         self.close()

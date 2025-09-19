@@ -23,7 +23,23 @@ class StrategyAction(Enum):
 
 default_strategies: DefaultDict[str, dict[tuple, Any]] = defaultdict(dict)
 
-async_calls = AsyncCallsQueue()
+# Use a function to get the configured async_calls instance
+def get_async_calls_queue():
+    """Get the properly configured AsyncCallsQueue instance.
+    
+    This function checks if there's a configured instance in training.async_utils
+    and falls back to a default instance if not available.
+    """
+    try:
+        # Try to get the configured instance from training.async_utils
+        from megatron.training.async_utils import get_async_calls_queue as get_training_queue
+        return get_training_queue()
+    except ImportError:
+        # Fall back to default instance if training module not available
+        global _default_async_calls
+        if '_default_async_calls' not in globals():
+            _default_async_calls = AsyncCallsQueue()
+        return _default_async_calls
 
 
 def get_default_strategy(action: StrategyAction, backend: str, version: int):
@@ -223,6 +239,14 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
         async_request = self.async_save(sharded_state_dict, checkpoint_dir)
         # multiprocessing routines  may cause issue when called on parent process
         # We keep this verbose call for now
-        global async_calls
-        async_calls.schedule_async_request(async_request)
-        async_calls.maybe_finalize_async_calls(blocking=True)
+        async_calls = get_async_calls_queue()
+        
+        # Check if we're using pipeline mode for sync execution
+        # Pipeline mode can provide benefits even in sync mode
+        if hasattr(async_calls, 'pipeline') and async_calls.pipeline:
+            # Use pipeline sync execution for better performance
+            async_calls.execute_sync_request(async_request)
+        else:
+            # Use traditional async execution with blocking wait
+            async_calls.schedule_async_request(async_request)
+            async_calls.maybe_finalize_async_calls(blocking=True)

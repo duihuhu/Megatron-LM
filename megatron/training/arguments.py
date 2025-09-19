@@ -1061,6 +1061,27 @@ def validate_args(args, defaults={}):
         assert not args.overlap_grad_reduce, \
             "Delaying wgrad compute is not supported with overlap_grad_reduce"
 
+    # Async checkpoint worker validation
+    if args.use_pipeline_ckpt_worker and args.use_persistent_ckpt_worker:
+        raise ValueError("Cannot use both --use-pipeline-ckpt-worker and --use-persistent-ckpt-worker. "
+                        "Please choose one async checkpoint worker type.")
+    
+    # if args.use_pipeline_ckpt_worker and not args.async_save:
+        # raise ValueError("--use-pipeline-ckpt-worker requires --async-save to be enabled.")
+    
+    if args.use_persistent_ckpt_worker and not args.async_save:
+        raise ValueError("--use-persistent-ckpt-worker requires --async-save to be enabled.")
+    
+    if args.pipeline_async_workers is not None:
+        if not args.use_pipeline_ckpt_worker:
+            print("Warning: --pipeline-async-workers specified but --use-pipeline-ckpt-worker not enabled. "
+                  "The worker count will be ignored.")
+        elif args.pipeline_async_workers < 1:
+            raise ValueError("--pipeline-async-workers must be at least 1.")
+        elif args.pipeline_async_workers > 8:
+            print(f"Warning: --pipeline-async-workers={args.pipeline_async_workers} is quite large. "
+                  f"Consider using 2-6 workers for optimal performance.")
+
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
         assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
@@ -2167,6 +2188,15 @@ def _add_checkpointing_args(parser):
                        help='Deprecated: see --ckpt-format.')
     group.add_argument('--use-persistent-ckpt-worker', action='store_true',
                        help='Enables a persitent checkpoint worker for async save')
+    group.add_argument('--use-pipeline-ckpt-worker', action='store_true',
+                       help='Enables a pipeline checkpoint worker pool for pipeline save. '
+                            'Uses pre-created worker processes with pipeline execution: '
+                            'GPU->CPU transfers happen sequentially to avoid bandwidth competition, '
+                            'while disk writes can overlap with subsequent GPU->CPU transfers.')
+    group.add_argument('--pipeline-async-workers', type=int, default=None,
+                       help='Number of worker processes for pipeline async checkpointing. '
+                            'Defaults to thread_count if available, otherwise 2-4 based on world size. '
+                            'Recommended: 2-3 for small models, 3-4 for medium models, 4-6 for large models.')
 
     group.add_argument('--auto-detect-ckpt-format', action='store_true',
                        help='Determine if the checkpoint format is in legacy or distributed format.'

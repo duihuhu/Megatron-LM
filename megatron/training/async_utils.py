@@ -24,6 +24,18 @@ def init_persistent_async_worker():
     _async_calls_queue = AsyncCallsQueue(persistent=True)
 
 
+def init_pipeline_async_worker(num_workers: int = 4):
+    """Initialize pipeline async worker with pre-created process pool.
+    
+    Args:
+        num_workers (int, optional): Number of worker processes to create.
+                                   If None, will use a default value based on system.
+    """
+    global _async_calls_queue
+    print("init_pipeline_async_worker init_pipeline_async_worker "  )
+    _async_calls_queue = AsyncCallsQueue(pipeline=True, num_workers=num_workers)
+
+
 def schedule_async_save(async_request: AsyncRequest):
     """Schedule the async save request.
 
@@ -63,3 +75,54 @@ def is_empty_async_queue() -> bool:
         bool: True if there is any ongoing async call.
     """
     return _async_calls_queue.get_num_unfinalized_calls() == 0
+
+
+def get_async_queue_info() -> dict:
+    """Get information about the current async queue configuration.
+    
+    Returns:
+        dict: Information about async queue configuration including:
+            - queue_type: 'temporal', 'persistent', or 'pipeline'
+            - num_workers: number of workers (for pipeline mode)
+            - active_calls: number of active async calls
+    """
+    global _async_calls_queue
+    
+    queue_type = 'temporal'  # default
+    num_workers = None
+    
+    if _async_calls_queue.persistent:
+        queue_type = 'persistent'
+    elif _async_calls_queue.pipeline:
+        queue_type = 'pipeline'
+        num_workers = _async_calls_queue.num_workers
+    
+    return {
+        'queue_type': queue_type,
+        'num_workers': num_workers,
+        'active_calls': _async_calls_queue.get_num_unfinalized_calls()
+    }
+
+
+# Usage example for pipeline async worker:
+# 
+# To enable pipeline async checkpointing in your training script:
+# 
+# 1. Initialize the pipeline worker early in training:
+#    from megatron.training.async_utils import init_pipeline_async_worker
+#    init_pipeline_async_worker(num_workers=4)  # Use 4 worker processes
+# 
+# 2. The rest of the checkpointing code remains the same:
+#    - schedule_async_save() will automatically use the pipeline workers
+#    - maybe_finalize_async_save() will handle completion checking
+# 
+# Benefits of pipeline mode:
+# - No process creation overhead during training (workers are pre-created)
+# - Parallel GPU-to-CPU transfer across multiple workers
+# - Pipeline execution: while one worker writes to disk, others can do GPU-to-CPU transfer
+# - Better resource utilization and potentially faster checkpointing
+#
+# Configuration recommendations:
+# - num_workers should typically be 2-8 depending on your I/O bandwidth and GPU memory
+# - More workers help with parallel data transfer but may compete for I/O resources
+# - Monitor memory usage as each worker may hold copied tensor data temporarily

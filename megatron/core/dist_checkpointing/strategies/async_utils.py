@@ -482,18 +482,26 @@ class AsyncCallsQueue:
     active calls with `maybe_finalize_async_calls`.
     """
 
-    def __init__(self, persistent: bool = False):
+    def __init__(self, persistent: bool = False, pipeline: bool = False, num_workers: int = None):
         self.async_calls: deque[_ActiveAsyncRequest] = deque([])
         self.call_idx: int = -1
         self.persistent: bool = persistent
+        self.pipeline: bool = pipeline
+        self.num_workers: int = num_workers
         self.persistent_caller: AsyncCaller = None
+        self.pipeline_caller: AsyncCaller = None
 
     def _get_async_caller(self):
-        if not self.persistent:
+        if self.pipeline:
+            if self.pipeline_caller is None:
+                self.pipeline_caller = PipelineAsyncCaller(self.num_workers)
+            return self.pipeline_caller
+        elif self.persistent:
+            if self.persistent_caller is None:
+                self.persistent_caller = PersistentAsyncCaller()
+            return self.persistent_caller
+        else:
             return TemporalAsyncCaller()
-        if self.persistent_caller is None:
-            self.persistent_caller = PersistentAsyncCaller()
-        return self.persistent_caller
 
     def schedule_async_request(self, async_request: AsyncRequest) -> int:
         """Start a new async call and add it to a queue of active async calls.
@@ -559,3 +567,436 @@ class AsyncCallsQueue:
         self.maybe_finalize_async_calls(blocking=True)
         if self.persistent and self.persistent_caller:
             self.persistent_caller.close()
+        if self.pipeline and self.pipeline_caller:
+            self.pipeline_caller.close()
+
+
+class PipelineAsyncCaller(AsyncCaller):
+    """Pipeline-based async caller with pre-created worker processes.
+    
+    This implementation creates a pool of worker processes during initialization
+    to avoid cold start overhead. It implements pipelining between GPU-to-CPU
+    data transfer and disk writing operations.
+    """
+
+    def __init__(self, num_workers: int = None):
+        """Initialize pipeline async caller with worker pool.
+        
+        Args:
+            num_workers (int): Number of worker processes to create. 
+                             Defaults to number of write buckets or 2.
+        """
+        self.num_workers = num_workers or 2
+        self.workers: List[mp.Process] = []
+        self.task_queues: List[mp.Queue] = []
+        self.result_queues: List[mp.Queue] = []
+        self.completion_queue: mp.Queue = None
+        self.stage_sync_queue: mp.Queue = None  # For pipeline stage synchronization
+        self.active_requests: Dict[int, AsyncRequest] = {}
+        self.collected_results: Dict[int, Dict[int, List]] = {}  # call_id -> {worker_id -> results}
+        self.next_worker_idx = 0
+        self.call_counter = 0
+        
+        self._init_worker_pool()
+    def _init_worker_pool(self):
+        """Initialize the worker process pool."""
+        ctx = mp.get_context('spawn')
+        self.completion_queue = ctx.Queue()
+        self.stage_sync_queue = ctx.Queue()  # For pipeline stage synchronization
+        
+        for worker_id in range(self.num_workers):
+            task_queue = ctx.Queue()
+            result_queue = ctx.Queue()
+            
+            worker = ctx.Process(
+                target=self._worker_main_loop,
+                args=(
+                    worker_id,
+                    task_queue,
+                    result_queue,
+                    self.completion_queue,
+                    self.stage_sync_queue,
+                    torch.distributed.get_rank(),
+                    logging.getLogger().getEffectiveLevel()
+                )
+            )
+            worker.start()
+            
+            self.workers.append(worker)
+            self.task_queues.append(task_queue)
+            self.result_queues.append(result_queue)
+        
+        logger.info(f"PipelineAsyncCaller: Initialized {self.num_workers} worker processes")
+
+    @staticmethod
+    @_disable_gc()
+    def _worker_main_loop(
+        worker_id: int,
+        task_queue: mp.Queue,
+        result_queue: mp.Queue,
+        completion_queue: mp.Queue,
+        stage_sync_queue: mp.Queue,
+        rank: int,
+        log_level: int
+    ):
+        """Main loop for worker processes with pipeline stage synchronization."""
+        logger = logging.getLogger(__name__)
+        logger.setLevel(log_level)
+        logger.info(f"Worker {worker_id} for rank {rank} started")
+        
+        while True:
+            try:
+                task = task_queue.get()
+                if task is None:  # Shutdown signal
+                    break
+                
+                task_type, call_id, data = task
+                
+                if task_type == "pipeline_preload_and_write":
+                    # Execute preload and write in true pipeline fashion
+                    async_req, write_buckets_slice, total_workers = data
+                    
+                    # Step 1: Wait for turn to do GPU to CPU transfer
+                    logger.debug(f"Worker {worker_id}: Waiting for GPU->CPU turn for call {call_id}")
+                    PipelineAsyncCaller._wait_for_gpu_transfer_turn(
+                        worker_id, call_id, stage_sync_queue, total_workers, logger
+                    )
+                    
+                    # Step 2: GPU to CPU transfer (preload) - only this worker does it now
+                    logger.debug(f"Worker {worker_id}: Starting GPU->CPU transfer for call {call_id}")
+                    preloaded_buckets = PipelineAsyncCaller._preload_bucket_slice(
+                        write_buckets_slice, non_blocking=True
+                    )
+                    
+                    # Step 3: Signal that GPU->CPU is done, next worker can start
+                    logger.debug(f"Worker {worker_id}: Finished GPU->CPU, signaling next worker for call {call_id}")
+                    PipelineAsyncCaller._signal_gpu_transfer_done(
+                        worker_id, call_id, stage_sync_queue, logger
+                    )
+                    
+                    # Step 4: Write to disk (can overlap with next worker's GPU->CPU transfer)
+                    logger.debug(f"Worker {worker_id}: Starting disk write for call {call_id}")
+                    write_results = PipelineAsyncCaller._write_bucket_slice(
+                        worker_id, preloaded_buckets, async_req
+                    )
+                    
+                    # Step 5: Notify completion with write results
+                    completion_queue.put((call_id, worker_id, "completed", write_results))
+                    logger.debug(f"Worker {worker_id}: Completed call {call_id}")
+                
+            except Exception as e:
+                logger.error(f"Worker {worker_id} error: {e}")
+                completion_queue.put((call_id, worker_id, f"error: {e}", []))
+        
+        logger.info(f"Worker {worker_id} for rank {rank} terminated")
+
+    @staticmethod
+    def _wait_for_gpu_transfer_turn(
+        worker_id: int, call_id: int, stage_sync_queue: mp.Queue, 
+        total_workers: int, logger
+    ):
+        """Wait for this worker's turn to perform GPU->CPU transfer."""
+        if worker_id == 0:
+            # First worker can start immediately
+            return
+        
+        # Wait for previous worker to signal completion
+        expected_signal = f"gpu_done_{call_id}_{worker_id - 1}"
+        while True:
+            try:
+                signal = stage_sync_queue.get(timeout=1.0)
+                if signal == expected_signal:
+                    break
+                else:
+                    # Put back unexpected signal for other workers
+                    stage_sync_queue.put(signal)
+            except:
+                # Timeout, continue waiting
+                continue
+
+    @staticmethod
+    def _signal_gpu_transfer_done(
+        worker_id: int, call_id: int, stage_sync_queue: mp.Queue, logger
+    ):
+        """Signal that GPU->CPU transfer is complete, next worker can start."""
+        signal = f"gpu_done_{call_id}_{worker_id}"
+        stage_sync_queue.put(signal)
+        logger.debug(f"Worker {worker_id}: Sent signal {signal}")
+
+    @staticmethod
+    def _preload_bucket_slice(write_buckets_slice: List, non_blocking=True):
+        """Preload a slice of write buckets from GPU to CPU."""
+        result = []
+        for bucket in write_buckets_slice:
+            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            tensor_data = [
+                (item, tensor.to("cpu", non_blocking=non_blocking)) 
+                for item, tensor in tensor_data
+            ]
+            result.append((file_name, storage_key, (bytes_data, tensor_data)))
+        
+        if non_blocking:
+            torch.cuda.synchronize()
+        return result
+
+    @staticmethod
+    def _write_bucket_slice(worker_id: int, preloaded_buckets: List, async_req: AsyncRequest):
+        """Write a slice of preloaded buckets to disk and return write results."""
+        from megatron.core.dist_checkpointing.strategies.filesystem_async import _write_item
+        import inspect
+        import os
+        
+        # Import necessary components for writing
+        try:
+            from torch.distributed.checkpoint.filesystem import SerializationFormat
+            extra_kwargs = {"serialization_format": SerializationFormat.TORCH_SAVE}
+        except ImportError:
+            extra_kwargs = {}
+        
+        # Extract parameters from async_req.async_fn_kwargs
+        transform_list = async_req.async_fn_kwargs.get('transform_list', [])
+        use_msc = async_req.async_fn_kwargs.get('use_msc', False)
+        
+        # Collect write results for this worker
+        local_results = []
+        
+        for bucket in preloaded_buckets:
+            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            
+            # Determine file opening method
+            if use_msc:
+                import multistorageclient as msc
+                open_file = msc.open
+            else:
+                open_file = open
+            # Write data to file
+            with open_file(file_name, "wb") as stream:
+                for write_item, data in bytes_data:
+                    write_result = _write_item(
+                        *transform_list, stream, data, write_item, storage_key, **extra_kwargs
+                    )
+                    local_results.append(write_result)
+                
+                for write_item, tensor in tensor_data:
+                    assert tensor.is_cpu, f"Tensor should be on CPU, got {tensor.device}"
+                    write_result = _write_item(
+                        *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
+                    )
+                    local_results.append(write_result)
+                
+                # Ensure data is written to disk
+                if use_msc:
+                    stream.fsync()
+                else:
+                    os.fsync(stream.fileno())
+
+        return local_results
+
+    def _split_write_buckets(self, write_buckets: List) -> List[List]:
+        """Split write buckets among workers."""
+        if not write_buckets:
+            return [[] for _ in range(self.num_workers)]
+        
+        # Distribute buckets round-robin style
+        worker_buckets = [[] for _ in range(self.num_workers)]
+        for i, bucket in enumerate(write_buckets):
+            worker_idx = i % self.num_workers
+            worker_buckets[worker_idx].append(bucket)
+        
+        return worker_buckets
+
+    @_disable_gc()
+    def schedule_async_call(self, async_req: AsyncRequest) -> None:
+        """Schedule async call using the worker pool."""
+        if async_req.async_fn is None:
+            return
+        
+        self.call_counter += 1
+        call_id = self.call_counter
+        
+        # Store the request for later finalization
+        self.active_requests[call_id] = async_req
+        
+        # Extract parameters from the original async request
+        # For FileSystemWriterAsync, args are: [rank, write_buckets, results_queue]
+        rank, write_buckets, results_queue = async_req.async_fn_args
+        
+        # If preload_fn is provided, call it to get preloaded buckets
+        if async_req.preload_fn is not None:
+            write_buckets = async_req.preload_fn()
+        
+        # Split buckets among workers
+        worker_bucket_slices = self._split_write_buckets(write_buckets)
+        
+        # Extract additional parameters from the original async_fn if it's write_preloaded_data_multiproc
+        transform_list = []
+        use_msc = False
+        
+        # Try to extract parameters from the original function (write_preloaded_data_multiproc)
+        if hasattr(async_req.async_fn, 'func'):
+            # This is a partial function, get the original args
+            original_args = getattr(async_req.async_fn, 'args', ())
+            if len(original_args) >= 2:
+                transform_list = original_args[0] if original_args[0] else []
+                use_msc = original_args[1] if len(original_args) > 1 else False
+        
+        # Create a simplified async request for workers with necessary parameters
+        worker_async_req = AsyncRequest(
+            async_fn=None,
+            async_fn_args=async_req.async_fn_args,
+            finalize_fns=[],
+            async_fn_kwargs={
+                'transform_list': transform_list,
+                'use_msc': use_msc,
+                **async_req.async_fn_kwargs
+            },
+            preload_fn=None,
+            is_frozen=True
+        )
+        
+        # Schedule tasks to workers with pipeline synchronization
+        active_workers = 0
+        for worker_idx, bucket_slice in enumerate(worker_bucket_slices):
+            if bucket_slice:  # Only send non-empty slices
+                task = ("pipeline_preload_and_write", call_id, (worker_async_req, bucket_slice, self.num_workers))
+                self.task_queues[worker_idx].put(task)
+                active_workers += 1
+        
+        logger.debug(f"Scheduled pipeline call {call_id} across {active_workers} workers")
+
+    def is_current_async_call_done(self, blocking: bool = False, no_dist: bool = False) -> bool:
+        """Check if async calls are completed."""
+        completed_calls = set()
+        
+        # Check for completed tasks and collect results
+        while True:
+            try:
+                result = self.completion_queue.get_nowait()
+                if len(result) == 4:  # New format with write_results
+                    call_id, worker_id, status, write_results = result
+                else:  # Legacy format without write_results
+                    call_id, worker_id, status = result
+                    write_results = []
+                
+                if status == "completed":
+                    # Collect write results for this call
+                    if call_id not in self.collected_results:
+                        self.collected_results[call_id] = {}
+                    self.collected_results[call_id][worker_id] = write_results
+                    
+                    # Check if all workers for this call have completed
+                    if call_id in self.active_requests:
+                        expected_workers = self._count_active_workers_for_call(call_id)
+                        if len(self.collected_results[call_id]) >= expected_workers:
+                            # All workers completed, put results in the FileSystemWriterAsync results_queue
+                            self._finalize_call_results(call_id)
+                            completed_calls.add(call_id)
+                else:
+                    logger.error(f"Worker {worker_id} failed for call {call_id}: {status}")
+                    # For failed workers, still need to finalize the call to avoid hanging
+                    if call_id in self.active_requests:
+                        async_req = self.active_requests[call_id]
+                        rank, write_buckets, results_queue = async_req.async_fn_args
+                        if results_queue is not None:
+                            # Put an error result to avoid hanging in retrieve_write_results
+                            error_exception = RuntimeError(f"Worker {worker_id} failed: {status}")
+                            results_queue.put(error_exception)
+                    completed_calls.add(call_id)  # Mark as done even if failed
+            except:
+                break
+        
+        # Remove completed requests
+        for call_id in completed_calls:
+            if call_id in self.active_requests:
+                del self.active_requests[call_id]
+            if call_id in self.collected_results:
+                del self.collected_results[call_id]
+        
+        # Check if all requests are done
+        has_active_requests = len(self.active_requests) > 0
+        
+        if blocking and has_active_requests:
+            # Wait for completion if blocking
+            while self.active_requests:
+                try:
+                    result = self.completion_queue.get(timeout=0.1)
+                    if len(result) == 4:
+                        call_id, worker_id, status, write_results = result
+                    else:
+                        call_id, worker_id, status = result
+                        write_results = []
+                    
+                    if call_id in self.active_requests:
+                        if status == "completed":
+                            if call_id not in self.collected_results:
+                                self.collected_results[call_id] = {}
+                            self.collected_results[call_id][worker_id] = write_results
+                            
+                            expected_workers = self._count_active_workers_for_call(call_id)
+                            if len(self.collected_results[call_id]) >= expected_workers:
+                                self._finalize_call_results(call_id)
+                                del self.active_requests[call_id]
+                                del self.collected_results[call_id]
+                        else:
+                            del self.active_requests[call_id]
+                except:
+                    continue
+        
+        # Synchronize across ranks if needed
+        is_done = not has_active_requests
+        if not no_dist:
+            is_alive = int(has_active_requests)
+            is_done = self.sync_all_async_calls(is_alive)
+        
+        return is_done
+
+    def _count_active_workers_for_call(self, call_id: int) -> int:
+        """Count the number of active workers for a specific call."""
+        if call_id not in self.active_requests:
+            return 0
+        
+        # Count non-empty bucket slices that were sent to workers
+        async_req = self.active_requests[call_id]
+        rank, write_buckets, results_queue = async_req.async_fn_args
+        
+        if async_req.preload_fn is not None:
+            write_buckets = async_req.preload_fn()
+        
+        worker_bucket_slices = self._split_write_buckets(write_buckets)
+        return sum(1 for bucket_slice in worker_bucket_slices if bucket_slice)
+
+    def _finalize_call_results(self, call_id: int):
+        """Finalize results for a completed call by putting them in the FileSystemWriterAsync results_queue."""
+        if call_id not in self.active_requests or call_id not in self.collected_results:
+            return
+        
+        async_req = self.active_requests[call_id]
+        rank, write_buckets, results_queue = async_req.async_fn_args
+        
+        if results_queue is not None:
+            # Combine all worker results into the format expected by FileSystemWriterAsync
+            # Format: {worker_id: [write_results]}
+            combined_results = self.collected_results[call_id]
+            
+            # Put the combined results in the FileSystemWriterAsync results_queue
+            results_queue.put(combined_results)
+            logger.debug(f"Finalized results for call {call_id} with {len(combined_results)} workers")
+
+    def close(self):
+        """Shutdown the worker pool."""
+        logger.info(f"PipelineAsyncCaller: Shutting down {self.num_workers} workers")
+        
+        # Send shutdown signal to all workers
+        for task_queue in self.task_queues:
+            task_queue.put(None)
+        
+        # Wait for workers to terminate
+        for worker in self.workers:
+            worker.join()
+        
+        self.workers.clear()
+        self.task_queues.clear()
+        self.result_queues.clear()
+
+    def __del__(self):
+        self.close()

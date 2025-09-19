@@ -27,7 +27,7 @@ from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
 from megatron.training import inprocess_restart
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.async_utils import init_persistent_async_worker
+from megatron.training.async_utils import init_persistent_async_worker, init_pipeline_async_worker
 from megatron.training.checkpointing import load_args_from_checkpoint
 from megatron.training.global_vars import set_global_variables
 from megatron.training.yaml_arguments import validate_yaml
@@ -81,6 +81,9 @@ def initialize_megatron(
 
     if args.async_save and args.use_persistent_ckpt_worker:
         init_persistent_async_worker()
+    if args.use_pipeline_ckpt_worker:
+        num_workers = getattr(args, 'pipeline_async_workers', None)
+        init_pipeline_async_worker(num_workers=num_workers)
 
     if args.yaml_cfg is not None:
         args = validate_yaml(args, args_defaults)

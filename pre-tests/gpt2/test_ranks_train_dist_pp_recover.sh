@@ -8,7 +8,7 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_FILE=./nccl.log
 export NCCL_DEBUG_SUBSYS=ALL
 
-GPUS_PER_NODE=1
+GPUS_PER_NODE=2
 # Change for multinode config
 if [ "$2" == "a800" ]; then
     MASTER_ADDR=10.0.0.62
@@ -35,7 +35,7 @@ DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify 
 SHM_PKT="/dev/shm/shm_pkt"
 
 if [ "$NODE_RANK" -eq 0 ]; then
-    export CUDA_VISIBLE_DEVICES=0
+    export CUDA_VISIBLE_DEVICES=0,1
 fi
 
 # export NCCL_SOCKET_IFNAME=ens37f0
@@ -95,7 +95,7 @@ GPT_ARGS=(
 
 
 MODEL_PARALLEL_ARGS=(
-	--tensor-model-parallel-size 1
+	--tensor-model-parallel-size 2
 	--pipeline-model-parallel-size 1
     # --replication
     # --replication-jump 1
@@ -116,7 +116,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --non-persistent-save-interval 7
     # --ckpt-format torch
     --use-pipeline-ckpt-worker
-    --pipeline-async-workers 2
+    --pipeline-async-workers 1
     # --async-save
 )
 

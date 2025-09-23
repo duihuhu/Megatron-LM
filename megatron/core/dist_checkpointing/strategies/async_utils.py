@@ -698,7 +698,6 @@ class PipelineAsyncCaller(AsyncCaller):
             self.workers.append(worker)
             self.task_queues.append(task_queue)
             self.result_queues.append(result_queue)
-        
         # logger.info(f"PipelineAsyncCaller: Initialized {self.num_workers} worker processes")
 
     @staticmethod
@@ -715,7 +714,8 @@ class PipelineAsyncCaller(AsyncCaller):
         logger = logging.getLogger(__name__)
         logger.setLevel(log_level)
         logger.info(f"Worker {worker_id} for rank {rank} started")
-        
+        torch.cuda.set_device(rank)
+
         while True:
             try:
                 task = task_queue.get()  # Add timeout to allow periodic checks

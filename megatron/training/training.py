@@ -2303,6 +2303,7 @@ def train(
             continue
 
         # Run training step.
+        t1 = time.time()
         args.curr_iteration = iteration
         ft_integration.on_training_step_start()
         (
@@ -2316,6 +2317,8 @@ def train(
         ) = train_step(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
+        t2 = time.time()
+        print(f"Train step completed *args.curr_iteration {iteration} in {t2 - t1} seconds")
         ft_integration.on_training_step_end()
         if should_checkpoint:
             save_checkpoint_and_time(

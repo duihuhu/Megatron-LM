@@ -10,7 +10,7 @@ from typing import Any, DefaultDict, Union
 
 from ..mapping import CheckpointingException, ShardedStateDict, StateDict
 from .async_utils import AsyncCallsQueue, AsyncRequest
-
+import time
 
 class StrategyAction(Enum):
     """Specifies save vs load and sharded vs common action."""
@@ -240,7 +240,7 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
         # multiprocessing routines  may cause issue when called on parent process
         # We keep this verbose call for now
         async_calls = get_async_calls_queue()
-        
+        t1 = time.time()
         # Check if we're using pipeline mode for sync execution
         # Pipeline mode can provide benefits even in sync mode
         if hasattr(async_calls, 'pipeline') and async_calls.pipeline:
@@ -250,3 +250,5 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
             # Use traditional async execution with blocking wait
             async_calls.schedule_async_request(async_request)
             async_calls.maybe_finalize_async_calls(blocking=True)
+        t2 = time.time()
+        print(f"Save completed in {t2 - t1} seconds")

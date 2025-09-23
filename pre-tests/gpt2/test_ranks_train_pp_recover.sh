@@ -76,7 +76,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
     --lr 0.00015 
-    --train-iters 3
+    --train-iters 10
     --lr-decay-iters 320000 
     --lr-decay-style cosine 
     --min-lr 1.0e-5 
@@ -116,7 +116,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --non-persistent-save-interval 7
     # --ckpt-format torch
     --use-pipeline-ckpt-worker
-    --pipeline-async-workers 2
+    --pipeline-async-workers 1
     # --async-save
 )
 

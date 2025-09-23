@@ -658,7 +658,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         backend: str,
         version: int,
         keep_only_main_replica: bool = True,
-        thread_count: int = 2,
+        thread_count: int = 1,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
     ):

@@ -189,7 +189,7 @@ class TemporalAsyncCaller(AsyncCaller):
             # to do the defined action in `async_req.preload_fn` to
             # stage GPU tensors to its defined destination
             async_fn_args[1] = async_req.preload_fn()
-
+            
         rank = torch.distributed.get_rank()
         start_sync = time()
         torch.cuda.synchronize()
@@ -671,6 +671,8 @@ class PipelineAsyncCaller(AsyncCaller):
         self._init_worker_pool()
     def _init_worker_pool(self):
         """Initialize the worker process pool."""
+        if hasattr(self, 'workers') and self.workers:
+            return  # 避免重复创建
         ctx = mp.get_context('spawn')
         self.completion_queue = ctx.Queue()
         self.stage_sync_queue = ctx.Queue()  # For pipeline stage synchronization
@@ -697,10 +699,9 @@ class PipelineAsyncCaller(AsyncCaller):
             self.task_queues.append(task_queue)
             self.result_queues.append(result_queue)
         
-        logger.info(f"PipelineAsyncCaller: Initialized {self.num_workers} worker processes")
+        # logger.info(f"PipelineAsyncCaller: Initialized {self.num_workers} worker processes")
 
     @staticmethod
-    @_disable_gc()
     def _worker_main_loop(
         worker_id: int,
         task_queue: mp.Queue,
@@ -753,9 +754,12 @@ class PipelineAsyncCaller(AsyncCaller):
                     # Step 2: GPU to CPU transfer (preload) - only this worker does it now
                     logger.debug(f"Worker {worker_id}: Starting GPU->CPU transfer for call {call_id}")
                     try:
+                        t1 = time()
                         preloaded_buckets = PipelineAsyncCaller._preload_bucket_slice(
                             write_buckets_slice, non_blocking=True
                         )
+                        t2 = time()
+                        print(f"Worker {worker_id}: GPU->CPU transfer completed for call {call_id} {t2 - t1} seconds", t1, t2)
                         logger.debug(f"Worker {worker_id}: GPU->CPU transfer completed for call {call_id}")
                     except Exception as e:
                         logger.error(f"Worker {worker_id}: Error in GPU->CPU transfer for call {call_id}: {e}")
@@ -774,10 +778,13 @@ class PipelineAsyncCaller(AsyncCaller):
                     # Step 4: Write to disk (can overlap with next worker's GPU->CPU transfer)
                     logger.debug(f"Worker {worker_id}: Starting disk write for call {call_id}")
                     try:
+                        # t3 = time()
                         write_results = PipelineAsyncCaller._write_bucket_slice(
                             worker_id, preloaded_buckets, async_req
                         )
                         logger.debug(f"Worker {worker_id}: Disk write completed for call {call_id}, {len(write_results)} results")
+                        # t4 = time()
+                        # print(f"Worker {worker_id}: CPU->Disk transfer completed for call {call_id} {t4 - t3} seconds", t3, t4)
                     except Exception as e:
                         logger.error(f"Worker {worker_id}: Error in disk write for call {call_id}: {e}")
                         raise
@@ -822,7 +829,7 @@ class PipelineAsyncCaller(AsyncCaller):
         
         while True:
             try:
-                signal = stage_sync_queue.get(timeout=1.0)
+                signal = stage_sync_queue.get()
                 if signal == expected_signal:
                     logger.debug(f"Worker {worker_id}: Received expected signal {signal}")
                     break
@@ -858,7 +865,7 @@ class PipelineAsyncCaller(AsyncCaller):
         """Preload a slice of write buckets from GPU to CPU."""
         result = []
         for bucket in write_buckets_slice:
-            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            file_name, storage_key, (bytes_data, tensor_data) = bucket          
             tensor_data = [
                 (item, tensor.to("cpu", non_blocking=non_blocking)) 
                 for item, tensor in tensor_data
@@ -952,10 +959,10 @@ class PipelineAsyncCaller(AsyncCaller):
         # Extract parameters from the original async request
         # For FileSystemWriterAsync, args are: [rank, write_buckets, results_queue]
         rank, write_buckets, results_queue = async_req.async_fn_args
-        
-        # If preload_fn is provided, call it to get preloaded buckets
-        if async_req.preload_fn is not None:
-            write_buckets = async_req.preload_fn()
+
+        # If preload_fn is provided, call it to get preloaded buckets, in pipeline mode, do not execute 
+        # if async_req.preload_fn is not None:
+            # write_buckets = async_req.preload_fn()
         
         # Split buckets among workers
         worker_bucket_slices = self._split_write_buckets(write_buckets)
@@ -1102,8 +1109,8 @@ class PipelineAsyncCaller(AsyncCaller):
         async_req = self.active_requests[call_id]
         rank, write_buckets, results_queue = async_req.async_fn_args
         
-        if async_req.preload_fn is not None:
-            write_buckets = async_req.preload_fn()
+        # if async_req.preload_fn is not None:
+        #     write_buckets = async_req.preload_fn()
         
         worker_bucket_slices = self._split_write_buckets(write_buckets)
         return sum(1 for bucket_slice in worker_bucket_slices if bucket_slice)

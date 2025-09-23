@@ -218,7 +218,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             non_blocking (bool, optional): knob to enable pinned D2H memcpy. Default is True.
         """
         result = []
-
+        t1 = time()
         for bucket in write_buckets:
             file_name, storage_key, (bytes_data, tensor_data) = bucket
             tensor_data = [
@@ -227,6 +227,8 @@ class FileSystemWriterAsync(FileSystemWriter):
             result.append((file_name, storage_key, (bytes_data, tensor_data)))
         if non_blocking:
             torch.cuda.synchronize()
+            t2 = time()
+            print(f"preload tensors rank: {torch.distributed.get_rank()}, takes {t2 - t1} to finish D2H ", t1, t2)
         return result
 
     @staticmethod
@@ -334,7 +336,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         global_results_queue.put(write_results_or_exc)
 
         w_end = time()
-        logger.debug(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
+        print(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
 
     @staticmethod
     @_disable_gc()

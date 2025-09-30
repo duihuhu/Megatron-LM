@@ -20,7 +20,7 @@ else
     export GLOO_SOCKET_IFNAME=ens37f0
 fi
 MASTER_PORT=6000
-NNODES=1
+NNODES=2
 NODE_RANK=$1
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
@@ -36,6 +36,8 @@ SHM_PKT="/dev/shm/shm_pkt"
 
 if [ "$NODE_RANK" -eq 0 ]; then
     export CUDA_VISIBLE_DEVICES=0,1
+elif [ "$NODE_RANK" -eq 1 ]; then
+    export CUDA_VISIBLE_DEVICES=2,3
 fi
 
 # export NCCL_SOCKET_IFNAME=ens37f0
@@ -118,6 +120,8 @@ EVAL_AND_LOGGING_ARGS=(
     --use-pipeline-ckpt-worker
     --pipeline-async-workers 1
     # --async-save
+    --instance-seq $3
+    --gpus-per-node $GPUS_PER_NODE
 )
 
 

@@ -2198,6 +2198,12 @@ def _add_checkpointing_args(parser):
                        help='Number of worker processes for pipeline async checkpointing. '
                             'Defaults to thread_count if available, otherwise 2-4 based on world size. '
                             'Recommended: 2-3 for small models, 3-4 for medium models, 4-6 for large models.')
+    
+    group.add_argument('--instance-seq', type=int, default=0,
+                       help='Number of instance for training')
+    
+    group.add_argument('--gpus-per-node', type=int, default=1,
+                       help='Number of instance for training')
 
     group.add_argument('--auto-detect-ckpt-format', action='store_true',
                        help='Determine if the checkpoint format is in legacy or distributed format.'

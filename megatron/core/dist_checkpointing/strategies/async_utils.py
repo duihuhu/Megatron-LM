@@ -4,6 +4,7 @@
 This module provides an async utilities which allow to start
 a checkpoint save process in the background.
 """
+import dis
 import gc
 import logging
 from abc import ABC, abstractmethod
@@ -11,10 +12,11 @@ from collections import deque
 from contextlib import contextmanager
 from queue import Empty
 from time import sleep, time
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, get_args
 
 import torch
 from torch import multiprocessing as mp
+import os
 
 from ..utils import debug_time
 
@@ -658,6 +660,12 @@ class PipelineAsyncCaller(AsyncCaller):
                              Defaults to number of write buckets or 2.
         """
         self.num_workers = num_workers or 2
+        from megatron.training import get_args
+        args = get_args()
+        if hasattr(args, 'instance_seq'):
+            self.instance_seq = args.instance_seq
+        if hasattr(args, 'gpus_per_node'):
+            self.gpus_per_node = args.gpus_per_node
         self.workers: List[mp.Process] = []
         self.task_queues: List[mp.Queue] = []
         self.result_queues: List[mp.Queue] = []
@@ -690,7 +698,10 @@ class PipelineAsyncCaller(AsyncCaller):
                     self.completion_queue,
                     self.stage_sync_queue,
                     torch.distributed.get_rank(),
-                    logging.getLogger().getEffectiveLevel()
+                    logging.getLogger().getEffectiveLevel(),
+                    self.instance_seq,
+                    self.num_workers,
+                    self.gpus_per_node
                 )
             )
             worker.start()
@@ -701,6 +712,33 @@ class PipelineAsyncCaller(AsyncCaller):
         # logger.info(f"PipelineAsyncCaller: Initialized {self.num_workers} worker processes")
 
     @staticmethod
+    def _init_workers_comm(worker_id: int, rank: int, instance_seq: int, num_workers: int, gpus_per_node: int):
+        # print(f"Worker {worker_id} for rank {rank} has instance_seq {instance_seq} num_workers {num_workers} gpus_per_node {gpus_per_node}")
+
+        device_id = rank % gpus_per_node
+        torch.cuda.set_device(device_id)
+        worker_rank = (rank * num_workers) + worker_id
+
+        world_size = int(os.environ["WORLD_SIZE"])
+        worker_port = int(os.environ.get('MASTER_PORT', '29500')) + 1000
+        addr = os.environ["MASTER_ADDR"]
+        print(f"Worker {worker_id} for rank {rank} has instance_seq {instance_seq} worker_rank {worker_rank} gpus_per_node {gpus_per_node}  num_workers {num_workers} world_size {world_size} worker_port {worker_port} master_addr {addr}")
+
+        # worker_rank = (instance_seq  * gpus_per_node * num_workers) + rank + worker_id
+        torch.distributed.init_process_group(backend='gloo', rank=worker_rank, world_size=num_workers * world_size)
+        print(f"Worker xxxxxxxxxxxxxxxxxxx")
+        if instance_seq % 2 == 0:
+            peer_rank = worker_rank + num_workers * gpus_per_node
+        else:
+            peer_rank = worker_rank - num_workers * gpus_per_node
+        worker_comm = torch.distributed.new_group(ranks=[worker_rank, peer_rank])
+        # torch.distributed.barrier()
+        print(f"Worker {worker_id} for rank {rank} has instance_seq {instance_seq} worker_rank {worker_rank} gpus_per_node {gpus_per_node} peer_rank {peer_rank} num_workers {num_workers}")
+
+        return worker_rank, peer_rank, worker_comm
+
+
+    @staticmethod
     def _worker_main_loop(
         worker_id: int,
         task_queue: mp.Queue,
@@ -708,14 +746,18 @@ class PipelineAsyncCaller(AsyncCaller):
         completion_queue: mp.Queue,
         stage_sync_queue: mp.Queue,
         rank: int,
-        log_level: int
+        log_level: int,
+        instance_seq: int,
+        num_workers: int,
+        gpus_per_node: int
     ):
         """Main loop for worker processes with pipeline stage synchronization."""
         logger = logging.getLogger(__name__)
         logger.setLevel(log_level)
         logger.info(f"Worker {worker_id} for rank {rank} started")
-        torch.cuda.set_device(rank)
-
+        
+        src_rank, peer_rank, comm = PipelineAsyncCaller._init_workers_comm(worker_id, rank, instance_seq, num_workers, gpus_per_node)
+        
         while True:
             try:
                 task = task_queue.get()  # Add timeout to allow periodic checks
@@ -775,19 +817,34 @@ class PipelineAsyncCaller(AsyncCaller):
                         logger.error(f"Worker {worker_id}: Error signaling completion for call {call_id}: {e}")
                         raise
                     
-                    # Step 4: Write to disk (can overlap with next worker's GPU->CPU transfer)
-                    logger.debug(f"Worker {worker_id}: Starting disk write for call {call_id}")
-                    try:
-                        # t3 = time()
-                        write_results = PipelineAsyncCaller._write_bucket_slice(
-                            worker_id, preloaded_buckets, async_req
-                        )
-                        logger.debug(f"Worker {worker_id}: Disk write completed for call {call_id}, {len(write_results)} results")
-                        # t4 = time()
-                        # print(f"Worker {worker_id}: CPU->Disk transfer completed for call {call_id} {t4 - t3} seconds", t3, t4)
-                    except Exception as e:
-                        logger.error(f"Worker {worker_id}: Error in disk write for call {call_id}: {e}")
-                        raise
+                    # Step 4: Choose between data transfer or disk write
+                    # use_data_transfer = async_req.async_fn_kwargs.get('use_data_transfer', False)
+                    use_data_transfer = True
+                    
+                    
+                    if use_data_transfer:
+                        # Data transfer between workers (can overlap with next worker's GPU->CPU transfer)
+                        logger.debug(f"Worker {worker_id}: Starting data transfer for call {call_id}")
+                        try:
+                            transfer_results = PipelineAsyncCaller._transfer_bucket_slice(
+                                worker_id, preloaded_buckets, async_req, src_rank, peer_rank, instance_seq, comm
+                            )
+                            logger.debug(f"Worker {worker_id}: Data transfer completed for call {call_id}, {len(transfer_results)} results")
+                            write_results = transfer_results
+                        except Exception as e:
+                            logger.error(f"Worker {worker_id}: Error in data transfer for call {call_id}: {e}")
+                            raise
+                    else:
+                        # Write to disk (can overlap with next worker's GPU->CPU transfer)
+                        logger.debug(f"Worker {worker_id}: Starting disk write for call {call_id}")
+                        try:
+                            write_results = PipelineAsyncCaller._write_bucket_slice(
+                                worker_id, preloaded_buckets, async_req
+                            )
+                            logger.debug(f"Worker {worker_id}: Disk write completed for call {call_id}, {len(write_results)} results")
+                        except Exception as e:
+                            logger.error(f"Worker {worker_id}: Error in disk write for call {call_id}: {e}")
+                            raise
                     
                     # Step 5: Notify completion with write results
                     completion_queue.put((call_id, worker_id, "completed", write_results))
@@ -931,6 +988,169 @@ class PipelineAsyncCaller(AsyncCaller):
             print(f"Worker {worker_id}: Write data to file {t2 - t1} seconds")
         return local_results
 
+    @staticmethod
+    def _transfer_bucket_slice(
+        worker_id: int, preloaded_buckets: List, async_req: AsyncRequest,
+        worker_rank: int, peer_rank: int, instance_seq: int, comm: torch.distributed.ProcessGroup
+    ):
+        """Transfer preloaded bucket data between workers using distributed communication.
+        
+        Args:
+            worker_id: ID of the worker process
+            preloaded_buckets: List of buckets with data already on CPU
+            async_req: AsyncRequest containing transfer parameters
+            worker_rank: Current worker's rank in the communication group
+            peer_rank: Peer worker's rank to communicate with
+            worker_comm: PyTorch distributed communication group
+            
+        Returns:
+            List of transfer result descriptions
+        """
+        import pickle
+        
+        # current_rank = torch.distributed.get_rank()
+        transfer_results = []
+        
+        logger = logging.getLogger(__name__)
+        logger.info(f"Worker {worker_id}: Starting data transfer worker_rank={worker_rank}, peer_rank={peer_rank}")
+        
+        # 确定是发送方还是接收方（基于worker_rank）
+        is_sender = (instance_seq % 2 == 0)
+        
+        try:
+            for bucket_idx, bucket in enumerate(preloaded_buckets):
+                file_name, storage_key, (bytes_data, tensor_data) = bucket
+                
+                t1 = time()
+                
+                if is_sender:
+                    # 发送数据到对等rank（数据保持在CPU上）
+                    logger.debug(f"Worker {worker_id}: Sending bucket {bucket_idx} to peer_rank {peer_rank}")
+                    
+                    # 1. 发送元数据
+                    metadata = {
+                        'file_name': file_name,
+                        'storage_key': storage_key,
+                        'num_bytes_items': len(bytes_data),
+                        'num_tensor_items': len(tensor_data),
+                    }
+                    metadata_bytes = pickle.dumps(metadata)
+                    
+                    # 发送元数据长度（使用CPU tensor）
+                    meta_len_tensor = torch.tensor([len(metadata_bytes)], dtype=torch.long)
+                    torch.distributed.send(meta_len_tensor, dst=peer_rank, group=comm)
+                    
+                    # 发送元数据内容（使用CPU tensor）
+                    meta_tensor = torch.tensor(list(metadata_bytes), dtype=torch.uint8)
+                    torch.distributed.send(meta_tensor, dst=peer_rank, group=comm)
+                    
+                    # # 2. 发送bytes_data
+                    # if bytes_data:
+                    #     bytes_pickle = pickle.dumps(bytes_data)
+                    #     bytes_len_tensor = torch.tensor([len(bytes_pickle)], dtype=torch.long)
+                    #     torch.distributed.send(bytes_len_tensor, dst=peer_rank, group=worker_comm)
+                        
+                    #     bytes_tensor = torch.tensor(list(bytes_pickle), dtype=torch.uint8)
+                    #     torch.distributed.send(bytes_tensor, dst=peer_rank, group=worker_comm)
+                    # else:
+                    #     # 发送0长度表示没有bytes_data
+                    #     zero_len = torch.tensor([0], dtype=torch.long)
+                    #     torch.distributed.send(zero_len, dst=peer_rank, group=worker_comm)
+                    
+                    # # 3. 发送tensor_data（数据保持在CPU上）
+                    # for tensor_idx, (item, tensor) in enumerate(tensor_data):
+                    #     # 发送tensor元数据
+                    #     tensor_meta = {
+                    #         'item': item,
+                    #         'shape': list(tensor.shape),
+                    #         'dtype': str(tensor.dtype)
+                    #     }
+                    #     tensor_meta_bytes = pickle.dumps(tensor_meta)
+                        
+                    #     tensor_meta_len = torch.tensor([len(tensor_meta_bytes)], dtype=torch.long)
+                    #     torch.distributed.send(tensor_meta_len, dst=peer_rank, group=worker_comm)
+                        
+                    #     tensor_meta_tensor = torch.tensor(list(tensor_meta_bytes), dtype=torch.uint8)
+                    #     torch.distributed.send(tensor_meta_tensor, dst=peer_rank, group=worker_comm)
+                        
+                    #     # 发送tensor数据（使用CPU tensor直接发送）
+                    #     assert tensor.is_cpu, f"Tensor should be on CPU, got {tensor.device}"
+                    #     torch.distributed.send(tensor.flatten(), dst=peer_rank, group=worker_comm)
+                    #     logger.debug(f"Worker {worker_id}: Sent tensor {tensor_idx} with shape {tensor.shape}")
+                    
+                    # transfer_results.append(f"sent_bucket_{bucket_idx}")
+                    
+                else:
+                    # 从对等rank接收数据（数据保持在CPU上）
+                    logger.debug(f"Worker {worker_id}: Receiving bucket {bucket_idx} from peer_rank {peer_rank}")
+                    
+                    # 1. 接收元数据
+                    meta_len_tensor = torch.empty(1, dtype=torch.long)
+                    torch.distributed.recv(meta_len_tensor, src=peer_rank, group=comm)
+                    
+                    meta_tensor = torch.empty(meta_len_tensor.item(), dtype=torch.uint8)
+                    torch.distributed.recv(meta_tensor, src=peer_rank, group=comm)
+                    
+                    metadata = pickle.loads(bytes(meta_tensor.tolist()))
+                    logger.debug(f"Worker {worker_id}: Received metadata: {metadata}")
+                    
+                    # # 2. 接收bytes_data
+                    # bytes_len_tensor = torch.empty(1, dtype=torch.long)
+                    # torch.distributed.recv(bytes_len_tensor, src=worker_rank, group=worker_comm)
+                    
+                    # received_bytes_data = None
+                    # if bytes_len_tensor.item() > 0:
+                    #     bytes_tensor = torch.empty(bytes_len_tensor.item(), dtype=torch.uint8)
+                    #     torch.distributed.recv(bytes_tensor, src=worker_rank, group=worker_comm)
+                    #     received_bytes_data = pickle.loads(bytes(bytes_tensor.tolist()))
+                    
+                    # # 3. 接收tensor_data
+                    # received_tensor_data = []
+                    # for tensor_idx in range(metadata['num_tensor_items']):
+                    #     # 接收tensor元数据
+                    #     tensor_meta_len = torch.empty(1, dtype=torch.long)
+                    #     torch.distributed.recv(tensor_meta_len, src=worker_rank, group=worker_comm)
+                        
+                    #     tensor_meta_tensor = torch.empty(tensor_meta_len.item(), dtype=torch.uint8)
+                    #     torch.distributed.recv(tensor_meta_tensor, src=worker_rank, group=worker_comm)
+                        
+                    #     tensor_meta = pickle.loads(bytes(tensor_meta_tensor.tolist()))
+                        
+                    #     # 接收tensor数据（保持在CPU上）
+                    #     tensor_numel = 1
+                    #     for dim in tensor_meta['shape']:
+                    #         tensor_numel *= dim
+                        
+                    #     received_tensor_flat = torch.empty(tensor_numel, dtype=getattr(torch, tensor_meta['dtype'].split('.')[-1]))
+                    #     torch.distributed.recv(received_tensor_flat, src=worker_rank, group=worker_comm)
+                        
+                    #     # 重塑为原始形状（保持在CPU上）
+                    #     received_tensor = received_tensor_flat.reshape(tensor_meta['shape'])
+                    #     received_tensor_data.append((tensor_meta['item'], received_tensor))
+                        
+                    #     logger.debug(f"Worker {worker_id}: Received tensor {tensor_idx} with shape {tensor_meta['shape']}")
+                    
+                    # # 构建接收到的bucket
+                    # received_bucket = (
+                    #     metadata['file_name'],
+                    #     metadata['storage_key'], 
+                    #     (received_bytes_data or [], received_tensor_data)
+                    # )
+                    
+                    # transfer_results.append(f"received_bucket_{bucket_idx}")
+                
+                t2 = time()
+                logger.info(f"Worker {worker_id}: {'Sent' if is_sender else 'Received'} bucket {bucket_idx} in {t2 - t1:.3f} seconds")
+        
+        except Exception as e:
+            logger.error(f"Worker {worker_id}: Error in data transfer: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+        
+        logger.info(f"Worker {worker_id}: Completed data transfer with {len(transfer_results)} operations")
+        return transfer_results
+
     def _split_write_buckets(self, write_buckets: List) -> List[List]:
         """Split write buckets among workers."""
         if not write_buckets:
@@ -979,6 +1199,9 @@ class PipelineAsyncCaller(AsyncCaller):
                 transform_list = original_args[0] if original_args[0] else []
                 use_msc = original_args[1] if len(original_args) > 1 else False
         
+        # Extract use_data_transfer option from async_req
+        # use_data_transfer = async_req.async_fn_kwargs.get('use_data_transfer', False)
+        
         # Create a simplified async request for workers with necessary parameters
         worker_async_req = AsyncRequest(
             async_fn=None,
@@ -987,6 +1210,7 @@ class PipelineAsyncCaller(AsyncCaller):
             async_fn_kwargs={
                 'transform_list': transform_list,
                 'use_msc': use_msc,
+                # 'use_data_transfer': use_data_transfer,
                 **async_req.async_fn_kwargs
             },
             preload_fn=None,

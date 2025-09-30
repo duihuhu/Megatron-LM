@@ -819,7 +819,7 @@ class PipelineAsyncCaller(AsyncCaller):
                     
                     # Step 4: Choose between data transfer or disk write
                     # use_data_transfer = async_req.async_fn_kwargs.get('use_data_transfer', False)
-                    use_data_transfer = True
+                    use_data_transfer = False
                     
                     
                     if use_data_transfer:

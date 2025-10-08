@@ -15,3 +15,7 @@ onelogger.err
 .venv
 test_cases/
 runs/
+G-CRSPCIE/*.o
+G-CRSPCIE/*.so
+G-CRSPCIE/*.out
+G-CRSPCIE/*.log

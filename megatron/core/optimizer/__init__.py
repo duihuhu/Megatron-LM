@@ -84,7 +84,6 @@ def _get_param_groups(
     """
 
     use_decoupled_learning_rate = decoupled_lr is not None
-
     # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
     params_map = {}
     for model_chunk in model_chunks:

@@ -1445,7 +1445,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
-
+    print(f"optimizer.step ", optimizer)
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()

@@ -126,6 +126,7 @@ class MegatronOptimizer(ABC):
         """
         params = []
         if hasattr(self.optimizer, 'param_groups'):
+            # print("self.optimizer.param_groups ", self.optimizer.param_groups)
             for param_group in self.optimizer.param_groups:
                 for param in param_group['params']:
                     params.append(param)

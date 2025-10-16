@@ -737,7 +737,6 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
     state_dict['checkpoint_version'] = 3.0
     if iteration is not None:
         state_dict['iteration'] = iteration
-
     for i in range(len(model)):
         key = "model"
         if len(model) > 1:
@@ -977,6 +976,7 @@ def _load_base_checkpoint(
     non_persistent_iteration = _get_non_persistent_iteration(
         non_persistent_global_dir, args, checkpointing_context
     )
+    
     iteration, release = -1, False
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
@@ -1019,7 +1019,7 @@ def _load_base_checkpoint(
     # Determine the type of the checkpoint on disk.
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
     ckpt_format = _get_checkpoint_format(checkpoint_name)
-
+    
     if not rank0:
         dist_infix = "distributed " if ckpt_format == "torch_dist" else ""
         if release:
@@ -1087,7 +1087,6 @@ def _load_base_checkpoint(
             )
     else:
         raise NotImplementedError(f"checkpoint format {ckpt_format} not supported")
-
     return state_dict, checkpoint_name, release, ckpt_type
 
 
@@ -1433,6 +1432,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
         **load_kwargs
     )
+    
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -1492,6 +1492,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     strict = False if args.retro_add_retriever else strict
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
+            # print("load_model_state_dict ", ddp_model[0], state_dict['model'], strict)
             load_model_state_dict(ddp_model[0], state_dict['model'], strict)
         else:
             for i in range(len(ddp_model)):

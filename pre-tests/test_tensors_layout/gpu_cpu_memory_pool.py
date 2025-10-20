@@ -121,14 +121,14 @@ class CPUMemoryPool:
         if not self.use_pinned_pool:
             # Use ctypes for regular memory allocation
             self._raw_buffer = ctypes.create_string_buffer(self.pool_size + self.alignment)
-            
+        
             # Get aligned address
             raw_address = ctypes.addressof(self._raw_buffer)
             self.base_address = (raw_address + self.alignment - 1) & ~(self.alignment - 1)
             self._pinned_tensor = None
-            
-            print(f"[MemoryPool] Allocated {self.pool_size / 1024 / 1024:.2f} MB at 0x{self.base_address:x}")
-    
+        
+        print(f"[MemoryPool] Allocated {self.pool_size / 1024 / 1024:.2f} MB at 0x{self.base_address:x}")
+        
     def allocate(self, size_bytes: int, tensor_id: Optional[int] = None) -> Tuple[int, int]:
         """
         Allocate memory from the pool.
@@ -432,6 +432,57 @@ class CPUMemoryPool:
             print(f"Free:  {stats['free_memory'] / 1024 / 1024:.2f} MB")
             print(f"Fragmentation: {stats['fragmentation_ratio']:.2%}")
             print("=" * 80 + "\n")
+    
+    def read_raw_bytes(self, address: int, size: int) -> bytes:
+        """
+        直接读取内存的原始字节（零拷贝，无序列化）
+        
+        用途：
+        - 网络发送前读取原始数据
+        - 避免 torch.save/pickle 的序列化开销
+        - 直接获取内存中的字节流
+        
+        Args:
+            address: 内存地址
+            size: 要读取的字节数
+            
+        Returns:
+            原始字节流
+            
+        Example:
+            address, tid = pool.allocate(1024)
+            pool.transfer(gpu_tensor, address)
+            raw_bytes = pool.read_raw_bytes(address, 1024)
+            # 发送 raw_bytes（无序列化开销）
+        """
+        ptr = ctypes.cast(address, ctypes.POINTER(ctypes.c_byte))
+        return bytes(ctypes.string_at(ptr, size))
+    
+    def write_raw_bytes(self, address: int, data: bytes):
+        """
+        直接写入原始字节到内存（零拷贝，无反序列化）
+        
+        用途：
+        - 网络接收后直接写入内存
+        - 避免 torch.load/pickle 的反序列化开销
+        - 直接将字节流写入内存
+        
+        Args:
+            address: 目标内存地址
+            data: 要写入的字节流
+            
+        Example:
+            # 接收原始字节
+            raw_bytes = recv_from_network()
+            # 分配内存
+            address, tid = pool.allocate(len(raw_bytes))
+            # 直接写入（无反序列化）
+            pool.write_raw_bytes(address, raw_bytes)
+            # 创建 tensor view
+            tensor = pool.get_tensor_from_pool(tid)
+        """
+        ptr = ctypes.cast(address, ctypes.POINTER(ctypes.c_byte))
+        ctypes.memmove(ptr, data, len(data))
 
 
 class GPUToCPUPoolTransfer:
@@ -449,170 +500,6 @@ class GPUToCPUPoolTransfer:
         self.pool = memory_pool
         self.tensor_metadata: Dict[int, Dict] = {}  # tensor_id -> {shape, dtype, address}
         self._cpu_tensor_cache: Dict[int, torch.Tensor] = {}  # Cache CPU tensor views
-    
-    def transfer_to_pool(
-        self,
-        gpu_tensor: torch.Tensor,
-        tensor_id: Optional[int] = None
-    ) -> int:
-        """
-        Transfer GPU tensor to memory pool.
-        
-        Args:
-            gpu_tensor: GPU tensor to transfer
-            tensor_id: Optional tensor ID
-            
-        Returns:
-            Tensor ID
-            
-        Note:
-            Transfer speed depends on pool.use_pinned_pool setting.
-            If pool is pinned, transfer is automatically faster.
-        """
-        if not gpu_tensor.is_cuda:
-            raise ValueError("Tensor must be on CUDA device")
-        
-        # Calculate required size
-        gpu_tensor = gpu_tensor.contiguous()
-        size_bytes = gpu_tensor.element_size() * gpu_tensor.nelement()
-        
-        # Allocate from pool
-        address, tensor_id = self.pool.allocate(size_bytes, tensor_id)
-        
-        # Get the actual allocated size (aligned) from the pool
-        actual_size = self.pool.allocations[tensor_id].size
-        
-        # Store metadata
-        self.tensor_metadata[tensor_id] = {
-            'shape': gpu_tensor.shape,
-            'dtype': gpu_tensor.dtype,
-            'address': address,
-            'size': actual_size  # Use actual aligned size, not original size
-        }
-        
-        # Transfer data (pass tensor_id for potential caching)
-        self._do_transfer(gpu_tensor, address, tensor_id)
-        
-        return tensor_id
-    
-    def transfer_batch_to_pool(
-        self,
-        gpu_tensors: List[torch.Tensor],
-        contiguous: bool = True
-    ) -> List[int]:
-        """
-        Transfer multiple GPU tensors to pool in batch.
-        
-        Args:
-            gpu_tensors: List of GPU tensors
-            contiguous: If True, allocate contiguous memory for all tensors (addresses consecutive)
-            
-        Returns:
-            List of tensor IDs
-            
-        Note:
-            Transfer speed depends on pool.use_pinned_pool setting.
-        """
-        if not contiguous:
-            # Original behavior: allocate separately
-            tensor_ids = []
-            for gpu_tensor in gpu_tensors:
-                tid = self.transfer_to_pool(gpu_tensor)
-                tensor_ids.append(tid)
-            return tensor_ids
-        
-        # Contiguous allocation: all tensors in consecutive memory
-        if not all(t.is_cuda for t in gpu_tensors):
-            raise ValueError("All tensors must be on CUDA device")
-        
-        # Make all tensors contiguous and calculate sizes
-        gpu_tensors_contig = [t.contiguous() for t in gpu_tensors]
-        sizes_bytes = [t.element_size() * t.nelement() for t in gpu_tensors_contig]
-        
-        # Allocate contiguous memory from pool
-        addresses, tensor_ids = self.pool.allocate_contiguous(sizes_bytes)
-        
-        # Transfer each tensor to its allocated address
-        for i, (gpu_tensor, address, tensor_id) in enumerate(zip(gpu_tensors_contig, addresses, tensor_ids)):
-            # Get the actual allocated size (aligned) from the pool
-            actual_size = self.pool.allocations[tensor_id].size
-            
-            # Store metadata
-            self.tensor_metadata[tensor_id] = {
-                'shape': gpu_tensor.shape,
-                'dtype': gpu_tensor.dtype,
-                'address': address,
-                'size': actual_size  # Use actual aligned size, not original size
-            }
-            
-            # Transfer data (pass tensor_id for caching)
-            self._do_transfer(gpu_tensor, address, tensor_id)
-        
-        return tensor_ids
-    
-    def transfer_batch_async(
-        self,
-        gpu_tensors: List[torch.Tensor],
-        stream: Optional[torch.cuda.Stream] = None,
-        contiguous: bool = True
-    ) -> Tuple[List[int], torch.cuda.Event]:
-        """
-        Asynchronously transfer multiple GPU tensors to pool.
-        
-        Args:
-            gpu_tensors: List of GPU tensors
-            stream: CUDA stream for async transfer
-            contiguous: If True, allocate contiguous memory for all tensors
-            
-        Returns:
-            Tuple of (list of tensor IDs, CUDA event)
-        """
-        if stream is None:
-            stream = torch.cuda.Stream()
-        
-        if not all(t.is_cuda for t in gpu_tensors):
-            raise ValueError("All tensors must be on CUDA device")
-        
-        # Make all tensors contiguous
-        gpu_tensors_contig = [t.contiguous() for t in gpu_tensors]
-        sizes_bytes = [t.element_size() * t.nelement() for t in gpu_tensors_contig]
-        
-        tensor_ids = []
-        
-        with torch.cuda.stream(stream):
-            if contiguous:
-                # Allocate contiguous memory for all tensors
-                addresses, tensor_ids = self.pool.allocate_contiguous(sizes_bytes)
-            else:
-                # Allocate separately
-                addresses = []
-                tensor_ids = []
-                for size_bytes in sizes_bytes:
-                    address, tensor_id = self.pool.allocate(size_bytes)
-                    addresses.append(address)
-                    tensor_ids.append(tensor_id)
-            
-            # Transfer all tensors asynchronously
-            for i, (gpu_tensor, address, tensor_id) in enumerate(zip(gpu_tensors_contig, addresses, tensor_ids)):
-                # Get the actual allocated size (aligned) from the pool
-                actual_size = self.pool.allocations[tensor_id].size
-                
-                # Store metadata
-                self.tensor_metadata[tensor_id] = {
-                    'shape': gpu_tensor.shape,
-                    'dtype': gpu_tensor.dtype,
-                    'address': address,
-                    'size': actual_size  # Use actual aligned size, not original size
-                }
-                
-                # Async transfer (pass tensor_id for caching)
-                self._do_transfer_async(gpu_tensor, address, stream, tensor_id)
-            
-            # Create event to mark completion
-            event = torch.cuda.Event()
-            event.record(stream)
-        
-        return tensor_ids, event
     
     def get_tensor_from_pool(self, tensor_id: int) -> torch.Tensor:
         """

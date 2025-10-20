@@ -277,8 +277,16 @@ def test_performance_comparison():
     
     pool = CPUMemoryPool(pool_size_bytes=int(total_size * 2))
     transfer_mgr = GPUToCPUPoolTransfer(pool)
-    _ = transfer_mgr.transfer_batch_to_pool(gpu_tensors[:5], contiguous=True)
-    transfer_mgr.free_batch(list(range(5)))
+    # 手动传输几个 tensor 进行预热
+    sizes = [t.element_size() * t.nelement() for t in gpu_tensors[:5]]
+    addresses, tids = pool.allocate_contiguous(sizes)
+    for t, addr, tid in zip(gpu_tensors[:5], addresses, tids):
+        transfer_mgr.tensor_metadata[tid] = {
+            'shape': t.shape, 'dtype': t.dtype, 'address': addr,
+            'size': pool.allocations[tid].size
+        }
+        transfer_mgr._do_transfer(t, addr, tid)
+    transfer_mgr.free_batch(tids)
     
     torch.cuda.synchronize()
     
@@ -806,21 +814,13 @@ def main():
     results = []
     
     try:
-        # 测试 1: 单个 tensor
-        # result1 = test_single_tensor_transfer()
-        # results.append(("单个 Tensor 传输", result1))
-        
-        # # 测试 2: 多个 tensors
-        # result2 = test_multiple_tensors_transfer()
-        # results.append(("多个 Tensor 批量传输", result2))
-        
         # # # 测试 3: 性能对比
-        # result3 = test_performance_comparison()
-        # results.append(("性能对比测试", result3))
+        result3 = test_performance_comparison()
+        results.append(("性能对比测试", result3))
         
         # 测试 4: 异步传输性能对比
-        result4 = test_async_transfer_performance()
-        results.append(("异步传输性能对比", result4))
+        # result4 = test_async_transfer_performance()
+        # results.append(("异步传输性能对比", result4))
         
         # 汇总结果
         print("=" * 80)

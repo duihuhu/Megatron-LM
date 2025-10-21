@@ -871,6 +871,257 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     def __init__(self):
         self.cached_global_metadata: Optional[Metadata] = None
         super().__init__()
+    
+    def _is_eccheck_checkpoint(self, checkpoint_dir: Path) -> bool:
+        """Check if the checkpoint is in EC-CHECK format.
+        
+        EC-CHECK checkpoints are .distcp files with 'ECCK' magic number in the header.
+        
+        Args:
+            checkpoint_dir (Path): checkpoint directory
+            
+        Returns:
+            bool: True if this is an EC-CHECK checkpoint
+        """
+        import struct
+        
+        checkpoint_dir = Path(checkpoint_dir)
+        if not checkpoint_dir.exists():
+            return False
+        
+        # Get current rank to find the corresponding file
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        
+        # Check for EC-CHECK format: __{rank}_0.distcp with ECCK magic number
+        potential_file = checkpoint_dir / f"__{rank}_0.distcp"
+        
+        if not potential_file.exists():
+            return False
+        
+        # Read first 4 bytes to check for ECCK magic number
+        try:
+            with open(potential_file, 'rb') as f:
+                magic = f.read(4)
+                return magic == b'ECCK'
+        except:
+            return False
+    
+    def _load_eccheck_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+        """Load checkpoint saved in EC-CHECK format.
+        
+        Args:
+            sharded_state_dict (ShardedStateDict): template showing what to load
+            checkpoint_dir (Path): checkpoint directory
+            
+        Returns:
+            StateDict: loaded state dict with structure matching sharded_state_dict
+        """
+        from .filesystem_async import FileSystemWriterAsync
+        from .state_dict_decomposer import reconstruct_state_dict
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        
+        # Find the EC-CHECK file for this rank
+        # Ensure checkpoint_dir is a Path object
+        checkpoint_dir = Path(checkpoint_dir)
+        # EC-CHECK uses standard .distcp extension but with custom ECCK format
+        eccheck_file = checkpoint_dir / f'__{rank}_0.distcp'
+        
+        if not eccheck_file.exists():
+            raise FileNotFoundError(
+                f"EC-CHECK file not found for rank {rank}: {eccheck_file}"
+            )
+        
+        logger.info(f"Loading EC-CHECK checkpoint from {eccheck_file}")
+        
+        # Load the decomposed state dict from file
+        decomposed = FileSystemWriterAsync.load_eccheck_components_from_file(
+            str(eccheck_file)
+        )
+        
+        # Build index map from loaded tensor_infos
+        # Map: metadata_index → (tensor_info, tensor_data)
+        logger.info(f"EC-CHECK: Building index map from {len(decomposed.tensor_infos)} tensor infos")
+        
+        index_to_data = {}
+        for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
+            if info.metadata_index is not None:
+                # Use full metadata_index as key
+                # Convert to hashable tuple: (fqn, offset_tuple, index)
+                index_key = (info.metadata_index.fqn, tuple(info.metadata_index.offset), info.metadata_index.index)
+                index_to_data[index_key] = (info, tensor)
+        
+        # Also add non-tensor data keyed by FQN only
+        non_tensor_by_fqn = decomposed.non_tensor_data
+        
+        logger.info(
+            f"Successfully loaded EC-CHECK checkpoint for rank {rank} "
+            f"({len(decomposed.tensor_data)} tensors, "
+            f"{decomposed.total_tensor_size_bytes / (1024**3):.2f} GB)"
+        )
+        
+        # Save original sharded_state_dict for type restoration later
+        orig_sharded_state_dict = sharded_state_dict
+        
+        # Generate PyT-compatible state dict from sharded_state_dict
+        # This creates the structure that standard load expects
+        (keyed_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict, keep_only_main_replica=True)
+        )
+        
+        # Create a mapping from loaded data using metadata_index
+        # For tensors: use metadata_index for precise matching
+        # For objects: use FQN
+        matched_count = 0
+        unmatched_count = 0
+        
+        for key, sh_base_list in keyed_state_dict.items():
+            for sh_base in sh_base_list:
+                if isinstance(sh_base, ShardedObject):
+                    # For ShardedObject, match by FQN
+                    if key in non_tensor_by_fqn:
+                        value = non_tensor_by_fqn[key]
+                        
+                        # Handle EC-CHECK wrapped BytesIO data
+                        if isinstance(value, dict) and '_eccheck_type' in value:
+                            if value['_eccheck_type'] == 'BytesIO':
+                                # Reconstruct and deserialize
+                                bytes_data = value['_eccheck_data']
+                                bytes_io = io.BytesIO(bytes_data)
+                                deserialized_list = torch.load(bytes_io, map_location='cpu', weights_only=False)
+                                value = deserialized_list[0] if isinstance(deserialized_list, list) else deserialized_list
+                        
+                        sh_base.data = value
+                        matched_count += 1
+                    else:
+                        unmatched_count += 1
+                
+                elif isinstance(sh_base, ShardedTensor):
+                    # For ShardedTensor, search for matching data by metadata_index
+                    # Match by (fqn, global_offset)
+                    matched = False
+                    for idx_key, (info, tensor) in index_to_data.items():
+                        fqn, offset_tuple, index = idx_key
+                        if fqn == key and offset_tuple == tuple(sh_base.global_offset):
+                            # Exact match found
+                            sh_base.data = tensor
+                            matched_count += 1
+                            matched = True
+                            break
+                    
+                    if not matched:
+                        unmatched_count += 1
+                        # Keep data as None - will be preserved in unwrap
+        
+        logger.info(
+            f"EC-CHECK: Matched {matched_count} ShardedBase objects, "
+            f"{unmatched_count} unmatched (will be None)"
+        )
+        
+        # Now apply the same post-processing as standard load
+        # This is critical for proper state_dict structure
+        
+        # Step 1: Unwrap ShardedTensors and ShardedObjects
+        # Convert from ShardedBase objects to actual data
+        unwrapped_state_dict = {}
+        for key, sh_base_list in keyed_state_dict.items():
+            if len(sh_base_list) == 0:
+                continue
+            
+            sh_base = sh_base_list[0]
+            if isinstance(sh_base, ShardedTensor):
+                # For ShardedTensor, unwrap and handle prepend_axis_num
+                # Similar to _unwrap_pyt_sharded_tensor
+                tensors = []
+                for sh in sh_base_list:
+                    ten = sh.data
+                    if ten is None:
+                        tensors.append(None)
+                        continue
+                    
+                    # Handle flattened_range (similar to _unwrap_pyt_sharded_tensor)
+                    if sh.flattened_range is not None:
+                        assert ten.shape[:-1] == (1,) * (len(ten.shape) - 1), ten.shape
+                        ten = ten.view(-1)
+                    else:
+                        # Squeeze prepend_axis_num dimensions
+                        for _ in range(sh.prepend_axis_num):
+                            if ten.size(0) == 1:
+                                ten = ten[0]
+                    
+                    tensors.append(ten)
+                
+                # Check if all data is None (unmatched)
+                if all(t is None for t in tensors):
+                    logger.warning(f"EC-CHECK: All data is None for key {key}")
+                
+                unwrapped_state_dict[key] = tensors
+            elif isinstance(sh_base, ShardedObject):
+                # For ShardedObject, collect data into a list (must match rename_mapping length)
+                # Standard format expects List[data] for ShardedObjects
+                data_list = [sh.data for sh in sh_base_list]
+                unwrapped_state_dict[key] = data_list
+        
+        # Step 2: Convert keyed keys back to original state_dict keys
+        # Debug: check lengths before calling
+        for k in list(unwrapped_state_dict.keys())[:5]:
+            tensors = unwrapped_state_dict[k]
+            expected_len = len(rename_mapping[k])
+            actual_len = len(tensors) if isinstance(tensors, list) else 1
+            logger.debug(f"EC-CHECK: Key {k}: actual_len={actual_len}, expected_len={expected_len}")
+        
+        mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
+            unwrapped_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
+        )
+        
+        # Step 3: Restore dict types (convert string keys back to original types if needed)
+        _restore_dict_types(mcore_state_dict, orig_sharded_state_dict)
+        
+        logger.info(f"EC-CHECK: Completed post-processing, returning state_dict")
+        
+        return mcore_state_dict
+    
+    def _populate_sharded_base_objects(self, sharded_state_dict: ShardedStateDict, flat_state_dict: Dict[str, Any]) -> None:
+        """Populate ShardedBase objects in sharded_state_dict with data from flat_state_dict.
+        
+        Args:
+            sharded_state_dict: nested dict containing ShardedTensor/ShardedObject (modified in-place)
+            flat_state_dict: flat dict with FQN keys and loaded data
+        """
+        import io
+        
+        # Recursively find and populate all ShardedBase objects
+        for sh_base in nested_values(sharded_state_dict):
+            if not isinstance(sh_base, ShardedBase):
+                continue
+            
+            # Get the key for this ShardedBase object
+            if isinstance(sh_base, ShardedObject):
+                key = sh_base.unique_key
+            else:
+                key = sh_base.key
+            
+            # Find matching data in flat_state_dict
+            if key not in flat_state_dict:
+                logger.warning(f"Key {key} not found in loaded data")
+                continue
+            
+            value = flat_state_dict[key]
+            
+            # Handle EC-CHECK wrapped BytesIO data
+            if isinstance(value, dict) and '_eccheck_type' in value:
+                if value['_eccheck_type'] == 'BytesIO':
+                    # Reconstruct BytesIO from stored bytes
+                    bytes_data = value['_eccheck_data']
+                    bytes_io = io.BytesIO(bytes_data)
+                    # For ShardedObject, deserialize the BytesIO content
+                    # The BytesIO contains torch.save'd list of data
+                    deserialized_list = torch.load(bytes_io, map_location='cpu', weights_only=False)
+                    # Extract the first element (standard format is [data])
+                    value = deserialized_list[0] if isinstance(deserialized_list, list) else deserialized_list
+            
+            # Assign data to ShardedBase object
+            sh_base.data = value
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
@@ -882,6 +1133,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
         Returns: loaded state dict
         """
+        # Check if this is an EC-CHECK format checkpoint
+        if self._is_eccheck_checkpoint(checkpoint_dir):
+            logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
+            return self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
+        
         # Apply N-D tensors resharding
         reformulation_metadata = get_reformulation_metadata(sharded_state_dict, checkpoint_dir)
         sharded_state_dict, formulation_restore_data = apply_nd_flattened_tensors_reformulation(

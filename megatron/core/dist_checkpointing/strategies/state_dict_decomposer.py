@@ -33,6 +33,7 @@ class TensorInfo:
         numel (int): number of elements in the tensor
         size_bytes (int): size in bytes
         offset (int): offset in the continuous tensor data buffer (for reconstruction)
+        metadata_index (Any): full metadata index from WriteItem (for proper reconstruction)
     """
     key: str
     shape: Tuple[int, ...]
@@ -41,6 +42,7 @@ class TensorInfo:
     numel: int
     size_bytes: int
     offset: int = 0
+    metadata_index: Any = None  # Store full WriteItem.index for proper key mapping
 
 
 @dataclass

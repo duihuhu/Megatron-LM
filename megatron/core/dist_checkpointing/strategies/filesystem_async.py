@@ -438,8 +438,9 @@ class FileSystemWriterAsync(FileSystemWriter):
                 tensor_keys_size = eccheck_metadata['tensor_keys_size']
                 tensor_buffer_size = eccheck_metadata['tensor_buffer_size']
                 
-                # Header format: magic(4) + 3 sizes(8 each) = 28 bytes
+                # Header format: magic(4) + padding(4) + 3 sizes(8 each) = 32 bytes
                 # Magic number: 'ECCK' (EC-CHECK)
+                # Default format includes padding for alignment
                 header = struct.pack(
                     '4sQQQ',
                     b'ECCK',              # Magic number
@@ -712,26 +713,47 @@ class FileSystemWriterAsync(FileSystemWriter):
         tensor_infos = []
         tensor_data_list = []
         
+        logger.info(f"EC-CHECK: Processing {len(plan.items)} items from SavePlan")
+        byte_io_count = 0
+        tensor_count = 0
+        
         for item in plan.items:
             data = planner.resolve_data(item)
             
             if item.type == WriteItemType.BYTE_IO:
-                # Non-tensor data
-                non_tensor_data[item.index.fqn] = data
+                # Non-tensor data (e.g., extra_state)
+                # BytesIO objects need special handling to preserve format
+                import io
+                if isinstance(data, io.BytesIO):
+                    # Store the BytesIO content directly as bytes
+                    # We'll also store metadata to indicate this was a BytesIO
+                    non_tensor_data[item.index.fqn] = {
+                        '_eccheck_type': 'BytesIO',
+                        '_eccheck_data': data.getvalue()
+                    }
+                else:
+                    non_tensor_data[item.index.fqn] = data
+                byte_io_count += 1
             else:
                 # Tensor data - create TensorInfo
+                # IMPORTANT: Store full WriteItem.index for proper key mapping during load
                 from .state_dict_decomposer import TensorInfo
+                
                 tensor_info = TensorInfo(
-                    key=item.index.fqn,
+                    key=item.index.fqn,  # Keep FQN as base key
                     shape=tuple(data.shape),
                     dtype=data.dtype,
                     device=data.device,
                     numel=data.numel(),
                     size_bytes=data.numel() * data.element_size(),
                     offset=0,  # Will be calculated below
+                    metadata_index=item.index,  # Store full WriteItem.index
                 )
                 tensor_infos.append(tensor_info)
                 tensor_data_list.append(data)
+                tensor_count += 1
+        
+        logger.info(f"EC-CHECK: Processed {byte_io_count} BytesIO items and {tensor_count} tensor items")
         
         # Calculate offsets for tensor data
         offset = 0
@@ -830,7 +852,11 @@ class FileSystemWriterAsync(FileSystemWriter):
         tensor_buffer_size = self.decomposed_state_dict.total_tensor_size_bytes
         
         # Create single file for all three components
-        eccheck_file = f"{storage_plan.prefix}eccheck_data{DEFAULT_SUFFIX}"
+        # Use standard .distcp extension for compatibility, but with EC-CHECK content
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        # Use the same naming convention as standard distributed checkpoint
+        # Format: __{rank}_{thread_id}.distcp
+        eccheck_file = f"__{rank}_0.distcp"  # Single file per rank, thread 0
         eccheck_path = os.path.join(self.checkpoint_dir, eccheck_file)
         
         # Store the serialized metadata in CPU memory for async save
@@ -978,10 +1004,11 @@ class FileSystemWriterAsync(FileSystemWriter):
         Load three components from a single EC-CHECK file.
         
         File structure:
-        [Header: 28 bytes] [Component 1] [Component 2] [Component 3]
+        [Header: 32 bytes] [Component 1] [Component 2] [Component 3]
         
         Header format:
         - Magic number: 4 bytes ('ECCK')
+        - Padding: 4 bytes (for alignment)
         - Component 1 size: 8 bytes (uint64)
         - Component 2 size: 8 bytes (uint64)
         - Component 3 size: 8 bytes (uint64)
@@ -996,12 +1023,12 @@ class FileSystemWriterAsync(FileSystemWriter):
         import numpy as np
         
         with open(file_path, "rb") as f:
-            # Read header (28 bytes)
-            header_bytes = f.read(28)
-            if len(header_bytes) != 28:
-                raise RuntimeError(f"EC-CHECK: Invalid file header (expected 28 bytes, got {len(header_bytes)})")
+            # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
+            header_bytes = f.read(32)
+            if len(header_bytes) != 32:
+                raise RuntimeError(f"EC-CHECK: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
             
-            # Parse header
+            # Parse header (default format includes padding for alignment)
             magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
             
             # Validate magic number

@@ -2218,6 +2218,24 @@ def _add_checkpointing_args(parser):
     group.add_argument('--load-model-opt-format', action='store_true',
                        help='Load a checkpoint for TensorRT model optimizer (nvidia-modelopt).'
                             'This function can also be used to load NeMo .nemo sharded checkpoints.')
+    
+    # EC-CHECK (Erasure Coding Checkpoint) arguments
+    group.add_argument('--use-eccheck', action='store_true',
+                       help='Enable EC-CHECK (Erasure Coding Checkpoint) for serialization-free '
+                            'checkpoint encoding. This feature decomposes state_dict into three '
+                            'components (non-tensor data, tensor keys, tensor data) to eliminate '
+                            'serialization overhead and enable pipelined encoding.')
+    group.add_argument('--no-eccheck-use-continuous-buffer', action='store_false',
+                       dest='eccheck_use_continuous_buffer',
+                       help='Disable continuous buffer for tensor data in EC-CHECK mode.')
+    group.add_argument('--eccheck-pin-memory', action='store_true',
+                       help='Use pinned memory for EC-CHECK CPU buffers. This can accelerate '
+                            'GPU-to-CPU transfers (2-3x bandwidth improvement) but requires '
+                            'more system memory. Recommended for GPU workloads.')
+    group.add_argument('--no-eccheck-preallocate-cpu-buffer', action='store_false',
+                       dest='eccheck_preallocate_cpu_buffer',
+                       help='Disable CPU memory buffer preallocation for EC-CHECK mode. '
+                            'Use this if system memory is limited.')
     return parser
 
 

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from itertools import product
 from logging import getLogger
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast, get_args
 
 import torch
 from packaging.version import Version as PkgVersion
@@ -658,7 +658,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         backend: str,
         version: int,
         keep_only_main_replica: bool = True,
-        thread_count: int = 2,
+        thread_count: int = 1,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
     ):
@@ -717,12 +717,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             )
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
+        from megatron.training import get_args as input_args
+        args = input_args()
         # Use PyT saving mechanism
         writer = FileSystemWriterAsync(
             checkpoint_dir,
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
+            use_eccheck=args.use_eccheck,
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0

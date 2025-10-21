@@ -32,6 +32,11 @@ from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
 
 from .async_utils import _disable_gc
+from .state_dict_decomposer import (
+    DecomposedStateDict,
+    decompose_state_dict,
+    organize_tensor_data_in_cpu_memory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +87,20 @@ class FileSystemWriterAsync(FileSystemWriter):
         *args,
         separation_hint: Optional[str] = None,
         use_msc: bool = False,
+        use_eccheck: bool = False,
+        eccheck_use_continuous_buffer: bool = True,
+        eccheck_pin_memory: bool = False,
+        eccheck_preallocate_cpu_buffer: bool = True,
         **kwargs,
     ):
         self.checkpoint_dir = path
         self.use_msc = use_msc
+        
+        # EC-CHECK configuration
+        self.use_eccheck = use_eccheck
+        self.eccheck_use_continuous_buffer = eccheck_use_continuous_buffer
+        self.eccheck_pin_memory = eccheck_pin_memory
+        self.eccheck_preallocate_cpu_buffer = eccheck_preallocate_cpu_buffer
 
         super().__init__(path, *args, **kwargs)
         if not self.single_file_per_rank:
@@ -99,6 +114,12 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.write_buckets: Optional[List[WriteBucket]] = None
         self.results_queue: Optional[mp.Queue] = None
         self.separation_hint = separation_hint
+        
+        # EC-CHECK intermediate state
+        self.decomposed_state_dict: Optional[DecomposedStateDict] = None
+        self.tensor_buffer: Optional[torch.Tensor] = None
+        self.preallocated_cpu_buffer: Optional[torch.Tensor] = None
+        self.eccheck_serialized_metadata: Optional[Dict] = None
 
     def prepare_write_data(self, plan: SavePlan, planner: SavePlanner) -> None:
         """
@@ -110,6 +131,11 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         Returns: None, but stores the save plan in `self.write_buckets`
         """
+        # EC-CHECK mode: decompose state_dict and preallocate CPU memory
+        if self.use_eccheck:
+            self._prepare_eccheck_data(plan, planner)
+            return
+        
         storage_plan: _StoragePrefix = plan.storage_data
         start = time()
         logger.debug(f"thread_count: {self.thread_count}, time: {start}")
@@ -200,7 +226,19 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         if not self.write_buckets:
             return None, None, []
+        
         transform_list = [self.transforms] if hasattr(self, "transforms") else []
+        
+        # EC-CHECK mode: use special preload function
+        # The preload function will embed EC-CHECK data in write_buckets
+        if self.use_eccheck:
+            return (
+                partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
+                partial(self._eccheck_preload_tensors_to_buffer, True),
+                [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+            )
+        
+        # Normal mode
         return (
             partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
             partial(self.preload_tensors, self.write_buckets, True),
@@ -254,7 +292,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         To prevent this, we disable the GC explicitly for this function with _disable_gc.
 
         Args:
-            write_buckets (List[WriteBucket]): write plan
+            write_buckets (List[WriteBucket]): write plan (may contain EC-CHECK data)
             global_results_queue (mp.Queue): mp.Queue to collect Dict[List[WriteResults]]
                 (or an Exception) from parallel write processes to the main training process
         Returns: None
@@ -335,7 +373,7 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         w_end = time()
         logger.debug(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
-
+        print(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
     @staticmethod
     @_disable_gc()
     def write_preloaded_data(
@@ -368,38 +406,130 @@ class FileSystemWriterAsync(FileSystemWriter):
         local_results = []
         try:
             file_name, storage_key, (bytes_data, tensor_data) = write_bucket
-            extra_kwargs = {}
-            if "serialization_format" in inspect.signature(_write_item).parameters:
-                from torch.distributed.checkpoint.filesystem import SerializationFormat
-
-                extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
-            if use_msc:
-                import multistorageclient as msc
-
-                open_file = msc.open
-            else:
-                open_file = open
-            with open_file(file_name, "wb") as stream:
-                for write_item, data in bytes_data:
-                    local_results.append(
-                        _write_item(
-                            *transform_list, stream, data, write_item, storage_key, **extra_kwargs
+            
+            # Check if this is EC-CHECK mode by detecting special markers in bytes_data
+            eccheck_metadata = None
+            eccheck_tensor_buffer = None
+            if len(bytes_data) > 0 and bytes_data[0][0] == 'eccheck_metadata':
+                # EC-CHECK mode detected
+                for key, value in bytes_data:
+                    if key == 'eccheck_metadata':
+                        eccheck_metadata = value
+                    elif key == 'eccheck_tensor_buffer':
+                        eccheck_tensor_buffer = value
+            
+            # EC-CHECK mode: save three components to ONE file
+            if eccheck_metadata is not None:
+                if use_msc:
+                    import multistorageclient as msc
+                    open_file = msc.open
+                else:
+                    open_file = open
+                
+                logger.info("EC-CHECK: Saving three components to single file...")
+                
+                # Get file path (file_name is the eccheck_file_path)
+                eccheck_file_path = eccheck_metadata['eccheck_file_path']
+                
+                # Prepare header with component sizes
+                import struct
+                non_tensor_size = eccheck_metadata['non_tensor_size']
+                tensor_keys_size = eccheck_metadata['tensor_keys_size']
+                tensor_buffer_size = eccheck_metadata['tensor_buffer_size']
+                
+                # Header format: magic(4) + 3 sizes(8 each) = 28 bytes
+                # Magic number: 'ECCK' (EC-CHECK)
+                header = struct.pack(
+                    '4sQQQ',
+                    b'ECCK',              # Magic number
+                    non_tensor_size,      # Component 1 size
+                    tensor_keys_size,     # Component 2 size
+                    tensor_buffer_size,   # Component 3 size
+                )
+                
+                # Write all three components to one file
+                with open_file(eccheck_file_path, "wb") as f:
+                    # Write header
+                    f.write(header)
+                    
+                    # Write Component 1: Non-tensor key-value pairs
+                    f.write(eccheck_metadata['non_tensor_data'])
+                    logger.debug(f"EC-CHECK: Wrote Component 1 ({non_tensor_size / 1024:.2f} KB)")
+                    
+                    # Write Component 2: Tensor keys
+                    f.write(eccheck_metadata['tensor_keys_data'])
+                    logger.debug(f"EC-CHECK: Wrote Component 2 ({tensor_keys_size / 1024:.2f} KB)")
+                    
+                    # Write Component 3: Tensor data buffer
+                    if eccheck_tensor_buffer is not None:
+                        import numpy as np
+                        buffer_bytes = eccheck_tensor_buffer.numpy().tobytes()
+                        f.write(buffer_bytes)
+                        logger.debug(
+                            f"EC-CHECK: Wrote Component 3 ({len(buffer_bytes) / (1024**3):.2f} GB)"
                         )
-                    )
-
-                for write_item, tensor in tensor_data:
-                    assert tensor.is_cpu
-                    local_results.append(
-                        _write_item(
-                            *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
-                        )
-                    )
-
-                if use_fsync:
-                    if use_msc:
-                        stream.fsync()
                     else:
-                        os.fsync(stream.fileno())
+                        logger.warning("EC-CHECK: Tensor buffer is None, skipping Component 3")
+                    
+                    # Flush to disk
+                    if use_fsync:
+                        if use_msc:
+                            f.fsync()
+                        else:
+                            os.fsync(f.fileno())
+                
+                total_size = len(header) + non_tensor_size + tensor_keys_size
+                if eccheck_tensor_buffer is not None:
+                    total_size += len(buffer_bytes)
+                
+                logger.info(
+                    f"EC-CHECK: Saved all three components to single file:\n"
+                    f"  File: {eccheck_file_path}\n"
+                    f"  Total size: {total_size / (1024**3):.2f} GB\n"
+                    f"  Header: 28 bytes\n"
+                    f"  Component 1: {non_tensor_size / 1024:.2f} KB\n"
+                    f"  Component 2: {tensor_keys_size / 1024:.2f} KB\n"
+                    f"  Component 3: {tensor_buffer_size / (1024**3):.2f} GB"
+                )
+                
+                # Create dummy results for compatibility
+                local_results = []
+            
+            # Normal mode: standard write
+            else:
+                extra_kwargs = {}
+                if "serialization_format" in inspect.signature(_write_item).parameters:
+                    from torch.distributed.checkpoint.filesystem import SerializationFormat
+
+                    extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
+                if use_msc:
+                    import multistorageclient as msc
+
+                    open_file = msc.open
+                else:
+                    open_file = open
+                with open_file(file_name, "wb") as stream:
+                    for write_item, data in bytes_data:
+                        local_results.append(
+                            _write_item(
+                                *transform_list, stream, data, write_item, storage_key, **extra_kwargs
+                            )
+                        )
+
+                    for write_item, tensor in tensor_data:
+                        assert tensor.is_cpu
+                        local_results.append(
+                            _write_item(
+                                *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
+                            )
+                        )
+
+                    if use_fsync:
+                        if use_msc:
+                            stream.fsync()
+                        else:
+                            os.fsync(stream.fileno())
+            
             local_output = (local_proc_idx, local_results)
         except Exception as e:
             logger.debug(f"{local_proc_idx} failed")
@@ -523,6 +653,468 @@ class FileSystemWriterAsync(FileSystemWriter):
             return FileSystemWriter.validate_checkpoint_id(checkpoint_id)
 
         return False
+    
+    def _prepare_eccheck_data(self, plan: SavePlan, planner: SavePlanner) -> None:
+        """
+        EC-CHECK preparation: organize data for serialization-free encoding.
+        
+        This method performs the following steps:
+        1. Process plan items like normal mode (separate bytes and tensors)
+        2. Organize tensors for EC-CHECK (extract metadata and data)
+        3. Preallocate CPU memory buffer for tensors
+        4. Prepare write buckets for async transfer
+        
+        Args:
+            plan (SavePlan): save plan from PyTorch distributed checkpoint
+            planner (SavePlanner): save planner to resolve data
+        """
+        start_total = time()
+        logger.info("EC-CHECK: Starting serialization-free checkpoint preparation")
+        
+        # Step 1: Process plan items (similar to normal mode)
+        start = time()
+        storage_plan: _StoragePrefix = plan.storage_data
+        
+        # Separate items into BYTE_IO (non-tensor) and TENSOR
+        non_tensor_data = {}
+        tensor_infos = []
+        tensor_data_list = []
+        
+        for item in plan.items:
+            data = planner.resolve_data(item)
+            
+            if item.type == WriteItemType.BYTE_IO:
+                # Non-tensor data
+                non_tensor_data[item.index.fqn] = data
+            else:
+                # Tensor data - create TensorInfo
+                from .state_dict_decomposer import TensorInfo
+                tensor_info = TensorInfo(
+                    key=item.index.fqn,
+                    shape=tuple(data.shape),
+                    dtype=data.dtype,
+                    device=data.device,
+                    numel=data.numel(),
+                    size_bytes=data.numel() * data.element_size(),
+                    offset=0,  # Will be calculated below
+                )
+                tensor_infos.append(tensor_info)
+                tensor_data_list.append(data)
+        
+        # Calculate offsets for tensor data
+        offset = 0
+        for info in tensor_infos:
+            info.offset = offset
+            offset += info.size_bytes
+        
+        # Create decomposed structure
+        self.decomposed_state_dict = DecomposedStateDict(
+            non_tensor_data=non_tensor_data,
+            tensor_infos=tensor_infos,
+            tensor_data=tensor_data_list,
+        )
+        
+        process_time = time() - start
+        
+        # Log statistics
+        stats = self.decomposed_state_dict.get_statistics()
+        logger.info(
+            f"EC-CHECK: Processed plan items in {process_time:.2f}s\n"
+            f"  Non-tensor items: {len(non_tensor_data)}\n"
+            f"  Tensor items: {len(tensor_data_list)}\n"
+            f"  Non-tensor data: {stats['non_tensor_size_bytes'] / 1024:.2f} KB "
+            f"({stats['non_tensor_percentage']:.4f}%)\n"
+            f"  Tensor keys: {stats['tensor_keys_size_bytes'] / 1024:.2f} KB "
+            f"({stats['tensor_keys_percentage']:.4f}%)\n"
+            f"  Tensor data: {stats['tensor_data_size_bytes'] / (1024**3):.2f} GB "
+            f"({stats['tensor_data_percentage']:.2f}%)"
+        )
+        
+        # Step 2: Preallocate CPU memory buffer if enabled
+        if self.eccheck_preallocate_cpu_buffer:
+            start = time()
+            total_size = self.decomposed_state_dict.total_tensor_size_bytes
+            logger.info(f"EC-CHECK: Preallocating CPU buffer of {total_size / (1024**3):.2f} GB")
+            
+            if self.eccheck_pin_memory and torch.cuda.is_available():
+                self.preallocated_cpu_buffer = torch.empty(
+                    total_size, dtype=torch.uint8
+                ).pin_memory()
+                logger.debug("EC-CHECK: Using pinned memory for CPU buffer")
+            else:
+                self.preallocated_cpu_buffer = torch.empty(
+                    total_size, dtype=torch.uint8
+                )
+            
+            prealloc_time = time() - start
+            logger.debug(f"EC-CHECK: CPU buffer preallocation took {prealloc_time:.2f}s")
+        else:
+            prealloc_time = 0
+        
+        # Step 3: Prepare write buckets for async transfer
+        start = time()
+        self._prepare_eccheck_write_buckets(plan)
+        bucket_time = time() - start
+        logger.debug(f"EC-CHECK: Write bucket preparation took {bucket_time:.2f}s")
+        
+        total_time = time() - start_total
+        logger.info(
+            f"EC-CHECK: Preparation completed in {total_time:.2f}s\n"
+            f"  Item processing: {process_time:.2f}s\n"
+            f"  Preallocation: {prealloc_time:.2f}s\n"
+            f"  Bucket prep: {bucket_time:.2f}s"
+        )
+        
+        # Validate decomposition
+        if not self.validate_eccheck_decomposition():
+            raise RuntimeError("EC-CHECK: Decomposition validation failed")
+    
+    def _prepare_eccheck_write_buckets(self, plan: SavePlan) -> None:
+        """
+        Prepare write buckets for EC-CHECK mode.
+        
+        In EC-CHECK mode, each node stores three components in ONE file:
+        1. Serialized non-tensor key-value pairs
+        2. Serialized tensor keys (tensor_infos)
+        3. Tensor data buffer (will be filled during preload)
+        
+        File structure:
+        [Header: sizes of 3 components] [Component 1] [Component 2] [Component 3]
+        
+        Args:
+            plan (SavePlan): save plan
+        """
+        storage_plan: _StoragePrefix = plan.storage_data
+        
+        self.write_buckets = []
+        
+        # Serialize Components 1 & 2 in CPU memory
+        non_tensor_data = pickle.dumps(self.decomposed_state_dict.non_tensor_data)
+        tensor_keys_data = pickle.dumps(self.decomposed_state_dict.tensor_infos)
+        
+        # Calculate sizes for header
+        non_tensor_size = len(non_tensor_data)
+        tensor_keys_size = len(tensor_keys_data)
+        tensor_buffer_size = self.decomposed_state_dict.total_tensor_size_bytes
+        
+        # Create single file for all three components
+        eccheck_file = f"{storage_plan.prefix}eccheck_data{DEFAULT_SUFFIX}"
+        eccheck_path = os.path.join(self.checkpoint_dir, eccheck_file)
+        
+        # Store the serialized metadata in CPU memory for async save
+        self.eccheck_serialized_metadata = {
+            'non_tensor_data': non_tensor_data,
+            'tensor_keys_data': tensor_keys_data,
+            'non_tensor_size': non_tensor_size,
+            'tensor_keys_size': tensor_keys_size,
+            'tensor_buffer_size': tensor_buffer_size,
+            'eccheck_file_path': eccheck_path,
+        }
+        
+        logger.debug(
+            f"EC-CHECK: Prepared single file structure:\n"
+            f"  File: {eccheck_file}\n"
+            f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
+            f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
+            f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
+        )
+        
+        # Create a single write bucket for EC-CHECK
+        # The actual data will be written by custom logic
+        self.write_buckets.append((
+            eccheck_path,  # Single file path
+            storage_plan.prefix,
+            ([], [])  # Will be handled specially in write_preloaded_data
+        ))
+        
+        # Set up results queue
+        if len(self.write_buckets) > 0:
+            self.results_queue = _get_write_results_queue()
+        else:
+            self.results_queue = None
+    
+    def _eccheck_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
+        """
+        EC-CHECK version: Transfer tensors from GPU to preallocated CPU buffer.
+        
+        This method transfers tensor data from GPU to the preallocated CPU buffer
+        in a pipelined manner, enabling overlap with subsequent encoding operations.
+        
+        Args:
+            non_blocking (bool): if True, use non-blocking GPU-to-CPU transfer
+        
+        Returns:
+            torch.Tensor: continuous CPU buffer containing all tensor data
+        """
+        if not self.decomposed_state_dict:
+            raise RuntimeError("EC-CHECK: State dict not decomposed yet")
+        
+        start = time()
+        logger.info("EC-CHECK: Starting GPU-to-CPU tensor transfer...")
+        
+        # Get buffer to copy into
+        if self.preallocated_cpu_buffer is not None:
+            buffer = self.preallocated_cpu_buffer
+        else:
+            # Allocate on demand if not preallocated
+            total_size = self.decomposed_state_dict.total_tensor_size_bytes
+            if self.eccheck_pin_memory and torch.cuda.is_available():
+                buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
+            else:
+                buffer = torch.empty(total_size, dtype=torch.uint8)
+        
+        # Copy tensors into buffer one by one
+        # Also update tensor_data and tensor_infos to reflect CPU location
+        offset = 0
+        num_gpu_tensors = 0
+        cpu_tensors = []
+        
+        for i, (info, tensor) in enumerate(zip(
+            self.decomposed_state_dict.tensor_infos,
+            self.decomposed_state_dict.tensor_data
+        )):
+            tensor_size = info.size_bytes
+            
+            # Transfer to CPU if needed
+            if tensor.device.type != 'cpu':
+                cpu_tensor = tensor.to('cpu', non_blocking=non_blocking)
+                num_gpu_tensors += 1
+                # Update device info in tensor_infos
+                info.device = torch.device('cpu')
+            else:
+                cpu_tensor = tensor
+            
+            # Store CPU tensor for updating tensor_data later
+            cpu_tensors.append(cpu_tensor)
+            
+            # Copy to buffer as bytes
+            # Must flatten first, then view as uint8 to get a 1D byte array
+            tensor_flat = cpu_tensor.flatten().contiguous().view(torch.uint8)
+            buffer[offset:offset + tensor_size].copy_(tensor_flat, non_blocking=non_blocking)
+            offset += tensor_size
+        
+        # Synchronize if using non-blocking transfers
+        if non_blocking and num_gpu_tensors > 0:
+            torch.cuda.synchronize()
+        
+        # Update tensor_data to point to CPU tensors
+        self.decomposed_state_dict.tensor_data = cpu_tensors
+        
+        transfer_time = time() - start
+        total_gb = self.decomposed_state_dict.total_tensor_size_bytes / (1024**3)
+        bandwidth = total_gb / transfer_time if transfer_time > 0 else 0
+        
+        logger.info(
+            f"EC-CHECK: Transferred {total_gb:.2f} GB in {transfer_time:.2f}s "
+            f"({bandwidth:.2f} GB/s), {num_gpu_tensors} tensors from GPU to CPU"
+        )
+        logger.info(
+            f"EC-CHECK: Updated tensor_infos device info - "
+            f"{num_gpu_tensors} tensors now on CPU"
+        )
+        
+        self.tensor_buffer = buffer
+        
+        # Validate that decomposition is still correct after transfer
+        if not self.validate_eccheck_decomposition():
+            logger.warning("EC-CHECK: Validation warning after GPU-to-CPU transfer")
+        
+        # Return write_buckets with EC-CHECK metadata and buffer embedded
+        # The async framework expects write_buckets as return value
+        result_buckets = []
+        for bucket in self.write_buckets:
+            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            # Add EC-CHECK metadata and buffer as special markers in bytes_data
+            eccheck_bytes_data = [
+                ('eccheck_metadata', self.eccheck_serialized_metadata),
+                ('eccheck_tensor_buffer', self.tensor_buffer),
+            ]
+            result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
+        
+        return result_buckets
+    
+    def get_eccheck_tensor_buffer(self) -> Optional[torch.Tensor]:
+        """
+        Get the continuous tensor buffer for EC encoding.
+        
+        Returns:
+            torch.Tensor or None: continuous buffer containing all tensor data
+        """
+        return self.tensor_buffer
+    
+    def get_eccheck_decomposed_state_dict(self) -> Optional[DecomposedStateDict]:
+        """
+        Get the decomposed state_dict structure.
+        
+        Returns:
+            DecomposedStateDict or None: decomposed structure if available
+        """
+        return self.decomposed_state_dict
+    
+    @staticmethod
+    def load_eccheck_components_from_file(file_path: Union[str, os.PathLike]) -> DecomposedStateDict:
+        """
+        Load three components from a single EC-CHECK file.
+        
+        File structure:
+        [Header: 28 bytes] [Component 1] [Component 2] [Component 3]
+        
+        Header format:
+        - Magic number: 4 bytes ('ECCK')
+        - Component 1 size: 8 bytes (uint64)
+        - Component 2 size: 8 bytes (uint64)
+        - Component 3 size: 8 bytes (uint64)
+        
+        Args:
+            file_path: path to the EC-CHECK file
+        
+        Returns:
+            DecomposedStateDict: reconstructed decomposed structure
+        """
+        import struct
+        import numpy as np
+        
+        with open(file_path, "rb") as f:
+            # Read header (28 bytes)
+            header_bytes = f.read(28)
+            if len(header_bytes) != 28:
+                raise RuntimeError(f"EC-CHECK: Invalid file header (expected 28 bytes, got {len(header_bytes)})")
+            
+            # Parse header
+            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            
+            # Validate magic number
+            if magic != b'ECCK':
+                raise RuntimeError(f"EC-CHECK: Invalid magic number (expected b'ECCK', got {magic})")
+            
+            logger.info(
+                f"EC-CHECK: Loading from {file_path}\n"
+                f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
+                f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
+                f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
+            )
+            
+            # Read Component 1: Non-tensor key-value pairs
+            non_tensor_bytes = f.read(non_tensor_size)
+            if len(non_tensor_bytes) != non_tensor_size:
+                raise RuntimeError(
+                    f"EC-CHECK: Failed to read Component 1 "
+                    f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
+                )
+            non_tensor_data = pickle.loads(non_tensor_bytes)
+            logger.debug(f"EC-CHECK: Loaded Component 1 ({non_tensor_size / 1024:.2f} KB)")
+            
+            # Read Component 2: Tensor keys
+            tensor_keys_bytes = f.read(tensor_keys_size)
+            if len(tensor_keys_bytes) != tensor_keys_size:
+                raise RuntimeError(
+                    f"EC-CHECK: Failed to read Component 2 "
+                    f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
+                )
+            tensor_infos = pickle.loads(tensor_keys_bytes)
+            logger.debug(f"EC-CHECK: Loaded Component 2 ({tensor_keys_size / 1024:.2f} KB)")
+            
+            # Read Component 3: Tensor data buffer
+            tensor_buffer_bytes = f.read(tensor_buffer_size)
+            if len(tensor_buffer_bytes) != tensor_buffer_size:
+                raise RuntimeError(
+                    f"EC-CHECK: Failed to read Component 3 "
+                    f"(expected {tensor_buffer_size} bytes, got {len(tensor_buffer_bytes)})"
+                )
+            
+            # Convert bytes to tensor buffer
+            tensor_buffer = torch.from_numpy(np.frombuffer(tensor_buffer_bytes, dtype=np.uint8))
+            logger.debug(f"EC-CHECK: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB)")
+        
+        # Extract individual tensors from buffer
+        from .state_dict_decomposer import extract_tensors_from_continuous_buffer
+        tensor_data = extract_tensors_from_continuous_buffer(tensor_buffer, tensor_infos)
+        
+        # Create DecomposedStateDict
+        decomposed = DecomposedStateDict(
+            non_tensor_data=non_tensor_data,
+            tensor_infos=tensor_infos,
+            tensor_data=tensor_data,
+        )
+        
+        logger.info(
+            f"EC-CHECK: Successfully loaded all components from {file_path}\n"
+            f"  Component 1: {len(non_tensor_data)} keys\n"
+            f"  Component 2: {len(tensor_infos)} tensor infos\n"
+            f"  Component 3: {len(tensor_data)} tensors"
+        )
+        
+        return decomposed
+    
+    def validate_eccheck_decomposition(self) -> bool:
+        """
+        Simple validation: check if state_dict is correctly decomposed into three components.
+        
+        Validates:
+        1. non_tensor_data is a dict
+        2. tensor_infos is a list (tensor keys)
+        3. tensor_data is a list of tensors
+        4. Counts match between tensor_infos and tensor_data
+        
+        Returns:
+            bool: True if decomposition is valid, False otherwise
+        """
+        if not self.use_eccheck:
+            logger.warning("EC-CHECK: Validation skipped - EC-CHECK is not enabled")
+            return False
+        
+        if not self.decomposed_state_dict:
+            logger.error("EC-CHECK: Validation failed - State dict not decomposed yet")
+            return False
+        
+        decomposed = self.decomposed_state_dict
+        
+        # Check 1: Non-tensor key-value pairs (dict)
+        if not isinstance(decomposed.non_tensor_data, dict):
+            logger.error(
+                f"EC-CHECK: Component 1 failed - non_tensor_data should be dict, "
+                f"got {type(decomposed.non_tensor_data).__name__}"
+            )
+            return False
+        
+        # Check 2: Tensor keys (list)
+        if not isinstance(decomposed.tensor_infos, list):
+            logger.error(
+                f"EC-CHECK: Component 2 failed - tensor_infos should be list, "
+                f"got {type(decomposed.tensor_infos).__name__}"
+            )
+            return False
+        
+        # Check 3: Tensor data (list)
+        if not isinstance(decomposed.tensor_data, list):
+            logger.error(
+                f"EC-CHECK: Component 3 failed - tensor_data should be list, "
+                f"got {type(decomposed.tensor_data).__name__}"
+            )
+            return False
+        
+        # Check 4: Counts match
+        if len(decomposed.tensor_infos) != len(decomposed.tensor_data):
+            logger.error(
+                f"EC-CHECK: Count mismatch - {len(decomposed.tensor_infos)} tensor_infos "
+                f"vs {len(decomposed.tensor_data)} tensors"
+            )
+            return False
+        
+        # All checks passed
+        logger.info(
+            f"EC-CHECK: Decomposition validation passed ✓\n"
+            f"  Component 1 (non-tensor dict): {len(decomposed.non_tensor_data)} keys\n"
+            f"  Component 2 (tensor keys list): {len(decomposed.tensor_infos)} tensors\n"
+            f"  Component 3 (tensor data list): {len(decomposed.tensor_data)} tensors"
+        )
+            
+        # Log device info for verification
+        if len(decomposed.tensor_infos) > 0:
+            devices = set(info.device.type for info in decomposed.tensor_infos)
+            logger.debug(f"EC-CHECK: Tensor devices: {devices}")
+        
+        return True
 
 
 def _split_by_size_and_type(bins: int, items: List[WriteItem]) -> List[List[WriteItem]]:

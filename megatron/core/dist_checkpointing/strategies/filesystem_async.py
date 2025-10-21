@@ -716,9 +716,17 @@ class FileSystemWriterAsync(FileSystemWriter):
         logger.info(f"EC-CHECK: Processing {len(plan.items)} items from SavePlan")
         byte_io_count = 0
         tensor_count = 0
+        none_data_count = 0
         
         for item in plan.items:
             data = planner.resolve_data(item)
+            
+            # Debug: check for None data
+            if data is None:
+                none_data_count += 1
+                if none_data_count <= 5:
+                    logger.warning(f"EC-CHECK SAVE: Found None data for item: fqn={item.index.fqn}, type={item.type}")
+                continue  # Skip None data items
             
             if item.type == WriteItemType.BYTE_IO:
                 # Non-tensor data (e.g., extra_state)
@@ -736,7 +744,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 byte_io_count += 1
             else:
                 # Tensor data - create TensorInfo
-                # IMPORTANT: Store full WriteItem.index for proper key mapping during load
+                # Extract and store serializable fields from WriteItem.index
                 from .state_dict_decomposer import TensorInfo
                 
                 tensor_info = TensorInfo(
@@ -747,13 +755,21 @@ class FileSystemWriterAsync(FileSystemWriter):
                     numel=data.numel(),
                     size_bytes=data.numel() * data.element_size(),
                     offset=0,  # Will be calculated below
-                    metadata_index=item.index,  # Store full WriteItem.index
+                    global_offset=tuple(item.index.offset),  # Extract offset as tuple (serializable)
+                    shard_index=item.index.index,  # Extract index (serializable)
                 )
                 tensor_infos.append(tensor_info)
                 tensor_data_list.append(data)
                 tensor_count += 1
         
-        logger.info(f"EC-CHECK: Processed {byte_io_count} BytesIO items and {tensor_count} tensor items")
+        logger.info(
+            f"EC-CHECK: Processed {byte_io_count} BytesIO items, {tensor_count} tensor items"
+            + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
+        )
+        
+        # Debug: log non-tensor keys
+        if len(non_tensor_data) > 0:
+            logger.info(f"EC-CHECK SAVE: Non-tensor keys: {list(non_tensor_data.keys())}")
         
         # Calculate offsets for tensor data
         offset = 0
@@ -1071,7 +1087,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                 )
             
             # Convert bytes to tensor buffer
-            tensor_buffer = torch.from_numpy(np.frombuffer(tensor_buffer_bytes, dtype=np.uint8))
+            # Use copy to make tensor writable
+            tensor_buffer = torch.from_numpy(np.frombuffer(tensor_buffer_bytes, dtype=np.uint8).copy())
             logger.debug(f"EC-CHECK: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB)")
         
         # Extract individual tensors from buffer

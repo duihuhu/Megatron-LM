@@ -26,14 +26,15 @@ class TensorInfo:
     """Information about a single tensor in the state_dict.
     
     Attributes:
-        key (str): the key/name of this tensor in state_dict
+        key (str): the key/name of this tensor in state_dict (FQN)
         shape (tuple): shape of the tensor
         dtype (torch.dtype): data type of the tensor
         device (torch.device): device where the tensor resides
         numel (int): number of elements in the tensor
         size_bytes (int): size in bytes
         offset (int): offset in the continuous tensor data buffer (for reconstruction)
-        metadata_index (Any): full metadata index from WriteItem (for proper reconstruction)
+        global_offset (tuple): global offset for sharded tensors (from WriteItem.index.offset)
+        shard_index (int): shard index for multiple shards with same key+offset
     """
     key: str
     shape: Tuple[int, ...]
@@ -42,7 +43,8 @@ class TensorInfo:
     numel: int
     size_bytes: int
     offset: int = 0
-    metadata_index: Any = None  # Store full WriteItem.index for proper key mapping
+    global_offset: Tuple[int, ...] = None  # Store WriteItem.index.offset as tuple
+    shard_index: int = None  # Store WriteItem.index.index
 
 
 @dataclass

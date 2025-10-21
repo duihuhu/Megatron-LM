@@ -906,6 +906,36 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         except:
             return False
     
+    def _restore_dict_types_lenient(self, x: Union[dict, list, Any], keys_template: Union[dict, list, Any]):
+        """Lenient version of _restore_dict_types that skips missing keys.
+        
+        This is needed for EC-CHECK where different ranks may have different keys.
+        """
+        if isinstance(keys_template, dict):
+            if not isinstance(x, dict):
+                return
+            
+            for k, v in keys_template.items():
+                # Convert non-string keys
+                if not isinstance(k, str):
+                    str_k = str(k)
+                    if str_k in x:
+                        x[k] = x.pop(str_k)
+                    else:
+                        # Key doesn't exist - skip it
+                        continue
+                
+                # Recursively restore types if key exists
+                if k in x:
+                    self._restore_dict_types_lenient(x[k], v)
+                # If key doesn't exist, just skip it (lenient behavior)
+                
+        elif isinstance(keys_template, list):
+            if not isinstance(x, list):
+                return
+            for x_val, templ_val in zip(x, keys_template):
+                self._restore_dict_types_lenient(x_val, templ_val)
+    
     def _load_eccheck_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Load checkpoint saved in EC-CHECK format.
         
@@ -940,16 +970,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         )
         
         # Build index map from loaded tensor_infos
-        # Map: metadata_index → (tensor_info, tensor_data)
+        # Map: (fqn, global_offset) → (tensor_info, tensor_data)
         logger.info(f"EC-CHECK: Building index map from {len(decomposed.tensor_infos)} tensor infos")
         
         index_to_data = {}
         for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
-            if info.metadata_index is not None:
-                # Use full metadata_index as key
-                # Convert to hashable tuple: (fqn, offset_tuple, index)
-                index_key = (info.metadata_index.fqn, tuple(info.metadata_index.offset), info.metadata_index.index)
-                index_to_data[index_key] = (info, tensor)
+            # Use (fqn, global_offset) as unique key
+            # global_offset is already a tuple from TensorInfo
+            index_key = (info.key, info.global_offset)
+            index_to_data[index_key] = (info, tensor)
         
         # Also add non-tensor data keyed by FQN only
         non_tensor_by_fqn = decomposed.non_tensor_data
@@ -960,13 +989,19 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             f"{decomposed.total_tensor_size_bytes / (1024**3):.2f} GB)"
         )
         
+        # Debug: log non-tensor keys
+        logger.info(f"EC-CHECK: Loaded {len(non_tensor_by_fqn)} non-tensor items")
+        if len(non_tensor_by_fqn) > 0:
+            logger.info(f"EC-CHECK: Non-tensor keys: {list(non_tensor_by_fqn.keys())}")
+        
         # Save original sharded_state_dict for type restoration later
         orig_sharded_state_dict = sharded_state_dict
         
         # Generate PyT-compatible state dict from sharded_state_dict
         # This creates the structure that standard load expects
+        # IMPORTANT: Do NOT use keep_only_main_replica=True, as standard load doesn't use it
         (keyed_state_dict, flat_mapping, rename_mapping) = (
-            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict, keep_only_main_replica=True)
+            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
         )
         
         # Create a mapping from loaded data using metadata_index
@@ -974,6 +1009,21 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # For objects: use FQN
         matched_count = 0
         unmatched_count = 0
+        
+        # Debug: print first few expected vs loaded
+        logger.info(f"EC-CHECK DEBUG: Sample loaded index_to_data keys (first 3):")
+        for idx, idx_key in enumerate(list(index_to_data.keys())[:3]):
+            fqn, global_offset = idx_key
+            logger.info(f"  [{idx}] fqn={fqn}, global_offset={global_offset}")
+        
+        logger.info(f"EC-CHECK DEBUG: Sample expected ShardedTensor (first 3):")
+        debug_count = 0
+        for key, sh_base_list in keyed_state_dict.items():
+            for sh_base in sh_base_list:
+                if isinstance(sh_base, ShardedTensor) and debug_count < 3:
+                    sh_offset = tuple(sh_base.global_offset) if hasattr(sh_base.global_offset, '__iter__') else (sh_base.global_offset,)
+                    logger.info(f"  [{debug_count}] key={key}, global_offset={sh_offset}")
+                    debug_count += 1
         
         for key, sh_base_list in keyed_state_dict.items():
             for sh_base in sh_base_list:
@@ -997,33 +1047,66 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         unmatched_count += 1
                 
                 elif isinstance(sh_base, ShardedTensor):
-                    # For ShardedTensor, search for matching data by metadata_index
-                    # Match by (fqn, global_offset)
-                    matched = False
-                    for idx_key, (info, tensor) in index_to_data.items():
-                        fqn, offset_tuple, index = idx_key
-                        if fqn == key and offset_tuple == tuple(sh_base.global_offset):
-                            # Exact match found
-                            sh_base.data = tensor
-                            matched_count += 1
-                            matched = True
-                            break
+                    # For ShardedTensor, match by (fqn, global_offset)
+                    sh_offset = tuple(sh_base.global_offset) if hasattr(sh_base.global_offset, '__iter__') else (sh_base.global_offset,)
                     
-                    if not matched:
+                    # Construct lookup key
+                    lookup_key = (key, sh_offset)
+                    
+                    if lookup_key in index_to_data:
+                        # Direct match found!
+                        info, tensor = index_to_data[lookup_key]
+                        sh_base.data = tensor
+                        matched_count += 1
+                        
+                        # Verify the data is not None
+                        if tensor is None:
+                            logger.error(f"EC-CHECK: Matched key {lookup_key} but tensor is None!")
+                    else:
                         unmatched_count += 1
-                        # Keep data as None - will be preserved in unwrap
+                        if unmatched_count <= 10:  # Log first 10
+                            logger.error(
+                                f"EC-CHECK: No match for ShardedTensor key={key}, "
+                                f"offset={sh_offset}"
+                            )
+                            # Check if key exists with different offset
+                            matching_fqn = [k for k in index_to_data.keys() if k[0] == key]
+                            if matching_fqn:
+                                logger.error(f"  Found {len(matching_fqn)} entries with same FQN but different offsets:")
+                                for match_key in matching_fqn[:3]:
+                                    logger.error(f"    Available offset: {match_key[1]}")
+                        # Keep data as None - will cause error if needed
         
         logger.info(
             f"EC-CHECK: Matched {matched_count} ShardedBase objects, "
             f"{unmatched_count} unmatched (will be None)"
         )
         
-        # Now apply the same post-processing as standard load
-        # This is critical for proper state_dict structure
+        # Debug: Count how many ShardedBase.data are actually None after matching
+        none_data_count = 0
+        none_data_keys = []
+        for key, sh_base_list in keyed_state_dict.items():
+            for idx, sh_base in enumerate(sh_base_list):
+                if sh_base.data is None:
+                    none_data_count += 1
+                    if len(none_data_keys) < 10:
+                        sh_offset = tuple(sh_base.global_offset) if isinstance(sh_base, ShardedTensor) else "N/A"
+                        none_data_keys.append(f"{key}@{sh_offset}")
+        
+        if none_data_count > 0:
+            logger.error(
+                f"EC-CHECK: After matching, {none_data_count} ShardedBase objects still have None data! "
+                f"First 10: {none_data_keys}"
+            )
+        
+        # Note: We don't track which index_to_data entries were used
+        # because we don't remove them during matching (can't modify dict while iterating)
+        # This is OK - the matched_count tells us how many were successfully matched
         
         # Step 1: Unwrap ShardedTensors and ShardedObjects
         # Convert from ShardedBase objects to actual data
         unwrapped_state_dict = {}
+        total_none_in_unwrap = 0
         for key, sh_base_list in keyed_state_dict.items():
             if len(sh_base_list) == 0:
                 continue
@@ -1033,10 +1116,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 # For ShardedTensor, unwrap and handle prepend_axis_num
                 # Similar to _unwrap_pyt_sharded_tensor
                 tensors = []
+                none_count = 0
                 for sh in sh_base_list:
                     ten = sh.data
                     if ten is None:
                         tensors.append(None)
+                        none_count += 1
                         continue
                     
                     # Handle flattened_range (similar to _unwrap_pyt_sharded_tensor)
@@ -1051,9 +1136,18 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     
                     tensors.append(ten)
                 
-                # Check if all data is None (unmatched)
-                if all(t is None for t in tensors):
-                    logger.warning(f"EC-CHECK: All data is None for key {key}")
+                # Check if any data is None (problematic)
+                if none_count > 0:
+                    total_none_in_unwrap += none_count
+                    logger.error(
+                        f"EC-CHECK UNWRAP: Key {key} has {none_count}/{len(tensors)} None values! "
+                        f"This will cause loading errors. "
+                        f"ShardedBase list length: {len(sh_base_list)}"
+                    )
+                    # Debug: check which shards have None data
+                    for idx, sh in enumerate(sh_base_list):
+                        if sh.data is None:
+                            logger.error(f"  shard[{idx}]: data=None, global_offset={sh.global_offset}")
                 
                 unwrapped_state_dict[key] = tensors
             elif isinstance(sh_base, ShardedObject):
@@ -1062,20 +1156,134 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 data_list = [sh.data for sh in sh_base_list]
                 unwrapped_state_dict[key] = data_list
         
+        # Log total None count
+        if total_none_in_unwrap > 0:
+            logger.error(f"EC-CHECK: Total {total_none_in_unwrap} None values found during unwrap!")
+        
         # Step 2: Convert keyed keys back to original state_dict keys
-        # Debug: check lengths before calling
-        for k in list(unwrapped_state_dict.keys())[:5]:
+        # Debug: LOG ALL KEYS in unwrapped_state_dict to find fp32 params
+        logger.info(f"EC-CHECK: unwrapped_state_dict has {len(unwrapped_state_dict)} keys")
+        fp32_keys = [k for k in unwrapped_state_dict.keys() if 'fp32' in k.lower() or 'float16' in k.lower()]
+        if fp32_keys:
+            logger.info(f"EC-CHECK: Found {len(fp32_keys)} fp32-related keys: {fp32_keys[:10]}")
+        
+        # Debug: check lengths before calling (focus on fp32_from_fp16_params)
+        for k in unwrapped_state_dict.keys():
             tensors = unwrapped_state_dict[k]
             expected_len = len(rename_mapping[k])
             actual_len = len(tensors) if isinstance(tensors, list) else 1
-            logger.debug(f"EC-CHECK: Key {k}: actual_len={actual_len}, expected_len={expected_len}")
+            
+            # Log fp32_from_fp16_params OR optimizer-related keys
+            if 'fp32' in k.lower() or 'float16' in k.lower() or 'optimizer' in k.lower():
+                logger.info(
+                    f"EC-CHECK BEFORE UNFLATTEN: Key={k}, "
+                    f"actual_len={actual_len}, expected_len={expected_len}, "
+                    f"match={actual_len == expected_len}"
+                )
+                # Check for None values in tensors list
+                if isinstance(tensors, list):
+                    none_count = sum(1 for t in tensors if t is None)
+                    if none_count > 0:
+                        logger.error(f"  {none_count}/{len(tensors)} values are None BEFORE unflatten!")
         
         mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
             unwrapped_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
         )
         
+        # Debug: check fp32_from_fp16_params after unflatten (without cleanup)
+        if 'optimizer' in mcore_state_dict and isinstance(mcore_state_dict['optimizer'], dict):
+            if 'fp32_from_fp16_params' in mcore_state_dict['optimizer']:
+                fp32_params = mcore_state_dict['optimizer']['fp32_from_fp16_params']
+                if isinstance(fp32_params, list):
+                    logger.info(f"EC-CHECK AFTER UNFLATTEN: fp32_from_fp16_params has {len(fp32_params)} groups")
+                    for i, group in enumerate(fp32_params):
+                        if isinstance(group, list):
+                            none_count = sum(1 for p in group if p is None)
+                            logger.info(f"  Group[{i}]: len={len(group)}, None count={none_count}")
+                
+                # TEMPORARY: Check if standard load also has None values by comparing
+                # If standard load works with None values, we should keep them too
+        
         # Step 3: Restore dict types (convert string keys back to original types if needed)
-        _restore_dict_types(mcore_state_dict, orig_sharded_state_dict)
+        # Note: Use a lenient version that skips missing keys
+        self._restore_dict_types_lenient(mcore_state_dict, orig_sharded_state_dict)
+        
+        # Debug: check for None values in final state_dict
+        def count_none_values(d, prefix=""):
+            none_count = 0
+            total_count = 0
+            none_keys = []
+            for k, v in d.items():
+                key_path = f"{prefix}.{k}" if prefix else k
+                if isinstance(v, dict):
+                    n, t, keys = count_none_values(v, key_path)
+                    none_count += n
+                    total_count += t
+                    none_keys.extend(keys)
+                elif v is None:
+                    none_count += 1
+                    total_count += 1
+                    none_keys.append(key_path)
+                else:
+                    total_count += 1
+            return none_count, total_count, none_keys
+        
+        none_count, total_count, none_keys = count_none_values(mcore_state_dict)
+        if none_count > 0:
+            logger.error(
+                f"EC-CHECK: Final state_dict has {none_count}/{total_count} None values! "
+                f"First 5: {none_keys[:5]}"
+            )
+        else:
+            logger.info(f"EC-CHECK: Final state_dict OK - {total_count} values, 0 None")
+        
+        # Debug: print top-level keys
+        logger.info(f"EC-CHECK: Returning state_dict with top-level keys: {list(mcore_state_dict.keys())}")
+        
+        # Debug: check optimizer structure if it exists
+        if 'optimizer' in mcore_state_dict:
+            opt_dict = mcore_state_dict['optimizer']
+            if isinstance(opt_dict, dict):
+                logger.info(f"EC-CHECK: optimizer has keys: {list(opt_dict.keys())}")
+                
+                # Check nested optimizer
+                if 'optimizer' in opt_dict and isinstance(opt_dict['optimizer'], dict):
+                    inner_opt = opt_dict['optimizer']
+                    logger.info(f"EC-CHECK: optimizer.optimizer has keys: {list(inner_opt.keys())}")
+                    
+                    if 'state' in inner_opt:
+                        logger.info(f"EC-CHECK: optimizer.optimizer.state type: {type(inner_opt['state'])}")
+                        if isinstance(inner_opt['state'], dict):
+                            all_state_keys = list(inner_opt['state'].keys())
+                            logger.info(f"EC-CHECK: optimizer.optimizer.state has {len(all_state_keys)} keys")
+                            logger.info(f"EC-CHECK: All state keys: {sorted([int(k) if isinstance(k, str) and k.isdigit() else k for k in all_state_keys])}")
+                            
+                            sample_keys = all_state_keys[:3]
+                            if len(sample_keys) > 0:
+                                first_key = sample_keys[0]
+                                first_val = inner_opt['state'][first_key]
+                                logger.info(f"EC-CHECK: optimizer.optimizer.state[{first_key}] = {type(first_val)}, is None: {first_val is None}")
+                                if isinstance(first_val, dict):
+                                    logger.info(f"  Keys in state dict: {list(first_val.keys())}")
+                                    # Check for None in exp_avg or exp_avg_sq
+                                    for k, v in first_val.items():
+                                        logger.info(f"    {k}: type={type(v)}, is None: {v is None}")
+                
+                # Check fp32_from_fp16_params
+                if 'fp32_from_fp16_params' in opt_dict:
+                    fp32_params = opt_dict['fp32_from_fp16_params']
+                    logger.info(f"EC-CHECK: fp32_from_fp16_params type: {type(fp32_params)}, len: {len(fp32_params) if isinstance(fp32_params, (list, dict)) else 'N/A'}")
+                    if isinstance(fp32_params, list):
+                        # Check each element in the list
+                        for idx, param_group in enumerate(fp32_params[:2]):  # Check first 2 groups
+                            logger.info(f"EC-CHECK: fp32_params[{idx}] type: {type(param_group)}, is None: {param_group is None}")
+                            if isinstance(param_group, list):
+                                none_in_group = sum(1 for p in param_group if p is None)
+                                logger.info(f"  Contains {len(param_group)} params, {none_in_group} are None")
+                                if none_in_group > 0:
+                                    # Find which params are None
+                                    none_indices = [i for i, p in enumerate(param_group) if p is None]
+                                    logger.error(f"  None params at indices: {none_indices[:10]}")
         
         logger.info(f"EC-CHECK: Completed post-processing, returning state_dict")
         
@@ -1201,6 +1409,22 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         mcore_state_dict = restore_nd_flattened_tensors_formulation(
             mcore_state_dict, formulation_restore_data
         )
+        
+        # Debug: check for None values in fp32_from_fp16_params (standard load)
+        if 'optimizer' in mcore_state_dict and isinstance(mcore_state_dict['optimizer'], dict):
+            opt_dict = mcore_state_dict['optimizer']
+            if 'fp32_from_fp16_params' in opt_dict:
+                fp32_params = opt_dict['fp32_from_fp16_params']
+                if isinstance(fp32_params, list):
+                    logger.info(f"STANDARD LOAD: fp32_from_fp16_params type: <class 'list'>, len: {len(fp32_params)}")
+                    for i, param_group in enumerate(fp32_params):
+                        if isinstance(param_group, list):
+                            none_count = sum(1 for p in param_group if p is None)
+                            logger.info(f"STANDARD LOAD: fp32_params[{i}] type: <class 'list'>, len: {len(param_group)}")
+                            if none_count > 0:
+                                logger.error(f"STANDARD LOAD: fp32_params[{i}] has {none_count} None values")
+                            else:
+                                logger.info(f"STANDARD LOAD: fp32_params[{i}] has 0 None values")
         return mcore_state_dict
 
     def load_tensors_metadata(self, checkpoint_dir: Path, metadata: Metadata = None):

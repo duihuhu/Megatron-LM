@@ -767,10 +767,6 @@ class FileSystemWriterAsync(FileSystemWriter):
             + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
         )
         
-        # Debug: log non-tensor keys
-        if len(non_tensor_data) > 0:
-            logger.info(f"EC-CHECK SAVE: Non-tensor keys: {list(non_tensor_data.keys())}")
-        
         # Calculate offsets for tensor data
         offset = 0
         for info in tensor_infos:

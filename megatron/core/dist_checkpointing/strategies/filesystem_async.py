@@ -409,14 +409,14 @@ class FileSystemWriterAsync(FileSystemWriter):
             
             # Check if this is EC-CHECK mode by detecting special markers in bytes_data
             eccheck_metadata = None
-            eccheck_tensor_buffer = None
+            eccheck_cpu_tensors = None
             if len(bytes_data) > 0 and bytes_data[0][0] == 'eccheck_metadata':
                 # EC-CHECK mode detected
                 for key, value in bytes_data:
                     if key == 'eccheck_metadata':
                         eccheck_metadata = value
-                    elif key == 'eccheck_tensor_buffer':
-                        eccheck_tensor_buffer = value
+                    elif key == 'eccheck_cpu_tensors':
+                        eccheck_cpu_tensors = value
             
             # EC-CHECK mode: save three components to ONE file
             if eccheck_metadata is not None:
@@ -426,6 +426,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 else:
                     open_file = open
                 
+                write_start = time()
                 logger.info("EC-CHECK: Saving three components to single file...")
                 
                 # Get file path (file_name is the eccheck_file_path)
@@ -450,26 +451,55 @@ class FileSystemWriterAsync(FileSystemWriter):
                 # Write all three components to one file
                 with open_file(eccheck_file_path, "wb") as f:
                     # Write header
+                    header_start = time()
                     f.write(header)
+                    logger.debug(f"EC-CHECK: Wrote header in {time() - header_start:.4f}s")
                     
                     # Write Component 1: Non-tensor key-value pairs
+                    comp1_start = time()
                     f.write(eccheck_metadata['non_tensor_data'])
-                    logger.debug(f"EC-CHECK: Wrote Component 1 ({non_tensor_size / 1024:.2f} KB)")
+                    comp1_time = time() - comp1_start
+                    logger.debug(f"EC-CHECK: Wrote Component 1 ({non_tensor_size / 1024:.2f} KB) in {comp1_time:.4f}s")
                     
                     # Write Component 2: Tensor keys
+                    comp2_start = time()
                     f.write(eccheck_metadata['tensor_keys_data'])
-                    logger.debug(f"EC-CHECK: Wrote Component 2 ({tensor_keys_size / 1024:.2f} KB)")
+                    comp2_time = time() - comp2_start
+                    logger.debug(f"EC-CHECK: Wrote Component 2 ({tensor_keys_size / 1024:.2f} KB) in {comp2_time:.4f}s")
                     
-                    # Write Component 3: Tensor data buffer
-                    if eccheck_tensor_buffer is not None:
-                        import numpy as np
-                        buffer_bytes = eccheck_tensor_buffer.numpy().tobytes()
-                        f.write(buffer_bytes)
-                        logger.debug(
-                            f"EC-CHECK: Wrote Component 3 ({len(buffer_bytes) / (1024**3):.2f} GB)"
+                    # Write Component 3: Tensor data
+                    # Optimize: write directly without extra copies
+                    component3_start = time()
+                    component3_size = 0
+                    
+                    if eccheck_cpu_tensors is not None:
+                        num_tensors = len(eccheck_cpu_tensors)
+                        
+                        # Write each tensor's raw bytes directly
+                        for cpu_tensor in eccheck_cpu_tensors:
+                            # Ensure contiguous memory layout
+                            if not cpu_tensor.is_contiguous():
+                                cpu_tensor = cpu_tensor.contiguous()
+                            
+                            # Get numpy view (zero-copy for CPU tensors)
+                            # Then use memoryview for efficient writing
+                            import numpy as np
+                            np_array = cpu_tensor.numpy()  # Zero-copy view for CPU tensors
+                            mv = memoryview(np_array)
+                            
+                            # Write directly from memory
+                            f.write(mv)
+                            component3_size += mv.nbytes
+                        
+                        component3_time = time() - component3_start
+                        bandwidth = (component3_size / (1024**3)) / component3_time if component3_time > 0 else 0
+                        logger.info(
+                            f"EC-CHECK: Wrote Component 3 ({component3_size / (1024**3):.2f} GB) "
+                            f"in {component3_time:.2f}s ({bandwidth:.2f} GB/s), "
+                            f"{num_tensors} tensors written directly"
                         )
                     else:
-                        logger.warning("EC-CHECK: Tensor buffer is None, skipping Component 3")
+                        logger.error("EC-CHECK: CPU tensors is None, cannot write Component 3")
                     
                     # Flush to disk
                     if use_fsync:
@@ -478,18 +508,20 @@ class FileSystemWriterAsync(FileSystemWriter):
                         else:
                             os.fsync(f.fileno())
                 
-                total_size = len(header) + non_tensor_size + tensor_keys_size
-                if eccheck_tensor_buffer is not None:
-                    total_size += len(buffer_bytes)
+                total_size = len(header) + non_tensor_size + tensor_keys_size + component3_size
+                total_write_time = time() - write_start
+                overall_bandwidth = (total_size / (1024**3)) / total_write_time if total_write_time > 0 else 0
                 
                 logger.info(
-                    f"EC-CHECK: Saved all three components to single file:\n"
+                    f"EC-CHECK: Saved all components in {total_write_time:.2f}s:\n"
                     f"  File: {eccheck_file_path}\n"
                     f"  Total size: {total_size / (1024**3):.2f} GB\n"
-                    f"  Header: 28 bytes\n"
-                    f"  Component 1: {non_tensor_size / 1024:.2f} KB\n"
-                    f"  Component 2: {tensor_keys_size / 1024:.2f} KB\n"
-                    f"  Component 3: {tensor_buffer_size / (1024**3):.2f} GB"
+                    f"  Overall bandwidth: {overall_bandwidth:.2f} GB/s\n"
+                    f"  Breakdown:\n"
+                    f"    Header: 28 bytes\n"
+                    f"    Component 1: {non_tensor_size / 1024:.2f} KB ({comp1_time:.4f}s)\n"
+                    f"    Component 2: {tensor_keys_size / 1024:.2f} KB ({comp2_time:.4f}s)\n"
+                    f"    Component 3: {component3_size / (1024**3):.2f} GB ({component3_time:.2f}s)"
                 )
                 
                 # Create dummy results for compatibility
@@ -863,9 +895,8 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 buffer = torch.empty(total_size, dtype=torch.uint8)
         
-        # Copy tensors into buffer one by one
-        # Also update tensor_data and tensor_infos to reflect CPU location
-        offset = 0
+        # Transfer tensors from GPU to CPU (same as normal mode)
+        # Keep it simple and fast - just like normal preload_tensors
         num_gpu_tensors = 0
         cpu_tensors = []
         
@@ -873,9 +904,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             self.decomposed_state_dict.tensor_infos,
             self.decomposed_state_dict.tensor_data
         )):
-            tensor_size = info.size_bytes
-            
-            # Transfer to CPU if needed
+            # Transfer to CPU if needed (same as normal preload_tensors)
             if tensor.device.type != 'cpu':
                 cpu_tensor = tensor.to('cpu', non_blocking=non_blocking)
                 num_gpu_tensors += 1
@@ -884,14 +913,8 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 cpu_tensor = tensor
             
-            # Store CPU tensor for updating tensor_data later
+            # Store CPU tensor
             cpu_tensors.append(cpu_tensor)
-            
-            # Copy to buffer as bytes
-            # Must flatten first, then view as uint8 to get a 1D byte array
-            tensor_flat = cpu_tensor.flatten().contiguous().view(torch.uint8)
-            buffer[offset:offset + tensor_size].copy_(tensor_flat, non_blocking=non_blocking)
-            offset += tensor_size
         
         # Synchronize if using non-blocking transfers
         if non_blocking and num_gpu_tensors > 0:
@@ -913,21 +936,19 @@ class FileSystemWriterAsync(FileSystemWriter):
             f"{num_gpu_tensors} tensors now on CPU"
         )
         
-        self.tensor_buffer = buffer
-        
         # Validate that decomposition is still correct after transfer
         if not self.validate_eccheck_decomposition():
             logger.warning("EC-CHECK: Validation warning after GPU-to-CPU transfer")
         
-        # Return write_buckets with EC-CHECK metadata and buffer embedded
-        # The async framework expects write_buckets as return value
+        # Return write_buckets with EC-CHECK metadata and CPU tensors
+        # Pass cpu_tensors directly to avoid extra copy overhead
         result_buckets = []
         for bucket in self.write_buckets:
             file_name, storage_key, (bytes_data, tensor_data) = bucket
-            # Add EC-CHECK metadata and buffer as special markers in bytes_data
+            # Add EC-CHECK metadata and CPU tensors as special markers
             eccheck_bytes_data = [
                 ('eccheck_metadata', self.eccheck_serialized_metadata),
-                ('eccheck_tensor_buffer', self.tensor_buffer),
+                ('eccheck_cpu_tensors', cpu_tensors),  # Pass tensors directly
             ]
             result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
         

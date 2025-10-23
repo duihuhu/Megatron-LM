@@ -13,8 +13,8 @@ checkpointing.
 """
 
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Tuple, Union, Optional
 
 import torch
 
@@ -45,6 +45,122 @@ class TensorInfo:
     offset: int = 0
     global_offset: Tuple[int, ...] = None  # Store WriteItem.index.offset as tuple
     shard_index: int = None  # Store WriteItem.index.index
+
+
+@dataclass
+class TensorMetadata:
+    """
+    Serializable metadata for a single tensor (for Phase 2 broadcasting).
+    
+    Used for all-to-all metadata exchange in distributed encoding.
+    
+    Attributes:
+        key (str): Tensor FQN
+        shape (tuple): Tensor shape
+        dtype (str): Data type as string (e.g., 'torch.float32')
+        size_bytes (int): Size in bytes
+        global_offset (tuple): Global offset for sharded tensors
+        shard_index (int): Shard index
+        chunk_type (str): 'data' or 'parity'
+        target_rank (int): Which rank should receive this chunk
+        source_rank (int): Which rank sends this chunk
+        cpu_buffer_address (int): CPU memory address (set after allocation)
+        cpu_buffer_size (int): Buffer size in bytes (set after allocation)
+    """
+    key: str
+    shape: Tuple[int, ...]
+    dtype: str
+    size_bytes: int
+    global_offset: Tuple[int, ...]
+    shard_index: int
+    chunk_type: str = 'data'
+    target_rank: int = 0
+    source_rank: int = 0
+    cpu_buffer_address: Optional[int] = None
+    cpu_buffer_size: Optional[int] = None
+
+
+@dataclass
+class GlobalMetadataRegistry:
+    """
+    Complete metadata from all ranks after all-to-all exchange.
+    
+    Attributes:
+        rank_metadata: Mapping from rank to its metadata list
+        rank_non_tensor_data: Mapping from rank to its non-tensor data
+    """
+    rank_metadata: Dict[int, List[TensorMetadata]] = field(default_factory=dict)
+    rank_non_tensor_data: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    
+    def get_send_list(self, my_rank: int) -> List[TensorMetadata]:
+        """
+        Get tensors I need to send (from my own metadata).
+        
+        Args:
+            my_rank (int): Current rank
+            
+        Returns:
+            List[TensorMetadata]: Metadata for tensors to send
+        """
+        return self.rank_metadata.get(my_rank, [])
+    
+    def get_recv_list(self, my_rank: int) -> List[TensorMetadata]:
+        """
+        Get tensors I need to receive (from other ranks' metadata).
+        
+        Args:
+            my_rank (int): Current rank
+            
+        Returns:
+            List[TensorMetadata]: Metadata for tensors to receive
+        """
+        recv_list = []
+        for source_rank, metadata_list in self.rank_metadata.items():
+            if source_rank == my_rank:
+                continue  # Skip own metadata
+            for meta in metadata_list:
+                # Check if this chunk should be received by me
+                if meta.target_rank == my_rank:
+                    recv_list.append(meta)
+        return recv_list
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """
+        Get statistics about metadata distribution.
+        
+        Returns:
+            Dict with statistics
+        """
+        import pickle
+        
+        stats = {
+            'total_ranks': len(self.rank_metadata),
+            'per_rank_tensor_items': {},      # Tensor items per rank
+            'per_rank_non_tensor_items': {},  # Non-tensor items per rank
+            'total_tensor_chunks': 0,
+            'total_non_tensor_items': 0,
+            'total_tensor_data_bytes': 0,  # Size of actual tensor data (not metadata)
+            'total_metadata_bytes': 0,  # Size of metadata itself (tensor + non-tensor)
+        }
+        
+        for rank, metadata_list in self.rank_metadata.items():
+            stats['per_rank_tensor_items'][rank] = len(metadata_list)
+            stats['total_tensor_chunks'] += len(metadata_list)
+            stats['total_tensor_data_bytes'] += sum(m.size_bytes for m in metadata_list)
+            
+            # Calculate actual metadata size (tensor metadata)
+            tensor_metadata_bytes = pickle.dumps(metadata_list)
+            stats['total_metadata_bytes'] += len(tensor_metadata_bytes)
+        
+        # Add non-tensor data statistics
+        for rank, non_tensor_data in self.rank_non_tensor_data.items():
+            stats['per_rank_non_tensor_items'][rank] = len(non_tensor_data)
+            stats['total_non_tensor_items'] += len(non_tensor_data)
+            
+            non_tensor_bytes = pickle.dumps(non_tensor_data)
+            stats['total_metadata_bytes'] += len(non_tensor_bytes)
+        
+        return stats
 
 
 @dataclass

@@ -698,6 +698,218 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.separation_hint = separation_hint
 
         self.validated_loaded_metadata_reuse = False
+        
+        # Initialize EC-CHECK if enabled
+        self._eccheck_native = None
+        self._init_eccheck_if_enabled()
+
+    def _init_eccheck_if_enabled(self):
+        """Initialize EC-CHECK C++ module if enabled and distributed environment is ready."""
+        try:
+            from megatron.training import get_args as input_args
+            args = input_args()
+            
+            if not getattr(args, 'use_eccheck', False):
+                return
+                
+            # Check if distributed environment is initialized
+            if not torch.distributed.is_initialized():
+                logger.warning("EC-CHECK: Distributed environment not initialized, skipping EC-CHECK initialization")
+                return
+                
+            # Initialize EC-CHECK C++ module
+            self._init_eccheck_native()
+            
+        except Exception as e:
+            logger.warning(f"EC-CHECK: Failed to initialize during strategy creation: {e}")
+            self._eccheck_native = None
+
+    def _init_eccheck_native(self):
+        """Initialize EC-CHECK C++ native module."""
+        eccheck_native = None
+        try:
+            # Direct import .so file without modifying sys.path or affecting other packages
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # Find .so file
+            import glob as _glob_module
+            so_files = _glob_module.glob(os.path.join(current_dir, "eccheck_native*.so"))
+            
+            if not so_files:
+                raise ImportError(f"No eccheck_native.so file found in {current_dir}")
+            
+            # Load .so file directly using importlib
+            import importlib.util as _importlib_util
+            so_path = so_files[0]
+            spec = _importlib_util.spec_from_file_location("eccheck_native", so_path)
+            eccheck_native = _importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(eccheck_native)
+            logger.debug(f"EC-CHECK: Loaded .so file from {so_path}")
+            
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            paired_rank = self._get_paired_rank(rank, world_size)
+            
+            # Create instance with error handling
+            try:
+                self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank)
+                logger.info(f"EC-CHECK: C++ native module initialized (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
+                print(f"EC-CHECK: C++ native module initialized (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
+                
+                # Initialize EC-CHECK buffers
+                self._init_eccheck_buffers()
+                
+            except Exception as e:
+                logger.warning(f"EC-CHECK: Failed to create C++ native module instance: {e}")
+                # Try to stop the pipeline if it was partially created
+                try:
+                    if hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
+                        self._eccheck_native.stop_pipeline()
+                except:
+                    pass
+                self._eccheck_native = None
+                raise e
+            
+        except ImportError as e:
+            logger.warning(f"EC-CHECK: C++ native module not available: {e}, EC-CHECK functionality will not work")
+            self._eccheck_native = None
+        except Exception as e:
+            logger.warning(f"EC-CHECK: Failed to initialize C++ native module: {e}, EC-CHECK functionality will not work")
+            self._eccheck_native = None
+
+    def _get_paired_rank(self, my_rank: int, world_size: int) -> int:
+        """Get the paired rank for parity exchange."""
+        if world_size % 2 != 0:
+            raise ValueError(f"EC-CHECK: World size must be even for pairing, got {world_size}")
+        
+        half_size = world_size // 2
+        
+        if my_rank < half_size:
+            # First half pairs with second half
+            paired_rank = my_rank + half_size
+        else:
+            # Second half pairs with first half
+            paired_rank = my_rank - half_size
+        
+        logger.debug(f"EC-CHECK: Rank {my_rank} paired with Rank {paired_rank}")
+        return paired_rank
+
+    def _init_eccheck_buffers(self):
+        """Initialize EC-CHECK buffers during C++ module initialization."""
+        rank = torch.distributed.get_rank()
+        logger.info("EC-CHECK: Initializing buffers for EC-CHECK")
+        print(f"EC-CHECK: Initializing buffers for EC-CHECK (rank={rank})")
+        
+        # EC-CHECK configuration parameters
+        self.eccheck_data_buffers_count = 12
+        self.eccheck_encoding_buffers_count = 24  # data_count * m (12 * 2)
+        self.eccheck_buffer_size = 64 * 1024 * 1024  # 64MB
+        self.eccheck_pin_memory = False
+        
+        # Allocate data buffers for storing original tensor data
+        self.eccheck_data_buffers = self._allocate_data_buffers()
+        
+        # Allocate encoding buffers for encoded packets
+        self.eccheck_encoding_buffers = self._allocate_encoding_buffers()
+        
+        # Allocate receive buffers for peer encoded packets
+        self.eccheck_recv_encoding_buffers = self._allocate_recv_encoding_buffers()
+        
+        # Allocate parity buffers for XOR computation results
+        self.eccheck_parity_buffers = self._allocate_parity_buffers()
+        
+        # Initialize free buffer queues for Phase 3
+        import queue
+        self._free_data_buffer_queue = queue.Queue()
+        for buffer in self.eccheck_data_buffers:
+            self._free_data_buffer_queue.put(int(buffer.data_ptr()))
+        
+        self._free_encoding_buffer_queue = queue.Queue()
+        for buffer in self.eccheck_encoding_buffers:
+            self._free_encoding_buffer_queue.put(int(buffer.data_ptr()))
+        
+        logger.info(f"EC-CHECK: Buffer initialization completed - "
+                   f"Data buffers: {len(self.eccheck_data_buffers)}, "
+                   f"Encoding buffers: {len(self.eccheck_encoding_buffers)}")
+        print(f"EC-CHECK: Buffer initialization completed (rank={rank}) - "
+              f"Data buffers: {len(self.eccheck_data_buffers)}, "
+              f"Encoding buffers: {len(self.eccheck_encoding_buffers)}")
+
+    def _allocate_data_buffers(self):
+        """Allocate data buffers for storing original tensor data."""
+        logger.info(f"EC-CHECK: Allocating data buffers ({self.eccheck_data_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
+        
+        data_buffers = []
+        for i in range(self.eccheck_data_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            data_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated data buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(data_buffers)} data buffers")
+        return data_buffers
+
+    def _allocate_encoding_buffers(self):
+        """Allocate encoding buffers for encoded packets."""
+        logger.info(f"EC-CHECK: Allocating encoding buffers ({self.eccheck_encoding_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
+        
+        encoding_buffers = []
+        for i in range(self.eccheck_encoding_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            encoding_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated encoding buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(encoding_buffers)} encoding buffers")
+        return encoding_buffers
+
+    def _allocate_recv_encoding_buffers(self):
+        """Allocate receive buffers for peer encoded packets."""
+        logger.info(f"EC-CHECK: Allocating receive encoding buffers ({self.eccheck_encoding_buffers_count} buffers)")
+        
+        recv_encoding_buffers = []
+        for i in range(self.eccheck_encoding_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            recv_encoding_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated recv encoding buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(recv_encoding_buffers)} receive encoding buffers")
+        return recv_encoding_buffers
+
+    def _allocate_parity_buffers(self):
+        """Allocate parity buffers for XOR computation results."""
+        logger.info(f"EC-CHECK: Allocating parity buffers ({self.eccheck_data_buffers_count} buffers)")
+        
+        parity_buffers = []
+        for i in range(self.eccheck_data_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            parity_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated parity buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(parity_buffers)} parity buffers")
+        return parity_buffers
+
+    def _get_eccheck_buffers(self):
+        """Get EC-CHECK buffers for FileSystemWriterAsync."""
+        if not hasattr(self, 'eccheck_data_buffers'):
+            return None
+        
+        return {
+            'data_buffers': self.eccheck_data_buffers,
+            'encoding_buffers': self.eccheck_encoding_buffers,
+            'recv_encoding_buffers': self.eccheck_recv_encoding_buffers,
+            'parity_buffers': self.eccheck_parity_buffers,
+            'free_data_buffer_queue': self._free_data_buffer_queue,
+            'free_encoding_buffer_queue': self._free_encoding_buffer_queue,
+        }
+
+    def __del__(self):
+        """Cleanup EC-CHECK resources when strategy is destroyed."""
+        try:
+            if hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
+                # Stop the C++ pipeline
+                self._eccheck_native.stop_pipeline()
+                logger.info("EC-CHECK: C++ native module stopped in strategy destructor")
+        except Exception as e:
+            logger.warning(f"EC-CHECK: Error during strategy cleanup: {e}")
 
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
@@ -726,6 +938,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
             use_eccheck=args.use_eccheck,
+            eccheck_native=self._eccheck_native,  # Pass pre-initialized C++ module
+            eccheck_buffers=self._get_eccheck_buffers(),  # Pass pre-allocated buffers
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
@@ -1044,18 +1258,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                             logger.error(f"EC-CHECK: Matched key {lookup_key} but tensor is None!")
                     else:
                         unmatched_count += 1
-                        if unmatched_count <= 10:  # Log first 10
-                            logger.error(
-                                f"EC-CHECK: No match for ShardedTensor key={key}, "
-                                f"offset={sh_offset}"
-                            )
-                            # Check if key exists with different offset
-                            matching_fqn = [k for k in index_to_data.keys() if k[0] == key]
-                            if matching_fqn:
-                                logger.error(f"  Found {len(matching_fqn)} entries with same FQN but different offsets:")
-                                for match_key in matching_fqn[:3]:
-                                    logger.error(f"    Available offset: {match_key[1]}")
-                        # Keep data as None - will cause error if needed
+                        # Keep data as None - this is normal in distributed checkpoints
+                        # Different ranks have different parameter shards
         
         logger.info(f"EC-CHECK: Matched {matched_count} ShardedBase objects")
         

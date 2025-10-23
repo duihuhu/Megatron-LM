@@ -91,6 +91,13 @@ class FileSystemWriterAsync(FileSystemWriter):
         eccheck_use_continuous_buffer: bool = True,
         eccheck_pin_memory: bool = False,
         eccheck_preallocate_cpu_buffer: bool = True,
+        eccheck_k: int = 2,
+        eccheck_m: int = 2,
+        eccheck_data_buffers_count: int = 12,
+        eccheck_encoding_buffers_count: Optional[int] = None,
+        eccheck_buffer_size: int = 64 * 1024 * 1024,
+        eccheck_native: Optional[Any] = None,  # Pre-initialized C++ module
+        eccheck_buffers: Optional[Dict] = None,  # Pre-allocated buffers
         **kwargs,
     ):
         self.checkpoint_dir = path
@@ -101,6 +108,13 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eccheck_use_continuous_buffer = eccheck_use_continuous_buffer
         self.eccheck_pin_memory = eccheck_pin_memory
         self.eccheck_preallocate_cpu_buffer = eccheck_preallocate_cpu_buffer
+        
+        # EC-CHECK encoding parameters (configurable)
+        self.eccheck_k = eccheck_k  # Number of data nodes
+        self.eccheck_m = eccheck_m  # Number of encoded packets per data packet
+        self.eccheck_data_buffers_count = eccheck_data_buffers_count  # Number of data buffers per worker
+        self.eccheck_encoding_buffers_count = eccheck_encoding_buffers_count or (eccheck_data_buffers_count * eccheck_m)  # Number of encoding buffers per worker
+        self.eccheck_buffer_size = eccheck_buffer_size  # Buffer size in bytes
 
         super().__init__(path, *args, **kwargs)
         if not self.single_file_per_rank:
@@ -120,6 +134,124 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.tensor_buffer: Optional[torch.Tensor] = None
         self.preallocated_cpu_buffer: Optional[torch.Tensor] = None
         self.eccheck_serialized_metadata: Optional[Dict] = None
+        
+        # EC-CHECK Phase 2 & 3 state
+        self.eccheck_global_registry = None  # GlobalMetadataRegistry from all ranks
+        self.eccheck_data_buffers = None  # List of data buffers
+        self.eccheck_encoding_buffers = None  # List of encoding buffers
+        self.eccheck_recv_encoding_buffers = None  # List of receive buffers for encoded packets
+        self.eccheck_parity_buffers = None  # List of parity buffers for XOR results
+        
+        # EC-CHECK buffer poller thread (persistent, created once)
+        self._buffer_poller_thread = None
+        self._buffer_poller_stop_event = None
+        self._buffer_poller_active_event = None  # Controls when polling is active
+        
+        # Initialize C++ native module if available
+        if eccheck_native is not None:
+            # Use pre-initialized C++ module from strategy
+            self._eccheck_native = eccheck_native
+            self._eccheck_shared = True  # Mark as shared module
+            logger.info("EC-CHECK: Using pre-initialized C++ native module from strategy")
+            
+            # Use pre-allocated buffers from strategy
+            if eccheck_buffers is not None:
+                self._setup_eccheck_buffers_from_strategy(eccheck_buffers)
+        elif self.use_eccheck:
+            # Initialize C++ module here (fallback for direct usage)
+            self._init_eccheck_native()
+            self._eccheck_shared = False  # Mark as owned module
+        else:
+            self._eccheck_native = None
+            self._eccheck_shared = False
+
+    def __del__(self):
+        """
+        Destructor to ensure proper cleanup of EC-CHECK resources.
+        Note: Only cleanup if this writer owns the C++ module (not shared).
+        """
+        try:
+            if hasattr(self, 'use_eccheck') and self.use_eccheck and hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
+                # Stop buffer poller thread
+                self._stop_buffer_poller_thread()
+                
+                # Only cleanup if we own the module (not shared from strategy)
+                # The strategy will handle cleanup of shared modules
+                if not hasattr(self, '_eccheck_shared') or not self._eccheck_shared:
+                    self._stop_phase3_workers()
+        except Exception as e:
+            # Log but don't raise exceptions in destructor
+            logger.warning(f"EC-CHECK: Error during cleanup in destructor: {e}")
+
+    def _init_eccheck_native(self) -> None:
+        """Initialize C++ native module during class construction."""
+        try:
+            import eccheck_native
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            paired_rank = self._get_paired_rank(rank, world_size)
+            
+            self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank)
+            logger.info(f"EC-CHECK: C++ native module initialized (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
+            
+            # Initialize buffer allocation for EC-CHECK
+            self._init_eccheck_buffers()
+            
+            # Start persistent buffer poller thread
+            self._start_buffer_poller_thread()
+            
+            # Note: No longer using callbacks to avoid GIL deadlock
+            # Instead, Python will poll C++ for buffers ready to be released
+            
+        except ImportError:
+            logger.warning("EC-CHECK: C++ native module not available, EC-CHECK functionality will not work")
+            self._eccheck_native = None
+        except Exception as e:
+            logger.warning(f"EC-CHECK: Failed to initialize C++ native module: {e}, EC-CHECK functionality will not work")
+            self._eccheck_native = None
+
+    def _setup_eccheck_buffers_from_strategy(self, buffers):
+        """Set up EC-CHECK buffers from pre-allocated strategy buffers."""
+        self.eccheck_data_buffers = buffers['data_buffers']
+        self.eccheck_encoding_buffers = buffers['encoding_buffers']
+        self.eccheck_recv_encoding_buffers = buffers['recv_encoding_buffers']
+        self.eccheck_parity_buffers = buffers['parity_buffers']
+        self._free_data_buffer_queue = buffers['free_data_buffer_queue']
+        self._free_encoding_buffer_queue = buffers['free_encoding_buffer_queue']
+        logger.info("EC-CHECK: Using pre-allocated buffers from strategy")
+
+    def _init_eccheck_buffers(self):
+        """Initialize EC-CHECK buffers during C++ module initialization."""
+        logger.info("EC-CHECK: Initializing buffers for EC-CHECK")
+        
+        # Allocate data buffers for storing original tensor data
+        # Each worker reserves 12 data buffers, each 64MB in size
+        self.eccheck_data_buffers = self._allocate_data_buffers()
+        
+        # Allocate encoding buffers for encoded packets
+        # Each worker reserves 24 encoding buffers, each 64MB in size
+        self.eccheck_encoding_buffers = self._allocate_encoding_buffers()
+        
+        # Allocate receive buffers for peer encoded packets
+        self.eccheck_recv_encoding_buffers = self._allocate_recv_encoding_buffers()
+        
+        # Allocate parity buffers for XOR computation results
+        self.eccheck_parity_buffers = self._allocate_parity_buffers()
+        
+        # Initialize free buffer queues for Phase 3
+        # Store buffer addresses directly in queue for easier management
+        import queue
+        self._free_data_buffer_queue = queue.Queue()
+        for buffer in self.eccheck_data_buffers:
+            self._free_data_buffer_queue.put(int(buffer.data_ptr()))
+        
+        self._free_encoding_buffer_queue = queue.Queue()
+        for buffer in self.eccheck_encoding_buffers:
+            self._free_encoding_buffer_queue.put(int(buffer.data_ptr()))
+        
+        logger.info(f"EC-CHECK: Buffer initialization completed - "
+                   f"Data buffers: {len(self.eccheck_data_buffers)}, "
+                   f"Encoding buffers: {len(self.eccheck_encoding_buffers)}")
 
     def prepare_write_data(self, plan: SavePlan, planner: SavePlanner) -> None:
         """
@@ -409,14 +541,14 @@ class FileSystemWriterAsync(FileSystemWriter):
             
             # Check if this is EC-CHECK mode by detecting special markers in bytes_data
             eccheck_metadata = None
-            eccheck_cpu_tensors = None
+            eccheck_continuous_buffer = None
             if len(bytes_data) > 0 and bytes_data[0][0] == 'eccheck_metadata':
                 # EC-CHECK mode detected
                 for key, value in bytes_data:
                     if key == 'eccheck_metadata':
                         eccheck_metadata = value
-                    elif key == 'eccheck_cpu_tensors':
-                        eccheck_cpu_tensors = value
+                    elif key == 'eccheck_continuous_buffer':
+                        eccheck_continuous_buffer = value
             
             # EC-CHECK mode: save three components to ONE file
             if eccheck_metadata is not None:
@@ -473,34 +605,25 @@ class FileSystemWriterAsync(FileSystemWriter):
                     component3_start = time()
                     component3_size = 0
                     
-                    if eccheck_cpu_tensors is not None:
-                        num_tensors = len(eccheck_cpu_tensors)
+                    if eccheck_continuous_buffer is not None:
+                        # Write continuous buffer directly (most efficient - single write)
+                        import numpy as np
+                        np_array = eccheck_continuous_buffer.numpy()  # Zero-copy view
+                        mv = memoryview(np_array)
                         
-                        # Write each tensor's raw bytes directly
-                        for cpu_tensor in eccheck_cpu_tensors:
-                            # Ensure contiguous memory layout
-                            if not cpu_tensor.is_contiguous():
-                                cpu_tensor = cpu_tensor.contiguous()
-                            
-                            # Get numpy view (zero-copy for CPU tensors)
-                            # Then use memoryview for efficient writing
-                            import numpy as np
-                            np_array = cpu_tensor.numpy()  # Zero-copy view for CPU tensors
-                            mv = memoryview(np_array)
-                            
-                            # Write directly from memory
-                            f.write(mv)
-                            component3_size += mv.nbytes
+                        # Write entire buffer at once
+                        f.write(mv)
+                        component3_size = mv.nbytes
                         
                         component3_time = time() - component3_start
                         bandwidth = (component3_size / (1024**3)) / component3_time if component3_time > 0 else 0
                         logger.info(
                             f"EC-CHECK: Wrote Component 3 ({component3_size / (1024**3):.2f} GB) "
                             f"in {component3_time:.2f}s ({bandwidth:.2f} GB/s), "
-                            f"{num_tensors} tensors written directly"
+                            f"continuous buffer"
                         )
                     else:
-                        logger.error("EC-CHECK: CPU tensors is None, cannot write Component 3")
+                        logger.error("EC-CHECK: Continuous buffer is None, cannot write Component 3")
                     
                     # Flush to disk
                     if use_fsync:
@@ -903,6 +1026,522 @@ class FileSystemWriterAsync(FileSystemWriter):
         else:
             self.results_queue = None
     
+    def _prepare_local_metadata_for_broadcast(self, my_rank: int, world_size: int):
+        """
+        Prepare local tensor metadata for broadcasting to all ranks.
+        
+        Currently implements simple strategy:
+        - Each rank keeps its own data chunks locally (target_rank = my_rank)
+        - Future: Add parity chunk generation for redundancy
+        
+        Args:
+            my_rank (int): Current rank
+            world_size (int): Total number of ranks
+            
+        Returns:
+            List[TensorMetadata]: Serializable metadata for broadcasting
+        """
+        from .state_dict_decomposer import TensorMetadata
+        
+        local_metadata = []
+        
+        for info in self.decomposed_state_dict.tensor_infos:
+            # Create metadata for data chunk
+            data_meta = TensorMetadata(
+                key=info.key,
+                shape=info.shape,
+                dtype=str(info.dtype),
+                size_bytes=info.size_bytes,
+                global_offset=info.global_offset if info.global_offset is not None else (),
+                shard_index=info.shard_index if info.shard_index is not None else 0,
+                chunk_type='data',
+                target_rank=my_rank,  # Data stays on same rank
+                source_rank=my_rank,
+            )
+            local_metadata.append(data_meta)
+        
+        return local_metadata
+    
+    def _broadcast_and_exchange_metadata(self):
+        """
+        All-to-all metadata exchange using torch.distributed.all_gather.
+        
+        Each rank broadcasts its metadata to all other ranks.
+        After this call, all ranks have complete metadata from all peers.
+        
+        Returns:
+            GlobalMetadataRegistry: Complete metadata from all ranks
+        """
+        from .state_dict_decomposer import GlobalMetadataRegistry
+        import pickle
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        logger.info(f"EC-CHECK: [Rank {rank}] Starting metadata exchange with {world_size} ranks")
+        
+        # ===== Step 1: Prepare local metadata (both tensor and non-tensor) =====
+        local_tensor_metadata = self._prepare_local_metadata_for_broadcast(rank, world_size)
+        local_non_tensor_data = self.decomposed_state_dict.non_tensor_data
+        
+        # Package both together
+        local_package = {
+            'tensor_metadata': local_tensor_metadata,
+            'non_tensor_data': local_non_tensor_data,
+        }
+        
+        logger.info(
+            f"EC-CHECK: [Rank {rank}] Local metadata: "
+            f"{len(local_tensor_metadata)} tensor items, "
+            f"{len(local_non_tensor_data)} non-tensor items"
+        )
+        
+        # ===== Step 2: All-gather complete metadata using all_gather_object =====
+        # This automatically handles serialization, padding, and deserialization
+        # Transmits both tensor_metadata and non_tensor_data
+        all_packages = [None] * world_size
+        torch.distributed.all_gather_object(all_packages, local_package)
+        
+        # ===== Step 3: Build rank_metadata and rank_non_tensor_data dicts =====
+        rank_metadata = {}
+        rank_non_tensor_data = {}
+        for i, package in enumerate(all_packages):
+            rank_metadata[i] = package['tensor_metadata']
+            rank_non_tensor_data[i] = package['non_tensor_data']
+        
+        logger.info(
+            f"EC-CHECK: [Rank {rank}] Received metadata from all {world_size} ranks"
+        )
+        
+        # Create registry with both tensor and non-tensor metadata
+        registry = GlobalMetadataRegistry(
+            rank_metadata=rank_metadata,
+            rank_non_tensor_data=rank_non_tensor_data
+        )
+        
+        # Log statistics
+        stats = registry.get_statistics()
+        logger.info(
+            f"EC-CHECK: Global metadata exchange complete:\n"
+            f"  Total ranks: {stats['total_ranks']}\n"
+            f"  Total tensor items: {stats['total_tensor_chunks']}\n"
+            f"  Total non-tensor items: {stats['total_non_tensor_items']}\n"
+            f"  Metadata size: {stats['total_metadata_bytes'] / 1024:.2f} KB (actual transmitted)\n"
+            f"  Tensor data size: {stats['total_tensor_data_bytes'] / (1024**3):.2f} GB (referenced, not transmitted)\n"
+            f"  Per-rank tensor items: {stats['per_rank_tensor_items']}\n"
+            f"  Per-rank non-tensor items: {stats['per_rank_non_tensor_items']}"
+        )
+        
+        return registry
+    
+    def _get_paired_rank(self, my_rank: int, world_size: int) -> int:
+        """
+        Get the paired rank for parity exchange.
+        
+        Pairing strategy:
+        - 2 ranks: rank0 ↔ rank1
+        - 4 ranks: rank0 ↔ rank2, rank1 ↔ rank3
+        - General: rank_i ↔ rank_{i + world_size/2}
+        
+        Args:
+            my_rank (int): Current rank
+            world_size (int): Total number of ranks
+            
+        Returns:
+            int: Paired rank ID
+        """
+        if world_size % 2 != 0:
+            raise ValueError(f"EC-CHECK: World size must be even for pairing, got {world_size}")
+        
+        half_size = world_size // 2
+        
+        if my_rank < half_size:
+            # First half pairs with second half
+            paired_rank = my_rank + half_size
+        else:
+            # Second half pairs with first half
+            paired_rank = my_rank - half_size
+        
+        logger.debug(f"EC-CHECK: Rank {my_rank} paired with Rank {paired_rank}")
+        return paired_rank
+    
+    def _allocate_data_buffers(self):
+        """
+        Allocate data buffers for storing original tensor data.
+        Configurable number of data buffers per worker.
+        
+        Returns:
+            List[torch.Tensor]: List of data buffers
+        """
+        logger.info(f"EC-CHECK: Allocating data buffers ({self.eccheck_data_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
+        
+        data_buffers = []
+        
+        for i in range(self.eccheck_data_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            data_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated data buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(data_buffers)} data buffers")
+        return data_buffers
+    
+    def _allocate_encoding_buffers(self):
+        """
+        Allocate encoding buffers for encoded packets.
+        Configurable number of encoding buffers per worker (data_count * m).
+        
+        Args:
+            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
+            
+        Returns:
+            List[torch.Tensor]: List of encoding buffers
+        """
+        logger.info(f"EC-CHECK: Allocating encoding buffers ({self.eccheck_encoding_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
+        
+        encoding_buffers = []
+        
+        for i in range(self.eccheck_encoding_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            encoding_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated encoding buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(encoding_buffers)} encoding buffers")
+        return encoding_buffers
+    
+    def _allocate_recv_encoding_buffers(self):
+        """
+        Allocate receive buffers for peer encoded packets.
+        These buffers will receive encoded packets from paired rank.
+        
+        Args:
+            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
+            
+        Returns:
+            List[torch.Tensor]: List of receive buffers for encoded packets
+        """
+        logger.info(f"EC-CHECK: Allocating receive encoding buffers ({self.eccheck_encoding_buffers_count} buffers)")
+        
+        recv_encoding_buffers = []
+        
+        # Allocate enough buffers to receive encoded packets from paired rank
+        for i in range(self.eccheck_encoding_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            recv_encoding_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated recv encoding buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(recv_encoding_buffers)} receive encoding buffers")
+        return recv_encoding_buffers
+    
+    def _allocate_parity_buffers(self):
+        """
+        Allocate parity buffers for XOR computation results.
+        These buffers will store the parity packets after XOR reduction.
+        
+        Args:
+            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
+            
+        Returns:
+            List[torch.Tensor]: List of parity buffers
+        """
+        logger.info(f"EC-CHECK: Allocating parity buffers ({self.eccheck_data_buffers_count} buffers)")
+        
+        parity_buffers = []
+        
+        # Allocate parity buffers for storing XOR results
+        for i in range(self.eccheck_data_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            parity_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated parity buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(parity_buffers)} parity buffers")
+        return parity_buffers
+    
+    def _poll_and_release_buffers(self):
+        """Poll C++ for buffers ready to be released and put them back to queues."""
+        if self._eccheck_native is None:
+            return
+        
+        # Get data buffers ready for release
+        data_buffers = self._eccheck_native.get_data_buffers_to_release()
+        for data_addr in data_buffers:
+            try:
+                self._free_data_buffer_queue.put_nowait(data_addr)
+                logger.debug(f"EC-CHECK: Released data buffer at address {data_addr}")
+            except queue.Full:
+                logger.error(f"EC-CHECK: Data buffer queue is full, cannot release buffer {data_addr}")
+        
+        # Get encoding buffers ready for release
+        encoding_buffers = self._eccheck_native.get_encoding_buffers_to_release()
+        for encoding_addr in encoding_buffers:
+            try:
+                self._free_encoding_buffer_queue.put_nowait(encoding_addr)
+                logger.debug(f"EC-CHECK: Released encoding buffer at address {encoding_addr}")
+            except queue.Full:
+                logger.error(f"EC-CHECK: Encoding buffer queue is full, cannot release buffer {encoding_addr}")
+    
+    def _start_buffer_poller_thread(self):
+        """Start a persistent background thread to poll and release buffers."""
+        import threading
+        
+        if self._buffer_poller_thread is not None:
+            logger.warning("EC-CHECK: Buffer poller thread already started")
+            return
+        
+        # Create control events
+        self._buffer_poller_stop_event = threading.Event()
+        self._buffer_poller_active_event = threading.Event()
+        
+        def buffer_poller_worker():
+            """Persistent background thread that polls for buffer releases."""
+            logger.info("EC-CHECK: Buffer poller thread started")
+            poll_count = 0
+            
+            while not self._buffer_poller_stop_event.is_set():
+                # Only poll when active
+                if self._buffer_poller_active_event.is_set():
+                    self._poll_and_release_buffers()
+                    poll_count += 1
+                    if poll_count % 1000 == 0:
+                        logger.debug(f"EC-CHECK: Buffer poller running (polled {poll_count} times)")
+                
+                # Sleep briefly to avoid busy waiting
+                import time
+                time.sleep(0.001)  # 1ms
+            
+            logger.info("EC-CHECK: Buffer poller thread stopping")
+        
+        # Start the daemon thread
+        self._buffer_poller_thread = threading.Thread(target=buffer_poller_worker, daemon=True)
+        self._buffer_poller_thread.start()
+        logger.info("EC-CHECK: Buffer poller thread created and started")
+    
+    def _stop_buffer_poller_thread(self):
+        """Stop the persistent buffer poller thread."""
+        if self._buffer_poller_thread is None:
+            return
+        
+        logger.info("EC-CHECK: Stopping buffer poller thread...")
+        
+        # Signal the thread to stop
+        if self._buffer_poller_stop_event:
+            self._buffer_poller_stop_event.set()
+        
+        # Wait for thread to finish
+        if self._buffer_poller_thread.is_alive():
+            self._buffer_poller_thread.join(timeout=2.0)
+            if self._buffer_poller_thread.is_alive():
+                logger.warning("EC-CHECK: Buffer poller thread did not stop in time")
+            else:
+                logger.info("EC-CHECK: Buffer poller thread stopped successfully")
+        
+        self._buffer_poller_thread = None
+        self._buffer_poller_stop_event = None
+        self._buffer_poller_active_event = None
+
+    def _execute_phase3_encoding(self, m=None):
+        """
+        Execute Phase 3: Complete tensor data exchange and encoding process with pipeline.
+        
+        Args:
+            m: Encoding parameter (uses self.eccheck_m if None)
+        """
+        if m is None:
+            m = self.eccheck_m
+            
+        logger.info(f"EC-CHECK: Starting Phase 3 - Tensor data exchange and encoding (k={self.eccheck_k}, m={m})")
+        phase3_start = time()
+    
+        # Phase 3.1: Copy tensor data to data buffers (producer)
+        self._copy_tensor_data_to_buffers()
+        
+        phase3_time = time() - phase3_start
+        logger.warning(f"EC-CHECK: Phase 3 completed in {phase3_time:.2f}s")
+    
+    # ===== Phase 3 - Pipeline implementation =====
+    def _stop_phase3_workers(self) -> None:
+        """Signal workers to stop and join them safely."""
+        if self._eccheck_native is not None:
+            # C++ implementation
+            self._eccheck_native.stop_pipeline()
+        else:
+            # No fallback - C++ module is required
+            raise RuntimeError("EC-CHECK: C++ native module is required but not available")
+    
+    
+    def _copy_tensor_data_to_buffers(self) -> None:
+        """Producer: memcpy from continuous tensor buffer into free data buffers, emit to encode queue.
+        
+        Only proceeds when a free data buffer is available. Emits (data_buf_index, used_size).
+        """
+        logger.info("EC-CHECK: Phase 3.1 - memcpy to data buffers with backpressure")
+        
+        if self._eccheck_native is None:
+            raise RuntimeError("EC-CHECK: C++ native module is required but not available")
+        
+        # Direct implementation
+        self._copy_tensor_data_to_buffers_pipeline()
+    
+    def _copy_tensor_data_to_buffers_pipeline(self) -> None:
+        """
+        Python memcpy implementation with C++ encoding coordination.
+        
+        Key improvements:
+        1. Data buffers are released as soon as both C++ threads copy the data
+        2. No need to wait for encoding completion to release data buffers
+        3. Better resource utilization and reduced risk of deadlock
+        """
+        logger.info("EC-CHECK: Phase 3.1 - Python memcpy to data buffers with C++ encoding")
+        
+        # Reset completion flags for new encoding round
+        self._eccheck_native.reset_encoding_completion_flags()
+        
+        def get_free_data_buffer():
+            """Get a free data buffer address, blocking if none available."""
+            # Poll for released buffers before trying to get one
+            self._poll_and_release_buffers()
+            
+            try:
+                return self._free_data_buffer_queue.get(timeout=5.0)
+            except queue.Empty:
+                logger.error("EC-CHECK: TIMEOUT waiting for free data buffer - possible deadlock!")
+                # Print queue status for debugging
+                logger.error(f"EC-CHECK: Data buffer queue size: {self._free_data_buffer_queue.qsize()}")
+                raise RuntimeError("EC-CHECK: Timeout waiting for data buffer")
+        
+        def get_free_encoding_buffer():
+            """Get a free encoding buffer address, blocking if none available."""
+            # Poll for released buffers before trying to get one
+            self._poll_and_release_buffers()
+            
+            try:
+                return self._free_encoding_buffer_queue.get(timeout=5.0)
+            except queue.Empty:
+                logger.error("EC-CHECK: TIMEOUT waiting for free encoding buffer - possible deadlock!")
+                # Print queue status for debugging
+                logger.error(f"EC-CHECK: Encoding buffer queue size: {self._free_encoding_buffer_queue.qsize()}")
+                raise RuntimeError("EC-CHECK: Timeout waiting for encoding buffer")
+        
+        # Process continuous tensor buffer sequentially
+        # Copy data from self.tensor_buffer (continuous CPU buffer) to data buffers
+        total_bytes = self.decomposed_state_dict.total_tensor_size_bytes
+        src_pos = 0  # Current position in continuous tensor buffer
+        chunk_count = 0
+        
+        logger.info(f"EC-CHECK: Starting data copy - Total size: {total_bytes / (1024**3):.2f} GB")
+        
+        while src_pos < total_bytes:
+            # Get a free data buffer (with timeout to detect deadlocks)
+            cur_buffer_addr = get_free_data_buffer()
+            
+            # Calculate how much data to copy to this buffer
+            remaining_in_source = total_bytes - src_pos
+            take = min(self.eccheck_buffer_size, remaining_in_source)
+            
+            # Python memcpy: copy from continuous tensor buffer to data buffer
+            import ctypes
+            buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
+            buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
+            
+            # Get source data from continuous tensor buffer
+            src_data = self.tensor_buffer[src_pos: src_pos + take].numpy()
+            
+            # Direct memory copy using ctypes
+            ctypes.memmove(buffer_array.contents, src_data.ctypes.data, take)
+            
+            # Get two encoding buffers (with timeout to detect deadlocks)
+            enc_addr1 = get_free_encoding_buffer()
+            enc_addr2 = get_free_encoding_buffer()
+            
+            # Submit to BOTH encoding threads
+            # The C++ threads will mark the data buffer as copied immediately after reading
+            # Once both threads mark it as copied, the data buffer will be released
+            self._eccheck_native.submit_data_for_encoding_thread1(
+                cur_buffer_addr, take, enc_addr1
+            )
+            
+            self._eccheck_native.submit_data_for_encoding_thread2(
+                cur_buffer_addr, take, enc_addr2
+            )
+            
+            chunk_count += 1
+            src_pos += take
+            
+            # Log progress every 10 chunks
+            if chunk_count % 10 == 0:
+                progress = (src_pos / total_bytes) * 100
+                logger.debug(f"EC-CHECK: Processed {chunk_count} chunks ({progress:.1f}% complete)")
+        
+        logger.info(f"EC-CHECK: Data copy complete - {chunk_count} chunks submitted")
+        
+        # Mark end of stream for both encoders
+        logger.info("EC-CHECK: Submitting end signals to both encoding threads...")
+        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0)  # Sentinel for thread 1
+        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0)  # Sentinel for thread 2
+        logger.info("EC-CHECK: End signals submitted to both threads")
+        
+        # Wait for both encoding threads to complete
+        # Activate persistent buffer poller while waiting
+        logger.info("EC-CHECK: Waiting for encoding threads to complete (with buffer polling)...")
+        
+        # Activate the persistent buffer poller
+        if self._buffer_poller_active_event:
+            self._buffer_poller_active_event.set()
+        
+        try:
+            # Wait for encoding completion (this may block)
+            self._eccheck_native.wait_for_encoding_completion()
+        finally:
+            # Deactivate the buffer poller
+            if self._buffer_poller_active_event:
+                self._buffer_poller_active_event.clear()
+        
+        # Final poll to ensure all buffers are released
+        self._poll_and_release_buffers()
+        logger.info("EC-CHECK: All encoding operations completed")
+    
+    def _validate_pairing_compatibility(self, own_total_size: int, peer_total_size: int, my_rank: int, paired_rank: int):
+        """
+        Validate that paired ranks have compatible data sizes for XOR encoding.
+        
+        For XOR encoding to work properly, we need to handle size differences:
+        - If sizes differ, we'll need padding or per-tensor XOR
+        - Log warnings if significant size mismatch
+        
+        Args:
+            own_total_size: Total size of own tensor data
+            peer_total_size: Total size of paired rank's tensor data
+            my_rank: Current rank
+            paired_rank: Paired rank
+        """
+        own_gb = own_total_size / (1024**3)
+        peer_gb = peer_total_size / (1024**3)
+        
+        logger.info(
+            f"EC-CHECK: [Rank {my_rank}] Pairing validation:\n"
+            f"  Own data size: {own_gb:.2f} GB\n"
+            f"  Peer data size (Rank {paired_rank}): {peer_gb:.2f} GB"
+        )
+        
+        if own_total_size != peer_total_size:
+            size_diff = abs(own_total_size - peer_total_size)
+            diff_percent = (size_diff / max(own_total_size, peer_total_size)) * 100
+            
+            logger.warning(
+                f"EC-CHECK: [Rank {my_rank}] Size mismatch with Rank {paired_rank}:\n"
+                f"  Difference: {size_diff / (1024**2):.2f} MB ({diff_percent:.1f}%)\n"
+                f"  Will use per-tensor XOR (not continuous buffer XOR)"
+            )
+            
+            # For now, we'll use per-tensor XOR which handles different sizes
+            # Future optimization: padding for continuous buffer XOR
+            return False  # Sizes don't match, use per-tensor XOR
+        else:
+            logger.info(
+                f"EC-CHECK: [Rank {my_rank}] Perfect match with Rank {paired_rank}, "
+                f"can use optimized continuous buffer XOR"
+            )
+            return True  # Sizes match, can use continuous buffer XOR
+ 
     def _eccheck_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
         """
         EC-CHECK version: Transfer tensors from GPU to preallocated CPU buffer.
@@ -922,44 +1561,51 @@ class FileSystemWriterAsync(FileSystemWriter):
         start = time()
         logger.info("EC-CHECK: Starting GPU-to-CPU tensor transfer...")
         
-        # Get buffer to copy into
+        # Allocate continuous CPU buffer if not already allocated
         if self.preallocated_cpu_buffer is not None:
             buffer = self.preallocated_cpu_buffer
         else:
-            # Allocate on demand if not preallocated
             total_size = self.decomposed_state_dict.total_tensor_size_bytes
             if self.eccheck_pin_memory and torch.cuda.is_available():
                 buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
             else:
                 buffer = torch.empty(total_size, dtype=torch.uint8)
+            logger.info(f"EC-CHECK: Allocated continuous CPU buffer: {total_size / (1024**3):.2f} GB")
         
-        # Transfer tensors from GPU to CPU (same as normal mode)
-        # Keep it simple and fast - just like normal preload_tensors
+        # Transfer tensors from GPU to continuous CPU buffer
         num_gpu_tensors = 0
-        cpu_tensors = []
+        offset = 0
         
-        for i, (info, tensor) in enumerate(zip(
+        for info, tensor in zip(
             self.decomposed_state_dict.tensor_infos,
             self.decomposed_state_dict.tensor_data
-        )):
-            # Transfer to CPU if needed (same as normal preload_tensors)
-            if tensor.device.type != 'cpu':
-                cpu_tensor = tensor.to('cpu', non_blocking=non_blocking)
-                num_gpu_tensors += 1
-                # Update device info in tensor_infos
-                info.device = torch.device('cpu')
-            else:
-                cpu_tensor = tensor
+        ):
+            # Calculate size for this tensor
+            tensor_size = info.size_bytes
             
-            # Store CPU tensor
-            cpu_tensors.append(cpu_tensor)
+            # Get view of buffer at current offset
+            buffer_view = buffer[offset:offset + tensor_size]
+            
+            # Flatten and copy tensor to continuous buffer
+            tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
+            buffer_view.copy_(tensor_flat, non_blocking=non_blocking)
+            
+            if tensor.device.type != 'cpu':
+                num_gpu_tensors += 1
+            
+            # Update tensor info
+            info.offset = offset
+            info.device = torch.device('cpu')
+            
+            # Move to next tensor position
+            offset += tensor_size
         
         # Synchronize if using non-blocking transfers
         if non_blocking and num_gpu_tensors > 0:
             torch.cuda.synchronize()
         
-        # Update tensor_data to point to CPU tensors
-        self.decomposed_state_dict.tensor_data = cpu_tensors
+        # Store the continuous buffer
+        self.tensor_buffer = buffer
         
         transfer_time = time() - start
         total_gb = self.decomposed_state_dict.total_tensor_size_bytes / (1024**3)
@@ -978,37 +1624,40 @@ class FileSystemWriterAsync(FileSystemWriter):
         if not self.validate_eccheck_decomposition():
             logger.warning("EC-CHECK: Validation warning after GPU-to-CPU transfer")
         
-        # Return write_buckets with EC-CHECK metadata and CPU tensors
-        # Pass cpu_tensors directly to avoid extra copy overhead
+        # ===== Phase 2: Metadata Broadcast =====
+        logger.warning("EC-CHECK: Phase 2 - Broadcasting metadata")
+        phase2_start = time()
+        
+        # Step 2.1: Broadcast and exchange metadata (tensor + non-tensor)
+        global_registry = self._broadcast_and_exchange_metadata()
+        
+        # Store global registry for Phase 3
+        self.eccheck_global_registry = global_registry
+        
+        phase2_time = time() - phase2_start
+        logger.warning(f"EC-CHECK: Phase 2 completed in {phase2_time:.2f}s")
+        
+        # Buffers are already allocated during initialization
+        # No need to reallocate them here
+        
+        # Execute Phase 3: Tensor data exchange and encoding
+        self._execute_phase3_encoding()
+        
+        # Return write_buckets with EC-CHECK continuous buffer
+        # Buffer contains all tensor data in continuous memory
+        
+        # todo(hucc):  mul write_buckets is for mul process write ,but here is one process write ,so we need to change the write_buckets to a list of write_buckets, leave it future
         result_buckets = []
         for bucket in self.write_buckets:
             file_name, storage_key, (bytes_data, tensor_data) = bucket
-            # Add EC-CHECK metadata and CPU tensors as special markers
+            # Add EC-CHECK metadata and continuous buffer
             eccheck_bytes_data = [
                 ('eccheck_metadata', self.eccheck_serialized_metadata),
-                ('eccheck_cpu_tensors', cpu_tensors),  # Pass tensors directly
+                ('eccheck_continuous_buffer', self.tensor_buffer),  # Continuous buffer
             ]
             result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
         
         return result_buckets
-    
-    def get_eccheck_tensor_buffer(self) -> Optional[torch.Tensor]:
-        """
-        Get the continuous tensor buffer for EC encoding.
-        
-        Returns:
-            torch.Tensor or None: continuous buffer containing all tensor data
-        """
-        return self.tensor_buffer
-    
-    def get_eccheck_decomposed_state_dict(self) -> Optional[DecomposedStateDict]:
-        """
-        Get the decomposed state_dict structure.
-        
-        Returns:
-            DecomposedStateDict or None: decomposed structure if available
-        """
-        return self.decomposed_state_dict
     
     @staticmethod
     def load_eccheck_components_from_file(file_path: Union[str, os.PathLike]) -> DecomposedStateDict:

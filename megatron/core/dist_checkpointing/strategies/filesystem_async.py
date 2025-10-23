@@ -139,7 +139,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eccheck_global_registry = None  # GlobalMetadataRegistry from all ranks
         self.eccheck_data_buffers = None  # List of data buffers
         self.eccheck_encoding_buffers = None  # List of encoding buffers
-        self.eccheck_recv_encoding_buffers = None  # List of receive buffers for encoded packets
+        self.eccheck_recv_encoding_buffers = None  # Tuple of two large receive buffers (thread1, thread2)
         self.eccheck_parity_buffers = None  # List of parity buffers for XOR results
         
         # EC-CHECK buffer poller thread (persistent, created once)
@@ -211,18 +211,33 @@ class FileSystemWriterAsync(FileSystemWriter):
             self._eccheck_native = None
 
     def _setup_eccheck_buffers_from_strategy(self, buffers):
-        """Set up EC-CHECK buffers from pre-allocated strategy buffers."""
+        """Set up EC-CHECK buffers from pre-allocated strategy buffers.
+        
+        Note: Only sets up data and encoding buffers from strategy.
+        Receive and parity buffers will be allocated later after metadata exchange.
+        """
         self.eccheck_data_buffers = buffers['data_buffers']
         self.eccheck_encoding_buffers = buffers['encoding_buffers']
-        self.eccheck_recv_encoding_buffers = buffers['recv_encoding_buffers']
-        self.eccheck_parity_buffers = buffers['parity_buffers']
         self._free_data_buffer_queue = buffers['free_data_buffer_queue']
         self._free_encoding_buffer_queue = buffers['free_encoding_buffer_queue']
-        logger.info("EC-CHECK: Using pre-allocated buffers from strategy")
+        
+        # Receive and parity buffers are NOT set here
+        # They will be allocated after metadata exchange when peer data size is known
+        
+        logger.info(
+            f"EC-CHECK: Using pre-allocated buffers from strategy - "
+            f"Data: {len(self.eccheck_data_buffers)}, "
+            f"Encoding: {len(self.eccheck_encoding_buffers)}"
+        )
 
     def _init_eccheck_buffers(self):
-        """Initialize EC-CHECK buffers during C++ module initialization."""
-        logger.info("EC-CHECK: Initializing buffers for EC-CHECK")
+        """Initialize EC-CHECK buffers during C++ module initialization.
+        
+        Note: Only allocates data and encoding buffers here.
+        Receive and parity buffers are allocated later after metadata exchange,
+        when we know the peer's data size.
+        """
+        logger.info("EC-CHECK: Initializing buffers for EC-CHECK (data and encoding only)")
         
         # Allocate data buffers for storing original tensor data
         # Each worker reserves 12 data buffers, each 64MB in size
@@ -231,12 +246,6 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Allocate encoding buffers for encoded packets
         # Each worker reserves 24 encoding buffers, each 64MB in size
         self.eccheck_encoding_buffers = self._allocate_encoding_buffers()
-        
-        # Allocate receive buffers for peer encoded packets
-        self.eccheck_recv_encoding_buffers = self._allocate_recv_encoding_buffers()
-        
-        # Allocate parity buffers for XOR computation results
-        self.eccheck_parity_buffers = self._allocate_parity_buffers()
         
         # Initialize free buffer queues for Phase 3
         # Store buffer addresses directly in queue for easier management
@@ -249,7 +258,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         for buffer in self.eccheck_encoding_buffers:
             self._free_encoding_buffer_queue.put(int(buffer.data_ptr()))
         
-        logger.info(f"EC-CHECK: Buffer initialization completed - "
+        logger.info(f"EC-CHECK: Initial buffer allocation completed - "
                    f"Data buffers: {len(self.eccheck_data_buffers)}, "
                    f"Encoding buffers: {len(self.eccheck_encoding_buffers)}")
 
@@ -1208,29 +1217,47 @@ class FileSystemWriterAsync(FileSystemWriter):
         logger.info(f"EC-CHECK: Allocated {len(encoding_buffers)} encoding buffers")
         return encoding_buffers
     
-    def _allocate_recv_encoding_buffers(self):
+    def _allocate_recv_encoding_buffers(self, global_registry):
         """
-        Allocate receive buffers for peer encoded packets.
-        These buffers will receive encoded packets from paired rank.
+        Allocate TWO large receive buffers for peer encoded packets (one per encoding thread).
+        
+        Each buffer is equal to peer's total data size, aligned to buffer_size (64MB).
         
         Args:
             global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
             
         Returns:
-            List[torch.Tensor]: List of receive buffers for encoded packets
+            Tuple[torch.Tensor, torch.Tensor]: Two receive buffers (one for thread1, one for thread2)
         """
-        logger.info(f"EC-CHECK: Allocating receive encoding buffers ({self.eccheck_encoding_buffers_count} buffers)")
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        paired_rank = self._get_paired_rank(rank, world_size)
         
-        recv_encoding_buffers = []
+        # Get peer's total data size from global registry
+        peer_metadata = global_registry.rank_metadata.get(paired_rank, [])
+        peer_total_size = sum(meta.size_bytes for meta in peer_metadata)
         
-        # Allocate enough buffers to receive encoded packets from paired rank
-        for i in range(self.eccheck_encoding_buffers_count):
-            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-            recv_encoding_buffers.append(buffer)
-            logger.debug(f"EC-CHECK: Allocated recv encoding buffer {i}: {self.eccheck_buffer_size} bytes")
+        # Align peer's data size to buffer_size (64MB)
+        aligned_size = ((peer_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
         
-        logger.info(f"EC-CHECK: Allocated {len(recv_encoding_buffers)} receive encoding buffers")
-        return recv_encoding_buffers
+        logger.info(
+            f"EC-CHECK: Allocating TWO receive buffers based on peer data size\n"
+            f"  Paired rank: {paired_rank}\n"
+            f"  Peer data size: {peer_total_size / (1024**3):.2f} GB\n"
+            f"  Aligned buffer size (per buffer): {aligned_size / (1024**3):.2f} GB\n"
+            f"  Total receive memory: {2 * aligned_size / (1024**3):.2f} GB"
+        )
+        
+        # Allocate two large continuous buffers (one for each encoding thread)
+        recv_buffer_thread1 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+        recv_buffer_thread2 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+        
+        logger.info(
+            f"EC-CHECK: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "
+            f"({aligned_size / (1024**2):.0f} MB each)"
+        )
+        
+        return recv_buffer_thread1, recv_buffer_thread2
     
     def _allocate_parity_buffers(self):
         """
@@ -1427,7 +1454,20 @@ class FileSystemWriterAsync(FileSystemWriter):
         src_pos = 0  # Current position in continuous tensor buffer
         chunk_count = 0
         
-        logger.info(f"EC-CHECK: Starting data copy - Total size: {total_bytes / (1024**3):.2f} GB")
+        # Get base addresses of TWO receive buffers (one per encoding thread)
+        recv_buffer_thread1, recv_buffer_thread2 = self.eccheck_recv_encoding_buffers
+        recv_buffer_base_addr_thread1 = int(recv_buffer_thread1.data_ptr())
+        recv_buffer_base_addr_thread2 = int(recv_buffer_thread2.data_ptr())
+        recv_buffer_offset_thread1 = 0  # Current offset in thread1's receive buffer
+        recv_buffer_offset_thread2 = 0  # Current offset in thread2's receive buffer
+        
+        logger.info(
+            f"EC-CHECK: Starting data copy - Total size: {total_bytes / (1024**3):.2f} GB\n"
+            f"  Receive buffer thread1 base: 0x{recv_buffer_base_addr_thread1:x} "
+            f"(size: {recv_buffer_thread1.numel() / (1024**3):.2f} GB)\n"
+            f"  Receive buffer thread2 base: 0x{recv_buffer_base_addr_thread2:x} "
+            f"(size: {recv_buffer_thread2.numel() / (1024**3):.2f} GB)"
+        )
         
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
@@ -1452,15 +1492,42 @@ class FileSystemWriterAsync(FileSystemWriter):
             enc_addr1 = get_free_encoding_buffer()
             enc_addr2 = get_free_encoding_buffer()
             
-            # Submit to BOTH encoding threads
+            # Allocate receive addresses from TWO recv_encoding_buffers (按实际数据大小分配)
+            # Each encoding thread gets its own receive address
+            # 如果剩余数据能够填满固定chunk size，则按照chunk size分配
+            # 否则按照实际剩余大小分配
+            recv_chunk_size = min(self.eccheck_buffer_size, remaining_in_source)
+            
+            # Thread1 receive address
+            recv_addr_thread1 = recv_buffer_base_addr_thread1 + recv_buffer_offset_thread1
+            recv_buffer_offset_thread1 += recv_chunk_size  # 按照实际大小移动
+            
+            # Thread2 receive address
+            recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2
+            recv_buffer_offset_thread2 += recv_chunk_size  # 按照实际大小移动
+            
+            if chunk_count < 3 or remaining_in_source < self.eccheck_buffer_size:  # Log first 3 chunks and last chunk
+                logger.debug(
+                    f"EC-CHECK: Chunk {chunk_count}: "
+                    f"data=0x{cur_buffer_addr:x}, "
+                    f"enc1=0x{enc_addr1:x}, "
+                    f"enc2=0x{enc_addr2:x}, "
+                    f"recv1=0x{recv_addr_thread1:x}, "
+                    f"recv2=0x{recv_addr_thread2:x}, "
+                    f"size={take / (1024**2):.2f}MB, "
+                    f"recv_size={recv_chunk_size / (1024**2):.2f}MB"
+                )
+            
+            # Submit to BOTH encoding threads with their respective receive addresses
             # The C++ threads will mark the data buffer as copied immediately after reading
             # Once both threads mark it as copied, the data buffer will be released
+            # recv_addr will be used by recv_worker to receive peer data
             self._eccheck_native.submit_data_for_encoding_thread1(
-                cur_buffer_addr, take, enc_addr1
+                cur_buffer_addr, take, enc_addr1, recv_addr_thread1, recv_chunk_size
             )
             
             self._eccheck_native.submit_data_for_encoding_thread2(
-                cur_buffer_addr, take, enc_addr2
+                cur_buffer_addr, take, enc_addr2, recv_addr_thread2, recv_chunk_size
             )
             
             chunk_count += 1
@@ -1471,12 +1538,17 @@ class FileSystemWriterAsync(FileSystemWriter):
                 progress = (src_pos / total_bytes) * 100
                 logger.debug(f"EC-CHECK: Processed {chunk_count} chunks ({progress:.1f}% complete)")
         
-        logger.info(f"EC-CHECK: Data copy complete - {chunk_count} chunks submitted")
+        logger.info(
+            f"EC-CHECK: Data copy complete - {chunk_count} chunks submitted\n"
+            f"  Thread1 receive buffer used: {recv_buffer_offset_thread1 / (1024**3):.2f} GB\n"
+            f"  Thread2 receive buffer used: {recv_buffer_offset_thread2 / (1024**3):.2f} GB\n"
+            f"  Total receive buffer used: {(recv_buffer_offset_thread1 + recv_buffer_offset_thread2) / (1024**3):.2f} GB"
+        )
         
         # Mark end of stream for both encoders
         logger.info("EC-CHECK: Submitting end signals to both encoding threads...")
-        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0)  # Sentinel for thread 1
-        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0)  # Sentinel for thread 2
+        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0)  # Sentinel for thread 1
+        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0)  # Sentinel for thread 2
         logger.info("EC-CHECK: End signals submitted to both threads")
         
         # Wait for both encoding threads to complete
@@ -1637,8 +1709,18 @@ class FileSystemWriterAsync(FileSystemWriter):
         phase2_time = time() - phase2_start
         logger.warning(f"EC-CHECK: Phase 2 completed in {phase2_time:.2f}s")
         
-        # Buffers are already allocated during initialization
-        # No need to reallocate them here
+        # ===== Phase 2.5: Allocate receive and parity buffers based on peer data size =====
+        logger.info("EC-CHECK: Phase 2.5 - Allocating receive and parity buffers based on peer data")
+        buffer_alloc_start = time()
+        
+        # Allocate receive buffers for peer encoded packets (based on peer's data size)
+        self.eccheck_recv_encoding_buffers = self._allocate_recv_encoding_buffers(global_registry)
+        
+        # Allocate parity buffers for XOR computation results
+        # self.eccheck_parity_buffers = self._allocate_parity_buffers()
+        
+        buffer_alloc_time = time() - buffer_alloc_start
+        logger.info(f"EC-CHECK: Phase 2.5 completed in {buffer_alloc_time:.2f}s")
         
         # Execute Phase 3: Tensor data exchange and encoding
         self._execute_phase3_encoding()

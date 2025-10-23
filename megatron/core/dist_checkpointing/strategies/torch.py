@@ -752,9 +752,19 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             
             # Create instance with error handling
             try:
+                # IMPORTANT: This constructor call will BLOCK until:
+                # 1. Send and recv threads are started
+                # 2. Both NCCL communicators (0to1 and 1to0) are fully initialized
+                # 3. All threads are ready for data exchange
+                # Only after all initialization is complete will this call return.
+                logger.info(f"EC-CHECK: Creating C++ native module (this will block until NCCL is initialized)...")
+                print(f"EC-CHECK: [Rank {rank}] Creating C++ native module (blocking until NCCL initialization completes)...")
+                
                 self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank)
-                logger.info(f"EC-CHECK: C++ native module initialized (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
-                print(f"EC-CHECK: C++ native module initialized (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
+                
+                # If we reach here, NCCL communicators are ready and threads are running
+                logger.info(f"EC-CHECK: C++ native module initialized successfully (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
+                print(f"EC-CHECK: [Rank {rank}] C++ native module initialized - NCCL communicators ready for data exchange")
                 
                 # Initialize EC-CHECK buffers
                 self._init_eccheck_buffers()
@@ -795,10 +805,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         return paired_rank
 
     def _init_eccheck_buffers(self):
-        """Initialize EC-CHECK buffers during C++ module initialization."""
+        """Initialize EC-CHECK buffers during C++ module initialization.
+        
+        Note: Only allocates data and encoding buffers at initialization.
+        Receive and parity buffers will be allocated by FileSystemWriterAsync
+        after metadata exchange, when peer data sizes are known.
+        """
         rank = torch.distributed.get_rank()
-        logger.info("EC-CHECK: Initializing buffers for EC-CHECK")
-        print(f"EC-CHECK: Initializing buffers for EC-CHECK (rank={rank})")
+        logger.info("EC-CHECK: Initializing buffers for EC-CHECK (data and encoding only)")
+        print(f"EC-CHECK: Initializing buffers for EC-CHECK (rank={rank}, data and encoding only)")
         
         # EC-CHECK configuration parameters
         self.eccheck_data_buffers_count = 12
@@ -888,17 +903,22 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         return parity_buffers
 
     def _get_eccheck_buffers(self):
-        """Get EC-CHECK buffers for FileSystemWriterAsync."""
+        """Get EC-CHECK buffers for FileSystemWriterAsync.
+        
+        Note: Only returns data and encoding buffers.
+        Receive and parity buffers will be allocated by FileSystemWriterAsync
+        after metadata exchange.
+        """
         if not hasattr(self, 'eccheck_data_buffers'):
             return None
         
         return {
             'data_buffers': self.eccheck_data_buffers,
             'encoding_buffers': self.eccheck_encoding_buffers,
-            'recv_encoding_buffers': self.eccheck_recv_encoding_buffers,
-            'parity_buffers': self.eccheck_parity_buffers,
             'free_data_buffer_queue': self._free_data_buffer_queue,
             'free_encoding_buffer_queue': self._free_encoding_buffer_queue,
+            # Note: recv_encoding_buffers and parity_buffers are NOT included
+            # They will be allocated by FileSystemWriterAsync after metadata exchange
         }
 
     def __del__(self):

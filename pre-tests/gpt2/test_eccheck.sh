@@ -20,7 +20,7 @@ else
     export GLOO_SOCKET_IFNAME=ens37f0
 fi
 MASTER_PORT=6000
-NNODES=2
+NNODES=1
 NODE_RANK=$1
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
@@ -36,8 +36,6 @@ SHM_PKT="/dev/shm/shm_pkt"
 
 if [ "$NODE_RANK" -eq 0 ]; then
     export CUDA_VISIBLE_DEVICES=0,1
-elif [ "$NODE_RANK" -eq 1 ]; then
-    export CUDA_VISIBLE_DEVICES=2,3
 fi
 
 # export NCCL_SOCKET_IFNAME=ens37f0
@@ -78,7 +76,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
     --lr 0.00015 
-    --train-iters 10
+    --train-iters 1000
     --lr-decay-iters 320000 
     --lr-decay-style cosine 
     --min-lr 1.0e-5 
@@ -115,13 +113,8 @@ EVAL_AND_LOGGING_ARGS=(
     # --load $SHM_PKT 
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    # --non-persistent-save-interval 7
-    # --ckpt-format torch
-    --use-pipeline-ckpt-worker
-    --pipeline-async-workers 1
-    # --async-save
-    --instance-seq $3
-    --gpus-per-node $GPUS_PER_NODE
+    --use-eccheck
+    --ckpt-format torch_dist
 )
 
 

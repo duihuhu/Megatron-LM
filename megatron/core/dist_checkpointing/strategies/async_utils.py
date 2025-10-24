@@ -184,6 +184,7 @@ class TemporalAsyncCaller(AsyncCaller):
             return  # nothing to do
 
         async_fn_args = list(async_req.async_fn_args)
+        start_sync = time()
         if async_req.preload_fn:
             # If there's a preload_fn in `async_req`, we call this func
             # to do the defined action in `async_req.preload_fn` to
@@ -191,10 +192,9 @@ class TemporalAsyncCaller(AsyncCaller):
             async_fn_args[1] = async_req.preload_fn()
             
         rank = torch.distributed.get_rank()
-        start_sync = time()
         torch.cuda.synchronize()
         end_sync = time()
-        logger.debug(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")
+        logger.warning(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")
 
         ctx = mp.get_context('fork')
         self.start_time = time()

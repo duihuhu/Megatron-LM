@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from itertools import product
 from logging import getLogger
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast, get_args
 
 import torch
 from packaging.version import Version as PkgVersion
@@ -698,6 +698,238 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.separation_hint = separation_hint
 
         self.validated_loaded_metadata_reuse = False
+        
+        # Initialize EC-CHECK if enabled
+        self._eccheck_native = None
+        self._init_eccheck_if_enabled()
+
+    def _init_eccheck_if_enabled(self):
+        """Initialize EC-CHECK C++ module if enabled and distributed environment is ready."""
+        try:
+            from megatron.training import get_args as input_args
+            args = input_args()
+            
+            if not getattr(args, 'use_eccheck', False):
+                return
+                
+            # Check if distributed environment is initialized
+            if not torch.distributed.is_initialized():
+                logger.warning("EC-CHECK: Distributed environment not initialized, skipping EC-CHECK initialization")
+                return
+                
+            # Initialize EC-CHECK C++ module
+            self._init_eccheck_native()
+            
+        except Exception as e:
+            logger.warning(f"EC-CHECK: Failed to initialize during strategy creation: {e}")
+            self._eccheck_native = None
+
+    def _init_eccheck_native(self):
+        """Initialize EC-CHECK C++ native module."""
+        eccheck_native = None
+        try:
+            # Direct import .so file without modifying sys.path or affecting other packages
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # Find .so file
+            import glob as _glob_module
+            so_files = _glob_module.glob(os.path.join(current_dir, "eccheck_native*.so"))
+            
+            if not so_files:
+                raise ImportError(f"No eccheck_native.so file found in {current_dir}")
+            
+            # Load .so file directly using importlib
+            import importlib.util as _importlib_util
+            so_path = so_files[0]
+            spec = _importlib_util.spec_from_file_location("eccheck_native", so_path)
+            eccheck_native = _importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(eccheck_native)
+            logger.debug(f"EC-CHECK: Loaded .so file from {so_path}")
+            
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            paired_rank = self._get_paired_rank(rank, world_size)
+            
+            # Create instance with error handling
+            try:
+                # IMPORTANT: This constructor call will BLOCK until:
+                # 1. Send and recv threads are started
+                # 2. Both NCCL communicators (0to1 and 1to0) are fully initialized
+                # 3. All threads are ready for data exchange
+                # Only after all initialization is complete will this call return.
+                logger.info(f"EC-CHECK: Creating C++ native module (this will block until NCCL is initialized)...")
+                print(f"EC-CHECK: [Rank {rank}] Creating C++ native module (blocking until NCCL initialization completes)...")
+                
+                self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank)
+                
+                # If we reach here, NCCL communicators are ready and threads are running
+                logger.info(f"EC-CHECK: C++ native module initialized successfully (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
+                print(f"EC-CHECK: [Rank {rank}] C++ native module initialized - NCCL communicators ready for data exchange")
+                
+                # Initialize EC-CHECK buffers
+                self._init_eccheck_buffers()
+                
+            except Exception as e:
+                logger.warning(f"EC-CHECK: Failed to create C++ native module instance: {e}")
+                # Try to stop the pipeline if it was partially created
+                try:
+                    if hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
+                        self._eccheck_native.stop_pipeline()
+                except:
+                    pass
+                self._eccheck_native = None
+                raise e
+            
+        except ImportError as e:
+            logger.warning(f"EC-CHECK: C++ native module not available: {e}, EC-CHECK functionality will not work")
+            self._eccheck_native = None
+        except Exception as e:
+            logger.warning(f"EC-CHECK: Failed to initialize C++ native module: {e}, EC-CHECK functionality will not work")
+            self._eccheck_native = None
+
+    def _get_paired_rank(self, my_rank: int, world_size: int) -> int:
+        """Get the paired rank for parity exchange."""
+        if world_size % 2 != 0:
+            raise ValueError(f"EC-CHECK: World size must be even for pairing, got {world_size}")
+        
+        half_size = world_size // 2
+        
+        if my_rank < half_size:
+            # First half pairs with second half
+            paired_rank = my_rank + half_size
+        else:
+            # Second half pairs with first half
+            paired_rank = my_rank - half_size
+        
+        logger.debug(f"EC-CHECK: Rank {my_rank} paired with Rank {paired_rank}")
+        return paired_rank
+
+    def _init_eccheck_buffers(self):
+        """Initialize EC-CHECK buffers during C++ module initialization.
+        
+        Note: Only allocates data and encoding buffers at initialization.
+        Receive and parity buffers will be allocated by FileSystemWriterAsync
+        after metadata exchange, when peer data sizes are known.
+        """
+        rank = torch.distributed.get_rank()
+        logger.info("EC-CHECK: Initializing buffers for EC-CHECK (data and encoding only)")
+        print(f"EC-CHECK: Initializing buffers for EC-CHECK (rank={rank}, data and encoding only)")
+        
+        # EC-CHECK configuration parameters
+        self.eccheck_data_buffers_count = 12
+        self.eccheck_encoding_buffers_count = 24  # data_count * m (12 * 2)
+        self.eccheck_buffer_size = 64 * 1024 * 1024  # 64MB
+        self.eccheck_pin_memory = False
+        
+        # Allocate data buffers for storing original tensor data
+        self.eccheck_data_buffers = self._allocate_data_buffers()
+        
+        # Allocate encoding buffers for encoded packets
+        self.eccheck_encoding_buffers = self._allocate_encoding_buffers()
+        
+        # Allocate receive buffers for peer encoded packets
+        self.eccheck_recv_encoding_buffers = self._allocate_recv_encoding_buffers()
+        
+        # Allocate parity buffers for XOR computation results
+        self.eccheck_parity_buffers = self._allocate_parity_buffers()
+        
+        # Initialize free buffer queues for Phase 3
+        import queue
+        self._free_data_buffer_queue = queue.Queue()
+        for buffer in self.eccheck_data_buffers:
+            self._free_data_buffer_queue.put(int(buffer.data_ptr()))
+        
+        self._free_encoding_buffer_queue = queue.Queue()
+        for buffer in self.eccheck_encoding_buffers:
+            self._free_encoding_buffer_queue.put(int(buffer.data_ptr()))
+        
+        logger.info(f"EC-CHECK: Buffer initialization completed - "
+                   f"Data buffers: {len(self.eccheck_data_buffers)}, "
+                   f"Encoding buffers: {len(self.eccheck_encoding_buffers)}")
+        print(f"EC-CHECK: Buffer initialization completed (rank={rank}) - "
+              f"Data buffers: {len(self.eccheck_data_buffers)}, "
+              f"Encoding buffers: {len(self.eccheck_encoding_buffers)}")
+
+    def _allocate_data_buffers(self):
+        """Allocate data buffers for storing original tensor data."""
+        logger.info(f"EC-CHECK: Allocating data buffers ({self.eccheck_data_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
+        
+        data_buffers = []
+        for i in range(self.eccheck_data_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            data_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated data buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(data_buffers)} data buffers")
+        return data_buffers
+
+    def _allocate_encoding_buffers(self):
+        """Allocate encoding buffers for encoded packets."""
+        logger.info(f"EC-CHECK: Allocating encoding buffers ({self.eccheck_encoding_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
+        
+        encoding_buffers = []
+        for i in range(self.eccheck_encoding_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            encoding_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated encoding buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(encoding_buffers)} encoding buffers")
+        return encoding_buffers
+
+    def _allocate_recv_encoding_buffers(self):
+        """Allocate receive buffers for peer encoded packets."""
+        logger.info(f"EC-CHECK: Allocating receive encoding buffers ({self.eccheck_encoding_buffers_count} buffers)")
+        
+        recv_encoding_buffers = []
+        for i in range(self.eccheck_encoding_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            recv_encoding_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated recv encoding buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(recv_encoding_buffers)} receive encoding buffers")
+        return recv_encoding_buffers
+
+    def _allocate_parity_buffers(self):
+        """Allocate parity buffers for XOR computation results."""
+        logger.info(f"EC-CHECK: Allocating parity buffers ({self.eccheck_data_buffers_count} buffers)")
+        
+        parity_buffers = []
+        for i in range(self.eccheck_data_buffers_count):
+            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            parity_buffers.append(buffer)
+            logger.debug(f"EC-CHECK: Allocated parity buffer {i}: {self.eccheck_buffer_size} bytes")
+        
+        logger.info(f"EC-CHECK: Allocated {len(parity_buffers)} parity buffers")
+        return parity_buffers
+
+    def _get_eccheck_buffers(self):
+        """Get EC-CHECK buffers for FileSystemWriterAsync.
+        
+        Note: Only returns data and encoding buffers.
+        Receive and parity buffers will be allocated by FileSystemWriterAsync
+        after metadata exchange.
+        """
+        if not hasattr(self, 'eccheck_data_buffers'):
+            return None
+        
+        return {
+            'data_buffers': self.eccheck_data_buffers,
+            'encoding_buffers': self.eccheck_encoding_buffers,
+            'free_data_buffer_queue': self._free_data_buffer_queue,
+            'free_encoding_buffer_queue': self._free_encoding_buffer_queue,
+            # Note: recv_encoding_buffers and parity_buffers are NOT included
+            # They will be allocated by FileSystemWriterAsync after metadata exchange
+        }
+
+    def __del__(self):
+        """Cleanup EC-CHECK resources when strategy is destroyed."""
+        try:
+            if hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
+                # Stop the C++ pipeline
+                self._eccheck_native.stop_pipeline()
+                logger.info("EC-CHECK: C++ native module stopped in strategy destructor")
+        except Exception as e:
+            logger.warning(f"EC-CHECK: Error during strategy cleanup: {e}")
 
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
@@ -717,12 +949,17 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             )
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
+        from megatron.training import get_args as input_args
+        args = input_args()
         # Use PyT saving mechanism
         writer = FileSystemWriterAsync(
             checkpoint_dir,
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
+            use_eccheck=args.use_eccheck,
+            eccheck_native=self._eccheck_native,  # Pass pre-initialized C++ module
+            eccheck_buffers=self._get_eccheck_buffers(),  # Pass pre-allocated buffers
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
@@ -868,6 +1105,273 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     def __init__(self):
         self.cached_global_metadata: Optional[Metadata] = None
         super().__init__()
+    
+    def _is_eccheck_checkpoint(self, checkpoint_dir: Path) -> bool:
+        """Check if the checkpoint is in EC-CHECK format.
+        
+        EC-CHECK checkpoints are .distcp files with 'ECCK' magic number in the header.
+        
+        Args:
+            checkpoint_dir (Path): checkpoint directory
+            
+        Returns:
+            bool: True if this is an EC-CHECK checkpoint
+        """
+        import struct
+        
+        checkpoint_dir = Path(checkpoint_dir)
+        if not checkpoint_dir.exists():
+            return False
+        
+        # Get current rank to find the corresponding file
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        
+        # Check for EC-CHECK format: __{rank}_0.distcp with ECCK magic number
+        potential_file = checkpoint_dir / f"__{rank}_0.distcp"
+        
+        if not potential_file.exists():
+            return False
+        
+        # Read first 4 bytes to check for ECCK magic number
+        try:
+            with open(potential_file, 'rb') as f:
+                magic = f.read(4)
+                return magic == b'ECCK'
+        except:
+            return False
+    
+    def _restore_dict_types_lenient(self, x: Union[dict, list, Any], keys_template: Union[dict, list, Any]):
+        """Lenient version of _restore_dict_types that skips missing keys.
+        
+        This is needed for EC-CHECK where different ranks may have different keys.
+        """
+        if isinstance(keys_template, dict):
+            if not isinstance(x, dict):
+                return
+            
+            for k, v in keys_template.items():
+                # Convert non-string keys
+                if not isinstance(k, str):
+                    str_k = str(k)
+                    if str_k in x:
+                        x[k] = x.pop(str_k)
+                    else:
+                        # Key doesn't exist - skip it
+                        continue
+                
+                # Recursively restore types if key exists
+                if k in x:
+                    self._restore_dict_types_lenient(x[k], v)
+                # If key doesn't exist, just skip it (lenient behavior)
+                
+        elif isinstance(keys_template, list):
+            if not isinstance(x, list):
+                return
+            for x_val, templ_val in zip(x, keys_template):
+                self._restore_dict_types_lenient(x_val, templ_val)
+    
+    def _load_eccheck_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+        """Load checkpoint saved in EC-CHECK format.
+        
+        Args:
+            sharded_state_dict (ShardedStateDict): template showing what to load
+            checkpoint_dir (Path): checkpoint directory
+            
+        Returns:
+            StateDict: loaded state dict with structure matching sharded_state_dict
+        """
+        from .filesystem_async import FileSystemWriterAsync
+        from .state_dict_decomposer import reconstruct_state_dict
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        
+        # Find the EC-CHECK file for this rank
+        # Ensure checkpoint_dir is a Path object
+        checkpoint_dir = Path(checkpoint_dir)
+        # EC-CHECK uses standard .distcp extension but with custom ECCK format
+        eccheck_file = checkpoint_dir / f'__{rank}_0.distcp'
+        
+        if not eccheck_file.exists():
+            raise FileNotFoundError(
+                f"EC-CHECK file not found for rank {rank}: {eccheck_file}"
+            )
+        
+        logger.info(f"Loading EC-CHECK checkpoint from {eccheck_file}")
+        
+        # Load the decomposed state dict from file
+        decomposed = FileSystemWriterAsync.load_eccheck_components_from_file(
+            str(eccheck_file)
+        )
+        
+        # Build index map from loaded tensor_infos
+        # Map: (fqn, global_offset) → (tensor_info, tensor_data)
+        logger.info(f"EC-CHECK: Building index map from {len(decomposed.tensor_infos)} tensor infos")
+        
+        index_to_data = {}
+        for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
+            # Use (fqn, global_offset) as unique key
+            # global_offset is already a tuple from TensorInfo
+            index_key = (info.key, info.global_offset)
+            index_to_data[index_key] = (info, tensor)
+        
+        # Also add non-tensor data keyed by FQN only
+        non_tensor_by_fqn = decomposed.non_tensor_data
+        
+        logger.info(
+            f"Successfully loaded EC-CHECK checkpoint for rank {rank} "
+            f"({len(decomposed.tensor_data)} tensors, "
+            f"{decomposed.total_tensor_size_bytes / (1024**3):.2f} GB)"
+        )
+        
+        # Save original sharded_state_dict for type restoration later
+        orig_sharded_state_dict = sharded_state_dict
+        
+        # Generate PyT-compatible state dict from sharded_state_dict
+        # This creates the structure that standard load expects
+        # IMPORTANT: Do NOT use keep_only_main_replica=True, as standard load doesn't use it
+        (keyed_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+        )
+        
+        # Create a mapping from loaded data using metadata_index
+        # For tensors: use metadata_index for precise matching
+        # For objects: use FQN
+        matched_count = 0
+        unmatched_count = 0
+        
+        for key, sh_base_list in keyed_state_dict.items():
+            for sh_base in sh_base_list:
+                if isinstance(sh_base, ShardedObject):
+                    # For ShardedObject, match by FQN
+                    if key in non_tensor_by_fqn:
+                        value = non_tensor_by_fqn[key]
+                        
+                        # Handle EC-CHECK wrapped BytesIO data
+                        if isinstance(value, dict) and '_eccheck_type' in value:
+                            if value['_eccheck_type'] == 'BytesIO':
+                                # Reconstruct and deserialize
+                                bytes_data = value['_eccheck_data']
+                                bytes_io = io.BytesIO(bytes_data)
+                                deserialized_list = torch.load(bytes_io, map_location='cpu', weights_only=False)
+                                value = deserialized_list[0] if isinstance(deserialized_list, list) else deserialized_list
+                        
+                        sh_base.data = value
+                        matched_count += 1
+                    else:
+                        unmatched_count += 1
+                
+                elif isinstance(sh_base, ShardedTensor):
+                    # For ShardedTensor, match by (fqn, global_offset)
+                    sh_offset = tuple(sh_base.global_offset) if hasattr(sh_base.global_offset, '__iter__') else (sh_base.global_offset,)
+                    
+                    # Construct lookup key
+                    lookup_key = (key, sh_offset)
+                    
+                    if lookup_key in index_to_data:
+                        # Direct match found!
+                        info, tensor = index_to_data[lookup_key]
+                        sh_base.data = tensor
+                        matched_count += 1
+                        
+                        # Verify the data is not None
+                        if tensor is None:
+                            logger.error(f"EC-CHECK: Matched key {lookup_key} but tensor is None!")
+                    else:
+                        unmatched_count += 1
+                        # Keep data as None - this is normal in distributed checkpoints
+                        # Different ranks have different parameter shards
+        
+        logger.info(f"EC-CHECK: Matched {matched_count} ShardedBase objects")
+        
+        # Step 1: Unwrap ShardedTensors and ShardedObjects
+        # Convert from ShardedBase objects to actual data
+        unwrapped_state_dict = {}
+        for key, sh_base_list in keyed_state_dict.items():
+            if len(sh_base_list) == 0:
+                continue
+            
+            sh_base = sh_base_list[0]
+            if isinstance(sh_base, ShardedTensor):
+                # For ShardedTensor, unwrap and handle prepend_axis_num
+                # Similar to _unwrap_pyt_sharded_tensor
+                tensors = []
+                for sh in sh_base_list:
+                    ten = sh.data
+                    if ten is None:
+                        tensors.append(None)
+                        continue
+                    
+                    # Handle flattened_range (similar to _unwrap_pyt_sharded_tensor)
+                    if sh.flattened_range is not None:
+                        assert ten.shape[:-1] == (1,) * (len(ten.shape) - 1), ten.shape
+                        ten = ten.view(-1)
+                    else:
+                        # Squeeze prepend_axis_num dimensions
+                        for _ in range(sh.prepend_axis_num):
+                            if ten.size(0) == 1:
+                                ten = ten[0]
+                    
+                    tensors.append(ten)
+                
+                unwrapped_state_dict[key] = tensors
+            elif isinstance(sh_base, ShardedObject):
+                # For ShardedObject, collect data into a list (must match rename_mapping length)
+                # Standard format expects List[data] for ShardedObjects
+                data_list = [sh.data for sh in sh_base_list]
+                unwrapped_state_dict[key] = data_list
+        
+        # Step 2: Convert keyed keys back to original state_dict keys
+        mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
+            unwrapped_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
+        )
+        
+        # Step 3: Restore dict types (convert string keys back to original types if needed)
+        # Note: Use a lenient version that skips missing keys
+        self._restore_dict_types_lenient(mcore_state_dict, orig_sharded_state_dict)
+        
+        return mcore_state_dict
+    
+    def _populate_sharded_base_objects(self, sharded_state_dict: ShardedStateDict, flat_state_dict: Dict[str, Any]) -> None:
+        """Populate ShardedBase objects in sharded_state_dict with data from flat_state_dict.
+        
+        Args:
+            sharded_state_dict: nested dict containing ShardedTensor/ShardedObject (modified in-place)
+            flat_state_dict: flat dict with FQN keys and loaded data
+        """
+        import io
+        
+        # Recursively find and populate all ShardedBase objects
+        for sh_base in nested_values(sharded_state_dict):
+            if not isinstance(sh_base, ShardedBase):
+                continue
+            
+            # Get the key for this ShardedBase object
+            if isinstance(sh_base, ShardedObject):
+                key = sh_base.unique_key
+            else:
+                key = sh_base.key
+            
+            # Find matching data in flat_state_dict
+            if key not in flat_state_dict:
+                logger.warning(f"Key {key} not found in loaded data")
+                continue
+            
+            value = flat_state_dict[key]
+            
+            # Handle EC-CHECK wrapped BytesIO data
+            if isinstance(value, dict) and '_eccheck_type' in value:
+                if value['_eccheck_type'] == 'BytesIO':
+                    # Reconstruct BytesIO from stored bytes
+                    bytes_data = value['_eccheck_data']
+                    bytes_io = io.BytesIO(bytes_data)
+                    # For ShardedObject, deserialize the BytesIO content
+                    # The BytesIO contains torch.save'd list of data
+                    deserialized_list = torch.load(bytes_io, map_location='cpu', weights_only=False)
+                    # Extract the first element (standard format is [data])
+                    value = deserialized_list[0] if isinstance(deserialized_list, list) else deserialized_list
+            
+            # Assign data to ShardedBase object
+            sh_base.data = value
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
@@ -879,6 +1383,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
         Returns: loaded state dict
         """
+        # Check if this is an EC-CHECK format checkpoint
+        if self._is_eccheck_checkpoint(checkpoint_dir):
+            logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
+            return self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
+        
         # Apply N-D tensors resharding
         reformulation_metadata = get_reformulation_metadata(sharded_state_dict, checkpoint_dir)
         sharded_state_dict, formulation_restore_data = apply_nd_flattened_tensors_reformulation(

@@ -89,7 +89,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         use_msc: bool = False,
         use_eccheck: bool = False,
         eccheck_use_continuous_buffer: bool = True,
-        eccheck_pin_memory: bool = False,
+        eccheck_pin_memory: bool = True,
         eccheck_preallocate_cpu_buffer: bool = True,
         eccheck_k: int = 2,
         eccheck_m: int = 2,
@@ -1417,7 +1417,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         2. No need to wait for encoding completion to release data buffers
         3. Better resource utilization and reduced risk of deadlock
         """
-        logger.info("EC-CHECK: Phase 3.1 - Python memcpy to data buffers with C++ encoding")
+        # logger.info("EC-CHECK: Phase 3.1 - Python memcpy to data buffers with C++ encoding")
         
         # Reset completion flags for new encoding round
         self._eccheck_native.reset_encoding_completion_flags()
@@ -1433,7 +1433,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                 logger.error("EC-CHECK: TIMEOUT waiting for free data buffer - possible deadlock!")
                 # Print queue status for debugging
                 logger.error(f"EC-CHECK: Data buffer queue size: {self._free_data_buffer_queue.qsize()}")
-                raise RuntimeError("EC-CHECK: Timeout waiting for data buffer")
+                return self._free_data_buffer_queue.get()
+                # raise RuntimeError("EC-CHECK: Timeout waiting for data buffer")
         
         def get_free_encoding_buffer():
             """Get a free encoding buffer address, blocking if none available."""
@@ -1445,14 +1446,15 @@ class FileSystemWriterAsync(FileSystemWriter):
             except queue.Empty:
                 logger.error("EC-CHECK: TIMEOUT waiting for free encoding buffer - possible deadlock!")
                 # Print queue status for debugging
-                logger.error(f"EC-CHECK: Encoding buffer queue size: {self._free_encoding_buffer_queue.qsize()}")
-                raise RuntimeError("EC-CHECK: Timeout waiting for encoding buffer")
+                # logger.error(f"EC-CHECK: Encoding buffer queue size: {self._free_encoding_buffer_queue.qsize()}")
+                return self._free_encoding_buffer_queue.get()
+                # raise RuntimeError("EC-CHECK: Timeout waiting for encoding buffer")
         
         # Process continuous tensor buffer sequentially
         # Copy data from self.tensor_buffer (continuous CPU buffer) to data buffers
         total_bytes = self.decomposed_state_dict.total_tensor_size_bytes
         src_pos = 0  # Current position in continuous tensor buffer
-        chunk_count = 0
+        # chunk_count = 0
         
         # Get base addresses of TWO receive buffers (one per encoding thread)
         recv_buffer_thread1, recv_buffer_thread2 = self.eccheck_recv_encoding_buffers
@@ -1460,15 +1462,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         recv_buffer_base_addr_thread2 = int(recv_buffer_thread2.data_ptr())
         recv_buffer_offset_thread1 = 0  # Current offset in thread1's receive buffer
         recv_buffer_offset_thread2 = 0  # Current offset in thread2's receive buffer
-        
-        logger.info(
-            f"EC-CHECK: Starting data copy - Total size: {total_bytes / (1024**3):.2f} GB\n"
-            f"  Receive buffer thread1 base: 0x{recv_buffer_base_addr_thread1:x} "
-            f"(size: {recv_buffer_thread1.numel() / (1024**3):.2f} GB)\n"
-            f"  Receive buffer thread2 base: 0x{recv_buffer_base_addr_thread2:x} "
-            f"(size: {recv_buffer_thread2.numel() / (1024**3):.2f} GB)"
-        )
-        
+
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
             cur_buffer_addr = get_free_data_buffer()
@@ -1506,18 +1500,6 @@ class FileSystemWriterAsync(FileSystemWriter):
             recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2
             recv_buffer_offset_thread2 += recv_chunk_size  # 按照实际大小移动
             
-            if chunk_count < 3 or remaining_in_source < self.eccheck_buffer_size:  # Log first 3 chunks and last chunk
-                logger.debug(
-                    f"EC-CHECK: Chunk {chunk_count}: "
-                    f"data=0x{cur_buffer_addr:x}, "
-                    f"enc1=0x{enc_addr1:x}, "
-                    f"enc2=0x{enc_addr2:x}, "
-                    f"recv1=0x{recv_addr_thread1:x}, "
-                    f"recv2=0x{recv_addr_thread2:x}, "
-                    f"size={take / (1024**2):.2f}MB, "
-                    f"recv_size={recv_chunk_size / (1024**2):.2f}MB"
-                )
-            
             # Submit to BOTH encoding threads with their respective receive addresses
             # The C++ threads will mark the data buffer as copied immediately after reading
             # Once both threads mark it as copied, the data buffer will be released
@@ -1530,27 +1512,17 @@ class FileSystemWriterAsync(FileSystemWriter):
                 cur_buffer_addr, take, enc_addr2, recv_addr_thread2, recv_chunk_size
             )
             
-            chunk_count += 1
             src_pos += take
             
-            # Log progress every 10 chunks
-            if chunk_count % 10 == 0:
-                progress = (src_pos / total_bytes) * 100
-                logger.debug(f"EC-CHECK: Processed {chunk_count} chunks ({progress:.1f}% complete)")
-        
         logger.info(
-            f"EC-CHECK: Data copy complete - {chunk_count} chunks submitted\n"
             f"  Thread1 receive buffer used: {recv_buffer_offset_thread1 / (1024**3):.2f} GB\n"
             f"  Thread2 receive buffer used: {recv_buffer_offset_thread2 / (1024**3):.2f} GB\n"
             f"  Total receive buffer used: {(recv_buffer_offset_thread1 + recv_buffer_offset_thread2) / (1024**3):.2f} GB"
         )
         
         # Mark end of stream for both encoders
-        logger.info("EC-CHECK: Submitting end signals to both encoding threads...")
         self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0)  # Sentinel for thread 1
-        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0)  # Sentinel for thread 2
-        logger.info("EC-CHECK: End signals submitted to both threads")
-        
+        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0)  # Sentinel for thread 2`
         # Wait for both encoding threads to complete
         # Activate persistent buffer poller while waiting
         logger.info("EC-CHECK: Waiting for encoding threads to complete (with buffer polling)...")
@@ -1569,7 +1541,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Final poll to ensure all buffers are released
         self._poll_and_release_buffers()
-        logger.info("EC-CHECK: All encoding operations completed")
+        # logger.info("EC-CHECK: All encoding operations completed")
     
     def _validate_pairing_compatibility(self, own_total_size: int, peer_total_size: int, my_rank: int, paired_rank: int):
         """
@@ -1630,9 +1602,8 @@ class FileSystemWriterAsync(FileSystemWriter):
         if not self.decomposed_state_dict:
             raise RuntimeError("EC-CHECK: State dict not decomposed yet")
         
-        start = time()
         logger.info("EC-CHECK: Starting GPU-to-CPU tensor transfer...")
-        
+        start = time()
         # Allocate continuous CPU buffer if not already allocated
         if self.preallocated_cpu_buffer is not None:
             buffer = self.preallocated_cpu_buffer
@@ -1647,7 +1618,6 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Transfer tensors from GPU to continuous CPU buffer
         num_gpu_tensors = 0
         offset = 0
-        
         for info, tensor in zip(
             self.decomposed_state_dict.tensor_infos,
             self.decomposed_state_dict.tensor_data
@@ -1722,8 +1692,11 @@ class FileSystemWriterAsync(FileSystemWriter):
         buffer_alloc_time = time() - buffer_alloc_start
         logger.info(f"EC-CHECK: Phase 2.5 completed in {buffer_alloc_time:.2f}s")
         
+        exec_start = time()
         # Execute Phase 3: Tensor data exchange and encoding
         self._execute_phase3_encoding()
+        exec_time = time() - exec_start
+        logger.info(f"EC-CHECK: Phase 3 completed in {exec_time:.2f}s")
         
         # Return write_buckets with EC-CHECK continuous buffer
         # Buffer contains all tensor data in continuous memory

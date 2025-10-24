@@ -76,6 +76,10 @@ private:
     // Completion flags
     std::atomic<bool> encoding_thread_1_completed_;
     std::atomic<bool> encoding_thread_2_completed_;
+    std::atomic<bool> send_worker_1_completed_;
+    std::atomic<bool> send_worker_2_completed_;
+    std::atomic<bool> recv_worker_1_completed_;
+    std::atomic<bool> recv_worker_2_completed_;
     
     // Stop flag for graceful shutdown
     std::atomic<bool> should_stop_threads_;
@@ -256,9 +260,11 @@ private:
                 encoding_tasks_1_.pop();
             }
             
-            // Check for sentinel (end signal)
-            if (task.data_addr == 0 && task.size == 0) {
+            // Check for sentinel (end signal): all fields are 0
+            if (task.data_addr == 0 && task.size == 0 && 
+                task.encoding_addr == 0 && task.recv_addr == 0 && task.recv_chunk_size == 0) {
                 encoding_thread_1_completed_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 received sentinel, marking completed" << std::endl;
                 
                 // Submit sentinel to send_worker_1
                 {
@@ -267,39 +273,56 @@ private:
                 }
                 send_queue_1_cv_.notify_one();
                 
+                // Submit sentinel to recv_worker_1
+                {
+                    std::lock_guard<std::mutex> lock(recv_queue_1_mutex_);
+                    recv_queue_1_.push({0, 0});
+                }
+                recv_queue_1_cv_.notify_one();
+                
                 continue;  // Continue waiting for next round
             }
             
-            // Perform encoding
-            encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 1);
+            // Check if we need to encode/send data
+            bool need_encode = (task.data_addr != 0 && task.encoding_addr != 0);
             
-            // Mark data buffer as copied by thread 1
-            {
-                std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
-                auto& state = data_buffer_states_[task.data_addr];
-                state.thread1_copied = true;
+            if (need_encode) {
+                // Perform encoding
+                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 1);
                 
-                // If both threads copied, release data buffer
-                if (state.thread2_copied) {
-                    std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                    data_buffers_to_release_.push(task.data_addr);
-                    data_buffer_states_.erase(task.data_addr);
+                // Mark data buffer as copied by thread 1
+                {
+                    std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
+                    auto& state = data_buffer_states_[task.data_addr];
+                    state.thread1_copied = true;
+                    
+                    // If both threads copied, release data buffer
+                    if (state.thread2_copied) {
+                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
+                        data_buffers_to_release_.push(task.data_addr);
+                        data_buffer_states_.erase(task.data_addr);
+                    }
                 }
+                
+                // Submit encoding result to send_worker_1
+                {
+                    std::lock_guard<std::mutex> lock(send_queue_1_mutex_);
+                    send_queue_1_.push({task.encoding_addr, task.size});
+                }
+                send_queue_1_cv_.notify_one();
             }
             
-            // Submit encoding result to send_worker_1
-            {
-                std::lock_guard<std::mutex> lock(send_queue_1_mutex_);
-                send_queue_1_.push({task.encoding_addr, task.size});
-            }
-            send_queue_1_cv_.notify_one();
+            // Check if we need to receive data
+            bool need_recv = (task.recv_addr != 0 && task.recv_chunk_size != 0);
             
-            // Submit recv task to recv_worker_1
-            {
-                std::lock_guard<std::mutex> lock(recv_queue_1_mutex_);
-                recv_queue_1_.push({task.recv_addr, task.recv_chunk_size});
+            if (need_recv) {
+                // Submit recv task to recv_worker_1
+                {
+                    std::lock_guard<std::mutex> lock(recv_queue_1_mutex_);
+                    recv_queue_1_.push({task.recv_addr, task.recv_chunk_size});
+                }
+                recv_queue_1_cv_.notify_one();
             }
-            recv_queue_1_cv_.notify_one();
         }
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 exiting" << std::endl;
@@ -326,9 +349,11 @@ private:
                 encoding_tasks_2_.pop();
             }
             
-            // Check for sentinel
-            if (task.data_addr == 0 && task.size == 0) {
+            // Check for sentinel (end signal): all fields are 0
+            if (task.data_addr == 0 && task.size == 0 && 
+                task.encoding_addr == 0 && task.recv_addr == 0 && task.recv_chunk_size == 0) {
                 encoding_thread_2_completed_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 received sentinel, marking completed" << std::endl;
                 
                 // Submit sentinel to send_worker_2
                 {
@@ -337,39 +362,56 @@ private:
                 }
                 send_queue_2_cv_.notify_one();
                 
+                // Submit sentinel to recv_worker_2
+                {
+                    std::lock_guard<std::mutex> lock(recv_queue_2_mutex_);
+                    recv_queue_2_.push({0, 0});
+                }
+                recv_queue_2_cv_.notify_one();
+                
                 continue;
             }
             
-            // Perform encoding
-            encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 2);
+            // Check if we need to encode/send data
+            bool need_encode = (task.data_addr != 0 && task.encoding_addr != 0);
             
-            // Mark data buffer as copied by thread 2
-            {
-                std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
-                auto& state = data_buffer_states_[task.data_addr];
-                state.thread2_copied = true;
+            if (need_encode) {
+                // Perform encoding
+                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 2);
                 
-                // If both threads copied, release data buffer
-                if (state.thread1_copied) {
-                    std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                    data_buffers_to_release_.push(task.data_addr);
-                    data_buffer_states_.erase(task.data_addr);
+                // Mark data buffer as copied by thread 2
+                {
+                    std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
+                    auto& state = data_buffer_states_[task.data_addr];
+                    state.thread2_copied = true;
+                    
+                    // If both threads copied, release data buffer
+                    if (state.thread1_copied) {
+                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
+                        data_buffers_to_release_.push(task.data_addr);
+                        data_buffer_states_.erase(task.data_addr);
+                    }
                 }
+                
+                // Submit encoding result to send_worker_2
+                {
+                    std::lock_guard<std::mutex> lock(send_queue_2_mutex_);
+                    send_queue_2_.push({task.encoding_addr, task.size});
+                }
+                send_queue_2_cv_.notify_one();
             }
             
-            // Submit encoding result to send_worker_2
-            {
-                std::lock_guard<std::mutex> lock(send_queue_2_mutex_);
-                send_queue_2_.push({task.encoding_addr, task.size});
-            }
-            send_queue_2_cv_.notify_one();
+            // Check if we need to receive data
+            bool need_recv = (task.recv_addr != 0 && task.recv_chunk_size != 0);
             
-            // Submit recv task to recv_worker_2
-            {
-                std::lock_guard<std::mutex> lock(recv_queue_2_mutex_);
-                recv_queue_2_.push({task.recv_addr, task.recv_chunk_size});
+            if (need_recv) {
+                // Submit recv task to recv_worker_2
+                {
+                    std::lock_guard<std::mutex> lock(recv_queue_2_mutex_);
+                    recv_queue_2_.push({task.recv_addr, task.recv_chunk_size});
+                }
+                recv_queue_2_cv_.notify_one();
             }
-            recv_queue_2_cv_.notify_one();
         }
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 exiting" << std::endl;
@@ -401,13 +443,17 @@ private:
             
             // Check for sentinel
             if (task.encoding_addr == 0 && task.size == 0) {
+                send_worker_1_completed_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 1 received sentinel, marking completed" << std::endl;
                 continue;
             }
             
 #ifdef NCCL_AVAILABLE
             if (nccl_thread1_initialized_ && world_size_ > 1) {
+                ncclGroupStart(); 
                 ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size, 
                          ncclUint8, paired_rank_, nccl_comm_thread1_, 0);
+                ncclGroupEnd();
             }
 #endif
 
@@ -452,13 +498,17 @@ private:
             
             // Check for sentinel
             if (task.recv_addr == 0 && task.size == 0) {
+                recv_worker_1_completed_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 1 received sentinel, marking completed" << std::endl;
                 continue;
             }
             
 #ifdef NCCL_AVAILABLE
             if (nccl_thread1_initialized_ && world_size_ > 1) {
+                ncclGroupStart();
                 ncclRecv(reinterpret_cast<void*>(task.recv_addr), task.size,
                          ncclUint8, paired_rank_, nccl_comm_thread1_, 0);
+                ncclGroupEnd();
             }
 #endif
         }
@@ -492,13 +542,17 @@ private:
             
             // Check for sentinel
             if (task.encoding_addr == 0 && task.size == 0) {
+                send_worker_2_completed_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 2 received sentinel, marking completed" << std::endl;
                 continue;
             }
             
 #ifdef NCCL_AVAILABLE
             if (nccl_thread2_initialized_ && world_size_ > 1) {
+                ncclGroupStart();
                 ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size,
                          ncclUint8, paired_rank_, nccl_comm_thread2_, 0);
+                ncclGroupEnd();
             }
 #endif
 
@@ -543,13 +597,17 @@ private:
             
             // Check for sentinel
             if (task.recv_addr == 0 && task.size == 0) {
+                recv_worker_2_completed_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 2 received sentinel, marking completed" << std::endl;
                 continue;
             }
             
 #ifdef NCCL_AVAILABLE
             if (nccl_thread2_initialized_ && world_size_ > 1) {
+                ncclGroupStart();
                 ncclRecv(reinterpret_cast<void*>(task.recv_addr), task.size,
                          ncclUint8, paired_rank_, nccl_comm_thread2_, 0);
+                ncclGroupEnd();
             }
 #endif
         }
@@ -597,6 +655,8 @@ public:
     ECCHECKNative(int rank, int world_size, int paired_rank) 
         : rank_(rank), world_size_(world_size), paired_rank_(paired_rank), 
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
+          send_worker_1_completed_(false), send_worker_2_completed_(false),
+          recv_worker_1_completed_(false), recv_worker_2_completed_(false),
           should_stop_threads_(false),
           nccl_thread1_initialized_(false), nccl_thread2_initialized_(false),
           nccl_thread1_init_completed_(false), nccl_thread2_init_completed_(false) {
@@ -631,14 +691,32 @@ public:
     void reset_encoding_completion_flags() {
         encoding_thread_1_completed_ = false;
         encoding_thread_2_completed_ = false;
+        send_worker_1_completed_ = false;
+        send_worker_2_completed_ = false;
+        recv_worker_1_completed_ = false;
+        recv_worker_2_completed_ = false;
     }
     
     void wait_for_encoding_completion() {
+        // Wait for all encoding threads to complete
         while (!encoding_thread_1_completed_ || !encoding_thread_2_completed_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Both encoding threads completed" << std::endl;
+        
+        // Wait for all send workers to complete
+        while (!send_worker_1_completed_ || !send_worker_2_completed_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Both send workers completed" << std::endl;
+        
+        // Wait for all recv workers to complete
+        while (!recv_worker_1_completed_ || !recv_worker_2_completed_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Both recv workers completed" << std::endl;
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] All threads completed (encoding + send + recv)" << std::endl;
     }
     
     void stop_pipeline() {

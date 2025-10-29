@@ -20,8 +20,8 @@
 #include <sched.h>
 #include <unistd.h>
 
-#include "erasure_code.h"
-#include "raid.h"
+#include <isa-l/erasure_code.h>
+#include <isa-l/raid.h>
 
 /* globals for threaded workers */
 static unsigned char **g_big_v = NULL; /* for xor: per-vect big buffers */
@@ -35,6 +35,12 @@ static int g_warmup = 0;
 static int g_use_base = 0;
 static int g_k = 0;
 static int g_rows = 0;
+/* Per-worker pointer views: g_worker_v[w][i] points to the i-th vector for worker w */
+static unsigned char ***g_worker_v = NULL;
+/* For ec: g_worker_src[w][i] and g_worker_dest[w][j] */
+static unsigned char ***g_worker_src = NULL;
+static unsigned char ***g_worker_dest = NULL;
+static int *g_worker_len = NULL; /* per-worker segment length (may vary if len%workers!=0) */
 
 static void *aligned_alloc32(size_t size) {
     void *ptr = NULL;
@@ -53,49 +59,154 @@ static double now_sec(void) {
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
 
+/* Simple recursive-descent evaluator for integer expressions used by -n
+ * Supports + - * / and parentheses. These helpers are at file scope to
+ * avoid nested-function compiler issues.
+ */
+static void _skip_spaces(const char **s) {
+    while (**s == ' ' || **s == '\t') (*s)++;
+}
+
+static long long _parse_expr(const char **s, const char *expr); /* forward */
+
+static long long _parse_number(const char **s, const char *expr) {
+    _skip_spaces(s);
+    if (**s == '(') {
+        (*s)++; /* skip '(' */
+        long long v = _parse_expr(s, expr);
+        _skip_spaces(s);
+        if (**s != ')') {
+            fprintf(stderr, "Invalid -n expression (missing ')'): %s\n", expr);
+            exit(1);
+        }
+        (*s)++; /* skip ')' */
+        return v;
+    }
+    char *endptr = NULL;
+    long long v = strtoll(*s, &endptr, 0);
+    if (endptr == *s) {
+        fprintf(stderr, "Invalid -n number in expression: %s\n", expr);
+        exit(1);
+    }
+    *s = endptr;
+    return v;
+}
+
+static long long _parse_term(const char **s, const char *expr) {
+    _skip_spaces(s);
+    long long v = _parse_number(s, expr);
+    for (;;) {
+        _skip_spaces(s);
+        if (**s == '*') {
+            (*s)++;
+            long long r = _parse_number(s, expr);
+            v = v * r;
+        } else if (**s == '/') {
+            (*s)++;
+            long long r = _parse_number(s, expr);
+            if (r == 0) { fprintf(stderr, "Division by zero in -n expression: %s\n", expr); exit(1); }
+            v = v / r;
+        } else break;
+    }
+    return v;
+}
+
+static long long _parse_expr(const char **s, const char *expr) {
+    _skip_spaces(s);
+    long long v = _parse_term(s, expr);
+    for (;;) {
+        _skip_spaces(s);
+        if (**s == '+') {
+            (*s)++;
+            long long r = _parse_term(s, expr);
+            v = v + r;
+        } else if (**s == '-') {
+            (*s)++;
+            long long r = _parse_term(s, expr);
+            v = v - r;
+        } else break;
+    }
+    return v;
+}
+
+static long long eval_expr_string(const char *expr) {
+    const char *p = expr;
+    long long val = _parse_expr(&p, expr);
+    _skip_spaces(&p);
+    if (*p != '\0') {
+        fprintf(stderr, "Invalid trailing characters in -n expression: %s\n", expr);
+        exit(1);
+    }
+    return val;
+}
+
+/* Warmup-only xor worker: runs g_warmup iterations but does not time.
+ * Returns NULL to indicate no timing value.
+ */
+static void *xor_worker_warm(void *arg) {
+    int id = *(int *)arg;
+    int curcpu = sched_getcpu();
+    printf("xor warmup worker %d started on cpu %d\n", id, curcpu);
+    /* Use precomputed per-worker pointer array */
+    unsigned char **local = g_worker_v[id];
+    int local_len = g_worker_len ? g_worker_len[id] : g_len;
+    for (int w = 0; w < g_warmup; ++w) {
+        if (g_use_base) xor_gen_base(g_vects, local_len, (void **)local);
+        else xor_gen_avx(g_vects, local_len, (void **)local);
+    }
+    return NULL;
+}
+
+/* Timed xor worker: runs g_iters iterations and returns elapsed seconds */
 static void *xor_worker_thread(void *arg) {
     int id = *(int *)arg;
     int curcpu = sched_getcpu();
     printf("xor worker %d started on cpu %d\n", id, curcpu);
-    unsigned char **local = malloc(sizeof(unsigned char*) * g_vects);
-    for (int i = 0; i < g_vects; ++i) local[i] = g_big_v[i] + (size_t)id * g_len;
-    for (int w = 0; w < g_warmup; ++w) {
-        if (g_use_base) xor_gen_base(g_vects, g_len, (void **)local);
-        else xor_gen(g_vects, g_len, (void **)local);
-    }
+    unsigned char **local = g_worker_v[id];
+    int local_len = g_worker_len ? g_worker_len[id] : g_len;
     double t0 = now_sec();
     for (int it = 0; it < g_iters; ++it) {
-        if (g_use_base) xor_gen_base(g_vects, g_len, (void **)local);
-        else xor_gen(g_vects, g_len, (void **)local);
+        if (g_use_base) xor_gen_base(g_vects, local_len, (void **)local);
+        else xor_gen_avx(g_vects, local_len, (void **)local);
     }
     double t1 = now_sec();
     double *ret = malloc(sizeof(double));
     *ret = t1 - t0;
-    free(local);
     return ret;
 }
 
+/* Warmup-only ec worker: runs g_warmup iterations but does not time. */
+static void *ec_worker_warm(void *arg) {
+    int id = *(int *)arg;
+    int curcpu = sched_getcpu();
+    printf("ec warmup worker %d started on cpu %d\n", id, curcpu);
+    /* Use precomputed per-worker pointer arrays */
+    unsigned char **src_local = g_worker_src[id];
+    unsigned char **dest_local = g_worker_dest[id];
+    int local_len = g_worker_len ? g_worker_len[id] : g_len;
+    for (int w = 0; w < g_warmup; ++w) {
+        if (g_use_base) ec_encode_data_base(local_len, g_k, g_rows, g_gftbls, src_local, dest_local);
+        else ec_encode_data_avx2(local_len, g_k, g_rows, g_gftbls, src_local, dest_local);
+    }
+    return NULL;
+}
+
+/* Timed ec worker: runs g_iters iterations and returns elapsed seconds */
 static void *ec_worker_thread(void *arg) {
     int id = *(int *)arg;
     int curcpu = sched_getcpu();
     printf("ec worker %d started on cpu %d\n", id, curcpu);
-    unsigned char **src_local = malloc(sizeof(unsigned char*) * g_k);
-    unsigned char **dest_local = malloc(sizeof(unsigned char*) * g_rows);
-    for (int i = 0; i < g_k; ++i) src_local[i] = g_big_src[i] + (size_t)id * g_len;
-    for (int i = 0; i < g_rows; ++i) dest_local[i] = g_big_dest[i] + (size_t)id * g_len;
-    for (int w = 0; w < g_warmup; ++w) {
-        if (g_use_base) ec_encode_data_base(g_len, g_k, g_rows, g_gftbls, src_local, dest_local);
-        else ec_encode_data(g_len, g_k, g_rows, g_gftbls, src_local, dest_local);
-    }
+    unsigned char **src_local = g_worker_src[id];
+    unsigned char **dest_local = g_worker_dest[id];
+    int local_len = g_worker_len ? g_worker_len[id] : g_len;
     double t0 = now_sec();
     for (int it = 0; it < g_iters; ++it) {
-        if (g_use_base) ec_encode_data_base(g_len, g_k, g_rows, g_gftbls, src_local, dest_local);
-        else ec_encode_data(g_len, g_k, g_rows, g_gftbls, src_local, dest_local);
+        if (g_use_base) ec_encode_data_base(local_len, g_k, g_rows, g_gftbls, src_local, dest_local);
+        else ec_encode_data_avx2(local_len, g_k, g_rows, g_gftbls, src_local, dest_local);
     }
     double t1 = now_sec();
     double *ret = malloc(sizeof(double));
     *ret = t1 - t0;
-    free(src_local); free(dest_local);
     return ret;
 }
 
@@ -120,7 +231,19 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--base") == 0) use_base = 1;
         else if (strcmp(argv[i], "-k") == 0 && i+1 < argc) k = atoi(argv[++i]);
         else if (strcmp(argv[i], "-d") == 0 && i+1 < argc) dests = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-n") == 0 && i+1 < argc) len = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-n") == 0 && i+1 < argc) {
+            const char *expr = argv[++i];
+            long long val = eval_expr_string(expr);
+            if (val <= 0) {
+                fprintf(stderr, "-n must be > 0 (got %lld)\n", val);
+                return 1;
+            }
+            if (val > INT32_MAX) {
+                fprintf(stderr, "-n value too large: %lld\n", val);
+                return 1;
+            }
+            len = (int)val;
+        }
         else if (strcmp(argv[i], "-i") == 0 && i+1 < argc) iters = atoi(argv[++i]);
         else if (strcmp(argv[i], "-w") == 0 && i+1 < argc) warmup = atoi(argv[++i]);
         else if (strcmp(argv[i], "--workers") == 0 && i+1 < argc) workers = atoi(argv[++i]);
@@ -145,13 +268,13 @@ int main(int argc, char **argv) {
             // Warmup
             for (int w = 0; w < warmup; ++w) {
                 if (use_base) xor_gen_base(vects, len, (void **)ptrs);
-                else xor_gen(vects, len, (void **)ptrs);
+                else xor_gen_avx(vects, len, (void **)ptrs);
             }
 
             double t0 = now_sec();
             for (int it = 0; it < iters; ++it) {
                 if (use_base) xor_gen_base(vects, len, (void **)ptrs);
-                else xor_gen(vects, len, (void **)ptrs);
+                else xor_gen_avx(vects, len, (void **)ptrs);
             }
             double t1 = now_sec();
             long long total = (long long)len * (long long)k * (long long)iters;
@@ -167,16 +290,66 @@ int main(int argc, char **argv) {
             g_vects = vects; g_len = len; g_iters = iters; g_warmup = warmup; g_use_base = use_base;
             g_big_v = malloc(sizeof(unsigned char*) * vects);
             for (int i = 0; i < vects; ++i) {
-                size_t sz = (size_t)len * (size_t)workers;
+                /* allocate only 'len' per vector (total memory = vects * len)
+                 * We'll partition that buffer across workers.
+                 */
+                size_t sz = (size_t)len;
                 g_big_v[i] = aligned_alloc32(sz);
                 if (!g_big_v[i]) { perror("posix_memalign big_v"); return 1; }
-                /* fill each worker segment */
-                for (int w = 0; w < workers; ++w) fill_random(g_big_v[i] + (size_t)w * len, len);
+                fill_random(g_big_v[i], len);
+            }
+            /* Precompute per-worker pointer arrays so threads can use them without
+             * allocating or computing offsets themselves. g_worker_v[w][i]
+             * points to vector i for worker w (offset by w * len).
+             */
+            g_worker_v = malloc(sizeof(unsigned char**) * workers);
+            if (!g_worker_v) { perror("malloc g_worker_v"); return 1; }
+            /* compute per-worker lengths (split len across workers) */
+            g_worker_len = malloc(sizeof(int) * workers);
+            if (!g_worker_len) { perror("malloc g_worker_len"); return 1; }
+            int base = len / workers;
+            int rem = len % workers;
+            for (int w = 0; w < workers; ++w) g_worker_len[w] = base + (w < rem ? 1 : 0);
+
+            for (int w = 0; w < workers; ++w) {
+                g_worker_v[w] = malloc(sizeof(unsigned char*) * vects);
+                if (!g_worker_v[w]) { perror("malloc g_worker_v[w]"); return 1; }
+            }
+            /* assign pointers with cumulative offsets */
+            for (int w = 0; w < workers; ++w) {
+                size_t off = 0;
+                for (int t = 0; t < w; ++t) off += (size_t)g_worker_len[t];
+                for (int i = 0; i < vects; ++i) {
+                    g_worker_v[w][i] = g_big_v[i] + off;
+                }
             }
             pthread_t *ths = malloc(sizeof(pthread_t) * workers);
             int *ids = malloc(sizeof(int) * workers);
+
+            /* Phase 1: run warmup across all workers (not timed) */
+            for (int id = 0; id < workers; ++id) ids[id] = id;
             for (int id = 0; id < workers; ++id) {
-                ids[id] = id;
+                if (do_pin) {
+                    pthread_attr_t attr;
+                    cpu_set_t cpuset;
+                    pthread_attr_init(&attr);
+                    CPU_ZERO(&cpuset);
+                    CPU_SET(cpu_start + id, &cpuset);
+                    pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
+                    if (pthread_create(&ths[id], &attr, xor_worker_warm, &ids[id]) != 0) {
+                        perror("pthread_create warmup"); return 1;
+                    }
+                    pthread_attr_destroy(&attr);
+                } else {
+                    if (pthread_create(&ths[id], NULL, xor_worker_warm, &ids[id]) != 0) {
+                        perror("pthread_create warmup"); return 1;
+                    }
+                }
+            }
+            for (int id = 0; id < workers; ++id) pthread_join(ths[id], NULL);
+
+            /* Phase 2: timed workers */
+            for (int id = 0; id < workers; ++id) {
                 if (do_pin) {
                     pthread_attr_t attr;
                     cpu_set_t cpuset;
@@ -185,12 +358,12 @@ int main(int argc, char **argv) {
                     CPU_SET(cpu_start + id, &cpuset);
                     pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
                     if (pthread_create(&ths[id], &attr, xor_worker_thread, &ids[id]) != 0) {
-                        perror("pthread_create"); return 1;
+                        perror("pthread_create timed"); return 1;
                     }
                     pthread_attr_destroy(&attr);
                 } else {
                     if (pthread_create(&ths[id], NULL, xor_worker_thread, &ids[id]) != 0) {
-                        perror("pthread_create"); return 1;
+                        perror("pthread_create timed"); return 1;
                     }
                 }
             }
@@ -201,13 +374,18 @@ int main(int argc, char **argv) {
                 double t = *(double*)r; free(r);
                 if (t > max_time) max_time = t;
             }
-            long long total = (long long)len * (long long)k * (long long)iters * (long long)workers;
-            double mb = total / (1024.0*1024.0);
+         long long total = 0;
+         for (int w = 0; w < workers; ++w) total += (long long)g_worker_len[w] * (long long)k * (long long)iters;
+         double mb = total / (1024.0*1024.0);
             double wall = max_time;
             printf("xor mode (%s) k=%d len=%d iters=%d workers=%d -> bytes=%lld MB=%.2f wall=%.6fs MB/s=%.2f\n",
                    use_base?"base":"opt", k, len, iters, workers, total, mb, wall, mb / wall);
 
             for (int i = 0; i < vects; ++i) free(g_big_v[i]);
+            /* free per-worker pointer arrays */
+            for (int w = 0; w < workers; ++w) free(g_worker_v[w]);
+            free(g_worker_v); g_worker_v = NULL;
+            free(g_worker_len); g_worker_len = NULL;
             free(g_big_v); free(ths); free(ids);
         }
 
@@ -243,13 +421,13 @@ int main(int argc, char **argv) {
             // Warmup
             for (int w = 0; w < warmup; ++w) {
                 if (use_base) ec_encode_data_base(len, k, rows, g_tbls, src, dest);
-                else ec_encode_data(len, k, rows, g_tbls, src, dest);
+                else ec_encode_data_avx2(len, k, rows, g_tbls, src, dest);
             }
 
             double t0 = now_sec();
             for (int it = 0; it < iters; ++it) {
                 if (use_base) ec_encode_data_base(len, k, rows, g_tbls, src, dest);
-                else ec_encode_data(len, k, rows, g_tbls, src, dest);
+                else ec_encode_data_avx2(len, k, rows, g_tbls, src, dest);
             }
             double t1 = now_sec();
 
@@ -265,24 +443,48 @@ int main(int argc, char **argv) {
         } else {
             /* multi-worker ec: allocate per-src and per-dest big buffers */
             g_k = k; g_rows = rows; g_len = len; g_iters = iters; g_warmup = warmup; g_use_base = use_base;
-            size_t seg = (size_t)len * (size_t)workers;
             g_big_src = malloc(sizeof(unsigned char*) * k);
             g_big_dest = malloc(sizeof(unsigned char*) * rows);
             for (int i = 0; i < k; ++i) {
-                g_big_src[i] = aligned_alloc32(seg);
+                /* allocate only 'len' per source and partition across workers */
+                g_big_src[i] = aligned_alloc32((size_t)len);
                 if (!g_big_src[i]) { perror("posix_memalign big_src"); return 1; }
-                for (int w = 0; w < workers; ++w) fill_random(g_big_src[i] + (size_t)w * len, len);
+                fill_random(g_big_src[i], len);
             }
             for (int i = 0; i < rows; ++i) {
-                g_big_dest[i] = aligned_alloc32(seg);
+                g_big_dest[i] = aligned_alloc32((size_t)len);
                 if (!g_big_dest[i]) { perror("posix_memalign big_dest"); return 1; }
-                for (int w = 0; w < workers; ++w) memset(g_big_dest[i] + (size_t)w * len, 0, len);
+                memset(g_big_dest[i], 0, len);
+            }
+
+            /* Precompute per-worker src/dest pointer arrays */
+            /* compute per-worker lengths (split len across workers) */
+            g_worker_len = malloc(sizeof(int) * workers);
+            if (!g_worker_len) { perror("malloc g_worker_len"); return 1; }
+            int base = len / workers;
+            int rem = len % workers;
+            for (int w = 0; w < workers; ++w) g_worker_len[w] = base + (w < rem ? 1 : 0);
+
+            g_worker_src = malloc(sizeof(unsigned char**) * workers);
+            g_worker_dest = malloc(sizeof(unsigned char**) * workers);
+            if (!g_worker_src || !g_worker_dest) { perror("malloc g_worker_src/dest"); return 1; }
+            for (int w = 0; w < workers; ++w) {
+                g_worker_src[w] = malloc(sizeof(unsigned char*) * k);
+                g_worker_dest[w] = malloc(sizeof(unsigned char*) * rows);
+                if (!g_worker_src[w] || !g_worker_dest[w]) { perror("malloc worker pointers"); return 1; }
+            }
+            /* assign pointers with cumulative offsets */
+            for (int w = 0; w < workers; ++w) {
+                size_t off = 0;
+                for (int t = 0; t < w; ++t) off += (size_t)g_worker_len[t];
+                for (int i = 0; i < k; ++i) g_worker_src[w][i] = g_big_src[i] + off;
+                for (int i = 0; i < rows; ++i) g_worker_dest[w][i] = g_big_dest[i] + off;
             }
 
             // prepare encode matrix a and g_tbls (shared read-only)
             int m = k + rows;
             unsigned char *a = malloc((size_t)k * m);
-            for (int i = 0; i < k * m; ++i) a[i] = 1;
+            gf_gen_cauchy1_matrix(a, m, k);
             size_t gtbls_size = 32 * (size_t)k * (size_t)rows;
             unsigned char *g_tbls = aligned_alloc32(gtbls_size);
             if (!g_tbls) { perror("posix_memalign g_tbls"); return 1; }
@@ -291,8 +493,10 @@ int main(int argc, char **argv) {
 
             pthread_t *ths = malloc(sizeof(pthread_t) * workers);
             int *ids = malloc(sizeof(int) * workers);
+
+            /* Phase 1: run warmup across all workers (not timed) */
+            for (int id = 0; id < workers; ++id) ids[id] = id;
             for (int id = 0; id < workers; ++id) {
-                ids[id] = id;
                 if (do_pin) {
                     pthread_attr_t attr;
                     cpu_set_t cpuset;
@@ -300,10 +504,27 @@ int main(int argc, char **argv) {
                     CPU_ZERO(&cpuset);
                     CPU_SET(cpu_start + id, &cpuset);
                     pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
-                    if (pthread_create(&ths[id], &attr, ec_worker_thread, &ids[id]) != 0) { perror("pthread_create"); return 1; }
+                    if (pthread_create(&ths[id], &attr, ec_worker_warm, &ids[id]) != 0) { perror("pthread_create warmup"); return 1; }
                     pthread_attr_destroy(&attr);
                 } else {
-                    if (pthread_create(&ths[id], NULL, ec_worker_thread, &ids[id]) != 0) { perror("pthread_create"); return 1; }
+                    if (pthread_create(&ths[id], NULL, ec_worker_warm, &ids[id]) != 0) { perror("pthread_create warmup"); return 1; }
+                }
+            }
+            for (int id = 0; id < workers; ++id) pthread_join(ths[id], NULL);
+
+            /* Phase 2: timed workers */
+            for (int id = 0; id < workers; ++id) {
+                if (do_pin) {
+                    pthread_attr_t attr;
+                    cpu_set_t cpuset;
+                    pthread_attr_init(&attr);
+                    CPU_ZERO(&cpuset);
+                    CPU_SET(cpu_start + id, &cpuset);
+                    pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
+                    if (pthread_create(&ths[id], &attr, ec_worker_thread, &ids[id]) != 0) { perror("pthread_create timed"); return 1; }
+                    pthread_attr_destroy(&attr);
+                } else {
+                    if (pthread_create(&ths[id], NULL, ec_worker_thread, &ids[id]) != 0) { perror("pthread_create timed"); return 1; }
                 }
             }
             double max_time = 0.0;
@@ -312,14 +533,20 @@ int main(int argc, char **argv) {
                 double t = *(double*)r; free(r);
                 if (t > max_time) max_time = t;
             }
-            long long total = (long long)len * (long long)k * (long long)iters * (long long)workers;
-            double mb = total / (1024.0*1024.0);
+         long long total = 0;
+         for (int w = 0; w < workers; ++w) total += (long long)g_worker_len[w] * (long long)k * (long long)iters;
+         double mb = total / (1024.0*1024.0);
             double wall = max_time;
             printf("ec mode (%s) k=%d rows=%d len=%d iters=%d workers=%d -> bytes=%lld MB=%.2f wall=%.6fs MB/s=%.2f\n",
                    use_base?"base":"opt", k, rows, len, iters, workers, total, mb, wall, mb / wall);
 
             for (int i = 0; i < k; ++i) free(g_big_src[i]);
             for (int i = 0; i < rows; ++i) free(g_big_dest[i]);
+            /* free per-worker pointer arrays */
+            for (int w = 0; w < workers; ++w) { free(g_worker_src[w]); free(g_worker_dest[w]); }
+            free(g_worker_src); g_worker_src = NULL;
+            free(g_worker_dest); g_worker_dest = NULL;
+            free(g_worker_len); g_worker_len = NULL;
             free(g_big_src); free(g_big_dest); free(a); free(g_tbls); free(ths); free(ids);
         }
 

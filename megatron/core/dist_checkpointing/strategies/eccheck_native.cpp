@@ -13,6 +13,9 @@
 #include <unordered_map>
 #include <fstream>
 #include <chrono>
+#include <isa-l/erasure_code.h>
+#include <isa-l/raid.h>
+#include <cstdlib>
 
 // NCCL includes
 #ifdef NCCL_AVAILABLE
@@ -111,6 +114,15 @@ private:
     ncclComm_t nccl_comm_thread2_;  // Thread2专用通信域
     bool nccl_thread1_initialized_;
     bool nccl_thread2_initialized_;
+#ifdef __GNUC__
+#endif
+
+    // EC parameters (k, rows=2) and tables
+    int k_;
+    int rows_;
+    int data_block_index_;
+    unsigned char *a_mat_;    // RS matrix (k * m)
+    unsigned char *g_tbls_;   // tables produced by ec_init_tables (32 * k * rows)
 #else
     bool nccl_thread1_initialized_;
     bool nccl_thread2_initialized_;
@@ -230,13 +242,46 @@ private:
     // ========== Worker线程函数 ==========
     
     void encode_with_coefficient(uintptr_t data_addr, size_t size, uintptr_t encoding_addr, int coefficient) {
-        // 简单的编码：乘以系数
-        uint8_t* data_ptr = reinterpret_cast<uint8_t*>(data_addr);
-        uint8_t* encoding_ptr = reinterpret_cast<uint8_t*>(encoding_addr);
-        
-        for (size_t i = 0; i < size; ++i) {
-            encoding_ptr[i] = data_ptr[i] * coefficient;
+        // 使用 isa-l 的 EC 编码对整块 buffer 进行编码。
+        // 我们在初始化时已经生成了 RS 矩阵并通过 ec_init_tables 产生了 g_tbls_。
+        // 每个 encoder 线程只保留自己负责的 parity（encoding_addr 指向本地 parity buffer），
+
+        // 如果没有正确初始化 EC 表，回退到简单乘法
+        if (k_ <= 0 || rows_ != 2 || g_tbls_ == nullptr) {
+            uint8_t* data_ptr = reinterpret_cast<uint8_t*>(data_addr);
+            uint8_t* encoding_ptr = reinterpret_cast<uint8_t*>(encoding_addr);
+            for (size_t i = 0; i < size; ++i) {
+                encoding_ptr[i] = data_ptr[i] * (uint8_t)(coefficient & 0xFF);
+            }
+            return;
         }
+
+        unsigned char *data_ptr = reinterpret_cast<unsigned char*>(data_addr);
+        unsigned char *enc_ptr = reinterpret_cast<unsigned char*>(encoding_addr);
+
+        // 从 g_tbls_ 中取出对应 (parity_index, vec_index) 的 32 字节表，
+        // 并构造 k=1, rows=1 的调用参数。
+        int parity_idx = coefficient;
+        if (parity_idx < 0 || parity_idx >= rows_) parity_idx = 0;
+
+        // Ensure data_block_index_ in range
+        if (data_block_index_ < 0 || data_block_index_ >= k_) {
+            std::cerr << "EC-CHECK: invalid data_block_index_=" << data_block_index_ << " for k=" << k_ << std::endl;
+            return;
+        }
+
+        // Compute offset into g_tbls_: layout from ec_init_tables is for i in rows, j in k -> offset = (i*k + j) * 32
+        size_t offset = (size_t)((parity_idx * k_) + data_block_index_) * 32;
+        unsigned char *gftbls_ptr = g_tbls_ + offset;
+
+        // Prepare single-element arrays for ec_encode_data
+        unsigned char *srcs[1];
+        unsigned char *dests[1];
+        srcs[0] = data_ptr;
+        dests[0] = enc_ptr;
+
+        // Call ec_encode_data with len=size, k=1, rows=1, gftbls_ptr
+        ec_encode_data((int)size, 1, 1, gftbls_ptr, srcs, dests);
     }
     
     // Encoding Thread 1 worker
@@ -287,8 +332,8 @@ private:
             bool need_encode = (task.data_addr != 0 && task.encoding_addr != 0);
             
             if (need_encode) {
-                // Perform encoding
-                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 1);
+                // Perform encoding (parity index 0 for thread1)
+                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 0);
                 
                 // Mark data buffer as copied by thread 1
                 {
@@ -376,8 +421,8 @@ private:
             bool need_encode = (task.data_addr != 0 && task.encoding_addr != 0);
             
             if (need_encode) {
-                // Perform encoding
-                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 2);
+                // Perform encoding (parity index 1 for thread2)
+                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 1);
                 
                 // Mark data buffer as copied by thread 2
                 {
@@ -659,25 +704,65 @@ public:
           recv_worker_1_completed_(false), recv_worker_2_completed_(false),
           should_stop_threads_(false),
           nccl_thread1_initialized_(false), nccl_thread2_initialized_(false),
-          nccl_thread1_init_completed_(false), nccl_thread2_init_completed_(false) {
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Constructor called, starting pipeline..." << std::endl;
-        
+          nccl_thread1_init_completed_(false), nccl_thread2_init_completed_(false),
+          k_(0), rows_(0), data_block_index_(0), a_mat_(nullptr), g_tbls_(nullptr) {
+
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Constructor called, initializing EC tables and starting pipeline..." << std::endl;
+
+        // Initialize EC params: k = world_size / 2, rows = 2, data_block_index = rank / 2
+        rows_ = 2;
+        if (world_size_ <= 0) {
+            k_ = 0;
+        } else {
+            k_ = world_size_ / 2;
+        }
+        data_block_index_ = rank_ / 2;
+
+        if (k_ > 0) {
+            int m = k_ + rows_;
+            // allocate matrix a (k * m)
+            a_mat_ = (unsigned char*)malloc((size_t)k_ * (size_t)m);
+            if (a_mat_ == nullptr) {
+                std::cerr << "EC-CHECK: failed to allocate a_mat_" << std::endl;
+            } else {
+                // generate RS matrix
+                gf_gen_rs_matrix(a_mat_, m, k_);
+
+                // allocate g_tbls_: 32 * k * rows
+                size_t gtbls_size = 32 * (size_t)k_ * (size_t)rows_;
+                void *tmp = nullptr;
+                if (posix_memalign(&tmp, 32, gtbls_size) != 0) tmp = nullptr;
+                if (tmp == nullptr) tmp = malloc(gtbls_size);
+                g_tbls_ = reinterpret_cast<unsigned char*>(tmp);
+                if (g_tbls_ == nullptr) {
+                    std::cerr << "EC-CHECK: failed to allocate g_tbls_" << std::endl;
+                } else {
+                    // initialize tables using isa-l
+                    ec_init_tables(k_, rows_, a_mat_, g_tbls_);
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] EC tables initialized (k=" << k_ << ", rows=" << rows_ << ", data_idx=" << data_block_index_ << ")" << std::endl;
+                }
+            }
+        } else {
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] skipping EC init because k<=0" << std::endl;
+        }
+
         start_pipeline();
-        
+
         // Wait for both NCCL communicators to be initialized
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Waiting for NCCL initialization (thread1 and thread2)..." << std::endl;
         std::unique_lock<std::mutex> lock(nccl_init_mutex_);
         nccl_init_cv_.wait(lock, [this] { 
             return nccl_thread1_init_completed_.load() && nccl_thread2_init_completed_.load(); 
         });
-        
+
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline and NCCL initialized successfully" << std::endl;
     }
     
     ~ECCHECKNative() {
         stop_pipeline();
         cleanup_nccl();
+        if (a_mat_) { free(a_mat_); a_mat_ = nullptr; }
+        if (g_tbls_) { free(g_tbls_); g_tbls_ = nullptr; }
     }
     
     void set_buffer_addresses(const std::vector<uintptr_t>& data_addrs,

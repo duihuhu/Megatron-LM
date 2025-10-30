@@ -16,6 +16,7 @@
 #include <isa-l/erasure_code.h>
 #include <isa-l/raid.h>
 #include <cstdlib>
+#include <cstdint>
 
 // NCCL includes
 #ifdef NCCL_AVAILABLE
@@ -42,6 +43,7 @@ private:
         uintptr_t encoding_addr;
         uintptr_t recv_addr;        // 接收地址
         size_t recv_chunk_size;     // 接收大小
+        uintptr_t parity_addr;      // Parity缓冲区地址（XOR结果）
     };
     
     std::queue<EncodingTask> encoding_tasks_1_;  // Thread1的编码任务
@@ -76,6 +78,20 @@ private:
     std::condition_variable recv_queue_1_cv_;
     std::condition_variable recv_queue_2_cv_;
     
+    // XOR任务队列（接收完成后提交）
+    struct XorTask {
+        uintptr_t local_encoding_addr;  // 本地编码数据地址
+        uintptr_t recv_encoding_addr;   // 接收到的编码数据地址
+        uintptr_t parity_addr;          // Parity缓冲区地址（XOR结果）
+        size_t size;                    // 数据大小
+    };
+    std::queue<XorTask> xor_queue_1_;
+    std::queue<XorTask> xor_queue_2_;
+    std::mutex xor_queue_1_mutex_;
+    std::mutex xor_queue_2_mutex_;
+    std::condition_variable xor_queue_1_cv_;
+    std::condition_variable xor_queue_2_cv_;
+    
     // Completion flags
     std::atomic<bool> encoding_thread_1_completed_;
     std::atomic<bool> encoding_thread_2_completed_;
@@ -83,6 +99,8 @@ private:
     std::atomic<bool> send_worker_2_completed_;
     std::atomic<bool> recv_worker_1_completed_;
     std::atomic<bool> recv_worker_2_completed_;
+    std::atomic<bool> xor_worker_1_completed_;
+    std::atomic<bool> xor_worker_2_completed_;
     
     // Stop flag for graceful shutdown
     std::atomic<bool> should_stop_threads_;
@@ -95,18 +113,42 @@ private:
     std::unordered_map<uintptr_t, DataBufferState> data_buffer_states_;
     std::mutex data_buffer_state_mutex_;
     
+    // Recv address to encoding/parity address mapping (for XOR task submission)
+    struct RecvMapping {
+        uintptr_t encoding_addr;
+        uintptr_t parity_addr;
+        size_t size;
+    };
+    std::unordered_map<uintptr_t, RecvMapping> recv_to_xor_mapping_1_;  // For thread 1
+    std::unordered_map<uintptr_t, RecvMapping> recv_to_xor_mapping_2_;  // For thread 2
+    std::mutex recv_mapping_1_mutex_;
+    std::mutex recv_mapping_2_mutex_;
+    
     // Buffers ready for release
     std::queue<uintptr_t> data_buffers_to_release_;
     std::queue<uintptr_t> encoding_buffers_to_release_;
+    std::queue<uintptr_t> parity_buffers_to_release_;
     std::mutex release_queue_mutex_;
     
-    // Worker threads - 每个encoding线程配备独立的send/recv worker
+    // Persistent stores for final results (in-memory), optional
+    uintptr_t persist_recv_base_ = 0;      // Base address for persistent recv store
+    uintptr_t persist_parity_base_ = 0;    // Base address for persistent parity store
+    size_t persist_recv_capacity_ = 0;     // Total bytes capacity of recv store
+    size_t persist_parity_capacity_ = 0;   // Total bytes capacity of parity store
+    std::atomic<size_t> persist_recv_offset_{0};
+    std::atomic<size_t> persist_parity_offset_{0};
+    std::atomic<bool> persist_recv_enabled_{false};
+    std::atomic<bool> persist_parity_enabled_{false};
+    
+    // Worker threads - 每个encoding线程配备独立的send/recv/xor worker
     std::thread encoder_thread_1_;
     std::thread encoder_thread_2_;
     std::thread send_worker_1_;     // 专门发送thread1的编码数据
     std::thread recv_worker_1_;     // 专门接收给thread1的数据
     std::thread send_worker_2_;     // 专门发送thread2的编码数据
     std::thread recv_worker_2_;     // 专门接收给thread2的数据
+    std::thread xor_worker_1_;      // 专门执行thread1的XOR操作
+    std::thread xor_worker_2_;      // 专门执行thread2的XOR操作
     
     // NCCL communicators - 每个线程有独立的通信域
 #ifdef NCCL_AVAILABLE
@@ -307,7 +349,7 @@ private:
             
             // Check for sentinel (end signal): all fields are 0
             if (task.data_addr == 0 && task.size == 0 && 
-                task.encoding_addr == 0 && task.recv_addr == 0 && task.recv_chunk_size == 0) {
+                task.encoding_addr == 0 && task.recv_addr == 0 && task.recv_chunk_size == 0 && task.parity_addr == 0) {
                 encoding_thread_1_completed_ = true;
                 std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 received sentinel, marking completed" << std::endl;
                 
@@ -324,6 +366,13 @@ private:
                     recv_queue_1_.push({0, 0});
                 }
                 recv_queue_1_cv_.notify_one();
+                
+                // Submit sentinel to xor_worker_1
+                {
+                    std::lock_guard<std::mutex> lock(xor_queue_1_mutex_);
+                    xor_queue_1_.push({0, 0, 0, 0});
+                }
+                xor_queue_1_cv_.notify_one();
                 
                 continue;  // Continue waiting for next round
             }
@@ -396,7 +445,7 @@ private:
             
             // Check for sentinel (end signal): all fields are 0
             if (task.data_addr == 0 && task.size == 0 && 
-                task.encoding_addr == 0 && task.recv_addr == 0 && task.recv_chunk_size == 0) {
+                task.encoding_addr == 0 && task.recv_addr == 0 && task.recv_chunk_size == 0 && task.parity_addr == 0) {
                 encoding_thread_2_completed_ = true;
                 std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 received sentinel, marking completed" << std::endl;
                 
@@ -413,6 +462,13 @@ private:
                     recv_queue_2_.push({0, 0});
                 }
                 recv_queue_2_cv_.notify_one();
+                
+                // Submit sentinel to xor_worker_2
+                {
+                    std::lock_guard<std::mutex> lock(xor_queue_2_mutex_);
+                    xor_queue_2_.push({0, 0, 0, 0});
+                }
+                xor_queue_2_cv_.notify_one();
                 
                 continue;
             }
@@ -556,6 +612,38 @@ private:
                 ncclGroupEnd();
             }
 #endif
+            
+            // Persist recv data into continuous store if enabled (thread1 only)
+            if (persist_recv_enabled_.load() && persist_recv_base_ != 0 && task.size > 0) {
+                size_t offset = persist_recv_offset_.fetch_add(task.size);
+                if (offset + task.size <= persist_recv_capacity_) {
+                    void* dst = reinterpret_cast<void*>(persist_recv_base_ + offset);
+                    void* src = reinterpret_cast<void*>(task.recv_addr);
+                    std::memcpy(dst, src, task.size);
+                } else {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] recv persist overflow: offset="
+                              << offset << ", size=" << task.size << ", cap=" << persist_recv_capacity_ << std::endl;
+                }
+            }
+            
+            // After receiving, submit XOR task: local_encoding XOR recv_encoding -> parity
+            {
+                std::lock_guard<std::mutex> lock(recv_mapping_1_mutex_);
+                auto it = recv_to_xor_mapping_1_.find(task.recv_addr);
+                if (it != recv_to_xor_mapping_1_.end()) {
+                    const RecvMapping& mapping = it->second;
+                    // Submit XOR task: local encoding XOR received encoding -> parity
+                    {
+                        std::lock_guard<std::mutex> xor_lock(xor_queue_1_mutex_);
+                        xor_queue_1_.push({mapping.encoding_addr, task.recv_addr, mapping.parity_addr, mapping.size});
+                    }
+                    xor_queue_1_cv_.notify_one();
+                    // Remove from mapping after submitting
+                    recv_to_xor_mapping_1_.erase(it);
+                } else {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] Warning: No mapping found for recv_addr=" << task.recv_addr << std::endl;
+                }
+            }
         }
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 1 exiting" << std::endl;
@@ -655,9 +743,153 @@ private:
                 ncclGroupEnd();
             }
 #endif
+            
+            // Thread2: skip persisting recv to avoid double-writing into single store
+            
+            // After receiving, submit XOR task: local_encoding XOR recv_encoding -> parity
+            {
+                std::lock_guard<std::mutex> lock(recv_mapping_2_mutex_);
+                auto it = recv_to_xor_mapping_2_.find(task.recv_addr);
+                if (it != recv_to_xor_mapping_2_.end()) {
+                    const RecvMapping& mapping = it->second;
+                    // Submit XOR task: local encoding XOR received encoding -> parity
+                    {
+                        std::lock_guard<std::mutex> xor_lock(xor_queue_2_mutex_);
+                        xor_queue_2_.push({mapping.encoding_addr, task.recv_addr, mapping.parity_addr, mapping.size});
+                    }
+                    xor_queue_2_cv_.notify_one();
+                    // Remove from mapping after submitting
+                    recv_to_xor_mapping_2_.erase(it);
+                } else {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] Warning: No mapping found for recv_addr=" << task.recv_addr << std::endl;
+                }
+            }
         }
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 2 exiting" << std::endl;
+    }
+    
+    // XOR Worker 1 - 执行本地编码数据与接收编码数据的XOR操作
+    void xor_worker_1() {
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 started" << std::endl;
+        
+        while (!should_stop_threads_) {
+            XorTask task;
+            
+            {
+                std::unique_lock<std::mutex> lock(xor_queue_1_mutex_);
+                xor_queue_1_cv_.wait(lock, [this] {
+                    return !xor_queue_1_.empty() || should_stop_threads_;
+                });
+                
+                if (should_stop_threads_ && xor_queue_1_.empty()) {
+                    break;
+                }
+                
+                task = xor_queue_1_.front();
+                xor_queue_1_.pop();
+            }
+            
+            // Check for sentinel
+            if (task.local_encoding_addr == 0 && task.recv_encoding_addr == 0 && 
+                task.parity_addr == 0 && task.size == 0) {
+                xor_worker_1_completed_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 received sentinel, marking completed" << std::endl;
+                continue;
+            }
+            
+            // Perform XOR: local_encoding XOR recv_encoding -> parity
+            // ISA-L xor_gen requires: array[0..N-1] = sources, array[N] = dest
+            void* xor_array[3];
+            xor_array[0] = reinterpret_cast<void*>(task.local_encoding_addr);
+            xor_array[1] = reinterpret_cast<void*>(task.recv_encoding_addr);
+            xor_array[2] = reinterpret_cast<void*>(task.parity_addr);
+            
+            // xor_gen(vects=3, len=size, array): XOR of sources into dest
+            // For 2 sources, vects=3 (array[0], array[1], array[2])
+            int result = xor_gen(3, (int)task.size, xor_array);
+            if (result != 0) {
+                std::cerr << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 failed: xor_gen returned " << result << std::endl;
+            }
+            
+            // Persist parity result into continuous store if enabled (thread1 only)
+            if (persist_parity_enabled_.load() && persist_parity_base_ != 0 && task.size > 0) {
+                size_t offset = persist_parity_offset_.fetch_add(task.size);
+                if (offset + task.size <= persist_parity_capacity_) {
+                    void* dst = reinterpret_cast<void*>(persist_parity_base_ + offset);
+                    void* src = reinterpret_cast<void*>(task.parity_addr);
+                    std::memcpy(dst, src, task.size);
+                } else {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] parity persist overflow: offset="
+                              << offset << ", size=" << task.size << ", cap=" << persist_parity_capacity_ << std::endl;
+                }
+            }
+            
+            // Release parity buffer after XOR completion
+            // Note: Parity result is stored, but buffer can be reused for next chunk if needed
+            {
+                std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                parity_buffers_to_release_.push(task.parity_addr);
+            }
+        }
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 exiting" << std::endl;
+    }
+    
+    // XOR Worker 2 - 执行本地编码数据与接收编码数据的XOR操作
+    void xor_worker_2() {
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 started" << std::endl;
+        
+        while (!should_stop_threads_) {
+            XorTask task;
+            
+            {
+                std::unique_lock<std::mutex> lock(xor_queue_2_mutex_);
+                xor_queue_2_cv_.wait(lock, [this] {
+                    return !xor_queue_2_.empty() || should_stop_threads_;
+                });
+                
+                if (should_stop_threads_ && xor_queue_2_.empty()) {
+                    break;
+                }
+                
+                task = xor_queue_2_.front();
+                xor_queue_2_.pop();
+            }
+            
+            // Check for sentinel
+            if (task.local_encoding_addr == 0 && task.recv_encoding_addr == 0 && 
+                task.parity_addr == 0 && task.size == 0) {
+                xor_worker_2_completed_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 received sentinel, marking completed" << std::endl;
+                continue;
+            }
+            
+            // Perform XOR: local_encoding XOR recv_encoding -> parity
+            // ISA-L xor_gen requires: array[0..N-1] = sources, array[N] = dest
+            void* xor_array[3];
+            xor_array[0] = reinterpret_cast<void*>(task.local_encoding_addr);
+            xor_array[1] = reinterpret_cast<void*>(task.recv_encoding_addr);
+            xor_array[2] = reinterpret_cast<void*>(task.parity_addr);
+            
+            // xor_gen(vects=3, len=size, array): XOR of sources into dest
+            // For 2 sources, vects=3 (array[0], array[1], array[2])
+            int result = xor_gen(3, (int)task.size, xor_array);
+            if (result != 0) {
+                std::cerr << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 failed: xor_gen returned " << result << std::endl;
+            }
+            
+            // Thread2: skip persisting parity to avoid double-writing into single store
+            
+            // Release parity buffer after XOR completion
+            // Note: Parity result is stored, but buffer can be reused for next chunk if needed
+            {
+                std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                parity_buffers_to_release_.push(task.parity_addr);
+            }
+        }
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 exiting" << std::endl;
     }
 
     void start_pipeline() {
@@ -687,13 +919,15 @@ private:
         encoder_thread_1_ = std::thread(&ECCHECKNative::encoder_worker_1, this);
         encoder_thread_2_ = std::thread(&ECCHECKNative::encoder_worker_2, this);
         
-        // Start send/recv workers for each thread
+        // Start send/recv/xor workers for each thread
         send_worker_1_ = std::thread(&ECCHECKNative::send_worker_1, this);
         recv_worker_1_ = std::thread(&ECCHECKNative::recv_worker_1, this);
+        xor_worker_1_ = std::thread(&ECCHECKNative::xor_worker_1, this);
         send_worker_2_ = std::thread(&ECCHECKNative::send_worker_2, this);
         recv_worker_2_ = std::thread(&ECCHECKNative::recv_worker_2, this);
+        xor_worker_2_ = std::thread(&ECCHECKNative::xor_worker_2, this);
         
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Started 6 threads (2 encoding + 4 send/recv)" << std::endl;
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Started 8 threads (2 encoding + 2 send + 2 recv + 2 XOR)" << std::endl;
     }
 
 public:
@@ -702,6 +936,7 @@ public:
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_1_completed_(false), send_worker_2_completed_(false),
           recv_worker_1_completed_(false), recv_worker_2_completed_(false),
+          xor_worker_1_completed_(false), xor_worker_2_completed_(false),
           should_stop_threads_(false),
           nccl_thread1_initialized_(false), nccl_thread2_initialized_(false),
           nccl_thread1_init_completed_(false), nccl_thread2_init_completed_(false),
@@ -758,6 +993,22 @@ public:
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline and NCCL initialized successfully" << std::endl;
     }
     
+    void set_persist_stores(uintptr_t recv_base, uintptr_t parity_base,
+                            size_t recv_capacity, size_t parity_capacity,
+                            int persist_recv, int persist_parity) {
+        persist_recv_base_ = recv_base;
+        persist_parity_base_ = parity_base;
+        persist_recv_capacity_ = recv_capacity;
+        persist_parity_capacity_ = parity_capacity;
+        persist_recv_enabled_ = (persist_recv != 0);
+        persist_parity_enabled_ = (persist_parity != 0);
+        persist_recv_offset_ = 0;
+        persist_parity_offset_ = 0;
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Registered persistent stores (recv="
+                  << (persist_recv_enabled_ ? "on" : "off") << ", parity="
+                  << (persist_parity_enabled_ ? "on" : "off") << ")" << std::endl;
+    }
+    
     ~ECCHECKNative() {
         stop_pipeline();
         cleanup_nccl();
@@ -780,6 +1031,8 @@ public:
         send_worker_2_completed_ = false;
         recv_worker_1_completed_ = false;
         recv_worker_2_completed_ = false;
+        xor_worker_1_completed_ = false;
+        xor_worker_2_completed_ = false;
     }
     
     void wait_for_encoding_completion() {
@@ -801,7 +1054,13 @@ public:
         }
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Both recv workers completed" << std::endl;
         
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] All threads completed (encoding + send + recv)" << std::endl;
+        // Wait for all XOR workers to complete
+        while (!xor_worker_1_completed_ || !xor_worker_2_completed_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Both XOR workers completed" << std::endl;
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] All threads completed (encoding + send + recv + XOR)" << std::endl;
     }
     
     void stop_pipeline() {
@@ -816,24 +1075,28 @@ public:
         send_queue_2_cv_.notify_all();
         recv_queue_1_cv_.notify_all();
         recv_queue_2_cv_.notify_all();
+        xor_queue_1_cv_.notify_all();
+        xor_queue_2_cv_.notify_all();
         
         // Join all threads
         if (encoder_thread_1_.joinable()) encoder_thread_1_.join();
         if (encoder_thread_2_.joinable()) encoder_thread_2_.join();
         if (send_worker_1_.joinable()) send_worker_1_.join();
         if (recv_worker_1_.joinable()) recv_worker_1_.join();
+        if (xor_worker_1_.joinable()) xor_worker_1_.join();
         if (send_worker_2_.joinable()) send_worker_2_.join();
         if (recv_worker_2_.joinable()) recv_worker_2_.join();
+        if (xor_worker_2_.joinable()) xor_worker_2_.join();
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline stopped" << std::endl;
     }
     
     void submit_data_for_encoding_thread1(uintptr_t data_addr, size_t size, 
                                           uintptr_t encoding_addr, uintptr_t recv_addr, 
-                                          size_t recv_chunk_size) {
+                                          size_t recv_chunk_size, uintptr_t parity_addr) {
         {
             std::lock_guard<std::mutex> lock(encoding_tasks_1_mutex_);
-            encoding_tasks_1_.push({data_addr, size, encoding_addr, recv_addr, recv_chunk_size});
+            encoding_tasks_1_.push({data_addr, size, encoding_addr, recv_addr, recv_chunk_size, parity_addr});
         }
         encoding_tasks_1_cv_.notify_one();
         
@@ -843,16 +1106,28 @@ public:
                 data_buffer_states_[data_addr] = {false, false};
             }
         }
+        
+        // Register recv_addr to encoding/parity mapping for XOR task submission
+        if (recv_addr != 0 && recv_chunk_size != 0 && encoding_addr != 0 && parity_addr != 0) {
+            std::lock_guard<std::mutex> lock(recv_mapping_1_mutex_);
+            recv_to_xor_mapping_1_[recv_addr] = {encoding_addr, parity_addr, recv_chunk_size};
+        }
     }
     
     void submit_data_for_encoding_thread2(uintptr_t data_addr, size_t size,
                                           uintptr_t encoding_addr, uintptr_t recv_addr,
-                                          size_t recv_chunk_size) {
+                                          size_t recv_chunk_size, uintptr_t parity_addr) {
         {
             std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_);
-            encoding_tasks_2_.push({data_addr, size, encoding_addr, recv_addr, recv_chunk_size});
+            encoding_tasks_2_.push({data_addr, size, encoding_addr, recv_addr, recv_chunk_size, parity_addr});
         }
         encoding_tasks_2_cv_.notify_one();
+        
+        // Register recv_addr to encoding/parity mapping for XOR task submission
+        if (recv_addr != 0 && recv_chunk_size != 0 && encoding_addr != 0 && parity_addr != 0) {
+            std::lock_guard<std::mutex> lock(recv_mapping_2_mutex_);
+            recv_to_xor_mapping_2_[recv_addr] = {encoding_addr, parity_addr, recv_chunk_size};
+        }
     }
     
     std::vector<uintptr_t> get_data_buffers_to_release() {
@@ -874,17 +1149,41 @@ public:
         }
         return buffers;
     }
+    
+    std::vector<uintptr_t> get_parity_buffers_to_release() {
+        std::vector<uintptr_t> buffers;
+        std::lock_guard<std::mutex> lock(release_queue_mutex_);
+        while (!parity_buffers_to_release_.empty()) {
+            buffers.push_back(parity_buffers_to_release_.front());
+            parity_buffers_to_release_.pop();
+        }
+        return buffers;
+    }
 };
 
 PYBIND11_MODULE(eccheck_native, m) {
     pybind11::class_<ECCHECKNative>(m, "ECCHECKNative")
         .def(pybind11::init<int, int, int>())
+        .def("set_persist_stores", &ECCHECKNative::set_persist_stores,
+             pybind11::arg("recv_base"),
+             pybind11::arg("parity_base"),
+             pybind11::arg("recv_capacity"),
+             pybind11::arg("parity_capacity"),
+             pybind11::arg("persist_recv"),
+             pybind11::arg("persist_parity"))
         .def("set_buffer_addresses", &ECCHECKNative::set_buffer_addresses)
         .def("reset_encoding_completion_flags", &ECCHECKNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECCHECKNative::wait_for_encoding_completion)
         .def("stop_pipeline", &ECCHECKNative::stop_pipeline)
-        .def("submit_data_for_encoding_thread1", &ECCHECKNative::submit_data_for_encoding_thread1)
-        .def("submit_data_for_encoding_thread2", &ECCHECKNative::submit_data_for_encoding_thread2)
+        .def("submit_data_for_encoding_thread1", &ECCHECKNative::submit_data_for_encoding_thread1,
+             pybind11::arg("data_addr"), pybind11::arg("size"), 
+             pybind11::arg("encoding_addr"), pybind11::arg("recv_addr"), 
+             pybind11::arg("recv_chunk_size"), pybind11::arg("parity_addr"))
+        .def("submit_data_for_encoding_thread2", &ECCHECKNative::submit_data_for_encoding_thread2,
+             pybind11::arg("data_addr"), pybind11::arg("size"),
+             pybind11::arg("encoding_addr"), pybind11::arg("recv_addr"),
+             pybind11::arg("recv_chunk_size"), pybind11::arg("parity_addr"))
         .def("get_data_buffers_to_release", &ECCHECKNative::get_data_buffers_to_release)
-        .def("get_encoding_buffers_to_release", &ECCHECKNative::get_encoding_buffers_to_release);
+        .def("get_encoding_buffers_to_release", &ECCHECKNative::get_encoding_buffers_to_release)
+        .def("get_parity_buffers_to_release", &ECCHECKNative::get_parity_buffers_to_release);
 }

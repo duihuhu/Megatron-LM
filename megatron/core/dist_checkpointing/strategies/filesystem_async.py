@@ -141,6 +141,11 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eccheck_encoding_buffers = None  # List of encoding buffers
         self.eccheck_recv_encoding_buffers = None  # Tuple of two large receive buffers (thread1, thread2)
         self.eccheck_parity_buffers = None  # List of parity buffers for XOR results
+        # Persistent stores (in-memory): final recv and parity results
+        self.eccheck_persist_recv_store: Optional[torch.Tensor] = None
+        self.eccheck_persist_parity_store: Optional[torch.Tensor] = None
+        self.eccheck_persist_recv_enabled: bool = True
+        self.eccheck_persist_parity_enabled: bool = True
         
         # EC-CHECK buffer poller thread (persistent, created once)
         self._buffer_poller_thread = None
@@ -1264,18 +1269,37 @@ class FileSystemWriterAsync(FileSystemWriter):
         Allocate parity buffers for XOR computation results.
         These buffers will store the parity packets after XOR reduction.
         
-        Args:
-            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
-            
+        Note: Each chunk requires 2 parity buffers (one per encoding thread).
+        We allocate enough buffers to support concurrent XOR operations.
+        
         Returns:
             List[torch.Tensor]: List of parity buffers
         """
-        logger.info(f"EC-CHECK: Allocating parity buffers ({self.eccheck_data_buffers_count} buffers)")
+        # Calculate number of chunks based on total tensor size
+        total_bytes = self.decomposed_state_dict.total_tensor_size_bytes
+        num_chunks = (total_bytes + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size
+        
+        # Each chunk requires 2 parity buffers (thread1 and thread2)
+        # We allocate at least as many as encoding buffers to ensure sufficient concurrency
+        # Use max to ensure we have enough even if calculation is off
+        min_parity_buffers = max(
+            self.eccheck_encoding_buffers_count,  # At least as many as encoding buffers
+            num_chunks * 2,  # At least enough for all chunks (2 per chunk)
+            self.eccheck_data_buffers_count * 2  # At least 2x data buffers
+        )
+        
+        logger.info(
+            f"EC-CHECK: Allocating parity buffers\n"
+            f"  Total data size: {total_bytes / (1024**3):.2f} GB\n"
+            f"  Estimated chunks: {num_chunks}\n"
+            f"  Required parity buffers: {num_chunks * 2} (2 per chunk)\n"
+            f"  Allocating: {min_parity_buffers} buffers"
+        )
         
         parity_buffers = []
         
         # Allocate parity buffers for storing XOR results
-        for i in range(self.eccheck_data_buffers_count):
+        for i in range(min_parity_buffers):
             buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
             parity_buffers.append(buffer)
             logger.debug(f"EC-CHECK: Allocated parity buffer {i}: {self.eccheck_buffer_size} bytes")
@@ -1305,6 +1329,16 @@ class FileSystemWriterAsync(FileSystemWriter):
                 logger.debug(f"EC-CHECK: Released encoding buffer at address {encoding_addr}")
             except queue.Full:
                 logger.error(f"EC-CHECK: Encoding buffer queue is full, cannot release buffer {encoding_addr}")
+        
+        # Get parity buffers ready for release
+        if hasattr(self, '_free_parity_buffer_queue'):
+            parity_buffers = self._eccheck_native.get_parity_buffers_to_release()
+            for parity_addr in parity_buffers:
+                try:
+                    self._free_parity_buffer_queue.put_nowait(parity_addr)
+                    logger.debug(f"EC-CHECK: Released parity buffer at address {parity_addr}")
+                except queue.Full:
+                    logger.error(f"EC-CHECK: Parity buffer queue is full, cannot release buffer {parity_addr}")
     
     def _start_buffer_poller_thread(self):
         """Start a persistent background thread to poll and release buffers."""
@@ -1422,6 +1456,16 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Reset completion flags for new encoding round
         self._eccheck_native.reset_encoding_completion_flags()
         
+        # Ensure buffer poller is active before starting
+        if self._buffer_poller_active_event:
+            self._buffer_poller_active_event.set()
+        
+        # Poll a few times to ensure all buffers from previous round are released
+        for _ in range(10):
+            self._poll_and_release_buffers()
+            import time
+            time.sleep(0.01)  # Small delay to let C++ release buffers
+        
         def get_free_data_buffer():
             """Get a free data buffer address, blocking if none available."""
             # Poll for released buffers before trying to get one
@@ -1433,8 +1477,12 @@ class FileSystemWriterAsync(FileSystemWriter):
                 logger.error("EC-CHECK: TIMEOUT waiting for free data buffer - possible deadlock!")
                 # Print queue status for debugging
                 logger.error(f"EC-CHECK: Data buffer queue size: {self._free_data_buffer_queue.qsize()}")
-                return self._free_data_buffer_queue.get()
-                # raise RuntimeError("EC-CHECK: Timeout waiting for data buffer")
+                # Try polling again before giving up
+                self._poll_and_release_buffers()
+                try:
+                    return self._free_data_buffer_queue.get(timeout=1.0)
+                except queue.Empty:
+                    raise RuntimeError("EC-CHECK: Failed to get data buffer even after extended wait")
         
         def get_free_encoding_buffer():
             """Get a free encoding buffer address, blocking if none available."""
@@ -1449,6 +1497,20 @@ class FileSystemWriterAsync(FileSystemWriter):
                 # logger.error(f"EC-CHECK: Encoding buffer queue size: {self._free_encoding_buffer_queue.qsize()}")
                 return self._free_encoding_buffer_queue.get()
                 # raise RuntimeError("EC-CHECK: Timeout waiting for encoding buffer")
+        
+        def get_free_parity_buffer():
+            """Get a free parity buffer address, blocking if none available."""
+            # Poll for released buffers before trying to get one
+            self._poll_and_release_buffers()
+            
+            try:
+                return self._free_parity_buffer_queue.get(timeout=5.0)
+            except queue.Empty:
+                # Try polling again before giving up
+                self._poll_and_release_buffers()
+                logger.error("EC-CHECK: TIMEOUT waiting for free parity buffer - possible deadlock!")
+                logger.error(f"EC-CHECK: Parity buffer queue size: {self._free_parity_buffer_queue.qsize()}")
+                return self._free_parity_buffer_queue.get()
         
         # Process continuous tensor buffer sequentially
         # Copy data from self.tensor_buffer (continuous CPU buffer) to data buffers
@@ -1486,6 +1548,10 @@ class FileSystemWriterAsync(FileSystemWriter):
             enc_addr1 = get_free_encoding_buffer()
             enc_addr2 = get_free_encoding_buffer()
             
+            # Get two parity buffers for XOR results
+            parity_addr1 = get_free_parity_buffer()
+            parity_addr2 = get_free_parity_buffer()
+            
             # Allocate receive addresses from TWO recv_encoding_buffers (按实际数据大小分配)
             # Each encoding thread gets its own receive address
             # 如果剩余数据能够填满固定chunk size，则按照chunk size分配
@@ -1500,16 +1566,17 @@ class FileSystemWriterAsync(FileSystemWriter):
             recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2
             recv_buffer_offset_thread2 += recv_chunk_size  # 按照实际大小移动
             
-            # Submit to BOTH encoding threads with their respective receive addresses
+            # Submit to BOTH encoding threads with their respective receive addresses and parity buffers
             # The C++ threads will mark the data buffer as copied immediately after reading
             # Once both threads mark it as copied, the data buffer will be released
             # recv_addr will be used by recv_worker to receive peer data
+            # parity_addr will be used by xor_worker to store XOR result (local_encoding XOR recv_encoding)
             self._eccheck_native.submit_data_for_encoding_thread1(
-                cur_buffer_addr, take, enc_addr1, recv_addr_thread1, recv_chunk_size
+                cur_buffer_addr, take, enc_addr1, recv_addr_thread1, recv_chunk_size, parity_addr1
             )
             
             self._eccheck_native.submit_data_for_encoding_thread2(
-                cur_buffer_addr, take, enc_addr2, recv_addr_thread2, recv_chunk_size
+                cur_buffer_addr, take, enc_addr2, recv_addr_thread2, recv_chunk_size, parity_addr2
             )
             
             src_pos += take
@@ -1521,8 +1588,8 @@ class FileSystemWriterAsync(FileSystemWriter):
         )
         
         # Mark end of stream for both encoders
-        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0)  # Sentinel for thread 1
-        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0)  # Sentinel for thread 2`
+        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0)  # Sentinel for thread 1
+        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0)  # Sentinel for thread 2
         # Wait for both encoding threads to complete
         # Activate persistent buffer poller while waiting
         logger.info("EC-CHECK: Waiting for encoding threads to complete (with buffer polling)...")
@@ -1540,7 +1607,49 @@ class FileSystemWriterAsync(FileSystemWriter):
                 self._buffer_poller_active_event.clear()
         
         # Final poll to ensure all buffers are released
-        self._poll_and_release_buffers()
+        # Poll multiple times with delays to ensure all buffers are released
+        for _ in range(20):
+            self._poll_and_release_buffers()
+            import time
+            time.sleep(0.01)
+        
+        # Verify all buffers are back in queues
+        expected_data_buffers = len(self.eccheck_data_buffers)
+        expected_encoding_buffers = len(self.eccheck_encoding_buffers)
+        actual_data_buffers = self._free_data_buffer_queue.qsize()
+        actual_encoding_buffers = self._free_encoding_buffer_queue.qsize()
+        
+        if actual_data_buffers < expected_data_buffers:
+            logger.warning(
+                f"EC-CHECK: Data buffer mismatch - expected {expected_data_buffers}, "
+                f"got {actual_data_buffers} in free queue"
+            )
+        
+        if actual_encoding_buffers < expected_encoding_buffers:
+            logger.warning(
+                f"EC-CHECK: Encoding buffer mismatch - expected {expected_encoding_buffers}, "
+                f"got {actual_encoding_buffers} in free queue"
+            )
+        
+        # If buffers are missing, try one more aggressive poll
+        if actual_data_buffers < expected_data_buffers or actual_encoding_buffers < expected_encoding_buffers:
+            logger.warning("EC-CHECK: Performing aggressive buffer recovery...")
+            for _ in range(50):
+                self._poll_and_release_buffers()
+                import time
+                time.sleep(0.02)
+        
+        # Final check
+        final_data = self._free_data_buffer_queue.qsize()
+        final_encoding = self._free_encoding_buffer_queue.qsize()
+        if hasattr(self, '_free_parity_buffer_queue'):
+            final_parity = self._free_parity_buffer_queue.qsize()
+            logger.debug(
+                f"EC-CHECK: Final buffer counts - Data: {final_data}/{expected_data_buffers}, "
+                f"Encoding: {final_encoding}/{expected_encoding_buffers}, "
+                f"Parity: {final_parity}"
+            )
+        
         # logger.info("EC-CHECK: All encoding operations completed")
     
     def _validate_pairing_compatibility(self, own_total_size: int, peer_total_size: int, my_rank: int, paired_rank: int):
@@ -1687,7 +1796,50 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eccheck_recv_encoding_buffers = self._allocate_recv_encoding_buffers(global_registry)
         
         # Allocate parity buffers for XOR computation results
-        # self.eccheck_parity_buffers = self._allocate_parity_buffers()
+        self.eccheck_parity_buffers = self._allocate_parity_buffers()
+        
+        # Initialize free parity buffer queue
+        self._free_parity_buffer_queue = queue.Queue()
+        for buffer in self.eccheck_parity_buffers:
+            self._free_parity_buffer_queue.put(int(buffer.data_ptr()))
+        
+        # Allocate persistent stores (recv/parity) for in-memory final results (no write-out here)
+        # recv_store size equals peer_total_size (aligned), parity_store equals own total size (aligned)
+        try:
+            # Peer total size already computed in _allocate_recv_encoding_buffers; recompute here
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            paired_rank = self._get_paired_rank(rank, world_size)
+            peer_metadata = self.eccheck_global_registry.rank_metadata.get(paired_rank, []) if self.eccheck_global_registry else []
+            peer_total_size = sum(meta.size_bytes for meta in peer_metadata)
+            own_total_size = self.decomposed_state_dict.total_tensor_size_bytes
+            aligned_peer = ((peer_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
+            aligned_own = ((own_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
+            
+            if self.eccheck_persist_recv_enabled:
+                self.eccheck_persist_recv_store = torch.empty(aligned_peer, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+                logger.info(f"EC-CHECK: Allocated persistent recv store: {aligned_peer / (1024**3):.2f} GB")
+            if self.eccheck_persist_parity_enabled:
+                self.eccheck_persist_parity_store = torch.empty(aligned_own, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+                logger.info(f"EC-CHECK: Allocated persistent parity store: {aligned_own / (1024**3):.2f} GB")
+            
+            # Pass persistent store addresses to C++ so that recv/xor workers memcpy into them
+            recv_base = int(self.eccheck_persist_recv_store.data_ptr()) if self.eccheck_persist_recv_store is not None else 0
+            parity_base = int(self.eccheck_persist_parity_store.data_ptr()) if self.eccheck_persist_parity_store is not None else 0
+            persist_recv_flag = 1 if self.eccheck_persist_recv_enabled and recv_base != 0 else 0
+            persist_parity_flag = 1 if self.eccheck_persist_parity_enabled and parity_base != 0 else 0
+            if hasattr(self._eccheck_native, 'set_persist_stores'):
+                # Pass capacities to guard memcpy in C++
+                self._eccheck_native.set_persist_stores(
+                    recv_base,
+                    parity_base,
+                    int(aligned_peer),
+                    int(aligned_own),
+                    persist_recv_flag,
+                    persist_parity_flag,
+                )
+        except Exception as e:
+            logger.warning(f"EC-CHECK: Failed to allocate or register persistent stores: {e}")
         
         buffer_alloc_time = time() - buffer_alloc_start
         logger.info(f"EC-CHECK: Phase 2.5 completed in {buffer_alloc_time:.2f}s")

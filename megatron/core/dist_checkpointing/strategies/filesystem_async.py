@@ -96,6 +96,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         eccheck_data_buffers_count: int = 12,
         eccheck_encoding_buffers_count: Optional[int] = None,
         eccheck_buffer_size: int = 64 * 1024 * 1024,
+        eccheck_config_path: Optional[Union[str, os.PathLike]] = "/workspace/Megatron-LM/pre-tests/gpt2/eccheck_2x2.json",
         eccheck_native: Optional[Any] = None,  # Pre-initialized C++ module
         eccheck_buffers: Optional[Dict] = None,  # Pre-allocated buffers
         **kwargs,
@@ -115,6 +116,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eccheck_data_buffers_count = eccheck_data_buffers_count  # Number of data buffers per worker
         self.eccheck_encoding_buffers_count = eccheck_encoding_buffers_count or (eccheck_data_buffers_count * eccheck_m)  # Number of encoding buffers per worker
         self.eccheck_buffer_size = eccheck_buffer_size  # Buffer size in bytes
+        self.eccheck_config_path = str(eccheck_config_path) if eccheck_config_path is not None else None
 
         super().__init__(path, *args, **kwargs)
         if not self.single_file_per_rank:
@@ -151,6 +153,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         self._buffer_poller_thread = None
         self._buffer_poller_stop_event = None
         self._buffer_poller_active_event = None  # Controls when polling is active
+        
+        # Try to load ECCHECK external configuration (YAML/JSON)
+        self._load_eccheck_config()
         
         # Initialize C++ native module if available
         if eccheck_native is not None:
@@ -214,6 +219,44 @@ class FileSystemWriterAsync(FileSystemWriter):
         except Exception as e:
             logger.warning(f"EC-CHECK: Failed to initialize C++ native module: {e}, EC-CHECK functionality will not work")
             self._eccheck_native = None
+
+    def _load_eccheck_config(self) -> None:
+        """Load optional ECCHECK config (YAML/JSON) to override defaults.
+        Supported keys:
+          - persist:
+              recv: bool
+              parity: bool
+        Future (not required now): columns mapping, coefficients, peers per column.
+        """
+        try:
+            cfg_path = self.eccheck_config_path or os.environ.get('ECCHECK_CONFIG_PATH')
+            if not cfg_path or not os.path.isfile(cfg_path):
+                return
+            with open(cfg_path, 'r') as f:
+                text = f.read()
+            data = None
+            # Try YAML first, then JSON
+            try:
+                import yaml  # type: ignore
+                data = yaml.safe_load(text)
+            except Exception:
+                pass
+            if data is None:
+                import json
+                data = json.loads(text)
+            if not isinstance(data, dict):
+                return
+            persist = data.get('persist', {}) if isinstance(data.get('persist', {}), dict) else {}
+            if 'recv' in persist:
+                self.eccheck_persist_recv_enabled = bool(persist['recv'])
+            if 'parity' in persist:
+                self.eccheck_persist_parity_enabled = bool(persist['parity'])
+            logger.info(
+                f"EC-CHECK: Config loaded from {cfg_path} (persist.recv={self.eccheck_persist_recv_enabled}, "
+                f"persist.parity={self.eccheck_persist_parity_enabled})"
+            )
+        except Exception as e:
+            logger.warning(f"EC-CHECK: Failed to load config: {e}")
 
     def _setup_eccheck_buffers_from_strategy(self, buffers):
         """Set up EC-CHECK buffers from pre-allocated strategy buffers.
@@ -1472,17 +1515,17 @@ class FileSystemWriterAsync(FileSystemWriter):
             self._poll_and_release_buffers()
             
             try:
-                return self._free_data_buffer_queue.get(timeout=5.0)
+                return self._free_data_buffer_queue.get(timeout=30.0)
             except queue.Empty:
-                logger.error("EC-CHECK: TIMEOUT waiting for free data buffer - possible deadlock!")
+                logger.warning("EC-CHECK: Waiting longer for free data buffer (system under load)...")
                 # Print queue status for debugging
-                logger.error(f"EC-CHECK: Data buffer queue size: {self._free_data_buffer_queue.qsize()}")
+                logger.warning(f"EC-CHECK: Data buffer queue size: {self._free_data_buffer_queue.qsize()}")
                 # Try polling again before giving up
                 self._poll_and_release_buffers()
                 try:
-                    return self._free_data_buffer_queue.get(timeout=1.0)
+                    return self._free_data_buffer_queue.get(timeout=10.0)
                 except queue.Empty:
-                    raise RuntimeError("EC-CHECK: Failed to get data buffer even after extended wait")
+                    raise RuntimeError("EC-CHECK: Failed to get data buffer after extended wait - possible deadlock")
         
         def get_free_encoding_buffer():
             """Get a free encoding buffer address, blocking if none available."""
@@ -1518,6 +1561,12 @@ class FileSystemWriterAsync(FileSystemWriter):
         src_pos = 0  # Current position in continuous tensor buffer
         # chunk_count = 0
         
+        # Determine columns config
+        columns_cfg = getattr(self, 'eccheck_columns_config', None)
+        num_columns = len(columns_cfg) if isinstance(columns_cfg, list) else 2
+        if num_columns > 2:
+            raise RuntimeError(f"EC-CHECK: Currently supports up to 2 columns, got {num_columns}. Please enable N-column engine in C++ before using >2.")
+        
         # Get base addresses of TWO receive buffers (one per encoding thread)
         recv_buffer_thread1, recv_buffer_thread2 = self.eccheck_recv_encoding_buffers
         recv_buffer_base_addr_thread1 = int(recv_buffer_thread1.data_ptr())
@@ -1544,43 +1593,34 @@ class FileSystemWriterAsync(FileSystemWriter):
             # Direct memory copy using ctypes
             ctypes.memmove(buffer_array.contents, src_data.ctypes.data, take)
             
-            # Get two encoding buffers (with timeout to detect deadlocks)
+            # Prepare per-column resources
+            # For now we support up to 2 columns mapped to thread1 and thread2
+            per_column = []  # list of tuples (col_idx, enc_addr, recv_addr, recv_chunk_size, parity_addr)
+            
+            # Column 0 → thread1
             enc_addr1 = get_free_encoding_buffer()
-            enc_addr2 = get_free_encoding_buffer()
-            
-            # Get two parity buffers for XOR results
             parity_addr1 = get_free_parity_buffer()
-            parity_addr2 = get_free_parity_buffer()
-            
-            # Allocate receive addresses from TWO recv_encoding_buffers (按实际数据大小分配)
-            # Each encoding thread gets its own receive address
-            # 如果剩余数据能够填满固定chunk size，则按照chunk size分配
-            # 否则按照实际剩余大小分配
             recv_chunk_size = min(self.eccheck_buffer_size, remaining_in_source)
-            
-            # Thread1 receive address
             recv_addr_thread1 = recv_buffer_base_addr_thread1 + recv_buffer_offset_thread1
-            recv_buffer_offset_thread1 += recv_chunk_size  # 按照实际大小移动
+            recv_buffer_offset_thread1 += recv_chunk_size
+            per_column.append((0, enc_addr1, recv_addr_thread1, recv_chunk_size, parity_addr1))
             
-            # Thread2 receive address
-            recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2
-            recv_buffer_offset_thread2 += recv_chunk_size  # 按照实际大小移动
+            # Column 1 → thread2 (only if exists)
+            if num_columns >= 2:
+                enc_addr2 = get_free_encoding_buffer()
+                parity_addr2 = get_free_parity_buffer()
+                recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2
+                recv_buffer_offset_thread2 += recv_chunk_size
+                per_column.append((1, enc_addr2, recv_addr_thread2, recv_chunk_size, parity_addr2))
             
-            # Submit to BOTH encoding threads with their respective receive addresses and parity buffers
-            # The C++ threads will mark the data buffer as copied immediately after reading
-            # Once both threads mark it as copied, the data buffer will be released
-            # recv_addr will be used by recv_worker to receive peer data
-            # parity_addr will be used by xor_worker to store XOR result (local_encoding XOR recv_encoding)
-            self._eccheck_native.submit_data_for_encoding_thread1(
-                cur_buffer_addr, take, enc_addr1, recv_addr_thread1, recv_chunk_size, parity_addr1
-            )
-            
-            self._eccheck_native.submit_data_for_encoding_thread2(
-                cur_buffer_addr, take, enc_addr2, recv_addr_thread2, recv_chunk_size, parity_addr2
-            )
+            # Submit per column via generic API
+            for (col_idx, enc_addr, recv_addr, rsz, parity_addr) in per_column:
+                self._eccheck_native.submit_data_for_encoding(
+                    col_idx, cur_buffer_addr, take, enc_addr, recv_addr, rsz, parity_addr
+                )
             
             src_pos += take
-            
+        
         logger.info(
             f"  Thread1 receive buffer used: {recv_buffer_offset_thread1 / (1024**3):.2f} GB\n"
             f"  Thread2 receive buffer used: {recv_buffer_offset_thread2 / (1024**3):.2f} GB\n"
@@ -1588,8 +1628,10 @@ class FileSystemWriterAsync(FileSystemWriter):
         )
         
         # Mark end of stream for both encoders
-        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0)  # Sentinel for thread 1
-        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0)  # Sentinel for thread 2
+        # Use legacy per-thread sentinels for now
+        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0)
+        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0)
+        
         # Wait for both encoding threads to complete
         # Activate persistent buffer poller while waiting
         logger.info("EC-CHECK: Waiting for encoding threads to complete (with buffer polling)...")
@@ -1843,6 +1885,30 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         buffer_alloc_time = time() - buffer_alloc_start
         logger.info(f"EC-CHECK: Phase 2.5 completed in {buffer_alloc_time:.2f}s")
+        
+        # If config provides per-column settings (2+2 at present), pass to native
+        try:
+            cfg_path = self.eccheck_config_path or os.environ.get('ECCHECK_CONFIG_PATH')
+            if cfg_path and os.path.isfile(cfg_path):
+                import json
+                with open(cfg_path, 'r') as f:
+                    data = json.load(f)
+                columns = data.get('columns')
+                if isinstance(columns, list) and len(columns) > 0 and hasattr(self._eccheck_native, 'set_columns_config'):
+                    # Normalize entries: {coefficient:int, send_peer:int, recv_peer:int}
+                    norm_cols = []
+                    for col in columns:
+                        if not isinstance(col, dict):
+                            continue
+                        coef = int(col.get('coefficient', 0))
+                        send_peer = int(col.get('send_peer', self._get_paired_rank(torch.distributed.get_rank(), torch.distributed.get_world_size())))
+                        recv_peer = int(col.get('recv_peer', self._get_paired_rank(torch.distributed.get_rank(), torch.distributed.get_world_size())))
+                        norm_cols.append({'coefficient': coef, 'send_peer': send_peer, 'recv_peer': recv_peer})
+                    if norm_cols:
+                        self._eccheck_native.set_columns_config(norm_cols)
+                        logger.info(f"EC-CHECK: Applied columns config ({len(norm_cols)} entries)")
+        except Exception as e:
+            logger.warning(f"EC-CHECK: Failed to apply columns config: {e}")
         
         exec_start = time()
         # Execute Phase 3: Tensor data exchange and encoding

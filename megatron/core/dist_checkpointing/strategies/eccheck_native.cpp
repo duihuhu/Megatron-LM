@@ -107,11 +107,15 @@ private:
     
     // Data buffer state tracking
     struct DataBufferState {
-        bool thread1_copied;
-        bool thread2_copied;
+        int copies_completed;
+        int copies_expected;
     };
     std::unordered_map<uintptr_t, DataBufferState> data_buffer_states_;
     std::mutex data_buffer_state_mutex_;
+
+    // Encoding buffer refcounts: how many downstream steps still need this encoding
+    std::unordered_map<uintptr_t, int> encoding_ref_counts_;
+    std::mutex encoding_ref_counts_mutex_;
     
     // Recv address to encoding/parity address mapping (for XOR task submission)
     struct RecvMapping {
@@ -281,19 +285,25 @@ private:
 #endif
     }
 
+    // Columns runtime config (for current 2 columns)
+    struct ColumnCfg { int coefficient; int send_peer; int recv_peer; };
+    ColumnCfg col1_cfg_{0, -1, -1};
+    ColumnCfg col2_cfg_{1, -1, -1};
+    int num_columns_ = 2;
+
     // ========== Worker线程函数 ==========
     
-    void encode_with_coefficient(uintptr_t data_addr, size_t size, uintptr_t encoding_addr, int coefficient) {
+    void encode_with_parity_index(uintptr_t data_addr, size_t size, uintptr_t encoding_addr, int parity_idx) {
         // 使用 isa-l 的 EC 编码对整块 buffer 进行编码。
         // 我们在初始化时已经生成了 RS 矩阵并通过 ec_init_tables 产生了 g_tbls_。
-        // 每个 encoder 线程只保留自己负责的 parity（encoding_addr 指向本地 parity buffer），
+        // 每个 encoder 线程只保留自己负责的 parity（encoding_addr 指向本地 parity buffer）。
 
         // 如果没有正确初始化 EC 表，回退到简单乘法
         if (k_ <= 0 || rows_ != 2 || g_tbls_ == nullptr) {
             uint8_t* data_ptr = reinterpret_cast<uint8_t*>(data_addr);
             uint8_t* encoding_ptr = reinterpret_cast<uint8_t*>(encoding_addr);
             for (size_t i = 0; i < size; ++i) {
-                encoding_ptr[i] = data_ptr[i] * (uint8_t)(coefficient & 0xFF);
+                encoding_ptr[i] = data_ptr[i];
             }
             return;
         }
@@ -301,9 +311,8 @@ private:
         unsigned char *data_ptr = reinterpret_cast<unsigned char*>(data_addr);
         unsigned char *enc_ptr = reinterpret_cast<unsigned char*>(encoding_addr);
 
-        // 从 g_tbls_ 中取出对应 (parity_index, vec_index) 的 32 字节表，
+        // 从 g_tbls_ 中取出对应 (parity_index, data_block_index_) 的 32 字节表，
         // 并构造 k=1, rows=1 的调用参数。
-        int parity_idx = coefficient;
         if (parity_idx < 0 || parity_idx >= rows_) parity_idx = 0;
 
         // Ensure data_block_index_ in range
@@ -381,20 +390,20 @@ private:
             bool need_encode = (task.data_addr != 0 && task.encoding_addr != 0);
             
             if (need_encode) {
-                // Perform encoding (parity index 0 for thread1)
-                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 0);
+                // Perform encoding selecting GF table by (parity_idx=0, data_block_index_=rank%k)
+                encode_with_parity_index(task.data_addr, task.size, task.encoding_addr, 0);
                 
-                // Mark data buffer as copied by thread 1
+                // Mark data buffer copy completion (count-based)
                 {
                     std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
-                    auto& state = data_buffer_states_[task.data_addr];
-                    state.thread1_copied = true;
-                    
-                    // If both threads copied, release data buffer
-                    if (state.thread2_copied) {
-                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                        data_buffers_to_release_.push(task.data_addr);
-                        data_buffer_states_.erase(task.data_addr);
+                    auto it = data_buffer_states_.find(task.data_addr);
+                    if (it != data_buffer_states_.end()) {
+                        it->second.copies_completed += 1;
+                        if (it->second.copies_completed >= it->second.copies_expected) {
+                            std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
+                            data_buffers_to_release_.push(task.data_addr);
+                            data_buffer_states_.erase(it);
+                        }
                     }
                 }
                 
@@ -404,6 +413,11 @@ private:
                     send_queue_1_.push({task.encoding_addr, task.size});
                 }
                 send_queue_1_cv_.notify_one();
+                // Increment encoding refcount for pending send
+                if (task.encoding_addr != 0) {
+                    std::lock_guard<std::mutex> rlock(encoding_ref_counts_mutex_);
+                    encoding_ref_counts_[task.encoding_addr] += 1;
+                }
             }
             
             // Check if we need to receive data
@@ -477,20 +491,20 @@ private:
             bool need_encode = (task.data_addr != 0 && task.encoding_addr != 0);
             
             if (need_encode) {
-                // Perform encoding (parity index 1 for thread2)
-                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 1);
+                // Perform encoding selecting GF table by (parity_idx=1, data_block_index_=rank%k)
+                encode_with_parity_index(task.data_addr, task.size, task.encoding_addr, 1);
                 
-                // Mark data buffer as copied by thread 2
+                // Mark data buffer copy completion (count-based)
                 {
                     std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
-                    auto& state = data_buffer_states_[task.data_addr];
-                    state.thread2_copied = true;
-                    
-                    // If both threads copied, release data buffer
-                    if (state.thread1_copied) {
-                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                        data_buffers_to_release_.push(task.data_addr);
-                        data_buffer_states_.erase(task.data_addr);
+                    auto it = data_buffer_states_.find(task.data_addr);
+                    if (it != data_buffer_states_.end()) {
+                        it->second.copies_completed += 1;
+                        if (it->second.copies_completed >= it->second.copies_expected) {
+                            std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
+                            data_buffers_to_release_.push(task.data_addr);
+                            data_buffer_states_.erase(it);
+                        }
                     }
                 }
                 
@@ -500,6 +514,11 @@ private:
                     send_queue_2_.push({task.encoding_addr, task.size});
                 }
                 send_queue_2_cv_.notify_one();
+                // Increment encoding refcount for pending send
+                if (task.encoding_addr != 0) {
+                    std::lock_guard<std::mutex> rlock(encoding_ref_counts_mutex_);
+                    encoding_ref_counts_[task.encoding_addr] += 1;
+                }
             }
             
             // Check if we need to receive data
@@ -552,16 +571,33 @@ private:
 #ifdef NCCL_AVAILABLE
             if (nccl_thread1_initialized_ && world_size_ > 1) {
                 ncclGroupStart(); 
+                int peer = (col1_cfg_.send_peer >= 0 ? col1_cfg_.send_peer : paired_rank_);
                 ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size, 
-                         ncclUint8, paired_rank_, nccl_comm_thread1_, 0);
+                         ncclUint8, peer, nccl_comm_thread1_, 0);
                 ncclGroupEnd();
             }
 #endif
 
-            // Release encoding buffer
-            {
-                std::lock_guard<std::mutex> lock(release_queue_mutex_);
-                encoding_buffers_to_release_.push(task.encoding_addr);
+            // Decrement encoding refcount and release if reaches zero
+            if (task.encoding_addr != 0) {
+                bool should_release = false;
+                {
+                    std::lock_guard<std::mutex> rlock(encoding_ref_counts_mutex_);
+                    auto it = encoding_ref_counts_.find(task.encoding_addr);
+                    if (it != encoding_ref_counts_.end()) {
+                        it->second -= 1;
+                        if (it->second <= 0) {
+                            should_release = true;
+                            encoding_ref_counts_.erase(it);
+                        }
+                    } else {
+                        should_release = true; // safety fallback
+                    }
+                }
+                if (should_release) {
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    encoding_buffers_to_release_.push(task.encoding_addr);
+                }
             }
         }
         
@@ -607,8 +643,9 @@ private:
 #ifdef NCCL_AVAILABLE
             if (nccl_thread1_initialized_ && world_size_ > 1) {
                 ncclGroupStart();
+                int peer = (col1_cfg_.recv_peer >= 0 ? col1_cfg_.recv_peer : paired_rank_);
                 ncclRecv(reinterpret_cast<void*>(task.recv_addr), task.size,
-                         ncclUint8, paired_rank_, nccl_comm_thread1_, 0);
+                         ncclUint8, peer, nccl_comm_thread1_, 0);
                 ncclGroupEnd();
             }
 #endif
@@ -632,6 +669,11 @@ private:
                 auto it = recv_to_xor_mapping_1_.find(task.recv_addr);
                 if (it != recv_to_xor_mapping_1_.end()) {
                     const RecvMapping& mapping = it->second;
+                    // Increment encoding refcount for XOR (XOR will use this encoding)
+                    {
+                        std::lock_guard<std::mutex> rlock(encoding_ref_counts_mutex_);
+                        encoding_ref_counts_[mapping.encoding_addr] += 1;
+                    }
                     // Submit XOR task: local encoding XOR received encoding -> parity
                     {
                         std::lock_guard<std::mutex> xor_lock(xor_queue_1_mutex_);
@@ -683,16 +725,33 @@ private:
 #ifdef NCCL_AVAILABLE
             if (nccl_thread2_initialized_ && world_size_ > 1) {
                 ncclGroupStart();
+                int peer = (col2_cfg_.send_peer >= 0 ? col2_cfg_.send_peer : paired_rank_);
                 ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size,
-                         ncclUint8, paired_rank_, nccl_comm_thread2_, 0);
+                         ncclUint8, peer, nccl_comm_thread2_, 0);
                 ncclGroupEnd();
             }
 #endif
 
-            // Release encoding buffer
-            {
-                std::lock_guard<std::mutex> lock(release_queue_mutex_);
-                encoding_buffers_to_release_.push(task.encoding_addr);
+            // Decrement encoding refcount and release if reaches zero
+            if (task.encoding_addr != 0) {
+                bool should_release = false;
+                {
+                    std::lock_guard<std::mutex> rlock(encoding_ref_counts_mutex_);
+                    auto it = encoding_ref_counts_.find(task.encoding_addr);
+                    if (it != encoding_ref_counts_.end()) {
+                        it->second -= 1;
+                        if (it->second <= 0) {
+                            should_release = true;
+                            encoding_ref_counts_.erase(it);
+                        }
+                    } else {
+                        should_release = true; // safety fallback
+                    }
+                }
+                if (should_release) {
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    encoding_buffers_to_release_.push(task.encoding_addr);
+                }
             }
         }
         
@@ -738,8 +797,9 @@ private:
 #ifdef NCCL_AVAILABLE
             if (nccl_thread2_initialized_ && world_size_ > 1) {
                 ncclGroupStart();
+                int peer = (col2_cfg_.recv_peer >= 0 ? col2_cfg_.recv_peer : paired_rank_);
                 ncclRecv(reinterpret_cast<void*>(task.recv_addr), task.size,
-                         ncclUint8, paired_rank_, nccl_comm_thread2_, 0);
+                         ncclUint8, peer, nccl_comm_thread2_, 0);
                 ncclGroupEnd();
             }
 #endif
@@ -752,6 +812,11 @@ private:
                 auto it = recv_to_xor_mapping_2_.find(task.recv_addr);
                 if (it != recv_to_xor_mapping_2_.end()) {
                     const RecvMapping& mapping = it->second;
+                    // Increment encoding refcount for XOR (XOR will use this encoding)
+                    {
+                        std::lock_guard<std::mutex> rlock(encoding_ref_counts_mutex_);
+                        encoding_ref_counts_[mapping.encoding_addr] += 1;
+                    }
                     // Submit XOR task: local encoding XOR received encoding -> parity
                     {
                         std::lock_guard<std::mutex> xor_lock(xor_queue_2_mutex_);
@@ -825,6 +890,26 @@ private:
                 }
             }
             
+            // After XOR completion, decrement encoding refcount for the local encoding
+            if (task.local_encoding_addr != 0) {
+                bool should_release = false;
+                {
+                    std::lock_guard<std::mutex> rlock(encoding_ref_counts_mutex_);
+                    auto it = encoding_ref_counts_.find(task.local_encoding_addr);
+                    if (it != encoding_ref_counts_.end()) {
+                        it->second -= 1;
+                        if (it->second <= 0) {
+                            should_release = true;
+                            encoding_ref_counts_.erase(it);
+                        }
+                    }
+                }
+                if (should_release) {
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    encoding_buffers_to_release_.push(task.local_encoding_addr);
+                }
+            }
+
             // Release parity buffer after XOR completion
             // Note: Parity result is stored, but buffer can be reused for next chunk if needed
             {
@@ -881,6 +966,26 @@ private:
             
             // Thread2: skip persisting parity to avoid double-writing into single store
             
+            // After XOR completion, decrement encoding refcount for the local encoding
+            if (task.local_encoding_addr != 0) {
+                bool should_release = false;
+                {
+                    std::lock_guard<std::mutex> rlock(encoding_ref_counts_mutex_);
+                    auto it = encoding_ref_counts_.find(task.local_encoding_addr);
+                    if (it != encoding_ref_counts_.end()) {
+                        it->second -= 1;
+                        if (it->second <= 0) {
+                            should_release = true;
+                            encoding_ref_counts_.erase(it);
+                        }
+                    }
+                }
+                if (should_release) {
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    encoding_buffers_to_release_.push(task.local_encoding_addr);
+                }
+            }
+
             // Release parity buffer after XOR completion
             // Note: Parity result is stored, but buffer can be reused for next chunk if needed
             {
@@ -993,6 +1098,29 @@ public:
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline and NCCL initialized successfully" << std::endl;
     }
     
+    void set_columns_config(const std::vector<std::map<std::string, int>>& cols) {
+        // Only first two columns used for current 2+2; ignore extras
+        if (!cols.empty()) {
+            const auto &c0 = cols[0];
+            col1_cfg_.coefficient = c0.count("coefficient") ? c0.at("coefficient") : 0;
+            col1_cfg_.send_peer   = c0.count("send_peer")   ? c0.at("send_peer")   : -1;
+            col1_cfg_.recv_peer   = c0.count("recv_peer")   ? c0.at("recv_peer")   : -1;
+        }
+        if (cols.size() > 1) {
+            const auto &c1 = cols[1];
+            col2_cfg_.coefficient = c1.count("coefficient") ? c1.at("coefficient") : 1;
+            col2_cfg_.send_peer   = c1.count("send_peer")   ? c1.at("send_peer")   : -1;
+            col2_cfg_.recv_peer   = c1.count("recv_peer")   ? c1.at("recv_peer")   : -1;
+        }
+        num_columns_ = std::max(1, std::min((int)cols.size(), 2));
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Columns config applied: col0(coef="
+                  << col1_cfg_.coefficient << ", send_peer=" << (col1_cfg_.send_peer>=0?col1_cfg_.send_peer:paired_rank_)
+                  << ", recv_peer=" << (col1_cfg_.recv_peer>=0?col1_cfg_.recv_peer:paired_rank_)
+                  << ") col1(coef=" << col2_cfg_.coefficient << ", send_peer="
+                  << (col2_cfg_.send_peer>=0?col2_cfg_.send_peer:paired_rank_) << ", recv_peer="
+                  << (col2_cfg_.recv_peer>=0?col2_cfg_.recv_peer:paired_rank_) << ")" << std::endl;
+    }
+    
     void set_persist_stores(uintptr_t recv_base, uintptr_t parity_base,
                             size_t recv_capacity, size_t parity_capacity,
                             int persist_recv, int persist_parity) {
@@ -1102,12 +1230,15 @@ public:
         
         if (data_addr != 0 && size != 0) {
             std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
-            if (data_buffer_states_.find(data_addr) == data_buffer_states_.end()) {
-                data_buffer_states_[data_addr] = {false, false};
+            auto &state = data_buffer_states_[data_addr];
+            if (state.copies_expected == 0) {
+                state.copies_expected = std::max(1, num_columns_);
+                state.copies_completed = 0;
             }
         }
         
         // Register recv_addr to encoding/parity mapping for XOR task submission
+        // Note: encoding_refcount for XOR will be incremented when recv completes and XOR task is created
         if (recv_addr != 0 && recv_chunk_size != 0 && encoding_addr != 0 && parity_addr != 0) {
             std::lock_guard<std::mutex> lock(recv_mapping_1_mutex_);
             recv_to_xor_mapping_1_[recv_addr] = {encoding_addr, parity_addr, recv_chunk_size};
@@ -1123,13 +1254,45 @@ public:
         }
         encoding_tasks_2_cv_.notify_one();
         
+        // Ensure data buffer state exists and has expected count (mirrors thread1 submission)
+        if (data_addr != 0 && size != 0) {
+            std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
+            auto &state = data_buffer_states_[data_addr];
+            if (state.copies_expected == 0) {
+                state.copies_expected = std::max(1, num_columns_);
+                state.copies_completed = 0;
+            }
+        }
+        
         // Register recv_addr to encoding/parity mapping for XOR task submission
+        // Note: encoding_refcount for XOR will be incremented when recv completes and XOR task is created
         if (recv_addr != 0 && recv_chunk_size != 0 && encoding_addr != 0 && parity_addr != 0) {
             std::lock_guard<std::mutex> lock(recv_mapping_2_mutex_);
             recv_to_xor_mapping_2_[recv_addr] = {encoding_addr, parity_addr, recv_chunk_size};
         }
     }
     
+    // Generic submit API for future N-column support: currently dispatches to thread1/2
+    void submit_data_for_encoding(int column_idx,
+                                  uintptr_t data_addr, size_t size,
+                                  uintptr_t encoding_addr, uintptr_t recv_addr,
+                                  size_t recv_chunk_size, uintptr_t parity_addr) {
+        if (column_idx == 0) {
+            submit_data_for_encoding_thread1(data_addr, size, encoding_addr, recv_addr, recv_chunk_size, parity_addr);
+        } else if (column_idx == 1) {
+            submit_data_for_encoding_thread2(data_addr, size, encoding_addr, recv_addr, recv_chunk_size, parity_addr);
+        } else {
+            // For now, only 2 columns are implemented in the engine
+            std::cerr << "EC-CHECK: submit_data_for_encoding: column_idx=" << column_idx
+                      << " not implemented (only 0 and 1 supported)" << std::endl;
+#ifdef PYBIND11_VERSION
+            throw pybind11::value_error("Only 2 columns (indices 0 and 1) are supported currently");
+#else
+            return;
+#endif
+        }
+    }
+
     std::vector<uintptr_t> get_data_buffers_to_release() {
         std::vector<uintptr_t> buffers;
         std::lock_guard<std::mutex> lock(release_queue_mutex_);
@@ -1164,6 +1327,7 @@ public:
 PYBIND11_MODULE(eccheck_native, m) {
     pybind11::class_<ECCHECKNative>(m, "ECCHECKNative")
         .def(pybind11::init<int, int, int>())
+        .def("set_columns_config", &ECCHECKNative::set_columns_config)
         .def("set_persist_stores", &ECCHECKNative::set_persist_stores,
              pybind11::arg("recv_base"),
              pybind11::arg("parity_base"),
@@ -1180,6 +1344,11 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("encoding_addr"), pybind11::arg("recv_addr"), 
              pybind11::arg("recv_chunk_size"), pybind11::arg("parity_addr"))
         .def("submit_data_for_encoding_thread2", &ECCHECKNative::submit_data_for_encoding_thread2,
+             pybind11::arg("data_addr"), pybind11::arg("size"),
+             pybind11::arg("encoding_addr"), pybind11::arg("recv_addr"),
+             pybind11::arg("recv_chunk_size"), pybind11::arg("parity_addr"))
+        .def("submit_data_for_encoding", &ECCHECKNative::submit_data_for_encoding,
+             pybind11::arg("column_idx"),
              pybind11::arg("data_addr"), pybind11::arg("size"),
              pybind11::arg("encoding_addr"), pybind11::arg("recv_addr"),
              pybind11::arg("recv_chunk_size"), pybind11::arg("parity_addr"))

@@ -1,0 +1,18 @@
+{
+  "persist": {
+    "recv": true,
+    "parity": true
+  },
+  "columns": [
+    {
+      "coefficient": 0,
+      "send_peer": 1,
+      "recv_peer": 1
+    },
+    {
+      "coefficient": 1,
+      "send_peer": 1,
+      "recv_peer": 1
+    }
+  ]
+}

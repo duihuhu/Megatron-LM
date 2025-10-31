@@ -1,0 +1,183 @@
+{
+  "_comment": "Heterogeneous pipeline configuration example",
+  "_description": "Example showing different processing pipelines for different threads",
+  
+  "persist": {
+    "recv": true,
+    "parity": true
+  },
+  
+  "ranks": {
+    "0": {
+      "columns": [
+        {
+          "_comment": "Column 0: First encoder - XOR with zero-initialized parity",
+          "column_idx": 0,
+          "coefficient": 0,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 1,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "with_zero_parity",
+              "sources": ["local_encoding"],
+              "target": "parity",
+              "zero_parity_addr": "initial_parity_buffer"
+            }
+          ]
+        },
+        {
+          "_comment": "Column 1: Second encoder - Send, Recv, then XOR with received data",
+          "column_idx": 1,
+          "coefficient": 1,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 1,
+              "count": 1
+            },
+            {
+              "step": "recv",
+              "type": "nccl_recv",
+              "source_rank": 1,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "with_recv_encoding",
+              "sources": ["local_encoding", "recv_encoding"],
+              "target": "parity"
+            }
+          ]
+        }
+      ],
+      "_comment": "Post-XOR synchronization and data exchange",
+      "post_xor_steps": [
+        {
+          "step": "sync",
+          "type": "barrier",
+          "sync_point": "after_all_xor",
+          "ranks": [0, 1]
+        },
+        {
+          "_comment": "Send own parity to target rank",
+          "step": "send",
+          "type": "nccl_send",
+          "target_rank": 1,
+          "data_type": "parity",
+          "data_source": "local_parity"
+        },
+        {
+          "_comment": "Receive target rank's data",
+          "step": "recv",
+          "type": "nccl_recv",
+          "source_rank": 1,
+          "data_type": "data",
+          "data_target": "peer_data_buffer"
+        }
+      ]
+    },
+    "1": {
+      "columns": [
+        {
+          "column_idx": 0,
+          "coefficient": 0,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 0,
+              "count": 1
+            },
+            {
+              "step": "recv",
+              "type": "nccl_recv",
+              "source_rank": 0,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "with_recv_encoding",
+              "sources": ["local_encoding", "recv_encoding"],
+              "target": "parity"
+            }
+          ]
+        },
+        {
+          "column_idx": 1,
+          "coefficient": 1,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 0,
+              "count": 1
+            },
+            {
+              "step": "recv",
+              "type": "nccl_recv",
+              "source_rank": 0,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "with_recv_encoding",
+              "sources": ["local_encoding", "recv_encoding"],
+              "target": "parity"
+            }
+          ]
+        }
+      ],
+      "post_xor_steps": [
+        {
+          "step": "sync",
+          "type": "barrier",
+          "sync_point": "after_all_xor",
+          "ranks": [0, 1]
+        },
+        {
+          "_comment": "Send own parity to target rank",
+          "step": "send",
+          "type": "nccl_send",
+          "target_rank": 0,
+          "data_type": "parity",
+          "data_source": "local_parity"
+        },
+        {
+          "_comment": "Receive target rank's data",
+          "step": "recv",
+          "type": "nccl_recv",
+          "source_rank": 0,
+          "data_type": "data",
+          "data_target": "peer_data_buffer"
+        }
+      ]
+    }
+  }
+}
+

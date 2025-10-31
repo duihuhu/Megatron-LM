@@ -1,0 +1,259 @@
+{
+  "_comment": "4-rank EC-CHECK configuration example",
+  "_description": "Example configuration for 4 ranks (0, 1, 2, 3) with shared parity buffer model",
+  
+  "persist": {
+    "recv": true,
+    "parity": true
+  },
+  
+  "ranks": {
+    "0": {
+      "_comment": "Rank 0 configuration - 2 columns with shared parity",
+      "columns": [
+        {
+          "_comment": "Column 0: Initialize shared parity with encoding XOR zero_parity",
+          "column_idx": 0,
+          "coefficient": 0,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 1,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "with_zero_parity",
+              "sources": ["local_encoding"],
+              "target": "parity",
+              "_note": "Initializes shared parity: parity = encoding0 XOR zero_parity"
+            }
+          ]
+        },
+        {
+          "_comment": "Column 1: Incrementally update shared parity with recv_encoding",
+          "column_idx": 1,
+          "coefficient": 1,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 1,
+              "count": 1
+            },
+            {
+              "step": "recv",
+              "type": "nccl_recv",
+              "source_rank": 1,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "incremental",
+              "sources": ["parity", "recv_encoding"],
+              "target": "parity",
+              "_note": "Incremental update: parity = parity XOR recv_encoding1"
+            }
+          ]
+        }
+      ]
+    },
+    "1": {
+      "_comment": "Rank 1 configuration - symmetric to rank 0",
+      "columns": [
+        {
+          "column_idx": 0,
+          "coefficient": 0,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 0,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "with_zero_parity",
+              "sources": ["local_encoding"],
+              "target": "parity"
+            }
+          ]
+        },
+        {
+          "column_idx": 1,
+          "coefficient": 1,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 0,
+              "count": 1
+            },
+            {
+              "step": "recv",
+              "type": "nccl_recv",
+              "source_rank": 0,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "incremental",
+              "sources": ["parity", "recv_encoding"],
+              "target": "parity"
+            }
+          ]
+        }
+      ]
+    },
+    "2": {
+      "_comment": "Rank 2 configuration - similar to rank 0",
+      "columns": [
+        {
+          "column_idx": 0,
+          "coefficient": 0,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 3,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "with_zero_parity",
+              "sources": ["local_encoding"],
+              "target": "parity"
+            }
+          ]
+        },
+        {
+          "column_idx": 1,
+          "coefficient": 1,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 3,
+              "count": 1
+            },
+            {
+              "step": "recv",
+              "type": "nccl_recv",
+              "source_rank": 3,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "incremental",
+              "sources": ["parity", "recv_encoding"],
+              "target": "parity"
+            }
+          ]
+        }
+      ]
+    },
+    "3": {
+      "_comment": "Rank 3 configuration - symmetric to rank 2",
+      "columns": [
+        {
+          "column_idx": 0,
+          "coefficient": 0,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 2,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "with_zero_parity",
+              "sources": ["local_encoding"],
+              "target": "parity"
+            }
+          ]
+        },
+        {
+          "column_idx": 1,
+          "coefficient": 1,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 2,
+              "count": 1
+            },
+            {
+              "step": "recv",
+              "type": "nccl_recv",
+              "source_rank": 2,
+              "count": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "mode": "incremental",
+              "sources": ["parity", "recv_encoding"],
+              "target": "parity"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  
+  "_pairing_rules": {
+    "_comment": "For 4 ranks, pairs are typically: (0,1) and (2,3)",
+    "rank_0": "paired with rank 1",
+    "rank_1": "paired with rank 0",
+    "rank_2": "paired with rank 3",
+    "rank_3": "paired with rank 2"
+  },
+  
+  "_usage": {
+    "_comment": "This configuration file supports all 4 ranks (0-3)",
+    "description": "Each rank reads its own configuration from the 'ranks' section using its rank number as key",
+    "example": "Rank 0 reads from 'ranks.0', Rank 1 reads from 'ranks.1', etc."
+  }
+}
+

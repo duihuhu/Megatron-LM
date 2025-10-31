@@ -1,0 +1,127 @@
+{
+  "_comment": "Advanced EC-CHECK configuration supporting multi-rank and heterogeneous thread pipelines",
+  "_description": "Each rank can have different thread configurations with custom processing pipelines",
+  
+  "persist": {
+    "recv": true,
+    "parity": true
+  },
+  
+  "ranks": {
+    "0": {
+      "_comment": "Rank 0 configuration",
+      "columns": [
+        {
+          "column_idx": 0,
+          "coefficient": 0,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 1
+            },
+            {
+              "step": "recv",
+              "type": "nccl_recv",
+              "source_rank": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "sources": ["local_encoding", "recv_encoding"],
+              "target": "parity"
+            }
+          ]
+        },
+        {
+          "column_idx": 1,
+          "coefficient": 1,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 1
+            },
+            {
+              "step": "recv",
+              "type": "nccl_recv",
+              "source_rank": 1
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "sources": ["local_encoding", "recv_encoding"],
+              "target": "parity"
+            }
+          ]
+        }
+      ]
+    },
+    "1": {
+      "_comment": "Rank 1 configuration (symmetric to rank 0)",
+      "columns": [
+        {
+          "column_idx": 0,
+          "coefficient": 0,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 0
+            },
+            {
+              "step": "recv",
+              "type": "nccl_recv",
+              "source_rank": 0
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "sources": ["local_encoding", "recv_encoding"],
+              "target": "parity"
+            }
+          ]
+        },
+        {
+          "column_idx": 1,
+          "coefficient": 1,
+          "pipeline": [
+            {
+              "step": "encode",
+              "type": "ec_encode"
+            },
+            {
+              "step": "send",
+              "type": "nccl_send",
+              "target_rank": 0
+            },
+            {
+              "step": "recv",
+              "type": "nccl_recv",
+              "source_rank": 0
+            },
+            {
+              "step": "xor",
+              "type": "xor_update",
+              "sources": ["local_encoding", "recv_encoding"],
+              "target": "parity"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+

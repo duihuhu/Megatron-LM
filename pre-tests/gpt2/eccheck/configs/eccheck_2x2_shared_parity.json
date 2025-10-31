@@ -1,0 +1,34 @@
+{
+  "_comment": "2+2 EC-CHECK configuration with shared parity buffer model",
+  "_description": "All columns share the same parity buffer. Column 0 initializes parity, Column 1+ incrementally update parity.",
+  
+  "persist": {
+    "recv": true,
+    "parity": true
+  },
+  
+  "columns": [
+    {
+      "_comment": "Column 0: First encoder - Initializes shared parity buffer with encoding XOR zero_parity",
+      "coefficient": 0,
+      "send_peer": -1,
+      "recv_peer": -1,
+      "_note": "send_peer and recv_peer set to -1 for auto-calculation based on current rank"
+    },
+    {
+      "_comment": "Column 1: Second encoder - Incrementally updates shared parity buffer with parity XOR recv_encoding",
+      "coefficient": 1,
+      "send_peer": -1,
+      "recv_peer": -1,
+      "_note": "In incremental mode: parity = parity XOR recv_encoding"
+    }
+  ],
+  
+  "_implementation_notes": {
+    "parity_model": "shared",
+    "column_0_behavior": "Initializes parity: parity = encoding0 XOR zero_parity",
+    "column_1_behavior": "Incremental update: parity = parity XOR recv_encoding1",
+    "thread_safety": "Uses mutex to protect shared parity buffer during incremental updates"
+  }
+}
+

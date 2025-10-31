@@ -96,7 +96,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         eccheck_data_buffers_count: int = 12,
         eccheck_encoding_buffers_count: Optional[int] = None,
         eccheck_buffer_size: int = 64 * 1024 * 1024,
-        eccheck_config_path: Optional[Union[str, os.PathLike]] = "/workspace/Megatron-LM/pre-tests/gpt2/eccheck_2x2.json",
+        eccheck_config_path: Optional[Union[str, os.PathLike]] = None,
         eccheck_native: Optional[Any] = None,  # Pre-initialized C++ module
         eccheck_buffers: Optional[Dict] = None,  # Pre-allocated buffers
         **kwargs,
@@ -141,7 +141,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eccheck_global_registry = None  # GlobalMetadataRegistry from all ranks
         self.eccheck_data_buffers = None  # List of data buffers
         self.eccheck_encoding_buffers = None  # List of encoding buffers
-        self.eccheck_recv_encoding_buffers = None  # Tuple of two large receive buffers (thread1, thread2)
+        self.eccheck_recv_encoding_buffers = None  # List of large receive buffers (one per column)
         self.eccheck_parity_buffers = None  # List of parity buffers for XOR results
         # Persistent stores (in-memory): final recv and parity results
         self.eccheck_persist_recv_store: Optional[torch.Tensor] = None
@@ -1267,7 +1267,7 @@ class FileSystemWriterAsync(FileSystemWriter):
     
     def _allocate_recv_encoding_buffers(self, global_registry):
         """
-        Allocate TWO large receive buffers for peer encoded packets (one per encoding thread).
+        Allocate large receive buffers for peer encoded packets (one per column).
         
         Each buffer is equal to peer's total data size, aligned to buffer_size (64MB).
         
@@ -1275,7 +1275,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
             
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Two receive buffers (one for thread1, one for thread2)
+            List[torch.Tensor]: List of receive buffers (one per column)
         """
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -1288,24 +1288,30 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Align peer's data size to buffer_size (64MB)
         aligned_size = ((peer_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
         
+        # Determine number of columns
+        columns_cfg = getattr(self, 'eccheck_columns_config', None)
+        num_columns = len(columns_cfg) if isinstance(columns_cfg, list) and len(columns_cfg) > 0 else 2
+        
         logger.info(
-            f"EC-CHECK: Allocating TWO receive buffers based on peer data size\n"
+            f"EC-CHECK: Allocating {num_columns} receive buffers based on peer data size\n"
             f"  Paired rank: {paired_rank}\n"
             f"  Peer data size: {peer_total_size / (1024**3):.2f} GB\n"
             f"  Aligned buffer size (per buffer): {aligned_size / (1024**3):.2f} GB\n"
-            f"  Total receive memory: {2 * aligned_size / (1024**3):.2f} GB"
+            f"  Total receive memory: {num_columns * aligned_size / (1024**3):.2f} GB"
         )
         
-        # Allocate two large continuous buffers (one for each encoding thread)
-        recv_buffer_thread1 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-        recv_buffer_thread2 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+        # Allocate large continuous buffers (one for each column)
+        recv_buffers = []
+        for i in range(num_columns):
+            recv_buffer = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            recv_buffers.append(recv_buffer)
         
         logger.info(
-            f"EC-CHECK: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "
+            f"EC-CHECK: Allocated {num_columns} receive buffers: {aligned_size / (1024**3):.2f} GB each "
             f"({aligned_size / (1024**2):.0f} MB each)"
         )
         
-        return recv_buffer_thread1, recv_buffer_thread2
+        return recv_buffers
     
     def _allocate_parity_buffers(self):
         """
@@ -1322,13 +1328,17 @@ class FileSystemWriterAsync(FileSystemWriter):
         total_bytes = self.decomposed_state_dict.total_tensor_size_bytes
         num_chunks = (total_bytes + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size
         
-        # Each chunk requires 2 parity buffers (thread1 and thread2)
+        # Determine number of columns
+        columns_cfg = getattr(self, 'eccheck_columns_config', None)
+        num_columns = len(columns_cfg) if isinstance(columns_cfg, list) and len(columns_cfg) > 0 else 2
+        
+        # Each chunk requires num_columns parity buffers (one per column)
         # We allocate at least as many as encoding buffers to ensure sufficient concurrency
         # Use max to ensure we have enough even if calculation is off
         min_parity_buffers = max(
             self.eccheck_encoding_buffers_count,  # At least as many as encoding buffers
-            num_chunks * 2,  # At least enough for all chunks (2 per chunk)
-            self.eccheck_data_buffers_count * 2  # At least 2x data buffers
+            num_chunks * num_columns,  # At least enough for all chunks (num_columns per chunk)
+            self.eccheck_data_buffers_count * num_columns  # At least num_columns x data buffers
         )
         
         logger.info(
@@ -1563,16 +1573,15 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Determine columns config
         columns_cfg = getattr(self, 'eccheck_columns_config', None)
-        num_columns = len(columns_cfg) if isinstance(columns_cfg, list) else 2
-        if num_columns > 2:
-            raise RuntimeError(f"EC-CHECK: Currently supports up to 2 columns, got {num_columns}. Please enable N-column engine in C++ before using >2.")
+        num_columns = len(columns_cfg) if isinstance(columns_cfg, list) and len(columns_cfg) > 0 else 2
         
-        # Get base addresses of TWO receive buffers (one per encoding thread)
-        recv_buffer_thread1, recv_buffer_thread2 = self.eccheck_recv_encoding_buffers
-        recv_buffer_base_addr_thread1 = int(recv_buffer_thread1.data_ptr())
-        recv_buffer_base_addr_thread2 = int(recv_buffer_thread2.data_ptr())
-        recv_buffer_offset_thread1 = 0  # Current offset in thread1's receive buffer
-        recv_buffer_offset_thread2 = 0  # Current offset in thread2's receive buffer
+        # Get base addresses of receive buffers (one per column)
+        recv_buffers = self.eccheck_recv_encoding_buffers
+        if len(recv_buffers) < num_columns:
+            raise RuntimeError(f"EC-CHECK: Mismatch: {num_columns} columns configured but only {len(recv_buffers)} receive buffers allocated")
+        
+        recv_buffer_base_addrs = [int(buf.data_ptr()) for buf in recv_buffers[:num_columns]]
+        recv_buffer_offsets = [0] * num_columns  # Current offset in each column's receive buffer
 
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
@@ -1594,47 +1603,109 @@ class FileSystemWriterAsync(FileSystemWriter):
             ctypes.memmove(buffer_array.contents, src_data.ctypes.data, take)
             
             # Prepare per-column resources
-            # For now we support up to 2 columns mapped to thread1 and thread2
-            per_column = []  # list of tuples (col_idx, enc_addr, recv_addr, recv_chunk_size, parity_addr)
+            # Check if we have pipeline hints (advanced mode)
+            pipeline_hints = getattr(self, 'eccheck_pipeline_hints', {})
+            zero_parity_buffers = getattr(self, 'eccheck_zero_parity_buffers', {})
             
-            # Column 0 → thread1
-            enc_addr1 = get_free_encoding_buffer()
-            parity_addr1 = get_free_parity_buffer()
+            # IMPORTANT: All columns share the SAME parity buffer for this chunk
+            # This enables incremental XOR updates: parity = parity XOR recv_encoding
+            shared_parity_addr = get_free_parity_buffer()
+            
+            per_column = []  # list of tuples (col_idx, enc_addr, recv_addr, recv_chunk_size, parity_addr, zero_parity_addr)
             recv_chunk_size = min(self.eccheck_buffer_size, remaining_in_source)
-            recv_addr_thread1 = recv_buffer_base_addr_thread1 + recv_buffer_offset_thread1
-            recv_buffer_offset_thread1 += recv_chunk_size
-            per_column.append((0, enc_addr1, recv_addr_thread1, recv_chunk_size, parity_addr1))
             
-            # Column 1 → thread2 (only if exists)
-            if num_columns >= 2:
-                enc_addr2 = get_free_encoding_buffer()
-                parity_addr2 = get_free_parity_buffer()
-                recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2
-                recv_buffer_offset_thread2 += recv_chunk_size
-                per_column.append((1, enc_addr2, recv_addr_thread2, recv_chunk_size, parity_addr2))
+            # Track chunk index for zero parity buffer selection
+            chunk_idx = src_pos // self.eccheck_buffer_size
+            
+            # Loop through all columns - all share the same parity buffer
+            for col_idx in range(num_columns):
+                enc_addr = get_free_encoding_buffer()
+                # All columns use the same parity buffer for incremental XOR
+                parity_addr = shared_parity_addr
+                
+                # Determine recv_addr based on pipeline hints
+                hints = pipeline_hints.get(col_idx, {})
+                needs_recv = hints.get('needs_recv', True)  # default: needs recv
+                
+                if needs_recv:
+                    recv_addr = recv_buffer_base_addrs[col_idx] + recv_buffer_offsets[col_idx]
+                    recv_buffer_offsets[col_idx] += recv_chunk_size
+                    recv_size = recv_chunk_size
+                else:
+                    recv_addr = 0  # No recv needed for this column
+                    recv_size = 0
+                
+                # Get zero-initialized parity buffer if needed (only for column 0)
+                zero_parity_addr = 0
+                if col_idx == 0 and hints.get('needs_zero_parity', False):
+                    col_zero_buffers = zero_parity_buffers.get(col_idx, [])
+                    if chunk_idx < len(col_zero_buffers):
+                        zero_parity_addr = int(col_zero_buffers[chunk_idx].data_ptr())
+                
+                per_column.append((col_idx, enc_addr, recv_addr, recv_size, parity_addr, zero_parity_addr))
             
             # Submit per column via generic API
-            for (col_idx, enc_addr, recv_addr, rsz, parity_addr) in per_column:
+            for (col_idx, enc_addr, recv_addr, rsz, parity_addr, zero_parity_addr) in per_column:
+                # Determine XOR mode based on column index and pipeline hints
+                hints = pipeline_hints.get(col_idx, {})
+                xor_mode_str = hints.get('xor_mode', 'with_recv_encoding')
+                
+                # For shared parity model:
+                # Column 0: with_zero_parity (parity = encoding XOR zero_parity)
+                # Column 1+: incremental (parity = parity XOR recv_encoding)
+                if col_idx == 0:
+                    # First column: initialize parity with zero
+                    if zero_parity_addr != 0:
+                        xor_mode_int = 1  # WITH_ZERO_PARITY
+                    else:
+                        # Fallback: direct write (if no zero parity provided)
+                        xor_mode_int = 1
+                else:
+                    # Subsequent columns: incremental update
+                    # Always use INCREMENTAL mode for shared parity updates
+                    xor_mode_int = 2  # INCREMENTAL
+                    # Override if explicitly specified in config
+                    if xor_mode_str == 'with_recv_encoding':
+                        # If config explicitly says with_recv_encoding, use it but treat as incremental
+                        # (since we're updating shared parity)
+                        xor_mode_int = 2
+                
+                # Pass zero_parity_addr and xor_mode to C++
+                # Get send_count and recv_count from pipeline hints
+                hints = pipeline_hints.get(col_idx, {})
+                send_count = hints.get('send_count', 1)
+                recv_count = hints.get('recv_count', 1)
+                
                 self._eccheck_native.submit_data_for_encoding(
-                    col_idx, cur_buffer_addr, take, enc_addr, recv_addr, rsz, parity_addr
+                    col_idx, cur_buffer_addr, take, enc_addr, recv_addr, rsz, parity_addr,
+                    zero_parity_addr, xor_mode_int, send_count, recv_count
                 )
+                
+                if zero_parity_addr != 0:
+                    logger.debug(f"EC-CHECK: Column {col_idx} chunk {chunk_idx} initializing parity with zero buffer at 0x{zero_parity_addr:x}")
+                elif col_idx > 0:
+                    logger.debug(f"EC-CHECK: Column {col_idx} chunk {chunk_idx} incrementally updating shared parity")
             
             src_pos += take
         
+        # Log buffer usage per column
+        total_recv_used = sum(recv_buffer_offsets)
+        buffer_usage_lines = [f"  Column {i} receive buffer used: {recv_buffer_offsets[i] / (1024**3):.2f} GB" 
+                              for i in range(num_columns)]
         logger.info(
-            f"  Thread1 receive buffer used: {recv_buffer_offset_thread1 / (1024**3):.2f} GB\n"
-            f"  Thread2 receive buffer used: {recv_buffer_offset_thread2 / (1024**3):.2f} GB\n"
-            f"  Total receive buffer used: {(recv_buffer_offset_thread1 + recv_buffer_offset_thread2) / (1024**3):.2f} GB"
+            "\n".join(buffer_usage_lines) + 
+            f"\n  Total receive buffer used: {total_recv_used / (1024**3):.2f} GB"
         )
         
-        # Mark end of stream for both encoders
-        # Use legacy per-thread sentinels for now
-        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0)
-        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0)
+        # Mark end of stream for all encoders (send sentinel to each column)
+        for col_idx in range(num_columns):
+            self._eccheck_native.submit_data_for_encoding(
+                col_idx, 0, 0, 0, 0, 0, 0
+            )
         
-        # Wait for both encoding threads to complete
+        # Wait for all encoding threads to complete
         # Activate persistent buffer poller while waiting
-        logger.info("EC-CHECK: Waiting for encoding threads to complete (with buffer polling)...")
+        logger.info(f"EC-CHECK: Waiting for {num_columns} encoding threads to complete (with buffer polling)...")
         
         # Activate the persistent buffer poller
         if self._buffer_poller_active_event:
@@ -1643,6 +1714,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         try:
             # Wait for encoding completion (this may block)
             self._eccheck_native.wait_for_encoding_completion()
+            
+            # Execute post_xor_steps if configured
+            self._execute_post_xor_steps()
         finally:
             # Deactivate the buffer poller
             if self._buffer_poller_active_event:
@@ -1886,29 +1960,401 @@ class FileSystemWriterAsync(FileSystemWriter):
         buffer_alloc_time = time() - buffer_alloc_start
         logger.info(f"EC-CHECK: Phase 2.5 completed in {buffer_alloc_time:.2f}s")
         
-        # If config provides per-column settings (2+2 at present), pass to native
+        # Parse and apply column configuration (supports simple and advanced modes)
         try:
             cfg_path = self.eccheck_config_path or os.environ.get('ECCHECK_CONFIG_PATH')
             if cfg_path and os.path.isfile(cfg_path):
                 import json
                 with open(cfg_path, 'r') as f:
                     data = json.load(f)
-                columns = data.get('columns')
-                if isinstance(columns, list) and len(columns) > 0 and hasattr(self._eccheck_native, 'set_columns_config'):
-                    # Normalize entries: {coefficient:int, send_peer:int, recv_peer:int}
-                    norm_cols = []
-                    for col in columns:
-                        if not isinstance(col, dict):
-                            continue
-                        coef = int(col.get('coefficient', 0))
-                        send_peer = int(col.get('send_peer', self._get_paired_rank(torch.distributed.get_rank(), torch.distributed.get_world_size())))
-                        recv_peer = int(col.get('recv_peer', self._get_paired_rank(torch.distributed.get_rank(), torch.distributed.get_world_size())))
-                        norm_cols.append({'coefficient': coef, 'send_peer': send_peer, 'recv_peer': recv_peer})
-                    if norm_cols:
-                        self._eccheck_native.set_columns_config(norm_cols)
-                        logger.info(f"EC-CHECK: Applied columns config ({len(norm_cols)} entries)")
+                
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+                paired_rank = self._get_paired_rank(rank, world_size)
+                
+                # Check for advanced mode: per-rank configuration
+                ranks_config = data.get('ranks')
+                if isinstance(ranks_config, dict):
+                    # Advanced mode: per-rank configuration
+                    rank_str = str(rank)
+                    rank_config = ranks_config.get(rank_str)
+                    if rank_config and isinstance(rank_config, dict):
+                        columns_config = rank_config.get('columns', [])
+                        post_xor_steps = rank_config.get('post_xor_steps', [])
+                        logger.info(f"EC-CHECK: Using advanced config mode for rank {rank}")
+                        norm_cols = self._parse_advanced_columns_config(columns_config, rank, world_size, paired_rank)
+                        if norm_cols and hasattr(self._eccheck_native, 'set_columns_config'):
+                            self._eccheck_native.set_columns_config(norm_cols)
+                            logger.info(f"EC-CHECK: Applied advanced columns config ({len(norm_cols)} entries)")
+                            # Store pipeline configs for future use (if C++ supports it)
+                            self._store_pipeline_configs(columns_config)
+                        # Store post_xor_steps for future use
+                        if post_xor_steps:
+                            if not hasattr(self, 'eccheck_post_xor_steps'):
+                                self.eccheck_post_xor_steps = []
+                            self.eccheck_post_xor_steps = post_xor_steps
+                            logger.info(f"EC-CHECK: Stored post_xor_steps config ({len(post_xor_steps)} steps)")
+                        
+                        # Allocate zero-initialized parity buffer if needed
+                        self._allocate_zero_parity_buffers_if_needed()
+                    else:
+                        logger.warning(f"EC-CHECK: No configuration found for rank {rank} in advanced mode, falling back to simple mode")
+                        # Fall through to simple mode
+                        ranks_config = None
+                
+                # Also allocate zero parity buffers for simple mode (check if needed)
+                if ranks_config is None:
+                    # For simple mode, check if we need zero parity (default: no)
+                    if not hasattr(self, 'eccheck_zero_parity_buffers'):
+                        self.eccheck_zero_parity_buffers = {}
+                
+                # Simple mode: backward compatible (all ranks use same config)
+                if ranks_config is None:
+                    columns = data.get('columns')
+                    if isinstance(columns, list) and len(columns) > 0 and hasattr(self._eccheck_native, 'set_columns_config'):
+                        # Normalize entries: {coefficient:int, send_peer:int, recv_peer:int}
+                        # Note: -1 means "auto-calculate based on current rank" (paired_rank)
+                        norm_cols = []
+                        # Initialize pipeline hints for simple mode (default: needs send and recv)
+                        if not hasattr(self, 'eccheck_pipeline_hints'):
+                            self.eccheck_pipeline_hints = {}
+                        
+                        for col_idx, col in enumerate(columns):
+                            if not isinstance(col, dict):
+                                continue
+                            coef = int(col.get('coefficient', col_idx))
+                            # If send_peer is -1 or not specified, use paired_rank (auto-calculate)
+                            send_peer_raw = col.get('send_peer', -1)
+                            send_peer = int(send_peer_raw) if send_peer_raw is not None else -1
+                            if send_peer < 0:
+                                send_peer = paired_rank
+                            # If recv_peer is -1 or not specified, use paired_rank (auto-calculate)
+                            recv_peer_raw = col.get('recv_peer', -1)
+                            recv_peer = int(recv_peer_raw) if recv_peer_raw is not None else -1
+                            if recv_peer < 0:
+                                recv_peer = paired_rank
+                            norm_cols.append({'coefficient': coef, 'send_peer': send_peer, 'recv_peer': recv_peer})
+                            
+                            # Set default pipeline hints for simple mode
+                            self.eccheck_pipeline_hints[col_idx] = {
+                                'needs_send': True,
+                                'needs_recv': True,
+                                'xor_mode': 'with_recv_encoding',
+                                'needs_zero_parity': False,
+                                'send_count': 1,
+                                'recv_count': 1
+                            }
+                        if norm_cols:
+                            self._eccheck_native.set_columns_config(norm_cols)
+                            logger.info(f"EC-CHECK: Applied simple columns config ({len(norm_cols)} entries)")
         except Exception as e:
             logger.warning(f"EC-CHECK: Failed to apply columns config: {e}")
+        
+        # IMPORTANT: Return write_buckets for multiprocessing
+        # This is called from async_utils.PipelineAsyncCaller and must return write_buckets
+        if self.write_buckets is None:
+            logger.warning("EC-CHECK: write_buckets is None, returning empty list")
+            return []
+        
+        return self.write_buckets
+    
+    def _parse_pipeline_step(self, pipeline, column_idx):
+        """
+        Parse pipeline steps for a column to extract execution hints.
+        Returns a dict with execution flags and parameters.
+        """
+        if not pipeline or not isinstance(pipeline, list):
+            return {
+                'needs_send': True,
+                'needs_recv': True,
+                'xor_mode': 'with_recv_encoding',
+                'needs_zero_parity': False,
+                'send_count': 1,
+                'recv_count': 1
+            }
+        
+        result = {
+            'needs_send': False,
+            'needs_recv': False,
+            'xor_mode': 'with_recv_encoding',  # default
+            'needs_zero_parity': False,
+            'send_count': 1,
+            'recv_count': 1
+        }
+        
+        for step in pipeline:
+            if not isinstance(step, dict):
+                continue
+            
+            step_type = step.get('type', '')
+            step_name = step.get('step', '')
+            
+            if step_type == 'nccl_send' or step_name == 'send':
+                result['needs_send'] = True
+                result['send_count'] = int(step.get('count', 1))
+            
+            elif step_type == 'nccl_recv' or step_name == 'recv':
+                result['needs_recv'] = True
+                result['recv_count'] = int(step.get('count', 1))
+            
+            elif step_type == 'xor_update' or step_name == 'xor':
+                mode = step.get('mode', 'with_recv_encoding')
+                result['xor_mode'] = mode
+                if mode == 'with_zero_parity':
+                    result['needs_zero_parity'] = True
+                    result['needs_recv'] = False  # with_zero_parity doesn't need recv
+        
+        return result
+    
+    def _parse_advanced_columns_config(self, columns_config, rank, world_size, paired_rank):
+        """
+        Parse advanced column configuration with pipeline support.
+        Returns normalized columns compatible with simple mode API.
+        
+        For now, extracts basic info (coefficient, send_peer, recv_peer) from pipeline.
+        Also stores pipeline execution hints for Python-side decision making.
+        """
+        norm_cols = []
+        
+        # Initialize pipeline hints storage
+        if not hasattr(self, 'eccheck_pipeline_hints'):
+            self.eccheck_pipeline_hints = {}
+        
+        for col_cfg in columns_config:
+            if not isinstance(col_cfg, dict):
+                continue
+            
+            column_idx = col_cfg.get('column_idx', len(norm_cols))
+            coefficient = int(col_cfg.get('coefficient', column_idx))
+            
+            # Extract send_peer and recv_peer from pipeline
+            send_peer = -1
+            recv_peer = -1
+            pipeline = col_cfg.get('pipeline', [])
+            
+            for step in pipeline:
+                if not isinstance(step, dict):
+                    continue
+                step_type = step.get('type', '')
+                if step_type == 'nccl_send':
+                    target = step.get('target_rank', -1)
+                    if target >= 0:
+                        send_peer = target
+                elif step_type == 'nccl_recv':
+                    source = step.get('source_rank', -1)
+                    if source >= 0:
+                        recv_peer = source
+            
+            # Auto-calculate if not found in pipeline
+            if send_peer < 0:
+                send_peer = paired_rank
+            if recv_peer < 0:
+                recv_peer = paired_rank
+            
+            norm_cols.append({
+                'coefficient': coefficient,
+                'send_peer': send_peer,
+                'recv_peer': recv_peer
+            })
+            
+            # Store full pipeline config for future use
+            if not hasattr(self, 'eccheck_pipeline_configs'):
+                self.eccheck_pipeline_configs = {}
+            self.eccheck_pipeline_configs[column_idx] = pipeline
+            
+            # Parse pipeline to get execution hints
+            self.eccheck_pipeline_hints[column_idx] = self._parse_pipeline_step(pipeline, column_idx)
+        
+        return norm_cols
+    
+    def _execute_post_xor_steps(self):
+        """
+        Execute post-XOR steps (sync, send, recv) after all XOR operations complete.
+        These steps are configured in post_xor_steps section of the config.
+        """
+        post_xor_steps = getattr(self, 'eccheck_post_xor_steps', [])
+        if not post_xor_steps:
+            return  # No post-xor steps configured
+        
+        logger.info(f"EC-CHECK: Executing {len(post_xor_steps)} post-XOR steps")
+        
+        # Allocate post-xor buffers if needed
+        # These buffers are for exchanging data/parity after XOR
+        if not hasattr(self, 'eccheck_post_xor_buffers'):
+            self.eccheck_post_xor_buffers = {}
+        
+        for step_idx, step in enumerate(post_xor_steps):
+            if not isinstance(step, dict):
+                continue
+            
+            step_name = step.get('step', '')
+            step_type = step.get('type', '')
+            
+            if step_name == 'sync' and step_type == 'barrier':
+                # Synchronization barrier
+                sync_point = step.get('sync_point', 'after_all_xor')
+                ranks = step.get('ranks', [])
+                logger.info(f"EC-CHECK: Post-XOR sync point: {sync_point}, ranks: {ranks}")
+                # TODO: Implement barrier synchronization (might need C++ support or use torch.distributed.barrier)
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    dist.barrier()
+                    logger.info(f"EC-CHECK: Post-XOR barrier completed")
+            
+            elif step_name == 'send' and step_type == 'nccl_send':
+                # Send data/parity to target rank
+                target_rank = step.get('target_rank', -1)
+                data_type = step.get('data_type', 'parity')
+                data_source = step.get('data_source', 'local_parity')
+                
+                if target_rank < 0:
+                    logger.warning(f"EC-CHECK: Post-XOR send: Invalid target_rank {target_rank}")
+                    continue
+                
+                # Determine source buffer address and size
+                send_addr = 0
+                send_size = 0
+                
+                if data_source == 'local_parity' and hasattr(self, 'eccheck_persist_parity_store'):
+                    if self.eccheck_persist_parity_store is not None:
+                        send_addr = int(self.eccheck_persist_parity_store.data_ptr())
+                        send_size = self.eccheck_persist_parity_store.numel()
+                        logger.info(f"EC-CHECK: Post-XOR send: target_rank={target_rank}, data_type={data_type}, source={data_source}, size={send_size}")
+                    else:
+                        logger.warning(f"EC-CHECK: Post-XOR send: parity store not allocated")
+                        continue
+                elif data_source == 'local_data' and hasattr(self, 'tensor_buffer'):
+                    if self.tensor_buffer is not None:
+                        send_addr = int(self.tensor_buffer.data_ptr())
+                        send_size = self.tensor_buffer.numel()
+                        logger.info(f"EC-CHECK: Post-XOR send: target_rank={target_rank}, data_type={data_type}, source={data_source}, size={send_size}")
+                    else:
+                        logger.warning(f"EC-CHECK: Post-XOR send: tensor buffer not available")
+                        continue
+                else:
+                    logger.warning(f"EC-CHECK: Post-XOR send: Unknown data_source '{data_source}'")
+                    continue
+                
+                # Call C++ post_xor_send
+                if hasattr(self._eccheck_native, 'post_xor_send') and send_addr > 0 and send_size > 0:
+                    try:
+                        self._eccheck_native.post_xor_send(target_rank, send_addr, send_size)
+                        logger.info(f"EC-CHECK: Post-XOR send completed to rank {target_rank}")
+                    except Exception as e:
+                        logger.error(f"EC-CHECK: Post-XOR send failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    logger.warning(f"EC-CHECK: Post-XOR send: C++ API not available")
+            
+            elif step_name == 'recv' and step_type == 'nccl_recv':
+                # Receive data/parity from source rank
+                source_rank = step.get('source_rank', -1)
+                data_type = step.get('data_type', 'data')
+                data_target = step.get('data_target', 'peer_data_buffer')
+                
+                if source_rank < 0:
+                    logger.warning(f"EC-CHECK: Post-XOR recv: Invalid source_rank {source_rank}")
+                    continue
+                
+                # Allocate or get receive buffer
+                recv_addr = 0
+                recv_size = 0
+                
+                if data_target == 'peer_data_buffer':
+                    # Allocate buffer for peer data if not exists
+                    if not hasattr(self, 'eccheck_post_xor_buffers'):
+                        self.eccheck_post_xor_buffers = {}
+                    
+                    if 'peer_data_buffer' not in self.eccheck_post_xor_buffers:
+                        # Allocate buffer based on peer's data size
+                        if hasattr(self, 'eccheck_global_registry') and self.eccheck_global_registry:
+                            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                            peer_metadata = self.eccheck_global_registry.rank_metadata.get(source_rank, [])
+                            peer_total_size = sum(meta.size_bytes for meta in peer_metadata)
+                            aligned_size = ((peer_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
+                            
+                            self.eccheck_post_xor_buffers['peer_data_buffer'] = torch.empty(
+                                aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory
+                            )
+                            logger.info(f"EC-CHECK: Allocated post-xor peer_data_buffer: {aligned_size / (1024**3):.2f} GB")
+                    
+                    buffer = self.eccheck_post_xor_buffers.get('peer_data_buffer')
+                    if buffer is not None:
+                        recv_addr = int(buffer.data_ptr())
+                        recv_size = buffer.numel()
+                        logger.info(f"EC-CHECK: Post-XOR recv: source_rank={source_rank}, data_type={data_type}, target={data_target}, size={recv_size}")
+                    else:
+                        logger.warning(f"EC-CHECK: Post-XOR recv: Failed to allocate peer_data_buffer")
+                        continue
+                elif data_target == 'peer_parity_buffer':
+                    # Use peer's parity store if available, or allocate new buffer
+                    if hasattr(self, 'eccheck_persist_recv_store') and self.eccheck_persist_recv_store is not None:
+                        recv_addr = int(self.eccheck_persist_recv_store.data_ptr())
+                        recv_size = self.eccheck_persist_recv_store.numel()
+                        logger.info(f"EC-CHECK: Post-XOR recv: source_rank={source_rank}, data_type={data_type}, target={data_target}, size={recv_size}")
+                    else:
+                        logger.warning(f"EC-CHECK: Post-XOR recv: recv_store not available")
+                        continue
+                else:
+                    logger.warning(f"EC-CHECK: Post-XOR recv: Unknown data_target '{data_target}'")
+                    continue
+                
+                # Call C++ post_xor_recv
+                if hasattr(self._eccheck_native, 'post_xor_recv') and recv_addr > 0 and recv_size > 0:
+                    try:
+                        self._eccheck_native.post_xor_recv(source_rank, recv_addr, recv_size)
+                        logger.info(f"EC-CHECK: Post-XOR recv completed from rank {source_rank}")
+                    except Exception as e:
+                        logger.error(f"EC-CHECK: Post-XOR recv failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    logger.warning(f"EC-CHECK: Post-XOR recv: C++ API not available")
+        
+        logger.info("EC-CHECK: Post-XOR steps execution completed")
+    
+    def _allocate_zero_parity_buffers_if_needed(self):
+        """
+        Allocate zero-initialized parity buffers for columns that need them.
+        These buffers are used for the first column that XORs with zero-initialized parity.
+        """
+        if not hasattr(self, 'eccheck_pipeline_hints'):
+            return
+        
+        if not hasattr(self, 'eccheck_zero_parity_buffers'):
+            self.eccheck_zero_parity_buffers = {}
+        
+        total_bytes = self.decomposed_state_dict.total_tensor_size_bytes
+        num_chunks = (total_bytes + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size
+        
+        for column_idx, hints in self.eccheck_pipeline_hints.items():
+            if hints.get('needs_zero_parity', False):
+                # Allocate one zero-initialized buffer per chunk for this column
+                # In practice, we might reuse one buffer if XOR is sequential, but for now allocate per chunk
+                buffers = []
+                for chunk_idx in range(num_chunks):
+                    # Use torch.zeros to create zero-initialized buffer
+                    zero_buffer = torch.zeros(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+                    buffers.append(zero_buffer)
+                    logger.debug(f"EC-CHECK: Allocated zero-initialized parity buffer for column {column_idx}, chunk {chunk_idx}")
+                
+                self.eccheck_zero_parity_buffers[column_idx] = buffers
+                logger.info(f"EC-CHECK: Allocated {len(buffers)} zero-initialized parity buffers for column {column_idx}")
+    
+    def _store_pipeline_configs(self, columns_config):
+        """Store pipeline configurations for potential future C++ pipeline engine."""
+        if not hasattr(self, 'eccheck_pipeline_configs'):
+            self.eccheck_pipeline_configs = {}
+        
+        for col_cfg in columns_config:
+            if not isinstance(col_cfg, dict):
+                continue
+            column_idx = col_cfg.get('column_idx', len(self.eccheck_pipeline_configs))
+            pipeline = col_cfg.get('pipeline', [])
+            if pipeline:
+                self.eccheck_pipeline_configs[column_idx] = pipeline
+                logger.debug(f"EC-CHECK: Stored pipeline config for column {column_idx}: {len(pipeline)} steps")
         
         exec_start = time()
         # Execute Phase 3: Tensor data exchange and encoding

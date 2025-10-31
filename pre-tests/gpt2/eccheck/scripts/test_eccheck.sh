@@ -1,8 +1,36 @@
 #!/bin/bash
 
+# ============================================================================
+# EC-CHECK 2+2 Test Script
+# ============================================================================
+# This script tests EC-CHECK with 2+2 column configuration:
+#   - 2 encoder threads per rank (column 0 and column 1)
+#   - Each column has its own send/recv/XOR worker threads
+#   - Configuration file: eccheck/configs/eccheck_2x2_shared_parity.json
+#   - Each rank sends encoded data to paired rank using NCCL
+#   - XOR operation is performed on local and received encoded data
+# 
+# Configuration file format:
+#   {
+#     "persist": { "recv": true, "parity": true },
+#     "columns": [
+#       { "coefficient": 0, "send_peer": -1, "recv_peer": -1 },
+#       { "coefficient": 1, "send_peer": -1, "recv_peer": -1 }
+#     ]
+#   }
+# ============================================================================
+
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ECCHECK_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+BASE_DIR="$(cd "$ECCHECK_DIR/.." && pwd)"
+
+# EC-CHECK configuration file path (default set in Python, can be overridden)
+export ECCHECK_CONFIG_PATH="${ECCHECK_CONFIG_PATH:-$ECCHECK_DIR/configs/eccheck_2x2_shared_parity.json}"
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_FILE=./nccl.log
@@ -141,6 +169,9 @@ fi
 
 export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \
+
+# Change to base directory (pre-tests/gpt2) for running pretrain_gpt.py
+cd "$BASE_DIR"
 
 PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     pretrain_gpt.py \

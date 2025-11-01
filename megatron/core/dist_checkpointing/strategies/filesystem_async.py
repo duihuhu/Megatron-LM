@@ -1961,27 +1961,35 @@ class FileSystemWriterAsync(FileSystemWriter):
         logger.info(f"EC-CHECK: Phase 2.5 completed in {buffer_alloc_time:.2f}s")
         
         # Parse and apply column configuration (supports simple and advanced modes)
+        logger.info("EC-CHECK: Phase 2.5 - Starting configuration parsing")
         try:
             cfg_path = self.eccheck_config_path or os.environ.get('ECCHECK_CONFIG_PATH')
+            logger.info(f"EC-CHECK: Config path check - self.eccheck_config_path={self.eccheck_config_path}, env ECCHECK_CONFIG_PATH={os.environ.get('ECCHECK_CONFIG_PATH')}, final cfg_path={cfg_path}")
+            logger.info(f"EC-CHECK: Config path: {cfg_path}, exists: {os.path.isfile(cfg_path) if cfg_path else False}")
             if cfg_path and os.path.isfile(cfg_path):
+                logger.info(f"EC-CHECK: Loading configuration from {cfg_path}")
                 import json
                 with open(cfg_path, 'r') as f:
                     data = json.load(f)
+                logger.info(f"EC-CHECK: Configuration loaded successfully")
                 
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                 world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
                 paired_rank = self._get_paired_rank(rank, world_size)
+                logger.info(f"EC-CHECK: Rank={rank}, world_size={world_size}, paired_rank={paired_rank}")
                 
                 # Check for advanced mode: per-rank configuration
                 ranks_config = data.get('ranks')
+                logger.info(f"EC-CHECK: Checking config mode, ranks_config type: {type(ranks_config)}, is dict: {isinstance(ranks_config, dict)}")
                 if isinstance(ranks_config, dict):
                     # Advanced mode: per-rank configuration
                     rank_str = str(rank)
+                    logger.info(f"EC-CHECK: Looking for rank {rank_str} in ranks_config, available keys: {list(ranks_config.keys())}")
                     rank_config = ranks_config.get(rank_str)
                     if rank_config and isinstance(rank_config, dict):
                         columns_config = rank_config.get('columns', [])
                         post_xor_steps = rank_config.get('post_xor_steps', [])
-                        logger.info(f"EC-CHECK: Using advanced config mode for rank {rank}")
+                        logger.info(f"EC-CHECK: Using advanced config mode for rank {rank}, columns={len(columns_config)}, post_xor_steps={len(post_xor_steps)}")
                         norm_cols = self._parse_advanced_columns_config(columns_config, rank, world_size, paired_rank)
                         if norm_cols and hasattr(self._eccheck_native, 'set_columns_config'):
                             self._eccheck_native.set_columns_config(norm_cols)
@@ -1994,9 +2002,13 @@ class FileSystemWriterAsync(FileSystemWriter):
                                 self.eccheck_post_xor_steps = []
                             self.eccheck_post_xor_steps = post_xor_steps
                             logger.info(f"EC-CHECK: Stored post_xor_steps config ({len(post_xor_steps)} steps)")
+                            logger.info(f"EC-CHECK: Post-XOR steps content: {post_xor_steps}")
+                        else:
+                            logger.warning(f"EC-CHECK: No post_xor_steps found in config for rank {rank}")
                         
                         # Allocate zero-initialized parity buffer if needed
                         self._allocate_zero_parity_buffers_if_needed()
+                        logger.info(f"EC-CHECK: Configuration parsing completed for rank {rank}")
                     else:
                         logger.warning(f"EC-CHECK: No configuration found for rank {rank} in advanced mode, falling back to simple mode")
                         # Fall through to simple mode
@@ -2049,7 +2061,10 @@ class FileSystemWriterAsync(FileSystemWriter):
                             logger.info(f"EC-CHECK: Applied simple columns config ({len(norm_cols)} entries)")
         except Exception as e:
             logger.warning(f"EC-CHECK: Failed to apply columns config: {e}")
+            import traceback
+            traceback.print_exc()
         
+        logger.info("EC-CHECK: Phase 2.5 configuration parsing section completed")
         # IMPORTANT: Return write_buckets for multiprocessing
         # This is called from async_utils.PipelineAsyncCaller and must return write_buckets
         if self.write_buckets is None:
@@ -2173,7 +2188,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         These steps are configured in post_xor_steps section of the config.
         """
         post_xor_steps = getattr(self, 'eccheck_post_xor_steps', [])
+        logger.info(f"EC-CHECK: _execute_post_xor_steps called, post_xor_steps={post_xor_steps}, type={type(post_xor_steps)}, hasattr={hasattr(self, 'eccheck_post_xor_steps')}")
         if not post_xor_steps:
+            logger.info("EC-CHECK: No post-xor steps configured, skipping")
             return  # No post-xor steps configured
         
         logger.info(f"EC-CHECK: Executing {len(post_xor_steps)} post-XOR steps")
@@ -2206,6 +2223,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 target_rank = step.get('target_rank', -1)
                 data_type = step.get('data_type', 'parity')
                 data_source = step.get('data_source', 'local_parity')
+                logger.info(f"EC-CHECK: Processing post-XOR send step: target_rank={target_rank}, data_type={data_type}, data_source={data_source}")
                 
                 if target_rank < 0:
                     logger.warning(f"EC-CHECK: Post-XOR send: Invalid target_rank {target_rank}")
@@ -2219,7 +2237,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     if self.eccheck_persist_parity_store is not None:
                         send_addr = int(self.eccheck_persist_parity_store.data_ptr())
                         send_size = self.eccheck_persist_parity_store.numel()
-                        logger.info(f"EC-CHECK: Post-XOR send: target_rank={target_rank}, data_type={data_type}, source={data_source}, size={send_size}")
+                        logger.info(f"EC-CHECK: Post-XOR send: target_rank={target_rank}, data_type={data_type}, source={data_source}, size={send_size}, addr=0x{send_addr:x}")
                     else:
                         logger.warning(f"EC-CHECK: Post-XOR send: parity store not allocated")
                         continue
@@ -2227,7 +2245,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     if self.tensor_buffer is not None:
                         send_addr = int(self.tensor_buffer.data_ptr())
                         send_size = self.tensor_buffer.numel()
-                        logger.info(f"EC-CHECK: Post-XOR send: target_rank={target_rank}, data_type={data_type}, source={data_source}, size={send_size}")
+                        logger.info(f"EC-CHECK: Post-XOR send: target_rank={target_rank}, data_type={data_type}, source={data_source}, size={send_size}, addr=0x{send_addr:x}")
                     else:
                         logger.warning(f"EC-CHECK: Post-XOR send: tensor buffer not available")
                         continue
@@ -2238,6 +2256,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 # Call C++ post_xor_send
                 if hasattr(self._eccheck_native, 'post_xor_send') and send_addr > 0 and send_size > 0:
                     try:
+                        logger.info(f"EC-CHECK: Calling C++ post_xor_send(target_rank={target_rank}, addr=0x{send_addr:x}, size={send_size})")
                         self._eccheck_native.post_xor_send(target_rank, send_addr, send_size)
                         logger.info(f"EC-CHECK: Post-XOR send completed to rank {target_rank}")
                     except Exception as e:
@@ -2245,13 +2264,14 @@ class FileSystemWriterAsync(FileSystemWriter):
                         import traceback
                         traceback.print_exc()
                 else:
-                    logger.warning(f"EC-CHECK: Post-XOR send: C++ API not available")
+                    logger.warning(f"EC-CHECK: Post-XOR send: C++ API not available or invalid params (hasattr={hasattr(self._eccheck_native, 'post_xor_send')}, send_addr={send_addr}, send_size={send_size})")
             
             elif step_name == 'recv' and step_type == 'nccl_recv':
                 # Receive data/parity from source rank
                 source_rank = step.get('source_rank', -1)
                 data_type = step.get('data_type', 'data')
                 data_target = step.get('data_target', 'peer_data_buffer')
+                logger.info(f"EC-CHECK: Processing post-XOR recv step: source_rank={source_rank}, data_type={data_type}, data_target={data_target}")
                 
                 if source_rank < 0:
                     logger.warning(f"EC-CHECK: Post-XOR recv: Invalid source_rank {source_rank}")
@@ -2303,6 +2323,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 # Call C++ post_xor_recv
                 if hasattr(self._eccheck_native, 'post_xor_recv') and recv_addr > 0 and recv_size > 0:
                     try:
+                        logger.info(f"EC-CHECK: Calling C++ post_xor_recv(source_rank={source_rank}, addr=0x{recv_addr:x}, size={recv_size})")
                         self._eccheck_native.post_xor_recv(source_rank, recv_addr, recv_size)
                         logger.info(f"EC-CHECK: Post-XOR recv completed from rank {source_rank}")
                     except Exception as e:
@@ -2310,7 +2331,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                         import traceback
                         traceback.print_exc()
                 else:
-                    logger.warning(f"EC-CHECK: Post-XOR recv: C++ API not available")
+                    logger.warning(f"EC-CHECK: Post-XOR recv: C++ API not available or invalid params (hasattr={hasattr(self._eccheck_native, 'post_xor_recv')}, recv_addr={recv_addr}, recv_size={recv_size})")
         
         logger.info("EC-CHECK: Post-XOR steps execution completed")
     

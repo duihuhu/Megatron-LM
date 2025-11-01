@@ -39,7 +39,7 @@ cd /workspace/Megatron-LM/pre-tests/gpt2/eccheck
 python3 scripts/verify_eccheck_config.py configs/eccheck_2x2_shared_parity.json
 ```
 
-### 2. 运行测试
+### 2. 运行测试（2 rank，默认）
 
 **使用默认配置（2+2 共享 parity）**:
 ```bash
@@ -47,17 +47,39 @@ cd /workspace/Megatron-LM/pre-tests/gpt2
 bash eccheck/scripts/test_eccheck.sh
 ```
 
-**使用自定义配置文件**:
+**配置说明**:
+- `GPUS_PER_NODE=2`: 每个节点 2 个 GPU
+- `NNODES=1`: 1 个节点
+- `WORLD_SIZE=2`: 总共 2 个 rank
+- **EC-CHECK 配对**: Rank 0 ↔ Rank 1
+
+### 3. 运行 4 rank 测试
+
+**单节点 4 GPU**:
 ```bash
-export ECCHECK_CONFIG_PATH=/workspace/Megatron-LM/pre-tests/gpt2/eccheck/configs/eccheck_2x2_advanced.json
 cd /workspace/Megatron-LM/pre-tests/gpt2
-bash eccheck/scripts/test_eccheck.sh
+bash eccheck/scripts/test_eccheck_4rank.sh
 ```
 
-### 3. 使用 4 rank 配置
+**配置说明**:
+- `GPUS_PER_NODE=4`: 4 个 GPU
+- `NNODES=1`: 1 个节点
+- `WORLD_SIZE=4`: 总共 4 个 rank
+- **EC-CHECK 配对**: Rank 0↔2, Rank 1↔3
+
+**多节点 2×2 GPU**（需要修改脚本）:
+```bash
+# 节点 0（在节点 0 上运行）
+bash eccheck/scripts/test_eccheck_4rank.sh 0
+
+# 节点 1（在节点 1 上运行，另一台机器）
+bash eccheck/scripts/test_eccheck_4rank.sh 1
+```
+
+### 4. 使用自定义配置文件
 
 ```bash
-export ECCHECK_CONFIG_PATH=/workspace/Megatron-LM/pre-tests/gpt2/eccheck/configs/eccheck_4rank.json
+export ECCHECK_CONFIG_PATH=/workspace/Megatron-LM/pre-tests/gpt2/eccheck/configs/eccheck_2x2_advanced.json
 cd /workspace/Megatron-LM/pre-tests/gpt2
 bash eccheck/scripts/test_eccheck.sh
 ```
@@ -92,6 +114,8 @@ bash eccheck/scripts/test_eccheck.sh
 - **配置详解**: `docs/ECCHECK_CONFIG_EXPLAINED.md` - 配置文件格式详解
 - **Pipeline 配置**: `docs/ECCHECK_PIPELINE_CONFIG.md` - 高级 pipeline 配置规范
 - **共享 Parity 模型**: `docs/PARITY_SHARED_MODEL.md` - 共享 parity buffer 模型说明
+- **Rank/Node 映射**: `docs/RANK_NODE_MAPPING.md` - Rank 和节点映射关系说明
+- **4 Rank 行为分析**: `docs/4RANK_BEHAVIOR_DETAILED.md` - **4 Rank 测试详细行为分析**（High-level 和细致实现）
 - **测试指南**: `docs/QUICK_TEST_GUIDE.md` - 快速测试指南
 - **实现状态**: `docs/IMPLEMENTATION_COMPLETE.md` - 完成功能清单
 

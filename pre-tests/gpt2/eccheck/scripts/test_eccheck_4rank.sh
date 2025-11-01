@@ -19,7 +19,9 @@ ECCHECK_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BASE_DIR="$(cd "$ECCHECK_DIR/.." && pwd)"
 
 # EC-CHECK configuration file path
-export ECCHECK_CONFIG_PATH="${ECCHECK_CONFIG_PATH:-$ECCHECK_DIR/configs/eccheck_4rank.json}"
+# Force use the correct path (ignore any pre-existing ECCHECK_CONFIG_PATH)
+ECCHECK_CONFIG_PATH="$ECCHECK_DIR/configs/eccheck_4rank.json"
+export ECCHECK_CONFIG_PATH
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_FILE=./nccl.log

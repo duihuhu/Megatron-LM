@@ -67,6 +67,31 @@
             }
           ]
         }
+      ],
+      "post_xor_steps": [
+        {
+          "_comment": "Synchronization barrier after all XOR operations complete",
+          "step": "sync",
+          "type": "barrier",
+          "sync_point": "after_all_xor",
+          "ranks": [0, 1, 2, 3]
+        },
+        {
+          "_comment": "Send own parity to paired rank (Rank 2)",
+          "step": "send",
+          "type": "nccl_send",
+          "target_rank": 2,
+          "data_type": "parity",
+          "data_source": "local_parity"
+        },
+        {
+          "_comment": "Receive paired rank's data",
+          "step": "recv",
+          "type": "nccl_recv",
+          "source_rank": 2,
+          "data_type": "data",
+          "data_target": "peer_data_buffer"
+        }
       ]
     },
     "1": {
@@ -123,6 +148,30 @@
               "target": "parity"
             }
           ]
+        }
+      ],
+      "post_xor_steps": [
+        {
+          "step": "sync",
+          "type": "barrier",
+          "sync_point": "after_all_xor",
+          "ranks": [0, 1, 2, 3]
+        },
+        {
+          "_comment": "Send own parity to paired rank (Rank 3)",
+          "step": "send",
+          "type": "nccl_send",
+          "target_rank": 3,
+          "data_type": "parity",
+          "data_source": "local_parity"
+        },
+        {
+          "_comment": "Receive paired rank's data",
+          "step": "recv",
+          "type": "nccl_recv",
+          "source_rank": 3,
+          "data_type": "data",
+          "data_target": "peer_data_buffer"
         }
       ]
     },
@@ -181,6 +230,30 @@
             }
           ]
         }
+      ],
+      "post_xor_steps": [
+        {
+          "step": "sync",
+          "type": "barrier",
+          "sync_point": "after_all_xor",
+          "ranks": [0, 1, 2, 3]
+        },
+        {
+          "_comment": "Send own parity to paired rank (Rank 0)",
+          "step": "send",
+          "type": "nccl_send",
+          "target_rank": 0,
+          "data_type": "parity",
+          "data_source": "local_parity"
+        },
+        {
+          "_comment": "Receive paired rank's data",
+          "step": "recv",
+          "type": "nccl_recv",
+          "source_rank": 0,
+          "data_type": "data",
+          "data_target": "peer_data_buffer"
+        }
       ]
     },
     "3": {
@@ -238,16 +311,41 @@
             }
           ]
         }
+      ],
+      "post_xor_steps": [
+        {
+          "step": "sync",
+          "type": "barrier",
+          "sync_point": "after_all_xor",
+          "ranks": [0, 1, 2, 3]
+        },
+        {
+          "_comment": "Send own parity to paired rank (Rank 1)",
+          "step": "send",
+          "type": "nccl_send",
+          "target_rank": 1,
+          "data_type": "parity",
+          "data_source": "local_parity"
+        },
+        {
+          "_comment": "Receive paired rank's data",
+          "step": "recv",
+          "type": "nccl_recv",
+          "source_rank": 1,
+          "data_type": "data",
+          "data_target": "peer_data_buffer"
+        }
       ]
     }
   },
   
   "_pairing_rules": {
-    "_comment": "For 4 ranks, pairs are typically: (0,1) and (2,3)",
-    "rank_0": "paired with rank 1",
-    "rank_1": "paired with rank 0",
-    "rank_2": "paired with rank 3",
-    "rank_3": "paired with rank 2"
+    "_comment": "EC-CHECK pairing rules: rank_i ↔ rank_{i + world_size/2}",
+    "_note": "For 4 ranks, pairs are: (0,2) and (1,3)",
+    "rank_0": "paired with rank 2 (0 + 4/2 = 2)",
+    "rank_1": "paired with rank 3 (1 + 4/2 = 3)",
+    "rank_2": "paired with rank 0 (2 - 4/2 = 0)",
+    "rank_3": "paired with rank 1 (3 - 4/2 = 1)"
   },
   
   "_usage": {

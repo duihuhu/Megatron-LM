@@ -952,12 +952,16 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         from megatron.training import get_args as input_args
         args = input_args()
         # Use PyT saving mechanism
+        # Get EC-CHECK config path from args or environment
+        eccheck_config_path = getattr(args, 'eccheck_config_path', None) or os.environ.get('ECCHECK_CONFIG_PATH')
+        
         writer = FileSystemWriterAsync(
             checkpoint_dir,
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
             use_eccheck=args.use_eccheck,
+            eccheck_config_path=eccheck_config_path,  # Pass config path
             eccheck_native=self._eccheck_native,  # Pass pre-initialized C++ module
             eccheck_buffers=self._get_eccheck_buffers(),  # Pass pre-allocated buffers
         )

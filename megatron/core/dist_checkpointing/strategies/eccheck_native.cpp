@@ -11,6 +11,7 @@
 #include <array>
 #include <optional>
 #include <cstring>
+#include <string>
 #include <iostream>
 #include <unordered_map>
 #include <fstream>
@@ -58,9 +59,13 @@ private:
         XorMode xor_mode;           // XOR模式
         int send_count;             // Number of times to send (default: 1)
         int recv_count;             // Number of times to recv (default: 1)
+        int chunk_idx;              // Chunk index (for chunk-level post-xor)
+        size_t chunk_size;          // Chunk size (for chunk-level post-xor)
+        bool is_last_column_in_chunk; // True if this is the last column for this chunk
         EncodingTask() : data_addr(0), size(0), encoding_addr(0), recv_addr(0), recv_chunk_size(0),
                         parity_addr(0), zero_parity_addr(0), xor_mode(XorMode::WITH_RECV_ENCODING),
-                        send_count(1), recv_count(1) {}
+                        send_count(1), recv_count(1), chunk_idx(-1), chunk_size(0),
+                        is_last_column_in_chunk(false) {}
     };
     
     struct SendTask {
@@ -85,6 +90,9 @@ private:
         uintptr_t parity_addr;          // Parity缓冲区地址（XOR结果）
         size_t size;                    // 数据大小
         XorMode mode;                   // XOR模式
+        int chunk_idx;                  // Chunk index (for chunk-level post-xor)
+        size_t chunk_size;              // Chunk size (for chunk-level post-xor)
+        bool is_last_column_in_chunk;   // True if this is the last column for this chunk
     };
     
     // Per-column queues and synchronization (use std::array for non-movable types)
@@ -131,6 +139,9 @@ private:
         uintptr_t parity_addr;
         size_t size;
         XorMode xor_mode;
+        int chunk_idx;              // Chunk index (for chunk-level post-xor)
+        size_t chunk_size;          // Chunk size (for chunk-level post-xor)
+        bool is_last_column_in_chunk; // True if this is the last column for this chunk
     };
     std::array<std::unordered_map<uintptr_t, RecvMapping>, MAX_COLUMNS> recv_to_xor_mappings_;  // One per column
     std::array<std::mutex, MAX_COLUMNS> recv_mapping_mutex_;
@@ -155,6 +166,21 @@ private:
     std::atomic<size_t> persist_parity_offset_{0};
     std::atomic<bool> persist_recv_enabled_{false};
     std::atomic<bool> persist_parity_enabled_{false};
+    
+    // Chunk-level post-xor configuration
+    struct PostXorStep {
+        std::string step_name;  // "send" or "recv"
+        std::string step_type;  // "nccl_send" or "nccl_recv"
+        int target_rank;        // For send
+        int source_rank;        // For recv
+        std::string data_type;  // "parity" or "data"
+        std::string data_source; // "local_parity" or "local_data"
+        std::string data_target; // "peer_data_buffer" or "peer_parity_buffer"
+    };
+    std::vector<PostXorStep> post_xor_steps_config_;  // Post-xor steps configuration
+    uintptr_t peer_data_buffer_base_ = 0;   // Base address for peer data buffer (for chunk-level recv)
+    size_t peer_data_buffer_capacity_ = 0;  // Capacity of peer data buffer
+    bool chunk_level_post_xor_enabled_ = false;  // Whether chunk-level post-xor is enabled
     
     // Worker threads - 4 threads per column (encoder, send, recv, xor)
     // Use optional because std::thread is not default-constructible in C++11
@@ -341,7 +367,7 @@ private:
                 // Submit sentinel to xor_worker
                 {
                     std::lock_guard<std::mutex> lock(xor_queue_mutex_[column_idx]);
-                    xor_queues_[column_idx].push({0, 0, 0, 0, XorMode::WITH_RECV_ENCODING});
+                    xor_queues_[column_idx].push({0, 0, 0, 0, XorMode::WITH_RECV_ENCODING, -1, 0, false});
                 }
                 xor_queue_cv_[column_idx].notify_one();
                 
@@ -404,7 +430,10 @@ private:
                         task.zero_parity_addr,        // zero_parity (used as second source)
                         task.parity_addr,              // result parity
                         task.size,                     // size
-                        XorMode::WITH_ZERO_PARITY      // mode
+                        XorMode::WITH_ZERO_PARITY,     // mode
+                        task.chunk_idx,                // chunk_idx
+                        task.chunk_size,               // chunk_size
+                        task.is_last_column_in_chunk    // is_last_column_in_chunk
                     });
                 }
                 xor_queue_cv_[column_idx].notify_one();
@@ -610,13 +639,19 @@ private:
                                 task.recv_addr,        // recv_encoding_addr (the received encoding to XOR)
                                 mapping.parity_addr,    // parity_addr (both source and destination)
                                 mapping.size,
-                                XorMode::INCREMENTAL
+                                XorMode::INCREMENTAL,
+                                mapping.chunk_idx,      // chunk_idx
+                                mapping.chunk_size,     // chunk_size
+                                mapping.is_last_column_in_chunk  // is_last_column_in_chunk
                             });
                         } else {
                             // For other modes: local encoding XOR received encoding -> parity
                             xor_queues_[column_idx].push({
                                 mapping.encoding_addr, task.recv_addr, mapping.parity_addr, 
-                                mapping.size, mapping.xor_mode
+                                mapping.size, mapping.xor_mode,
+                                mapping.chunk_idx,      // chunk_idx
+                                mapping.chunk_size,     // chunk_size
+                                mapping.is_last_column_in_chunk  // is_last_column_in_chunk
                             });
                         }
                     }
@@ -666,6 +701,11 @@ private:
                 std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker " << column_idx << " received sentinel, marking completed" << std::endl;
                 continue;
             }
+            
+            // Store chunk info for potential post-xor (before XOR operation)
+            int chunk_idx = task.chunk_idx;
+            size_t chunk_size = task.chunk_size;
+            bool is_last_column = task.is_last_column_in_chunk;
             
             // Perform XOR based on mode
             int result = 0;
@@ -768,6 +808,12 @@ private:
                 }
             }
 
+            // Chunk-level post-xor: execute after last column's XOR completes
+            if (is_last_column && chunk_idx >= 0 && chunk_size > 0) {
+                // This is the last column for this chunk, execute chunk-level post-xor
+                execute_chunk_level_post_xor(chunk_idx, chunk_size, task.parity_addr);
+            }
+
             // Release parity buffer after XOR completion
             // Note: Parity result is stored, but buffer can be reused for next chunk if needed
             {
@@ -777,6 +823,137 @@ private:
         }
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker " << column_idx << " exiting" << std::endl;
+    }
+    
+    // Execute chunk-level post-xor for a specific chunk
+    void execute_chunk_level_post_xor(int chunk_idx, size_t chunk_size, uintptr_t parity_addr) {
+        // Calculate offset in persistent stores for this chunk
+        size_t chunk_offset = (size_t)chunk_idx * chunk_size;
+        
+        // Copy parity to persistent store (if enabled and not already copied)
+        if (persist_parity_enabled_.load() && persist_parity_base_ != 0) {
+            if (chunk_offset + chunk_size <= persist_parity_capacity_) {
+                void* dst = reinterpret_cast<void*>(persist_parity_base_ + chunk_offset);
+                void* src = reinterpret_cast<void*>(parity_addr);
+                std::memcpy(dst, src, chunk_size);
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Chunk " << chunk_idx 
+                          << " parity copied to persistent store at offset " << chunk_offset << std::endl;
+            }
+        }
+        
+        // Execute chunk-level post-xor send/recv steps if configured
+        if (!chunk_level_post_xor_enabled_ || post_xor_steps_config_.empty()) {
+            return;  // No chunk-level post-xor configured
+        }
+        
+        // Use column 0's NCCL communicator for post-xor operations
+        int use_column = 0;
+        
+#ifdef NCCL_AVAILABLE
+        if (!nccl_initialized_[use_column]) {
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] NCCL not initialized for chunk-level post-xor" << std::endl;
+            return;
+        }
+        
+        // Wait for NCCL to be ready
+        {
+            std::unique_lock<std::mutex> lock(nccl_init_mutex_);
+            nccl_init_cv_.wait(lock, [this, use_column] {
+                return nccl_init_completed_[use_column].load();
+            });
+        }
+        
+        // Collect send and recv operations to group them for better performance
+        std::vector<std::pair<uintptr_t, int>> send_ops;  // (addr, target_rank)
+        std::vector<std::pair<uintptr_t, int>> recv_ops;  // (addr, source_rank)
+        
+        // First pass: collect all send/recv operations
+        for (const auto& step : post_xor_steps_config_) {
+            if (step.step_name == "send" && step.step_type == "nccl_send") {
+                // Send chunk data/parity to target rank
+                uintptr_t send_addr = 0;
+                
+                if (step.data_source == "local_parity") {
+                    // Send from persistent parity store (chunk offset)
+                    if (chunk_offset + chunk_size <= persist_parity_capacity_) {
+                        send_addr = persist_parity_base_ + chunk_offset;
+                    }
+                } else if (step.data_source == "local_data") {
+                    // TODO: Support sending local data chunks (need data buffer addresses)
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] Sending local_data chunks not yet implemented for chunk " 
+                              << chunk_idx << std::endl;
+                    continue;
+                }
+                
+                if (send_addr != 0 && step.target_rank >= 0) {
+                    send_ops.push_back({send_addr, step.target_rank});
+                } else {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid send parameters for chunk " 
+                              << chunk_idx << std::endl;
+                }
+                
+            } else if (step.step_name == "recv" && step.step_type == "nccl_recv") {
+                // Receive chunk data/parity from source rank
+                uintptr_t recv_addr = 0;
+                
+                if (step.data_target == "peer_data_buffer" && peer_data_buffer_base_ != 0) {
+                    // Receive into peer data buffer (chunk offset)
+                    if (chunk_offset + chunk_size <= peer_data_buffer_capacity_) {
+                        recv_addr = peer_data_buffer_base_ + chunk_offset;
+                    }
+                } else if (step.data_target == "peer_parity_buffer" && persist_recv_base_ != 0) {
+                    // Receive into persistent recv store (chunk offset)
+                    if (chunk_offset + chunk_size <= persist_recv_capacity_) {
+                        recv_addr = persist_recv_base_ + chunk_offset;
+                    }
+                }
+                
+                if (recv_addr != 0 && step.source_rank >= 0) {
+                    recv_ops.push_back({recv_addr, step.source_rank});
+                } else {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid recv parameters for chunk " 
+                              << chunk_idx << std::endl;
+                }
+            }
+            // Note: "sync" steps are not executed here (handled by Python or before chunks)
+        }
+        
+        // Execute all send/recv operations in a single NCCL group for better performance
+        if (!send_ops.empty() || !recv_ops.empty()) {
+            ncclGroupStart();
+            
+            // Execute all sends
+            for (const auto& op : send_ops) {
+                ncclSend(reinterpret_cast<void*>(op.first), chunk_size, 
+                         ncclUint8, op.second, nccl_comms_[use_column], 0);
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Chunk " << chunk_idx 
+                          << " post-xor send to rank " << op.second 
+                          << ", size: " << chunk_size << " bytes" << std::endl;
+            }
+            
+            // Execute all receives
+            for (const auto& op : recv_ops) {
+                ncclRecv(reinterpret_cast<void*>(op.first), chunk_size, 
+                         ncclUint8, op.second, nccl_comms_[use_column], 0);
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Chunk " << chunk_idx 
+                          << " post-xor recv from rank " << op.second 
+                          << ", size: " << chunk_size << " bytes" << std::endl;
+            }
+            
+            ncclGroupEnd();
+            
+            if (!send_ops.empty() || !recv_ops.empty()) {
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Chunk " << chunk_idx 
+                          << " post-xor: " << send_ops.size() << " sends, " 
+                          << recv_ops.size() << " recvs completed" << std::endl;
+            }
+        }
+#else
+        std::cerr << "EC-CHECK: [Rank " << rank_ << "] NCCL not available for chunk-level post-xor" << std::endl;
+#endif
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Chunk-level post-xor for chunk " 
+                  << chunk_idx << " completed (size=" << chunk_size << ")" << std::endl;
     }
     
     // Legacy functions for backward compatibility
@@ -969,6 +1146,33 @@ public:
                   << (persist_parity_enabled_ ? "on" : "off") << ")" << std::endl;
     }
     
+    // Set chunk-level post-xor configuration and peer data buffer
+    void set_chunk_level_post_xor_config(uintptr_t peer_data_base, size_t peer_data_capacity,
+                                         const std::vector<std::map<std::string, std::string>>& steps_config) {
+        peer_data_buffer_base_ = peer_data_base;
+        peer_data_buffer_capacity_ = peer_data_capacity;
+        // Enable chunk-level post-xor if we have steps (even if peer_data_base is 0, send-only operations are valid)
+        chunk_level_post_xor_enabled_ = !steps_config.empty();
+        
+        // Parse and store post-xor steps configuration
+        post_xor_steps_config_.clear();
+        for (const auto& step_map : steps_config) {
+            PostXorStep step;
+            step.step_name = step_map.count("step") ? step_map.at("step") : "";
+            step.step_type = step_map.count("type") ? step_map.at("type") : "";
+            step.target_rank = step_map.count("target_rank") ? std::stoi(step_map.at("target_rank")) : -1;
+            step.source_rank = step_map.count("source_rank") ? std::stoi(step_map.at("source_rank")) : -1;
+            step.data_type = step_map.count("data_type") ? step_map.at("data_type") : "";
+            step.data_source = step_map.count("data_source") ? step_map.at("data_source") : "";
+            step.data_target = step_map.count("data_target") ? step_map.at("data_target") : "";
+            post_xor_steps_config_.push_back(step);
+        }
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Chunk-level post-xor config set: "
+                  << post_xor_steps_config_.size() << " steps, peer_data_base=0x" 
+                  << std::hex << peer_data_base << std::dec << ", capacity=" << peer_data_capacity << std::endl;
+    }
+    
     ~ECCHECKNative() {
         stop_pipeline();
         cleanup_nccl();
@@ -1097,7 +1301,10 @@ public:
                                   uintptr_t zero_parity_addr = 0,
                                   int xor_mode_int = 0,
                                   int send_count = 1,
-                                  int recv_count = 1) {
+                                  int recv_count = 1,
+                                  int chunk_idx = -1,
+                                  size_t chunk_size = 0,
+                                  bool is_last_column_in_chunk = false) {
         if (column_idx < 0 || column_idx >= num_columns_) {
             std::cerr << "EC-CHECK: submit_data_for_encoding: column_idx=" << column_idx
                       << " out of range (num_columns_=" << num_columns_ << ")" << std::endl;
@@ -1127,6 +1334,9 @@ public:
         task.xor_mode = xor_mode;
         task.send_count = send_count;
         task.recv_count = recv_count;
+        task.chunk_idx = chunk_idx;
+        task.chunk_size = chunk_size;
+        task.is_last_column_in_chunk = is_last_column_in_chunk;
         encoding_tasks_[column_idx].push(task);
         }
         encoding_tasks_cv_[column_idx].notify_one();
@@ -1150,6 +1360,9 @@ public:
             mapping.parity_addr = parity_addr;
             mapping.size = recv_chunk_size;
             mapping.xor_mode = xor_mode;
+            mapping.chunk_idx = chunk_idx;
+            mapping.chunk_size = chunk_size;
+            mapping.is_last_column_in_chunk = is_last_column_in_chunk;
             recv_to_xor_mappings_[column_idx][recv_addr] = mapping;
         }
     }
@@ -1283,6 +1496,10 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("parity_capacity"),
              pybind11::arg("persist_recv"),
              pybind11::arg("persist_parity"))
+        .def("set_chunk_level_post_xor_config", &ECCHECKNative::set_chunk_level_post_xor_config,
+             pybind11::arg("peer_data_base"),
+             pybind11::arg("peer_data_capacity"),
+             pybind11::arg("steps_config"))
         .def("set_buffer_addresses", &ECCHECKNative::set_buffer_addresses)
         .def("reset_encoding_completion_flags", &ECCHECKNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECCHECKNative::wait_for_encoding_completion)
@@ -1303,7 +1520,10 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("zero_parity_addr") = 0,
              pybind11::arg("xor_mode_int") = 0,
              pybind11::arg("send_count") = 1,
-             pybind11::arg("recv_count") = 1)
+             pybind11::arg("recv_count") = 1,
+             pybind11::arg("chunk_idx") = -1,
+             pybind11::arg("chunk_size") = 0,
+             pybind11::arg("is_last_column_in_chunk") = false)
         .def("get_data_buffers_to_release", &ECCHECKNative::get_data_buffers_to_release)
         .def("get_encoding_buffers_to_release", &ECCHECKNative::get_encoding_buffers_to_release)
         .def("get_parity_buffers_to_release", &ECCHECKNative::get_parity_buffers_to_release)

@@ -1667,7 +1667,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                 per_column.append((col_idx, enc_addr, recv_addr, recv_size, parity_addr, zero_parity_addr))
             
             # Submit per column via generic API
-            for (col_idx, enc_addr, recv_addr, rsz, parity_addr, zero_parity_addr) in per_column:
+            is_last_chunk = (src_pos + take >= total_bytes)
+            for idx, (col_idx, enc_addr, recv_addr, rsz, parity_addr, zero_parity_addr) in enumerate(per_column):
                 # Determine XOR mode based on column index and pipeline hints
                 hints = pipeline_hints.get(col_idx, {})
                 xor_mode_str = hints.get('xor_mode', 'with_recv_encoding')
@@ -1698,9 +1699,16 @@ class FileSystemWriterAsync(FileSystemWriter):
                 send_count = hints.get('send_count', 1)
                 recv_count = hints.get('recv_count', 1)
                 
+                # Determine if this is the last column for this chunk
+                is_last_column = (idx == len(per_column) - 1)
+                
+                # Submit with chunk information for chunk-level post-xor
                 self._eccheck_native.submit_data_for_encoding(
                     col_idx, cur_buffer_addr, take, enc_addr, recv_addr, rsz, parity_addr,
-                    zero_parity_addr, xor_mode_int, send_count, recv_count
+                    zero_parity_addr, xor_mode_int, send_count, recv_count,
+                    chunk_idx,  # chunk_idx
+                    take,       # chunk_size (use take, which is the actual chunk size)
+                    is_last_column  # is_last_column_in_chunk
                 )
                 
                 if zero_parity_addr != 0:
@@ -1735,10 +1743,32 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         try:
             # Wait for encoding completion (this may block)
+            # Note: Chunk-level post-xor is now executed in C++ after each chunk's last column completes
+            # Global post-xor steps (if any) can still be executed here for backward compatibility
             self._eccheck_native.wait_for_encoding_completion()
             
-            # Execute post_xor_steps if configured
-            self._execute_post_xor_steps()
+            # Execute global post_xor_steps if configured (for sync steps and backward compatibility)
+            # Chunk-level post-xor (send/recv) is already executed in C++ XOR worker per chunk
+            # Global post-xor is for sync barriers and any steps marked chunk_level=false
+            if hasattr(self, 'eccheck_post_xor_steps') and self.eccheck_post_xor_steps:
+                # Filter global steps (sync or chunk_level=false)
+                global_steps = [
+                    step for step in self.eccheck_post_xor_steps
+                    if isinstance(step, dict) and (
+                        step.get('step') == 'sync' or 
+                        step.get('chunk_level', False) == False
+                    )
+                ]
+                
+                if global_steps:
+                    logger.info(f"EC-CHECK: Executing {len(global_steps)} global post-xor steps (sync barriers)")
+                    # Temporarily replace post_xor_steps with global_steps for execution
+                    original_steps = self.eccheck_post_xor_steps
+                    self.eccheck_post_xor_steps = global_steps
+                    self._execute_post_xor_steps()
+                    self.eccheck_post_xor_steps = original_steps
+                else:
+                    logger.info("EC-CHECK: All post-xor steps executed at chunk-level, no global steps needed")
         finally:
             # Deactivate the buffer poller
             if self._buffer_poller_active_event:
@@ -1976,6 +2006,70 @@ class FileSystemWriterAsync(FileSystemWriter):
                     persist_recv_flag,
                     persist_parity_flag,
                 )
+            
+            # Setup chunk-level post-xor configuration if post_xor_steps are configured
+            post_xor_steps = getattr(self, 'eccheck_post_xor_steps', [])
+            if post_xor_steps and hasattr(self._eccheck_native, 'set_chunk_level_post_xor_config'):
+                # Check if chunk-level post-xor is enabled (default: enabled if post_xor_steps exist)
+                chunk_level_enabled = True  # Default: enable chunk-level post-xor
+                
+                # Filter steps: chunk_level=true for chunk-level execution, chunk_level=false or missing for global
+                chunk_level_steps = [
+                    step for step in post_xor_steps 
+                    if isinstance(step, dict) and step.get('step') in ['send', 'recv'] 
+                    and step.get('chunk_level', True)  # Default to True for backward compatibility
+                ]
+                
+                if chunk_level_steps:
+                    # Allocate or get peer data buffer for chunk-level recv (if needed)
+                    peer_data_buffer = None
+                    peer_data_base = 0
+                    peer_data_capacity = 0
+                    
+                    # Check if any step needs peer_data_buffer
+                    needs_peer_data = any(
+                        step.get('data_target') == 'peer_data_buffer' 
+                        for step in chunk_level_steps if isinstance(step, dict)
+                    )
+                    
+                    if needs_peer_data:
+                        # Allocate peer data buffer if not exists
+                        if not hasattr(self, 'eccheck_post_xor_buffers'):
+                            self.eccheck_post_xor_buffers = {}
+                        
+                        if 'peer_data_buffer' not in self.eccheck_post_xor_buffers:
+                            # Allocate based on peer's data size
+                            self.eccheck_post_xor_buffers['peer_data_buffer'] = torch.empty(
+                                aligned_peer, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory
+                            )
+                            logger.info(f"EC-CHECK: Allocated peer_data_buffer for chunk-level post-xor: {aligned_peer / (1024**3):.2f} GB")
+                        
+                        peer_data_buffer = self.eccheck_post_xor_buffers.get('peer_data_buffer')
+                        if peer_data_buffer is not None:
+                            peer_data_base = int(peer_data_buffer.data_ptr())
+                            peer_data_capacity = peer_data_buffer.numel()
+                    
+                    # Convert steps to C++ format (vector of maps)
+                    steps_config = []
+                    for step in chunk_level_steps:
+                        if isinstance(step, dict):
+                            step_map = {}
+                            for key in ['step', 'type', 'target_rank', 'source_rank', 'data_type', 'data_source', 'data_target']:
+                                if key in step:
+                                    step_map[key] = str(step[key])
+                            if step_map:
+                                steps_config.append(step_map)
+                    
+                    # Set config even if peer_data_base is 0 (for send-only operations)
+                    if steps_config:
+                        logger.info(f"EC-CHECK: Setting chunk-level post-xor config: {len(steps_config)} steps, peer_data_base=0x{peer_data_base:x}, capacity={peer_data_capacity}")
+                        self._eccheck_native.set_chunk_level_post_xor_config(
+                            peer_data_base,
+                            peer_data_capacity,
+                            steps_config
+                        )
+                    else:
+                        logger.warning("EC-CHECK: No valid chunk-level post-xor steps found")
         except Exception as e:
             logger.warning(f"EC-CHECK: Failed to allocate or register persistent stores: {e}")
         

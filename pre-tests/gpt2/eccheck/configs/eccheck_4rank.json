@@ -77,27 +77,30 @@
       ],
       "post_xor_steps": [
         {
-          "_comment": "Synchronization barrier after all XOR operations complete",
+          "_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)",
           "step": "sync",
           "type": "barrier",
           "sync_point": "after_all_xor",
-          "ranks": [0, 1, 2, 3]
+          "ranks": [0, 1, 2, 3],
+          "chunk_level": false
         },
         {
-          "_comment": "Send own parity to paired rank (Rank 2)",
+          "_comment": "Send own parity to paired rank (Rank 2) - executed per chunk after XOR completes",
           "step": "send",
           "type": "nccl_send",
           "target_rank": 2,
           "data_type": "parity",
-          "data_source": "local_parity"
+          "data_source": "local_parity",
+          "chunk_level": true
         },
         {
-          "_comment": "Receive paired rank's data",
+          "_comment": "Receive paired rank's data - executed per chunk after XOR completes",
           "step": "recv",
           "type": "nccl_recv",
           "source_rank": 2,
           "data_type": "data",
-          "data_target": "peer_data_buffer"
+          "data_target": "peer_data_buffer",
+          "chunk_level": true
         }
       ]
     },
@@ -159,26 +162,30 @@
       ],
       "post_xor_steps": [
         {
+          "_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)",
           "step": "sync",
           "type": "barrier",
           "sync_point": "after_all_xor",
-          "ranks": [0, 1, 2, 3]
+          "ranks": [0, 1, 2, 3],
+          "chunk_level": false
         },
         {
-          "_comment": "Send own parity to paired rank (Rank 3)",
+          "_comment": "Send own parity to paired rank (Rank 3) - executed per chunk after XOR completes",
           "step": "send",
           "type": "nccl_send",
           "target_rank": 3,
           "data_type": "parity",
-          "data_source": "local_parity"
+          "data_source": "local_parity",
+          "chunk_level": true
         },
         {
-          "_comment": "Receive paired rank's data",
+          "_comment": "Receive paired rank's data - executed per chunk after XOR completes",
           "step": "recv",
           "type": "nccl_recv",
           "source_rank": 3,
           "data_type": "data",
-          "data_target": "peer_data_buffer"
+          "data_target": "peer_data_buffer",
+          "chunk_level": true
         }
       ]
     },
@@ -240,26 +247,30 @@
       ],
       "post_xor_steps": [
         {
+          "_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)",
           "step": "sync",
           "type": "barrier",
           "sync_point": "after_all_xor",
-          "ranks": [0, 1, 2, 3]
+          "ranks": [0, 1, 2, 3],
+          "chunk_level": false
         },
         {
-          "_comment": "Send own parity to paired rank (Rank 0)",
+          "_comment": "Send own parity to paired rank (Rank 0) - executed per chunk after XOR completes",
           "step": "send",
           "type": "nccl_send",
           "target_rank": 0,
           "data_type": "parity",
-          "data_source": "local_parity"
+          "data_source": "local_parity",
+          "chunk_level": true
         },
         {
-          "_comment": "Receive paired rank's data",
+          "_comment": "Receive paired rank's data - executed per chunk after XOR completes",
           "step": "recv",
           "type": "nccl_recv",
           "source_rank": 0,
           "data_type": "data",
-          "data_target": "peer_data_buffer"
+          "data_target": "peer_data_buffer",
+          "chunk_level": true
         }
       ]
     },
@@ -321,26 +332,30 @@
       ],
       "post_xor_steps": [
         {
+          "_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)",
           "step": "sync",
           "type": "barrier",
           "sync_point": "after_all_xor",
-          "ranks": [0, 1, 2, 3]
+          "ranks": [0, 1, 2, 3],
+          "chunk_level": false
         },
         {
-          "_comment": "Send own parity to paired rank (Rank 1)",
+          "_comment": "Send own parity to paired rank (Rank 1) - executed per chunk after XOR completes",
           "step": "send",
           "type": "nccl_send",
           "target_rank": 1,
           "data_type": "parity",
-          "data_source": "local_parity"
+          "data_source": "local_parity",
+          "chunk_level": true
         },
         {
-          "_comment": "Receive paired rank's data",
+          "_comment": "Receive paired rank's data - executed per chunk after XOR completes",
           "step": "recv",
           "type": "nccl_recv",
           "source_rank": 1,
           "data_type": "data",
-          "data_target": "peer_data_buffer"
+          "data_target": "peer_data_buffer",
+          "chunk_level": true
         }
       ]
     }

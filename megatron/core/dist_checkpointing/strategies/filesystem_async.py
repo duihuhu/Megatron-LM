@@ -201,7 +201,15 @@ class FileSystemWriterAsync(FileSystemWriter):
             world_size = torch.distributed.get_world_size()
             paired_rank = self._get_paired_rank(rank, world_size)
             
-            self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank)
+            # Get k and m from config (if loaded), otherwise use defaults (-1 means auto-calculate)
+            k = getattr(self, 'eccheck_k', -1)
+            m = getattr(self, 'eccheck_m', -1)
+            if k > 0 and m > 0:
+                logger.info(f"EC-CHECK: Creating C++ native module with k={k}, m={m} from config")
+                self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank, k, m)
+            else:
+                logger.info(f"EC-CHECK: Creating C++ native module with auto-calculated k and m")
+                self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank)
             logger.info(f"EC-CHECK: C++ native module initialized (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
             
             # Initialize buffer allocation for EC-CHECK
@@ -223,6 +231,9 @@ class FileSystemWriterAsync(FileSystemWriter):
     def _load_eccheck_config(self) -> None:
         """Load optional ECCHECK config (YAML/JSON) to override defaults.
         Supported keys:
+          - ec_params:
+              k: int (number of data nodes)
+              m: int (number of parity rows)
           - persist:
               recv: bool
               parity: bool
@@ -246,6 +257,17 @@ class FileSystemWriterAsync(FileSystemWriter):
                 data = json.loads(text)
             if not isinstance(data, dict):
                 return
+            
+            # Load EC parameters (k, m)
+            ec_params = data.get('ec_params', {}) if isinstance(data.get('ec_params', {}), dict) else {}
+            if 'k' in ec_params:
+                self.eccheck_k = int(ec_params['k'])
+                logger.info(f"EC-CHECK: Loaded k={self.eccheck_k} from config")
+            if 'm' in ec_params:
+                self.eccheck_m = int(ec_params['m'])
+                logger.info(f"EC-CHECK: Loaded m={self.eccheck_m} from config")
+            
+            # Load persist settings
             persist = data.get('persist', {}) if isinstance(data.get('persist', {}), dict) else {}
             if 'recv' in persist:
                 self.eccheck_persist_recv_enabled = bool(persist['recv'])

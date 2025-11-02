@@ -833,7 +833,7 @@ private:
     }
 
 public:
-    ECCHECKNative(int rank, int world_size, int paired_rank) 
+    ECCHECKNative(int rank, int world_size, int paired_rank, int k = -1, int m = -1) 
         : rank_(rank), world_size_(world_size), paired_rank_(paired_rank), 
           should_stop_threads_(false),
           k_(0), rows_(0), data_block_index_(0), a_mat_(nullptr), g_tbls_(nullptr) {
@@ -859,12 +859,21 @@ public:
 
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Constructor called, initializing EC tables and starting pipeline..." << std::endl;
 
-        // Initialize EC params: k = world_size / 2, rows = 2, data_block_index = rank / 2
-        rows_ = 2;
-        if (world_size_ <= 0) {
-            k_ = 0;
+        // Initialize EC params: use provided k and m, or calculate from world_size (backward compatibility)
+        if (k > 0 && m > 0) {
+            // Use provided parameters from config file
+            k_ = k;
+            rows_ = m;
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Using EC params from config: k=" << k_ << ", m=" << rows_ << std::endl;
         } else {
-            k_ = world_size_ / 2;
+            // Backward compatibility: calculate from world_size
+            rows_ = 2;
+            if (world_size_ <= 0) {
+                k_ = 0;
+            } else {
+                k_ = world_size_ / 2;
+            }
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Using default EC params: k=" << k_ << " (world_size/2), m=" << rows_ << std::endl;
         }
         data_block_index_ = rank_ / 2;
 
@@ -1260,7 +1269,12 @@ public:
 
 PYBIND11_MODULE(eccheck_native, m) {
     pybind11::class_<ECCHECKNative>(m, "ECCHECKNative")
-        .def(pybind11::init<int, int, int>())
+        .def(pybind11::init<int, int, int, int, int>(),
+             pybind11::arg("rank"),
+             pybind11::arg("world_size"),
+             pybind11::arg("paired_rank"),
+             pybind11::arg("k") = -1,
+             pybind11::arg("m") = -1)
         .def("set_columns_config", &ECCHECKNative::set_columns_config)
         .def("set_persist_stores", &ECCHECKNative::set_persist_stores,
              pybind11::arg("recv_base"),

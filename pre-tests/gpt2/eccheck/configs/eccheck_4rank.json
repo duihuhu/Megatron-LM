@@ -2,6 +2,13 @@
   "_comment": "4-rank EC-CHECK configuration example",
   "_description": "Example configuration for 4 ranks (0, 1, 2, 3) with shared parity buffer model",
   
+  "ec_params": {
+    "_comment": "Erasure Coding parameters: k = number of data nodes, m = number of parity nodes (rows)",
+    "_note": "For 4 ranks: k=2 (data nodes), m=2 (parity rows), total encoded packets = k + m = 4",
+    "k": 2,
+    "m": 2
+  },
+  
   "persist": {
     "recv": true,
     "parity": true

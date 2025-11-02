@@ -750,6 +750,27 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             world_size = torch.distributed.get_world_size()
             paired_rank = self._get_paired_rank(rank, world_size)
             
+            # Load EC parameters (k, m) from config file if available
+            k = -1
+            m = -1
+            try:
+                cfg_path = os.environ.get('ECCHECK_CONFIG_PATH')
+                if cfg_path and os.path.isfile(cfg_path):
+                    import json
+                    with open(cfg_path, 'r') as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        ec_params = data.get('ec_params', {})
+                        if isinstance(ec_params, dict):
+                            if 'k' in ec_params:
+                                k = int(ec_params['k'])
+                            if 'm' in ec_params:
+                                m = int(ec_params['m'])
+                            if k > 0 and m > 0:
+                                logger.info(f"EC-CHECK: Loaded EC params from config: k={k}, m={m}")
+            except Exception as e:
+                logger.debug(f"EC-CHECK: Failed to load EC params from config: {e}, using defaults")
+            
             # Create instance with error handling
             try:
                 # IMPORTANT: This constructor call will BLOCK until:
@@ -760,7 +781,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 logger.info(f"EC-CHECK: Creating C++ native module (this will block until NCCL is initialized)...")
                 print(f"EC-CHECK: [Rank {rank}] Creating C++ native module (blocking until NCCL initialization completes)...")
                 
-                self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank)
+                if k > 0 and m > 0:
+                    self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank, k, m)
+                else:
+                    self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank)
                 
                 # If we reach here, NCCL communicators are ready and threads are running
                 logger.info(f"EC-CHECK: C++ native module initialized successfully (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")

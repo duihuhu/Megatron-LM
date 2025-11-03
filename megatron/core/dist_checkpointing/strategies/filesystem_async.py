@@ -2144,20 +2144,100 @@ class FileSystemWriterAsync(FileSystemWriter):
                         logger.info(f"EC-CHECK: Using advanced config mode for rank {rank}, columns={len(columns_config)}, post_xor_steps={len(post_xor_steps)}")
                         norm_cols = self._parse_advanced_columns_config(columns_config, rank, world_size, paired_rank)
                         if norm_cols and hasattr(self._eccheck_native, 'set_columns_config'):
+                            # Synchronize all ranks before starting NCCL initialization
+                            # This ensures all ranks' threads start NCCL init simultaneously,
+                            # preventing deadlock where some ranks wait for others that haven't started yet
+                            import torch.distributed as dist
+                            if dist.is_initialized():
+                                logger.info(f"EC-CHECK: [Rank {rank}] Barrier before NCCL initialization...")
+                                dist.barrier()
+                                logger.info(f"EC-CHECK: [Rank {rank}] Barrier passed, starting columns config...")
                             self._eccheck_native.set_columns_config(norm_cols)
                             logger.info(f"EC-CHECK: Applied advanced columns config ({len(norm_cols)} entries)")
                             # Store normalized columns config for later use
                             self.eccheck_columns_config = norm_cols
                             logger.info(f"EC-CHECK: Stored columns config: {len(norm_cols)} columns")
-                            # Store pipeline configs for future use (if C++ supports it)
-                            self._store_pipeline_configs(columns_config)
-                        # Store post_xor_steps for future use
+                        
+                        # Store post_xor_steps for future use (MUST be before _store_pipeline_configs which executes Phase 3)
                         if post_xor_steps:
                             if not hasattr(self, 'eccheck_post_xor_steps'):
                                 self.eccheck_post_xor_steps = []
                             self.eccheck_post_xor_steps = post_xor_steps
                             logger.info(f"EC-CHECK: Stored post_xor_steps config ({len(post_xor_steps)} steps)")
                             logger.info(f"EC-CHECK: Post-XOR steps content: {post_xor_steps}")
+                            
+                            # CRITICAL: Set chunk-level post-xor config BEFORE Phase 3 execution
+                            # _store_pipeline_configs() will execute Phase 3, so config must be set before that
+                            if hasattr(self._eccheck_native, 'set_chunk_level_post_xor_config'):
+                                chunk_level_steps = [
+                                    step for step in post_xor_steps 
+                                    if isinstance(step, dict) and step.get('step') in ['send', 'recv'] 
+                                    and step.get('chunk_level', True)
+                                ]
+                                
+                                if chunk_level_steps:
+                                    # Get or allocate peer data buffer if needed
+                                    peer_data_base = 0
+                                    peer_data_capacity = 0
+                                    
+                                    # Check if any step needs peer_data_buffer
+                                    needs_peer_data = any(
+                                        step.get('data_target') == 'peer_data_buffer' 
+                                        for step in chunk_level_steps if isinstance(step, dict)
+                                    )
+                                    
+                                    if needs_peer_data:
+                                        # Ensure eccheck_post_xor_buffers dict exists
+                                        if not hasattr(self, 'eccheck_post_xor_buffers'):
+                                            self.eccheck_post_xor_buffers = {}
+                                        
+                                        # Allocate peer_data_buffer if not exists
+                                        if 'peer_data_buffer' not in self.eccheck_post_xor_buffers:
+                                            # Get peer data size from persistent recv store (if available)
+                                            # Otherwise, use a reasonable default based on local data size
+                                            if hasattr(self, 'eccheck_persist_recv_store') and self.eccheck_persist_recv_store is not None:
+                                                peer_data_size = self.eccheck_persist_recv_store.numel()
+                                            else:
+                                                # Fallback: use local data size estimate
+                                                peer_data_size = getattr(self, 'eccheck_peer_data_size', 0)
+                                                if peer_data_size == 0 and hasattr(self, 'tensor_buffer') and self.tensor_buffer is not None:
+                                                    peer_data_size = self.tensor_buffer.numel()
+                                            
+                                            if peer_data_size > 0:
+                                                self.eccheck_post_xor_buffers['peer_data_buffer'] = torch.empty(
+                                                    peer_data_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory
+                                                )
+                                                logger.info(f"EC-CHECK: Allocated peer_data_buffer for chunk-level post-xor (in config parsing): {peer_data_size / (1024**3):.2f} GB")
+                                        
+                                        # Get buffer pointer
+                                        peer_buffer = self.eccheck_post_xor_buffers.get('peer_data_buffer')
+                                        if peer_buffer is not None:
+                                            peer_data_base = int(peer_buffer.data_ptr())
+                                            peer_data_capacity = peer_buffer.numel()
+                                            logger.info(f"EC-CHECK: peer_data_buffer found: base=0x{peer_data_base:x}, capacity={peer_data_capacity}")
+                                        else:
+                                            logger.warning("EC-CHECK: peer_data_buffer is None after allocation attempt")
+                                    else:
+                                        logger.info("EC-CHECK: No peer_data_buffer needed (send-only operations)")
+                                    
+                                    # Convert steps to C++ format
+                                    steps_config = []
+                                    for step in chunk_level_steps:
+                                        if isinstance(step, dict):
+                                            step_map = {}
+                                            for key in ['step', 'type', 'target_rank', 'source_rank', 'data_type', 'data_source', 'data_target']:
+                                                if key in step:
+                                                    step_map[key] = str(step[key])
+                                            if step_map:
+                                                steps_config.append(step_map)
+                                    
+                                    if steps_config:
+                                        logger.info(f"EC-CHECK: Setting chunk-level post-xor config (after parsing): {len(steps_config)} steps, peer_data_base=0x{peer_data_base:x}, capacity={peer_data_capacity}")
+                                        self._eccheck_native.set_chunk_level_post_xor_config(
+                                            peer_data_base,
+                                            peer_data_capacity,
+                                            steps_config
+                                        )
                         else:
                             logger.warning(f"EC-CHECK: No post_xor_steps found in config for rank {rank}")
                         

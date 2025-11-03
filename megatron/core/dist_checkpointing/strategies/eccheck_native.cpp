@@ -237,11 +237,12 @@ private:
             std::cout << "EC-CHECK: [Rank " << rank_ << "] Column" << column_idx << " NCCL ID read from " << id_file << std::endl;
         }
         
-        // Initialize NCCL communicator
+        // Initialize NCCL communicator (BLOCKING: requires all ranks to call this simultaneously)
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Column" << column_idx << " calling ncclCommInitRank (waiting for all " << world_size_ << " ranks)..." << std::endl;
         ncclCommInitRank(&nccl_comms_[column_idx], world_size_, nccl_id, rank_);
         nccl_initialized_[column_idx] = true;
         
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Column" << column_idx << " NCCL communicator initialized" << std::endl;
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Column" << column_idx << " NCCL communicator initialized successfully" << std::endl;
         
         // Signal completion
         {
@@ -459,8 +460,10 @@ private:
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker " << column_idx << " started" << std::endl;
         
-        // Initialize NCCL for this column
+        // Initialize NCCL for this column (this will block until all ranks call ncclCommInitRank)
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker " << column_idx << " calling init_nccl_column..." << std::endl;
         init_nccl_column(column_idx);
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker " << column_idx << " NCCL initialization completed" << std::endl;
         
         while (!should_stop_threads_) {
             SendTask task;
@@ -811,7 +814,14 @@ private:
             // Chunk-level post-xor: execute after last column's XOR completes
             if (is_last_column && chunk_idx >= 0 && chunk_size > 0) {
                 // This is the last column for this chunk, execute chunk-level post-xor
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Column " << column_idx 
+                          << " is last column for chunk " << chunk_idx 
+                          << ", calling execute_chunk_level_post_xor..." << std::endl;
                 execute_chunk_level_post_xor(chunk_idx, chunk_size, task.parity_addr);
+            } else if (is_last_column) {
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Column " << column_idx 
+                          << " is last column but chunk info invalid: chunk_idx=" << chunk_idx 
+                          << ", chunk_size=" << chunk_size << std::endl;
             }
 
             // Release parity buffer after XOR completion
@@ -842,7 +852,12 @@ private:
         }
         
         // Execute chunk-level post-xor send/recv steps if configured
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] execute_chunk_level_post_xor called for chunk " 
+                  << chunk_idx << ", chunk_level_post_xor_enabled_=" << chunk_level_post_xor_enabled_
+                  << ", post_xor_steps_config_.size()=" << post_xor_steps_config_.size() << std::endl;
         if (!chunk_level_post_xor_enabled_ || post_xor_steps_config_.empty()) {
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Skipping chunk-level post-xor: enabled=" 
+                      << chunk_level_post_xor_enabled_ << ", steps=" << post_xor_steps_config_.size() << std::endl;
             return;  // No chunk-level post-xor configured
         }
         
@@ -1082,19 +1097,10 @@ public:
             std::cout << "EC-CHECK: [Rank " << rank_ << "] skipping EC init because k<=0" << std::endl;
         }
 
-        start_pipeline();
-
-        // Wait for all NCCL communicators to be initialized
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Waiting for NCCL initialization (" << num_columns_ << " columns)..." << std::endl;
-        std::unique_lock<std::mutex> lock(nccl_init_mutex_);
-        nccl_init_cv_.wait(lock, [this] { 
-            for (int i = 0; i < num_columns_; ++i) {
-                if (!nccl_init_completed_[i].load()) return false;
-            }
-            return true;
-        });
-
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline and NCCL initialized successfully" << std::endl;
+        // Note: Threads are NOT started here - they will be started after set_columns_config is called
+        // This allows the correct number of columns to be configured before threads start
+        // start_pipeline() will be called from set_columns_config if needed, or explicitly after config
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Constructor completed, waiting for columns config before starting threads..." << std::endl;
     }
     
     void set_columns_config(const std::vector<std::map<std::string, int>>& cols) {
@@ -1106,6 +1112,12 @@ public:
                       << " columns, but MAX_COLUMNS=" << MAX_COLUMNS << std::endl;
             new_num_columns = MAX_COLUMNS;
         }
+        
+        // Check if threads are already started
+        bool threads_started = (encoder_threads_[0].has_value() && encoder_threads_[0]->joinable());
+        
+        // Store old num_columns for restart detection
+        int old_num_columns = num_columns_;
         
         // All arrays are pre-allocated with MAX_COLUMNS elements in constructor
         // We just need to update num_columns_ and column_configs_
@@ -1128,6 +1140,135 @@ public:
                       << ")";
         }
         std::cout << std::endl;
+        
+        // If threads are not started yet, start them now with the correct num_columns_
+        if (!threads_started) {
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Starting threads with " << num_columns_ << " columns..." << std::endl;
+        start_pipeline();
+
+            // Wait for all NCCL communicators to be initialized
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Waiting for NCCL initialization (" << num_columns_ << " columns)..." << std::endl;
+        std::unique_lock<std::mutex> lock(nccl_init_mutex_);
+            
+            // Add timeout and progress logging
+            auto start_time = std::chrono::steady_clock::now();
+            auto timeout = std::chrono::seconds(60);  // 60 second timeout
+            
+            bool init_complete = nccl_init_cv_.wait_for(lock, timeout, [this] { 
+                for (int i = 0; i < num_columns_; ++i) {
+                    if (!nccl_init_completed_[i].load()) {
+                        // Log which columns are still waiting
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Column " << i << " NCCL init not completed yet" << std::endl;
+                        return false;
+                    }
+                }
+                return true;
+            });
+            
+            if (!init_complete) {
+                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: NCCL initialization timeout after 60s!" << std::endl;
+                std::cerr << "EC-CHECK: [Rank " << rank_ << "] Column status: ";
+                for (int i = 0; i < num_columns_; ++i) {
+                    std::cerr << "col" << i << "=" << (nccl_init_completed_[i].load() ? "OK" : "WAIT") << " ";
+                }
+                std::cerr << std::endl;
+                throw std::runtime_error("NCCL initialization timeout");
+            }
+
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline and NCCL initialized successfully" << std::endl;
+        }
+        // If column count changed and threads are already started, restart them
+        else if (old_num_columns != new_num_columns) {
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Column count changed from " << old_num_columns << " to " << new_num_columns << ", restarting threads..." << std::endl;
+            
+            // Stop existing threads
+            should_stop_threads_ = true;
+            // Notify all threads to wake up and exit
+            for (int i = 0; i < MAX_COLUMNS; ++i) {
+                encoding_tasks_cv_[i].notify_all();
+                send_queue_cv_[i].notify_all();
+                recv_queue_cv_[i].notify_all();
+                xor_queue_cv_[i].notify_all();
+            }
+            
+            // Wait for existing threads to finish
+            for (int i = 0; i < MAX_COLUMNS; ++i) {
+                if (encoder_threads_[i].has_value() && encoder_threads_[i]->joinable()) {
+                    encoder_threads_[i]->join();
+                    encoder_threads_[i].reset();
+                }
+                if (send_workers_[i].has_value() && send_workers_[i]->joinable()) {
+                    send_workers_[i]->join();
+                    send_workers_[i].reset();
+                }
+                if (recv_workers_[i].has_value() && recv_workers_[i]->joinable()) {
+                    recv_workers_[i]->join();
+                    recv_workers_[i].reset();
+                }
+                if (xor_workers_[i].has_value() && xor_workers_[i]->joinable()) {
+                    xor_workers_[i]->join();
+                    xor_workers_[i].reset();
+                }
+                // Reset completion flags
+                encoding_thread_completed_[i] = false;
+                send_worker_completed_[i] = false;
+                recv_worker_completed_[i] = false;
+                xor_worker_completed_[i] = false;
+                nccl_init_completed_[i] = false;
+#ifdef NCCL_AVAILABLE
+                nccl_initialized_[i] = false;
+                if (nccl_comms_[i] != nullptr) {
+                    ncclCommDestroy(nccl_comms_[i]);
+                    nccl_comms_[i] = nullptr;
+                }
+#endif
+            }
+            
+            // Reset stop flag
+            should_stop_threads_ = false;
+            
+            // Clean up old NCCL ID files
+            for (int i = 0; i < MAX_COLUMNS; ++i) {
+                std::string id_file = "/tmp/eccheck_nccl_column" + std::to_string(i) + "_id.txt";
+                if (std::ifstream(id_file).good()) {
+                    std::remove(id_file.c_str());
+                }
+            }
+            
+            // Start new threads with correct count
+            start_pipeline();
+            
+            // Wait for NCCL initialization again
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Waiting for NCCL initialization (" << num_columns_ << " columns)..." << std::endl;
+            std::unique_lock<std::mutex> lock(nccl_init_mutex_);
+            
+            // Add timeout and progress logging
+            auto start_time = std::chrono::steady_clock::now();
+            auto timeout = std::chrono::seconds(60);  // 60 second timeout
+            
+            bool init_complete = nccl_init_cv_.wait_for(lock, timeout, [this] { 
+                for (int i = 0; i < num_columns_; ++i) {
+                    if (!nccl_init_completed_[i].load()) {
+                        // Log which columns are still waiting
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Column " << i << " NCCL init not completed yet" << std::endl;
+                        return false;
+                    }
+                }
+                return true;
+            });
+            
+            if (!init_complete) {
+                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: NCCL re-initialization timeout after 60s!" << std::endl;
+                std::cerr << "EC-CHECK: [Rank " << rank_ << "] Column status: ";
+                for (int i = 0; i < num_columns_; ++i) {
+                    std::cerr << "col" << i << "=" << (nccl_init_completed_[i].load() ? "OK" : "WAIT") << " ";
+                }
+                std::cerr << std::endl;
+                throw std::runtime_error("NCCL re-initialization timeout");
+            }
+            
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline and NCCL re-initialized successfully" << std::endl;
+        }
     }
     
     void set_persist_stores(uintptr_t recv_base, uintptr_t parity_base,

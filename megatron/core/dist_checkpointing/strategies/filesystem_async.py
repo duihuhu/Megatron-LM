@@ -1287,6 +1287,32 @@ class FileSystemWriterAsync(FileSystemWriter):
         logger.info(f"EC-CHECK: Allocated {len(encoding_buffers)} encoding buffers")
         return encoding_buffers
     
+    def _get_num_columns_from_config(self):
+        """Helper method to read number of columns from config file if not yet set."""
+        try:
+            cfg_path = self.eccheck_config_path or os.environ.get('ECCHECK_CONFIG_PATH')
+            if cfg_path and os.path.isfile(cfg_path):
+                import json
+                with open(cfg_path, 'r') as f:
+                    data = json.load(f)
+                
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                ranks_config = data.get('ranks')
+                if isinstance(ranks_config, dict):
+                    rank_str = str(rank)
+                    rank_config = ranks_config.get(rank_str)
+                    if rank_config and isinstance(rank_config, dict):
+                        columns_config = rank_config.get('columns', [])
+                        if isinstance(columns_config, list) and len(columns_config) > 0:
+                            return len(columns_config)
+                # Simple mode
+                columns = data.get('columns')
+                if isinstance(columns, list) and len(columns) > 0:
+                    return len(columns)
+        except Exception as e:
+            logger.debug(f"EC-CHECK: Failed to read columns from config: {e}")
+        return None
+    
     def _allocate_recv_encoding_buffers(self, global_registry):
         """
         Allocate large receive buffers for peer encoded packets (one per column).
@@ -1311,8 +1337,13 @@ class FileSystemWriterAsync(FileSystemWriter):
         aligned_size = ((peer_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
         
         # Determine number of columns
+        # First try to get from already-set config
         columns_cfg = getattr(self, 'eccheck_columns_config', None)
-        num_columns = len(columns_cfg) if isinstance(columns_cfg, list) and len(columns_cfg) > 0 else 2
+        if isinstance(columns_cfg, list) and len(columns_cfg) > 0:
+            num_columns = len(columns_cfg)
+        else:
+            # If not set yet, try to read from config file
+            num_columns = self._get_num_columns_from_config() or 2
         
         logger.info(
             f"EC-CHECK: Allocating {num_columns} receive buffers based on peer data size\n"
@@ -1351,8 +1382,13 @@ class FileSystemWriterAsync(FileSystemWriter):
         num_chunks = (total_bytes + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size
         
         # Determine number of columns
+        # First try to get from already-set config
         columns_cfg = getattr(self, 'eccheck_columns_config', None)
-        num_columns = len(columns_cfg) if isinstance(columns_cfg, list) and len(columns_cfg) > 0 else 2
+        if isinstance(columns_cfg, list) and len(columns_cfg) > 0:
+            num_columns = len(columns_cfg)
+        else:
+            # If not set yet, try to read from config file
+            num_columns = self._get_num_columns_from_config() or 2
         
         # Each chunk requires num_columns parity buffers (one per column)
         # We allocate at least as many as encoding buffers to ensure sufficient concurrency
@@ -2110,6 +2146,9 @@ class FileSystemWriterAsync(FileSystemWriter):
                         if norm_cols and hasattr(self._eccheck_native, 'set_columns_config'):
                             self._eccheck_native.set_columns_config(norm_cols)
                             logger.info(f"EC-CHECK: Applied advanced columns config ({len(norm_cols)} entries)")
+                            # Store normalized columns config for later use
+                            self.eccheck_columns_config = norm_cols
+                            logger.info(f"EC-CHECK: Stored columns config: {len(norm_cols)} columns")
                             # Store pipeline configs for future use (if C++ supports it)
                             self._store_pipeline_configs(columns_config)
                         # Store post_xor_steps for future use

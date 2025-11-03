@@ -491,10 +491,10 @@ private:
             if (nccl_initialized_[column_idx] && world_size_ > 1) {
                 int peer = (column_configs_[column_idx].send_peer >= 0 ? column_configs_[column_idx].send_peer : paired_rank_);
                 for (int i = 0; i < task.count; ++i) {
-                    ncclGroupStart(); 
-                    ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size, 
+                ncclGroupStart(); 
+                ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size, 
                              ncclUint8, peer, nccl_comms_[column_idx], 0);
-                    ncclGroupEnd();
+                ncclGroupEnd();
                     if (task.count > 1 && i < task.count - 1) {
                         std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker " << column_idx 
                                   << " completed send " << (i + 1) << "/" << task.count << std::endl;
@@ -526,7 +526,7 @@ private:
                 if (should_release) {
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
                 encoding_buffers_to_release_.push(task.encoding_addr);
-                }
+            }
             }
         }
         
@@ -582,10 +582,10 @@ private:
                 int peer = (column_configs_[column_idx].recv_peer >= 0 ? column_configs_[column_idx].recv_peer : paired_rank_);
                 for (int i = 0; i < task.count; ++i) {
                     uintptr_t recv_offset_addr = task.recv_addr + (i * task.size);
-                    ncclGroupStart();
+                ncclGroupStart();
                     ncclRecv(reinterpret_cast<void*>(recv_offset_addr), task.size,
                              ncclUint8, peer, nccl_comms_[column_idx], 0);
-                    ncclGroupEnd();
+                ncclGroupEnd();
                     if (task.count > 1 && i < task.count - 1) {
                         std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker " << column_idx 
                                   << " completed recv " << (i + 1) << "/" << task.count << std::endl;
@@ -609,8 +609,8 @@ private:
                     std::cerr << "EC-CHECK: [Rank " << rank_ << "] recv persist overflow: offset="
                               << offset << ", size=" << task.size << ", cap=" << persist_recv_capacity_ << std::endl;
                 }
-            }
-            
+    }
+    
             // After receiving, submit XOR task for incremental update: parity XOR recv_encoding -> parity
             {
                 std::lock_guard<std::mutex> lock(recv_mapping_mutex_[column_idx]);
@@ -803,11 +803,11 @@ private:
                     }
                 }
                 if (should_release) {
-                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.local_encoding_addr);
-                }
             }
-
+        }
+        
             // Chunk-level post-xor: execute after last column's XOR completes
             if (is_last_column && chunk_idx >= 0 && chunk_size > 0) {
                 // This is the last column for this chunk, execute chunk-level post-xor
@@ -900,7 +900,7 @@ private:
                     // Receive into peer data buffer (chunk offset)
                     if (chunk_offset + chunk_size <= peer_data_buffer_capacity_) {
                         recv_addr = peer_data_buffer_base_ + chunk_offset;
-                    }
+                }
                 } else if (step.data_target == "peer_parity_buffer" && persist_recv_base_ != 0) {
                     // Receive into persistent recv store (chunk offset)
                     if (chunk_offset + chunk_size <= persist_recv_capacity_) {
@@ -920,7 +920,7 @@ private:
         
         // Execute all send/recv operations in a single NCCL group for better performance
         if (!send_ops.empty() || !recv_ops.empty()) {
-            ncclGroupStart();
+                ncclGroupStart();
             
             // Execute all sends
             for (const auto& op : send_ops) {
@@ -940,7 +940,7 @@ private:
                           << ", size: " << chunk_size << " bytes" << std::endl;
             }
             
-            ncclGroupEnd();
+                ncclGroupEnd();
             
             if (!send_ops.empty() || !recv_ops.empty()) {
                 std::cout << "EC-CHECK: [Rank " << rank_ << "] Chunk " << chunk_idx 
@@ -1044,11 +1044,11 @@ public:
             std::cout << "EC-CHECK: [Rank " << rank_ << "] Using EC params from config: k=" << k_ << ", m=" << rows_ << std::endl;
         } else {
             // Backward compatibility: calculate from world_size
-            rows_ = 2;
-            if (world_size_ <= 0) {
-                k_ = 0;
-            } else {
-                k_ = world_size_ / 2;
+        rows_ = 2;
+        if (world_size_ <= 0) {
+            k_ = 0;
+        } else {
+            k_ = world_size_ / 2;
             }
             std::cout << "EC-CHECK: [Rank " << rank_ << "] Using default EC params: k=" << k_ << " (world_size/2), m=" << rows_ << std::endl;
         }

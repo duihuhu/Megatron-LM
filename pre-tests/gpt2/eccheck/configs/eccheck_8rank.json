@@ -1,0 +1,476 @@
+{
+  "_comment": "8-rank EC-CHECK configuration example",
+  "_description": "Example configuration for 8 ranks (0-7) with 4+4 erasure coding, divided into 2 groups",
+  "_grouping": "Group 1: ranks 0,1,2,3; Group 2: ranks 4,5,6,7. Post-xor pairs: rank0↔rank4, rank1↔rank5, rank2↔rank6, rank3↔rank7",
+  
+  "ec_params": {
+    "_comment": "Erasure Coding parameters: k = number of data nodes, m = number of parity nodes (rows)",
+    "_note": "For 8 ranks: k=4 (data nodes), m=4 (parity rows), total encoded packets = k + m = 8",
+    "k": 4,
+    "m": 4
+  },
+  
+  "persist": {
+    "recv": true,
+    "parity": true
+  },
+  
+  "ranks": {
+    "0": {
+      "_comment": "Rank 0 (Group 1) - 4 columns, receives from ranks 1,2,3 in same group",
+      "columns": [
+        {
+          "_comment": "Column 0: Initialize shared parity with encoding XOR zero_parity",
+          "column_idx": 0,
+          "coefficient": 0,
+          "pipeline": [
+            {"step": "encode", "type": "ec_encode"},
+            {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+            {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+            {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+            {"step": "xor", "type": "xor_update", "mode": "with_zero_parity", "sources": ["local_encoding"], "target": "parity"}
+          ]
+        },
+        {
+          "_comment": "Column 1: Receive column 0 from ranks 1,2,3 and update parity",
+          "column_idx": 1,
+          "coefficient": 1,
+          "pipeline": [
+            {"step": "encode", "type": "ec_encode"},
+            {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+            {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+            {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+            {"step": "recv", "type": "nccl_recv", "source_rank": 1, "count": 1},
+            {"step": "recv", "type": "nccl_recv", "source_rank": 2, "count": 1},
+            {"step": "recv", "type": "nccl_recv", "source_rank": 3, "count": 1},
+            {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+            {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+            {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+          ]
+        },
+        {
+          "_comment": "Column 2: Receive column 1 from ranks 1,2,3 and update parity",
+          "column_idx": 2,
+          "coefficient": 2,
+          "pipeline": [
+            {"step": "encode", "type": "ec_encode"},
+            {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+            {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+            {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+            {"step": "recv", "type": "nccl_recv", "source_rank": 1, "count": 1},
+            {"step": "recv", "type": "nccl_recv", "source_rank": 2, "count": 1},
+            {"step": "recv", "type": "nccl_recv", "source_rank": 3, "count": 1},
+            {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+            {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+            {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+          ]
+        },
+        {
+          "_comment": "Column 3: Receive column 2 from ranks 1,2,3 and update parity",
+          "column_idx": 3,
+          "coefficient": 3,
+          "pipeline": [
+            {"step": "encode", "type": "ec_encode"},
+            {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+            {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+            {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+            {"step": "recv", "type": "nccl_recv", "source_rank": 1, "count": 1},
+            {"step": "recv", "type": "nccl_recv", "source_rank": 2, "count": 1},
+            {"step": "recv", "type": "nccl_recv", "source_rank": 3, "count": 1},
+            {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+            {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+            {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+          ]
+        }
+      ],
+      "post_xor_steps": [
+        {"_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)", "step": "sync", "type": "barrier", "sync_point": "after_all_xor", "ranks": [0, 1, 2, 3, 4, 5, 6, 7], "chunk_level": false},
+        {"_comment": "Send own parity to paired rank in Group 2 (Rank 4) - executed per chunk after XOR completes", "step": "send", "type": "nccl_send", "target_rank": 4, "data_type": "parity", "data_source": "local_parity", "chunk_level": true},
+        {"_comment": "Receive paired rank's data from Group 2 (Rank 4) - executed per chunk after XOR completes", "step": "recv", "type": "nccl_recv", "source_rank": 4, "data_type": "data", "data_target": "peer_data_buffer", "chunk_level": true}
+      ]
+    },
+    "1": {
+      "_comment": "Rank 1 (Group 1) - 4 columns, receives from ranks 0,2,3 in same group",
+      "columns": [
+        {"column_idx": 0, "coefficient": 0, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "with_zero_parity", "sources": ["local_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 1, "coefficient": 1, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 0, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 2, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 3, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 2, "coefficient": 2, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 0, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 2, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 3, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 3, "coefficient": 3, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 0, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 2, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 3, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]}
+      ],
+      "post_xor_steps": [
+        {"_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)", "step": "sync", "type": "barrier", "sync_point": "after_all_xor", "ranks": [0, 1, 2, 3, 4, 5, 6, 7], "chunk_level": false},
+        {"_comment": "Send own parity to paired rank in Group 2 (Rank 5) - executed per chunk after XOR completes", "step": "send", "type": "nccl_send", "target_rank": 5, "data_type": "parity", "data_source": "local_parity", "chunk_level": true},
+        {"_comment": "Receive paired rank's data from Group 2 (Rank 5) - executed per chunk after XOR completes", "step": "recv", "type": "nccl_recv", "source_rank": 5, "data_type": "data", "data_target": "peer_data_buffer", "chunk_level": true}
+      ]
+    },
+    "2": {
+      "_comment": "Rank 2 (Group 1) - 4 columns, receives from ranks 0,1,3 in same group",
+      "columns": [
+        {"column_idx": 0, "coefficient": 0, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "with_zero_parity", "sources": ["local_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 1, "coefficient": 1, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 0, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 1, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 3, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 2, "coefficient": 2, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 0, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 1, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 3, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 3, "coefficient": 3, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 3, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 0, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 1, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 3, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]}
+      ],
+      "post_xor_steps": [
+        {"_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)", "step": "sync", "type": "barrier", "sync_point": "after_all_xor", "ranks": [0, 1, 2, 3, 4, 5, 6, 7], "chunk_level": false},
+        {"_comment": "Send own parity to paired rank in Group 2 (Rank 6) - executed per chunk after XOR completes", "step": "send", "type": "nccl_send", "target_rank": 6, "data_type": "parity", "data_source": "local_parity", "chunk_level": true},
+        {"_comment": "Receive paired rank's data from Group 2 (Rank 6) - executed per chunk after XOR completes", "step": "recv", "type": "nccl_recv", "source_rank": 6, "data_type": "data", "data_target": "peer_data_buffer", "chunk_level": true}
+      ]
+    },
+    "3": {
+      "_comment": "Rank 3 (Group 1) - 4 columns, receives from ranks 0,1,2 in same group",
+      "columns": [
+        {"column_idx": 0, "coefficient": 0, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "with_zero_parity", "sources": ["local_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 1, "coefficient": 1, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 0, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 1, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 2, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 2, "coefficient": 2, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 0, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 1, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 2, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 3, "coefficient": 3, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 0, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 1, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 2, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 0, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 1, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 2, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]}
+      ],
+      "post_xor_steps": [
+        {"_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)", "step": "sync", "type": "barrier", "sync_point": "after_all_xor", "ranks": [0, 1, 2, 3, 4, 5, 6, 7], "chunk_level": false},
+        {"_comment": "Send own parity to paired rank in Group 2 (Rank 7) - executed per chunk after XOR completes", "step": "send", "type": "nccl_send", "target_rank": 7, "data_type": "parity", "data_source": "local_parity", "chunk_level": true},
+        {"_comment": "Receive paired rank's data from Group 2 (Rank 7) - executed per chunk after XOR completes", "step": "recv", "type": "nccl_recv", "source_rank": 7, "data_type": "data", "data_target": "peer_data_buffer", "chunk_level": true}
+      ]
+    },
+    "4": {
+      "_comment": "Rank 4 (Group 2) - 4 columns, receives from ranks 5,6,7 in same group, paired with rank 0 for post-xor",
+      "columns": [
+        {"column_idx": 0, "coefficient": 0, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "with_zero_parity", "sources": ["local_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 1, "coefficient": 1, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 5, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 6, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 2, "coefficient": 2, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 5, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 6, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 3, "coefficient": 3, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 5, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 6, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]}
+      ],
+      "post_xor_steps": [
+        {"_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)", "step": "sync", "type": "barrier", "sync_point": "after_all_xor", "ranks": [0, 1, 2, 3, 4, 5, 6, 7], "chunk_level": false},
+        {"_comment": "Send own parity to paired rank in Group 1 (Rank 0) - executed per chunk after XOR completes", "step": "send", "type": "nccl_send", "target_rank": 0, "data_type": "parity", "data_source": "local_parity", "chunk_level": true},
+        {"_comment": "Receive paired rank's data from Group 1 (Rank 0) - executed per chunk after XOR completes", "step": "recv", "type": "nccl_recv", "source_rank": 0, "data_type": "data", "data_target": "peer_data_buffer", "chunk_level": true}
+      ]
+    },
+    "5": {
+      "_comment": "Rank 5 (Group 2) - 4 columns, receives from ranks 4,6,7 in same group, paired with rank 1 for post-xor",
+      "columns": [
+        {"column_idx": 0, "coefficient": 0, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "with_zero_parity", "sources": ["local_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 1, "coefficient": 1, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 4, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 6, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 2, "coefficient": 2, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 4, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 6, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 3, "coefficient": 3, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 4, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 6, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]}
+      ],
+      "post_xor_steps": [
+        {"_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)", "step": "sync", "type": "barrier", "sync_point": "after_all_xor", "ranks": [0, 1, 2, 3, 4, 5, 6, 7], "chunk_level": false},
+        {"_comment": "Send own parity to paired rank in Group 1 (Rank 1) - executed per chunk after XOR completes", "step": "send", "type": "nccl_send", "target_rank": 1, "data_type": "parity", "data_source": "local_parity", "chunk_level": true},
+        {"_comment": "Receive paired rank's data from Group 1 (Rank 1) - executed per chunk after XOR completes", "step": "recv", "type": "nccl_recv", "source_rank": 1, "data_type": "data", "data_target": "peer_data_buffer", "chunk_level": true}
+      ]
+    },
+    "6": {
+      "_comment": "Rank 6 (Group 2) - 4 columns, receives from ranks 4,5,7 in same group, paired with rank 2 for post-xor",
+      "columns": [
+        {"column_idx": 0, "coefficient": 0, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "with_zero_parity", "sources": ["local_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 1, "coefficient": 1, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 4, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 5, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 2, "coefficient": 2, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 4, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 5, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 3, "coefficient": 3, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 7, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 4, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 5, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 7, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]}
+      ],
+      "post_xor_steps": [
+        {"_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)", "step": "sync", "type": "barrier", "sync_point": "after_all_xor", "ranks": [0, 1, 2, 3, 4, 5, 6, 7], "chunk_level": false},
+        {"_comment": "Send own parity to paired rank in Group 1 (Rank 2) - executed per chunk after XOR completes", "step": "send", "type": "nccl_send", "target_rank": 2, "data_type": "parity", "data_source": "local_parity", "chunk_level": true},
+        {"_comment": "Receive paired rank's data from Group 1 (Rank 2) - executed per chunk after XOR completes", "step": "recv", "type": "nccl_recv", "source_rank": 2, "data_type": "data", "data_target": "peer_data_buffer", "chunk_level": true}
+      ]
+    },
+    "7": {
+      "_comment": "Rank 7 (Group 2) - 4 columns, receives from ranks 4,5,6 in same group, paired with rank 3 for post-xor",
+      "columns": [
+        {"column_idx": 0, "coefficient": 0, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "with_zero_parity", "sources": ["local_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 1, "coefficient": 1, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 4, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 5, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 6, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 2, "coefficient": 2, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 4, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 5, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 6, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]},
+        {"column_idx": 3, "coefficient": 3, "pipeline": [
+          {"step": "encode", "type": "ec_encode"},
+          {"step": "send", "type": "nccl_send", "target_rank": 4, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 5, "count": 1},
+          {"step": "send", "type": "nccl_send", "target_rank": 6, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 4, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 5, "count": 1},
+          {"step": "recv", "type": "nccl_recv", "source_rank": 6, "count": 1},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"},
+          {"step": "xor", "type": "xor_update", "mode": "incremental", "sources": ["parity", "recv_encoding"], "target": "parity"}
+        ]}
+      ],
+      "post_xor_steps": [
+        {"_comment": "Synchronization barrier after all XOR operations complete (executed globally, not per-chunk)", "step": "sync", "type": "barrier", "sync_point": "after_all_xor", "ranks": [0, 1, 2, 3, 4, 5, 6, 7], "chunk_level": false},
+        {"_comment": "Send own parity to paired rank in Group 1 (Rank 3) - executed per chunk after XOR completes", "step": "send", "type": "nccl_send", "target_rank": 3, "data_type": "parity", "data_source": "local_parity", "chunk_level": true},
+        {"_comment": "Receive paired rank's data from Group 1 (Rank 3) - executed per chunk after XOR completes", "step": "recv", "type": "nccl_recv", "source_rank": 3, "data_type": "data", "data_target": "peer_data_buffer", "chunk_level": true}
+      ]
+    }
+  },
+  "_pairing_rules": {
+    "_comment": "EC-CHECK post-xor pairing rules: rank_i (Group 1) ↔ rank_{i+4} (Group 2)",
+    "_group1": [0, 1, 2, 3],
+    "_group2": [4, 5, 6, 7],
+    "_pairs": {
+      "0": 4,
+      "1": 5,
+      "2": 6,
+      "3": 7
+    }
+  }
+}
+

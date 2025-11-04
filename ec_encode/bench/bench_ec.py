@@ -160,7 +160,9 @@ def run_gpu_benchmark(k: int, m: int, block_size: int, iters: int, gpu_id: int, 
                 data = np.random.randint(0, 256, (k, block_size), dtype=np.uint8)
         else:
             data = np.random.randint(0, 256, (k, block_size), dtype=np.uint8)
-        _ = wrapper.encode(data, k, m, return_gpu=False, use_device_ptr=per_call_flag)
+        # Use return_gpu=True for GPU tensors to enable zero-copy optimization
+        return_gpu_flag = (input_device == 'tensor')
+        _ = wrapper.encode(data, k, m, return_gpu=return_gpu_flag, use_device_ptr=per_call_flag)
 
     print(f"GPU benchmark: k={k}, m={m}, block_size={block_size}, iters={iters}, gpu_id={gpu_id}")
     total_bytes = 0
@@ -176,7 +178,9 @@ def run_gpu_benchmark(k: int, m: int, block_size: int, iters: int, gpu_id: int, 
                 data = np.random.randint(0, 256, (k, block_size), dtype=np.uint8)
         else:
             data = np.random.randint(0, 256, (k, block_size), dtype=np.uint8)
-        _ = wrapper.encode(data, k, m, return_gpu=False, use_device_ptr=per_call_flag)
+        # Use return_gpu=True for GPU tensors to enable zero-copy optimization
+        return_gpu_flag = (input_device == 'tensor')
+        _ = wrapper.encode(data, k, m, return_gpu=return_gpu_flag, use_device_ptr=per_call_flag)
         total_bytes += block_size * k
     t1 = time.time()
 

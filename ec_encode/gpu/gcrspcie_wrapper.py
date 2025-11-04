@@ -132,6 +132,16 @@ class GCRSPCIEWrapper:
         ]
         self.lib.PErasureWorkerGetOutputData.restype = None
 
+        # PErasureWorkerGetOutputDevicePtr (new API for zero-copy GPU output)
+        try:
+            self.lib.PErasureWorkerGetOutputDevicePtr.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p)  # struct PErasureWorker *
+            ]
+            self.lib.PErasureWorkerGetOutputDevicePtr.restype = ctypes.c_void_p
+            self._has_get_output_device_ptr = True
+        except Exception:
+            self._has_get_output_device_ptr = False
+
         # PErasureWorkerSetInputDevicePtr (optional zero-copy device pointer API)
         try:
             self.lib.PErasureWorkerSetInputDevicePtr.argtypes = [
@@ -228,23 +238,22 @@ class GCRSPCIEWrapper:
         whole_buf_size = k * block_size
 
         # Determine per-call device-pointer attempt behavior
+        # Note: device_ptr optimization has issues, disabled by default for now
+        # Default to False - can be enabled via env var or explicit parameter
         env_use = (os.environ.get('GCRS_USE_DEVICE_PTR', '0') == '1')
         lib_supports = getattr(self, '_has_set_input_device_ptr', False)
         if use_device_ptr is None:
-            attempt_device_ptr = env_use and lib_supports
+            # Disable auto-enable for now due to stability issues
+            attempt_device_ptr = False  # env_use and lib_supports and is_gpu
         else:
             attempt_device_ptr = bool(use_device_ptr) and lib_supports
-        self._dbg(f"Device-pointer decision for this call: use_device_ptr_param={use_device_ptr}, env={env_use}, lib_supports={lib_supports} -> attempt_device_ptr={attempt_device_ptr}")
+        self._dbg(f"Device-pointer decision for this call: use_device_ptr_param={use_device_ptr}, env={env_use}, lib_supports={lib_supports}, is_gpu={is_gpu} -> attempt_device_ptr={attempt_device_ptr}")
 
-        # Ensure worker exists and bitmatrix ready
+        # Ensure worker exists (bitmatrix is already created in worker initialization)
         try:
             worker = self._ensure_worker(k, m, w, whole_buf_size, task_size)
         except Exception as e:
             raise RuntimeError(f"Failed to ensure PErasureWorker: {e}")
-
-        bitmatrix = self.lib.gcrs_create_bitmatrix(k, m, w)
-        if not bitmatrix:
-            raise RuntimeError("Failed to create bitmatrix")
 
         # Prepare and set input data
         data_used_device_ptr = False
@@ -301,34 +310,82 @@ class GCRSPCIEWrapper:
         except Exception as e:
             raise RuntimeError(f"Failed to run encoding: {e}")
 
-        # Get output coding blocks
-        coding_flat = np.zeros(m * block_size, dtype=np.int8)
-        self.lib.PErasureWorkerGetOutputData(worker, coding_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_char)), coding_flat.nbytes)
-        coding_blocks = coding_flat.reshape((m, block_size))
-        self._dbg(f"Debug: coding_blocks shape {coding_blocks.shape}, dtype {coding_blocks.dtype}")
-        try:
-            self._dbg(f"Debug: coding_blocks min {coding_blocks.min()}, max {coding_blocks.max()}")
-            self._dbg(f"Debug: first few values {coding_blocks.flatten()[:10]}")
-        except Exception:
-            pass
-
-        if is_gpu and return_gpu and TORCH_AVAILABLE:
-            self._dbg(f"Debug: Converting to torch tensor with dtype {original_dtype}")
-            coding_blocks_uint8 = np.ascontiguousarray(coding_blocks.astype(np.uint8))
+        # Get output coding blocks - optimize for GPU zero-copy path
+        if is_gpu and return_gpu and TORCH_AVAILABLE and getattr(self, '_has_get_output_device_ptr', False):
+            # Zero-copy GPU path: directly copy from C library's GPU buffer to PyTorch tensor
+            self._dbg("Using zero-copy GPU output path")
             try:
-                tensor_gpu = torch.tensor(coding_blocks_uint8, device='cuda', dtype=original_dtype)
-                torch.cuda.synchronize()
-                coding_blocks = tensor_gpu
-            except Exception as e:
-                self._dbg(f"Debug: Error during direct GPU tensor creation: {e}")
-                tensor_cpu = torch.from_numpy(coding_blocks_uint8.copy())
-                try:
-                    coding_blocks = tensor_cpu.to(device='cuda', dtype=original_dtype)
+                # Ensure encoding is complete before accessing output buffer
+                if TORCH_AVAILABLE:
                     torch.cuda.synchronize()
-                except Exception as ee:
-                    self._dbg(f"Debug: Fallback move to CUDA failed: {ee}")
-                    raise
-        elif original_dtype != np.int8:
+                
+                # Get device pointer from C library
+                output_dev_ptr = self.lib.PErasureWorkerGetOutputDevicePtr(worker)
+                if output_dev_ptr is None or output_dev_ptr == 0:
+                    raise RuntimeError("Failed to get output device pointer")
+                
+                # Create output tensor directly on GPU
+                coding_blocks_gpu = torch.empty((m, block_size), dtype=original_dtype, device='cuda')
+                
+                # Copy from C library's GPU buffer to PyTorch tensor (device-to-device copy)
+                from ctypes.util import find_library
+                libname = find_library('cudart') or 'libcudart.so'
+                libcudart = ctypes.CDLL(libname)
+                libcudart.cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+                libcudart.cudaMemcpy.restype = ctypes.c_int
+                
+                # Calculate output size in bytes (C library always uses int8/uint8 internally)
+                output_size_bytes = m * block_size  # C library uses int8, so 1 byte per element
+                
+                # Use cudaMemcpyDeviceToDevice (2) for GPU-to-GPU copy
+                cudaMemcpyDeviceToDevice = 2
+                err = libcudart.cudaMemcpy(
+                    ctypes.c_void_p(coding_blocks_gpu.data_ptr()),
+                    ctypes.c_void_p(output_dev_ptr),
+                    output_size_bytes,
+                    cudaMemcpyDeviceToDevice
+                )
+                if err != 0:
+                    raise RuntimeError(f"cudaMemcpy failed with error {err}")
+                
+                torch.cuda.synchronize()
+                coding_blocks = coding_blocks_gpu
+                self._dbg(f"Zero-copy GPU output succeeded: shape {coding_blocks.shape}, dtype {coding_blocks.dtype}")
+            except Exception as e:
+                self._dbg(f"Zero-copy GPU output failed (falling back to host path): {e}")
+                # Fallback to host path
+                coding_flat = np.zeros(m * block_size, dtype=np.int8)
+                self.lib.PErasureWorkerGetOutputData(worker, coding_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_char)), coding_flat.nbytes)
+                coding_blocks = coding_flat.reshape((m, block_size))
+                coding_blocks_uint8 = np.ascontiguousarray(coding_blocks.astype(np.uint8))
+                coding_blocks = torch.from_numpy(coding_blocks_uint8.copy()).to(device='cuda', dtype=original_dtype)
+                torch.cuda.synchronize()
+        else:
+            # Host path: get output from CPU buffer
+            coding_flat = np.zeros(m * block_size, dtype=np.int8)
+            self.lib.PErasureWorkerGetOutputData(worker, coding_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_char)), coding_flat.nbytes)
+            coding_blocks = coding_flat.reshape((m, block_size))
+            
+            if is_gpu and return_gpu and TORCH_AVAILABLE:
+                # Convert to GPU tensor if requested
+                self._dbg(f"Converting to torch tensor with dtype {original_dtype}")
+                coding_blocks_uint8 = np.ascontiguousarray(coding_blocks.astype(np.uint8))
+                try:
+                    tensor_gpu = torch.tensor(coding_blocks_uint8, device='cuda', dtype=original_dtype)
+                    torch.cuda.synchronize()
+                    coding_blocks = tensor_gpu
+                except Exception as e:
+                    self._dbg(f"Error during direct GPU tensor creation: {e}")
+                    tensor_cpu = torch.from_numpy(coding_blocks_uint8.copy())
+                    try:
+                        coding_blocks = tensor_cpu.to(device='cuda', dtype=original_dtype)
+                        torch.cuda.synchronize()
+                    except Exception as ee:
+                        self._dbg(f"Fallback move to CUDA failed: {ee}")
+                        raise
+        
+        # Convert dtype if needed (for non-GPU outputs)
+        if isinstance(coding_blocks, np.ndarray) and original_dtype != np.int8:
             try:
                 if TORCH_AVAILABLE and isinstance(original_dtype, type(torch.uint8)):
                     torch_to_np = {
@@ -352,6 +409,14 @@ class GCRSPCIEWrapper:
                     coding_blocks = coding_blocks.astype(original_dtype)
             except Exception:
                 pass
+        
+        self._dbg(f"Debug: coding_blocks shape {coding_blocks.shape}, dtype {coding_blocks.dtype}")
+        try:
+            if isinstance(coding_blocks, np.ndarray):
+                self._dbg(f"Debug: coding_blocks min {coding_blocks.min()}, max {coding_blocks.max()}")
+                self._dbg(f"Debug: first few values {coding_blocks.flatten()[:10]}")
+        except Exception:
+            pass
 
         # Note: Do NOT deallocate worker here; we reuse the cached worker across
         # multiple encode() calls. Deallocation will be handled in close()/__del__.
@@ -378,24 +443,15 @@ class GCRSPCIEWrapper:
             self._worker = None
             self._worker_params = None
 
-        # Create new worker
+        # Create new worker (bitmatrix is already created inside PErasureWorkerInit)
         worker = self.lib.PErasureWorkerInit(k, m, w, whole_buf_size, task_size)
         if not worker:
             raise RuntimeError("Failed to allocate PErasureWorker")
         self._dbg(f"Worker initialized (cached): {worker}")
 
-        # create bitmatrix and set if necessary
-        bitmatrix = self.lib.gcrs_create_bitmatrix(k, m, w)
-        if not bitmatrix:
-            # Clean up worker we just created
-            try:
-                self.lib.PErasureWorkerDealloc(worker)
-            except Exception:
-                pass
-            raise RuntimeError("Failed to create bitmatrix")
+        # Note: bitmatrix is already created and set inside PErasureWorkerInit
+        # No need to create it again here
 
-        # We assume C library or worker expects bitmatrix to be set elsewhere; if API
-        # exists to set it, it should be called here. For now, cache the worker.
         self._worker = worker
         self._worker_params = params
         return worker

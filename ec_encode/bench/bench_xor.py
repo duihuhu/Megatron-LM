@@ -14,6 +14,7 @@ import time
 import os
 import sys
 from typing import List
+from functools import reduce
 
 # Ensure repo root on sys.path for worker processes
 try:
@@ -165,9 +166,8 @@ def run_gpu_benchmark(k: int, block_size: int, iters: int, gpu_id: int, warmup: 
     # Perform a warmup kernel and synchronize to initialize CUDA and stabilize clocks
     for _ in range(max(1, warmup)):
         data = torch.randint(0, 256, (k+1, block_size), dtype=torch.uint8, device='cuda')
-        target = data[-1]
-        for i in range(k):
-            target ^= data[i]
+        # XOR all k tensors at once using reduce
+        target = reduce(torch.bitwise_xor, [data[i] for i in range(k)], data[-1].clone())
     torch.cuda.synchronize()
 
     # Accurate timing: synchronize before starting timer and after finishing
@@ -186,14 +186,12 @@ def run_gpu_benchmark(k: int, block_size: int, iters: int, gpu_id: int, warmup: 
     t0 = time.time()
     for _ in range(iters):
         if prealloc:
-            target = data[-1]
-            for i in range(k):
-                target ^= data[i]
+            # XOR all k tensors at once using reduce
+            target = reduce(torch.bitwise_xor, [data[i] for i in range(k)], data[-1].clone())
         else:
             data = torch.randint(0, 256, (k+1, block_size), dtype=torch.uint8, device='cuda')
-            target = data[-1]
-            for i in range(k):
-                target ^= data[i]
+            # XOR all k tensors at once using reduce
+            target = reduce(torch.bitwise_xor, [data[i] for i in range(k)], data[-1].clone())
         total_bytes += block_size * k
     torch.cuda.synchronize()
     t1 = time.time()

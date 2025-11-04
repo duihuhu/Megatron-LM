@@ -786,9 +786,14 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 else:
                     self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank)
                 
-                # If we reach here, NCCL communicators are ready and threads are running
-                logger.info(f"EC-CHECK: C++ native module initialized successfully (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
-                print(f"EC-CHECK: [Rank {rank}] C++ native module initialized - NCCL communicators ready for data exchange")
+                # If we reach here, C++ native module is created but threads are NOT started yet
+                # Threads will be started after set_columns_config is called
+                logger.info(f"EC-CHECK: C++ native module created (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
+                print(f"EC-CHECK: [Rank {rank}] C++ native module created - will initialize NCCL after columns config")
+                
+                # Load and apply columns configuration from config file (if available)
+                # This must be done BEFORE any FileSystemWriterAsync uses it
+                self._init_eccheck_columns_config()
                 
                 # Initialize EC-CHECK buffers
                 self._init_eccheck_buffers()
@@ -827,6 +832,135 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         logger.debug(f"EC-CHECK: Rank {my_rank} paired with Rank {paired_rank}")
         return paired_rank
+
+    def _init_eccheck_columns_config(self):
+        """Load and apply columns configuration from config file, then initialize NCCL.
+        
+        This is called during Strategy initialization to ensure NCCL is initialized
+        once at the beginning, not repeatedly in each checkpoint step.
+        """
+        if self._eccheck_native is None:
+            return
+        
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        paired_rank = self._get_paired_rank(rank, world_size)
+        
+        try:
+            cfg_path = os.environ.get('ECCHECK_CONFIG_PATH')
+            if not cfg_path or not os.path.isfile(cfg_path):
+                logger.info("EC-CHECK: No config file found, using default columns config")
+                # Use default 2 columns config
+                default_cols = [
+                    {'coefficient': 0, 'send_peer': paired_rank, 'recv_peer': paired_rank},
+                    {'coefficient': 1, 'send_peer': paired_rank, 'recv_peer': paired_rank}
+                ]
+                norm_cols = default_cols
+            else:
+                import json
+                with open(cfg_path, 'r') as f:
+                    data = json.load(f)
+                
+                if not isinstance(data, dict):
+                    logger.warning("EC-CHECK: Invalid config file format, using defaults")
+                    return
+                
+                # Try to load advanced config with ranks_config
+                ranks_config = data.get('ranks_config', {})
+                rank_str = str(rank)
+                rank_config = ranks_config.get(rank_str)
+                
+                if rank_config and isinstance(rank_config, dict):
+                    columns_config = rank_config.get('columns', [])
+                    if columns_config:
+                        logger.info(f"EC-CHECK: Loading advanced columns config for rank {rank} ({len(columns_config)} columns)")
+                        norm_cols = self._parse_advanced_columns_config(columns_config, rank, world_size, paired_rank)
+                    else:
+                        logger.info("EC-CHECK: No columns config in advanced mode, using defaults")
+                        norm_cols = [
+                            {'coefficient': 0, 'send_peer': paired_rank, 'recv_peer': paired_rank},
+                            {'coefficient': 1, 'send_peer': paired_rank, 'recv_peer': paired_rank}
+                        ]
+                else:
+                    # Fallback to default
+                    logger.info("EC-CHECK: No advanced config found, using default columns config")
+                    norm_cols = [
+                        {'coefficient': 0, 'send_peer': paired_rank, 'recv_peer': paired_rank},
+                        {'coefficient': 1, 'send_peer': paired_rank, 'recv_peer': paired_rank}
+                    ]
+            
+            if norm_cols and hasattr(self._eccheck_native, 'set_columns_config'):
+                # CRITICAL: Synchronize all ranks before NCCL initialization
+                # This prevents deadlock where some ranks wait for others that haven't started yet
+                logger.info(f"EC-CHECK: [Rank {rank}] Barrier before NCCL initialization...")
+                torch.distributed.barrier()
+                logger.info(f"EC-CHECK: [Rank {rank}] Barrier passed, applying columns config and initializing NCCL...")
+                
+                # Convert to format expected by C++
+                cols_for_cpp = []
+                for col in norm_cols:
+                    cols_for_cpp.append({
+                        'coefficient': col.get('coefficient', 0),
+                        'send_peer': col.get('send_peer', paired_rank),
+                        'recv_peer': col.get('recv_peer', paired_rank)
+                    })
+                
+                self._eccheck_native.set_columns_config(cols_for_cpp)
+                logger.info(f"EC-CHECK: Columns config applied and NCCL initialized ({len(cols_for_cpp)} columns)")
+                print(f"EC-CHECK: [Rank {rank}] Columns config applied and NCCL initialized - ready for data exchange")
+                
+                # Store config for later use
+                self.eccheck_columns_config = norm_cols
+            else:
+                logger.warning("EC-CHECK: No columns config to apply or set_columns_config not available")
+                
+        except Exception as e:
+            logger.warning(f"EC-CHECK: Failed to load/apply columns config: {e}, using defaults")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+    def _parse_advanced_columns_config(self, columns_config, rank, world_size, paired_rank):
+        """Parse advanced column configuration (copied from filesystem_async.py logic)."""
+        norm_cols = []
+        
+        for col_cfg in columns_config:
+            if not isinstance(col_cfg, dict):
+                continue
+            
+            column_idx = col_cfg.get('column_idx', len(norm_cols))
+            coefficient = int(col_cfg.get('coefficient', column_idx))
+            
+            # Extract send_peer and recv_peer from pipeline
+            send_peer = -1
+            recv_peer = -1
+            pipeline = col_cfg.get('pipeline', [])
+            
+            for step in pipeline:
+                if not isinstance(step, dict):
+                    continue
+                step_type = step.get('type', '')
+                if step_type == 'nccl_send':
+                    target = step.get('target_rank', -1)
+                    if target >= 0:
+                        send_peer = target
+                elif step_type == 'nccl_recv':
+                    source = step.get('source_rank', -1)
+                    if source >= 0:
+                        recv_peer = source
+            
+            # Auto-calculate if not found in pipeline
+            if send_peer < 0:
+                send_peer = paired_rank
+            if recv_peer < 0:
+                recv_peer = paired_rank
+            
+            norm_cols.append({
+                'coefficient': coefficient,
+                'send_peer': send_peer,
+                'recv_peer': recv_peer
+            })
+        
+        return norm_cols
 
     def _init_eccheck_buffers(self):
         """Initialize EC-CHECK buffers during C++ module initialization.

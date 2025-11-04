@@ -19,4 +19,8 @@ G-CRSPCIE/*.o
 G-CRSPCIE/*.so
 G-CRSPCIE/*.out
 G-CRSPCIE/*.log
+G-CRS_Workload/*.o
+G-CRS_Workload/*.so
+G-CRS_Workload/*.out
+G-CRS_Workload/*.log
 isa-l/

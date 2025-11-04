@@ -1811,37 +1811,66 @@ class FileSystemWriterAsync(FileSystemWriter):
                 self._buffer_poller_active_event.clear()
         
         # Final poll to ensure all buffers are released
-        # Poll multiple times with delays to ensure all buffers are released
-        for _ in range(20):
-            self._poll_and_release_buffers()
-            import time
-            time.sleep(0.01)
-        
-        # Verify all buffers are back in queues
+        # Use condition-based waiting instead of fixed loops
         expected_data_buffers = len(self.eccheck_data_buffers)
         expected_encoding_buffers = len(self.eccheck_encoding_buffers)
+        
+        # Wait for all buffers to be released with timeout
+        max_wait_time = 5.0  # Maximum wait time in seconds
+        poll_interval = 0.01  # Poll interval in seconds
+        start_time = time()
+        
+        while (time() - start_time) < max_wait_time:
+            self._poll_and_release_buffers()
+            
+            actual_data_buffers = self._free_data_buffer_queue.qsize()
+            actual_encoding_buffers = self._free_encoding_buffer_queue.qsize()
+            
+            # Check if all buffers are released
+            if actual_data_buffers >= expected_data_buffers and actual_encoding_buffers >= expected_encoding_buffers:
+                elapsed = time() - start_time
+                if elapsed > 0.01:  # Only log if we had to wait
+                    logger.debug(f"EC-CHECK: All buffers released after {elapsed:.3f}s")
+                break
+            
+            time.sleep(poll_interval)
+        
+        # Verify all buffers are back in queues
         actual_data_buffers = self._free_data_buffer_queue.qsize()
         actual_encoding_buffers = self._free_encoding_buffer_queue.qsize()
         
         if actual_data_buffers < expected_data_buffers:
             logger.warning(
                 f"EC-CHECK: Data buffer mismatch - expected {expected_data_buffers}, "
-                f"got {actual_data_buffers} in free queue"
+                f"got {actual_data_buffers} in free queue after {max_wait_time}s wait"
             )
         
         if actual_encoding_buffers < expected_encoding_buffers:
             logger.warning(
                 f"EC-CHECK: Encoding buffer mismatch - expected {expected_encoding_buffers}, "
-                f"got {actual_encoding_buffers} in free queue"
+                f"got {actual_encoding_buffers} in free queue after {max_wait_time}s wait"
             )
         
-        # If buffers are missing, try one more aggressive poll
+        # If buffers are still missing, try one more recovery attempt with longer timeout
         if actual_data_buffers < expected_data_buffers or actual_encoding_buffers < expected_encoding_buffers:
-            logger.warning("EC-CHECK: Performing aggressive buffer recovery...")
-            for _ in range(50):
+            logger.warning("EC-CHECK: Performing extended buffer recovery...")
+            extended_wait_time = 10.0  # Extended wait time in seconds
+            extended_poll_interval = 0.02  # Longer poll interval
+            extended_start_time = time()
+            
+            while (time() - extended_start_time) < extended_wait_time:
                 self._poll_and_release_buffers()
-                import time
-                time.sleep(0.02)
+                
+                actual_data_buffers = self._free_data_buffer_queue.qsize()
+                actual_encoding_buffers = self._free_encoding_buffer_queue.qsize()
+                
+                # Check if all buffers are released
+                if actual_data_buffers >= expected_data_buffers and actual_encoding_buffers >= expected_encoding_buffers:
+                    elapsed = time() - extended_start_time
+                    logger.info(f"EC-CHECK: All buffers recovered after extended wait ({elapsed:.3f}s)")
+                    break
+                
+                time.sleep(extended_poll_interval)
         
         # Final check
         final_data = self._free_data_buffer_queue.qsize()
@@ -2143,20 +2172,29 @@ class FileSystemWriterAsync(FileSystemWriter):
                         post_xor_steps = rank_config.get('post_xor_steps', [])
                         logger.info(f"EC-CHECK: Using advanced config mode for rank {rank}, columns={len(columns_config)}, post_xor_steps={len(post_xor_steps)}")
                         norm_cols = self._parse_advanced_columns_config(columns_config, rank, world_size, paired_rank)
+                        # Check if NCCL is already initialized (from Strategy level)
+                        # If using shared eccheck_native from Strategy, it should already be initialized
+                        # Only call set_columns_config if threads are not started yet
                         if norm_cols and hasattr(self._eccheck_native, 'set_columns_config'):
-                            # Synchronize all ranks before starting NCCL initialization
-                            # This ensures all ranks' threads start NCCL init simultaneously,
-                            # preventing deadlock where some ranks wait for others that haven't started yet
-                            import torch.distributed as dist
-                            if dist.is_initialized():
-                                logger.info(f"EC-CHECK: [Rank {rank}] Barrier before NCCL initialization...")
-                                dist.barrier()
-                                logger.info(f"EC-CHECK: [Rank {rank}] Barrier passed, starting columns config...")
-                            self._eccheck_native.set_columns_config(norm_cols)
-                            logger.info(f"EC-CHECK: Applied advanced columns config ({len(norm_cols)} entries)")
-                            # Store normalized columns config for later use
-                            self.eccheck_columns_config = norm_cols
-                            logger.info(f"EC-CHECK: Stored columns config: {len(norm_cols)} columns")
+                            # If using shared module from Strategy, NCCL should already be initialized
+                            # Strategy calls set_columns_config during initialization
+                            if hasattr(self, '_eccheck_shared') and self._eccheck_shared:
+                                logger.info(f"EC-CHECK: Columns config already initialized at Strategy level (shared module), skipping NCCL init")
+                                # Store the config for reference
+                                self.eccheck_columns_config = norm_cols
+                            else:
+                                # This should not happen if Strategy initialization worked correctly
+                                # But handle it gracefully for backward compatibility
+                                logger.warning(f"EC-CHECK: Columns config not initialized at Strategy level, initializing now...")
+                                import torch.distributed as dist
+                                if dist.is_initialized():
+                                    logger.info(f"EC-CHECK: [Rank {rank}] Barrier before NCCL initialization...")
+                                    dist.barrier()
+                                    logger.info(f"EC-CHECK: [Rank {rank}] Barrier passed, starting columns config...")
+                                self._eccheck_native.set_columns_config(norm_cols)
+                                logger.info(f"EC-CHECK: Applied advanced columns config ({len(norm_cols)} entries)")
+                                self.eccheck_columns_config = norm_cols
+                                logger.info(f"EC-CHECK: Stored columns config: {len(norm_cols)} columns")
                         
                         # Store post_xor_steps for future use (MUST be before _store_pipeline_configs which executes Phase 3)
                         if post_xor_steps:

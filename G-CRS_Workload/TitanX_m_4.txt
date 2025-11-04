@@ -1,0 +1,72 @@
+BlockId	 w4	 w5 	 w6 	 w7 	 w8
+1	9.552027	9.701277	9.524890	9.110765	8.098457
+2	15.820744	15.398851	15.481088	14.638597	14.717195
+3	27.515129	26.267736	26.983995	25.772770	24.883869
+4	60.387806	53.432156	54.794868	52.621815	51.563900
+5	126.293587	114.854019	116.130898	103.990387	105.146011
+6	216.774948	180.183319	171.484985	160.166031	159.327438
+7	292.818817	238.609482	225.717468	206.863678	203.491196
+8	343.511688	326.977051	299.210571	274.457458	244.033264
+9	464.781891	391.234924	352.332397	312.509338	276.540070
+10	557.182434	445.176208	386.624725	335.838379	313.813477
+BlockId	 w4	 w5 	 w6 	 w7 	 w8
+1Invalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	inf
+2Invalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	inf
+3Invalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	inf
+4Invalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	inf
+5Invalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	inf
+6Invalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	inf
+7Invalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	inf
+8Invalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	inf
+9Invalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	inf
+10Invalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	infInvalid k,m,w
+	inf

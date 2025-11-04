@@ -104,6 +104,9 @@ void PErasureWorkerSetInputDevicePtr(struct PErasureWorker *worker, char *device
 
 void PErasureWorkerGetOutputData(struct PErasureWorker *worker, char *output_data, size_t data_size);
 
+// New API to get output device pointer (zero-copy path for output)
+char *PErasureWorkerGetOutputDevicePtr(struct PErasureWorker *worker);
+
 void PErasureWorkerResetDevice();
 
 void PErasureWorkerCalculateRecord(struct PErasureWorker *worker);

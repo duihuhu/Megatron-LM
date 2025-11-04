@@ -280,8 +280,8 @@ void fullDuplexRunEncode(struct PErasureWorker *worker){
         if (idx != worker->taskNum-1) {
             
             if (worker->use_external_data_dev_buf && worker->external_data_dev_buf != NULL) {
-                // Point data_dev_buf to external buffer region for this task
-                memcpy((worker->data_dev_buf + idx * worker->k * worker->bufSizePerTask), (worker->external_data_dev_buf + idx * worker->k * worker->bufSizePerTask), 0);
+                // External buffer is already set as data_dev_buf in PErasureWorkerSetInputDevicePtr
+                // data_dev_buf_ptr already points to the correct locations, no need to copy
                 // No H2D transfer here; external buffer is assumed already on device
             } else {
                 transfer_cuda_memory_host_to_device_async((worker->data_dev_buf + idx * worker->k * worker->bufSizePerTask), (worker->data_host_buf + idx * worker->k * worker->bufSizePerTask), (worker->k * worker->bufSizePerTask),worker->workerKernelStream[idx]);
@@ -559,6 +559,11 @@ void PErasureWorkerGetOutputData(struct PErasureWorker *worker, char *output_dat
         return;
     }
     memcpy(output_data, worker->code_host_buf, data_size);
+}
+
+// New API: get output device pointer for zero-copy GPU output
+char *PErasureWorkerGetOutputDevicePtr(struct PErasureWorker *worker) {
+    return worker->code_dev_buf;
 }
 
 void PErasureWorkerResetDevice(){

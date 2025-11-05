@@ -17,3 +17,26 @@ You can do the following to see our experimental results:
 Note that for a machine with multiple GPUs, set the DEVICE_SELCTED_ID in GCRSCommon.h to make the code run on the target device before run make.
 
 Please contact through email cscjliu@comp.hkbu.edu.hk if you have any further question. 
+
+=====
+
+Reference & Attribution
+=====
+
+**This repository contains supplementary code from the G-CRS paper.**
+
+This code is based on the original implementation from the following paper:
+
+**G-CRS: GPU Accelerated Cauchy Reed-Solomon Coding**
+
+- **Paper**: [PDF](https://www.comp.hkbu.edu.hk/~chxw/papers/G-CRS.pdf)
+- **Project Website**: [Supplementary Materials](https://www.comp.hkbu.edu.hk/~chxw/gcrs.html)
+
+The original code and experimental results can be found on the project website, which provides:
+- Experimental results and performance analysis
+- Additional source code and measurement tools
+- Detailed optimization analysis
+
+**Acknowledgments**
+
+We thank the original authors for making their code and research publicly available. The original implementation was developed by Liu Chengjian and colleagues at Hong Kong Baptist University.

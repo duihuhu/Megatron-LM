@@ -158,4 +158,17 @@ void gcrs_raw_coding_measure(int k, int m, int w,
                              int workSizeTotalInLong,
                              char *devDataPtr, char *devCodePtr, float *timeElasped);
 
+// XOR coding function (simple XOR of k input blocks)
+void gcrs_xor_coding(int k, int index,
+                     char *dataPtr, char *codeDevPtr,
+                     int threadDimX, int blockDimX,
+                     int workSizePerGridInLong,
+                     cudaStream_t stream);
+
+// XOR measurement function
+void gcrs_xor_measure(int k,
+                      int threadDimX, int blockDimX,
+                      int workSizeTotalInLong,
+                      char *devDataPtr, char *devCodePtr, float *timeElapsed);
+
 #endif /* defined(__NoSynFree__GCRSCoding__) */

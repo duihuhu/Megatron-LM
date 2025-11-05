@@ -23,19 +23,25 @@ LIB_CUDA := -L$(CUDA_INSTALL_PATH)/lib64 -lcudart -lcuda
 LINKLINE = $(LINK) -o $(TARGET) $(LIB_CUDA) $(OBJS)
 
 TARGET = PCIEMeasure
+TEST_TARGET = test_gpu_tensor
 
 OBJS = galois.o jerasure.o GCRSKernel.o GCRSMatrix.o GCRSCoding.o PErasureUtilities.o  PErasureWorker.o PCIEMeasure.o
+TEST_OBJS = galois.o jerasure.o GCRSKernel.o GCRSMatrix.o GCRSCoding.o PErasureUtilities.o  PErasureWorker.o test_gpu_tensor.o
 
 LIBTARGET = libgcrspcie.so
 ALL = $(OBJS) $(TARGET) $(LIBTARGET)
+ALL_WITH_TEST = $(ALL) $(TEST_TARGET)
+
 all: $(ALL)
+
+test: $(ALL_WITH_TEST)
 
 $(LIBTARGET): $(OBJS)
 	$(LINK) -shared -o $(LIBTARGET) $(OBJS) $(LIB_CUDA)
 
 clean:
 	rm -rf *.o
-	rm $(TARGET)
+	rm -f $(TARGET) test_gpu_tensor
 
 
 .SUFFIXES: .c .cpp .cu .o
@@ -57,5 +63,10 @@ GCRSCoding.o: GCRSCoding.h
 PErasureUtilities.o: PErasureUtilities.h
 PErasureWorker.o: PErasureWorker.h PErasureUtilities.h
 PCIEMeasure.o: PErasureWorker.h PErasureUtilities.h GCRSCoding.h GCRSMatrix.h
+test_gpu_tensor.o: PErasureWorker.h PErasureUtilities.h GCRSCoding.h GCRSMatrix.h GCRSCommon.h
+
 $(TARGET): $(OBJS)
 	$(LINKLINE)
+
+$(TEST_TARGET): $(TEST_OBJS)
+	$(LINK) -o $(TEST_TARGET) $(LIB_CUDA) $(TEST_OBJS)

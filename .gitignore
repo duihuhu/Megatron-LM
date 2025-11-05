@@ -19,8 +19,12 @@ G-CRSPCIE/*.o
 G-CRSPCIE/*.so
 G-CRSPCIE/*.out
 G-CRSPCIE/*.log
+G-CRSPCIE/*.csv
+G-CRSPCIE/test_gpu_tensor
 G-CRS_Workload/*.o
 G-CRS_Workload/*.so
 G-CRS_Workload/*.out
 G-CRS_Workload/*.log
+G-CRS_Workload/*.csv
+G-CRS_Workload/GCRSMeasureWorkload
 isa-l/

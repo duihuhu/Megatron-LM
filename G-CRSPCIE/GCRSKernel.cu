@@ -1320,4 +1320,41 @@ extern "C" void m_4_w_8_coding(int k, int index,
     
 }
 
+// Simple XOR kernel: XOR k input blocks into one output block
+// This is similar to EC encoding but only performs XOR operations
+__global__ void gcrs_xor_kernel(int k, long *in, long *out, int size) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= size) {
+        return;
+    }
+    
+    // Initialize result with first input block
+    long result = in[idx];
+    
+    // XOR with remaining k-1 input blocks
+    for (int i = 1; i < k; i++) {
+        result = result ^ in[i * size + idx];
+    }
+    
+    out[idx] = result;
+}
+
+// Wrapper function for XOR kernel (similar to EC coding functions)
+extern "C" void gcrs_xor_coding(int k, int index,
+                                 char *dataPtr, char *codeDevPtr,
+                                 int threadDimX, int blockDimX,
+                                 int workSizePerGridInLong,
+                                 cudaStream_t stream) {
+    dim3 gridDim(blockDimX, 1, 1);
+    dim3 blockDim(threadDimX, 1, 1);
+    
+    gcrs_xor_kernel<<<gridDim, blockDim, 0, stream>>>(
+        k, 
+        (long *)dataPtr, 
+        (long *)codeDevPtr, 
+        workSizePerGridInLong
+    );
+}
+
 

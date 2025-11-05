@@ -151,6 +151,18 @@ void initBuf(struct PErasureWorker *worker){
     worker->output_dev_buf_ptr = talloc(char *, worker->taskNum);
     worker->external_data_dev_buf = NULL;
     worker->use_external_data_dev_buf = 0;
+    worker->skip_d2h_transfer = 0;
+    worker->external_code_dev_buf = NULL;
+    worker->use_external_code_dev_buf = 0;
+    
+    // Save internal buffer pointers for proper cleanup
+    worker->internal_data_dev_buf = worker->data_dev_buf;
+    worker->internal_code_dev_buf = worker->code_dev_buf;
+    
+    // Initialize CUDA execution configuration
+    worker->threads_per_block = MAX_THREAD_NUM;  // Default: 128
+    worker->blocks_per_grid = 0;  // 0 means auto-calculate
+    worker->use_custom_grid_config = 0;
 
     dataSizePerAssign = worker->bufSizePerTask * worker->k;
     codeSizePerAssign = worker->bufSizePerTask * worker->m;
@@ -265,14 +277,20 @@ void startSingleDirectionDataTransfer(struct PErasureWorker *worker){
 void fullDuplexRunEncode(struct PErasureWorker *worker){
     
     int warpThreadNum = 32;
-    int threadNum = MAX_THREAD_NUM;
+    int threadNum = worker->threads_per_block;  // Use configurable threads_per_block
     int idx;
     size_t workSizePerWarp = warpThreadNum / worker->w * worker->w;
     size_t workSizePerBlock = threadNum / warpThreadNum * workSizePerWarp * sizeof(long);
-    size_t blockNum = worker->bufSizePerTask / workSizePerBlock;
+    size_t blockNum;
     
-    if ((worker->bufSizePerTask % workSizePerBlock) != 0) {
-        blockNum = blockNum + 1;
+    // Calculate blockNum: use custom if set, otherwise auto-calculate
+    if (worker->use_custom_grid_config && worker->blocks_per_grid > 0) {
+        blockNum = worker->blocks_per_grid;
+    } else {
+        blockNum = worker->bufSizePerTask / workSizePerBlock;
+        if ((worker->bufSizePerTask % workSizePerBlock) != 0) {
+            blockNum = blockNum + 1;
+        }
     }
     
     gettimeofday(&worker->startEncodeTime, NULL);
@@ -312,7 +330,10 @@ void fullDuplexRunEncode(struct PErasureWorker *worker){
                 }
             }
 
-            transfer_cuda_memory_device_to_host_async((worker->code_host_buf + idx * worker->m * worker->bufSizePerTask), (worker->code_dev_buf + idx * worker->m * worker->bufSizePerTask), (worker->m * worker->bufSizePerTask),worker->workerKernelStream[idx]);
+            // Skip D2H transfer if zero-copy GPU tensor encoding is enabled
+            if (!worker->skip_d2h_transfer) {
+                transfer_cuda_memory_device_to_host_async((worker->code_host_buf + idx * worker->m * worker->bufSizePerTask), (worker->code_dev_buf + idx * worker->m * worker->bufSizePerTask), (worker->m * worker->bufSizePerTask),worker->workerKernelStream[idx]);
+            }
         }else{
             if (worker->use_external_data_dev_buf && worker->external_data_dev_buf != NULL) {
                 memcpy((worker->data_dev_buf + idx * worker->k * worker->bufSizePerTask), (worker->external_data_dev_buf + idx * worker->k * worker->bufSizePerTask), 0);
@@ -344,7 +365,10 @@ void fullDuplexRunEncode(struct PErasureWorker *worker){
                 }
             }
 
-            transfer_cuda_memory_device_to_host_async((worker->code_host_buf + idx * worker->m * worker->bufSizePerTask), (worker->code_dev_buf + idx * worker->m * worker->bufSizePerTask), (worker->m * worker->bufSizeForLastTask),worker->workerKernelStream[idx]);
+            // Skip D2H transfer if zero-copy GPU tensor encoding is enabled
+            if (!worker->skip_d2h_transfer) {
+                transfer_cuda_memory_device_to_host_async((worker->code_host_buf + idx * worker->m * worker->bufSizePerTask), (worker->code_dev_buf + idx * worker->m * worker->bufSizePerTask), (worker->m * worker->bufSizeForLastTask),worker->workerKernelStream[idx]);
+            }
 
         }
 
@@ -358,14 +382,20 @@ void fullDuplexRunEncode(struct PErasureWorker *worker){
 void fullDuplexRunDecode(struct PErasureWorker *worker){
     
     int warpThreadNum = 32;
-    int threadNum = MAX_THREAD_NUM;
+    int threadNum = worker->threads_per_block;  // Use configurable threads_per_block
     int idx;
     size_t workSizePerWarp = warpThreadNum / worker->w * worker->w;
     size_t workSizePerBlock = threadNum / warpThreadNum * workSizePerWarp * sizeof(long);
-    size_t blockNum = worker->bufSizePerTask / workSizePerBlock;
+    size_t blockNum;
     
-    if ((worker->bufSizePerTask % workSizePerBlock) != 0) {
-        blockNum = blockNum + 1;
+    // Calculate blockNum: use custom if set, otherwise auto-calculate
+    if (worker->use_custom_grid_config && worker->blocks_per_grid > 0) {
+        blockNum = worker->blocks_per_grid;
+    } else {
+        blockNum = worker->bufSizePerTask / workSizePerBlock;
+        if ((worker->bufSizePerTask % workSizePerBlock) != 0) {
+            blockNum = blockNum + 1;
+        }
     }
     
     gettimeofday(&worker->startDecodeTime, NULL);
@@ -383,7 +413,10 @@ void fullDuplexRunDecode(struct PErasureWorker *worker){
 //                               threadNum,blockNum,
 //                               worker->bufSizePerTask/sizeof(long),
 //                               worker->workerKernelStream[idx]);
-            transfer_cuda_memory_device_to_host_async((worker->output_buf + idx * worker->m * worker->bufSizePerTask), (worker->output_dev_buf + idx * worker->m * worker->bufSizePerTask), (worker->m * worker->bufSizePerTask),worker->workerKernelStream[idx]);
+            // Skip D2H transfer if zero-copy GPU tensor decoding is enabled
+            if (!worker->skip_d2h_transfer) {
+                transfer_cuda_memory_device_to_host_async((worker->output_buf + idx * worker->m * worker->bufSizePerTask), (worker->output_dev_buf + idx * worker->m * worker->bufSizePerTask), (worker->m * worker->bufSizePerTask),worker->workerKernelStream[idx]);
+            }
         }else{
             transfer_cuda_memory_host_to_device_async((worker->input_dev_buf + idx * worker->k * worker->bufSizePerTask), (worker->input_buf + idx * worker->k * worker->bufSizePerTask), (worker->k * worker->bufSizeForLastTask),worker->workerKernelStream[idx]);
             
@@ -398,7 +431,10 @@ void fullDuplexRunDecode(struct PErasureWorker *worker){
                             worker->bufSizeForLastTask/sizeof(long),
                             worker->workerKernelStream[idx]);
 
-            transfer_cuda_memory_device_to_host_async((worker->output_buf + idx * worker->m * worker->bufSizePerTask), (worker->output_dev_buf + idx * worker->m * worker->bufSizePerTask), (worker->m * worker->bufSizeForLastTask),worker->workerKernelStream[idx]);
+            // Skip D2H transfer if zero-copy GPU tensor decoding is enabled
+            if (!worker->skip_d2h_transfer) {
+                transfer_cuda_memory_device_to_host_async((worker->output_buf + idx * worker->m * worker->bufSizePerTask), (worker->output_dev_buf + idx * worker->m * worker->bufSizePerTask), (worker->m * worker->bufSizeForLastTask),worker->workerKernelStream[idx]);
+            }
             
         }
         
@@ -498,8 +534,13 @@ void PErasureWorkerDealloc(struct PErasureWorker *worker){
     free_cuda_host_memory(worker->input_buf);
     free_cuda_host_memory(worker->output_buf);
 
-    free_cuda_device_memory(worker->data_dev_buf);
-    free_cuda_device_memory(worker->code_dev_buf);
+    // Only free internal buffers, not external ones
+    if (!worker->use_external_data_dev_buf && worker->internal_data_dev_buf != NULL) {
+        free_cuda_device_memory(worker->internal_data_dev_buf);
+    }
+    if (!worker->use_external_code_dev_buf && worker->internal_code_dev_buf != NULL) {
+        free_cuda_device_memory(worker->internal_code_dev_buf);
+    }
     free_cuda_device_memory(worker->input_dev_buf);
     free_cuda_device_memory(worker->output_dev_buf);
 
@@ -545,6 +586,7 @@ void PErasureWorkerSetInputDevicePtr(struct PErasureWorker *worker, char *device
     worker->external_data_dev_buf = device_ptr;
     worker->use_external_data_dev_buf = 1;
     // Replace internal device buffer pointer to point to the external buffer
+    // Keep internal buffer pointer for cleanup
     worker->data_dev_buf = device_ptr;
     // Recompute per-task device pointers
     size_t dataSizePerAssign = worker->bufSizePerTask * worker->k;
@@ -566,6 +608,88 @@ char *PErasureWorkerGetOutputDevicePtr(struct PErasureWorker *worker) {
     return worker->code_dev_buf;
 }
 
+// New API to enable/disable D2H transfer (for zero-copy GPU tensor encoding)
+void PErasureWorkerSetSkipD2HTransfer(struct PErasureWorker *worker, int skip) {
+    worker->skip_d2h_transfer = skip;
+}
+
+// New API to set external output device buffer (for zero-copy GPU tensor output)
+void PErasureWorkerSetOutputDevicePtr(struct PErasureWorker *worker, char *device_ptr, size_t data_size) {
+    // Note: data_size validation omitted here; caller must ensure buffer is large enough
+    worker->external_code_dev_buf = device_ptr;
+    worker->use_external_code_dev_buf = 1;
+    // Replace internal device buffer pointer to point to the external buffer
+    // Keep internal buffer pointer for cleanup
+    worker->code_dev_buf = device_ptr;
+    // Recompute per-task device pointers
+    size_t codeSizePerAssign = worker->bufSizePerTask * worker->m;
+    for (size_t taskIdx = 0; taskIdx < worker->taskNum; ++taskIdx) {
+        worker->code_dev_buf_ptr[taskIdx] = worker->code_dev_buf + codeSizePerAssign * taskIdx;
+    }
+}
+
+// New API for GPU tensor zero-copy encoding: input and output are both on GPU
+// This function sets up both input and output device pointers and enables zero-copy mode
+void PErasureWorkerEncodeGPUZeroCopy(struct PErasureWorker *worker, char *input_dev_ptr, char *output_dev_ptr, size_t data_size) {
+    // Set input device pointer (skip H2D)
+    PErasureWorkerSetInputDevicePtr(worker, input_dev_ptr, data_size);
+    // Set output device pointer (skip D2H)
+    PErasureWorkerSetOutputDevicePtr(worker, output_dev_ptr, data_size);
+    // Enable skip D2H transfer
+    PErasureWorkerSetSkipD2HTransfer(worker, 1);
+}
+
 void PErasureWorkerResetDevice(){
     cudaDeviceReset();
+}
+
+// New API to configure CUDA execution parameters
+void PErasureWorkerSetThreadsPerBlock(struct PErasureWorker *worker, int threads) {
+    if (threads <= 0 || threads > 1024) {
+        printf("Warning: threads_per_block should be between 1 and 1024, using default %d\n", MAX_THREAD_NUM);
+        worker->threads_per_block = MAX_THREAD_NUM;
+    } else {
+        // Ensure threads is a multiple of warp size (32) for best performance
+        if (threads % 32 != 0) {
+            printf("Warning: threads_per_block (%d) is not a multiple of 32, rounding up\n", threads);
+            threads = ((threads + 31) / 32) * 32;
+        }
+        worker->threads_per_block = threads;
+    }
+}
+
+void PErasureWorkerSetBlocksPerGrid(struct PErasureWorker *worker, int blocks) {
+    if (blocks < 0) {
+        printf("Warning: blocks_per_grid cannot be negative, disabling custom config\n");
+        worker->use_custom_grid_config = 0;
+        worker->blocks_per_grid = 0;
+    } else if (blocks == 0) {
+        // 0 means auto-calculate
+        worker->use_custom_grid_config = 0;
+        worker->blocks_per_grid = 0;
+    } else {
+        worker->use_custom_grid_config = 1;
+        worker->blocks_per_grid = blocks;
+    }
+}
+
+int PErasureWorkerGetThreadsPerBlock(struct PErasureWorker *worker) {
+    return worker->threads_per_block;
+}
+
+int PErasureWorkerGetBlocksPerGrid(struct PErasureWorker *worker) {
+    if (worker->use_custom_grid_config) {
+        return worker->blocks_per_grid;
+    } else {
+        // Calculate and return auto-calculated value
+        int warpThreadNum = 32;
+        int threadNum = worker->threads_per_block;
+        size_t workSizePerWarp = warpThreadNum / worker->w * worker->w;
+        size_t workSizePerBlock = threadNum / warpThreadNum * workSizePerWarp * sizeof(long);
+        int blockNum = worker->bufSizePerTask / workSizePerBlock;
+        if ((worker->bufSizePerTask % workSizePerBlock) != 0) {
+            blockNum = blockNum + 1;
+        }
+        return blockNum;
+    }
 }

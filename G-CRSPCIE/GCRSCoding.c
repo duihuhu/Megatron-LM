@@ -220,3 +220,24 @@ void GCRSMCodingVerifyBitmatrix(struct GCRSMCoding * mCoding,
     
 }
 
+// XOR measurement function
+void gcrs_xor_measure(int k,
+                      int threadDimX, int blockDimX,
+                      int workSizeTotalInLong,
+                      char *devDataPtr, char *devCodePtr, float *timeElapsed) {
+    cudaEvent_t startEvent, stopEvent;
+    
+    cudaEventCreate(&startEvent);
+    cudaEventCreate(&stopEvent);
+    
+    cudaEventRecord(startEvent, 0);
+    gcrs_xor_coding(k, 0, devDataPtr, devCodePtr, threadDimX, blockDimX, workSizeTotalInLong, 0);
+    cudaEventRecord(stopEvent, 0);
+    
+    cudaEventSynchronize(stopEvent);
+    cudaEventElapsedTime(timeElapsed, startEvent, stopEvent);
+    
+    cudaEventDestroy(startEvent);
+    cudaEventDestroy(stopEvent);
+}
+

@@ -28,3 +28,4 @@ G-CRS_Workload/*.log
 G-CRS_Workload/*.csv
 G-CRS_Workload/GCRSMeasureWorkload
 isa-l/
+nccl.log

@@ -14,6 +14,7 @@
 #include <string>
 #include <iostream>
 #include <unordered_map>
+#include <map>
 #include <fstream>
 #include <chrono>
 #include <isa-l/erasure_code.h>
@@ -193,6 +194,8 @@ private:
 #ifdef NCCL_AVAILABLE
     std::array<ncclComm_t, MAX_COLUMNS> nccl_comms_;  // One per column
     std::array<bool, MAX_COLUMNS> nccl_initialized_;
+    std::array<ncclUniqueId, MAX_COLUMNS> nccl_ids_;  // NCCL IDs for each column (set from Python)
+    std::array<bool, MAX_COLUMNS> nccl_ids_set_;      // Whether NCCL ID has been set for each column
 #endif
 
     // EC parameters (k, rows=2) and tables
@@ -214,6 +217,17 @@ private:
         if (column_idx < 0 || column_idx >= num_columns_) return;
         
         ncclUniqueId nccl_id;
+        
+        // Check if NCCL ID was set from Python (preferred method, works across nodes)
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Column" << column_idx << " init_nccl_column: checking nccl_ids_set_[" << column_idx << "] = " << (nccl_ids_set_[column_idx] ? "true" : "false") << std::endl;
+        
+        if (nccl_ids_set_[column_idx]) {
+            nccl_id = nccl_ids_[column_idx];
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Column" << column_idx << " using NCCL ID from Python broadcast" << std::endl;
+        } else {
+            // Fallback to file-based method (for backward compatibility, single-node only)
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: Column" << column_idx << " NCCL ID not set from Python (nccl_ids_set_[" << column_idx << "] = false), falling back to file-based method" << std::endl;
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Column" << column_idx << " NCCL ID not set from Python, falling back to file-based method" << std::endl;
         std::string id_file = "/tmp/eccheck_nccl_column" + std::to_string(column_idx) + "_id.txt";
         
         if (rank_ == 0) {
@@ -235,6 +249,7 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             std::cout << "EC-CHECK: [Rank " << rank_ << "] Column" << column_idx << " NCCL ID read from " << id_file << std::endl;
+            }
         }
         
         // Initialize NCCL communicator (BLOCKING: requires all ranks to call this simultaneously)
@@ -456,9 +471,12 @@ private:
     
     // Unified send worker for column_idx
     void send_worker(int column_idx) {
-        if (column_idx < 0 || column_idx >= num_columns_) return;
+        if (column_idx < 0 || column_idx >= num_columns_) {
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Send worker: invalid column_idx=" << column_idx << std::endl;
+            return;
+        }
         
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker " << column_idx << " started" << std::endl;
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker " << column_idx << " started (num_columns_=" << num_columns_ << ")" << std::endl;
         
         // Initialize NCCL for this column (this will block until all ranks call ncclCommInitRank)
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker " << column_idx << " calling init_nccl_column..." << std::endl;
@@ -1013,10 +1031,12 @@ private:
         
         // Start 4 threads per column: encoder, send, recv, xor
         for (int i = 0; i < num_columns_; ++i) {
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Starting threads for column " << i << "..." << std::endl;
             encoder_threads_[i].emplace(&ECCHECKNative::encoder_worker, this, i);
             send_workers_[i].emplace(&ECCHECKNative::send_worker, this, i);
             recv_workers_[i].emplace(&ECCHECKNative::recv_worker, this, i);
             xor_workers_[i].emplace(&ECCHECKNative::xor_worker, this, i);
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Started threads for column " << i << std::endl;
         }
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Started " << (4 * num_columns_) 
@@ -1046,6 +1066,7 @@ public:
             nccl_init_completed_[i] = false;
 #ifdef NCCL_AVAILABLE
             nccl_initialized_[i] = false;
+            nccl_ids_set_[i] = false;
 #endif
         }
 
@@ -1101,6 +1122,40 @@ public:
         // This allows the correct number of columns to be configured before threads start
         // start_pipeline() will be called from set_columns_config if needed, or explicitly after config
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Constructor completed, waiting for columns config before starting threads..." << std::endl;
+    }
+    
+    // Generate NCCL unique ID (called from Python, typically on rank 0)
+    std::vector<uint8_t> generate_nccl_id() {
+#ifdef NCCL_AVAILABLE
+        ncclUniqueId nccl_id;
+        ncclGetUniqueId(&nccl_id);
+        std::vector<uint8_t> id_bytes(sizeof(ncclUniqueId));
+        std::memcpy(id_bytes.data(), &nccl_id, sizeof(ncclUniqueId));
+        return id_bytes;
+#else
+        return std::vector<uint8_t>();
+#endif
+    }
+    
+    // Set NCCL ID for a column (called from Python after broadcasting)
+    void set_nccl_id(int column_idx, const std::vector<uint8_t>& nccl_id_bytes) {
+#ifdef NCCL_AVAILABLE
+        if (column_idx < 0 || column_idx >= num_columns_) {
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] set_nccl_id: invalid column_idx=" << column_idx << " (num_columns_=" << num_columns_ << ")" << std::endl;
+            return;
+        }
+        if (nccl_id_bytes.size() != sizeof(ncclUniqueId)) {
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid NCCL ID size: " << nccl_id_bytes.size() 
+                      << " (expected " << sizeof(ncclUniqueId) << ")" << std::endl;
+            return;
+        }
+        std::memcpy(&nccl_ids_[column_idx], nccl_id_bytes.data(), sizeof(ncclUniqueId));
+        nccl_ids_set_[column_idx] = true;
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Column" << column_idx << " NCCL ID set from Python (" << nccl_id_bytes.size() << " bytes)" << std::endl;
+#else
+        (void)column_idx;
+        (void)nccl_id_bytes;
+#endif
     }
     
     void set_columns_config(const std::vector<std::map<std::string, int>>& cols) {
@@ -1619,6 +1674,7 @@ public:
         std::cerr << "EC-CHECK: [Rank " << rank_ << "] Post-XOR recv: NCCL not available" << std::endl;
 #endif
     }
+    
 };
 
 PYBIND11_MODULE(eccheck_native, m) {
@@ -1630,6 +1686,10 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("k") = -1,
              pybind11::arg("m") = -1)
         .def("set_columns_config", &ECCHECKNative::set_columns_config)
+        .def("generate_nccl_id", &ECCHECKNative::generate_nccl_id)
+        .def("set_nccl_id", &ECCHECKNative::set_nccl_id,
+             pybind11::arg("column_idx"),
+             pybind11::arg("nccl_id_bytes"))
         .def("set_persist_stores", &ECCHECKNative::set_persist_stores,
              pybind11::arg("recv_base"),
              pybind11::arg("parity_base"),

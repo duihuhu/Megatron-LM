@@ -37,7 +37,6 @@ from .state_dict_decomposer import (
     decompose_state_dict,
     organize_tensor_data_in_cpu_memory,
 )
-
 logger = logging.getLogger(__name__)
 
 WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file

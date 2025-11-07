@@ -892,9 +892,78 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             if norm_cols and hasattr(self._eccheck_native, 'set_columns_config'):
                 # CRITICAL: Synchronize all ranks before NCCL initialization
                 # This prevents deadlock where some ranks wait for others that haven't started yet
+                logger.info(f"EC-CHECK: [Rank {rank}] About to enter NCCL initialization (norm_cols={len(norm_cols)}, has set_columns_config={hasattr(self._eccheck_native, 'set_columns_config')})")
+                print(f"EC-CHECK: [Rank {rank}] About to enter NCCL initialization barrier...")
                 logger.info(f"EC-CHECK: [Rank {rank}] Barrier before NCCL initialization...")
+                print(f"EC-CHECK: [Rank {rank}] Entering barrier before NCCL initialization...")
                 torch.distributed.barrier()
                 logger.info(f"EC-CHECK: [Rank {rank}] Barrier passed, applying columns config and initializing NCCL...")
+                print(f"EC-CHECK: [Rank {rank}] Barrier passed, applying columns config and initializing NCCL...")
+                
+                # Generate and broadcast NCCL IDs for each column (works across nodes without shared filesystem)
+                num_columns = len(norm_cols)
+                nccl_ids = []
+                
+                for col_idx in range(num_columns):
+                    # Rank 0 generates NCCL ID
+                    nccl_id_bytes = None
+                    if rank == 0:
+                        if hasattr(self._eccheck_native, 'generate_nccl_id'):
+                            nccl_id_bytes = self._eccheck_native.generate_nccl_id()
+                            logger.info(f"EC-CHECK: [Rank {rank}] Generated NCCL ID for column {col_idx} ({len(nccl_id_bytes)} bytes)")
+                            print(f"EC-CHECK: [Rank {rank}] Generated NCCL ID for column {col_idx} ({len(nccl_id_bytes)} bytes)")
+                        else:
+                            logger.warning("EC-CHECK: generate_nccl_id not available, falling back to file-based method")
+                            print(f"EC-CHECK: [Rank {rank}] WARNING: generate_nccl_id not available")
+                            nccl_id_bytes = None
+                    
+                    # ALWAYS broadcast NCCL ID from rank 0 to all ranks (even if None, to ensure synchronization)
+                    # Use broadcast_object_list for cross-node compatibility
+                    # CRITICAL: All ranks must participate in broadcast_object_list with the same list structure
+                    nccl_id_list = [nccl_id_bytes]  # All ranks start with their local value
+                    logger.info(f"EC-CHECK: [Rank {rank}] Before broadcast for column {col_idx}: list_len={len(nccl_id_list)}, id_len={len(nccl_id_bytes) if nccl_id_bytes else 0}")
+                    print(f"EC-CHECK: [Rank {rank}] Before broadcast for column {col_idx}: id_len={len(nccl_id_bytes) if nccl_id_bytes else 0}")
+                    
+                    try:
+                        # All ranks must call broadcast_object_list - it's a collective operation
+                        torch.distributed.broadcast_object_list(nccl_id_list, src=0)
+                        nccl_id_bytes = nccl_id_list[0] if nccl_id_list else None
+                        logger.info(f"EC-CHECK: [Rank {rank}] After broadcast for column {col_idx}: received id_len={len(nccl_id_bytes) if nccl_id_bytes else 0}")
+                        print(f"EC-CHECK: [Rank {rank}] After broadcast for column {col_idx}: received id_len={len(nccl_id_bytes) if nccl_id_bytes else 0}")
+                    except Exception as e:
+                        logger.error(f"EC-CHECK: [Rank {rank}] Failed to broadcast NCCL ID for column {col_idx}: {e}", exc_info=True)
+                        print(f"EC-CHECK: [Rank {rank}] ERROR: Broadcast failed for column {col_idx}: {e}")
+                        nccl_id_bytes = None
+                    
+                    # Set NCCL ID in C++ module
+                    if nccl_id_bytes is not None and len(nccl_id_bytes) > 0:
+                        if hasattr(self._eccheck_native, 'set_nccl_id'):
+                            try:
+                                self._eccheck_native.set_nccl_id(col_idx, nccl_id_bytes)
+                                logger.info(f"EC-CHECK: [Rank {rank}] Set NCCL ID for column {col_idx} via broadcast ({len(nccl_id_bytes)} bytes)")
+                                print(f"EC-CHECK: [Rank {rank}] Set NCCL ID for column {col_idx} via broadcast ({len(nccl_id_bytes)} bytes)")
+                            except Exception as e:
+                                logger.error(f"EC-CHECK: [Rank {rank}] Failed to set NCCL ID for column {col_idx}: {e}", exc_info=True)
+                                print(f"EC-CHECK: [Rank {rank}] ERROR: Failed to set NCCL ID for column {col_idx}: {e}")
+                                raise  # Re-raise to fail fast
+                        else:
+                            logger.warning("EC-CHECK: set_nccl_id not available, falling back to file-based method")
+                            print(f"EC-CHECK: [Rank {rank}] WARNING: set_nccl_id not available")
+                    else:
+                        logger.error(f"EC-CHECK: [Rank {rank}] CRITICAL: nccl_id_bytes is None or empty for column {col_idx}, cannot proceed!")
+                        print(f"EC-CHECK: [Rank {rank}] CRITICAL ERROR: nccl_id_bytes is None or empty for column {col_idx}!")
+                        raise RuntimeError(f"Rank {rank} failed to receive NCCL ID for column {col_idx} via broadcast")
+                    
+                    # Synchronize after setting each column's NCCL ID to ensure all ranks have set it before proceeding
+                    # This prevents race conditions where threads might start before all ranks have set their IDs
+                    torch.distributed.barrier()
+                    logger.info(f"EC-CHECK: [Rank {rank}] Barrier passed after setting NCCL ID for column {col_idx}")
+                
+                # CRITICAL: Synchronize all ranks after setting NCCL IDs and before starting threads
+                # This ensures all ranks have set their NCCL IDs before any thread calls ncclCommInitRank
+                logger.info(f"EC-CHECK: [Rank {rank}] Barrier after setting NCCL IDs, before starting threads...")
+                torch.distributed.barrier()
+                logger.info(f"EC-CHECK: [Rank {rank}] Barrier passed, all ranks have set NCCL IDs, starting threads...")
                 
                 # Convert to format expected by C++
                 cols_for_cpp = []
@@ -908,6 +977,12 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 self._eccheck_native.set_columns_config(cols_for_cpp)
                 logger.info(f"EC-CHECK: Columns config applied and NCCL initialized ({len(cols_for_cpp)} columns)")
                 print(f"EC-CHECK: [Rank {rank}] Columns config applied and NCCL initialized - ready for data exchange")
+                
+                # CRITICAL: Wait for all ranks to start their threads and begin NCCL initialization
+                # This ensures all ranks' send workers have started before any of them calls ncclCommInitRank
+                logger.info(f"EC-CHECK: [Rank {rank}] Barrier after starting threads, waiting for NCCL initialization...")
+                torch.distributed.barrier()
+                logger.info(f"EC-CHECK: [Rank {rank}] Barrier passed, all ranks have started threads")
                 
                 # Store config for later use
                 self.eccheck_columns_config = norm_cols

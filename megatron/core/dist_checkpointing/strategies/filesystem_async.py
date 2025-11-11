@@ -88,13 +88,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         separation_hint: Optional[str] = None,
         use_msc: bool = False,
         use_eccheck: bool = False,
-        eccheck_use_continuous_buffer: bool = True,
         eccheck_pin_memory: bool = True,
-        eccheck_preallocate_cpu_buffer: bool = True,
         eccheck_k: int = 2,
         eccheck_m: int = 2,
-        eccheck_data_buffers_count: int = 12,
-        eccheck_encoding_buffers_count: Optional[int] = None,
         eccheck_buffer_size: int = 64 * 1024 * 1024,
         eccheck_native: Optional[Any] = None,  # Pre-initialized C++ module
         eccheck_buffers: Optional[Dict] = None,  # Pre-allocated buffers
@@ -105,15 +101,12 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # EC-CHECK configuration
         self.use_eccheck = use_eccheck
-        self.eccheck_use_continuous_buffer = eccheck_use_continuous_buffer
         self.eccheck_pin_memory = eccheck_pin_memory
-        self.eccheck_preallocate_cpu_buffer = eccheck_preallocate_cpu_buffer
         
         # EC-CHECK encoding parameters (configurable)
         self.eccheck_k = eccheck_k  # Number of data nodes
         self.eccheck_m = eccheck_m  # Number of encoded packets per data packet
-        self.eccheck_data_buffers_count = eccheck_data_buffers_count  # Number of data buffers per worker
-        self.eccheck_encoding_buffers_count = eccheck_encoding_buffers_count or (eccheck_data_buffers_count * eccheck_m)  # Number of encoding buffers per worker
+
         self.eccheck_buffer_size = eccheck_buffer_size  # Buffer size in bytes
 
         super().__init__(path, *args, **kwargs)
@@ -157,10 +150,6 @@ class FileSystemWriterAsync(FileSystemWriter):
             # Use pre-allocated buffers from strategy
             if eccheck_buffers is not None:
                 self._setup_eccheck_buffers_from_strategy(eccheck_buffers)
-        elif self.use_eccheck:
-            # Initialize C++ module here (fallback for direct usage)
-            self._init_eccheck_native()
-            self._eccheck_shared = False  # Mark as owned module
         else:
             self._eccheck_native = None
             self._eccheck_shared = False
@@ -172,43 +161,15 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         try:
             if hasattr(self, 'use_eccheck') and self.use_eccheck and hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
-                # Stop buffer poller thread
-                self._stop_buffer_poller_thread()
-                
                 # Only cleanup if we own the module (not shared from strategy)
                 # The strategy will handle cleanup of shared modules
+                # Buffer poller thread is managed by strategy, not by writer
                 if not hasattr(self, '_eccheck_shared') or not self._eccheck_shared:
                     self._stop_phase3_workers()
         except Exception as e:
             # Log but don't raise exceptions in destructor
             logger.warning(f"EC-CHECK: Error during cleanup in destructor: {e}")
 
-    def _init_eccheck_native(self) -> None:
-        """Initialize C++ native module during class construction."""
-        try:
-            import eccheck_native
-            rank = torch.distributed.get_rank()
-            world_size = torch.distributed.get_world_size()
-            paired_rank = self._get_paired_rank(rank, world_size)
-            
-            self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank)
-            logger.info(f"EC-CHECK: C++ native module initialized (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
-            
-            # Initialize buffer allocation for EC-CHECK
-            self._init_eccheck_buffers()
-            
-            # Start persistent buffer poller thread
-            self._start_buffer_poller_thread()
-            
-            # Note: No longer using callbacks to avoid GIL deadlock
-            # Instead, Python will poll C++ for buffers ready to be released
-            
-        except ImportError:
-            logger.warning("EC-CHECK: C++ native module not available, EC-CHECK functionality will not work")
-            self._eccheck_native = None
-        except Exception as e:
-            logger.warning(f"EC-CHECK: Failed to initialize C++ native module: {e}, EC-CHECK functionality will not work")
-            self._eccheck_native = None
 
     def _setup_eccheck_buffers_from_strategy(self, buffers):
         """Set up EC-CHECK buffers from pre-allocated strategy buffers.
@@ -221,46 +182,24 @@ class FileSystemWriterAsync(FileSystemWriter):
         self._free_data_buffer_queue = buffers['free_data_buffer_queue']
         self._free_encoding_buffer_queue = buffers['free_encoding_buffer_queue']
         
+        # Use buffer poller from strategy (already running)
+        self._buffer_poller_active_event = buffers.get('buffer_poller_active_event')
+        # Store the strategy's poll method with a different name to avoid conflict
+        self._strategy_poll_and_release_buffers = buffers.get('poll_and_release_buffers')
+        
+        # Mark that we're using shared buffer poller (don't start our own)
+        self._buffer_poller_shared = True
+        
         # Receive and parity buffers are NOT set here
         # They will be allocated after metadata exchange when peer data size is known
         
         logger.info(
             f"EC-CHECK: Using pre-allocated buffers from strategy - "
             f"Data: {len(self.eccheck_data_buffers)}, "
-            f"Encoding: {len(self.eccheck_encoding_buffers)}"
+            f"Encoding: {len(self.eccheck_encoding_buffers)}, "
+            f"Buffer poller: {'shared from strategy' if self._buffer_poller_active_event else 'will create own'}"
         )
 
-    def _init_eccheck_buffers(self):
-        """Initialize EC-CHECK buffers during C++ module initialization.
-        
-        Note: Only allocates data and encoding buffers here.
-        Receive and parity buffers are allocated later after metadata exchange,
-        when we know the peer's data size.
-        """
-        logger.info("EC-CHECK: Initializing buffers for EC-CHECK (data and encoding only)")
-        
-        # Allocate data buffers for storing original tensor data
-        # Each worker reserves 12 data buffers, each 64MB in size
-        self.eccheck_data_buffers = self._allocate_data_buffers()
-        
-        # Allocate encoding buffers for encoded packets
-        # Each worker reserves 24 encoding buffers, each 64MB in size
-        self.eccheck_encoding_buffers = self._allocate_encoding_buffers()
-        
-        # Initialize free buffer queues for Phase 3
-        # Store buffer addresses directly in queue for easier management
-        import queue
-        self._free_data_buffer_queue = queue.Queue()
-        for buffer in self.eccheck_data_buffers:
-            self._free_data_buffer_queue.put(int(buffer.data_ptr()))
-        
-        self._free_encoding_buffer_queue = queue.Queue()
-        for buffer in self.eccheck_encoding_buffers:
-            self._free_encoding_buffer_queue.put(int(buffer.data_ptr()))
-        
-        logger.info(f"EC-CHECK: Initial buffer allocation completed - "
-                   f"Data buffers: {len(self.eccheck_data_buffers)}, "
-                   f"Encoding buffers: {len(self.eccheck_encoding_buffers)}")
 
     def prepare_write_data(self, plan: SavePlan, planner: SavePlanner) -> None:
         """
@@ -272,9 +211,11 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         Returns: None, but stores the save plan in `self.write_buckets`
         """
-        # EC-CHECK mode: decompose state_dict and preallocate CPU memory
+        # EC-CHECK mode: use decomposed state_dict passed from strategy
         if self.use_eccheck:
-            self._prepare_eccheck_data(plan, planner)
+            # In EC-CHECK mode, decomposed_state_dict and metadata are already prepared
+            # by the strategy layer (torch.py). We just need to prepare write_buckets.
+            self._prepare_eccheck_write_buckets(plan)
             return
         
         storage_plan: _StoragePrefix = plan.storage_data
@@ -373,6 +314,14 @@ class FileSystemWriterAsync(FileSystemWriter):
         # EC-CHECK mode: use special preload function
         # The preload function will embed EC-CHECK data in write_buckets
         if self.use_eccheck:
+            # Ensure eccheck_file_path is set in eccheck_serialized_metadata
+            if self.eccheck_serialized_metadata and self.eccheck_serialized_metadata.get('eccheck_file_path') is None:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                eccheck_file = self.eccheck_serialized_metadata.get('eccheck_file', f'__{rank}_0.distcp')
+                eccheck_path = os.path.join(self.checkpoint_dir, eccheck_file)
+                self.eccheck_serialized_metadata['eccheck_file_path'] = eccheck_path
+                logger.debug(f"EC-CHECK: Set eccheck_file_path to {eccheck_path}")
+            
             return (
                 partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
                 partial(self._eccheck_preload_tensors_to_buffer, True),
@@ -515,6 +464,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         w_end = time()
         logger.debug(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
         print(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
+    
     @staticmethod
     @_disable_gc()
     def write_preloaded_data(
@@ -819,165 +769,12 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         return False
     
-    def _prepare_eccheck_data(self, plan: SavePlan, planner: SavePlanner) -> None:
-        """
-        EC-CHECK preparation: organize data for serialization-free encoding.
-        
-        This method performs the following steps:
-        1. Process plan items like normal mode (separate bytes and tensors)
-        2. Organize tensors for EC-CHECK (extract metadata and data)
-        3. Preallocate CPU memory buffer for tensors
-        4. Prepare write buckets for async transfer
-        
-        Args:
-            plan (SavePlan): save plan from PyTorch distributed checkpoint
-            planner (SavePlanner): save planner to resolve data
-        """
-        start_total = time()
-        logger.info("EC-CHECK: Starting serialization-free checkpoint preparation")
-        
-        # Step 1: Process plan items (similar to normal mode)
-        start = time()
-        storage_plan: _StoragePrefix = plan.storage_data
-        
-        # Separate items into BYTE_IO (non-tensor) and TENSOR
-        non_tensor_data = {}
-        tensor_infos = []
-        tensor_data_list = []
-        
-        logger.info(f"EC-CHECK: Processing {len(plan.items)} items from SavePlan")
-        byte_io_count = 0
-        tensor_count = 0
-        none_data_count = 0
-        
-        for item in plan.items:
-            data = planner.resolve_data(item)
-            
-            # Debug: check for None data
-            if data is None:
-                none_data_count += 1
-                if none_data_count <= 5:
-                    logger.warning(f"EC-CHECK SAVE: Found None data for item: fqn={item.index.fqn}, type={item.type}")
-                continue  # Skip None data items
-            
-            if item.type == WriteItemType.BYTE_IO:
-                # Non-tensor data (e.g., extra_state)
-                # BytesIO objects need special handling to preserve format
-                import io
-                if isinstance(data, io.BytesIO):
-                    # Store the BytesIO content directly as bytes
-                    # We'll also store metadata to indicate this was a BytesIO
-                    non_tensor_data[item.index.fqn] = {
-                        '_eccheck_type': 'BytesIO',
-                        '_eccheck_data': data.getvalue()
-                    }
-                else:
-                    non_tensor_data[item.index.fqn] = data
-                byte_io_count += 1
-            else:
-                # Tensor data - create TensorInfo
-                # Extract and store serializable fields from WriteItem.index
-                from .state_dict_decomposer import TensorInfo
-                
-                tensor_info = TensorInfo(
-                    key=item.index.fqn,  # Keep FQN as base key
-                    shape=tuple(data.shape),
-                    dtype=data.dtype,
-                    device=data.device,
-                    numel=data.numel(),
-                    size_bytes=data.numel() * data.element_size(),
-                    offset=0,  # Will be calculated below
-                    global_offset=tuple(item.index.offset),  # Extract offset as tuple (serializable)
-                    shard_index=item.index.index,  # Extract index (serializable)
-                )
-                tensor_infos.append(tensor_info)
-                tensor_data_list.append(data)
-                tensor_count += 1
-        
-        logger.info(
-            f"EC-CHECK: Processed {byte_io_count} BytesIO items, {tensor_count} tensor items"
-            + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
-        )
-        
-        # Calculate offsets for tensor data
-        offset = 0
-        for info in tensor_infos:
-            info.offset = offset
-            offset += info.size_bytes
-        
-        # Create decomposed structure
-        self.decomposed_state_dict = DecomposedStateDict(
-            non_tensor_data=non_tensor_data,
-            tensor_infos=tensor_infos,
-            tensor_data=tensor_data_list,
-        )
-        
-        process_time = time() - start
-        
-        # Log statistics
-        stats = self.decomposed_state_dict.get_statistics()
-        logger.info(
-            f"EC-CHECK: Processed plan items in {process_time:.2f}s\n"
-            f"  Non-tensor items: {len(non_tensor_data)}\n"
-            f"  Tensor items: {len(tensor_data_list)}\n"
-            f"  Non-tensor data: {stats['non_tensor_size_bytes'] / 1024:.2f} KB "
-            f"({stats['non_tensor_percentage']:.4f}%)\n"
-            f"  Tensor keys: {stats['tensor_keys_size_bytes'] / 1024:.2f} KB "
-            f"({stats['tensor_keys_percentage']:.4f}%)\n"
-            f"  Tensor data: {stats['tensor_data_size_bytes'] / (1024**3):.2f} GB "
-            f"({stats['tensor_data_percentage']:.2f}%)"
-        )
-        
-        # Step 2: Preallocate CPU memory buffer if enabled
-        if self.eccheck_preallocate_cpu_buffer:
-            start = time()
-            total_size = self.decomposed_state_dict.total_tensor_size_bytes
-            logger.info(f"EC-CHECK: Preallocating CPU buffer of {total_size / (1024**3):.2f} GB")
-            
-            if self.eccheck_pin_memory and torch.cuda.is_available():
-                self.preallocated_cpu_buffer = torch.empty(
-                    total_size, dtype=torch.uint8
-                ).pin_memory()
-                logger.debug("EC-CHECK: Using pinned memory for CPU buffer")
-            else:
-                self.preallocated_cpu_buffer = torch.empty(
-                    total_size, dtype=torch.uint8
-                )
-            
-            prealloc_time = time() - start
-            logger.debug(f"EC-CHECK: CPU buffer preallocation took {prealloc_time:.2f}s")
-        else:
-            prealloc_time = 0
-        
-        # Step 3: Prepare write buckets for async transfer
-        start = time()
-        self._prepare_eccheck_write_buckets(plan)
-        bucket_time = time() - start
-        logger.debug(f"EC-CHECK: Write bucket preparation took {bucket_time:.2f}s")
-        
-        total_time = time() - start_total
-        logger.info(
-            f"EC-CHECK: Preparation completed in {total_time:.2f}s\n"
-            f"  Item processing: {process_time:.2f}s\n"
-            f"  Preallocation: {prealloc_time:.2f}s\n"
-            f"  Bucket prep: {bucket_time:.2f}s"
-        )
-        
-        # Validate decomposition
-        if not self.validate_eccheck_decomposition():
-            raise RuntimeError("EC-CHECK: Decomposition validation failed")
-    
     def _prepare_eccheck_write_buckets(self, plan: SavePlan) -> None:
         """
         Prepare write buckets for EC-CHECK mode.
         
-        In EC-CHECK mode, each node stores three components in ONE file:
-        1. Serialized non-tensor key-value pairs
-        2. Serialized tensor keys (tensor_infos)
-        3. Tensor data buffer (will be filled during preload)
-        
-        File structure:
-        [Header: sizes of 3 components] [Component 1] [Component 2] [Component 3]
+        In EC-CHECK mode, the serialized metadata is already prepared by torch.py.
+        We just need to create write_buckets using that metadata.
         
         Args:
             plan (SavePlan): save plan
@@ -986,39 +783,25 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         self.write_buckets = []
         
-        # Serialize Components 1 & 2 in CPU memory
-        non_tensor_data = pickle.dumps(self.decomposed_state_dict.non_tensor_data)
-        tensor_keys_data = pickle.dumps(self.decomposed_state_dict.tensor_infos)
+        # Use eccheck_serialized_metadata passed from torch.py
+        if self.eccheck_serialized_metadata is None:
+            raise RuntimeError("EC-CHECK: eccheck_serialized_metadata not set by strategy")
         
-        # Calculate sizes for header
-        non_tensor_size = len(non_tensor_data)
-        tensor_keys_size = len(tensor_keys_data)
-        tensor_buffer_size = self.decomposed_state_dict.total_tensor_size_bytes
-        
-        # Create single file for all three components
-        # Use standard .distcp extension for compatibility, but with EC-CHECK content
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        # Use the same naming convention as standard distributed checkpoint
-        # Format: __{rank}_{thread_id}.distcp
-        eccheck_file = f"__{rank}_0.distcp"  # Single file per rank, thread 0
-        eccheck_path = os.path.join(self.checkpoint_dir, eccheck_file)
-        
-        # Store the serialized metadata in CPU memory for async save
-        self.eccheck_serialized_metadata = {
-            'non_tensor_data': non_tensor_data,
-            'tensor_keys_data': tensor_keys_data,
-            'non_tensor_size': non_tensor_size,
-            'tensor_keys_size': tensor_keys_size,
-            'tensor_buffer_size': tensor_buffer_size,
-            'eccheck_file_path': eccheck_path,
-        }
+        # Get file path from metadata
+        eccheck_path = self.eccheck_serialized_metadata.get('eccheck_file_path')
+        if eccheck_path is None:
+            # Build path if not set
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            eccheck_file = f"__{rank}_0.distcp"
+            eccheck_path = os.path.join(self.checkpoint_dir, eccheck_file)
+            self.eccheck_serialized_metadata['eccheck_file_path'] = eccheck_path
         
         logger.debug(
-            f"EC-CHECK: Prepared single file structure:\n"
-            f"  File: {eccheck_file}\n"
-            f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
-            f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
-            f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
+            f"EC-CHECK: Using serialized metadata from strategy:\n"
+            f"  File: {eccheck_path}\n"
+            f"  Component 1 size: {self.eccheck_serialized_metadata['non_tensor_size'] / 1024:.2f} KB\n"
+            f"  Component 2 size: {self.eccheck_serialized_metadata['tensor_keys_size'] / 1024:.2f} KB\n"
+            f"  Component 3 size: {self.eccheck_serialized_metadata['tensor_buffer_size'] / (1024**3):.2f} GB"
         )
         
         # Create a single write bucket for EC-CHECK
@@ -1033,337 +816,14 @@ class FileSystemWriterAsync(FileSystemWriter):
         if len(self.write_buckets) > 0:
             self.results_queue = _get_write_results_queue()
         else:
-            self.results_queue = None
-    
-    def _prepare_local_metadata_for_broadcast(self, my_rank: int, world_size: int):
-        """
-        Prepare local tensor metadata for broadcasting to all ranks.
-        
-        Currently implements simple strategy:
-        - Each rank keeps its own data chunks locally (target_rank = my_rank)
-        - Future: Add parity chunk generation for redundancy
-        
-        Args:
-            my_rank (int): Current rank
-            world_size (int): Total number of ranks
-            
-        Returns:
-            List[TensorMetadata]: Serializable metadata for broadcasting
-        """
-        from .state_dict_decomposer import TensorMetadata
-        
-        local_metadata = []
-        
-        for info in self.decomposed_state_dict.tensor_infos:
-            # Create metadata for data chunk
-            data_meta = TensorMetadata(
-                key=info.key,
-                shape=info.shape,
-                dtype=str(info.dtype),
-                size_bytes=info.size_bytes,
-                global_offset=info.global_offset if info.global_offset is not None else (),
-                shard_index=info.shard_index if info.shard_index is not None else 0,
-                chunk_type='data',
-                target_rank=my_rank,  # Data stays on same rank
-                source_rank=my_rank,
-            )
-            local_metadata.append(data_meta)
-        
-        return local_metadata
-    
-    def _broadcast_and_exchange_metadata(self):
-        """
-        All-to-all metadata exchange using torch.distributed.all_gather.
-        
-        Each rank broadcasts its metadata to all other ranks.
-        After this call, all ranks have complete metadata from all peers.
-        
-        Returns:
-            GlobalMetadataRegistry: Complete metadata from all ranks
-        """
-        from .state_dict_decomposer import GlobalMetadataRegistry
-        import pickle
-        
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        
-        logger.info(f"EC-CHECK: [Rank {rank}] Starting metadata exchange with {world_size} ranks")
-        
-        # ===== Step 1: Prepare local metadata (both tensor and non-tensor) =====
-        local_tensor_metadata = self._prepare_local_metadata_for_broadcast(rank, world_size)
-        local_non_tensor_data = self.decomposed_state_dict.non_tensor_data
-        
-        # Package both together
-        local_package = {
-            'tensor_metadata': local_tensor_metadata,
-            'non_tensor_data': local_non_tensor_data,
-        }
-        
-        logger.info(
-            f"EC-CHECK: [Rank {rank}] Local metadata: "
-            f"{len(local_tensor_metadata)} tensor items, "
-            f"{len(local_non_tensor_data)} non-tensor items"
-        )
-        
-        # ===== Step 2: All-gather complete metadata using all_gather_object =====
-        # This automatically handles serialization, padding, and deserialization
-        # Transmits both tensor_metadata and non_tensor_data
-        all_packages = [None] * world_size
-        torch.distributed.all_gather_object(all_packages, local_package)
-        
-        # ===== Step 3: Build rank_metadata and rank_non_tensor_data dicts =====
-        rank_metadata = {}
-        rank_non_tensor_data = {}
-        for i, package in enumerate(all_packages):
-            rank_metadata[i] = package['tensor_metadata']
-            rank_non_tensor_data[i] = package['non_tensor_data']
-        
-        logger.info(
-            f"EC-CHECK: [Rank {rank}] Received metadata from all {world_size} ranks"
-        )
-        
-        # Create registry with both tensor and non-tensor metadata
-        registry = GlobalMetadataRegistry(
-            rank_metadata=rank_metadata,
-            rank_non_tensor_data=rank_non_tensor_data
-        )
-        
-        # Log statistics
-        stats = registry.get_statistics()
-        logger.info(
-            f"EC-CHECK: Global metadata exchange complete:\n"
-            f"  Total ranks: {stats['total_ranks']}\n"
-            f"  Total tensor items: {stats['total_tensor_chunks']}\n"
-            f"  Total non-tensor items: {stats['total_non_tensor_items']}\n"
-            f"  Metadata size: {stats['total_metadata_bytes'] / 1024:.2f} KB (actual transmitted)\n"
-            f"  Tensor data size: {stats['total_tensor_data_bytes'] / (1024**3):.2f} GB (referenced, not transmitted)\n"
-            f"  Per-rank tensor items: {stats['per_rank_tensor_items']}\n"
-            f"  Per-rank non-tensor items: {stats['per_rank_non_tensor_items']}"
-        )
-        
-        return registry
-    
-    def _get_paired_rank(self, my_rank: int, world_size: int) -> int:
-        """
-        Get the paired rank for parity exchange.
-        
-        Pairing strategy:
-        - 2 ranks: rank0 ↔ rank1
-        - 4 ranks: rank0 ↔ rank2, rank1 ↔ rank3
-        - General: rank_i ↔ rank_{i + world_size/2}
-        
-        Args:
-            my_rank (int): Current rank
-            world_size (int): Total number of ranks
-            
-        Returns:
-            int: Paired rank ID
-        """
-        if world_size % 2 != 0:
-            raise ValueError(f"EC-CHECK: World size must be even for pairing, got {world_size}")
-        
-        half_size = world_size // 2
-        
-        if my_rank < half_size:
-            # First half pairs with second half
-            paired_rank = my_rank + half_size
-        else:
-            # Second half pairs with first half
-            paired_rank = my_rank - half_size
-        
-        logger.debug(f"EC-CHECK: Rank {my_rank} paired with Rank {paired_rank}")
-        return paired_rank
-    
-    def _allocate_data_buffers(self):
-        """
-        Allocate data buffers for storing original tensor data.
-        Configurable number of data buffers per worker.
-        
-        Returns:
-            List[torch.Tensor]: List of data buffers
-        """
-        logger.info(f"EC-CHECK: Allocating data buffers ({self.eccheck_data_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
-        
-        data_buffers = []
-        
-        for i in range(self.eccheck_data_buffers_count):
-            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-            data_buffers.append(buffer)
-            logger.debug(f"EC-CHECK: Allocated data buffer {i}: {self.eccheck_buffer_size} bytes")
-        
-        logger.info(f"EC-CHECK: Allocated {len(data_buffers)} data buffers")
-        return data_buffers
-    
-    def _allocate_encoding_buffers(self):
-        """
-        Allocate encoding buffers for encoded packets.
-        Configurable number of encoding buffers per worker (data_count * m).
-        
-        Args:
-            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
-            
-        Returns:
-            List[torch.Tensor]: List of encoding buffers
-        """
-        logger.info(f"EC-CHECK: Allocating encoding buffers ({self.eccheck_encoding_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
-        
-        encoding_buffers = []
-        
-        for i in range(self.eccheck_encoding_buffers_count):
-            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-            encoding_buffers.append(buffer)
-            logger.debug(f"EC-CHECK: Allocated encoding buffer {i}: {self.eccheck_buffer_size} bytes")
-        
-        logger.info(f"EC-CHECK: Allocated {len(encoding_buffers)} encoding buffers")
-        return encoding_buffers
-    
-    def _allocate_recv_encoding_buffers(self, global_registry):
-        """
-        Allocate TWO large receive buffers for peer encoded packets (one per encoding thread).
-        
-        Each buffer is equal to peer's total data size, aligned to buffer_size (64MB).
-        
-        Args:
-            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
-            
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Two receive buffers (one for thread1, one for thread2)
-        """
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        paired_rank = self._get_paired_rank(rank, world_size)
-        
-        # Get peer's total data size from global registry
-        peer_metadata = global_registry.rank_metadata.get(paired_rank, [])
-        peer_total_size = sum(meta.size_bytes for meta in peer_metadata)
-        
-        # Align peer's data size to buffer_size (64MB)
-        aligned_size = ((peer_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
-        
-        logger.info(
-            f"EC-CHECK: Allocating TWO receive buffers based on peer data size\n"
-            f"  Paired rank: {paired_rank}\n"
-            f"  Peer data size: {peer_total_size / (1024**3):.2f} GB\n"
-            f"  Aligned buffer size (per buffer): {aligned_size / (1024**3):.2f} GB\n"
-            f"  Total receive memory: {2 * aligned_size / (1024**3):.2f} GB"
-        )
-        
-        # Allocate two large continuous buffers (one for each encoding thread)
-        recv_buffer_thread1 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-        recv_buffer_thread2 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-        
-        logger.info(
-            f"EC-CHECK: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "
-            f"({aligned_size / (1024**2):.0f} MB each)"
-        )
-        
-        return recv_buffer_thread1, recv_buffer_thread2
-    
-    def _allocate_parity_buffers(self):
-        """
-        Allocate parity buffers for XOR computation results.
-        These buffers will store the parity packets after XOR reduction.
-        
-        Args:
-            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
-            
-        Returns:
-            List[torch.Tensor]: List of parity buffers
-        """
-        logger.info(f"EC-CHECK: Allocating parity buffers ({self.eccheck_data_buffers_count} buffers)")
-        
-        parity_buffers = []
-        
-        # Allocate parity buffers for storing XOR results
-        for i in range(self.eccheck_data_buffers_count):
-            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-            parity_buffers.append(buffer)
-            logger.debug(f"EC-CHECK: Allocated parity buffer {i}: {self.eccheck_buffer_size} bytes")
-        
-        logger.info(f"EC-CHECK: Allocated {len(parity_buffers)} parity buffers")
-        return parity_buffers
+            self.results_queue = None 
     
     def _poll_and_release_buffers(self):
         """Poll C++ for buffers ready to be released and put them back to queues."""
-        if self._eccheck_native is None:
+        # If using shared buffers from strategy, use strategy's poll method
+        if hasattr(self, '_strategy_poll_and_release_buffers') and self._strategy_poll_and_release_buffers:
+            self._strategy_poll_and_release_buffers()
             return
-        
-        # Get data buffers ready for release
-        data_buffers = self._eccheck_native.get_data_buffers_to_release()
-        for data_addr in data_buffers:
-            try:
-                self._free_data_buffer_queue.put_nowait(data_addr)
-                logger.debug(f"EC-CHECK: Released data buffer at address {data_addr}")
-            except queue.Full:
-                logger.error(f"EC-CHECK: Data buffer queue is full, cannot release buffer {data_addr}")
-        
-        # Get encoding buffers ready for release
-        encoding_buffers = self._eccheck_native.get_encoding_buffers_to_release()
-        for encoding_addr in encoding_buffers:
-            try:
-                self._free_encoding_buffer_queue.put_nowait(encoding_addr)
-                logger.debug(f"EC-CHECK: Released encoding buffer at address {encoding_addr}")
-            except queue.Full:
-                logger.error(f"EC-CHECK: Encoding buffer queue is full, cannot release buffer {encoding_addr}")
-    
-    def _start_buffer_poller_thread(self):
-        """Start a persistent background thread to poll and release buffers."""
-        import threading
-        
-        if self._buffer_poller_thread is not None:
-            logger.warning("EC-CHECK: Buffer poller thread already started")
-            return
-        
-        # Create control events
-        self._buffer_poller_stop_event = threading.Event()
-        self._buffer_poller_active_event = threading.Event()
-        
-        def buffer_poller_worker():
-            """Persistent background thread that polls for buffer releases."""
-            logger.info("EC-CHECK: Buffer poller thread started")
-            poll_count = 0
-            
-            while not self._buffer_poller_stop_event.is_set():
-                # Only poll when active
-                if self._buffer_poller_active_event.is_set():
-                    self._poll_and_release_buffers()
-                    poll_count += 1
-                    if poll_count % 1000 == 0:
-                        logger.debug(f"EC-CHECK: Buffer poller running (polled {poll_count} times)")
-                
-                # Sleep briefly to avoid busy waiting
-                import time
-                time.sleep(0.001)  # 1ms
-            
-            logger.info("EC-CHECK: Buffer poller thread stopping")
-        
-        # Start the daemon thread
-        self._buffer_poller_thread = threading.Thread(target=buffer_poller_worker, daemon=True)
-        self._buffer_poller_thread.start()
-        logger.info("EC-CHECK: Buffer poller thread created and started")
-    
-    def _stop_buffer_poller_thread(self):
-        """Stop the persistent buffer poller thread."""
-        if self._buffer_poller_thread is None:
-            return
-        
-        logger.info("EC-CHECK: Stopping buffer poller thread...")
-        
-        # Signal the thread to stop
-        if self._buffer_poller_stop_event:
-            self._buffer_poller_stop_event.set()
-        
-        # Wait for thread to finish
-        if self._buffer_poller_thread.is_alive():
-            self._buffer_poller_thread.join(timeout=2.0)
-            if self._buffer_poller_thread.is_alive():
-                logger.warning("EC-CHECK: Buffer poller thread did not stop in time")
-            else:
-                logger.info("EC-CHECK: Buffer poller thread stopped successfully")
-        
-        self._buffer_poller_thread = None
-        self._buffer_poller_stop_event = None
-        self._buffer_poller_active_event = None
 
     def _execute_phase3_encoding(self, m=None):
         """
@@ -1421,6 +881,26 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Reset completion flags for new encoding round
         self._eccheck_native.reset_encoding_completion_flags()
+        
+        # Activate the persistent buffer poller at the start of pipeline
+        # This ensures buffers can be released as soon as C++ threads finish using them
+        if self._buffer_poller_active_event:
+            self._buffer_poller_active_event.set()
+            logger.info("EC-CHECK: Activated buffer poller for pipeline operation")
+        
+        try:
+            self._copy_tensor_data_to_buffers_pipeline_impl()
+        finally:
+            # Deactivate the buffer poller
+            if self._buffer_poller_active_event:
+                self._buffer_poller_active_event.clear()
+                logger.info("EC-CHECK: Deactivated buffer poller after pipeline completion")
+            
+            # Final poll to ensure all buffers are released
+            self._poll_and_release_buffers()
+    
+    def _copy_tensor_data_to_buffers_pipeline_impl(self) -> None:
+        """Implementation of the pipeline logic (called within try-finally block)."""
         
         def get_free_data_buffer():
             """Get a free data buffer address, blocking if none available."""
@@ -1523,69 +1003,18 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Mark end of stream for both encoders
         self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0)  # Sentinel for thread 1
         self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0)  # Sentinel for thread 2`
+        
         # Wait for both encoding threads to complete
-        # Activate persistent buffer poller while waiting
+        # Buffer poller is already active (activated at function start)
         logger.info("EC-CHECK: Waiting for encoding threads to complete (with buffer polling)...")
         
-        # Activate the persistent buffer poller
-        if self._buffer_poller_active_event:
-            self._buffer_poller_active_event.set()
+        # Wait for encoding completion (this may block)
+        # The buffer poller will continue running in the background
+        self._eccheck_native.wait_for_encoding_completion()
         
-        try:
-            # Wait for encoding completion (this may block)
-            self._eccheck_native.wait_for_encoding_completion()
-        finally:
-            # Deactivate the buffer poller
-            if self._buffer_poller_active_event:
-                self._buffer_poller_active_event.clear()
-        
-        # Final poll to ensure all buffers are released
-        self._poll_and_release_buffers()
+        # Buffer poller will be deactivated in the outer finally block
         # logger.info("EC-CHECK: All encoding operations completed")
     
-    def _validate_pairing_compatibility(self, own_total_size: int, peer_total_size: int, my_rank: int, paired_rank: int):
-        """
-        Validate that paired ranks have compatible data sizes for XOR encoding.
-        
-        For XOR encoding to work properly, we need to handle size differences:
-        - If sizes differ, we'll need padding or per-tensor XOR
-        - Log warnings if significant size mismatch
-        
-        Args:
-            own_total_size: Total size of own tensor data
-            peer_total_size: Total size of paired rank's tensor data
-            my_rank: Current rank
-            paired_rank: Paired rank
-        """
-        own_gb = own_total_size / (1024**3)
-        peer_gb = peer_total_size / (1024**3)
-        
-        logger.info(
-            f"EC-CHECK: [Rank {my_rank}] Pairing validation:\n"
-            f"  Own data size: {own_gb:.2f} GB\n"
-            f"  Peer data size (Rank {paired_rank}): {peer_gb:.2f} GB"
-        )
-        
-        if own_total_size != peer_total_size:
-            size_diff = abs(own_total_size - peer_total_size)
-            diff_percent = (size_diff / max(own_total_size, peer_total_size)) * 100
-            
-            logger.warning(
-                f"EC-CHECK: [Rank {my_rank}] Size mismatch with Rank {paired_rank}:\n"
-                f"  Difference: {size_diff / (1024**2):.2f} MB ({diff_percent:.1f}%)\n"
-                f"  Will use per-tensor XOR (not continuous buffer XOR)"
-            )
-            
-            # For now, we'll use per-tensor XOR which handles different sizes
-            # Future optimization: padding for continuous buffer XOR
-            return False  # Sizes don't match, use per-tensor XOR
-        else:
-            logger.info(
-                f"EC-CHECK: [Rank {my_rank}] Perfect match with Rank {paired_rank}, "
-                f"can use optimized continuous buffer XOR"
-            )
-            return True  # Sizes match, can use continuous buffer XOR
- 
     def _eccheck_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
         """
         EC-CHECK version: Transfer tensors from GPU to preallocated CPU buffer.
@@ -1666,34 +1095,28 @@ class FileSystemWriterAsync(FileSystemWriter):
         if not self.validate_eccheck_decomposition():
             logger.warning("EC-CHECK: Validation warning after GPU-to-CPU transfer")
         
-        # ===== Phase 2: Metadata Broadcast =====
-        logger.warning("EC-CHECK: Phase 2 - Broadcasting metadata")
-        phase2_start = time()
+        # ===== Verify that metadata and buffers are passed from strategy =====
+        # Metadata exchange and buffer allocation are now done in torch.py
+        # The global_registry and receive buffers should already be set by the strategy
         
-        # Step 2.1: Broadcast and exchange metadata (tensor + non-tensor)
-        global_registry = self._broadcast_and_exchange_metadata()
+        if not hasattr(self, 'eccheck_global_registry') or self.eccheck_global_registry is None:
+            raise RuntimeError(
+                "EC-CHECK: Global registry not set. Should be passed from strategy "
+                "after _prepare_eccheck_data completes."
+            )
         
-        # Store global registry for Phase 3
-        self.eccheck_global_registry = global_registry
+        if not hasattr(self, 'eccheck_recv_encoding_buffers') or self.eccheck_recv_encoding_buffers is None:
+            raise RuntimeError(
+                "EC-CHECK: Receive buffers not set. Should be passed from strategy "
+                "after _prepare_eccheck_data completes."
+            )
         
-        phase2_time = time() - phase2_start
-        logger.warning(f"EC-CHECK: Phase 2 completed in {phase2_time:.2f}s")
+        logger.info(
+            "EC-CHECK: Using metadata and receive buffers from strategy (already allocated in torch.py)"
+        )
         
-        # ===== Phase 2.5: Allocate receive and parity buffers based on peer data size =====
-        logger.info("EC-CHECK: Phase 2.5 - Allocating receive and parity buffers based on peer data")
-        buffer_alloc_start = time()
-        
-        # Allocate receive buffers for peer encoded packets (based on peer's data size)
-        self.eccheck_recv_encoding_buffers = self._allocate_recv_encoding_buffers(global_registry)
-        
-        # Allocate parity buffers for XOR computation results
-        # self.eccheck_parity_buffers = self._allocate_parity_buffers()
-        
-        buffer_alloc_time = time() - buffer_alloc_start
-        logger.info(f"EC-CHECK: Phase 2.5 completed in {buffer_alloc_time:.2f}s")
-        
-        exec_start = time()
         # Execute Phase 3: Tensor data exchange and encoding
+        exec_start = time()
         self._execute_phase3_encoding()
         exec_time = time() - exec_start
         logger.info(f"EC-CHECK: Phase 3 completed in {exec_time:.2f}s")

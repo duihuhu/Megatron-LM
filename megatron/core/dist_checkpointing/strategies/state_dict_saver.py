@@ -155,16 +155,17 @@ def save_state_dict_async_plan(
     logger.debug(f"rank: {rank}, plan time: {end_plan - start_plan}")
     # Prepare async writing of tensors.
     # The `storage_writer` will store the information about tensors it needs to save
-    start = time()
-    storage_writer.prepare_write_data(central_plan, planner)
-    end = time()
-    logger.debug(f"{time()} rank: {rank}, write(async) time: {end - start}")
+    # start = time()
+    # storage_writer.prepare_write_data(central_plan, planner)
+    # end = time()
+    # logger.debug(f"{time()} rank: {rank}, write(async) time: {end - start}")
     return (
         (storage_writer, global_metadata, dist_wrapper),
         central_plan,
         local_plan,
         cached_central_plan == central_plan,
         global_md_verify_reuse,
+        planner
     )
 
 

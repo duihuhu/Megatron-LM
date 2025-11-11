@@ -1,0 +1,6 @@
+---
+alwaysApply: true
+---
+<!-- - 在没有明确要求的情况下，一般在原文件上进行修改，不产生新的文件 -->
+- 代码文件中的所有内容都用英文，包括log日志，注释等内容
+- Do NOT create separate documentation files (MD, README, etc.) unless explicitly requested.

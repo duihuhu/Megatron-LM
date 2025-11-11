@@ -33,6 +33,7 @@ from torch.distributed.checkpoint import (
     TensorStorageMetadata,
     WriteItem,
 )
+from torch.distributed.checkpoint.planner import SavePlanner, WriteItemType
 from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten_state_dict
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.metadata import Metadata
@@ -66,6 +67,8 @@ from .resharding import (
     restore_nd_flattened_tensors_formulation,
 )
 from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
+from .state_dict_decomposer import DecomposedStateDict, TensorInfo
+from time import time
 
 try:
     if not torch.cuda.is_available():
@@ -708,7 +711,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         try:
             from megatron.training import get_args as input_args
             args = input_args()
-            
+            self.use_eccheck = True
             if not getattr(args, 'use_eccheck', False):
                 return
                 
@@ -719,6 +722,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 
             # Initialize EC-CHECK C++ module
             self._init_eccheck_native()
+            
+            # Start persistent buffer poller thread
+            self._start_buffer_poller_thread()
             
         except Exception as e:
             logger.warning(f"EC-CHECK: Failed to initialize during strategy creation: {e}")
@@ -768,7 +774,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 
                 # Initialize EC-CHECK buffers
                 self._init_eccheck_buffers()
-                
+        
             except Exception as e:
                 logger.warning(f"EC-CHECK: Failed to create C++ native module instance: {e}")
                 # Try to stop the pipeline if it was partially created
@@ -819,7 +825,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.eccheck_data_buffers_count = 12
         self.eccheck_encoding_buffers_count = 24  # data_count * m (12 * 2)
         self.eccheck_buffer_size = 64 * 1024 * 1024  # 64MB
-        self.eccheck_pin_memory = False
+        self.eccheck_pin_memory = True
+        
+        self.eccheck_preallocate_cpu_buffer = True  # Preallocate CPU buffer for tensor data
+        self.eccheck_use_continuous_buffer = True  # Use continuous buffer for tensor data
+        
+        # Initialize state for EC-CHECK preparation
+        self.decomposed_state_dict = None
+        self.preallocated_cpu_buffer = None
+        self.eccheck_serialized_metadata = None
         
         # Allocate data buffers for storing original tensor data
         self.eccheck_data_buffers = self._allocate_data_buffers()
@@ -828,10 +842,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.eccheck_encoding_buffers = self._allocate_encoding_buffers()
         
         # Allocate receive buffers for peer encoded packets
-        self.eccheck_recv_encoding_buffers = self._allocate_recv_encoding_buffers()
+        self.eccheck_recv_encoding_buffers = None
         
         # Allocate parity buffers for XOR computation results
-        self.eccheck_parity_buffers = self._allocate_parity_buffers()
+        self.eccheck_parity_buffers = None
         
         # Initialize free buffer queues for Phase 3
         import queue
@@ -842,7 +856,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self._free_encoding_buffer_queue = queue.Queue()
         for buffer in self.eccheck_encoding_buffers:
             self._free_encoding_buffer_queue.put(int(buffer.data_ptr()))
-        
+
         logger.info(f"EC-CHECK: Buffer initialization completed - "
                    f"Data buffers: {len(self.eccheck_data_buffers)}, "
                    f"Encoding buffers: {len(self.eccheck_encoding_buffers)}")
@@ -875,19 +889,49 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         logger.info(f"EC-CHECK: Allocated {len(encoding_buffers)} encoding buffers")
         return encoding_buffers
-
-    def _allocate_recv_encoding_buffers(self):
-        """Allocate receive buffers for peer encoded packets."""
-        logger.info(f"EC-CHECK: Allocating receive encoding buffers ({self.eccheck_encoding_buffers_count} buffers)")
+ 
+    def _allocate_recv_encoding_buffers_phase2(self, global_registry):
+        """
+        Allocate TWO large receive buffers for peer encoded packets (one per encoding thread).
         
-        recv_encoding_buffers = []
-        for i in range(self.eccheck_encoding_buffers_count):
-            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-            recv_encoding_buffers.append(buffer)
-            logger.debug(f"EC-CHECK: Allocated recv encoding buffer {i}: {self.eccheck_buffer_size} bytes")
+        Each buffer is equal to peer's total data size, aligned to buffer_size (64MB).
+        This is called after metadata exchange when peer data sizes are known.
         
-        logger.info(f"EC-CHECK: Allocated {len(recv_encoding_buffers)} receive encoding buffers")
-        return recv_encoding_buffers
+        Args:
+            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Two receive buffers (one for thread1, one for thread2)
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        paired_rank = self._get_paired_rank(rank, world_size)
+        
+        # Get peer's total data size from global registry
+        peer_metadata = global_registry.rank_metadata.get(paired_rank, [])
+        peer_total_size = sum(meta.size_bytes for meta in peer_metadata)
+        
+        # Align peer's data size to buffer_size (64MB)
+        aligned_size = ((peer_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
+        
+        logger.info(
+            f"EC-CHECK: Allocating TWO receive buffers based on peer data size\n"
+            f"  Paired rank: {paired_rank}\n"
+            f"  Peer data size: {peer_total_size / (1024**3):.2f} GB\n"
+            f"  Aligned buffer size (per buffer): {aligned_size / (1024**3):.2f} GB\n"
+            f"  Total receive memory: {2 * aligned_size / (1024**3):.2f} GB"
+        )
+        
+        # # Allocate two large continuous buffers (one for each encoding thread)
+        recv_buffer_thread1 = torch.empty(aligned_size, dtype=torch.uint8)
+        recv_buffer_thread2 = torch.empty(aligned_size, dtype=torch.uint8)
+        
+        logger.info(
+            f"EC-CHECK: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "
+            f"({aligned_size / (1024**2):.0f} MB each)"
+        )
+        
+        return (recv_buffer_thread1, recv_buffer_thread2)
 
     def _allocate_parity_buffers(self):
         """Allocate parity buffers for XOR computation results."""
@@ -901,6 +945,88 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         logger.info(f"EC-CHECK: Allocated {len(parity_buffers)} parity buffers")
         return parity_buffers
+
+    def _poll_and_release_buffers(self):
+        """Poll C++ for buffers ready to be released and put them back to queues."""
+        if self._eccheck_native is None:
+            return
+        
+        # Get data buffers ready for release
+        data_buffers = self._eccheck_native.get_data_buffers_to_release()
+        for data_addr in data_buffers:
+            try:
+                self._free_data_buffer_queue.put_nowait(data_addr)
+                logger.debug(f"EC-CHECK: Released data buffer at address {data_addr}")
+            except Exception:
+                logger.error(f"EC-CHECK: Data buffer queue is full, cannot release buffer {data_addr}")
+        
+        # Get encoding buffers ready for release
+        encoding_buffers = self._eccheck_native.get_encoding_buffers_to_release()
+        for encoding_addr in encoding_buffers:
+            try:
+                self._free_encoding_buffer_queue.put_nowait(encoding_addr)
+                logger.debug(f"EC-CHECK: Released encoding buffer at address {encoding_addr}")
+            except Exception:
+                logger.error(f"EC-CHECK: Encoding buffer queue is full, cannot release buffer {encoding_addr}")
+    
+    def _start_buffer_poller_thread(self):
+        """Start a persistent background thread to poll and release buffers."""
+        import threading
+        
+        if hasattr(self, '_buffer_poller_thread') and self._buffer_poller_thread is not None:
+            logger.warning("EC-CHECK: Buffer poller thread already started")
+            return
+        
+        # Create control events
+        self._buffer_poller_stop_event = threading.Event()
+        self._buffer_poller_active_event = threading.Event()
+        
+        def buffer_poller_worker():
+            """Persistent background thread that polls for buffer releases."""
+            logger.info("EC-CHECK: Buffer poller thread started")
+            poll_count = 0
+            
+            while not self._buffer_poller_stop_event.is_set():
+                # Only poll when active
+                if self._buffer_poller_active_event.is_set():
+                    self._poll_and_release_buffers()
+                    poll_count += 1
+                    if poll_count % 1000 == 0:
+                        logger.debug(f"EC-CHECK: Buffer poller running (polled {poll_count} times)")
+                
+                # Sleep briefly to avoid busy waiting
+                from time import sleep
+                sleep(0.001)  # 1ms
+            
+            logger.info("EC-CHECK: Buffer poller thread stopping")
+        
+        # Start the daemon thread
+        self._buffer_poller_thread = threading.Thread(target=buffer_poller_worker, daemon=True)
+        self._buffer_poller_thread.start()
+        logger.info("EC-CHECK: Buffer poller thread created and started")
+    
+    def _stop_buffer_poller_thread(self):
+        """Stop the persistent buffer poller thread."""
+        if not hasattr(self, '_buffer_poller_thread') or self._buffer_poller_thread is None:
+            return
+        
+        logger.info("EC-CHECK: Stopping buffer poller thread...")
+        
+        # Signal the thread to stop
+        if self._buffer_poller_stop_event:
+            self._buffer_poller_stop_event.set()
+        
+        # Wait for thread to finish
+        if self._buffer_poller_thread.is_alive():
+            self._buffer_poller_thread.join(timeout=2.0)
+            if self._buffer_poller_thread.is_alive():
+                logger.warning("EC-CHECK: Buffer poller thread did not stop in time")
+            else:
+                logger.info("EC-CHECK: Buffer poller thread stopped successfully")
+        
+        self._buffer_poller_thread = None
+        self._buffer_poller_stop_event = None
+        self._buffer_poller_active_event = None
 
     def _get_eccheck_buffers(self):
         """Get EC-CHECK buffers for FileSystemWriterAsync.
@@ -917,6 +1043,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             'encoding_buffers': self.eccheck_encoding_buffers,
             'free_data_buffer_queue': self._free_data_buffer_queue,
             'free_encoding_buffer_queue': self._free_encoding_buffer_queue,
+            # Pass buffer poller control objects
+            'buffer_poller_active_event': self._buffer_poller_active_event,
+            'poll_and_release_buffers': self._poll_and_release_buffers,
             # Note: recv_encoding_buffers and parity_buffers are NOT included
             # They will be allocated by FileSystemWriterAsync after metadata exchange
         }
@@ -942,6 +1071,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         Returns: None
         """
+        # Store checkpoint_dir for EC-CHECK preparation
+        self.current_checkpoint_dir = checkpoint_dir
+        
         # Translate the state dict
         (sharded_state_dict, flat_mapping, rename_mapping) = (
             _replace_state_dict_keys_with_sharded_keys(
@@ -961,6 +1093,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             eccheck_native=self._eccheck_native,  # Pass pre-initialized C++ module
             eccheck_buffers=self._get_eccheck_buffers(),  # Pass pre-allocated buffers
         )
+
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
         # Try twice to validate the generated `central_plan` is the same across iterations
@@ -988,6 +1121,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             self.cached_local_plan,
             self.validated_cache_reuse,
             self.validated_loaded_metadata_reuse,
+            planner
         ) = save_state_dict_async_plan(
             pyt_state_dict,
             writer,
@@ -999,6 +1133,26 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             cached_ckpt_structure=args_cached_plans,
             loaded_all_plans=loaded_all_plans,
         )
+        # EC-CHECK mode: decompose state_dict and preallocate CPU memory
+        if self.use_eccheck:
+            self._prepare_eccheck_data(self.cached_central_plan, planner)
+            # Pass EC-CHECK state to writer if available
+            writer.decomposed_state_dict = self.decomposed_state_dict
+            writer.preallocated_cpu_buffer = self.preallocated_cpu_buffer
+            writer.eccheck_serialized_metadata = self.eccheck_serialized_metadata
+            writer.eccheck_global_registry = self.eccheck_global_registry
+            # Pass the updated receive buffers (TWO large buffers allocated based on peer size)
+            writer.eccheck_recv_encoding_buffers = self.eccheck_recv_encoding_buffers
+            
+            # In EC-CHECK mode, call prepare_write_data to create write_buckets
+            # It will use the metadata we just prepared
+            writer.prepare_write_data(self.cached_central_plan, planner)
+        else:
+            start = time()
+            writer.prepare_write_data(self.cached_central_plan, planner)
+            end = time()
+            logger.debug(f"{time()} rank: {rank}, write(async) time: {end - start}")
+            
         rank = torch.distributed.get_rank()
         if self.use_cached_ckpt_structure:
             if (
@@ -1029,6 +1183,411 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                     save_state_dict_ret[1] = self.cached_global_metadata
 
         return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
+
+    def _prepare_eccheck_data(self, plan: SavePlan, planner: SavePlanner) -> None:
+        """
+        EC-CHECK preparation: organize data for serialization-free encoding.
+        
+        This method performs the following steps:
+        1. Process plan items like normal mode (separate bytes and tensors)
+        2. Organize tensors for EC-CHECK (extract metadata and data)
+        3. Preallocate CPU memory buffer for tensors
+        4. Prepare write buckets for async transfer
+        
+        Args:
+            plan (SavePlan): save plan from PyTorch distributed checkpoint
+            planner (SavePlanner): save planner to resolve data
+        """
+        from torch.distributed.checkpoint.filesystem import _StoragePrefix
+        
+        start_total = time()
+        logger.info("EC-CHECK: Starting serialization-free checkpoint preparation")
+        
+        # Step 1: Process plan items (similar to normal mode)
+        start = time()
+        storage_plan: _StoragePrefix = plan.storage_data
+        
+        # Separate items into BYTE_IO (non-tensor) and TENSOR
+        non_tensor_data = {}
+        tensor_infos = []
+        tensor_data_list = []
+        
+        logger.info(f"EC-CHECK: Processing {len(plan.items)} items from SavePlan")
+        byte_io_count = 0
+        tensor_count = 0
+        none_data_count = 0
+        
+        for item in plan.items:
+            data = planner.resolve_data(item)
+            
+            # Debug: check for None data
+            if data is None:
+                none_data_count += 1
+                if none_data_count <= 5:
+                    logger.warning(f"EC-CHECK SAVE: Found None data for item: fqn={item.index.fqn}, type={item.type}")
+                continue  # Skip None data items
+            
+            if item.type == WriteItemType.BYTE_IO:
+                # Non-tensor data (e.g., extra_state)
+                # BytesIO objects need special handling to preserve format
+                import io
+                if isinstance(data, io.BytesIO):
+                    # Store the BytesIO content directly as bytes
+                    # We'll also store metadata to indicate this was a BytesIO
+                    non_tensor_data[item.index.fqn] = {
+                        '_eccheck_type': 'BytesIO',
+                        '_eccheck_data': data.getvalue()
+                    }
+                else:
+                    non_tensor_data[item.index.fqn] = data
+                byte_io_count += 1
+            else:
+                # Tensor data - create TensorInfo
+                # Extract and store serializable fields from WriteItem.index
+                from .state_dict_decomposer import TensorInfo
+                
+                tensor_info = TensorInfo(
+                    key=item.index.fqn,  # Keep FQN as base key
+                    shape=tuple(data.shape),
+                    dtype=data.dtype,
+                    device=data.device,
+                    numel=data.numel(),
+                    size_bytes=data.numel() * data.element_size(),
+                    offset=0,  # Will be calculated below
+                    global_offset=tuple(item.index.offset),  # Extract offset as tuple (serializable)
+                    shard_index=item.index.index,  # Extract index (serializable)
+                )
+                tensor_infos.append(tensor_info)
+                tensor_data_list.append(data)
+                tensor_count += 1
+        
+        logger.info(
+            f"EC-CHECK: Processed {byte_io_count} BytesIO items, {tensor_count} tensor items"
+            + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
+        )
+        
+        # Calculate offsets for tensor data
+        offset = 0
+        for info in tensor_infos:
+            info.offset = offset
+            offset += info.size_bytes
+        
+        # Create decomposed structure
+        self.decomposed_state_dict = DecomposedStateDict(
+            non_tensor_data=non_tensor_data,
+            tensor_infos=tensor_infos,
+            tensor_data=tensor_data_list,
+        )
+        
+        process_time = time() - start
+        
+        # Log statistics
+        stats = self.decomposed_state_dict.get_statistics()
+        logger.info(
+            f"EC-CHECK: Processed plan items in {process_time:.2f}s\n"
+            f"  Non-tensor items: {len(non_tensor_data)}\n"
+            f"  Tensor items: {len(tensor_data_list)}\n"
+            f"  Non-tensor data: {stats['non_tensor_size_bytes'] / 1024:.2f} KB "
+            f"({stats['non_tensor_percentage']:.4f}%)\n"
+            f"  Tensor keys: {stats['tensor_keys_size_bytes'] / 1024:.2f} KB "
+            f"({stats['tensor_keys_percentage']:.4f}%)\n"
+            f"  Tensor data: {stats['tensor_data_size_bytes'] / (1024**3):.2f} GB "
+            f"({stats['tensor_data_percentage']:.2f}%)"
+        )
+        
+        # Step 2: Preallocate CPU memory buffer if enabled
+        if self.eccheck_preallocate_cpu_buffer:
+            start = time()
+            total_size = self.decomposed_state_dict.total_tensor_size_bytes
+            logger.info(f"EC-CHECK: Preallocating CPU buffer of {total_size / (1024**3):.2f} GB")
+            
+            if self.preallocated_cpu_buffer == None:
+                if self.eccheck_pin_memory and torch.cuda.is_available():
+                    self.preallocated_cpu_buffer = torch.empty(
+                        total_size, dtype=torch.uint8).pin_memory()
+                    logger.debug("EC-CHECK: Using pinned memory for CPU buffer")
+                else:
+                    self.preallocated_cpu_buffer = torch.empty(
+                        total_size, dtype=torch.uint8
+                    )
+                
+            prealloc_time = time() - start
+            logger.debug(f"EC-CHECK: CPU buffer preallocation took {prealloc_time:.2f}s")
+        else:
+            prealloc_time = 0
+        
+        # Step 3: Prepare write buckets for async transfer
+        start = time()
+        self._prepare_eccheck_write_buckets(plan, self.current_checkpoint_dir)
+        bucket_time = time() - start
+        logger.debug(f"EC-CHECK: Write bucket preparation took {bucket_time:.2f}s")
+        
+        # Validate decomposition
+        if not self.validate_eccheck_decomposition():
+            raise RuntimeError("EC-CHECK: Decomposition validation failed")
+        
+        # Step 4: Broadcast and exchange metadata
+        start = time()
+        self.eccheck_global_registry = self._broadcast_and_exchange_metadata()
+        metadata_time = time() - start
+        logger.info(f"EC-CHECK: Metadata exchange completed in {metadata_time:.2f}s")
+        
+        # Step 5: Allocate receive buffers based on peer data size
+        start = time()
+        if self.eccheck_recv_encoding_buffers == None:
+            self.eccheck_recv_encoding_buffers = self._allocate_recv_encoding_buffers_phase2(self.eccheck_global_registry)
+        buffer_alloc_time = time() - start
+        logger.info(f"EC-CHECK: Receive buffer allocation completed in {buffer_alloc_time:.2f}s")
+        
+        total_time = time() - start_total
+        logger.info(
+            f"EC-CHECK: Preparation completed in {total_time:.2f}s\n"
+            f"  Item processing: {process_time:.2f}s\n"
+            f"  Preallocation: {prealloc_time:.2f}s\n"
+            f"  Bucket prep: {bucket_time:.2f}s\n"
+            f"  Metadata exchange: {metadata_time:.2f}s\n"
+            f"  Buffer allocation: {buffer_alloc_time:.2f}s"
+        )
+        
+    def _broadcast_and_exchange_metadata(self):
+        """
+        All-to-all metadata exchange using torch.distributed.all_gather.
+        
+        Each rank broadcasts its metadata to all other ranks.
+        After this call, all ranks have complete metadata from all peers.
+        
+        Returns:
+            GlobalMetadataRegistry: Complete metadata from all ranks
+        """
+        from .state_dict_decomposer import GlobalMetadataRegistry
+        import pickle
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        logger.info(f"EC-CHECK: [Rank {rank}] Starting metadata exchange with {world_size} ranks")
+        
+        # ===== Step 1: Prepare local metadata (both tensor and non-tensor) =====
+        local_tensor_metadata = self._prepare_local_metadata_for_broadcast(rank, world_size)
+        local_non_tensor_data = self.decomposed_state_dict.non_tensor_data
+        
+        # Package both together
+        local_package = {
+            'tensor_metadata': local_tensor_metadata,
+            'non_tensor_data': local_non_tensor_data,
+        }
+        
+        logger.info(
+            f"EC-CHECK: [Rank {rank}] Local metadata: "
+            f"{len(local_tensor_metadata)} tensor items, "
+            f"{len(local_non_tensor_data)} non-tensor items"
+        )
+        
+        # ===== Step 2: All-gather complete metadata using all_gather_object =====
+        # This automatically handles serialization, padding, and deserialization
+        # Transmits both tensor_metadata and non_tensor_data
+        all_packages = [None] * world_size
+        torch.distributed.all_gather_object(all_packages, local_package)
+        
+        # ===== Step 3: Build rank_metadata and rank_non_tensor_data dicts =====
+        rank_metadata = {}
+        rank_non_tensor_data = {}
+        for i, package in enumerate(all_packages):
+            rank_metadata[i] = package['tensor_metadata']
+            rank_non_tensor_data[i] = package['non_tensor_data']
+        
+        logger.info(
+            f"EC-CHECK: [Rank {rank}] Received metadata from all {world_size} ranks"
+        )
+        
+        # Create registry with both tensor and non-tensor metadata
+        registry = GlobalMetadataRegistry(
+            rank_metadata=rank_metadata,
+            rank_non_tensor_data=rank_non_tensor_data
+        )
+        
+        # Log statistics
+        stats = registry.get_statistics()
+        logger.info(
+            f"EC-CHECK: Global metadata exchange complete:\n"
+            f"  Total ranks: {stats['total_ranks']}\n"
+            f"  Total tensor items: {stats['total_tensor_chunks']}\n"
+            f"  Total non-tensor items: {stats['total_non_tensor_items']}\n"
+            f"  Metadata size: {stats['total_metadata_bytes'] / 1024:.2f} KB (actual transmitted)\n"
+            f"  Tensor data size: {stats['total_tensor_data_bytes'] / (1024**3):.2f} GB (referenced, not transmitted)\n"
+            f"  Per-rank tensor items: {stats['per_rank_tensor_items']}\n"
+            f"  Per-rank non-tensor items: {stats['per_rank_non_tensor_items']}"
+        )
+        
+        return registry
+
+    def _prepare_local_metadata_for_broadcast(self, my_rank: int, world_size: int):
+        """
+        Prepare local tensor metadata for broadcasting to all ranks.
+        
+        Currently implements simple strategy:
+        - Each rank keeps its own data chunks locally (target_rank = my_rank)
+        - Future: Add parity chunk generation for redundancy
+        
+        Args:
+            my_rank (int): Current rank
+            world_size (int): Total number of ranks
+            
+        Returns:
+            List[TensorMetadata]: Serializable metadata for broadcasting
+        """
+        from .state_dict_decomposer import TensorMetadata
+        
+        local_metadata = []
+        
+        for info in self.decomposed_state_dict.tensor_infos:
+            # Create metadata for data chunk
+            data_meta = TensorMetadata(
+                key=info.key,
+                shape=info.shape,
+                dtype=str(info.dtype),
+                size_bytes=info.size_bytes,
+                global_offset=info.global_offset if info.global_offset is not None else (),
+                shard_index=info.shard_index if info.shard_index is not None else 0,
+                chunk_type='data',
+                target_rank=my_rank,  # Data stays on same rank
+                source_rank=my_rank,
+            )
+            local_metadata.append(data_meta)
+        
+        return local_metadata
+        
+    def _prepare_eccheck_write_buckets(self, plan: SavePlan, checkpoint_dir: Optional[Path] = None) -> None:
+        """
+        Prepare write buckets for EC-CHECK mode.
+        
+        In EC-CHECK mode, each node stores three components in ONE file:
+        1. Serialized non-tensor key-value pairs
+        2. Serialized tensor keys (tensor_infos)
+        3. Tensor data buffer (will be filled during preload)
+        
+        File structure:
+        [Header: sizes of 3 components] [Component 1] [Component 2] [Component 3]
+        
+        Args:
+            plan (SavePlan): save plan
+            checkpoint_dir (Optional[Path]): checkpoint directory (if available)
+        """
+        from torch.distributed.checkpoint.filesystem import _StoragePrefix
+        
+        storage_plan: _StoragePrefix = plan.storage_data
+        
+        # Serialize Components 1 & 2 in CPU memory
+        non_tensor_data = pickle.dumps(self.decomposed_state_dict.non_tensor_data)
+        tensor_keys_data = pickle.dumps(self.decomposed_state_dict.tensor_infos)
+        
+        # Calculate sizes for header
+        non_tensor_size = len(non_tensor_data)
+        tensor_keys_size = len(tensor_keys_data)
+        tensor_buffer_size = self.decomposed_state_dict.total_tensor_size_bytes
+        
+        # Create single file for all three components
+        # Use standard .distcp extension for compatibility, but with EC-CHECK content
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        # Use the same naming convention as standard distributed checkpoint
+        # Format: __{rank}_{thread_id}.distcp
+        eccheck_file = f"__{rank}_0.distcp"  # Single file per rank, thread 0
+        
+        # Build full path if checkpoint_dir is available
+        if checkpoint_dir is not None:
+            eccheck_path = os.path.join(str(checkpoint_dir), eccheck_file)
+        else:
+            # Will be set by FileSystemWriterAsync later
+            eccheck_path = None
+        
+        # Store the serialized metadata for later use by FileSystemWriterAsync
+        self.eccheck_serialized_metadata = {
+            'non_tensor_data': non_tensor_data,
+            'tensor_keys_data': tensor_keys_data,
+            'non_tensor_size': non_tensor_size,
+            'tensor_keys_size': tensor_keys_size,
+            'tensor_buffer_size': tensor_buffer_size,
+            'eccheck_file': eccheck_file,  # Filename
+            'eccheck_file_path': eccheck_path,  # Full path (if available)
+        }
+        
+        logger.debug(
+            f"EC-CHECK: Prepared single file structure:\n"
+            f"  File: {eccheck_file}\n"
+            f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
+            f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
+            f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
+        )
+    
+    def validate_eccheck_decomposition(self) -> bool:
+        """
+        Simple validation: check if state_dict is correctly decomposed into three components.
+        
+        Validates:
+        1. non_tensor_data is a dict
+        2. tensor_infos is a list (tensor keys)
+        3. tensor_data is a list of tensors
+        4. Counts match between tensor_infos and tensor_data
+        
+        Returns:
+            bool: True if decomposition is valid, False otherwise
+        """
+        if not self.use_eccheck:
+            logger.warning("EC-CHECK: Validation skipped - EC-CHECK is not enabled")
+            return False
+        
+        if not self.decomposed_state_dict:
+            logger.error("EC-CHECK: Validation failed - State dict not decomposed yet")
+            return False
+        
+        decomposed = self.decomposed_state_dict
+        
+        # Check 1: Non-tensor key-value pairs (dict)
+        if not isinstance(decomposed.non_tensor_data, dict):
+            logger.error(
+                f"EC-CHECK: Component 1 failed - non_tensor_data should be dict, "
+                f"got {type(decomposed.non_tensor_data).__name__}"
+            )
+            return False
+        
+        # Check 2: Tensor keys (list)
+        if not isinstance(decomposed.tensor_infos, list):
+            logger.error(
+                f"EC-CHECK: Component 2 failed - tensor_infos should be list, "
+                f"got {type(decomposed.tensor_infos).__name__}"
+            )
+            return False
+        
+        # Check 3: Tensor data (list)
+        if not isinstance(decomposed.tensor_data, list):
+            logger.error(
+                f"EC-CHECK: Component 3 failed - tensor_data should be list, "
+                f"got {type(decomposed.tensor_data).__name__}"
+            )
+            return False
+        
+        # Check 4: Counts match
+        if len(decomposed.tensor_infos) != len(decomposed.tensor_data):
+            logger.error(
+                f"EC-CHECK: Count mismatch - {len(decomposed.tensor_infos)} tensor_infos "
+                f"vs {len(decomposed.tensor_data)} tensors"
+            )
+            return False
+        
+        # All checks passed
+        logger.info(
+            f"EC-CHECK: Decomposition validation passed ✓\n"
+            f"  Component 1 (non-tensor dict): {len(decomposed.non_tensor_data)} keys\n"
+            f"  Component 2 (tensor keys list): {len(decomposed.tensor_infos)} tensors\n"
+            f"  Component 3 (tensor data list): {len(decomposed.tensor_data)} tensors"
+        )
+            
+        # Log device info for verification
+        if len(decomposed.tensor_infos) > 0:
+            devices = set(info.device.type for info in decomposed.tensor_infos)
+            logger.debug(f"EC-CHECK: Tensor devices: {devices}")
+        
+        return True
 
     def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret) -> AsyncRequest:
         save_fn_args = writer.get_save_function_and_args()

@@ -845,7 +845,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.eccheck_recv_encoding_buffers = None
         
         # Allocate parity buffers for XOR computation results
-        self.eccheck_parity_buffers = None
+        self.eccheck_parity_buffers = self._allocate_parity_buffers()
         
         # Initialize free buffer queues for Phase 3
         import queue
@@ -856,13 +856,19 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self._free_encoding_buffer_queue = queue.Queue()
         for buffer in self.eccheck_encoding_buffers:
             self._free_encoding_buffer_queue.put(int(buffer.data_ptr()))
+        
+        self._free_parity_buffer_queue = queue.Queue()
+        for buffer in self.eccheck_parity_buffers:
+            self._free_parity_buffer_queue.put(int(buffer.data_ptr()))
 
         logger.info(f"EC-CHECK: Buffer initialization completed - "
                    f"Data buffers: {len(self.eccheck_data_buffers)}, "
-                   f"Encoding buffers: {len(self.eccheck_encoding_buffers)}")
+                   f"Encoding buffers: {len(self.eccheck_encoding_buffers)}, "
+                   f"Parity buffers: {len(self.eccheck_parity_buffers)}")
         print(f"EC-CHECK: Buffer initialization completed (rank={rank}) - "
               f"Data buffers: {len(self.eccheck_data_buffers)}, "
-              f"Encoding buffers: {len(self.eccheck_encoding_buffers)}")
+              f"Encoding buffers: {len(self.eccheck_encoding_buffers)}, "
+              f"Parity buffers: {len(self.eccheck_parity_buffers)}")
 
     def _allocate_data_buffers(self):
         """Allocate data buffers for storing original tensor data."""
@@ -934,11 +940,18 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         return (recv_buffer_thread1, recv_buffer_thread2)
 
     def _allocate_parity_buffers(self):
-        """Allocate parity buffers for XOR computation results."""
-        logger.info(f"EC-CHECK: Allocating parity buffers ({self.eccheck_data_buffers_count} buffers)")
+        """Allocate parity buffers for XOR computation results.
+        
+        Note: Parity buffer count should match encoding buffer count (24) to support
+        pipelined operations where each data chunk needs 2 parity buffers (one per thread).
+        """
+        # Use encoding buffer count instead of data buffer count
+        # Each data chunk needs 2 parity buffers (thread1 and thread2)
+        parity_buffer_count = self.eccheck_encoding_buffers_count
+        logger.info(f"EC-CHECK: Allocating parity buffers ({parity_buffer_count} buffers)")
         
         parity_buffers = []
-        for i in range(self.eccheck_data_buffers_count):
+        for i in range(parity_buffer_count):
             buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
             parity_buffers.append(buffer)
             logger.debug(f"EC-CHECK: Allocated parity buffer {i}: {self.eccheck_buffer_size} bytes")
@@ -968,6 +981,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 logger.debug(f"EC-CHECK: Released encoding buffer at address {encoding_addr}")
             except Exception:
                 logger.error(f"EC-CHECK: Encoding buffer queue is full, cannot release buffer {encoding_addr}")
+        
+        # Get parity buffers ready for release
+        parity_buffers = self._eccheck_native.get_parity_buffers_to_release()
+        for parity_addr in parity_buffers:
+            try:
+                self._free_parity_buffer_queue.put_nowait(parity_addr)
+                logger.debug(f"EC-CHECK: Released parity buffer at address {parity_addr}")
+            except Exception:
+                logger.error(f"EC-CHECK: Parity buffer queue is full, cannot release buffer {parity_addr}")
     
     def _start_buffer_poller_thread(self):
         """Start a persistent background thread to poll and release buffers."""
@@ -1031,8 +1053,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
     def _get_eccheck_buffers(self):
         """Get EC-CHECK buffers for FileSystemWriterAsync.
         
-        Note: Only returns data and encoding buffers.
-        Receive and parity buffers will be allocated by FileSystemWriterAsync
+        Note: Returns data, encoding, and parity buffers.
+        Receive buffers will be allocated by FileSystemWriterAsync
         after metadata exchange.
         """
         if not hasattr(self, 'eccheck_data_buffers'):
@@ -1041,13 +1063,14 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         return {
             'data_buffers': self.eccheck_data_buffers,
             'encoding_buffers': self.eccheck_encoding_buffers,
+            'parity_buffers': self.eccheck_parity_buffers,
             'free_data_buffer_queue': self._free_data_buffer_queue,
             'free_encoding_buffer_queue': self._free_encoding_buffer_queue,
+            'free_parity_buffer_queue': self._free_parity_buffer_queue,
             # Pass buffer poller control objects
             'buffer_poller_active_event': self._buffer_poller_active_event,
             'poll_and_release_buffers': self._poll_and_release_buffers,
-            # Note: recv_encoding_buffers and parity_buffers are NOT included
-            # They will be allocated by FileSystemWriterAsync after metadata exchange
+            # Note: recv_encoding_buffers will be allocated by FileSystemWriterAsync after metadata exchange
         }
 
     def __del__(self):

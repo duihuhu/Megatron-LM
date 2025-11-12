@@ -12,6 +12,78 @@ import os
 print(f"PyTorch version: {torch.__version__}")
 
 # Get include directories manually
+isa_available = False
+isa_lib_dirs = []
+isa_libs = []
+isa_include_dirs = []
+
+# Common library paths to check for libisal
+isa_lib_paths = [
+    "/usr/lib",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/local/lib",
+    "/lib",
+    "/lib64",
+    "/usr/lib64",
+]
+
+for path in isa_lib_paths:
+    if os.path.exists(os.path.join(path, "libisal.so")) or os.path.exists(os.path.join(path, "libisal.a")):
+        isa_lib_dirs.append(path)
+        isa_libs.append("isal")
+        isa_available = True
+        print(f"Found isa-l library at: {path}")
+        break
+
+# Common include paths for isa-l headers
+isa_header_paths = [
+    "/usr/include/isa-l",
+    "/usr/include",
+    "/usr/local/include",
+]
+
+for path in isa_header_paths:
+    # prefer directory that contains isa-l headers
+    if os.path.isdir(path) and (os.path.exists(os.path.join(path, "isa-l.h")) or os.path.exists(os.path.join(path, "isa-l", "isa-l.h"))):
+        isa_include_dirs.append(path)
+        print(f"Found isa-l include at: {path}")
+        break
+
+if not isa_available:
+    print("Warning: isa-l not found, building without isa-l support")
+
+# Wrap setuptools.setup so we can inject isa-l include/libs into ext_modules at call time.
+_original_setup = setup
+
+def setup(*args, **kwargs):
+    ext_modules = kwargs.get("ext_modules")
+    if ext_modules:
+        for ext in ext_modules:
+            # Pybind11Extension exposes include_dirs, libraries, library_dirs attributes
+            try:
+                if isa_include_dirs:
+                    existing = list(getattr(ext, "include_dirs", []) or [])
+                    # avoid duplicates
+                    for p in isa_include_dirs:
+                        if p not in existing:
+                            existing.append(p)
+                    ext.include_dirs = existing
+                if isa_libs:
+                    existing = list(getattr(ext, "libraries", []) or [])
+                    for lib in isa_libs:
+                        if lib not in existing:
+                            existing.append(lib)
+                    ext.libraries = existing
+                if isa_lib_dirs:
+                    existing = list(getattr(ext, "library_dirs", []) or [])
+                    for d in isa_lib_dirs:
+                        if d not in existing:
+                            existing.append(d)
+                    ext.library_dirs = existing
+            except Exception:
+                # If anything goes wrong, fall back to original behavior
+                pass
+    return _original_setup(*args, **kwargs)
 torch_path = torch.__file__
 torch_dir = os.path.dirname(torch_path)
 
@@ -77,6 +149,15 @@ for path in nccl_header_paths:
 if not nccl_available:
     print("Warning: NCCL not found, building without NCCL support")
 
+cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')
+cuda_include_dir = os.path.join(cuda_home, 'include')
+cuda_include = []
+if os.path.isdir(cuda_include_dir):
+    cuda_include.append(cuda_include_dir)
+    print(f"Found CUDA include: {cuda_include_dir}")
+else:
+    print(f"Warning: CUDA include directory not found at {cuda_include_dir}")
+
 # Define the extension
 ext_modules = [
     Pybind11Extension(
@@ -86,6 +167,7 @@ ext_modules = [
             *torch_include,
             pybind11_include,
             *nccl_include_dirs,
+            *cuda_include,
         ],
         libraries=nccl_libs,
         library_dirs=nccl_lib_dirs,

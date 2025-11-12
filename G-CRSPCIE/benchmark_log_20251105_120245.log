@@ -1,0 +1,1207 @@
+[0;34mRunning: XOR | Block=1024 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            1024 KB (1048576 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=1024 KB
+✓ GPU memory allocated (input=2048 KB, output=1024 KB)
+✓ GPU input data prepared (2097152 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=1024
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.009 ms
+  Throughput: 227107.53 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=1024 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            1024 KB (1048576 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=1024 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=1024
+✓ GPU memory allocated (aligned: input=2048 KB, output=1024 KB)
+✓ GPU input data prepared (2097152 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 0.062 ms
+  Throughput: 32258.06 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=2048 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            2048 KB (2097152 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=2048 KB
+✓ GPU memory allocated (input=4096 KB, output=2048 KB)
+✓ GPU input data prepared (4194304 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=2048
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.010 ms
+  Throughput: 420026.85 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=2048 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            2048 KB (2097152 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=2048 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=2048
+✓ GPU memory allocated (aligned: input=4096 KB, output=2048 KB)
+✓ GPU input data prepared (4194304 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 0.057 ms
+  Throughput: 70175.44 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=4096 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            4096 KB (4194304 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=4096 KB
+✓ GPU memory allocated (input=8192 KB, output=4096 KB)
+✓ GPU input data prepared (8388608 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=4096
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.012 ms
+  Throughput: 691371.76 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=4096 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            4096 KB (4194304 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=4096 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=4096
+✓ GPU memory allocated (aligned: input=8192 KB, output=4096 KB)
+✓ GPU input data prepared (8388608 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 0.065 ms
+  Throughput: 123076.92 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=8192 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            8192 KB (8388608 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=8192 KB
+✓ GPU memory allocated (input=16384 KB, output=8192 KB)
+✓ GPU input data prepared (16777216 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=8192
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.016 ms
+  Throughput: 1008064.65 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=8192 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            8192 KB (8388608 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=8192 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=8192
+✓ GPU memory allocated (aligned: input=16384 KB, output=8192 KB)
+✓ GPU input data prepared (16777216 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 0.095 ms
+  Throughput: 168421.05 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=16384 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            16384 KB (16777216 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=16384 KB
+✓ GPU memory allocated (input=32768 KB, output=16384 KB)
+✓ GPU input data prepared (33554432 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=16384
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.036 ms
+  Throughput: 877809.03 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=16384 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            16384 KB (16777216 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=16384 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=16384
+✓ GPU memory allocated (aligned: input=32768 KB, output=16384 KB)
+✓ GPU input data prepared (33554432 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 0.141 ms
+  Throughput: 226950.35 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=32768 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            32768 KB (33554432 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=32768 KB
+✓ GPU memory allocated (input=65536 KB, output=32768 KB)
+✓ GPU input data prepared (67108864 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=32768
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.066 ms
+  Throughput: 972006.19 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=32768 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            32768 KB (33554432 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=32768 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=32768
+✓ GPU memory allocated (aligned: input=65536 KB, output=32768 KB)
+✓ GPU input data prepared (67108864 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 0.179 ms
+  Throughput: 357541.90 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=65536 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            65536 KB (67108864 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=65536 KB
+✓ GPU memory allocated (input=131072 KB, output=65536 KB)
+✓ GPU input data prepared (134217728 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=65536
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.122 ms
+  Throughput: 1051303.65 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=65536 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            65536 KB (67108864 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=65536 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=65536
+✓ GPU memory allocated (aligned: input=131072 KB, output=65536 KB)
+✓ GPU input data prepared (134217728 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 0.247 ms
+  Throughput: 518218.62 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=131072 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            131072 KB (134217728 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=131072 KB
+✓ GPU memory allocated (input=262144 KB, output=131072 KB)
+✓ GPU input data prepared (268435456 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=131072
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.236 ms
+  Throughput: 1086484.11 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=131072 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            131072 KB (134217728 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=131072 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=131072
+✓ GPU memory allocated (aligned: input=262144 KB, output=131072 KB)
+✓ GPU input data prepared (268435456 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 0.377 ms
+  Throughput: 679045.09 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=262144 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            262144 KB (268435456 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=262144 KB
+✓ GPU memory allocated (input=524288 KB, output=262144 KB)
+✓ GPU input data prepared (536870912 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=262144
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.459 ms
+  Throughput: 1115075.80 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=262144 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            262144 KB (268435456 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=262144 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=262144
+✓ GPU memory allocated (aligned: input=524288 KB, output=262144 KB)
+✓ GPU input data prepared (536870912 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 0.636 ms
+  Throughput: 805031.45 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=524288 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=524288 KB
+✓ GPU memory allocated (input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=524288
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.911 ms
+  Throughput: 1123848.17 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=524288 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=524288 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=524288
+✓ GPU memory allocated (aligned: input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 1.159 ms
+  Throughput: 883520.28 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=1048576 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            1048576 KB (1073741824 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=1048576 KB
+✓ GPU memory allocated (input=2097152 KB, output=1048576 KB)
+✓ GPU input data prepared (2147483648 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=1048576
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 1.816 ms
+  Throughput: 1127840.75 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=1048576 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            1048576 KB (1073741824 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=1048576 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=1048576
+✓ GPU memory allocated (aligned: input=2097152 KB, output=1048576 KB)
+✓ GPU input data prepared (2147483648 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 2.278 ms
+  Throughput: 899034.24 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=524288 KB | Threads=16 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     16
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=524288 KB
+✓ GPU memory allocated (input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ CUDA config: threads_per_block=16, blocks_per_grid=4194304
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 3.893 ms
+  Throughput: 263047.15 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=524288 KB | Threads=16 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     16
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+Warning: threads_per_block (16) is not a multiple of 32, rounding up
+✓ Worker initialized: k=2, m=1, w=8, block_size=524288 KB
+✓ CUDA config: threads_per_block=32, blocks_per_grid=2097152
+✓ GPU memory allocated (aligned: input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 2.059 ms
+  Throughput: 497328.80 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=524288 KB | Threads=32 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     32
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=524288 KB
+✓ GPU memory allocated (input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ CUDA config: threads_per_block=32, blocks_per_grid=2097152
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 1.951 ms
+  Throughput: 524934.43 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=524288 KB | Threads=32 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     32
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=524288 KB
+✓ CUDA config: threads_per_block=32, blocks_per_grid=2097152
+✓ GPU memory allocated (aligned: input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 2.064 ms
+  Throughput: 496124.03 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=524288 KB | Threads=64 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     64
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=524288 KB
+✓ GPU memory allocated (input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ CUDA config: threads_per_block=64, blocks_per_grid=1048576
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.982 ms
+  Throughput: 1042535.48 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=524288 KB | Threads=64 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     64
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=524288 KB
+✓ CUDA config: threads_per_block=64, blocks_per_grid=1048576
+✓ GPU memory allocated (aligned: input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 1.167 ms
+  Throughput: 877463.58 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=524288 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=524288 KB
+✓ GPU memory allocated (input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ CUDA config: threads_per_block=128, blocks_per_grid=524288
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.911 ms
+  Throughput: 1124100.62 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=524288 KB | Threads=128 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     128
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=524288 KB
+✓ CUDA config: threads_per_block=128, blocks_per_grid=524288
+✓ GPU memory allocated (aligned: input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 1.159 ms
+  Throughput: 883520.28 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=524288 KB | Threads=256 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     256
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=524288 KB
+✓ GPU memory allocated (input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ CUDA config: threads_per_block=256, blocks_per_grid=262144
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.913 ms
+  Throughput: 1121453.50 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=524288 KB | Threads=256 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     256
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=524288 KB
+✓ CUDA config: threads_per_block=256, blocks_per_grid=262144
+✓ GPU memory allocated (aligned: input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 1.195 ms
+  Throughput: 856903.77 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=524288 KB | Threads=512 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     512
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=524288 KB
+✓ GPU memory allocated (input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ CUDA config: threads_per_block=512, blocks_per_grid=131072
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.918 ms
+  Throughput: 1115200.16 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=524288 KB | Threads=512 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     512
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=524288 KB
+✓ CUDA config: threads_per_block=512, blocks_per_grid=131072
+✓ GPU memory allocated (aligned: input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 1.275 ms
+  Throughput: 803137.25 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: XOR | Block=524288 KB | Threads=1024 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      2
+  w (Galois field width): 4
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     1024
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 4] XOR Operation Test
+---------------------------
+✓ Configuration: k=2, block_size=524288 KB
+✓ GPU memory allocated (input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ CUDA config: threads_per_block=1024, blocks_per_grid=65536
+Running warm-up...
+Running XOR operation (10 iterations)...
+✓ XOR operation completed successfully
+  Average time (10 iterations): 0.921 ms
+  Throughput: 1111852.37 MB/s
+  Note: XOR is simpler than EC encoding, should be faster!
+  WARNING: XOR result is all zeros (inputs might be identical)
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================
+[0;34mRunning: EC | Block=524288 KB | Threads=1024 | Blocks=0 | Tasks=1[0m
+==================================================
+G-CRSPCIE GPU Tensor Zero-Copy Encoding Tests
+==================================================
+Configuration:
+  k (data blocks):        2
+  m (parity blocks):      1
+  w (Galois field width): 8
+  block_size:            524288 KB (536870912 bytes)
+  task_num:              1
+  threads_per_block:     1024
+  blocks_per_grid:       auto-calculate
+
+Found 8 CUDA device(s)
+Using device: NVIDIA A800-SXM4-80GB
+
+
+[Test 2] GPU Tensor -> GPU Encoding -> GPU Tensor (Zero-Copy Mode)
+-------------------------------------------------------------------
+✓ Worker initialized: k=2, m=1, w=8, block_size=524288 KB
+✓ CUDA config: threads_per_block=1024, blocks_per_grid=65536
+✓ GPU memory allocated (aligned: input=1048576 KB, output=524288 KB)
+✓ GPU input data prepared (1073741824 bytes)
+✓ Zero-copy mode enabled (no H2D/D2H transfers)
+Running encoding (zero-copy mode)...
+✓ Zero-copy encoding completed successfully
+  Encoding time: 1.432 ms
+  Throughput: 715083.80 MB/s
+  Note: Zero-copy mode eliminates PCIe transfer overhead!
+
+==================================================
+Test Summary: 1/1 tests passed
+==================================================

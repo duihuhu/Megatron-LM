@@ -13,6 +13,9 @@
 #include <unordered_map>
 #include <fstream>
 #include <chrono>
+#include <isa-l/erasure_code.h>
+#include <isa-l/raid.h>
+#include <cstdlib>
 
 // NCCL includes
 #ifdef NCCL_AVAILABLE
@@ -39,6 +42,7 @@ private:
         uintptr_t encoding_addr;
         uintptr_t recv_addr;        // 接收地址
         size_t recv_chunk_size;     // 接收大小
+        uintptr_t parity_addr;      // XOR结果地址（parity buffer）
     };
     
     std::queue<EncodingTask> encoding_tasks_1_;  // Thread1的编码任务
@@ -65,6 +69,7 @@ private:
     struct RecvTask {
         uintptr_t recv_addr;
         size_t size;
+        uintptr_t parity_addr;      // XOR结果地址（从EncodingTask传递）
     };
     std::queue<RecvTask> recv_queue_1_;
     std::queue<RecvTask> recv_queue_2_;
@@ -80,6 +85,8 @@ private:
     std::atomic<bool> send_worker_2_completed_;
     std::atomic<bool> recv_worker_1_completed_;
     std::atomic<bool> recv_worker_2_completed_;
+    std::atomic<bool> xor_worker_1_completed_;
+    std::atomic<bool> xor_worker_2_completed_;
     
     // Stop flag for graceful shutdown
     std::atomic<bool> should_stop_threads_;
@@ -95,15 +102,55 @@ private:
     // Buffers ready for release
     std::queue<uintptr_t> data_buffers_to_release_;
     std::queue<uintptr_t> encoding_buffers_to_release_;
+    std::queue<uintptr_t> parity_buffers_to_release_;
     std::mutex release_queue_mutex_;
     
-    // Worker threads - 每个encoding线程配备独立的send/recv worker
+    // XOR configuration
+    struct XORConfig {
+        int xor_partner_rank;        // XOR配对的rank
+        bool thread0_is_receiver;    // thread0是否接收（做XOR）
+        bool thread1_is_receiver;    // thread1是否接收（做XOR）
+    };
+    XORConfig xor_config_;
+    
+    // XOR task structure
+    struct XORTask {
+        uintptr_t local_encoding_addr;   // 本地encoded数据地址
+        uintptr_t remote_encoding_addr;  // 接收到的远程encoded数据地址
+        uintptr_t parity_addr;           // XOR结果地址（parity buffer）
+        size_t size;                     // 数据大小
+    };
+    
+    // XOR任务队列（每个thread一个）
+    std::queue<XORTask> xor_queue_1_;
+    std::queue<XORTask> xor_queue_2_;
+    std::mutex xor_queue_1_mutex_;
+    std::mutex xor_queue_2_mutex_;
+    std::condition_variable xor_queue_1_cv_;
+    std::condition_variable xor_queue_2_cv_;
+    
+    // Pending encoding buffers等待XOR（用于匹配encoding和recv）
+    // Key: recv_addr, Value: encoding_addr
+    std::unordered_map<uintptr_t, uintptr_t> pending_xor_encoding_1_;
+    std::unordered_map<uintptr_t, uintptr_t> pending_xor_encoding_2_;
+    std::mutex pending_xor_1_mutex_;
+    std::mutex pending_xor_2_mutex_;
+    
+    // Track recv_addr -> parity_addr mapping
+    std::unordered_map<uintptr_t, uintptr_t> recv_to_parity_1_;
+    std::unordered_map<uintptr_t, uintptr_t> recv_to_parity_2_;
+    std::mutex recv_to_parity_1_mutex_;
+    std::mutex recv_to_parity_2_mutex_;
+    
+    // Worker threads - 每个encoding线程配备独立的send/recv/xor worker
     std::thread encoder_thread_1_;
     std::thread encoder_thread_2_;
     std::thread send_worker_1_;     // 专门发送thread1的编码数据
     std::thread recv_worker_1_;     // 专门接收给thread1的数据
     std::thread send_worker_2_;     // 专门发送thread2的编码数据
     std::thread recv_worker_2_;     // 专门接收给thread2的数据
+    std::thread xor_worker_1_;      // 专门执行thread1的XOR操作
+    std::thread xor_worker_2_;      // 专门执行thread2的XOR操作
     
     // NCCL communicators - 每个线程有独立的通信域
 #ifdef NCCL_AVAILABLE
@@ -111,6 +158,15 @@ private:
     ncclComm_t nccl_comm_thread2_;  // Thread2专用通信域
     bool nccl_thread1_initialized_;
     bool nccl_thread2_initialized_;
+#ifdef __GNUC__
+#endif
+
+    // EC parameters (k, rows=2) and tables
+    int k_;
+    int rows_;
+    int data_block_index_;
+    unsigned char *a_mat_;    // RS matrix (k * m)
+    unsigned char *g_tbls_;   // tables produced by ec_init_tables (32 * k * rows)
 #else
     bool nccl_thread1_initialized_;
     bool nccl_thread2_initialized_;
@@ -121,6 +177,49 @@ private:
     std::atomic<bool> nccl_thread2_init_completed_;
     std::mutex nccl_init_mutex_;
     std::condition_variable nccl_init_cv_;
+
+    // ========== XOR配置构建函数 ==========
+    
+    void build_xor_config() {
+        // Hardcoded XOR configuration for 2+2 setup
+        // Pairing: rank0<->rank2, rank1<->rank3
+        // rank0 thread0: receive from rank2 thread0, do XOR
+        // rank0 thread1: send to rank2 thread1
+        // rank2 thread0: send to rank0 thread0
+        // rank2 thread1: receive from rank0 thread1, do XOR
+        // rank1 thread0: receive from rank3 thread0, do XOR
+        // rank1 thread1: send to rank3 thread1
+        // rank3 thread0: send to rank1 thread0
+        // rank3 thread1: receive from rank1 thread1, do XOR
+        
+        if (rank_ == 0) {
+            xor_config_.xor_partner_rank = 2;
+            xor_config_.thread0_is_receiver = true;   // thread0接收rank2的encode，做XOR
+            xor_config_.thread1_is_receiver = false;  // thread1发送encode给rank2
+        } else if (rank_ == 1) {
+            xor_config_.xor_partner_rank = 3;
+            xor_config_.thread0_is_receiver = true;   // thread0接收rank3的encode，做XOR
+            xor_config_.thread1_is_receiver = false;  // thread1发送encode给rank3
+        } else if (rank_ == 2) {
+            xor_config_.xor_partner_rank = 0;
+            xor_config_.thread0_is_receiver = false;  // thread0发送encode给rank0
+            xor_config_.thread1_is_receiver = true;   // thread1接收rank0的encode，做XOR
+        } else if (rank_ == 3) {
+            xor_config_.xor_partner_rank = 1;
+            xor_config_.thread0_is_receiver = false;  // thread0发送encode给rank1
+            xor_config_.thread1_is_receiver = true;    // thread1接收rank1的encode，做XOR
+        } else {
+            // For other ranks, no XOR (fallback)
+            xor_config_.xor_partner_rank = -1;
+            xor_config_.thread0_is_receiver = false;
+            xor_config_.thread1_is_receiver = false;
+        }
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR config - "
+                  << "partner_rank=" << xor_config_.xor_partner_rank
+                  << ", thread0_receiver=" << xor_config_.thread0_is_receiver
+                  << ", thread1_receiver=" << xor_config_.thread1_is_receiver << std::endl;
+    }
 
     // ========== NCCL初始化函数 ==========
     
@@ -151,10 +250,13 @@ private:
         }
         
         // Initialize NCCL communicator
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread1 calling ncclCommInitRank..." << std::endl;
+        std::cout.flush();
         ncclCommInitRank(&nccl_comm_thread1_, world_size_, nccl_id, rank_);
         nccl_thread1_initialized_ = true;
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread1 NCCL communicator initialized" << std::endl;
+        std::cout.flush();
         
         // Signal completion
         {
@@ -197,10 +299,13 @@ private:
         }
         
         // Initialize NCCL communicator
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread2 calling ncclCommInitRank..." << std::endl;
+        std::cout.flush();
         ncclCommInitRank(&nccl_comm_thread2_, world_size_, nccl_id, rank_);
         nccl_thread2_initialized_ = true;
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread2 NCCL communicator initialized" << std::endl;
+        std::cout.flush();
         
         // Signal completion
         {
@@ -230,13 +335,46 @@ private:
     // ========== Worker线程函数 ==========
     
     void encode_with_coefficient(uintptr_t data_addr, size_t size, uintptr_t encoding_addr, int coefficient) {
-        // 简单的编码：乘以系数
-        uint8_t* data_ptr = reinterpret_cast<uint8_t*>(data_addr);
-        uint8_t* encoding_ptr = reinterpret_cast<uint8_t*>(encoding_addr);
-        
-        for (size_t i = 0; i < size; ++i) {
-            encoding_ptr[i] = data_ptr[i] * coefficient;
+        // 使用 isa-l 的 EC 编码对整块 buffer 进行编码。
+        // 我们在初始化时已经生成了 RS 矩阵并通过 ec_init_tables 产生了 g_tbls_。
+        // 每个 encoder 线程只保留自己负责的 parity（encoding_addr 指向本地 parity buffer），
+
+        // 如果没有正确初始化 EC 表，回退到简单乘法
+        if (k_ <= 0 || rows_ != 2 || g_tbls_ == nullptr) {
+            uint8_t* data_ptr = reinterpret_cast<uint8_t*>(data_addr);
+            uint8_t* encoding_ptr = reinterpret_cast<uint8_t*>(encoding_addr);
+            for (size_t i = 0; i < size; ++i) {
+                encoding_ptr[i] = data_ptr[i] * (uint8_t)(coefficient & 0xFF);
+            }
+            return;
         }
+
+        unsigned char *data_ptr = reinterpret_cast<unsigned char*>(data_addr);
+        unsigned char *enc_ptr = reinterpret_cast<unsigned char*>(encoding_addr);
+
+        // 从 g_tbls_ 中取出对应 (parity_index, vec_index) 的 32 字节表，
+        // 并构造 k=1, rows=1 的调用参数。
+        int parity_idx = coefficient;
+        if (parity_idx < 0 || parity_idx >= rows_) parity_idx = 0;
+
+        // Ensure data_block_index_ in range
+        if (data_block_index_ < 0 || data_block_index_ >= k_) {
+            std::cerr << "EC-CHECK: invalid data_block_index_=" << data_block_index_ << " for k=" << k_ << std::endl;
+            return;
+        }
+
+        // Compute offset into g_tbls_: layout from ec_init_tables is for i in rows, j in k -> offset = (i*k + j) * 32
+        size_t offset = (size_t)((parity_idx * k_) + data_block_index_) * 32;
+        unsigned char *gftbls_ptr = g_tbls_ + offset;
+
+        // Prepare single-element arrays for ec_encode_data
+        unsigned char *srcs[1];
+        unsigned char *dests[1];
+        srcs[0] = data_ptr;
+        dests[0] = enc_ptr;
+
+        // Call ec_encode_data with len=size, k=1, rows=1, gftbls_ptr
+        ec_encode_data((int)size, 1, 1, gftbls_ptr, srcs, dests);
     }
     
     // Encoding Thread 1 worker
@@ -276,9 +414,16 @@ private:
                 // Submit sentinel to recv_worker_1
                 {
                     std::lock_guard<std::mutex> lock(recv_queue_1_mutex_);
-                    recv_queue_1_.push({0, 0});
+                    recv_queue_1_.push({0, 0, 0});
                 }
                 recv_queue_1_cv_.notify_one();
+                
+                // Submit sentinel to xor_worker_1
+                {
+                    std::lock_guard<std::mutex> lock(xor_queue_1_mutex_);
+                    xor_queue_1_.push({0, 0, 0, 0});
+                }
+                xor_queue_1_cv_.notify_one();
                 
                 continue;  // Continue waiting for next round
             }
@@ -287,8 +432,8 @@ private:
             bool need_encode = (task.data_addr != 0 && task.encoding_addr != 0);
             
             if (need_encode) {
-                // Perform encoding
-                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 1);
+                // Step 1: Perform encoding (parity index 0 for thread1)
+                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 0);
                 
                 // Mark data buffer as copied by thread 1
                 {
@@ -304,22 +449,46 @@ private:
                     }
                 }
                 
-                // Submit encoding result to send_worker_1
-                {
-                    std::lock_guard<std::mutex> lock(send_queue_1_mutex_);
-                    send_queue_1_.push({task.encoding_addr, task.size});
+                // Step 2: Handle based on XOR configuration
+                if (xor_config_.thread0_is_receiver && task.parity_addr != 0 && task.recv_addr != 0) {
+                    // This thread is receiver: save encoding buffer to pending, wait for recv
+                    // The recv_worker will trigger XOR when recv completes
+                    {
+                        std::lock_guard<std::mutex> lock(pending_xor_1_mutex_);
+                        pending_xor_encoding_1_[task.recv_addr] = task.encoding_addr;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(recv_to_parity_1_mutex_);
+                        recv_to_parity_1_[task.recv_addr] = task.parity_addr;
+                    }
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread1 encoding completed, "
+                              << "pending XOR for recv_addr=" << task.recv_addr 
+                              << ", encoding_addr=" << task.encoding_addr << std::endl;
+                    // Note: encoding buffer will be released by XOR worker after XOR completes
+                } else {
+                    // This thread is sender: send encoding result immediately
+                    {
+                        std::lock_guard<std::mutex> lock(send_queue_1_mutex_);
+                        send_queue_1_.push({task.encoding_addr, task.size});
+                    }
+                    send_queue_1_cv_.notify_one();
+                    
+                    // Sender doesn't need parity buffer, release it immediately
+                    if (task.parity_addr != 0) {
+                        std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                        parity_buffers_to_release_.push(task.parity_addr);
+                    }
                 }
-                send_queue_1_cv_.notify_one();
             }
             
             // Check if we need to receive data
             bool need_recv = (task.recv_addr != 0 && task.recv_chunk_size != 0);
             
-            if (need_recv) {
-                // Submit recv task to recv_worker_1
+            if (need_recv && xor_config_.thread0_is_receiver) {
+                // Submit recv task to recv_worker_1 with parity_addr
                 {
                     std::lock_guard<std::mutex> lock(recv_queue_1_mutex_);
-                    recv_queue_1_.push({task.recv_addr, task.recv_chunk_size});
+                    recv_queue_1_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr});
                 }
                 recv_queue_1_cv_.notify_one();
             }
@@ -365,9 +534,16 @@ private:
                 // Submit sentinel to recv_worker_2
                 {
                     std::lock_guard<std::mutex> lock(recv_queue_2_mutex_);
-                    recv_queue_2_.push({0, 0});
+                    recv_queue_2_.push({0, 0, 0});
                 }
                 recv_queue_2_cv_.notify_one();
+                
+                // Submit sentinel to xor_worker_2
+                {
+                    std::lock_guard<std::mutex> lock(xor_queue_2_mutex_);
+                    xor_queue_2_.push({0, 0, 0, 0});
+                }
+                xor_queue_2_cv_.notify_one();
                 
                 continue;
             }
@@ -376,8 +552,8 @@ private:
             bool need_encode = (task.data_addr != 0 && task.encoding_addr != 0);
             
             if (need_encode) {
-                // Perform encoding
-                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 2);
+                // Step 1: Perform encoding (parity index 1 for thread2)
+                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 1);
                 
                 // Mark data buffer as copied by thread 2
                 {
@@ -393,22 +569,44 @@ private:
                     }
                 }
                 
-                // Submit encoding result to send_worker_2
-                {
-                    std::lock_guard<std::mutex> lock(send_queue_2_mutex_);
-                    send_queue_2_.push({task.encoding_addr, task.size});
+                // Step 2: Handle based on XOR configuration
+                if (xor_config_.thread1_is_receiver && task.parity_addr != 0 && task.recv_addr != 0) {
+                    // This thread is receiver: save encoding buffer to pending, wait for recv
+                    {
+                        std::lock_guard<std::mutex> lock(pending_xor_2_mutex_);
+                        pending_xor_encoding_2_[task.recv_addr] = task.encoding_addr;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(recv_to_parity_2_mutex_);
+                        recv_to_parity_2_[task.recv_addr] = task.parity_addr;
+                    }
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread2 encoding completed, "
+                              << "pending XOR for recv_addr=" << task.recv_addr 
+                              << ", encoding_addr=" << task.encoding_addr << std::endl;
+                } else {
+                    // This thread is sender: send encoding result immediately
+                    {
+                        std::lock_guard<std::mutex> lock(send_queue_2_mutex_);
+                        send_queue_2_.push({task.encoding_addr, task.size});
+                    }
+                    send_queue_2_cv_.notify_one();
+                    
+                    // Sender doesn't need parity buffer, release it immediately
+                    if (task.parity_addr != 0) {
+                        std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                        parity_buffers_to_release_.push(task.parity_addr);
+                    }
                 }
-                send_queue_2_cv_.notify_one();
             }
             
             // Check if we need to receive data
             bool need_recv = (task.recv_addr != 0 && task.recv_chunk_size != 0);
             
-            if (need_recv) {
-                // Submit recv task to recv_worker_2
+            if (need_recv && xor_config_.thread1_is_receiver) {
+                // Submit recv task to recv_worker_2 with parity_addr
                 {
                     std::lock_guard<std::mutex> lock(recv_queue_2_mutex_);
-                    recv_queue_2_.push({task.recv_addr, task.recv_chunk_size});
+                    recv_queue_2_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr});
                 }
                 recv_queue_2_cv_.notify_one();
             }
@@ -450,9 +648,13 @@ private:
             
 #ifdef NCCL_AVAILABLE
             if (nccl_thread1_initialized_ && world_size_ > 1) {
+                // Determine target rank: if this thread is receiver, send to paired_rank
+                // Otherwise, send to xor_partner_rank
+                int target_rank = xor_config_.thread0_is_receiver ? paired_rank_ : xor_config_.xor_partner_rank;
+                
                 ncclGroupStart(); 
                 ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size, 
-                         ncclUint8, paired_rank_, nccl_comm_thread1_, 0);
+                         ncclUint8, target_rank, nccl_comm_thread1_, 0);
                 ncclGroupEnd();
             }
 #endif
@@ -505,12 +707,60 @@ private:
             
 #ifdef NCCL_AVAILABLE
             if (nccl_thread1_initialized_ && world_size_ > 1) {
+                // Determine source rank: if receiver, receive from xor_partner_rank
+                // Otherwise, receive from paired_rank
+                int source_rank = xor_config_.thread0_is_receiver ? xor_config_.xor_partner_rank : paired_rank_;
+                
                 ncclGroupStart();
                 ncclRecv(reinterpret_cast<void*>(task.recv_addr), task.size,
-                         ncclUint8, paired_rank_, nccl_comm_thread1_, 0);
+                         ncclUint8, source_rank, nccl_comm_thread1_, 0);
                 ncclGroupEnd();
             }
 #endif
+            
+            // If this recv is for XOR, trigger XOR worker
+            if (xor_config_.thread0_is_receiver) {
+                uintptr_t local_encoding_addr = 0;
+                uintptr_t parity_addr = 0;
+                
+                // Find corresponding encoding buffer
+                {
+                    std::lock_guard<std::mutex> lock(pending_xor_1_mutex_);
+                    auto it = pending_xor_encoding_1_.find(task.recv_addr);
+                    if (it != pending_xor_encoding_1_.end()) {
+                        local_encoding_addr = it->second;
+                        pending_xor_encoding_1_.erase(it);
+                    }
+                }
+                
+                // Get parity buffer
+                {
+                    std::lock_guard<std::mutex> lock(recv_to_parity_1_mutex_);
+                    auto it = recv_to_parity_1_.find(task.recv_addr);
+                    if (it != recv_to_parity_1_.end()) {
+                        parity_addr = it->second;
+                        recv_to_parity_1_.erase(it);
+                    }
+                }
+                
+                if (local_encoding_addr != 0 && parity_addr != 0) {
+                    // Submit XOR task
+                    {
+                        std::lock_guard<std::mutex> lock(xor_queue_1_mutex_);
+                        xor_queue_1_.push({
+                            local_encoding_addr,      // local encoded
+                            task.recv_addr,          // remote encoded (received)
+                            parity_addr,              // XOR result
+                            task.size
+                        });
+                    }
+                    xor_queue_1_cv_.notify_one();
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread1 recv completed, "
+                              << "triggered XOR: local=" << local_encoding_addr 
+                              << ", remote=" << task.recv_addr 
+                              << ", parity=" << parity_addr << std::endl;
+                }
+            }
         }
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 1 exiting" << std::endl;
@@ -549,9 +799,13 @@ private:
             
 #ifdef NCCL_AVAILABLE
             if (nccl_thread2_initialized_ && world_size_ > 1) {
+                // Determine target rank: if this thread is receiver, send to paired_rank
+                // Otherwise, send to xor_partner_rank
+                int target_rank = xor_config_.thread1_is_receiver ? paired_rank_ : xor_config_.xor_partner_rank;
+                
                 ncclGroupStart();
                 ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size,
-                         ncclUint8, paired_rank_, nccl_comm_thread2_, 0);
+                         ncclUint8, target_rank, nccl_comm_thread2_, 0);
                 ncclGroupEnd();
             }
 #endif
@@ -604,15 +858,179 @@ private:
             
 #ifdef NCCL_AVAILABLE
             if (nccl_thread2_initialized_ && world_size_ > 1) {
+                // Determine source rank: if receiver, receive from xor_partner_rank
+                // Otherwise, receive from paired_rank
+                int source_rank = xor_config_.thread1_is_receiver ? xor_config_.xor_partner_rank : paired_rank_;
+                
                 ncclGroupStart();
                 ncclRecv(reinterpret_cast<void*>(task.recv_addr), task.size,
-                         ncclUint8, paired_rank_, nccl_comm_thread2_, 0);
+                         ncclUint8, source_rank, nccl_comm_thread2_, 0);
                 ncclGroupEnd();
             }
 #endif
+            
+            // If this recv is for XOR, trigger XOR worker
+            if (xor_config_.thread1_is_receiver) {
+                uintptr_t local_encoding_addr = 0;
+                uintptr_t parity_addr = 0;
+                
+                // Find corresponding encoding buffer
+                {
+                    std::lock_guard<std::mutex> lock(pending_xor_2_mutex_);
+                    auto it = pending_xor_encoding_2_.find(task.recv_addr);
+                    if (it != pending_xor_encoding_2_.end()) {
+                        local_encoding_addr = it->second;
+                        pending_xor_encoding_2_.erase(it);
+                    }
+                }
+                
+                // Get parity buffer
+                {
+                    std::lock_guard<std::mutex> lock(recv_to_parity_2_mutex_);
+                    auto it = recv_to_parity_2_.find(task.recv_addr);
+                    if (it != recv_to_parity_2_.end()) {
+                        parity_addr = it->second;
+                        recv_to_parity_2_.erase(it);
+                    }
+                }
+                
+                if (local_encoding_addr != 0 && parity_addr != 0) {
+                    // Submit XOR task
+                    {
+                        std::lock_guard<std::mutex> lock(xor_queue_2_mutex_);
+                        xor_queue_2_.push({
+                            local_encoding_addr,      // local encoded
+                            task.recv_addr,           // remote encoded (received)
+                            parity_addr,               // XOR result
+                            task.size
+                        });
+                    }
+                    xor_queue_2_cv_.notify_one();
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread2 recv completed, "
+                              << "triggered XOR: local=" << local_encoding_addr 
+                              << ", remote=" << task.recv_addr 
+                              << ", parity=" << parity_addr << std::endl;
+                }
+            }
         }
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 2 exiting" << std::endl;
+    }
+    
+    // XOR Worker 1 - 专门执行thread1的XOR操作
+    void xor_worker_1() {
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 started" << std::endl;
+        
+        while (!should_stop_threads_) {
+            XORTask task;
+            
+            {
+                std::unique_lock<std::mutex> lock(xor_queue_1_mutex_);
+                xor_queue_1_cv_.wait(lock, [this] {
+                    return !xor_queue_1_.empty() || should_stop_threads_;
+                });
+                
+                if (should_stop_threads_ && xor_queue_1_.empty()) {
+                    break;
+                }
+                
+                task = xor_queue_1_.front();
+                xor_queue_1_.pop();
+            }
+            
+            // Check for sentinel
+            if (task.local_encoding_addr == 0 && task.remote_encoding_addr == 0 && 
+                task.parity_addr == 0 && task.size == 0) {
+                xor_worker_1_completed_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 received sentinel, marking completed" << std::endl;
+                continue;
+            }
+            
+            // Perform XOR using isa-l xor_gen
+            unsigned char* srcs[2];
+            srcs[0] = reinterpret_cast<unsigned char*>(task.local_encoding_addr);
+            srcs[1] = reinterpret_cast<unsigned char*>(task.remote_encoding_addr);
+            unsigned char* dest = reinterpret_cast<unsigned char*>(task.parity_addr);
+            
+            void* xor_array[3];
+            xor_array[0] = srcs[0];
+            xor_array[1] = srcs[1];
+            xor_array[2] = dest;
+            
+            // Call isa-l xor_gen: vects=3 (2 sources + 1 dest), len=size
+            xor_gen(3, (int)task.size, xor_array);
+            
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread1 XOR completed, parity at " 
+                      << task.parity_addr << std::endl;
+            
+            // Release encoding buffers (both local and remote) and parity buffer after XOR
+            {
+                std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                encoding_buffers_to_release_.push(task.local_encoding_addr);
+                encoding_buffers_to_release_.push(task.remote_encoding_addr);
+                parity_buffers_to_release_.push(task.parity_addr);
+            }
+        }
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 exiting" << std::endl;
+    }
+    
+    // XOR Worker 2 - 专门执行thread2的XOR操作
+    void xor_worker_2() {
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 started" << std::endl;
+        
+        while (!should_stop_threads_) {
+            XORTask task;
+            
+            {
+                std::unique_lock<std::mutex> lock(xor_queue_2_mutex_);
+                xor_queue_2_cv_.wait(lock, [this] {
+                    return !xor_queue_2_.empty() || should_stop_threads_;
+                });
+                
+                if (should_stop_threads_ && xor_queue_2_.empty()) {
+                    break;
+                }
+                
+                task = xor_queue_2_.front();
+                xor_queue_2_.pop();
+            }
+            
+            // Check for sentinel
+            if (task.local_encoding_addr == 0 && task.remote_encoding_addr == 0 && 
+                task.parity_addr == 0 && task.size == 0) {
+                xor_worker_2_completed_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 received sentinel, marking completed" << std::endl;
+                continue;
+            }
+            
+            // Perform XOR using isa-l xor_gen
+            unsigned char* srcs[2];
+            srcs[0] = reinterpret_cast<unsigned char*>(task.local_encoding_addr);
+            srcs[1] = reinterpret_cast<unsigned char*>(task.remote_encoding_addr);
+            unsigned char* dest = reinterpret_cast<unsigned char*>(task.parity_addr);
+            
+            void* xor_array[3];
+            xor_array[0] = srcs[0];
+            xor_array[1] = srcs[1];
+            xor_array[2] = dest;
+            
+            // Call isa-l xor_gen: vects=3 (2 sources + 1 dest), len=size
+            xor_gen(3, (int)task.size, xor_array);
+            
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread2 XOR completed, parity at " 
+                      << task.parity_addr << std::endl;
+            
+            // Release encoding buffers (both local and remote) and parity buffer after XOR
+            {
+                std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                encoding_buffers_to_release_.push(task.local_encoding_addr);
+                encoding_buffers_to_release_.push(task.remote_encoding_addr);
+                parity_buffers_to_release_.push(task.parity_addr);
+            }
+        }
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 exiting" << std::endl;
     }
 
     void start_pipeline() {
@@ -648,7 +1066,11 @@ private:
         send_worker_2_ = std::thread(&ECCHECKNative::send_worker_2, this);
         recv_worker_2_ = std::thread(&ECCHECKNative::recv_worker_2, this);
         
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Started 6 threads (2 encoding + 4 send/recv)" << std::endl;
+        // Start XOR workers
+        xor_worker_1_ = std::thread(&ECCHECKNative::xor_worker_1, this);
+        xor_worker_2_ = std::thread(&ECCHECKNative::xor_worker_2, this);
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Started 8 threads (2 encoding + 4 send/recv + 2 XOR)" << std::endl;
     }
 
 public:
@@ -657,27 +1079,71 @@ public:
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_1_completed_(false), send_worker_2_completed_(false),
           recv_worker_1_completed_(false), recv_worker_2_completed_(false),
+          xor_worker_1_completed_(false), xor_worker_2_completed_(false),
           should_stop_threads_(false),
           nccl_thread1_initialized_(false), nccl_thread2_initialized_(false),
-          nccl_thread1_init_completed_(false), nccl_thread2_init_completed_(false) {
+          nccl_thread1_init_completed_(false), nccl_thread2_init_completed_(false),
+          k_(0), rows_(0), data_block_index_(0), a_mat_(nullptr), g_tbls_(nullptr) {
+
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Constructor called, initializing EC tables and starting pipeline..." << std::endl;
         
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Constructor called, starting pipeline..." << std::endl;
-        
+        // Build XOR configuration
+        build_xor_config();
+
+        // Initialize EC params: k = world_size / 2, rows = 2, data_block_index = rank / 2
+        rows_ = 2;
+        if (world_size_ <= 0) {
+            k_ = 0;
+        } else {
+            k_ = world_size_ / 2;
+        }
+        data_block_index_ = rank_ / 2;
+
+        if (k_ > 0) {
+            int m = k_ + rows_;
+            // allocate matrix a (k * m)
+            a_mat_ = (unsigned char*)malloc((size_t)k_ * (size_t)m);
+            if (a_mat_ == nullptr) {
+                std::cerr << "EC-CHECK: failed to allocate a_mat_" << std::endl;
+            } else {
+                // generate RS matrix
+                gf_gen_rs_matrix(a_mat_, m, k_);
+
+                // allocate g_tbls_: 32 * k * rows
+                size_t gtbls_size = 32 * (size_t)k_ * (size_t)rows_;
+                void *tmp = nullptr;
+                if (posix_memalign(&tmp, 32, gtbls_size) != 0) tmp = nullptr;
+                if (tmp == nullptr) tmp = malloc(gtbls_size);
+                g_tbls_ = reinterpret_cast<unsigned char*>(tmp);
+                if (g_tbls_ == nullptr) {
+                    std::cerr << "EC-CHECK: failed to allocate g_tbls_" << std::endl;
+                } else {
+                    // initialize tables using isa-l
+                    ec_init_tables(k_, rows_, a_mat_, g_tbls_);
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] EC tables initialized (k=" << k_ << ", rows=" << rows_ << ", data_idx=" << data_block_index_ << ")" << std::endl;
+                }
+            }
+        } else {
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] skipping EC init because k<=0" << std::endl;
+        }
+
         start_pipeline();
-        
+
         // Wait for both NCCL communicators to be initialized
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Waiting for NCCL initialization (thread1 and thread2)..." << std::endl;
         std::unique_lock<std::mutex> lock(nccl_init_mutex_);
         nccl_init_cv_.wait(lock, [this] { 
             return nccl_thread1_init_completed_.load() && nccl_thread2_init_completed_.load(); 
         });
-        
+
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline and NCCL initialized successfully" << std::endl;
     }
     
     ~ECCHECKNative() {
         stop_pipeline();
         cleanup_nccl();
+        if (a_mat_) { free(a_mat_); a_mat_ = nullptr; }
+        if (g_tbls_) { free(g_tbls_); g_tbls_ = nullptr; }
     }
     
     void set_buffer_addresses(const std::vector<uintptr_t>& data_addrs,
@@ -695,6 +1161,8 @@ public:
         send_worker_2_completed_ = false;
         recv_worker_1_completed_ = false;
         recv_worker_2_completed_ = false;
+        xor_worker_1_completed_ = false;
+        xor_worker_2_completed_ = false;
     }
     
     void wait_for_encoding_completion() {
@@ -716,7 +1184,13 @@ public:
         }
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Both recv workers completed" << std::endl;
         
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] All threads completed (encoding + send + recv)" << std::endl;
+        // Wait for all XOR workers to complete
+        while (!xor_worker_1_completed_ || !xor_worker_2_completed_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Both XOR workers completed" << std::endl;
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] All threads completed (encoding + send + recv + XOR)" << std::endl;
     }
     
     void stop_pipeline() {
@@ -731,6 +1205,8 @@ public:
         send_queue_2_cv_.notify_all();
         recv_queue_1_cv_.notify_all();
         recv_queue_2_cv_.notify_all();
+        xor_queue_1_cv_.notify_all();
+        xor_queue_2_cv_.notify_all();
         
         // Join all threads
         if (encoder_thread_1_.joinable()) encoder_thread_1_.join();
@@ -739,16 +1215,18 @@ public:
         if (recv_worker_1_.joinable()) recv_worker_1_.join();
         if (send_worker_2_.joinable()) send_worker_2_.join();
         if (recv_worker_2_.joinable()) recv_worker_2_.join();
+        if (xor_worker_1_.joinable()) xor_worker_1_.join();
+        if (xor_worker_2_.joinable()) xor_worker_2_.join();
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline stopped" << std::endl;
     }
     
     void submit_data_for_encoding_thread1(uintptr_t data_addr, size_t size, 
                                           uintptr_t encoding_addr, uintptr_t recv_addr, 
-                                          size_t recv_chunk_size) {
+                                          size_t recv_chunk_size, uintptr_t parity_addr) {
         {
             std::lock_guard<std::mutex> lock(encoding_tasks_1_mutex_);
-            encoding_tasks_1_.push({data_addr, size, encoding_addr, recv_addr, recv_chunk_size});
+            encoding_tasks_1_.push({data_addr, size, encoding_addr, recv_addr, recv_chunk_size, parity_addr});
         }
         encoding_tasks_1_cv_.notify_one();
         
@@ -762,10 +1240,10 @@ public:
     
     void submit_data_for_encoding_thread2(uintptr_t data_addr, size_t size,
                                           uintptr_t encoding_addr, uintptr_t recv_addr,
-                                          size_t recv_chunk_size) {
+                                          size_t recv_chunk_size, uintptr_t parity_addr) {
         {
             std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_);
-            encoding_tasks_2_.push({data_addr, size, encoding_addr, recv_addr, recv_chunk_size});
+            encoding_tasks_2_.push({data_addr, size, encoding_addr, recv_addr, recv_chunk_size, parity_addr});
         }
         encoding_tasks_2_cv_.notify_one();
     }
@@ -789,6 +1267,16 @@ public:
         }
         return buffers;
     }
+    
+    std::vector<uintptr_t> get_parity_buffers_to_release() {
+        std::vector<uintptr_t> buffers;
+        std::lock_guard<std::mutex> lock(release_queue_mutex_);
+        while (!parity_buffers_to_release_.empty()) {
+            buffers.push_back(parity_buffers_to_release_.front());
+            parity_buffers_to_release_.pop();
+        }
+        return buffers;
+    }
 };
 
 PYBIND11_MODULE(eccheck_native, m) {
@@ -801,5 +1289,6 @@ PYBIND11_MODULE(eccheck_native, m) {
         .def("submit_data_for_encoding_thread1", &ECCHECKNative::submit_data_for_encoding_thread1)
         .def("submit_data_for_encoding_thread2", &ECCHECKNative::submit_data_for_encoding_thread2)
         .def("get_data_buffers_to_release", &ECCHECKNative::get_data_buffers_to_release)
-        .def("get_encoding_buffers_to_release", &ECCHECKNative::get_encoding_buffers_to_release);
+        .def("get_encoding_buffers_to_release", &ECCHECKNative::get_encoding_buffers_to_release)
+        .def("get_parity_buffers_to_release", &ECCHECKNative::get_parity_buffers_to_release);
 }

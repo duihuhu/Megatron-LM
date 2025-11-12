@@ -174,13 +174,15 @@ class FileSystemWriterAsync(FileSystemWriter):
     def _setup_eccheck_buffers_from_strategy(self, buffers):
         """Set up EC-CHECK buffers from pre-allocated strategy buffers.
         
-        Note: Only sets up data and encoding buffers from strategy.
-        Receive and parity buffers will be allocated later after metadata exchange.
+        Note: Sets up data, encoding, and parity buffers from strategy.
+        Receive buffers will be allocated later after metadata exchange.
         """
         self.eccheck_data_buffers = buffers['data_buffers']
         self.eccheck_encoding_buffers = buffers['encoding_buffers']
+        self.eccheck_parity_buffers = buffers.get('parity_buffers')
         self._free_data_buffer_queue = buffers['free_data_buffer_queue']
         self._free_encoding_buffer_queue = buffers['free_encoding_buffer_queue']
+        self._free_parity_buffer_queue = buffers.get('free_parity_buffer_queue')
         
         # Use buffer poller from strategy (already running)
         self._buffer_poller_active_event = buffers.get('buffer_poller_active_event')
@@ -190,13 +192,14 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Mark that we're using shared buffer poller (don't start our own)
         self._buffer_poller_shared = True
         
-        # Receive and parity buffers are NOT set here
+        # Receive buffers are NOT set here
         # They will be allocated after metadata exchange when peer data size is known
         
         logger.info(
             f"EC-CHECK: Using pre-allocated buffers from strategy - "
             f"Data: {len(self.eccheck_data_buffers)}, "
             f"Encoding: {len(self.eccheck_encoding_buffers)}, "
+            f"Parity: {len(self.eccheck_parity_buffers) if self.eccheck_parity_buffers else 0}, "
             f"Buffer poller: {'shared from strategy' if self._buffer_poller_active_event else 'will create own'}"
         )
 
@@ -930,6 +933,17 @@ class FileSystemWriterAsync(FileSystemWriter):
                 return self._free_encoding_buffer_queue.get()
                 # raise RuntimeError("EC-CHECK: Timeout waiting for encoding buffer")
         
+        def get_free_parity_buffer():
+            """Get a free parity buffer address, blocking if none available."""
+            # Poll for released buffers before trying to get one
+            self._poll_and_release_buffers()
+            
+            try:
+                return self._free_parity_buffer_queue.get(timeout=5.0)
+            except queue.Empty:
+                logger.error("EC-CHECK: TIMEOUT waiting for free parity buffer - possible deadlock!")
+                return self._free_parity_buffer_queue.get()
+        
         # Process continuous tensor buffer sequentially
         # Copy data from self.tensor_buffer (continuous CPU buffer) to data buffers
         total_bytes = self.decomposed_state_dict.total_tensor_size_bytes
@@ -966,6 +980,10 @@ class FileSystemWriterAsync(FileSystemWriter):
             enc_addr1 = get_free_encoding_buffer()
             enc_addr2 = get_free_encoding_buffer()
             
+            # Get two parity buffers for XOR results
+            parity_addr1 = get_free_parity_buffer()
+            parity_addr2 = get_free_parity_buffer()
+            
             # Allocate receive addresses from TWO recv_encoding_buffers (按实际数据大小分配)
             # Each encoding thread gets its own receive address
             # 如果剩余数据能够填满固定chunk size，则按照chunk size分配
@@ -980,16 +998,17 @@ class FileSystemWriterAsync(FileSystemWriter):
             recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2
             recv_buffer_offset_thread2 += recv_chunk_size  # 按照实际大小移动
             
-            # Submit to BOTH encoding threads with their respective receive addresses
+            # Submit to BOTH encoding threads with their respective receive addresses and parity buffers
             # The C++ threads will mark the data buffer as copied immediately after reading
             # Once both threads mark it as copied, the data buffer will be released
             # recv_addr will be used by recv_worker to receive peer data
+            # parity_addr will be used by XOR worker to store XOR results
             self._eccheck_native.submit_data_for_encoding_thread1(
-                cur_buffer_addr, take, enc_addr1, recv_addr_thread1, recv_chunk_size
+                cur_buffer_addr, take, enc_addr1, recv_addr_thread1, recv_chunk_size, parity_addr1
             )
             
             self._eccheck_native.submit_data_for_encoding_thread2(
-                cur_buffer_addr, take, enc_addr2, recv_addr_thread2, recv_chunk_size
+                cur_buffer_addr, take, enc_addr2, recv_addr_thread2, recv_chunk_size, parity_addr2
             )
             
             src_pos += take
@@ -1001,8 +1020,8 @@ class FileSystemWriterAsync(FileSystemWriter):
         )
         
         # Mark end of stream for both encoders
-        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0)  # Sentinel for thread 1
-        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0)  # Sentinel for thread 2`
+        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0)  # Sentinel for thread 1
+        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0)  # Sentinel for thread 2
         
         # Wait for both encoding threads to complete
         # Buffer poller is already active (activated at function start)

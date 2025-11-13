@@ -133,6 +133,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eccheck_data_buffers = None  # List of data buffers
         self.eccheck_encoding_buffers = None  # List of encoding buffers
         self.eccheck_recv_encoding_buffers = None  # Tuple of two large receive buffers (thread1, thread2)
+        self.eccheck_p2p_buffers = None  # Dict with 'own_buffer' and 'partner_buffer' for P2P stage
         self.eccheck_parity_buffers = None  # List of parity buffers for XOR results
         
         # EC-CHECK buffer poller thread (persistent, created once)
@@ -1130,8 +1131,14 @@ class FileSystemWriterAsync(FileSystemWriter):
                 "after _prepare_eccheck_data completes."
             )
         
+        if not hasattr(self, 'eccheck_p2p_buffers') or self.eccheck_p2p_buffers is None:
+            raise RuntimeError(
+                "EC-CHECK: P2P buffers not set. Should be passed from strategy "
+                "after _prepare_eccheck_data completes."
+            )
+        
         logger.info(
-            "EC-CHECK: Using metadata and receive buffers from strategy (already allocated in torch.py)"
+            "EC-CHECK: Using metadata, receive buffers, and P2P buffers from strategy (already allocated in torch.py)"
         )
         
         # Execute Phase 3: Tensor data exchange and encoding

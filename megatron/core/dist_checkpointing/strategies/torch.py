@@ -758,15 +758,55 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             
             # Create instance with error handling
             try:
+                # ===== Step 1: Rank 0 generates two NCCL IDs =====
+                if rank == 0:
+                    # Generate NCCL IDs using module-level function (no instance needed)
+                    nccl_id_thread1 = eccheck_native.generate_nccl_id()
+                    nccl_id_thread2 = eccheck_native.generate_nccl_id()
+                    logger.info(f"EC-CHECK: [Rank 0] Generated two NCCL IDs (size: {len(nccl_id_thread1)} bytes each)")
+                else:
+                    # Other ranks prepare empty lists (will be filled by broadcast)
+                    nccl_id_thread1 = [0] * 128  # NCCL ID is typically 128 bytes
+                    nccl_id_thread2 = [0] * 128
+                
+                # ===== Step 2: Broadcast NCCL IDs to all ranks =====
+                # Convert lists to torch tensors for broadcasting
+                # NOTE: NCCL backend requires tensors to be on CUDA device
+                nccl_id_size = 128  # sizeof(ncclUniqueId)
+                
+                # Convert to tensors and move to CUDA (NCCL requires CUDA tensors)
+                if rank == 0:
+                    id1_tensor = torch.tensor(nccl_id_thread1, dtype=torch.uint8, device=torch.cuda.current_device())
+                    id2_tensor = torch.tensor(nccl_id_thread2, dtype=torch.uint8, device=torch.cuda.current_device())
+                else:
+                    id1_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
+                    id2_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
+                
+                # Broadcast both IDs (synchronous operation - all ranks wait)
+                # NCCL backend requires tensors to be on CUDA device
+                torch.distributed.broadcast(id1_tensor, src=0)
+                torch.distributed.broadcast(id2_tensor, src=0)
+                
+                # Convert back to lists (move to CPU first, then tolist)
+                nccl_id_thread1 = id1_tensor.cpu().tolist()
+                nccl_id_thread2 = id2_tensor.cpu().tolist()
+                
+                logger.info(f"EC-CHECK: [Rank {rank}] Received NCCL IDs via broadcast")
+                
+                # ===== Step 3: Create C++ instance with broadcasted IDs =====
                 # IMPORTANT: This constructor call will BLOCK until:
                 # 1. Send and recv threads are started
-                # 2. Both NCCL communicators (0to1 and 1to0) are fully initialized
+                # 2. Both NCCL communicators are fully initialized using the broadcasted IDs
                 # 3. All threads are ready for data exchange
                 # Only after all initialization is complete will this call return.
                 logger.info(f"EC-CHECK: Creating C++ native module (this will block until NCCL is initialized)...")
                 print(f"EC-CHECK: [Rank {rank}] Creating C++ native module (blocking until NCCL initialization completes)...")
                 
-                self._eccheck_native = eccheck_native.ECCHECKNative(rank, world_size, paired_rank)
+                self._eccheck_native = eccheck_native.ECCHECKNative(
+                    rank, world_size, paired_rank,
+                    nccl_id_thread1,  # Pass broadcasted IDs
+                    nccl_id_thread2
+                )
                 
                 # If we reach here, NCCL communicators are ready and threads are running
                 logger.info(f"EC-CHECK: C++ native module initialized successfully (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
@@ -810,6 +850,44 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         logger.debug(f"EC-CHECK: Rank {my_rank} paired with Rank {paired_rank}")
         return paired_rank
 
+    def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
+        """
+        Get P2P partner rank for data/parity exchange.
+        
+        P2P pairing rules (different from XOR pairing):
+        - Rank 0 ↔ Rank 1 (P2P)
+        - Rank 2 ↔ Rank 3 (P2P)
+        
+        XOR pairing (for reference):
+        - Rank 0 ↔ Rank 2 (XOR)
+        - Rank 1 ↔ Rank 3 (XOR)
+        
+        Args:
+            my_rank (int): Current rank
+            world_size (int): Total number of ranks
+            
+        Returns:
+            int: P2P partner rank
+        """
+        if world_size % 2 != 0:
+            raise ValueError(f"EC-CHECK: World size must be even for P2P pairing, got {world_size}")
+        
+        # P2P pairing: adjacent ranks in pairs
+        # For 4-rank setup: (0,1) and (2,3)
+        if my_rank % 2 == 0:
+            # Even rank: pair with next rank
+            p2p_partner_rank = my_rank + 1
+        else:
+            # Odd rank: pair with previous rank
+            p2p_partner_rank = my_rank - 1
+        
+        # Ensure partner rank is valid
+        if p2p_partner_rank < 0 or p2p_partner_rank >= world_size:
+            raise ValueError(f"EC-CHECK: Invalid P2P partner rank {p2p_partner_rank} for rank {my_rank}")
+        
+        logger.debug(f"EC-CHECK: Rank {my_rank} P2P partner is Rank {p2p_partner_rank}")
+        return p2p_partner_rank
+
     def _init_eccheck_buffers(self):
         """Initialize EC-CHECK buffers during C++ module initialization.
         
@@ -846,6 +924,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         # Allocate parity buffers for XOR computation results
         self.eccheck_parity_buffers = self._allocate_parity_buffers()
+        
+        # Allocate P2P buffers (will be allocated after metadata exchange)
+        self.eccheck_p2p_buffers = None
         
         # Initialize free buffer queues for Phase 3
         import queue
@@ -938,6 +1019,67 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         
         return (recv_buffer_thread1, recv_buffer_thread2)
+
+    def _allocate_p2p_buffers(self, global_registry):
+        """
+        Allocate TWO large continuous buffers for P2P stage:
+        - Buffer 1: Store own data/parity (based on P2P role)
+        - Buffer 2: Store P2P partner's data/parity
+        
+        Buffer sizes are determined from metadata in global_registry.
+        This is called after metadata exchange when data sizes are known.
+        
+        Args:
+            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
+            
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary with 'own_buffer' and 'partner_buffer'
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        p2p_partner_rank = self._get_p2p_partner_rank(rank, world_size)
+        
+        # ===== Get own data size from metadata =====
+        own_metadata = global_registry.rank_metadata.get(rank, [])
+        own_total_size = sum(meta.size_bytes for meta in own_metadata)
+        
+        # ===== Get P2P partner's data size from metadata =====
+        partner_metadata = global_registry.rank_metadata.get(p2p_partner_rank, [])
+        partner_total_size = sum(meta.size_bytes for meta in partner_metadata)
+        
+        # ===== Align both sizes to buffer_size (64MB) =====
+        own_aligned_size = ((own_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
+        partner_aligned_size = ((partner_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
+        
+        logger.info(
+            f"EC-CHECK: Allocating P2P buffers based on metadata\n"
+            f"  P2P partner rank: {p2p_partner_rank}\n"
+            f"  Own data size: {own_total_size / (1024**3):.2f} GB "
+            f"(aligned: {own_aligned_size / (1024**3):.2f} GB)\n"
+            f"  Partner data size: {partner_total_size / (1024**3):.2f} GB "
+            f"(aligned: {partner_aligned_size / (1024**3):.2f} GB)\n"
+            f"  Total P2P memory: {(own_aligned_size + partner_aligned_size) / (1024**3):.2f} GB"
+        )
+        
+        # ===== Allocate two large continuous buffers =====
+        # Buffer 1: Own data/parity
+        own_buffer = torch.empty(own_aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+        
+        # Buffer 2: Partner's data/parity
+        partner_buffer = torch.empty(partner_aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+        
+        logger.info(
+            f"EC-CHECK: Allocated P2P buffers:\n"
+            f"  Own buffer: {own_aligned_size / (1024**3):.2f} GB "
+            f"({own_aligned_size / (1024**2):.0f} MB)\n"
+            f"  Partner buffer: {partner_aligned_size / (1024**3):.2f} GB "
+            f"({partner_aligned_size / (1024**2):.0f} MB)"
+        )
+        
+        return {
+            'own_buffer': own_buffer,
+            'partner_buffer': partner_buffer
+        }
 
     def _allocate_parity_buffers(self):
         """Allocate parity buffers for XOR computation results.
@@ -1166,6 +1308,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             writer.eccheck_global_registry = self.eccheck_global_registry
             # Pass the updated receive buffers (TWO large buffers allocated based on peer size)
             writer.eccheck_recv_encoding_buffers = self.eccheck_recv_encoding_buffers
+            # Pass P2P buffers (own_buffer and partner_buffer)
+            writer.eccheck_p2p_buffers = self.eccheck_p2p_buffers
             
             # In EC-CHECK mode, call prepare_write_data to create write_buckets
             # It will use the metadata we just prepared
@@ -1362,6 +1506,13 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         buffer_alloc_time = time() - start
         logger.info(f"EC-CHECK: Receive buffer allocation completed in {buffer_alloc_time:.2f}s")
         
+        # Step 6: Allocate P2P buffers based on metadata
+        start = time()
+        if self.eccheck_p2p_buffers is None:
+            self.eccheck_p2p_buffers = self._allocate_p2p_buffers(self.eccheck_global_registry)
+        p2p_buffer_alloc_time = time() - start
+        logger.info(f"EC-CHECK: P2P buffer allocation completed in {p2p_buffer_alloc_time:.2f}s")
+        
         total_time = time() - start_total
         logger.info(
             f"EC-CHECK: Preparation completed in {total_time:.2f}s\n"
@@ -1369,7 +1520,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             f"  Preallocation: {prealloc_time:.2f}s\n"
             f"  Bucket prep: {bucket_time:.2f}s\n"
             f"  Metadata exchange: {metadata_time:.2f}s\n"
-            f"  Buffer allocation: {buffer_alloc_time:.2f}s"
+            f"  Receive buffer allocation: {buffer_alloc_time:.2f}s\n"
+            f"  P2P buffer allocation: {p2p_buffer_alloc_time:.2f}s"
         )
         
     def _broadcast_and_exchange_metadata(self):

@@ -44,7 +44,7 @@ cp "$TEMP_DIR"/eccheck_native*.pyd . 2>/dev/null || true
 
 # Clean up
 rm -rf "$TEMP_DIR"
-
+<< EOF
 # Test the built module
 echo "Testing built module..."
 python3 -c "
@@ -76,3 +76,4 @@ except Exception as e:
 
 echo "✅ EC-CHECK native module built successfully!"
 echo "Module location: $(pwd)/eccheck_native*.so"
+EOF

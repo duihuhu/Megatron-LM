@@ -11,7 +11,6 @@
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
-#include <fstream>
 #include <chrono>
 #include <isa-l/erasure_code.h>
 #include <isa-l/raid.h>
@@ -20,6 +19,15 @@
 // NCCL includes
 #ifdef NCCL_AVAILABLE
 #include <nccl.h>
+
+// ========== Global function: Generate NCCL ID ==========
+// This function can be called without creating an instance
+std::vector<uint8_t> generate_nccl_id() {
+    ncclUniqueId nccl_id;
+    ncclGetUniqueId(&nccl_id);
+    const uint8_t* id_bytes = reinterpret_cast<const uint8_t*>(&nccl_id);
+    return std::vector<uint8_t>(id_bytes, id_bytes + sizeof(ncclUniqueId));
+}
 #endif
 
 class ECCHECKNative {
@@ -172,6 +180,10 @@ private:
     bool nccl_thread2_initialized_;
 #endif
 
+    // NCCL IDs stored as member variables (passed from Python via broadcast)
+    std::vector<uint8_t> nccl_id_thread1_;
+    std::vector<uint8_t> nccl_id_thread2_;
+    
     // Synchronization for NCCL initialization
     std::atomic<bool> nccl_thread1_init_completed_;
     std::atomic<bool> nccl_thread2_init_completed_;
@@ -225,29 +237,18 @@ private:
     
     void init_nccl_thread1() {
 #ifdef NCCL_AVAILABLE
-        ncclUniqueId nccl_id;
-        std::string id_file = "/tmp/eccheck_nccl_thread1_id.txt";
-        
-        if (rank_ == 0) {
-            // Rank 0 creates NCCL ID and writes to file
-            ncclGetUniqueId(&nccl_id);
-            std::ofstream outfile(id_file, std::ios::binary);
-            outfile.write(reinterpret_cast<char*>(&nccl_id), sizeof(ncclUniqueId));
-            outfile.close();
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread1 NCCL ID written to " << id_file << std::endl;
-        } else {
-            // Other ranks read NCCL ID from file (with retry)
-            for (int retry = 0; retry < 100; ++retry) {
-                std::ifstream infile(id_file, std::ios::binary);
-                if (infile.good()) {
-                    infile.read(reinterpret_cast<char*>(&nccl_id), sizeof(ncclUniqueId));
-                    infile.close();
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread1 NCCL ID read from " << id_file << std::endl;
+        // Read NCCL ID from member variable (set by constructor)
+        if (nccl_id_thread1_.size() != sizeof(ncclUniqueId)) {
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid NCCL ID size for thread1: " 
+                      << nccl_id_thread1_.size() << " (expected " << sizeof(ncclUniqueId) << ")" << std::endl;
+            nccl_thread1_initialized_ = false;
+            nccl_thread1_init_completed_ = true;
+            nccl_init_cv_.notify_all();
+            return;
         }
+        
+        ncclUniqueId nccl_id;
+        std::memcpy(&nccl_id, nccl_id_thread1_.data(), sizeof(ncclUniqueId));
         
         // Initialize NCCL communicator
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread1 calling ncclCommInitRank..." << std::endl;
@@ -274,29 +275,18 @@ private:
     
     void init_nccl_thread2() {
 #ifdef NCCL_AVAILABLE
-        ncclUniqueId nccl_id;
-        std::string id_file = "/tmp/eccheck_nccl_thread2_id.txt";
-        
-        if (rank_ == 0) {
-            // Rank 0 creates NCCL ID and writes to file
-            ncclGetUniqueId(&nccl_id);
-            std::ofstream outfile(id_file, std::ios::binary);
-            outfile.write(reinterpret_cast<char*>(&nccl_id), sizeof(ncclUniqueId));
-            outfile.close();
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread2 NCCL ID written to " << id_file << std::endl;
-        } else {
-            // Other ranks read NCCL ID from file (with retry)
-            for (int retry = 0; retry < 100; ++retry) {
-                std::ifstream infile(id_file, std::ios::binary);
-                if (infile.good()) {
-                    infile.read(reinterpret_cast<char*>(&nccl_id), sizeof(ncclUniqueId));
-                    infile.close();
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread2 NCCL ID read from " << id_file << std::endl;
+        // Read NCCL ID from member variable (set by constructor)
+        if (nccl_id_thread2_.size() != sizeof(ncclUniqueId)) {
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid NCCL ID size for thread2: " 
+                      << nccl_id_thread2_.size() << " (expected " << sizeof(ncclUniqueId) << ")" << std::endl;
+            nccl_thread2_initialized_ = false;
+            nccl_thread2_init_completed_ = true;
+            nccl_init_cv_.notify_all();
+            return;
         }
+        
+        ncclUniqueId nccl_id;
+        std::memcpy(&nccl_id, nccl_id_thread2_.data(), sizeof(ncclUniqueId));
         
         // Initialize NCCL communicator
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread2 calling ncclCommInitRank..." << std::endl;
@@ -1034,28 +1024,6 @@ private:
     }
 
     void start_pipeline() {
-        // Clean up any existing NCCL ID files before starting
-        std::string thread1_id_file = "/tmp/eccheck_nccl_thread1_id.txt";
-        std::string thread2_id_file = "/tmp/eccheck_nccl_thread2_id.txt";
-        
-        // Check and remove thread1 ID file if exists
-        std::ifstream file1(thread1_id_file);
-        if (file1.good()) {
-            file1.close();
-            std::remove(thread1_id_file.c_str());
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] Removed existing thread1 ID file" << std::endl;
-        }
-        
-        // Check and remove thread2 ID file if exists
-        std::ifstream file2(thread2_id_file);
-        if (file2.good()) {
-            file2.close();
-            std::remove(thread2_id_file.c_str());
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] Removed existing thread2 ID file" << std::endl;
-        }
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] NCCL ID file cleanup completed" << std::endl;
-        
         // Start encoding threads
         encoder_thread_1_ = std::thread(&ECCHECKNative::encoder_worker_1, this);
         encoder_thread_2_ = std::thread(&ECCHECKNative::encoder_worker_2, this);
@@ -1074,8 +1042,12 @@ private:
     }
 
 public:
-    ECCHECKNative(int rank, int world_size, int paired_rank) 
-        : rank_(rank), world_size_(world_size), paired_rank_(paired_rank), 
+    ECCHECKNative(int rank, int world_size, int paired_rank,
+                  const std::vector<uint8_t>& nccl_id_thread1,
+                  const std::vector<uint8_t>& nccl_id_thread2) 
+        : rank_(rank), world_size_(world_size), paired_rank_(paired_rank),
+          nccl_id_thread1_(nccl_id_thread1),
+          nccl_id_thread2_(nccl_id_thread2),
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_1_completed_(false), send_worker_2_completed_(false),
           recv_worker_1_completed_(false), recv_worker_2_completed_(false),
@@ -1280,8 +1252,15 @@ public:
 };
 
 PYBIND11_MODULE(eccheck_native, m) {
+    // Module-level function: Generate NCCL ID (can be called without creating an instance)
+#ifdef NCCL_AVAILABLE
+    m.def("generate_nccl_id", &generate_nccl_id, 
+          "Generate a new NCCL unique ID. Returns a list of uint8_t bytes (128 bytes).");
+#endif
+    
+    // Class definition
     pybind11::class_<ECCHECKNative>(m, "ECCHECKNative")
-        .def(pybind11::init<int, int, int>())
+        .def(pybind11::init<int, int, int, const std::vector<uint8_t>&, const std::vector<uint8_t>&>())
         .def("set_buffer_addresses", &ECCHECKNative::set_buffer_addresses)
         .def("reset_encoding_completion_flags", &ECCHECKNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECCHECKNative::wait_for_encoding_completion)

@@ -133,7 +133,6 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eccheck_data_buffers = None  # List of data buffers
         self.eccheck_encoding_buffers = None  # List of encoding buffers
         self.eccheck_recv_encoding_buffers = None  # Tuple of two large receive buffers (thread1, thread2)
-        self.eccheck_p2p_buffers = None  # Dict with 'own_buffer' and 'partner_buffer' for P2P stage
         self.eccheck_parity_buffers = None  # List of parity buffers for XOR results
         
         # EC-CHECK buffer poller thread (persistent, created once)
@@ -957,6 +956,20 @@ class FileSystemWriterAsync(FileSystemWriter):
         recv_buffer_base_addr_thread2 = int(recv_buffer_thread2.data_ptr())
         recv_buffer_offset_thread1 = 0  # Current offset in thread1's receive buffer
         recv_buffer_offset_thread2 = 0  # Current offset in thread2's receive buffer
+        
+        # Get base addresses of P2P buffers (own_buffer and partner_buffer)
+        if self.eccheck_p2p_buffers is not None:
+            own_buffer = self.eccheck_p2p_buffers['own_buffer']
+            partner_buffer = self.eccheck_p2p_buffers['partner_buffer']
+            p2p_own_buffer_base_addr = int(own_buffer.data_ptr())
+            p2p_partner_buffer_base_addr = int(partner_buffer.data_ptr())
+            p2p_own_buffer_offset = 0  # Current offset in own_buffer
+            p2p_partner_buffer_offset = 0  # Current offset in partner_buffer
+        else:
+            p2p_own_buffer_base_addr = 0
+            p2p_partner_buffer_base_addr = 0
+            p2p_own_buffer_offset = 0
+            p2p_partner_buffer_offset = 0
 
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
@@ -999,17 +1012,31 @@ class FileSystemWriterAsync(FileSystemWriter):
             recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2
             recv_buffer_offset_thread2 += recv_chunk_size  # 按照实际大小移动
             
+            # Calculate P2P write addresses (similar to recv addresses)
+            # Both thread1 and thread2 use the same P2P addresses for the same chunk
+            if p2p_own_buffer_base_addr != 0:
+                p2p_own_write_addr = p2p_own_buffer_base_addr + p2p_own_buffer_offset
+                p2p_partner_write_addr = p2p_partner_buffer_base_addr + p2p_partner_buffer_offset
+                p2p_own_buffer_offset += take
+                p2p_partner_buffer_offset += take
+            else:
+                p2p_own_write_addr = 0
+                p2p_partner_write_addr = 0
+            
             # Submit to BOTH encoding threads with their respective receive addresses and parity buffers
             # The C++ threads will mark the data buffer as copied immediately after reading
             # Once both threads mark it as copied, the data buffer will be released
             # recv_addr will be used by recv_worker to receive peer data
             # parity_addr will be used by XOR worker to store XOR results
+            # p2p_own_write_addr and p2p_partner_write_addr will be used by P2P worker after XOR
             self._eccheck_native.submit_data_for_encoding_thread1(
-                cur_buffer_addr, take, enc_addr1, recv_addr_thread1, recv_chunk_size, parity_addr1
+                cur_buffer_addr, take, enc_addr1, recv_addr_thread1, recv_chunk_size, parity_addr1,
+                p2p_own_write_addr, p2p_partner_write_addr
             )
             
             self._eccheck_native.submit_data_for_encoding_thread2(
-                cur_buffer_addr, take, enc_addr2, recv_addr_thread2, recv_chunk_size, parity_addr2
+                cur_buffer_addr, take, enc_addr2, recv_addr_thread2, recv_chunk_size, parity_addr2,
+                p2p_own_write_addr, p2p_partner_write_addr
             )
             
             src_pos += take
@@ -1020,9 +1047,9 @@ class FileSystemWriterAsync(FileSystemWriter):
             f"  Total receive buffer used: {(recv_buffer_offset_thread1 + recv_buffer_offset_thread2) / (1024**3):.2f} GB"
         )
         
-        # Mark end of stream for both encoders
-        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0)  # Sentinel for thread 1
-        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0)  # Sentinel for thread 2
+        # Mark end of stream for both encoders (with P2P addresses set to 0)
+        self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0, 0, 0)  # Sentinel for thread 1
+        self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0, 0, 0)  # Sentinel for thread 2
         
         # Wait for both encoding threads to complete
         # Buffer poller is already active (activated at function start)
@@ -1131,14 +1158,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                 "after _prepare_eccheck_data completes."
             )
         
-        if not hasattr(self, 'eccheck_p2p_buffers') or self.eccheck_p2p_buffers is None:
-            raise RuntimeError(
-                "EC-CHECK: P2P buffers not set. Should be passed from strategy "
-                "after _prepare_eccheck_data completes."
-            )
-        
         logger.info(
-            "EC-CHECK: Using metadata, receive buffers, and P2P buffers from strategy (already allocated in torch.py)"
+            "EC-CHECK: Using metadata and receive buffers from strategy (already allocated in torch.py)"
         )
         
         # Execute Phase 3: Tensor data exchange and encoding

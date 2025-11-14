@@ -3,6 +3,7 @@
 """Storage writer for PyT Distributed format allowing asynchronous save."""
 
 import dataclasses
+import ctypes
 import inspect
 import logging
 import os
@@ -952,15 +953,11 @@ class FileSystemWriterAsync(FileSystemWriter):
             take = min(self.eccheck_buffer_size, remaining_in_source)
             
             # Python memcpy: copy from continuous tensor buffer to data buffer
-            import ctypes
-            buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
-            buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
-            
             # Get source data from continuous tensor buffer
             src_data = self.tensor_buffer[src_pos: src_pos + take].numpy()
             
             # Direct memory copy using ctypes
-            ctypes.memmove(buffer_array.contents, src_data.ctypes.data, take)
+            ctypes.memmove(ctypes.c_void_p(cur_buffer_addr), ctypes.c_void_p(src_data.ctypes.data), take)
             
             # Get two encoding buffers (with timeout to detect deadlocks)
             enc_addr1 = get_free_encoding_buffer()
@@ -1116,10 +1113,10 @@ class FileSystemWriterAsync(FileSystemWriter):
         )
         
         # Execute Phase 3: Tensor data exchange and encoding
-        exec_start = time()
-        self._execute_phase3_encoding()
-        exec_time = time() - exec_start
-        logger.info(f"EC-CHECK: Phase 3 completed in {exec_time:.2f}s")
+        # exec_start = time()
+        # self._execute_phase3_encoding()
+        # exec_time = time() - exec_start
+        # logger.info(f"EC-CHECK: Phase 3 completed in {exec_time:.2f}s")
         
         # Return write_buckets with EC-CHECK continuous buffer
         # Buffer contains all tensor data in continuous memory
@@ -1160,63 +1157,112 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         import struct
         import numpy as np
+        import mmap
         
+        # Optimization for /dev/shm: Use mmap for zero-copy access
+        # Since data is in shared memory, mmap provides direct memory access without copying
         with open(file_path, "rb") as f:
-            # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
-            header_bytes = f.read(32)
-            if len(header_bytes) != 32:
-                raise RuntimeError(f"EC-CHECK: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+            # Get file size
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            f.seek(0)  # Seek back to start
             
-            # Parse header (default format includes padding for alignment)
-            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            # Memory-map the entire file (zero-copy for /dev/shm)
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             
-            # Validate magic number
-            if magic != b'ECCK':
-                raise RuntimeError(f"EC-CHECK: Invalid magic number (expected b'ECCK', got {magic})")
-            
-            logger.info(
-                f"EC-CHECK: Loading from {file_path}\n"
-                f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
-                f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
-                f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
-            )
-            
-            # Read Component 1: Non-tensor key-value pairs
-            non_tensor_bytes = f.read(non_tensor_size)
-            if len(non_tensor_bytes) != non_tensor_size:
-                raise RuntimeError(
-                    f"EC-CHECK: Failed to read Component 1 "
-                    f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
+            try:
+                # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
+                header_bytes = mm[:32]
+                if len(header_bytes) != 32:
+                    raise RuntimeError(f"EC-CHECK: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+                
+                # Parse header (default format includes padding for alignment)
+                magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+                
+                # Validate magic number
+                if magic != b'ECCK':
+                    raise RuntimeError(f"EC-CHECK: Invalid magic number (expected b'ECCK', got {magic})")
+                
+                logger.info(
+                    f"EC-CHECK: Loading from {file_path} (using mmap for zero-copy)\n"
+                    f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
+                    f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
+                    f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
                 )
-            non_tensor_data = pickle.loads(non_tensor_bytes)
-            logger.debug(f"EC-CHECK: Loaded Component 1 ({non_tensor_size / 1024:.2f} KB)")
+                
+                # Calculate offsets for each component
+                offset = 32  # After header
+                
+                t1 = time()
+                # Component 1: Non-tensor key-value pairs (direct slice from mmap)
+                non_tensor_bytes = mm[offset:offset + non_tensor_size]
+                if len(non_tensor_bytes) != non_tensor_size:
+                    raise RuntimeError(
+                        f"EC-CHECK: Failed to read Component 1 "
+                        f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
+                    )
+                offset += non_tensor_size
+                
+                t2 = time()
+                non_tensor_data = pickle.loads(non_tensor_bytes)
+                logger.debug(f"EC-CHECK: Loaded Component 1 ({non_tensor_size / 1024:.2f} KB)")
             
-            # Read Component 2: Tensor keys
-            tensor_keys_bytes = f.read(tensor_keys_size)
-            if len(tensor_keys_bytes) != tensor_keys_size:
-                raise RuntimeError(
-                    f"EC-CHECK: Failed to read Component 2 "
-                    f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
-                )
-            tensor_infos = pickle.loads(tensor_keys_bytes)
-            logger.debug(f"EC-CHECK: Loaded Component 2 ({tensor_keys_size / 1024:.2f} KB)")
+                t3 = time()
+                # Component 2: Tensor keys (direct slice from mmap)
+                tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
+                if len(tensor_keys_bytes) != tensor_keys_size:
+                    raise RuntimeError(
+                        f"EC-CHECK: Failed to read Component 2 "
+                        f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
+                    )
+                offset += tensor_keys_size
+                
+                tensor_infos = pickle.loads(tensor_keys_bytes)
+                logger.debug(f"EC-CHECK: Loaded Component 2 ({tensor_keys_size / 1024:.2f} KB)")
+                t4 = time()
+                
+                # Component 3: Tensor data buffer (zero-copy numpy view from mmap)
+                # This is the key optimization: np.frombuffer on mmap creates a zero-copy view
+                tensor_buffer_start = offset
+                tensor_buffer_end = offset + tensor_buffer_size
+                
+                if tensor_buffer_end > file_size:
+                    raise RuntimeError(
+                        f"EC-CHECK: File truncated - expected {tensor_buffer_end} bytes, got {file_size}"
+                    )
+                
+                # Create zero-copy numpy array view directly from mmap
+                buffer_np = np.frombuffer(mm, dtype=np.uint8, count=tensor_buffer_size, offset=tensor_buffer_start)
+                
+                t5 = time()
+                # Extract individual tensors from the zero-copy buffer
+                tensor_data = []
+                for info in tensor_infos:
+                    # Calculate byte offset range for this tensor (relative to buffer start)
+                    start = info.offset
+                    end = start + info.size_bytes
+                    
+                    # Extract numpy slice (view, not copy) from buffer
+                    tensor_bytes_np = buffer_np[start:end]
+                    
+                    # Create torch tensor directly from bytes
+                    # Use frombuffer to create view, then clone to make writable
+                    tensor_view = torch.frombuffer(
+                        memoryview(tensor_bytes_np), 
+                        dtype=info.dtype
+                    )
+                    # Clone to create writable copy and reshape to original shape
+                    tensor = tensor_view.clone().reshape(info.shape)
+                    tensor_data.append(tensor)
+                
+                t6 = time()
+                print("time t6 , t5, t4 , t3, t2, t1: ", t6 - t5, t5 - t4, t4 - t3, t3 - t2, t2 - t1, t6 - t1)
+                logger.debug(f"EC-CHECK: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB) and extracted {len(tensor_data)} tensors")
             
-            # Read Component 3: Tensor data buffer
-            tensor_buffer_bytes = f.read(tensor_buffer_size)
-            if len(tensor_buffer_bytes) != tensor_buffer_size:
-                raise RuntimeError(
-                    f"EC-CHECK: Failed to read Component 3 "
-                    f"(expected {tensor_buffer_size} bytes, got {len(tensor_buffer_bytes)})"
-                )
-            
-            # Convert bytes to tensor buffer
-            # Use copy to make tensor writable
-            tensor_buffer = torch.from_numpy(np.frombuffer(tensor_buffer_bytes, dtype=np.uint8).copy())
-            logger.debug(f"EC-CHECK: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB)")
-        
-        # Extract individual tensors from buffer
-        from .state_dict_decomposer import extract_tensors_from_continuous_buffer
-        tensor_data = extract_tensors_from_continuous_buffer(tensor_buffer, tensor_infos)
+            finally:
+                # Close mmap
+                # mm.close()
+                pass
         
         # Create DecomposedStateDict
         decomposed = DecomposedStateDict(

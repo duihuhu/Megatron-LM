@@ -67,9 +67,9 @@ from .resharding import (
     restore_nd_flattened_tensors_formulation,
 )
 from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
-from .state_dict_decomposer import DecomposedStateDict, TensorInfo
+from .state_dict_decomposer import DecomposedStateDict, TensorInfo, reconstruct_state_dict
 from time import time
-
+from .filesystem_async import FileSystemWriterAsync
 try:
     if not torch.cuda.is_available():
         raise ImportError
@@ -91,9 +91,14 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 MSC_PREFIX = "msc://"
 
 _metadata_fn: str = ".metadata"
+_TORCH_STRATEGIES_REGISTERED = False
 
 
 def register_default_torch_strategies():
+    global _TORCH_STRATEGIES_REGISTERED
+
+    if _TORCH_STRATEGIES_REGISTERED:
+        return
     """Register default strategies related to PyT Distributed backend."""
     register_default_strategy(
         StrategyAction.LOAD_SHARDED, 'torch_dist', 1, TorchDistLoadShardedStrategy()
@@ -101,6 +106,7 @@ def register_default_torch_strategies():
     register_default_strategy(
         StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy('torch_dist', 1)
     )
+    _TORCH_STRATEGIES_REGISTERED = True
 
 
 logger = getLogger(__name__)
@@ -701,19 +707,44 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.separation_hint = separation_hint
 
         self.validated_loaded_metadata_reuse = False
+    
+        from megatron.training import get_args as input_args
+        args = input_args()
+        self.use_eccheck = args.use_eccheck
         
-        # Initialize EC-CHECK if enabled
+        # Initialize EC-CHECK configuration parameters (even if not enabled, for safety)
+        self.eccheck_data_buffers_count = 12
+        self.eccheck_encoding_buffers_count = 24
+        self.eccheck_buffer_size = 64 * 1024 * 1024  # 64MB
+        self.eccheck_pin_memory = True
+        self.eccheck_preallocate_cpu_buffer = True
+        self.eccheck_use_continuous_buffer = True
+        
+        # Initialize EC-CHECK state variables
+        self.decomposed_state_dict = None
+        self.preallocated_cpu_buffer = None
+        self.eccheck_serialized_metadata = None
+        self.eccheck_global_registry = None
+        self.eccheck_data_buffers = None
+        self.eccheck_encoding_buffers = None
+        self.eccheck_recv_encoding_buffers = None
+        self.eccheck_parity_buffers = None
+        self._free_data_buffer_queue = None
+        self._free_encoding_buffer_queue = None
+        self._buffer_poller_thread = None
+        self._buffer_poller_stop_event = None
+        self._buffer_poller_active_event = None
         self._eccheck_native = None
-        self._init_eccheck_if_enabled()
+        
+        if self.use_eccheck:
+            # Initialize EC-CHECK if enabled
+            self._init_eccheck_if_enabled()
 
     def _init_eccheck_if_enabled(self):
         """Initialize EC-CHECK C++ module if enabled and distributed environment is ready."""
         try:
-            from megatron.training import get_args as input_args
-            args = input_args()
-            self.use_eccheck = True
-            if not getattr(args, 'use_eccheck', False):
-                return
+            # if not getattr(args, 'use_eccheck', False):
+            #     return
                 
             # Check if distributed environment is initialized
             if not torch.distributed.is_initialized():
@@ -796,6 +827,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
     def _get_paired_rank(self, my_rank: int, world_size: int) -> int:
         """Get the paired rank for parity exchange."""
         if world_size % 2 != 0:
+            return my_rank
             raise ValueError(f"EC-CHECK: World size must be even for pairing, got {world_size}")
         
         half_size = world_size // 2
@@ -816,36 +848,18 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         Note: Only allocates data and encoding buffers at initialization.
         Receive and parity buffers will be allocated by FileSystemWriterAsync
         after metadata exchange, when peer data sizes are known.
+        
+        Configuration parameters are already set in __init__.
         """
         rank = torch.distributed.get_rank()
         logger.info("EC-CHECK: Initializing buffers for EC-CHECK (data and encoding only)")
         print(f"EC-CHECK: Initializing buffers for EC-CHECK (rank={rank}, data and encoding only)")
-        
-        # EC-CHECK configuration parameters
-        self.eccheck_data_buffers_count = 12
-        self.eccheck_encoding_buffers_count = 24  # data_count * m (12 * 2)
-        self.eccheck_buffer_size = 64 * 1024 * 1024  # 64MB
-        self.eccheck_pin_memory = True
-        
-        self.eccheck_preallocate_cpu_buffer = True  # Preallocate CPU buffer for tensor data
-        self.eccheck_use_continuous_buffer = True  # Use continuous buffer for tensor data
-        
-        # Initialize state for EC-CHECK preparation
-        self.decomposed_state_dict = None
-        self.preallocated_cpu_buffer = None
-        self.eccheck_serialized_metadata = None
         
         # Allocate data buffers for storing original tensor data
         self.eccheck_data_buffers = self._allocate_data_buffers()
         
         # Allocate encoding buffers for encoded packets
         self.eccheck_encoding_buffers = self._allocate_encoding_buffers()
-        
-        # Allocate receive buffers for peer encoded packets
-        self.eccheck_recv_encoding_buffers = None
-        
-        # Allocate parity buffers for XOR computation results
-        self.eccheck_parity_buffers = None
         
         # Initialize free buffer queues for Phase 3
         import queue
@@ -1084,15 +1098,23 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         from megatron.training import get_args as input_args
         args = input_args()
         # Use PyT saving mechanism
-        writer = FileSystemWriterAsync(
-            checkpoint_dir,
-            separation_hint=self.separation_hint,
-            thread_count=self.thread_count,
-            use_msc=MultiStorageClientFeature.is_enabled(),
-            use_eccheck=args.use_eccheck,
-            eccheck_native=self._eccheck_native,  # Pass pre-initialized C++ module
-            eccheck_buffers=self._get_eccheck_buffers(),  # Pass pre-allocated buffers
-        )
+        if self.use_eccheck:
+            writer = FileSystemWriterAsync(
+                checkpoint_dir,
+                separation_hint=self.separation_hint,
+                thread_count=self.thread_count,
+                use_msc=MultiStorageClientFeature.is_enabled(),
+                use_eccheck=args.use_eccheck,
+                eccheck_native=self._eccheck_native,  # Pass pre-initialized C++ module
+                eccheck_buffers=self._get_eccheck_buffers(),  # Pass pre-allocated buffers
+            )
+        else:
+            writer = FileSystemWriterAsync(
+                checkpoint_dir,
+                separation_hint=self.separation_hint,
+                thread_count=self.thread_count,
+                use_msc=MultiStorageClientFeature.is_enabled(),
+            )
 
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
@@ -1133,6 +1155,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             cached_ckpt_structure=args_cached_plans,
             loaded_all_plans=loaded_all_plans,
         )
+        rank = torch.distributed.get_rank()
         # EC-CHECK mode: decompose state_dict and preallocate CPU memory
         if self.use_eccheck:
             self._prepare_eccheck_data(self.cached_central_plan, planner)
@@ -1152,8 +1175,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             writer.prepare_write_data(self.cached_central_plan, planner)
             end = time()
             logger.debug(f"{time()} rank: {rank}, write(async) time: {end - start}")
-            
-        rank = torch.distributed.get_rank()
+        
         if self.use_cached_ckpt_structure:
             if (
                 loaded_all_plans
@@ -1663,6 +1685,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
     def __init__(self):
         self.cached_global_metadata: Optional[Metadata] = None
+        from megatron.training import get_args as input_args
+        args = input_args()
+        self.use_eccheck = args.use_eccheck
         super().__init__()
     
     def _is_eccheck_checkpoint(self, checkpoint_dir: Path) -> bool:
@@ -1739,9 +1764,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         Returns:
             StateDict: loaded state dict with structure matching sharded_state_dict
         """
-        from .filesystem_async import FileSystemWriterAsync
-        from .state_dict_decomposer import reconstruct_state_dict
-        
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         
         # Find the EC-CHECK file for this rank
@@ -1756,12 +1778,13 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             )
         
         logger.info(f"Loading EC-CHECK checkpoint from {eccheck_file}")
-        
+        t1 = time()
         # Load the decomposed state dict from file
         decomposed = FileSystemWriterAsync.load_eccheck_components_from_file(
             str(eccheck_file)
         )
-        
+        t2 = time()
+        print(f"load eccheck components from file time: {t2 - t1} seconds")
         # Build index map from loaded tensor_infos
         # Map: (fqn, global_offset) → (tensor_info, tensor_data)
         logger.info(f"EC-CHECK: Building index map from {len(decomposed.tensor_infos)} tensor infos")
@@ -1941,10 +1964,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             checkpoint_dir (Path): checkpoint directory
 
         Returns: loaded state dict
-        """
+        """       
         # Check if this is an EC-CHECK format checkpoint
-        if self._is_eccheck_checkpoint(checkpoint_dir):
+        if self.use_eccheck and self._is_eccheck_checkpoint(checkpoint_dir):
             logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
+            
             return self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
         
         # Apply N-D tensors resharding
@@ -1979,6 +2003,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         pyt_state_dict = mcore_to_pyt_state_dict(
             sharded_state_dict, True, load_legacy_1d_flatten_tensors=has_legacy_1d_flattened_tensors
         )
+        t1 = time()
         # Load PyT Distributed format
         fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
         checkpoint.load_state_dict(
@@ -1989,7 +2014,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
             ),
         )
-
+        t2 = time()
+        print("time t2 , t1: ", t2 - t1)
         self.cached_global_metadata = (
             fsr.read_metadata()
         )  # no storage interaction thanks to caching

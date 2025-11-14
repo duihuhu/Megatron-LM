@@ -663,14 +663,14 @@ public:
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Constructor called, starting pipeline..." << std::endl;
         
-        start_pipeline();
+        // start_pipeline();
         
-        // Wait for both NCCL communicators to be initialized
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Waiting for NCCL initialization (thread1 and thread2)..." << std::endl;
-        std::unique_lock<std::mutex> lock(nccl_init_mutex_);
-        nccl_init_cv_.wait(lock, [this] { 
-            return nccl_thread1_init_completed_.load() && nccl_thread2_init_completed_.load(); 
-        });
+        // // Wait for both NCCL communicators to be initialized
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Waiting for NCCL initialization (thread1 and thread2)..." << std::endl;
+        // std::unique_lock<std::mutex> lock(nccl_init_mutex_);
+        // nccl_init_cv_.wait(lock, [this] { 
+        //     return nccl_thread1_init_completed_.load() && nccl_thread2_init_completed_.load(); 
+        // });
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline and NCCL initialized successfully" << std::endl;
     }

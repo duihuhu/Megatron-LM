@@ -31,6 +31,10 @@ from .global_vars import get_args
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
+from megatron.core.dist_checkpointing.strategies.base import (
+    StrategyAction,
+    get_default_strategy,
+)
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from . import wandb_utils
 
@@ -55,6 +59,7 @@ _CHECKPOINT_VERSION = None
 
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
+_TORCH_DIST_STRATEGY_PREINITIALIZED = False
 
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
@@ -67,6 +72,32 @@ def set_checkpoint_version(value):
 def get_checkpoint_version():
     global _CHECKPOINT_VERSION
     return _CHECKPOINT_VERSION
+
+
+def maybe_preinitialize_torch_dist_save_strategy():
+    """提前初始化 TorchDist 保存策略以避免训练过程中阻塞。"""
+    global _TORCH_DIST_STRATEGY_PREINITIALIZED
+
+    if _TORCH_DIST_STRATEGY_PREINITIALIZED:
+        return
+
+    args = get_args()
+    if not getattr(args, 'use_eccheck', False):
+        return
+
+    if args.ckpt_format != 'torch_dist':
+        return
+
+    if not torch.distributed.is_initialized():
+        logger.debug('EC-CHECK: 分布式环境尚未初始化，跳过保存策略预初始化')
+        return
+
+    try:
+        get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+        _TORCH_DIST_STRATEGY_PREINITIALIZED = True
+        logger.info('EC-CHECK: 已在训练前预初始化 TorchDist 保存策略')
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning('EC-CHECK: 预初始化 TorchDist 保存策略失败: %s', exc)
 
 
 def check_checkpoint_args(checkpoint_args):
@@ -924,6 +955,7 @@ def _load_global_dist_base_checkpoint(
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
+
     state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 

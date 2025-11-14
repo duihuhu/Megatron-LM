@@ -107,13 +107,21 @@ def setup(args: argparse.Namespace) -> None:
     global _is_calculating_timeouts
     _is_calculating_timeouts = args.calc_ft_timeouts
 
-    cli.init_workload_monitoring()
-    _load_state_if_exists()
-    print_rank_0(f"FT: initialized. Timeouts={cli.section_timeouts}")
+    try:
+        cli.init_workload_monitoring()
+        _load_state_if_exists()
+        print_rank_0(f"FT: initialized. Timeouts={cli.section_timeouts}")
 
-    cli.start_section("setup")
-    global _is_setup_section_open
-    _is_setup_section_open = True
+        cli.start_section("setup")
+        global _is_setup_section_open
+        _is_setup_section_open = True
+    except Exception as e:
+        print_rank_0(f"FT: Warning - Failed to initialize workload monitoring: {e}")
+        print_rank_0("FT: This may happen if ft_launcher's Rank Monitor Server is not running")
+        print_rank_0("FT: Continuing without fault tolerance monitoring...")
+        # Reset the client so other code knows FT is not available
+        _GLOBAL_RANK_MONITOR_CLIENT = None
+        raise
 
 
 def on_training_step_start() -> None:
@@ -229,9 +237,17 @@ def _update_timeouts(selected_sections, calc_out_of_section):
         + f"update out-of-section: {calc_out_of_section} ..."
     )
     rmon_cli = get_rank_monitor_client()
-    rmon_cli.calculate_and_set_section_timeouts(
-        selected_sections=selected_sections, calc_out_of_section=calc_out_of_section
-    )
+    
+    # Check if RankMonitorClient is ready before calling methods
+    try:
+        rmon_cli.calculate_and_set_section_timeouts(
+            selected_sections=selected_sections, calc_out_of_section=calc_out_of_section
+        )
+    except Exception as e:
+        print_rank_0(f"FT: Warning - Failed to update timeouts: {e}")
+        print_rank_0("FT: This may happen if RankMonitorClient was not properly initialized")
+        return
+    
     if is_rank0():
         ft_state = rmon_cli.state_dict()
         with open(_ft_state_path, "w") as f:

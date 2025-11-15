@@ -1017,8 +1017,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         
         # # Allocate two large continuous buffers (one for each encoding thread)
-        recv_buffer_thread1 = torch.empty(aligned_size, dtype=torch.uint8)
-        recv_buffer_thread2 = torch.empty(aligned_size, dtype=torch.uint8)
+        recv_buffer_thread1 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+        recv_buffer_thread2 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
         
         logger.info(
             f"EC-CHECK: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "

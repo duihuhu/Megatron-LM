@@ -99,6 +99,17 @@ private:
     std::atomic<bool> xor_worker_2_completed_;
     std::atomic<bool> p2p_worker_completed_;
     
+    // Sentinel received flags (to track if sentinel was received, but queue may not be empty yet)
+    std::atomic<bool> encoding_thread_1_sentinel_received_;
+    std::atomic<bool> encoding_thread_2_sentinel_received_;
+    std::atomic<bool> send_worker_1_sentinel_received_;
+    std::atomic<bool> send_worker_2_sentinel_received_;
+    std::atomic<bool> recv_worker_1_sentinel_received_;
+    std::atomic<bool> recv_worker_2_sentinel_received_;
+    std::atomic<bool> xor_worker_1_sentinel_received_;
+    std::atomic<bool> xor_worker_2_sentinel_received_;
+    std::atomic<bool> p2p_worker_sentinel_received_;
+    
     // Stop flag for graceful shutdown
     std::atomic<bool> should_stop_threads_;
     
@@ -186,6 +197,9 @@ private:
     std::mutex p2p_queue_mutex_;
     std::condition_variable p2p_queue_cv_;
     
+    // Mutex to protect sending sentinel to P2P worker (to avoid race condition)
+    std::mutex p2p_sentinel_mutex_;
+    
     // Worker threads - 每个encoding线程配备独立的send/recv/xor worker
     std::thread encoder_thread_1_;
     std::thread encoder_thread_2_;
@@ -223,14 +237,14 @@ private:
     std::vector<uint8_t> nccl_id_thread1_;
     std::vector<uint8_t> nccl_id_thread2_;
     std::vector<uint8_t> nccl_id_p2p_;
-    
+
     // Synchronization for NCCL initialization
     std::atomic<bool> nccl_thread1_init_completed_;
     std::atomic<bool> nccl_thread2_init_completed_;
     std::atomic<bool> nccl_p2p_init_completed_;
     std::mutex nccl_init_mutex_;
     std::condition_variable nccl_init_cv_;
-    
+
     // P2P configuration
     int p2p_partner_rank_;  // P2P partner rank (adjacent pairing: 0<->1, 2<->3)
 
@@ -500,31 +514,36 @@ private:
             if (task.data_addr == 0 && task.size == 0 && 
                 task.encoding_addr == 0 && task.recv_addr == 0 && task.recv_chunk_size == 0 &&
                 task.p2p_own_write_addr == 0 && task.p2p_partner_write_addr == 0) {
-                encoding_thread_1_completed_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 received sentinel, marking completed" << std::endl;
-                
-                // Submit sentinel to send_worker_1
+                encoding_thread_1_sentinel_received_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 received sentinel, waiting for queue to empty" << std::endl;
+                // Check if queue is empty now
                 {
-                    std::lock_guard<std::mutex> lock(send_queue_1_mutex_);
+                    std::lock_guard<std::mutex> lock(encoding_tasks_1_mutex_);
+                    if (encoding_tasks_1_.empty()) {
+                encoding_thread_1_completed_ = true;
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 queue is empty, marking completed" << std::endl;
+                        // Submit sentinel to downstream workers
+                {
+                            std::lock_guard<std::mutex> send_lock(send_queue_1_mutex_);
                     send_queue_1_.push({0, 0});
                 }
                 send_queue_1_cv_.notify_one();
-                
-                // Submit sentinel to recv_worker_1
                 {
-                    std::lock_guard<std::mutex> lock(recv_queue_1_mutex_);
-                    recv_queue_1_.push({0, 0, 0});
+                            std::lock_guard<std::mutex> recv_lock(recv_queue_1_mutex_);
+                            recv_queue_1_.push({0, 0, 0});
                 }
                 recv_queue_1_cv_.notify_one();
-                
-                // Submit sentinel to xor_worker_1
-                {
-                    std::lock_guard<std::mutex> lock(xor_queue_1_mutex_);
-                    xor_queue_1_.push({0, 0, 0, 0, 0, 0, 0});
+                        {
+                            std::lock_guard<std::mutex> xor_lock(xor_queue_1_mutex_);
+                            xor_queue_1_.push({0, 0, 0, 0, 0, 0, 0});
+                        }
+                        xor_queue_1_cv_.notify_one();
+                        // Reset sentinel flag and continue (don't exit)
+                        encoding_thread_1_sentinel_received_ = false;
+                        continue;
+                    }
                 }
-                xor_queue_1_cv_.notify_one();
-                
-                continue;  // Continue waiting for next round
+                continue;  // Continue processing remaining tasks
             }
             
             // Check if we need to encode/send data
@@ -546,9 +565,9 @@ private:
                         // For odd ranks, data buffer will be released by P2P worker after P2P completes
                         // For even ranks, data buffer can be released immediately
                         if (rank_ % 2 == 0) {
-                            std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                            data_buffers_to_release_.push(task.data_addr);
-                            data_buffer_states_.erase(task.data_addr);
+                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
+                        data_buffers_to_release_.push(task.data_addr);
+                        data_buffer_states_.erase(task.data_addr);
                         }
                         // For odd ranks, data buffer will be released by P2P worker
                     }
@@ -582,11 +601,11 @@ private:
                     // Note: encoding buffer will be released by XOR worker after XOR completes
                 } else {
                     // This thread is sender: send encoding result immediately
-                    {
-                        std::lock_guard<std::mutex> lock(send_queue_1_mutex_);
-                        send_queue_1_.push({task.encoding_addr, task.size});
-                    }
-                    send_queue_1_cv_.notify_one();
+                {
+                    std::lock_guard<std::mutex> lock(send_queue_1_mutex_);
+                    send_queue_1_.push({task.encoding_addr, task.size});
+                }
+                send_queue_1_cv_.notify_one();
                     
                     // Sender doesn't need parity buffer, release it immediately
                     if (task.parity_addr != 0) {
@@ -607,9 +626,35 @@ private:
                 }
                 recv_queue_1_cv_.notify_one();
             }
+            
+            // After processing task, check if sentinel was received and queue is empty
+            if (encoding_thread_1_sentinel_received_.load()) {
+                std::lock_guard<std::mutex> lock(encoding_tasks_1_mutex_);
+                if (encoding_tasks_1_.empty()) {
+                    encoding_thread_1_completed_ = true;
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 queue is empty after processing, marking completed" << std::endl;
+                    // Submit sentinel to downstream workers
+                    {
+                        std::lock_guard<std::mutex> send_lock(send_queue_1_mutex_);
+                        send_queue_1_.push({0, 0});
+                    }
+                    send_queue_1_cv_.notify_one();
+                    {
+                        std::lock_guard<std::mutex> recv_lock(recv_queue_1_mutex_);
+                        recv_queue_1_.push({0, 0, 0});
+                    }
+                    recv_queue_1_cv_.notify_one();
+                    {
+                        std::lock_guard<std::mutex> xor_lock(xor_queue_1_mutex_);
+                        xor_queue_1_.push({0, 0, 0, 0, 0, 0, 0});
+                    }
+                    xor_queue_1_cv_.notify_one();
+                    // Reset sentinel flag and continue (don't exit)
+                    encoding_thread_1_sentinel_received_ = false;
+                    continue;
+                }
+            }
         }
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 exiting" << std::endl;
     }
     
     // Encoding Thread 2 worker
@@ -637,31 +682,36 @@ private:
             if (task.data_addr == 0 && task.size == 0 && 
                 task.encoding_addr == 0 && task.recv_addr == 0 && task.recv_chunk_size == 0 &&
                 task.p2p_own_write_addr == 0 && task.p2p_partner_write_addr == 0) {
-                encoding_thread_2_completed_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 received sentinel, marking completed" << std::endl;
-                
-                // Submit sentinel to send_worker_2
+                encoding_thread_2_sentinel_received_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 received sentinel, waiting for queue to empty" << std::endl;
+                // Check if queue is empty now
                 {
-                    std::lock_guard<std::mutex> lock(send_queue_2_mutex_);
+                    std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_);
+                    if (encoding_tasks_2_.empty()) {
+                encoding_thread_2_completed_ = true;
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 queue is empty, marking completed" << std::endl;
+                        // Submit sentinel to downstream workers
+                {
+                            std::lock_guard<std::mutex> send_lock(send_queue_2_mutex_);
                     send_queue_2_.push({0, 0});
                 }
                 send_queue_2_cv_.notify_one();
-                
-                // Submit sentinel to recv_worker_2
                 {
-                    std::lock_guard<std::mutex> lock(recv_queue_2_mutex_);
-                    recv_queue_2_.push({0, 0, 0});
+                            std::lock_guard<std::mutex> recv_lock(recv_queue_2_mutex_);
+                            recv_queue_2_.push({0, 0, 0});
                 }
                 recv_queue_2_cv_.notify_one();
-                
-                // Submit sentinel to xor_worker_2
-                {
-                    std::lock_guard<std::mutex> lock(xor_queue_2_mutex_);
-                    xor_queue_2_.push({0, 0, 0, 0, 0, 0, 0});
-                }
-                xor_queue_2_cv_.notify_one();
-                
+                        {
+                            std::lock_guard<std::mutex> xor_lock(xor_queue_2_mutex_);
+                            xor_queue_2_.push({0, 0, 0, 0, 0, 0, 0});
+                        }
+                        xor_queue_2_cv_.notify_one();
+                        // Reset sentinel flag and continue (don't exit)
+                        encoding_thread_2_sentinel_received_ = false;
                 continue;
+                    }
+                }
+                continue;  // Continue processing remaining tasks
             }
             
             // Check if we need to encode/send data
@@ -683,9 +733,9 @@ private:
                         // For odd ranks, data buffer will be released by P2P worker after P2P completes
                         // For even ranks, data buffer can be released immediately
                         if (rank_ % 2 == 0) {
-                            std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                            data_buffers_to_release_.push(task.data_addr);
-                            data_buffer_states_.erase(task.data_addr);
+                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
+                        data_buffers_to_release_.push(task.data_addr);
+                        data_buffer_states_.erase(task.data_addr);
                         }
                         // For odd ranks, data buffer will be released by P2P worker
                     }
@@ -717,11 +767,11 @@ private:
                               << ", p2p_partner=" << task.p2p_partner_write_addr << std::endl;
                 } else {
                     // This thread is sender: send encoding result immediately
-                    {
-                        std::lock_guard<std::mutex> lock(send_queue_2_mutex_);
-                        send_queue_2_.push({task.encoding_addr, task.size});
-                    }
-                    send_queue_2_cv_.notify_one();
+                {
+                    std::lock_guard<std::mutex> lock(send_queue_2_mutex_);
+                    send_queue_2_.push({task.encoding_addr, task.size});
+                }
+                send_queue_2_cv_.notify_one();
                     
                     // Sender doesn't need parity buffer, release it immediately
                     if (task.parity_addr != 0) {
@@ -742,9 +792,35 @@ private:
                 }
                 recv_queue_2_cv_.notify_one();
             }
+            
+            // After processing task, check if sentinel was received and queue is empty
+            if (encoding_thread_2_sentinel_received_.load()) {
+                std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_);
+                if (encoding_tasks_2_.empty()) {
+                    encoding_thread_2_completed_ = true;
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 queue is empty after processing, marking completed" << std::endl;
+                    // Submit sentinel to downstream workers
+                    {
+                        std::lock_guard<std::mutex> send_lock(send_queue_2_mutex_);
+                        send_queue_2_.push({0, 0});
+                    }
+                    send_queue_2_cv_.notify_one();
+                    {
+                        std::lock_guard<std::mutex> recv_lock(recv_queue_2_mutex_);
+                        recv_queue_2_.push({0, 0, 0});
+                    }
+                    recv_queue_2_cv_.notify_one();
+                    {
+                        std::lock_guard<std::mutex> xor_lock(xor_queue_2_mutex_);
+                        xor_queue_2_.push({0, 0, 0, 0, 0, 0, 0});
+                    }
+                    xor_queue_2_cv_.notify_one();
+                    // Reset sentinel flag and continue (don't exit)
+                    encoding_thread_2_sentinel_received_ = false;
+                    continue;
+                }
+            }
         }
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 exiting" << std::endl;
     }
     
     // Send Worker 1 - 专门发送thread1的编码数据
@@ -773,8 +849,19 @@ private:
             
             // Check for sentinel
             if (task.encoding_addr == 0 && task.size == 0) {
+                send_worker_1_sentinel_received_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 1 received sentinel, waiting for queue to empty" << std::endl;
+                // Check if queue is empty now
+                {
+                    std::lock_guard<std::mutex> lock(send_queue_1_mutex_);
+                    if (send_queue_1_.empty()) {
                 send_worker_1_completed_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 1 received sentinel, marking completed" << std::endl;
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 1 queue is empty, marking completed" << std::endl;
+                        // Reset sentinel flag and continue (don't exit)
+                        send_worker_1_sentinel_received_ = false;
+                        continue;
+                    }
+                }
                 continue;
             }
             
@@ -796,9 +883,19 @@ private:
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
                 encoding_buffers_to_release_.push(task.encoding_addr);
             }
+            
+            // After processing task, check if sentinel was received and queue is empty
+            if (send_worker_1_sentinel_received_.load()) {
+                std::lock_guard<std::mutex> lock(send_queue_1_mutex_);
+                if (send_queue_1_.empty()) {
+                    send_worker_1_completed_ = true;
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 1 queue is empty after processing, marking completed" << std::endl;
+                    // Reset sentinel flag and continue (don't exit)
+                    send_worker_1_sentinel_received_ = false;
+                    continue;
+                }
+            }
         }
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 1 exiting" << std::endl;
     }
     
     // Recv Worker 1 - 专门接收给thread1的数据
@@ -832,8 +929,19 @@ private:
             
             // Check for sentinel
             if (task.recv_addr == 0 && task.size == 0) {
-                recv_worker_1_completed_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 1 received sentinel, marking completed" << std::endl;
+                recv_worker_1_sentinel_received_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 1 received sentinel, waiting for queue to empty" << std::endl;
+                // Check if queue is empty now
+                {
+                    std::lock_guard<std::mutex> lock(recv_queue_1_mutex_);
+                    if (recv_queue_1_.empty()) {
+                        recv_worker_1_completed_ = true;
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 1 queue is empty, marking completed" << std::endl;
+                        // Reset sentinel flag and continue (don't exit)
+                        recv_worker_1_sentinel_received_ = false;
+                        continue;
+                    }
+                }
                 continue;
             }
             
@@ -922,9 +1030,19 @@ private:
                               << ", p2p_partner=" << p2p_partner_write_addr << std::endl;
                 }
             }
+            
+            // After processing task, check if sentinel was received and queue is empty
+            if (recv_worker_1_sentinel_received_.load()) {
+                std::lock_guard<std::mutex> lock(recv_queue_1_mutex_);
+                if (recv_queue_1_.empty()) {
+                    recv_worker_1_completed_ = true;
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 1 queue is empty after processing, marking completed" << std::endl;
+                    // Reset sentinel flag and continue (don't exit)
+                    recv_worker_1_sentinel_received_ = false;
+                    continue;
+                }
+            }
         }
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 1 exiting" << std::endl;
     }
     
     // Send Worker 2 - 专门发送thread2的编码数据
@@ -953,8 +1071,19 @@ private:
             
             // Check for sentinel
             if (task.encoding_addr == 0 && task.size == 0) {
-                send_worker_2_completed_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 2 received sentinel, marking completed" << std::endl;
+                send_worker_2_sentinel_received_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 2 received sentinel, waiting for queue to empty" << std::endl;
+                // Check if queue is empty now
+                {
+                    std::lock_guard<std::mutex> lock(send_queue_2_mutex_);
+                    if (send_queue_2_.empty()) {
+                        send_worker_2_completed_ = true;
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 2 queue is empty, marking completed" << std::endl;
+                        // Reset sentinel flag and continue (don't exit)
+                        send_worker_2_sentinel_received_ = false;
+                        continue;
+                    }
+                }
                 continue;
             }
             
@@ -976,9 +1105,19 @@ private:
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
                 encoding_buffers_to_release_.push(task.encoding_addr);
             }
+            
+            // After processing task, check if sentinel was received and queue is empty
+            if (send_worker_2_sentinel_received_.load()) {
+                std::lock_guard<std::mutex> lock(send_queue_2_mutex_);
+                if (send_queue_2_.empty()) {
+                    send_worker_2_completed_ = true;
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 2 queue is empty after processing, marking completed" << std::endl;
+                    // Reset sentinel flag and continue (don't exit)
+                    send_worker_2_sentinel_received_ = false;
+                    continue;
+                }
+            }
         }
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker 2 exiting" << std::endl;
     }
     
     // Recv Worker 2 - 专门接收给thread2的数据
@@ -1012,8 +1151,19 @@ private:
             
             // Check for sentinel
             if (task.recv_addr == 0 && task.size == 0) {
-                recv_worker_2_completed_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 2 received sentinel, marking completed" << std::endl;
+                recv_worker_2_sentinel_received_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 2 received sentinel, waiting for queue to empty" << std::endl;
+                // Check if queue is empty now
+                {
+                    std::lock_guard<std::mutex> lock(recv_queue_2_mutex_);
+                    if (recv_queue_2_.empty()) {
+                        recv_worker_2_completed_ = true;
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 2 queue is empty, marking completed" << std::endl;
+                        // Reset sentinel flag and continue (don't exit)
+                        recv_worker_2_sentinel_received_ = false;
+                        continue;
+                    }
+                }
                 continue;
             }
             
@@ -1102,11 +1252,21 @@ private:
                               << ", p2p_partner=" << p2p_partner_write_addr << std::endl;
                 }
             }
+            
+            // After processing task, check if sentinel was received and queue is empty
+            if (recv_worker_2_sentinel_received_.load()) {
+                std::lock_guard<std::mutex> lock(recv_queue_2_mutex_);
+                if (recv_queue_2_.empty()) {
+                    recv_worker_2_completed_ = true;
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 2 queue is empty after processing, marking completed" << std::endl;
+                    // Reset sentinel flag and continue (don't exit)
+                    recv_worker_2_sentinel_received_ = false;
+                    continue;
+                }
+            }
         }
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker 2 exiting" << std::endl;
     }
-    
+
     // XOR Worker 1 - 专门执行thread1的XOR操作
     void xor_worker_1() {
         std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 started" << std::endl;
@@ -1133,17 +1293,33 @@ private:
                 task.parity_addr == 0 && task.size == 0 &&
                 task.p2p_own_write_addr == 0 && task.p2p_partner_write_addr == 0 &&
                 task.data_addr == 0) {
-                xor_worker_1_completed_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 received sentinel, marking completed" << std::endl;
-                
-                // Submit sentinel to P2P worker
+                xor_worker_1_sentinel_received_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 received sentinel, waiting for queue to empty" << std::endl;
+                // Check if queue is empty now
                 {
-                    std::lock_guard<std::mutex> lock(p2p_queue_mutex_);
-                    p2p_queue_.push({0, 0, 0, 0, 0});
+                    std::lock_guard<std::mutex> lock(xor_queue_1_mutex_);
+                    if (xor_queue_1_.empty()) {
+                        xor_worker_1_completed_ = true;
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 queue is empty, marking completed" << std::endl;
+                        // Submit sentinel to P2P worker only when both XOR workers complete
+                        // Use mutex to ensure only one worker sends the sentinel
+                        {
+                            std::lock_guard<std::mutex> p2p_sentinel_lock(p2p_sentinel_mutex_);
+                            if (xor_worker_1_completed_.load() && xor_worker_2_completed_.load()) {
+                                {
+                                    std::lock_guard<std::mutex> p2p_lock(p2p_queue_mutex_);
+                                    p2p_queue_.push({0, 0, 0, 0, 0});
+                                }
+                                p2p_queue_cv_.notify_one();
+                                std::cout << "EC-CHECK: [Rank " << rank_ << "] Both XOR workers completed, sentinel sent to P2P worker" << std::endl;
+                            }
+                        }
+                        // Reset sentinel flag and continue (don't exit)
+                        xor_worker_1_sentinel_received_ = false;
+                        continue;
+                    }
                 }
-                p2p_queue_cv_.notify_one();
-                
-                continue;
+                continue;  // If queue is not empty, continue processing remaining tasks
             }
             
             // Perform XOR using isa-l xor_gen
@@ -1190,11 +1366,34 @@ private:
             {
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
                 encoding_buffers_to_release_.push(task.local_encoding_addr);
-                encoding_buffers_to_release_.push(task.remote_encoding_addr);
+                //encoding_buffers_to_release_.push(task.remote_encoding_addr);
+            }
+            
+            // After processing task, check if sentinel was received and queue is empty
+            if (xor_worker_1_sentinel_received_.load()) {
+                std::lock_guard<std::mutex> lock(xor_queue_1_mutex_);
+                if (xor_queue_1_.empty()) {
+                    xor_worker_1_completed_ = true;
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 queue is empty after processing, marking completed" << std::endl;
+                    // Submit sentinel to P2P worker only when both XOR workers complete
+                    // Use mutex to ensure only one worker sends the sentinel
+                    {
+                        std::lock_guard<std::mutex> p2p_sentinel_lock(p2p_sentinel_mutex_);
+                        if (xor_worker_1_completed_.load() && xor_worker_2_completed_.load()) {
+                            {
+                                std::lock_guard<std::mutex> p2p_lock(p2p_queue_mutex_);
+                                p2p_queue_.push({0, 0, 0, 0, 0});
+                            }
+                            p2p_queue_cv_.notify_one();
+                            std::cout << "EC-CHECK: [Rank " << rank_ << "] Both XOR workers completed, sentinel sent to P2P worker" << std::endl;
+                        }
+                    }
+                    // Reset sentinel flag and continue (don't exit)
+                    xor_worker_1_sentinel_received_ = false;
+                    continue;
+                }
             }
         }
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 1 exiting" << std::endl;
     }
     
     // XOR Worker 2 - 专门执行thread2的XOR操作
@@ -1223,19 +1422,33 @@ private:
                 task.parity_addr == 0 && task.size == 0 &&
                 task.p2p_own_write_addr == 0 && task.p2p_partner_write_addr == 0 &&
                 task.data_addr == 0) {
-                xor_worker_2_completed_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 received sentinel, marking completed" << std::endl;
-                
-                // Submit sentinel to P2P worker (only once, when both XOR workers complete)
-                // Note: We submit sentinel from both XOR workers, but P2P worker will only process it once
-                // This ensures P2P worker receives sentinel after all XOR tasks are done
+                xor_worker_2_sentinel_received_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 received sentinel, waiting for queue to empty" << std::endl;
+                // Check if queue is empty now
                 {
-                    std::lock_guard<std::mutex> lock(p2p_queue_mutex_);
-                    p2p_queue_.push({0, 0, 0, 0, 0});
+                    std::lock_guard<std::mutex> lock(xor_queue_2_mutex_);
+                    if (xor_queue_2_.empty()) {
+                        xor_worker_2_completed_ = true;
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 queue is empty, marking completed" << std::endl;
+                        // Submit sentinel to P2P worker only when both XOR workers complete
+                        // Use mutex to ensure only one worker sends the sentinel
+                        {
+                            std::lock_guard<std::mutex> p2p_sentinel_lock(p2p_sentinel_mutex_);
+                            if (xor_worker_1_completed_.load() && xor_worker_2_completed_.load()) {
+                                {
+                                    std::lock_guard<std::mutex> p2p_lock(p2p_queue_mutex_);
+                                    p2p_queue_.push({0, 0, 0, 0, 0});
+                                }
+                                p2p_queue_cv_.notify_one();
+                                std::cout << "EC-CHECK: [Rank " << rank_ << "] Both XOR workers completed, sentinel sent to P2P worker" << std::endl;
+                            }
+                        }
+                        // Reset sentinel flag and continue (don't exit)
+                        xor_worker_2_sentinel_received_ = false;
+                        continue;
+                    }
                 }
-                p2p_queue_cv_.notify_one();
-                
-                continue;
+                continue;  // If queue is not empty, continue processing remaining tasks
             }
             
             // Perform XOR using isa-l xor_gen
@@ -1282,11 +1495,34 @@ private:
             {
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
                 encoding_buffers_to_release_.push(task.local_encoding_addr);
-                encoding_buffers_to_release_.push(task.remote_encoding_addr);
+                //encoding_buffers_to_release_.push(task.remote_encoding_addr);
+            }
+            
+            // After processing task, check if sentinel was received and queue is empty
+            if (xor_worker_2_sentinel_received_.load()) {
+                std::lock_guard<std::mutex> lock(xor_queue_2_mutex_);
+                if (xor_queue_2_.empty()) {
+                    xor_worker_2_completed_ = true;
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 queue is empty after processing, marking completed" << std::endl;
+                    // Submit sentinel to P2P worker only when both XOR workers complete
+                    // Use mutex to ensure only one worker sends the sentinel
+                    {
+                        std::lock_guard<std::mutex> p2p_sentinel_lock(p2p_sentinel_mutex_);
+                        if (xor_worker_1_completed_.load() && xor_worker_2_completed_.load()) {
+                            {
+                                std::lock_guard<std::mutex> p2p_lock(p2p_queue_mutex_);
+                                p2p_queue_.push({0, 0, 0, 0, 0});
+                            }
+                            p2p_queue_cv_.notify_one();
+                            std::cout << "EC-CHECK: [Rank " << rank_ << "] Both XOR workers completed, sentinel sent to P2P worker" << std::endl;
+                        }
+                    }
+                    // Reset sentinel flag and continue (don't exit)
+                    xor_worker_2_sentinel_received_ = false;
+                    continue;
+                }
             }
         }
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker 2 exiting" << std::endl;
     }
     
     // P2P Worker - 处理P2P通信（单线程）
@@ -1316,8 +1552,19 @@ private:
             // Check for sentinel
             if (task.parity_addr == 0 && task.data_addr == 0 && task.p2p_own_write_addr == 0 && 
                 task.p2p_partner_write_addr == 0 && task.size == 0) {
-                p2p_worker_completed_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P worker received sentinel, marking completed" << std::endl;
+                p2p_worker_sentinel_received_ = true;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P worker received sentinel, waiting for queue to empty" << std::endl;
+                // Check if queue is empty now
+                {
+                    std::lock_guard<std::mutex> lock(p2p_queue_mutex_);
+                    if (p2p_queue_.empty()) {
+                        p2p_worker_completed_ = true;
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P worker queue is empty, marking completed" << std::endl;
+                        // Reset sentinel flag and continue (don't exit)
+                        p2p_worker_sentinel_received_ = false;
+                        continue;
+                    }
+                }
                 continue;
             }
             
@@ -1396,9 +1643,19 @@ private:
                     }
                 }
             }
+            
+            // After processing task, check if sentinel was received and queue is empty
+            if (p2p_worker_sentinel_received_.load()) {
+                std::lock_guard<std::mutex> lock(p2p_queue_mutex_);
+                if (p2p_queue_.empty()) {
+                    p2p_worker_completed_ = true;
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P worker queue is empty after processing, marking completed" << std::endl;
+                    // Reset sentinel flag and continue (don't exit)
+                    p2p_worker_sentinel_received_ = false;
+                    continue;
+                }
+            }
         }
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P worker exiting" << std::endl;
     }
 
     void start_pipeline() {
@@ -1427,7 +1684,7 @@ public:
                   const std::vector<uint8_t>& nccl_id_thread1,
                   const std::vector<uint8_t>& nccl_id_thread2,
                   const std::vector<uint8_t>& nccl_id_p2p) 
-        : rank_(rank), world_size_(world_size), paired_rank_(paired_rank),
+        : rank_(rank), world_size_(world_size), paired_rank_(paired_rank), 
           nccl_id_thread1_(nccl_id_thread1),
           nccl_id_thread2_(nccl_id_thread2),
           nccl_id_p2p_(nccl_id_p2p),
@@ -1436,6 +1693,11 @@ public:
           recv_worker_1_completed_(false), recv_worker_2_completed_(false),
           xor_worker_1_completed_(false), xor_worker_2_completed_(false),
           p2p_worker_completed_(false),
+          encoding_thread_1_sentinel_received_(false), encoding_thread_2_sentinel_received_(false),
+          send_worker_1_sentinel_received_(false), send_worker_2_sentinel_received_(false),
+          recv_worker_1_sentinel_received_(false), recv_worker_2_sentinel_received_(false),
+          xor_worker_1_sentinel_received_(false), xor_worker_2_sentinel_received_(false),
+          p2p_worker_sentinel_received_(false),
           should_stop_threads_(false),
           nccl_thread1_initialized_(false), nccl_thread2_initialized_(false),
           nccl_p2p_initialized_(false),
@@ -1526,6 +1788,15 @@ public:
         xor_worker_1_completed_ = false;
         xor_worker_2_completed_ = false;
         p2p_worker_completed_ = false;
+        encoding_thread_1_sentinel_received_ = false;
+        encoding_thread_2_sentinel_received_ = false;
+        send_worker_1_sentinel_received_ = false;
+        send_worker_2_sentinel_received_ = false;
+        recv_worker_1_sentinel_received_ = false;
+        recv_worker_2_sentinel_received_ = false;
+        xor_worker_1_sentinel_received_ = false;
+        xor_worker_2_sentinel_received_ = false;
+        p2p_worker_sentinel_received_ = false;
     }
     
     void wait_for_encoding_completion() {

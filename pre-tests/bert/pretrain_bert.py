@@ -156,6 +156,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
             get_blend_from_list(args.test_data_path)
         ],
         split=args.split,
+        num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,
         tokenizer=tokenizer,
         masking_probability=args.mask_prob,

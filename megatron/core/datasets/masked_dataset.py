@@ -159,7 +159,23 @@ class MaskedWordPieceDataset(MegatronDataset):
         cache_hit = all(map(os.path.isfile, [path_to_description, path_to_sample_index]))
 
         if self.num_samples is not None:
-            num_epochs = numpy.iinfo(numpy.int32).max - 1
+            # Calculate a reasonable upper bound for num_epochs
+            # The build_mapping function will stop when max_num_samples is reached,
+            # but we need to set num_epochs high enough to potentially reach that limit.
+            # Use a conservative estimate based on dataset size
+            num_docs = len(self.indices)
+            if num_docs > 0:
+                # Estimate samples per epoch: each document can potentially produce multiple samples
+                # Use a conservative estimate of 1-2 samples per document per epoch
+                estimated_samples_per_epoch = max(1, num_docs)
+                # Calculate epochs needed with margin, but cap at reasonable limit
+                # This ensures build_mapping can reach num_samples without excessive iteration
+                num_epochs = min(
+                    max(100, (self.num_samples // estimated_samples_per_epoch) * 2),
+                    10000  # Reasonable upper bound to avoid excessive computation in first pass
+                )
+            else:
+                num_epochs = 10000  # Fallback upper bound
         else:
             num_epochs = 1
 
@@ -187,18 +203,75 @@ class MaskedWordPieceDataset(MegatronDataset):
 
             # Add +1 for access to document upper bound
             indices = numpy.append(self.indices, self.indices[-1] + 1)
+            
+            # Debug: log parameters before calling build_mapping
+            doc_indices_subset = self.dataset.document_indices[indices]
+            seq_lengths_subset = self.dataset.sequence_lengths
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"\tbuild_mapping parameters: "
+                f"num_docs={len(indices)-1}, "
+                f"doc_indices_range=[{doc_indices_subset[0]}, {doc_indices_subset[-1]}), "
+                f"seq_lengths_range=[{seq_lengths_subset.min()}, {seq_lengths_subset.max()}], "
+                f"num_epochs={num_epochs}, "
+                f"max_num_samples={self.num_samples}, "
+                f"sequence_length={sequence_length}, "
+                f"min_sentences_per_sample={min_sentences_per_sample}"
+            )
 
             sample_index = helpers.build_mapping(
-                self.dataset.document_indices[indices],
-                self.dataset.sequence_lengths,
+                doc_indices_subset,
+                seq_lengths_subset,
                 num_epochs,
                 self.num_samples,
                 sequence_length,
                 self.config.short_sequence_probability,
                 self.config.random_seed,
-                False,
+                True,  # Set verbose=True to get debug output from C++ code
                 min_sentences_per_sample,
             )
+            
+            # If build_mapping returns empty, we should not automatically downgrade min_sentences_per_sample
+            # because it may be required (e.g., min_sentences_per_sample=2 for BERT binary head requires at least 2 sentences)
+            # Instead, we should provide a clear error message with diagnostic information
+            if sample_index.shape[0] == 0:
+                # Check if we can safely try with min_sentences_per_sample=1
+                # Only do this if min_sentences_per_sample > 1 and we're not in a context that requires it
+                # For BERT with binary head, min_sentences_per_sample=2 is required, so we shouldn't downgrade
+                can_downgrade = min_sentences_per_sample > 1
+                
+                # Try to check if classification_head is required by checking if it's a BERT dataset
+                # If min_sentences_per_sample == 2, it likely means binary head is required
+                if min_sentences_per_sample == 2:
+                    can_downgrade = False
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        f"build_mapping returned empty sample_index with min_sentences_per_sample=2. "
+                        f"This is required for BERT binary head (Next Sentence Prediction). "
+                        f"Cannot downgrade to min_sentences_per_sample=1 as it would break BERT requirements."
+                    )
+                
+                if can_downgrade:
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        f"build_mapping returned empty sample_index with min_sentences_per_sample={min_sentences_per_sample}. "
+                        f"Trying with min_sentences_per_sample=1..."
+                    )
+                    sample_index = helpers.build_mapping(
+                        doc_indices_subset,
+                        seq_lengths_subset,
+                        num_epochs,
+                        self.num_samples,
+                        sequence_length,
+                        self.config.short_sequence_probability,
+                        self.config.random_seed,
+                        True,
+                        1,  # Try with min_sentences_per_sample=1
+                    )
+            
             numpy.save(path_to_sample_index, sample_index, allow_pickle=True)
             t_end = time.time()
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
@@ -207,6 +280,22 @@ class MaskedWordPieceDataset(MegatronDataset):
                 logger, logging.INFO, f"> total number of samples: {sample_index.shape[0]}"
             )
             log_single_rank(logger, logging.INFO, f"> total number of epochs: {num_epochs}")
+            
+            # Validate sample_index is not empty
+            if sample_index.shape[0] == 0:
+                log_single_rank(
+                    logger,
+                    logging.ERROR,
+                    f"ERROR: build_mapping returned empty sample_index! "
+                    f"num_samples={self.num_samples}, num_epochs={num_epochs}, "
+                    f"num_docs={len(self.indices)}, sequence_length={sequence_length}, "
+                    f"min_sentences_per_sample={min_sentences_per_sample}"
+                )
+                raise RuntimeError(
+                    f"build_mapping returned empty sample_index. "
+                    f"This may indicate insufficient data or incorrect parameters. "
+                    f"Check verbose output above for details about skipped documents."
+                )
 
             return sample_index
 
@@ -223,6 +312,20 @@ class MaskedWordPieceDataset(MegatronDataset):
         sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
+        
+        # Validate loaded sample_index is not empty
+        if sample_index.shape[0] == 0:
+            log_single_rank(
+                logger,
+                logging.ERROR,
+                f"ERROR: Loaded sample_index is empty from {path_to_sample_index}! "
+                f"This may indicate a corrupted cache file. Consider deleting the cache."
+            )
+            raise RuntimeError(
+                f"Loaded sample_index is empty. "
+                f"This may indicate a corrupted cache file. "
+                f"Try deleting the cache directory: {path_to_cache}"
+            )
 
         return sample_index
 

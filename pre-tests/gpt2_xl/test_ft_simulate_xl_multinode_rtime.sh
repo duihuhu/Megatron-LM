@@ -115,13 +115,13 @@ fi
 
 # =============================================================================
 # 路径配置
-# =============================BERT-L-336M================================================
-VOCAB_FILE="/workspace/Megatron-LM/pre-tests/bert/data/vocab.txt"
-# MERGE_FILE="/workspace/Megatron-LM/pre-tests/bert2/data/bert2-merges.txt"
+# =============================================================================
+VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
+MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/models/bert-336M-ft-simnode/logs"
-CHECKPOINT_PATH="/dev/shm/bert-336M-ft-simnode"
-DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
+TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-xl-ft-simnode/logs"
+CHECKPOINT_PATH="/dev/shm/gpt2-xl-ft-simnode"
+DATA_PATH="/workspace/models/gpt2-xl-0/codeparrot_content_document"
 
 # 创建必要的目录
 mkdir -p $CHECKPOINT_PATH
@@ -143,29 +143,22 @@ FT_TIMEOUT_OUT_OF_SECTION=300
 # =============================================================================
 # 模型和训练配置
 # =============================================================================
-HIDDEN_SIZE=1024
-NUM_ATTENTION_HEADS=16
-SEQ_LENGTH=512
-MAX_POSITION_EMBEDDINGS=512
+HIDDEN_SIZE=1600
+NUM_ATTENTION_HEADS=25
+SEQ_LENGTH=1024
+MAX_POSITION_EMBEDDINGS=1024
 MICRO_BATCH_SIZE=4
 # GLOBAL_BATCH_SIZE=16
-
-LR=1.5e-4
-MIN_LR=1.5e-5
-LR_WARMUP_TOKENS=300000000
-TRAIN_TOKENS=300000000000
-
 # =============================================================================
 # Megatron 训练参数
 # =============================================================================
 DATA_ARGS=(
     --vocab-file $VOCAB_FILE 
-    # --merge-file $MERGE_FILE 
+    --merge-file $MERGE_FILE 
     --mock-data 
-    --split 969,30,1
 )
 
-MODEL_ARGS=(
+GPT_ARGS=(
     --no-async-tensor-model-parallel-allreduce 
     --hidden-size $HIDDEN_SIZE 
     --num-attention-heads $NUM_ATTENTION_HEADS 
@@ -182,11 +175,11 @@ MODEL_ARGS=(
     --lr-warmup-fraction 0.01 
     --clip-grad 1.0 
     --fp16 
-    --tokenizer-type BertWordPieceLowerCase 
+    --tokenizer-type GPT2BPETokenizer 
     --use-mcore-models 
     --transformer-impl transformer_engine 
     --no-scatter-gather-tensors-in-pipeline 
-    --num-layers 24
+    --num-layers 48
     --optimizer adam
     --loss-scale-window 1000
     --initial-loss-scale 4096
@@ -212,14 +205,14 @@ MODEL_PARALLEL_ARGS=(
 
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
-    --save-interval 10
+    --save-interval 1
     --eval-interval 50
     --save $CHECKPOINT_PATH 
     --load $CHECKPOINT_PATH
     --eval-iters 10
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --ckpt-format torch_dist
-    # --use-eccheck
+    --use-eccheck
     # --rerun-mode disabled
 )
 
@@ -238,7 +231,7 @@ FT_LAUNCHER_ARGS=(
     # Rendezvous 配置
     --rdzv_backend=c10d
     --rdzv_endpoint=${MASTER_ADDR}:${RDZV_PORT}
-    --rdzv_id=megatron_bert_simulated_multinode  # 作业唯一ID
+    --rdzv_id=megatron_gpt_simulated_multinode  # 作业唯一ID
     
     # 多节点配置 - 关键！
     --nnodes=${TOTAL_NODES}:${TOTAL_NODES}  # 最小:最大节点数
@@ -314,8 +307,8 @@ echo ""
 # 执行 ft_launcher
 ft_launcher \
     ${FT_LAUNCHER_ARGS[@]} \
-    pretrain_bert.py \
-    ${MODEL_ARGS[@]} \
+    pretrain_gpt.py \
+    ${GPT_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \

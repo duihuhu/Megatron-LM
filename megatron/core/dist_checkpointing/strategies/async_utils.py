@@ -190,18 +190,22 @@ class TemporalAsyncCaller(AsyncCaller):
             # to do the defined action in `async_req.preload_fn` to
             # stage GPU tensors to its defined destination
             async_fn_args[1] = async_req.preload_fn()
-
+        logger.info(f"EC-CHECK: Preload function called, got {len(async_fn_args[1])} items")
         rank = torch.distributed.get_rank()
+        logger.info(f"EC-CHECK: Synchronizing CUDA")
         torch.cuda.synchronize()
+        logger.info(f"EC-CHECK: CUDA synchronized")
         end_sync = time()
         logger.warning(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")
-
         ctx = mp.get_context('fork')
         self.start_time = time()
+        logger.info(f"EC-CHECK: Creating process for write_preloaded_data")
         self.process = ctx.Process(
             target=async_req.async_fn, args=async_fn_args, kwargs=async_req.async_fn_kwargs
         )
+        logger.info(f"EC-CHECK: Create process for write_preloaded_data")
         self.process.start()
+        logger.info(f"EC-CHECK: Started process for write_preloaded_data")
         init_time = time()
         logger.debug(f"rank: {rank}, takes {init_time - self.start_time} to schedule async ckpt ")
 

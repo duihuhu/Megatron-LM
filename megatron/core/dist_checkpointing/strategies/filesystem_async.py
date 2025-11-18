@@ -390,7 +390,10 @@ class FileSystemWriterAsync(FileSystemWriter):
                 (or an Exception) from parallel write processes to the main training process
         Returns: None
         """
+        import sys
+        print(f"EC-CHECK: Write preloaded data multiproc started", file=sys.stdout)
         logger = logging.getLogger(__name__)
+        logger.info(f"EC-CHECK: Write preloaded data multiproc started")
         w_start = time()
         write_results_or_exc: Union[dict, Exception] = dict()
         ctx = mp.get_context("fork")
@@ -429,13 +432,18 @@ class FileSystemWriterAsync(FileSystemWriter):
                 write_results_or_exc = RuntimeError(err_msg)
 
         if not isinstance(write_results_or_exc, Exception):
+            logger.info(f"EC-CHECK: Starting {len(p_list)} write processes...")
             for p in p_list:
                 p.start()
+                logger.info(f"EC-CHECK: Started process {p.pid}")
 
             logger.debug("FileSystemWriterAsync: collecting worker results...")
 
             # To make sure all nodes are completed
+            logger.info("EC-CHECK: Waiting for all processes to complete (count_queue.join)...")
             count_queue.join()
+            logger.info("EC-CHECK: All processes completed (count_queue.join returned)")
+
             # At this point, all workers completed, so the queue should have exactly
             # `len(write_buckets)` items
             for proc_idx in range(len(write_buckets)):
@@ -493,6 +501,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         Returns: None, the write result are put into the `queue`
         """
         logger = logging.getLogger(__name__)
+        logger.info(f"EC-CHECK: Process {local_proc_idx} started (write_preloaded_data)")
         logger.debug(f"{local_proc_idx} started")
         mem_before = _process_memory()
         use_msc = kwargs.get("use_msc", False)
@@ -506,6 +515,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             eccheck_continuous_buffer = None
             if len(bytes_data) > 0 and bytes_data[0][0] == 'eccheck_metadata':
                 # EC-CHECK mode detected
+                logger.info(f"EC-CHECK: Process {local_proc_idx} detected EC-CHECK mode")
                 for key, value in bytes_data:
                     if key == 'eccheck_metadata':
                         eccheck_metadata = value
@@ -971,6 +981,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             p2p_own_buffer_offset = 0
             p2p_partner_buffer_offset = 0
 
+        #total_bytes = 1024 * 1024 * 64# debug
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
             cur_buffer_addr = get_free_data_buffer()
@@ -1058,6 +1069,8 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Wait for encoding completion (this may block)
         # The buffer poller will continue running in the background
         self._eccheck_native.wait_for_encoding_completion()
+        torch.cuda.synchronize()
+        logger.info(f"EC-CHECK: Pipeline CUDA synchronized")
         
         # Buffer poller will be deactivated in the outer finally block
         # logger.info("EC-CHECK: All encoding operations completed")
@@ -1181,7 +1194,9 @@ class FileSystemWriterAsync(FileSystemWriter):
                 ('eccheck_continuous_buffer', self.tensor_buffer),  # Continuous buffer
             ]
             result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
-        
+        logger.info(
+            f"EC-CHECK: Preload to buffer result buckets: {len(result_buckets)}"
+        )
         return result_buckets
     
     @staticmethod

@@ -19,6 +19,7 @@
 // NCCL includes
 #ifdef NCCL_AVAILABLE
 #include <nccl.h>
+#include <cuda_runtime.h>
 
 // ========== Global function: Generate NCCL ID ==========
 // This function can be called without creating an instance
@@ -875,6 +876,8 @@ private:
                 ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size, 
                          ncclUint8, target_rank, nccl_comm_thread1_, 0);
                 ncclGroupEnd();
+                // Synchronize to ensure NCCL operation completes
+                cudaDeviceSynchronize();
             }
 #endif
 
@@ -955,6 +958,8 @@ private:
                 ncclRecv(reinterpret_cast<void*>(task.recv_addr), task.size,
                          ncclUint8, source_rank, nccl_comm_thread1_, 0);
                 ncclGroupEnd();
+                // Synchronize to ensure NCCL operation completes
+                cudaDeviceSynchronize();
             }
 #endif
             
@@ -1097,6 +1102,8 @@ private:
                 ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size,
                          ncclUint8, target_rank, nccl_comm_thread2_, 0);
                 ncclGroupEnd();
+                // Synchronize to ensure NCCL operation completes
+                cudaDeviceSynchronize();
             }
 #endif
 
@@ -1177,6 +1184,8 @@ private:
                 ncclRecv(reinterpret_cast<void*>(task.recv_addr), task.size,
                          ncclUint8, source_rank, nccl_comm_thread2_, 0);
                 ncclGroupEnd();
+                // Synchronize to ensure NCCL operation completes
+                cudaDeviceSynchronize();
             }
 #endif
             
@@ -1606,6 +1615,8 @@ private:
                         ncclSend(reinterpret_cast<void*>(task.parity_addr), task.size,
                                 ncclUint8, p2p_partner_rank_, nccl_comm_p2p_, 0);
                         ncclGroupEnd();
+                        // Synchronize to ensure NCCL operation completes
+                        cudaDeviceSynchronize();
                         std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P: Received data from Rank " 
                                   << p2p_partner_rank_ << ", sent parity to Rank " << p2p_partner_rank_ << std::endl;
                     } else {
@@ -1617,6 +1628,8 @@ private:
                             ncclRecv(reinterpret_cast<void*>(task.p2p_partner_write_addr), task.size,
                                     ncclUint8, p2p_partner_rank_, nccl_comm_p2p_, 0);
                             ncclGroupEnd();
+                            // Synchronize to ensure NCCL operation completes
+                            cudaDeviceSynchronize();
                             std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P: Sent data to Rank " 
                                       << p2p_partner_rank_ << ", received parity from Rank " << p2p_partner_rank_ << std::endl;
                         } else {
@@ -1754,13 +1767,13 @@ public:
         start_pipeline();
 
         // Wait for all NCCL communicators to be initialized
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Waiting for NCCL initialization (thread1, thread2, and P2P)..." << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Waiting for NCCL initialization (thread1, thread2, and P2P)..." << std::endl;
         std::unique_lock<std::mutex> lock(nccl_init_mutex_);
         nccl_init_cv_.wait(lock, [this] { 
             return nccl_thread1_init_completed_.load() && nccl_thread2_init_completed_.load() && nccl_p2p_init_completed_.load(); 
         });
 
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline and NCCL initialized successfully" << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline and NCCL initialized successfully" << std::endl;
     }
     
     ~ECCHECKNative() {
@@ -1804,31 +1817,31 @@ public:
         while (!encoding_thread_1_completed_ || !encoding_thread_2_completed_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Both encoding threads completed" << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Both encoding threads completed" << std::endl;
         
         // Wait for all send workers to complete
         while (!send_worker_1_completed_ || !send_worker_2_completed_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Both send workers completed" << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Both send workers completed" << std::endl;
         
         // Wait for all recv workers to complete
         while (!recv_worker_1_completed_ || !recv_worker_2_completed_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Both recv workers completed" << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Both recv workers completed" << std::endl;
         
         // Wait for all XOR workers to complete
         while (!xor_worker_1_completed_ || !xor_worker_2_completed_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Both XOR workers completed" << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Both XOR workers completed" << std::endl;
         
         // Wait for P2P worker to complete
         while (!p2p_worker_completed_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P worker completed" << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P worker completed" << std::endl;
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] All threads completed (encoding + send + recv + XOR + P2P)" << std::endl;
     }

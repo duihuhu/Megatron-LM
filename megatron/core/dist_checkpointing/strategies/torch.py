@@ -935,6 +935,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # Allocate P2P buffers (will be allocated after metadata exchange)
         self.eccheck_p2p_buffers = None
         
+        self.ecc_write_buckets = []
         # Initialize free buffer queues for Phase 3
         import queue
         self._free_data_buffer_queue = queue.Queue()
@@ -1070,10 +1071,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         # ===== Allocate two large continuous buffers =====
         # Buffer 1: Own data/parity
-        own_buffer = torch.empty(own_aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+        own_buffer = torch.empty(own_aligned_size, dtype=torch.uint8)
         
         # Buffer 2: Partner's data/parity
-        partner_buffer = torch.empty(partner_aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+        partner_buffer = torch.empty(partner_aligned_size, dtype=torch.uint8)
         
         logger.info(
             f"EC-CHECK: Allocated P2P buffers:\n"
@@ -1083,9 +1084,118 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             f"({partner_aligned_size / (1024**2):.0f} MB)"
         )
         
+        # ===== Package own and partner metadata/buffers into eccheck_bytes_data format =====
+        # Get non-tensor data from global_registry
+        own_non_tensor_data = global_registry.rank_non_tensor_data.get(rank, {})
+        partner_non_tensor_data = global_registry.rank_non_tensor_data.get(p2p_partner_rank, {})
+        
+        # Serialize own metadata
+        own_non_tensor_data_bytes = pickle.dumps(own_non_tensor_data)
+        own_tensor_keys_data_bytes = pickle.dumps(own_metadata)
+        own_non_tensor_size = len(own_non_tensor_data_bytes)
+        own_tensor_keys_size = len(own_tensor_keys_data_bytes)
+        own_tensor_buffer_size = own_total_size
+        
+        # Serialize partner metadata
+        partner_non_tensor_data_bytes = pickle.dumps(partner_non_tensor_data)
+        partner_tensor_keys_data_bytes = pickle.dumps(partner_metadata)
+        partner_non_tensor_size = len(partner_non_tensor_data_bytes)
+        partner_tensor_keys_size = len(partner_tensor_keys_data_bytes)
+        partner_tensor_buffer_size = partner_total_size
+        
+        # Create own serialized metadata (similar to eccheck_serialized_metadata)
+        own_serialized_metadata = {
+            'non_tensor_data': own_non_tensor_data_bytes,
+            'tensor_keys_data': own_tensor_keys_data_bytes,
+            'non_tensor_size': own_non_tensor_size,
+            'tensor_keys_size': own_tensor_keys_size,
+            'tensor_buffer_size': own_tensor_buffer_size,
+            'eccheck_file': f'__{rank}_p2p_own.distcp',  # P2P own file
+            'eccheck_file_path': None,  # Will be set later if needed
+        }
+        
+        # Create partner serialized metadata
+        partner_serialized_metadata = {
+            'non_tensor_data': partner_non_tensor_data_bytes,
+            'tensor_keys_data': partner_tensor_keys_data_bytes,
+            'non_tensor_size': partner_non_tensor_size,
+            'tensor_keys_size': partner_tensor_keys_size,
+            'tensor_buffer_size': partner_tensor_buffer_size,
+            'eccheck_file': f'__{p2p_partner_rank}_p2p_partner.distcp',  # P2P partner file
+            'eccheck_file_path': None,  # Will be set later if needed
+        }
+        
+        # Create eccheck_bytes_data format for own data
+        own_eccheck_bytes_data = [
+            ('eccheck_metadata', own_serialized_metadata),
+            ('eccheck_continuous_buffer', own_buffer),  # Own buffer
+        ]
+        
+        # Create eccheck_bytes_data format for partner data
+        partner_eccheck_bytes_data = [
+            ('eccheck_metadata', partner_serialized_metadata),
+            ('eccheck_continuous_buffer', partner_buffer),  # Partner buffer
+        ]
+        
+        # ===== Package into WriteBucket format =====
+        # WriteBucket = Tuple[Path, str, Tuple[list, list]]
+        # Format: (file_path, storage_key, (bytes_data, tensor_data))
+        from pathlib import Path
+        
+        # Get checkpoint_dir (should be set in save() method)
+        checkpoint_dir = getattr(self, 'current_checkpoint_dir', None)
+        if checkpoint_dir is None:
+            logger.warning("EC-CHECK: checkpoint_dir not available, using file_name as path")
+            checkpoint_dir = Path(".")
+        else:
+            checkpoint_dir = Path(checkpoint_dir)
+        
+        # Generate file names for own and partner
+        own_file_name = own_serialized_metadata['eccheck_file']
+        partner_file_name = partner_serialized_metadata['eccheck_file']
+        
+        # Build full file paths using checkpoint_dir
+        own_file_path = checkpoint_dir / own_file_name
+        partner_file_path = checkpoint_dir / partner_file_name
+        
+        # Update serialized metadata with full paths
+        own_serialized_metadata['eccheck_file_path'] = str(own_file_path)
+        partner_serialized_metadata['eccheck_file_path'] = str(partner_file_path)
+        
+        # Create WriteBucket for own data
+        own_write_bucket = (
+            own_file_path,              # file_path (full path with checkpoint_dir)
+            own_file_name,              # storage_key (used in metadata)
+            (own_eccheck_bytes_data, []),  # (bytes_data, tensor_data)
+        )
+        
+        # Create WriteBucket for partner data
+        partner_write_bucket = (
+            partner_file_path,          # file_path (full path with checkpoint_dir)
+            partner_file_name,          # storage_key (used in metadata)
+            (partner_eccheck_bytes_data, []),  # (bytes_data, tensor_data)
+        )
+        
+        self.ecc_write_buckets.append(own_write_bucket)
+        self.ecc_write_buckets.append(partner_write_bucket)
+        
+        logger.info(
+            f"EC-CHECK: Packaged P2P data into eccheck_bytes_data and WriteBucket format:\n"
+            f"  Own metadata: {own_non_tensor_size / 1024:.2f} KB (non-tensor) + "
+            f"{own_tensor_keys_size / 1024:.2f} KB (tensor keys), "
+            f"{own_tensor_buffer_size / (1024**3):.2f} GB (buffer)\n"
+            f"  Own WriteBucket: {own_file_name}\n"
+            f"  Partner metadata: {partner_non_tensor_size / 1024:.2f} KB (non-tensor) + "
+            f"{partner_tensor_keys_size / 1024:.2f} KB (tensor keys), "
+            f"{partner_tensor_buffer_size / (1024**3):.2f} GB (buffer)\n"
+            f"  Partner WriteBucket: {partner_file_name}"
+        )
+        
         return {
             'own_buffer': own_buffer,
-            'partner_buffer': partner_buffer
+            'partner_buffer': partner_buffer,
+            "own_write_bucket": own_write_bucket,
+            "partner_write_bucket": partner_write_bucket
         }
 
     def _allocate_parity_buffers(self):
@@ -1118,7 +1228,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         for data_addr in data_buffers:
             try:
                 self._free_data_buffer_queue.put_nowait(data_addr)
-                logger.debug(f"EC-CHECK: Released data buffer at address {data_addr}")
+                logger.info(f"EC-CHECK: Released data buffer at address {data_addr}")
             except Exception:
                 logger.error(f"EC-CHECK: Data buffer queue is full, cannot release buffer {data_addr}")
         
@@ -1127,7 +1237,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         for encoding_addr in encoding_buffers:
             try:
                 self._free_encoding_buffer_queue.put_nowait(encoding_addr)
-                logger.debug(f"EC-CHECK: Released encoding buffer at address {encoding_addr}")
+                logger.info(f"EC-CHECK: Released encoding buffer at address {encoding_addr}")
             except Exception:
                 logger.error(f"EC-CHECK: Encoding buffer queue is full, cannot release buffer {encoding_addr}")
         
@@ -1318,6 +1428,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             # Pass P2P buffers (own_buffer and partner_buffer)
             writer.eccheck_p2p_buffers = self.eccheck_p2p_buffers
             
+            writer.ecc_write_buckets = self.ecc_write_buckets
             # In EC-CHECK mode, call prepare_write_data to create write_buckets
             # It will use the metadata we just prepared
             writer.prepare_write_data(self.cached_central_plan, planner)

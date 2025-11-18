@@ -135,11 +135,14 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eccheck_recv_encoding_buffers = None  # Tuple of two large receive buffers (thread1, thread2)
         self.eccheck_parity_buffers = None  # List of parity buffers for XOR results
         
+        self.eccheck_p2p_buffers = None
+        
         # EC-CHECK buffer poller thread (persistent, created once)
         self._buffer_poller_thread = None
         self._buffer_poller_stop_event = None
         self._buffer_poller_active_event = None  # Controls when polling is active
         
+        self.ecc_write_buckets = None
         # Initialize C++ native module if available
         if eccheck_native is not None:
             # Use pre-initialized C++ module from strategy
@@ -815,6 +818,21 @@ class FileSystemWriterAsync(FileSystemWriter):
             ([], [])  # Will be handled specially in write_preloaded_data
         ))
         
+        # Add P2P write buckets if P2P buffers are available
+        # P2P buckets are tuples: (file_path, storage_key, (bytes_data, tensor_data))
+        # We add them with empty bytes_data/tensor_data, which will be filled in _eccheck_preload_tensors_to_buffer
+        if hasattr(self, 'eccheck_p2p_buffers') and self.eccheck_p2p_buffers is not None:
+            if 'own_write_bucket' in self.eccheck_p2p_buffers:
+                # Unpack the tuple to get file_path and storage_key
+                own_file_path, own_storage_key, own_eccheck_bytes_data = self.eccheck_p2p_buffers['own_write_bucket']
+                self.write_buckets.append((own_file_path, own_storage_key, ([own_eccheck_bytes_data], [])))
+                logger.debug("EC-CHECK: Added own P2P write bucket to write_buckets")
+            if 'partner_write_bucket' in self.eccheck_p2p_buffers:
+                # Unpack the tuple to get file_path and storage_key
+                partner_file_path, partner_storage_key, partner_eccheck_bytes_data = self.eccheck_p2p_buffers['partner_write_bucket']
+                self.write_buckets.append((partner_file_path, partner_storage_key, ([partner_eccheck_bytes_data], [])))
+                logger.debug("EC-CHECK: Added partner P2P write bucket to write_buckets")
+        
         # Set up results queue
         if len(self.write_buckets) > 0:
             self.results_queue = _get_write_results_queue()
@@ -971,6 +989,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             p2p_own_buffer_offset = 0
             p2p_partner_buffer_offset = 0
 
+        total_bytes = 1024
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
             cur_buffer_addr = get_free_data_buffer()
@@ -1166,22 +1185,37 @@ class FileSystemWriterAsync(FileSystemWriter):
         exec_start = time()
         self._execute_phase3_encoding()
         exec_time = time() - exec_start
-        logger.info(f"EC-CHECK: Phase 3 completed in {exec_time:.2f}s")
         
         # Return write_buckets with EC-CHECK continuous buffer
         # Buffer contains all tensor data in continuous memory
         
         # todo(hucc):  mul write_buckets is for mul process write ,but here is one process write ,so we need to change the write_buckets to a list of write_buckets, leave it future
         result_buckets = []
-        for bucket in self.write_buckets:
+        for i, bucket in enumerate(self.write_buckets):
             file_name, storage_key, (bytes_data, tensor_data) = bucket
             # Add EC-CHECK metadata and continuous buffer
-            eccheck_bytes_data = [
-                ('eccheck_metadata', self.eccheck_serialized_metadata),
-                ('eccheck_continuous_buffer', self.tensor_buffer),  # Continuous buffer
-            ]
-            result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
-        
+            if self.use_eccheck:
+                if i == 0:
+                    eccheck_bytes_data = [
+                        ('eccheck_metadata', self.eccheck_serialized_metadata),
+                        ('eccheck_continuous_buffer', self.tensor_buffer),  # Continuous buffer
+                    ]
+                    result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
+                else:
+                    continue
+            else:
+                eccheck_bytes_data = [
+                    ('eccheck_metadata', self.eccheck_serialized_metadata),
+                    ('eccheck_continuous_buffer', self.tensor_buffer),  # Continuous buffer
+                ]
+                result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
+            
+        if self.use_eccheck and self.ecc_write_buckets is not None:
+            for bucket in self.ecc_write_buckets:
+                result_buckets.append(bucket)
+                
+        logger.info(f"EC-CHECK: eccheck preload tensor to buffer {exec_time:.2f}s")
+
         return result_buckets
     
     @staticmethod

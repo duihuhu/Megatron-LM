@@ -97,14 +97,15 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 1
+    --pipeline-model-parallel-size 4
 )
 
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
-    --save-interval 1
+    --save-interval 100
     --eval-interval 1
     --save $CHECKPOINT_PATH 
+    --load $CHECKPOINT_PATH 
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --use-eccheck

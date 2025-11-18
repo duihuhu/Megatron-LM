@@ -92,8 +92,14 @@ MSC_PREFIX = "msc://"
 
 _metadata_fn: str = ".metadata"
 
+_TORCH_STRATEGIES_REGISTERED = False
+
 
 def register_default_torch_strategies():
+    global _TORCH_STRATEGIES_REGISTERED
+
+    if _TORCH_STRATEGIES_REGISTERED:
+        return
     """Register default strategies related to PyT Distributed backend."""
     register_default_strategy(
         StrategyAction.LOAD_SHARDED, 'torch_dist', 1, TorchDistLoadShardedStrategy()
@@ -101,6 +107,7 @@ def register_default_torch_strategies():
     register_default_strategy(
         StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy('torch_dist', 1)
     )
+    _TORCH_STRATEGIES_REGISTERED = True
 
 
 logger = getLogger(__name__)

@@ -58,6 +58,7 @@ from .base import (
     register_default_strategy,
 )
 from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
+from .eccheck_manager import ECCHECKManager
 from .filesystem_async import FileSystemWriterAsync
 from .resharding import (
     TensorReformulationMetadata,
@@ -709,272 +710,25 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         self.validated_loaded_metadata_reuse = False
         
-        # Initialize EC-CHECK if enabled
-        self._eccheck_native = None
-        self._init_eccheck_if_enabled()
-
-    def _init_eccheck_if_enabled(self):
-        """Initialize EC-CHECK C++ module if enabled and distributed environment is ready."""
-        try:
-            from megatron.training import get_args as input_args
-            args = input_args()
-            self.use_eccheck = True
-            if not getattr(args, 'use_eccheck', False):
-                return
-                
-            # Check if distributed environment is initialized
-            if not torch.distributed.is_initialized():
-                logger.warning("EC-CHECK: Distributed environment not initialized, skipping EC-CHECK initialization")
-                return
-                
-            # Initialize EC-CHECK C++ module
-            self._init_eccheck_native()
-            
-            # Start persistent buffer poller thread
-            self._start_buffer_poller_thread()
-            
-        except Exception as e:
-            logger.warning(f"EC-CHECK: Failed to initialize during strategy creation: {e}")
-            self._eccheck_native = None
-
-    def _init_eccheck_native(self):
-        """Initialize EC-CHECK C++ native module."""
-        eccheck_native = None
-        try:
-            # Direct import .so file without modifying sys.path or affecting other packages
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            
-            # Find .so file
-            import glob as _glob_module
-            so_files = _glob_module.glob(os.path.join(current_dir, "eccheck_native*.so"))
-            
-            if not so_files:
-                raise ImportError(f"No eccheck_native.so file found in {current_dir}")
-            
-            # Load .so file directly using importlib
-            import importlib.util as _importlib_util
-            so_path = so_files[0]
-            spec = _importlib_util.spec_from_file_location("eccheck_native", so_path)
-            eccheck_native = _importlib_util.module_from_spec(spec)
-            spec.loader.exec_module(eccheck_native)
-            logger.debug(f"EC-CHECK: Loaded .so file from {so_path}")
-            
-            rank = torch.distributed.get_rank()
-            world_size = torch.distributed.get_world_size()
-            paired_rank = self._get_p2p_partner_rank(rank, world_size)
-            
-            # Create instance with error handling
-            try:
-                # ===== Step 1: Rank 0 generates three NCCL IDs =====
-                if rank == 0:
-                    # Generate NCCL IDs using module-level function (no instance needed)
-                    nccl_id_thread1 = eccheck_native.generate_nccl_id()
-                    nccl_id_thread2 = eccheck_native.generate_nccl_id()
-                    nccl_id_p2p = eccheck_native.generate_nccl_id()
-                    logger.info(f"EC-CHECK: [Rank 0] Generated three NCCL IDs (size: {len(nccl_id_thread1)} bytes each)")
-                else:
-                    # Other ranks prepare empty lists (will be filled by broadcast)
-                    nccl_id_thread1 = [0] * 128  # NCCL ID is typically 128 bytes
-                    nccl_id_thread2 = [0] * 128
-                    nccl_id_p2p = [0] * 128
-                
-                # ===== Step 2: Broadcast NCCL IDs to all ranks =====
-                # Convert lists to torch tensors for broadcasting
-                # NOTE: NCCL backend requires tensors to be on CUDA device
-                nccl_id_size = 128  # sizeof(ncclUniqueId)
-                
-                # Convert to tensors and move to CUDA (NCCL requires CUDA tensors)
-                if rank == 0:
-                    id1_tensor = torch.tensor(nccl_id_thread1, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id2_tensor = torch.tensor(nccl_id_thread2, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id_p2p_tensor = torch.tensor(nccl_id_p2p, dtype=torch.uint8, device=torch.cuda.current_device())
-                else:
-                    id1_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id2_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id_p2p_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
-                
-                # Broadcast all three IDs (synchronous operation - all ranks wait)
-                # NCCL backend requires tensors to be on CUDA device
-                torch.distributed.broadcast(id1_tensor, src=0)
-                torch.distributed.broadcast(id2_tensor, src=0)
-                torch.distributed.broadcast(id_p2p_tensor, src=0)
-                
-                # Convert back to lists (move to CPU first, then tolist)
-                nccl_id_thread1 = id1_tensor.cpu().tolist()
-                nccl_id_thread2 = id2_tensor.cpu().tolist()
-                nccl_id_p2p = id_p2p_tensor.cpu().tolist()
-                
-                logger.info(f"EC-CHECK: [Rank {rank}] Received three NCCL IDs via broadcast")
-                
-                # ===== Step 3: Create C++ instance with broadcasted IDs =====
-                # IMPORTANT: This constructor call will BLOCK until:
-                # 1. Send and recv threads are started
-                # 2. All three NCCL communicators are fully initialized using the broadcasted IDs
-                # 3. All threads are ready for data exchange
-                # Only after all initialization is complete will this call return.
-                logger.info(f"EC-CHECK: Creating C++ native module (this will block until NCCL is initialized)...")
-                print(f"EC-CHECK: [Rank {rank}] Creating C++ native module (blocking until NCCL initialization completes)...")
-                
-                self._eccheck_native = eccheck_native.ECCHECKNative(
-                    rank, world_size, paired_rank,
-                    nccl_id_thread1,  # Pass broadcasted IDs
-                    nccl_id_thread2,
-                    nccl_id_p2p      # Pass P2P NCCL ID
-                )
-                
-                # If we reach here, NCCL communicators are ready and threads are running
-                logger.info(f"EC-CHECK: C++ native module initialized successfully (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
-                print(f"EC-CHECK: [Rank {rank}] C++ native module initialized - NCCL communicators ready for data exchange")
-                
-                # Initialize EC-CHECK buffers
-                self._init_eccheck_buffers()
+        # Initialize EC-CHECK manager (singleton instance shared with Load strategy)
+        self.eccheck_manager = ECCHECKManager()
+        self.eccheck_manager.init_eccheck_if_enabled()
         
-            except Exception as e:
-                logger.warning(f"EC-CHECK: Failed to create C++ native module instance: {e}")
-                # Try to stop the pipeline if it was partially created
-                try:
-                    if hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
-                        self._eccheck_native.stop_pipeline()
-                except:
-                    pass
-                self._eccheck_native = None
-                raise e
-            
-        except ImportError as e:
-            logger.warning(f"EC-CHECK: C++ native module not available: {e}, EC-CHECK functionality will not work")
-            self._eccheck_native = None
-        except Exception as e:
-            logger.warning(f"EC-CHECK: Failed to initialize C++ native module: {e}, EC-CHECK functionality will not work")
-            self._eccheck_native = None
-
-    def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
-        """
-        Get P2P partner rank for data/parity exchange.
-        
-        P2P pairing rules (different from XOR pairing):
-        - Rank 0 ↔ Rank 1 (P2P)
-        - Rank 2 ↔ Rank 3 (P2P)
-        
-        XOR pairing (for reference):
-        - Rank 0 ↔ Rank 2 (XOR)
-        - Rank 1 ↔ Rank 3 (XOR)
-        
-        Args:
-            my_rank (int): Current rank
-            world_size (int): Total number of ranks
-            
-        Returns:
-            int: P2P partner rank
-        """
-        if world_size % 2 != 0:
-            raise ValueError(f"EC-CHECK: World size must be even for P2P pairing, got {world_size}")
-        
-        # P2P pairing: adjacent ranks in pairs
-        # For 4-rank setup: (0,1) and (2,3)
-        if my_rank % 2 == 0:
-            # Even rank: pair with next rank
-            p2p_partner_rank = my_rank + 1
-        else:
-            # Odd rank: pair with previous rank
-            p2p_partner_rank = my_rank - 1
-        
-        # Ensure partner rank is valid
-        if p2p_partner_rank < 0 or p2p_partner_rank >= world_size:
-            raise ValueError(f"EC-CHECK: Invalid P2P partner rank {p2p_partner_rank} for rank {my_rank}")
-        
-        logger.debug(f"EC-CHECK: Rank {my_rank} P2P partner is Rank {p2p_partner_rank}")
-        return p2p_partner_rank
-
-    def _init_eccheck_buffers(self):
-        """Initialize EC-CHECK buffers during C++ module initialization.
-        
-        Note: Only allocates data and encoding buffers at initialization.
-        Receive and parity buffers will be allocated by FileSystemWriterAsync
-        after metadata exchange, when peer data sizes are known.
-        """
-        rank = torch.distributed.get_rank()
-        logger.info("EC-CHECK: Initializing buffers for EC-CHECK (data and encoding only)")
-        print(f"EC-CHECK: Initializing buffers for EC-CHECK (rank={rank}, data and encoding only)")
-        
-        # EC-CHECK configuration parameters
-        self.eccheck_data_buffers_count = 12
-        self.eccheck_encoding_buffers_count = 24  # data_count * m (12 * 2)
-        self.eccheck_buffer_size = 64 * 1024 * 1024  # 64MB
-        self.eccheck_pin_memory = True
-        
+        # Initialize strategy-specific EC-CHECK state
         self.eccheck_preallocate_cpu_buffer = True  # Preallocate CPU buffer for tensor data
         self.eccheck_use_continuous_buffer = True  # Use continuous buffer for tensor data
-        
-        # Initialize state for EC-CHECK preparation
         self.decomposed_state_dict = None
         self.preallocated_cpu_buffer = None
         self.eccheck_serialized_metadata = None
-        
-        # Allocate data buffers for storing original tensor data
-        self.eccheck_data_buffers = self._allocate_data_buffers()
-        
-        # Allocate encoding buffers for encoded packets
-        self.eccheck_encoding_buffers = self._allocate_encoding_buffers()
-        
-        # Allocate receive buffers for peer encoded packets
+        self.eccheck_global_registry = None
         self.eccheck_recv_encoding_buffers = None
-        
-        # Allocate parity buffers for XOR computation results
-        self.eccheck_parity_buffers = self._allocate_parity_buffers()
-        
-        # Allocate P2P buffers (will be allocated after metadata exchange)
         self.eccheck_p2p_buffers = None
-        
         self.ecc_write_buckets = []
-        # Initialize free buffer queues for Phase 3
-        import queue
-        self._free_data_buffer_queue = queue.Queue()
-        for buffer in self.eccheck_data_buffers:
-            self._free_data_buffer_queue.put(int(buffer.data_ptr()))
-        
-        self._free_encoding_buffer_queue = queue.Queue()
-        for buffer in self.eccheck_encoding_buffers:
-            self._free_encoding_buffer_queue.put(int(buffer.data_ptr()))
-        
-        self._free_parity_buffer_queue = queue.Queue()
-        for buffer in self.eccheck_parity_buffers:
-            self._free_parity_buffer_queue.put(int(buffer.data_ptr()))
 
-        logger.info(f"EC-CHECK: Buffer initialization completed - "
-                   f"Data buffers: {len(self.eccheck_data_buffers)}, "
-                   f"Encoding buffers: {len(self.eccheck_encoding_buffers)}, "
-                   f"Parity buffers: {len(self.eccheck_parity_buffers)}")
-        print(f"EC-CHECK: Buffer initialization completed (rank={rank}) - "
-              f"Data buffers: {len(self.eccheck_data_buffers)}, "
-              f"Encoding buffers: {len(self.eccheck_encoding_buffers)}, "
-              f"Parity buffers: {len(self.eccheck_parity_buffers)}")
+    def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
+        """Get P2P partner rank using the shared manager."""
+        return self.eccheck_manager.get_p2p_partner_rank(my_rank, world_size)
 
-    def _allocate_data_buffers(self):
-        """Allocate data buffers for storing original tensor data."""
-        logger.info(f"EC-CHECK: Allocating data buffers ({self.eccheck_data_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
-        
-        data_buffers = []
-        for i in range(self.eccheck_data_buffers_count):
-            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-            data_buffers.append(buffer)
-            logger.debug(f"EC-CHECK: Allocated data buffer {i}: {self.eccheck_buffer_size} bytes")
-        
-        logger.info(f"EC-CHECK: Allocated {len(data_buffers)} data buffers")
-        return data_buffers
-
-    def _allocate_encoding_buffers(self):
-        """Allocate encoding buffers for encoded packets."""
-        logger.info(f"EC-CHECK: Allocating encoding buffers ({self.eccheck_encoding_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
-        
-        encoding_buffers = []
-        for i in range(self.eccheck_encoding_buffers_count):
-            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-            encoding_buffers.append(buffer)
-            logger.debug(f"EC-CHECK: Allocated encoding buffer {i}: {self.eccheck_buffer_size} bytes")
-        
-        logger.info(f"EC-CHECK: Allocated {len(encoding_buffers)} encoding buffers")
-        return encoding_buffers
- 
     def _allocate_recv_encoding_buffers_phase2(self, global_registry):
         """
         Allocate TWO large receive buffers for peer encoded packets (one per encoding thread).
@@ -988,35 +742,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Two receive buffers (one for thread1, one for thread2)
         """
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        paired_rank = self._get_p2p_partner_rank(rank, world_size)
-        
-        # Get peer's total data size from global registry
-        peer_metadata = global_registry.rank_metadata.get(paired_rank, [])
-        peer_total_size = sum(meta.size_bytes for meta in peer_metadata)
-        
-        # Align peer's data size to buffer_size (64MB)
-        aligned_size = ((peer_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
-        
-        logger.info(
-            f"EC-CHECK: Allocating TWO receive buffers based on peer data size\n"
-            f"  Paired rank: {paired_rank}\n"
-            f"  Peer data size: {peer_total_size / (1024**3):.2f} GB\n"
-            f"  Aligned buffer size (per buffer): {aligned_size / (1024**3):.2f} GB\n"
-            f"  Total receive memory: {2 * aligned_size / (1024**3):.2f} GB"
-        )
-        
-        # # Allocate two large continuous buffers (one for each encoding thread)
-        recv_buffer_thread1 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-        recv_buffer_thread2 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-        
-        logger.info(
-            f"EC-CHECK: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "
-            f"({aligned_size / (1024**2):.0f} MB each)"
-        )
-        
-        return (recv_buffer_thread1, recv_buffer_thread2)
+        return self.eccheck_manager.allocate_recv_encoding_buffers_phase2(global_registry)
 
     def _allocate_p2p_buffers(self, global_registry):
         """
@@ -1072,8 +798,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # print("own_metadata_updated: ", own_metadata_updated)
         # print("partner_metadata_updated: ", partner_metadata_updated)
         # ===== Align both sizes to buffer_size (64MB) =====
-        own_aligned_size = ((own_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
-        partner_aligned_size = ((partner_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
+        eccheck_buffer_size = self.eccheck_manager.eccheck_buffer_size
+        own_aligned_size = ((own_total_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
+        partner_aligned_size = ((partner_total_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
         
         logger.info(
             f"EC-CHECK: Allocating P2P buffers based on metadata\n"
@@ -1214,117 +941,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             "partner_write_bucket": partner_write_bucket
         }
     
-    def _allocate_parity_buffers(self):
-        """Allocate parity buffers for XOR computation results.
-        
-        Note: Parity buffer count should match encoding buffer count (24) to support
-        pipelined operations where each data chunk needs 2 parity buffers (one per thread).
-        """
-        # Use encoding buffer count instead of data buffer count
-        # Each data chunk needs 2 parity buffers (thread1 and thread2)
-        parity_buffer_count = self.eccheck_encoding_buffers_count
-        logger.info(f"EC-CHECK: Allocating parity buffers ({parity_buffer_count} buffers)")
-        
-        parity_buffers = []
-        for i in range(parity_buffer_count):
-            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-            parity_buffers.append(buffer)
-            logger.debug(f"EC-CHECK: Allocated parity buffer {i}: {self.eccheck_buffer_size} bytes")
-        
-        logger.info(f"EC-CHECK: Allocated {len(parity_buffers)} parity buffers")
-        return parity_buffers
-
-    def _poll_and_release_buffers(self):
-        """Poll C++ for buffers ready to be released and put them back to queues."""
-        if self._eccheck_native is None:
-            return
-        
-        # Get data buffers ready for release
-        data_buffers = self._eccheck_native.get_data_buffers_to_release()
-        for data_addr in data_buffers:
-            try:
-                self._free_data_buffer_queue.put_nowait(data_addr)
-                logger.info(f"EC-CHECK: Released data buffer at address {data_addr}")
-            except Exception:
-                logger.error(f"EC-CHECK: Data buffer queue is full, cannot release buffer {data_addr}")
-        
-        # Get encoding buffers ready for release
-        encoding_buffers = self._eccheck_native.get_encoding_buffers_to_release()
-        for encoding_addr in encoding_buffers:
-            try:
-                self._free_encoding_buffer_queue.put_nowait(encoding_addr)
-                logger.info(f"EC-CHECK: Released encoding buffer at address {encoding_addr}")
-            except Exception:
-                logger.error(f"EC-CHECK: Encoding buffer queue is full, cannot release buffer {encoding_addr}")
-        
-        # Get parity buffers ready for release
-        parity_buffers = self._eccheck_native.get_parity_buffers_to_release()
-        for parity_addr in parity_buffers:
-            try:
-                self._free_parity_buffer_queue.put_nowait(parity_addr)
-                logger.debug(f"EC-CHECK: Released parity buffer at address {parity_addr}")
-            except Exception:
-                logger.error(f"EC-CHECK: Parity buffer queue is full, cannot release buffer {parity_addr}")
-    
-    def _start_buffer_poller_thread(self):
-        """Start a persistent background thread to poll and release buffers."""
-        import threading
-        
-        if hasattr(self, '_buffer_poller_thread') and self._buffer_poller_thread is not None:
-            logger.warning("EC-CHECK: Buffer poller thread already started")
-            return
-        
-        # Create control events
-        self._buffer_poller_stop_event = threading.Event()
-        self._buffer_poller_active_event = threading.Event()
-        
-        def buffer_poller_worker():
-            """Persistent background thread that polls for buffer releases."""
-            logger.info("EC-CHECK: Buffer poller thread started")
-            poll_count = 0
-            
-            while not self._buffer_poller_stop_event.is_set():
-                # Only poll when active
-                if self._buffer_poller_active_event.is_set():
-                    self._poll_and_release_buffers()
-                    poll_count += 1
-                    if poll_count % 1000 == 0:
-                        logger.debug(f"EC-CHECK: Buffer poller running (polled {poll_count} times)")
-                
-                # Sleep briefly to avoid busy waiting
-                from time import sleep
-                sleep(0.001)  # 1ms
-            
-            logger.info("EC-CHECK: Buffer poller thread stopping")
-        
-        # Start the daemon thread
-        self._buffer_poller_thread = threading.Thread(target=buffer_poller_worker, daemon=True)
-        self._buffer_poller_thread.start()
-        logger.info("EC-CHECK: Buffer poller thread created and started")
-    
-    def _stop_buffer_poller_thread(self):
-        """Stop the persistent buffer poller thread."""
-        if not hasattr(self, '_buffer_poller_thread') or self._buffer_poller_thread is None:
-            return
-        
-        logger.info("EC-CHECK: Stopping buffer poller thread...")
-        
-        # Signal the thread to stop
-        if self._buffer_poller_stop_event:
-            self._buffer_poller_stop_event.set()
-        
-        # Wait for thread to finish
-        if self._buffer_poller_thread.is_alive():
-            self._buffer_poller_thread.join(timeout=2.0)
-            if self._buffer_poller_thread.is_alive():
-                logger.warning("EC-CHECK: Buffer poller thread did not stop in time")
-            else:
-                logger.info("EC-CHECK: Buffer poller thread stopped successfully")
-        
-        self._buffer_poller_thread = None
-        self._buffer_poller_stop_event = None
-        self._buffer_poller_active_event = None
-
     def _get_eccheck_buffers(self):
         """Get EC-CHECK buffers for FileSystemWriterAsync.
         
@@ -1332,31 +948,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         Receive buffers will be allocated by FileSystemWriterAsync
         after metadata exchange.
         """
-        if not hasattr(self, 'eccheck_data_buffers'):
-            return None
-        
-        return {
-            'data_buffers': self.eccheck_data_buffers,
-            'encoding_buffers': self.eccheck_encoding_buffers,
-            'parity_buffers': self.eccheck_parity_buffers,
-            'free_data_buffer_queue': self._free_data_buffer_queue,
-            'free_encoding_buffer_queue': self._free_encoding_buffer_queue,
-            'free_parity_buffer_queue': self._free_parity_buffer_queue,
-            # Pass buffer poller control objects
-            'buffer_poller_active_event': self._buffer_poller_active_event,
-            'poll_and_release_buffers': self._poll_and_release_buffers,
-            # Note: recv_encoding_buffers will be allocated by FileSystemWriterAsync after metadata exchange
-        }
+        return self.eccheck_manager.get_eccheck_buffers()
 
     def __del__(self):
-        """Cleanup EC-CHECK resources when strategy is destroyed."""
-        try:
-            if hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
-                # Stop the C++ pipeline
-                self._eccheck_native.stop_pipeline()
-                logger.info("EC-CHECK: C++ native module stopped in strategy destructor")
-        except Exception as e:
-            logger.warning(f"EC-CHECK: Error during strategy cleanup: {e}")
+        """Cleanup EC-CHECK resources when strategy is destroyed.
+        
+        Note: Manager cleanup is handled by the manager itself (singleton).
+        We don't need to cleanup here since the manager is shared.
+        """
+        pass
 
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
@@ -1387,8 +987,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
-            use_eccheck=args.use_eccheck,
-            eccheck_native=self._eccheck_native,  # Pass pre-initialized C++ module
+            use_eccheck=self.eccheck_manager.use_eccheck,
+            eccheck_native=self.eccheck_manager._eccheck_native,  # Pass pre-initialized C++ module
             eccheck_buffers=self._get_eccheck_buffers(),  # Pass pre-allocated buffers
         )
 
@@ -1432,7 +1032,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             loaded_all_plans=loaded_all_plans,
         )
         # EC-CHECK mode: decompose state_dict and preallocate CPU memory
-        if self.use_eccheck:
+        if self.eccheck_manager.use_eccheck:
             self._prepare_eccheck_data(self.cached_central_plan, planner)
             # Pass EC-CHECK state to writer if available
             writer.decomposed_state_dict = self.decomposed_state_dict
@@ -1603,7 +1203,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             logger.info(f"EC-CHECK: Preallocating CPU buffer of {total_size / (1024**3):.2f} GB")
             
             if self.preallocated_cpu_buffer == None:
-                if self.eccheck_pin_memory and torch.cuda.is_available():
+                if self.eccheck_manager.eccheck_pin_memory and torch.cuda.is_available():
                     self.preallocated_cpu_buffer = torch.empty(
                         total_size, dtype=torch.uint8).pin_memory()
                     logger.debug("EC-CHECK: Using pinned memory for CPU buffer")
@@ -1842,7 +1442,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         Returns:
             bool: True if decomposition is valid, False otherwise
         """
-        if not self.use_eccheck:
+        if not self.eccheck_manager.use_eccheck:
             logger.warning("EC-CHECK: Validation skipped - EC-CHECK is not enabled")
             return False
         
@@ -1974,6 +1574,14 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     def __init__(self):
         self.cached_global_metadata: Optional[Metadata] = None
         super().__init__()
+        
+        # Initialize EC-CHECK manager (singleton instance shared with Save strategy)
+        self.eccheck_manager = ECCHECKManager()
+        self.eccheck_manager.init_eccheck_if_enabled()
+    
+    def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
+        """Get P2P partner rank using the shared manager."""
+        return self.eccheck_manager.get_p2p_partner_rank(my_rank, world_size)
     
     def _is_eccheck_checkpoint(self, checkpoint_dir: Path) -> bool:
         """Check if the checkpoint is in EC-CHECK format.
@@ -2039,44 +1647,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             for x_val, templ_val in zip(x, keys_template):
                 self._restore_dict_types_lenient(x_val, templ_val)
     
-    def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
-        """
-        Get P2P partner rank for data/parity exchange.
-        
-        P2P pairing rules (different from XOR pairing):
-        - Rank 0 ↔ Rank 1 (P2P)
-        - Rank 2 ↔ Rank 3 (P2P)
-        
-        XOR pairing (for reference):
-        - Rank 0 ↔ Rank 2 (XOR)
-        - Rank 1 ↔ Rank 3 (XOR)
-        
-        Args:
-            my_rank (int): Current rank
-            world_size (int): Total number of ranks
-            
-        Returns:
-            int: P2P partner rank
-        """
-        if world_size % 2 != 0:
-            raise ValueError(f"EC-CHECK: World size must be even for P2P pairing, got {world_size}")
-        
-        # P2P pairing: adjacent ranks in pairs
-        # For 4-rank setup: (0,1) and (2,3)
-        if my_rank % 2 == 0:
-            # Even rank: pair with next rank
-            p2p_partner_rank = my_rank + 1
-        else:
-            # Odd rank: pair with previous rank
-            p2p_partner_rank = my_rank - 1
-        
-        # Ensure partner rank is valid
-        if p2p_partner_rank < 0 or p2p_partner_rank >= world_size:
-            raise ValueError(f"EC-CHECK: Invalid P2P partner rank {p2p_partner_rank} for rank {my_rank}")
-        
-        logger.debug(f"EC-CHECK: Rank {my_rank} P2P partner is Rank {p2p_partner_rank}")
-        return p2p_partner_rank
-    
     def _load_ecccheck_p2p_checkpoint(self, checkpoint_dir: Path) -> Tuple:
         from .filesystem_async import EccheckMappedFile
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -2135,10 +1705,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     
         recv_own_buffer = torch.empty(recv_total_size, dtype=torch.uint8)
         
-        # if rank % 2 == 0 and meta_type == 'data':   
-        #     torch.distributed.recv(recv_buffer, src=paired_rank)
-        # else:
-        #     torch.distributed.send(mapped_file_partner.memory_address, mapped_file_partner.file_size, src=paired_rank)
+        if rank == 0 or rank == 3:
+            self.eccheck_manager._eccheck_native.submit_data_to_p2p_thread(mapped_file_partner.memory_address, mapped_file_partner.file_size, 'send')
+        else:
+            # Convert data_ptr() to int to ensure type compatibility
+            self.eccheck_manager._eccheck_native.submit_data_to_p2p_thread(recv_own_buffer.data_ptr(), recv_total_size, 'recv')
         
 
         # if not eccheck_p2p_own_file.exists():

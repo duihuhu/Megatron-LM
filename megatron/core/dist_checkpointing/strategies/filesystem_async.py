@@ -976,12 +976,13 @@ class FileSystemWriterAsync(FileSystemWriter):
             p2p_own_buffer_offset = 0  # Current offset in own_buffer
             p2p_partner_buffer_offset = 0  # Current offset in partner_buffer
         else:
+            logger.warning("EC-CHECK: P2P buffers not set, using 0 addresses")
             p2p_own_buffer_base_addr = 0
             p2p_partner_buffer_base_addr = 0
             p2p_own_buffer_offset = 0
             p2p_partner_buffer_offset = 0
 
-        #total_bytes = 1024 * 1024 * 64# debug
+        total_bytes = 1024 * 1024 * 64 * 5 #debug
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
             cur_buffer_addr = get_free_data_buffer()

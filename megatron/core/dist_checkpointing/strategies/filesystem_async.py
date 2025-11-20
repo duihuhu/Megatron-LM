@@ -38,9 +38,33 @@ from .state_dict_decomposer import (
     organize_tensor_data_in_cpu_memory,
 )
 
+from .state_dict_decomposer import TensorMetadata
+
 logger = logging.getLogger(__name__)
 
 WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
+
+
+@dataclasses.dataclass
+class EccheckMappedFile:
+    """Container for mmap file information used for NCCL send/recv operations.
+    
+    Attributes:
+        mmap_object: mmap object that must be kept alive for the memory to remain valid
+        memory_address: starting memory address (can be used with NCCL)
+        file_size: total size of the mapped file in bytes
+    """
+    mmap_object: Any  # mmap.mmap object
+    memory_address: int
+    file_size: int
+    local_metadata: List[TensorMetadata]
+    non_tensor_data: Dict[str, Any]
+    
+    def close(self) -> None:
+        """Close the mmap object to release resources."""
+        if self.mmap_object is not None:
+            self.mmap_object.close()
+            self.mmap_object = None
 
 try:
     import psutil
@@ -820,18 +844,23 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Add P2P write buckets if P2P buffers are available
         # P2P buckets are tuples: (file_path, storage_key, (bytes_data, tensor_data))
-        # We add them with empty bytes_data/tensor_data, which will be filled in _eccheck_preload_tensors_to_buffer
         if hasattr(self, 'eccheck_p2p_buffers') and self.eccheck_p2p_buffers is not None:
             if 'own_write_bucket' in self.eccheck_p2p_buffers:
                 # Unpack the tuple to get file_path and storage_key
-                own_file_path, own_storage_key, own_eccheck_bytes_data = self.eccheck_p2p_buffers['own_write_bucket']
+                old_own_file_path, own_storage_key, own_eccheck_bytes_data = self.eccheck_p2p_buffers['own_write_bucket']
+                # Update path with current checkpoint_dir
+                own_file_name = Path(old_own_file_path).name if isinstance(old_own_file_path, (str, Path)) else str(old_own_file_path).split('/')[-1]
+                own_file_path = Path(self.checkpoint_dir) / own_file_name
                 self.write_buckets.append((own_file_path, own_storage_key, ([own_eccheck_bytes_data], [])))
-                logger.debug("EC-CHECK: Added own P2P write bucket to write_buckets")
+                # logger.debug(f"EC-CHECK: Added own P2P write bucket to write_buckets with path {own_file_path}")
             if 'partner_write_bucket' in self.eccheck_p2p_buffers:
                 # Unpack the tuple to get file_path and storage_key
-                partner_file_path, partner_storage_key, partner_eccheck_bytes_data = self.eccheck_p2p_buffers['partner_write_bucket']
+                old_partner_file_path, partner_storage_key, partner_eccheck_bytes_data = self.eccheck_p2p_buffers['partner_write_bucket']
+                # Update path with current checkpoint_dir
+                partner_file_name = Path(old_partner_file_path).name if isinstance(old_partner_file_path, (str, Path)) else str(old_partner_file_path).split('/')[-1]
+                partner_file_path = Path(self.checkpoint_dir) / partner_file_name
                 self.write_buckets.append((partner_file_path, partner_storage_key, ([partner_eccheck_bytes_data], [])))
-                logger.debug("EC-CHECK: Added partner P2P write bucket to write_buckets")
+                # logger.debug(f"EC-CHECK: Added partner P2P write bucket to write_buckets with path {partner_file_path}")
         
         # Set up results queue
         if len(self.write_buckets) > 0:
@@ -887,7 +916,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             raise RuntimeError("EC-CHECK: C++ native module is required but not available")
         
         # Direct implementation
-        self._copy_tensor_data_to_buffers_pipeline()
+        # self._copy_tensor_data_to_buffers_pipeline()
     
     def _copy_tensor_data_to_buffers_pipeline(self) -> None:
         """
@@ -1211,12 +1240,204 @@ class FileSystemWriterAsync(FileSystemWriter):
                 result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
             
         if self.use_eccheck and self.ecc_write_buckets is not None:
+            # Update bucket paths with current checkpoint_dir before adding to result_buckets
+            # This ensures paths are updated for each iteration
             for bucket in self.ecc_write_buckets:
-                result_buckets.append(bucket)
+                file_path, storage_key, data = bucket
+                # Extract file name from path
+                if isinstance(file_path, (str, Path)):
+                    file_path_obj = Path(file_path)
+                    file_name = file_path_obj.name
+                else:
+                    file_name = str(file_path).split('/')[-1] if '/' in str(file_path) else str(file_path)
+                
+                # Build new path with current checkpoint_dir
+                new_file_path = Path(self.checkpoint_dir) / file_name
+                
+                # Update eccheck_metadata['eccheck_file_path'] in data
+                # This is critical because write_preloaded_data uses metadata['eccheck_file_path'] (line 550)
+                updated_data = data
+                if isinstance(data, tuple) and len(data) > 0:
+                    bytes_data_list = data[0] if isinstance(data[0], list) else []
+                    updated_bytes_data = []
+                    for item in bytes_data_list:
+                        if isinstance(item, tuple) and len(item) == 2:
+                            key, value = item
+                            if key == 'eccheck_metadata' and isinstance(value, dict):
+                                # Update the file path in metadata
+                                updated_metadata = value.copy()
+                                updated_metadata['eccheck_file_path'] = str(new_file_path)
+                                updated_bytes_data.append((key, updated_metadata))
+                            else:
+                                updated_bytes_data.append(item)
+                        else:
+                            updated_bytes_data.append(item)
+                    updated_data = (updated_bytes_data, data[1] if len(data) > 1 else [])
+                
+                # Create updated bucket with new path and updated metadata
+                updated_bucket = (new_file_path, storage_key, updated_data)
+                result_buckets.append(updated_bucket)
                 
         logger.info(f"EC-CHECK: eccheck preload tensor to buffer {exec_time:.2f}s")
 
         return result_buckets
+    
+    @staticmethod
+    def load_eccheck_bytes_from_file(file_path: Union[str, os.PathLike], my_rank: int = 0) -> Tuple[EccheckMappedFile, Dict[str, Any], List[Any]]:
+        """
+        Load EC-CHECK file using mmap and return memory address and size for NCCL send/recv.
+        Also extracts non_tensor_data and tensor metadata for preparing local_metadata.
+        
+        File structure:
+        [Header: 32 bytes] [Component 1] [Component 2] [Component 3]
+        
+        Header format:
+        - Magic number: 4 bytes ('ECCK')
+        - Padding: 4 bytes (for alignment)
+        - Component 1 size: 8 bytes (uint64)
+        - Component 2 size: 8 bytes (uint64)
+        - Component 3 size: 8 bytes (uint64)
+        
+        Args:
+            file_path: path to the EC-CHECK file
+            my_rank: current rank (used for preparing local_metadata), default 0
+        
+        Returns:
+            Tuple[EccheckMappedFile, Dict[str, Any], List[TensorMetadata]]: tuple containing:
+                - EccheckMappedFile: dataclass containing:
+                    - mmap_object: mmap object that must be kept alive for the memory to remain valid
+                    - memory_address: starting memory address (can be used with NCCL)
+                    - file_size: total size of the mapped file in bytes
+                - non_tensor_data: Dict[str, Any] extracted from Component 1
+                - local_metadata: List[TensorMetadata] for preparing local metadata
+        
+        Note:
+            The mmap object must be kept alive (not garbage collected) while using the memory
+            for NCCL operations. The caller should call mapped_file.close() when done.
+        """
+        import mmap
+        import struct
+        import pickle
+        from .state_dict_decomposer import TensorMetadata
+        
+        # Open file and get size
+        f = open(file_path, "rb")
+        mm = None
+        try:
+            # Get file size
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            f.seek(0)  # Seek back to start
+            
+            # Memory-map the entire file (zero-copy for /dev/shm)
+            # Note: We don't use 'with' statement to keep mmap alive for NCCL operations
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            
+            # Close file handle - mmap is independent of the file handle
+            f.close()
+            f = None
+            
+            # Parse header to extract Component 1 (non_tensor_data) and Component 2 (tensor_infos)
+            header_bytes = mm[:32]
+            if len(header_bytes) != 32:
+                raise RuntimeError(f"EC-CHECK: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+            
+            # Parse header (default format includes padding for alignment)
+            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            
+            # Validate magic number
+            if magic != b'ECCK':
+                raise RuntimeError(f"EC-CHECK: Invalid magic number (expected b'ECCK', got {magic})")
+            
+            # Extract Component 1: non_tensor_data
+            offset = 32  # After header
+            
+            non_tensor_bytes = mm[offset:offset + non_tensor_size]
+            if len(non_tensor_bytes) != non_tensor_size:
+                raise RuntimeError(
+                    f"EC-CHECK: Failed to read Component 1 "
+                    f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
+                )
+            
+            # Deserialize non_tensor_data
+            non_tensor_data = pickle.loads(non_tensor_bytes)
+            logger.debug(f"EC-CHECK: Extracted non_tensor_data from Component 1 ({non_tensor_size / 1024:.2f} KB)")
+            
+            offset += non_tensor_size  # Move to Component 2
+            
+            # Extract Component 2: tensor_infos (for preparing local_metadata)
+            tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
+            if len(tensor_keys_bytes) != tensor_keys_size:
+                raise RuntimeError(
+                    f"EC-CHECK: Failed to read Component 2 "
+                    f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
+                )
+            
+            # Deserialize tensor_infos
+            tensor_infos = pickle.loads(tensor_keys_bytes)
+            logger.debug(f"EC-CHECK: Extracted {len(tensor_infos)} tensor infos from Component 2")
+            
+            # Convert tensor_infos to local_metadata (List[TensorMetadata])
+            local_metadata = []
+            for info in tensor_infos:
+                # print("info.target_rank, info.source_rank: ", info)
+                # Create TensorMetadata for each TensorInfo
+                data_meta = TensorMetadata(
+                    key=info.key,
+                    shape=info.shape,
+                    dtype=str(info.dtype),
+                    size_bytes=info.size_bytes,
+                    global_offset=info.global_offset if info.global_offset is not None else (),
+                    shard_index=info.shard_index if info.shard_index is not None else 0,
+                    chunk_type=info.chunk_type,
+                    target_rank=info.target_rank,  # Data stays on same rank
+                    source_rank=info.source_rank,
+                )
+                local_metadata.append(data_meta)
+            
+            logger.debug(f"EC-CHECK: Prepared {len(local_metadata)} TensorMetadata entries for local_metadata")
+            
+            # Get memory address for NCCL operations
+            # Use numpy.frombuffer to get address from read-only mmap (doesn't require write access)
+            # This creates a read-only numpy view and extracts its memory address
+            import numpy as np
+            
+            # Create minimal numpy view to get buffer address (works with read-only buffers)
+            np_view = np.frombuffer(mm, dtype=np.uint8, count=min(1, file_size))
+            memory_address = np_view.ctypes.data
+            
+            # Note: The mmap object itself implements the buffer protocol and can be used
+            # directly with NCCL. The memory_address is provided for cases where a raw
+            # pointer is needed.
+            
+            logger.info(
+                f"EC-CHECK: Mapped file {file_path} for NCCL operations\n"
+                f"  File size: {file_size / (1024**3):.2f} GB\n"
+                f"  Memory address: {hex(memory_address)}\n"
+                f"  Non-tensor data: {len(non_tensor_data)} keys\n"
+                f"  Tensor metadata: {len(local_metadata)} entries\n"
+                f"  Note: mmap object must be kept alive during NCCL operations"
+            )
+            
+            mapped_file = EccheckMappedFile(
+                mmap_object=mm,
+                memory_address=memory_address,
+                file_size=file_size,
+                local_metadata=local_metadata,
+                non_tensor_data=non_tensor_data
+            )
+            
+            return mapped_file
+            
+        except Exception as e:
+            if mm is not None:
+                try:
+                    mm.close()
+                except:
+                    pass
+            if f is not None:
+                f.close()
+            raise RuntimeError(f"EC-CHECK: Failed to map file {file_path} for NCCL: {e}") from e
     
     @staticmethod
     def load_eccheck_components_from_file(file_path: Union[str, os.PathLike]) -> DecomposedStateDict:

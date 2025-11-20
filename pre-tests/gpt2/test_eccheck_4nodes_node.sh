@@ -78,7 +78,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
     --lr 0.00015 
-    --train-iters 50
+    --train-iters 1000
     --lr-decay-iters 320000 
     --lr-decay-style cosine 
     --min-lr 1.0e-5 
@@ -102,10 +102,10 @@ MODEL_PARALLEL_ARGS=(
 
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
-    --save-interval 100
+    --save-interval 1
     --eval-interval 1
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH 
+    --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --use-eccheck

@@ -7,7 +7,7 @@ import pickle
 import warnings
 from collections import ChainMap, defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import product
 from logging import getLogger
 from pathlib import Path
@@ -67,7 +67,7 @@ from .resharding import (
     restore_nd_flattened_tensors_formulation,
 )
 from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
-from .state_dict_decomposer import DecomposedStateDict, TensorInfo
+from .state_dict_decomposer import DecomposedStateDict, TensorMetadata
 from time import time
 
 try:
@@ -761,7 +761,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
-            paired_rank = self._get_paired_rank(rank, world_size)
+            paired_rank = self._get_p2p_partner_rank(rank, world_size)
             
             # Create instance with error handling
             try:
@@ -846,23 +846,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         except Exception as e:
             logger.warning(f"EC-CHECK: Failed to initialize C++ native module: {e}, EC-CHECK functionality will not work")
             self._eccheck_native = None
-
-    def _get_paired_rank(self, my_rank: int, world_size: int) -> int:
-        """Get the paired rank for parity exchange."""
-        if world_size % 2 != 0:
-            raise ValueError(f"EC-CHECK: World size must be even for pairing, got {world_size}")
-        
-        half_size = world_size // 2
-        
-        if my_rank < half_size:
-            # First half pairs with second half
-            paired_rank = my_rank + half_size
-        else:
-            # Second half pairs with first half
-            paired_rank = my_rank - half_size
-        
-        logger.debug(f"EC-CHECK: Rank {my_rank} paired with Rank {paired_rank}")
-        return paired_rank
 
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """
@@ -1007,7 +990,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         """
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        paired_rank = self._get_paired_rank(rank, world_size)
+        paired_rank = self._get_p2p_partner_rank(rank, world_size)
         
         # Get peer's total data size from global registry
         peer_metadata = global_registry.rank_metadata.get(paired_rank, [])
@@ -1058,10 +1041,36 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         own_metadata = global_registry.rank_metadata.get(rank, [])
         own_total_size = sum(meta.size_bytes for meta in own_metadata)
         
+        if rank % 2 == 0:
+            own_metadata_updated = [
+                replace(meta, source_rank=rank, target_rank=rank, chunk_type='data')
+                for meta in own_metadata
+            ]  
+        else:
+            own_metadata_updated = [
+                replace(meta, source_rank=rank, target_rank=rank, chunk_type='parity')
+                for meta in own_metadata
+            ]
+            
         # ===== Get P2P partner's data size from metadata =====
         partner_metadata = global_registry.rank_metadata.get(p2p_partner_rank, [])
         partner_total_size = sum(meta.size_bytes for meta in partner_metadata)
         
+        # Update partner_metadata: set source_rank to p2p_partner_rank and target_rank to rank
+        if rank % 2 == 0:
+            partner_metadata_updated = [
+                replace(meta, source_rank=p2p_partner_rank, target_rank=rank, chunk_type='data')
+                for meta in partner_metadata
+            ]
+        else:
+            partner_metadata_updated = [
+                replace(meta, source_rank=p2p_partner_rank, target_rank=rank, chunk_type='parity')
+                for meta in partner_metadata
+            ]
+
+        
+        # print("own_metadata_updated: ", own_metadata_updated)
+        # print("partner_metadata_updated: ", partner_metadata_updated)
         # ===== Align both sizes to buffer_size (64MB) =====
         own_aligned_size = ((own_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
         partner_aligned_size = ((partner_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
@@ -1098,14 +1107,14 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         # Serialize own metadata
         own_non_tensor_data_bytes = pickle.dumps(own_non_tensor_data)
-        own_tensor_keys_data_bytes = pickle.dumps(own_metadata)
+        own_tensor_keys_data_bytes = pickle.dumps(own_metadata_updated)
         own_non_tensor_size = len(own_non_tensor_data_bytes)
         own_tensor_keys_size = len(own_tensor_keys_data_bytes)
         own_tensor_buffer_size = own_total_size
         
         # Serialize partner metadata
         partner_non_tensor_data_bytes = pickle.dumps(partner_non_tensor_data)
-        partner_tensor_keys_data_bytes = pickle.dumps(partner_metadata)
+        partner_tensor_keys_data_bytes = pickle.dumps(partner_metadata_updated)
         partner_non_tensor_size = len(partner_non_tensor_data_bytes)
         partner_tensor_keys_size = len(partner_tensor_keys_data_bytes)
         partner_tensor_buffer_size = partner_total_size
@@ -1204,7 +1213,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             "own_write_bucket": own_write_bucket,
             "partner_write_bucket": partner_write_bucket
         }
-
+    
     def _allocate_parity_buffers(self):
         """Allocate parity buffers for XOR computation results.
         
@@ -1635,6 +1644,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         start = time()
         if self.eccheck_p2p_buffers is None:
             self.eccheck_p2p_buffers = self._allocate_p2p_buffers(self.eccheck_global_registry)
+            
         p2p_buffer_alloc_time = time() - start
         logger.info(f"EC-CHECK: P2P buffer allocation completed in {p2p_buffer_alloc_time:.2f}s")
         
@@ -2029,6 +2039,120 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             for x_val, templ_val in zip(x, keys_template):
                 self._restore_dict_types_lenient(x_val, templ_val)
     
+    def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
+        """
+        Get P2P partner rank for data/parity exchange.
+        
+        P2P pairing rules (different from XOR pairing):
+        - Rank 0 ↔ Rank 1 (P2P)
+        - Rank 2 ↔ Rank 3 (P2P)
+        
+        XOR pairing (for reference):
+        - Rank 0 ↔ Rank 2 (XOR)
+        - Rank 1 ↔ Rank 3 (XOR)
+        
+        Args:
+            my_rank (int): Current rank
+            world_size (int): Total number of ranks
+            
+        Returns:
+            int: P2P partner rank
+        """
+        if world_size % 2 != 0:
+            raise ValueError(f"EC-CHECK: World size must be even for P2P pairing, got {world_size}")
+        
+        # P2P pairing: adjacent ranks in pairs
+        # For 4-rank setup: (0,1) and (2,3)
+        if my_rank % 2 == 0:
+            # Even rank: pair with next rank
+            p2p_partner_rank = my_rank + 1
+        else:
+            # Odd rank: pair with previous rank
+            p2p_partner_rank = my_rank - 1
+        
+        # Ensure partner rank is valid
+        if p2p_partner_rank < 0 or p2p_partner_rank >= world_size:
+            raise ValueError(f"EC-CHECK: Invalid P2P partner rank {p2p_partner_rank} for rank {my_rank}")
+        
+        logger.debug(f"EC-CHECK: Rank {my_rank} P2P partner is Rank {p2p_partner_rank}")
+        return p2p_partner_rank
+    
+    def _load_ecccheck_p2p_checkpoint(self, checkpoint_dir: Path) -> Tuple:
+        from .filesystem_async import EccheckMappedFile
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        p2p_partner_rank = self._get_p2p_partner_rank(rank, world_size)
+        
+        checkpoint_dir = Path(checkpoint_dir)
+        eccheck_p2p_own_file = checkpoint_dir / f"__{rank}_p2p_own.distcp"
+        eccheck_p2p_partner_file = checkpoint_dir / f"__{p2p_partner_rank}_p2p_partner.distcp"
+        
+        if not eccheck_p2p_own_file.exists():
+            mapped_file_own = EccheckMappedFile(None, None, None, None, None)
+            mapped_file_partner = EccheckMappedFile(None, None, None, None, None)
+            return mapped_file_own, mapped_file_partner
+        
+        # Load the decomposed state dict from file
+        # Returns tuple: (EccheckMappedFile, non_tensor_data, List[TensorMetadata])
+        mapped_file_own = FileSystemWriterAsync.load_eccheck_bytes_from_file(
+            str(eccheck_p2p_own_file), my_rank=rank
+        )
+        mapped_file_partner = FileSystemWriterAsync.load_eccheck_bytes_from_file(
+            str(eccheck_p2p_partner_file), my_rank=p2p_partner_rank
+        )
+        
+        # Package both together
+        local_package = {
+            'tensor_metadata': mapped_file_partner.local_metadata,
+            'non_tensor_data': mapped_file_partner.non_tensor_data,
+        }
+        
+        # ===== Step 2: All-gather complete metadata using all_gather_object =====
+        # This automatically handles serialization, padding, and deserialization
+        # Transmits both tensor_metadata and non_tensor_data
+        all_packages = [None] * world_size
+        torch.distributed.all_gather_object(all_packages, local_package)
+
+        rank_metadata = {}
+        rank_non_tensor_data = {}
+        for i, package in enumerate(all_packages):
+            rank_metadata[i] = package['tensor_metadata']
+            rank_non_tensor_data[i] = package['non_tensor_data']       
+
+        # Create registry with both tensor and non-tensor metadata
+        from .state_dict_decomposer import GlobalMetadataRegistry
+        registry = GlobalMetadataRegistry(
+            rank_metadata=rank_metadata,
+            rank_non_tensor_data=rank_non_tensor_data
+        )
+        
+        paired_rank = self._get_p2p_partner_rank(rank, world_size)
+        
+        # Get self metadata form peer rank in global registry
+        metadata_in_peer = registry.rank_metadata.get(paired_rank, [])
+        meta_type = metadata_in_peer[0].chunk_type
+        recv_total_size = sum(meta.size_bytes for meta in metadata_in_peer)
+    
+        recv_own_buffer = torch.empty(recv_total_size, dtype=torch.uint8)
+        
+        # if rank % 2 == 0 and meta_type == 'data':   
+        #     torch.distributed.recv(recv_buffer, src=paired_rank)
+        # else:
+        #     torch.distributed.send(mapped_file_partner.memory_address, mapped_file_partner.file_size, src=paired_rank)
+        
+
+        # if not eccheck_p2p_own_file.exists():
+            # return mapped_file_own, mapped_file_partner
+        # print("all_packages: ", all_packages)
+        # Return EccheckMappedFile, non_tensor_data, and local_metadata for each file
+        return mapped_file_own, mapped_file_partner
+    
+    def _load_eccheck_metadata_broadcast(self, checkpoint_dir: Path) -> Tuple[Dict[str, Any], List[TensorMetadata]]:
+        """
+        Broadcast the metadata from the mapped file to all ranks.
+        """
+        return self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
+
     def _load_eccheck_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Load checkpoint saved in EC-CHECK format.
         
@@ -2061,7 +2185,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         decomposed = FileSystemWriterAsync.load_eccheck_components_from_file(
             str(eccheck_file)
         )
-        
+
         # Build index map from loaded tensor_infos
         # Map: (fqn, global_offset) → (tensor_info, tensor_data)
         logger.info(f"EC-CHECK: Building index map from {len(decomposed.tensor_infos)} tensor infos")
@@ -2245,6 +2369,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Check if this is an EC-CHECK format checkpoint
         if self._is_eccheck_checkpoint(checkpoint_dir):
             logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
+            mapped_file_own, mapped_file_partner = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
+            
+            
             return self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
         
         # Apply N-D tensors resharding

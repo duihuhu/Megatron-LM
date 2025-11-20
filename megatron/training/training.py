@@ -768,8 +768,6 @@ def pretrain(
         store=store,
     )
     
-    maybe_preinitialize_torch_dist_save_strategy()
-
     args = get_args()
     timers = get_timers()
 
@@ -781,6 +779,13 @@ def pretrain(
     if args.enable_ft_package:
         ft_integration.setup(args)
         ft_integration.maybe_setup_simulated_fault()
+
+    if ft_integration.is_ft_restart():
+        print_rank_0("Training restarted from ft_launcher after fault")
+    else:
+        print_rank_0("Initial training run")
+
+    maybe_preinitialize_torch_dist_save_strategy()
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()

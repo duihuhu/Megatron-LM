@@ -2672,6 +2672,10 @@ public:
         }
         return buffers;
     }
+    
+    void submit_data_to_p2p_thread(uintptr_t data_addr, size_t size, std::string ops) {
+        std:: cout << "EC-CHECK: [Rank " << rank_ << "] Submitting data to P2P thread: " << data_addr << " " << size << " " << ops << std::endl;
+    }
 };
 
 PYBIND11_MODULE(eccheck_native, m) {
@@ -2692,5 +2696,6 @@ PYBIND11_MODULE(eccheck_native, m) {
         .def("submit_data_for_encoding_thread2", &ECCHECKNative::submit_data_for_encoding_thread2)
         .def("get_data_buffers_to_release", &ECCHECKNative::get_data_buffers_to_release)
         .def("get_encoding_buffers_to_release", &ECCHECKNative::get_encoding_buffers_to_release)
-        .def("get_parity_buffers_to_release", &ECCHECKNative::get_parity_buffers_to_release);
+        .def("get_parity_buffers_to_release", &ECCHECKNative::get_parity_buffers_to_release)
+        .def("submit_data_to_p2p_thread", &ECCHECKNative::submit_data_to_p2p_thread);
 }

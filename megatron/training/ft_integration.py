@@ -22,6 +22,10 @@ If timeout calculation is enabled (--calc-ft-timeouts),
 FT timeouts are updated after each checkpoint and at the end of the run.
 Updated values are based on observed intervals.
 
+When ft_launcher restarts the training after a fault, the training script can detect this by:
+1. Calling `ft_integration.is_ft_restart()` function which returns True for restart runs
+2. Checking the environment variable `FT_RESTARTED` which is set to '1' for restart runs, '0' otherwise
+
 `ft_launcher` command example:
 ```
 ft_launcher \
@@ -58,6 +62,7 @@ _is_setup_section_open = False
 _seen_checkpoints_cnt = 0
 _seen_tr_iters_cnt = 0
 _curr_eval_iter_idx = 0
+_is_ft_restart = False
 
 _NUM_WARMUP_ITERS = 1
 _MIN_ITERS_FOR_STEP_TIMEOUT_UPDATE = 16
@@ -70,6 +75,18 @@ def get_rank_monitor_client() -> Optional[Any]:
         RankMonitorClient: rank monitor client instance, or None if FT was not initialized
     """
     return _GLOBAL_RANK_MONITOR_CLIENT
+
+
+def is_ft_restart() -> bool:
+    """Returns whether the current run is a restart from ft_launcher.
+
+    This function returns True if the training is restarted by ft_launcher
+    after a fault was detected. It returns False for the initial run.
+
+    Returns:
+        bool: True if this is a restart run, False otherwise
+    """
+    return _is_ft_restart
 
 
 def setup(args: argparse.Namespace) -> None:
@@ -106,6 +123,19 @@ def setup(args: argparse.Namespace) -> None:
 
     global _is_calculating_timeouts
     _is_calculating_timeouts = args.calc_ft_timeouts
+
+    # hardcode for test restart
+    # Detect if this is a restart by checking if ft_state.json exists
+    global _is_ft_restart
+    _is_ft_restart = os.path.exists(_ft_state_path)
+    
+    # Set environment variable to indicate restart status for other code to check
+    if _is_ft_restart:
+        os.environ['FT_RESTARTED'] = '1'
+        print_rank_0("FT: Detected restart from ft_launcher (ft_state.json exists)")
+    else:
+        os.environ['FT_RESTARTED'] = '0'
+        print_rank_0("FT: Initial run (ft_state.json does not exist)")
 
     cli.init_workload_monitoring()
     _load_state_if_exists()

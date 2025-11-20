@@ -166,18 +166,24 @@ class ECCHECKManager:
             
             # Create instance with error handling
             try:
-                # ===== Step 1: Rank 0 generates three NCCL IDs =====
+                # ===== Step 1: Rank 0 generates four NCCL IDs =====
+                # thread1: for rank0↔rank2 XOR communication
+                # thread2: for rank1↔rank3 XOR communication
+                # p2p_0_1: for rank0↔rank1 P2P communication
+                # p2p_2_3: for rank2↔rank3 P2P communication
                 if rank == 0:
                     # Generate NCCL IDs using module-level function (no instance needed)
-                    nccl_id_thread1 = eccheck_native.generate_nccl_id()
-                    nccl_id_thread2 = eccheck_native.generate_nccl_id()
-                    nccl_id_p2p = eccheck_native.generate_nccl_id()
-                    logger.info(f"EC-CHECK: [Rank 0] Generated three NCCL IDs (size: {len(nccl_id_thread1)} bytes each)")
+                    nccl_id_thread1 = eccheck_native.generate_nccl_id()  # rank0↔rank2
+                    nccl_id_thread2 = eccheck_native.generate_nccl_id()  # rank1↔rank3
+                    nccl_id_p2p_0_1 = eccheck_native.generate_nccl_id()  # rank0↔rank1
+                    nccl_id_p2p_2_3 = eccheck_native.generate_nccl_id()  # rank2↔rank3
+                    logger.info(f"EC-CHECK: [Rank 0] Generated four NCCL IDs (size: {len(nccl_id_thread1)} bytes each)")
                 else:
                     # Other ranks prepare empty lists (will be filled by broadcast)
                     nccl_id_thread1 = [0] * 128  # NCCL ID is typically 128 bytes
                     nccl_id_thread2 = [0] * 128
-                    nccl_id_p2p = [0] * 128
+                    nccl_id_p2p_0_1 = [0] * 128
+                    nccl_id_p2p_2_3 = [0] * 128
                 
                 # ===== Step 2: Broadcast NCCL IDs to all ranks =====
                 # Convert lists to torch tensors for broadcasting
@@ -188,29 +194,40 @@ class ECCHECKManager:
                 if rank == 0:
                     id1_tensor = torch.tensor(nccl_id_thread1, dtype=torch.uint8, device=torch.cuda.current_device())
                     id2_tensor = torch.tensor(nccl_id_thread2, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id_p2p_tensor = torch.tensor(nccl_id_p2p, dtype=torch.uint8, device=torch.cuda.current_device())
+                    id_p2p_0_1_tensor = torch.tensor(nccl_id_p2p_0_1, dtype=torch.uint8, device=torch.cuda.current_device())
+                    id_p2p_2_3_tensor = torch.tensor(nccl_id_p2p_2_3, dtype=torch.uint8, device=torch.cuda.current_device())
                 else:
                     id1_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
                     id2_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id_p2p_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
+                    id_p2p_0_1_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
+                    id_p2p_2_3_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
                 
-                # Broadcast all three IDs (synchronous operation - all ranks wait)
+                # Broadcast all four IDs (synchronous operation - all ranks wait)
                 # NCCL backend requires tensors to be on CUDA device
                 torch.distributed.broadcast(id1_tensor, src=0)
                 torch.distributed.broadcast(id2_tensor, src=0)
-                torch.distributed.broadcast(id_p2p_tensor, src=0)
+                torch.distributed.broadcast(id_p2p_0_1_tensor, src=0)
+                torch.distributed.broadcast(id_p2p_2_3_tensor, src=0)
                 
                 # Convert back to lists (move to CPU first, then tolist)
                 nccl_id_thread1 = id1_tensor.cpu().tolist()
                 nccl_id_thread2 = id2_tensor.cpu().tolist()
-                nccl_id_p2p = id_p2p_tensor.cpu().tolist()
+                nccl_id_p2p_0_1 = id_p2p_0_1_tensor.cpu().tolist()
+                nccl_id_p2p_2_3 = id_p2p_2_3_tensor.cpu().tolist()
                 
-                logger.info(f"EC-CHECK: [Rank {rank}] Received three NCCL IDs via broadcast")
+                logger.info(f"EC-CHECK: [Rank {rank}] Received four NCCL IDs via broadcast")
                 
-                # ===== Step 3: Create C++ instance with broadcasted IDs =====
+                # ===== Step 3: Synchronize all ranks before creating C++ instances =====
+                # This barrier ensures all ranks start creating C++ instances at roughly the same time,
+                # which helps synchronize the NCCL communicator initialization calls.
+                logger.info(f"EC-CHECK: [Rank {rank}] Synchronizing all ranks before creating C++ native module...")
+                torch.distributed.barrier()
+                logger.info(f"EC-CHECK: [Rank {rank}] All ranks synchronized, creating C++ native module...")
+                
+                # ===== Step 4: Create C++ instance with broadcasted IDs =====
                 # IMPORTANT: This constructor call will BLOCK until:
                 # 1. Send and recv threads are started
-                # 2. All three NCCL communicators are fully initialized using the broadcasted IDs
+                # 2. All NCCL communicators are fully initialized using the broadcasted IDs
                 # 3. All threads are ready for data exchange
                 # Only after all initialization is complete will this call return.
                 logger.info(f"EC-CHECK: Creating C++ native module (this will block until NCCL is initialized)...")
@@ -218,9 +235,10 @@ class ECCHECKManager:
                 
                 self._eccheck_native = eccheck_native.ECCHECKNative(
                     rank, world_size, paired_rank,
-                    nccl_id_thread1,  # Pass broadcasted IDs
-                    nccl_id_thread2,
-                    nccl_id_p2p      # Pass P2P NCCL ID
+                    nccl_id_thread1,    # rank0↔rank2 XOR
+                    nccl_id_thread2,    # rank1↔rank3 XOR
+                    nccl_id_p2p_0_1,   # rank0↔rank1 P2P
+                    nccl_id_p2p_2_3    # rank2↔rank3 P2P
                 )
                 
                 # If we reach here, NCCL communicators are ready and threads are running

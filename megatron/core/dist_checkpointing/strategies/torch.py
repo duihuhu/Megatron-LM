@@ -758,58 +758,50 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             
             # Create instance with error handling
             try:
-                # ===== Step 1: Rank 0 generates four NCCL IDs =====
-                # thread1: for rank0↔rank2 XOR communication
-                # thread2: for rank1↔rank3 XOR communication
-                # p2p_0_1: for rank0↔rank1 P2P communication
-                # p2p_2_3: for rank2↔rank3 P2P communication
-                if rank == 0:
-                    # Generate NCCL IDs using module-level function (no instance needed)
-                    nccl_id_thread1 = eccheck_native.generate_nccl_id()  # rank0↔rank2
-                    nccl_id_thread2 = eccheck_native.generate_nccl_id()  # rank1↔rank3
-                    nccl_id_p2p_0_1 = eccheck_native.generate_nccl_id()  # rank0↔rank1
-                    nccl_id_p2p_2_3 = eccheck_native.generate_nccl_id()  # rank2↔rank3
-                    logger.info(f"EC-CHECK: [Rank 0] Generated four NCCL IDs (size: {len(nccl_id_thread1)} bytes each)")
-                else:
-                    # Other ranks prepare empty lists (will be filled by broadcast)
-                    nccl_id_thread1 = [0] * 128  # NCCL ID is typically 128 bytes
-                    nccl_id_thread2 = [0] * 128
-                    nccl_id_p2p_0_1 = [0] * 128
-                    nccl_id_p2p_2_3 = [0] * 128
-                
-                # ===== Step 2: Broadcast NCCL IDs to all ranks =====
-                # Convert lists to torch tensors for broadcasting
-                # NOTE: NCCL backend requires tensors to be on CUDA device
+                # ===== Step 1: Each rank generates local send IDs and exchanges with its partner =====
                 nccl_id_size = 128  # sizeof(ncclUniqueId)
-                
-                # Convert to tensors and move to CUDA (NCCL requires CUDA tensors)
-                if rank == 0:
-                    id1_tensor = torch.tensor(nccl_id_thread1, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id2_tensor = torch.tensor(nccl_id_thread2, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id_p2p_0_1_tensor = torch.tensor(nccl_id_p2p_0_1, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id_p2p_2_3_tensor = torch.tensor(nccl_id_p2p_2_3, dtype=torch.uint8, device=torch.cuda.current_device())
-                else:
-                    id1_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id2_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id_p2p_0_1_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
-                    id_p2p_2_3_tensor = torch.zeros(nccl_id_size, dtype=torch.uint8, device=torch.cuda.current_device())
-                
-                # Broadcast all four IDs (synchronous operation - all ranks wait)
-                # NCCL backend requires tensors to be on CUDA device
-                torch.distributed.broadcast(id1_tensor, src=0)
-                torch.distributed.broadcast(id2_tensor, src=0)
-                torch.distributed.broadcast(id_p2p_0_1_tensor, src=0)
-                torch.distributed.broadcast(id_p2p_2_3_tensor, src=0)
-                
-                # Convert back to lists (move to CPU first, then tolist)
-                nccl_id_thread1 = id1_tensor.cpu().tolist()
-                nccl_id_thread2 = id2_tensor.cpu().tolist()
-                nccl_id_p2p_0_1 = id_p2p_0_1_tensor.cpu().tolist()
-                nccl_id_p2p_2_3 = id_p2p_2_3_tensor.cpu().tolist()
-                
-                logger.info(f"EC-CHECK: [Rank {rank}] Received four NCCL IDs via broadcast")
-                
-                # ===== Step 3: Synchronize all ranks before creating C++ instances =====
+                device = torch.device("cuda", torch.cuda.current_device())
+
+                def _tensor_from_id(id_bytes: List[int]) -> torch.Tensor:
+                    if len(id_bytes) != nccl_id_size:
+                        raise ValueError(
+                            f"EC-CHECK: NCCL ID size mismatch, got {len(id_bytes)}, expected {nccl_id_size}"
+                        )
+                    return torch.tensor(id_bytes, dtype=torch.uint8, device=device)
+
+                def _exchange_nccl_id(my_tensor: torch.Tensor, partner_rank: int, tag_base: int, desc: str) -> torch.Tensor:
+                    if partner_rank < 0 or partner_rank >= world_size:
+                        raise ValueError(f"EC-CHECK: Invalid partner rank {partner_rank} for {desc}")
+                    recv_tensor = torch.empty_like(my_tensor)
+                    send_tag = tag_base
+                    recv_tag = tag_base + 1
+                    if rank < partner_rank:
+                        torch.distributed.send(my_tensor, dst=partner_rank, tag=send_tag)
+                        torch.distributed.recv(recv_tensor, src=partner_rank, tag=recv_tag)
+                    else:
+                        torch.distributed.recv(recv_tensor, src=partner_rank, tag=send_tag)
+                        torch.distributed.send(my_tensor, dst=partner_rank, tag=recv_tag)
+                    logger.info(
+                        f"EC-CHECK: [Rank {rank}] Exchanged NCCL ID ({desc}) with rank {partner_rank} "
+                        f"(send_tag={send_tag}, recv_tag={recv_tag})"
+                    )
+                    return recv_tensor
+
+                # XOR pairing (erasure coding)
+                xor_partner = self._get_paired_rank(rank, world_size)
+                xor_send_id = eccheck_native.generate_nccl_id()
+                xor_send_tensor = _tensor_from_id(xor_send_id)
+                xor_recv_tensor = _exchange_nccl_id(xor_send_tensor, xor_partner, 1000, "XOR")
+                xor_recv_id = xor_recv_tensor.cpu().tolist()
+
+                # P2P pairing (data/parity exchange)
+                p2p_partner = self._get_p2p_partner_rank(rank, world_size)
+                p2p_send_id = eccheck_native.generate_nccl_id()
+                p2p_send_tensor = _tensor_from_id(p2p_send_id)
+                p2p_recv_tensor = _exchange_nccl_id(p2p_send_tensor, p2p_partner, 2000, "P2P")
+                p2p_recv_id = p2p_recv_tensor.cpu().tolist()
+
+                # ===== Step 2: Synchronize all ranks before creating the C++ instance =====
                 # This barrier ensures all ranks start creating C++ instances at roughly the same time,
                 # which helps synchronize the NCCL communicator initialization calls.
                 logger.info(f"EC-CHECK: [Rank {rank}] Synchronizing all ranks before creating C++ native module...")
@@ -827,10 +819,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 
                 self._eccheck_native = eccheck_native.ECCHECKNative(
                     rank, world_size, paired_rank,
-                    nccl_id_thread1,    # rank0↔rank2 XOR
-                    nccl_id_thread2,    # rank1↔rank3 XOR
-                    nccl_id_p2p_0_1,   # rank0↔rank1 P2P
-                    nccl_id_p2p_2_3    # rank2↔rank3 P2P
+                    xor_send_id,     # ID used when this rank sends XOR data
+                    xor_recv_id,     # ID used when this rank receives XOR data (partner's send ID)
+                    p2p_send_id,     # ID used when this rank sends P2P data/parity
+                    p2p_recv_id      # ID used when this rank receives P2P data/parity
                 )
                 
                 # If we reach here, NCCL communicators are ready and threads are running

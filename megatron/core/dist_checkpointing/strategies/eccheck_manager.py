@@ -72,7 +72,34 @@ class ECCHECKManager:
         self._buffer_poller_active_event: Optional[threading.Event] = None
         
         self._initialized = True
-    
+
+
+    def _get_xor_paired_rank(self, my_rank: int, world_size: int) -> int:
+        """Get the paired rank for parity exchange."""
+        if world_size % 2 != 0:
+            raise ValueError(f"EC-CHECK: World size must be even for pairing, got {world_size}")
+        
+        if my_rank == 0:
+            return 2
+        if my_rank == 1:
+            return 3
+        if my_rank == 2:
+            return 0
+        if my_rank == 3:
+            return 1
+        
+        # half_size = world_size // 2
+        
+        # if my_rank < half_size:
+        #     # First half pairs with second half
+        #     paired_rank = my_rank + half_size
+        # else:
+        #     # Second half pairs with first half
+        #     paired_rank = my_rank - half_size
+        
+        # logger.debug(f"EC-CHECK: Rank {my_rank} paired with Rank {paired_rank}")
+        # return paired_rank
+
     def get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank for data/parity exchange.
         
@@ -162,7 +189,7 @@ class ECCHECKManager:
             
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
-            paired_rank = self.get_p2p_partner_rank(rank, world_size)
+            paired_rank = self._get_xor_paired_rank(rank, world_size)
             
             # Create instance with error handling
             try:
@@ -490,7 +517,7 @@ class ECCHECKManager:
         """
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        paired_rank = self.get_p2p_partner_rank(rank, world_size)
+        paired_rank = self._get_xor_paired_rank(rank, world_size)
         
         # Get peer's total data size from global registry
         peer_metadata = global_registry.rank_metadata.get(paired_rank, [])

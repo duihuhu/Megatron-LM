@@ -14,6 +14,7 @@
 #include <chrono>
 #include <isa-l/erasure_code.h>
 #include <isa-l/raid.h>
+#include <boost/asio.hpp>
 #include <cstdlib>
 
 // NCCL includes

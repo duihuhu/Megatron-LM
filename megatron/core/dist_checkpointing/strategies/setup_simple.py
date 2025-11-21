@@ -17,6 +17,7 @@ isa_lib_dirs = []
 isa_libs = []
 isa_include_dirs = []
 
+boost_include_dirs = []
 # Common library paths to check for libisal
 isa_lib_paths = [
     "/usr/lib",
@@ -26,6 +27,19 @@ isa_lib_paths = [
     "/lib64",
     "/usr/lib64",
 ]
+
+boost_header_paths = [
+    "/usr/include/boost",
+    "/usr/local/include/boost",
+    "/usr/include",
+    "/usr/local/include",
+]
+
+for path in boost_header_paths:
+    if os.path.exists(os.path.join(path, "boost/filesystem.hpp")):
+        boost_include_dirs.append(path)
+        print(f"Found boost include at: {path}")
+        break
 
 for path in isa_lib_paths:
     if os.path.exists(os.path.join(path, "libisal.so")) or os.path.exists(os.path.join(path, "libisal.a")):

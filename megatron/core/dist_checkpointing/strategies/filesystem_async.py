@@ -38,9 +38,33 @@ from .state_dict_decomposer import (
     organize_tensor_data_in_cpu_memory,
 )
 
+from .state_dict_decomposer import TensorMetadata
+
 logger = logging.getLogger(__name__)
 
 WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
+
+
+@dataclasses.dataclass
+class EccheckMappedFile:
+    """Container for mmap file information used for NCCL send/recv operations.
+    
+    Attributes:
+        mmap_object: mmap object that must be kept alive for the memory to remain valid
+        memory_address: starting memory address (can be used with NCCL)
+        file_size: total size of the mapped file in bytes
+    """
+    mmap_object: Any  # mmap.mmap object
+    memory_address: int
+    file_size: int
+    local_metadata: List[TensorMetadata]
+    non_tensor_data: Dict[str, Any]
+    
+    def close(self) -> None:
+        """Close the mmap object to release resources."""
+        if self.mmap_object is not None:
+            self.mmap_object.close()
+            self.mmap_object = None
 
 try:
     import psutil
@@ -135,11 +159,14 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eccheck_recv_encoding_buffers = None  # Tuple of two large receive buffers (thread1, thread2)
         self.eccheck_parity_buffers = None  # List of parity buffers for XOR results
         
+        self.eccheck_p2p_buffers = None
+        
         # EC-CHECK buffer poller thread (persistent, created once)
         self._buffer_poller_thread = None
         self._buffer_poller_stop_event = None
         self._buffer_poller_active_event = None  # Controls when polling is active
         
+        self.ecc_write_buckets = None
         # Initialize C++ native module if available
         if eccheck_native is not None:
             # Use pre-initialized C++ module from strategy
@@ -825,6 +852,26 @@ class FileSystemWriterAsync(FileSystemWriter):
             ([], [])  # Will be handled specially in write_preloaded_data
         ))
         
+        # Add P2P write buckets if P2P buffers are available
+        # P2P buckets are tuples: (file_path, storage_key, (bytes_data, tensor_data))
+        if hasattr(self, 'eccheck_p2p_buffers') and self.eccheck_p2p_buffers is not None:
+            if 'own_write_bucket' in self.eccheck_p2p_buffers:
+                # Unpack the tuple to get file_path and storage_key
+                old_own_file_path, own_storage_key, own_eccheck_bytes_data = self.eccheck_p2p_buffers['own_write_bucket']
+                # Update path with current checkpoint_dir
+                own_file_name = Path(old_own_file_path).name if isinstance(old_own_file_path, (str, Path)) else str(old_own_file_path).split('/')[-1]
+                own_file_path = Path(self.checkpoint_dir) / own_file_name
+                self.write_buckets.append((own_file_path, own_storage_key, ([own_eccheck_bytes_data], [])))
+                # logger.debug(f"EC-CHECK: Added own P2P write bucket to write_buckets with path {own_file_path}")
+            if 'partner_write_bucket' in self.eccheck_p2p_buffers:
+                # Unpack the tuple to get file_path and storage_key
+                old_partner_file_path, partner_storage_key, partner_eccheck_bytes_data = self.eccheck_p2p_buffers['partner_write_bucket']
+                # Update path with current checkpoint_dir
+                partner_file_name = Path(old_partner_file_path).name if isinstance(old_partner_file_path, (str, Path)) else str(old_partner_file_path).split('/')[-1]
+                partner_file_path = Path(self.checkpoint_dir) / partner_file_name
+                self.write_buckets.append((partner_file_path, partner_storage_key, ([partner_eccheck_bytes_data], [])))
+                # logger.debug(f"EC-CHECK: Added partner P2P write bucket to write_buckets with path {partner_file_path}")
+        
         # Set up results queue
         if len(self.write_buckets) > 0:
             self.results_queue = _get_write_results_queue()
@@ -982,7 +1029,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             p2p_own_buffer_offset = 0
             p2p_partner_buffer_offset = 0
 
-        total_bytes = 1024 * 1024 * 64 * 5 #debug
+        # total_bytes = 1
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
             cur_buffer_addr = get_free_data_buffer()
@@ -990,6 +1037,39 @@ class FileSystemWriterAsync(FileSystemWriter):
             # Calculate how much data to copy to this buffer
             remaining_in_source = total_bytes - src_pos
             take = min(self.eccheck_buffer_size, remaining_in_source)
+            
+            # Check recv_buffer bounds BEFORE copying data
+            # This ensures we don't copy more data than can fit in recv buffers
+            recv_buffer_size_thread1 = recv_buffer_thread1.numel()
+            recv_buffer_size_thread2 = recv_buffer_thread2.numel()
+            
+            # Calculate aligned offsets to check available space
+            recv_buffer_offset_thread1_aligned = ((recv_buffer_offset_thread1 + 63) // 64) * 64
+            recv_buffer_offset_thread2_aligned = ((recv_buffer_offset_thread2 + 63) // 64) * 64
+            
+            remaining_space_thread1 = recv_buffer_size_thread1 - recv_buffer_offset_thread1_aligned
+            remaining_space_thread2 = recv_buffer_size_thread2 - recv_buffer_offset_thread2_aligned
+            max_available_recv_space = min(remaining_space_thread1, remaining_space_thread2)
+            
+            # Adjust 'take' if needed to fit within recv buffer bounds
+            if take > max_available_recv_space:
+                if max_available_recv_space < 64:
+                    # Not even 64 bytes available - recv buffers are exhausted
+                    logger.warning(
+                        f"EC-CHECK: Recv buffers exhausted. "
+                        f"Thread1 remaining: {remaining_space_thread1} bytes, "
+                        f"Thread2 remaining: {remaining_space_thread2} bytes. "
+                        f"Processed {src_pos / (1024**3):.2f} GB of {total_bytes / (1024**3):.2f} GB. "
+                        f"Stopping data processing."
+                    )
+                    break  # Exit the loop
+                
+                # Adjust take to fit available space
+                take = max_available_recv_space
+                logger.debug(
+                    f"EC-CHECK: Adjusted 'take' from {min(self.eccheck_buffer_size, remaining_in_source)} "
+                    f"to {take} to fit recv buffer bounds"
+                )
             
             # Python memcpy: copy from continuous tensor buffer to data buffer
             import ctypes
@@ -1010,27 +1090,70 @@ class FileSystemWriterAsync(FileSystemWriter):
             parity_addr1 = get_free_parity_buffer()
             parity_addr2 = get_free_parity_buffer()
             
-            # Allocate receive addresses from TWO recv_encoding_buffers (按实际数据大小分配)
+            # Allocate receive addresses from TWO recv_encoding_buffers
             # Each encoding thread gets its own receive address
-            # 如果剩余数据能够填满固定chunk size，则按照chunk size分配
-            # 否则按照实际剩余大小分配
-            recv_chunk_size = min(self.eccheck_buffer_size, remaining_in_source)
+            # 
+            # CRITICAL: Addresses must be 64-byte aligned for ISA-L AVX512 XOR operations
+            # Size does NOT need to be a multiple of 64 bytes (ISA-L handles this)
+            # recv_chunk_size should match 'take' (already adjusted for buffer bounds above)
+            recv_chunk_size = take
             
-            # Thread1 receive address
-            recv_addr_thread1 = recv_buffer_base_addr_thread1 + recv_buffer_offset_thread1
-            recv_buffer_offset_thread1 += recv_chunk_size  # 按照实际大小移动
+            # Align offsets to 64-byte boundary (address alignment requirement)
+            # Note: We already checked bounds above, so aligned offset + recv_chunk_size should be safe
+            recv_buffer_offset_thread1_aligned = ((recv_buffer_offset_thread1 + 63) // 64) * 64
+            recv_buffer_offset_thread2_aligned = ((recv_buffer_offset_thread2 + 63) // 64) * 64
             
-            # Thread2 receive address
-            recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2
-            recv_buffer_offset_thread2 += recv_chunk_size  # 按照实际大小移动
+            # Thread1 receive address (guaranteed 64-byte aligned and within bounds)
+            recv_addr_thread1 = recv_buffer_base_addr_thread1 + recv_buffer_offset_thread1_aligned
+            recv_buffer_offset_thread1 = recv_buffer_offset_thread1_aligned + recv_chunk_size  # Update offset after processing
+            
+            # Thread2 receive address (guaranteed 64-byte aligned and within bounds)
+            recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2_aligned
+            recv_buffer_offset_thread2 = recv_buffer_offset_thread2_aligned + recv_chunk_size  # Update offset after processing
+            
+            # Verify address alignment and bounds (for debugging)
+            assert recv_addr_thread1 % 64 == 0, (
+                f"recv_addr_thread1 not 64-byte aligned: {hex(recv_addr_thread1)}, "
+                f"base={hex(recv_buffer_base_addr_thread1)}, offset={recv_buffer_offset_thread1_aligned}"
+            )
+            assert recv_addr_thread2 % 64 == 0, (
+                f"recv_addr_thread2 not 64-byte aligned: {hex(recv_addr_thread2)}, "
+                f"base={hex(recv_buffer_base_addr_thread2)}, offset={recv_buffer_offset_thread2_aligned}"
+            )
+            assert recv_buffer_offset_thread1_aligned + recv_chunk_size <= recv_buffer_size_thread1, (
+                f"recv_addr_thread1 out of bounds: offset={recv_buffer_offset_thread1_aligned}, "
+                f"size={recv_chunk_size}, buffer_size={recv_buffer_size_thread1}"
+            )
+            assert recv_buffer_offset_thread2_aligned + recv_chunk_size <= recv_buffer_size_thread2, (
+                f"recv_addr_thread2 out of bounds: offset={recv_buffer_offset_thread2_aligned}, "
+                f"size={recv_chunk_size}, buffer_size={recv_buffer_size_thread2}"
+            )
             
             # Calculate P2P write addresses (similar to recv addresses)
             # Both thread1 and thread2 use the same P2P addresses for the same chunk
+            # CRITICAL: Addresses must be 64-byte aligned for ISA-L AVX512 operations
             if p2p_own_buffer_base_addr != 0:
-                p2p_own_write_addr = p2p_own_buffer_base_addr + p2p_own_buffer_offset
-                p2p_partner_write_addr = p2p_partner_buffer_base_addr + p2p_partner_buffer_offset
-                p2p_own_buffer_offset += take
-                p2p_partner_buffer_offset += take
+                # Align offsets to 64-byte boundary (address alignment requirement)
+                p2p_own_buffer_offset_aligned = ((p2p_own_buffer_offset + 63) // 64) * 64
+                p2p_partner_buffer_offset_aligned = ((p2p_partner_buffer_offset + 63) // 64) * 64
+                
+                # Calculate aligned addresses
+                p2p_own_write_addr = p2p_own_buffer_base_addr + p2p_own_buffer_offset_aligned
+                p2p_partner_write_addr = p2p_partner_buffer_base_addr + p2p_partner_buffer_offset_aligned
+                
+                # Update offsets after processing (size does NOT need to be aligned)
+                p2p_own_buffer_offset = p2p_own_buffer_offset_aligned + take
+                p2p_partner_buffer_offset = p2p_partner_buffer_offset_aligned + take
+                
+                # Verify address alignment (for debugging)
+                assert p2p_own_write_addr % 64 == 0, (
+                    f"p2p_own_write_addr not 64-byte aligned: {hex(p2p_own_write_addr)}, "
+                    f"base={hex(p2p_own_buffer_base_addr)}, offset={p2p_own_buffer_offset_aligned}"
+                )
+                assert p2p_partner_write_addr % 64 == 0, (
+                    f"p2p_partner_write_addr not 64-byte aligned: {hex(p2p_partner_write_addr)}, "
+                    f"base={hex(p2p_partner_buffer_base_addr)}, offset={p2p_partner_buffer_offset_aligned}"
+                )
             else:
                 p2p_own_write_addr = 0
                 p2p_partner_write_addr = 0
@@ -1180,25 +1303,230 @@ class FileSystemWriterAsync(FileSystemWriter):
         exec_start = time()
         self._execute_phase3_encoding()
         exec_time = time() - exec_start
-        logger.info(f"EC-CHECK: Phase 3 completed in {exec_time:.2f}s")
         
         # Return write_buckets with EC-CHECK continuous buffer
         # Buffer contains all tensor data in continuous memory
         
         # todo(hucc):  mul write_buckets is for mul process write ,but here is one process write ,so we need to change the write_buckets to a list of write_buckets, leave it future
         result_buckets = []
-        for bucket in self.write_buckets:
+        for i, bucket in enumerate(self.write_buckets):
             file_name, storage_key, (bytes_data, tensor_data) = bucket
             # Add EC-CHECK metadata and continuous buffer
-            eccheck_bytes_data = [
-                ('eccheck_metadata', self.eccheck_serialized_metadata),
-                ('eccheck_continuous_buffer', self.tensor_buffer),  # Continuous buffer
-            ]
-            result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
-        logger.info(
-            f"EC-CHECK: Preload to buffer result buckets: {len(result_buckets)}"
-        )
+            if self.use_eccheck:
+                if i == 0:
+                    eccheck_bytes_data = [
+                        ('eccheck_metadata', self.eccheck_serialized_metadata),
+                        ('eccheck_continuous_buffer', self.tensor_buffer),  # Continuous buffer
+                    ]
+                    result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
+                else:
+                    continue
+            else:
+                eccheck_bytes_data = [
+                    ('eccheck_metadata', self.eccheck_serialized_metadata),
+                    ('eccheck_continuous_buffer', self.tensor_buffer),  # Continuous buffer
+                ]
+                result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
+            
+        if self.use_eccheck and self.ecc_write_buckets is not None:
+            # Update bucket paths with current checkpoint_dir before adding to result_buckets
+            # This ensures paths are updated for each iteration
+            for bucket in self.ecc_write_buckets:
+                file_path, storage_key, data = bucket
+                # Extract file name from path
+                if isinstance(file_path, (str, Path)):
+                    file_path_obj = Path(file_path)
+                    file_name = file_path_obj.name
+                else:
+                    file_name = str(file_path).split('/')[-1] if '/' in str(file_path) else str(file_path)
+                
+                # Build new path with current checkpoint_dir
+                new_file_path = Path(self.checkpoint_dir) / file_name
+                
+                # Update eccheck_metadata['eccheck_file_path'] in data
+                # This is critical because write_preloaded_data uses metadata['eccheck_file_path'] (line 550)
+                updated_data = data
+                if isinstance(data, tuple) and len(data) > 0:
+                    bytes_data_list = data[0] if isinstance(data[0], list) else []
+                    updated_bytes_data = []
+                    for item in bytes_data_list:
+                        if isinstance(item, tuple) and len(item) == 2:
+                            key, value = item
+                            if key == 'eccheck_metadata' and isinstance(value, dict):
+                                # Update the file path in metadata
+                                updated_metadata = value.copy()
+                                updated_metadata['eccheck_file_path'] = str(new_file_path)
+                                updated_bytes_data.append((key, updated_metadata))
+                            else:
+                                updated_bytes_data.append(item)
+                        else:
+                            updated_bytes_data.append(item)
+                    updated_data = (updated_bytes_data, data[1] if len(data) > 1 else [])
+                
+                # Create updated bucket with new path and updated metadata
+                updated_bucket = (new_file_path, storage_key, updated_data)
+                result_buckets.append(updated_bucket)
+                
+        logger.info(f"EC-CHECK: eccheck preload tensor to buffer {exec_time:.2f}s")
+
         return result_buckets
+    
+    @staticmethod
+    def load_eccheck_bytes_from_file(file_path: Union[str, os.PathLike], my_rank: int = 0) -> Tuple[EccheckMappedFile, Dict[str, Any], List[Any]]:
+        """
+        Load EC-CHECK file using mmap and return memory address and size for NCCL send/recv.
+        Also extracts non_tensor_data and tensor metadata for preparing local_metadata.
+        
+        File structure:
+        [Header: 32 bytes] [Component 1] [Component 2] [Component 3]
+        
+        Header format:
+        - Magic number: 4 bytes ('ECCK')
+        - Padding: 4 bytes (for alignment)
+        - Component 1 size: 8 bytes (uint64)
+        - Component 2 size: 8 bytes (uint64)
+        - Component 3 size: 8 bytes (uint64)
+        
+        Args:
+            file_path: path to the EC-CHECK file
+            my_rank: current rank (used for preparing local_metadata), default 0
+        
+        Returns:
+            Tuple[EccheckMappedFile, Dict[str, Any], List[TensorMetadata]]: tuple containing:
+                - EccheckMappedFile: dataclass containing:
+                    - mmap_object: mmap object that must be kept alive for the memory to remain valid
+                    - memory_address: starting memory address (can be used with NCCL)
+                    - file_size: total size of the mapped file in bytes
+                - non_tensor_data: Dict[str, Any] extracted from Component 1
+                - local_metadata: List[TensorMetadata] for preparing local metadata
+        
+        Note:
+            The mmap object must be kept alive (not garbage collected) while using the memory
+            for NCCL operations. The caller should call mapped_file.close() when done.
+        """
+        import mmap
+        import struct
+        import pickle
+        from .state_dict_decomposer import TensorMetadata
+        
+        # Open file and get size
+        f = open(file_path, "rb")
+        mm = None
+        try:
+            # Get file size
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            f.seek(0)  # Seek back to start
+            
+            # Memory-map the entire file (zero-copy for /dev/shm)
+            # Note: We don't use 'with' statement to keep mmap alive for NCCL operations
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            
+            # Close file handle - mmap is independent of the file handle
+            f.close()
+            f = None
+            
+            # Parse header to extract Component 1 (non_tensor_data) and Component 2 (tensor_infos)
+            header_bytes = mm[:32]
+            if len(header_bytes) != 32:
+                raise RuntimeError(f"EC-CHECK: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+            
+            # Parse header (default format includes padding for alignment)
+            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            
+            # Validate magic number
+            if magic != b'ECCK':
+                raise RuntimeError(f"EC-CHECK: Invalid magic number (expected b'ECCK', got {magic})")
+            
+            # Extract Component 1: non_tensor_data
+            offset = 32  # After header
+            
+            non_tensor_bytes = mm[offset:offset + non_tensor_size]
+            if len(non_tensor_bytes) != non_tensor_size:
+                raise RuntimeError(
+                    f"EC-CHECK: Failed to read Component 1 "
+                    f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
+                )
+            
+            # Deserialize non_tensor_data
+            non_tensor_data = pickle.loads(non_tensor_bytes)
+            logger.debug(f"EC-CHECK: Extracted non_tensor_data from Component 1 ({non_tensor_size / 1024:.2f} KB)")
+            
+            offset += non_tensor_size  # Move to Component 2
+            
+            # Extract Component 2: tensor_infos (for preparing local_metadata)
+            tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
+            if len(tensor_keys_bytes) != tensor_keys_size:
+                raise RuntimeError(
+                    f"EC-CHECK: Failed to read Component 2 "
+                    f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
+                )
+            
+            # Deserialize tensor_infos
+            tensor_infos = pickle.loads(tensor_keys_bytes)
+            logger.debug(f"EC-CHECK: Extracted {len(tensor_infos)} tensor infos from Component 2")
+            
+            # Convert tensor_infos to local_metadata (List[TensorMetadata])
+            local_metadata = []
+            for info in tensor_infos:
+                # print("info.target_rank, info.source_rank: ", info)
+                # Create TensorMetadata for each TensorInfo
+                data_meta = TensorMetadata(
+                    key=info.key,
+                    shape=info.shape,
+                    dtype=str(info.dtype),
+                    size_bytes=info.size_bytes,
+                    global_offset=info.global_offset if info.global_offset is not None else (),
+                    shard_index=info.shard_index if info.shard_index is not None else 0,
+                    chunk_type=info.chunk_type,
+                    target_rank=info.target_rank,  # Data stays on same rank
+                    source_rank=info.source_rank,
+                )
+                local_metadata.append(data_meta)
+            
+            logger.debug(f"EC-CHECK: Prepared {len(local_metadata)} TensorMetadata entries for local_metadata")
+            
+            # Get memory address for NCCL operations
+            # Use numpy.frombuffer to get address from read-only mmap (doesn't require write access)
+            # This creates a read-only numpy view and extracts its memory address
+            import numpy as np
+            
+            # Create minimal numpy view to get buffer address (works with read-only buffers)
+            np_view = np.frombuffer(mm, dtype=np.uint8, count=min(1, file_size))
+            memory_address = np_view.ctypes.data
+            
+            # Note: The mmap object itself implements the buffer protocol and can be used
+            # directly with NCCL. The memory_address is provided for cases where a raw
+            # pointer is needed.
+            
+            logger.info(
+                f"EC-CHECK: Mapped file {file_path} for NCCL operations\n"
+                f"  File size: {file_size / (1024**3):.2f} GB\n"
+                f"  Memory address: {hex(memory_address)}\n"
+                f"  Non-tensor data: {len(non_tensor_data)} keys\n"
+                f"  Tensor metadata: {len(local_metadata)} entries\n"
+                f"  Note: mmap object must be kept alive during NCCL operations"
+            )
+            
+            mapped_file = EccheckMappedFile(
+                mmap_object=mm,
+                memory_address=memory_address,
+                file_size=file_size,
+                local_metadata=local_metadata,
+                non_tensor_data=non_tensor_data
+            )
+            
+            return mapped_file
+            
+        except Exception as e:
+            if mm is not None:
+                try:
+                    mm.close()
+                except:
+                    pass
+            if f is not None:
+                f.close()
+            raise RuntimeError(f"EC-CHECK: Failed to map file {file_path} for NCCL: {e}") from e
     
     @staticmethod
     def load_eccheck_components_from_file(file_path: Union[str, os.PathLike]) -> DecomposedStateDict:
@@ -1223,63 +1551,112 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         import struct
         import numpy as np
+        import mmap
         
+        # Optimization for /dev/shm: Use mmap for zero-copy access
+        # Since data is in shared memory, mmap provides direct memory access without copying
         with open(file_path, "rb") as f:
-            # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
-            header_bytes = f.read(32)
-            if len(header_bytes) != 32:
-                raise RuntimeError(f"EC-CHECK: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+            # Get file size
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            f.seek(0)  # Seek back to start
             
-            # Parse header (default format includes padding for alignment)
-            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            # Memory-map the entire file (zero-copy for /dev/shm)
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             
-            # Validate magic number
-            if magic != b'ECCK':
-                raise RuntimeError(f"EC-CHECK: Invalid magic number (expected b'ECCK', got {magic})")
-            
-            logger.info(
-                f"EC-CHECK: Loading from {file_path}\n"
-                f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
-                f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
-                f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
-            )
-            
-            # Read Component 1: Non-tensor key-value pairs
-            non_tensor_bytes = f.read(non_tensor_size)
-            if len(non_tensor_bytes) != non_tensor_size:
-                raise RuntimeError(
-                    f"EC-CHECK: Failed to read Component 1 "
-                    f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
+            try:
+                # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
+                header_bytes = mm[:32]
+                if len(header_bytes) != 32:
+                    raise RuntimeError(f"EC-CHECK: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+                
+                # Parse header (default format includes padding for alignment)
+                magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+                
+                # Validate magic number
+                if magic != b'ECCK':
+                    raise RuntimeError(f"EC-CHECK: Invalid magic number (expected b'ECCK', got {magic})")
+                
+                logger.info(
+                    f"EC-CHECK: Loading from {file_path} (using mmap for zero-copy)\n"
+                    f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
+                    f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
+                    f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
                 )
-            non_tensor_data = pickle.loads(non_tensor_bytes)
-            logger.debug(f"EC-CHECK: Loaded Component 1 ({non_tensor_size / 1024:.2f} KB)")
+                
+                # Calculate offsets for each component
+                offset = 32  # After header
+                
+                t1 = time()
+                # Component 1: Non-tensor key-value pairs (direct slice from mmap)
+                non_tensor_bytes = mm[offset:offset + non_tensor_size]
+                if len(non_tensor_bytes) != non_tensor_size:
+                    raise RuntimeError(
+                        f"EC-CHECK: Failed to read Component 1 "
+                        f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
+                    )
+                offset += non_tensor_size
+                
+                t2 = time()
+                non_tensor_data = pickle.loads(non_tensor_bytes)
+                logger.debug(f"EC-CHECK: Loaded Component 1 ({non_tensor_size / 1024:.2f} KB)")
             
-            # Read Component 2: Tensor keys
-            tensor_keys_bytes = f.read(tensor_keys_size)
-            if len(tensor_keys_bytes) != tensor_keys_size:
-                raise RuntimeError(
-                    f"EC-CHECK: Failed to read Component 2 "
-                    f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
-                )
-            tensor_infos = pickle.loads(tensor_keys_bytes)
-            logger.debug(f"EC-CHECK: Loaded Component 2 ({tensor_keys_size / 1024:.2f} KB)")
+                t3 = time()
+                # Component 2: Tensor keys (direct slice from mmap)
+                tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
+                if len(tensor_keys_bytes) != tensor_keys_size:
+                    raise RuntimeError(
+                        f"EC-CHECK: Failed to read Component 2 "
+                        f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
+                    )
+                offset += tensor_keys_size
+                
+                tensor_infos = pickle.loads(tensor_keys_bytes)
+                logger.debug(f"EC-CHECK: Loaded Component 2 ({tensor_keys_size / 1024:.2f} KB)")
+                t4 = time()
+                
+                # Component 3: Tensor data buffer (zero-copy numpy view from mmap)
+                # This is the key optimization: np.frombuffer on mmap creates a zero-copy view
+                tensor_buffer_start = offset
+                tensor_buffer_end = offset + tensor_buffer_size
+                
+                if tensor_buffer_end > file_size:
+                    raise RuntimeError(
+                        f"EC-CHECK: File truncated - expected {tensor_buffer_end} bytes, got {file_size}"
+                    )
+                
+                # Create zero-copy numpy array view directly from mmap
+                buffer_np = np.frombuffer(mm, dtype=np.uint8, count=tensor_buffer_size, offset=tensor_buffer_start)
+                
+                t5 = time()
+                # Extract individual tensors from the zero-copy buffer
+                tensor_data = []
+                for info in tensor_infos:
+                    # Calculate byte offset range for this tensor (relative to buffer start)
+                    start = info.offset
+                    end = start + info.size_bytes
+                    
+                    # Extract numpy slice (view, not copy) from buffer
+                    tensor_bytes_np = buffer_np[start:end]
+                    
+                    # Create torch tensor directly from bytes
+                    # Use frombuffer to create view, then clone to make writable
+                    tensor_view = torch.frombuffer(
+                        memoryview(tensor_bytes_np), 
+                        dtype=info.dtype
+                    )
+                    # Clone to create writable copy and reshape to original shape
+                    tensor = tensor_view.clone().reshape(info.shape)
+                    tensor_data.append(tensor)
+                
+                t6 = time()
+                print("time t6 , t5, t4 , t3, t2, t1: ", t6 - t5, t5 - t4, t4 - t3, t3 - t2, t2 - t1, t6 - t1)
+                logger.debug(f"EC-CHECK: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB) and extracted {len(tensor_data)} tensors")
             
-            # Read Component 3: Tensor data buffer
-            tensor_buffer_bytes = f.read(tensor_buffer_size)
-            if len(tensor_buffer_bytes) != tensor_buffer_size:
-                raise RuntimeError(
-                    f"EC-CHECK: Failed to read Component 3 "
-                    f"(expected {tensor_buffer_size} bytes, got {len(tensor_buffer_bytes)})"
-                )
-            
-            # Convert bytes to tensor buffer
-            # Use copy to make tensor writable
-            tensor_buffer = torch.from_numpy(np.frombuffer(tensor_buffer_bytes, dtype=np.uint8).copy())
-            logger.debug(f"EC-CHECK: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB)")
-        
-        # Extract individual tensors from buffer
-        from .state_dict_decomposer import extract_tensors_from_continuous_buffer
-        tensor_data = extract_tensors_from_continuous_buffer(tensor_buffer, tensor_infos)
+            finally:
+                # Close mmap
+                # mm.close()
+                pass
         
         # Create DecomposedStateDict
         decomposed = DecomposedStateDict(

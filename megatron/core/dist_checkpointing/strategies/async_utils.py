@@ -190,7 +190,9 @@ class TemporalAsyncCaller(AsyncCaller):
             # to do the defined action in `async_req.preload_fn` to
             # stage GPU tensors to its defined destination
             async_fn_args[1] = async_req.preload_fn()
-        logger.info(f"EC-CHECK: Preload function called, got {len(async_fn_args[1])} items")
+        
+        print("preload_fn preload_fn ")
+        
         rank = torch.distributed.get_rank()
         logger.info(f"EC-CHECK: Synchronizing CUDA")
         torch.cuda.synchronize()

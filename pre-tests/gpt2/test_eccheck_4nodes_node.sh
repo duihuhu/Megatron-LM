@@ -13,8 +13,8 @@ export NCCL_DEBUG_SUBSYS=ALL
 
 GPUS_PER_NODE=1
 MASTER_ADDR=127.0.0.1
-export NCCL_SOCKET_IFNAME=eth0
-export GLOO_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME=bond0
+export GLOO_SOCKET_IFNAME=bond0
 MASTER_PORT=6000
 NNODES=4
 
@@ -38,7 +38,7 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0" #<Specify path>
+CHECKPOINT_PATH="/dev/shm/models/gpt2-345m-0" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -78,7 +78,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
     --lr 0.00015 
-    --train-iters 50
+    --train-iters 1000
     --lr-decay-iters 320000 
     --lr-decay-style cosine 
     --min-lr 1.0e-5 
@@ -97,7 +97,7 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 1
+    --pipeline-model-parallel-size 4
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -105,6 +105,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 1
     --save $CHECKPOINT_PATH 
+    --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --use-eccheck

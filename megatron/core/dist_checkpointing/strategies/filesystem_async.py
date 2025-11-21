@@ -926,7 +926,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             raise RuntimeError("EC-CHECK: C++ native module is required but not available")
         
         # Direct implementation
-        # self._copy_tensor_data_to_buffers_pipeline()
+        self._copy_tensor_data_to_buffers_pipeline()
     
     def _copy_tensor_data_to_buffers_pipeline(self) -> None:
         """
@@ -1038,6 +1038,39 @@ class FileSystemWriterAsync(FileSystemWriter):
             remaining_in_source = total_bytes - src_pos
             take = min(self.eccheck_buffer_size, remaining_in_source)
             
+            # Check recv_buffer bounds BEFORE copying data
+            # This ensures we don't copy more data than can fit in recv buffers
+            recv_buffer_size_thread1 = recv_buffer_thread1.numel()
+            recv_buffer_size_thread2 = recv_buffer_thread2.numel()
+            
+            # Calculate aligned offsets to check available space
+            recv_buffer_offset_thread1_aligned = ((recv_buffer_offset_thread1 + 63) // 64) * 64
+            recv_buffer_offset_thread2_aligned = ((recv_buffer_offset_thread2 + 63) // 64) * 64
+            
+            remaining_space_thread1 = recv_buffer_size_thread1 - recv_buffer_offset_thread1_aligned
+            remaining_space_thread2 = recv_buffer_size_thread2 - recv_buffer_offset_thread2_aligned
+            max_available_recv_space = min(remaining_space_thread1, remaining_space_thread2)
+            
+            # Adjust 'take' if needed to fit within recv buffer bounds
+            if take > max_available_recv_space:
+                if max_available_recv_space < 64:
+                    # Not even 64 bytes available - recv buffers are exhausted
+                    logger.warning(
+                        f"EC-CHECK: Recv buffers exhausted. "
+                        f"Thread1 remaining: {remaining_space_thread1} bytes, "
+                        f"Thread2 remaining: {remaining_space_thread2} bytes. "
+                        f"Processed {src_pos / (1024**3):.2f} GB of {total_bytes / (1024**3):.2f} GB. "
+                        f"Stopping data processing."
+                    )
+                    break  # Exit the loop
+                
+                # Adjust take to fit available space
+                take = max_available_recv_space
+                logger.debug(
+                    f"EC-CHECK: Adjusted 'take' from {min(self.eccheck_buffer_size, remaining_in_source)} "
+                    f"to {take} to fit recv buffer bounds"
+                )
+            
             # Python memcpy: copy from continuous tensor buffer to data buffer
             import ctypes
             buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
@@ -1057,27 +1090,70 @@ class FileSystemWriterAsync(FileSystemWriter):
             parity_addr1 = get_free_parity_buffer()
             parity_addr2 = get_free_parity_buffer()
             
-            # Allocate receive addresses from TWO recv_encoding_buffers (按实际数据大小分配)
+            # Allocate receive addresses from TWO recv_encoding_buffers
             # Each encoding thread gets its own receive address
-            # 如果剩余数据能够填满固定chunk size，则按照chunk size分配
-            # 否则按照实际剩余大小分配
-            recv_chunk_size = min(self.eccheck_buffer_size, remaining_in_source)
+            # 
+            # CRITICAL: Addresses must be 64-byte aligned for ISA-L AVX512 XOR operations
+            # Size does NOT need to be a multiple of 64 bytes (ISA-L handles this)
+            # recv_chunk_size should match 'take' (already adjusted for buffer bounds above)
+            recv_chunk_size = take
             
-            # Thread1 receive address
-            recv_addr_thread1 = recv_buffer_base_addr_thread1 + recv_buffer_offset_thread1
-            recv_buffer_offset_thread1 += recv_chunk_size  # 按照实际大小移动
+            # Align offsets to 64-byte boundary (address alignment requirement)
+            # Note: We already checked bounds above, so aligned offset + recv_chunk_size should be safe
+            recv_buffer_offset_thread1_aligned = ((recv_buffer_offset_thread1 + 63) // 64) * 64
+            recv_buffer_offset_thread2_aligned = ((recv_buffer_offset_thread2 + 63) // 64) * 64
             
-            # Thread2 receive address
-            recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2
-            recv_buffer_offset_thread2 += recv_chunk_size  # 按照实际大小移动
+            # Thread1 receive address (guaranteed 64-byte aligned and within bounds)
+            recv_addr_thread1 = recv_buffer_base_addr_thread1 + recv_buffer_offset_thread1_aligned
+            recv_buffer_offset_thread1 = recv_buffer_offset_thread1_aligned + recv_chunk_size  # Update offset after processing
+            
+            # Thread2 receive address (guaranteed 64-byte aligned and within bounds)
+            recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2_aligned
+            recv_buffer_offset_thread2 = recv_buffer_offset_thread2_aligned + recv_chunk_size  # Update offset after processing
+            
+            # Verify address alignment and bounds (for debugging)
+            assert recv_addr_thread1 % 64 == 0, (
+                f"recv_addr_thread1 not 64-byte aligned: {hex(recv_addr_thread1)}, "
+                f"base={hex(recv_buffer_base_addr_thread1)}, offset={recv_buffer_offset_thread1_aligned}"
+            )
+            assert recv_addr_thread2 % 64 == 0, (
+                f"recv_addr_thread2 not 64-byte aligned: {hex(recv_addr_thread2)}, "
+                f"base={hex(recv_buffer_base_addr_thread2)}, offset={recv_buffer_offset_thread2_aligned}"
+            )
+            assert recv_buffer_offset_thread1_aligned + recv_chunk_size <= recv_buffer_size_thread1, (
+                f"recv_addr_thread1 out of bounds: offset={recv_buffer_offset_thread1_aligned}, "
+                f"size={recv_chunk_size}, buffer_size={recv_buffer_size_thread1}"
+            )
+            assert recv_buffer_offset_thread2_aligned + recv_chunk_size <= recv_buffer_size_thread2, (
+                f"recv_addr_thread2 out of bounds: offset={recv_buffer_offset_thread2_aligned}, "
+                f"size={recv_chunk_size}, buffer_size={recv_buffer_size_thread2}"
+            )
             
             # Calculate P2P write addresses (similar to recv addresses)
             # Both thread1 and thread2 use the same P2P addresses for the same chunk
+            # CRITICAL: Addresses must be 64-byte aligned for ISA-L AVX512 operations
             if p2p_own_buffer_base_addr != 0:
-                p2p_own_write_addr = p2p_own_buffer_base_addr + p2p_own_buffer_offset
-                p2p_partner_write_addr = p2p_partner_buffer_base_addr + p2p_partner_buffer_offset
-                p2p_own_buffer_offset += take
-                p2p_partner_buffer_offset += take
+                # Align offsets to 64-byte boundary (address alignment requirement)
+                p2p_own_buffer_offset_aligned = ((p2p_own_buffer_offset + 63) // 64) * 64
+                p2p_partner_buffer_offset_aligned = ((p2p_partner_buffer_offset + 63) // 64) * 64
+                
+                # Calculate aligned addresses
+                p2p_own_write_addr = p2p_own_buffer_base_addr + p2p_own_buffer_offset_aligned
+                p2p_partner_write_addr = p2p_partner_buffer_base_addr + p2p_partner_buffer_offset_aligned
+                
+                # Update offsets after processing (size does NOT need to be aligned)
+                p2p_own_buffer_offset = p2p_own_buffer_offset_aligned + take
+                p2p_partner_buffer_offset = p2p_partner_buffer_offset_aligned + take
+                
+                # Verify address alignment (for debugging)
+                assert p2p_own_write_addr % 64 == 0, (
+                    f"p2p_own_write_addr not 64-byte aligned: {hex(p2p_own_write_addr)}, "
+                    f"base={hex(p2p_own_buffer_base_addr)}, offset={p2p_own_buffer_offset_aligned}"
+                )
+                assert p2p_partner_write_addr % 64 == 0, (
+                    f"p2p_partner_write_addr not 64-byte aligned: {hex(p2p_partner_write_addr)}, "
+                    f"base={hex(p2p_partner_buffer_base_addr)}, offset={p2p_partner_buffer_offset_aligned}"
+                )
             else:
                 p2p_own_write_addr = 0
                 p2p_partner_write_addr = 0

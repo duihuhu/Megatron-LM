@@ -1029,7 +1029,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             p2p_own_buffer_offset = 0
             p2p_partner_buffer_offset = 0
 
-        # total_bytes = 1
+        total_bytes = 1024 * 1024 * 64 * 8
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
             cur_buffer_addr = get_free_data_buffer()

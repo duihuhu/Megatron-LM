@@ -16,6 +16,7 @@
 #include <isa-l/raid.h>
 #include <boost/asio.hpp>
 #include <cstdlib>
+#include <arpa/inet.h>  // For htonl/ntohl
 
 // NCCL includes
 #ifdef NCCL_AVAILABLE
@@ -31,6 +32,181 @@ std::vector<uint8_t> generate_nccl_id() {
     return std::vector<uint8_t>(id_bytes, id_bytes + sizeof(ncclUniqueId));
 }
 #endif
+
+// ========== ASIO Connection Manager ==========
+class AsioConnectionManager {
+private:
+    boost::asio::io_context io_context_;
+    boost::asio::ip::tcp::socket xor_send_socket_;
+    boost::asio::ip::tcp::socket xor_recv_socket_;
+    boost::asio::ip::tcp::socket p2p_send_socket_;
+    boost::asio::ip::tcp::socket p2p_recv_socket_;
+    boost::asio::ip::tcp::acceptor xor_recv_acceptor_;
+    boost::asio::ip::tcp::acceptor p2p_recv_acceptor_;
+    
+    std::atomic<bool> xor_send_connected_;
+    std::atomic<bool> xor_recv_connected_;
+    std::atomic<bool> p2p_send_connected_;
+    std::atomic<bool> p2p_recv_connected_;
+    
+    std::mutex connection_mutex_;
+    std::condition_variable connection_cv_;
+    
+public:
+    AsioConnectionManager() 
+        : io_context_(),
+          xor_send_socket_(io_context_),
+          xor_recv_socket_(io_context_),
+          p2p_send_socket_(io_context_),
+          p2p_recv_socket_(io_context_),
+          xor_recv_acceptor_(io_context_),
+          p2p_recv_acceptor_(io_context_),
+          xor_send_connected_(false),
+          xor_recv_connected_(false),
+          p2p_send_connected_(false),
+          p2p_recv_connected_(false) {}
+    
+    boost::asio::io_context& get_io_context() { return io_context_; }
+    boost::asio::ip::tcp::socket& get_xor_send_socket() { return xor_send_socket_; }
+    boost::asio::ip::tcp::socket& get_xor_recv_socket() { return xor_recv_socket_; }
+    boost::asio::ip::tcp::socket& get_p2p_send_socket() { return p2p_send_socket_; }
+    boost::asio::ip::tcp::socket& get_p2p_recv_socket() { return p2p_recv_socket_; }
+    
+    bool is_xor_send_connected() const { return xor_send_connected_; }
+    bool is_xor_recv_connected() const { return xor_recv_connected_; }
+    bool is_p2p_send_connected() const { return p2p_send_connected_; }
+    bool is_p2p_recv_connected() const { return p2p_recv_connected_; }
+    
+    void init_xor_send(const std::string& partner_ip, uint16_t port);
+    void init_xor_recv(const std::string& listen_ip, uint16_t port);
+    void init_p2p_send(const std::string& partner_ip, uint16_t port);
+    void init_p2p_recv(const std::string& listen_ip, uint16_t port);
+    void wait_for_connections(int timeout_seconds = 30);
+    void cleanup();
+};
+
+// ========== ASIO Connection Manager Implementation ==========
+
+void AsioConnectionManager::init_xor_send(const std::string& partner_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        boost::asio::ip::tcp::resolver::results_type endpoints = 
+            resolver.resolve(partner_ip, std::to_string(port));
+        
+        std::cout << "ASIO: Connecting XOR send to " << partner_ip << ":" << port << "..." << std::endl;
+        
+        // Use synchronous connect
+        boost::asio::connect(xor_send_socket_, endpoints);
+        xor_send_connected_ = true;
+        std::cout << "ASIO: XOR send connected successfully" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: XOR send init error: " << e.what() << std::endl;
+        xor_send_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::init_xor_recv(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(
+            boost::asio::ip::address::from_string(listen_ip), port);
+        
+        xor_recv_acceptor_.open(endpoint.protocol());
+        xor_recv_acceptor_.set_option(
+            boost::asio::ip::tcp::acceptor::reuse_address(true));
+        xor_recv_acceptor_.bind(endpoint);
+        xor_recv_acceptor_.listen();
+        
+        std::cout << "ASIO: Listening XOR recv on " << listen_ip << ":" << port << "..." << std::endl;
+        
+        // Use synchronous accept (will block until connection is established)
+        xor_recv_acceptor_.accept(xor_recv_socket_);
+        xor_recv_connected_ = true;
+        std::cout << "ASIO: XOR recv accepted connection successfully" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: XOR recv init error: " << e.what() << std::endl;
+        xor_recv_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::init_p2p_send(const std::string& partner_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        boost::asio::ip::tcp::resolver::results_type endpoints = 
+            resolver.resolve(partner_ip, std::to_string(port));
+        
+        std::cout << "ASIO: Connecting P2P send to " << partner_ip << ":" << port << "..." << std::endl;
+        
+        // Use synchronous connect
+        boost::asio::connect(p2p_send_socket_, endpoints);
+        p2p_send_connected_ = true;
+        std::cout << "ASIO: P2P send connected successfully" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: P2P send init error: " << e.what() << std::endl;
+        p2p_send_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::init_p2p_recv(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(
+            boost::asio::ip::address::from_string(listen_ip), port);
+        
+        p2p_recv_acceptor_.open(endpoint.protocol());
+        p2p_recv_acceptor_.set_option(
+            boost::asio::ip::tcp::acceptor::reuse_address(true));
+        p2p_recv_acceptor_.bind(endpoint);
+        p2p_recv_acceptor_.listen();
+        
+        std::cout << "ASIO: Listening P2P recv on " << listen_ip << ":" << port << "..." << std::endl;
+        
+        // Use synchronous accept (will block until connection is established)
+        p2p_recv_acceptor_.accept(p2p_recv_socket_);
+        p2p_recv_connected_ = true;
+        std::cout << "ASIO: P2P recv accepted connection successfully" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: P2P recv init error: " << e.what() << std::endl;
+        p2p_recv_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::wait_for_connections(int timeout_seconds) {
+    std::unique_lock<std::mutex> lock(connection_mutex_);
+    bool all_connected = connection_cv_.wait_for(
+        lock,
+        std::chrono::seconds(timeout_seconds),
+        [this]() {
+            return xor_send_connected_ && xor_recv_connected_ &&
+                   p2p_send_connected_ && p2p_recv_connected_;
+        }
+    );
+    
+    if (!all_connected) {
+        std::cerr << "ASIO: WARNING: Not all connections established within timeout" << std::endl;
+        std::cerr << "  XOR send: " << xor_send_connected_ << std::endl;
+        std::cerr << "  XOR recv: " << xor_recv_connected_ << std::endl;
+        std::cerr << "  P2P send: " << p2p_send_connected_ << std::endl;
+        std::cerr << "  P2P recv: " << p2p_recv_connected_ << std::endl;
+    } else {
+        std::cout << "ASIO: All connections established successfully" << std::endl;
+    }
+}
+
+void AsioConnectionManager::cleanup() {
+    if (xor_send_socket_.is_open()) xor_send_socket_.close();
+    if (xor_recv_socket_.is_open()) xor_recv_socket_.close();
+    if (p2p_send_socket_.is_open()) p2p_send_socket_.close();
+    if (p2p_recv_socket_.is_open()) p2p_recv_socket_.close();
+    if (xor_recv_acceptor_.is_open()) xor_recv_acceptor_.close();
+    if (p2p_recv_acceptor_.is_open()) p2p_recv_acceptor_.close();
+}
 
 class ECCHECKNative {
 private:
@@ -237,6 +413,11 @@ private:
 
     // P2P configuration
     int p2p_partner_rank_;  // P2P partner rank (adjacent pairing: 0<->1, 2<->3)
+    
+    // ASIO connection manager
+    AsioConnectionManager asio_conn_mgr_;
+    bool asio_initialized_;
+    bool use_asio_;  // Flag to indicate if using ASIO instead of NCCL
     
     // Helper function to synchronize NCCL operation
 #ifdef NCCL_AVAILABLE
@@ -1054,37 +1235,77 @@ private:
                 continue;
             }
             
-#ifdef NCCL_AVAILABLE
-            // DISABLE SEND/RECV FOR DEBUGGING - set to false to enable
-            const bool DISABLE_SEND_RECV_NCCL = false;  // Set to true to disable Send/Recv NCCL operations
-            
-            // Use XOR send communicator
-            int target_rank = xor_config_.xor_partner_rank;
-            bool comm_initialized = nccl_xor_send_initialized_;
-            ncclComm_t comm_to_use = nccl_comm_xor_send_;
-            
-            if (comm_initialized && world_size_ > 1 && !DISABLE_SEND_RECV_NCCL) {
-                // Map global target_rank to communicator-internal rank (0 or 1)
-                int target_rank_in_comm = (rank_ < target_rank) ? 1 : 0;
-                if (target_rank_in_comm < 0) {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid target_rank " << target_rank 
-                              << " for XOR send communicator" << std::endl;
-                } else {
-                    ncclGroupStart(); 
-                    ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size, 
-                             ncclUint8, target_rank_in_comm, comm_to_use, 0);
-                    ncclGroupEnd();
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker: NCCL GroupEnd completed, starting sync..." << std::endl;
+            // Send data using ASIO or NCCL
+            if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_send_connected()) {
+                // ASIO send path (synchronous)
+                uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.encoding_addr);
+                uint32_t size_net = htonl(static_cast<uint32_t>(task.size));  // Network byte order
+                
+                try {
+                    // Send message header (size) first
+                    boost::asio::write(
+                        asio_conn_mgr_.get_xor_send_socket(),
+                        boost::asio::buffer(&size_net, sizeof(uint32_t))
+                    );
                     
-                    // Synchronize NCCL operation before releasing buffer
-                    sync_nccl_operation("Send worker: NCCL send");
+                    // Send data
+                    boost::asio::write(
+                        asio_conn_mgr_.get_xor_send_socket(),
+                        boost::asio::buffer(buffer_ptr, task.size)
+                    );
+                    
+                    // Send completed successfully, release buffer
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    encoding_buffers_to_release_.push(task.encoding_addr);
+                } catch (const boost::system::system_error& e) {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                              << "] ASIO send failed: " << e.what() << std::endl;
+                    // Release buffer even on error to avoid memory leak
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    encoding_buffers_to_release_.push(task.encoding_addr);
                 }
-            } else if (DISABLE_SEND_RECV_NCCL) {
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker: NCCL DISABLED for debugging" << std::endl;
+            }
+#ifdef NCCL_AVAILABLE
+            else if (!use_asio_) {
+                // NCCL send path (fallback)
+                const bool DISABLE_SEND_RECV_NCCL = false;
+                
+                int target_rank = xor_config_.xor_partner_rank;
+                bool comm_initialized = nccl_xor_send_initialized_;
+                ncclComm_t comm_to_use = nccl_comm_xor_send_;
+                
+                if (comm_initialized && world_size_ > 1 && !DISABLE_SEND_RECV_NCCL) {
+                    int target_rank_in_comm = (rank_ < target_rank) ? 1 : 0;
+                    if (target_rank_in_comm < 0) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid target_rank " << target_rank 
+                                  << " for XOR send communicator" << std::endl;
+                    } else {
+                        ncclGroupStart(); 
+                        ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size, 
+                                 ncclUint8, target_rank_in_comm, comm_to_use, 0);
+                        ncclGroupEnd();
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker: NCCL GroupEnd completed, starting sync..." << std::endl;
+                        
+                        sync_nccl_operation("Send worker: NCCL send");
+                    }
+                } else if (DISABLE_SEND_RECV_NCCL) {
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker: NCCL DISABLED for debugging" << std::endl;
+                }
+                
+                // Release encoding buffer (only after NCCL operation is guaranteed complete)
+                {
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    encoding_buffers_to_release_.push(task.encoding_addr);
+                }
             }
 #endif
-
-            // Release encoding buffer (only after NCCL operation is guaranteed complete)
+            else {
+                // No communication method available
+                std::cerr << "EC-CHECK: [Rank " << rank_ 
+                          << "] WARNING: No communication method available, releasing buffer" << std::endl;
+                std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                encoding_buffers_to_release_.push(task.encoding_addr);
+            }
             {
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
                 encoding_buffers_to_release_.push(task.encoding_addr);
@@ -1105,11 +1326,20 @@ private:
     void recv_worker() {
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker started" << std::endl;
         
-        {
-            std::unique_lock<std::mutex> lock(nccl_init_mutex_);
-            nccl_init_cv_.wait(lock, [this] {
-                return nccl_xor_recv_init_completed_.load();
-            });
+        // Wait for initialization to complete
+        if (use_asio_) {
+            // For ASIO, wait for connection to be established
+            while (!should_stop_threads_ && (!asio_initialized_ || !asio_conn_mgr_.is_xor_recv_connected())) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        } else {
+            // For NCCL, wait for NCCL initialization
+            {
+                std::unique_lock<std::mutex> lock(nccl_init_mutex_);
+                nccl_init_cv_.wait(lock, [this] {
+                    return nccl_xor_recv_init_completed_.load();
+                });
+            }
         }
         
         while (!should_stop_threads_) {
@@ -1147,27 +1377,69 @@ private:
                 continue;
             }
             
-#ifdef NCCL_AVAILABLE
-            const bool DISABLE_SEND_RECV_NCCL = false;
-            int source_rank = xor_config_.xor_partner_rank;
-            bool comm_initialized = nccl_xor_recv_initialized_;
-            ncclComm_t comm_to_use = nccl_comm_xor_recv_;
-            
-            if (comm_initialized && world_size_ > 1 && !DISABLE_SEND_RECV_NCCL) {
-                int source_rank_in_comm = (rank_ < source_rank) ? 0 : 1;
-                if (source_rank_in_comm >= 0) {
-                    ncclGroupStart();
-                    ncclRecv(reinterpret_cast<void*>(task.recv_addr), task.size,
-                             ncclUint8, source_rank_in_comm, comm_to_use, 0);
-                    ncclGroupEnd();
-                    sync_nccl_operation("Recv worker: NCCL recv");
-                } else {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid source rank for recv " << source_rank << std::endl;
+            // Receive data using ASIO or NCCL
+            if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_recv_connected()) {
+                // ASIO recv path (synchronous)
+                uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_addr);
+                uint32_t size_net;
+                
+                try {
+                    // Receive message header (size) first
+                    boost::asio::read(
+                        asio_conn_mgr_.get_xor_recv_socket(),
+                        boost::asio::buffer(&size_net, sizeof(uint32_t))
+                    );
+                    
+                    uint32_t size = ntohl(size_net);
+                    if (size != task.size) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ 
+                                  << "] Size mismatch: expected " << task.size 
+                                  << ", got " << size << std::endl;
+                        continue;  // Skip this task
+                    }
+                    
+                    // Receive data
+                    boost::asio::read(
+                        asio_conn_mgr_.get_xor_recv_socket(),
+                        boost::asio::buffer(buffer_ptr, size)
+                    );
+                    
+                    // Receive completed successfully, continue with XOR processing below
+                } catch (const boost::system::system_error& e) {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                              << "] ASIO recv failed: " << e.what() << std::endl;
+                    continue;  // Skip XOR processing on error
                 }
-            } else if (DISABLE_SEND_RECV_NCCL) {
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker: NCCL DISABLED for debugging" << std::endl;
+            }
+#ifdef NCCL_AVAILABLE
+            else if (!use_asio_) {
+                // NCCL recv path (fallback)
+                const bool DISABLE_SEND_RECV_NCCL = false;
+                int source_rank = xor_config_.xor_partner_rank;
+                bool comm_initialized = nccl_xor_recv_initialized_;
+                ncclComm_t comm_to_use = nccl_comm_xor_recv_;
+                
+                if (comm_initialized && world_size_ > 1 && !DISABLE_SEND_RECV_NCCL) {
+                    int source_rank_in_comm = (rank_ < source_rank) ? 0 : 1;
+                    if (source_rank_in_comm >= 0) {
+                        ncclGroupStart();
+                        ncclRecv(reinterpret_cast<void*>(task.recv_addr), task.size,
+                                 ncclUint8, source_rank_in_comm, comm_to_use, 0);
+                        ncclGroupEnd();
+                        sync_nccl_operation("Recv worker: NCCL recv");
+                    } else {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid source rank for recv " << source_rank << std::endl;
+                    }
+                } else if (DISABLE_SEND_RECV_NCCL) {
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker: NCCL DISABLED for debugging" << std::endl;
+                }
             }
 #endif
+            else {
+                std::cerr << "EC-CHECK: [Rank " << rank_ 
+                          << "] WARNING: No communication method available for recv" << std::endl;
+                continue;  // Skip processing
+            }
             
             uintptr_t local_encoding_addr = 0;
             uintptr_t parity_addr = 0;
@@ -1410,61 +1682,99 @@ private:
                 }
             }
             
-            // Step 2: NCCL send (similar to send_worker_1)
-            const bool DISABLE_P2P_NCCL = false;  // Set to true to disable P2P NCCL operations
-            
+            // Step 2: Send data using ASIO or NCCL
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
+                if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_send_connected()) {
+                    // ASIO send path (synchronous)
+                    uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.send_buffer_addr);
+                    uint32_t size_net = htonl(static_cast<uint32_t>(task.size));  // Network byte order
+                    
+                    const char* send_label = (rank_ % 2 == 0) ? "parity" : "data";
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Starting ASIO send ("
+                              << send_label << "), size=" << task.size << std::endl;
+                    
+                    try {
+                        // Send message header (size) first
+                        boost::asio::write(
+                            asio_conn_mgr_.get_p2p_send_socket(),
+                            boost::asio::buffer(&size_net, sizeof(uint32_t))
+                        );
+                        
+                        // Send data
+                        boost::asio::write(
+                            asio_conn_mgr_.get_p2p_send_socket(),
+                            boost::asio::buffer(buffer_ptr, task.size)
+                        );
+                        
+                        // Send completed successfully
+                        if (rank_ % 2 == 0) {
+                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent parity to Rank " << p2p_partner_rank_ << std::endl;
+                        } else {
+                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent data to Rank " << p2p_partner_rank_ << std::endl;
+                        }
+                    } catch (const boost::system::system_error& e) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ 
+                                  << "] P2P ASIO send failed: " << e.what() << std::endl;
+                    }
+                }
 #ifdef NCCL_AVAILABLE
-                if (nccl_p2p_send_initialized_ && world_size_ > 1 && !DISABLE_P2P_NCCL) {
-                    // Verify communicator is valid
-                    if (nccl_comm_p2p_send_ == nullptr) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: nccl_comm_p2p_send_ is NULL but nccl_p2p_send_initialized_ is true!" << std::endl;
-                        std::cerr.flush();
-                    } else {
-                        // Map global p2p_partner_rank to communicator-internal rank (0 or 1)
-                        int partner_rank_in_comm = (rank_ < p2p_partner_rank_) ? 1 : 0;
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: partner_rank_in_comm=" 
-                                  << partner_rank_in_comm << " (from global rank " << p2p_partner_rank_ << ")" << std::endl;
-                        if (partner_rank_in_comm < 0 || partner_rank_in_comm >= 2) {
-                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid partner_rank_in_comm=" 
-                                      << partner_rank_in_comm << " (must be 0 or 1 for 2-rank communicator)" << std::endl;
-                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
+                else if (!use_asio_) {
+                    // NCCL send path (fallback)
+                    const bool DISABLE_P2P_NCCL = false;  // Set to true to disable P2P NCCL operations
+                    
+                    if (nccl_p2p_send_initialized_ && world_size_ > 1 && !DISABLE_P2P_NCCL) {
+                        // Verify communicator is valid
+                        if (nccl_comm_p2p_send_ == nullptr) {
+                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: nccl_comm_p2p_send_ is NULL but nccl_p2p_send_initialized_ is true!" << std::endl;
                             std::cerr.flush();
                         } else {
-                            const char* send_label = (rank_ % 2 == 0) ? "parity" : "data";
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Starting NCCL send ("
-                                      << send_label << "), size=" << task.size
-                                      << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
-                            std::cout.flush();
-                            
-                            ncclGroupStart();
-                            ncclSend(reinterpret_cast<void*>(task.send_buffer_addr), task.size,
-                                     ncclUint8, partner_rank_in_comm, nccl_comm_p2p_send_, 0);
-                            ncclGroupEnd();
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: NCCL GroupEnd completed, starting sync..." << std::endl;
-                            
-                            // Synchronize NCCL operation before releasing buffer
-                            sync_nccl_operation("P2P send worker: NCCL send");
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: NCCL sync completed" << std::endl;
-                            
-                            if (rank_ % 2 == 0) {
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent parity to Rank " << p2p_partner_rank_ << std::endl;
+                            // Map global p2p_partner_rank to communicator-internal rank (0 or 1)
+                            int partner_rank_in_comm = (rank_ < p2p_partner_rank_) ? 1 : 0;
+                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: partner_rank_in_comm=" 
+                                      << partner_rank_in_comm << " (from global rank " << p2p_partner_rank_ << ")" << std::endl;
+                            if (partner_rank_in_comm < 0 || partner_rank_in_comm >= 2) {
+                                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid partner_rank_in_comm=" 
+                                          << partner_rank_in_comm << " (must be 0 or 1 for 2-rank communicator)" << std::endl;
+                                std::cerr << "EC-CHECK: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
+                                std::cerr.flush();
                             } else {
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent data to Rank " << p2p_partner_rank_ << std::endl;
+                                const char* send_label = (rank_ % 2 == 0) ? "parity" : "data";
+                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Starting NCCL send ("
+                                          << send_label << "), size=" << task.size
+                                          << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
+                                std::cout.flush();
+                                
+                                ncclGroupStart();
+                                ncclSend(reinterpret_cast<void*>(task.send_buffer_addr), task.size,
+                                         ncclUint8, partner_rank_in_comm, nccl_comm_p2p_send_, 0);
+                                ncclGroupEnd();
+                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: NCCL GroupEnd completed, starting sync..." << std::endl;
+                                
+                                // Synchronize NCCL operation before releasing buffer
+                                sync_nccl_operation("P2P send worker: NCCL send");
+                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: NCCL sync completed" << std::endl;
+                                
+                                if (rank_ % 2 == 0) {
+                                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent parity to Rank " << p2p_partner_rank_ << std::endl;
+                                } else {
+                                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent data to Rank " << p2p_partner_rank_ << std::endl;
+                                }
                             }
                         }
+                    } else if (DISABLE_P2P_NCCL) {
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: NCCL DISABLED for debugging" << std::endl;
+                    } else {
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Skipping NCCL (nccl_p2p_send_initialized_=" 
+                                  << (nccl_p2p_send_initialized_ ? "true" : "false") << ", world_size_=" << world_size_ << ")" << std::endl;
                     }
-                } else if (DISABLE_P2P_NCCL) {
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: NCCL DISABLED for debugging" << std::endl;
-                } else {
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Skipping NCCL (nccl_p2p_send_initialized_=" 
-                              << (nccl_p2p_send_initialized_ ? "true" : "false") << ", world_size_=" << world_size_ << ")" << std::endl;
                 }
-#else
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: NCCL not available" << std::endl;
 #endif
+                else {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                              << "] WARNING: No communication method available for P2P send" << std::endl;
+                }
             } else {
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Skipping NCCL (p2p_partner_rank_=" 
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Skipping send (p2p_partner_rank_=" 
                           << p2p_partner_rank_ << ", task.size=" << task.size << ")" << std::endl;
             }
             
@@ -1546,70 +1856,118 @@ private:
                 continue;
             }
             
-            // NCCL recv (similar to recv_worker_1)
-            const bool DISABLE_P2P_NCCL = false;  // Set to true to disable P2P NCCL operations
-            
+            // Receive data using ASIO or NCCL
             // Track if task was processed (for sentinel check logic)
             bool task_processed = false;
             
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
+                if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_recv_connected()) {
+                    // ASIO recv path (synchronous)
+                    uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_buffer_addr);
+                    uint32_t size_net;
+                    
+                    const char* recv_label = (rank_ % 2 == 0) ? "data" : "parity";
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Starting ASIO recv ("
+                              << recv_label << "), size=" << task.size << std::endl;
+                    
+                    try {
+                        // Receive message header (size) first
+                        boost::asio::read(
+                            asio_conn_mgr_.get_p2p_recv_socket(),
+                            boost::asio::buffer(&size_net, sizeof(uint32_t))
+                        );
+                        
+                        uint32_t size = ntohl(size_net);
+                        if (size != task.size) {
+                            std::cerr << "EC-CHECK: [Rank " << rank_ 
+                                      << "] P2P size mismatch: expected " << task.size 
+                                      << ", got " << size << std::endl;
+                            continue;  // Skip this task
+                        }
+                        
+                        // Receive data
+                        boost::asio::read(
+                            asio_conn_mgr_.get_p2p_recv_socket(),
+                            boost::asio::buffer(buffer_ptr, size)
+                        );
+                        
+                        // Receive completed successfully
+                        if (rank_ % 2 == 0) {
+                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received data from Rank " << p2p_partner_rank_ << std::endl;
+                        } else {
+                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received parity from Rank " << p2p_partner_rank_ << std::endl;
+                        }
+                        task_processed = true;
+                    } catch (const boost::system::system_error& e) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ 
+                                  << "] P2P ASIO recv failed: " << e.what() << std::endl;
+                        continue;  // Skip processing on error
+                    }
+                }
 #ifdef NCCL_AVAILABLE
-                if (nccl_p2p_recv_initialized_ && world_size_ > 1 && !DISABLE_P2P_NCCL) {
-                    // Verify communicator is valid
-                    if (nccl_comm_p2p_recv_ == nullptr) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: nccl_comm_p2p_recv_ is NULL but nccl_p2p_recv_initialized_ is true!" << std::endl;
-                        std::cerr.flush();
-                    } else {
-                        // Map global p2p_partner_rank to communicator-internal rank (0 or 1)
-                        int partner_rank_in_comm = (rank_ < p2p_partner_rank_) ? 0 : 1;
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: partner_rank_in_comm=" 
-                                  << partner_rank_in_comm << " (from global rank " << p2p_partner_rank_ << ")" << std::endl;
-                        if (partner_rank_in_comm < 0 || partner_rank_in_comm >= 2) {
-                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid partner_rank_in_comm=" 
-                                      << partner_rank_in_comm << " (must be 0 or 1 for 2-rank communicator)" << std::endl;
-                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
+                else if (!use_asio_) {
+                    // NCCL recv path (fallback)
+                    const bool DISABLE_P2P_NCCL = false;  // Set to true to disable P2P NCCL operations
+                    
+                    if (nccl_p2p_recv_initialized_ && world_size_ > 1 && !DISABLE_P2P_NCCL) {
+                        // Verify communicator is valid
+                        if (nccl_comm_p2p_recv_ == nullptr) {
+                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: nccl_comm_p2p_recv_ is NULL but nccl_p2p_recv_initialized_ is true!" << std::endl;
                             std::cerr.flush();
                         } else {
-                            const char* recv_label = (rank_ % 2 == 0) ? "data" : "parity";
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Starting NCCL recv ("
-                                      << recv_label << "), size=" << task.size
-                                      << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
-                            std::cout.flush();
-                            
-                            ncclGroupStart();
-                            ncclRecv(reinterpret_cast<void*>(task.recv_buffer_addr), task.size,
-                                     ncclUint8, partner_rank_in_comm, nccl_comm_p2p_recv_, 0);
-                            ncclGroupEnd();
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL GroupEnd completed, starting sync..." << std::endl;
-                            
-                            // Synchronize NCCL operation
-                            sync_nccl_operation("P2P recv worker: NCCL recv");
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL sync completed" << std::endl;
-                            
-                            if (rank_ % 2 == 0) {
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received data from Rank " << p2p_partner_rank_ << std::endl;
+                            // Map global p2p_partner_rank to communicator-internal rank (0 or 1)
+                            int partner_rank_in_comm = (rank_ < p2p_partner_rank_) ? 0 : 1;
+                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: partner_rank_in_comm=" 
+                                      << partner_rank_in_comm << " (from global rank " << p2p_partner_rank_ << ")" << std::endl;
+                            if (partner_rank_in_comm < 0 || partner_rank_in_comm >= 2) {
+                                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid partner_rank_in_comm=" 
+                                          << partner_rank_in_comm << " (must be 0 or 1 for 2-rank communicator)" << std::endl;
+                                std::cerr << "EC-CHECK: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
+                                std::cerr.flush();
                             } else {
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received parity from Rank " << p2p_partner_rank_ << std::endl;
+                                const char* recv_label = (rank_ % 2 == 0) ? "data" : "parity";
+                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Starting NCCL recv ("
+                                          << recv_label << "), size=" << task.size
+                                          << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
+                                std::cout.flush();
+                                
+                                ncclGroupStart();
+                                ncclRecv(reinterpret_cast<void*>(task.recv_buffer_addr), task.size,
+                                         ncclUint8, partner_rank_in_comm, nccl_comm_p2p_recv_, 0);
+                                ncclGroupEnd();
+                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL GroupEnd completed, starting sync..." << std::endl;
+                                
+                                // Synchronize NCCL operation
+                                sync_nccl_operation("P2P recv worker: NCCL recv");
+                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL sync completed" << std::endl;
+                                
+                                if (rank_ % 2 == 0) {
+                                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received data from Rank " << p2p_partner_rank_ << std::endl;
+                                } else {
+                                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received parity from Rank " << p2p_partner_rank_ << std::endl;
+                                }
+                                task_processed = true;
                             }
-                            task_processed = true;
                         }
+                    } else if (DISABLE_P2P_NCCL) {
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL DISABLED for debugging, task processed (no-op)" << std::endl;
+                        // Even when NCCL is disabled, the task is considered processed
+                        // This ensures sentinel check logic works correctly
+                        task_processed = true;
+                    } else {
+                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Skipping NCCL (nccl_p2p_recv_initialized_=" 
+                                  << (nccl_p2p_recv_initialized_ ? "true" : "false") << ", world_size_=" << world_size_ << ")" << std::endl;
+                        task_processed = true;
                     }
-                } else if (DISABLE_P2P_NCCL) {
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL DISABLED for debugging, task processed (no-op)" << std::endl;
-                    // Even when NCCL is disabled, the task is considered processed
-                    // This ensures sentinel check logic works correctly
-                    task_processed = true;
-                } else {
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Skipping NCCL (nccl_p2p_recv_initialized_=" 
-                              << (nccl_p2p_recv_initialized_ ? "true" : "false") << ", world_size_=" << world_size_ << ")" << std::endl;
-                    task_processed = true;
                 }
-#else
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL not available, task processed (no-op)" << std::endl;
-                task_processed = true;
 #endif
+                else {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                              << "] WARNING: No communication method available for P2P recv" << std::endl;
+                    task_processed = true;  // Mark as processed to avoid blocking
+                }
             } else {
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Skipping NCCL (p2p_partner_rank_=" 
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Skipping recv (p2p_partner_rank_=" 
                           << p2p_partner_rank_ << ", task.size=" << task.size << "), task processed" << std::endl;
                 task_processed = true;
             }
@@ -1666,7 +2024,8 @@ public:
           nccl_xor_send_init_completed_(false), nccl_xor_recv_init_completed_(false),
           nccl_p2p_send_init_completed_(false), nccl_p2p_recv_init_completed_(false),
           k_(0), rows_(0), data_block_index_(0), a_mat_(nullptr), g_tbls_(nullptr),
-          p2p_partner_rank_(-1) {
+          p2p_partner_rank_(-1),
+          asio_initialized_(false), use_asio_(false) {
 
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Constructor called, initializing EC tables and starting pipeline..." << std::endl;
         
@@ -1736,9 +2095,134 @@ public:
     
     ~ECCHECKNative() {
         stop_pipeline();
-        cleanup_nccl();
+        if (use_asio_) {
+            asio_conn_mgr_.cleanup();
+            // No need to stop IO context thread since we're using synchronous I/O
+        } else {
+            cleanup_nccl();
+        }
         if (a_mat_) { free(a_mat_); a_mat_ = nullptr; }
         if (g_tbls_) { free(g_tbls_); g_tbls_ = nullptr; }
+    }
+    
+    // ASIO constructor (new, accepts IP/Port parameters)
+    ECCHECKNative(int rank, int world_size, int paired_rank,
+                  const std::string& xor_partner_ip, uint16_t xor_send_port,
+                  const std::string& xor_listen_ip, uint16_t xor_recv_port,
+                  const std::string& p2p_partner_ip, uint16_t p2p_send_port,
+                  const std::string& p2p_listen_ip, uint16_t p2p_recv_port)
+        : rank_(rank), world_size_(world_size), paired_rank_(paired_rank),
+          encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
+          send_worker_completed_(false), recv_worker_completed_(false),
+          xor_worker_completed_(false), p2p_send_worker_completed_(false), p2p_recv_worker_completed_(false),
+          encoding_thread_1_sentinel_received_(false), encoding_thread_2_sentinel_received_(false),
+          send_worker_sentinel_received_(false), recv_worker_sentinel_received_(false),
+          xor_worker_sentinel_received_(false), p2p_send_worker_sentinel_received_(false), p2p_recv_worker_sentinel_received_(false),
+          should_stop_threads_(false),
+          nccl_xor_send_initialized_(false), nccl_xor_recv_initialized_(false),
+          nccl_p2p_send_initialized_(false), nccl_p2p_recv_initialized_(false),
+          nccl_xor_send_init_completed_(false), nccl_xor_recv_init_completed_(false),
+          nccl_p2p_send_init_completed_(false), nccl_p2p_recv_init_completed_(false),
+          k_(0), rows_(0), data_block_index_(0), a_mat_(nullptr), g_tbls_(nullptr),
+          p2p_partner_rank_(-1),
+          asio_initialized_(false), use_asio_(true) {
+
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] ASIO Constructor called, initializing EC tables and ASIO connections..." << std::endl;
+        
+        // Build XOR configuration
+        build_xor_config();
+        
+        // Build P2P configuration
+        build_p2p_config();
+
+        // Initialize EC params: k = world_size / 2, rows = 2, data_block_index = rank / 2
+        rows_ = 2;
+        if (world_size_ <= 0) {
+            k_ = 0;
+        } else {
+            k_ = world_size_ / 2;
+        }
+        data_block_index_ = rank_ / 2;
+
+        if (k_ > 0) {
+            int m = k_ + rows_;
+            // allocate matrix a (k * m)
+            a_mat_ = (unsigned char*)malloc((size_t)k_ * (size_t)m);
+            if (a_mat_ == nullptr) {
+                std::cerr << "EC-CHECK: failed to allocate a_mat_" << std::endl;
+            } else {
+                // generate RS matrix
+                gf_gen_rs_matrix(a_mat_, m, k_);
+
+                // allocate g_tbls_: 32 * k * rows
+                size_t gtbls_size = 32 * (size_t)k_ * (size_t)rows_;
+                void *tmp = nullptr;
+                if (posix_memalign(&tmp, 32, gtbls_size) != 0) tmp = nullptr;
+                if (tmp == nullptr) tmp = malloc(gtbls_size);
+                g_tbls_ = reinterpret_cast<unsigned char*>(tmp);
+                if (g_tbls_ == nullptr) {
+                    std::cerr << "EC-CHECK: failed to allocate g_tbls_" << std::endl;
+                } else {
+                    // initialize tables using isa-l
+                    ec_init_tables(k_, rows_, a_mat_, g_tbls_);
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] EC tables initialized (k=" << k_ << ", rows=" << rows_ << ", data_idx=" << data_block_index_ << ")" << std::endl;
+                }
+            }
+        } else {
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] skipping EC init because k<=0" << std::endl;
+        }
+
+        // Initialize ASIO connections in main thread (before starting worker threads)
+        // Note: Using synchronous connect/accept
+        // Strategy: Start accept operations in separate thread, then connect
+        // This avoids deadlock when both ranks try to connect simultaneously
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Initializing ASIO connections in main thread..." << std::endl;
+        
+        // Start accept operations in separate threads (parallel execution)
+        // This ensures both XOR and P2P accept operations start listening simultaneously
+        std::thread recv_init_thread([this, xor_listen_ip, xor_recv_port, p2p_listen_ip, p2p_recv_port]() {
+            // Start two parallel threads for XOR and P2P recv
+            std::thread xor_recv_thread([this, xor_listen_ip, xor_recv_port]() {
+                asio_conn_mgr_.init_xor_recv(xor_listen_ip, xor_recv_port);
+            });
+            
+            std::thread p2p_recv_thread([this, p2p_listen_ip, p2p_recv_port]() {
+                asio_conn_mgr_.init_p2p_recv(p2p_listen_ip, p2p_recv_port);
+            });
+            
+            // Wait for both accept operations to complete
+            xor_recv_thread.join();
+            p2p_recv_thread.join();
+        });
+        
+        // Small delay to ensure accept sockets are bound and listening
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        // Connect operations (will block until connected to partner's accept)
+        asio_conn_mgr_.init_xor_send(xor_partner_ip, xor_send_port);
+        asio_conn_mgr_.init_p2p_send(p2p_partner_ip, p2p_send_port);
+        
+        // Wait for accept operations to complete
+        recv_init_thread.join();
+        
+        // Verify all connections are established
+        if (asio_conn_mgr_.is_xor_send_connected() && asio_conn_mgr_.is_xor_recv_connected() &&
+            asio_conn_mgr_.is_p2p_send_connected() && asio_conn_mgr_.is_p2p_recv_connected()) {
+            asio_initialized_ = true;
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] ASIO connections initialization completed" << std::endl;
+        } else {
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: Not all ASIO connections established" << std::endl;
+            std::cerr << "  XOR send: " << asio_conn_mgr_.is_xor_send_connected() << std::endl;
+            std::cerr << "  XOR recv: " << asio_conn_mgr_.is_xor_recv_connected() << std::endl;
+            std::cerr << "  P2P send: " << asio_conn_mgr_.is_p2p_send_connected() << std::endl;
+            std::cerr << "  P2P recv: " << asio_conn_mgr_.is_p2p_recv_connected() << std::endl;
+            asio_initialized_ = false;
+        }
+
+        // Now start worker threads (ASIO is already initialized)
+        start_pipeline();
+
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Pipeline and ASIO initialized successfully" << std::endl;
     }
     
     void set_buffer_addresses(const std::vector<uintptr_t>& data_addrs,
@@ -1930,7 +2414,14 @@ PYBIND11_MODULE(eccheck_native, m) {
     
     // Class definition
     pybind11::class_<ECCHECKNative>(m, "ECCHECKNative")
+        // NCCL constructor (original)
         .def(pybind11::init<int, int, int, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&>())
+        // ASIO constructor (new)
+        .def(pybind11::init<int, int, int,
+             const std::string&, uint16_t,
+             const std::string&, uint16_t,
+             const std::string&, uint16_t,
+             const std::string&, uint16_t>())
         .def("set_buffer_addresses", &ECCHECKNative::set_buffer_addresses)
         .def("reset_encoding_completion_flags", &ECCHECKNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECCHECKNative::wait_for_encoding_completion)

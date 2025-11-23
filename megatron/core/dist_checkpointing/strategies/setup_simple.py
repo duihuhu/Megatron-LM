@@ -165,12 +165,29 @@ if not nccl_available:
 
 cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')
 cuda_include_dir = os.path.join(cuda_home, 'include')
+cuda_lib_dir = os.path.join(cuda_home, 'lib64')
 cuda_include = []
+cuda_libs = []
+cuda_lib_dirs = []
 if os.path.isdir(cuda_include_dir):
     cuda_include.append(cuda_include_dir)
     print(f"Found CUDA include: {cuda_include_dir}")
 else:
     print(f"Warning: CUDA include directory not found at {cuda_include_dir}")
+
+if os.path.isdir(cuda_lib_dir):
+    cuda_lib_dirs.append(cuda_lib_dir)
+    cuda_libs.append("cudart")
+    print(f"Found CUDA lib: {cuda_lib_dir}")
+else:
+    # Try alternative paths
+    alt_cuda_lib_dirs = ["/usr/local/cuda/lib64", "/opt/cuda/lib64", "/usr/lib/x86_64-linux-gnu"]
+    for alt_dir in alt_cuda_lib_dirs:
+        if os.path.isdir(alt_dir):
+            cuda_lib_dirs.append(alt_dir)
+            cuda_libs.append("cudart")
+            print(f"Found CUDA lib: {alt_dir}")
+            break
 
 # Define the extension
 ext_modules = [
@@ -183,8 +200,8 @@ ext_modules = [
             *nccl_include_dirs,
             *cuda_include,
         ],
-        libraries=nccl_libs,
-        library_dirs=nccl_lib_dirs,
+        libraries=nccl_libs + cuda_libs,
+        library_dirs=nccl_lib_dirs + cuda_lib_dirs,
         define_macros=[
             ("NCCL_AVAILABLE", "1") if nccl_available else ("NCCL_AVAILABLE", "0"),
         ],

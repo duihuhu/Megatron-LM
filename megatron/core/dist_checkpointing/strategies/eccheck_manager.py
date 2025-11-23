@@ -137,6 +137,140 @@ class ECCHECKManager:
         logger.debug(f"EC-CHECK: Rank {my_rank} P2P partner is Rank {p2p_partner_rank}")
         return p2p_partner_rank
     
+    def _get_eccheck_network_config(self, rank: int, world_size: int) -> dict:
+        """
+        Get network configuration for EC-CHECK ASIO connections.
+        
+        This function:
+        1. Gets base IP address (from ECCHECK_BASE_IP env var, MASTER_ADDR, or auto-detect)
+        2. Calculates ports for this rank (base_port + rank * 4 + offset)
+        3. Exchanges IP addresses with all ranks via torch.distributed.all_gather
+        4. Returns configuration dictionary
+        
+        Args:
+            rank (int): Current rank
+            world_size (int): Total number of ranks
+            
+        Returns:
+            dict: Network configuration with keys:
+                - 'my_ip': str - This rank's IP address
+                - 'base_port': int - Base port number
+                - 'xor_partner_ip': str - XOR partner's IP address
+                - 'p2p_partner_ip': str - P2P partner's IP address
+                - 'ports': dict - Port numbers for each connection type
+                    - 'xor_send': int
+                    - 'xor_recv': int
+                    - 'p2p_send': int
+                    - 'p2p_recv': int
+        """
+        import socket
+        
+        # Step 1: Get base IP address
+        # Priority: ECCHECK_BASE_IP > MASTER_ADDR > auto-detect
+        base_ip = os.environ.get('ECCHECK_BASE_IP')
+        if not base_ip:
+            base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
+        
+        # If using localhost, try to get actual IP
+        if base_ip == '127.0.0.1' or base_ip == 'localhost':
+            try:
+                # Get IP of the interface used for distributed training
+                # Connect to a remote address (doesn't actually send data)
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(('8.8.8.8', 80))
+                base_ip = s.getsockname()[0]
+                s.close()
+                logger.info(f"EC-CHECK: Auto-detected IP address: {base_ip}")
+            except Exception as e:
+                # Fallback to localhost
+                logger.warning(f"EC-CHECK: Failed to auto-detect IP, using localhost: {e}")
+                base_ip = '127.0.0.1'
+        
+        # Step 2: Get base port
+        # Priority: ECCHECK_BASE_PORT > MASTER_PORT + 10000 > default 16000
+        master_port = int(os.environ.get('MASTER_PORT', '6000'))
+        base_port = int(os.environ.get('ECCHECK_BASE_PORT', master_port + 10000))
+        
+        # Step 3: Calculate ports for this rank
+        # Port allocation: base_port + rank * 4 + offset
+        # offset: 0=xor_send, 1=xor_recv, 2=p2p_send, 3=p2p_recv
+        ports = {
+            'xor_send': base_port + rank * 4 + 0,
+            'xor_recv': base_port + rank * 4 + 1,
+            'p2p_send': base_port + rank * 4 + 2,
+            'p2p_recv': base_port + rank * 4 + 3,
+        }
+        
+        # Step 4: Get partner ranks
+        xor_partner = self._get_xor_paired_rank(rank, world_size)
+        p2p_partner = self.get_p2p_partner_rank(rank, world_size)
+        
+        # Step 5: Exchange IP addresses via torch.distributed.all_gather
+        xor_partner_ip = base_ip
+        p2p_partner_ip = base_ip
+        
+        if torch.distributed.is_initialized():
+            try:
+                # Convert IP to bytes, then to int list for tensor
+                my_ip_bytes = socket.inet_aton(base_ip)
+                my_ip_tensor = torch.tensor(
+                    [int(b) for b in my_ip_bytes], 
+                    dtype=torch.uint8
+                )
+                
+                # Move to CUDA if available (for NCCL backend compatibility)
+                if torch.cuda.is_available():
+                    my_ip_tensor = my_ip_tensor.cuda()
+                
+                # Gather all IPs
+                ip_list = [torch.zeros_like(my_ip_tensor) for _ in range(world_size)]
+                torch.distributed.all_gather(ip_list, my_ip_tensor)
+                
+                # Convert back to IP strings
+                rank_ips = {}
+                for r, ip_tensor in enumerate(ip_list):
+                    ip_bytes = bytes(ip_tensor.cpu().tolist())
+                    rank_ips[r] = socket.inet_ntoa(ip_bytes)
+                
+                # Get partner IPs
+                xor_partner_ip = rank_ips.get(xor_partner, base_ip)
+                p2p_partner_ip = rank_ips.get(p2p_partner, base_ip)
+                
+                logger.info(
+                    f"EC-CHECK: [Rank {rank}] IP exchange completed - "
+                    f"XOR partner ({xor_partner}): {xor_partner_ip}, "
+                    f"P2P partner ({p2p_partner}): {p2p_partner_ip}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"EC-CHECK: Failed to exchange IPs via all_gather, using local IP: {e}"
+                )
+                # Fallback to using local IP for all partners
+                xor_partner_ip = base_ip
+                p2p_partner_ip = base_ip
+        else:
+            # Single rank mode - use local IP
+            logger.info("EC-CHECK: Distributed not initialized, using local IP for all partners")
+        
+        config = {
+            'my_ip': base_ip,
+            'base_port': base_port,
+            'xor_partner_ip': xor_partner_ip,
+            'p2p_partner_ip': p2p_partner_ip,
+            'ports': ports,
+        }
+        
+        logger.info(
+            f"EC-CHECK: [Rank {rank}] Network config:\n"
+            f"  My IP: {config['my_ip']}\n"
+            f"  Base port: {config['base_port']}\n"
+            f"  XOR partner IP: {config['xor_partner_ip']}\n"
+            f"  P2P partner IP: {config['p2p_partner_ip']}\n"
+            f"  Ports: {config['ports']}"
+        )
+        
+        return config
+    
     def init_eccheck_if_enabled(self):
         """Initialize EC-CHECK C++ module if enabled and distributed environment is ready."""
         if self._eccheck_native is not None:
@@ -191,8 +325,59 @@ class ECCHECKManager:
             world_size = torch.distributed.get_world_size()
             paired_rank = self._get_xor_paired_rank(rank, world_size)
             
+            # Check if using ASIO (via environment variable)
+            use_asio = os.environ.get('ECCHECK_USE_ASIO', 'false').lower() in ('true', '1', 'yes')
+            
             # Create instance with error handling
             try:
+                if use_asio:
+                    # ===== ASIO Initialization Path =====
+                    logger.info(f"EC-CHECK: [Rank {rank}] Using ASIO for communication")
+                    
+                    # Get network configuration
+                    net_config = self._get_eccheck_network_config(rank, world_size)
+                    
+                    # Synchronize all ranks before creating C++ instances
+                    logger.info(f"EC-CHECK: [Rank {rank}] Synchronizing all ranks before creating C++ native module (ASIO)...")
+                    torch.distributed.barrier()
+                    logger.info(f"EC-CHECK: [Rank {rank}] All ranks synchronized, creating C++ native module with ASIO...")
+                    
+                    # Create C++ instance with ASIO parameters
+                    logger.info(f"EC-CHECK: Creating C++ native module with ASIO (this will block until ASIO connections are established)...")
+                    print(f"EC-CHECK: [Rank {rank}] Creating C++ native module with ASIO (blocking until ASIO initialization completes)...")
+                    
+                    # Calculate partner ports (send connects to partner's recv port)
+                    # For XOR: rank 0 sends to rank 2's recv port, rank 2 sends to rank 0's recv port
+                    # For P2P: rank 0 sends to rank 1's recv port, rank 1 sends to rank 0's recv port
+                    xor_partner = self._get_xor_paired_rank(rank, world_size)
+                    p2p_partner = self.get_p2p_partner_rank(rank, world_size)
+                    
+                    # Partner's recv ports (where we send to)
+                    base_port = net_config['base_port']
+                    xor_partner_recv_port = base_port + xor_partner * 4 + 1  # partner's xor_recv port
+                    p2p_partner_recv_port = base_port + p2p_partner * 4 + 3  # partner's p2p_recv port
+                    
+                    self._eccheck_native = eccheck_native.ECCHECKNative(
+                        rank, world_size, paired_rank,
+                        # XOR connections: (partner_ip, partner_recv_port, my_ip, my_recv_port)
+                        net_config['xor_partner_ip'], xor_partner_recv_port,
+                        net_config['my_ip'], net_config['ports']['xor_recv'],
+                        # P2P connections: (partner_ip, partner_recv_port, my_ip, my_recv_port)
+                        net_config['p2p_partner_ip'], p2p_partner_recv_port,
+                        net_config['my_ip'], net_config['ports']['p2p_recv']
+                    )
+                    
+                    # If we reach here, ASIO connections are ready and threads are running
+                    logger.info(f"EC-CHECK: C++ native module initialized successfully with ASIO (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
+                    print(f"EC-CHECK: [Rank {rank}] C++ native module initialized - ASIO connections ready for data exchange")
+                    
+                    # Initialize EC-CHECK buffers (same for both ASIO and NCCL)
+                    self._init_eccheck_buffers()
+                    
+                else:
+                    # ===== NCCL Initialization Path (original) =====
+                    logger.info(f"EC-CHECK: [Rank {rank}] Using NCCL for communication")
+                    
                 # ===== Step 1: Rank 0 generates four NCCL IDs =====
                 # thread1: for rank0↔rank2 XOR communication
                 # thread2: for rank1↔rank3 XOR communication

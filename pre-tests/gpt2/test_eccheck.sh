@@ -7,7 +7,7 @@ export DEBUG_PARALLEL_STATES=1
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_FILE=./nccl.log
 export NCCL_DEBUG_SUBSYS=ALL
-
+export ECCHECK_USE_ASIO=true
 GPUS_PER_NODE=4
 # Change for multinode config
 # Preserve original args so callers can pass: ./test_eccheck.sh <node_rank> a800

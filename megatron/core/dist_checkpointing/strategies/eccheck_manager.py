@@ -704,17 +704,26 @@ class ECCHECKManager:
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         paired_rank = self._get_xor_paired_rank(rank, world_size)
         
-        # Get peer's total data size from global registry
+        # Get peer's total data size from global registry (actual reference)
         peer_metadata = global_registry.rank_metadata.get(paired_rank, [])
         peer_total_size = sum(meta.size_bytes for meta in peer_metadata)
         
-        # Align peer's data size to buffer_size (64MB)
-        aligned_size = ((peer_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
+        # Calculate maximum total size across all ranks for pipeline synchronization
+        max_total_size = 0
+        for r in range(world_size):
+            rank_metadata = global_registry.rank_metadata.get(r, [])
+            rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+            if rank_total_size > max_total_size:
+                max_total_size = rank_total_size
+        
+        # Align maximum size to buffer_size (64MB) so recv buffers match pipeline iterations
+        aligned_size = ((max_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
         
         logger.info(
-            f"EC-CHECK: Allocating TWO receive buffers based on peer data size\n"
+            f"EC-CHECK: Allocating TWO receive buffers using global maximum size\n"
             f"  Paired rank: {paired_rank}\n"
             f"  Peer data size: {peer_total_size / (1024**3):.2f} GB\n"
+            f"  Pipeline max size: {max_total_size / (1024**3):.2f} GB\n"
             f"  Aligned buffer size (per buffer): {aligned_size / (1024**3):.2f} GB\n"
             f"  Total receive memory: {2 * aligned_size / (1024**3):.2f} GB"
         )

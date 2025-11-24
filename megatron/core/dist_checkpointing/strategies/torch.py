@@ -794,21 +794,38 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 for meta in partner_metadata
             ]
 
+        # ===== Calculate maximum data size across all ranks (for pipeline synchronization) =====
+        if torch.distributed.is_initialized():
+            # Get all ranks' data sizes from global_registry and compute max locally
+            # (We already have all ranks' metadata, so no need for all_reduce/all_gather)
+            all_total_bytes_list = []
+            for r in range(world_size):
+                rank_metadata = global_registry.rank_metadata.get(r, [])
+                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                all_total_bytes_list.append(rank_total_size)
+            
+            # Compute maximum locally (all ranks have the same global_registry)
+            max_total_bytes = max(all_total_bytes_list)
+        else:
+            max_total_bytes = max(own_total_size, partner_total_size)
         
-        # print("own_metadata_updated: ", own_metadata_updated)
-        # print("partner_metadata_updated: ", partner_metadata_updated)
-        # ===== Align both sizes to buffer_size (64MB) =====
+        # ===== Align both sizes to buffer_size (64MB) using maximum for pipeline sync =====
         eccheck_buffer_size = self.eccheck_manager.eccheck_buffer_size
-        own_aligned_size = ((own_total_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
-        partner_aligned_size = ((partner_total_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
+        # Use maximum size for pipeline synchronization (all ranks use same size)
+        own_pipeline_size = max_total_bytes
+        partner_pipeline_size = max_total_bytes
+        own_aligned_size = ((own_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
+        partner_aligned_size = ((partner_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
         
         logger.info(
             f"EC-CHECK: Allocating P2P buffers based on metadata\n"
             f"  P2P partner rank: {p2p_partner_rank}\n"
             f"  Own data size: {own_total_size / (1024**3):.2f} GB "
-            f"(aligned: {own_aligned_size / (1024**3):.2f} GB)\n"
+            f"(actual), {max_total_bytes / (1024**3):.2f} GB (pipeline max), "
+            f"{own_aligned_size / (1024**3):.2f} GB (aligned)\n"
             f"  Partner data size: {partner_total_size / (1024**3):.2f} GB "
-            f"(aligned: {partner_aligned_size / (1024**3):.2f} GB)\n"
+            f"(actual), {max_total_bytes / (1024**3):.2f} GB (pipeline max), "
+            f"{partner_aligned_size / (1024**3):.2f} GB (aligned)\n"
             f"  Total P2P memory: {(own_aligned_size + partner_aligned_size) / (1024**3):.2f} GB"
         )
         
@@ -837,14 +854,19 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         own_tensor_keys_data_bytes = pickle.dumps(own_metadata_updated)
         own_non_tensor_size = len(own_non_tensor_data_bytes)
         own_tensor_keys_size = len(own_tensor_keys_data_bytes)
-        own_tensor_buffer_size = own_total_size
+        own_tensor_buffer_size = own_total_size  # Use actual size for metadata (not padded)
         
         # Serialize partner metadata
         partner_non_tensor_data_bytes = pickle.dumps(partner_non_tensor_data)
         partner_tensor_keys_data_bytes = pickle.dumps(partner_metadata_updated)
         partner_non_tensor_size = len(partner_non_tensor_data_bytes)
         partner_tensor_keys_size = len(partner_tensor_keys_data_bytes)
-        partner_tensor_buffer_size = partner_total_size
+        partner_tensor_buffer_size = partner_total_size  # Use actual size for metadata (not padded)
+        
+        # Store actual sizes and pipeline sizes for later use
+        own_actual_size = own_total_size
+        partner_actual_size = partner_total_size
+        p2p_pipeline_total_bytes = max_total_bytes
         
         # Create own serialized metadata (similar to eccheck_serialized_metadata)
         own_serialized_metadata = {
@@ -938,7 +960,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             'own_buffer': own_buffer,
             'partner_buffer': partner_buffer,
             "own_write_bucket": own_write_bucket,
-            "partner_write_bucket": partner_write_bucket
+            "partner_write_bucket": partner_write_bucket,
+            'own_actual_size': own_actual_size,
+            'partner_actual_size': partner_actual_size,
+            'p2p_pipeline_total_bytes': p2p_pipeline_total_bytes,
         }
     
     def _get_eccheck_buffers(self):

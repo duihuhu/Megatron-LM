@@ -600,26 +600,45 @@ class FileSystemWriterAsync(FileSystemWriter):
                     logger.debug(f"EC-CHECK: Wrote Component 2 ({tensor_keys_size / 1024:.2f} KB) in {comp2_time:.4f}s")
                     
                     # Write Component 3: Tensor data
-                    # Optimize: write directly without extra copies
+                    # Only write actual data (exclude padding zeros for pipeline synchronization)
                     component3_start = time()
                     component3_size = 0
                     
                     if eccheck_continuous_buffer is not None:
-                        # Write continuous buffer directly (most efficient - single write)
+                        # Write only actual data portion (exclude padding zeros)
                         import numpy as np
-                        np_array = eccheck_continuous_buffer.numpy()  # Zero-copy view
+                        # tensor_buffer_size from metadata is the actual data size
+                        actual_size = tensor_buffer_size
+                        buffer_size = eccheck_continuous_buffer.numel()
+                        
+                        if actual_size > buffer_size:
+                            logger.warning(
+                                f"EC-CHECK: Actual size ({actual_size}) > buffer size ({buffer_size}), "
+                                f"writing entire buffer"
+                            )
+                            actual_size = buffer_size
+                        
+                        # Only write the actual data portion (exclude padding)
+                        np_array = eccheck_continuous_buffer[:actual_size].numpy()  # Zero-copy view
                         mv = memoryview(np_array)
                         
-                        # Write entire buffer at once
+                        # Write actual data at once
                         f.write(mv)
                         component3_size = mv.nbytes
+                        
+                        # Verify size matches
+                        if component3_size != tensor_buffer_size:
+                            logger.warning(
+                                f"EC-CHECK: Size mismatch: wrote {component3_size} bytes, "
+                                f"expected {tensor_buffer_size} bytes"
+                            )
                         
                         component3_time = time() - component3_start
                         bandwidth = (component3_size / (1024**3)) / component3_time if component3_time > 0 else 0
                         logger.info(
                             f"EC-CHECK: Wrote Component 3 ({component3_size / (1024**3):.2f} GB) "
                             f"in {component3_time:.2f}s ({bandwidth:.2f} GB/s), "
-                            f"continuous buffer"
+                            f"actual data only (excluded {buffer_size - actual_size} bytes padding)"
                         )
                     else:
                         logger.error("EC-CHECK: Continuous buffer is None, cannot write Component 3")
@@ -1003,7 +1022,19 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Process continuous tensor buffer sequentially
         # Copy data from self.tensor_buffer (continuous CPU buffer) to data buffers
-        total_bytes = self.decomposed_state_dict.total_tensor_size_bytes
+        # Use pipeline_total_bytes to ensure all ranks have same iterations
+        if hasattr(self, 'pipeline_total_bytes'):
+            total_bytes = self.pipeline_total_bytes
+        else:
+            total_bytes = self.decomposed_state_dict.total_tensor_size_bytes
+            logger.warning(
+                "EC-CHECK: pipeline_total_bytes not set, using actual size. "
+                "This may cause pipeline synchronization issues."
+            )
+        
+        # Get actual data size for padding logic
+        actual_data_bytes = getattr(self, 'actual_tensor_buffer_size', total_bytes)
+        
         src_pos = 0  # Current position in continuous tensor buffer
         # chunk_count = 0
         
@@ -1029,7 +1060,6 @@ class FileSystemWriterAsync(FileSystemWriter):
             p2p_own_buffer_offset = 0
             p2p_partner_buffer_offset = 0
 
-        total_bytes = 1024 * 1024 * 64 * 8
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
             cur_buffer_addr = get_free_data_buffer()
@@ -1076,11 +1106,26 @@ class FileSystemWriterAsync(FileSystemWriter):
             buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
             buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
             
-            # Get source data from continuous tensor buffer
-            src_data = self.tensor_buffer[src_pos: src_pos + take].numpy()
-            
-            # Direct memory copy using ctypes
-            ctypes.memmove(buffer_array.contents, src_data.ctypes.data, take)
+            # Check if we need to pad with zeros (for ranks with smaller data)
+            if src_pos < actual_data_bytes:
+                # Still have actual data to copy
+                bytes_to_copy = min(take, actual_data_bytes - src_pos)
+                src_data = self.tensor_buffer[src_pos: src_pos + bytes_to_copy].numpy()
+                
+                # Copy actual data
+                ctypes.memmove(buffer_array.contents, src_data.ctypes.data, bytes_to_copy)
+                
+                # Fill remaining space with zeros if needed
+                if take > bytes_to_copy:
+                    padding_size = take - bytes_to_copy
+                    padding_ptr = ctypes.cast(
+                        ctypes.addressof(buffer_array.contents) + bytes_to_copy,
+                        ctypes.POINTER(ctypes.c_uint8)
+                    )
+                    ctypes.memset(padding_ptr, 0, padding_size)
+            else:
+                # Already past actual data, fill entire chunk with zeros
+                ctypes.memset(buffer_array.contents, 0, take)
             
             # Get two encoding buffers (with timeout to detect deadlocks)
             enc_addr1 = get_free_encoding_buffer()
@@ -1206,6 +1251,11 @@ class FileSystemWriterAsync(FileSystemWriter):
         This method transfers tensor data from GPU to the preallocated CPU buffer
         in a pipelined manner, enabling overlap with subsequent encoding operations.
         
+        To ensure all ranks have the same pipeline iterations, this method:
+        1. Calculates the maximum data size across all ranks
+        2. Allocates a buffer of maximum size
+        3. Fills remaining space with zeros for ranks with smaller data
+        
         Args:
             non_blocking (bool): if True, use non-blocking GPU-to-CPU transfer
         
@@ -1217,18 +1267,54 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         logger.info("EC-CHECK: Starting GPU-to-CPU tensor transfer...")
         start = time()
-        # Allocate continuous CPU buffer if not already allocated
+        
+        # Step 1: Get actual data size for this rank
+        actual_total_size = self.decomposed_state_dict.total_tensor_size_bytes
+        
+        # Step 2: Calculate maximum data size across all ranks
+        # Use global_registry if available (no communication needed, all ranks have same registry)
+        if (torch.distributed.is_initialized() and 
+            hasattr(self, 'eccheck_global_registry') and 
+            self.eccheck_global_registry is not None):
+            # Get all ranks' data sizes from global_registry (no communication needed)
+            all_total_bytes_list = []
+            for r in range(torch.distributed.get_world_size()):
+                rank_metadata = self.eccheck_global_registry.rank_metadata.get(r, [])
+                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                all_total_bytes_list.append(rank_total_size)
+            
+            # Compute maximum locally (all ranks have the same global_registry)
+            max_total_bytes = max(all_total_bytes_list)
+        else:
+            max_total_bytes = actual_total_size
+        
+        # Step 3: Allocate buffer with maximum size (for pipeline synchronization)
         if self.preallocated_cpu_buffer is not None:
             buffer = self.preallocated_cpu_buffer
+            # If preallocated buffer exists, ensure it's large enough
+            if buffer.numel() < max_total_bytes:
+                logger.warning(
+                    f"EC-CHECK: Preallocated buffer ({buffer.numel() / (1024**3):.2f} GB) "
+                    f"is smaller than max_total_bytes ({max_total_bytes / (1024**3):.2f} GB). "
+                    f"Reallocating..."
+                )
+                if self.eccheck_pin_memory and torch.cuda.is_available():
+                    buffer = torch.empty(max_total_bytes, dtype=torch.uint8).pin_memory()
+                else:
+                    buffer = torch.empty(max_total_bytes, dtype=torch.uint8)
         else:
-            total_size = self.decomposed_state_dict.total_tensor_size_bytes
             if self.eccheck_pin_memory and torch.cuda.is_available():
-                buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
+                buffer = torch.empty(max_total_bytes, dtype=torch.uint8).pin_memory()
             else:
-                buffer = torch.empty(total_size, dtype=torch.uint8)
-            logger.info(f"EC-CHECK: Allocated continuous CPU buffer: {total_size / (1024**3):.2f} GB")
+                buffer = torch.empty(max_total_bytes, dtype=torch.uint8)
         
-        # Transfer tensors from GPU to continuous CPU buffer
+        logger.info(
+            f"EC-CHECK: Allocated continuous CPU buffer: {max_total_bytes / (1024**3):.2f} GB "
+            f"(actual data: {actual_total_size / (1024**3):.2f} GB, "
+            f"padding: {(max_total_bytes - actual_total_size) / (1024**3):.2f} GB)"
+        )
+        
+        # Step 4: Transfer tensors from GPU to continuous CPU buffer
         num_gpu_tensors = 0
         offset = 0
         for info, tensor in zip(
@@ -1255,15 +1341,26 @@ class FileSystemWriterAsync(FileSystemWriter):
             # Move to next tensor position
             offset += tensor_size
         
+        # Step 5: Fill remaining space with zeros (for pipeline synchronization)
+        if offset < max_total_bytes:
+            padding_size = max_total_bytes - offset
+            buffer[offset:max_total_bytes].fill_(0)
+            logger.debug(
+                f"EC-CHECK: Filled {padding_size / (1024**2):.2f} MB with zeros "
+                f"for pipeline synchronization"
+            )
+        
         # Synchronize if using non-blocking transfers
         if non_blocking and num_gpu_tensors > 0:
             torch.cuda.synchronize()
         
-        # Store the continuous buffer
+        # Step 6: Store the continuous buffer and metadata
         self.tensor_buffer = buffer
+        self.actual_tensor_buffer_size = actual_total_size  # Actual data size
+        self.pipeline_total_bytes = max_total_bytes  # Maximum size for pipeline
         
         transfer_time = time() - start
-        total_gb = self.decomposed_state_dict.total_tensor_size_bytes / (1024**3)
+        total_gb = actual_total_size / (1024**3)
         bandwidth = total_gb / transfer_time if transfer_time > 0 else 0
         
         logger.info(
@@ -1273,6 +1370,10 @@ class FileSystemWriterAsync(FileSystemWriter):
         logger.info(
             f"EC-CHECK: Updated tensor_infos device info - "
             f"{num_gpu_tensors} tensors now on CPU"
+        )
+        logger.info(
+            f"EC-CHECK: Pipeline will use {max_total_bytes / (1024**3):.2f} GB "
+            f"to ensure all ranks have same iterations"
         )
         
         # Validate that decomposition is still correct after transfer

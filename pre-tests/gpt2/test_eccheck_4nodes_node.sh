@@ -95,9 +95,12 @@ GPT_ARGS=(
     --loss-scale 8192
 )
 
-MODEL_PARALLEL_ARGS=(
+MODEL_PARALLEL_ARGS=(                    
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 4
+
+    # --account-for-loss-in-pipeline-split
+    # --account-for-embedding-in-pipeline-split
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -105,10 +108,10 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 1
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH
+    # --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --use-eccheck
+    # --use-eccheck
     --ckpt-format torch_dist
 )
 

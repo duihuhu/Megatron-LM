@@ -1052,7 +1052,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             start = time()
             writer.prepare_write_data(self.cached_central_plan, planner)
             end = time()
-            logger.debug(f"{time()} rank: {rank}, write(async) time: {end - start}")
+            # logger.debug(f"{time()} rank: {rank}, write(async) time: {end - start}")
             
         rank = torch.distributed.get_rank()
         if self.use_cached_ckpt_structure:

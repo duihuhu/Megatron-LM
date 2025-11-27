@@ -146,9 +146,10 @@ class ECCHECKManager:
         try:
             from megatron.training import get_args as input_args
             args = input_args()
-            self.use_eccheck = True
             if not getattr(args, 'use_eccheck', False):
                 return
+            
+            self.use_eccheck = True
                 
             # Check if distributed environment is initialized
             if not torch.distributed.is_initialized():

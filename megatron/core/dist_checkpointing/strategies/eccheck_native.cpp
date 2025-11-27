@@ -1668,7 +1668,7 @@ private:
                 continue;
             }
             
-            // Step 1: Copy own data/parity to own_buffer
+            // Step 1: Copy own data/parity to own_buffer (save path only)
             if (task.p2p_own_write_addr != 0 && task.send_buffer_addr != 0 && task.size > 0) {
                 std::memcpy(reinterpret_cast<void*>(task.p2p_own_write_addr),
                            reinterpret_cast<void*>(task.send_buffer_addr),
@@ -1680,6 +1680,10 @@ private:
                     std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Copied own data to own_buffer at "
                               << task.p2p_own_write_addr << std::endl;
                 }
+            } else if (task.p2p_own_write_addr == 0 && task.send_buffer_addr != 0 && task.size > 0) {
+                // Load path: direct send from provided buffer (typically mmap)
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Using provided buffer directly (no local copy)"
+                          << std::endl;
             }
             
             // Step 2: Send data using ASIO or NCCL
@@ -2401,7 +2405,37 @@ public:
     }
     
     void submit_data_to_p2p_thread(uintptr_t data_addr, size_t size, std::string ops) {
-        std:: cout << "EC-CHECK: [Rank " << rank_ << "] Submitting data to P2P thread: " << data_addr << " " << size << " " << ops << std::endl;
+        if (data_addr == 0 || size == 0) {
+            std::cerr << "EC-CHECK: [Rank " << rank_
+                      << "] submit_data_to_p2p_thread received invalid args: addr="
+                      << data_addr << ", size=" << size << std::endl;
+            return;
+        }
+        
+        if (ops == "send") {
+            {
+                std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
+                // Load-time P2P transfer doesn't need a local copy, so p2p_own_write_addr/parity/data are 0
+                p2p_send_queue_.push({data_addr, 0, size, 0, 0});
+            }
+            p2p_send_queue_cv_.notify_one();
+            std::cout << "EC-CHECK: [Rank " << rank_
+                      << "] Queued P2P send task (addr=" << data_addr
+                      << ", size=" << size << ")" << std::endl;
+        } else if (ops == "recv") {
+            {
+                std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
+                p2p_recv_queue_.push({data_addr, size});
+            }
+            p2p_recv_queue_cv_.notify_one();
+            std::cout << "EC-CHECK: [Rank " << rank_
+                      << "] Queued P2P recv task (addr=" << data_addr
+                      << ", size=" << size << ")" << std::endl;
+        } else {
+            std::cerr << "EC-CHECK: [Rank " << rank_
+                      << "] submit_data_to_p2p_thread received unknown op: "
+                      << ops << std::endl;
+        }
     }
 };
 

@@ -1269,6 +1269,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         start = time()
         if self.eccheck_p2p_buffers is None:
             self.eccheck_p2p_buffers = self._allocate_p2p_buffers(self.eccheck_global_registry)
+            # Store to manager for reuse in load phase
+            self.eccheck_manager.eccheck_p2p_buffers = self.eccheck_p2p_buffers
             
         p2p_buffer_alloc_time = time() - start
         logger.info(f"EC-CHECK: P2P buffer allocation completed in {p2p_buffer_alloc_time:.2f}s")
@@ -1603,6 +1605,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Initialize EC-CHECK manager (singleton instance shared with Save strategy)
         self.eccheck_manager = ECCHECKManager()
         self.eccheck_manager.init_eccheck_if_enabled()
+        
+        # Initialize strategy-specific EC-CHECK state
+        self.eccheck_p2p_buffers = None
     
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank using the shared manager."""
@@ -1721,6 +1726,56 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             rank_non_tensor_data=rank_non_tensor_data
         )
         
+        # ===== Step 3: Prepare P2P buffers (own_buffer and partner_buffer) =====
+        # Check if buffers exist in manager and can be reused, or allocate new ones
+        if self.eccheck_manager.eccheck_p2p_buffers is not None:
+            existing_buffers = self.eccheck_manager.eccheck_p2p_buffers
+            existing_own_size = existing_buffers['own_buffer'].numel()
+            existing_partner_size = existing_buffers['partner_buffer'].numel()
+            
+            # Calculate required buffer sizes from registry
+            own_metadata = registry.rank_metadata.get(rank, [])
+            own_total_size = sum(meta.size_bytes for meta in own_metadata)
+            partner_metadata = registry.rank_metadata.get(p2p_partner_rank, [])
+            partner_total_size = sum(meta.size_bytes for meta in partner_metadata)
+            
+            # Calculate maximum size across all ranks (for pipeline synchronization)
+            all_total_bytes_list = []
+            for r in range(world_size):
+                rank_metadata = registry.rank_metadata.get(r, [])
+                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                all_total_bytes_list.append(rank_total_size)
+            max_total_bytes = max(all_total_bytes_list)
+            
+            # Calculate aligned sizes
+            eccheck_buffer_size = self.eccheck_manager.eccheck_buffer_size
+            needed_own_size = ((max_total_bytes + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
+            needed_partner_size = needed_own_size  # Same size for pipeline sync
+            
+            if (existing_own_size >= needed_own_size and 
+                existing_partner_size >= needed_partner_size):
+                # Reuse existing buffers
+                logger.info(
+                    f"EC-CHECK: Reusing existing P2P buffers from manager "
+                    f"(own: {existing_own_size / (1024**3):.2f} GB >= {needed_own_size / (1024**3):.2f} GB, "
+                    f"partner: {existing_partner_size / (1024**3):.2f} GB >= {needed_partner_size / (1024**3):.2f} GB)"
+                )
+                self.eccheck_p2p_buffers = existing_buffers
+            else:
+                # Existing buffers too small, reallocate
+                logger.info(
+                    f"EC-CHECK: Existing buffers too small, reallocating "
+                    f"(own: {existing_own_size / (1024**3):.2f} GB < {needed_own_size / (1024**3):.2f} GB or "
+                    f"partner: {existing_partner_size / (1024**3):.2f} GB < {needed_partner_size / (1024**3):.2f} GB)"
+                )
+                self.eccheck_p2p_buffers = self._allocate_p2p_buffers(registry)
+                self.eccheck_manager.eccheck_p2p_buffers = self.eccheck_p2p_buffers
+        else:
+            # First-time allocation (e.g., after process restart)
+            logger.info("EC-CHECK: Allocating P2P buffers from checkpoint metadata")
+            self.eccheck_p2p_buffers = self._allocate_p2p_buffers(registry)
+            self.eccheck_manager.eccheck_p2p_buffers = self.eccheck_p2p_buffers
+        
         paired_rank = self._get_p2p_partner_rank(rank, world_size)
         
         # Get self metadata form peer rank in global registry
@@ -1730,18 +1785,626 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     
         recv_own_buffer = torch.empty(recv_total_size, dtype=torch.uint8)
         
-        if rank == 0 or rank == 3:
-            self.eccheck_manager._eccheck_native.submit_data_to_p2p_thread(mapped_file_partner.memory_address, mapped_file_partner.file_size, 'send')
-        else:
-            # Convert data_ptr() to int to ensure type compatibility
-            self.eccheck_manager._eccheck_native.submit_data_to_p2p_thread(recv_own_buffer.data_ptr(), recv_total_size, 'recv')
+        # Simple P2P exchange placeholder. This will be extended into a full
+        # EC-CHECK recovery pipeline (encoding + XOR + P2P) in later steps.
+        self._run_eccheck_p2p_pipeline_simple(
+            rank=rank,
+            world_size=world_size,
+            registry=registry,
+            mapped_file_own=mapped_file_own,
+            mapped_file_partner=mapped_file_partner,
+            recv_own_buffer=recv_own_buffer,
+            recv_total_size=recv_total_size,
+        )
         
-
-        # if not eccheck_p2p_own_file.exists():
-            # return mapped_file_own, mapped_file_partner
-        # print("all_packages: ", all_packages)
         # Return EccheckMappedFile, non_tensor_data, and local_metadata for each file
         return mapped_file_own, mapped_file_partner
+    
+    def _run_eccheck_p2p_pipeline_simple(
+        self,
+        rank: int,
+        world_size: int,
+        registry,
+        mapped_file_own,
+        mapped_file_partner,
+        recv_own_buffer: torch.Tensor,
+        recv_total_size: int,
+    ) -> None:
+        """EC-CHECK recovery pipeline for rank2 single-failure scenario.
+
+        This implements a chunked pipeline that drives C++ encoding, XOR, and P2P
+        workers to recover lost data. The pipeline structure mirrors the save-side
+        implementation for consistency.
+        """
+        import queue
+        import ctypes
+        import mmap
+        
+        # === Step 1: Prepare recv_encoding_buffers (if not already allocated) ===
+        if self.eccheck_manager.eccheck_recv_encoding_buffers is None:
+            logger.info("EC-CHECK: Allocating recv_encoding_buffers for load pipeline")
+            self.eccheck_manager.eccheck_recv_encoding_buffers = (
+                self.eccheck_manager.allocate_recv_encoding_buffers_phase2(registry)
+            )
+        
+        recv_buffer_thread1, recv_buffer_thread2 = self.eccheck_manager.eccheck_recv_encoding_buffers
+        recv_buffer_base_addr_thread1 = int(recv_buffer_thread1.data_ptr())
+        recv_buffer_base_addr_thread2 = int(recv_buffer_thread2.data_ptr())
+        recv_buffer_offset_thread1 = 0
+        recv_buffer_offset_thread2 = 0
+        
+        # === Step 2: Buffer helper functions (from ECCHECKManager) ===
+        mgr = self.eccheck_manager
+        
+        def get_free_data_buffer():
+            mgr._poll_and_release_buffers()
+            try:
+                return mgr._free_data_buffer_queue.get(timeout=5.0)
+            except queue.Empty:
+                logger.error("EC-CHECK: TIMEOUT waiting for free data buffer - possible deadlock!")
+                return mgr._free_data_buffer_queue.get()
+        
+        def get_free_encoding_buffer():
+            mgr._poll_and_release_buffers()
+            try:
+                return mgr._free_encoding_buffer_queue.get(timeout=5.0)
+            except queue.Empty:
+                logger.error("EC-CHECK: TIMEOUT waiting for free encoding buffer - possible deadlock!")
+                return mgr._free_encoding_buffer_queue.get()
+        
+        def get_free_parity_buffer():
+            mgr._poll_and_release_buffers()
+            try:
+                return mgr._free_parity_buffer_queue.get(timeout=5.0)
+            except queue.Empty:
+                logger.error("EC-CHECK: TIMEOUT waiting for free parity buffer - possible deadlock!")
+                return mgr._free_parity_buffer_queue.get()
+        
+        # === Step 3: P2P buffers base addresses ===
+        p2p_own_buffer_base_addr = 0
+        p2p_partner_buffer_base_addr = 0
+        p2p_own_buffer_offset = 0
+        p2p_partner_buffer_offset = 0
+        
+        if self.eccheck_p2p_buffers is not None:
+            own_buffer = self.eccheck_p2p_buffers['own_buffer']
+            partner_buffer = self.eccheck_p2p_buffers['partner_buffer']
+            p2p_own_buffer_base_addr = int(own_buffer.data_ptr())
+            p2p_partner_buffer_base_addr = int(partner_buffer.data_ptr())
+        
+        # === Step 4: Set load mode in C++ native module ===
+        # For rank2 recovery scenario, set failed_rank=2
+        # TODO: In the future, this could be determined dynamically based on which rank failed
+        failed_rank = 2  # Hardcoded for now
+        self.eccheck_manager._eccheck_native.set_load_mode(True, failed_rank)
+        logger.info(f"EC-CHECK: Set load mode (failed_rank={failed_rank})")
+        
+        # === Step 5: Compute unified total_bytes for pipeline synchronization ===
+        all_total_bytes_list = []
+        for r in range(world_size):
+            rank_metadata = registry.rank_metadata.get(r, [])
+            rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+            all_total_bytes_list.append(rank_total_size)
+        
+        if len(all_total_bytes_list) == 0:
+            return
+        
+        max_total_bytes = max(all_total_bytes_list)
+        eccheck_buffer_size = self.eccheck_manager.eccheck_buffer_size
+        total_bytes = max_total_bytes
+        
+        # === Step 5: Determine data source based on rank role ===
+        # For rank2 recovery scenario:
+        # - rank0/3: read from mapped_file_own (their own data/parity)
+        # - rank1/2: read from mapped_file_partner (received from step2)
+        if rank == 0 or rank == 3:
+            source_mmap = mapped_file_own.mmap_object if mapped_file_own.mmap_object is not None else None
+            source_file_size = mapped_file_own.file_size if mapped_file_own.file_size is not None else 0
+        else:
+            source_mmap = mapped_file_partner.mmap_object if mapped_file_partner.mmap_object is not None else None
+            source_file_size = mapped_file_partner.file_size if mapped_file_partner.file_size is not None else 0
+        
+        # Calculate actual data size (skip header: 32 bytes + Component 1 + Component 2)
+        # Component 3 (tensor buffer) starts after header + Component 1 + Component 2
+        # For simplicity, we'll read from the tensor buffer portion directly
+        # The header parsing is already done in load_eccheck_bytes_from_file
+        # We need to find the offset where Component 3 (tensor buffer) starts
+        tensor_buffer_start_offset = 32  # After header
+        if source_mmap is not None:
+            # Parse header to get Component 1 and Component 2 sizes
+            header_bytes = source_mmap[:32]
+            import struct
+            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            tensor_buffer_start_offset = 32 + non_tensor_size + tensor_keys_size
+        
+        # === Step 6: Reset encoding completion flags and activate buffer poller ===
+        self.eccheck_manager._eccheck_native.reset_encoding_completion_flags()
+        if mgr._buffer_poller_active_event:
+            mgr._buffer_poller_active_event.set()
+            logger.info("EC-CHECK: Activated buffer poller for load pipeline")
+        
+        try:
+            # === Step 7: Main pipeline loop ===
+            processed = 0
+            
+            while processed < total_bytes:
+                take = min(eccheck_buffer_size, total_bytes - processed)
+                
+                # Get free buffers
+                cur_buffer_addr = get_free_data_buffer()
+                enc_addr1 = get_free_encoding_buffer()
+                enc_addr2 = get_free_encoding_buffer()
+                parity_addr1 = get_free_parity_buffer()
+                parity_addr2 = get_free_parity_buffer()
+                
+                # Calculate recv addresses (64-byte aligned)
+                recv_buffer_offset_thread1_aligned = ((recv_buffer_offset_thread1 + 63) // 64) * 64
+                recv_buffer_offset_thread2_aligned = ((recv_buffer_offset_thread2 + 63) // 64) * 64
+                
+                recv_addr_thread1 = recv_buffer_base_addr_thread1 + recv_buffer_offset_thread1_aligned
+                recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2_aligned
+                recv_chunk_size = take
+                
+                recv_buffer_offset_thread1 = recv_buffer_offset_thread1_aligned + recv_chunk_size
+                recv_buffer_offset_thread2 = recv_buffer_offset_thread2_aligned + recv_chunk_size
+                
+                # Calculate P2P write addresses (64-byte aligned)
+                if p2p_own_buffer_base_addr != 0:
+                    p2p_own_buffer_offset_aligned = ((p2p_own_buffer_offset + 63) // 64) * 64
+                    p2p_partner_buffer_offset_aligned = ((p2p_partner_buffer_offset + 63) // 64) * 64
+                    
+                    p2p_own_write_addr = p2p_own_buffer_base_addr + p2p_own_buffer_offset_aligned
+                    p2p_partner_write_addr = p2p_partner_buffer_base_addr + p2p_partner_buffer_offset_aligned
+                    
+                    p2p_own_buffer_offset = p2p_own_buffer_offset_aligned + take
+                    p2p_partner_buffer_offset = p2p_partner_buffer_offset_aligned + take
+                else:
+                    p2p_own_write_addr = 0
+                    p2p_partner_write_addr = 0
+                
+                # Prepare Step 2 P2P transfer parameters
+                step2_send_addr = 0
+                step2_recv_data_addr = 0
+                step2_size = 0
+                
+                if rank == 0 or rank == 3:
+                    # Sender: prepare partner_file chunk address for Step 2 P2P send
+                    if mapped_file_partner.mmap_object is not None:
+                        # Real mmap file: Calculate source offset in Component 3 (tensor buffer)
+                        partner_tensor_buffer_start_offset = 32  # After header
+                        partner_header_bytes = mapped_file_partner.mmap_object[:32]
+                        import struct
+                        partner_magic, partner_non_tensor_size, partner_tensor_keys_size, partner_tensor_buffer_size = struct.unpack('4sQQQ', partner_header_bytes)
+                        partner_tensor_buffer_start_offset = 32 + partner_non_tensor_size + partner_tensor_keys_size
+                        
+                        partner_source_offset = partner_tensor_buffer_start_offset + processed
+                        partner_bytes_to_send = min(take, mapped_file_partner.file_size - partner_source_offset)
+                        
+                        if partner_bytes_to_send > 0:
+                            # Use memory_address from mapped_file_partner + offset
+                            if mapped_file_partner.memory_address is not None:
+                                step2_send_addr = mapped_file_partner.memory_address + partner_source_offset
+                            else:
+                                # Fallback: use ctypes.addressof (less efficient)
+                                step2_send_addr = int(ctypes.addressof(ctypes.c_char.from_buffer(
+                                    mapped_file_partner.mmap_object, partner_source_offset
+                                )))
+                            step2_size = partner_bytes_to_send
+                    elif mapped_file_partner.memory_address is not None:
+                        # Test mode: Use memory_address directly (no header offset for test data)
+                        step2_send_addr = mapped_file_partner.memory_address + processed
+                        step2_size = min(take, mapped_file_partner.file_size - processed)
+                        logger.debug(f"EC-CHECK: [Rank {rank}] Test mode Step2 P2P send: addr={step2_send_addr}, size={step2_size}")
+                    else:
+                        logger.warning(f"EC-CHECK: [Rank {rank}] mapped_file_partner has no mmap_object or memory_address, skipping Step2 P2P")
+                        step2_send_addr = 0
+                        step2_size = 0
+                    
+                    # rank0/3: copy from own_file to data_buffer before submitting pipeline
+                    buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
+                    buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
+                    
+                    if source_mmap is not None and processed < source_file_size - tensor_buffer_start_offset:
+                        # Real mmap file: Calculate source offset in Component 3 (tensor buffer)
+                        source_offset = tensor_buffer_start_offset + processed
+                        bytes_to_copy = min(take, source_file_size - source_offset)
+                        
+                        if bytes_to_copy > 0:
+                            # Read from mmap
+                            source_data = source_mmap[source_offset:source_offset + bytes_to_copy]
+                            ctypes.memmove(buffer_array.contents, source_data, bytes_to_copy)
+                            
+                            # Pad with zeros if needed
+                            if take > bytes_to_copy:
+                                padding_size = take - bytes_to_copy
+                                padding_ptr = ctypes.cast(
+                                    ctypes.addressof(buffer_array.contents) + bytes_to_copy,
+                                    ctypes.POINTER(ctypes.c_uint8)
+                                )
+                                ctypes.memset(padding_ptr, 0, padding_size)
+                        else:
+                            # Past actual data, fill with zeros
+                            ctypes.memset(buffer_array.contents, 0, take)
+                    elif mapped_file_own.memory_address is not None:
+                        # Test mode: Copy directly from memory_address (no header offset for test data)
+                        source_addr = mapped_file_own.memory_address + processed
+                        bytes_to_copy = min(take, mapped_file_own.file_size - processed)
+                        
+                        if bytes_to_copy > 0:
+                            source_ptr = ctypes.cast(source_addr, ctypes.POINTER(ctypes.c_uint8))
+                            ctypes.memmove(buffer_array.contents, source_ptr, bytes_to_copy)
+                            
+                            # Pad with zeros if needed
+                            if take > bytes_to_copy:
+                                padding_size = take - bytes_to_copy
+                                padding_ptr = ctypes.cast(
+                                    ctypes.addressof(buffer_array.contents) + bytes_to_copy,
+                                    ctypes.POINTER(ctypes.c_uint8)
+                                )
+                                ctypes.memset(padding_ptr, 0, padding_size)
+                        else:
+                            # Past actual data, fill with zeros
+                            ctypes.memset(buffer_array.contents, 0, take)
+                        logger.debug(f"EC-CHECK: [Rank {rank}] Test mode: Copied {bytes_to_copy} bytes from own_file to data_buffer")
+                    else:
+                        # No source data available, fill with zeros
+                        logger.warning(f"EC-CHECK: [Rank {rank}] No source data available, filling data_buffer with zeros")
+                        ctypes.memset(buffer_array.contents, 0, take)
+                else:
+                    # rank1/2: receive partner_file chunk into data_buffer via Step 2 P2P
+                    step2_recv_data_addr = cur_buffer_addr
+                    step2_size = take
+                
+                # Submit complete load pipeline chunk (Step2 P2P -> Encoding -> XOR -> Step6 P2P)
+                # This single call handles the entire pipeline internally in C++
+                self.eccheck_manager._eccheck_native.submit_load_pipeline_chunk(
+                    step2_send_addr=step2_send_addr,           # rank0/3: partner_file chunk addr; rank1/2: 0
+                    step2_recv_data_addr=step2_recv_data_addr,  # rank1/2: data_buffer addr; rank0/3: 0
+                    step2_size=step2_size,                      # Step 2 transfer size
+                    data_addr=cur_buffer_addr,                  # Data buffer address (own_file for rank0/3, received for rank1/2)
+                    size=take,                                  # Data size
+                    encoding_addr1=enc_addr1,                   # Thread1 encoding buffer
+                    encoding_addr2=enc_addr2,                   # Thread2 encoding buffer
+                    recv_addr_thread1=recv_addr_thread1,        # Thread1 receive address
+                    recv_addr_thread2=recv_addr_thread2,        # Thread2 receive address
+                    recv_chunk_size=recv_chunk_size,            # Receive chunk size
+                    parity_addr1=parity_addr1,                  # Thread1 parity buffer
+                    parity_addr2=parity_addr2,                  # Thread2 parity buffer
+                    p2p_own_write_addr=p2p_own_write_addr,       # P2P own buffer write address
+                    p2p_partner_write_addr=p2p_partner_write_addr  # P2P partner buffer write address
+                )
+                
+                processed += take
+            
+            # === Step 8: Send sentinel and wait for completion ===
+            logger.info("EC-CHECK: Load pipeline: Sending sentinel to encoding threads")
+            self.eccheck_manager._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0, 0, 0)
+            self.eccheck_manager._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0, 0, 0)
+            
+            logger.info("EC-CHECK: Load pipeline: Waiting for encoding threads to complete...")
+            self.eccheck_manager._eccheck_native.wait_for_encoding_completion()
+            
+            # Wait for P2P workers to complete
+            # Note: C++ should have wait_for_p2p_workers or similar, but for now we'll rely on
+            # the encoding completion which should ensure P2P is done
+            torch.cuda.synchronize()
+            logger.info("EC-CHECK: Load pipeline: Pipeline completed")
+            
+        finally:
+            # Deactivate buffer poller
+            if mgr._buffer_poller_active_event:
+                mgr._buffer_poller_active_event.clear()
+                logger.info("EC-CHECK: Deactivated buffer poller after load pipeline")
+    
+    def prepare_for_load_pipeline_test(self):
+        """
+        Prepare environment for load pipeline testing.
+        
+        This function ensures all prerequisites are met:
+        1. Distributed environment is initialized
+        2. EC-CHECK is enabled via args
+        3. ECCHECKManager is initialized
+        4. C++ native module is ready
+        
+        Returns:
+            bool: True if preparation successful, False otherwise
+        """
+        # === Step 1: Check distributed environment ===
+        if not torch.distributed.is_initialized():
+            logger.error("EC-CHECK TEST: Distributed environment not initialized!")
+            logger.error("  Please initialize distributed environment first:")
+            logger.error("    torch.distributed.init_process_group(...)")
+            return False
+        
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        
+        if world_size < 4:
+            logger.error(f"EC-CHECK TEST: Need at least 4 ranks, got {world_size}")
+            return False
+        
+        logger.info(f"EC-CHECK TEST: Distributed environment OK (rank={rank}, world_size={world_size})")
+        
+        # === Step 2: Ensure args.use_eccheck is True ===
+        # The init_eccheck_if_enabled() checks get_args().use_eccheck
+        # We need to mock or set this before calling init_eccheck_if_enabled()
+        try:
+            from megatron.training import get_args as input_args
+            args = input_args()
+            
+            # Set use_eccheck if not already set
+            if not hasattr(args, 'use_eccheck') or not args.use_eccheck:
+                logger.info("EC-CHECK TEST: Setting args.use_eccheck = True")
+                args.use_eccheck = True
+        except Exception as e:
+            logger.warning(f"EC-CHECK TEST: Could not get/set args: {e}")
+            logger.warning("  Will try to proceed anyway...")
+        
+        # === Step 3: Ensure ECCHECKManager is initialized ===
+        # Create strategy instance (which initializes manager)
+        if self.eccheck_manager is None:
+            logger.error("EC-CHECK TEST: eccheck_manager is None!")
+            return False
+        
+        # Force initialization if not already done
+        if self.eccheck_manager._eccheck_native is None:
+            logger.info("EC-CHECK TEST: Initializing ECCHECKManager...")
+            try:
+                self.eccheck_manager.init_eccheck_if_enabled()
+            except Exception as e:
+                logger.error(f"EC-CHECK TEST: Failed to initialize ECCHECKManager: {e}")
+                return False
+        
+        # === Step 4: Verify C++ native module is ready ===
+        if self.eccheck_manager._eccheck_native is None:
+            logger.error("EC-CHECK TEST: C++ native module is None!")
+            logger.error("  This usually means:")
+            logger.error("    1. args.use_eccheck is False")
+            logger.error("    2. Distributed environment not initialized")
+            logger.error("    3. eccheck_native.so file not found")
+            logger.error("    4. C++ module initialization failed")
+            return False
+        
+        logger.info(f"EC-CHECK TEST: C++ native module is ready (rank={rank})")
+        
+        # === Step 5: Verify buffers are allocated ===
+        if self.eccheck_manager.eccheck_data_buffers is None:
+            logger.warning("EC-CHECK TEST: Data buffers not allocated yet (will be allocated during pipeline)")
+        else:
+            logger.info(f"EC-CHECK TEST: Data buffers allocated ({len(self.eccheck_manager.eccheck_data_buffers)} buffers)")
+        
+        logger.info(f"EC-CHECK TEST: Preparation complete for rank {rank}")
+        return True
+    
+    def test_load_pipeline(self, test_data_size: int = 64 * 1024 * 1024):
+        """
+        Test load pipeline without requiring actual checkpoint files.
+        
+        This function creates mock data structures and directly calls the load pipeline
+        to test the rank2 recovery flow. All 4 ranks will participate, but the pipeline
+        will simulate rank2 failure recovery.
+        
+        Args:
+            test_data_size (int): Size of test data in bytes (default: 64MB)
+        """
+        import mmap
+        import ctypes
+        import struct
+        from .filesystem_async import EccheckMappedFile
+        from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
+        
+        # === Preparation ===
+        if not self.prepare_for_load_pipeline_test():
+            logger.error("EC-CHECK TEST: Preparation failed, aborting test")
+            return False
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 4
+        
+        if world_size < 4:
+            logger.warning(f"EC-CHECK TEST: World size {world_size} < 4, test may not work correctly")
+        
+        logger.info(f"EC-CHECK TEST: Starting load pipeline test (rank={rank}, world_size={world_size}, test_data_size={test_data_size} bytes)")
+        
+        # === Step 1: Create mock TensorMetadata for all ranks ===
+        # For simplicity, each rank has one tensor chunk
+        rank_metadata = {}
+        for r in range(world_size):
+            # Create metadata for this rank
+            # In real scenario, rank0/1 have data, rank2/3 have parity
+            # For test, we'll create data for all ranks
+            chunk_type = 'data' if r < 2 else 'parity'
+            metadata = TensorMetadata(
+                key=f"test_tensor_rank_{r}",
+                shape=(test_data_size,),
+                dtype='torch.uint8',
+                size_bytes=test_data_size,
+                global_offset=(0,),
+                shard_index=0,
+                chunk_type=chunk_type,
+                target_rank=r,
+                source_rank=r
+            )
+            rank_metadata[r] = [metadata]
+        
+        # Create GlobalMetadataRegistry
+        registry = GlobalMetadataRegistry(
+            rank_metadata=rank_metadata,
+            rank_non_tensor_data={r: {} for r in range(world_size)}
+        )
+        
+        logger.info(f"EC-CHECK TEST: Created registry with {len(rank_metadata)} ranks")
+        
+        # === Step 2: Create mock EccheckMappedFile for own_file and partner_file ===
+        # We'll use torch tensors as data source, then create mmap-like objects
+        
+        # For own_file: rank0/3 have their own data/parity
+        # For partner_file: rank0/3 have partner's data/parity (for Step2 P2P send)
+        p2p_partner_rank = self._get_p2p_partner_rank(rank, world_size)
+        
+        # Create test data: fill with rank-specific pattern for verification
+        own_data = torch.full((test_data_size,), rank, dtype=torch.uint8)
+        partner_data = torch.full((test_data_size,), p2p_partner_rank, dtype=torch.uint8)
+        
+        # Create mmap-like objects from torch tensors
+        # Use PyTorch's data_ptr() to get the actual memory address
+        # This is more reliable than ctypes.addressof for torch tensors
+        own_memory_address = int(own_data.data_ptr())
+        partner_memory_address = int(partner_data.data_ptr())
+        
+        # Create EccheckMappedFile objects
+        # Note: We use None for mmap_object since we're using torch tensor memory
+        # The memory_address points to the actual data
+        mapped_file_own = EccheckMappedFile(
+            mmap_object=None,  # Not a real mmap, but we keep data in torch tensor
+            memory_address=own_memory_address,
+            file_size=test_data_size,
+            local_metadata=rank_metadata.get(rank, []),
+            non_tensor_data={}
+        )
+        
+        mapped_file_partner = EccheckMappedFile(
+            mmap_object=None,  # Not a real mmap, but we keep data in torch tensor
+            memory_address=partner_memory_address,
+            file_size=test_data_size,
+            local_metadata=rank_metadata.get(p2p_partner_rank, []),
+            non_tensor_data={}
+        )
+        
+        # Keep references to prevent garbage collection
+        mapped_file_own._data_ref = own_data
+        mapped_file_partner._data_ref = partner_data
+        
+        logger.info(f"EC-CHECK TEST: Created mock mapped files (own_addr={own_memory_address}, partner_addr={partner_memory_address})")
+        
+        # === Step 3: Create recv_own_buffer ===
+        # This is where rank2 will receive the recovered data
+        recv_own_buffer = torch.empty(test_data_size, dtype=torch.uint8)
+        recv_total_size = test_data_size
+        
+        logger.info(f"EC-CHECK TEST: Created recv_own_buffer (size={recv_total_size} bytes)")
+        
+        # === Step 4: Call the pipeline ===
+        try:
+            logger.info(f"EC-CHECK TEST: Calling _run_eccheck_p2p_pipeline_simple...")
+            self._run_eccheck_p2p_pipeline_simple(
+                rank=rank,
+                world_size=world_size,
+                registry=registry,
+                mapped_file_own=mapped_file_own,
+                mapped_file_partner=mapped_file_partner,
+                recv_own_buffer=recv_own_buffer,
+                recv_total_size=recv_total_size,
+            )
+            logger.info(f"EC-CHECK TEST: Pipeline completed successfully for rank {rank}")
+            
+            # === Step 5: Verify results (for rank2) ===
+            if rank == 2:
+                # Check if own_buffer contains recovered d2
+                if self.eccheck_p2p_buffers is not None:
+                    own_buffer = self.eccheck_p2p_buffers['own_buffer']
+                    partner_buffer = self.eccheck_p2p_buffers['partner_buffer']
+                    
+                    logger.info(f"EC-CHECK TEST: Rank2 verification:")
+                    logger.info(f"  own_buffer shape: {own_buffer.shape}, dtype: {own_buffer.dtype}")
+                    logger.info(f"  partner_buffer shape: {partner_buffer.shape}, dtype: {partner_buffer.dtype}")
+                    
+                    # Check if buffers are not all zeros (basic sanity check)
+                    own_nonzero = torch.count_nonzero(own_buffer).item()
+                    partner_nonzero = torch.count_nonzero(partner_buffer).item()
+                    
+                    logger.info(f"  own_buffer non-zero elements: {own_nonzero} / {own_buffer.numel()}")
+                    logger.info(f"  partner_buffer non-zero elements: {partner_nonzero} / {partner_buffer.numel()}")
+                    
+                    if own_nonzero == 0:
+                        logger.warning("EC-CHECK TEST: WARNING - own_buffer is all zeros!")
+                    if partner_nonzero == 0:
+                        logger.warning("EC-CHECK TEST: WARNING - partner_buffer is all zeros!")
+                else:
+                    logger.warning("EC-CHECK TEST: Rank2 - eccheck_p2p_buffers is None")
+            
+            logger.info(f"EC-CHECK TEST: Test completed successfully for rank {rank}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"EC-CHECK TEST: Pipeline failed with error: {e}", exc_info=True)
+            raise
+            if mgr._buffer_poller_active_event:
+                mgr._buffer_poller_active_event.clear()
+                logger.info("EC-CHECK: Deactivated buffer poller after load pipeline completion")
+            
+            # Final poll to ensure all buffers are released
+            mgr._poll_and_release_buffers()
+
+    def _allocate_p2p_buffers(self, global_registry):
+        """
+        Allocate TWO large continuous buffers for P2P stage (load phase).
+        This is a simplified version that only allocates buffers without creating write buckets.
+        
+        Args:
+            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
+            
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary with 'own_buffer' and 'partner_buffer'
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        p2p_partner_rank = self._get_p2p_partner_rank(rank, world_size)
+        
+        # ===== Get own data size from metadata =====
+        own_metadata = global_registry.rank_metadata.get(rank, [])
+        own_total_size = sum(meta.size_bytes for meta in own_metadata)
+        
+        # ===== Get P2P partner's data size from metadata =====
+        partner_metadata = global_registry.rank_metadata.get(p2p_partner_rank, [])
+        partner_total_size = sum(meta.size_bytes for meta in partner_metadata)
+        
+        # ===== Calculate maximum data size across all ranks (for pipeline synchronization) =====
+        if torch.distributed.is_initialized():
+            all_total_bytes_list = []
+            for r in range(world_size):
+                rank_metadata = global_registry.rank_metadata.get(r, [])
+                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                all_total_bytes_list.append(rank_total_size)
+            max_total_bytes = max(all_total_bytes_list)
+        else:
+            max_total_bytes = max(own_total_size, partner_total_size)
+        
+        # ===== Align both sizes to buffer_size (64MB) using maximum for pipeline sync =====
+        eccheck_buffer_size = self.eccheck_manager.eccheck_buffer_size
+        own_pipeline_size = max_total_bytes
+        partner_pipeline_size = max_total_bytes
+        own_aligned_size = ((own_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
+        partner_aligned_size = ((partner_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
+        
+        logger.info(
+            f"EC-CHECK: Allocating P2P buffers for load phase based on metadata\n"
+            f"  P2P partner rank: {p2p_partner_rank}\n"
+            f"  Own data size: {own_total_size / (1024**3):.2f} GB "
+            f"(actual), {max_total_bytes / (1024**3):.2f} GB (pipeline max), "
+            f"{own_aligned_size / (1024**3):.2f} GB (aligned)\n"
+            f"  Partner data size: {partner_total_size / (1024**3):.2f} GB "
+            f"(actual), {max_total_bytes / (1024**3):.2f} GB (pipeline max), "
+            f"{partner_aligned_size / (1024**3):.2f} GB (aligned)\n"
+            f"  Total P2P memory: {(own_aligned_size + partner_aligned_size) / (1024**3):.2f} GB"
+        )
+        
+        # ===== Allocate two large continuous buffers =====
+        own_buffer = torch.empty(own_aligned_size, dtype=torch.uint8)
+        partner_buffer = torch.empty(partner_aligned_size, dtype=torch.uint8)
+        
+        logger.info(
+            f"EC-CHECK: Allocated P2P buffers for load phase:\n"
+            f"  Own buffer: {own_aligned_size / (1024**3):.2f} GB "
+            f"({own_aligned_size / (1024**2):.0f} MB)\n"
+            f"  Partner buffer: {partner_aligned_size / (1024**3):.2f} GB "
+            f"({partner_aligned_size / (1024**2):.0f} MB)"
+        )
+        
+        return {
+            'own_buffer': own_buffer,
+            'partner_buffer': partner_buffer,
+        }
     
     def _load_eccheck_metadata_broadcast(self, checkpoint_dir: Path) -> Tuple[Dict[str, Any], List[TensorMetadata]]:
         """

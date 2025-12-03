@@ -1917,14 +1917,85 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
             tensor_buffer_start_offset = 32 + non_tensor_size + tensor_keys_size
         
-        # === Step 6: Reset encoding completion flags and activate buffer poller ===
+        # === Step 6: Pre-process partner_file for rank0/3 (fill zeros before pipeline) ===
+        # Similar to save stage: read actual data and pad with zeros to max_total_bytes
+        # This ensures pipeline can always send full chunks without boundary checks
+        if (rank == 0 or rank == 3) and mapped_file_partner.mmap_object is not None:
+            # Parse partner_file header to get tensor buffer info
+            partner_header_bytes = mapped_file_partner.mmap_object[:32]
+            import struct
+            partner_magic, partner_non_tensor_size, partner_tensor_keys_size, partner_tensor_buffer_size = struct.unpack('4sQQQ', partner_header_bytes)
+            partner_tensor_buffer_start_offset = 32 + partner_non_tensor_size + partner_tensor_keys_size
+            
+            # Get partner_buffer for preprocessing
+            if self.eccheck_p2p_buffers is not None:
+                partner_buffer = self.eccheck_p2p_buffers['partner_buffer']
+                
+                # Read actual data from partner_file into partner_buffer
+                partner_actual_bytes = min(partner_tensor_buffer_size, max_total_bytes)
+                if partner_actual_bytes > 0:
+                    if mapped_file_partner.memory_address is not None:
+                        partner_source_addr = mapped_file_partner.memory_address + partner_tensor_buffer_start_offset
+                        partner_dest_addr = p2p_partner_buffer_base_addr
+                        
+                        # Copy actual data using ctypes
+                        source_ptr = ctypes.cast(partner_source_addr, ctypes.POINTER(ctypes.c_uint8))
+                        dest_ptr = ctypes.cast(partner_dest_addr, ctypes.POINTER(ctypes.c_uint8))
+                        ctypes.memmove(dest_ptr, source_ptr, partner_actual_bytes)
+                    else:
+                        # Fallback: use mmap slice and torch
+                        partner_source_data = mapped_file_partner.mmap_object[
+                            partner_tensor_buffer_start_offset:partner_tensor_buffer_start_offset + partner_actual_bytes
+                        ]
+                        import numpy as np
+                        np_array = np.frombuffer(partner_source_data, dtype=np.uint8)
+                        partner_buffer[:partner_actual_bytes].copy_(torch.from_numpy(np_array))
+                
+                    # Fill remaining space with zeros (for pipeline synchronization)
+                    if partner_actual_bytes < max_total_bytes:
+                        padding_size = max_total_bytes - partner_actual_bytes
+                        partner_buffer[partner_actual_bytes:max_total_bytes].fill_(0)
+                        logger.debug(
+                            f"EC-CHECK: [Rank {rank}] Pre-filled partner_buffer with zeros "
+                            f"({padding_size / (1024**2):.2f} MB padding)"
+                        )
+                
+                logger.info(
+                    f"EC-CHECK: [Rank {rank}] Pre-processed partner_file: "
+                    f"{partner_actual_bytes / (1024**2):.2f} MB actual data, "
+                    f"{(max_total_bytes - partner_actual_bytes) / (1024**2):.2f} MB padding"
+                )
+            else:
+                logger.warning(f"EC-CHECK: [Rank {rank}] partner_buffer not available for preprocessing")
+        elif (rank == 0 or rank == 3) and mapped_file_partner.memory_address is not None:
+            # Test mode: Pre-process partner_file data
+            if self.eccheck_p2p_buffers is not None:
+                partner_buffer = self.eccheck_p2p_buffers['partner_buffer']
+                partner_actual_bytes = min(mapped_file_partner.file_size, max_total_bytes)
+                
+                if partner_actual_bytes > 0:
+                    # Copy from memory_address directly
+                    source_ptr = ctypes.cast(mapped_file_partner.memory_address, ctypes.POINTER(ctypes.c_uint8))
+                    dest_ptr = ctypes.cast(p2p_partner_buffer_base_addr, ctypes.POINTER(ctypes.c_uint8))
+                    ctypes.memmove(dest_ptr, source_ptr, partner_actual_bytes)
+                
+                # Fill remaining space with zeros
+                if partner_actual_bytes < max_total_bytes:
+                    padding_size = max_total_bytes - partner_actual_bytes
+                    partner_buffer[partner_actual_bytes:max_total_bytes].fill_(0)
+                    logger.debug(
+                        f"EC-CHECK: [Rank {rank}] Test mode: Pre-filled partner_buffer with zeros "
+                        f"({padding_size / (1024**2):.2f} MB padding)"
+                    )
+        
+        # === Step 7: Reset encoding completion flags and activate buffer poller ===
         self.eccheck_manager._eccheck_native.reset_encoding_completion_flags()
         if mgr._buffer_poller_active_event:
             mgr._buffer_poller_active_event.set()
             logger.info("EC-CHECK: Activated buffer poller for load pipeline")
         
         try:
-            # === Step 7: Main pipeline loop ===
+            # === Step 8: Main pipeline loop ===
             processed = 0
             
             while processed < total_bytes:
@@ -1968,35 +2039,14 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 step2_size = 0
                 
                 if rank == 0 or rank == 3:
-                    # Sender: prepare partner_file chunk address for Step 2 P2P send
-                    if mapped_file_partner.mmap_object is not None:
-                        # Real mmap file: Calculate source offset in Component 3 (tensor buffer)
-                        partner_tensor_buffer_start_offset = 32  # After header
-                        partner_header_bytes = mapped_file_partner.mmap_object[:32]
-                        import struct
-                        partner_magic, partner_non_tensor_size, partner_tensor_keys_size, partner_tensor_buffer_size = struct.unpack('4sQQQ', partner_header_bytes)
-                        partner_tensor_buffer_start_offset = 32 + partner_non_tensor_size + partner_tensor_keys_size
-                        
-                        partner_source_offset = partner_tensor_buffer_start_offset + processed
-                        partner_bytes_to_send = min(take, mapped_file_partner.file_size - partner_source_offset)
-                        
-                        if partner_bytes_to_send > 0:
-                            # Use memory_address from mapped_file_partner + offset
-                            if mapped_file_partner.memory_address is not None:
-                                step2_send_addr = mapped_file_partner.memory_address + partner_source_offset
-                            else:
-                                # Fallback: use ctypes.addressof (less efficient)
-                                step2_send_addr = int(ctypes.addressof(ctypes.c_char.from_buffer(
-                                    mapped_file_partner.mmap_object, partner_source_offset
-                                )))
-                            step2_size = partner_bytes_to_send
-                    elif mapped_file_partner.memory_address is not None:
-                        # Test mode: Use memory_address directly (no header offset for test data)
-                        step2_send_addr = mapped_file_partner.memory_address + processed
-                        step2_size = min(take, mapped_file_partner.file_size - processed)
-                        logger.debug(f"EC-CHECK: [Rank {rank}] Test mode Step2 P2P send: addr={step2_send_addr}, size={step2_size}")
+                    # Sender: use pre-processed partner_buffer (already filled with zeros)
+                    if self.eccheck_p2p_buffers is not None:
+                        # Calculate offset in partner_buffer
+                        partner_buffer_offset = processed
+                        step2_send_addr = p2p_partner_buffer_base_addr + partner_buffer_offset
+                        step2_size = take  # Always send full chunk (zeros already filled in preprocessing)
                     else:
-                        logger.warning(f"EC-CHECK: [Rank {rank}] mapped_file_partner has no mmap_object or memory_address, skipping Step2 P2P")
+                        logger.warning(f"EC-CHECK: [Rank {rank}] partner_buffer not available, skipping Step2 P2P")
                         step2_send_addr = 0
                         step2_size = 0
                     
@@ -2078,8 +2128,13 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             # === Step 8: Send sentinel and wait for completion ===
             logger.info("EC-CHECK: Load pipeline: Sending sentinel to encoding threads")
-            self.eccheck_manager._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0, 0, 0)
-            self.eccheck_manager._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0, 0, 0)
+            # For rank 2 and rank 3 in load mode, only submit sentinel to thread2
+            # (thread1 doesn't process any tasks in load mode for these ranks)
+            if rank in [2, 3]:
+                self.eccheck_manager._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0, 0, 0)
+            else:
+                self.eccheck_manager._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0, 0, 0)
+                self.eccheck_manager._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0, 0, 0)
             
             logger.info("EC-CHECK: Load pipeline: Waiting for encoding threads to complete...")
             self.eccheck_manager._eccheck_native.wait_for_encoding_completion()

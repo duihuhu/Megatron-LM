@@ -992,14 +992,23 @@ private:
                     // If both threads copied, check if we need to delay release for P2P
                     // For odd ranks, data buffer is needed by P2P worker, so delay release
                     if (state.thread2_copied) {
-                        // For odd ranks, data buffer will be released by P2P worker after P2P completes
-                        // For even ranks, data buffer can be released immediately
-                        if (rank_ % 2 == 0) {
-                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                        data_buffers_to_release_.push(task.data_addr);
-                        data_buffer_states_.erase(task.data_addr);
-                    }
-                        // For odd ranks, data buffer will be released by P2P worker
+                        // In load mode, rank 1 and rank 2 don't send data, so data buffer should be released immediately
+                        // In save mode, even ranks release immediately, odd ranks release in P2P worker
+                        bool should_release = false;
+                        if (is_load_mode_ && failed_rank_ == 2 && (rank_ == 1 || rank_ == 2)) {
+                            // Load mode: rank 1 and rank 2 release data buffer immediately
+                            should_release = true;
+                        } else if (rank_ % 2 == 0) {
+                            // Save mode: even ranks release immediately
+                            should_release = true;
+                        }
+                        // For odd ranks in save mode, data buffer will be released by P2P worker
+                        
+                        if (should_release) {
+                            std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
+                            data_buffers_to_release_.push(task.data_addr);
+                            data_buffer_states_.erase(task.data_addr);
+                        }
                     }
                 }
                 
@@ -1164,14 +1173,23 @@ private:
                     // If both threads copied, check if we need to delay release for P2P
                     // For odd ranks, data buffer is needed by P2P worker, so delay release
                     if (state.thread1_copied) {
-                        // For odd ranks, data buffer will be released by P2P worker after P2P completes
-                        // For even ranks, data buffer can be released immediately
-                        if (rank_ % 2 == 0) {
-                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                        data_buffers_to_release_.push(task.data_addr);
-                        data_buffer_states_.erase(task.data_addr);
-                    }
-                        // For odd ranks, data buffer will be released by P2P worker
+                        // In load mode, rank 1 and rank 2 don't send data, so data buffer should be released immediately
+                        // In save mode, even ranks release immediately, odd ranks release in P2P worker
+                        bool should_release = false;
+                        if (is_load_mode_ && failed_rank_ == 2 && (rank_ == 1 || rank_ == 2)) {
+                            // Load mode: rank 1 and rank 2 release data buffer immediately
+                            should_release = true;
+                        } else if (rank_ % 2 == 0) {
+                            // Save mode: even ranks release immediately
+                            should_release = true;
+                        }
+                        // For odd ranks in save mode, data buffer will be released by P2P worker
+                        
+                        if (should_release) {
+                            std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
+                            data_buffers_to_release_.push(task.data_addr);
+                            data_buffer_states_.erase(task.data_addr);
+                        }
                     }
                 }
                 
@@ -1640,52 +1658,22 @@ private:
             
             if (task.p2p_own_write_addr != 0 && task.p2p_partner_write_addr != 0 && task.parity_addr != 0) {
                 if (is_load_mode_ && failed_rank_ == 2) {
-                    // Load mode: rank2 and rank3's XOR results need special handling
+                    // Load mode: special handling for rank2 and rank3
                     if (rank_ == 2) {
-                        // rank2: XOR result (d2) write to p2p_own_write_addr
-                        // No need to send, just write to own_buffer
-                        if (task.p2p_own_write_addr != 0) {
-                            std::memcpy(
-                                reinterpret_cast<void*>(task.p2p_own_write_addr),
-                                reinterpret_cast<void*>(task.parity_addr),
-                                task.size
-                            );
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] Load XOR: Wrote d2 to own_buffer at "
-                                      << task.p2p_own_write_addr << " (size=" << task.size << ")" << std::endl;
+                        // rank2: parity buffer (d2) already written to own_buffer, can release immediately
+                        if (task.parity_addr != 0) {
+                            parity_buffers_to_release_.push(task.parity_addr);
                         }
-                        // rank2 will receive d3 from rank3 via P2P in Step6 (handled separately)
                     } else if (rank_ == 3) {
-                        // rank3: XOR result (d3) needs to be sent to rank2 (Step6 P2P transfer)
-                        // Write d3 to p2p_partner_write_addr (rank2's partner_buffer address)
-                        uintptr_t send_buffer = task.parity_addr;  // d3
-                        
-                        {
-                            std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
-                            p2p_send_queue_.push({
-                                send_buffer,
-                                0,  // p2p_own_write_addr (not needed for Step6)
-                                task.size,
-                                task.parity_addr,
-                                0,  // data_addr (not needed)
-                                false,  // is_load_mode_transfer (this is Step6 P2P, not Step2)
-                                0   // load_mode_data_addr (not needed for Step6)
-                            });
+                        // rank3: parity buffer (d3) will be sent via P2P, release after P2P send completes
+                        // (handled in p2p_send_worker, line 2044-2046)
+                        // Do not release here
+                    } else {
+                        // Other ranks (0, 1) in load mode: release parity buffer
+                        // In load mode Step2, P2P send worker doesn't release parity, so both ranks release in XOR worker
+                        if (task.parity_addr != 0) {
+                            parity_buffers_to_release_.push(task.parity_addr);
                         }
-                        p2p_send_queue_cv_.notify_one();
-                        
-                        {
-                            std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
-                            p2p_recv_queue_.push({
-                                task.p2p_partner_write_addr,  // rank2's partner_buffer address
-                                task.size,
-                                false,  // is_load_mode_transfer (Step6, not Step2)
-                                0       // data_buffer_addr (not needed)
-                            });
-                        }
-                        p2p_recv_queue_cv_.notify_one();
-                        
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load XOR: Queued d3 for P2P send to rank2 "
-                                  << "(size=" << task.size << ", target_addr=" << task.p2p_partner_write_addr << ")" << std::endl;
                     }
                 } else {
                     // Save mode: original logic
@@ -1720,9 +1708,22 @@ private:
             
             {
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                // Always release local encoding buffer
                 encoding_buffers_to_release_.push(task.local_encoding_addr);
-                if (rank_ % 2 == 1 && task.parity_addr != 0) {
-                    parity_buffers_to_release_.push(task.parity_addr);
+                
+                // Release remote encoding buffer (received encoding)
+                if (task.remote_encoding_addr != 0) {
+                    encoding_buffers_to_release_.push(task.remote_encoding_addr);
+                }
+                
+                // Parity buffer release logic
+                // Note: For load mode, parity buffer release is already handled above (line 1641-1689)
+                // Only handle save mode here to avoid duplicate release
+                if (!(is_load_mode_ && failed_rank_ == 2)) {
+                    // Save mode: original logic
+                    if (rank_ % 2 == 1 && task.parity_addr != 0) {
+                        parity_buffers_to_release_.push(task.parity_addr);
+                    }
                 }
             }
             
@@ -2494,8 +2495,17 @@ public:
     
     void wait_for_encoding_completion() {
         // Wait for all encoding threads to complete
+        // In load mode, rank 2 and rank 3 only use thread2, so skip thread1 check
+        bool need_thread1 = true;
+        if (is_load_mode_ && failed_rank_ == 2 && (rank_ == 2 || rank_ == 3)) {
+            need_thread1 = false;
+            // Mark thread1 as completed since it won't receive sentinel
+            encoding_thread_1_completed_ = true;
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Load mode: Skipping thread1 wait (rank2/3 only use thread2)" << std::endl;
+        }
+        
         int encoding_wait_count = 0;
-        while (!encoding_thread_1_completed_ || !encoding_thread_2_completed_) {
+        while ((need_thread1 && !encoding_thread_1_completed_) || !encoding_thread_2_completed_) {
             if (encoding_wait_count % 100 == 0) {  // Log every 1 second (100 * 10ms)
                 std::cout << "EC-CHECK: [Rank " << rank_ << "] Waiting for encoding threads: "
                           << "thread1=" << (encoding_thread_1_completed_ ? "true" : "false")

@@ -414,6 +414,8 @@ private:
     int data_block_index_;
     unsigned char *a_mat_;    // RS matrix (k * m)
     unsigned char *g_tbls_;   // tables produced by ec_init_tables (32 * k * rows)
+    unsigned char decode_coefficient_0_;  // Decoding coefficient for rank 0/1 in load mode (temporarily set to 1)
+    unsigned char decode_coefficient_1_;  // Decoding coefficient for rank 2/3 in load mode (temporarily set to 1)
 #else
     bool nccl_xor_send_initialized_;
     bool nccl_xor_recv_initialized_;
@@ -899,6 +901,29 @@ private:
         int parity_idx = coefficient;
         if (parity_idx < 0 || parity_idx >= rows_) parity_idx = 0;
 
+        // In load mode, use decode coefficients for decoding operation
+        // TODO: Compute decode coefficients from inverse matrix of submatrix
+        // For now, use coefficient 1 for all ranks (simplified version)
+        if (is_load_mode_ && failed_rank_ == 2) {
+            // Use decode coefficients based on rank
+            // These coefficients should be computed from inverse matrix, but temporarily set to 1
+            if (rank_ < 2) {
+                // rank 0/1: use first decode coefficient
+                parity_idx = decode_coefficient_0_;
+            } else if (rank_ < 4) {
+                // rank 2/3: use second decode coefficient
+                parity_idx = decode_coefficient_1_;
+            } else {
+                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid rank " << rank_ << " for load mode (expected 0-3)" << std::endl;
+                parity_idx = 1;  // Fallback
+            }
+            
+            // Validation check
+            if (decode_coefficient_0_ == 0 || decode_coefficient_1_ == 0) {
+                std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: Decode coefficient is 0, this may cause issues" << std::endl;
+            }
+        }
+
         // Ensure data_block_index_ in range
         if (data_block_index_ < 0 || data_block_index_ >= k_) {
             std::cerr << "EC-CHECK: invalid data_block_index_=" << data_block_index_ << " for k=" << k_ << std::endl;
@@ -1005,10 +1030,10 @@ private:
                         // For odd ranks in save mode, data buffer will be released by P2P worker
                         
                         if (should_release) {
-                            std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                            data_buffers_to_release_.push(task.data_addr);
-                            data_buffer_states_.erase(task.data_addr);
-                        }
+                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
+                        data_buffers_to_release_.push(task.data_addr);
+                        data_buffer_states_.erase(task.data_addr);
+                    }
                     }
                 }
                 
@@ -1186,10 +1211,10 @@ private:
                         // For odd ranks in save mode, data buffer will be released by P2P worker
                         
                         if (should_release) {
-                            std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                            data_buffers_to_release_.push(task.data_addr);
-                            data_buffer_states_.erase(task.data_addr);
-                        }
+                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
+                        data_buffers_to_release_.push(task.data_addr);
+                        data_buffer_states_.erase(task.data_addr);
+                    }
                     }
                 }
                 
@@ -1721,8 +1746,8 @@ private:
                 // Only handle save mode here to avoid duplicate release
                 if (!(is_load_mode_ && failed_rank_ == 2)) {
                     // Save mode: original logic
-                    if (rank_ % 2 == 1 && task.parity_addr != 0) {
-                        parity_buffers_to_release_.push(task.parity_addr);
+                if (rank_ % 2 == 1 && task.parity_addr != 0) {
+                    parity_buffers_to_release_.push(task.parity_addr);
                     }
                 }
             }
@@ -2265,6 +2290,7 @@ public:
           nccl_xor_send_init_completed_(false), nccl_xor_recv_init_completed_(false),
           nccl_p2p_send_init_completed_(false), nccl_p2p_recv_init_completed_(false),
           k_(0), rows_(0), data_block_index_(0), a_mat_(nullptr), g_tbls_(nullptr),
+          decode_coefficient_0_(1), decode_coefficient_1_(1),  // Initialize to 1 for simplified version
           p2p_partner_rank_(-1),
           is_load_mode_(false), failed_rank_(-1),
           asio_initialized_(false), use_asio_(false) {
@@ -2366,6 +2392,7 @@ public:
           nccl_xor_send_init_completed_(false), nccl_xor_recv_init_completed_(false),
           nccl_p2p_send_init_completed_(false), nccl_p2p_recv_init_completed_(false),
           k_(0), rows_(0), data_block_index_(0), a_mat_(nullptr), g_tbls_(nullptr),
+          decode_coefficient_0_(1), decode_coefficient_1_(1),  // Initialize to 1 for simplified version
           p2p_partner_rank_(-1),
           is_load_mode_(false), failed_rank_(-1),
           asio_initialized_(false), use_asio_(true) {
@@ -2477,6 +2504,7 @@ public:
     }
     
     void reset_encoding_completion_flags() {
+        // Reset completion flags
         encoding_thread_1_completed_ = false;
         encoding_thread_2_completed_ = false;
         send_worker_completed_ = false;
@@ -2491,6 +2519,70 @@ public:
         xor_worker_sentinel_received_ = false;
         p2p_send_worker_sentinel_received_ = false;
         p2p_recv_worker_sentinel_received_ = false;
+        
+        // Clear queues to remove any residual tasks from previous pipeline
+        {
+            std::lock_guard<std::mutex> lock1(encoding_tasks_1_mutex_);
+            while (!encoding_tasks_1_.empty()) {
+                encoding_tasks_1_.pop();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock2(encoding_tasks_2_mutex_);
+            while (!encoding_tasks_2_.empty()) {
+                encoding_tasks_2_.pop();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock3(send_queue_mutex_);
+            while (!send_queue_.empty()) {
+                send_queue_.pop();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock4(recv_queue_mutex_);
+            while (!recv_queue_.empty()) {
+                recv_queue_.pop();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock5(xor_queue_mutex_);
+            while (!xor_queue_.empty()) {
+                xor_queue_.pop();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock6(p2p_send_queue_mutex_);
+            while (!p2p_send_queue_.empty()) {
+                p2p_send_queue_.pop();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock7(p2p_recv_queue_mutex_);
+            while (!p2p_recv_queue_.empty()) {
+                p2p_recv_queue_.pop();
+            }
+        }
+        
+        // Clear buffer states
+        {
+            std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
+            data_buffer_states_.clear();
+        }
+        
+        // Clear pending encoding tasks
+        {
+            std::lock_guard<std::mutex> lock(pending_encoding_tasks_mutex_);
+            pending_encoding_tasks_.clear();
+        }
+        
+        // Clear pending XOR encoding
+        {
+            std::lock_guard<std::mutex> lock(pending_xor_mutex_);
+            pending_xor_encoding_.clear();
+        }
+        
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Reset encoding completion flags and cleared all queues" << std::endl;
     }
     
     void wait_for_encoding_completion() {

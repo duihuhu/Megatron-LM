@@ -2145,6 +2145,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             torch.cuda.synchronize()
             logger.info("EC-CHECK: Load pipeline: Pipeline completed")
             
+            # Reset load mode flag after load pipeline completes
+            self.eccheck_manager._eccheck_native.set_load_mode(False, -1)
+            logger.info("EC-CHECK: Reset load mode after load pipeline completion")
+            
         finally:
             # Deactivate buffer poller
             if mgr._buffer_poller_active_event:

@@ -961,6 +961,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Reset completion flags for new encoding round
         self._eccheck_native.reset_encoding_completion_flags()
         
+        # Ensure we're in save mode (not load mode)
+        self._eccheck_native.set_load_mode(False, -1)
+        
         # Activate the persistent buffer poller at the start of pipeline
         # This ensures buffers can be released as soon as C++ threads finish using them
         if self._buffer_poller_active_event:

@@ -1686,20 +1686,20 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         checkpoint_dir = Path(checkpoint_dir)
         eccheck_p2p_own_file = checkpoint_dir / f"__{rank}_p2p_own.distcp"
         eccheck_p2p_partner_file = checkpoint_dir / f"__{p2p_partner_rank}_p2p_partner.distcp"
-        
+
         if not eccheck_p2p_own_file.exists():
             mapped_file_own = EccheckMappedFile(None, None, None, None, None)
             mapped_file_partner = EccheckMappedFile(None, None, None, None, None)
-            return mapped_file_own, mapped_file_partner
-        
-        # Load the decomposed state dict from file
-        # Returns tuple: (EccheckMappedFile, non_tensor_data, List[TensorMetadata])
-        mapped_file_own = FileSystemWriterAsync.load_eccheck_bytes_from_file(
-            str(eccheck_p2p_own_file), my_rank=rank
-        )
-        mapped_file_partner = FileSystemWriterAsync.load_eccheck_bytes_from_file(
-            str(eccheck_p2p_partner_file), my_rank=p2p_partner_rank
-        )
+            # return mapped_file_own, mapped_file_partner
+        else:
+            # Load the decomposed state dict from file
+            # Returns tuple: (EccheckMappedFile, non_tensor_data, List[TensorMetadata])
+            mapped_file_own = FileSystemWriterAsync.load_eccheck_bytes_from_file(
+                str(eccheck_p2p_own_file), my_rank=rank
+            )
+            mapped_file_partner = FileSystemWriterAsync.load_eccheck_bytes_from_file(
+                str(eccheck_p2p_partner_file), my_rank=p2p_partner_rank
+            )
         
         # Package both together
         local_package = {
@@ -2685,7 +2685,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         Returns: loaded state dict
         """
         # Check if this is an EC-CHECK format checkpoint
-        if self._is_eccheck_checkpoint(checkpoint_dir):
+        rank = torch.distributed.get_rank()
+        if self._is_eccheck_checkpoint(checkpoint_dir) or rank == 2:
             logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
             mapped_file_own, mapped_file_partner = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
             

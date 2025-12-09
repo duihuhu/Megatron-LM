@@ -2223,7 +2223,7 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-eccheck', action='store_true',
                        help='Enable EC-CHECK (Erasure Coding Checkpoint) for serialization-free '
                             'checkpoint encoding. This feature decomposes state_dict into three '
-                            'components (non-tensor data, tensor keys, tensor data) to eliminate '
+                            'components (non-tensor data, tensor keys, tensor data) to eliminate'
                             'serialization overhead and enable pipelined encoding.')
     group.add_argument('--no-eccheck-use-continuous-buffer', action='store_false',
                        dest='eccheck_use_continuous_buffer',
@@ -2236,6 +2236,10 @@ def _add_checkpointing_args(parser):
                        dest='eccheck_preallocate_cpu_buffer',
                        help='Disable CPU memory buffer preallocation for EC-CHECK mode. '
                             'Use this if system memory is limited.')
+    
+    # use gemini checkpointing arguments
+    group.add_argument('--use-gemini', action='store_true',
+                       help='Enable Gemini checkpointing. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')
     return parser
 
 

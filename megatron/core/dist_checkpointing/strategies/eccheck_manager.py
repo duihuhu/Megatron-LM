@@ -280,7 +280,7 @@ class ECCHECKManager:
         try:
             from megatron.training import get_args as input_args
             args = input_args()
-            self.use_eccheck = True
+            self.use_eccheck = args.use_eccheck
             if not getattr(args, 'use_eccheck', False):
                 return
                 

@@ -5,6 +5,7 @@ This module provides an async utilities which allow to start
 a checkpoint save process in the background.
 """
 import gc
+import io
 import logging
 from abc import ABC, abstractmethod
 from collections import deque
@@ -13,12 +14,107 @@ from queue import Empty
 from time import sleep, time
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
+import numpy as np
 import torch
 from torch import multiprocessing as mp
 
 from ..utils import debug_time
 
 logger = logging.getLogger(__name__)
+
+# Module-level cache for pair process groups
+_pair_process_groups_cache: Dict[int, torch.distributed.ProcessGroup] = {}
+_gloo_backend_initialized: bool = False
+
+
+def _ensure_gloo_backend_available() -> None:
+    """Ensure gloo backend is available for CPU tensor communication.
+    
+    When main process group uses NCCL, we may need to ensure gloo backend
+    is properly initialized before creating gloo sub-groups.
+    """
+    global _gloo_backend_initialized
+    
+    if _gloo_backend_initialized:
+        return
+    
+    try:
+        current_backend = torch.distributed.get_backend()
+        logger.debug(f"Current backend: {current_backend}")
+        _gloo_backend_initialized = True
+    except Exception as e:
+        logger.warning(f"Could not verify gloo backend availability: {e}")
+
+
+def _create_all_pair_process_groups() -> None:
+    """Create all pair process groups at once.
+    
+    IMPORTANT: torch.distributed.new_group requires ALL ranks to call it,
+    not just the ranks participating in the group. This function ensures
+    all ranks call new_group for all pair groups.
+    """
+    global _pair_process_groups_cache
+    
+    if _pair_process_groups_cache:
+        return  # Already created
+    
+    rank = torch.distributed.get_rank()
+    
+    # Ensure gloo backend is available
+    _ensure_gloo_backend_available()
+    
+    # Define all pairs: rank 0<->2, rank 1<->3
+    all_pairs = [[0, 2], [1, 3]]
+    
+    logger.info(f"rank: {rank}, creating all pair process groups")
+    
+    # All ranks must call new_group for each pair, even if they're not in that pair
+    for pair_ranks in all_pairs:
+        group_key = min(pair_ranks)
+        try:
+            logger.info(f"rank: {rank}, calling new_group for ranks {pair_ranks}")
+            # ALL ranks must call this, not just the ranks in pair_ranks
+            pair_group = torch.distributed.new_group(ranks=pair_ranks, backend='gloo')
+            
+            # Only store the group if this rank is in it
+            if rank in pair_ranks:
+                _pair_process_groups_cache[group_key] = pair_group
+                logger.info(f"rank: {rank}, stored pair process group for ranks {pair_ranks}")
+            else:
+                logger.info(f"rank: {rank}, participated in creating group for ranks {pair_ranks} (not a member)")
+        except Exception as e:
+            logger.error(f"rank: {rank}, failed to create pair process group for ranks {pair_ranks}: {e}", exc_info=True)
+            raise
+    
+    logger.info(f"rank: {rank}, finished creating all pair process groups")
+
+
+def get_or_create_pair_process_group(rank: int, paired_rank: int) -> torch.distributed.ProcessGroup:
+    """Get or create a process group for paired ranks.
+    
+    This is a standalone function that can be used without creating a TemporalAsyncCaller instance.
+    Uses module-level cache to store process groups.
+    
+    Args:
+        rank: Current rank
+        paired_rank: Paired rank to communicate with
+        
+    Returns:
+        ProcessGroup for the pair
+    """
+    # Create all pair groups if not already created
+    # This ensures all ranks participate in creating all groups
+    _create_all_pair_process_groups()
+    
+    # Use the lower rank as the key to retrieve the group
+    group_key = min(rank, paired_rank)
+    
+    if group_key not in _pair_process_groups_cache:
+        raise RuntimeError(
+            f"rank: {rank}, pair process group for ranks [{min(rank, paired_rank)}, {max(rank, paired_rank)}] not found"
+        )
+    
+    return _pair_process_groups_cache[group_key]
 
 
 @contextmanager
@@ -166,8 +262,262 @@ class TemporalAsyncCaller(AsyncCaller):
 
     def __init__(self):
         self.process: Optional[mp.Process] = None
+        self.replica_process: Optional[mp.Process] = None
         self.start_time: Optional[float] = None
+        self._pair_process_groups: Dict[int, torch.distributed.ProcessGroup] = {}
+        self._gloo_initialized: bool = False
+        
+        # Reusable buffers for data exchange to avoid repeated allocations
+        self._serialization_buffer: Optional[io.BytesIO] = None
+        self._local_tensor_buffer: Optional[torch.Tensor] = None
+        self._remote_tensor_buffer: Optional[torch.Tensor] = None
+        self._local_array_buffer: Optional[np.ndarray] = None
+        self._last_local_size: int = 0
+        self._last_remote_size: int = 0
+        
+        self.pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
 
+    def _ensure_gloo_backend_available(self) -> None:
+        """Ensure gloo backend is available for CPU tensor communication.
+        
+        When main process group uses NCCL, we may need to ensure gloo backend
+        is properly initialized before creating gloo sub-groups.
+        """
+        if self._gloo_initialized:
+            return
+        
+        # Check if gloo backend is available
+        # new_group should handle gloo initialization automatically,
+        # but we can check if it's needed
+        try:
+            # Try to get backend info - this will tell us if gloo is available
+            current_backend = torch.distributed.get_backend()
+            logger.debug(f"Current backend: {current_backend}")
+            # If main backend is NCCL, new_group with gloo should still work
+            # PyTorch will handle gloo initialization automatically
+            self._gloo_initialized = True
+        except Exception as e:
+            logger.warning(f"Could not verify gloo backend availability: {e}")
+
+    def _create_all_pair_process_groups(self) -> None:
+        """Create all pair process groups at once.
+        
+        IMPORTANT: torch.distributed.new_group requires ALL ranks to call it,
+        not just the ranks participating in the group. This method ensures
+        all ranks call new_group for all pair groups.
+        """
+        if self._pair_process_groups:
+            return  # Already created
+        
+        rank = torch.distributed.get_rank()
+        
+        # Ensure gloo backend is available
+        self._ensure_gloo_backend_available()
+        
+        # Define all pairs: rank 0<->2, rank 1<->3
+        all_pairs = [[0, 2], [1, 3]]
+        
+        logger.info(f"rank: {rank}, creating all pair process groups")
+        
+        # All ranks must call new_group for each pair, even if they're not in that pair
+        for pair_ranks in all_pairs:
+            group_key = min(pair_ranks)
+            try:
+                logger.info(f"rank: {rank}, calling new_group for ranks {pair_ranks}")
+                # ALL ranks must call this, not just the ranks in pair_ranks
+                pair_group = torch.distributed.new_group(ranks=pair_ranks, backend='gloo')
+                
+                # Only store the group if this rank is in it
+                if rank in pair_ranks:
+                    self._pair_process_groups[group_key] = pair_group
+                    logger.info(f"rank: {rank}, stored pair process group for ranks {pair_ranks}")
+                else:
+                    logger.info(f"rank: {rank}, participated in creating group for ranks {pair_ranks} (not a member)")
+            except Exception as e:
+                logger.error(f"rank: {rank}, failed to create pair process group for ranks {pair_ranks}: {e}", exc_info=True)
+                raise
+        
+        logger.info(f"rank: {rank}, finished creating all pair process groups")
+
+    def _get_or_create_pair_process_group(self, rank: int, paired_rank: int) -> torch.distributed.ProcessGroup:
+        """Get or create a process group for paired ranks.
+        
+        Args:
+            rank: Current rank
+            paired_rank: Paired rank to communicate with
+            
+        Returns:
+            ProcessGroup for the pair
+        """
+        # Create all pair groups if not already created
+        # This ensures all ranks participate in creating all groups
+        self._create_all_pair_process_groups()
+        
+        # Use the lower rank as the key to retrieve the group
+        group_key = min(rank, paired_rank)
+        
+        if group_key not in self._pair_process_groups:
+            raise RuntimeError(f"rank: {rank}, pair process group for ranks [{min(rank, paired_rank)}, {max(rank, paired_rank)}] not found")
+        
+        return self._pair_process_groups[group_key]
+
+    def calculate_buckets_data_size(self, write_buckets):
+        """Calculate data size by traversing write_buckets structure.
+        
+        Args:
+            write_buckets: List of write buckets (file_name, storage_key, (bytes_data, tensor_data))
+            
+        Returns:
+            int: Total data size in bytes
+        """
+        total_size_bytes = 0
+        
+        if write_buckets is None:
+            return 0
+        
+        # Traverse each bucket
+        for bucket in write_buckets:
+            if isinstance(bucket, tuple) and len(bucket) >= 3:
+                _, _, (bytes_data, tensor_data) = bucket
+                
+                # Calculate bytes_data size
+                if isinstance(bytes_data, list):
+                    for item in bytes_data:
+                        if isinstance(item, (bytes, bytearray)):
+                            total_size_bytes += len(item)
+                        elif isinstance(item, io.BytesIO):
+                            total_size_bytes += len(item.getvalue())
+                        elif isinstance(item, tuple) and len(item) >= 2:
+                            # Handle (key, value) pairs
+                            key, value = item[0], item[1]
+                            if isinstance(value, (bytes, bytearray)):
+                                total_size_bytes += len(value)
+                            elif isinstance(value, io.BytesIO):
+                                total_size_bytes += len(value.getvalue())
+                
+                # Calculate tensor_data size
+                if isinstance(tensor_data, list):
+                    for item_tuple in tensor_data:
+                        if isinstance(item_tuple, tuple) and len(item_tuple) >= 2:
+                            tensor = item_tuple[1]
+                            if isinstance(tensor, torch.Tensor):
+                                total_size_bytes += tensor.numel() * tensor.element_size()
+        
+        return total_size_bytes
+    
+    def exchange_checkpoint_data(self, write_buckets):
+        """Exchange checkpoint data between paired ranks.
+        
+        Step 1: Calculate local data size by traversing buckets
+        Step 2: Exchange data sizes with paired rank
+        Step 3: Exchange actual data
+        
+        Args:
+            write_buckets: The checkpoint data to exchange (list of buckets)
+            
+        Returns:
+            Tuple[list, int, int]: (replica_buckets, local_size_bytes, remote_size_bytes)
+        """
+        rank = torch.distributed.get_rank()
+        
+        # Pairwise communication: rank 0<->rank 2, rank 1<->rank 3
+        paired_rank = self.pairing_map.get(rank, None)
+        
+        if paired_rank is None or write_buckets is None:
+            logger.warning(f"rank: {rank}, no paired rank or no data, skipping exchange")
+            return None, 0, 0
+        
+        # Create or get pair process group
+        pair_group = self._get_or_create_pair_process_group(rank, paired_rank)
+        
+        # Step 1: Serialize local data first to get actual size
+        serialize_start = time()
+        
+        # Reuse serialization buffer if possible
+        if self._serialization_buffer is None:
+            self._serialization_buffer = io.BytesIO()
+        else:
+            # Reset buffer for reuse
+            self._serialization_buffer.seek(0)
+            self._serialization_buffer.truncate(0)
+        
+        torch.save(write_buckets, self._serialization_buffer)
+        buffer_view = self._serialization_buffer.getbuffer()
+        local_size = buffer_view.nbytes
+        serialize_time = time() - serialize_start
+        logger.info(f"rank: {rank}, serialized local data: {local_size / (1024**2):.2f} MB in {serialize_time:.4f}s")
+        
+        # Step 2: Exchange actual data sizes using all_gather
+        size_exchange_start = time()
+        size_tensor = torch.tensor([local_size], dtype=torch.long, device='cpu')
+        gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(2)]
+        torch.distributed.all_gather(gathered_sizes, size_tensor, group=pair_group)
+        
+        # Determine paired rank's data size
+        pair_ranks = [min(rank, paired_rank), max(rank, paired_rank)]
+        my_idx = pair_ranks.index(rank)
+        paired_idx = 1 - my_idx
+        remote_size = gathered_sizes[paired_idx].item()
+        size_exchange_time = time() - size_exchange_start
+        
+        logger.info(f"rank: {rank}, size exchange took {size_exchange_time:.4f}s, "
+                   f"paired rank {paired_rank} data size: {remote_size / (1024**2):.2f} MB")
+        
+        # Step 3: Exchange actual data using broadcast
+        data_exchange_start = time()
+        
+        # Convert bytes to tensor for communication
+        # Reuse or allocate local tensor buffer
+        if self._local_tensor_buffer is None or self._local_tensor_buffer.numel() < local_size:
+            # Allocate new buffer with some extra space (10% overhead) to reduce reallocations
+            # buffer_size = int(local_size * 1.1)
+            self._local_tensor_buffer = torch.empty(local_size, dtype=torch.uint8, device='cpu')
+            logger.debug(f"rank: {rank}, allocated local tensor buffer: {local_size / (1024**2):.2f} MB")
+        
+        # Copy data from buffer_view to tensor
+        local_array = np.frombuffer(buffer_view, dtype=np.uint8)
+        # Use the preallocated buffer (only the needed portion)
+        self._local_tensor_buffer.copy_(torch.from_numpy(local_array))
+        local_tensor = self._local_tensor_buffer
+        # Reuse or allocate remote tensor buffer
+        if self._remote_tensor_buffer is None or self._remote_tensor_buffer.numel() < remote_size:
+            # Allocate new buffer with some extra space (10% overhead)
+            # buffer_size = int(remote_size * 1.1)
+            self._remote_tensor_buffer = torch.empty(remote_size, dtype=torch.uint8, device='cpu')
+            logger.debug(f"rank: {rank}, allocated remote tensor buffer: {remote_size / (1024**2):.2f} MB")
+        
+        # Use the preallocated buffer (only the needed portion)
+        remote_tensor = self._remote_tensor_buffer
+        
+        # Determine the global ranks for src in broadcast
+        # pair_ranks is already sorted: [min_rank, max_rank]
+        lower_global_rank = pair_ranks[0]
+        higher_global_rank = pair_ranks[1]
+        
+        # Each rank broadcasts its data to the other
+        # Use global rank as src (PyTorch will map it to group rank internally)
+        if rank == lower_global_rank:
+            # I'm the lower rank, broadcast my data first
+            torch.distributed.broadcast(local_tensor, src=lower_global_rank, group=pair_group)
+            # Then receive from higher rank
+            torch.distributed.broadcast(remote_tensor, src=higher_global_rank, group=pair_group)
+        else:
+            # I'm the higher rank, receive from lower rank first
+            torch.distributed.broadcast(remote_tensor, src=lower_global_rank, group=pair_group)
+            # Then broadcast my data
+            torch.distributed.broadcast(local_tensor, src=higher_global_rank, group=pair_group)
+        
+        # Get remote bytes directly (no deserialization needed)
+        remote_bytes = remote_tensor.numpy().tobytes()
+        
+        data_exchange_time = time() - data_exchange_start
+        logger.info(f"rank: {rank}, data exchange took {data_exchange_time:.4f}s, "
+                   f"received {remote_size / (1024**2):.2f} MB from rank {paired_rank}")
+        
+        # Return remote_bytes instead of deserialized replica_buckets
+        # This avoids deserialization overhead and preserves exact size
+        return remote_bytes, local_size, remote_size
+    
     @_disable_gc()
     def schedule_async_call(self, async_req: AsyncRequest) -> None:
         """Spawn a process with `async_fn` as the target.
@@ -194,22 +544,122 @@ class TemporalAsyncCaller(AsyncCaller):
         print("preload_fn preload_fn ")
         
         rank = torch.distributed.get_rank()
-        logger.info(f"EC-CHECK: Synchronizing CUDA")
+        # logger.info(f"EC-CHECK: Synchronizing CUDA")
         torch.cuda.synchronize()
-        logger.info(f"EC-CHECK: CUDA synchronized")
+        # logger.info(f"EC-CHECK: CUDA synchronized")
         end_sync = time()
         logger.warning(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")
+        
+        # Exchange checkpoint data with paired rank
+        # Step 1: Calculate size by traversing buckets
+        # Step 2: Exchange sizes
+        # Step 3: Exchange actual data
+        exchange_start = time()
         ctx = mp.get_context('fork')
+        
+        from megatron.training import get_args
+        args = get_args()
+        if args.use_gemini:
+            remote_bytes, local_size, remote_size = self.exchange_checkpoint_data(async_fn_args[1])
+                    # Start process to save replica checkpoint if we received data
+            if remote_bytes is not None:
+                # Get replica file path from original write_buckets
+                replica_file_path = self._get_replica_file_path(async_fn_args[1], rank)
+
+                # Start process to directly write remote_bytes to file
+                self.replica_process = ctx.Process(
+                    target=self._write_bytes_to_file,
+                    args=(remote_bytes, replica_file_path)
+                )
+                self.replica_process.start()
+
+                logger.info(f"rank: {rank}, started replica checkpoint save process, "
+                        f"will write {remote_size / (1024**2):.2f} MB to {replica_file_path}")
+            else:
+                self.replica_process = None
+        exchange_end = time()
+        logger.info(f"rank: {rank}, total exchange (size + data) took {exchange_end - exchange_start:.2f}s")
+
         self.start_time = time()
-        logger.info(f"EC-CHECK: Creating process for write_preloaded_data")
+        
+        # Start process to save original checkpoint
+        # logger.info(f"EC-CHECK: Creating process for write_preloaded_data")
         self.process = ctx.Process(
             target=async_req.async_fn, args=async_fn_args, kwargs=async_req.async_fn_kwargs
         )
-        logger.info(f"EC-CHECK: Create process for write_preloaded_data")
+        # logger.info(f"EC-CHECK: Create process for write_preloaded_data")
         self.process.start()
-        logger.info(f"EC-CHECK: Started process for write_preloaded_data")
-        init_time = time()
-        logger.debug(f"rank: {rank}, takes {init_time - self.start_time} to schedule async ckpt ")
+        # logger.info(f"EC-CHECK: Started process for write_preloaded_data")
+        
+        # init_time = time()
+        # logger.debug(f"rank: {rank}, takes {init_time - self.start_time} to schedule async ckpt ")
+    
+    def _get_replica_file_path(self, write_buckets, rank):
+        """Get replica file path from write_buckets by adding _replica_on_rank{id} suffix.
+        
+        Args:
+            write_buckets: List of write buckets (file_name, storage_key, data)
+            rank: Current rank id
+            
+        Returns:
+            str: Replica file path
+        """
+        import os
+        
+        if not write_buckets or len(write_buckets) == 0:
+            raise ValueError("write_buckets is empty, cannot determine file path")
+        
+        # Get the first bucket's file name (assuming all buckets are in the same directory)
+        first_bucket = write_buckets[0]
+        pair_rank = self.pairing_map.get(rank)
+        if isinstance(first_bucket, tuple) and len(first_bucket) >= 3:
+            file_name, _, _ = first_bucket
+            
+            # Extract directory and filename
+            file_dir = os.path.dirname(file_name)
+            base_name = os.path.basename(file_name)
+            
+            # Add replica suffix
+            base_name_no_ext, ext = os.path.splitext(base_name)
+            replica_file_name = f"{base_name_no_ext}_replica{pair_rank}_rank{rank}{ext}"
+            
+            # Construct full path
+            if file_dir:
+                replica_file_path = os.path.join(file_dir, replica_file_name)
+            else:
+                replica_file_path = replica_file_name
+            
+            return replica_file_path
+        else:
+            raise ValueError(f"Invalid bucket format: {first_bucket}")
+    
+    @staticmethod
+    def _write_bytes_to_file(data_bytes: bytes, file_path: str):
+        """Write bytes directly to file.
+        
+        This function is designed to be called in a separate process to write
+        the received checkpoint data directly to disk without deserialization.
+        
+        Args:
+            data_bytes: Bytes data to write
+            file_path: Target file path
+        """
+        import os
+        import logging
+        
+        # Get logger for this module
+        _logger = logging.getLogger(__name__)
+        
+        # Ensure directory exists
+        file_dir = os.path.dirname(file_path)
+        if file_dir:
+            os.makedirs(file_dir, exist_ok=True)
+        
+        # Write bytes directly to file
+        with open(file_path, 'wb') as f:
+            f.write(data_bytes)
+
+        _logger.info(f"Successfully wrote {len(data_bytes) / (1024**2):.2f} MB to {file_path}")
 
     def is_current_async_call_done(self, blocking: bool = False, no_dist: bool = False) -> bool:
         """Check if async save is finished on all ranks.
@@ -231,6 +681,11 @@ class TemporalAsyncCaller(AsyncCaller):
         # The following takes the same overhead
         # as torch.distributed.barrier (single integer all-reduce)
         is_alive = int(self.process.is_alive()) if self.process is not None else 0
+        
+        # Also check replica process if it exists
+        if hasattr(self, 'replica_process') and self.replica_process is not None:
+            is_alive = max(is_alive, int(self.replica_process.is_alive()))
+        
         is_done = not is_alive if no_dist else self.sync_all_async_calls(is_alive)
 
         if is_done or blocking:
@@ -257,7 +712,15 @@ class TemporalAsyncCaller(AsyncCaller):
                 "TemporalAsyncCaller: Async process join finished "
                 f"after {time() - self.start_time:.2f}s from forking"
             )
-            self.start_time = None
+        
+        # Also join replica process if it exists
+        if hasattr(self, 'replica_process') and self.replica_process is not None:
+            logger.debug(f"rank: {torch.distributed.get_rank()}, joining replica_process")
+            self.replica_process.join()
+            self.replica_process = None
+            logger.debug(f"rank: {torch.distributed.get_rank()}, replica process join finished")
+        
+        self.start_time = None
 
     def __del__(self):
         pass

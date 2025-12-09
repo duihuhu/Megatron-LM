@@ -1056,6 +1056,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             cached_ckpt_structure=args_cached_plans,
             loaded_all_plans=loaded_all_plans,
         )
+        rank = torch.distributed.get_rank()
         # EC-CHECK mode: decompose state_dict and preallocate CPU memory
         if self.eccheck_manager.use_eccheck:
             self._prepare_eccheck_data(self.cached_central_plan, planner)
@@ -1079,7 +1080,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             end = time()
             logger.debug(f"{time()} rank: {rank}, write(async) time: {end - start}")
             
-        rank = torch.distributed.get_rank()
         if self.use_cached_ckpt_structure:
             if (
                 loaded_all_plans
@@ -1609,6 +1609,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Initialize strategy-specific EC-CHECK state
         self.eccheck_p2p_buffers = None
     
+        self.pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank using the shared manager."""
         return self.eccheck_manager.get_p2p_partner_rank(my_rank, world_size)
@@ -1799,6 +1800,302 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # Return EccheckMappedFile, non_tensor_data, and local_metadata for each file
         return mapped_file_own, mapped_file_partner
+    
+    def _load_gemini_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+        """Load checkpoint using Gemini (replica) backup data with mmap.
+        
+        This method:
+        1. Finds the replica checkpoint file for the paired rank
+        2. Uses mmap to read the replica data (zero-copy)
+        3. Exchanges replica data with the paired rank
+        4. Writes received backup data to original checkpoint file location
+        5. Loads state_dict from the restored checkpoint data
+        
+        Args:
+            sharded_state_dict: Sharded state dict template for loading
+            checkpoint_dir: Checkpoint directory
+            
+        Returns:
+            StateDict: Loaded state dict from backup data
+        """
+        import mmap
+        import numpy as np
+        
+        rank = torch.distributed.get_rank()
+        
+        # Get pairing map (same as in async_utils)
+
+        paired_rank = self.pairing_map.get(rank, None)
+        
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        # Find replica file: original file with _replica{paired_rank}_rank{rank} suffix
+        # Example: __0_0.distcp -> __0_0_replica2_rank0.distcp
+        replica_files = list(checkpoint_dir.glob(f"*_replica{paired_rank}_rank{rank}*.distcp"))
+        
+        replica_file_path = replica_files[0]
+        logger.info(f"rank: {rank}, found replica file: {replica_file_path}")
+        
+        # Step 1: Use mmap to read replica file (zero-copy)
+        replica_data_bytes = None
+        replica_file_size = 0
+        
+        try:
+            with open(replica_file_path, 'rb') as f:
+                # Get file size
+                f.seek(0, 2)  # Seek to end
+                replica_file_size = f.tell()
+                f.seek(0)  # Seek back to start
+                
+                # Memory-map the file for zero-copy access
+                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                
+                # Read all data from mmap
+                replica_data_bytes = mm[:]
+                
+                # Close mmap (file handle will be closed automatically)
+                mm.close()
+            
+            logger.info(f"rank: {rank}, read {replica_file_size / (1024**2):.2f} MB from replica file using mmap")
+        
+        except Exception as e:
+            logger.error(f"rank: {rank}, failed to read replica file with mmap: {e}, "
+                        f"falling back to normal load", exc_info=True)
+            # return self.load(sharded_state_dict, checkpoint_dir)
+        
+        # Step 2: Create pair process group for communication
+        from .async_utils import get_or_create_pair_process_group
+        pair_group = get_or_create_pair_process_group(rank, paired_rank)
+        
+        # Step 3: Exchange data sizes first
+        size_tensor = torch.tensor([replica_file_size], dtype=torch.long, device='cpu')
+        gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(2)]
+        torch.distributed.all_gather(gathered_sizes, size_tensor, group=pair_group)
+        
+        # Determine paired rank's data size
+        pair_ranks = [min(rank, paired_rank), max(rank, paired_rank)]
+        my_idx = pair_ranks.index(rank)
+        paired_idx = 1 - my_idx
+        remote_size = gathered_sizes[paired_idx].item()
+        
+        logger.info(f"rank: {rank}, local replica size: {replica_file_size / (1024**2):.2f} MB, "
+                   f"paired rank {paired_rank} replica size: {remote_size / (1024**2):.2f} MB")
+        
+        # Step 4: Convert bytes to tensor and send to paired rank
+        replica_array = np.frombuffer(replica_data_bytes, dtype=np.uint8)
+        replica_tensor = torch.from_numpy(replica_array.copy()).cpu()
+        
+        # Allocate receive buffer
+        remote_tensor = torch.zeros(remote_size, dtype=torch.uint8, device='cpu')
+        
+        # Step 5: Exchange data using broadcast
+        lower_global_rank = pair_ranks[0]
+        higher_global_rank = pair_ranks[1]
+        
+        if rank == lower_global_rank:
+            # Lower rank: send first, then receive
+            torch.distributed.broadcast(replica_tensor, src=lower_global_rank, group=pair_group)
+            torch.distributed.broadcast(remote_tensor, src=higher_global_rank, group=pair_group)
+        else:
+            # Higher rank: receive first, then send
+            torch.distributed.broadcast(remote_tensor, src=lower_global_rank, group=pair_group)
+            torch.distributed.broadcast(replica_tensor, src=higher_global_rank, group=pair_group)
+        
+        logger.info(f"rank: {rank}, exchanged replica data with rank {paired_rank}, "
+                   f"received {remote_size / (1024**2):.2f} MB")
+        
+        # Step 6: Deserialize received data and directly restore state_dict from memory
+        # No need to write to file - we can load directly from memory
+        remote_bytes = remote_tensor.numpy().tobytes()
+        remote_data_io = io.BytesIO(remote_bytes)
+    
+        # Deserialize the checkpoint data (write_buckets)
+        replica_buckets = torch.load(remote_data_io, weights_only=False)
+        logger.info(f"rank: {rank}, deserialized replica data, restoring state_dict from memory...")
+        
+        # Step 7: Directly restore state_dict from replica_buckets
+        # Parse write_buckets and extract data to populate sharded_state_dict
+        loaded_state_dict = self._restore_state_dict_from_write_buckets(
+            replica_buckets, sharded_state_dict
+        )
+        
+        logger.info(f"rank: {rank}, successfully restored state_dict from backup data in memory")
+        return loaded_state_dict
+        
+    def _restore_state_dict_from_write_buckets(
+        self, write_buckets: List, sharded_state_dict: ShardedStateDict
+    ) -> StateDict:
+        """Restore state_dict directly from write_buckets in memory.
+        
+        write_buckets structure: [(file_name, storage_key, (bytes_data, tensor_data)), ...]
+        - bytes_data: [(WriteItem, data), ...] for non-tensor data
+        - tensor_data: [(WriteItem, tensor), ...] for tensor data
+        
+        This method directly extracts data from write_buckets and populates sharded_state_dict,
+        avoiding the need to write to temporary files.
+        
+        Args:
+            write_buckets: List of write buckets from deserialized checkpoint data
+            sharded_state_dict: Template sharded state dict to populate
+            
+        Returns:
+            StateDict: Restored state dict
+        """
+        rank = torch.distributed.get_rank()
+        
+        logger.info(f"rank: {rank}, restoring state_dict directly from write_buckets in memory")
+        
+        # Step 1: Build a mapping from FQN to data
+        # FQN (Fully Qualified Name) is the key in WriteItem.index.fqn
+        fqn_to_data = {}
+        fqn_to_tensor_list = {}  # For tensors with same FQN but different offsets
+        
+        for bucket in write_buckets:
+            if isinstance(bucket, tuple) and len(bucket) >= 3:
+                file_name, storage_key, (bytes_data, tensor_data) = bucket
+                
+                # Process bytes_data (non-tensor data: metadata, ShardedObjects, etc.)
+                if isinstance(bytes_data, list):
+                    for write_item, data in bytes_data:
+                        fqn = write_item.index.fqn
+                        
+                        # BytesIO objects contain serialized data (list of ShardedObject.data)
+                        # We need to deserialize them
+                        if isinstance(data, io.BytesIO):
+                            # Reset position to beginning
+                            data.seek(0)
+                            # Deserialize: torch.save([sh_obj.data for sh_obj in sh_objs], ...)
+                            # So torch.load returns a list
+                            deserialized_list = torch.load(data, map_location='cpu', weights_only=False)
+                            # Store the deserialized list
+                            fqn_to_data[fqn] = deserialized_list
+                            logger.debug(f"rank: {rank}, extracted and deserialized BytesIO for FQN: {fqn}, "
+                                       f"got {len(deserialized_list) if isinstance(deserialized_list, list) else 1} items")
+                        else:
+                            # Other types of data (shouldn't happen in standard format)
+                            fqn_to_data[fqn] = data
+                            logger.debug(f"rank: {rank}, extracted bytes_data for FQN: {fqn}")
+                
+                # Process tensor_data (ShardedTensors)
+                if isinstance(tensor_data, list):
+                    for write_item, tensor in tensor_data:
+                        fqn = write_item.index.fqn
+                        offset = tuple(write_item.index.offset) if hasattr(write_item.index, 'offset') else ()
+                        shard_index = write_item.index.index if hasattr(write_item.index, 'index') else 0
+                        
+                        # Create unique key: (fqn, offset, shard_index)
+                        key = (fqn, offset, shard_index)
+                        
+                        if fqn not in fqn_to_tensor_list:
+                            fqn_to_tensor_list[fqn] = []
+                        fqn_to_tensor_list[fqn].append((offset, shard_index, tensor))
+                        
+                        logger.debug(f"rank: {rank}, extracted tensor for FQN: {fqn}, offset: {offset}, index: {shard_index}")
+        
+        logger.info(f"rank: {rank}, extracted {len(fqn_to_data)} non-tensor items, "
+                   f"{len(fqn_to_tensor_list)} tensor groups from write_buckets")
+        
+        # Step 2: Generate PyT-compatible state dict from sharded_state_dict
+        orig_sharded_state_dict = sharded_state_dict
+        (keyed_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+        )
+        
+        # Step 3: Match and populate data
+        matched_count = 0
+        unmatched_count = 0
+        
+        for key, sh_base_list in keyed_state_dict.items():
+            for idx, sh_base in enumerate(sh_base_list):
+                if isinstance(sh_base, ShardedObject):
+                    # Match by FQN for ShardedObject
+                    if key in fqn_to_data:
+                        # fqn_to_data[key] is a list: [sh_obj.data for sh_obj in sh_objs]
+                        # Each sh_base in sh_base_list corresponds to one element in the list
+                        data_list = fqn_to_data[key]
+                        if isinstance(data_list, list) and idx < len(data_list):
+                            sh_base.data = data_list[idx]
+                            matched_count += 1
+                            logger.debug(f"rank: {rank}, matched ShardedObject: {key}[{idx}]")
+                        else:
+                            # Fallback: if not a list or index out of range, use the whole thing
+                            sh_base.data = data_list
+                            matched_count += 1
+                            logger.debug(f"rank: {rank}, matched ShardedObject (fallback): {key}")
+                    else:
+                        unmatched_count += 1
+                        logger.debug(f"rank: {rank}, unmatched ShardedObject: {key}")
+                
+                elif isinstance(sh_base, ShardedTensor):
+                    # Match by (FQN, offset) for ShardedTensor
+                    sh_offset = tuple(sh_base.global_offset) if hasattr(sh_base.global_offset, '__iter__') else (sh_base.global_offset,)
+                    
+                    if key in fqn_to_tensor_list:
+                        # Find matching tensor by offset
+                        found = False
+                        for offset, shard_index, tensor in fqn_to_tensor_list[key]:
+                            if offset == sh_offset:
+                                sh_base.data = tensor
+                                matched_count += 1
+                                found = True
+                                logger.debug(f"rank: {rank}, matched ShardedTensor: {key}, offset: {sh_offset}")
+                                break
+                        
+                        if not found:
+                            unmatched_count += 1
+                            logger.debug(f"rank: {rank}, unmatched ShardedTensor: {key}, offset: {sh_offset}")
+                    else:
+                        unmatched_count += 1
+                        logger.debug(f"rank: {rank}, unmatched ShardedTensor (no FQN): {key}")
+        
+        logger.info(f"rank: {rank}, matched {matched_count} items, unmatched {unmatched_count} items")
+        
+        # Step 4: Unwrap and convert to MCore format
+        unwrapped_state_dict = {}
+        for key, sh_base_list in keyed_state_dict.items():
+            if len(sh_base_list) == 0:
+                continue
+            
+            sh_base = sh_base_list[0]
+            if isinstance(sh_base, ShardedTensor):
+                tensors = []
+                for sh in sh_base_list:
+                    ten = sh.data
+                    if ten is None:
+                        tensors.append(None)
+                        continue
+                    
+                    # Handle prepend_axis_num: remove singleton dimensions added during save
+                    # These are extra dimensions at the beginning of the tensor
+                    # e.g., [1, 1024, 1024] -> [1024, 1024] when prepend_axis_num=1
+                    if hasattr(sh, 'prepend_axis_num') and sh.prepend_axis_num > 0:
+                        for _ in range(sh.prepend_axis_num):
+                            if isinstance(ten, torch.Tensor) and ten.size(0) == 1:
+                                ten = ten[0]  # Remove first singleton dimension
+                    
+                    tensors.append(ten)
+                unwrapped_state_dict[key] = tensors
+            elif isinstance(sh_base, ShardedObject):
+                # For ShardedObject, create a list of data
+                data_list = [sh.data for sh in sh_base_list]
+                # If there's only one element, unwrap it (standard case)
+                # Otherwise keep as list (for replicated objects)
+                
+                if len(data_list) == 1:
+                    unwrapped_state_dict[key] = data_list
+                else:
+                    unwrapped_state_dict[key] = data_list
+        
+        # Step 5: Convert back to MCore format
+        mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
+            unwrapped_state_dict, flat_mapping, rename_mapping
+        )
+        
+        # Step 6: Restore dict types
+        self._restore_dict_types_lenient(mcore_state_dict, orig_sharded_state_dict)
+        
+        logger.info(f"rank: {rank}, successfully restored state_dict from write_buckets in memory")
+        return mcore_state_dict
     
     def _run_eccheck_p2p_pipeline_simple(
         self,
@@ -2686,7 +2983,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         """
         # Check if this is an EC-CHECK format checkpoint
         rank = torch.distributed.get_rank()
-        if self._is_eccheck_checkpoint(checkpoint_dir) or rank == 2:
+        pair_rank = self.pairing_map(rank)
+        from megatron.training import get_args as use_args
+        input_args = use_args()
+        if input_args.use_gemini and (rank ==2 or pair_rank ==2):
+            logger.info(f"Using Gemini checkpointing")
+            # Load directly from backup data and return the state_dict
+            return self._load_gemini_checkpoint(sharded_state_dict, checkpoint_dir)
+        
+        if input_args.use_eccheck and (self._is_eccheck_checkpoint(checkpoint_dir) or rank == 2):
             logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
             mapped_file_own, mapped_file_partner = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
             

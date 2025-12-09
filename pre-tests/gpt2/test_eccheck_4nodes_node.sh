@@ -109,7 +109,8 @@ EVAL_AND_LOGGING_ARGS=(
     --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --use-eccheck
+    # --use-eccheck
+    --use-gemini
     --ckpt-format torch_dist
 )
 

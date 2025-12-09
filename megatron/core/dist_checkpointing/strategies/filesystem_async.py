@@ -418,9 +418,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         Returns: None
         """
         import sys
-        print(f"EC-CHECK: Write preloaded data multiproc started", file=sys.stdout)
+        # print(f"EC-CHECK: Write preloaded data multiproc started", file=sys.stdout)
         logger = logging.getLogger(__name__)
-        logger.info(f"EC-CHECK: Write preloaded data multiproc started")
+        # logger.info(f"EC-CHECK: Write preloaded data multiproc started")
         w_start = time()
         write_results_or_exc: Union[dict, Exception] = dict()
         ctx = mp.get_context("fork")
@@ -459,17 +459,17 @@ class FileSystemWriterAsync(FileSystemWriter):
                 write_results_or_exc = RuntimeError(err_msg)
 
         if not isinstance(write_results_or_exc, Exception):
-            logger.info(f"EC-CHECK: Starting {len(p_list)} write processes...")
+            # logger.info(f"EC-CHECK: Starting {len(p_list)} write processes...")
             for p in p_list:
                 p.start()
                 logger.info(f"EC-CHECK: Started process {p.pid}")
 
-            logger.debug("FileSystemWriterAsync: collecting worker results...")
+            # logger.debug("FileSystemWriterAsync: collecting worker results...")
 
             # To make sure all nodes are completed
-            logger.info("EC-CHECK: Waiting for all processes to complete (count_queue.join)...")
+            # logger.info("EC-CHECK: Waiting for all processes to complete (count_queue.join)...")
             count_queue.join()
-            logger.info("EC-CHECK: All processes completed (count_queue.join returned)")
+            # logger.info("EC-CHECK: All processes completed (count_queue.join returned)")
 
             # At this point, all workers completed, so the queue should have exactly
             # `len(write_buckets)` items

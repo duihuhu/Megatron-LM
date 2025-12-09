@@ -1801,6 +1801,131 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Return EccheckMappedFile, non_tensor_data, and local_metadata for each file
         return mapped_file_own, mapped_file_partner
     
+    def _load_gemini_checkpoint_recovery(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+        """Load checkpoint for rank2 failure recovery scenario.
+        
+        In this scenario, rank2 has no data and needs to recover from rank0's replica.
+        Only rank0 (pair_rank=2) and rank2 need to participate.
+        
+        Process:
+        1. Rank0 (pair_rank=2) reads replica file and sends size to rank2
+        2. Rank2 creates receive buffer based on the size
+        3. Rank0 sends replica data to rank2
+        4. Rank2 deserializes and restores state_dict from received data
+        
+        Args:
+            sharded_state_dict: Sharded state dict template for loading
+            checkpoint_dir: Checkpoint directory
+            
+        Returns:
+            StateDict: Loaded state dict (only rank2 returns valid data)
+        """
+        import mmap
+        import numpy as np
+        from .async_utils import get_or_create_pair_process_group
+        
+        rank = torch.distributed.get_rank()
+        paired_rank = self.pairing_map.get(rank, None)
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        logger.info(f"rank: {rank}, starting Gemini checkpoint recovery for rank2 failure")
+        
+        # Only rank0 (pair_rank=2) and rank2 participate
+        if rank == 0 and paired_rank == 2:
+            # Rank0: Read replica file and send to rank2
+            logger.info(f"rank: {rank}, reading replica file for rank2 recovery")
+            
+            # Find replica file: __0_0_replica2_rank0.distcp
+            replica_files = list(checkpoint_dir.glob(f"*_replica{paired_rank}_rank{rank}*.distcp"))
+            
+            if not replica_files:
+                logger.error(f"rank: {rank}, no replica file found for rank2 recovery")
+                raise FileNotFoundError(f"No replica file found for rank2 recovery")
+            
+            replica_file_path = replica_files[0]
+            logger.info(f"rank: {rank}, found replica file: {replica_file_path}")
+            
+            # Step 1: Read replica file using mmap (zero-copy)
+            try:
+                with open(replica_file_path, 'rb') as f:
+                    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                    replica_file_size = len(mm)
+                    replica_data_bytes = mm[:]
+                    mm.close()
+                
+                logger.info(f"rank: {rank}, read replica file: {replica_file_size / (1024**2):.2f} MB")
+            
+            except Exception as e:
+                logger.error(f"rank: {rank}, failed to read replica file: {e}", exc_info=True)
+                raise
+            
+            # Step 2: Create pair process group for communication with rank2
+            pair_group = get_or_create_pair_process_group(rank, paired_rank)
+            
+            # Step 3: Exchange file size with rank2
+            local_size_tensor = torch.tensor([replica_file_size], dtype=torch.int64)
+            remote_size_tensor = torch.tensor([0], dtype=torch.int64)
+            
+            # Use all_gather to exchange sizes
+            size_list = [local_size_tensor, remote_size_tensor]
+            torch.distributed.all_gather(size_list, local_size_tensor, group=pair_group)
+            
+            logger.info(f"rank: {rank}, exchanged size with rank2: {replica_file_size / (1024**2):.2f} MB")
+            
+            # Step 4: Convert replica data to tensor for broadcast
+            replica_np = np.frombuffer(replica_data_bytes, dtype=np.uint8).copy()
+            replica_tensor = torch.from_numpy(replica_np)
+            
+            logger.info(f"rank: {rank}, prepared replica tensor: {replica_tensor.numel() / (1024**2):.2f} MB")
+            
+            # Step 5: Send replica data to rank2 using broadcast
+            # Rank0 is the source (src=0 in global ranks)
+            torch.distributed.broadcast(replica_tensor, src=rank, group=pair_group)
+            
+            logger.info(f"rank: {rank}, sent replica data to rank2")
+            return {}
+        elif rank == 2:
+            # Rank2: Receive data from rank0 and restore state_dict
+            logger.info(f"rank: {rank}, receiving replica data from rank0 for recovery")
+            
+            # Step 1: Create pair process group for communication with rank0
+            pair_group = get_or_create_pair_process_group(rank, 0)
+            
+            # Step 2: Receive file size from rank0
+            local_size_tensor = torch.tensor([0], dtype=torch.int64)
+            remote_size_tensor = torch.tensor([0], dtype=torch.int64)
+            
+            # Use all_gather to exchange sizes
+            size_list = [remote_size_tensor, local_size_tensor]
+            torch.distributed.all_gather(size_list, local_size_tensor, group=pair_group)
+            
+            remote_size = size_list[0].item()
+            logger.info(f"rank: {rank}, received size from rank0: {remote_size / (1024**2):.2f} MB")
+            
+            # Step 3: Create receive buffer
+            remote_tensor = torch.empty(remote_size, dtype=torch.uint8)
+            
+            # Step 4: Receive replica data from rank0 using broadcast
+            torch.distributed.broadcast(remote_tensor, src=0, group=pair_group)
+            
+            logger.info(f"rank: {rank}, received replica data from rank0: {remote_size / (1024**2):.2f} MB")
+            
+            # Step 5: Deserialize received data
+            remote_bytes = remote_tensor.numpy().tobytes()
+            remote_data_io = io.BytesIO(remote_bytes)
+            
+            replica_buckets = torch.load(remote_data_io, weights_only=False)
+            logger.info(f"rank: {rank}, deserialized replica data, restoring state_dict from memory...")
+            
+            # Step 6: Restore state_dict from replica_buckets
+            loaded_state_dict = self._restore_state_dict_from_write_buckets(
+                replica_buckets, sharded_state_dict
+            )
+            
+            logger.info(f"rank: {rank}, successfully restored state_dict from rank0's replica data")
+            return loaded_state_dict
+    
+    
     def _load_gemini_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Load checkpoint using Gemini (replica) backup data with mmap.
         
@@ -2983,19 +3108,49 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         """
         # Check if this is an EC-CHECK format checkpoint
         rank = torch.distributed.get_rank()
-        pair_rank = self.pairing_map(rank)
+        pair_rank = self.pairing_map.get(rank, None)
         from megatron.training import get_args as use_args
         input_args = use_args()
-        if input_args.use_gemini and (rank ==2 or pair_rank ==2):
-            logger.info(f"Using Gemini checkpointing")
-            # Load directly from backup data and return the state_dict
-            return self._load_gemini_checkpoint(sharded_state_dict, checkpoint_dir)
+        
+        # Gemini checkpoint recovery for rank2 failure scenario
+        # Only rank0 and rank2 participate in recovery, but ALL ranks must synchronize
+        rank2_recovered_state_dict = None
+        if input_args.use_gemini:
+            # Check if this is a rank2 recovery scenario
+            is_rank2_recovery = (rank == 2 or pair_rank == 2)
+            
+            if is_rank2_recovery:
+                logger.info(f"rank: {rank}, using Gemini checkpoint recovery for rank2 failure")
+                # Only rank0 (pair_rank=2) and rank2 participate in recovery
+                rank2_recovered_state_dict = self._load_gemini_checkpoint_recovery(sharded_state_dict, checkpoint_dir)
+            else:
+                logger.info(f"rank: {rank}, not participating in rank2 recovery, waiting at barrier")
+            
+            # ALL ranks must synchronize here (including rank1 and rank3)
+            # This ensures no rank proceeds to collective operations while others are still in recovery
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+                logger.info(f"rank: {rank}, synchronized after Gemini recovery check")
+            
+            # If rank2 successfully recovered, we still need to participate in collective ops
+            # in the standard load flow, but will return the recovered data at the end
+            if rank == 2 and rank2_recovered_state_dict:
+                logger.info(f"rank: {rank}, rank2 recovery successful, will participate in collective ops then return")
+            
+            # Other ranks continue to standard load flow
+            if not is_rank2_recovery:
+                logger.info(f"rank: {rank}, continuing to standard load flow")
+        
+        # Normal Gemini checkpoint load (mutual exchange between paired ranks, and all rank recovery from peer replication)
+        # if input_args.use_gemini:
+        #     logger.info(f"rank: {rank}, using Gemini checkpointing (normal mode)")
+        #     # Load directly from backup data and return the state_dict
+        #     return self._load_gemini_checkpoint(sharded_state_dict, checkpoint_dir)
         
         if input_args.use_eccheck and (self._is_eccheck_checkpoint(checkpoint_dir) or rank == 2):
             logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
             mapped_file_own, mapped_file_partner = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
-            
-            
+    
             return self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
         
         # Apply N-D tensors resharding
@@ -3031,19 +3186,50 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             sharded_state_dict, True, load_legacy_1d_flatten_tensors=has_legacy_1d_flattened_tensors
         )
         # Load PyT Distributed format
-        fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
-        checkpoint.load_state_dict(
-            pyt_state_dict,
-            fsr,
-            planner=MCoreLoadPlanner(
-                shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
-                allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
-            ),
-        )
+        logger.info(f"rank: {rank}, starting checkpoint.load_state_dict")
+        
+        # Special handling for rank2 recovery: still call load_state_dict for collective ops
+        # but catch any errors since rank2 has no checkpoint files
+        if rank == 2 and rank2_recovered_state_dict is not None:
+            logger.info(f"rank: {rank}, rank2 has recovered data, but still participating in collective ops")
+            # Rank2 needs to participate in collective operations inside load_state_dict
+            # Even though it will fail to read files, it must participate in collectives
+            try:
+                fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
+                checkpoint.load_state_dict(
+                    pyt_state_dict,
+                    fsr,
+                    planner=MCoreLoadPlanner(
+                        shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
+                        allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+                    ),
+                )
+                logger.info(f"rank: {rank}, finished checkpoint.load_state_dict (unexpected success)")
+            except Exception as e:
+                logger.info(f"rank: {rank}, checkpoint.load_state_dict failed as expected (no files): {e}")
+                # This is expected for rank2, continue to return recovered data
+        else:
+            fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
+            checkpoint.load_state_dict(
+                pyt_state_dict,
+                fsr,
+                planner=MCoreLoadPlanner(
+                    shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
+                    allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+                ),
+            )
+            logger.info(f"rank: {rank}, finished checkpoint.load_state_dict")
 
+        # If rank2 has recovered data, return that directly (skip standard load processing)
+        # Only rank2 should return recovered data, not rank0
+        if rank == 2 and rank2_recovered_state_dict is not None:
+            logger.info(f"rank: {rank}, returning Gemini recovered state_dict (skipped standard load)")
+            return rank2_recovered_state_dict
+        
         self.cached_global_metadata = (
             fsr.read_metadata()
         )  # no storage interaction thanks to caching
+        logger.info(f"rank: {rank}, finished read_metadata")
 
         pyt_state_dict = cast(
             Dict[str, Union[TorchShardedTensor, List[io.BytesIO]]], pyt_state_dict
@@ -3061,6 +3247,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         mcore_state_dict = restore_nd_flattened_tensors_formulation(
             mcore_state_dict, formulation_restore_data
         )
+        
         return mcore_state_dict
 
     def load_tensors_metadata(self, checkpoint_dir: Path, metadata: Metadata = None):

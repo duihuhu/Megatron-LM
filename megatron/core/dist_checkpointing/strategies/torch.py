@@ -1007,6 +1007,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         from megatron.training import get_args as input_args
         args = input_args()
         # Use PyT saving mechanism
+
         writer = FileSystemWriterAsync(
             checkpoint_dir,
             separation_hint=self.separation_hint,
@@ -1682,30 +1683,80 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         p2p_partner_rank = self._get_p2p_partner_rank(rank, world_size)
+        # Temporary hardcoding for rank2 failure recovery
+        failed_rank = 2
         
         checkpoint_dir = Path(checkpoint_dir)
         eccheck_p2p_own_file = checkpoint_dir / f"__{rank}_p2p_own.distcp"
         eccheck_p2p_partner_file = checkpoint_dir / f"__{p2p_partner_rank}_p2p_partner.distcp"
 
-        if not eccheck_p2p_own_file.exists():
-            mapped_file_own = EccheckMappedFile(None, None, None, None, None)
-            mapped_file_partner = EccheckMappedFile(None, None, None, None, None)
-            # return mapped_file_own, mapped_file_partner
-        else:
-            # Load the decomposed state dict from file
-            # Returns tuple: (EccheckMappedFile, non_tensor_data, List[TensorMetadata])
+        # Default placeholders
+        mapped_file_own = EccheckMappedFile(None, None, None, None, None)
+        mapped_file_partner = EccheckMappedFile(None, None, None, None, None)
+
+        # Load own file if present
+        if eccheck_p2p_own_file.exists():
             mapped_file_own = FileSystemWriterAsync.load_eccheck_bytes_from_file(
                 str(eccheck_p2p_own_file), my_rank=rank
             )
+
+        # Load partner file if present
+        if eccheck_p2p_partner_file.exists():
             mapped_file_partner = FileSystemWriterAsync.load_eccheck_bytes_from_file(
                 str(eccheck_p2p_partner_file), my_rank=p2p_partner_rank
             )
         
+        # 如果 failed_rank 缺失 partner 文件，则 partner 点对点 send 元数据给 failed_rank，避免大对象广播
+        # 仅当 failed_rank 缺失 partner 文件时触发点对点补元数据
+        local_missing = (
+            failed_rank >= 0
+            and rank == failed_rank
+            and not eccheck_p2p_partner_file.exists()
+        )
+        if torch.distributed.is_initialized():
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            missing_any = torch.tensor(int(local_missing), device=device)
+            torch.distributed.all_reduce(missing_any, op=torch.distributed.ReduceOp.SUM)
+            need_recover = bool(missing_any.item())
+        else:
+            need_recover = local_missing
+
+        partner_rank = self._get_p2p_partner_rank(failed_rank, world_size)
+        if need_recover and rank in (failed_rank, partner_rank):
+            import pickle
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            if rank == partner_rank:
+                payload = pickle.dumps({
+                    'tensor_metadata': mapped_file_own.local_metadata or [],
+                    'non_tensor_data': mapped_file_own.non_tensor_data or {},
+                })
+                buf = torch.tensor(list(payload), dtype=torch.uint8, device=device)
+                size = torch.tensor([buf.numel()], dtype=torch.int64, device=device)
+                torch.distributed.send(size, dst=failed_rank)
+                torch.distributed.send(buf, dst=failed_rank)
+            elif rank == failed_rank:
+                size = torch.empty(1, dtype=torch.int64, device=device)
+                torch.distributed.recv(size, src=partner_rank)
+                buf = torch.empty(int(size.item()), dtype=torch.uint8, device=device)
+                torch.distributed.recv(buf, src=partner_rank)
+                obj = pickle.loads(bytes(buf.cpu().tolist()))
+                mapped_file_partner = EccheckMappedFile(
+                    mmap_object=None,
+                    memory_address=None,
+                    file_size=None,
+                    local_metadata=obj.get('tensor_metadata'),
+                    non_tensor_data=obj.get('non_tensor_data'),
+                )
+
         # Package both together
         local_package = {
-            'tensor_metadata': mapped_file_partner.local_metadata,
-            'non_tensor_data': mapped_file_partner.non_tensor_data,
+            'tensor_metadata': mapped_file_partner.local_metadata or [],
+            'non_tensor_data': mapped_file_partner.non_tensor_data or {},
         }
+        
+        if local_package['tensor_metadata'] is None or local_package['non_tensor_data'] is None:
+            logger.error(f"EC-CHECK: [Rank {rank}] Local metadata is None, skipping metadata exchange")
+            return mapped_file_own, mapped_file_partner
         
         # ===== Step 2: All-gather complete metadata using all_gather_object =====
         # This automatically handles serialization, padding, and deserialization

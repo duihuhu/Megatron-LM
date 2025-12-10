@@ -3205,10 +3205,13 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     ),
                 )
                 logger.info(f"rank: {rank}, finished checkpoint.load_state_dict (unexpected success)")
-            except Exception as e:
+            # except Exception as e:
+            #     logger.info(f"ran: {rank}, checkpoint.load_state_dict failed as expected (no files): {e}")
+            except FileNotFoundError as e:
                 logger.info(f"rank: {rank}, checkpoint.load_state_dict failed as expected (no files): {e}")
                 # This is expected for rank2, continue to return recovered data
         else:
+            
             fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
             checkpoint.load_state_dict(
                 pyt_state_dict,

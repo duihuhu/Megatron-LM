@@ -1007,11 +1007,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         from megatron.training import get_args as input_args
         args = input_args()
         # Use PyT saving mechanism
-        try:
-            # Rebuild native/buffers to avoid carrying load-phase state into save
-            self.eccheck_manager.rebuild_native_and_buffers()
-        except Exception as e:  # defensive: do not block save
-            logger.warning(f"EC-CHECK: Failed to rebuild EC-CHECK before save: {e}")
 
         writer = FileSystemWriterAsync(
             checkpoint_dir,

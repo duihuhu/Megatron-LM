@@ -1849,8 +1849,128 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             recv_total_size=recv_total_size,
         )
         
+        # For rank2 recovery: reconstruct loaded_state_dict from own_buffer and metadata
+        if rank == failed_rank:
+            logger.info(f"EC-CHECK: [Rank {rank}] Reconstructing loaded_state_dict from recovered data")
+            loaded_state_dict = self._reconstruct_state_dict_from_eccheck_buffer(
+                recv_own_buffer=recv_own_buffer,
+                mapped_file_own=mapped_file_own,
+                registry=registry
+            )
+            if loaded_state_dict is not None:
+                logger.info(f"EC-CHECK: [Rank {rank}] Successfully reconstructed loaded_state_dict")
+                return mapped_file_own, mapped_file_partner, loaded_state_dict
+        
         # Return EccheckMappedFile, non_tensor_data, and local_metadata for each file
         return mapped_file_own, mapped_file_partner
+    
+    def _reconstruct_state_dict_from_eccheck_buffer(
+        self,
+        recv_own_buffer: torch.Tensor,
+        mapped_file_own,
+        registry
+    ) -> Optional[StateDict]:
+        """Reconstruct loaded_state_dict from recovered buffer and metadata for rank2.
+        
+        This function extracts tensors from recv_own_buffer using metadata from
+        mapped_file_own.local_metadata and builds a state_dict structure.
+        
+        Args:
+            recv_own_buffer: Buffer containing recovered tensor data
+            mapped_file_own: EccheckMappedFile with local_metadata and non_tensor_data
+            registry: GlobalMetadataRegistry with complete metadata
+            
+        Returns:
+            Optional[StateDict]: Reconstructed state dict, or None if reconstruction fails
+        """
+        import io
+        from .state_dict_decomposer import TensorInfo, DecomposedStateDict, reconstruct_state_dict
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        
+        try:
+            # Get metadata for this rank (rank2's own metadata)
+            local_metadata = mapped_file_own.local_metadata or []
+            non_tensor_data = mapped_file_own.non_tensor_data or {}
+            
+            if not local_metadata:
+                logger.warning(f"EC-CHECK: [Rank {rank}] No local_metadata available for reconstruction")
+                return None
+            
+            logger.info(f"EC-CHECK: [Rank {rank}] Reconstructing from {len(local_metadata)} tensor metadata entries")
+            
+            # Convert TensorMetadata to TensorInfo and extract tensors from buffer
+            tensor_infos = []
+            tensor_data = []
+            current_offset = 0
+            
+            for meta in local_metadata:
+                # Convert dtype string to torch.dtype
+                # meta.dtype is a string like 'torch.float32' or 'float32'
+                dtype_str = meta.dtype.replace('torch.', '') if 'torch.' in meta.dtype else meta.dtype
+                try:
+                    dtype = getattr(torch, dtype_str)
+                except AttributeError:
+                    logger.warning(f"EC-CHECK: [Rank {rank}] Unknown dtype {meta.dtype}, using float32")
+                    dtype = torch.float32
+                
+                # Calculate element size for numel calculation
+                element_size = torch.tensor(0, dtype=dtype).element_size()
+                numel = meta.size_bytes // element_size
+                
+                # Create TensorInfo
+                tensor_info = TensorInfo(
+                    key=meta.key,
+                    shape=meta.shape,
+                    dtype=dtype,
+                    device=torch.device('cpu'),
+                    numel=numel,
+                    size_bytes=meta.size_bytes,
+                    offset=current_offset,
+                    global_offset=meta.global_offset,
+                    shard_index=meta.shard_index
+                )
+                tensor_infos.append(tensor_info)
+                
+                # Extract tensor from buffer
+                start = current_offset
+                end = start + meta.size_bytes
+                if end > recv_own_buffer.numel():
+                    logger.error(f"EC-CHECK: [Rank {rank}] Buffer overflow: end={end}, buffer_size={recv_own_buffer.numel()}")
+                    return None
+                
+                tensor_bytes = recv_own_buffer[start:end]
+                
+                # Reshape to original tensor
+                try:
+                    # Convert uint8 buffer to target dtype and reshape
+                    # First view as target dtype, then reshape to original shape
+                    tensor = tensor_bytes.view(dtype).reshape(meta.shape).clone()
+                    tensor_data.append(tensor)
+                except Exception as e:
+                    logger.error(f"EC-CHECK: [Rank {rank}] Failed to reshape tensor {meta.key}: {e}")
+                    return None
+                
+                current_offset = end
+            
+            logger.info(f"EC-CHECK: [Rank {rank}] Extracted {len(tensor_data)} tensors from buffer")
+            
+            # Create DecomposedStateDict
+            decomposed = DecomposedStateDict(
+                non_tensor_data=non_tensor_data,
+                tensor_infos=tensor_infos,
+                tensor_data=tensor_data
+            )
+            
+            # Reconstruct state_dict using reconstruct_state_dict
+            state_dict = reconstruct_state_dict(decomposed)
+            
+            logger.info(f"EC-CHECK: [Rank {rank}] Successfully reconstructed state_dict with {len(state_dict)} top-level keys")
+            return state_dict
+            
+        except Exception as e:
+            logger.error(f"EC-CHECK: [Rank {rank}] Failed to reconstruct state_dict from buffer: {e}", exc_info=True)
+            return None
     
     def _load_gemini_checkpoint_recovery(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Load checkpoint for rank2 failure recovery scenario.
@@ -3200,7 +3320,16 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         if input_args.use_eccheck and (self._is_eccheck_checkpoint(checkpoint_dir) or rank == 2):
             logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
-            mapped_file_own, mapped_file_partner = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
+            result = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
+            
+            # Check if rank2 recovery returned loaded_state_dict
+            if len(result) == 3:
+                mapped_file_own, mapped_file_partner, loaded_state_dict = result
+                if loaded_state_dict is not None and rank == 2:
+                    logger.info(f"EC-CHECK: [Rank {rank}] Returning recovered loaded_state_dict")
+                    return loaded_state_dict
+            else:
+                mapped_file_own, mapped_file_partner = result
     
             return self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
         

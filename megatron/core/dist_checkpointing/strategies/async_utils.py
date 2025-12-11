@@ -577,22 +577,72 @@ class TemporalAsyncCaller(AsyncCaller):
                         f"will write {remote_size / (1024**2):.2f} MB to {replica_file_path}")
             else:
                 self.replica_process = None
+                
         exchange_end = time()
         logger.info(f"rank: {rank}, total exchange (size + data) took {exchange_end - exchange_start:.2f}s")
 
         self.start_time = time()
         
         # Start process to save original checkpoint
-        # logger.info(f"EC-CHECK: Creating process for write_preloaded_data")
-        self.process = ctx.Process(
-            target=async_req.async_fn, args=async_fn_args, kwargs=async_req.async_fn_kwargs
-        )
-        # logger.info(f"EC-CHECK: Create process for write_preloaded_data")
-        self.process.start()
-        # logger.info(f"EC-CHECK: Started process for write_preloaded_data")
+        if args.use_gemini:
+            # Serialize original checkpoint data to bytes
+            original_serialize_start = time()
+            # Use a new buffer for original checkpoint to avoid conflicts with exchange buffer
+            original_buffer = io.BytesIO()
+            torch.save(async_fn_args[1], original_buffer)
+            original_buffer_view = original_buffer.getbuffer()
+            original_bytes = original_buffer_view.tobytes()
+            original_size = len(original_bytes)
+            original_serialize_time = time() - original_serialize_start
+            logger.info(f"rank: {rank}, serialized original checkpoint: {original_size / (1024**2):.2f} MB in {original_serialize_time:.4f}s")
+            
+            # Get original checkpoint file path
+            original_file_path = self._get_original_file_path(async_fn_args[1])
+            
+            # Get global_results_queue from async_fn_args (it's the 3rd element)
+            # async_fn_args structure: [rank, write_buckets, global_results_queue]
+            global_results_queue = async_fn_args[2] if len(async_fn_args) > 2 else None
+            
+            # Start process to directly write original_bytes to file
+            self.process = ctx.Process(
+                target=self._write_bytes_to_file_with_queue,
+                args=(original_bytes, original_file_path, len(async_fn_args[1]), global_results_queue)
+            )
+            self.process.start()
+            
+            logger.info(f"rank: {rank}, started original checkpoint save process, "
+                       f"will write {original_size / (1024**2):.2f} MB to {original_file_path}")
+        else:
+            # Use original async function for non-gemini mode
+            self.process = ctx.Process(
+                target=async_req.async_fn, args=async_fn_args, kwargs=async_req.async_fn_kwargs
+            )
+            self.process.start()
         
         # init_time = time()
         # logger.debug(f"rank: {rank}, takes {init_time - self.start_time} to schedule async ckpt ")
+    
+    def _get_original_file_path(self, write_buckets):
+        """Get original checkpoint file path from write_buckets.
+        
+        Args:
+            write_buckets: List of write buckets (file_name, storage_key, data)
+            
+        Returns:
+            str: Original file path
+        """
+        import os
+        
+        if not write_buckets or len(write_buckets) == 0:
+            raise ValueError("write_buckets is empty, cannot determine file path")
+        
+        # Get the first bucket's file name (assuming all buckets are in the same directory)
+        first_bucket = write_buckets[0]
+        if isinstance(first_bucket, tuple) and len(first_bucket) >= 3:
+            file_name, _, _ = first_bucket
+            return file_name
+        else:
+            raise ValueError(f"Invalid bucket format: {first_bucket}")
     
     def _get_replica_file_path(self, write_buckets, rank):
         """Get replica file path from write_buckets by adding _replica_on_rank{id} suffix.
@@ -639,6 +689,7 @@ class TemporalAsyncCaller(AsyncCaller):
         
         This function is designed to be called in a separate process to write
         the received checkpoint data directly to disk without deserialization.
+        Used for replica checkpoint saving (no results queue needed).
         
         Args:
             data_bytes: Bytes data to write
@@ -660,6 +711,64 @@ class TemporalAsyncCaller(AsyncCaller):
             f.write(data_bytes)
 
         _logger.info(f"Successfully wrote {len(data_bytes) / (1024**2):.2f} MB to {file_path}")
+    
+    @staticmethod
+    def _write_bytes_to_file_with_queue(data_bytes: bytes, file_path: str, num_buckets: int, global_results_queue):
+        """Write bytes directly to file and put results to queue.
+        
+        This function is designed to be called in a separate process to write
+        the original checkpoint data directly to disk without deserialization.
+        It also reports write results to the global_results_queue.
+        
+        Args:
+            data_bytes: Bytes data to write
+            file_path: Target file path
+            num_buckets: Number of write buckets (for results reporting)
+            global_results_queue: Queue to report write results
+        """
+        import os
+        import logging
+        from time import time
+        
+        # Get logger for this module
+        _logger = logging.getLogger(__name__)
+        
+        w_start = time()
+        
+        try:
+            # Ensure directory exists
+            file_dir = os.path.dirname(file_path)
+            if file_dir:
+                os.makedirs(file_dir, exist_ok=True)
+            
+            # Write bytes directly to file
+            with open(file_path, 'wb') as f:
+                f.write(data_bytes)
+
+            _logger.info(f"Successfully wrote {len(data_bytes) / (1024**2):.2f} MB to {file_path}")
+            
+            # Create write results compatible with FileSystemWriterAsync.retrieve_write_results
+            # It expects a dict with keys 0..num_buckets-1, each containing a list of WriteResult
+            write_results_or_exc = {}
+            for i in range(num_buckets):
+                # Create empty WriteResult list for each bucket
+                # Since we're writing serialized bytes directly, we don't have individual WriteResult objects
+                # But we need to maintain the expected structure
+                write_results_or_exc[i] = []
+            
+            # Put results to queue if provided
+            if global_results_queue is not None:
+                global_results_queue.put(write_results_or_exc)
+            
+            w_end = time()
+            _logger.info(f"Write with queue took {w_end - w_start:.2f}s")
+            
+        except Exception as e:
+            _logger.error(f"Failed to write bytes to file: {e}")
+            # Put exception to queue
+            if global_results_queue is not None:
+                global_results_queue.put(RuntimeError(f"Write failed: {e}"))
+            raise
 
     def is_current_async_call_done(self, blocking: bool = False, no_dist: bool = False) -> bool:
         """Check if async save is finished on all ranks.

@@ -2240,6 +2240,10 @@ def _add_checkpointing_args(parser):
     # use gemini checkpointing arguments
     group.add_argument('--use-gemini', action='store_true',
                        help='Enable Gemini checkpointing. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')
+    group.add_argument('--use-gemini-software-failure', action='store_true',
+                       help='Enable Gemini checkpointing for software failure. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')
+    group.add_argument('--use-gemini-hardware-failure', action='store_true',
+                       help='Enable Gemini checkpointing for hardware failure. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')
     return parser
 
 

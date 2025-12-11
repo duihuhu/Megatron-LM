@@ -2052,7 +2052,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             torch.distributed.broadcast(replica_tensor, src=rank, group=pair_group)
             
             logger.info(f"rank: {rank}, sent replica data to rank2")
-            return {}
+            
+            # Step 6: Rank0 also needs to load its own checkpoint from file
+            logger.info(f"rank: {rank}, loading own checkpoint from saved file")
+            return self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
         elif rank == 2:
             # Rank2: Receive data from rank0 and restore state_dict
             logger.info(f"rank: {rank}, receiving replica data from rank0 for recovery")
@@ -2094,6 +2097,81 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info(f"rank: {rank}, successfully restored state_dict from rank0's replica data")
             return loaded_state_dict
     
+    def _load_from_saved_checkpoint_file(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+        """Load checkpoint from saved checkpoint file (for non-recovery ranks).
+        
+        This method is used by ranks that are not participating in rank2 recovery.
+        It reads the checkpoint file that was saved by _write_bytes_to_file_with_queue.
+        
+        Args:
+            sharded_state_dict: Sharded state dict template for loading
+            checkpoint_dir: Checkpoint directory
+            
+        Returns:
+            StateDict: Loaded state dict from saved file
+        """
+        import mmap
+        
+        rank = torch.distributed.get_rank()
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        logger.info(f"rank: {rank}, loading checkpoint from saved file")
+        
+        # Find the checkpoint file for this rank: __{rank}_0.distcp
+        checkpoint_files = list(checkpoint_dir.glob(f"__{rank}_0.distcp"))
+        
+        if not checkpoint_files:
+            logger.error(f"rank: {rank}, no checkpoint file found")
+            raise FileNotFoundError(f"No checkpoint file found for rank {rank}")
+        
+        checkpoint_file_path = checkpoint_files[0]
+        logger.info(f"rank: {rank}, found checkpoint file: {checkpoint_file_path}")
+        
+        # Read the checkpoint file using mmap (zero-copy)
+        checkpoint_data_bytes = None
+        checkpoint_file_size = 0
+        
+        try:
+            with open(checkpoint_file_path, 'rb') as f:
+                # Get file size
+                f.seek(0, 2)  # Seek to end
+                checkpoint_file_size = f.tell()
+                f.seek(0)  # Seek back to start
+                
+                # Memory-map the file for zero-copy access
+                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                
+                # Read all data from mmap
+                checkpoint_data_bytes = mm[:]
+                
+                # Close mmap
+                mm.close()
+            
+            logger.info(f"rank: {rank}, read {checkpoint_file_size / (1024**2):.2f} MB from checkpoint file using mmap")
+        
+        except Exception as e:
+            logger.error(f"rank: {rank}, failed to read checkpoint file: {e}", exc_info=True)
+            raise
+        
+        # Deserialize the checkpoint data (write_buckets)
+        try:
+            checkpoint_buffer = io.BytesIO(checkpoint_data_bytes)
+            write_buckets = torch.load(checkpoint_buffer, map_location='cpu', weights_only=False)
+            
+            logger.info(f"rank: {rank}, deserialized write_buckets from checkpoint file, "
+                       f"got {len(write_buckets)} buckets")
+        
+        except Exception as e:
+            logger.error(f"rank: {rank}, failed to deserialize checkpoint data: {e}", exc_info=True)
+            raise
+        
+        # Restore state_dict from write_buckets
+        loaded_state_dict = self._restore_state_dict_from_write_buckets(
+            write_buckets, sharded_state_dict
+        )
+        
+        logger.info(f"rank: {rank}, successfully restored state_dict from saved checkpoint file")
+        return loaded_state_dict
     
     def _load_gemini_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Load checkpoint using Gemini (replica) backup data with mmap.
@@ -3262,17 +3340,19 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # Gemini checkpoint recovery for rank2 failure scenario
         # Only rank0 and rank2 participate in recovery, but ALL ranks must synchronize
-        rank2_recovered_state_dict = None
-        if input_args.use_gemini:
+        recovered_state_dict = None
+        if input_args.use_gemini and input_args.use_gemini_hardware_failure:
             # Check if this is a rank2 recovery scenario
             is_rank2_recovery = (rank == 2 or pair_rank == 2)
             
             if is_rank2_recovery:
                 logger.info(f"rank: {rank}, using Gemini checkpoint recovery for rank2 failure")
                 # Only rank0 (pair_rank=2) and rank2 participate in recovery
-                rank2_recovered_state_dict = self._load_gemini_checkpoint_recovery(sharded_state_dict, checkpoint_dir)
+                recovered_state_dict = self._load_gemini_checkpoint_recovery(sharded_state_dict, checkpoint_dir)
             else:
-                logger.info(f"rank: {rank}, not participating in rank2 recovery, waiting at barrier")
+                logger.info(f"rank: {rank}, not participating in rank2 recovery, loading from own checkpoint file")
+                # Other ranks (rank1, rank3) load from their own saved checkpoint files
+                recovered_state_dict = self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
             
             # ALL ranks must synchronize here (including rank1 and rank3)
             # This ensures no rank proceeds to collective operations while others are still in recovery
@@ -3280,14 +3360,14 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 torch.distributed.barrier()
                 logger.info(f"rank: {rank}, synchronized after Gemini recovery check")
             
-            # If rank2 successfully recovered, we still need to participate in collective ops
-            # in the standard load flow, but will return the recovered data at the end
-            if rank == 2 and rank2_recovered_state_dict:
-                logger.info(f"rank: {rank}, rank2 recovery successful, will participate in collective ops then return")
-            
-            # Other ranks continue to standard load flow
-            if not is_rank2_recovery:
-                logger.info(f"rank: {rank}, continuing to standard load flow")
+            # All ranks have loaded their data, return it directly
+            if recovered_state_dict:
+                logger.info(f"rank: {rank}, returning loaded state dict")
+                return recovered_state_dict
+        
+        if input_args.use_gemini and input_args.use_gemini_software_failure:
+            logger.info(f"rank: {rank}, using Gemini checkpoint recovery for software failure")
+            return self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
         
         # Normal Gemini checkpoint load (mutual exchange between paired ranks, and all rank recovery from peer replication)
         # if input_args.use_gemini:
@@ -3338,46 +3418,16 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Load PyT Distributed format
         logger.info(f"rank: {rank}, starting checkpoint.load_state_dict")
         
-        # Special handling for rank2 recovery: still call load_state_dict for collective ops
-        # but catch any errors since rank2 has no checkpoint files
-        if input_args.use_gemini and rank == 2 and rank2_recovered_state_dict is not None:
-            logger.info(f"rank: {rank}, rank2 has recovered data, but still participating in collective ops")
-            # Rank2 needs to participate in collective operations inside load_state_dict
-            # Even though it will fail to read files, it must participate in collectives
-            try:
-                fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
-                checkpoint.load_state_dict(
-                    pyt_state_dict,
-                    fsr,
-                    planner=MCoreLoadPlanner(
-                        shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
-                        allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
-                    ),
-                )
-                logger.info(f"rank: {rank}, finished checkpoint.load_state_dict (unexpected success)")
-            # except Exception as e:
-            #     logger.info(f"ran: {rank}, checkpoint.load_state_dict failed as expected (no files): {e}")
-            except FileNotFoundError as e:
-                logger.info(f"rank: {rank}, checkpoint.load_state_dict failed as expected (no files): {e}")
-                # This is expected for rank2, continue to return recovered data
-        else:
-            
-            fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
-            checkpoint.load_state_dict(
-                pyt_state_dict,
-                fsr,
-                planner=MCoreLoadPlanner(
-                    shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
-                    allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
-                ),
-            )
-            logger.info(f"rank: {rank}, finished checkpoint.load_state_dict")
-
-        # If rank2 has recovered data, return that directly (skip standard load processing)
-        # Only rank2 should return recovered data, not rank0
-        if input_args.use_gemini and rank == 2 and rank2_recovered_state_dict is not None:
-            logger.info(f"rank: {rank}, returning Gemini recovered state_dict (skipped standard load)")
-            return rank2_recovered_state_dict
+        fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
+        checkpoint.load_state_dict(
+            pyt_state_dict,
+            fsr,
+            planner=MCoreLoadPlanner(
+                shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
+                allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+            ),
+        )
+        logger.info(f"rank: {rank}, finished checkpoint.load_state_dict")
         
         self.cached_global_metadata = (
             fsr.read_metadata()

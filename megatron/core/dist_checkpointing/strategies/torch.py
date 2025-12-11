@@ -1609,6 +1609,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # Initialize strategy-specific EC-CHECK state
         self.eccheck_p2p_buffers = None
+        
+        # Initialize rank2 recovery state
+        self.eccheck_recovered_buffer = None
+        self.eccheck_recovered_metadata = None
+        self.eccheck_recovered_registry = None
     
         self.pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
@@ -1849,31 +1854,27 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             recv_total_size=recv_total_size,
         )
         
-        # For rank2 recovery: reconstruct loaded_state_dict from own_buffer and metadata
+        # For rank2 recovery: save recovered data for later use in _load_eccheck_checkpoint
         if rank == failed_rank:
-            logger.info(f"EC-CHECK: [Rank {rank}] Reconstructing loaded_state_dict from recovered data")
-            loaded_state_dict = self._reconstruct_state_dict_from_eccheck_buffer(
-                recv_own_buffer=recv_own_buffer,
-                mapped_file_own=mapped_file_own,
-                registry=registry
-            )
-            if loaded_state_dict is not None:
-                logger.info(f"EC-CHECK: [Rank {rank}] Successfully reconstructed loaded_state_dict")
-                return mapped_file_own, mapped_file_partner, loaded_state_dict
+            logger.info(f"EC-CHECK: [Rank {rank}] Saving recovered buffer for _load_eccheck_checkpoint")
+            # Store recovered data in instance variables for _load_eccheck_checkpoint to use
+            self.eccheck_recovered_buffer = recv_own_buffer
+            self.eccheck_recovered_metadata = mapped_file_own
+            self.eccheck_recovered_registry = registry
         
         # Return EccheckMappedFile, non_tensor_data, and local_metadata for each file
         return mapped_file_own, mapped_file_partner
     
-    def _reconstruct_state_dict_from_eccheck_buffer(
+    def _extract_decomposed_from_buffer(
         self,
         recv_own_buffer: torch.Tensor,
         mapped_file_own,
         registry
-    ) -> Optional[StateDict]:
-        """Reconstruct loaded_state_dict from recovered buffer and metadata for rank2.
+    ):
+        """Extract DecomposedStateDict from recovered buffer and metadata for rank2.
         
         This function extracts tensors from recv_own_buffer using metadata from
-        mapped_file_own.local_metadata and builds a state_dict structure.
+        mapped_file_own.local_metadata and builds a DecomposedStateDict structure.
         
         Args:
             recv_own_buffer: Buffer containing recovered tensor data
@@ -1881,10 +1882,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             registry: GlobalMetadataRegistry with complete metadata
             
         Returns:
-            Optional[StateDict]: Reconstructed state dict, or None if reconstruction fails
+            DecomposedStateDict: Decomposed state dict with tensor_infos, tensor_data, and non_tensor_data
         """
         import io
-        from .state_dict_decomposer import TensorInfo, DecomposedStateDict, reconstruct_state_dict
+        from .state_dict_decomposer import TensorInfo, DecomposedStateDict
         
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         
@@ -1955,22 +1956,19 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             logger.info(f"EC-CHECK: [Rank {rank}] Extracted {len(tensor_data)} tensors from buffer")
             
-            # Create DecomposedStateDict
+            # Create and return DecomposedStateDict
             decomposed = DecomposedStateDict(
                 non_tensor_data=non_tensor_data,
                 tensor_infos=tensor_infos,
                 tensor_data=tensor_data
             )
             
-            # Reconstruct state_dict using reconstruct_state_dict
-            state_dict = reconstruct_state_dict(decomposed)
-            
-            logger.info(f"EC-CHECK: [Rank {rank}] Successfully reconstructed state_dict with {len(state_dict)} top-level keys")
-            return state_dict
+            logger.info(f"EC-CHECK: [Rank {rank}] Successfully created DecomposedStateDict with {len(tensor_data)} tensors")
+            return decomposed
             
         except Exception as e:
-            logger.error(f"EC-CHECK: [Rank {rank}] Failed to reconstruct state_dict from buffer: {e}", exc_info=True)
-            return None
+            logger.error(f"EC-CHECK: [Rank {rank}] Failed to extract DecomposedStateDict from buffer: {e}", exc_info=True)
+            raise
     
     def _load_gemini_checkpoint_recovery(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Load checkpoint for rank2 failure recovery scenario.
@@ -3040,23 +3038,41 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         
-        # Find the EC-CHECK file for this rank
-        # Ensure checkpoint_dir is a Path object
-        checkpoint_dir = Path(checkpoint_dir)
-        # EC-CHECK uses standard .distcp extension but with custom ECCK format
-        eccheck_file = checkpoint_dir / f'__{rank}_0.distcp'
-        
-        if not eccheck_file.exists():
-            raise FileNotFoundError(
-                f"EC-CHECK file not found for rank {rank}: {eccheck_file}"
+        # Check if rank2 has recovered data from P2P pipeline
+        if (rank == 2 and hasattr(self, 'eccheck_recovered_buffer') 
+            and self.eccheck_recovered_buffer is not None):
+            logger.info(f"EC-CHECK: [Rank {rank}] Using recovered data from P2P pipeline")
+            
+            # Extract tensors from recovered buffer using saved metadata
+            decomposed = self._extract_decomposed_from_buffer(
+                self.eccheck_recovered_buffer,
+                self.eccheck_recovered_metadata,
+                self.eccheck_recovered_registry
             )
-        
-        logger.info(f"Loading EC-CHECK checkpoint from {eccheck_file}")
-        
-        # Load the decomposed state dict from file
-        decomposed = FileSystemWriterAsync.load_eccheck_components_from_file(
-            str(eccheck_file)
-        )
+            
+            # Clear saved data
+            self.eccheck_recovered_buffer = None
+            self.eccheck_recovered_metadata = None
+            self.eccheck_recovered_registry = None
+        else:
+            # Normal path: load from file
+            # Find the EC-CHECK file for this rank
+            # Ensure checkpoint_dir is a Path object
+            checkpoint_dir = Path(checkpoint_dir)
+            # EC-CHECK uses standard .distcp extension but with custom ECCK format
+            eccheck_file = checkpoint_dir / f'__{rank}_0.distcp'
+            
+            if not eccheck_file.exists():
+                raise FileNotFoundError(
+                    f"EC-CHECK file not found for rank {rank}: {eccheck_file}"
+                )
+            
+            logger.info(f"Loading EC-CHECK checkpoint from {eccheck_file}")
+            
+            # Load the decomposed state dict from file
+            decomposed = FileSystemWriterAsync.load_eccheck_components_from_file(
+                str(eccheck_file)
+            )
 
         # Build index map from loaded tensor_infos
         # Map: (fqn, global_offset) → (tensor_info, tensor_data)
@@ -3281,17 +3297,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         if input_args.use_eccheck and (self._is_eccheck_checkpoint(checkpoint_dir) or rank == 2):
             logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
-            result = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
+            # Load P2P checkpoint data (for rank2 recovery, this prepares the buffer)
+            mapped_file_own, mapped_file_partner = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
             
-            # Check if rank2 recovery returned loaded_state_dict
-            if len(result) == 3:
-                mapped_file_own, mapped_file_partner, loaded_state_dict = result
-                if loaded_state_dict is not None and rank == 2:
-                    logger.info(f"EC-CHECK: [Rank {rank}] Returning recovered loaded_state_dict")
-                    return loaded_state_dict
-            else:
-                mapped_file_own, mapped_file_partner = result
-    
+            # _load_eccheck_checkpoint will use recovered data if available (rank2)
             return self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
         
         # Apply N-D tensors resharding
@@ -3331,7 +3340,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # Special handling for rank2 recovery: still call load_state_dict for collective ops
         # but catch any errors since rank2 has no checkpoint files
-        if rank == 2 and rank2_recovered_state_dict is not None:
+        if input_args.use_gemini and rank == 2 and rank2_recovered_state_dict is not None:
             logger.info(f"rank: {rank}, rank2 has recovered data, but still participating in collective ops")
             # Rank2 needs to participate in collective operations inside load_state_dict
             # Even though it will fail to read files, it must participate in collectives
@@ -3366,7 +3375,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
         # If rank2 has recovered data, return that directly (skip standard load processing)
         # Only rank2 should return recovered data, not rank0
-        if rank == 2 and rank2_recovered_state_dict is not None:
+        if input_args.use_gemini and rank == 2 and rank2_recovered_state_dict is not None:
             logger.info(f"rank: {rank}, returning Gemini recovered state_dict (skipped standard load)")
             return rank2_recovered_state_dict
         

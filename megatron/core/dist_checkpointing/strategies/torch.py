@@ -2524,40 +2524,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if self.eccheck_p2p_buffers is not None:
                 partner_buffer = self.eccheck_p2p_buffers['partner_buffer']
                 
-                # Read actual data from partner_file into partner_buffer
-                partner_actual_bytes = min(partner_tensor_buffer_size, max_total_bytes)
-                if partner_actual_bytes > 0:
-                    if mapped_file_partner.memory_address is not None:
-                        partner_source_addr = mapped_file_partner.memory_address + partner_tensor_buffer_start_offset
-                        partner_dest_addr = p2p_partner_buffer_base_addr
-                        
-                        # Copy actual data using ctypes
-                        source_ptr = ctypes.cast(partner_source_addr, ctypes.POINTER(ctypes.c_uint8))
-                        dest_ptr = ctypes.cast(partner_dest_addr, ctypes.POINTER(ctypes.c_uint8))
-                        ctypes.memmove(dest_ptr, source_ptr, partner_actual_bytes)
-                    else:
-                        # Fallback: use mmap slice and torch
-                        partner_source_data = mapped_file_partner.mmap_object[
-                            partner_tensor_buffer_start_offset:partner_tensor_buffer_start_offset + partner_actual_bytes
-                        ]
-                        import numpy as np
-                        np_array = np.frombuffer(partner_source_data, dtype=np.uint8)
-                        partner_buffer[:partner_actual_bytes].copy_(torch.from_numpy(np_array))
-                
-                    # Fill remaining space with zeros (for pipeline synchronization)
-                    if partner_actual_bytes < max_total_bytes:
-                        padding_size = max_total_bytes - partner_actual_bytes
-                        partner_buffer[partner_actual_bytes:max_total_bytes].fill_(0)
-                        logger.debug(
-                            f"EC-CHECK: [Rank {rank}] Pre-filled partner_buffer with zeros "
-                            f"({padding_size / (1024**2):.2f} MB padding)"
-                        )
-                
-                logger.info(
-                    f"EC-CHECK: [Rank {rank}] Pre-processed partner_file: "
-                    f"{partner_actual_bytes / (1024**2):.2f} MB actual data, "
-                    f"{(max_total_bytes - partner_actual_bytes) / (1024**2):.2f} MB padding"
-                )
+                # Do not pre-fill partner_buffer here; pipeline loop will copy actual data
+                # and pad with zeros per chunk to max_total_bytes.
             else:
                 logger.warning(f"EC-CHECK: [Rank {rank}] partner_buffer not available for preprocessing")
         elif (rank == 0 or rank == 3) and mapped_file_partner.memory_address is not None:
@@ -2738,15 +2706,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             torch.cuda.synchronize()
             logger.info("EC-CHECK: Load pipeline: Pipeline completed")
             
-            # Reset load mode flag after load pipeline completes
-            self.eccheck_manager._eccheck_native.set_load_mode(False, -1)
-            logger.info("EC-CHECK: Reset load mode after load pipeline completion")
-            
         finally:
-            # Deactivate buffer poller
-            if mgr._buffer_poller_active_event:
-                mgr._buffer_poller_active_event.clear()
-                logger.info("EC-CHECK: Deactivated buffer poller after load pipeline")
+            pass
     
     def prepare_for_load_pipeline_test(self):
         """

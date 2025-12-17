@@ -21,8 +21,11 @@ class ECLATINManager:
     
     This class provides a singleton instance that manages:
     - ECLATIN C++ native module (_eclatin_native)
-    - Buffer allocation and management (data, encoding, parity buffers)
+    - Buffer allocation and management (data and recv buffers, pooled)
     - Buffer poller thread for releasing buffers
+    
+    Note: The 4 persistent blocks (data_block_1/2, parity_block_1/2) are allocated
+    in strategy after metadata exchange, not in manager.
     
     Both TorchDistSaveShardedStrategy and TorchDistLoadShardedStrategy
     can share the same manager instance to reuse initialized resources.
@@ -50,21 +53,18 @@ class ECLATINManager:
         
         # Buffer configuration
         self.eclatin_data_buffers_count = 12
-        self.eclatin_encoding_buffers_count = 24  # data_count * m (12 * 2)
+        self.eclatin_recv_buffers_count = 12  # Pooled recv buffers
         self.eclatin_buffer_size = 64 * 1024 * 1024  # 64MB
         self.eclatin_pin_memory = True
         
-        # Buffers
+        # Buffers (simplified: only data and recv pools)
         self.eclatin_data_buffers: Optional[List[torch.Tensor]] = None
-        self.eclatin_encoding_buffers: Optional[List[torch.Tensor]] = None
-        self.eclatin_recv_encoding_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        self.eclatin_parity_buffers: Optional[List[torch.Tensor]] = None
-        self.eclatin_p2p_buffers: Optional[Dict[str, torch.Tensor]] = None
+        self.eclatin_recv_buffers: Optional[List[torch.Tensor]] = None  # Pooled recv buffers
+        # Note: The 4 persistent blocks (data_block_1/2, parity_block_1/2) are allocated in strategy
         
-        # Free buffer queues
+        # Free buffer queues (simplified)
         self._free_data_buffer_queue: Optional[queue.Queue] = None
-        self._free_encoding_buffer_queue: Optional[queue.Queue] = None
-        self._free_parity_buffer_queue: Optional[queue.Queue] = None
+        self._free_recv_buffer_queue: Optional[queue.Queue] = None
         
         # Buffer poller thread
         self._buffer_poller_thread: Optional[threading.Thread] = None
@@ -449,50 +449,35 @@ class ECLATINManager:
     def _init_eclatin_buffers(self):
         """Initialize ECLATIN buffers during C++ module initialization.
         
-        Note: Only allocates data and encoding buffers at initialization.
-        Receive and parity buffers will be allocated after metadata exchange,
-        when peer data sizes are known.
+        Note: Only allocates data and recv buffers (pooled) at initialization.
+        The 4 persistent blocks (data_block_1/2, parity_block_1/2) will be allocated
+        in strategy after metadata exchange.
         """
         rank = torch.distributed.get_rank()
-        logger.info("ECLATIN: Initializing buffers for ECLATIN (data and encoding only)")
-        print(f"ECLATIN: Initializing buffers for ECLATIN (rank={rank}, data and encoding only)")
+        logger.info("ECLATIN: Initializing buffers for ECLATIN (data and recv pools only)")
+        print(f"ECLATIN: Initializing buffers for ECLATIN (rank={rank}, data and recv pools only)")
         
         # Allocate data buffers for storing original tensor data
         self.eclatin_data_buffers = self._allocate_data_buffers()
         
-        # Allocate encoding buffers for encoded packets
-        self.eclatin_encoding_buffers = self._allocate_encoding_buffers()
-        
-        # Allocate receive buffers for peer encoded packets (will be allocated later)
-        self.eclatin_recv_encoding_buffers = None
-        
-        # Allocate parity buffers for XOR computation results
-        self.eclatin_parity_buffers = self._allocate_parity_buffers()
-        
-        # Allocate P2P buffers (will be allocated after metadata exchange)
-        self.eclatin_p2p_buffers = None
+        # Allocate recv buffers (pooled) for receiving data
+        self.eclatin_recv_buffers = self._allocate_recv_buffers()
         
         # Initialize free buffer queues
         self._free_data_buffer_queue = queue.Queue()
         for buffer in self.eclatin_data_buffers:
             self._free_data_buffer_queue.put(int(buffer.data_ptr()))
         
-        self._free_encoding_buffer_queue = queue.Queue()
-        for buffer in self.eclatin_encoding_buffers:
-            self._free_encoding_buffer_queue.put(int(buffer.data_ptr()))
-        
-        self._free_parity_buffer_queue = queue.Queue()
-        for buffer in self.eclatin_parity_buffers:
-            self._free_parity_buffer_queue.put(int(buffer.data_ptr()))
+        self._free_recv_buffer_queue = queue.Queue()
+        for buffer in self.eclatin_recv_buffers:
+            self._free_recv_buffer_queue.put(int(buffer.data_ptr()))
 
         logger.info(f"ECLATIN: Buffer initialization completed - "
                    f"Data buffers: {len(self.eclatin_data_buffers)}, "
-                   f"Encoding buffers: {len(self.eclatin_encoding_buffers)}, "
-                   f"Parity buffers: {len(self.eclatin_parity_buffers)}")
+                   f"Recv buffers: {len(self.eclatin_recv_buffers)}")
         print(f"ECLATIN: Buffer initialization completed (rank={rank}) - "
               f"Data buffers: {len(self.eclatin_data_buffers)}, "
-              f"Encoding buffers: {len(self.eclatin_encoding_buffers)}, "
-              f"Parity buffers: {len(self.eclatin_parity_buffers)}")
+              f"Recv buffers: {len(self.eclatin_recv_buffers)}")
     
     def _allocate_data_buffers(self):
         """Allocate data buffers for storing original tensor data."""
@@ -507,65 +492,41 @@ class ECLATINManager:
         logger.info(f"ECLATIN: Allocated {len(data_buffers)} data buffers")
         return data_buffers
     
-    def _allocate_encoding_buffers(self):
-        """Allocate encoding buffers for encoded packets."""
-        logger.info(f"ECLATIN: Allocating encoding buffers ({self.eclatin_encoding_buffers_count} buffers, {self.eclatin_buffer_size // (1024*1024)}MB each)")
+    def _allocate_recv_buffers(self):
+        """Allocate recv buffers (pooled) for receiving data."""
+        logger.info(f"ECLATIN: Allocating recv buffers ({self.eclatin_recv_buffers_count} buffers, {self.eclatin_buffer_size // (1024*1024)}MB each)")
         
-        encoding_buffers = []
-        for i in range(self.eclatin_encoding_buffers_count):
+        recv_buffers = []
+        for i in range(self.eclatin_recv_buffers_count):
             buffer = torch.empty(self.eclatin_buffer_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory)
-            encoding_buffers.append(buffer)
-            logger.debug(f"ECLATIN: Allocated encoding buffer {i}: {self.eclatin_buffer_size} bytes")
+            recv_buffers.append(buffer)
+            logger.debug(f"ECLATIN: Allocated recv buffer {i}: {self.eclatin_buffer_size} bytes")
         
-        logger.info(f"ECLATIN: Allocated {len(encoding_buffers)} encoding buffers")
-        return encoding_buffers
-    
-    def _allocate_parity_buffers(self):
-        """Allocate parity buffers for XOR computation results.
-        
-        Note: Parity buffer count should match encoding buffer count (24) to support
-        pipelined operations where each data chunk needs 2 parity buffers (one per thread).
-        """
-        # Use encoding buffer count instead of data buffer count
-        # Each data chunk needs 2 parity buffers (thread1 and thread2)
-        parity_buffer_count = self.eclatin_encoding_buffers_count
-        logger.info(f"ECLATIN: Allocating parity buffers ({parity_buffer_count} buffers)")
-        
-        parity_buffers = []
-        for i in range(parity_buffer_count):
-            buffer = torch.empty(self.eclatin_buffer_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory)
-            parity_buffers.append(buffer)
-            logger.debug(f"ECLATIN: Allocated parity buffer {i}: {self.eclatin_buffer_size} bytes")
-        
-        logger.info(f"ECLATIN: Allocated {len(parity_buffers)} parity buffers")
-        return parity_buffers
+        logger.info(f"ECLATIN: Allocated {len(recv_buffers)} recv buffers")
+        return recv_buffers
     
     def _poll_and_release_buffers(self):
         """Poll C++ for buffers ready to be released and put them back to queues."""
         if self._eclatin_native is None:
             return
         
-        # ECLATIN uses unified get_buffers_to_release() method
-        # TODO: Need to determine buffer type and route to appropriate queue
-        # For now, this is a placeholder - actual implementation depends on buffer type identification
-        buffers = self._eclatin_native.get_buffers_to_release()
-        for buffer_addr in buffers:
-            # TODO: Determine buffer type (data/encoding/parity) and route accordingly
-            # This requires additional logic to identify buffer types
-            # For now, try to put in all queues (will fail if not matching)
+        # Get data buffers ready for release
+        data_buffers = self._eclatin_native.get_data_buffers_to_release()
+        for data_addr in data_buffers:
             try:
-                self._free_data_buffer_queue.put_nowait(buffer_addr)
-                logger.info(f"ECLATIN: Released buffer at address {buffer_addr} (routed to data queue)")
-            except:
-                try:
-                    self._free_encoding_buffer_queue.put_nowait(buffer_addr)
-                    logger.info(f"ECLATIN: Released buffer at address {buffer_addr} (routed to encoding queue)")
-                except:
-                    try:
-                        self._free_parity_buffer_queue.put_nowait(buffer_addr)
-                        logger.debug(f"ECLATIN: Released buffer at address {buffer_addr} (routed to parity queue)")
-                    except Exception:
-                        logger.error(f"ECLATIN: All buffer queues are full, cannot release buffer {buffer_addr}")
+                self._free_data_buffer_queue.put_nowait(data_addr)
+                logger.debug(f"ECLATIN: Released data buffer at address {data_addr}")
+            except Exception:
+                logger.error(f"ECLATIN: Data buffer queue is full, cannot release buffer {data_addr}")
+        
+        # Get recv buffers ready for release
+        recv_buffers = self._eclatin_native.get_recv_buffers_to_release()
+        for recv_addr in recv_buffers:
+            try:
+                self._free_recv_buffer_queue.put_nowait(recv_addr)
+                logger.debug(f"ECLATIN: Released recv buffer at address {recv_addr}")
+            except Exception:
+                logger.error(f"ECLATIN: Recv buffer queue is full, cannot release buffer {recv_addr}")
     
     def _start_buffer_poller_thread(self):
         """Start a persistent background thread to poll and release buffers."""
@@ -627,9 +588,9 @@ class ECLATINManager:
     def get_eclatin_buffers(self):
         """Get ECLATIN buffers for FileSystemWriterAsync.
         
-        Note: Returns data, encoding, and parity buffers.
-        Receive buffers will be allocated by FileSystemWriterAsync
-        after metadata exchange.
+        Note: Returns data and recv buffers (pooled).
+        The 4 persistent blocks (data_block_1/2, parity_block_1/2) will be allocated
+        in strategy after metadata exchange.
         
         Returns:
             Dict containing all buffer information, or None if not initialized
@@ -639,69 +600,15 @@ class ECLATINManager:
         
         return {
             'data_buffers': self.eclatin_data_buffers,
-            'encoding_buffers': self.eclatin_encoding_buffers,
-            'parity_buffers': self.eclatin_parity_buffers,
+            'recv_buffers': self.eclatin_recv_buffers,
             'free_data_buffer_queue': self._free_data_buffer_queue,
-            'free_encoding_buffer_queue': self._free_encoding_buffer_queue,
-            'free_parity_buffer_queue': self._free_parity_buffer_queue,
+            'free_recv_buffer_queue': self._free_recv_buffer_queue,
             # Pass buffer poller control objects
             'buffer_poller_active_event': self._buffer_poller_active_event,
             'poll_and_release_buffers': self._poll_and_release_buffers,
-            # Note: recv_encoding_buffers will be allocated by FileSystemWriterAsync after metadata exchange
+            # Note: The 4 persistent blocks (data_block_1/2, parity_block_1/2) 
+            # will be allocated in strategy after metadata exchange
         }
-    
-    def allocate_recv_encoding_buffers_phase2(self, global_registry: GlobalMetadataRegistry):
-        """
-        Allocate TWO large receive buffers for peer encoded packets (one per encoding thread).
-        
-        Each buffer is equal to peer's total data size, aligned to buffer_size (64MB).
-        This is called after metadata exchange when peer data sizes are known.
-        
-        Args:
-            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
-            
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Two receive buffers (one for thread1, one for thread2)
-        """
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        paired_rank = self._get_xor_paired_rank(rank, world_size)
-        
-        # Get peer's total data size from global registry (actual reference)
-        peer_metadata = global_registry.rank_metadata.get(paired_rank, [])
-        peer_total_size = sum(meta.size_bytes for meta in peer_metadata)
-        
-        # Calculate maximum total size across all ranks for pipeline synchronization
-        max_total_size = 0
-        for r in range(world_size):
-            rank_metadata = global_registry.rank_metadata.get(r, [])
-            rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
-            if rank_total_size > max_total_size:
-                max_total_size = rank_total_size
-        
-        # Align maximum size to buffer_size (64MB) so recv buffers match pipeline iterations
-        aligned_size = ((max_total_size + self.eclatin_buffer_size - 1) // self.eclatin_buffer_size) * self.eclatin_buffer_size
-        
-        logger.info(
-            f"ECLATIN: Allocating TWO receive buffers using global maximum size\n"
-            f"  Paired rank: {paired_rank}\n"
-            f"  Peer data size: {peer_total_size / (1024**3):.2f} GB\n"
-            f"  Pipeline max size: {max_total_size / (1024**3):.2f} GB\n"
-            f"  Aligned buffer size (per buffer): {aligned_size / (1024**3):.2f} GB\n"
-            f"  Total receive memory: {2 * aligned_size / (1024**3):.2f} GB"
-        )
-        
-        # Allocate two large continuous buffers (one for each encoding thread)
-        recv_buffer_thread1 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory)
-        recv_buffer_thread2 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory)
-        
-        logger.info(
-            f"ECLATIN: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "
-            f"({aligned_size / (1024**2):.0f} MB each)"
-        )
-        
-        self.eclatin_recv_encoding_buffers = (recv_buffer_thread1, recv_buffer_thread2)
-        return (recv_buffer_thread1, recv_buffer_thread2)
     
     def cleanup(self):
         """Cleanup ECLATIN resources when manager is destroyed."""

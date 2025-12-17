@@ -497,14 +497,26 @@ public:
     }
 
     // Release helpers: Python can poll these to free buffers.
-    std::vector<uintptr_t> get_buffers_to_release() {
-        std::vector<uintptr_t> res;
-        std::lock_guard<std::mutex> lk(release_mutex_);
-        while (!release_q_.empty()) {
-            res.push_back(release_q_.front());
-            release_q_.pop();
+    // Data buffers are released after send operations complete
+    std::vector<uintptr_t> get_data_buffers_to_release() {
+        std::vector<uintptr_t> buffers;
+        std::lock_guard<std::mutex> lock(release_queue_mutex_);
+        while (!data_buffers_to_release_.empty()) {
+            buffers.push_back(data_buffers_to_release_.front());
+            data_buffers_to_release_.pop();
         }
-        return res;
+        return buffers;
+    }
+    
+    // Recv buffers are released after recv_xor operations complete (XOR done)
+    std::vector<uintptr_t> get_recv_buffers_to_release() {
+        std::vector<uintptr_t> buffers;
+        std::lock_guard<std::mutex> lock(release_queue_mutex_);
+        while (!recv_buffers_to_release_.empty()) {
+            buffers.push_back(recv_buffers_to_release_.front());
+            recv_buffers_to_release_.pop();
+        }
+        return buffers;
     }
 
     void reset_encoding_completion_flags() {
@@ -641,8 +653,10 @@ private:
     std::mutex parity2_recv_xor_mutex_;
     std::condition_variable parity2_recv_xor_cv_;
 
-    std::queue<uintptr_t> release_q_;
-    std::mutex release_mutex_;
+    // Separate release queues for data and recv buffers
+    std::queue<uintptr_t> data_buffers_to_release_;
+    std::queue<uintptr_t> recv_buffers_to_release_;
+    std::mutex release_queue_mutex_;
 
     // Completion flags
     std::atomic<bool> parity1_send1_completed_;
@@ -832,11 +846,12 @@ private:
             xor_array[2] = parity_ptr;
             xor_gen(3, static_cast<int>(task.size), xor_array);
 
-            // Release recv buffers (parity managed by Python)
+            // Release recv buffers after XOR operation completes
+            // Note: parity_addr is managed by Python, not released here
             {
-                std::lock_guard<std::mutex> lk(release_mutex_);
-                release_q_.push(task.recv1_addr);
-                release_q_.push(task.recv2_addr);
+                std::lock_guard<std::mutex> lk(release_queue_mutex_);
+                recv_buffers_to_release_.push(task.recv1_addr);
+                recv_buffers_to_release_.push(task.recv2_addr);
             }
 
             if (parity1_recv_xor_sentinel_received_.load()) {
@@ -880,8 +895,11 @@ private:
             if (conn_.is_parity1_send1_connected()) {
                 send_with_size(conn_.get_parity1_send1_socket(), task.addr, task.size);
             }
-            std::lock_guard<std::mutex> lk(release_mutex_);
-            release_q_.push(task.addr);
+            // Release data buffer after send operation completes
+            {
+                std::lock_guard<std::mutex> lk(release_queue_mutex_);
+                data_buffers_to_release_.push(task.addr);
+            }
 
             if (parity1_send1_sentinel_received_.load()) {
                 std::lock_guard<std::mutex> lock(parity1_send1_mutex_);
@@ -924,8 +942,11 @@ private:
             if (conn_.is_parity1_send2_connected()) {
                 send_with_size(conn_.get_parity1_send2_socket(), task.addr, task.size);
             }
-            std::lock_guard<std::mutex> lk(release_mutex_);
-            release_q_.push(task.addr);
+            // Release data buffer after send operation completes
+            {
+                std::lock_guard<std::mutex> lk(release_queue_mutex_);
+                data_buffers_to_release_.push(task.addr);
+            }
 
             if (parity1_send2_sentinel_received_.load()) {
                 std::lock_guard<std::mutex> lock(parity1_send2_mutex_);
@@ -1058,11 +1079,12 @@ private:
             xor_array[2] = parity_ptr;
             xor_gen(3, static_cast<int>(task.size), xor_array);
 
-            // Release recv buffers (parity managed by Python)
+            // Release recv buffers after XOR operation completes
+            // Note: parity_addr is managed by Python, not released here
             {
-                std::lock_guard<std::mutex> lk(release_mutex_);
-                release_q_.push(task.recv1_addr);
-                release_q_.push(task.recv2_addr);
+                std::lock_guard<std::mutex> lk(release_queue_mutex_);
+                recv_buffers_to_release_.push(task.recv1_addr);
+                recv_buffers_to_release_.push(task.recv2_addr);
             }
 
             if (parity2_recv_xor_sentinel_received_.load()) {
@@ -1106,8 +1128,11 @@ private:
             if (conn_.is_parity2_send1_connected()) {
                 send_with_size(conn_.get_parity2_send1_socket(), task.addr, task.size);
             }
-            std::lock_guard<std::mutex> lk(release_mutex_);
-            release_q_.push(task.addr);
+            // Release data buffer after send operation completes
+            {
+                std::lock_guard<std::mutex> lk(release_queue_mutex_);
+                data_buffers_to_release_.push(task.addr);
+            }
 
             if (parity2_send1_sentinel_received_.load()) {
                 std::lock_guard<std::mutex> lock(parity2_send1_mutex_);
@@ -1150,8 +1175,11 @@ private:
             if (conn_.is_parity2_send2_connected()) {
                 send_with_size(conn_.get_parity2_send2_socket(), task.addr, task.size);
             }
-            std::lock_guard<std::mutex> lk(release_mutex_);
-            release_q_.push(task.addr);
+            // Release data buffer after send operation completes
+            {
+                std::lock_guard<std::mutex> lk(release_queue_mutex_);
+                data_buffers_to_release_.push(task.addr);
+            }
 
             if (parity2_send2_sentinel_received_.load()) {
                 std::lock_guard<std::mutex> lock(parity2_send2_mutex_);
@@ -1202,7 +1230,8 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("parity_addr"),
              pybind11::arg("size"))
         // Common functions
-        .def("get_buffers_to_release", &ECLATINNative::get_buffers_to_release)
+        .def("get_data_buffers_to_release", &ECLATINNative::get_data_buffers_to_release)
+        .def("get_recv_buffers_to_release", &ECLATINNative::get_recv_buffers_to_release)
         .def("reset_encoding_completion_flags", &ECLATINNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECLATINNative::wait_for_encoding_completion)
         // Parity 1 sentinels

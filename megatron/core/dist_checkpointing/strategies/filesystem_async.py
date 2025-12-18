@@ -118,6 +118,11 @@ class FileSystemWriterAsync(FileSystemWriter):
         eccheck_buffer_size: int = 64 * 1024 * 1024,
         eccheck_native: Optional[Any] = None,  # Pre-initialized C++ module
         eccheck_buffers: Optional[Dict] = None,  # Pre-allocated buffers
+        use_eclatin: bool = False,
+        eclatin_pin_memory: bool = True,
+        eclatin_buffer_size: int = 64 * 1024 * 1024,
+        eclatin_native: Optional[Any] = None,  # Pre-initialized C++ module
+        eclatin_buffers: Optional[Dict] = None,  # Pre-allocated buffers
         **kwargs,
     ):
         self.checkpoint_dir = path
@@ -132,6 +137,11 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eccheck_m = eccheck_m  # Number of encoded packets per data packet
 
         self.eccheck_buffer_size = eccheck_buffer_size  # Buffer size in bytes
+        
+        # ECLATIN configuration
+        self.use_eclatin = use_eclatin
+        self.eclatin_pin_memory = eclatin_pin_memory
+        self.eclatin_buffer_size = eclatin_buffer_size  # Buffer size in bytes
 
         super().__init__(path, *args, **kwargs)
         if not self.single_file_per_rank:
@@ -180,6 +190,35 @@ class FileSystemWriterAsync(FileSystemWriter):
         else:
             self._eccheck_native = None
             self._eccheck_shared = False
+        
+        # ECLATIN intermediate state
+        self.eclatin_serialized_metadata: Optional[Dict] = None
+        
+        # ECLATIN Phase 2 & 3 state
+        self.eclatin_global_registry = None  # GlobalMetadataRegistry from all ranks
+        self.eclatin_data_buffers = None  # List of data buffers (pooled)
+        self.eclatin_recv_buffers = None  # List of recv buffers (pooled)
+        # Note: 4 persistent blocks (data_block_1/2, parity_block_1/2) will be allocated in strategy
+        
+        # ECLATIN buffer poller thread (persistent, created once, shared with ECCHECK if both enabled)
+        self._eclatin_buffer_poller_thread = None
+        self._eclatin_buffer_poller_stop_event = None
+        self._eclatin_buffer_poller_active_event = None  # Controls when polling is active
+        
+        self.ecl_write_buckets = None
+        # Initialize C++ native module if available
+        if eclatin_native is not None:
+            # Use pre-initialized C++ module from strategy
+            self._eclatin_native = eclatin_native
+            self._eclatin_shared = True  # Mark as shared module
+            logger.info("ECLATIN: Using pre-initialized C++ native module from strategy")
+            
+            # Use pre-allocated buffers from strategy
+            if eclatin_buffers is not None:
+                self._setup_eclatin_buffers_from_strategy(eclatin_buffers)
+        else:
+            self._eclatin_native = None
+            self._eclatin_shared = False
 
     def __del__(self):
         """
@@ -228,6 +267,36 @@ class FileSystemWriterAsync(FileSystemWriter):
             f"Encoding: {len(self.eccheck_encoding_buffers)}, "
             f"Parity: {len(self.eccheck_parity_buffers) if self.eccheck_parity_buffers else 0}, "
             f"Buffer poller: {'shared from strategy' if self._buffer_poller_active_event else 'will create own'}"
+        )
+
+    def _setup_eclatin_buffers_from_strategy(self, buffers):
+        """Set up ECLATIN buffers from pre-allocated strategy buffers.
+        
+        Note: Sets up data and recv buffers (pooled) from strategy.
+        The 4 persistent blocks (data_block_1/2, parity_block_1/2) will be allocated
+        in strategy after metadata exchange.
+        """
+        self.eclatin_data_buffers = buffers['data_buffers']
+        self.eclatin_recv_buffers = buffers['recv_buffers']
+        self._free_eclatin_data_buffer_queue = buffers['free_data_buffer_queue']
+        self._free_eclatin_recv_buffer_queue = buffers['free_recv_buffer_queue']
+        
+        # Use buffer poller from strategy (already running)
+        self._eclatin_buffer_poller_active_event = buffers.get('buffer_poller_active_event')
+        # Store the strategy's poll method with a different name to avoid conflict
+        self._eclatin_strategy_poll_and_release_buffers = buffers.get('poll_and_release_buffers')
+        
+        # Mark that we're using shared buffer poller (don't start our own)
+        self._eclatin_buffer_poller_shared = True
+        
+        # Persistent blocks are NOT set here
+        # They will be allocated in strategy after metadata exchange
+        
+        logger.info(
+            f"ECLATIN: Using pre-allocated buffers from strategy - "
+            f"Data: {len(self.eclatin_data_buffers)}, "
+            f"Recv: {len(self.eclatin_recv_buffers)}, "
+            f"Buffer poller: {'shared from strategy' if self._eclatin_buffer_poller_active_event else 'will create own'}"
         )
 
 
@@ -340,6 +409,24 @@ class FileSystemWriterAsync(FileSystemWriter):
             return None, None, []
         
         transform_list = [self.transforms] if hasattr(self, "transforms") else []
+        
+        # ECLATIN mode: use special preload function
+        # The preload function will embed ECLATIN data in write_buckets
+        if self.use_eclatin:
+            # Ensure eclatin blocks are available
+            if self.eclatin_blocks is None:
+                logger.warning("ECLATIN: eclatin_blocks not set, falling back to normal mode")
+                return (
+                    partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
+                    partial(self.preload_tensors, self.write_buckets, True),
+                    [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+                )
+            
+            return (
+                partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
+                partial(self._eclatin_preload_tensors_to_buffer, True),
+                [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+            )
         
         # EC-CHECK mode: use special preload function
         # The preload function will embed EC-CHECK data in write_buckets
@@ -549,8 +636,154 @@ class FileSystemWriterAsync(FileSystemWriter):
                     elif key == 'eccheck_continuous_buffer':
                         eccheck_continuous_buffer = value
             
+            # Check if this is ECLATIN mode by detecting special markers in bytes_data
+            eclatin_metadata = None
+            eclatin_continuous_buffer = None
+            if len(bytes_data) > 0 and bytes_data[0][0] == 'eclatin_metadata':
+                # ECLATIN mode detected
+                logger.info(f"ECLATIN: Process {local_proc_idx} detected ECLATIN mode")
+                for key, value in bytes_data:
+                    if key == 'eclatin_metadata':
+                        eclatin_metadata = value
+                    elif key == 'eclatin_continuous_buffer':
+                        eclatin_continuous_buffer = value
+            
+            # ECLATIN mode: save three components to ONE file (similar to ECCHECK)
+            if eclatin_metadata is not None:
+                if use_msc:
+                    import multistorageclient as msc
+                    open_file = msc.open
+                else:
+                    open_file = open
+                
+                write_start = time()
+                logger.info("ECLATIN: Saving three components to single file...")
+                
+                # Get file path (file_name is the full path)
+                eclatin_file_path = str(file_name)
+                
+                # Prepare header with component sizes
+                import struct
+                non_tensor_size = eclatin_metadata['non_tensor_size']
+                tensor_keys_size = eclatin_metadata['tensor_keys_size']
+                tensor_buffer_size = eclatin_metadata['tensor_buffer_size']
+                
+                # Determine if this is a data block or parity block
+                is_data_block = 'data_block' in storage_key
+                is_parity_block = 'parity_block' in storage_key
+                block_type = "data" if is_data_block else ("parity" if is_parity_block else "unknown")
+                
+                if eclatin_continuous_buffer is not None:
+                    buffer_size = eclatin_continuous_buffer.numel()
+                    
+                    # For data blocks: write only actual data portion (half of total, since data is split)
+                    # For parity blocks: write full aligned half size (include padding)
+                    if is_data_block:
+                        # Data blocks: write only actual data portion (half of total tensor_buffer_size)
+                        # Each data block stores half of the total data
+                        write_size = tensor_buffer_size // 2
+                        if write_size > buffer_size:
+                            logger.warning(
+                                f"ECLATIN: Write size ({write_size}) > buffer size ({buffer_size}), "
+                                f"writing entire buffer"
+                            )
+                            write_size = buffer_size
+                    elif is_parity_block:
+                        # Parity blocks: write full aligned half size (aligned_half_block_size)
+                        write_size = buffer_size
+                    else:
+                        # Fallback: write actual data size
+                        write_size = min(tensor_buffer_size, buffer_size)
+                        logger.warning(
+                            f"ECLATIN: Unknown block type in storage_key '{storage_key}', "
+                            f"writing {write_size} bytes"
+                        )
+                    
+                    # Header format: magic(4) + padding(4) + 3 sizes(8 each) = 32 bytes
+                    # Magic number: 'ECLT' (ECLATIN)
+                    header = struct.pack(
+                        '4sQQQ',
+                        b'ECLT',              # Magic number
+                        non_tensor_size,      # Component 1 size
+                        tensor_keys_size,     # Component 2 size
+                        write_size,           # Component 3 size (actual or aligned)
+                    )
+                    
+                    # Write all three components to one file
+                    with open_file(eclatin_file_path, "wb") as f:
+                        # Write header
+                        header_start = time()
+                        f.write(header)
+                        logger.debug(f"ECLATIN: Wrote header in {time() - header_start:.4f}s")
+                        
+                        # Write Component 1: Non-tensor key-value pairs
+                        comp1_start = time()
+                        f.write(eclatin_metadata['non_tensor_data'])
+                        comp1_time = time() - comp1_start
+                        logger.debug(f"ECLATIN: Wrote Component 1 ({non_tensor_size / 1024:.2f} KB) in {comp1_time:.4f}s")
+                        
+                        # Write Component 2: Tensor keys
+                        comp2_start = time()
+                        f.write(eclatin_metadata['tensor_keys_data'])
+                        comp2_time = time() - comp2_start
+                        logger.debug(f"ECLATIN: Wrote Component 2 ({tensor_keys_size / 1024:.2f} KB) in {comp2_time:.4f}s")
+                        
+                        # Write Component 3: Block data
+                        component3_start = time()
+                        import numpy as np
+                        np_array = eclatin_continuous_buffer[:write_size].numpy()  # Zero-copy view
+                        mv = memoryview(np_array)
+                        
+                        # Write data at once
+                        f.write(mv)
+                        component3_size = mv.nbytes
+                        
+                        # Verify size matches
+                        if component3_size != write_size:
+                            logger.warning(
+                                f"ECLATIN: Size mismatch: wrote {component3_size} bytes, "
+                                f"expected {write_size} bytes"
+                            )
+                        
+                        component3_time = time() - component3_start
+                        bandwidth = (component3_size / (1024**3)) / component3_time if component3_time > 0 else 0
+                        logger.info(
+                            f"ECLATIN: Wrote Component 3 ({component3_size / (1024**3):.2f} GB) "
+                            f"in {component3_time:.2f}s ({bandwidth:.2f} GB/s), "
+                            f"{block_type} block (excluded {buffer_size - write_size} bytes padding)"
+                        )
+                        
+                        # Flush to disk
+                        if use_fsync:
+                            if use_msc:
+                                f.fsync()
+                            else:
+                                os.fsync(f.fileno())
+                    
+                    total_size = len(header) + non_tensor_size + tensor_keys_size + component3_size
+                    total_write_time = time() - write_start
+                    overall_bandwidth = (total_size / (1024**3)) / total_write_time if total_write_time > 0 else 0
+                    
+                    logger.info(
+                        f"ECLATIN: Saved all components in {total_write_time:.2f}s:\n"
+                        f"  File: {eclatin_file_path}\n"
+                        f"  Block type: {block_type}\n"
+                        f"  Total size: {total_size / (1024**3):.2f} GB\n"
+                        f"  Overall bandwidth: {overall_bandwidth:.2f} GB/s\n"
+                        f"  Breakdown:\n"
+                        f"    Header: 32 bytes\n"
+                        f"    Component 1: {non_tensor_size / 1024:.2f} KB ({comp1_time:.4f}s)\n"
+                        f"    Component 2: {tensor_keys_size / 1024:.2f} KB ({comp2_time:.4f}s)\n"
+                        f"    Component 3: {component3_size / (1024**3):.2f} GB ({component3_time:.2f}s)"
+                    )
+                else:
+                    logger.error("ECLATIN: Continuous buffer is None, cannot write Component 3")
+                
+                # Create dummy results for compatibility
+                local_results = []
+            
             # EC-CHECK mode: save three components to ONE file
-            if eccheck_metadata is not None:
+            elif eccheck_metadata is not None:
                 if use_msc:
                     import multistorageclient as msc
                     open_file = msc.open
@@ -1246,6 +1479,483 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Buffer poller will be deactivated in the outer finally block
         # logger.info("EC-CHECK: All encoding operations completed")
+    
+    def _eclatin_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
+        """
+        ECLATIN version: Transfer tensors from GPU to preallocated CPU buffer and submit to C++ pipelines.
+        
+        This method transfers tensor data from GPU to the preallocated CPU buffer
+        in a pipelined manner, enabling overlap with subsequent encoding operations.
+        
+        Args:
+            non_blocking (bool): if True, use non-blocking GPU-to-CPU transfer
+        
+        Returns:
+            List[WriteBucket]: List of WriteBuckets for the 4 blocks
+        """
+        if not self.decomposed_state_dict:
+            raise RuntimeError("ECLATIN: State dict not decomposed yet")
+        
+        logger.info("ECLATIN: Starting GPU-to-CPU tensor transfer...")
+        start = time()
+        
+        # Step 1: Get actual data size for this rank
+        actual_total_size = self.decomposed_state_dict.total_tensor_size_bytes
+        
+        # Step 2: Calculate maximum data size across all ranks
+        if (torch.distributed.is_initialized() and 
+            hasattr(self, 'eclatin_global_registry') and 
+            self.eclatin_global_registry is not None):
+            all_total_bytes_list = []
+            for r in range(torch.distributed.get_world_size()):
+                rank_metadata = self.eclatin_global_registry.rank_metadata.get(r, [])
+                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                all_total_bytes_list.append(rank_total_size)
+            max_total_bytes = max(all_total_bytes_list)
+        else:
+            max_total_bytes = actual_total_size
+        
+        # Step 3: Allocate buffer with maximum size (for pipeline synchronization)
+        if self.preallocated_cpu_buffer is not None:
+            buffer = self.preallocated_cpu_buffer
+            if buffer.numel() < max_total_bytes:
+                logger.warning(
+                    f"ECLATIN: Preallocated buffer ({buffer.numel() / (1024**3):.2f} GB) "
+                    f"is smaller than max_total_bytes ({max_total_bytes / (1024**3):.2f} GB). "
+                    f"Reallocating..."
+                )
+                if self.eclatin_pin_memory and torch.cuda.is_available():
+                    buffer = torch.empty(max_total_bytes, dtype=torch.uint8).pin_memory()
+                else:
+                    buffer = torch.empty(max_total_bytes, dtype=torch.uint8)
+        else:
+            if self.eclatin_pin_memory and torch.cuda.is_available():
+                buffer = torch.empty(max_total_bytes, dtype=torch.uint8).pin_memory()
+            else:
+                buffer = torch.empty(max_total_bytes, dtype=torch.uint8)
+        
+        logger.info(
+            f"ECLATIN: Allocated continuous CPU buffer: {max_total_bytes / (1024**3):.2f} GB "
+            f"(actual data: {actual_total_size / (1024**3):.2f} GB, "
+            f"padding: {(max_total_bytes - actual_total_size) / (1024**3):.2f} GB)"
+        )
+        
+        # Step 4: Transfer tensors from GPU to continuous CPU buffer
+        num_gpu_tensors = 0
+        offset = 0
+        for info, tensor in zip(
+            self.decomposed_state_dict.tensor_infos,
+            self.decomposed_state_dict.tensor_data
+        ):
+            tensor_size = info.size_bytes
+            buffer_view = buffer[offset:offset + tensor_size]
+            tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
+            buffer_view.copy_(tensor_flat, non_blocking=non_blocking)
+            
+            if tensor.device.type != 'cpu':
+                num_gpu_tensors += 1
+            
+            info.offset = offset
+            info.device = torch.device('cpu')
+            offset += tensor_size
+        
+        # Step 5: Fill remaining space with zeros (for pipeline synchronization)
+        if offset < max_total_bytes:
+            padding_size = max_total_bytes - offset
+            buffer[offset:max_total_bytes].fill_(0)
+            logger.debug(
+                f"ECLATIN: Filled {padding_size / (1024**2):.2f} MB with zeros "
+                f"for pipeline synchronization"
+            )
+        
+        # Synchronize if using non-blocking transfers
+        if non_blocking and num_gpu_tensors > 0:
+            torch.cuda.synchronize()
+        
+        # Step 6: Store the continuous buffer
+        self.tensor_buffer = buffer
+        self.actual_tensor_buffer_size = actual_total_size
+        self.pipeline_total_bytes = max_total_bytes
+        
+        transfer_time = time() - start
+        total_gb = actual_total_size / (1024**3)
+        bandwidth = total_gb / transfer_time if transfer_time > 0 else 0
+        
+        logger.info(
+            f"ECLATIN: Transferred {total_gb:.2f} GB in {transfer_time:.2f}s "
+            f"({bandwidth:.2f} GB/s), {num_gpu_tensors} tensors from GPU to CPU"
+        )
+        
+        # Step 7: Verify blocks and buffers are set
+        if not hasattr(self, 'eclatin_blocks') or self.eclatin_blocks is None:
+            raise RuntimeError(
+                "ECLATIN: Blocks not set. Should be passed from strategy "
+                "after _prepare_eclatin_data completes."
+            )
+        
+        if not hasattr(self, 'eclatin_data_buffers') or self.eclatin_data_buffers is None:
+            raise RuntimeError(
+                "ECLATIN: Data buffers not set. Should be passed from strategy."
+            )
+        
+        if not hasattr(self, 'eclatin_recv_buffers') or self.eclatin_recv_buffers is None:
+            raise RuntimeError(
+                "ECLATIN: Recv buffers not set. Should be passed from strategy."
+            )
+        
+        # Step 8: Execute pipelines
+        exec_start = time()
+        self._execute_eclatin_pipelines()
+        exec_time = time() - exec_start
+        
+        logger.info(f"ECLATIN: Pipeline execution completed in {exec_time:.2f}s")
+        
+        # Step 9: Update self.write_buckets and return (consistent with ECCHECK)
+        # This ensures retrieve_write_results() can check the correct count
+        if hasattr(self, 'ecl_write_buckets') and self.ecl_write_buckets:
+            # Update paths with current checkpoint_dir (similar to ECCHECK)
+            result_buckets = []
+            for bucket in self.ecl_write_buckets:
+                file_path, storage_key, data = bucket
+                # Extract file name from path
+                if isinstance(file_path, (str, Path)):
+                    file_path_obj = Path(file_path)
+                    file_name = file_path_obj.name
+                else:
+                    file_name = str(file_path).split('/')[-1] if '/' in str(file_path) else str(file_path)
+                
+                # Build new path with current checkpoint_dir
+                new_file_path = Path(self.checkpoint_dir) / file_name
+                result_buckets.append((new_file_path, storage_key, data))
+            
+            # Update self.write_buckets so retrieve_write_results() can check the correct count
+            self.write_buckets = result_buckets
+            return result_buckets
+        else:
+            return []
+
+    def _execute_eclatin_pipelines(self) -> None:
+        """
+        Execute ECLATIN pipelines: Copy data to blocks and submit to 6 C++ pipelines.
+        """
+        logger.info("ECLATIN: Starting pipeline execution...")
+        
+        # Activate buffer poller if available
+        if hasattr(self, '_eclatin_buffer_poller_active_event'):
+            if self._eclatin_buffer_poller_active_event is not None:
+                self._eclatin_buffer_poller_active_event.set()
+                logger.debug("ECLATIN: Activated buffer poller")
+        
+        try:
+            # Copy tensor data to blocks and submit to pipelines
+            self._copy_tensor_data_to_eclatin_blocks()
+        finally:
+            # Deactivate buffer poller
+            if hasattr(self, '_eclatin_buffer_poller_active_event'):
+                if self._eclatin_buffer_poller_active_event is not None:
+                    self._eclatin_buffer_poller_active_event.clear()
+                    logger.debug("ECLATIN: Deactivated buffer poller")
+
+    def _copy_tensor_data_to_eclatin_blocks(self) -> None:
+        """Copy tensor data to 4 blocks and submit to 6 C++ pipelines."""
+        
+        def get_free_data_buffer():
+            """Get a free data buffer address, blocking if none available."""
+            if hasattr(self, '_eclatin_strategy_poll_and_release_buffers'):
+                self._eclatin_strategy_poll_and_release_buffers()
+            
+            try:
+                return self._free_eclatin_data_buffer_queue.get(timeout=5.0)
+            except queue.Empty:
+                logger.error("ECLATIN: TIMEOUT waiting for free data buffer!")
+                logger.error(f"ECLATIN: Data buffer queue size: {self._free_eclatin_data_buffer_queue.qsize()}")
+                return self._free_eclatin_data_buffer_queue.get()
+        
+        def get_free_recv_buffer():
+            """Get a free recv buffer address, blocking if none available."""
+            if hasattr(self, '_eclatin_strategy_poll_and_release_buffers'):
+                self._eclatin_strategy_poll_and_release_buffers()
+            
+            try:
+                return self._free_eclatin_recv_buffer_queue.get(timeout=5.0)
+            except queue.Empty:
+                logger.error("ECLATIN: TIMEOUT waiting for free recv buffer!")
+                return self._free_eclatin_recv_buffer_queue.get()
+        
+        # Get 4 blocks from eclatin_blocks
+        data_block_1 = self.eclatin_blocks['data_block_1']
+        data_block_2 = self.eclatin_blocks['data_block_2']
+        parity_block_1 = self.eclatin_blocks['parity_block_1']
+        parity_block_2 = self.eclatin_blocks['parity_block_2']
+        
+        # Calculate base addresses
+        data_block_1_base = int(data_block_1.data_ptr())
+        data_block_2_base = int(data_block_2.data_ptr())
+        parity_block_1_base = int(parity_block_1.data_ptr())
+        parity_block_2_base = int(parity_block_2.data_ptr())
+        
+        # Initialize offsets (will be 64-byte aligned when used)
+        data_block_1_offset = 0
+        data_block_2_offset = 0
+        parity_block_1_offset = 0
+        parity_block_2_offset = 0
+        
+        # Get block sizes (all should be the same - aligned_size)
+        aligned_block_size = self.eclatin_blocks['aligned_size']
+        block_size = aligned_block_size
+        
+        # Process continuous tensor buffer sequentially
+        # Use pipeline_total_bytes (padded size) to ensure all ranks have same iterations
+        total_bytes = self.pipeline_total_bytes
+        actual_data_bytes = self.actual_tensor_buffer_size
+        
+        # Split total_bytes into two halves
+        half_total = total_bytes // 2  # Divide pipeline_total_bytes into two halves
+        
+        src_pos = 0  # Current position in continuous tensor buffer (for iteration)
+        
+        logger.info(
+            f"ECLATIN: Processing {total_bytes / (1024**3):.2f} GB "
+            f"(actual: {actual_data_bytes / (1024**3):.2f} GB) "
+            f"in chunks of {self.eclatin_buffer_size / (1024**2):.0f} MB, "
+            f"split into two halves of {half_total / (1024**3):.2f} GB each"
+        )
+        
+        import ctypes
+        
+        while src_pos < half_total:
+            # Calculate chunk size
+            remaining_in_source = total_bytes - src_pos
+            take = min(self.eclatin_buffer_size, remaining_in_source)
+            
+            # Get 4 data buffers (to avoid release coordination issues in C++)
+            buffer1_addr = get_free_data_buffer()  # For parity1_send1 (data_block_1 part)
+            buffer2_addr = get_free_data_buffer()  # For parity1_send2 (data_block_2 part)
+            buffer3_addr = get_free_data_buffer()  # For parity2_send1 (data_block_1 part, same as buffer1)
+            buffer4_addr = get_free_data_buffer()  # For parity2_send2 (data_block_2 part, same as buffer2)
+            
+            # Copy from first half to buffer1 and buffer3 (data_block_1 part)
+            buffer1_ptr = ctypes.cast(buffer1_addr, ctypes.POINTER(ctypes.c_uint8))
+            buffer1_array = ctypes.cast(buffer1_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
+            buffer3_ptr = ctypes.cast(buffer3_addr, ctypes.POINTER(ctypes.c_uint8))
+            buffer3_array = ctypes.cast(buffer3_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
+            
+            # Source position in first half
+            src_pos_half1 = src_pos  # Position in first half
+            if src_pos_half1 < half_total:
+                bytes_to_copy_half1 = min(take, half_total - src_pos_half1)
+                if src_pos_half1 < actual_data_bytes:
+                    actual_bytes_half1 = min(bytes_to_copy_half1, actual_data_bytes - src_pos_half1)
+                    src_data_half1 = self.tensor_buffer[src_pos_half1: src_pos_half1 + actual_bytes_half1].numpy()
+                    ctypes.memmove(buffer1_array.contents, src_data_half1.ctypes.data, actual_bytes_half1)
+                    ctypes.memmove(buffer3_array.contents, src_data_half1.ctypes.data, actual_bytes_half1)
+                    
+                    if bytes_to_copy_half1 > actual_bytes_half1:
+                        padding_size = bytes_to_copy_half1 - actual_bytes_half1
+                        padding_ptr1 = ctypes.cast(
+                            ctypes.addressof(buffer1_array.contents) + actual_bytes_half1,
+                            ctypes.POINTER(ctypes.c_uint8)
+                        )
+                        padding_ptr3 = ctypes.cast(
+                            ctypes.addressof(buffer3_array.contents) + actual_bytes_half1,
+                            ctypes.POINTER(ctypes.c_uint8)
+                        )
+                        ctypes.memset(padding_ptr1, 0, padding_size)
+                        ctypes.memset(padding_ptr3, 0, padding_size)
+                    
+                    if take > bytes_to_copy_half1:
+                        # Fill remaining with zeros
+                        remaining_padding = take - bytes_to_copy_half1
+                        remaining_ptr1 = ctypes.cast(
+                            ctypes.addressof(buffer1_array.contents) + bytes_to_copy_half1,
+                            ctypes.POINTER(ctypes.c_uint8)
+                        )
+                        remaining_ptr3 = ctypes.cast(
+                            ctypes.addressof(buffer3_array.contents) + bytes_to_copy_half1,
+                            ctypes.POINTER(ctypes.c_uint8)
+                        )
+                        ctypes.memset(remaining_ptr1, 0, remaining_padding)
+                        ctypes.memset(remaining_ptr3, 0, remaining_padding)
+                else:
+                    ctypes.memset(buffer1_array.contents, 0, take)
+                    ctypes.memset(buffer3_array.contents, 0, take)
+            else:
+                # Past first half, fill with zeros
+                ctypes.memset(buffer1_array.contents, 0, take)
+                ctypes.memset(buffer3_array.contents, 0, take)
+            
+            # Copy from second half to buffer2 and buffer4 (data_block_2 part)
+            buffer2_ptr = ctypes.cast(buffer2_addr, ctypes.POINTER(ctypes.c_uint8))
+            buffer2_array = ctypes.cast(buffer2_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
+            buffer4_ptr = ctypes.cast(buffer4_addr, ctypes.POINTER(ctypes.c_uint8))
+            buffer4_array = ctypes.cast(buffer4_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
+            
+            # Source position in second half
+            src_pos_half2 = src_pos  # Same src_pos, but we read from second half
+            src_pos_in_second_half = half_total + src_pos_half2  # Position in second half
+            
+            if src_pos_in_second_half < total_bytes:
+                bytes_to_copy_half2 = min(take, total_bytes - src_pos_in_second_half)
+                if src_pos_in_second_half < actual_data_bytes:
+                    actual_bytes_half2 = min(bytes_to_copy_half2, actual_data_bytes - src_pos_in_second_half)
+                    src_data_half2 = self.tensor_buffer[src_pos_in_second_half: src_pos_in_second_half + actual_bytes_half2].numpy()
+                    ctypes.memmove(buffer2_array.contents, src_data_half2.ctypes.data, actual_bytes_half2)
+                    ctypes.memmove(buffer4_array.contents, src_data_half2.ctypes.data, actual_bytes_half2)
+                    
+                    if bytes_to_copy_half2 > actual_bytes_half2:
+                        padding_size = bytes_to_copy_half2 - actual_bytes_half2
+                        padding_ptr2 = ctypes.cast(
+                            ctypes.addressof(buffer2_array.contents) + actual_bytes_half2,
+                            ctypes.POINTER(ctypes.c_uint8)
+                        )
+                        padding_ptr4 = ctypes.cast(
+                            ctypes.addressof(buffer4_array.contents) + actual_bytes_half2,
+                            ctypes.POINTER(ctypes.c_uint8)
+                        )
+                        ctypes.memset(padding_ptr2, 0, padding_size)
+                        ctypes.memset(padding_ptr4, 0, padding_size)
+                    
+                    if take > bytes_to_copy_half2:
+                        # Fill remaining with zeros
+                        remaining_padding = take - bytes_to_copy_half2
+                        remaining_ptr2 = ctypes.cast(
+                            ctypes.addressof(buffer2_array.contents) + bytes_to_copy_half2,
+                            ctypes.POINTER(ctypes.c_uint8)
+                        )
+                        remaining_ptr4 = ctypes.cast(
+                            ctypes.addressof(buffer4_array.contents) + bytes_to_copy_half2,
+                            ctypes.POINTER(ctypes.c_uint8)
+                        )
+                        ctypes.memset(remaining_ptr2, 0, remaining_padding)
+                        ctypes.memset(remaining_ptr4, 0, remaining_padding)
+                else:
+                    ctypes.memset(buffer2_array.contents, 0, take)
+                    ctypes.memset(buffer4_array.contents, 0, take)
+            else:
+                # Past second half, fill with zeros
+                ctypes.memset(buffer2_array.contents, 0, take)
+                ctypes.memset(buffer4_array.contents, 0, take)
+            
+            # Write to data_block_1 and data_block_2 (for persistence)
+            # Calculate write addresses for data blocks (64-byte aligned)
+            data_block_1_offset_aligned = ((data_block_1_offset + 63) // 64) * 64
+            data_block_2_offset_aligned = ((data_block_2_offset + 63) // 64) * 64
+            
+            # Check bounds
+            if data_block_1_offset_aligned + take > block_size:
+                logger.warning(f"ECLATIN: data_block_1 exhausted")
+                break
+            if data_block_2_offset_aligned + take > block_size:
+                logger.warning(f"ECLATIN: data_block_2 exhausted")
+                break
+            
+            data_block_1_write_addr = data_block_1_base + data_block_1_offset_aligned
+            data_block_2_write_addr = data_block_2_base + data_block_2_offset_aligned
+            
+            # Copy to persistent data blocks (only actual data part, not padding)
+            data_block_1_ptr = ctypes.cast(data_block_1_write_addr, ctypes.POINTER(ctypes.c_uint8))
+            data_block_2_ptr = ctypes.cast(data_block_2_write_addr, ctypes.POINTER(ctypes.c_uint8))
+            
+            # Copy from buffers to data blocks (only the actual data portion)
+            if src_pos_half1 < half_total:
+                bytes_to_write_half1 = min(take, half_total - src_pos_half1)
+                if src_pos_half1 < actual_data_bytes:
+                    actual_write_half1 = min(bytes_to_write_half1, actual_data_bytes - src_pos_half1)
+                    ctypes.memmove(data_block_1_ptr, buffer1_array.contents, actual_write_half1)
+                else:
+                    ctypes.memmove(data_block_1_ptr, buffer1_array.contents, bytes_to_write_half1)
+            else:
+                ctypes.memset(data_block_1_ptr, 0, take)
+            
+            if src_pos_in_second_half < total_bytes:
+                bytes_to_write_half2 = min(take, total_bytes - src_pos_in_second_half)
+                if src_pos_in_second_half < actual_data_bytes:
+                    actual_write_half2 = min(bytes_to_write_half2, actual_data_bytes - src_pos_in_second_half)
+                    ctypes.memmove(data_block_2_ptr, buffer2_array.contents, actual_write_half2)
+                else:
+                    ctypes.memmove(data_block_2_ptr, buffer2_array.contents, bytes_to_write_half2)
+            else:
+                ctypes.memset(data_block_2_ptr, 0, take)
+            
+            # Update offsets (use take for data blocks, as they store full chunks)
+            data_block_1_offset = data_block_1_offset_aligned + take
+            data_block_2_offset = data_block_2_offset_aligned + take
+            
+            # Get recv buffers for parity1 (2 buffers for recv_xor)
+            recv1_addr_parity1 = get_free_recv_buffer()
+            recv2_addr_parity1 = get_free_recv_buffer()
+            
+            # Get recv buffers for parity2 (2 buffers for recv_xor)
+            recv1_addr_parity2 = get_free_recv_buffer()
+            recv2_addr_parity2 = get_free_recv_buffer()
+            
+            # Calculate write addresses for parity blocks (64-byte aligned)
+            parity_block_1_offset_aligned = ((parity_block_1_offset + 63) // 64) * 64
+            parity_block_2_offset_aligned = ((parity_block_2_offset + 63) // 64) * 64
+            
+            # Check bounds (parity blocks use take size)
+            if parity_block_1_offset_aligned + take > block_size:
+                logger.warning(f"ECLATIN: parity_block_1 exhausted")
+                break
+            if parity_block_2_offset_aligned + take > block_size:
+                logger.warning(f"ECLATIN: parity_block_2 exhausted")
+                break
+            
+            parity_block_1_write_addr = parity_block_1_base + parity_block_1_offset_aligned
+            parity_block_2_write_addr = parity_block_2_base + parity_block_2_offset_aligned
+            
+            # Update offsets (parity blocks use take size)
+            parity_block_1_offset = parity_block_1_offset_aligned + take
+            parity_block_2_offset = parity_block_2_offset_aligned + take
+            
+            # Verify address alignment
+            assert parity_block_1_write_addr % 64 == 0
+            assert parity_block_2_write_addr % 64 == 0
+            
+            # Submit to 6 pipelines - all use take size (full chunk)
+            # Parity 1 pipelines: send data_block_1 and data_block_2 parts
+            self._eclatin_native.submit_parity1_send1(buffer1_addr, take)  # data_block_1 part, full chunk size
+            self._eclatin_native.submit_parity1_send2(buffer2_addr, take)  # data_block_2 part, full chunk size
+            self._eclatin_native.submit_parity1_recv_xor(
+                recv1_addr_parity1,      # recv1_addr
+                recv2_addr_parity1,      # recv2_addr
+                parity_block_1_write_addr,  # parity_addr
+                take                      # size
+            )
+            
+            # Parity 2 pipelines: send data_block_1 and data_block_2 parts (same data, different buffers)
+            self._eclatin_native.submit_parity2_send1(buffer3_addr, take)  # data_block_1 part, full chunk size
+            self._eclatin_native.submit_parity2_send2(buffer4_addr, take)  # data_block_2 part, full chunk size
+            self._eclatin_native.submit_parity2_recv_xor(
+                recv1_addr_parity2,      # recv1_addr
+                recv2_addr_parity2,      # recv2_addr
+                parity_block_2_write_addr,  # parity_addr
+                take                      # size
+            )
+            
+            src_pos += take
+        
+        logger.info(
+            f"ECLATIN: Processed {src_pos / (1024**3):.2f} GB\n"
+            f"  data_block_1 used: {data_block_1_offset / (1024**3):.2f} GB\n"
+            f"  data_block_2 used: {data_block_2_offset / (1024**3):.2f} GB\n"
+            f"  parity_block_1 used: {parity_block_1_offset / (1024**3):.2f} GB\n"
+            f"  parity_block_2 used: {parity_block_2_offset / (1024**3):.2f} GB"
+        )
+        
+        # Mark end of stream for all 6 pipelines (sentinels)
+        self._eclatin_native.submit_parity1_send1(0, 0)
+        self._eclatin_native.submit_parity1_send2(0, 0)
+        self._eclatin_native.submit_parity1_recv_xor(0, 0, 0, 0)  # Changed from (0, 0, 0, 0, 0) to (0, 0, 0, 0)
+        self._eclatin_native.submit_parity2_send1(0, 0)
+        self._eclatin_native.submit_parity2_send2(0, 0)
+        self._eclatin_native.submit_parity2_recv_xor(0, 0, 0, 0)  # Changed from (0, 0, 0, 0, 0) to (0, 0, 0, 0)
+        
+        # Wait for all pipelines to complete
+        logger.info("ECLATIN: Waiting for all pipelines to complete...")
+        self._eclatin_native.wait_for_encoding_completion()
+        torch.cuda.synchronize()
+        logger.info("ECLATIN: All pipelines completed and CUDA synchronized")
     
     def _eccheck_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
         """

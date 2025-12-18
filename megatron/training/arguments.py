@@ -2237,6 +2237,12 @@ def _add_checkpointing_args(parser):
                        help='Disable CPU memory buffer preallocation for EC-CHECK mode. '
                             'Use this if system memory is limited.')
     
+    # ECLATIN (Erasure Coding Checkpoint with different pipeline) arguments
+    group.add_argument('--use-eclatin', action='store_true',
+                       help='Enable ECLATIN (Erasure Coding Checkpoint with different pipeline) '
+                            'for serialization-free checkpoint encoding. Similar to EC-CHECK but '
+                            'uses a different internal pipeline structure for saving.')
+    
     # use gemini checkpointing arguments
     group.add_argument('--use-gemini', action='store_true',
                        help='Enable Gemini checkpointing. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')

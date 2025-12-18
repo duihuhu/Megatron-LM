@@ -1038,7 +1038,7 @@ private:
                     } else {
                         recv2_success = true;
                     }
-                } catch (const std::exception& e) {
+        } catch (const std::exception& e) {
                     recv2_exception = std::current_exception();
                     recv2_error_msg = std::string("ECLATIN: parity2_recv2 exception: ") + e.what();
                 } catch (...) {

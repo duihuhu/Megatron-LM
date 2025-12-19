@@ -2267,3 +2267,141 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             timers('params-all-gather').stop()
 
         return update_successful
+
+    def _step_with_ready_grads_layer_by_layer(
+        self, layer_params_groups: List[List[torch.nn.Parameter]]
+    ) -> bool:
+        """
+        Step the distributed optimizer layer by layer.
+        
+        Updates parameters layer by layer, with appropriate handling of distributed
+        parameter sharding and all-gather operations.
+        
+        Args:
+            layer_params_groups: List of parameter groups, one per layer
+            
+        Returns:
+            bool: True if update was successful
+        """
+        if self.is_stub_optimizer:
+            return True
+        
+        timers = self.config.timers
+        
+        # Build mapping from model param to shard main param for quick lookup
+        model_to_shard_param_map = {}
+        for model_group, shard_group in zip(
+            self.model_float16_groups, self.shard_fp32_from_float16_groups
+        ):
+            for model_param, shard_param in zip(model_group, shard_group):
+                model_to_shard_param_map[id(model_param)] = shard_param
+        
+        for model_group, shard_group in zip(self.model_fp32_groups, self.shard_fp32_groups):
+            for model_param, shard_param in zip(model_group, shard_group):
+                model_to_shard_param_map[id(model_param)] = shard_param
+        
+        # Step layer by layer
+        if timers is not None:
+            timers('optimizer-layer-by-layer-inner-step', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
+            )
+        
+        for layer_idx, layer_params in enumerate(layer_params_groups):
+            if len(layer_params) == 0:
+                continue
+            
+            # Get shard params for this layer
+            layer_shard_params = []
+            layer_model_params = []
+            for param in layer_params:
+                shard_param = model_to_shard_param_map.get(id(param))
+                if shard_param is not None:
+                    layer_shard_params.append(shard_param)
+                    layer_model_params.append(param)
+            
+            if not layer_shard_params:
+                continue
+            
+            # Log layer update for verification
+            logger.debug(
+                f"[Layer-wise Update] [Distributed] Updating layer {layer_idx}/{len(layer_params_groups)-1} "
+                f"with {len(layer_shard_params)} shard parameters"
+            )
+            
+            # Create temporary param groups for this layer
+            saved_param_groups = []
+            for param_group in self.optimizer.param_groups:
+                original_params = param_group['params']
+                saved_param_groups.append(original_params)
+                
+                # Filter to only include this layer's shard params
+                layer_shard_param_ids = set(id(p) for p in layer_shard_params)
+                param_group['params'] = [p for p in original_params if id(p) in layer_shard_param_ids]
+            
+            # Step optimizer for this layer only
+            self.optimizer.step()
+            
+            # Copy updated shard params back to model params for this layer
+            self._copy_shard_main_params_to_model_params_for_layer(layer_model_params)
+            
+            # Restore original param groups
+            for param_group, original_params in zip(self.optimizer.param_groups, saved_param_groups):
+                param_group['params'] = original_params
+        
+        if timers is not None:
+            timers('optimizer-layer-by-layer-inner-step').stop()
+        
+        # Handle parameter all-gather (same as regular step_with_ready_grads)
+        if timers is not None:
+            timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
+        
+        if self.ddp_config.use_custom_fsdp:
+            for model_chunk in self.model_chunks:
+                model_chunk.start_param_sync()
+        else:
+            if not self.ddp_config.overlap_param_gather:
+                for model_chunk in self.model_chunks:
+                    model_chunk.start_param_sync()
+        
+        if timers is not None:
+            timers('params-all-gather').stop()
+        
+        return True
+
+    def _copy_shard_main_params_to_model_params_for_layer(
+        self, layer_model_params: List[torch.nn.Parameter]
+    ):
+        """
+        Copy updated shard main params back to model params for a specific layer.
+        
+        Args:
+            layer_model_params: List of model parameters for this layer
+        """
+        layer_param_ids = set(id(p) for p in layer_model_params)
+        
+        # When using precision-aware optimizer, copying is handled by the optimizer
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return
+        
+        def copy_group_params(model_groups, shard_main_groups):
+            """Copy params for this layer only."""
+            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                for model_param, shard_main_param in zip(model_group, shard_main_group):
+                    # Only copy if this param is in the current layer
+                    if id(model_param) not in layer_param_ids:
+                        continue
+                    
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_main_param.nelement()
+                    
+                    if is_float8tensor(model_param):
+                        quantize_param_shard(model_param, shard_main_param, param_range)
+                    else:
+                        model_param.view(-1)[
+                            param_range.start : param_range.end
+                        ].data.copy_(shard_main_param)
+        
+        # Copy shard groups to model groups for this layer
+        copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
+        copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)

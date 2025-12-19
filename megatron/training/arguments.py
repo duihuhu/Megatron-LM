@@ -1846,6 +1846,19 @@ def _add_training_args(parser):
                        help='Call torch.cuda.empty_cache() each iteration '
                        '(training and eval), to reduce fragmentation.'
                        '0=off, 1=moderate, 2=aggressive.')
+    group.add_argument('--layer-wise-optimizer-update', action='store_true',
+                       default=False,
+                       help='Update model parameters layer by layer instead of all at once. '
+                       'This can help with memory efficiency and allows for layer-specific '
+                       'update strategies. Gradients are still clipped globally.')
+    group.add_argument('--layer-wise-fallback-grouping', action='store_true',
+                       default=False,
+                       help='When layer-wise update is enabled but layer structure cannot be '
+                       'automatically detected, use fallback grouping strategy that splits '
+                       'parameters into approximately equal-sized groups based on --num-layers.')
+    group.add_argument('--use-layer-transfer', action='store_true',
+                       default=False,
+                       help='Use layer-wise tensor transfer instead of standard tensor transfer.')
     group.add_argument('--deterministic-mode', action='store_true',
                        help='Choose code that has deterministic execution. This usually '
                        'means slower execution, but is good for debugging and testing.')

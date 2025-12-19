@@ -1262,6 +1262,20 @@ def setup_model_and_optimizer(
         #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
         default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
     )
+    # Verify layer-wise update capability
+    if hasattr(args, 'layer_wise_optimizer_update') and args.layer_wise_optimizer_update:
+        if hasattr(optimizer, 'step_layer_by_layer'):
+            print_rank_0(
+                "[VERIFICATION] ✓ Layer-wise optimizer update is SUPPORTED and ENABLED. "
+                f"Optimizer type: {type(optimizer).__name__}"
+            )
+        else:
+            print_rank_0(
+                "[VERIFICATION] ✗ Layer-wise optimizer update was requested but NOT SUPPORTED "
+                f"by optimizer type: {type(optimizer).__name__}. "
+                "Will use standard update instead."
+            )
+    
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
@@ -1386,6 +1400,45 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+def create_layer_groups_by_param_count(optimizer, num_groups=None):
+    """
+    Create layer groups by splitting parameters into approximately equal-sized groups.
+    This is a fallback when automatic layer detection fails.
+    
+    Args:
+        optimizer: The optimizer instance
+        num_groups: Number of groups to create. If None, tries to use args.num_layers
+    
+    Returns:
+        List of parameter groups
+    """
+    args = get_args()
+    params = optimizer.get_parameters()
+    
+    if num_groups is None:
+        # Try to use num_layers from args
+        num_groups = getattr(args, 'num_layers', None)
+        if num_groups is None:
+            # Default to sqrt of total params for reasonable grouping
+            num_groups = max(1, int(len(params) ** 0.5))
+    
+    # Split parameters into groups
+    params_per_group = max(1, len(params) // num_groups)
+    layer_groups = []
+    
+    for i in range(0, len(params), params_per_group):
+        group = params[i:i + params_per_group]
+        if group:
+            layer_groups.append(group)
+    
+    print_rank_0(
+        f"[Layer-wise Update] Created {len(layer_groups)} parameter groups "
+        f"(fallback grouping with ~{params_per_group} params per group)"
+    )
+    
+    return layer_groups
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
     """Single training step."""
     args = get_args()
@@ -1455,7 +1508,42 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    # Check if layer-wise update is enabled
+    use_layer_wise_update = (
+        hasattr(args, 'layer_wise_optimizer_update') 
+        and args.layer_wise_optimizer_update
+        and hasattr(optimizer, 'step_layer_by_layer')
+    )
+    
+    if use_layer_wise_update:
+        # Log verification message on first iteration
+        if args.curr_iteration == args.iteration:
+            print_rank_0(
+                "[VERIFICATION] Layer-wise optimizer update is ENABLED. "
+                "Parameters will be updated layer by layer."
+            )
+        
+        # Try automatic layer detection first, then fallback to manual grouping if needed
+        layer_groups = None
+        if hasattr(args, 'layer_wise_fallback_grouping') and args.layer_wise_fallback_grouping:
+            # Use fallback grouping strategy
+            layer_groups = create_layer_groups_by_param_count(optimizer)
+
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step_layer_by_layer(
+            layer_params_groups=layer_groups
+        )
+    else:
+        # Log if layer-wise was requested but not available
+        if (
+            hasattr(args, 'layer_wise_optimizer_update') 
+            and args.layer_wise_optimizer_update 
+            and args.curr_iteration == args.iteration
+        ):
+            print_rank_0(
+                "[VERIFICATION] Layer-wise optimizer update was requested but not supported "
+                "by current optimizer. Falling back to standard update."
+            )
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,

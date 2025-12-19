@@ -466,11 +466,11 @@ def _get_megatron_optimizer_based_on_param_groups(
                 parallel_state.get_intra_distributed_optimizer_instance_group(),
             )
         else:
-            optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
+            optimizer = Float16OptimizerWithFloat16Params(*optimizer_args, model_chunks=model_chunks)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
-        optimizer = FP32Optimizer(optimizer, config, init_state_fn)
+        optimizer = FP32Optimizer(optimizer, config, init_state_fn, model_chunks=model_chunks)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
     return optimizer

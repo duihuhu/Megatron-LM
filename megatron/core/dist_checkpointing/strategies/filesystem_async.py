@@ -444,7 +444,14 @@ class FileSystemWriterAsync(FileSystemWriter):
                 partial(self._eccheck_preload_tensors_to_buffer, True),
                 [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
             )
-        
+        from megatron.training import get_args
+        args = get_args()
+        if args.use_layer_transfer:
+            return (
+                partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
+                partial(self.preload_tensors_layerwise_cpp, self.write_buckets, True),
+                [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+            )
         # Normal mode
         return (
             partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
@@ -472,6 +479,335 @@ class FileSystemWriterAsync(FileSystemWriter):
             result.append((file_name, storage_key, (bytes_data, tensor_data)))
         if non_blocking:
             torch.cuda.synchronize()
+        return result
+
+    @staticmethod
+    def preload_tensors_layerwise_cpp(write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
+        """
+        Preloads tensors layer-by-layer using C++ thread for coordination.
+        
+        This function organizes model parameters by layer and coordinates their transfer
+        from GPU to CPU using a dedicated C++ worker thread. The actual transfer can be
+        done either by PyTorch (default) or by CUDA in C++ (if compiled with USE_CUDA).
+        
+        Transfer Modes:
+            1. PyTorch mode (default, no CUDA needed in C++):
+               - Python: Allocates CPU buffers and initiates async GPU->CPU copy via PyTorch
+               - C++ thread: Ensures layers complete sequentially
+               - Best for: Easy compilation, works everywhere
+            
+            2. CUDA mode (requires C++ compiled with USE_CUDA):
+               - Python: Only allocates CPU buffers and passes pointers
+               - C++ thread: Performs actual cudaMemcpy for each layer
+               - Best for: Direct control, potentially lower overhead
+        
+        Args:
+            write_buckets (List): List of `WriteBucket` objects that define what to
+                save in a checkpoint.
+            non_blocking (bool, optional): knob to enable pinned D2H memcpy. Default is True.
+        
+        Returns:
+            List[WriteBucket]: Same structure as input but with tensors moved to CPU.
+        
+        Implementation Flow:
+            1. Group write_buckets by layer (using file_name)
+            2. For each layer:
+               a. Allocate pinned CPU buffers for GPU tensors
+               b. Initiate async transfer (PyTorch) or pass to C++ (CUDA mode)
+               c. Submit layer info to C++ thread
+            3. C++ thread processes layers sequentially
+            4. Wait for all layers to complete
+            5. Construct result with CPU tensors
+        """
+        # Load layer_transfer_cpp module directly from .so file
+        layer_transfer_cpp = None
+        try:
+            # Direct import .so file without modifying sys.path or affecting other packages
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # Find .so file
+            import glob as _glob_module
+            so_files = _glob_module.glob(os.path.join(current_dir, "layer_transfer_cpp*.so"))
+            
+            if not so_files:
+                raise ImportError(f"No layer_transfer_cpp.so file found in {current_dir}")
+            
+            # Load .so file directly using importlib
+            import importlib.util as _importlib_util
+            so_path = so_files[0]
+            spec = _importlib_util.spec_from_file_location("layer_transfer_cpp", so_path)
+            layer_transfer_cpp = _importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(layer_transfer_cpp)
+            logger.debug(f"Loaded layer_transfer_cpp from {so_path}")
+            
+        except Exception as e:
+            logger.warning(
+                f"layer_transfer_cpp module not found: {e}. Falling back to standard preload_tensors. "
+                "To build the C++ module, run: bash build_layer_transfer.sh"
+            )
+            return FileSystemWriterAsync.preload_tensors(write_buckets, non_blocking)
+        
+        logger.info("Starting layer-wise tensor preloading using C++ thread")
+        start_time = time()
+        
+        # Initialize the C++ processor
+        processor = layer_transfer_cpp.LayerTransferProcessor()
+        
+        # Check if C++ module was compiled with CUDA support
+        # If USE_CUDA is defined in C++, it will handle the actual GPU->CPU transfer
+        # Otherwise, PyTorch handles the transfer and C++ only coordinates
+        use_cuda_in_cpp = hasattr(layer_transfer_cpp, 'USE_CUDA') and layer_transfer_cpp.USE_CUDA
+        
+        if use_cuda_in_cpp:
+            logger.info("Using C++ CUDA mode: C++ thread performs GPU->CPU transfer")
+        else:
+            logger.info("Using PyTorch mode: PyTorch performs GPU->CPU transfer, C++ coordinates")
+        
+        # Organize tensors by layer for layer-wise transfer
+        # Extract layer numbers from tensor FQNs (Fully Qualified Names)
+        layer_groups = {}
+        
+        # Map to store CPU tensors by (bucket_idx, tensor_idx)
+        cpu_tensor_map = {}
+        
+        # Helper function to extract layer number from FQN
+        def extract_layer_number(fqn: str) -> int:
+            """Extract layer number from FQN like 'decoder.layers.0.weight' -> 0
+            Returns -1 for non-layer tensors (embeddings, output layers, etc.)
+            
+            Supports patterns:
+            - decoder.layers.N.
+            - encoder.layers.N.
+            - transformer.layers.N.
+            - model.layers.N.
+            - layers.N.
+            """
+            import re
+            # Match patterns like .layers.N. or .layer.N. (with or without leading component)
+            # Also match patterns at start of string or after underscore
+            patterns = [
+                r'\.layers\.(\d+)\.',      # .layers.N.
+                r'^layers\.(\d+)\.',       # layers.N. at start
+                r'\.layer\.(\d+)\.',       # .layer.N.
+                r'^layer\.(\d+)\.',        # layer.N. at start
+                r'_layers_(\d+)_',         # _layers_N_
+                r'_layer_(\d+)_',          # _layer_N_
+                r'\.blocks\.(\d+)\.',      # .blocks.N.
+                r'^blocks\.(\d+)\.',       # blocks.N. at start
+                r'_blocks_(\d+)_',         # _blocks_N_
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, fqn)
+                if match:
+                    return int(match.group(1))
+            return -1  # Non-layer tensor
+        
+        # Group tensors within each bucket by layer
+        # Track sample FQNs and item attributes for debugging
+        sample_fqns = []
+        
+        # Strategy: Since FQN doesn't contain layer number (e.g., "decoder.layers.xxx"),
+        # we need to infer layer number from tensor order and FQN patterns.
+        # For ShardedTensors, same FQN appears multiple times for different layers.
+        fqn_to_occurrences = {}  # Track how many times each FQN appears (indicates number of layers)
+        
+        for bucket_idx, bucket in enumerate(write_buckets):
+            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            
+            # First pass: count occurrences of each FQN pattern
+            for tensor_idx, (item, tensor) in enumerate(tensor_data):
+                if hasattr(item, 'index') and hasattr(item.index, 'fqn'):
+                    fqn = item.index.fqn
+                    # Extract base FQN pattern (normalize to pattern without layer number)
+                    import re
+                    base_fqn = fqn
+                    # If FQN contains .layers.N. (with number), remove the number
+                    if re.search(r'\.layers\.\d+\.', fqn):
+                        base_fqn = re.sub(r'\.layers\.\d+\.', '.layers.', fqn)
+                    elif re.search(r'^layers\.\d+\.', fqn):
+                        base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
+                    # If FQN contains .layers. but no number (like decoder.layers.xxx), use as-is
+                    # This is already the base pattern
+                    
+                    fqn_to_occurrences[base_fqn] = fqn_to_occurrences.get(base_fqn, 0) + 1
+        
+        # Determine if this is a layer-based FQN pattern
+        # If same FQN appears multiple times (e.g., 12 times for 12 layers), it's a layer tensor
+        layer_fqn_patterns = set()
+        for fqn, count in fqn_to_occurrences.items():
+            if count > 1 and ('layers.' in fqn or 'layer.' in fqn):
+                layer_fqn_patterns.add(fqn)
+        
+        logger.info(f"Found {len(layer_fqn_patterns)} layer FQN patterns (appearing multiple times)")
+        if layer_fqn_patterns and logger.isEnabledFor(logging.DEBUG):
+            for pattern in sorted(list(layer_fqn_patterns))[:5]:
+                logger.debug(f"  Layer pattern: {pattern} (appears {fqn_to_occurrences[pattern]} times)")
+        
+        # Second pass: assign layer numbers based on FQN pattern and occurrence order
+        fqn_to_layer_counter = {}  # Track current layer number for each FQN pattern
+        
+        for bucket_idx, bucket in enumerate(write_buckets):
+            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            
+            # Process each tensor in this bucket
+            for tensor_idx, (item, tensor) in enumerate(tensor_data):
+                # Extract layer number from FQN or infer from pattern
+                if hasattr(item, 'index') and hasattr(item.index, 'fqn'):
+                    fqn = item.index.fqn
+                    
+                    # Try direct extraction first
+                    layer_num = extract_layer_number(fqn)
+                    
+                    # If not found, try to infer from FQN pattern
+                    if layer_num == -1:
+                        import re
+                        base_fqn = fqn
+                        # Normalize to base pattern (remove layer number if present)
+                        if re.search(r'\.layers\.\d+\.', fqn):
+                            base_fqn = re.sub(r'\.layers\.\d+\.', '.layers.', fqn)
+                        elif re.search(r'^layers\.\d+\.', fqn):
+                            base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
+                        # If FQN contains .layers. but no number, use as-is
+                        
+                        # If this is a layer pattern (appears multiple times), assign layer number based on occurrence
+                        if base_fqn in layer_fqn_patterns:
+                            if base_fqn not in fqn_to_layer_counter:
+                                fqn_to_layer_counter[base_fqn] = 0
+                            layer_num = fqn_to_layer_counter[base_fqn]
+                            fqn_to_layer_counter[base_fqn] += 1
+                    
+                    # Collect sample FQNs for debugging (first 10)
+                    if len(sample_fqns) < 10:
+                        sample_fqns.append(f"{fqn} -> layer_{layer_num}")
+                else:
+                    # Fallback if no FQN available
+                    fqn = str(item)
+                    layer_num = -1
+                    if len(sample_fqns) < 10:
+                        sample_fqns.append(f"{fqn} -> no FQN")
+                
+                # Use layer number as key, group non-layer tensors together
+                layer_key = f"layer_{layer_num}" if layer_num >= 0 else "non_layer"
+                
+                if layer_key not in layer_groups:
+                    layer_groups[layer_key] = []
+                
+                # Store (bucket_idx, tensor_idx, item, tensor) for this layer
+                layer_groups[layer_key].append((bucket_idx, tensor_idx, item, tensor))
+        
+        # Log sample FQNs for debugging
+        if sample_fqns:
+            logger.info(f"Sample tensor FQNs and layer extraction:")
+            for sample in sample_fqns:
+                logger.info(f"  {sample}")
+        
+        total_tensors = sum(len(tensors) for tensors in layer_groups.values())
+        logger.info(f"Organized {total_tensors} tensors into {len(layer_groups)} layer groups")
+        
+        # Log layer distribution for debugging
+        if logger.isEnabledFor(logging.DEBUG):
+            for layer_key, tensors in sorted(layer_groups.items()):
+                logger.debug(f"  {layer_key}: {len(tensors)} tensors")
+        
+        # Process each layer group - prepare tensors and submit to C++ thread
+        # Sort layer groups by layer number for sequential processing
+        sorted_layer_groups = sorted(
+            layer_groups.items(),
+            key=lambda x: int(x[0].split('_')[1]) if x[0] != "non_layer" else -1
+        )
+        
+        for layer_id, (layer_key, tensor_list) in enumerate(sorted_layer_groups):
+            layer_start_time = time()
+            
+            # Collect all tensors for this layer
+            layer_tensors_info = []
+            
+            for bucket_idx, tensor_idx, item, tensor in tensor_list:
+                if tensor.is_cuda:
+                    # Allocate CPU buffer (pinned memory for faster transfer)
+                    cpu_tensor = torch.empty_like(tensor, device='cpu', pin_memory=True)
+                    
+                    if not use_cuda_in_cpp:
+                        # PyTorch mode: Initiate async transfer now
+                        # The C++ thread will just ensure layer-by-layer completion
+                        cpu_tensor.copy_(tensor, non_blocking=True)
+                    # else: CUDA mode - C++ will do the actual transfer
+                    
+                    # Store CPU tensor for later result construction using index
+                    cpu_tensor_map[(bucket_idx, tensor_idx)] = cpu_tensor
+                    
+                    # Get FQN for logging
+                    fqn = item.index.fqn if hasattr(item, 'index') and hasattr(item.index, 'fqn') else str(item)
+                    
+                    # Prepare info for C++ thread
+                    tensor_info = (
+                        tensor.data_ptr(),           # GPU pointer (source)
+                        cpu_tensor.data_ptr(),       # CPU pointer (destination)
+                        cpu_tensor.numel() * cpu_tensor.element_size(),  # Size in bytes
+                        list(cpu_tensor.shape),      # Shape
+                        fqn                          # Name (FQN)
+                    )
+                    layer_tensors_info.append(tensor_info)
+                else:
+                    # Already on CPU, store directly using index
+                    cpu_tensor_map[(bucket_idx, tensor_idx)] = tensor
+            
+            # Submit this layer to C++ processor for GPU->CPU transfer
+            if layer_tensors_info:
+                processor.submit_layer(layer_id, layer_tensors_info)
+                total_bytes = sum(info[2] for info in layer_tensors_info)
+                logger.info(f"Layer {layer_id} ({layer_key}): submitted {len(layer_tensors_info)} tensors ({total_bytes/(1024**2):.2f} MB) for transfer")
+                
+                # Log each tensor's name and size in this layer
+                for tensor_info in layer_tensors_info:
+                    tensor_name = tensor_info[4]  # FQN is the 5th element (index 4)
+                    tensor_size_bytes = tensor_info[2]  # Size is the 3rd element (index 2)
+                    tensor_shape = tensor_info[3]  # Shape is the 4th element (index 3)
+                    logger.info(f"  Tensor: {tensor_name}, Size: {tensor_size_bytes/(1024**2):.2f} MB, Shape: {tensor_shape}")
+        
+        # Wait for C++ thread to finish processing all layers
+        logger.info("Waiting for C++ thread to complete all layer transfers...")
+        processor.wait_all_complete()
+        
+        # Synchronize CUDA to ensure all transfers are complete
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
+        # Get statistics
+        stats = processor.get_stats()
+        cpp_results = processor.get_results()
+        
+        # Clean up processor
+        processor.stop()
+        
+        # Log detailed results
+        for layer_result in cpp_results:
+            layer_id, success, transfer_time, total_bytes, error_msg = layer_result
+            if success:
+                logger.debug(f"Layer {layer_id}: transferred {total_bytes/1e6:.2f} MB in {transfer_time:.4f}s")
+            else:
+                logger.warning(f"Layer {layer_id} transfer failed: {error_msg}")
+        
+        # Now construct the result buckets with CPU tensors
+        result = []
+        for bucket_idx, bucket in enumerate(write_buckets):
+            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            
+            # Build tensor_data with CPU tensors
+            cpu_tensor_data = []
+            for tensor_idx, (item, original_tensor) in enumerate(tensor_data):
+                # Get the CPU tensor from our map using index
+                cpu_tensor = cpu_tensor_map.get((bucket_idx, tensor_idx), original_tensor)
+                cpu_tensor_data.append((item, cpu_tensor))
+            
+            result.append((file_name, storage_key, (bytes_data, cpu_tensor_data)))
+        
+        total_time = time() - start_time
+        logger.info(
+            f"Layer-wise tensor preloading completed: "
+            f"{stats['tasks_completed']} layers, {len(write_buckets)} buckets in {total_time:.4f}s"
+        )
+        
         return result
 
     @staticmethod

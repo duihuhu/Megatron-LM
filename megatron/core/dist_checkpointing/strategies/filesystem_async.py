@@ -672,11 +672,11 @@ class FileSystemWriterAsync(FileSystemWriter):
                 logger.info(f"Layer {layer_id} ({layer_key}): submitted {len(layer_tensors_info)} tensors ({total_bytes/(1024**2):.2f} MB) for transfer")
                 
                 # Log each tensor's name and size in this layer
-                for tensor_info in layer_tensors_info:
-                    tensor_name = tensor_info[4]  # FQN is the 5th element (index 4)
-                    tensor_size_bytes = tensor_info[2]  # Size is the 3rd element (index 2)
-                    tensor_shape = tensor_info[3]  # Shape is the 4th element (index 3)
-                    logger.info(f"  Tensor: {tensor_name}, Size: {tensor_size_bytes/(1024**2):.2f} MB, Shape: {tensor_shape}")
+                # for tensor_info in layer_tensors_info:
+                #     tensor_name = tensor_info[4]  # FQN is the 5th element (index 4)
+                #     tensor_size_bytes = tensor_info[2]  # Size is the 3rd element (index 2)
+                #     tensor_shape = tensor_info[3]  # Shape is the 4th element (index 3)
+                #     logger.info(f"  Tensor: {tensor_name}, Size: {tensor_size_bytes/(1024**2):.2f} MB, Shape: {tensor_shape}")
         
         # Wait for C++ thread to finish processing all layers
         logger.info("Waiting for C++ thread to complete all layer transfers...")

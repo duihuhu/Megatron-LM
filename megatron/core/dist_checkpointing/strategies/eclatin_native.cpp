@@ -47,6 +47,28 @@ private:
     boost::asio::ip::tcp::acceptor parity2_recv1_acceptor_;
     boost::asio::ip::tcp::acceptor parity2_recv2_acceptor_;
 
+    // Load mode sockets (rank0 as receiver)
+    boost::asio::ip::tcp::socket load_recv_rank1_data1_socket_;
+    boost::asio::ip::tcp::socket load_recv_rank1_data2_socket_;
+    boost::asio::ip::tcp::socket load_recv_rank2_data2_socket_;
+    boost::asio::ip::tcp::socket load_recv_rank2_parity2_socket_;
+    boost::asio::ip::tcp::socket load_recv_rank3_data1_socket_;
+    boost::asio::ip::tcp::socket load_recv_rank3_parity1_socket_;
+    boost::asio::ip::tcp::acceptor load_recv_rank1_data1_acceptor_;
+    boost::asio::ip::tcp::acceptor load_recv_rank1_data2_acceptor_;
+    boost::asio::ip::tcp::acceptor load_recv_rank2_data2_acceptor_;
+    boost::asio::ip::tcp::acceptor load_recv_rank2_parity2_acceptor_;
+    boost::asio::ip::tcp::acceptor load_recv_rank3_data1_acceptor_;
+    boost::asio::ip::tcp::acceptor load_recv_rank3_parity1_acceptor_;
+    
+    // Load mode sockets (other ranks as senders)
+    boost::asio::ip::tcp::socket load_send_rank1_data1_socket_;
+    boost::asio::ip::tcp::socket load_send_rank1_data2_socket_;
+    boost::asio::ip::tcp::socket load_send_rank2_data2_socket_;
+    boost::asio::ip::tcp::socket load_send_rank2_parity2_socket_;
+    boost::asio::ip::tcp::socket load_send_rank3_data1_socket_;
+    boost::asio::ip::tcp::socket load_send_rank3_parity1_socket_;
+
     std::atomic<bool> parity1_send1_connected_;
     std::atomic<bool> parity1_send2_connected_;
     std::atomic<bool> parity1_recv1_connected_;
@@ -55,6 +77,22 @@ private:
     std::atomic<bool> parity2_send2_connected_;
     std::atomic<bool> parity2_recv1_connected_;
     std::atomic<bool> parity2_recv2_connected_;
+    
+    // Load mode connection flags (rank0 receiver)
+    std::atomic<bool> load_recv_rank1_data1_connected_{false};
+    std::atomic<bool> load_recv_rank1_data2_connected_{false};
+    std::atomic<bool> load_recv_rank2_data2_connected_{false};
+    std::atomic<bool> load_recv_rank2_parity2_connected_{false};
+    std::atomic<bool> load_recv_rank3_data1_connected_{false};
+    std::atomic<bool> load_recv_rank3_parity1_connected_{false};
+    
+    // Load mode connection flags (other ranks sender)
+    std::atomic<bool> load_send_rank1_data1_connected_{false};
+    std::atomic<bool> load_send_rank1_data2_connected_{false};
+    std::atomic<bool> load_send_rank2_data2_connected_{false};
+    std::atomic<bool> load_send_rank2_parity2_connected_{false};
+    std::atomic<bool> load_send_rank3_data1_connected_{false};
+    std::atomic<bool> load_send_rank3_parity1_connected_{false};
 
     std::mutex connection_mutex_;
     std::condition_variable connection_cv_;
@@ -74,6 +112,24 @@ public:
           parity2_recv2_socket_(io_context_),
           parity2_recv1_acceptor_(io_context_),
           parity2_recv2_acceptor_(io_context_),
+          load_recv_rank1_data1_socket_(io_context_),
+          load_recv_rank1_data2_socket_(io_context_),
+          load_recv_rank2_data2_socket_(io_context_),
+          load_recv_rank2_parity2_socket_(io_context_),
+          load_recv_rank3_data1_socket_(io_context_),
+          load_recv_rank3_parity1_socket_(io_context_),
+          load_recv_rank1_data1_acceptor_(io_context_),
+          load_recv_rank1_data2_acceptor_(io_context_),
+          load_recv_rank2_data2_acceptor_(io_context_),
+          load_recv_rank2_parity2_acceptor_(io_context_),
+          load_recv_rank3_data1_acceptor_(io_context_),
+          load_recv_rank3_parity1_acceptor_(io_context_),
+          load_send_rank1_data1_socket_(io_context_),
+          load_send_rank1_data2_socket_(io_context_),
+          load_send_rank2_data2_socket_(io_context_),
+          load_send_rank2_parity2_socket_(io_context_),
+          load_send_rank3_data1_socket_(io_context_),
+          load_send_rank3_parity1_socket_(io_context_),
           parity1_send1_connected_(false),
           parity1_send2_connected_(false),
           parity1_recv1_connected_(false),
@@ -94,6 +150,22 @@ public:
     boost::asio::ip::tcp::socket& get_parity2_send2_socket() { return parity2_send2_socket_; }
     boost::asio::ip::tcp::socket& get_parity2_recv1_socket() { return parity2_recv1_socket_; }
     boost::asio::ip::tcp::socket& get_parity2_recv2_socket() { return parity2_recv2_socket_; }
+    
+    // Load mode getters (rank0 receiver)
+    boost::asio::ip::tcp::socket& get_load_recv_rank1_data1_socket() { return load_recv_rank1_data1_socket_; }
+    boost::asio::ip::tcp::socket& get_load_recv_rank1_data2_socket() { return load_recv_rank1_data2_socket_; }
+    boost::asio::ip::tcp::socket& get_load_recv_rank2_data2_socket() { return load_recv_rank2_data2_socket_; }
+    boost::asio::ip::tcp::socket& get_load_recv_rank2_parity2_socket() { return load_recv_rank2_parity2_socket_; }
+    boost::asio::ip::tcp::socket& get_load_recv_rank3_data1_socket() { return load_recv_rank3_data1_socket_; }
+    boost::asio::ip::tcp::socket& get_load_recv_rank3_parity1_socket() { return load_recv_rank3_parity1_socket_; }
+    
+    // Load mode getters (other ranks sender)
+    boost::asio::ip::tcp::socket& get_load_send_rank1_data1_socket() { return load_send_rank1_data1_socket_; }
+    boost::asio::ip::tcp::socket& get_load_send_rank1_data2_socket() { return load_send_rank1_data2_socket_; }
+    boost::asio::ip::tcp::socket& get_load_send_rank2_data2_socket() { return load_send_rank2_data2_socket_; }
+    boost::asio::ip::tcp::socket& get_load_send_rank2_parity2_socket() { return load_send_rank2_parity2_socket_; }
+    boost::asio::ip::tcp::socket& get_load_send_rank3_data1_socket() { return load_send_rank3_data1_socket_; }
+    boost::asio::ip::tcp::socket& get_load_send_rank3_parity1_socket() { return load_send_rank3_parity1_socket_; }
 
     // Parity 1 connection checks
     bool is_parity1_send1_connected() const { return parity1_send1_connected_; }
@@ -118,6 +190,22 @@ public:
     void init_parity2_send2(const std::string& partner_ip, uint16_t port);
     void init_parity2_recv1(const std::string& listen_ip, uint16_t port);
     void init_parity2_recv2(const std::string& listen_ip, uint16_t port);
+    
+    // Load mode init functions (rank0 as receiver)
+    void init_load_recv_rank1_data1(const std::string& listen_ip, uint16_t port);
+    void init_load_recv_rank1_data2(const std::string& listen_ip, uint16_t port);
+    void init_load_recv_rank2_data2(const std::string& listen_ip, uint16_t port);
+    void init_load_recv_rank2_parity2(const std::string& listen_ip, uint16_t port);
+    void init_load_recv_rank3_data1(const std::string& listen_ip, uint16_t port);
+    void init_load_recv_rank3_parity1(const std::string& listen_ip, uint16_t port);
+    
+    // Load mode init functions (other ranks as senders)
+    void init_load_send_rank1_data1(const std::string& rank0_ip, uint16_t port);
+    void init_load_send_rank1_data2(const std::string& rank0_ip, uint16_t port);
+    void init_load_send_rank2_data2(const std::string& rank0_ip, uint16_t port);
+    void init_load_send_rank2_parity2(const std::string& rank0_ip, uint16_t port);
+    void init_load_send_rank3_data1(const std::string& rank0_ip, uint16_t port);
+    void init_load_send_rank3_parity1(const std::string& rank0_ip, uint16_t port);
     
     void wait_for_connections(int timeout_seconds = 30);
     void cleanup();
@@ -263,6 +351,193 @@ void AsioConnectionManager::wait_for_connections(int timeout_seconds) {
     );
 }
 
+void AsioConnectionManager::init_load_recv_rank1_data1(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        load_recv_rank1_data1_acceptor_.open(endpoint.protocol());
+        load_recv_rank1_data1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        load_recv_rank1_data1_acceptor_.bind(endpoint);
+        load_recv_rank1_data1_acceptor_.listen();
+        load_recv_rank1_data1_acceptor_.accept(load_recv_rank1_data1_socket_);
+        load_recv_rank1_data1_connected_ = true;
+        std::cout << "ASIO: load_recv_rank1_data1 connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank1_data1 init error: " << e.what() << std::endl;
+        load_recv_rank1_data1_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_load_recv_rank1_data2(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        load_recv_rank1_data2_acceptor_.open(endpoint.protocol());
+        load_recv_rank1_data2_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        load_recv_rank1_data2_acceptor_.bind(endpoint);
+        load_recv_rank1_data2_acceptor_.listen();
+        load_recv_rank1_data2_acceptor_.accept(load_recv_rank1_data2_socket_);
+        load_recv_rank1_data2_connected_ = true;
+        std::cout << "ASIO: load_recv_rank1_data2 connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank1_data2 init error: " << e.what() << std::endl;
+        load_recv_rank1_data2_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_load_recv_rank2_data2(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        load_recv_rank2_data2_acceptor_.open(endpoint.protocol());
+        load_recv_rank2_data2_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        load_recv_rank2_data2_acceptor_.bind(endpoint);
+        load_recv_rank2_data2_acceptor_.listen();
+        load_recv_rank2_data2_acceptor_.accept(load_recv_rank2_data2_socket_);
+        load_recv_rank2_data2_connected_ = true;
+        std::cout << "ASIO: load_recv_rank2_data2 connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank2_data2 init error: " << e.what() << std::endl;
+        load_recv_rank2_data2_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_load_recv_rank2_parity2(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        load_recv_rank2_parity2_acceptor_.open(endpoint.protocol());
+        load_recv_rank2_parity2_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        load_recv_rank2_parity2_acceptor_.bind(endpoint);
+        load_recv_rank2_parity2_acceptor_.listen();
+        load_recv_rank2_parity2_acceptor_.accept(load_recv_rank2_parity2_socket_);
+        load_recv_rank2_parity2_connected_ = true;
+        std::cout << "ASIO: load_recv_rank2_parity2 connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank2_parity2 init error: " << e.what() << std::endl;
+        load_recv_rank2_parity2_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_load_recv_rank3_data1(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        load_recv_rank3_data1_acceptor_.open(endpoint.protocol());
+        load_recv_rank3_data1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        load_recv_rank3_data1_acceptor_.bind(endpoint);
+        load_recv_rank3_data1_acceptor_.listen();
+        load_recv_rank3_data1_acceptor_.accept(load_recv_rank3_data1_socket_);
+        load_recv_rank3_data1_connected_ = true;
+        std::cout << "ASIO: load_recv_rank3_data1 connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank3_data1 init error: " << e.what() << std::endl;
+        load_recv_rank3_data1_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_load_recv_rank3_parity1(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        load_recv_rank3_parity1_acceptor_.open(endpoint.protocol());
+        load_recv_rank3_parity1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        load_recv_rank3_parity1_acceptor_.bind(endpoint);
+        load_recv_rank3_parity1_acceptor_.listen();
+        load_recv_rank3_parity1_acceptor_.accept(load_recv_rank3_parity1_socket_);
+        load_recv_rank3_parity1_connected_ = true;
+        std::cout << "ASIO: load_recv_rank3_parity1 connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank3_parity1 init error: " << e.what() << std::endl;
+        load_recv_rank3_parity1_connected_ = false;
+        throw;
+    }
+}
+
+// Load mode init functions (other ranks as senders)
+void AsioConnectionManager::init_load_send_rank1_data1(const std::string& rank0_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank0_ip, std::to_string(port));
+        boost::asio::connect(load_send_rank1_data1_socket_, endpoints);
+        load_send_rank1_data1_connected_ = true;
+        std::cout << "ASIO: load_send_rank1_data1 connected to rank0" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_send_rank1_data1 init error: " << e.what() << std::endl;
+        load_send_rank1_data1_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_load_send_rank1_data2(const std::string& rank0_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank0_ip, std::to_string(port));
+        boost::asio::connect(load_send_rank1_data2_socket_, endpoints);
+        load_send_rank1_data2_connected_ = true;
+        std::cout << "ASIO: load_send_rank1_data2 connected to rank0" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_send_rank1_data2 init error: " << e.what() << std::endl;
+        load_send_rank1_data2_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_load_send_rank2_data2(const std::string& rank0_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank0_ip, std::to_string(port));
+        boost::asio::connect(load_send_rank2_data2_socket_, endpoints);
+        load_send_rank2_data2_connected_ = true;
+        std::cout << "ASIO: load_send_rank2_data2 connected to rank0" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_send_rank2_data2 init error: " << e.what() << std::endl;
+        load_send_rank2_data2_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_load_send_rank2_parity2(const std::string& rank0_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank0_ip, std::to_string(port));
+        boost::asio::connect(load_send_rank2_parity2_socket_, endpoints);
+        load_send_rank2_parity2_connected_ = true;
+        std::cout << "ASIO: load_send_rank2_parity2 connected to rank0" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_send_rank2_parity2 init error: " << e.what() << std::endl;
+        load_send_rank2_parity2_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_load_send_rank3_data1(const std::string& rank0_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank0_ip, std::to_string(port));
+        boost::asio::connect(load_send_rank3_data1_socket_, endpoints);
+        load_send_rank3_data1_connected_ = true;
+        std::cout << "ASIO: load_send_rank3_data1 connected to rank0" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_send_rank3_data1 init error: " << e.what() << std::endl;
+        load_send_rank3_data1_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_load_send_rank3_parity1(const std::string& rank0_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank0_ip, std::to_string(port));
+        boost::asio::connect(load_send_rank3_parity1_socket_, endpoints);
+        load_send_rank3_parity1_connected_ = true;
+        std::cout << "ASIO: load_send_rank3_parity1 connected to rank0" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_send_rank3_parity1 init error: " << e.what() << std::endl;
+        load_send_rank3_parity1_connected_ = false;
+        throw;
+    }
+}
+
 void AsioConnectionManager::cleanup() {
     // Parity 1 sockets
     if (parity1_send1_socket_.is_open()) parity1_send1_socket_.close();
@@ -279,6 +554,28 @@ void AsioConnectionManager::cleanup() {
     if (parity2_recv2_socket_.is_open()) parity2_recv2_socket_.close();
     if (parity2_recv1_acceptor_.is_open()) parity2_recv1_acceptor_.close();
     if (parity2_recv2_acceptor_.is_open()) parity2_recv2_acceptor_.close();
+    
+    // Load mode sockets (rank0 receiver)
+    if (load_recv_rank1_data1_socket_.is_open()) load_recv_rank1_data1_socket_.close();
+    if (load_recv_rank1_data2_socket_.is_open()) load_recv_rank1_data2_socket_.close();
+    if (load_recv_rank2_data2_socket_.is_open()) load_recv_rank2_data2_socket_.close();
+    if (load_recv_rank2_parity2_socket_.is_open()) load_recv_rank2_parity2_socket_.close();
+    if (load_recv_rank3_data1_socket_.is_open()) load_recv_rank3_data1_socket_.close();
+    if (load_recv_rank3_parity1_socket_.is_open()) load_recv_rank3_parity1_socket_.close();
+    if (load_recv_rank1_data1_acceptor_.is_open()) load_recv_rank1_data1_acceptor_.close();
+    if (load_recv_rank1_data2_acceptor_.is_open()) load_recv_rank1_data2_acceptor_.close();
+    if (load_recv_rank2_data2_acceptor_.is_open()) load_recv_rank2_data2_acceptor_.close();
+    if (load_recv_rank2_parity2_acceptor_.is_open()) load_recv_rank2_parity2_acceptor_.close();
+    if (load_recv_rank3_data1_acceptor_.is_open()) load_recv_rank3_data1_acceptor_.close();
+    if (load_recv_rank3_parity1_acceptor_.is_open()) load_recv_rank3_parity1_acceptor_.close();
+    
+    // Load mode sockets (other ranks sender)
+    if (load_send_rank1_data1_socket_.is_open()) load_send_rank1_data1_socket_.close();
+    if (load_send_rank1_data2_socket_.is_open()) load_send_rank1_data2_socket_.close();
+    if (load_send_rank2_data2_socket_.is_open()) load_send_rank2_data2_socket_.close();
+    if (load_send_rank2_parity2_socket_.is_open()) load_send_rank2_parity2_socket_.close();
+    if (load_send_rank3_data1_socket_.is_open()) load_send_rank3_data1_socket_.close();
+    if (load_send_rank3_parity1_socket_.is_open()) load_send_rank3_parity1_socket_.close();
 }
 
 
@@ -605,6 +902,283 @@ public:
         conn_.cleanup();
     }
 
+    // Load mode functions
+    void set_load_mode(bool is_load, int failed_rank) {
+        is_load_mode_ = is_load;
+        failed_rank_ = failed_rank;
+        std::cout << "ECLATIN: Set load mode: " 
+                  << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank << std::endl;
+    }
+
+    // Unified recovery interface for rank0 (parallel recv + parallel XOR)
+    void load_recover(
+        // Receive buffers (6 blocks from other ranks)
+        uintptr_t rank1_data1_addr,
+        uintptr_t rank1_data2_addr,
+        uintptr_t rank2_data2_addr,
+        uintptr_t rank2_parity2_addr,
+        uintptr_t rank3_data1_addr,
+        uintptr_t rank3_parity1_addr,
+        // Recovered buffers (4 blocks to write results)
+        uintptr_t recovered_data1_addr,
+        uintptr_t recovered_data2_addr,
+        uintptr_t recovered_parity1_addr,
+        uintptr_t recovered_parity2_addr,
+        size_t size
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "ECLATIN: [Rank 0] load_recover called but not in load mode" << std::endl;
+            return;
+        }
+        
+        std::cout << "ECLATIN: [Rank 0] Starting recovery (size=" << size << ")" << std::endl;
+        
+        // Step 1: Parallel receive all 6 blocks using threads
+        std::vector<std::exception_ptr> recv_exceptions(6);
+        std::vector<std::thread> recv_threads;
+        
+        recv_threads.emplace_back([&]() {
+            try {
+                if (!recv_with_size_bool(conn_.get_load_recv_rank1_data1_socket(), 
+                                        reinterpret_cast<void*>(rank1_data1_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank1_data1");
+                }
+            } catch (...) {
+                recv_exceptions[0] = std::current_exception();
+            }
+        });
+        
+        recv_threads.emplace_back([&]() {
+            try {
+                if (!recv_with_size_bool(conn_.get_load_recv_rank1_data2_socket(), 
+                                        reinterpret_cast<void*>(rank1_data2_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank1_data2");
+                }
+            } catch (...) {
+                recv_exceptions[1] = std::current_exception();
+            }
+        });
+        
+        recv_threads.emplace_back([&]() {
+            try {
+                if (!recv_with_size_bool(conn_.get_load_recv_rank2_data2_socket(), 
+                                        reinterpret_cast<void*>(rank2_data2_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank2_data2");
+                }
+            } catch (...) {
+                recv_exceptions[2] = std::current_exception();
+            }
+        });
+        
+        recv_threads.emplace_back([&]() {
+            try {
+                if (!recv_with_size_bool(conn_.get_load_recv_rank2_parity2_socket(), 
+                                        reinterpret_cast<void*>(rank2_parity2_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank2_parity2");
+                }
+            } catch (...) {
+                recv_exceptions[3] = std::current_exception();
+            }
+        });
+        
+        recv_threads.emplace_back([&]() {
+            try {
+                if (!recv_with_size_bool(conn_.get_load_recv_rank3_data1_socket(), 
+                                        reinterpret_cast<void*>(rank3_data1_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank3_data1");
+                }
+            } catch (...) {
+                recv_exceptions[4] = std::current_exception();
+            }
+        });
+        
+        recv_threads.emplace_back([&]() {
+            try {
+                if (!recv_with_size_bool(conn_.get_load_recv_rank3_parity1_socket(), 
+                                        reinterpret_cast<void*>(rank3_parity1_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank3_parity1");
+                }
+            } catch (...) {
+                recv_exceptions[5] = std::current_exception();
+            }
+        });
+        
+        // Join all receive threads
+        for (auto& t : recv_threads) {
+            t.join();
+        }
+        
+        // Check for exceptions
+        for (size_t i = 0; i < recv_exceptions.size(); ++i) {
+            if (recv_exceptions[i]) {
+                std::rethrow_exception(recv_exceptions[i]);
+            }
+        }
+        
+        std::cout << "ECLATIN: [Rank 0] All 6 blocks received" << std::endl;
+        
+        // Step 2: Parallel XOR recoveries using threads
+        std::vector<std::exception_ptr> xor_exceptions(4);
+        std::vector<std::thread> xor_threads;
+        
+        // data1 = rank2.data2 XOR rank3.parity1
+        xor_threads.emplace_back([&]() {
+            try {
+                std::memcpy(reinterpret_cast<void*>(recovered_data1_addr), 
+                           reinterpret_cast<void*>(rank2_data2_addr), size);
+                void* xor_array[2] = {reinterpret_cast<void*>(recovered_data1_addr), 
+                                     reinterpret_cast<void*>(rank3_parity1_addr)};
+                xor_gen(2, static_cast<int>(size), xor_array);
+            } catch (...) {
+                xor_exceptions[0] = std::current_exception();
+            }
+        });
+        
+        // data2 = rank3.data1 XOR rank2.parity2
+        xor_threads.emplace_back([&]() {
+            try {
+                std::memcpy(reinterpret_cast<void*>(recovered_data2_addr), 
+                           reinterpret_cast<void*>(rank3_data1_addr), size);
+                void* xor_array[2] = {reinterpret_cast<void*>(recovered_data2_addr), 
+                                     reinterpret_cast<void*>(rank2_parity2_addr)};
+                xor_gen(2, static_cast<int>(size), xor_array);
+            } catch (...) {
+                xor_exceptions[1] = std::current_exception();
+            }
+        });
+        
+        // parity1 = rank3.data1 XOR rank1.data2
+        xor_threads.emplace_back([&]() {
+            try {
+                std::memcpy(reinterpret_cast<void*>(recovered_parity1_addr), 
+                           reinterpret_cast<void*>(rank3_data1_addr), size);
+                void* xor_array[2] = {reinterpret_cast<void*>(recovered_parity1_addr), 
+                                     reinterpret_cast<void*>(rank1_data2_addr)};
+                xor_gen(2, static_cast<int>(size), xor_array);
+            } catch (...) {
+                xor_exceptions[2] = std::current_exception();
+            }
+        });
+        
+        // parity2 = rank1.data1 XOR rank2.data2
+        xor_threads.emplace_back([&]() {
+            try {
+                std::memcpy(reinterpret_cast<void*>(recovered_parity2_addr), 
+                           reinterpret_cast<void*>(rank1_data1_addr), size);
+                void* xor_array[2] = {reinterpret_cast<void*>(recovered_parity2_addr), 
+                                     reinterpret_cast<void*>(rank2_data2_addr)};
+                xor_gen(2, static_cast<int>(size), xor_array);
+            } catch (...) {
+                xor_exceptions[3] = std::current_exception();
+            }
+        });
+        
+        // Join all XOR threads
+        for (auto& t : xor_threads) {
+            t.join();
+        }
+        
+        // Check for exceptions
+        for (size_t i = 0; i < xor_exceptions.size(); ++i) {
+            if (xor_exceptions[i]) {
+                std::rethrow_exception(xor_exceptions[i]);
+            }
+        }
+        
+        std::cout << "ECLATIN: [Rank 0] Recovery completed successfully" << std::endl;
+    }
+
+    // Unified send interface for other ranks (rank1, rank2, rank3) - parallel send two blocks
+    void load_send_blocks(
+        const std::string& block1_name,
+        uintptr_t block1_addr,
+        const std::string& block2_name,
+        uintptr_t block2_addr,
+        size_t size
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "ECLATIN: load_send_blocks called but not in load mode" << std::endl;
+            return;
+        }
+        
+        std::cout << "ECLATIN: Starting parallel send of " << block1_name 
+                  << " and " << block2_name << " to rank0 (size=" << size << ")" << std::endl;
+        
+        // Helper function to get socket by block name
+        auto get_socket = [this](const std::string& block_name) -> boost::asio::ip::tcp::socket* {
+            if (block_name == "rank1_data1") {
+                return &conn_.get_load_send_rank1_data1_socket();
+            } else if (block_name == "rank1_data2") {
+                return &conn_.get_load_send_rank1_data2_socket();
+            } else if (block_name == "rank2_data2") {
+                return &conn_.get_load_send_rank2_data2_socket();
+            } else if (block_name == "rank2_parity2") {
+                return &conn_.get_load_send_rank2_parity2_socket();
+            } else if (block_name == "rank3_data1") {
+                return &conn_.get_load_send_rank3_data1_socket();
+            } else if (block_name == "rank3_parity1") {
+                return &conn_.get_load_send_rank3_parity1_socket();
+            }
+            return nullptr;
+        };
+        
+        // Parallel send using two threads
+        std::exception_ptr thread1_exception = nullptr;
+        std::exception_ptr thread2_exception = nullptr;
+        
+        std::thread thread1([&]() {
+            try {
+                boost::asio::ip::tcp::socket* sock = get_socket(block1_name);
+                if (sock == nullptr || !sock->is_open()) {
+                    throw std::runtime_error("ECLATIN: load_send_blocks socket not available for " + block1_name);
+                }
+                
+                std::cout << "ECLATIN: Sending " << block1_name << " to rank0 (size=" << size << ")" << std::endl;
+                
+                if (!send_with_size(*sock, block1_addr, size)) {
+                    throw std::runtime_error("ECLATIN: load_send_blocks send failed for " + block1_name);
+                }
+                
+                std::cout << "ECLATIN: Successfully sent " << block1_name << " to rank0" << std::endl;
+            } catch (...) {
+                thread1_exception = std::current_exception();
+            }
+        });
+        
+        std::thread thread2([&]() {
+            try {
+                boost::asio::ip::tcp::socket* sock = get_socket(block2_name);
+                if (sock == nullptr || !sock->is_open()) {
+                    throw std::runtime_error("ECLATIN: load_send_blocks socket not available for " + block2_name);
+                }
+                
+                std::cout << "ECLATIN: Sending " << block2_name << " to rank0 (size=" << size << ")" << std::endl;
+                
+                if (!send_with_size(*sock, block2_addr, size)) {
+                    throw std::runtime_error("ECLATIN: load_send_blocks send failed for " + block2_name);
+                }
+                
+                std::cout << "ECLATIN: Successfully sent " << block2_name << " to rank0" << std::endl;
+            } catch (...) {
+                thread2_exception = std::current_exception();
+            }
+        });
+        
+        // Join both threads
+        thread1.join();
+        thread2.join();
+        
+        // Check for exceptions
+        if (thread1_exception) {
+            std::rethrow_exception(thread1_exception);
+        }
+        if (thread2_exception) {
+            std::rethrow_exception(thread2_exception);
+        }
+        
+        std::cout << "ECLATIN: Both blocks sent successfully" << std::endl;
+    }
+
 private:
     std::atomic<bool> stop_;
 
@@ -680,6 +1254,10 @@ private:
     std::thread parity2_send1_thread_;
     std::thread parity2_send2_thread_;
     std::thread parity2_recv_xor_thread_;
+    
+    // Load mode flags
+    std::atomic<bool> is_load_mode_{false};
+    int failed_rank_{-1};
 
     void start_threads() {
         std::cout << "ECLATIN: Starting worker threads..." << std::endl;
@@ -1242,6 +1820,31 @@ PYBIND11_MODULE(eclatin_native, m) {
         .def("submit_parity2_send1_sentinel", &ECLATINNative::submit_parity2_send1_sentinel)
         .def("submit_parity2_send2_sentinel", &ECLATINNative::submit_parity2_send2_sentinel)
         .def("submit_parity2_recv_xor_sentinel", &ECLATINNative::submit_parity2_recv_xor_sentinel)
+        // Load mode functions
+        .def("set_load_mode", &ECLATINNative::set_load_mode,
+             "Set load mode for recovery",
+             pybind11::arg("is_load"),
+             pybind11::arg("failed_rank") = -1)
+        .def("load_recover", &ECLATINNative::load_recover,
+             "Unified recovery interface for rank0 (parallel recv + parallel XOR)",
+             pybind11::arg("rank1_data1_addr"),
+             pybind11::arg("rank1_data2_addr"),
+             pybind11::arg("rank2_data2_addr"),
+             pybind11::arg("rank2_parity2_addr"),
+             pybind11::arg("rank3_data1_addr"),
+             pybind11::arg("rank3_parity1_addr"),
+             pybind11::arg("recovered_data1_addr"),
+             pybind11::arg("recovered_data2_addr"),
+             pybind11::arg("recovered_parity1_addr"),
+             pybind11::arg("recovered_parity2_addr"),
+             pybind11::arg("size"))
+        .def("load_send_blocks", &ECLATINNative::load_send_blocks,
+             "Send two blocks to rank0 in parallel (for rank1, rank2, rank3)",
+             pybind11::arg("block1_name"),
+             pybind11::arg("block1_addr"),
+             pybind11::arg("block2_name"),
+             pybind11::arg("block2_addr"),
+             pybind11::arg("size"))
         .def("stop", &ECLATINNative::stop);
 }
 

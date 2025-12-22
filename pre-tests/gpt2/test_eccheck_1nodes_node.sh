@@ -13,8 +13,8 @@ export NCCL_DEBUG_SUBSYS=ALL
 
 GPUS_PER_NODE=1
 MASTER_ADDR=127.0.0.1
-export NCCL_SOCKET_IFNAME=bond0
-export GLOO_SOCKET_IFNAME=bond0
+export NCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
 NNODES=1
@@ -94,7 +94,7 @@ GPT_ARGS=(
     --num-layers 12 
     --optimizer adam
     --loss-scale 8192
-    --position-embedding-type rope
+    #--position-embedding-type rope
 )
 
 MODEL_PARALLEL_ARGS=(

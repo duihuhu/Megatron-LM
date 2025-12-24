@@ -2356,9 +2356,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         return mapped_file_own, mapped_file_partner
     
     def _load_eclatin_p2p_checkpoint(self, checkpoint_dir: Path) -> Tuple:
-        """Load ECLATIN checkpoint data and recover rank0.
+        """Load ECLATIN checkpoint data and recover rank2.
         
-        Similar to EC-CHECK but for rank0 recovery instead of rank2.
+        Similar to EC-CHECK for rank2 recovery.
         
         Args:
             checkpoint_dir (Path): checkpoint directory
@@ -2371,8 +2371,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         
-        # ECLATIN recovers rank0 (instead of rank2)
-        failed_rank = 0
+        # ECLATIN recovers rank2 (same as EC-CHECK)
+        failed_rank = 2
         
         checkpoint_dir = Path(checkpoint_dir)
         
@@ -2421,13 +2421,13 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             self.eclatin_blocks = self._allocate_eclatin_blocks(registry)
             logger.info(f"ECLATIN: [Rank {rank}] Allocated 4 blocks using registry metadata")
         
-        # ===== Step 4: rank1/2/3 load block data from files =====
-        if rank != 0:
-            # rank1/2/3: Load block data from files into allocated blocks
+        # ===== Step 4: rank0/1/3 load block data from files =====
+        if rank != 2:
+            # rank0/1/3: Load block data from files into allocated blocks
             self._load_eclatin_blocks_from_files(checkpoint_dir, rank)
         
-        # ===== Step 5: rank0 allocate recv buffers =====
-        if rank == 0:
+        # ===== Step 5: rank2 allocate recv buffers =====
+        if rank == 2:
             if self.eclatin_recv_buffers is None:
                 self.eclatin_recv_buffers = self._allocate_eclatin_load_recv_buffers(registry)
             
@@ -2445,8 +2445,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             world_size=world_size,
             registry=registry,
             eclatin_blocks=self.eclatin_blocks,
-            recv_buffers=self.eclatin_recv_buffers if rank == 0 else None,
-            recovered_buffer=self.eclatin_recovered_buffer if rank == 0 else None,
+            recv_buffers=self.eclatin_recv_buffers if rank == 2 else None,
+            recovered_buffer=self.eclatin_recovered_buffer if rank == 2 else None,
             total_size=total_size,
         )
         
@@ -2468,17 +2468,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             checkpoint_dir (Path): checkpoint directory
             rank (int): current rank
         """
-        # rank1: Load data_block_1, data_block_2
-        if rank == 1:
-            self._load_block_data_from_file(
-                checkpoint_dir, rank, 'data_block_1', self.eclatin_blocks['data_block_1']
-            )
-            self._load_block_data_from_file(
-                checkpoint_dir, rank, 'data_block_2', self.eclatin_blocks['data_block_2']
-            )
-        
-        # rank2: Load data_block_2, parity_block_2
-        elif rank == 2:
+        # rank0: Load data_block_2, parity_block_2 (send to rank2)
+        if rank == 0:
             self._load_block_data_from_file(
                 checkpoint_dir, rank, 'data_block_2', self.eclatin_blocks['data_block_2']
             )
@@ -2486,14 +2477,25 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 checkpoint_dir, rank, 'parity_block_2', self.eclatin_blocks['parity_block_2']
             )
         
-        # rank3: Load data_block_1, parity_block_1
-        elif rank == 3:
+        # rank1: Load data_block_1, parity_block_1 (send to rank2)
+        elif rank == 1:
             self._load_block_data_from_file(
                 checkpoint_dir, rank, 'data_block_1', self.eclatin_blocks['data_block_1']
             )
             self._load_block_data_from_file(
                 checkpoint_dir, rank, 'parity_block_1', self.eclatin_blocks['parity_block_1']
             )
+        
+        # rank3: Load data_block_1, data_block_2 (send to rank2)
+        elif rank == 3:
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'data_block_1', self.eclatin_blocks['data_block_1']
+            )
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'data_block_2', self.eclatin_blocks['data_block_2']
+            )
+        
+        # rank2: No need to load blocks (will receive from others)
     
     def _load_block_data_from_file(
         self, checkpoint_dir: Path, rank: int, block_name: str, block_tensor: torch.Tensor
@@ -3604,19 +3606,19 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         total_size: int,
     ) -> None:
         """
-        Run ECLATIN recovery pipeline to recover rank0 data.
+        Run ECLATIN recovery pipeline to recover rank2 data.
         
-        Similar to EC-CHECK but for rank0 recovery:
-        - rank0: Receives 6 blocks from rank1/2/3, runs load_recover to recover 4 blocks
-        - rank1/2/3: Send their blocks to rank0 using load_send_blocks
+        Similar to EC-CHECK for rank2 recovery:
+        - rank2: Receives 6 blocks from rank0/1/3, runs load_recover to recover 4 blocks
+        - rank0/1/3: Send their blocks to rank2 using load_send_blocks
         
         Args:
             rank (int): Current rank
             world_size (int): Total number of ranks
             registry: GlobalMetadataRegistry
             eclatin_blocks (Dict[str, torch.Tensor]): 4 allocated blocks (all ranks)
-            recv_buffers (Optional[Dict[str, torch.Tensor]]): 6 recv buffers (rank0 only)
-            recovered_buffer (Optional[torch.Tensor]): Buffer to store recovered data (rank0 only)
+            recv_buffers (Optional[Dict[str, torch.Tensor]]): 6 recv buffers (rank2 only)
+            recovered_buffer (Optional[torch.Tensor]): Buffer to store recovered data (rank2 only)
             total_size (int): Total size of data to recover
         """
         import ctypes
@@ -3630,55 +3632,55 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             return
         
         # === Step 1: Set load mode in C++ native module ===
-        failed_rank = 0  # ECLATIN recovers rank0
+        failed_rank = 2  # ECLATIN recovers rank2
         self.eclatin_manager._eclatin_native.set_load_mode(True, failed_rank)
         logger.info(f"ECLATIN: [Rank {rank}] Set load mode (failed_rank={failed_rank})")
         
         # === Step 1.5: Initialize load connections ===
         # Get network configuration for load mode ports
-        # All ranks need rank0's network config to get the correct ports
-        net_config_rank0 = self.eclatin_manager._get_eclatin_network_config(0, world_size)
-        rank0_ip = net_config_rank0['rank_ips'].get(0, net_config_rank0['my_ip'])
+        # All ranks need rank2's network config to get the correct ports
+        net_config_rank2 = self.eclatin_manager._get_eclatin_network_config(2, world_size)
+        rank2_ip = net_config_rank2['rank_ips'].get(2, net_config_rank2['my_ip'])
         
-        # All ranks use rank0's recv ports (rank0 listens, rank1/2/3 connect)
-        load_recv_rank1_data1_port = net_config_rank0['ports']['load_recv_rank1_data1']
-        load_recv_rank1_data2_port = net_config_rank0['ports']['load_recv_rank1_data2']
-        load_recv_rank2_data2_port = net_config_rank0['ports']['load_recv_rank2_data2']
-        load_recv_rank2_parity2_port = net_config_rank0['ports']['load_recv_rank2_parity2']
-        load_recv_rank3_data1_port = net_config_rank0['ports']['load_recv_rank3_data1']
-        load_recv_rank3_parity1_port = net_config_rank0['ports']['load_recv_rank3_parity1']
+        # All ranks use rank2's recv ports (rank2 listens, rank0/1/3 connect)
+        load_recv_rank0_data2_port = net_config_rank2['ports']['load_recv_rank0_data2']
+        load_recv_rank0_parity2_port = net_config_rank2['ports']['load_recv_rank0_parity2']
+        load_recv_rank1_data1_port = net_config_rank2['ports']['load_recv_rank1_data1']
+        load_recv_rank1_parity1_port = net_config_rank2['ports']['load_recv_rank1_parity1']
+        load_recv_rank3_data1_port = net_config_rank2['ports']['load_recv_rank3_data1']
+        load_recv_rank3_data2_port = net_config_rank2['ports']['load_recv_rank3_data2']
         
-        # Similar to EC-CHECK: rank0 starts accept operations first, then other ranks connect
-        if rank == 0:
-            # rank0: Initialize accept operations (will start accept threads)
-            logger.info(f"ECLATIN: [Rank 0] Initializing load accept connections...")
+        # Similar to EC-CHECK: rank2 starts accept operations first, then other ranks connect
+        if rank == 2:
+            # rank2: Initialize accept operations (will start accept threads)
+            logger.info(f"ECLATIN: [Rank 2] Initializing load accept connections...")
             self.eclatin_manager._eclatin_native.init_load_connections(
                 rank,
-                rank0_ip,
+                rank2_ip,
+                load_recv_rank0_data2_port,
+                load_recv_rank0_parity2_port,
                 load_recv_rank1_data1_port,
-                load_recv_rank1_data2_port,
-                load_recv_rank2_data2_port,
-                load_recv_rank2_parity2_port,
+                load_recv_rank1_parity1_port,
                 load_recv_rank3_data1_port,
-                load_recv_rank3_parity1_port
+                load_recv_rank3_data2_port
             )
-            logger.info(f"ECLATIN: [Rank 0] Accept operations started, waiting for other ranks...")
+            logger.info(f"ECLATIN: [Rank 2] Accept operations started, waiting for other ranks...")
         
-        # Synchronize: ensure rank0's acceptors are ready before other ranks connect
+        # Synchronize: ensure rank2's acceptors are ready before other ranks connect
         torch.distributed.barrier()
         
-        if rank != 0:
-            # rank1/2/3: Connect to rank0 (will block until connected)
-            logger.info(f"ECLATIN: [Rank {rank}] Connecting load send sockets to rank0...")
+        if rank != 2:
+            # rank0/1/3: Connect to rank2 (will block until connected)
+            logger.info(f"ECLATIN: [Rank {rank}] Connecting load send sockets to rank2...")
             self.eclatin_manager._eclatin_native.init_load_connections(
                 rank,
-                rank0_ip,
+                rank2_ip,
+                load_recv_rank0_data2_port,
+                load_recv_rank0_parity2_port,
                 load_recv_rank1_data1_port,
-                load_recv_rank1_data2_port,
-                load_recv_rank2_data2_port,
-                load_recv_rank2_parity2_port,
+                load_recv_rank1_parity1_port,
                 load_recv_rank3_data1_port,
-                load_recv_rank3_parity1_port
+                load_recv_rank3_data2_port
             )
             logger.info(f"ECLATIN: [Rank {rank}] Load send sockets connected")
         
@@ -3690,19 +3692,19 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         torch.distributed.barrier()
         logger.info(f"ECLATIN: [Rank {rank}] Load connections initialized")
         
-        # === Step 2: rank0: Receive blocks and recover ===
-        if rank == 0:
+        # === Step 2: rank2: Receive blocks and recover ===
+        if rank == 2:
             if recv_buffers is None or recovered_buffer is None:
-                logger.error("ECLATIN: [Rank 0] recv_buffers or recovered_buffer is None")
+                logger.error("ECLATIN: [Rank 2] recv_buffers or recovered_buffer is None")
                 return
             
             # Get base addresses for recv buffers
+            rank0_data2_addr = int(recv_buffers['rank0_data2'].data_ptr())
+            rank0_parity2_addr = int(recv_buffers['rank0_parity2'].data_ptr())
             rank1_data1_addr = int(recv_buffers['rank1_data1'].data_ptr())
-            rank1_data2_addr = int(recv_buffers['rank1_data2'].data_ptr())
-            rank2_data2_addr = int(recv_buffers['rank2_data2'].data_ptr())
-            rank2_parity2_addr = int(recv_buffers['rank2_parity2'].data_ptr())
+            rank1_parity1_addr = int(recv_buffers['rank1_parity1'].data_ptr())
             rank3_data1_addr = int(recv_buffers['rank3_data1'].data_ptr())
-            rank3_parity1_addr = int(recv_buffers['rank3_parity1'].data_ptr())
+            rank3_data2_addr = int(recv_buffers['rank3_data2'].data_ptr())
             
             # Get base addresses for recovered blocks
             recovered_data1_addr = int(eclatin_blocks['data_block_1'].data_ptr())
@@ -3714,22 +3716,22 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             aligned_half_block_size = eclatin_blocks['data_block_1'].numel()
             
             logger.info(
-                f"ECLATIN: [Rank 0] Starting recovery pipeline\n"
+                f"ECLATIN: [Rank 2] Starting recovery pipeline\n"
                 f"  Recv buffers: {aligned_half_block_size / (1024**3):.2f} GB each\n"
                 f"  Recovered blocks: {aligned_half_block_size / (1024**3):.2f} GB each"
             )
             
             # Call C++ load_recover: receives 6 blocks and recovers 4 blocks
             self.eclatin_manager._eclatin_native.load_recover(
-                rank1_data1_addr, rank1_data2_addr,
-                rank2_data2_addr, rank2_parity2_addr,
-                rank3_data1_addr, rank3_parity1_addr,
+                rank0_data2_addr, rank0_parity2_addr,
+                rank1_data1_addr, rank1_parity1_addr,
+                rank3_data1_addr, rank3_data2_addr,
                 recovered_data1_addr, recovered_data2_addr,
                 recovered_parity1_addr, recovered_parity2_addr,
                 aligned_half_block_size
             )
             
-            logger.info("ECLATIN: [Rank 0] Recovery pipeline completed")
+            logger.info("ECLATIN: [Rank 2] Recovery pipeline completed")
             
             # Copy recovered blocks to recovered_buffer (for compatibility with _load_eclatin_checkpoint)
             # Note: This is a simplified version - actual implementation may need to combine blocks
@@ -3738,54 +3740,54 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 recovered_buffer[:min(total_size, aligned_half_block_size)].copy_(
                     eclatin_blocks['data_block_1'][:min(total_size, aligned_half_block_size)]
                 )
-                logger.info(f"ECLATIN: [Rank 0] Copied recovered data to buffer ({total_size / (1024**3):.2f} GB)")
+                logger.info(f"ECLATIN: [Rank 2] Copied recovered data to buffer ({total_size / (1024**3):.2f} GB)")
             else:
                 logger.warning(
-                    f"ECLATIN: [Rank 0] recovered_buffer too small "
+                    f"ECLATIN: [Rank 2] recovered_buffer too small "
                     f"({recovered_buffer.numel()} < {total_size})"
                 )
         
-        # === Step 3: rank1/2/3: Send blocks to rank0 ===
+        # === Step 3: rank0/1/3: Send blocks to rank2 ===
         else:
             aligned_half_block_size = eclatin_blocks['data_block_1'].numel()
             
-            if rank == 1:
-                # rank1 sends: data_block_1, data_block_2
-                data1_addr = int(eclatin_blocks['data_block_1'].data_ptr())
-                data2_addr = int(eclatin_blocks['data_block_2'].data_ptr())
-                
-                logger.info(f"ECLATIN: [Rank 1] Sending data_block_1 and data_block_2 to rank0")
-                self.eclatin_manager._eclatin_native.load_send_blocks(
-                    'rank1_data1', data1_addr,
-                    'rank1_data2', data2_addr,
-                    aligned_half_block_size
-                )
-            
-            elif rank == 2:
-                # rank2 sends: data_block_2, parity_block_2
+            if rank == 0:
+                # rank0 sends: data_block_2, parity_block_2
                 data2_addr = int(eclatin_blocks['data_block_2'].data_ptr())
                 parity2_addr = int(eclatin_blocks['parity_block_2'].data_ptr())
                 
-                logger.info(f"ECLATIN: [Rank 2] Sending data_block_2 and parity_block_2 to rank0")
+                logger.info(f"ECLATIN: [Rank 0] Sending data_block_2 and parity_block_2 to rank2")
                 self.eclatin_manager._eclatin_native.load_send_blocks(
-                    'rank2_data2', data2_addr,
-                    'rank2_parity2', parity2_addr,
+                    'rank0_data2', data2_addr,
+                    'rank0_parity2', parity2_addr,
+                    aligned_half_block_size
+                )
+            
+            elif rank == 1:
+                # rank1 sends: data_block_1, parity_block_1
+                data1_addr = int(eclatin_blocks['data_block_1'].data_ptr())
+                parity1_addr = int(eclatin_blocks['parity_block_1'].data_ptr())
+                
+                logger.info(f"ECLATIN: [Rank 1] Sending data_block_1 and parity_block_1 to rank2")
+                self.eclatin_manager._eclatin_native.load_send_blocks(
+                    'rank1_data1', data1_addr,
+                    'rank1_parity1', parity1_addr,
                     aligned_half_block_size
                 )
             
             elif rank == 3:
-                # rank3 sends: data_block_1, parity_block_1
+                # rank3 sends: data_block_1, data_block_2
                 data1_addr = int(eclatin_blocks['data_block_1'].data_ptr())
-                parity1_addr = int(eclatin_blocks['parity_block_1'].data_ptr())
+                data2_addr = int(eclatin_blocks['data_block_2'].data_ptr())
                 
-                logger.info(f"ECLATIN: [Rank 3] Sending data_block_1 and parity_block_1 to rank0")
+                logger.info(f"ECLATIN: [Rank 3] Sending data_block_1 and data_block_2 to rank2")
                 self.eclatin_manager._eclatin_native.load_send_blocks(
                     'rank3_data1', data1_addr,
-                    'rank3_parity1', parity1_addr,
+                    'rank3_data2', data2_addr,
                     aligned_half_block_size
                 )
             
-            logger.info(f"ECLATIN: [Rank {rank}] Sent blocks to rank0")
+            logger.info(f"ECLATIN: [Rank {rank}] Sent blocks to rank2")
         
         # Synchronize all ranks
         torch.distributed.barrier()
@@ -4335,10 +4337,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         
-        # Recovery path: rank0 may have recovered buffer
-        if (False):
-        #if (rank == 0 and hasattr(self, 'eclatin_recovered_buffer')
-        #    and self.eclatin_recovered_buffer is not None):
+        # Recovery path: rank2 may have recovered buffer
+        if (rank == 2 and hasattr(self, 'eclatin_recovered_buffer')
+            and self.eclatin_recovered_buffer is not None):
             logger.info(f"ECLATIN: [Rank {rank}] Using recovered data from recovery pipeline")
             decomposed = self._extract_decomposed_from_buffer(
                 self.eclatin_recovered_buffer,
@@ -4504,12 +4505,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # _load_eccheck_checkpoint will use recovered data if available (rank2)
             return self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
         
-        if input_args.use_eclatin and (self._is_eclatin_checkpoint(checkpoint_dir) or rank == 0):
+        if input_args.use_eclatin and (self._is_eclatin_checkpoint(checkpoint_dir) or rank == 2):
             logger.info(f"Detected ECLATIN format checkpoint at {checkpoint_dir}")
-            # Load P2P checkpoint data (for rank0 recovery, this prepares the buffer)
+            # Load P2P checkpoint data (for rank2 recovery, this prepares the buffer)
             mapped_file_own, mapped_file_partner = self._load_eclatin_p2p_checkpoint(checkpoint_dir)
             
-            # _load_eclatin_checkpoint will use recovered data if available (rank0)
+            # _load_eclatin_checkpoint will use recovered data if available (rank2)
             return self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)
         
         # Apply N-D tensors resharding

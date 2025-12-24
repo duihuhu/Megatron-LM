@@ -207,7 +207,24 @@ public:
     void init_load_send_rank3_data1(const std::string& rank0_ip, uint16_t port);
     void init_load_send_rank3_parity1(const std::string& rank0_ip, uint16_t port);
     
+    // Load mode bind+listen helpers (for rank0, before accept)
+    void bind_listen_load_recv_rank1_data1(const std::string& listen_ip, uint16_t port);
+    void bind_listen_load_recv_rank1_data2(const std::string& listen_ip, uint16_t port);
+    void bind_listen_load_recv_rank2_data2(const std::string& listen_ip, uint16_t port);
+    void bind_listen_load_recv_rank2_parity2(const std::string& listen_ip, uint16_t port);
+    void bind_listen_load_recv_rank3_data1(const std::string& listen_ip, uint16_t port);
+    void bind_listen_load_recv_rank3_parity1(const std::string& listen_ip, uint16_t port);
+    
+    // Load mode accept helpers (for rank0, after bind+listen)
+    void accept_load_recv_rank1_data1();
+    void accept_load_recv_rank1_data2();
+    void accept_load_recv_rank2_data2();
+    void accept_load_recv_rank2_parity2();
+    void accept_load_recv_rank3_data1();
+    void accept_load_recv_rank3_parity1();
+    
     void wait_for_connections(int timeout_seconds = 30);
+    void wait_for_load_connections(int timeout_seconds = 30);
     void cleanup();
 };
 
@@ -349,6 +366,68 @@ void AsioConnectionManager::wait_for_connections(int timeout_seconds) {
                    parity2_recv1_connected_ && parity2_recv2_connected_;
         }
     );
+}
+
+void AsioConnectionManager::wait_for_load_connections(int timeout_seconds) {
+    // For rank0: wait for all 6 recv connections
+    // For rank1/2/3: wait for 2 send connections each
+    int rank = -1;  // Will be determined by which connections are being waited
+    if (load_recv_rank1_data1_connected_ || load_recv_rank1_data2_connected_) {
+        // rank0: wait for all 6 recv connections
+        int wait_count = 0;
+        while (!(load_recv_rank1_data1_connected_ && load_recv_rank1_data2_connected_ &&
+                 load_recv_rank2_data2_connected_ && load_recv_rank2_parity2_connected_ &&
+                 load_recv_rank3_data1_connected_ && load_recv_rank3_parity1_connected_)) {
+            if (wait_count % 100 == 0) {
+                std::cout << "ECLATIN: [Rank 0] Waiting for load connections: "
+                          << "r1_d1=" << (load_recv_rank1_data1_connected_ ? "true" : "false")
+                          << ", r1_d2=" << (load_recv_rank1_data2_connected_ ? "true" : "false")
+                          << ", r2_d2=" << (load_recv_rank2_data2_connected_ ? "true" : "false")
+                          << ", r2_p2=" << (load_recv_rank2_parity2_connected_ ? "true" : "false")
+                          << ", r3_d1=" << (load_recv_rank3_data1_connected_ ? "true" : "false")
+                          << ", r3_p1=" << (load_recv_rank3_parity1_connected_ ? "true" : "false") << std::endl;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            wait_count++;
+            if (wait_count * 10 > timeout_seconds * 1000) {
+                std::cerr << "ECLATIN: [Rank 0] Timeout waiting for load connections" << std::endl;
+                break;
+            }
+        }
+    } else if (load_send_rank1_data1_connected_ || load_send_rank1_data2_connected_) {
+        // rank1: wait for 2 send connections
+        int wait_count = 0;
+        while (!(load_send_rank1_data1_connected_ && load_send_rank1_data2_connected_)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            wait_count++;
+            if (wait_count * 10 > timeout_seconds * 1000) {
+                std::cerr << "ECLATIN: [Rank 1] Timeout waiting for load connections" << std::endl;
+                break;
+            }
+        }
+    } else if (load_send_rank2_data2_connected_ || load_send_rank2_parity2_connected_) {
+        // rank2: wait for 2 send connections
+        int wait_count = 0;
+        while (!(load_send_rank2_data2_connected_ && load_send_rank2_parity2_connected_)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            wait_count++;
+            if (wait_count * 10 > timeout_seconds * 1000) {
+                std::cerr << "ECLATIN: [Rank 2] Timeout waiting for load connections" << std::endl;
+                break;
+            }
+        }
+    } else if (load_send_rank3_data1_connected_ || load_send_rank3_parity1_connected_) {
+        // rank3: wait for 2 send connections
+        int wait_count = 0;
+        while (!(load_send_rank3_data1_connected_ && load_send_rank3_parity1_connected_)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            wait_count++;
+            if (wait_count * 10 > timeout_seconds * 1000) {
+                std::cerr << "ECLATIN: [Rank 3] Timeout waiting for load connections" << std::endl;
+                break;
+            }
+        }
+    }
 }
 
 void AsioConnectionManager::init_load_recv_rank1_data1(const std::string& listen_ip, uint16_t port) {
@@ -535,6 +614,134 @@ void AsioConnectionManager::init_load_send_rank3_parity1(const std::string& rank
         std::cerr << "ASIO: load_send_rank3_parity1 init error: " << e.what() << std::endl;
         load_send_rank3_parity1_connected_ = false;
         throw;
+    }
+}
+
+// Load mode bind+listen helpers (for rank0, before accept)
+void AsioConnectionManager::bind_listen_load_recv_rank1_data1(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    load_recv_rank1_data1_acceptor_.open(endpoint.protocol());
+    load_recv_rank1_data1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    load_recv_rank1_data1_acceptor_.bind(endpoint);
+    load_recv_rank1_data1_acceptor_.listen();
+}
+
+void AsioConnectionManager::bind_listen_load_recv_rank1_data2(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    load_recv_rank1_data2_acceptor_.open(endpoint.protocol());
+    load_recv_rank1_data2_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    load_recv_rank1_data2_acceptor_.bind(endpoint);
+    load_recv_rank1_data2_acceptor_.listen();
+}
+
+void AsioConnectionManager::bind_listen_load_recv_rank2_data2(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    load_recv_rank2_data2_acceptor_.open(endpoint.protocol());
+    load_recv_rank2_data2_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    load_recv_rank2_data2_acceptor_.bind(endpoint);
+    load_recv_rank2_data2_acceptor_.listen();
+}
+
+void AsioConnectionManager::bind_listen_load_recv_rank2_parity2(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    load_recv_rank2_parity2_acceptor_.open(endpoint.protocol());
+    load_recv_rank2_parity2_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    load_recv_rank2_parity2_acceptor_.bind(endpoint);
+    load_recv_rank2_parity2_acceptor_.listen();
+}
+
+void AsioConnectionManager::bind_listen_load_recv_rank3_data1(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    load_recv_rank3_data1_acceptor_.open(endpoint.protocol());
+    load_recv_rank3_data1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    load_recv_rank3_data1_acceptor_.bind(endpoint);
+    load_recv_rank3_data1_acceptor_.listen();
+}
+
+void AsioConnectionManager::bind_listen_load_recv_rank3_parity1(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    load_recv_rank3_parity1_acceptor_.open(endpoint.protocol());
+    load_recv_rank3_parity1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    load_recv_rank3_parity1_acceptor_.bind(endpoint);
+    load_recv_rank3_parity1_acceptor_.listen();
+}
+
+// Load mode accept helpers (for rank0, after bind+listen)
+void AsioConnectionManager::accept_load_recv_rank1_data1() {
+    try {
+        load_recv_rank1_data1_acceptor_.accept(load_recv_rank1_data1_socket_);
+        load_recv_rank1_data1_connected_ = true;
+        std::cout << "ASIO: load_recv_rank1_data1 connected" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank1_data1 accept error: " << e.what() << std::endl;
+        load_recv_rank1_data1_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_load_recv_rank1_data2() {
+    try {
+        load_recv_rank1_data2_acceptor_.accept(load_recv_rank1_data2_socket_);
+        load_recv_rank1_data2_connected_ = true;
+        std::cout << "ASIO: load_recv_rank1_data2 connected" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank1_data2 accept error: " << e.what() << std::endl;
+        load_recv_rank1_data2_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_load_recv_rank2_data2() {
+    try {
+        load_recv_rank2_data2_acceptor_.accept(load_recv_rank2_data2_socket_);
+        load_recv_rank2_data2_connected_ = true;
+        std::cout << "ASIO: load_recv_rank2_data2 connected" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank2_data2 accept error: " << e.what() << std::endl;
+        load_recv_rank2_data2_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_load_recv_rank2_parity2() {
+    try {
+        load_recv_rank2_parity2_acceptor_.accept(load_recv_rank2_parity2_socket_);
+        load_recv_rank2_parity2_connected_ = true;
+        std::cout << "ASIO: load_recv_rank2_parity2 connected" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank2_parity2 accept error: " << e.what() << std::endl;
+        load_recv_rank2_parity2_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_load_recv_rank3_data1() {
+    try {
+        load_recv_rank3_data1_acceptor_.accept(load_recv_rank3_data1_socket_);
+        load_recv_rank3_data1_connected_ = true;
+        std::cout << "ASIO: load_recv_rank3_data1 connected" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank3_data1 accept error: " << e.what() << std::endl;
+        load_recv_rank3_data1_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_load_recv_rank3_parity1() {
+    try {
+        load_recv_rank3_parity1_acceptor_.accept(load_recv_rank3_parity1_socket_);
+        load_recv_rank3_parity1_connected_ = true;
+        std::cout << "ASIO: load_recv_rank3_parity1 connected" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_recv_rank3_parity1 accept error: " << e.what() << std::endl;
+        load_recv_rank3_parity1_connected_ = false;
+        connection_cv_.notify_all();
     }
 }
 
@@ -908,6 +1115,109 @@ public:
         failed_rank_ = failed_rank;
         std::cout << "ECLATIN: Set load mode: " 
                   << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank << std::endl;
+    }
+    
+    void init_load_connections(
+        int rank,
+        const std::string& rank0_ip,
+        uint16_t load_recv_rank1_data1_port,
+        uint16_t load_recv_rank1_data2_port,
+        uint16_t load_recv_rank2_data2_port,
+        uint16_t load_recv_rank2_parity2_port,
+        uint16_t load_recv_rank3_data1_port,
+        uint16_t load_recv_rank3_parity1_port
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "ECLATIN: init_load_connections called but not in load mode" << std::endl;
+            return;
+        }
+        
+        std::cout << "ECLATIN: [Rank " << rank << "] Initializing load connections..." << std::endl;
+        
+        if (rank == 0) {
+            // rank0: Initialize 6 recv sockets (accept connections from rank1/2/3)
+            // Step 1: First, bind and listen all acceptors synchronously (before accept)
+            std::cout << "ECLATIN: [Rank 0] Binding and listening all acceptors..." << std::endl;
+            try {
+                conn_.bind_listen_load_recv_rank1_data1(rank0_ip, load_recv_rank1_data1_port);
+                conn_.bind_listen_load_recv_rank1_data2(rank0_ip, load_recv_rank1_data2_port);
+                conn_.bind_listen_load_recv_rank2_data2(rank0_ip, load_recv_rank2_data2_port);
+                conn_.bind_listen_load_recv_rank2_parity2(rank0_ip, load_recv_rank2_parity2_port);
+                conn_.bind_listen_load_recv_rank3_data1(rank0_ip, load_recv_rank3_data1_port);
+                conn_.bind_listen_load_recv_rank3_parity1(rank0_ip, load_recv_rank3_parity1_port);
+                
+                std::cout << "ECLATIN: [Rank 0] All acceptors bound and listening" << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "ECLATIN: [Rank 0] Failed to bind/listen acceptors: " << e.what() << std::endl;
+                throw;
+            }
+            
+            // Step 2: Start accept operations in separate threads (similar to EC-CHECK)
+            // These threads will block on accept() until connections arrive
+            std::thread recv_init_thread([this]() {
+                std::thread r1_d1([this]() {
+                    conn_.accept_load_recv_rank1_data1();
+                });
+                std::thread r1_d2([this]() {
+                    conn_.accept_load_recv_rank1_data2();
+                });
+                std::thread r2_d2([this]() {
+                    conn_.accept_load_recv_rank2_data2();
+                });
+                std::thread r2_p2([this]() {
+                    conn_.accept_load_recv_rank2_parity2();
+                });
+                std::thread r3_d1([this]() {
+                    conn_.accept_load_recv_rank3_data1();
+                });
+                std::thread r3_p1([this]() {
+                    conn_.accept_load_recv_rank3_parity1();
+                });
+                r1_d1.join();
+                r1_d2.join();
+                r2_d2.join();
+                r2_p2.join();
+                r3_d1.join();
+                r3_p1.join();
+            });
+            
+            // Step 3: Small delay to ensure accept sockets are bound and listening (similar to EC-CHECK)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            
+            // Step 4: Detach the recv_init_thread so it runs in background
+            // The accept operations will block until connections arrive from rank1/2/3
+            recv_init_thread.detach();
+            
+            std::cout << "ECLATIN: [Rank 0] Accept threads started, waiting for connections..." << std::endl;
+        } else {
+            // rank1/2/3: Initialize 2 send sockets each (connect to rank0)
+            if (rank == 1) {
+                std::cout << "ECLATIN: [Rank 1] Connecting load send sockets to rank0..." << std::endl;
+                conn_.init_load_send_rank1_data1(rank0_ip, load_recv_rank1_data1_port);
+                conn_.init_load_send_rank1_data2(rank0_ip, load_recv_rank1_data2_port);
+                std::cout << "ECLATIN: [Rank 1] Load send sockets connected" << std::endl;
+            } else if (rank == 2) {
+                std::cout << "ECLATIN: [Rank 2] Connecting load send sockets to rank0..." << std::endl;
+                conn_.init_load_send_rank2_data2(rank0_ip, load_recv_rank2_data2_port);
+                conn_.init_load_send_rank2_parity2(rank0_ip, load_recv_rank2_parity2_port);
+                std::cout << "ECLATIN: [Rank 2] Load send sockets connected" << std::endl;
+            } else if (rank == 3) {
+                std::cout << "ECLATIN: [Rank 3] Connecting load send sockets to rank0..." << std::endl;
+                conn_.init_load_send_rank3_data1(rank0_ip, load_recv_rank3_data1_port);
+                conn_.init_load_send_rank3_parity1(rank0_ip, load_recv_rank3_parity1_port);
+                std::cout << "ECLATIN: [Rank 3] Load send sockets connected" << std::endl;
+            }
+        }
+        
+            std::cout << "ECLATIN: [Rank " << rank << "] Load connections initialized" << std::endl;
+    }
+    
+    void wait_for_load_connections(int timeout_seconds = 30) {
+        if (!is_load_mode_) {
+            std::cerr << "ECLATIN: wait_for_load_connections called but not in load mode" << std::endl;
+            return;
+        }
+        conn_.wait_for_load_connections(timeout_seconds);
     }
 
     // Unified recovery interface for rank0 (parallel recv + parallel XOR)
@@ -1825,6 +2135,19 @@ PYBIND11_MODULE(eclatin_native, m) {
              "Set load mode for recovery",
              pybind11::arg("is_load"),
              pybind11::arg("failed_rank") = -1)
+        .def("init_load_connections", &ECLATINNative::init_load_connections,
+             "Initialize load mode connections (rank0 recv, rank1/2/3 send)",
+             pybind11::arg("rank"),
+             pybind11::arg("rank0_ip"),
+             pybind11::arg("load_recv_rank1_data1_port"),
+             pybind11::arg("load_recv_rank1_data2_port"),
+             pybind11::arg("load_recv_rank2_data2_port"),
+             pybind11::arg("load_recv_rank2_parity2_port"),
+             pybind11::arg("load_recv_rank3_data1_port"),
+             pybind11::arg("load_recv_rank3_parity1_port"))
+        .def("wait_for_load_connections", &ECLATINNative::wait_for_load_connections,
+             "Wait for load mode connections to be established",
+             pybind11::arg("timeout_seconds") = 30)
         .def("load_recover", &ECLATINNative::load_recover,
              "Unified recovery interface for rank0 (parallel recv + parallel XOR)",
              pybind11::arg("rank1_data1_addr"),

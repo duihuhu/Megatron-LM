@@ -659,7 +659,7 @@ public:
         std::cout << "ECLATIN: Initializing connections..." << std::endl;
         init_connections();
         start_threads();
-        std::cout << "ECLATIN: Pipeline started successfully" << std::endl;
+        // std::cout << "ECLATIN: Pipeline started successfully" << std::endl;
     }
 
     ~ECLATINNative() {
@@ -668,8 +668,8 @@ public:
 
     // Parity 1 pipelines
     void submit_parity1_send1(uintptr_t send_addr, size_t size) {
-        std::cout << "ECLATIN: Submitting parity1_send1 task: send_addr=" << send_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECLATIN: Submitting parity1_send1 task: send_addr=" << send_addr
+                //   << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity1_send1_mutex_);
             parity1_send1_q_.push({send_addr, size});
@@ -678,8 +678,8 @@ public:
     }
 
     void submit_parity1_send2(uintptr_t send_addr, size_t size) {
-        std::cout << "ECLATIN: Submitting parity1_send2 task: send_addr=" << send_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECLATIN: Submitting parity1_send2 task: send_addr=" << send_addr
+                //   << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity1_send2_mutex_);
             parity1_send2_q_.push({send_addr, size});
@@ -691,10 +691,10 @@ public:
                                   uintptr_t recv2_addr,
                                   uintptr_t parity_addr,
                                   size_t size) {
-        std::cout << "ECLATIN: Submitting parity1_recv_xor task: recv1_addr=" << recv1_addr
-                  << ", recv2_addr=" << recv2_addr
-                  << ", parity_addr=" << parity_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECLATIN: Submitting parity1_recv_xor task: recv1_addr=" << recv1_addr
+        //           << ", recv2_addr=" << recv2_addr
+        //           << ", parity_addr=" << parity_addr
+        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity1_recv_xor_mutex_);
             parity1_recv_xor_q_.push({recv1_addr, recv2_addr, parity_addr, size});
@@ -704,8 +704,8 @@ public:
 
     // Parity 2 pipelines
     void submit_parity2_send1(uintptr_t send_addr, size_t size) {
-        std::cout << "ECLATIN: Submitting parity2_send1 task: send_addr=" << send_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECLATIN: Submitting parity2_send1 task: send_addr=" << send_addr
+        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity2_send1_mutex_);
             parity2_send1_q_.push({send_addr, size});
@@ -714,8 +714,8 @@ public:
     }
 
     void submit_parity2_send2(uintptr_t send_addr, size_t size) {
-        std::cout << "ECLATIN: Submitting parity2_send2 task: send_addr=" << send_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECLATIN: Submitting parity2_send2 task: send_addr=" << send_addr
+        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity2_send2_mutex_);
             parity2_send2_q_.push({send_addr, size});
@@ -727,10 +727,10 @@ public:
                                   uintptr_t recv2_addr,
                                   uintptr_t parity_addr,
                                   size_t size) {
-        std::cout << "ECLATIN: Submitting parity2_recv_xor task: recv1_addr=" << recv1_addr
-                  << ", recv2_addr=" << recv2_addr
-                  << ", parity_addr=" << parity_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECLATIN: Submitting parity2_recv_xor task: recv1_addr=" << recv1_addr
+        //           << ", recv2_addr=" << recv2_addr
+        //           << ", parity_addr=" << parity_addr
+        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity2_recv_xor_mutex_);
             parity2_recv_xor_q_.push({recv1_addr, recv2_addr, parity_addr, size});
@@ -740,7 +740,7 @@ public:
 
     // Submit sentinels to signal pipeline completion
     void submit_parity1_send1_sentinel() {
-        std::cout << "ECLATIN: Submitting sentinel to parity1_send1 pipeline" << std::endl;
+        // std::cout << "ECLATIN: Submitting sentinel to parity1_send1 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity1_send1_mutex_);
             parity1_send1_q_.push({0, 0});
@@ -749,7 +749,7 @@ public:
     }
 
     void submit_parity1_send2_sentinel() {
-        std::cout << "ECLATIN: Submitting sentinel to parity1_send2 pipeline" << std::endl;
+        // std::cout << "ECLATIN: Submitting sentinel to parity1_send2 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity1_send2_mutex_);
             parity1_send2_q_.push({0, 0});
@@ -758,7 +758,7 @@ public:
     }
 
     void submit_parity1_recv_xor_sentinel() {
-        std::cout << "ECLATIN: Submitting sentinel to parity1_recv_xor pipeline" << std::endl;
+        // std::cout << "ECLATIN: Submitting sentinel to parity1_recv_xor pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity1_recv_xor_mutex_);
             parity1_recv_xor_q_.push({0, 0, 0, 0});
@@ -767,7 +767,7 @@ public:
     }
 
     void submit_parity2_send1_sentinel() {
-        std::cout << "ECLATIN: Submitting sentinel to parity2_send1 pipeline" << std::endl;
+        // std::cout << "ECLATIN: Submitting sentinel to parity2_send1 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity2_send1_mutex_);
             parity2_send1_q_.push({0, 0});
@@ -776,7 +776,7 @@ public:
     }
 
     void submit_parity2_send2_sentinel() {
-        std::cout << "ECLATIN: Submitting sentinel to parity2_send2 pipeline" << std::endl;
+        // std::cout << "ECLATIN: Submitting sentinel to parity2_send2 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity2_send2_mutex_);
             parity2_send2_q_.push({0, 0});
@@ -785,7 +785,7 @@ public:
     }
 
     void submit_parity2_recv_xor_sentinel() {
-        std::cout << "ECLATIN: Submitting sentinel to parity2_recv_xor pipeline" << std::endl;
+        // std::cout << "ECLATIN: Submitting sentinel to parity2_recv_xor pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(parity2_recv_xor_mutex_);
             parity2_recv_xor_q_.push({0, 0, 0, 0});

@@ -1945,7 +1945,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         exec_time = time() - exec_start
         
         logger.info(f"ECLATIN: Pipeline execution completed in {exec_time:.2f}s")
-        
+        duration = time() - start
+        logger.warning(f"ECLATIN: Pipeline execution completed in {duration:.2f}s")
+
         # Step 9: Update self.write_buckets and return (consistent with ECCHECK)
         # This ensures retrieve_write_results() can check the correct count
         if hasattr(self, 'ecl_write_buckets') and self.ecl_write_buckets:

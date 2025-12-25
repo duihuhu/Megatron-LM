@@ -208,25 +208,25 @@ class ECLATINManager:
         import socket
         
         # Step 1: Get base IP address
-        # Priority: ECLATIN_BASE_IP > MASTER_ADDR > auto-detect
+        # Priority: ECLATIN_BASE_IP > auto-detect > MASTER_ADDR (fallback)
         base_ip = os.environ.get('ECLATIN_BASE_IP')
-        if not base_ip:
-            base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
         
-        # If using localhost, try to get actual IP
-        if base_ip == '127.0.0.1' or base_ip == 'localhost':
+        # If ECLATIN_BASE_IP is not set, try to auto-detect actual IP
+        if not base_ip:
             try:
                 # Get IP of the interface used for distributed training
                 # Connect to a remote address (doesn't actually send data)
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                # Use a public DNS server IP to determine the default route interface
                 s.connect(('8.8.8.8', 80))
                 base_ip = s.getsockname()[0]
                 s.close()
                 logger.info(f"ECLATIN: Auto-detected IP address: {base_ip}")
             except Exception as e:
-                # Fallback to localhost
-                logger.warning(f"ECLATIN: Failed to auto-detect IP, using localhost: {e}")
-                base_ip = '127.0.0.1'
+                logger.warning(f"ECLATIN: Failed to auto-detect IP: {e}")
+                # Fallback to MASTER_ADDR or localhost
+                base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
+                logger.warning(f"ECLATIN: Using fallback IP: {base_ip}")
         
         # Step 2: Get base port
         # Priority: ECLATIN_BASE_PORT > MASTER_PORT + 10000 > default 16000

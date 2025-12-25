@@ -1464,11 +1464,12 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 if self.eclatin_manager.eclatin_pin_memory and torch.cuda.is_available():
                     self.preallocated_cpu_buffer = torch.empty(
                         total_size, dtype=torch.uint8).pin_memory()
-                    logger.debug("ECLATIN: Using pinned memory for CPU buffer")
+                    logger.info("ECLATIN: Using pinned memory for CPU buffer")
                 else:
                     self.preallocated_cpu_buffer = torch.empty(
                         total_size, dtype=torch.uint8
                     )
+                    logger.info("ECLATIN: Using non-pinned memory for CPU buffer")
             
             prealloc_time = time() - start
             logger.debug(f"ECLATIN: CPU buffer preallocation took {prealloc_time:.2f}s")

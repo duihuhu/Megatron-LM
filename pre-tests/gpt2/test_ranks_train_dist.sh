@@ -8,13 +8,17 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_FILE=./nccl.log
 export NCCL_DEBUG_SUBSYS=ALL
 
+export NCCL_IB_DISABLE=1
+export NCCL_P2P_DISABLE=1
+export NCCL_SHM_DISABLE=1
+
 export CUDA_LAUNCH_BLOCKING=1
 
 
-GPUS_PER_NODE=2
+GPUS_PER_NODE=1
 # Change for multinode config
-MASTER_ADDR=10.156.154.36
-MASTER_PORT=6000
+MASTER_ADDR=128.105.146.42
+MASTER_PORT=29500
 NNODES=2
 NODE_RANK=$1
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
@@ -40,13 +44,13 @@ fi
 
 
 if [ "$NODE_RANK" -eq 0 ]; then
-    export CUDA_VISIBLE_DEVICES=0,1
+    export CUDA_VISIBLE_DEVICES=0
 elif [ "$NODE_RANK" -eq 1 ]; then
-    export CUDA_VISIBLE_DEVICES=0,1
+    export CUDA_VISIBLE_DEVICES=0
 fi
 
-export NCCL_SOCKET_IFNAME=ens37f0
-export GLOO_SOCKET_IFNAME=ens37f0
+export NCCL_SOCKET_IFNAME=eno33np0
+export GLOO_SOCKET_IFNAME=eno33np0
 
 
 TEST_NUM=${2:-0}
@@ -101,7 +105,7 @@ GPT_ARGS=(
 #replication-factor是副本数量
 #replication-jump是在多个副本的时候，将自己的副本放到哪个rank上
 MODEL_PARALLEL_ARGS=(
-	--tensor-model-parallel-size 2
+	--tensor-model-parallel-size 1
 	--pipeline-model-parallel-size 2
     # --replication
     # --replication-jump 2
@@ -134,8 +138,8 @@ EVAL_AND_LOGGING_ARGS=(
 mkdir -p logs
 mkdir -p logs/csv
 
-export USE_FLASH_ATTN=1 && \
-export NVTE_SYNC_P2P=1 && \
+# export USE_FLASH_ATTN=1 && \
+# export NVTE_SYNC_P2P=1 && \
 
 PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     pretrain_gpt.py \

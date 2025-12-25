@@ -264,8 +264,6 @@ class TemporalAsyncCaller(AsyncCaller):
         self.process: Optional[mp.Process] = None
         self.replica_process: Optional[mp.Process] = None
         self.start_time: Optional[float] = None
-        self._pair_process_groups: Dict[int, torch.distributed.ProcessGroup] = {}
-        self._gloo_initialized: bool = False
         
         # Reusable buffers for data exchange to avoid repeated allocations
         self._serialization_buffer: Optional[io.BytesIO] = None
@@ -276,90 +274,6 @@ class TemporalAsyncCaller(AsyncCaller):
         self._last_remote_size: int = 0
         
         self.pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
-
-    def _ensure_gloo_backend_available(self) -> None:
-        """Ensure gloo backend is available for CPU tensor communication.
-        
-        When main process group uses NCCL, we may need to ensure gloo backend
-        is properly initialized before creating gloo sub-groups.
-        """
-        if self._gloo_initialized:
-            return
-        
-        # Check if gloo backend is available
-        # new_group should handle gloo initialization automatically,
-        # but we can check if it's needed
-        try:
-            # Try to get backend info - this will tell us if gloo is available
-            current_backend = torch.distributed.get_backend()
-            logger.debug(f"Current backend: {current_backend}")
-            # If main backend is NCCL, new_group with gloo should still work
-            # PyTorch will handle gloo initialization automatically
-            self._gloo_initialized = True
-        except Exception as e:
-            logger.warning(f"Could not verify gloo backend availability: {e}")
-
-    def _create_all_pair_process_groups(self) -> None:
-        """Create all pair process groups at once.
-        
-        IMPORTANT: torch.distributed.new_group requires ALL ranks to call it,
-        not just the ranks participating in the group. This method ensures
-        all ranks call new_group for all pair groups.
-        """
-        if self._pair_process_groups:
-            return  # Already created
-        
-        rank = torch.distributed.get_rank()
-        
-        # Ensure gloo backend is available
-        self._ensure_gloo_backend_available()
-        
-        # Define all pairs: rank 0<->2, rank 1<->3
-        all_pairs = [[0, 2], [1, 3]]
-        
-        logger.info(f"rank: {rank}, creating all pair process groups")
-        
-        # All ranks must call new_group for each pair, even if they're not in that pair
-        for pair_ranks in all_pairs:
-            group_key = min(pair_ranks)
-            try:
-                logger.info(f"rank: {rank}, calling new_group for ranks {pair_ranks}")
-                # ALL ranks must call this, not just the ranks in pair_ranks
-                pair_group = torch.distributed.new_group(ranks=pair_ranks, backend='gloo')
-                
-                # Only store the group if this rank is in it
-                if rank in pair_ranks:
-                    self._pair_process_groups[group_key] = pair_group
-                    logger.info(f"rank: {rank}, stored pair process group for ranks {pair_ranks}")
-                else:
-                    logger.info(f"rank: {rank}, participated in creating group for ranks {pair_ranks} (not a member)")
-            except Exception as e:
-                logger.error(f"rank: {rank}, failed to create pair process group for ranks {pair_ranks}: {e}", exc_info=True)
-                raise
-        
-        logger.info(f"rank: {rank}, finished creating all pair process groups")
-
-    def _get_or_create_pair_process_group(self, rank: int, paired_rank: int) -> torch.distributed.ProcessGroup:
-        """Get or create a process group for paired ranks.
-        
-        Args:
-            rank: Current rank
-            paired_rank: Paired rank to communicate with
-            
-        Returns:
-            ProcessGroup for the pair
-        """
-        # Create all pair groups if not already created
-        # This ensures all ranks participate in creating all groups
-        self._create_all_pair_process_groups()
-        
-        # Use the lower rank as the key to retrieve the group
-        group_key = min(rank, paired_rank)
-        
-        if group_key not in self._pair_process_groups:
-            raise RuntimeError(f"rank: {rank}, pair process group for ranks [{min(rank, paired_rank)}, {max(rank, paired_rank)}] not found")
-        
-        return self._pair_process_groups[group_key]
 
     def calculate_buckets_data_size(self, write_buckets):
         """Calculate data size by traversing write_buckets structure.
@@ -428,7 +342,7 @@ class TemporalAsyncCaller(AsyncCaller):
             return None, 0, 0
         
         # Create or get pair process group
-        pair_group = self._get_or_create_pair_process_group(rank, paired_rank)
+        pair_group = get_or_create_pair_process_group(rank, paired_rank)
         
         # Step 1: Serialize local data first to get actual size
         serialize_start = time()
@@ -479,6 +393,8 @@ class TemporalAsyncCaller(AsyncCaller):
         # Use the preallocated buffer (only the needed portion)
         self._local_tensor_buffer.copy_(torch.from_numpy(local_array))
         local_tensor = self._local_tensor_buffer
+        data_end_copy = time()
+        logger.info(f"rank: {rank}, data end copy took {data_end_copy - data_exchange_start:.4f}s")
         # Reuse or allocate remote tensor buffer
         if self._remote_tensor_buffer is None or self._remote_tensor_buffer.numel() < remote_size:
             # Allocate new buffer with some extra space (10% overhead)
@@ -506,14 +422,15 @@ class TemporalAsyncCaller(AsyncCaller):
             torch.distributed.broadcast(remote_tensor, src=lower_global_rank, group=pair_group)
             # Then broadcast my data
             torch.distributed.broadcast(local_tensor, src=higher_global_rank, group=pair_group)
-        
+
+        data_exchange_time = time() - data_end_copy
+        logger.info(f"rank: {rank}, data exchange took {data_exchange_time:.4f}s, "
+                   f"received {remote_size / (1024**2):.2f} MB from rank {paired_rank}")
+                
         # Get remote bytes directly (no deserialization needed)
         remote_bytes = remote_tensor.numpy().tobytes()
         
-        data_exchange_time = time() - data_exchange_start
-        logger.info(f"rank: {rank}, data exchange took {data_exchange_time:.4f}s, "
-                   f"received {remote_size / (1024**2):.2f} MB from rank {paired_rank}")
-        
+
         # Return remote_bytes instead of deserialized replica_buckets
         # This avoids deserialization overhead and preserves exact size
         return remote_bytes, local_size, remote_size
@@ -541,20 +458,20 @@ class TemporalAsyncCaller(AsyncCaller):
             # stage GPU tensors to its defined destination
             async_fn_args[1] = async_req.preload_fn()
         
-        print("preload_fn preload_fn ")
+        # print("preload_fn preload_fn ")
         
         rank = torch.distributed.get_rank()
         # logger.info(f"EC-CHECK: Synchronizing CUDA")
         torch.cuda.synchronize()
         # logger.info(f"EC-CHECK: CUDA synchronized")
         end_sync = time()
-        logger.warning(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")
+        logger.info(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")
         
         # Exchange checkpoint data with paired rank
         # Step 1: Calculate size by traversing buckets
         # Step 2: Exchange sizes
         # Step 3: Exchange actual data
-        exchange_start = time()
+        # exchange_start = time()
         ctx = mp.get_context('fork')
         
         from megatron.training import get_args
@@ -562,6 +479,9 @@ class TemporalAsyncCaller(AsyncCaller):
         if args.use_gemini:
             remote_bytes, local_size, remote_size = self.exchange_checkpoint_data(async_fn_args[1])
                     # Start process to save replica checkpoint if we received data
+            exchange_end = time()
+            logger.info(f"rank: {rank}, takes {exchange_end - start_sync} to schedule async ckpt {exchange_end} {start_sync}")
+
             if remote_bytes is not None:
                 # Get replica file path from original write_buckets
                 replica_file_path = self._get_replica_file_path(async_fn_args[1], rank)
@@ -573,28 +493,28 @@ class TemporalAsyncCaller(AsyncCaller):
                 )
                 self.replica_process.start()
 
-                logger.info(f"rank: {rank}, started replica checkpoint save process, "
-                        f"will write {remote_size / (1024**2):.2f} MB to {replica_file_path}")
+                # logger.info(f"rank: {rank}, started replica checkpoint save process, "
+                        # f"will write {remote_size / (1024**2):.2f} MB to {replica_file_path}")
             else:
                 self.replica_process = None
                 
-        exchange_end = time()
-        logger.info(f"rank: {rank}, total exchange (size + data) took {exchange_end - exchange_start:.2f}s")
+        # exchange_end = time()
+        # logger.info(f"rank: {rank}, total exchange (size + data) took {exchange_end - exchange_start:.2f}s")
 
         self.start_time = time()
         
         # Start process to save original checkpoint
         if args.use_gemini:
             # Serialize original checkpoint data to bytes
-            original_serialize_start = time()
+            # original_serialize_start = time()
             # Use a new buffer for original checkpoint to avoid conflicts with exchange buffer
             original_buffer = io.BytesIO()
             torch.save(async_fn_args[1], original_buffer)
             original_buffer_view = original_buffer.getbuffer()
             original_bytes = original_buffer_view.tobytes()
-            original_size = len(original_bytes)
-            original_serialize_time = time() - original_serialize_start
-            logger.info(f"rank: {rank}, serialized original checkpoint: {original_size / (1024**2):.2f} MB in {original_serialize_time:.4f}s")
+            # original_size = len(original_bytes)
+            # original_serialize_time = time() - original_serialize_start
+            # logger.info(f"rank: {rank}, serialized original checkpoint: {original_size / (1024**2):.2f} MB in {original_serialize_time:.4f}s")
             
             # Get original checkpoint file path
             original_file_path = self._get_original_file_path(async_fn_args[1])
@@ -610,8 +530,8 @@ class TemporalAsyncCaller(AsyncCaller):
             )
             self.process.start()
             
-            logger.info(f"rank: {rank}, started original checkpoint save process, "
-                       f"will write {original_size / (1024**2):.2f} MB to {original_file_path}")
+            # logger.info(f"rank: {rank}, started original checkpoint save process, "
+                    #    f"will write {original_size / (1024**2):.2f} MB to {original_file_path}")
         else:
             # Use original async function for non-gemini mode
             self.process = ctx.Process(
@@ -620,7 +540,7 @@ class TemporalAsyncCaller(AsyncCaller):
             self.process.start()
         
         # init_time = time()
-        # logger.debug(f"rank: {rank}, takes {init_time - self.start_time} to schedule async ckpt ")
+        # logger.info(f"rank: {rank}, takes {init_time - start_sync} to schedule async ckpt ", init_time, " ", start_sync)
     
     def _get_original_file_path(self, write_buckets):
         """Get original checkpoint file path from write_buckets.

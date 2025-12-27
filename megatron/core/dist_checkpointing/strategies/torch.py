@@ -4542,7 +4542,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if input_args.use_gemini and input_args.use_gemini_hardware_failure:
             # Check if this is a rank2 recovery scenario
             is_rank2_recovery = (rank == 2 or pair_rank == 2)
-            
+            start_recovery_time = time()
             if is_rank2_recovery:
                 logger.info(f"rank: {rank}, using Gemini checkpoint recovery for rank2 failure")
                 # Only rank0 (pair_rank=2) and rank2 participate in recovery
@@ -4563,7 +4563,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
                 logger.info(f"rank: {rank}, synchronized after Gemini recovery check")
-            
+            end_recovery_time = time()
+            recovery_time = end_recovery_time - start_recovery_time
+            logger.info(f"rank: {rank}, Gemini hardware failure recovery time: {recovery_time:.2f} seconds")
             # All ranks have loaded their data, return it directly
             if recovered_state_dict:
                 logger.info(f"rank: {rank}, returning loaded state dict")
@@ -4571,7 +4573,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         if input_args.use_gemini and input_args.use_gemini_software_failure:
             logger.info(f"rank: {rank}, using Gemini checkpoint recovery for software failure")
-            return self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
+            start_recovery_time = time()
+            recovered_state_dict = self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
+            end_recovery_time = time()
+            recovery_time = end_recovery_time - start_recovery_time
+            logger.info(f"rank: {rank}, Gemini software failure recovery time: {recovery_time:.2f} seconds")
+            return recovered_state_dict
         
         # Normal Gemini checkpoint load (mutual exchange between paired ranks, and all rank recovery from peer replication)
         # if input_args.use_gemini:

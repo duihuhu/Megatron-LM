@@ -719,6 +719,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.eclatin_manager = ECLATINManager()
         self.eclatin_manager.init_eclatin_if_enabled()
         
+        # Initialize Gemini manager (singleton instance for replica-level data transfer)
+        from .gemini_manager import GeminiManager
+        self.gemini_manager = GeminiManager()
+        self.gemini_manager.init_gemini_if_enabled()
+        
         # Initialize strategy-specific EC-CHECK state
         self.eccheck_preallocate_cpu_buffer = True  # Preallocate CPU buffer for tensor data
         self.eccheck_use_continuous_buffer = True  # Use continuous buffer for tensor data
@@ -1031,7 +1036,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         args = input_args()
         # Use PyT saving mechanism
 
-        # Create FileSystemWriterAsync with EC-CHECK or ECLATIN parameters
+        # Create FileSystemWriterAsync with EC-CHECK, ECLATIN, or Gemini parameters
         if self.eclatin_manager.use_eclatin:
             writer = FileSystemWriterAsync(
                 checkpoint_dir,
@@ -1041,6 +1046,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 use_eclatin=self.eclatin_manager.use_eclatin,
                 eclatin_native=self.eclatin_manager._eclatin_native,  # Pass pre-initialized C++ module
                 eclatin_buffers=self._get_eclatin_buffers(),  # Pass pre-allocated buffers
+            )
+        elif self.gemini_manager.use_gemini and self.gemini_manager.use_gemini_optimized:
+            writer = FileSystemWriterAsync(
+                checkpoint_dir,
+                separation_hint=self.separation_hint,
+                thread_count=self.thread_count,
+                use_msc=MultiStorageClientFeature.is_enabled(),
+                use_gemini=self.gemini_manager.use_gemini,
+                gemini_native=self.gemini_manager.get_native_module(),  # Pass pre-initialized C++ module
             )
         else:
             writer = FileSystemWriterAsync(
@@ -1108,6 +1122,16 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             # In ECLATIN mode, call prepare_write_data to create write_buckets
             # It will use the metadata we just prepared
             writer.prepare_write_data(self.cached_central_plan, planner)
+        # Gemini mode: decompose state_dict and preallocate CPU memory for replica exchange
+        elif self.gemini_manager.use_gemini and self.gemini_manager.use_gemini_optimized:
+            self._prepare_gemini_data(self.cached_central_plan, planner)
+            # Pass Gemini state to writer if available
+            writer.decomposed_state_dict = self.decomposed_state_dict
+            writer.preallocated_cpu_buffer = self.preallocated_cpu_buffer
+            
+            # In Gemini mode, call prepare_write_data to create write_buckets
+            # It will use the decomposed state_dict we just prepared
+            writer.prepare_write_data(self.cached_central_plan, planner)
         # EC-CHECK mode: decompose state_dict and preallocate CPU memory
         elif self.eccheck_manager.use_eccheck:
             self._prepare_eccheck_data(self.cached_central_plan, planner)
@@ -1160,6 +1184,134 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                     save_state_dict_ret[1] = self.cached_global_metadata
 
         return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
+
+    def _prepare_gemini_data(self, plan: SavePlan, planner: SavePlanner) -> None:
+        """
+        Gemini preparation: organize data for replica-level transfer.
+        
+        This method performs the following steps:
+        1. Process plan items (separate bytes and tensors)
+        2. Create DecomposedStateDict for efficient GPU-to-CPU transfer
+        3. Preallocate CPU memory buffer for tensors
+        
+        Similar to EC-CHECK but simplified for Gemini's replica exchange use case.
+        
+        Args:
+            plan (SavePlan): save plan from PyTorch distributed checkpoint
+            planner (SavePlanner): save planner to resolve data
+        """
+        from torch.distributed.checkpoint.filesystem import _StoragePrefix
+        
+        start_total = time()
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logger.info(f"Gemini: [Rank {rank}] Starting replica-level checkpoint preparation")
+        
+        # Step 1: Process plan items
+        storage_plan: _StoragePrefix = plan.storage_data
+        
+        # Separate items into BYTE_IO (non-tensor) and TENSOR
+        non_tensor_data = {}
+        tensor_infos = []
+        tensor_data_list = []
+        
+        logger.info(f"Gemini: [Rank {rank}] Processing {len(plan.items)} items from SavePlan")
+        byte_io_count = 0
+        tensor_count = 0
+        none_data_count = 0
+        
+        for item in plan.items:
+            data = planner.resolve_data(item)
+            
+            if data is None:
+                none_data_count += 1
+                continue
+            
+            if item.type == WriteItemType.BYTE_IO:
+                # Non-tensor data
+                # Convert BytesIO to bytes for proper serialization
+                if hasattr(data, 'getvalue'):  # BytesIO object
+                    data.seek(0)
+                    data_bytes = data.getvalue()
+                    non_tensor_data[item.index.fqn] = data_bytes
+                else:
+                    non_tensor_data[item.index.fqn] = data
+                byte_io_count += 1
+            else:
+                # Tensor data - create TensorInfo
+                from .state_dict_decomposer import TensorInfo
+                
+                tensor_info = TensorInfo(
+                    key=item.index.fqn,
+                    shape=tuple(data.shape),
+                    dtype=data.dtype,
+                    device=data.device,
+                    numel=data.numel(),
+                    size_bytes=data.numel() * data.element_size(),
+                    offset=0,  # Will be calculated below
+                    global_offset=tuple(item.index.offset) if hasattr(item.index, 'offset') else None,
+                    shard_index=item.index.index if hasattr(item.index, 'index') else None,
+                )
+                tensor_infos.append(tensor_info)
+                tensor_data_list.append(data)
+                tensor_count += 1
+        
+        logger.info(
+            f"Gemini: [Rank {rank}] Processed {byte_io_count} BytesIO items, {tensor_count} tensor items"
+            + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
+        )
+        
+        # Calculate offsets for tensor data
+        offset = 0
+        for info in tensor_infos:
+            info.offset = offset
+            offset += info.size_bytes
+        
+        # Create decomposed structure
+        self.decomposed_state_dict = DecomposedStateDict(
+            non_tensor_data=non_tensor_data,
+            tensor_infos=tensor_infos,
+            tensor_data=tensor_data_list,
+        )
+        
+        # Log statistics
+        stats = self.decomposed_state_dict.get_statistics()
+        logger.info(
+            f"Gemini: [Rank {rank}] Created DecomposedStateDict:\n"
+            f"  Non-tensor data: {stats['non_tensor_size_bytes'] / 1024:.2f} KB\n"
+            f"  Tensor data: {stats['tensor_data_size_bytes'] / (1024**3):.2f} GB\n"
+            f"  Total tensors: {stats['num_tensors']}"
+        )
+        
+        # Step 2: Preallocate CPU buffer
+        total_tensor_size = self.decomposed_state_dict.total_tensor_size_bytes
+        
+        if self.preallocated_cpu_buffer is None or self.preallocated_cpu_buffer.numel() < total_tensor_size:
+            logger.info(
+                f"Gemini: [Rank {rank}] Allocating preallocated CPU buffer: "
+                f"{total_tensor_size / (1024**3):.2f} GB"
+            )
+            
+            # Use pinned memory for faster GPU-to-CPU transfer
+            if torch.cuda.is_available():
+                self.preallocated_cpu_buffer = torch.empty(
+                    total_tensor_size, dtype=torch.uint8
+                ).pin_memory()
+                logger.info(f"Gemini: [Rank {rank}] Allocated pinned memory buffer")
+            else:
+                self.preallocated_cpu_buffer = torch.empty(
+                    total_tensor_size, dtype=torch.uint8
+                )
+                logger.info(f"Gemini: [Rank {rank}] Allocated regular CPU buffer")
+        else:
+            logger.info(
+                f"Gemini: [Rank {rank}] Reusing existing preallocated CPU buffer: "
+                f"{self.preallocated_cpu_buffer.numel() / (1024**3):.2f} GB"
+            )
+        
+        total_time = time() - start_total
+        logger.info(
+            f"Gemini: [Rank {rank}] Preparation completed in {total_time:.2f}s"
+        )
 
     def _prepare_eccheck_data(self, plan: SavePlan, planner: SavePlanner) -> None:
         """
@@ -2056,6 +2208,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.eccheck_manager = ECCHECKManager()
         self.eccheck_manager.init_eccheck_if_enabled()
         
+        # Initialize Gemini manager (singleton instance shared with Save strategy)
+        from .gemini_manager import GeminiManager
+        self.gemini_manager = GeminiManager()
+        self.gemini_manager.init_gemini_if_enabled()
+        
         # Initialize strategy-specific EC-CHECK state
         self.eccheck_p2p_buffers = None
         
@@ -2419,6 +2576,192 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.error(f"EC-CHECK: [Rank {rank}] Failed to extract DecomposedStateDict from buffer: {e}", exc_info=True)
             raise
     
+    def _load_gemini_checkpoint_recovery_asio(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+        """Load checkpoint for rank2 failure recovery using ASIO for data transfer.
+        
+        This method uses Gemini's ASIO-based communication for efficient data transfer
+        between rank0 and rank2 during recovery. It's optimized for large checkpoint files.
+        
+        Process:
+        1. Rank0 reads replica file into memory
+        2. Rank0 sends data to rank2 using ASIO (non-blocking, high-performance)
+        3. Rank2 receives data via ASIO and deserializes
+        4. Both ranks restore their state_dict
+        
+        Args:
+            sharded_state_dict: Sharded state dict template for loading
+            checkpoint_dir: Checkpoint directory
+            
+        Returns:
+            StateDict: Loaded state dict
+        """
+        import mmap
+        import numpy as np
+        
+        rank = torch.distributed.get_rank()
+        paired_rank = self.pairing_map.get(rank, None)
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        logger.info(f"rank: {rank}, starting Gemini checkpoint recovery with ASIO for rank2 failure")
+        
+        # Ensure Gemini native module is initialized
+        if self.gemini_manager._gemini_native is None:
+            logger.warning(f"rank: {rank}, Gemini native module not initialized, falling back to standard recovery")
+            return self._load_gemini_checkpoint_recovery(sharded_state_dict, checkpoint_dir)
+        
+        # Only rank0 (pair_rank=2) and rank2 participate
+        if rank == 0 and paired_rank == 2:
+            # Rank0: Read replica file and send to rank2 via ASIO
+            logger.info(f"rank: {rank}, reading replica file for rank2 recovery (ASIO mode)")
+            
+            # Find replica file: __0_0_replica2_rank0.distcp
+            replica_files = list(checkpoint_dir.glob(f"*_replica{paired_rank}_rank{rank}*.distcp"))
+            
+            if not replica_files:
+                logger.error(f"rank: {rank}, no replica file found for rank2 recovery")
+                raise FileNotFoundError(f"No replica file found for rank2 recovery")
+            
+            replica_file_path = replica_files[0]
+            logger.info(f"rank: {rank}, found replica file: {replica_file_path}")
+            
+            # Step 1: Read replica file using mmap (zero-copy)
+            try:
+                with open(replica_file_path, 'rb') as f:
+                    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                    replica_file_size = len(mm)
+                    replica_data_bytes = mm[:]
+                    mm.close()
+                
+                logger.info(f"rank: {rank}, read replica file: {replica_file_size / (1024**2):.2f} MB")
+            
+            except Exception as e:
+                logger.error(f"rank: {rank}, failed to read replica file: {e}", exc_info=True)
+                raise
+            
+            # Step 2: Convert replica data to numpy array for ASIO transfer
+            # Note: frombuffer creates a read-only view, but that's fine for sending
+            replica_np = np.frombuffer(replica_data_bytes, dtype=np.uint8)
+            
+            # Step 3: Send size information first
+            size_array = np.array([replica_file_size], dtype=np.int64)
+            logger.info(f"rank: {rank}, sending size to rank2 via ASIO: {replica_file_size / (1024**2):.2f} MB")
+            
+            try:
+                # Send size (8 bytes) using raw memory address
+                size_addr = size_array.ctypes.data
+                self.gemini_manager._gemini_native.send_buffer(size_addr, size_array.nbytes)
+                logger.info(f"rank: {rank}, size sent successfully")
+                
+                # Step 4: Send actual replica data via ASIO using raw memory address
+                logger.info(f"rank: {rank}, sending replica data to rank2 via ASIO...")
+                replica_addr = replica_np.ctypes.data
+                self.gemini_manager._gemini_native.send_buffer(replica_addr, replica_np.nbytes)
+                logger.info(f"rank: {rank}, replica data sent successfully via ASIO")
+                
+            except Exception as e:
+                logger.error(f"rank: {rank}, ASIO send failed: {e}", exc_info=True)
+                raise
+            
+            # Step 5: Rank0 also needs to load its own checkpoint from file
+            logger.info(f"rank: {rank}, loading own checkpoint from saved file")
+            return self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
+            
+        elif rank == 2:
+            # Rank2: Receive data from rank0 via ASIO and restore state_dict
+            logger.info(f"rank: {rank}, receiving replica data from rank0 via ASIO for recovery")
+            
+            try:
+                # Step 1: Receive size information first using raw memory address
+                size_buffer = np.zeros(1, dtype=np.int64)
+                size_addr = size_buffer.ctypes.data
+                self.gemini_manager._gemini_native.receive_buffer(size_addr, size_buffer.nbytes)
+                remote_size = int(size_buffer[0])
+                
+                logger.info(f"rank: {rank}, received size from rank0 via ASIO: {remote_size / (1024**2):.2f} MB")
+                
+                # Step 2: Create receive buffer
+                remote_buffer = np.zeros(remote_size, dtype=np.uint8)
+                
+                # Step 3: Receive replica data via ASIO using raw memory address
+                logger.info(f"rank: {rank}, receiving replica data from rank0 via ASIO...")
+                remote_addr = remote_buffer.ctypes.data
+                self.gemini_manager._gemini_native.receive_buffer(remote_addr, remote_buffer.nbytes)
+                logger.info(f"rank: {rank}, received replica data via ASIO: {remote_size / (1024**2):.2f} MB")
+                
+                # Step 4: Deserialize received data
+                # Check if this is Gemini optimized format
+                remote_bytes = remote_buffer.tobytes()
+                
+                # Try to detect Gemini optimized format
+                use_gemini_optimized = False
+                try:
+                    from megatron.training import get_args
+                    args = get_args()
+                    use_gemini_optimized = getattr(args, 'use_gemini', False) and getattr(args, 'use_gemini_optimized', False)
+                except:
+                    pass
+                
+                if use_gemini_optimized and len(remote_bytes) >= 8:
+                    # Parse as Gemini optimized format: [metadata_size(8)] + [metadata_bytes] + [buffer_bytes]
+                    metadata_size = int.from_bytes(remote_bytes[:8], byteorder='little')
+                    
+                    logger.info(f"rank: {rank}, parsing received data as Gemini optimized format, metadata_size: {metadata_size / 1024:.2f} KB")
+                    
+                    # Extract metadata
+                    metadata_bytes = remote_bytes[8:8+metadata_size]
+                    metadata_buffer = io.BytesIO(metadata_bytes)
+                    gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
+                    
+                    # Extract buffer
+                    buffer_bytes = remote_bytes[8+metadata_size:]
+                    buffer_np = np.frombuffer(buffer_bytes, dtype=np.uint8)
+                    gemini_buffer = torch.from_numpy(buffer_np.copy())
+                    
+                    logger.info(
+                        f"rank: {rank}, parsed Gemini data: "
+                        f"metadata_size={metadata_size / 1024:.2f} KB, "
+                        f"buffer_size={len(buffer_bytes) / (1024**2):.2f} MB"
+                    )
+                    
+                    # Create write_buckets structure for Gemini format
+                    replica_buckets = [(
+                        checkpoint_dir / f"__{rank}_0.distcp",
+                        'gemini_optimized_local',
+                        (
+                            [('gemini_metadata', gemini_metadata), ('gemini_buffer', gemini_buffer)],
+                            []
+                        )
+                    )]
+                    
+                    # Step 5: Restore state_dict from Gemini format
+                    logger.info(f"rank: {rank}, restoring state_dict from Gemini format...")
+                    loaded_state_dict = self._restore_state_dict_from_gemini_format(
+                        replica_buckets, sharded_state_dict
+                    )
+                else:
+                    # Standard pickle format
+                    logger.info(f"rank: {rank}, parsing received data as standard pickle format")
+                    remote_data_io = io.BytesIO(remote_bytes)
+                    replica_buckets = torch.load(remote_data_io, weights_only=False)
+                    
+                    logger.info(f"rank: {rank}, deserialized replica data, restoring state_dict from memory...")
+                    
+                    # Step 5: Restore state_dict from replica_buckets
+                    loaded_state_dict = self._restore_state_dict_from_write_buckets(
+                        replica_buckets, sharded_state_dict
+                    )
+                
+                logger.info(f"rank: {rank}, successfully restored state_dict from rank0's replica data (ASIO)")
+                return loaded_state_dict
+                
+            except Exception as e:
+                logger.error(f"rank: {rank}, ASIO receive failed: {e}", exc_info=True)
+                raise
+        else:
+            # Should not reach here
+            logger.error(f"rank: {rank}, unexpected rank in ASIO recovery")
+            raise RuntimeError(f"Unexpected rank {rank} in ASIO recovery")
+    
     def _load_gemini_checkpoint_recovery(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Load checkpoint for rank2 failure recovery scenario.
         
@@ -2532,16 +2875,67 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info(f"rank: {rank}, received replica data from rank0: {remote_size / (1024**2):.2f} MB")
             
             # Step 5: Deserialize received data
+            # Check if this is Gemini optimized format
             remote_bytes = remote_tensor.numpy().tobytes()
-            remote_data_io = io.BytesIO(remote_bytes)
             
-            replica_buckets = torch.load(remote_data_io, weights_only=False)
-            logger.info(f"rank: {rank}, deserialized replica data, restoring state_dict from memory...")
+            # Try to detect Gemini optimized format
+            use_gemini_optimized = False
+            try:
+                from megatron.training import get_args
+                args = get_args()
+                use_gemini_optimized = getattr(args, 'use_gemini', False) and getattr(args, 'use_gemini_optimized', False)
+            except:
+                pass
             
-            # Step 6: Restore state_dict from replica_buckets
-            loaded_state_dict = self._restore_state_dict_from_write_buckets(
-                replica_buckets, sharded_state_dict
-            )
+            if use_gemini_optimized and len(remote_bytes) >= 8:
+                # Parse as Gemini optimized format: [metadata_size(8)] + [metadata_bytes] + [buffer_bytes]
+                metadata_size = int.from_bytes(remote_bytes[:8], byteorder='little')
+                
+                logger.info(f"rank: {rank}, parsing received data as Gemini optimized format, metadata_size: {metadata_size / 1024:.2f} KB")
+                
+                # Extract metadata
+                metadata_bytes = remote_bytes[8:8+metadata_size]
+                metadata_buffer = io.BytesIO(metadata_bytes)
+                gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
+                
+                # Extract buffer
+                buffer_bytes = remote_bytes[8+metadata_size:]
+                buffer_np = np.frombuffer(buffer_bytes, dtype=np.uint8)
+                gemini_buffer = torch.from_numpy(buffer_np.copy())
+                
+                logger.info(
+                    f"rank: {rank}, parsed Gemini data: "
+                    f"metadata_size={metadata_size / 1024:.2f} KB, "
+                    f"buffer_size={len(buffer_bytes) / (1024**2):.2f} MB"
+                )
+                
+                # Create write_buckets structure for Gemini format
+                replica_buckets = [(
+                    checkpoint_dir / f"__{rank}_0.distcp",
+                    'gemini_optimized_local',
+                    (
+                        [('gemini_metadata', gemini_metadata), ('gemini_buffer', gemini_buffer)],
+                        []
+                    )
+                )]
+                
+                # Step 6: Restore state_dict from Gemini format
+                logger.info(f"rank: {rank}, restoring state_dict from Gemini format...")
+                loaded_state_dict = self._restore_state_dict_from_gemini_format(
+                    replica_buckets, sharded_state_dict
+                )
+            else:
+                # Standard pickle format
+                logger.info(f"rank: {rank}, parsing received data as standard pickle format")
+                remote_data_io = io.BytesIO(remote_bytes)
+                replica_buckets = torch.load(remote_data_io, weights_only=False)
+                
+                logger.info(f"rank: {rank}, deserialized replica data, restoring state_dict from memory...")
+                
+                # Step 6: Restore state_dict from replica_buckets
+                loaded_state_dict = self._restore_state_dict_from_write_buckets(
+                    replica_buckets, sharded_state_dict
+                )
             
             logger.info(f"rank: {rank}, successfully restored state_dict from rank0's replica data")
             return loaded_state_dict
@@ -2602,22 +2996,120 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.error(f"rank: {rank}, failed to read checkpoint file: {e}", exc_info=True)
             raise
         
-        # Deserialize the checkpoint data (write_buckets)
+        # Deserialize the checkpoint data
+        # Gemini optimized format: [metadata_size(8)] + [metadata_bytes] + [buffer_bytes]
+        # Standard format: pickle serialized write_buckets
         try:
-            checkpoint_buffer = io.BytesIO(checkpoint_data_bytes)
-            write_buckets = torch.load(checkpoint_buffer, map_location='cpu', weights_only=False)
+            # Priority 1: Check command-line flags to determine format
+            use_gemini_optimized = False
+            try:
+                from megatron.training import get_args
+                args = get_args()
+                use_gemini_optimized = getattr(args, 'use_gemini', False) and getattr(args, 'use_gemini_optimized', False)
+                if use_gemini_optimized:
+                    logger.info(f"rank: {rank}, using Gemini optimized format (from args flags)")
+            except Exception as e:
+                # Args not available, will auto-detect format
+                logger.debug(f"rank: {rank}, cannot access args, will auto-detect format: {e}")
             
-            logger.info(f"rank: {rank}, deserialized write_buckets from checkpoint file, "
-                       f"got {len(write_buckets)} buckets")
+            # Parse checkpoint data based on format
+            if use_gemini_optimized or (not use_gemini_optimized and len(checkpoint_data_bytes) >= 8):
+                # Try Gemini format first (if flag is set, or auto-detect)
+                if len(checkpoint_data_bytes) >= 8:
+                    metadata_size = int.from_bytes(checkpoint_data_bytes[:8], byteorder='little')
+                    
+                    # Sanity check: metadata_size should be reasonable (< 10MB for metadata)
+                    is_valid_gemini = (0 < metadata_size < 10 * 1024 * 1024 and 
+                                      (8 + metadata_size) <= len(checkpoint_data_bytes))
+                    
+                    if use_gemini_optimized or is_valid_gemini:
+                        # Parse as Gemini optimized format
+                        logger.info(f"rank: {rank}, parsing as Gemini optimized format, metadata_size: {metadata_size / 1024:.2f} KB")
+                        
+                        # Extract metadata
+                        metadata_bytes = checkpoint_data_bytes[8:8+metadata_size]
+                        metadata_buffer = io.BytesIO(metadata_bytes)
+                        gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
+                        
+                        # Extract buffer
+                        buffer_bytes = checkpoint_data_bytes[8+metadata_size:]
+                        import numpy as np
+                        buffer_np = np.frombuffer(buffer_bytes, dtype=np.uint8)
+                        gemini_buffer = torch.from_numpy(buffer_np.copy())  # Copy to make it writable
+                        
+                        logger.info(
+                            f"rank: {rank}, loaded Gemini checkpoint: "
+                            f"metadata_size={metadata_size / 1024:.2f} KB, "
+                            f"buffer_size={len(buffer_bytes) / (1024**2):.2f} MB"
+                        )
+                        
+                        # Create write_buckets structure compatible with restoration
+                        # Format: [(file_path, storage_key, (bytes_data, tensor_data))]
+                        write_buckets = [(
+                            checkpoint_file_path,
+                            'gemini_optimized_local',
+                            (
+                                [('gemini_metadata', gemini_metadata), ('gemini_buffer', gemini_buffer)],
+                                []
+                            )
+                        )]
+                    else:
+                        # Not valid Gemini format, try standard pickle
+                        logger.info(f"rank: {rank}, not valid Gemini format (metadata_size={metadata_size}), trying standard pickle")
+                        checkpoint_buffer = io.BytesIO(checkpoint_data_bytes)
+                        write_buckets = torch.load(checkpoint_buffer, map_location='cpu', weights_only=False)
+                else:
+                    # File too small for Gemini format, try standard pickle
+                    logger.warning(f"rank: {rank}, file too small ({len(checkpoint_data_bytes)} bytes) for Gemini format, trying standard pickle")
+                    checkpoint_buffer = io.BytesIO(checkpoint_data_bytes)
+                    write_buckets = torch.load(checkpoint_buffer, map_location='cpu', weights_only=False)
+            else:
+                # Standard pickle format
+                logger.info(f"rank: {rank}, using standard pickle format")
+                checkpoint_buffer = io.BytesIO(checkpoint_data_bytes)
+                write_buckets = torch.load(checkpoint_buffer, map_location='cpu', weights_only=False)
+            
+            logger.info(f"rank: {rank}, deserialized checkpoint data, got {len(write_buckets)} buckets")
         
         except Exception as e:
             logger.error(f"rank: {rank}, failed to deserialize checkpoint data: {e}", exc_info=True)
             raise
         
         # Restore state_dict from write_buckets
-        loaded_state_dict = self._restore_state_dict_from_write_buckets(
-            write_buckets, sharded_state_dict
-        )
+        # Check if this is Gemini optimized format
+        # Priority 1: Check command-line flags if available
+        is_gemini_format = False
+        try:
+            from megatron.training import get_args
+            args = get_args()
+            is_gemini_format = getattr(args, 'use_gemini', False) and getattr(args, 'use_gemini_optimized', False)
+            if is_gemini_format:
+                logger.info(f"rank: {rank}, detected Gemini optimized format from args flags")
+        except Exception as e:
+            # Args not available, fall back to format detection
+            logger.debug(f"rank: {rank}, cannot access args, will detect format from data: {e}")
+        
+        # Priority 2: If flags not set, check write_buckets structure
+        if not is_gemini_format:
+            is_gemini_format = (
+                len(write_buckets) > 0 and 
+                isinstance(write_buckets[0], tuple) and 
+                len(write_buckets[0]) >= 3 and 
+                write_buckets[0][1] == 'gemini_optimized_local'
+            )
+            if is_gemini_format:
+                logger.info(f"rank: {rank}, detected Gemini optimized format from write_buckets structure")
+        
+        if is_gemini_format:
+            logger.info(f"rank: {rank}, restoring from Gemini optimized format")
+            loaded_state_dict = self._restore_state_dict_from_gemini_format(
+                write_buckets, sharded_state_dict
+            )
+        else:
+            logger.info(f"rank: {rank}, restoring from standard format")
+            loaded_state_dict = self._restore_state_dict_from_write_buckets(
+                write_buckets, sharded_state_dict
+            )
         
         logger.info(f"rank: {rank}, successfully restored state_dict from saved checkpoint file")
         return loaded_state_dict
@@ -2726,23 +3218,280 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                    f"received {remote_size / (1024**2):.2f} MB")
         
         # Step 6: Deserialize received data and directly restore state_dict from memory
-        # No need to write to file - we can load directly from memory
+        # Check if this is Gemini optimized format
         remote_bytes = remote_tensor.numpy().tobytes()
-        remote_data_io = io.BytesIO(remote_bytes)
-    
-        # Deserialize the checkpoint data (write_buckets)
-        replica_buckets = torch.load(remote_data_io, weights_only=False)
-        logger.info(f"rank: {rank}, deserialized replica data, restoring state_dict from memory...")
         
-        # Step 7: Directly restore state_dict from replica_buckets
-        # Parse write_buckets and extract data to populate sharded_state_dict
-        loaded_state_dict = self._restore_state_dict_from_write_buckets(
-            replica_buckets, sharded_state_dict
-        )
+        # Try to detect Gemini optimized format
+        use_gemini_optimized = False
+        try:
+            from megatron.training import get_args
+            args = get_args()
+            use_gemini_optimized = getattr(args, 'use_gemini', False) and getattr(args, 'use_gemini_optimized', False)
+        except:
+            pass
+        
+        if use_gemini_optimized and len(remote_bytes) >= 8:
+            # Parse as Gemini optimized format: [metadata_size(8)] + [metadata_bytes] + [buffer_bytes]
+            metadata_size = int.from_bytes(remote_bytes[:8], byteorder='little')
+            
+            logger.info(f"rank: {rank}, parsing received replica as Gemini optimized format, metadata_size: {metadata_size / 1024:.2f} KB")
+            
+            # Extract metadata
+            metadata_bytes = remote_bytes[8:8+metadata_size]
+            metadata_buffer = io.BytesIO(metadata_bytes)
+            gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
+            
+            # Extract buffer
+            buffer_bytes = remote_bytes[8+metadata_size:]
+            buffer_np = np.frombuffer(buffer_bytes, dtype=np.uint8)
+            gemini_buffer = torch.from_numpy(buffer_np.copy())
+            
+            logger.info(
+                f"rank: {rank}, parsed Gemini replica data: "
+                f"metadata_size={metadata_size / 1024:.2f} KB, "
+                f"buffer_size={len(buffer_bytes) / (1024**2):.2f} MB"
+            )
+            
+            # Create write_buckets structure for Gemini format
+            replica_buckets = [(
+                checkpoint_dir / f"__{rank}_0.distcp",
+                'gemini_optimized_local',
+                (
+                    [('gemini_metadata', gemini_metadata), ('gemini_buffer', gemini_buffer)],
+                    []
+                )
+            )]
+            
+            # Step 7: Restore state_dict from Gemini format
+            logger.info(f"rank: {rank}, restoring state_dict from Gemini replica...")
+            loaded_state_dict = self._restore_state_dict_from_gemini_format(
+                replica_buckets, sharded_state_dict
+            )
+        else:
+            # Standard pickle format
+            logger.info(f"rank: {rank}, parsing received replica as standard pickle format")
+            remote_data_io = io.BytesIO(remote_bytes)
+            
+            # Deserialize the checkpoint data (write_buckets)
+            replica_buckets = torch.load(remote_data_io, weights_only=False)
+            logger.info(f"rank: {rank}, deserialized replica data, restoring state_dict from memory...")
+            
+            # Step 7: Directly restore state_dict from replica_buckets
+            # Parse write_buckets and extract data to populate sharded_state_dict
+            loaded_state_dict = self._restore_state_dict_from_write_buckets(
+                replica_buckets, sharded_state_dict
+            )
         
         logger.info(f"rank: {rank}, successfully restored state_dict from backup data in memory")
         return loaded_state_dict
         
+    def _restore_state_dict_from_gemini_format(
+        self, write_buckets: List, sharded_state_dict: ShardedStateDict
+    ) -> StateDict:
+        """Restore state_dict from Gemini optimized format.
+        
+        Gemini optimized format stores checkpoint as:
+        - gemini_metadata: contains non_tensor_data and tensor_infos
+        - gemini_buffer: continuous buffer with all tensor data
+        
+        Args:
+            write_buckets: List with single bucket containing Gemini format data
+            sharded_state_dict: Template sharded state dict to populate
+            
+        Returns:
+            StateDict: Restored state dict
+        """
+        rank = torch.distributed.get_rank()
+        logger.info(f"rank: {rank}, restoring state_dict from Gemini optimized format")
+        
+        # Extract gemini_metadata and gemini_buffer
+        if len(write_buckets) == 0 or len(write_buckets[0]) < 3:
+            raise ValueError(f"rank: {rank}, invalid Gemini write_buckets format")
+        
+        _, storage_key, (bytes_data, _) = write_buckets[0]
+        
+        gemini_metadata = None
+        gemini_buffer = None
+        
+        for key, value in bytes_data:
+            if key == 'gemini_metadata':
+                gemini_metadata = value
+            elif key == 'gemini_buffer':
+                gemini_buffer = value
+        
+        if gemini_metadata is None or gemini_buffer is None:
+            raise ValueError(f"rank: {rank}, missing gemini_metadata or gemini_buffer")
+        
+        logger.info(
+            f"rank: {rank}, extracted Gemini data: "
+            f"buffer_size={gemini_buffer.numel() / (1024**2):.2f} MB, "
+            f"num_tensors={len(gemini_metadata.get('tensor_infos', []))}"
+        )
+        
+        # Rebuild state_dict from gemini_metadata and gemini_buffer
+        # The metadata contains:
+        # - non_tensor_data: dict of non-tensor items
+        # - tensor_infos: list of dicts with keys: 'key', 'shape', 'dtype', 'offset', 'size_bytes', etc.
+        
+        non_tensor_data_raw = gemini_metadata.get('non_tensor_data', {})
+        tensor_infos = gemini_metadata.get('tensor_infos', [])
+        
+        # Deserialize non_tensor_data
+        # In Gemini format, BytesIO content was extracted as bytes before saving
+        # We need to convert bytes back to BytesIO and then deserialize
+        non_tensor_data = {}
+        for key, data in non_tensor_data_raw.items():
+            if isinstance(data, bytes):
+                # Bytes data from BytesIO.getvalue() - need to deserialize
+                try:
+                    data_io = io.BytesIO(data)
+                    deserialized_list = torch.load(data_io, map_location='cpu', weights_only=False)
+                    non_tensor_data[key] = deserialized_list
+                    logger.debug(f"rank: {rank}, deserialized bytes for key: {key}, got {len(deserialized_list) if isinstance(deserialized_list, list) else 1} items")
+                except Exception as e:
+                    logger.warning(f"rank: {rank}, failed to deserialize bytes for key {key}: {e}")
+                    # Fallback: use as is
+                    non_tensor_data[key] = data
+            elif isinstance(data, io.BytesIO):
+                # Still a BytesIO object (shouldn't happen with new code, but handle it)
+                try:
+                    data.seek(0)
+                    deserialized_list = torch.load(data, map_location='cpu', weights_only=False)
+                    non_tensor_data[key] = deserialized_list
+                    logger.debug(f"rank: {rank}, deserialized BytesIO for key: {key}")
+                except Exception as e:
+                    logger.warning(f"rank: {rank}, failed to deserialize BytesIO for key {key}: {e}")
+                    non_tensor_data[key] = data
+            else:
+                # Other types - use as is (shouldn't happen in normal case)
+                non_tensor_data[key] = data
+                logger.debug(f"rank: {rank}, using data as-is for key: {key}, type: {type(data)}")
+        
+        logger.info(f"rank: {rank}, processed {len(non_tensor_data)} non-tensor items from metadata")
+        
+        # Step 1: Reconstruct tensors from buffer
+        tensor_dict = {}
+        for info in tensor_infos:
+            key = info['key']
+            shape = tuple(info['shape'])
+            dtype_str = info['dtype']
+            offset = info['offset']
+            size_bytes = info['size_bytes']
+            
+            # Parse dtype string (e.g., 'torch.float32' -> torch.float32)
+            if dtype_str.startswith('torch.'):
+                dtype_name = dtype_str.split('.')[1]
+                dtype = getattr(torch, dtype_name, torch.float32)
+            else:
+                dtype = torch.float32  # Default fallback
+            
+            # Calculate element size for dtype
+            element_size = {
+                torch.float32: 4, torch.float16: 2, torch.bfloat16: 2,
+                torch.float64: 8, torch.int32: 4, torch.int64: 8,
+                torch.int16: 2, torch.int8: 1, torch.uint8: 1,
+                torch.bool: 1,
+            }.get(dtype, 4)
+            
+            # Calculate number of elements
+            numel = size_bytes // element_size
+            
+            # Extract tensor data from buffer
+            # gemini_buffer is uint8, need to view as target dtype
+            start_offset = offset
+            end_offset = offset + size_bytes
+            
+            # Create a view of the buffer
+            tensor_bytes = gemini_buffer[start_offset:end_offset]
+            
+            # Convert to target dtype and reshape
+            # Need to ensure proper byte alignment
+            tensor = tensor_bytes.view(dtype)[:numel].reshape(shape).clone()
+            
+            tensor_dict[key] = tensor
+            logger.debug(f"rank: {rank}, reconstructed tensor: {key}, shape: {shape}, dtype: {dtype}")
+        
+        logger.info(f"rank: {rank}, reconstructed {len(tensor_dict)} tensors, {len(non_tensor_data)} non-tensor items")
+        
+        # Step 2: Match reconstructed data with sharded_state_dict
+        # Use the same matching logic as _restore_state_dict_from_write_buckets
+        (keyed_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+        )
+        
+        matched_count = 0
+        unmatched_count = 0
+        
+        for key, sh_base_list in keyed_state_dict.items():
+            for idx, sh_base in enumerate(sh_base_list):
+                if isinstance(sh_base, ShardedObject):
+                    # Match non-tensor data
+                    if key in non_tensor_data:
+                        data = non_tensor_data[key]
+                        if isinstance(data, list) and idx < len(data):
+                            sh_base.data = data[idx]
+                            logger.debug(f"rank: {rank}, matched ShardedObject: {key}[{idx}], data type: {type(data[idx])}")
+                        else:
+                            sh_base.data = data
+                            logger.debug(f"rank: {rank}, matched ShardedObject (whole): {key}, data type: {type(data)}")
+                        matched_count += 1
+                    else:
+                        unmatched_count += 1
+                        logger.debug(f"rank: {rank}, unmatched ShardedObject: {key}")
+                
+                elif isinstance(sh_base, ShardedTensor):
+                    # Match tensor data
+                    if key in tensor_dict:
+                        sh_base.data = tensor_dict[key]
+                        matched_count += 1
+                        logger.debug(f"rank: {rank}, matched ShardedTensor: {key}")
+                    else:
+                        unmatched_count += 1
+                        logger.debug(f"rank: {rank}, unmatched ShardedTensor: {key}")
+        
+        logger.info(f"rank: {rank}, matched {matched_count} items, unmatched {unmatched_count} items")
+        
+        # Step 3: Unwrap and convert to regular state dict
+        unwrapped_state_dict = {}
+        for key, sh_base_list in keyed_state_dict.items():
+            if len(sh_base_list) == 0:
+                continue
+            
+            sh_base = sh_base_list[0]
+            if isinstance(sh_base, ShardedTensor):
+                tensors = []
+                for sh in sh_base_list:
+                    ten = sh.data
+                    if ten is None:
+                        tensors.append(None)
+                        continue
+                    
+                    # Handle prepend_axis_num: remove singleton dimensions added during save
+                    if hasattr(sh, 'prepend_axis_num') and sh.prepend_axis_num > 0:
+                        for _ in range(sh.prepend_axis_num):
+                            if isinstance(ten, torch.Tensor) and ten.size(0) == 1:
+                                ten = ten[0]  # Remove first singleton dimension
+                    
+                    tensors.append(ten)
+                unwrapped_state_dict[key] = tensors
+            elif isinstance(sh_base, ShardedObject):
+                # For ShardedObject, create a list of data
+                data_list = [sh.data for sh in sh_base_list]
+                # Keep as list format (consistent with _restore_state_dict_from_write_buckets)
+                unwrapped_state_dict[key] = data_list
+        
+        # Step 4: Convert back to MCore format
+        orig_sharded_state_dict = sharded_state_dict
+        mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
+            unwrapped_state_dict, flat_mapping, rename_mapping
+        )
+        
+        # Step 5: Restore dict types
+        self._restore_dict_types_lenient(mcore_state_dict, orig_sharded_state_dict)
+        
+        logger.info(f"rank: {rank}, successfully restored {len(mcore_state_dict)} items from Gemini format")
+        return mcore_state_dict
+    
     def _restore_state_dict_from_write_buckets(
         self, write_buckets: List, sharded_state_dict: ShardedStateDict
     ) -> StateDict:
@@ -3797,7 +4546,13 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if is_rank2_recovery:
                 logger.info(f"rank: {rank}, using Gemini checkpoint recovery for rank2 failure")
                 # Only rank0 (pair_rank=2) and rank2 participate in recovery
-                recovered_state_dict = self._load_gemini_checkpoint_recovery(sharded_state_dict, checkpoint_dir)
+                # Use ASIO-based recovery if Gemini optimized mode is enabled
+                if input_args.use_gemini_optimized:
+                    logger.info(f"rank: {rank}, using ASIO-based recovery for rank2 failure")
+                    recovered_state_dict = self._load_gemini_checkpoint_recovery_asio(sharded_state_dict, checkpoint_dir)
+                else:
+                    logger.info(f"rank: {rank}, using standard recovery for rank2 failure")
+                    recovered_state_dict = self._load_gemini_checkpoint_recovery(sharded_state_dict, checkpoint_dir)
             else:
                 logger.info(f"rank: {rank}, not participating in rank2 recovery, loading from own checkpoint file")
                 # Other ranks (rank1, rank3) load from their own saved checkpoint files
@@ -3905,6 +4660,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     def load_tensors_metadata(self, checkpoint_dir: Path, metadata: Metadata = None):
         """Uses tensors metadata stored in the metadata file."""
         if metadata is None:
+            # _ensure_metadata_accessible is called by _get_filesystem_reader
+            # so all ranks should now have access to .metadata
             fs_reader = _get_filesystem_reader(checkpoint_dir)
             metadata = fs_reader.read_metadata()
 
@@ -3937,6 +4694,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
     def load_sharded_metadata(self, checkpoint_dir: Path) -> ShardedStateDict:
         """Uses tensors and objects metadata stored in the metadata file."""
+        # _ensure_metadata_accessible is called by _get_filesystem_reader
+        # so all ranks should now have access to .metadata
         fs_reader = _get_filesystem_reader(checkpoint_dir)
         metadata = fs_reader.read_metadata()
 

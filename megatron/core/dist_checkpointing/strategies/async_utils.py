@@ -476,27 +476,100 @@ class TemporalAsyncCaller(AsyncCaller):
         
         from megatron.training import get_args
         args = get_args()
+        
+        # Check if we should use optimized version (no serialization)
+        use_optimized = getattr(args, 'use_gemini_optimized', False)
+        
         if args.use_gemini:
-            remote_bytes, local_size, remote_size = self.exchange_checkpoint_data(async_fn_args[1])
-                    # Start process to save replica checkpoint if we received data
-            exchange_end = time()
-            logger.info(f"rank: {rank}, takes {exchange_end - start_sync} to schedule async ckpt {exchange_end} {start_sync}")
-
-            if remote_bytes is not None:
-                # Get replica file path from original write_buckets
-                replica_file_path = self._get_replica_file_path(async_fn_args[1], rank)
-
-                # Start process to directly write remote_bytes to file
-                self.replica_process = ctx.Process(
-                    target=self._write_bytes_to_file,
-                    args=(remote_bytes, replica_file_path)
-                )
-                self.replica_process.start()
-
-                # logger.info(f"rank: {rank}, started replica checkpoint save process, "
-                        # f"will write {remote_size / (1024**2):.2f} MB to {replica_file_path}")
+            
+            if use_optimized:
+                # Use optimized version: preload already completed exchange
+                # async_fn_args[1] now contains [local_bucket, remote_bucket]
+                logger.info(f"Gemini rank {rank}: Using optimized mode (exchange completed in preload)")
+                
+                write_buckets = async_fn_args[1]
+                
+                # Check if we have both local and remote buckets
+                if len(write_buckets) == 2:
+                    local_bucket = write_buckets[0]
+                    remote_bucket = write_buckets[1]
+                    
+                    # Extract remote buffer and metadata
+                    if remote_bucket[1] == 'gemini_optimized_remote':
+                        _, _, (bytes_data, _) = remote_bucket
+                        
+                        remote_metadata = None
+                        remote_buffer = None
+                        
+                        for item in bytes_data:
+                            if isinstance(item, tuple) and len(item) == 2:
+                                key, value = item
+                                if key == 'gemini_metadata':
+                                    remote_metadata = value
+                                elif key == 'gemini_buffer':
+                                    remote_buffer = value
+                        
+                        if remote_buffer is not None and remote_metadata is not None:
+                            # Get replica file path
+                            replica_file_path = self._get_replica_file_path([local_bucket], rank)
+                            
+                            # Serialize metadata
+                            metadata_buffer = io.BytesIO()
+                            torch.save(remote_metadata, metadata_buffer)
+                            remote_metadata_bytes = metadata_buffer.getvalue()
+                            
+                            # Convert buffer to bytes
+                            remote_buffer_bytes = remote_buffer.numpy().tobytes()
+                            
+                            # Combine: [metadata_size (8 bytes)] + [metadata_bytes] + [buffer_bytes]
+                            metadata_size = len(remote_metadata_bytes)
+                            header = metadata_size.to_bytes(8, byteorder='little')
+                            combined_bytes = header + remote_metadata_bytes + remote_buffer_bytes
+                            
+                            # Start process to write replica checkpoint
+                            self.replica_process = ctx.Process(
+                                target=self._write_bytes_to_file,
+                                args=(combined_bytes, replica_file_path)
+                            )
+                            self.replica_process.start()
+                            
+                            logger.info(
+                                f"Gemini rank {rank}: Started replica save process, "
+                                f"buffer: {len(remote_buffer_bytes) / (1024**2):.2f} MB, "
+                                f"metadata: {metadata_size / 1024:.2f} KB"
+                            )
+                        else:
+                            self.replica_process = None
+                            logger.warning(f"Gemini rank {rank}: Failed to extract remote buffer/metadata")
+                    else:
+                        self.replica_process = None
+                        logger.warning(f"Gemini rank {rank}: Remote bucket not in expected format")
+                else:
+                    self.replica_process = None
+                    logger.warning(f"Gemini rank {rank}: Expected 2 buckets, got {len(write_buckets)}")
             else:
-                self.replica_process = None
+                # Use original version with serialization
+                logger.info(f"Gemini rank {rank}: Using original exchange (with serialization)")
+                remote_bytes, local_size, remote_size = self.exchange_checkpoint_data(async_fn_args[1])
+                
+                exchange_end = time()
+                logger.info(f"rank: {rank}, takes {exchange_end - start_sync} to schedule async ckpt {exchange_end} {start_sync}")
+
+                if remote_bytes is not None:
+                    # Get replica file path from original write_buckets
+                    replica_file_path = self._get_replica_file_path(async_fn_args[1], rank)
+
+                    # Start process to directly write remote_bytes to file
+                    self.replica_process = ctx.Process(
+                        target=self._write_bytes_to_file,
+                        args=(remote_bytes, replica_file_path)
+                    )
+                    self.replica_process.start()
+
+                    # logger.info(f"rank: {rank}, started replica checkpoint save process, "
+                            # f"will write {remote_size / (1024**2):.2f} MB to {replica_file_path}")
+                else:
+                    self.replica_process = None
                 
         # exchange_end = time()
         # logger.info(f"rank: {rank}, total exchange (size + data) took {exchange_end - exchange_start:.2f}s")
@@ -505,17 +578,6 @@ class TemporalAsyncCaller(AsyncCaller):
         
         # Start process to save original checkpoint
         if args.use_gemini:
-            # Serialize original checkpoint data to bytes
-            # original_serialize_start = time()
-            # Use a new buffer for original checkpoint to avoid conflicts with exchange buffer
-            original_buffer = io.BytesIO()
-            torch.save(async_fn_args[1], original_buffer)
-            original_buffer_view = original_buffer.getbuffer()
-            original_bytes = original_buffer_view.tobytes()
-            # original_size = len(original_bytes)
-            # original_serialize_time = time() - original_serialize_start
-            # logger.info(f"rank: {rank}, serialized original checkpoint: {original_size / (1024**2):.2f} MB in {original_serialize_time:.4f}s")
-            
             # Get original checkpoint file path
             original_file_path = self._get_original_file_path(async_fn_args[1])
             
@@ -523,15 +585,91 @@ class TemporalAsyncCaller(AsyncCaller):
             # async_fn_args structure: [rank, write_buckets, global_results_queue]
             global_results_queue = async_fn_args[2] if len(async_fn_args) > 2 else None
             
-            # Start process to directly write original_bytes to file
-            self.process = ctx.Process(
-                target=self._write_bytes_to_file_with_queue,
-                args=(original_bytes, original_file_path, len(async_fn_args[1]), global_results_queue)
-            )
-            self.process.start()
-            
-            # logger.info(f"rank: {rank}, started original checkpoint save process, "
-                    #    f"will write {original_size / (1024**2):.2f} MB to {original_file_path}")
+            if use_optimized:
+                # Use optimized version: extract local buffer and metadata from preloaded write_buckets
+                logger.info(f"Gemini rank {rank}: Preparing optimized original checkpoint save")
+                
+                # Extract buffer and metadata from async_fn_args[1] (already preloaded)
+                write_buckets = async_fn_args[1]
+                
+                # Check if we have the expected format: [local_bucket, remote_bucket]
+                if len(write_buckets) >= 1:
+                    local_bucket = write_buckets[0]
+                    
+                    # Extract local buffer and metadata
+                    if local_bucket[1] == 'gemini_optimized_local':
+                        _, _, (bytes_data, _) = local_bucket
+                        
+                        original_metadata = None
+                        original_buffer = None
+                        
+                        for item in bytes_data:
+                            if isinstance(item, tuple) and len(item) == 2:
+                                key, value = item
+                                if key == 'gemini_metadata':
+                                    original_metadata = value
+                                elif key == 'gemini_buffer':
+                                    original_buffer = value
+                        
+                        if original_buffer is not None and original_metadata is not None:
+                            # Serialize metadata
+                            metadata_buffer = io.BytesIO()
+                            torch.save(original_metadata, metadata_buffer)
+                            original_metadata_bytes = metadata_buffer.getvalue()
+                            
+                            # Convert buffer to bytes
+                            original_buffer_bytes = original_buffer.numpy().tobytes()
+                            
+                            # Combine: [metadata_size (8 bytes)] + [metadata_bytes] + [buffer_bytes]
+                            metadata_size = len(original_metadata_bytes)
+                            header = metadata_size.to_bytes(8, byteorder='little')
+                            original_bytes = header + original_metadata_bytes + original_buffer_bytes
+                            
+                            logger.info(
+                                f"Gemini rank {rank}: Original checkpoint prepared, "
+                                f"buffer: {len(original_buffer_bytes) / (1024**2):.2f} MB, "
+                                f"metadata: {metadata_size / 1024:.2f} KB"
+                            )
+                        else:
+                            # Fallback to serialization
+                            logger.warning(f"Gemini rank {rank}: Failed to extract buffer/metadata, falling back to serialization")
+                            original_buffer = io.BytesIO()
+                            torch.save(async_fn_args[1], original_buffer)
+                            original_bytes = original_buffer.getvalue()
+                    else:
+                        # Not in optimized format, fallback to serialization
+                        logger.warning(f"Gemini rank {rank}: Local bucket not in expected format, falling back to serialization")
+                        original_buffer = io.BytesIO()
+                        torch.save(async_fn_args[1], original_buffer)
+                        original_bytes = original_buffer.getvalue()
+                else:
+                    # Empty write_buckets, fallback to serialization
+                    logger.warning(f"Gemini rank {rank}: Empty write_buckets, falling back to serialization")
+                    original_buffer = io.BytesIO()
+                    torch.save(async_fn_args[1], original_buffer)
+                    original_bytes = original_buffer.getvalue()
+                
+                # Start process to write original checkpoint
+                self.process = ctx.Process(
+                    target=self._write_bytes_to_file_with_queue,
+                    args=(original_bytes, original_file_path, len(async_fn_args[1]), global_results_queue, 
+                          args.use_gemini, args.use_gemini_optimized)
+                )
+                self.process.start()
+            else:
+                # Use original serialization method
+                original_buffer = io.BytesIO()
+                torch.save(async_fn_args[1], original_buffer)
+                original_buffer_view = original_buffer.getbuffer()
+                original_bytes = original_buffer_view.tobytes()
+                
+                # Start process to directly write original_bytes to file
+                self.process = ctx.Process(
+                    target=self._write_bytes_to_file_with_queue,
+                    args=(original_bytes, original_file_path, len(async_fn_args[1]), global_results_queue,
+                          args.use_gemini, False)  # use_gemini=True but use_gemini_optimized=False
+                )
+                self.process.start()
         else:
             # Use original async function for non-gemini mode
             self.process = ctx.Process(
@@ -633,7 +771,8 @@ class TemporalAsyncCaller(AsyncCaller):
         _logger.info(f"Successfully wrote {len(data_bytes) / (1024**2):.2f} MB to {file_path}")
     
     @staticmethod
-    def _write_bytes_to_file_with_queue(data_bytes: bytes, file_path: str, num_buckets: int, global_results_queue):
+    def _write_bytes_to_file_with_queue(data_bytes: bytes, file_path: str, num_buckets: int, global_results_queue, 
+                                       use_gemini: bool = False, use_gemini_optimized: bool = False):
         """Write bytes directly to file and put results to queue.
         
         This function is designed to be called in a separate process to write
@@ -645,6 +784,8 @@ class TemporalAsyncCaller(AsyncCaller):
             file_path: Target file path
             num_buckets: Number of write buckets (for results reporting)
             global_results_queue: Queue to report write results
+            use_gemini: Whether Gemini mode is enabled
+            use_gemini_optimized: Whether Gemini optimized mode is enabled
         """
         import os
         import logging
@@ -668,20 +809,26 @@ class TemporalAsyncCaller(AsyncCaller):
             _logger.info(f"Successfully wrote {len(data_bytes) / (1024**2):.2f} MB to {file_path}")
             
             # Create write results compatible with FileSystemWriterAsync.retrieve_write_results
-            # It expects a dict with keys 0..num_buckets-1, each containing a list of WriteResult
-            write_results_or_exc = {}
-            for i in range(num_buckets):
-                # Create empty WriteResult list for each bucket
-                # Since we're writing serialized bytes directly, we don't have individual WriteResult objects
-                # But we need to maintain the expected structure
-                write_results_or_exc[i] = []
+            if use_gemini and use_gemini_optimized:
+                # In Gemini optimized mode, we write serialized bytes directly as a single operation
+                # So we only report one result entry (key 0), regardless of how many buckets
+                # were in the original write_buckets before preload
+                write_results_or_exc = {0: []}
+            else:
+                # In normal mode, report results for each bucket
+                write_results_or_exc = {}
+                for i in range(num_buckets):
+                    write_results_or_exc[i] = []
             
             # Put results to queue if provided
             if global_results_queue is not None:
                 global_results_queue.put(write_results_or_exc)
+                _logger.info(f"Put write results to queue: {len(write_results_or_exc)} entries")
+            else:
+                _logger.warning("global_results_queue is None, cannot report write results")
             
             w_end = time()
-            _logger.info(f"Write with queue took {w_end - w_start:.2f}s")
+            _logger.info(f"Write with queue took {w_end - w_start:.2f}s, process exiting normally")
             
         except Exception as e:
             _logger.error(f"Failed to write bytes to file: {e}")

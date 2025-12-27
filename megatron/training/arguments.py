@@ -2263,6 +2263,12 @@ def _add_checkpointing_args(parser):
                        help='Enable Gemini checkpointing for software failure. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')
     group.add_argument('--use-gemini-hardware-failure', action='store_true',
                        help='Enable Gemini checkpointing for hardware failure. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')
+    group.add_argument('--use-gemini-optimized', action='store_true',
+                       help='Enable optimized Gemini checkpointing without torch.save serialization overhead. '
+                            'Uses continuous buffer approach for direct GPU-to-CPU transfer and zero-copy communication. '
+                            'This eliminates serialization/deserialization overhead and improves checkpoint exchange performance. '
+                            'When enabled, tensors are copied directly to a continuous CPU buffer during preload phase, '
+                            'avoiding expensive pickle serialization in torch.save.')
     return parser
 
 

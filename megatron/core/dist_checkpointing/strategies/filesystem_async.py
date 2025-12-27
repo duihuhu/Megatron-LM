@@ -123,6 +123,8 @@ class FileSystemWriterAsync(FileSystemWriter):
         eclatin_buffer_size: int = 64 * 1024 * 1024,
         eclatin_native: Optional[Any] = None,  # Pre-initialized C++ module
         eclatin_buffers: Optional[Dict] = None,  # Pre-allocated buffers
+        use_gemini: bool = False,
+        gemini_native: Optional[Any] = None,  # Pre-initialized C++ module
         **kwargs,
     ):
         self.checkpoint_dir = path
@@ -142,6 +144,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.use_eclatin = use_eclatin
         self.eclatin_pin_memory = eclatin_pin_memory
         self.eclatin_buffer_size = eclatin_buffer_size  # Buffer size in bytes
+        
+        # Gemini configuration
+        self.use_gemini = use_gemini
 
         super().__init__(path, *args, **kwargs)
         if not self.single_file_per_rank:
@@ -219,6 +224,18 @@ class FileSystemWriterAsync(FileSystemWriter):
         else:
             self._eclatin_native = None
             self._eclatin_shared = False
+        
+        # Gemini intermediate state
+        # Note: Gemini reuses decomposed_state_dict and preallocated_cpu_buffer from EC-CHECK
+        # Initialize C++ native module if available
+        if gemini_native is not None:
+            # Use pre-initialized C++ module from strategy
+            self._gemini_native = gemini_native
+            self._gemini_shared = True  # Mark as shared module
+            logger.info("Gemini: Using pre-initialized C++ native module from strategy")
+        else:
+            self._gemini_native = None
+            self._gemini_shared = False
 
     def __del__(self):
         """
@@ -446,6 +463,17 @@ class FileSystemWriterAsync(FileSystemWriter):
             )
         from megatron.training import get_args
         args = get_args()
+        
+        # Gemini optimized mode: use continuous buffer preload to avoid serialization
+        if hasattr(args, 'use_gemini') and args.use_gemini and \
+           hasattr(args, 'use_gemini_optimized') and args.use_gemini_optimized:
+            logger.info("Gemini: Using optimized preload (continuous buffer, no serialization)")
+            return (
+                partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
+                partial(self._gemini_preload_to_continuous_buffer, self.write_buckets, True),
+                [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+            )
+        
         if args.use_layer_transfer:
             return (
                 partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
@@ -480,6 +508,344 @@ class FileSystemWriterAsync(FileSystemWriter):
         if non_blocking:
             torch.cuda.synchronize()
         return result
+
+    def _gemini_preload_to_continuous_buffer(self, write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
+        """
+        Gemini optimized preload: Transfer tensors to continuous CPU buffer and exchange with peer rank.
+        
+        This method is designed for Gemini checkpointing to eliminate torch.save serialization overhead.
+        It performs the following operations in one pass:
+        1. GPU→CPU: Copy tensor data to continuous CPU buffer (no serialization)
+        2. Exchange: Swap buffers with paired rank
+        3. Return: Both local and remote buffers in write_buckets format
+        
+        Strategy:
+        1. Calculate total size of all data in write_buckets
+        2. Allocate a single continuous CPU buffer (pinned memory for faster transfer)
+        3. Copy all tensor and bytes data sequentially to the buffer
+        4. Generate lightweight metadata for reconstruction
+        5. Exchange buffer and metadata with paired rank
+        6. Return write_buckets containing both local and remote data
+        
+        Args:
+            write_buckets (List[WriteBucket]): Original write buckets with tensors
+            non_blocking (bool): Use non-blocking GPU-to-CPU transfer
+            
+        Returns:
+            List[WriteBucket]: Two buckets - [local_bucket, remote_bucket]
+                - local_bucket: Contains local buffer and metadata for original checkpoint
+                - remote_bucket: Contains remote buffer and metadata for replica checkpoint
+        """
+        if not write_buckets or len(write_buckets) == 0:
+            return write_buckets
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        start_time = time()
+        
+        logger.info(f"Gemini rank {rank}: Starting optimized preload using decomposed_state_dict...")
+        
+        # Phase 1: Use decomposed_state_dict if available (prepared by strategy)
+        if not hasattr(self, 'decomposed_state_dict') or self.decomposed_state_dict is None:
+            logger.error(f"Gemini rank {rank}: decomposed_state_dict not available, falling back to normal mode")
+            return self.preload_tensors(write_buckets, non_blocking)
+        
+        # Get total size from decomposed_state_dict
+        total_size = self.decomposed_state_dict.total_tensor_size_bytes
+        
+        logger.info(
+            f"Gemini rank {rank}: Using decomposed_state_dict with {len(self.decomposed_state_dict.tensor_infos)} tensors, "
+            f"total size: {total_size / (1024**2):.2f} MB"
+        )
+        
+        # Phase 2: Allocate continuous buffer (reuse preallocated buffer if available)
+        if self.preallocated_cpu_buffer is not None:
+            buffer = self.preallocated_cpu_buffer
+            # If preallocated buffer exists, ensure it's large enough
+            if buffer.numel() < total_size:
+                logger.warning(
+                    f"Gemini rank {rank}: Preallocated buffer ({buffer.numel() / (1024**3):.2f} GB) "
+                    f"is smaller than total_size ({total_size / (1024**3):.2f} GB). Reallocating..."
+                )
+                if torch.cuda.is_available():
+                    buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
+            else:
+                # Use slice of preallocated buffer
+                buffer = buffer[:total_size]
+                logger.info(f"Gemini rank {rank}: Reusing preallocated buffer")
+        else:
+            # Allocate new buffer with pinned memory for faster GPU-CPU transfer
+            if torch.cuda.is_available():
+                buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
+                logger.info(f"Gemini rank {rank}: Allocated new pinned memory buffer")
+            else:
+                buffer = torch.empty(total_size, dtype=torch.uint8)
+                logger.info(f"Gemini rank {rank}: Allocated new CPU buffer")
+        
+        # Phase 3: Copy tensor data to buffer using decomposed_state_dict (EC-CHECK style)
+        num_gpu_tensors = 0
+        
+        for info, tensor in zip(
+            self.decomposed_state_dict.tensor_infos,
+            self.decomposed_state_dict.tensor_data
+        ):
+            # Get view of buffer at current offset
+            buffer_view = buffer[info.offset:info.offset + info.size_bytes]
+            
+            # Flatten and copy tensor to continuous buffer (same as EC-CHECK)
+            tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
+            buffer_view.copy_(tensor_flat, non_blocking=non_blocking)
+            
+            if tensor.device.type != 'cpu':
+                num_gpu_tensors += 1
+        
+        # Synchronize GPU operations
+        if non_blocking and num_gpu_tensors > 0:
+            torch.cuda.synchronize()
+        
+        preload_time = time() - start_time
+        bandwidth = (total_size / (1024**3)) / preload_time if preload_time > 0 else 0
+        
+        logger.info(
+            f"Gemini rank {rank}: Preload completed in {preload_time:.4f}s, "
+            f"copied {total_size / (1024**2):.2f} MB, "
+            f"bandwidth: {bandwidth:.2f} GB/s, "
+            f"GPU tensors: {num_gpu_tensors}"
+        )
+        
+        # Package local metadata using decomposed_state_dict
+        local_metadata = {
+            'total_size': total_size,
+            'num_tensors': len(self.decomposed_state_dict.tensor_infos),
+            'non_tensor_data': self.decomposed_state_dict.non_tensor_data,
+            'tensor_infos': [
+                {
+                    'key': info.key,
+                    'shape': list(info.shape),
+                    'dtype': str(info.dtype),
+                    'offset': info.offset,
+                    'size_bytes': info.size_bytes,
+                }
+                for info in self.decomposed_state_dict.tensor_infos
+            ],
+        }
+        
+        # ===== Phase 2: Exchange buffer and metadata with paired rank =====
+        from megatron.training import get_args
+        args = get_args()
+        
+        # Check if Gemini exchange is enabled
+        if not (hasattr(args, 'use_gemini') and args.use_gemini):
+            # No exchange needed, just return local data
+            result_bucket = (
+                write_buckets[0][0] if write_buckets else 'gemini_optimized.distcp',
+                'gemini_optimized',
+                (
+                    [('gemini_metadata', local_metadata), ('gemini_buffer', buffer)],
+                    []
+                )
+            )
+            return [result_bucket]
+        
+        # Perform exchange with paired rank
+        logger.info(f"Gemini rank {rank}: Starting buffer exchange with paired rank...")
+        exchange_start = time()
+        
+        # Serialize metadata (small, overhead acceptable)
+        import io
+        metadata_buffer = io.BytesIO()
+        torch.save(local_metadata, metadata_buffer)
+        local_metadata_bytes = metadata_buffer.getvalue()
+        local_metadata_size = len(local_metadata_bytes)
+        local_buffer_size = buffer.numel()
+        
+        logger.info(
+            f"Gemini rank {rank}: Local buffer size: {local_buffer_size / (1024**2):.2f} MB, "
+            f"metadata size: {local_metadata_size / 1024:.2f} KB"
+        )
+        
+        # Check if C++ native module is available
+        if self._gemini_native is not None:
+            # Use C++ ASIO-based exchange (optimized path)
+            logger.info(f"Gemini rank {rank}: Using C++ ASIO-based exchange")
+            
+            # Step 1: Exchange buffer sizes first via torch.distributed
+            # (needed to allocate remote buffer before C++ exchange)
+            paired_rank = self._gemini_native.get_partner_rank()
+            
+            from ..strategies.async_utils import get_or_create_pair_process_group
+            pair_group = get_or_create_pair_process_group(rank, paired_rank)
+            
+            size_tensor = torch.tensor([local_buffer_size, local_metadata_size], dtype=torch.long, device='cpu')
+            gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(2)]
+            torch.distributed.all_gather(gathered_sizes, size_tensor, group=pair_group)
+            
+            pair_ranks = [min(rank, paired_rank), max(rank, paired_rank)]
+            my_idx = pair_ranks.index(rank)
+            paired_idx = 1 - my_idx
+            remote_buffer_size = gathered_sizes[paired_idx][0].item()
+            remote_metadata_size = gathered_sizes[paired_idx][1].item()
+            
+            logger.info(
+                f"Gemini rank {rank}: Remote buffer size: {remote_buffer_size / (1024**2):.2f} MB, "
+                f"metadata size: {remote_metadata_size / 1024:.2f} KB"
+            )
+            
+            # Step 2: Allocate remote buffer
+            remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
+            
+            # Step 3: Exchange buffers using C++ ASIO (simultaneous send/recv)
+            logger.info(f"Gemini rank {rank}: Starting C++ ASIO buffer exchange...")
+            asio_start = time()
+            
+            try:
+                # Get raw memory addresses and sizes from tensors
+                send_buffer_addr = buffer.data_ptr()
+                send_buffer_size = buffer.numel()
+                recv_buffer_addr = remote_buffer.data_ptr()
+                recv_buffer_size = remote_buffer.numel()
+                
+                # Call C++ exchange with raw memory addresses
+                received_size = self._gemini_native.exchange_buffers(
+                    send_buffer_addr, send_buffer_size,
+                    recv_buffer_addr, recv_buffer_size
+                )
+                
+                asio_time = time() - asio_start
+                asio_bandwidth = ((send_buffer_size + received_size) / (1024**3)) / asio_time if asio_time > 0 else 0
+                
+                logger.info(
+                    f"Gemini rank {rank}: C++ ASIO buffer exchange completed in {asio_time:.4f}s, "
+                    f"sent: {send_buffer_size / (1024**2):.2f} MB, "
+                    f"received: {received_size / (1024**2):.2f} MB, "
+                    f"bandwidth: {asio_bandwidth:.2f} GB/s"
+                )
+            except Exception as e:
+                logger.error(f"Gemini rank {rank}: C++ ASIO exchange failed: {e}")
+                raise
+            
+            # Step 4: Exchange metadata using torch.distributed (small, overhead acceptable)
+            remote_metadata_tensor = torch.empty(remote_metadata_size, dtype=torch.uint8, device='cpu')
+            local_metadata_tensor = torch.frombuffer(local_metadata_bytes, dtype=torch.uint8).clone()
+            
+            lower_global_rank = pair_ranks[0]
+            higher_global_rank = pair_ranks[1]
+            
+            if rank == lower_global_rank:
+                torch.distributed.broadcast(local_metadata_tensor, src=lower_global_rank, group=pair_group)
+                torch.distributed.broadcast(remote_metadata_tensor, src=higher_global_rank, group=pair_group)
+            else:
+                torch.distributed.broadcast(remote_metadata_tensor, src=lower_global_rank, group=pair_group)
+                torch.distributed.broadcast(local_metadata_tensor, src=higher_global_rank, group=pair_group)
+            
+            # Deserialize remote metadata
+            remote_metadata_bytes = remote_metadata_tensor.numpy().tobytes()
+            remote_metadata_buffer = io.BytesIO(remote_metadata_bytes)
+            remote_metadata = torch.load(remote_metadata_buffer)
+            
+        else:
+            # Fallback to torch.distributed broadcast (original path)
+            logger.info(f"Gemini rank {rank}: Using torch.distributed broadcast (C++ module not available)")
+            
+            # Get paired rank (rank 0<->2, 1<->3)
+            pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
+            paired_rank = pairing_map.get(rank, None)
+            
+            if paired_rank is None:
+                logger.warning(f"Gemini rank {rank}: No paired rank found, skipping exchange")
+                result_bucket = (
+                    write_buckets[0][0] if write_buckets else 'gemini_optimized.distcp',
+                    'gemini_optimized',
+                    (
+                        [('gemini_metadata', local_metadata), ('gemini_buffer', buffer)],
+                        []
+                    )
+                )
+                return [result_bucket]
+            
+            # Create or get pair process group
+            from ..strategies.async_utils import get_or_create_pair_process_group
+            pair_group = get_or_create_pair_process_group(rank, paired_rank)
+            
+            # Exchange sizes (buffer size + metadata size)
+            size_tensor = torch.tensor([local_buffer_size, local_metadata_size], dtype=torch.long, device='cpu')
+            gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(2)]
+            torch.distributed.all_gather(gathered_sizes, size_tensor, group=pair_group)
+            
+            # Get remote sizes
+            pair_ranks = [min(rank, paired_rank), max(rank, paired_rank)]
+            my_idx = pair_ranks.index(rank)
+            paired_idx = 1 - my_idx
+            remote_buffer_size = gathered_sizes[paired_idx][0].item()
+            remote_metadata_size = gathered_sizes[paired_idx][1].item()
+            
+            logger.info(
+                f"Gemini rank {rank}: Exchanging with rank {paired_rank}, "
+                f"local: {local_buffer_size / (1024**2):.2f} MB, "
+                f"remote: {remote_buffer_size / (1024**2):.2f} MB"
+            )
+            
+            # Allocate remote buffers
+            remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
+            remote_metadata_tensor = torch.empty(remote_metadata_size, dtype=torch.uint8, device='cpu')
+            
+            # Convert local metadata to tensor
+            local_metadata_tensor = torch.frombuffer(local_metadata_bytes, dtype=torch.uint8).clone()
+            
+            # Determine broadcast order
+            lower_global_rank = pair_ranks[0]
+            higher_global_rank = pair_ranks[1]
+            
+            # Exchange buffers
+            if rank == lower_global_rank:
+                torch.distributed.broadcast(buffer, src=lower_global_rank, group=pair_group)
+                torch.distributed.broadcast(remote_buffer, src=higher_global_rank, group=pair_group)
+                torch.distributed.broadcast(local_metadata_tensor, src=lower_global_rank, group=pair_group)
+                torch.distributed.broadcast(remote_metadata_tensor, src=higher_global_rank, group=pair_group)
+            else:
+                torch.distributed.broadcast(remote_buffer, src=lower_global_rank, group=pair_group)
+                torch.distributed.broadcast(buffer, src=higher_global_rank, group=pair_group)
+                torch.distributed.broadcast(remote_metadata_tensor, src=lower_global_rank, group=pair_group)
+                torch.distributed.broadcast(local_metadata_tensor, src=higher_global_rank, group=pair_group)
+            
+            # Deserialize remote metadata
+            remote_metadata_bytes = remote_metadata_tensor.numpy().tobytes()
+            remote_metadata_buffer = io.BytesIO(remote_metadata_bytes)
+            remote_metadata = torch.load(remote_metadata_buffer)
+        
+        exchange_time = time() - exchange_start
+        exchange_bandwidth = ((local_buffer_size + remote_buffer_size) / (1024**3)) / exchange_time if exchange_time > 0 else 0
+        
+        logger.info(
+            f"Gemini rank {rank}: Exchange completed in {exchange_time:.4f}s, "
+            f"bandwidth: {exchange_bandwidth:.2f} GB/s"
+        )
+        
+        total_time = time() - start_time
+        logger.info(
+            f"Gemini rank {rank}: Total time: {total_time:.4f}s "
+            f"(preload: {preload_time:.4f}s, exchange: {exchange_time:.4f}s)"
+        )
+        
+        # Return two buckets: local (for original checkpoint) and remote (for replica checkpoint)
+        local_bucket = (
+            write_buckets[0][0] if write_buckets else 'gemini_optimized.distcp',
+            'gemini_optimized_local',
+            (
+                [('gemini_metadata', local_metadata), ('gemini_buffer', buffer)],
+                []
+            )
+        )
+        
+        remote_bucket = (
+            write_buckets[0][0] if write_buckets else 'gemini_optimized_replica.distcp',
+            'gemini_optimized_remote',
+            (
+                [('gemini_metadata', remote_metadata), ('gemini_buffer', remote_buffer)],
+                []
+            )
+        )
+        
+        return [local_bucket, remote_bucket]
 
     @staticmethod
     def preload_tensors_layerwise_cpp(write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:

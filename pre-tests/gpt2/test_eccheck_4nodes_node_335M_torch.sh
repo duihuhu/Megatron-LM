@@ -118,7 +118,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-gemini-hardware-failure
 
     # --use-eclatin
-    --ckpt-format torch_dist
+    --ckpt-format torch
 )
 
 mkdir -p logs

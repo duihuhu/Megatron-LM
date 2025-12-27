@@ -1117,7 +1117,7 @@ public:
         std::cout << "ECLATIN: Set load mode: " 
                   << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank << std::endl;
     }
-    
+
     void init_load_connections(
         int rank,
         const std::string& rank2_ip,

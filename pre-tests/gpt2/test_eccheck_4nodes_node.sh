@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Script to run a single node in 4-node simulation (1 GPU per node)
-# Usage: ./test_eccheck_4nodes_node.sh <node_rank> [additional_args...]
-# Example: ./test_eccheck_4nodes_node.sh 0
+# Script to run a single node in 4-node simulation (1 GPU per node), allowing specification of both node rank and GPU device.
+# Usage: ./test_eccheck_4nodes_node.sh <node_rank> <gpu_id> [additional_args...]
+# Example: ./test_eccheck_4nodes_node.sh 0 1
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
@@ -19,11 +19,19 @@ export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
 NNODES=4
 
-# If first argument is a numeric node rank use it, otherwise default to 0
+# Parse node rank and gpu id
 NODE_RANK=0
+GPU_ID=0
 if [ -n "$1" ]; then
     if [[ "$1" =~ ^[0-9]+$ ]]; then
-        NODE_RANK=$1
+        NODE_RANK="$1"
+        shift
+    fi
+fi
+
+if [ -n "$1" ]; then
+    if [[ "$1" =~ ^[0-9]+$ ]]; then
+        GPU_ID="$1"
         shift
     fi
 fi
@@ -32,8 +40,8 @@ fi
 export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-# Set CUDA_VISIBLE_DEVICES for each node
-export CUDA_VISIBLE_DEVICES=$NODE_RANK
+# Set CUDA_VISIBLE_DEVICES for selected GPU
+export CUDA_VISIBLE_DEVICES=$GPU_ID
 
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
@@ -44,7 +52,7 @@ DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify 
 
 SHM_PKT="/dev/shm/shm_pkt"
 
-# Remaining args after optional node-rank are passed to the training script
+# Remaining args after node-rank and gpu-id are passed to the training script
 ARGS_TO_PASS=("$@")
 
 # fixed Model related configuration here, pls not overlap with json config
@@ -109,8 +117,8 @@ EVAL_AND_LOGGING_ARGS=(
     --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --use-eccheck
-    #--use-eclatin
+    #--use-eccheck
+    --use-eclatin
 
     # --use-gemini
     # --use-gemini-software-failure
@@ -125,12 +133,12 @@ mkdir -p logs/csv
 # Print command if PRINT_CMD is set
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK, GPU $GPU_ID): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
 
-echo "Starting Node $NODE_RANK with GPU $NODE_RANK"
+echo "Starting Node $NODE_RANK with GPU $GPU_ID"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 
 export USE_FLASH_ATTN=1 && \

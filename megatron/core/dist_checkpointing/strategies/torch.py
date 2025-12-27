@@ -2355,7 +2355,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Return EccheckMappedFile, non_tensor_data, and local_metadata for each file
         return mapped_file_own, mapped_file_partner
     
-    def _load_eclatin_p2p_checkpoint(self, checkpoint_dir: Path) -> Tuple:
+    def _load_eclatin_block_checkpoint(self, checkpoint_dir: Path) -> Tuple:
         """Load ECLATIN checkpoint data and recover rank2.
         
         Similar to EC-CHECK for rank2 recovery.
@@ -2450,7 +2450,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             total_size=total_size,
         )
         
-        # ===== Step 7: rank0 save recovered buffer =====
+        # ===== Step 7: rank2 save recovered buffer =====
         if rank == failed_rank:
             logger.info(f"ECLATIN: [Rank {rank}] Saving recovered buffer for _load_eclatin_checkpoint")
             self.eclatin_recovered_metadata = mapped_file_own
@@ -2710,59 +2710,89 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             logger.info(f"EC-CHECK: [Rank {rank}] Reconstructing from {len(local_metadata)} tensor metadata entries")
             
-            # Convert TensorMetadata to TensorInfo and extract tensors from buffer
+            # CRITICAL FIX: Use original tensor_infos with offset if available
+            # The recovered buffer contains data in the order saved (with proper offsets),
+            # not in sequential order. Using sequential current_offset causes mismatches.
             tensor_infos = []
             tensor_data = []
-            current_offset = 0
             
-            for meta in local_metadata:
-                # Convert dtype string to torch.dtype
-                # meta.dtype is a string like 'torch.float32' or 'float32'
-                dtype_str = meta.dtype.replace('torch.', '') if 'torch.' in meta.dtype else meta.dtype
-                try:
-                    dtype = getattr(torch, dtype_str)
-                except AttributeError:
-                    logger.warning(f"EC-CHECK: [Rank {rank}] Unknown dtype {meta.dtype}, using float32")
-                    dtype = torch.float32
+            # Check if mapped_file_own has original tensor_infos with offset information
+            if hasattr(mapped_file_own, 'tensor_infos') and mapped_file_own.tensor_infos:
+                logger.info(f"EC-CHECK: [Rank {rank}] Using tensor_infos with offset from mapped_file")
+                # Use original tensor_infos with correct offset
+                for info in mapped_file_own.tensor_infos:
+                    start = info.offset  # Use offset from TensorInfo (from save phase)
+                    end = start + info.size_bytes
+                    
+                    if end > recv_own_buffer.numel():
+                        logger.error(f"EC-CHECK: [Rank {rank}] Buffer overflow: end={end}, buffer_size={recv_own_buffer.numel()}")
+                        return None
+                    
+                    tensor_bytes = recv_own_buffer[start:end]
+                    
+                    # Reshape to original tensor
+                    try:
+                        tensor = tensor_bytes.view(info.dtype).reshape(info.shape).clone()
+                        tensor_data.append(tensor)
+                        tensor_infos.append(info)
+                    except Exception as e:
+                        logger.error(f"EC-CHECK: [Rank {rank}] Failed to reshape tensor {info.key}: {e}")
+                        return None
+            else:
+                # Fallback: sequential extraction (may cause mismatches if data order differs)
+                logger.warning(f"EC-CHECK: [Rank {rank}] No tensor_infos with offset found, using sequential extraction (may cause mismatches)")
+                current_offset = 0
                 
-                # Calculate element size for numel calculation
-                element_size = torch.tensor(0, dtype=dtype).element_size()
-                numel = meta.size_bytes // element_size
-                
-                # Create TensorInfo
-                tensor_info = TensorInfo(
-                    key=meta.key,
-                    shape=meta.shape,
-                    dtype=dtype,
-                    device=torch.device('cpu'),
-                    numel=numel,
-                    size_bytes=meta.size_bytes,
-                    offset=current_offset,
-                    global_offset=meta.global_offset,
-                    shard_index=meta.shard_index
-                )
-                tensor_infos.append(tensor_info)
-                
-                # Extract tensor from buffer
-                start = current_offset
-                end = start + meta.size_bytes
-                if end > recv_own_buffer.numel():
-                    logger.error(f"EC-CHECK: [Rank {rank}] Buffer overflow: end={end}, buffer_size={recv_own_buffer.numel()}")
-                    return None
-                
-                tensor_bytes = recv_own_buffer[start:end]
-                
-                # Reshape to original tensor
-                try:
-                    # Convert uint8 buffer to target dtype and reshape
-                    # First view as target dtype, then reshape to original shape
-                    tensor = tensor_bytes.view(dtype).reshape(meta.shape).clone()
-                    tensor_data.append(tensor)
-                except Exception as e:
-                    logger.error(f"EC-CHECK: [Rank {rank}] Failed to reshape tensor {meta.key}: {e}")
-                    return None
-                
-                current_offset = end
+                for meta in local_metadata:
+                    # Convert dtype string to torch.dtype
+                    # meta.dtype is a string like 'torch.float32' or 'float32'
+                    dtype_str = meta.dtype.replace('torch.', '') if 'torch.' in meta.dtype else meta.dtype
+                    try:
+                        dtype = getattr(torch, dtype_str)
+                    except AttributeError:
+                        logger.warning(f"EC-CHECK: [Rank {rank}] Unknown dtype {meta.dtype}, using float32")
+                        dtype = torch.float32
+                    
+                    # Calculate element size for numel calculation
+                    # Use torch._utils._element_size instead of creating a tensor
+                    # to avoid GPU memory allocation
+                    element_size = torch._utils._element_size(dtype)
+                    numel = meta.size_bytes // element_size
+                    
+                    # Create TensorInfo
+                    tensor_info = TensorInfo(
+                        key=meta.key,
+                        shape=meta.shape,
+                        dtype=dtype,
+                        device=torch.device('cpu'),
+                        numel=numel,
+                        size_bytes=meta.size_bytes,
+                        offset=current_offset,
+                        global_offset=meta.global_offset,
+                        shard_index=meta.shard_index
+                    )
+                    tensor_infos.append(tensor_info)
+                    
+                    # Extract tensor from buffer
+                    start = current_offset
+                    end = start + meta.size_bytes
+                    if end > recv_own_buffer.numel():
+                        logger.error(f"EC-CHECK: [Rank {rank}] Buffer overflow: end={end}, buffer_size={recv_own_buffer.numel()}")
+                        return None
+                    
+                    tensor_bytes = recv_own_buffer[start:end]
+                    
+                    # Reshape to original tensor
+                    try:
+                        # Convert uint8 buffer to target dtype and reshape
+                        # First view as target dtype, then reshape to original shape
+                        tensor = tensor_bytes.view(dtype).reshape(meta.shape).clone()
+                        tensor_data.append(tensor)
+                    except Exception as e:
+                        logger.error(f"EC-CHECK: [Rank {rank}] Failed to reshape tensor {meta.key}: {e}")
+                        return None
+                    
+                    current_offset = end
             
             logger.info(f"EC-CHECK: [Rank {rank}] Extracted {len(tensor_data)} tensors from buffer")
             
@@ -3733,14 +3763,43 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             logger.info("ECLATIN: [Rank 2] Recovery pipeline completed")
             
-            # Copy recovered blocks to recovered_buffer (for compatibility with _load_eclatin_checkpoint)
-            # Note: This is a simplified version - actual implementation may need to combine blocks
+            # Copy recovered blocks to recovered_buffer (combine data_block_1 and data_block_2)
+            # CRITICAL FIX: Use actual_tensor_buffer_size // 2 as split point (same as save phase's actual_data_bytes // 2)
+            # Save phase splits actual data at actual_data_bytes // 2, not pipeline_total_bytes // 2
+            # Calculate actual_tensor_buffer_size from registry (same as save phase's actual_data_bytes)
+            actual_tensor_buffer_size = 0
+            for r in range(world_size):
+                rank_metadata = registry.rank_metadata.get(r, [])
+                rank_actual_size = sum(meta.size_bytes for meta in rank_metadata)
+                if rank_actual_size > actual_tensor_buffer_size:
+                    actual_tensor_buffer_size = rank_actual_size
+            
+            # Use actual_tensor_buffer_size // 2 (same as save phase's actual_data_bytes // 2)
+            # This ensures the split point matches save phase exactly
+            half_actual_data = actual_tensor_buffer_size // 2  # Same split point as save phase
+            
             if recovered_buffer.numel() >= total_size:
-                # For now, just copy data_block_1 (actual implementation should combine all blocks)
-                recovered_buffer[:min(total_size, aligned_half_block_size)].copy_(
-                    eclatin_blocks['data_block_1'][:min(total_size, aligned_half_block_size)]
+                # Copy first half: from data_block_1[0:half_actual_data]
+                first_half_actual = min(half_actual_data, total_size)
+                recovered_buffer[:first_half_actual].copy_(
+                    eclatin_blocks['data_block_1'][:first_half_actual]
                 )
-                logger.info(f"ECLATIN: [Rank 2] Copied recovered data to buffer ({total_size / (1024**3):.2f} GB)")
+                
+                # Copy second half: from data_block_2[0:remaining_data] if total_size > half_actual_data
+                if total_size > half_actual_data:
+                    second_half_size = total_size - half_actual_data
+                    recovered_buffer[first_half_actual:total_size].copy_(
+                        eclatin_blocks['data_block_2'][:second_half_size]
+                    )
+                
+                logger.info(
+                    f"ECLATIN: [Rank 2] Copied recovered data to buffer "
+                    f"({total_size / (1024**3):.2f} GB): "
+                    f"actual_tensor_buffer_size={actual_tensor_buffer_size / (1024**3):.2f} GB, "
+                    f"half_actual_data={half_actual_data / (1024**3):.2f} GB, "
+                    f"first half {first_half_actual / (1024**3):.2f} GB from data_block_1, "
+                    f"second half {(total_size - first_half_actual) / (1024**3):.2f} GB from data_block_2"
+                )
             else:
                 logger.warning(
                     f"ECLATIN: [Rank 2] recovered_buffer too small "
@@ -4338,6 +4397,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         
         # Recovery path: rank2 may have recovered buffer
+        #if (False):
         if (rank == 2 and hasattr(self, 'eclatin_recovered_buffer')
             and self.eclatin_recovered_buffer is not None):
             logger.info(f"ECLATIN: [Rank {rank}] Using recovered data from recovery pipeline")
@@ -4361,7 +4421,13 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         logger.info(f"ECLATIN: Building index map from {len(decomposed.tensor_infos)} tensor infos")
         index_to_data = {}
         for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
-            index_key = (info.key, info.global_offset)
+            # Normalize global_offset to tuple format for consistent matching
+            info_offset = info.global_offset
+            if info_offset is None:
+                info_offset = ()
+            elif not isinstance(info_offset, tuple):
+                info_offset = tuple(info_offset) if hasattr(info_offset, '__iter__') else (info_offset,)
+            index_key = (info.key, info_offset)
             index_to_data[index_key] = (info, tensor)
         
         non_tensor_by_fqn = decomposed.non_tensor_data
@@ -4508,7 +4574,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if input_args.use_eclatin and (self._is_eclatin_checkpoint(checkpoint_dir) or rank == 2):
             logger.info(f"Detected ECLATIN format checkpoint at {checkpoint_dir}")
             # Load P2P checkpoint data (for rank2 recovery, this prepares the buffer)
-            mapped_file_own, mapped_file_partner = self._load_eclatin_p2p_checkpoint(checkpoint_dir)
+            mapped_file_own, mapped_file_partner = self._load_eclatin_block_checkpoint(checkpoint_dir)
             
             # _load_eclatin_checkpoint will use recovered data if available (rank2)
             return self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)

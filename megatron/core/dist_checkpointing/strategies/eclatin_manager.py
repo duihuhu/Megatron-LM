@@ -250,12 +250,12 @@ class ECLATINManager:
             'parity2_recv2': base_port + rank * 8 + 7,
         }
         
-        # Load mode ports (for rank0 recovery)
-        # rank0 needs 6 recv sockets (from rank1/2/3)
-        # rank1/2/3 need 2 send sockets each (to rank0)
+        # Load mode ports (for rank2 recovery)
+        # rank2 needs 6 recv sockets (from rank0/1/3)
+        # rank0/1/3 need 2 send sockets each (to rank2)
         # Port allocation: base_port + 1000 + offset (to avoid conflict with save mode)
         load_base_port = base_port + 1000
-        if rank == 0:
+        if rank == 2:
             # rank2: 6 recv ports
             ports.update({
                 'load_recv_rank0_data2': load_base_port + 0,

@@ -79,12 +79,14 @@ class EclatinMappedFile:
         file_size: total size of the mapped file in bytes
         local_metadata: List of TensorMetadata extracted from Component 2
         non_tensor_data: Dict of non-tensor data extracted from Component 1
+        tensor_infos: List of TensorInfo with offset information (for recovery buffer extraction)
     """
     mmap_object: Any  # mmap.mmap object
     memory_address: int
     file_size: int
     local_metadata: List[TensorMetadata]
     non_tensor_data: Dict[str, Any]
+    tensor_infos: Optional[List[Any]] = None  # List[TensorInfo] with offset information
     
     def close(self) -> None:
         """Close the mmap object to release resources."""
@@ -2260,25 +2262,34 @@ class FileSystemWriterAsync(FileSystemWriter):
             data_block_1_ptr = ctypes.cast(data_block_1_write_addr, ctypes.POINTER(ctypes.c_uint8))
             data_block_2_ptr = ctypes.cast(data_block_2_write_addr, ctypes.POINTER(ctypes.c_uint8))
             
+            # CRITICAL FIX: Use actual_data_bytes // 2 as split point for data blocks
+            # Pipeline uses half_total (pipeline_total_bytes // 2) for synchronization,
+            # but data blocks should split actual data at actual_data_bytes // 2
+            half_actual_data = actual_data_bytes // 2  # Split point for actual data
+            
             # Copy from buffers to data blocks (only the actual data portion)
-            if src_pos_half1 < half_total:
-                bytes_to_write_half1 = min(take, half_total - src_pos_half1)
+            # data_block_1: first half of actual data [0, half_actual_data)
+            if src_pos_half1 < half_actual_data:
+                bytes_to_write_half1 = min(take, half_actual_data - src_pos_half1)
                 if src_pos_half1 < actual_data_bytes:
                     actual_write_half1 = min(bytes_to_write_half1, actual_data_bytes - src_pos_half1)
                     ctypes.memmove(data_block_1_ptr, buffer1_array.contents, actual_write_half1)
                 else:
                     ctypes.memmove(data_block_1_ptr, buffer1_array.contents, bytes_to_write_half1)
             else:
+                # Past first half of actual data, no data for data_block_1
                 ctypes.memset(data_block_1_ptr, 0, take)
             
-            if src_pos_in_second_half < total_bytes:
-                bytes_to_write_half2 = min(take, total_bytes - src_pos_in_second_half)
-                if src_pos_in_second_half < actual_data_bytes:
-                    actual_write_half2 = min(bytes_to_write_half2, actual_data_bytes - src_pos_in_second_half)
-                    ctypes.memmove(data_block_2_ptr, buffer2_array.contents, actual_write_half2)
-                else:
-                    ctypes.memmove(data_block_2_ptr, buffer2_array.contents, bytes_to_write_half2)
+            # data_block_2: second half of actual data [half_actual_data, actual_data_bytes)
+            # Map src_pos_half1 to second half position
+            if src_pos_half1 >= half_actual_data and src_pos_half1 < actual_data_bytes:
+                src_pos_in_second_half_mapped = src_pos_half1  # Same position in second half
+                bytes_to_write_half2 = min(take, actual_data_bytes - src_pos_in_second_half_mapped)
+                actual_write_half2 = min(bytes_to_write_half2, actual_data_bytes - src_pos_in_second_half_mapped)
+                # Use buffer2 which contains data from second half of pipeline
+                ctypes.memmove(data_block_2_ptr, buffer2_array.contents, actual_write_half2)
             else:
+                # Before second half or past actual data, no data for data_block_2
                 ctypes.memset(data_block_2_ptr, 0, take)
             
             # Update offsets (use take for data blocks, as they store full chunks)
@@ -2865,7 +2876,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                 memory_address=memory_address,
                 file_size=file_size,
                 local_metadata=local_metadata,
-                non_tensor_data=non_tensor_data
+                non_tensor_data=non_tensor_data,
+                tensor_infos=tensor_infos  # Preserve original tensor_infos with offset information
             )
             
             return mapped_file

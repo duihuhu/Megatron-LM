@@ -250,6 +250,39 @@ class ECLATINManager:
             'parity2_recv2': base_port + rank * 8 + 7,
         }
         
+        # Load mode ports (for rank2 recovery)
+        # rank2 needs 6 recv sockets (from rank0/1/3)
+        # rank0/1/3 need 2 send sockets each (to rank2)
+        # Port allocation: base_port + 1000 + offset (to avoid conflict with save mode)
+        load_base_port = base_port + 1000
+        if rank == 2:
+            # rank2: 6 recv ports
+            ports.update({
+                'load_recv_rank0_data2': load_base_port + 0,
+                'load_recv_rank0_parity2': load_base_port + 1,
+                'load_recv_rank1_data1': load_base_port + 2,
+                'load_recv_rank1_parity1': load_base_port + 3,
+                'load_recv_rank3_data1': load_base_port + 4,
+                'load_recv_rank3_data2': load_base_port + 5,
+            })
+        else:
+            # rank0/1/3: 2 send ports each
+            if rank == 0:
+                ports.update({
+                    'load_send_rank0_data2': load_base_port + 0,  # connects to rank2's load_recv_rank0_data2
+                    'load_send_rank0_parity2': load_base_port + 1,  # connects to rank2's load_recv_rank0_parity2
+                })
+            elif rank == 1:
+                ports.update({
+                    'load_send_rank1_data1': load_base_port + 2,  # connects to rank2's load_recv_rank1_data1
+                    'load_send_rank1_parity1': load_base_port + 3,  # connects to rank2's load_recv_rank1_parity1
+                })
+            elif rank == 3:
+                ports.update({
+                    'load_send_rank3_data1': load_base_port + 4,  # connects to rank2's load_recv_rank3_data1
+                    'load_send_rank3_data2': load_base_port + 5,  # connects to rank2's load_recv_rank3_data2
+                })
+        
         # Step 4: Exchange IP addresses via torch.distributed.all_gather
         # TODO: Determine partner ranks for send1/send2/recv1/recv2 based on ECLATIN pairing logic
         rank_ips = {}
@@ -503,6 +536,66 @@ class ECLATINManager:
             logger.debug(f"ECLATIN: Allocated recv buffer {i}: {self.eclatin_buffer_size} bytes")
         
         logger.info(f"ECLATIN: Allocated {len(recv_buffers)} recv buffers")
+        return recv_buffers
+    
+    def allocate_eclatin_load_recv_buffers(self, global_registry: GlobalMetadataRegistry) -> Dict[str, torch.Tensor]:
+        """
+        Allocate 6 recv buffers for rank0 to receive blocks from other ranks.
+        
+        Rank0 needs to receive:
+        - rank1_data1, rank1_data2 (from rank1)
+        - rank2_data2, rank2_parity2 (from rank2)
+        - rank3_data1, rank3_parity1 (from rank3)
+        
+        Each buffer size is aligned_half_block_size (half of max_total_bytes).
+        
+        Args:
+            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
+            
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary with 6 recv buffers
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        if rank != 2:
+            logger.warning("ECLATIN: allocate_eclatin_load_recv_buffers called on non-rank2, returning empty dict")
+            return {}
+        
+        # Calculate maximum data size across all ranks
+        max_total_bytes = 0
+        for r in range(world_size):
+            rank_metadata = global_registry.rank_metadata.get(r, [])
+            rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+            if rank_total_size > max_total_bytes:
+                max_total_bytes = rank_total_size
+        
+        # Calculate aligned half block size (same as save phase)
+        half_max_total_bytes = max_total_bytes // 2
+        aligned_half_block_size = ((half_max_total_bytes + self.eclatin_buffer_size - 1) // self.eclatin_buffer_size) * self.eclatin_buffer_size
+        
+        logger.info(
+            f"ECLATIN: Allocating 6 recv buffers for rank2 load recovery\n"
+            f"  Pipeline max size: {max_total_bytes / (1024**3):.2f} GB\n"
+            f"  Aligned half block size (per buffer): {aligned_half_block_size / (1024**3):.2f} GB\n"
+            f"  Total recv memory: {6 * aligned_half_block_size / (1024**3):.2f} GB"
+        )
+        
+        # Allocate 6 recv buffers
+        recv_buffers = {
+            'rank0_data2': torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory),
+            'rank0_parity2': torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory),
+            'rank1_data1': torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory),
+            'rank1_parity1': torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory),
+            'rank3_data1': torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory),
+            'rank3_data2': torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory),
+        }
+        
+        logger.info(
+            f"ECLATIN: Allocated 6 recv buffers for rank2: "
+            f"{aligned_half_block_size / (1024**3):.2f} GB each"
+        )
+        
         return recv_buffers
     
     def _poll_and_release_buffers(self):

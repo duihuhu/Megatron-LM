@@ -66,6 +66,34 @@ class EccheckMappedFile:
             self.mmap_object.close()
             self.mmap_object = None
 
+
+@dataclasses.dataclass
+class EclatinMappedFile:
+    """Container for mmap file information used for ECLATIN load operations.
+    
+    Similar to EccheckMappedFile but for ECLATIN format.
+    
+    Attributes:
+        mmap_object: mmap object that must be kept alive for the memory to remain valid
+        memory_address: starting memory address
+        file_size: total size of the mapped file in bytes
+        local_metadata: List of TensorMetadata extracted from Component 2
+        non_tensor_data: Dict of non-tensor data extracted from Component 1
+        tensor_infos: List of TensorInfo with offset information (for recovery buffer extraction)
+    """
+    mmap_object: Any  # mmap.mmap object
+    memory_address: int
+    file_size: int
+    local_metadata: List[TensorMetadata]
+    non_tensor_data: Dict[str, Any]
+    tensor_infos: Optional[List[Any]] = None  # List[TensorInfo] with offset information
+    
+    def close(self) -> None:
+        """Close the mmap object to release resources."""
+        if self.mmap_object is not None:
+            self.mmap_object.close()
+            self.mmap_object = None
+
 try:
     import psutil
 
@@ -1370,17 +1398,25 @@ class FileSystemWriterAsync(FileSystemWriter):
                 tensor_keys_size = eclatin_metadata['tensor_keys_size']
                 tensor_buffer_size = eclatin_metadata['tensor_buffer_size']
                 
-                # Determine if this is a data block or parity block
+                # Determine if this is a main file, data block, or parity block
+                is_main_file = storage_key.endswith('_0.distcp') or '_0.distcp' in storage_key
                 is_data_block = 'data_block' in storage_key
                 is_parity_block = 'parity_block' in storage_key
-                block_type = "data" if is_data_block else ("parity" if is_parity_block else "unknown")
+                block_type = "main" if is_main_file else ("data" if is_data_block else ("parity" if is_parity_block else "unknown"))
                 
                 if eclatin_continuous_buffer is not None:
                     buffer_size = eclatin_continuous_buffer.numel()
                     
-                    # For data blocks: write only actual data portion (half of total, since data is split)
-                    # For parity blocks: write full aligned half size (include padding)
-                    if is_data_block:
+                    if is_main_file:
+                        # Main file: write full tensor_buffer_size (actual data only, exclude padding)
+                        write_size = tensor_buffer_size
+                        if write_size > buffer_size:
+                            logger.warning(
+                                f"ECLATIN: Write size ({write_size}) > buffer size ({buffer_size}), "
+                                f"writing entire buffer"
+                            )
+                            write_size = buffer_size
+                    elif is_data_block:
                         # Data blocks: write only actual data portion (half of total tensor_buffer_size)
                         # Each data block stores half of the total data
                         write_size = tensor_buffer_size // 2
@@ -1449,11 +1485,18 @@ class FileSystemWriterAsync(FileSystemWriter):
                         
                         component3_time = time() - component3_start
                         bandwidth = (component3_size / (1024**3)) / component3_time if component3_time > 0 else 0
-                        logger.info(
-                            f"ECLATIN: Wrote Component 3 ({component3_size / (1024**3):.2f} GB) "
-                            f"in {component3_time:.2f}s ({bandwidth:.2f} GB/s), "
-                            f"{block_type} block (excluded {buffer_size - write_size} bytes padding)"
-                        )
+                        if is_main_file:
+                            logger.info(
+                                f"ECLATIN: Wrote Component 3 ({component3_size / (1024**3):.2f} GB) "
+                                f"in {component3_time:.2f}s ({bandwidth:.2f} GB/s), "
+                                f"main file (actual data only, excluded {buffer_size - write_size} bytes padding)"
+                            )
+                        else:
+                            logger.info(
+                                f"ECLATIN: Wrote Component 3 ({component3_size / (1024**3):.2f} GB) "
+                                f"in {component3_time:.2f}s ({bandwidth:.2f} GB/s), "
+                                f"{block_type} block (excluded {buffer_size - write_size} bytes padding)"
+                            )
                         
                         # Flush to disk
                         if use_fsync:
@@ -2319,6 +2362,33 @@ class FileSystemWriterAsync(FileSystemWriter):
         if hasattr(self, 'ecl_write_buckets') and self.ecl_write_buckets:
             # Update paths with current checkpoint_dir (similar to ECCHECK)
             result_buckets = []
+            
+            # Extract metadata from first block (all blocks use the same metadata)
+            first_bucket = self.ecl_write_buckets[0]
+            _, _, (first_bytes_data, _) = first_bucket
+            
+            # Extract metadata for main file
+            main_file_metadata = None
+            for key, value in first_bytes_data:
+                if key == 'eclatin_metadata':
+                    main_file_metadata = value
+                    break
+            
+            # Add main file bucket (similar to ECCHECK)
+            if main_file_metadata:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                eclatin_main_file = f"__{rank}_0.distcp"
+                eclatin_main_path = Path(self.checkpoint_dir) / eclatin_main_file
+                
+                # Use same metadata but with full tensor_buffer instead of block tensor
+                eclatin_main_bytes_data = [
+                    ('eclatin_metadata', main_file_metadata),
+                    ('eclatin_continuous_buffer', self.tensor_buffer),  # Full tensor_buffer
+                ]
+                result_buckets.append((eclatin_main_path, eclatin_main_file, (eclatin_main_bytes_data, [])))
+                logger.debug(f"ECLATIN: Added main file bucket: {eclatin_main_path}")
+            
+            # Add 4 block buckets
             for bucket in self.ecl_write_buckets:
                 file_path, storage_key, data = bucket
                 # Extract file name from path
@@ -2560,25 +2630,34 @@ class FileSystemWriterAsync(FileSystemWriter):
             data_block_1_ptr = ctypes.cast(data_block_1_write_addr, ctypes.POINTER(ctypes.c_uint8))
             data_block_2_ptr = ctypes.cast(data_block_2_write_addr, ctypes.POINTER(ctypes.c_uint8))
             
+            # CRITICAL FIX: Use actual_data_bytes // 2 as split point for data blocks
+            # Pipeline uses half_total (pipeline_total_bytes // 2) for synchronization,
+            # but data blocks should split actual data at actual_data_bytes // 2
+            half_actual_data = actual_data_bytes // 2  # Split point for actual data
+            
             # Copy from buffers to data blocks (only the actual data portion)
-            if src_pos_half1 < half_total:
-                bytes_to_write_half1 = min(take, half_total - src_pos_half1)
+            # data_block_1: first half of actual data [0, half_actual_data)
+            if src_pos_half1 < half_actual_data:
+                bytes_to_write_half1 = min(take, half_actual_data - src_pos_half1)
                 if src_pos_half1 < actual_data_bytes:
                     actual_write_half1 = min(bytes_to_write_half1, actual_data_bytes - src_pos_half1)
                     ctypes.memmove(data_block_1_ptr, buffer1_array.contents, actual_write_half1)
                 else:
                     ctypes.memmove(data_block_1_ptr, buffer1_array.contents, bytes_to_write_half1)
             else:
+                # Past first half of actual data, no data for data_block_1
                 ctypes.memset(data_block_1_ptr, 0, take)
             
-            if src_pos_in_second_half < total_bytes:
-                bytes_to_write_half2 = min(take, total_bytes - src_pos_in_second_half)
-                if src_pos_in_second_half < actual_data_bytes:
-                    actual_write_half2 = min(bytes_to_write_half2, actual_data_bytes - src_pos_in_second_half)
-                    ctypes.memmove(data_block_2_ptr, buffer2_array.contents, actual_write_half2)
-                else:
-                    ctypes.memmove(data_block_2_ptr, buffer2_array.contents, bytes_to_write_half2)
+            # data_block_2: second half of actual data [half_actual_data, actual_data_bytes)
+            # Map src_pos_half1 to second half position
+            if src_pos_half1 >= half_actual_data and src_pos_half1 < actual_data_bytes:
+                src_pos_in_second_half_mapped = src_pos_half1  # Same position in second half
+                bytes_to_write_half2 = min(take, actual_data_bytes - src_pos_in_second_half_mapped)
+                actual_write_half2 = min(bytes_to_write_half2, actual_data_bytes - src_pos_in_second_half_mapped)
+                # Use buffer2 which contains data from second half of pipeline
+                ctypes.memmove(data_block_2_ptr, buffer2_array.contents, actual_write_half2)
             else:
+                # Before second half or past actual data, no data for data_block_2
                 ctypes.memset(data_block_2_ptr, 0, take)
             
             # Update offsets (use take for data blocks, as they store full chunks)
@@ -3047,6 +3126,141 @@ class FileSystemWriterAsync(FileSystemWriter):
             raise RuntimeError(f"EC-CHECK: Failed to map file {file_path} for NCCL: {e}") from e
     
     @staticmethod
+    def load_eclatin_bytes_from_file(file_path: Union[str, os.PathLike], my_rank: int = 0) -> EclatinMappedFile:
+        """
+        Load ECLATIN file using mmap and extract metadata.
+        
+        Similar to load_eccheck_bytes_from_file but for ECLATIN format (ECLT magic).
+        
+        File structure:
+        [Header: 32 bytes] [Component 1] [Component 2] [Component 3]
+        
+        Args:
+            file_path: path to the ECLATIN file
+            my_rank: current rank (used for preparing local_metadata), default 0
+        
+        Returns:
+            EclatinMappedFile: dataclass containing mmap object, memory address, file size,
+                              local_metadata, and non_tensor_data
+        """
+        import mmap
+        import struct
+        import pickle
+        from .state_dict_decomposer import TensorMetadata
+        
+        # Open file and get size
+        f = open(file_path, "rb")
+        mm = None
+        try:
+            # Get file size
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            f.seek(0)  # Seek back to start
+            
+            # Memory-map the entire file
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            
+            # Close file handle - mmap is independent of the file handle
+            f.close()
+            f = None
+            
+            # Parse header to extract Component 1 (non_tensor_data) and Component 2 (tensor_infos)
+            header_bytes = mm[:32]
+            if len(header_bytes) != 32:
+                raise RuntimeError(f"ECLATIN: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+            
+            # Parse header
+            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            
+            # Validate magic number
+            if magic != b'ECLT':
+                raise RuntimeError(f"ECLATIN: Invalid magic number (expected b'ECLT', got {magic})")
+            
+            # Extract Component 1: non_tensor_data
+            offset = 32  # After header
+            
+            non_tensor_bytes = mm[offset:offset + non_tensor_size]
+            if len(non_tensor_bytes) != non_tensor_size:
+                raise RuntimeError(
+                    f"ECLATIN: Failed to read Component 1 "
+                    f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
+                )
+            
+            # Deserialize non_tensor_data
+            non_tensor_data = pickle.loads(non_tensor_bytes)
+            logger.debug(f"ECLATIN: Extracted non_tensor_data from Component 1 ({non_tensor_size / 1024:.2f} KB)")
+            
+            offset += non_tensor_size  # Move to Component 2
+            
+            # Extract Component 2: tensor_infos (for preparing local_metadata)
+            tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
+            if len(tensor_keys_bytes) != tensor_keys_size:
+                raise RuntimeError(
+                    f"ECLATIN: Failed to read Component 2 "
+                    f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
+                )
+            
+            # Deserialize tensor_infos
+            tensor_infos = pickle.loads(tensor_keys_bytes)
+            logger.debug(f"ECLATIN: Extracted {len(tensor_infos)} tensor infos from Component 2")
+            
+            # Convert tensor_infos to local_metadata (List[TensorMetadata])
+            # Saved objects may be TensorInfo (no chunk_type/target/source), so fill defaults.
+            local_metadata = []
+            for info in tensor_infos:
+                chunk_type = getattr(info, "chunk_type", "data")
+                target_rank = getattr(info, "target_rank", my_rank)
+                source_rank = getattr(info, "source_rank", my_rank)
+                data_meta = TensorMetadata(
+                    key=info.key,
+                    shape=info.shape,
+                    dtype=str(info.dtype),
+                    size_bytes=info.size_bytes,
+                    global_offset=info.global_offset if info.global_offset is not None else (),
+                    shard_index=info.shard_index if info.shard_index is not None else 0,
+                    chunk_type=chunk_type,
+                    target_rank=target_rank,
+                    source_rank=source_rank,
+                )
+                local_metadata.append(data_meta)
+            
+            logger.debug(f"ECLATIN: Prepared {len(local_metadata)} TensorMetadata entries for local_metadata")
+            
+            # Get memory address
+            import numpy as np
+            np_view = np.frombuffer(mm, dtype=np.uint8, count=min(1, file_size))
+            memory_address = np_view.ctypes.data
+            
+            logger.info(
+                f"ECLATIN: Mapped file {file_path}\n"
+                f"  File size: {file_size / (1024**3):.2f} GB\n"
+                f"  Memory address: {hex(memory_address)}\n"
+                f"  Non-tensor data: {len(non_tensor_data)} keys\n"
+                f"  Tensor metadata: {len(local_metadata)} entries"
+            )
+            
+            mapped_file = EclatinMappedFile(
+                mmap_object=mm,
+                memory_address=memory_address,
+                file_size=file_size,
+                local_metadata=local_metadata,
+                non_tensor_data=non_tensor_data,
+                tensor_infos=tensor_infos  # Preserve original tensor_infos with offset information
+            )
+            
+            return mapped_file
+            
+        except Exception as e:
+            if mm is not None:
+                try:
+                    mm.close()
+                except:
+                    pass
+            if f is not None:
+                f.close()
+            raise RuntimeError(f"ECLATIN: Failed to map file {file_path}: {e}") from e
+    
+    @staticmethod
     def load_eccheck_components_from_file(file_path: Union[str, os.PathLike]) -> DecomposedStateDict:
         """
         Load three components from a single EC-CHECK file.
@@ -3185,6 +3399,138 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         logger.info(
             f"EC-CHECK: Successfully loaded all components from {file_path}\n"
+            f"  Component 1: {len(non_tensor_data)} keys\n"
+            f"  Component 2: {len(tensor_infos)} tensor infos\n"
+            f"  Component 3: {len(tensor_data)} tensors"
+        )
+        
+        return decomposed
+    
+    @staticmethod
+    def load_eclatin_components_from_file(file_path: Union[str, os.PathLike]) -> DecomposedStateDict:
+        """
+        Load three components from a single ECLATIN file.
+        
+        Similar to load_eccheck_components_from_file but for ECLATIN format (ECLT magic).
+        
+        File structure:
+        [Header: 32 bytes] [Component 1] [Component 2] [Component 3]
+        
+        Args:
+            file_path: path to the ECLATIN file
+        
+        Returns:
+            DecomposedStateDict: reconstructed decomposed structure
+        """
+        import struct
+        import numpy as np
+        import mmap
+        import pickle
+        from .state_dict_decomposer import DecomposedStateDict
+        
+        # Optimization for /dev/shm: Use mmap for zero-copy access
+        with open(file_path, "rb") as f:
+            # Get file size
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            f.seek(0)  # Seek back to start
+            
+            # Memory-map the entire file (zero-copy for /dev/shm)
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            
+            try:
+                # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
+                header_bytes = mm[:32]
+                if len(header_bytes) != 32:
+                    raise RuntimeError(f"ECLATIN: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+                
+                # Parse header
+                magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+                
+                # Validate magic number
+                if magic != b'ECLT':
+                    raise RuntimeError(f"ECLATIN: Invalid magic number (expected b'ECLT', got {magic})")
+                
+                logger.info(
+                    f"ECLATIN: Loading from {file_path}\n"
+                    f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
+                    f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
+                    f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
+                )
+                
+                # Calculate offsets for each component
+                offset = 32  # After header
+                
+                # Component 1: Non-tensor key-value pairs
+                non_tensor_bytes = mm[offset:offset + non_tensor_size]
+                if len(non_tensor_bytes) != non_tensor_size:
+                    raise RuntimeError(
+                        f"ECLATIN: Failed to read Component 1 "
+                        f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
+                    )
+                offset += non_tensor_size
+                
+                non_tensor_data = pickle.loads(non_tensor_bytes)
+                logger.debug(f"ECLATIN: Loaded Component 1 ({non_tensor_size / 1024:.2f} KB)")
+            
+                # Component 2: Tensor keys
+                tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
+                if len(tensor_keys_bytes) != tensor_keys_size:
+                    raise RuntimeError(
+                        f"ECLATIN: Failed to read Component 2 "
+                        f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
+                    )
+                offset += tensor_keys_size
+                
+                tensor_infos = pickle.loads(tensor_keys_bytes)
+                logger.debug(f"ECLATIN: Loaded Component 2 ({tensor_keys_size / 1024:.2f} KB)")
+                
+                # Component 3: Tensor data buffer (zero-copy numpy view from mmap)
+                tensor_buffer_start = offset
+                tensor_buffer_end = offset + tensor_buffer_size
+                
+                if tensor_buffer_end > file_size:
+                    raise RuntimeError(
+                        f"ECLATIN: File truncated - expected {tensor_buffer_end} bytes, got {file_size}"
+                    )
+                
+                # Create zero-copy numpy array view directly from mmap
+                buffer_np = np.frombuffer(mm, dtype=np.uint8, count=tensor_buffer_size, offset=tensor_buffer_start)
+                
+                # Extract individual tensors from the zero-copy buffer
+                tensor_data = []
+                for info in tensor_infos:
+                    # Calculate byte offset range for this tensor (relative to buffer start)
+                    start = info.offset
+                    end = start + info.size_bytes
+                    
+                    # Extract numpy slice (view, not copy) from buffer
+                    tensor_bytes_np = buffer_np[start:end]
+                    
+                    # Create torch tensor directly from bytes
+                    tensor_view = torch.frombuffer(
+                        memoryview(tensor_bytes_np), 
+                        dtype=info.dtype
+                    )
+                    # Clone to create writable copy and reshape to original shape
+                    tensor = tensor_view.clone().reshape(info.shape)
+                    tensor_data.append(tensor)
+                
+                logger.debug(f"ECLATIN: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB) and extracted {len(tensor_data)} tensors")
+            
+            finally:
+                # Close mmap
+                pass
+        
+        # Create DecomposedStateDict
+        decomposed = DecomposedStateDict(
+            non_tensor_data=non_tensor_data,
+            tensor_infos=tensor_infos,
+            tensor_data=tensor_data,
+        )
+        
+        logger.info(
+            f"ECLATIN: Successfully loaded all components from {file_path}\n"
             f"  Component 1: {len(non_tensor_data)} keys\n"
             f"  Component 2: {len(tensor_infos)} tensor infos\n"
             f"  Component 3: {len(tensor_data)} tensors"

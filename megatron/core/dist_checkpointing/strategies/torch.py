@@ -60,6 +60,7 @@ from .base import (
 from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .eccheck_manager import ECCHECKManager
 from .eclatin_manager import ECLATINManager
+from .gemini_manager import GeminiManager
 from .filesystem_async import FileSystemWriterAsync
 from .resharding import (
     TensorReformulationMetadata,
@@ -1540,8 +1541,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 import io
                 if isinstance(data, io.BytesIO):
                     non_tensor_data[item.index.fqn] = {
-                        '_eclatin_type': 'BytesIO',
-                        '_eclatin_data': data.getvalue()
+                        '_eccheck_type': 'BytesIO',
+                        '_eccheck_data': data.getvalue()
                     }
                 else:
                     non_tensor_data[item.index.fqn] = data
@@ -1804,15 +1805,14 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         
         # ===== Package blocks with metadata =====
-        # Get non-tensor data from global_registry
-        own_non_tensor_data = global_registry.rank_non_tensor_data.get(rank, {})
-        
-        # Serialize own metadata
+        # Align with EC-CHECK: use decomposed_state_dict.non_tensor_data directly
+        own_non_tensor_data = self.decomposed_state_dict.non_tensor_data
+        tensor_infos = self.decomposed_state_dict.tensor_infos  # List[TensorInfo] with offsets
         own_non_tensor_data_bytes = pickle.dumps(own_non_tensor_data)
-        own_tensor_keys_data_bytes = pickle.dumps(own_metadata)
+        own_tensor_keys_data_bytes = pickle.dumps(tensor_infos)
         own_non_tensor_size = len(own_non_tensor_data_bytes)
         own_tensor_keys_size = len(own_tensor_keys_data_bytes)
-        own_tensor_buffer_size = own_total_size  # Use actual size for metadata (not padded)
+        own_tensor_buffer_size = self.decomposed_state_dict.total_tensor_size_bytes
         
         # Create serialized metadata for all blocks (same metadata for all)
         block_serialized_metadata = {
@@ -2209,9 +2209,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.eccheck_manager.init_eccheck_if_enabled()
         
         # Initialize Gemini manager (singleton instance shared with Save strategy)
-        from .gemini_manager import GeminiManager
         self.gemini_manager = GeminiManager()
         self.gemini_manager.init_gemini_if_enabled()
+        # Initialize ECLATIN manager (singleton instance shared with Save strategy)
+        self.eclatin_manager = ECLATINManager()
+        self.eclatin_manager.init_eclatin_if_enabled()
         
         # Initialize strategy-specific EC-CHECK state
         self.eccheck_p2p_buffers = None
@@ -2220,6 +2222,13 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.eccheck_recovered_buffer = None
         self.eccheck_recovered_metadata = None
         self.eccheck_recovered_registry = None
+        
+        # Initialize strategy-specific ECLATIN state
+        self.eclatin_blocks = None
+        self.eclatin_recv_buffers = None
+        self.eclatin_recovered_buffer = None
+        self.eclatin_recovered_metadata = None
+        self.eclatin_recovered_registry = None
     
         self.pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
@@ -2257,6 +2266,38 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             with open(potential_file, 'rb') as f:
                 magic = f.read(4)
                 return magic == b'ECCK'
+        except:
+            return False
+    
+    def _is_eclatin_checkpoint(self, checkpoint_dir: Path) -> bool:
+        """Check if the checkpoint is in ECLATIN format.
+        
+        ECLATIN checkpoints are .distcp files with 'ECLT' magic number in the header.
+        
+        Args:
+            checkpoint_dir (Path): checkpoint directory
+            
+        Returns:
+            bool: True if this is an ECLATIN checkpoint
+        """
+        checkpoint_dir = Path(checkpoint_dir)
+        if not checkpoint_dir.exists():
+            return False
+        
+        # Get current rank to find the corresponding file
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        
+        # Check for ECLATIN format: __{rank}_0.distcp with ECLT magic number
+        potential_file = checkpoint_dir / f"__{rank}_0.distcp"
+        
+        if not potential_file.exists():
+            return False
+        
+        # Read first 4 bytes to check for ECLT magic number
+        try:
+            with open(potential_file, 'rb') as f:
+                magic = f.read(4)
+                return magic == b'ECLT'
         except:
             return False
     
@@ -2471,6 +2512,326 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Return EccheckMappedFile, non_tensor_data, and local_metadata for each file
         return mapped_file_own, mapped_file_partner
     
+    def _load_eclatin_block_checkpoint(self, checkpoint_dir: Path) -> Tuple:
+        """Load ECLATIN checkpoint data and recover rank2.
+        
+        Similar to EC-CHECK for rank2 recovery.
+        
+        Args:
+            checkpoint_dir (Path): checkpoint directory
+        
+        Returns:
+            Tuple: (mapped_file_own, None) - placeholder for compatibility
+        """
+        from .filesystem_async import FileSystemWriterAsync
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        # ECLATIN recovers rank2 (same as EC-CHECK)
+        failed_rank = 2
+        
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        # ===== Step 1: Load main file to extract metadata =====
+        eclatin_main_file = checkpoint_dir / f'__{rank}_0.distcp'
+        if not eclatin_main_file.exists():
+            logger.warning(f"ECLATIN: Main file not found for rank {rank}: {eclatin_main_file}")
+            return None, None
+        
+        # Load main file, extract Component 1 and Component 2 (metadata)
+        mapped_file_own = FileSystemWriterAsync.load_eclatin_bytes_from_file(
+            str(eclatin_main_file), my_rank=rank
+        )
+        
+        # ===== Step 2: Metadata exchange (similar to EC-CHECK) =====
+        local_package = {
+            'tensor_metadata': mapped_file_own.local_metadata or [],
+            'non_tensor_data': mapped_file_own.non_tensor_data or {},
+        }
+        
+        if local_package['tensor_metadata'] is None or local_package['non_tensor_data'] is None:
+            logger.error(f"ECLATIN: [Rank {rank}] Local metadata is None, skipping metadata exchange")
+            return mapped_file_own, None
+        
+        # All-gather complete metadata using all_gather_object
+        all_packages = [None] * world_size
+        torch.distributed.all_gather_object(all_packages, local_package)
+        
+        rank_metadata = {}
+        rank_non_tensor_data = {}
+        for i, package in enumerate(all_packages):
+            rank_metadata[i] = package['tensor_metadata']
+            rank_non_tensor_data[i] = package['non_tensor_data']
+        
+        # Create registry with both tensor and non-tensor metadata
+        from .state_dict_decomposer import GlobalMetadataRegistry
+        registry = GlobalMetadataRegistry(
+            rank_metadata=rank_metadata,
+            rank_non_tensor_data=rank_non_tensor_data
+        )
+        
+        # ===== Step 3: Allocate 4 blocks uniformly (reuse save phase logic) =====
+        if self.eclatin_blocks is None:
+            # Use the same _allocate_eclatin_blocks method as save phase
+            # This allocates 4 blocks based on registry metadata
+            self.eclatin_blocks = self._allocate_eclatin_blocks(registry)
+            logger.info(f"ECLATIN: [Rank {rank}] Allocated 4 blocks using registry metadata")
+        
+        # ===== Step 4: rank0/1/3 load block data from files =====
+        if rank != 2:
+            # rank0/1/3: Load block data from files into allocated blocks
+            self._load_eclatin_blocks_from_files(checkpoint_dir, rank)
+        
+        # ===== Step 5: rank2 allocate recv buffers =====
+        if rank == 2:
+            if self.eclatin_recv_buffers is None:
+                self.eclatin_recv_buffers = self._allocate_eclatin_load_recv_buffers(registry)
+            
+            if self.eclatin_recovered_buffer is None:
+                own_metadata = registry.rank_metadata.get(rank, [])
+                total_size = sum(meta.size_bytes for meta in own_metadata)
+                self.eclatin_recovered_buffer = torch.empty(total_size, dtype=torch.uint8)
+        
+        # ===== Step 6: Run recovery pipeline =====
+        own_metadata = registry.rank_metadata.get(rank, [])
+        total_size = sum(meta.size_bytes for meta in own_metadata)
+        
+        self._run_eclatin_recovery_pipeline(
+            rank=rank,
+            world_size=world_size,
+            registry=registry,
+            eclatin_blocks=self.eclatin_blocks,
+            recv_buffers=self.eclatin_recv_buffers if rank == 2 else None,
+            recovered_buffer=self.eclatin_recovered_buffer if rank == 2 else None,
+            total_size=total_size,
+        )
+        
+        # ===== Step 7: rank2 save recovered buffer =====
+        if rank == failed_rank:
+            logger.info(f"ECLATIN: [Rank {rank}] Saving recovered buffer for _load_eclatin_checkpoint")
+            self.eclatin_recovered_metadata = mapped_file_own
+            self.eclatin_recovered_registry = registry
+        
+        return mapped_file_own, None
+    
+    def _load_eclatin_blocks_from_files(self, checkpoint_dir: Path, rank: int) -> None:
+        """Load block data from files into already allocated blocks.
+        
+        Note: Blocks are already allocated via _allocate_eclatin_blocks.
+        This method only loads data from files into the allocated blocks.
+        
+        Args:
+            checkpoint_dir (Path): checkpoint directory
+            rank (int): current rank
+        """
+        # rank0: Load data_block_2, parity_block_2 (send to rank2)
+        if rank == 0:
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'data_block_2', self.eclatin_blocks['data_block_2']
+            )
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'parity_block_2', self.eclatin_blocks['parity_block_2']
+            )
+        
+        # rank1: Load data_block_1, parity_block_1 (send to rank2)
+        elif rank == 1:
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'data_block_1', self.eclatin_blocks['data_block_1']
+            )
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'parity_block_1', self.eclatin_blocks['parity_block_1']
+            )
+        
+        # rank3: Load data_block_1, data_block_2 (send to rank2)
+        elif rank == 3:
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'data_block_1', self.eclatin_blocks['data_block_1']
+            )
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'data_block_2', self.eclatin_blocks['data_block_2']
+            )
+        
+        # rank2: No need to load blocks (will receive from others)
+    
+    def _load_block_data_from_file(
+        self, checkpoint_dir: Path, rank: int, block_name: str, block_tensor: torch.Tensor
+    ) -> None:
+        """Load block data from file into allocated block tensor using mmap.
+        
+        File format: __{rank}_{block_name}.distcp
+        Only loads Component 3 (block data) into block_tensor.
+        Uses mmap for zero-copy access, similar to EC-CHECK.
+        
+        Args:
+            checkpoint_dir (Path): checkpoint directory
+            rank (int): current rank
+            block_name (str): block name (e.g., 'data_block_1')
+            block_tensor (torch.Tensor): pre-allocated tensor to load data into
+        """
+        import struct
+        import numpy as np
+        import mmap
+        
+        file_path = checkpoint_dir / f'__{rank}_{block_name}.distcp'
+        
+        if not file_path.exists():
+            raise FileNotFoundError(f"ECLATIN: Block file not found: {file_path}")
+        
+        logger.info(f"ECLATIN: [Rank {rank}] Loading {block_name} from {file_path} using mmap")
+        
+        # Open file and memory-map it
+        f = open(file_path, "rb")
+        mm = None
+        try:
+            # Get file size
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            f.seek(0)  # Seek back to start
+            
+            # Memory-map the entire file (zero-copy access)
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            
+            # Close file handle - mmap is independent of the file handle
+            f.close()
+            f = None
+            
+            # Parse header from mmap
+            header_bytes = mm[:32]
+            if len(header_bytes) != 32:
+                raise RuntimeError(f"ECLATIN: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+            
+            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            
+            if magic != b'ECLT':
+                raise RuntimeError(f"ECLATIN: Invalid magic number (expected b'ECLT', got {magic})")
+            
+            # Calculate Component 3 offset (skip Component 1 and Component 2)
+            offset = 32 + non_tensor_size + tensor_keys_size
+            
+            # Read Component 3 (block data) directly from mmap into block_tensor
+            # Note: block_tensor size should match tensor_buffer_size (aligned_half_block_size)
+            expected_size = block_tensor.numel()
+            if tensor_buffer_size > expected_size:
+                logger.warning(
+                    f"ECLATIN: Block data size ({tensor_buffer_size}) > allocated size ({expected_size}), "
+                    f"truncating to {expected_size}"
+                )
+                read_size = expected_size
+            else:
+                read_size = tensor_buffer_size
+            
+            # Read data directly from mmap (zero-copy numpy view)
+            source_data = mm[offset:offset + read_size]
+            if len(source_data) != read_size:
+                raise RuntimeError(
+                    f"ECLATIN: Failed to read block data from mmap "
+                    f"(expected {read_size} bytes, got {len(source_data)})"
+                )
+            
+            # Copy to block_tensor using numpy (zero-copy from mmap)
+            block_tensor_np = block_tensor.numpy()
+            block_tensor_np[:read_size] = np.frombuffer(source_data, dtype=np.uint8)
+            
+            # Fill remaining with zeros if needed
+            if read_size < expected_size:
+                block_tensor_np[read_size:] = 0
+            
+            logger.debug(
+                f"ECLATIN: [Rank {rank}] Loaded {block_name} ({read_size / (1024**2):.2f} MB) "
+                f"from mmap (zero-copy)"
+            )
+            
+        finally:
+            if mm is not None:
+                try:
+                    mm.close()
+                except:
+                    pass
+            if f is not None:
+                f.close()
+    
+    def _allocate_eclatin_blocks(self, global_registry):
+        """
+        Allocate 4 persistent blocks for ECLATIN load.
+        
+        Similar to save phase but simplified - only allocates blocks without WriteBuckets.
+        
+        Args:
+            global_registry: GlobalMetadataRegistry from all ranks
+            
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary with 'data_block_1', 'data_block_2', 
+                                    'parity_block_1', 'parity_block_2'
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        # ===== Get own data size from metadata =====
+        own_metadata = global_registry.rank_metadata.get(rank, [])
+        own_total_size = sum(meta.size_bytes for meta in own_metadata)
+        
+        # ===== Calculate maximum data size across all ranks =====
+        if torch.distributed.is_initialized():
+            all_total_bytes_list = []
+            for r in range(world_size):
+                rank_metadata = global_registry.rank_metadata.get(r, [])
+                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                all_total_bytes_list.append(rank_total_size)
+            max_total_bytes = max(all_total_bytes_list)
+        else:
+            max_total_bytes = own_total_size
+        
+        # ===== Align block size to buffer_size (64MB) using half of maximum =====
+        eclatin_buffer_size = self.eclatin_manager.eclatin_buffer_size
+        half_max_total_bytes = max_total_bytes // 2
+        aligned_half_block_size = ((half_max_total_bytes + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+        
+        logger.info(
+            f"ECLATIN: [Load] Allocating 4 persistent blocks based on metadata\n"
+            f"  Own data size: {own_total_size / (1024**3):.2f} GB (actual), "
+            f"{max_total_bytes / (1024**3):.2f} GB (pipeline max), "
+            f"{aligned_half_block_size / (1024**3):.2f} GB (aligned half block size)"
+        )
+        
+        # ===== Allocate 4 large continuous buffers =====
+        data_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        data_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        parity_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        parity_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        
+        logger.info(
+            f"ECLATIN: [Load] Allocated 4 persistent blocks:\n"
+            f"  data_block_1: {aligned_half_block_size / (1024**3):.2f} GB\n"
+            f"  data_block_2: {aligned_half_block_size / (1024**3):.2f} GB\n"
+            f"  parity_block_1: {aligned_half_block_size / (1024**3):.2f} GB\n"
+            f"  parity_block_2: {aligned_half_block_size / (1024**3):.2f} GB\n"
+            f"  Total memory: {4 * aligned_half_block_size / (1024**3):.2f} GB"
+        )
+        
+        # Return only blocks dictionary (no WriteBuckets needed for load)
+        blocks = {
+            'data_block_1': data_block_1,
+            'data_block_2': data_block_2,
+            'parity_block_1': parity_block_1,
+            'parity_block_2': parity_block_2,
+        }
+        
+        return blocks
+    
+    def _allocate_eclatin_load_recv_buffers(self, global_registry) -> Dict[str, torch.Tensor]:
+        """Allocate recv buffers for rank0 load recovery.
+        
+        Delegates to manager's allocate_eclatin_load_recv_buffers method.
+        
+        Args:
+            global_registry: GlobalMetadataRegistry
+            
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary with 6 recv buffers (rank0 only)
+        """
+        return self.eclatin_manager.allocate_eclatin_load_recv_buffers(global_registry)
+    
     def _extract_decomposed_from_buffer(
         self,
         recv_own_buffer: torch.Tensor,
@@ -2506,59 +2867,89 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             logger.info(f"EC-CHECK: [Rank {rank}] Reconstructing from {len(local_metadata)} tensor metadata entries")
             
-            # Convert TensorMetadata to TensorInfo and extract tensors from buffer
+            # CRITICAL FIX: Use original tensor_infos with offset if available
+            # The recovered buffer contains data in the order saved (with proper offsets),
+            # not in sequential order. Using sequential current_offset causes mismatches.
             tensor_infos = []
             tensor_data = []
-            current_offset = 0
             
-            for meta in local_metadata:
-                # Convert dtype string to torch.dtype
-                # meta.dtype is a string like 'torch.float32' or 'float32'
-                dtype_str = meta.dtype.replace('torch.', '') if 'torch.' in meta.dtype else meta.dtype
-                try:
-                    dtype = getattr(torch, dtype_str)
-                except AttributeError:
-                    logger.warning(f"EC-CHECK: [Rank {rank}] Unknown dtype {meta.dtype}, using float32")
-                    dtype = torch.float32
+            # Check if mapped_file_own has original tensor_infos with offset information
+            if hasattr(mapped_file_own, 'tensor_infos') and mapped_file_own.tensor_infos:
+                logger.info(f"EC-CHECK: [Rank {rank}] Using tensor_infos with offset from mapped_file")
+                # Use original tensor_infos with correct offset
+                for info in mapped_file_own.tensor_infos:
+                    start = info.offset  # Use offset from TensorInfo (from save phase)
+                    end = start + info.size_bytes
+                    
+                    if end > recv_own_buffer.numel():
+                        logger.error(f"EC-CHECK: [Rank {rank}] Buffer overflow: end={end}, buffer_size={recv_own_buffer.numel()}")
+                        return None
+                    
+                    tensor_bytes = recv_own_buffer[start:end]
+                    
+                    # Reshape to original tensor
+                    try:
+                        tensor = tensor_bytes.view(info.dtype).reshape(info.shape).clone()
+                        tensor_data.append(tensor)
+                        tensor_infos.append(info)
+                    except Exception as e:
+                        logger.error(f"EC-CHECK: [Rank {rank}] Failed to reshape tensor {info.key}: {e}")
+                        return None
+            else:
+                # Fallback: sequential extraction (may cause mismatches if data order differs)
+                logger.warning(f"EC-CHECK: [Rank {rank}] No tensor_infos with offset found, using sequential extraction (may cause mismatches)")
+                current_offset = 0
                 
-                # Calculate element size for numel calculation
-                element_size = torch.tensor(0, dtype=dtype).element_size()
-                numel = meta.size_bytes // element_size
-                
-                # Create TensorInfo
-                tensor_info = TensorInfo(
-                    key=meta.key,
-                    shape=meta.shape,
-                    dtype=dtype,
-                    device=torch.device('cpu'),
-                    numel=numel,
-                    size_bytes=meta.size_bytes,
-                    offset=current_offset,
-                    global_offset=meta.global_offset,
-                    shard_index=meta.shard_index
-                )
-                tensor_infos.append(tensor_info)
-                
-                # Extract tensor from buffer
-                start = current_offset
-                end = start + meta.size_bytes
-                if end > recv_own_buffer.numel():
-                    logger.error(f"EC-CHECK: [Rank {rank}] Buffer overflow: end={end}, buffer_size={recv_own_buffer.numel()}")
-                    return None
-                
-                tensor_bytes = recv_own_buffer[start:end]
-                
-                # Reshape to original tensor
-                try:
-                    # Convert uint8 buffer to target dtype and reshape
-                    # First view as target dtype, then reshape to original shape
-                    tensor = tensor_bytes.view(dtype).reshape(meta.shape).clone()
-                    tensor_data.append(tensor)
-                except Exception as e:
-                    logger.error(f"EC-CHECK: [Rank {rank}] Failed to reshape tensor {meta.key}: {e}")
-                    return None
-                
-                current_offset = end
+                for meta in local_metadata:
+                    # Convert dtype string to torch.dtype
+                    # meta.dtype is a string like 'torch.float32' or 'float32'
+                    dtype_str = meta.dtype.replace('torch.', '') if 'torch.' in meta.dtype else meta.dtype
+                    try:
+                        dtype = getattr(torch, dtype_str)
+                    except AttributeError:
+                        logger.warning(f"EC-CHECK: [Rank {rank}] Unknown dtype {meta.dtype}, using float32")
+                        dtype = torch.float32
+                    
+                    # Calculate element size for numel calculation
+                    # Use torch._utils._element_size instead of creating a tensor
+                    # to avoid GPU memory allocation
+                    element_size = torch._utils._element_size(dtype)
+                    numel = meta.size_bytes // element_size
+                    
+                    # Create TensorInfo
+                    tensor_info = TensorInfo(
+                        key=meta.key,
+                        shape=meta.shape,
+                        dtype=dtype,
+                        device=torch.device('cpu'),
+                        numel=numel,
+                        size_bytes=meta.size_bytes,
+                        offset=current_offset,
+                        global_offset=meta.global_offset,
+                        shard_index=meta.shard_index
+                    )
+                    tensor_infos.append(tensor_info)
+                    
+                    # Extract tensor from buffer
+                    start = current_offset
+                    end = start + meta.size_bytes
+                    if end > recv_own_buffer.numel():
+                        logger.error(f"EC-CHECK: [Rank {rank}] Buffer overflow: end={end}, buffer_size={recv_own_buffer.numel()}")
+                        return None
+                    
+                    tensor_bytes = recv_own_buffer[start:end]
+                    
+                    # Reshape to original tensor
+                    try:
+                        # Convert uint8 buffer to target dtype and reshape
+                        # First view as target dtype, then reshape to original shape
+                        tensor = tensor_bytes.view(dtype).reshape(meta.shape).clone()
+                        tensor_data.append(tensor)
+                    except Exception as e:
+                        logger.error(f"EC-CHECK: [Rank {rank}] Failed to reshape tensor {meta.key}: {e}")
+                        return None
+                    
+                    current_offset = end
             
             logger.info(f"EC-CHECK: [Rank {rank}] Extracted {len(tensor_data)} tensors from buffer")
             
@@ -4075,6 +4466,233 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         finally:
             pass
     
+    def _run_eclatin_recovery_pipeline(
+        self,
+        rank: int,
+        world_size: int,
+        registry,
+        eclatin_blocks: Dict[str, torch.Tensor],
+        recv_buffers: Optional[Dict[str, torch.Tensor]],
+        recovered_buffer: Optional[torch.Tensor],
+        total_size: int,
+    ) -> None:
+        """
+        Run ECLATIN recovery pipeline to recover rank2 data.
+        
+        Similar to EC-CHECK for rank2 recovery:
+        - rank2: Receives 6 blocks from rank0/1/3, runs load_recover to recover 4 blocks
+        - rank0/1/3: Send their blocks to rank2 using load_send_blocks
+        
+        Args:
+            rank (int): Current rank
+            world_size (int): Total number of ranks
+            registry: GlobalMetadataRegistry
+            eclatin_blocks (Dict[str, torch.Tensor]): 4 allocated blocks (all ranks)
+            recv_buffers (Optional[Dict[str, torch.Tensor]]): 6 recv buffers (rank2 only)
+            recovered_buffer (Optional[torch.Tensor]): Buffer to store recovered data (rank2 only)
+            total_size (int): Total size of data to recover
+        """
+        import ctypes
+        
+        if not self.eclatin_manager.use_eclatin:
+            logger.warning("ECLATIN: Manager not enabled, skipping recovery pipeline")
+            return
+        
+        if self.eclatin_manager._eclatin_native is None:
+            logger.error("ECLATIN: Native module not initialized")
+            return
+        
+        # === Step 1: Set load mode in C++ native module ===
+        failed_rank = 2  # ECLATIN recovers rank2
+        self.eclatin_manager._eclatin_native.set_load_mode(True, failed_rank)
+        logger.info(f"ECLATIN: [Rank {rank}] Set load mode (failed_rank={failed_rank})")
+        
+        # === Step 1.5: Initialize load connections ===
+        # Get network configuration for load mode ports
+        # All ranks need rank2's network config to get the correct ports
+        net_config_rank2 = self.eclatin_manager._get_eclatin_network_config(2, world_size)
+        rank2_ip = net_config_rank2['rank_ips'].get(2, net_config_rank2['my_ip'])
+        
+        # All ranks use rank2's recv ports (rank2 listens, rank0/1/3 connect)
+        load_recv_rank0_data2_port = net_config_rank2['ports']['load_recv_rank0_data2']
+        load_recv_rank0_parity2_port = net_config_rank2['ports']['load_recv_rank0_parity2']
+        load_recv_rank1_data1_port = net_config_rank2['ports']['load_recv_rank1_data1']
+        load_recv_rank1_parity1_port = net_config_rank2['ports']['load_recv_rank1_parity1']
+        load_recv_rank3_data1_port = net_config_rank2['ports']['load_recv_rank3_data1']
+        load_recv_rank3_data2_port = net_config_rank2['ports']['load_recv_rank3_data2']
+        
+        # Similar to EC-CHECK: rank2 starts accept operations first, then other ranks connect
+        if rank == 2:
+            # rank2: Initialize accept operations (will start accept threads)
+            logger.info(f"ECLATIN: [Rank 2] Initializing load accept connections...")
+            self.eclatin_manager._eclatin_native.init_load_connections(
+                rank,
+                rank2_ip,
+                load_recv_rank0_data2_port,
+                load_recv_rank0_parity2_port,
+                load_recv_rank1_data1_port,
+                load_recv_rank1_parity1_port,
+                load_recv_rank3_data1_port,
+                load_recv_rank3_data2_port
+            )
+            logger.info(f"ECLATIN: [Rank 2] Accept operations started, waiting for other ranks...")
+        
+        # Synchronize: ensure rank2's acceptors are ready before other ranks connect
+        torch.distributed.barrier()
+        
+        if rank != 2:
+            # rank0/1/3: Connect to rank2 (will block until connected)
+            logger.info(f"ECLATIN: [Rank {rank}] Connecting load send sockets to rank2...")
+            self.eclatin_manager._eclatin_native.init_load_connections(
+                rank,
+                rank2_ip,
+                load_recv_rank0_data2_port,
+                load_recv_rank0_parity2_port,
+                load_recv_rank1_data1_port,
+                load_recv_rank1_parity1_port,
+                load_recv_rank3_data1_port,
+                load_recv_rank3_data2_port
+            )
+            logger.info(f"ECLATIN: [Rank {rank}] Load send sockets connected")
+        
+        # Wait for all connections to be established
+        logger.info(f"ECLATIN: [Rank {rank}] Waiting for load connections to be established...")
+        self.eclatin_manager._eclatin_native.wait_for_load_connections(timeout_seconds=30)
+        
+        # Synchronize to ensure all connections are established
+        torch.distributed.barrier()
+        logger.info(f"ECLATIN: [Rank {rank}] Load connections initialized")
+        
+        # === Step 2: rank2: Receive blocks and recover ===
+        if rank == 2:
+            if recv_buffers is None or recovered_buffer is None:
+                logger.error("ECLATIN: [Rank 2] recv_buffers or recovered_buffer is None")
+                return
+            
+            # Get base addresses for recv buffers
+            rank0_data2_addr = int(recv_buffers['rank0_data2'].data_ptr())
+            rank0_parity2_addr = int(recv_buffers['rank0_parity2'].data_ptr())
+            rank1_data1_addr = int(recv_buffers['rank1_data1'].data_ptr())
+            rank1_parity1_addr = int(recv_buffers['rank1_parity1'].data_ptr())
+            rank3_data1_addr = int(recv_buffers['rank3_data1'].data_ptr())
+            rank3_data2_addr = int(recv_buffers['rank3_data2'].data_ptr())
+            
+            # Get base addresses for recovered blocks
+            recovered_data1_addr = int(eclatin_blocks['data_block_1'].data_ptr())
+            recovered_data2_addr = int(eclatin_blocks['data_block_2'].data_ptr())
+            recovered_parity1_addr = int(eclatin_blocks['parity_block_1'].data_ptr())
+            recovered_parity2_addr = int(eclatin_blocks['parity_block_2'].data_ptr())
+            
+            # Calculate aligned half block size (same as save phase)
+            aligned_half_block_size = eclatin_blocks['data_block_1'].numel()
+            
+            logger.info(
+                f"ECLATIN: [Rank 2] Starting recovery pipeline\n"
+                f"  Recv buffers: {aligned_half_block_size / (1024**3):.2f} GB each\n"
+                f"  Recovered blocks: {aligned_half_block_size / (1024**3):.2f} GB each"
+            )
+            
+            # Call C++ load_recover: receives 6 blocks and recovers 4 blocks
+            self.eclatin_manager._eclatin_native.load_recover(
+                rank0_data2_addr, rank0_parity2_addr,
+                rank1_data1_addr, rank1_parity1_addr,
+                rank3_data1_addr, rank3_data2_addr,
+                recovered_data1_addr, recovered_data2_addr,
+                recovered_parity1_addr, recovered_parity2_addr,
+                aligned_half_block_size
+            )
+            
+            logger.info("ECLATIN: [Rank 2] Recovery pipeline completed")
+            
+            # Copy recovered blocks to recovered_buffer (combine data_block_1 and data_block_2)
+            # CRITICAL FIX: Use actual_tensor_buffer_size // 2 as split point (same as save phase's actual_data_bytes // 2)
+            # Save phase splits actual data at actual_data_bytes // 2, not pipeline_total_bytes // 2
+            # Calculate actual_tensor_buffer_size from registry (same as save phase's actual_data_bytes)
+            actual_tensor_buffer_size = 0
+            for r in range(world_size):
+                rank_metadata = registry.rank_metadata.get(r, [])
+                rank_actual_size = sum(meta.size_bytes for meta in rank_metadata)
+                if rank_actual_size > actual_tensor_buffer_size:
+                    actual_tensor_buffer_size = rank_actual_size
+            
+            # Use actual_tensor_buffer_size // 2 (same as save phase's actual_data_bytes // 2)
+            # This ensures the split point matches save phase exactly
+            half_actual_data = actual_tensor_buffer_size // 2  # Same split point as save phase
+            
+            if recovered_buffer.numel() >= total_size:
+                # Copy first half: from data_block_1[0:half_actual_data]
+                first_half_actual = min(half_actual_data, total_size)
+                recovered_buffer[:first_half_actual].copy_(
+                    eclatin_blocks['data_block_1'][:first_half_actual]
+                )
+                
+                # Copy second half: from data_block_2[0:remaining_data] if total_size > half_actual_data
+                if total_size > half_actual_data:
+                    second_half_size = total_size - half_actual_data
+                    recovered_buffer[first_half_actual:total_size].copy_(
+                        eclatin_blocks['data_block_2'][:second_half_size]
+                    )
+                
+                logger.info(
+                    f"ECLATIN: [Rank 2] Copied recovered data to buffer "
+                    f"({total_size / (1024**3):.2f} GB): "
+                    f"actual_tensor_buffer_size={actual_tensor_buffer_size / (1024**3):.2f} GB, "
+                    f"half_actual_data={half_actual_data / (1024**3):.2f} GB, "
+                    f"first half {first_half_actual / (1024**3):.2f} GB from data_block_1, "
+                    f"second half {(total_size - first_half_actual) / (1024**3):.2f} GB from data_block_2"
+                )
+            else:
+                logger.warning(
+                    f"ECLATIN: [Rank 2] recovered_buffer too small "
+                    f"({recovered_buffer.numel()} < {total_size})"
+                )
+        
+        # === Step 3: rank0/1/3: Send blocks to rank2 ===
+        else:
+            aligned_half_block_size = eclatin_blocks['data_block_1'].numel()
+            
+            if rank == 0:
+                # rank0 sends: data_block_2, parity_block_2
+                data2_addr = int(eclatin_blocks['data_block_2'].data_ptr())
+                parity2_addr = int(eclatin_blocks['parity_block_2'].data_ptr())
+                
+                logger.info(f"ECLATIN: [Rank 0] Sending data_block_2 and parity_block_2 to rank2")
+                self.eclatin_manager._eclatin_native.load_send_blocks(
+                    'rank0_data2', data2_addr,
+                    'rank0_parity2', parity2_addr,
+                    aligned_half_block_size
+                )
+            
+            elif rank == 1:
+                # rank1 sends: data_block_1, parity_block_1
+                data1_addr = int(eclatin_blocks['data_block_1'].data_ptr())
+                parity1_addr = int(eclatin_blocks['parity_block_1'].data_ptr())
+                
+                logger.info(f"ECLATIN: [Rank 1] Sending data_block_1 and parity_block_1 to rank2")
+                self.eclatin_manager._eclatin_native.load_send_blocks(
+                    'rank1_data1', data1_addr,
+                    'rank1_parity1', parity1_addr,
+                    aligned_half_block_size
+                )
+            
+            elif rank == 3:
+                # rank3 sends: data_block_1, data_block_2
+                data1_addr = int(eclatin_blocks['data_block_1'].data_ptr())
+                data2_addr = int(eclatin_blocks['data_block_2'].data_ptr())
+                
+                logger.info(f"ECLATIN: [Rank 3] Sending data_block_1 and data_block_2 to rank2")
+                self.eclatin_manager._eclatin_native.load_send_blocks(
+                    'rank3_data1', data1_addr,
+                    'rank3_data2', data2_addr,
+                    aligned_half_block_size
+                )
+            
+            logger.info(f"ECLATIN: [Rank {rank}] Sent blocks to rank2")
+        
+        # Synchronize all ranks
+        torch.distributed.barrier()
+        logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed")
+    
     def prepare_for_load_pipeline_test(self):
         """
         Prepare environment for load pipeline testing.
@@ -4612,6 +5230,127 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # Assign data to ShardedBase object
             sh_base.data = value
 
+    def _load_eclatin_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+        """Load checkpoint saved in ECLATIN format (mirror EC-CHECK flow)."""
+        from .filesystem_async import FileSystemWriterAsync
+        from .state_dict_decomposer import reconstruct_state_dict
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        
+        # Recovery path: rank2 may have recovered buffer
+        #if (False):
+        if (rank == 2 and hasattr(self, 'eclatin_recovered_buffer')
+            and self.eclatin_recovered_buffer is not None):
+            logger.info(f"ECLATIN: [Rank {rank}] Using recovered data from recovery pipeline")
+            decomposed = self._extract_decomposed_from_buffer(
+                self.eclatin_recovered_buffer,
+                self.eclatin_recovered_metadata,
+                self.eclatin_recovered_registry
+            )
+            self.eclatin_recovered_buffer = None
+            self.eclatin_recovered_metadata = None
+            self.eclatin_recovered_registry = None
+        else:
+            checkpoint_dir = Path(checkpoint_dir)
+            eclatin_file = checkpoint_dir / f'__{rank}_0.distcp'
+            if not eclatin_file.exists():
+                raise FileNotFoundError(f"ECLATIN file not found for rank {rank}: {eclatin_file}")
+            logger.info(f"Loading ECLATIN checkpoint from {eclatin_file}")
+            decomposed = FileSystemWriterAsync.load_eclatin_components_from_file(str(eclatin_file))
+        
+        # Build index map: (key, global_offset) -> (info, tensor)
+        logger.info(f"ECLATIN: Building index map from {len(decomposed.tensor_infos)} tensor infos")
+        index_to_data = {}
+        for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
+            # Normalize global_offset to tuple format for consistent matching
+            info_offset = info.global_offset
+            if info_offset is None:
+                info_offset = ()
+            elif not isinstance(info_offset, tuple):
+                info_offset = tuple(info_offset) if hasattr(info_offset, '__iter__') else (info_offset,)
+            index_key = (info.key, info_offset)
+            index_to_data[index_key] = (info, tensor)
+        
+        non_tensor_by_fqn = decomposed.non_tensor_data
+        logger.info(
+            f"Successfully loaded ECLATIN checkpoint for rank {rank} "
+            f"({len(decomposed.tensor_data)} tensors, "
+            f"{decomposed.total_tensor_size_bytes / (1024**3):.2f} GB)"
+        )
+        
+        orig_sharded_state_dict = sharded_state_dict
+        (keyed_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+        )
+        
+        matched_count = 0
+        unmatched_count = 0
+        for key, sh_base_list in keyed_state_dict.items():
+            for sh_base in sh_base_list:
+                if isinstance(sh_base, ShardedObject):
+                    if key in non_tensor_by_fqn:
+                        value = non_tensor_by_fqn[key]
+                        # Handle BytesIO wrapper (support both '_eccheck_type' and '_eclatin_type' for backward compatibility)
+                        if isinstance(value, dict) and ('_eccheck_type' in value or '_eclatin_type' in value):
+                            wrapper_type = value.get('_eccheck_type') or value.get('_eclatin_type')
+                            if wrapper_type == 'BytesIO':
+                                bytes_data = value.get('_eccheck_data') or value.get('_eclatin_data')
+                                bytes_io = io.BytesIO(bytes_data)
+                                deserialized_list = torch.load(bytes_io, map_location='cpu', weights_only=False)
+                                value = deserialized_list[0] if isinstance(deserialized_list, list) else deserialized_list
+                        sh_base.data = value
+                        matched_count += 1
+                    else:
+                        unmatched_count += 1
+                        logger.warning(f"ECLATIN: [Rank {rank}] Unmatched ShardedObject: key={key}")
+                elif isinstance(sh_base, ShardedTensor):
+                    sh_offset = tuple(sh_base.global_offset) if hasattr(sh_base.global_offset, '__iter__') else (sh_base.global_offset,)
+                    lookup_key = (key, sh_offset)
+                    if lookup_key in index_to_data:
+                        _, tensor = index_to_data[lookup_key]
+                        sh_base.data = tensor
+                        matched_count += 1
+                        if tensor is None:
+                            logger.error(f"ECLATIN: Matched key {lookup_key} but tensor is None!")
+                    else:
+                        unmatched_count += 1
+                        logger.warning(f"ECLATIN: [Rank {rank}] Unmatched ShardedTensor: key={key}, global_offset={sh_offset}, lookup_key={lookup_key}")
+        
+        logger.info(f"ECLATIN: Matched {matched_count} ShardedBase objects")
+        if unmatched_count > 0:
+            logger.warning(f"ECLATIN: {unmatched_count} ShardedBase objects were not matched - this may cause NaN after several iterations!")
+        
+        # Unwrap to plain state_dict
+        unwrapped_state_dict = {}
+        for key, sh_base_list in keyed_state_dict.items():
+            if len(sh_base_list) == 0:
+                continue
+            sh_base = sh_base_list[0]
+            if isinstance(sh_base, ShardedTensor):
+                tensors = []
+                for sh in sh_base_list:
+                    ten = sh.data
+                    if ten is None:
+                        tensors.append(None)
+                        continue
+                    if sh.flattened_range is not None:
+                        assert ten.shape[:-1] == (1,) * (len(ten.shape) - 1), ten.shape
+                        ten = ten.view(-1)
+                    else:
+                        for _ in range(sh.prepend_axis_num):
+                            if ten.size(0) == 1:
+                                ten = ten[0]
+                    tensors.append(ten)
+                unwrapped_state_dict[key] = tensors
+            elif isinstance(sh_base, ShardedObject):
+                unwrapped_state_dict[key] = [sh.data for sh in sh_base_list]
+        
+        mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
+            unwrapped_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
+        )
+        self._restore_dict_types_lenient(mcore_state_dict, orig_sharded_state_dict)
+        return mcore_state_dict
+
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
 
@@ -4685,6 +5424,14 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             # _load_eccheck_checkpoint will use recovered data if available (rank2)
             return self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
+        
+        if input_args.use_eclatin and (self._is_eclatin_checkpoint(checkpoint_dir) or rank == 2):
+            logger.info(f"Detected ECLATIN format checkpoint at {checkpoint_dir}")
+            # Load P2P checkpoint data (for rank2 recovery, this prepares the buffer)
+            mapped_file_own, mapped_file_partner = self._load_eclatin_block_checkpoint(checkpoint_dir)
+            
+            # _load_eclatin_checkpoint will use recovered data if available (rank2)
+            return self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)
         
         # Apply N-D tensors resharding
         reformulation_metadata = get_reformulation_metadata(sharded_state_dict, checkpoint_dir)

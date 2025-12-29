@@ -206,13 +206,31 @@ class ECCHECKManager:
         p2p_partner = self.get_p2p_partner_rank(rank, world_size)
         
         # Step 5: Exchange IP addresses via torch.distributed.all_gather
+        # Initialize with fallback values
         xor_partner_ip = base_ip
         p2p_partner_ip = base_ip
         
         if torch.distributed.is_initialized():
             try:
+                # Get actual IP address for each rank
+                # Priority: ECCHECK_RANK_IP_<rank> > auto-detect from network interface
+                my_actual_ip = os.environ.get(f'ECCHECK_RANK_IP_{rank}')
+                if not my_actual_ip:
+                    # Try to get actual IP from network interface
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        s.connect(('8.8.8.8', 80))
+                        my_actual_ip = s.getsockname()[0]
+                        s.close()
+                        logger.info(f"EC-CHECK: [Rank {rank}] Auto-detected my IP: {my_actual_ip}")
+                    except Exception as e:
+                        logger.warning(f"EC-CHECK: [Rank {rank}] Failed to auto-detect IP, using base_ip: {e}")
+                        my_actual_ip = base_ip
+                else:
+                    logger.info(f"EC-CHECK: [Rank {rank}] Using IP from ECCHECK_RANK_IP_{rank}: {my_actual_ip}")
+                
                 # Convert IP to bytes, then to int list for tensor
-                my_ip_bytes = socket.inet_aton(base_ip)
+                my_ip_bytes = socket.inet_aton(my_actual_ip)
                 my_ip_tensor = torch.tensor(
                     [int(b) for b in my_ip_bytes], 
                     dtype=torch.uint8
@@ -232,9 +250,14 @@ class ECCHECKManager:
                     ip_bytes = bytes(ip_tensor.cpu().tolist())
                     rank_ips[r] = socket.inet_ntoa(ip_bytes)
                 
-                # Get partner IPs
+                logger.info(f"EC-CHECK: [Rank {rank}] All ranks IPs: {rank_ips}")
+                
+                # Get partner IPs from gathered results
                 xor_partner_ip = rank_ips.get(xor_partner, base_ip)
                 p2p_partner_ip = rank_ips.get(p2p_partner, base_ip)
+                
+                # Update my_ip to use the actual detected IP
+                base_ip = my_actual_ip
                 
                 logger.info(
                     f"EC-CHECK: [Rank {rank}] IP exchange completed - "

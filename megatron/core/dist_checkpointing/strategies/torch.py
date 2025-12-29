@@ -4563,6 +4563,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         torch.distributed.barrier()
         logger.info(f"ECLATIN: [Rank {rank}] Load connections initialized")
         
+        start_time = time()
         # === Step 2: rank2: Receive blocks and recover ===
         if rank == 2:
             if recv_buffers is None or recovered_buffer is None:
@@ -4603,7 +4604,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             )
             
             logger.info("ECLATIN: [Rank 2] Recovery pipeline completed")
-            
+            end_time = time()
+            logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.2f} seconds")
             # Copy recovered blocks to recovered_buffer (combine data_block_1 and data_block_2)
             # CRITICAL FIX: Use actual_tensor_buffer_size // 2 as split point (same as save phase's actual_data_bytes // 2)
             # Save phase splits actual data at actual_data_bytes // 2, not pipeline_total_bytes // 2
@@ -4662,7 +4664,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     'rank0_parity2', parity2_addr,
                     aligned_half_block_size
                 )
-            
+                end_time = time()
+                logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.2f} seconds")
             elif rank == 1:
                 # rank1 sends: data_block_1, parity_block_1
                 data1_addr = int(eclatin_blocks['data_block_1'].data_ptr())
@@ -4686,11 +4689,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     'rank3_data2', data2_addr,
                     aligned_half_block_size
                 )
+                end_time = time()
+                logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.2f} seconds")
             
             logger.info(f"ECLATIN: [Rank {rank}] Sent blocks to rank2")
         
         # Synchronize all ranks
         torch.distributed.barrier()
+        # end_time = time()
+        # logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.2f} seconds")
         logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed")
     
     def prepare_for_load_pipeline_test(self):

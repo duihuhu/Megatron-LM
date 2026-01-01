@@ -11,7 +11,6 @@
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
-#include <map>
 #include <chrono>
 #include <isa-l/erasure_code.h>
 #include <isa-l/raid.h>
@@ -269,20 +268,6 @@ private:
     std::atomic<bool> xor_worker_completed_;
     std::atomic<bool> p2p_send_worker_completed_;
     std::atomic<bool> p2p_recv_worker_completed_;
-    
-    // Time statistics
-    std::atomic<double> total_encoding_time_ms_;
-    std::atomic<double> total_send_time_ms_;
-    std::atomic<double> total_recv_time_ms_;
-    std::atomic<double> total_xor_time_ms_;
-    std::atomic<double> total_p2p_send_time_ms_;
-    std::atomic<double> total_p2p_recv_time_ms_;
-    std::atomic<int> encoding_count_;
-    std::atomic<int> send_count_;
-    std::atomic<int> recv_count_;
-    std::atomic<int> xor_count_;
-    std::atomic<int> p2p_send_count_;
-    std::atomic<int> p2p_recv_count_;
     
     // Sentinel received flags (to track if sentinel was received, but queue may not be empty yet)
     std::atomic<bool> encoding_thread_1_sentinel_received_;
@@ -1019,12 +1004,7 @@ private:
             
             if (need_encode) {
                 // Step 1: Perform encoding (parity index 0 for thread1)
-                auto encode_start = std::chrono::high_resolution_clock::now();
                 encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 0);
-                auto encode_end = std::chrono::high_resolution_clock::now();
-                double encode_time_ms = std::chrono::duration<double, std::milli>(encode_end - encode_start).count();
-                total_encoding_time_ms_.store(total_encoding_time_ms_.load() + encode_time_ms);
-                encoding_count_++;
                 
                 // Mark data buffer as copied by thread 1
                 {
@@ -1205,12 +1185,7 @@ private:
             
             if (need_encode) {
                 // Step 1: Perform encoding (parity index 1 for thread2)
-                auto encode_start = std::chrono::high_resolution_clock::now();
                 encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 1);
-                auto encode_end = std::chrono::high_resolution_clock::now();
-                double encode_time_ms = std::chrono::duration<double, std::milli>(encode_end - encode_start).count();
-                total_encoding_time_ms_.store(total_encoding_time_ms_.load() + encode_time_ms);
-                encoding_count_++;
                 
                 // Mark data buffer as copied by thread 2
                 {
@@ -1362,7 +1337,6 @@ private:
             }
             
             // Send data using ASIO or NCCL
-            auto send_start = std::chrono::high_resolution_clock::now();
             if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_send_connected()) {
                 // ASIO send path (synchronous)
                 uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.encoding_addr);
@@ -1433,10 +1407,10 @@ private:
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
                 encoding_buffers_to_release_.push(task.encoding_addr);
             }
-            auto send_end = std::chrono::high_resolution_clock::now();
-            double send_time_ms = std::chrono::duration<double, std::milli>(send_end - send_start).count();
-            total_send_time_ms_.store(total_send_time_ms_.load() + send_time_ms);
-            send_count_++;
+            // auto send_end = std::chrono::high_resolution_clock::now();
+            // double send_time_ms = std::chrono::duration<double, std::milli>(send_end - send_start).count();
+            // total_send_time_ms_.store(total_send_time_ms_.load() + send_time_ms);
+            // send_count_++;
             
             // After processing task, check if sentinel was received and queue is empty
             if (send_worker_sentinel_received_.load()) {
@@ -1505,7 +1479,6 @@ private:
             }
             
             // Receive data using ASIO or NCCL
-            auto recv_start = std::chrono::high_resolution_clock::now();
             if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_recv_connected()) {
                 // ASIO recv path (synchronous)
                 uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_addr);
@@ -1568,10 +1541,6 @@ private:
                           << "] WARNING: No communication method available for recv" << std::endl;
                 continue;  // Skip processing
             }
-            auto recv_end = std::chrono::high_resolution_clock::now();
-            double recv_time_ms = std::chrono::duration<double, std::milli>(recv_end - recv_start).count();
-            total_recv_time_ms_.store(total_recv_time_ms_.load() + recv_time_ms);
-            recv_count_++;
             
             uintptr_t local_encoding_addr = 0;
             uintptr_t parity_addr = 0;
@@ -1707,12 +1676,7 @@ private:
             xor_array[1] = srcs[1];
             xor_array[2] = dest;
             
-            auto xor_start = std::chrono::high_resolution_clock::now();
             xor_gen(3, static_cast<int>(task.size), xor_array);
-            auto xor_end = std::chrono::high_resolution_clock::now();
-            double xor_time_ms = std::chrono::duration<double, std::milli>(xor_end - xor_start).count();
-            total_xor_time_ms_.store(total_xor_time_ms_.load() + xor_time_ms);
-            xor_count_++;
             // std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker: XOR completed, parity addr=" << task.parity_addr << std::endl;
             
             if (task.p2p_own_write_addr != 0 && task.p2p_partner_write_addr != 0 && task.parity_addr != 0) {
@@ -1863,7 +1827,6 @@ private:
             }
             
             // Step 2: Send data using ASIO or NCCL
-            auto p2p_send_start = std::chrono::high_resolution_clock::now();
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_send_connected()) {
                     // ASIO send path (synchronous)
@@ -1974,10 +1937,6 @@ private:
                 std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Skipping send (p2p_partner_rank_=" 
                           << p2p_partner_rank_ << ", task.size=" << task.size << ")" << std::endl;
             }
-            auto p2p_send_end = std::chrono::high_resolution_clock::now();
-            double p2p_send_time_ms = std::chrono::duration<double, std::milli>(p2p_send_end - p2p_send_start).count();
-            total_p2p_send_time_ms_.store(total_p2p_send_time_ms_.load() + p2p_send_time_ms);
-            p2p_send_count_++;
             
             // Step 3: For load mode Step2, submit encoding task after P2P send completes
             if (task.is_load_mode_transfer && task.load_mode_data_addr != 0) {
@@ -2068,7 +2027,6 @@ private:
         
         while (!should_stop_threads_) {
             P2PRecvTask task;
-            bool task_processed = false;  // Flag to track if task was processed successfully
             
             {
                 std::unique_lock<std::mutex> lock(p2p_recv_queue_mutex_);
@@ -2107,7 +2065,8 @@ private:
             }
             
             // Receive data using ASIO or NCCL
-            auto p2p_recv_start = std::chrono::high_resolution_clock::now();
+            bool task_processed = false;  // Track whether task was successfully processed
+            
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_recv_connected()) {
                     // ASIO recv path (synchronous)
@@ -2154,6 +2113,7 @@ private:
                 }
 #ifdef NCCL_AVAILABLE
                 else if (!use_asio_) {
+                    bool task_processed_nccl = false;  // Local flag for NCCL path
                     // NCCL recv path (fallback)
                     const bool DISABLE_P2P_NCCL = false;  // Set to true to disable P2P NCCL operations
                     
@@ -2190,19 +2150,20 @@ private:
                                 std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL sync completed" << std::endl;
                                 
                                 // Log will be handled in the common section after recv completes
-                                task_processed = true;
+                                task_processed_nccl = true;
                             }
                         }
                     } else if (DISABLE_P2P_NCCL) {
                         std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL DISABLED for debugging, task processed (no-op)" << std::endl;
                         // Even when NCCL is disabled, the task is considered processed
                         // This ensures sentinel check logic works correctly
-                        task_processed = true;
+                        task_processed_nccl = true;
                     } else {
                         std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Skipping NCCL (nccl_p2p_recv_initialized_=" 
                                   << (nccl_p2p_recv_initialized_ ? "true" : "false") << ", world_size_=" << world_size_ << ")" << std::endl;
-                        task_processed = true;
+                        task_processed_nccl = true;
                     }
+                    task_processed = task_processed_nccl;
                 }
 #endif
                 else {
@@ -2215,10 +2176,6 @@ private:
                           << p2p_partner_rank_ << ", task.size=" << task.size << "), task processed" << std::endl;
                 task_processed = true;
             }
-            auto p2p_recv_end = std::chrono::high_resolution_clock::now();
-            double p2p_recv_time_ms = std::chrono::duration<double, std::milli>(p2p_recv_end - p2p_recv_start).count();
-            total_p2p_recv_time_ms_.store(total_p2p_recv_time_ms_.load() + p2p_recv_time_ms);
-            p2p_recv_count_++;
             
             // Load mode Step2: handle received data and submit encoding task
             if (task_processed && task.is_load_mode_transfer && task.data_buffer_addr != 0) {
@@ -2338,11 +2295,7 @@ public:
           decode_coefficient_0_(1), decode_coefficient_1_(1),  // Initialize to 1 for simplified version
           p2p_partner_rank_(-1),
           is_load_mode_(false), failed_rank_(-1),
-          asio_initialized_(false), use_asio_(false),
-          total_encoding_time_ms_(0.0), total_send_time_ms_(0.0), total_recv_time_ms_(0.0),
-          total_xor_time_ms_(0.0), total_p2p_send_time_ms_(0.0), total_p2p_recv_time_ms_(0.0),
-          encoding_count_(0), send_count_(0), recv_count_(0),
-          xor_count_(0), p2p_send_count_(0), p2p_recv_count_(0) {
+          asio_initialized_(false), use_asio_(false) {
 
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Constructor called, initializing EC tables and starting pipeline..." << std::endl;
         
@@ -2444,11 +2397,7 @@ public:
           decode_coefficient_0_(1), decode_coefficient_1_(1),  // Initialize to 1 for simplified version
           p2p_partner_rank_(-1),
           is_load_mode_(false), failed_rank_(-1),
-          asio_initialized_(false), use_asio_(true),
-          total_encoding_time_ms_(0.0), total_send_time_ms_(0.0), total_recv_time_ms_(0.0),
-          total_xor_time_ms_(0.0), total_p2p_send_time_ms_(0.0), total_p2p_recv_time_ms_(0.0),
-          encoding_count_(0), send_count_(0), recv_count_(0),
-          xor_count_(0), p2p_send_count_(0), p2p_recv_count_(0) {
+          asio_initialized_(false), use_asio_(true) {
 
         std::cout << "EC-CHECK: [Rank " << rank_ << "] ASIO Constructor called, initializing EC tables and ASIO connections..." << std::endl;
         
@@ -2572,9 +2521,6 @@ public:
         xor_worker_sentinel_received_ = false;
         p2p_send_worker_sentinel_received_ = false;
         p2p_recv_worker_sentinel_received_ = false;
-        
-        // Reset time statistics at the start of each checkpoint
-        reset_time_statistics();
         
         // Clear queues to remove any residual tasks from previous pipeline
         {
@@ -2711,9 +2657,6 @@ public:
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Both P2P workers completed" << std::endl;
         
         std::cout << "EC-CHECK: [Rank " << rank_ << "] All threads completed (encoding + send + recv + XOR + P2P)" << std::endl;
-        
-        // Print time statistics after all operations complete
-        print_time_statistics();
     }
     
     void stop_pipeline() {
@@ -2903,67 +2846,6 @@ public:
         build_xor_config();
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Set load mode: " 
                   << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank << std::endl;
-    }
-    
-    void reset_time_statistics() {
-        total_encoding_time_ms_ = 0.0;
-        total_send_time_ms_ = 0.0;
-        total_recv_time_ms_ = 0.0;
-        total_xor_time_ms_ = 0.0;
-        total_p2p_send_time_ms_ = 0.0;
-        total_p2p_recv_time_ms_ = 0.0;
-        encoding_count_ = 0;
-        send_count_ = 0;
-        recv_count_ = 0;
-        xor_count_ = 0;
-        p2p_send_count_ = 0;
-        p2p_recv_count_ = 0;
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Reset time statistics" << std::endl;
-    }
-    
-    void print_time_statistics() {
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Time Statistics:" << std::endl;
-        std::cout << "  Encoding: total=" << total_encoding_time_ms_.load() << " ms, "
-                  << "count=" << encoding_count_.load() << ", "
-                  << "avg=" << (encoding_count_.load() > 0 ? total_encoding_time_ms_.load() / encoding_count_.load() : 0.0) << " ms" << std::endl;
-        std::cout << "  Send: total=" << total_send_time_ms_.load() << " ms, "
-                  << "count=" << send_count_.load() << ", "
-                  << "avg=" << (send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0) << " ms" << std::endl;
-        std::cout << "  Recv: total=" << total_recv_time_ms_.load() << " ms, "
-                  << "count=" << recv_count_.load() << ", "
-                  << "avg=" << (recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0) << " ms" << std::endl;
-        std::cout << "  XOR: total=" << total_xor_time_ms_.load() << " ms, "
-                  << "count=" << xor_count_.load() << ", "
-                  << "avg=" << (xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0) << " ms" << std::endl;
-        std::cout << "  P2P Send: total=" << total_p2p_send_time_ms_.load() << " ms, "
-                  << "count=" << p2p_send_count_.load() << ", "
-                  << "avg=" << (p2p_send_count_.load() > 0 ? total_p2p_send_time_ms_.load() / p2p_send_count_.load() : 0.0) << " ms" << std::endl;
-        std::cout << "  P2P Recv: total=" << total_p2p_recv_time_ms_.load() << " ms, "
-                  << "count=" << p2p_recv_count_.load() << ", "
-                  << "avg=" << (p2p_recv_count_.load() > 0 ? total_p2p_recv_time_ms_.load() / p2p_recv_count_.load() : 0.0) << " ms" << std::endl;
-    }
-    
-    std::map<std::string, double> get_time_statistics() {
-        std::map<std::string, double> stats;
-        stats["encoding_total_ms"] = total_encoding_time_ms_.load();
-        stats["encoding_count"] = static_cast<double>(encoding_count_.load());
-        stats["encoding_avg_ms"] = encoding_count_.load() > 0 ? total_encoding_time_ms_.load() / encoding_count_.load() : 0.0;
-        stats["send_total_ms"] = total_send_time_ms_.load();
-        stats["send_count"] = static_cast<double>(send_count_.load());
-        stats["send_avg_ms"] = send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0;
-        stats["recv_total_ms"] = total_recv_time_ms_.load();
-        stats["recv_count"] = static_cast<double>(recv_count_.load());
-        stats["recv_avg_ms"] = recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0;
-        stats["xor_total_ms"] = total_xor_time_ms_.load();
-        stats["xor_count"] = static_cast<double>(xor_count_.load());
-        stats["xor_avg_ms"] = xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0;
-        stats["p2p_send_total_ms"] = total_p2p_send_time_ms_.load();
-        stats["p2p_send_count"] = static_cast<double>(p2p_send_count_.load());
-        stats["p2p_send_avg_ms"] = p2p_send_count_.load() > 0 ? total_p2p_send_time_ms_.load() / p2p_send_count_.load() : 0.0;
-        stats["p2p_recv_total_ms"] = total_p2p_recv_time_ms_.load();
-        stats["p2p_recv_count"] = static_cast<double>(p2p_recv_count_.load());
-        stats["p2p_recv_avg_ms"] = p2p_recv_count_.load() > 0 ? total_p2p_recv_time_ms_.load() / p2p_recv_count_.load() : 0.0;
-        return stats;
     }
     
     void submit_load_pipeline_chunk(

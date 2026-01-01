@@ -1962,6 +1962,18 @@ class FileSystemWriterAsync(FileSystemWriter):
     def _copy_tensor_data_to_buffers_pipeline_impl(self) -> None:
         """Implementation of the pipeline logic (called within try-finally block)."""
         
+        # Timing statistics for breakdown analysis
+        timing_stats = {
+            'get_data_buffer': 0.0,
+            'memcpy_data': 0.0,
+            'get_encoding_buffers': 0.0,
+            'get_parity_buffers': 0.0,
+            'address_calculation': 0.0,
+            'submit_encoding': 0.0,
+            'wait_completion': 0.0,
+            'total_chunks': 0
+        }
+        
         def get_free_data_buffer():
             """Get a free data buffer address, blocking if none available."""
             # Poll for released buffers before trying to get one
@@ -2043,7 +2055,9 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
+            t_start = time()
             cur_buffer_addr = get_free_data_buffer()
+            timing_stats['get_data_buffer'] += time() - t_start
             
             # Calculate how much data to copy to this buffer
             remaining_in_source = total_bytes - src_pos
@@ -2083,6 +2097,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 )
             
             # Python memcpy: copy from continuous tensor buffer to data buffer
+            t_start = time()
             import ctypes
             buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
             buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
@@ -2091,10 +2106,14 @@ class FileSystemWriterAsync(FileSystemWriter):
             if src_pos < actual_data_bytes:
                 # Still have actual data to copy
                 bytes_to_copy = min(take, actual_data_bytes - src_pos)
-                src_data = self.tensor_buffer[src_pos: src_pos + bytes_to_copy].numpy()
                 
-                # Copy actual data
-                ctypes.memmove(buffer_array.contents, src_data.ctypes.data, bytes_to_copy)
+                # Zero-copy optimization: directly use tensor's data pointer
+                # Avoid creating intermediate numpy array which causes unnecessary copy
+                src_base_ptr = self.tensor_buffer.data_ptr()
+                src_addr = src_base_ptr + src_pos
+                
+                # Copy actual data (only one memcpy, no intermediate numpy conversion)
+                ctypes.memmove(buffer_array.contents, src_addr, bytes_to_copy)
                 
                 # Fill remaining space with zeros if needed
                 if take > bytes_to_copy:
@@ -2107,14 +2126,19 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 # Already past actual data, fill entire chunk with zeros
                 ctypes.memset(buffer_array.contents, 0, take)
+            timing_stats['memcpy_data'] += time() - t_start
             
             # Get two encoding buffers (with timeout to detect deadlocks)
+            t_start = time()
             enc_addr1 = get_free_encoding_buffer()
             enc_addr2 = get_free_encoding_buffer()
+            timing_stats['get_encoding_buffers'] += time() - t_start
             
             # Get two parity buffers for XOR results
+            t_start = time()
             parity_addr1 = get_free_parity_buffer()
             parity_addr2 = get_free_parity_buffer()
+            timing_stats['get_parity_buffers'] += time() - t_start
             
             # Allocate receive addresses from TWO recv_encoding_buffers
             # Each encoding thread gets its own receive address
@@ -2122,6 +2146,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             # CRITICAL: Addresses must be 64-byte aligned for ISA-L AVX512 XOR operations
             # Size does NOT need to be a multiple of 64 bytes (ISA-L handles this)
             # recv_chunk_size should match 'take' (already adjusted for buffer bounds above)
+            t_start = time()
             recv_chunk_size = take
             
             # Align offsets to 64-byte boundary (address alignment requirement)
@@ -2183,6 +2208,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 p2p_own_write_addr = 0
                 p2p_partner_write_addr = 0
+            timing_stats['address_calculation'] += time() - t_start
             
             # Submit to BOTH encoding threads with their respective receive addresses and parity buffers
             # The C++ threads will mark the data buffer as copied immediately after reading
@@ -2190,6 +2216,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             # recv_addr will be used by recv_worker to receive peer data
             # parity_addr will be used by XOR worker to store XOR results
             # p2p_own_write_addr and p2p_partner_write_addr will be used by P2P worker after XOR
+            t_start = time()
             self._eccheck_native.submit_data_for_encoding_thread1(
                 cur_buffer_addr, take, enc_addr1, recv_addr_thread1, recv_chunk_size, parity_addr1,
                 p2p_own_write_addr, p2p_partner_write_addr
@@ -2199,8 +2226,10 @@ class FileSystemWriterAsync(FileSystemWriter):
                 cur_buffer_addr, take, enc_addr2, recv_addr_thread2, recv_chunk_size, parity_addr2,
                 p2p_own_write_addr, p2p_partner_write_addr
             )
+            timing_stats['submit_encoding'] += time() - t_start
             
             src_pos += take
+            timing_stats['total_chunks'] += 1
             
         logger.info(
             f"  Thread1 receive buffer used: {recv_buffer_offset_thread1 / (1024**3):.2f} GB\n"
@@ -2218,9 +2247,26 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Wait for encoding completion (this may block)
         # The buffer poller will continue running in the background
+        t_start = time()
         self._eccheck_native.wait_for_encoding_completion()
         torch.cuda.synchronize()
+        timing_stats['wait_completion'] = time() - t_start
         logger.info(f"EC-CHECK: Pipeline CUDA synchronized")
+        
+        # Print detailed timing breakdown
+        total_time = sum(timing_stats[k] for k in timing_stats if k != 'total_chunks')
+        logger.warning("=" * 80)
+        logger.warning("EC-CHECK: Phase 3 Encoding Time Breakdown:")
+        logger.warning(f"  Total chunks processed: {timing_stats['total_chunks']}")
+        logger.warning(f"  1. Get data buffers:      {timing_stats['get_data_buffer']:.3f}s ({timing_stats['get_data_buffer']/total_time*100:.1f}%)")
+        logger.warning(f"  2. Memcpy data to buffer: {timing_stats['memcpy_data']:.3f}s ({timing_stats['memcpy_data']/total_time*100:.1f}%)")
+        logger.warning(f"  3. Get encoding buffers:  {timing_stats['get_encoding_buffers']:.3f}s ({timing_stats['get_encoding_buffers']/total_time*100:.1f}%)")
+        logger.warning(f"  4. Get parity buffers:    {timing_stats['get_parity_buffers']:.3f}s ({timing_stats['get_parity_buffers']/total_time*100:.1f}%)")
+        logger.warning(f"  5. Address calculation:   {timing_stats['address_calculation']:.3f}s ({timing_stats['address_calculation']/total_time*100:.1f}%)")
+        logger.warning(f"  6. Submit to encoding:    {timing_stats['submit_encoding']:.3f}s ({timing_stats['submit_encoding']/total_time*100:.1f}%)")
+        logger.warning(f"  7. Wait for completion:   {timing_stats['wait_completion']:.3f}s ({timing_stats['wait_completion']/total_time*100:.1f}%)")
+        logger.warning(f"  TOTAL TIME: {total_time:.3f}s")
+        logger.warning("=" * 80)
         
         # Buffer poller will be deactivated in the outer finally block
         # logger.info("EC-CHECK: All encoding operations completed")
@@ -2520,9 +2566,13 @@ class FileSystemWriterAsync(FileSystemWriter):
                 bytes_to_copy_half1 = min(take, half_total - src_pos_half1)
                 if src_pos_half1 < actual_data_bytes:
                     actual_bytes_half1 = min(bytes_to_copy_half1, actual_data_bytes - src_pos_half1)
-                    src_data_half1 = self.tensor_buffer[src_pos_half1: src_pos_half1 + actual_bytes_half1].numpy()
-                    ctypes.memmove(buffer1_array.contents, src_data_half1.ctypes.data, actual_bytes_half1)
-                    ctypes.memmove(buffer3_array.contents, src_data_half1.ctypes.data, actual_bytes_half1)
+                    
+                    # Zero-copy optimization: directly use tensor's data pointer
+                    src_base_ptr = self.tensor_buffer.data_ptr()
+                    src_addr_half1 = src_base_ptr + src_pos_half1
+                    
+                    ctypes.memmove(buffer1_array.contents, src_addr_half1, actual_bytes_half1)
+                    ctypes.memmove(buffer3_array.contents, src_addr_half1, actual_bytes_half1)
                     
                     if bytes_to_copy_half1 > actual_bytes_half1:
                         padding_size = bytes_to_copy_half1 - actual_bytes_half1
@@ -2572,9 +2622,13 @@ class FileSystemWriterAsync(FileSystemWriter):
                 bytes_to_copy_half2 = min(take, total_bytes - src_pos_in_second_half)
                 if src_pos_in_second_half < actual_data_bytes:
                     actual_bytes_half2 = min(bytes_to_copy_half2, actual_data_bytes - src_pos_in_second_half)
-                    src_data_half2 = self.tensor_buffer[src_pos_in_second_half: src_pos_in_second_half + actual_bytes_half2].numpy()
-                    ctypes.memmove(buffer2_array.contents, src_data_half2.ctypes.data, actual_bytes_half2)
-                    ctypes.memmove(buffer4_array.contents, src_data_half2.ctypes.data, actual_bytes_half2)
+                    
+                    # Zero-copy optimization: directly use tensor's data pointer
+                    src_base_ptr = self.tensor_buffer.data_ptr()
+                    src_addr_half2 = src_base_ptr + src_pos_in_second_half
+                    
+                    ctypes.memmove(buffer2_array.contents, src_addr_half2, actual_bytes_half2)
+                    ctypes.memmove(buffer4_array.contents, src_addr_half2, actual_bytes_half2)
                     
                     if bytes_to_copy_half2 > actual_bytes_half2:
                         padding_size = bytes_to_copy_half2 - actual_bytes_half2
@@ -2863,14 +2917,14 @@ class FileSystemWriterAsync(FileSystemWriter):
             f"EC-CHECK: Transferred {total_gb:.2f} GB in {transfer_time:.2f}s "
             f"({bandwidth:.2f} GB/s), {num_gpu_tensors} tensors from GPU to CPU"
         )
-        logger.info(
-            f"EC-CHECK: Updated tensor_infos device info - "
-            f"{num_gpu_tensors} tensors now on CPU"
-        )
-        logger.info(
-            f"EC-CHECK: Pipeline will use {max_total_bytes / (1024**3):.2f} GB "
-            f"to ensure all ranks have same iterations"
-        )
+        # logger.info(
+        #     f"EC-CHECK: Updated tensor_infos device info - "
+        #     f"{num_gpu_tensors} tensors now on CPU"
+        # )
+        # logger.info(
+        #     f"EC-CHECK: Pipeline will use {max_total_bytes / (1024**3):.2f} GB "
+        #     f"to ensure all ranks have same iterations"
+        # )
         
         # Validate that decomposition is still correct after transfer
         if not self.validate_eccheck_decomposition():
@@ -2901,6 +2955,8 @@ class FileSystemWriterAsync(FileSystemWriter):
         self._execute_phase3_encoding()
         exec_time = time() - exec_start
         
+        end_time = time() - start
+        logger.info(f"EC-CHECK: eccheck time to buffer: {end_time:.2f}s")
         # Return write_buckets with EC-CHECK continuous buffer
         # Buffer contains all tensor data in continuous memory
         
@@ -2964,7 +3020,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 updated_bucket = (new_file_path, storage_key, updated_data)
                 result_buckets.append(updated_bucket)
                 
-        logger.info(f"EC-CHECK: eccheck preload tensor to buffer {exec_time:.2f}s")
+        # logger.info(f"EC-CHECK: eccheck preload tensor to buffer {exec_time:.2f}s")
 
         return result_buckets
     

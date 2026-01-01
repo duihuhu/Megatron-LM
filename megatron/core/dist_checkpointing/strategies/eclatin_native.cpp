@@ -19,6 +19,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <chrono>
+#include <map>
 
 #include <isa-l/erasure_code.h>
 #include <isa-l/raid.h>
@@ -863,7 +865,15 @@ public:
           parity1_recv_xor_sentinel_received_(false),
           parity2_send1_sentinel_received_(false),
           parity2_send2_sentinel_received_(false),
-          parity2_recv_xor_sentinel_received_(false) {
+          parity2_recv_xor_sentinel_received_(false),
+          total_encoding_time_ms_(0.0),
+          total_send_time_ms_(0.0),
+          total_recv_time_ms_(0.0),
+          total_xor_time_ms_(0.0),
+          encoding_count_(0),
+          send_count_(0),
+          recv_count_(0),
+          xor_count_(0) {
         std::cout << "ECLATIN: Initializing connections..." << std::endl;
         init_connections();
         start_threads();
@@ -1029,6 +1039,7 @@ public:
         parity1_send1_completed_ = false;
         parity1_send2_completed_ = false;
         parity1_recv_xor_completed_ = false;
+        
         parity1_send1_sentinel_received_ = false;
         parity1_send2_sentinel_received_ = false;
         parity1_recv_xor_sentinel_received_ = false;
@@ -1040,6 +1051,13 @@ public:
         parity2_send1_sentinel_received_ = false;
         parity2_send2_sentinel_received_ = false;
         parity2_recv_xor_sentinel_received_ = false;
+
+        // Reset time statistics at the start of each checkpoint
+        reset_time_statistics();
+        
+        // Start pipeline timing
+        pipeline_start_time_ = std::chrono::high_resolution_clock::now();
+        pipeline_timing_started_ = true;
 
         // Clear queues
         {
@@ -1088,6 +1106,16 @@ public:
             wait_count++;
         }
         std::cout << "ECLATIN: All workers completed" << std::endl;
+        
+        // Calculate pipeline wall-clock time
+        double pipeline_wall_time_ms = 0.0;
+        if (pipeline_timing_started_) {
+            auto pipeline_end_time = std::chrono::high_resolution_clock::now();
+            pipeline_wall_time_ms = std::chrono::duration<double, std::milli>(pipeline_end_time - pipeline_start_time_).count();
+        }
+        
+        // Print time statistics after all operations complete
+        print_time_statistics(pipeline_wall_time_ms);
     }
 
     void stop() {
@@ -1558,6 +1586,38 @@ private:
     std::atomic<bool> parity2_send1_sentinel_received_;
     std::atomic<bool> parity2_send2_sentinel_received_;
     std::atomic<bool> parity2_recv_xor_sentinel_received_;
+    
+    // Time statistics (accumulated time from all operations)
+    std::atomic<double> total_encoding_time_ms_;
+    std::atomic<double> total_send_time_ms_;
+    std::atomic<double> total_recv_time_ms_;
+    std::atomic<double> total_xor_time_ms_;
+    std::atomic<int> encoding_count_;
+    std::atomic<int> send_count_;
+    std::atomic<int> recv_count_;
+    std::atomic<int> xor_count_;
+    
+    // Per-worker execution time (from first task to last task completion)
+    std::atomic<double> parity1_send1_total_time_ms_{0.0};
+    std::atomic<double> parity1_send2_total_time_ms_{0.0};
+    std::atomic<double> parity1_recv_xor_total_time_ms_{0.0};
+    std::atomic<double> parity2_send1_total_time_ms_{0.0};
+    std::atomic<double> parity2_send2_total_time_ms_{0.0};
+    std::atomic<double> parity2_recv_xor_total_time_ms_{0.0};
+    
+    // Per-worker operation time breakdown (for bottleneck analysis)
+    std::atomic<double> parity1_send1_ops_time_ms_{0.0};
+    std::atomic<double> parity1_send2_ops_time_ms_{0.0};
+    std::atomic<double> parity1_recv_xor_recv_time_ms_{0.0};
+    std::atomic<double> parity1_recv_xor_xor_time_ms_{0.0};
+    std::atomic<double> parity2_send1_ops_time_ms_{0.0};
+    std::atomic<double> parity2_send2_ops_time_ms_{0.0};
+    std::atomic<double> parity2_recv_xor_recv_time_ms_{0.0};
+    std::atomic<double> parity2_recv_xor_xor_time_ms_{0.0};
+    
+    // Pipeline wall-clock time
+    std::chrono::high_resolution_clock::time_point pipeline_start_time_;
+    std::atomic<bool> pipeline_timing_started_{false};
 
     std::thread parity1_send1_thread_;
     std::thread parity1_send2_thread_;
@@ -1618,6 +1678,9 @@ private:
     // Parity 1 workers
     void parity1_recv_xor_worker() {
         std::cout << "ECLATIN: Parity1_RecvXor worker started" << std::endl;
+        std::chrono::high_resolution_clock::time_point worker_start_time;
+        bool worker_start_time_set = false;
+        
         while (!stop_) {
             RecvXorTask task;
             {
@@ -1634,9 +1697,16 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(parity1_recv_xor_mutex_);
                     if (parity1_recv_xor_q_.empty()) {
+                        if (worker_start_time_set) {
+                            auto worker_end_time = std::chrono::high_resolution_clock::now();
+                            double worker_total_time_ms = std::chrono::duration<double, std::milli>(worker_end_time - worker_start_time).count();
+                            parity1_recv_xor_total_time_ms_.store(worker_total_time_ms);
+                        }
                         parity1_recv_xor_completed_ = true;
                         std::cout << "ECLATIN: Parity1_RecvXor worker completed" << std::endl;
                         parity1_recv_xor_sentinel_received_ = false;
+                        // Reset for next round
+                        worker_start_time_set = false;
                     }
                 }
                 continue;
@@ -1656,6 +1726,13 @@ private:
                 throw std::runtime_error("ECLATIN: parity1_recv2 socket not connected");
             }
 
+            // Record start time when first real task begins
+            if (!worker_start_time_set) {
+                worker_start_time = std::chrono::high_resolution_clock::now();
+                worker_start_time_set = true;
+            }
+
+            auto recv_start = std::chrono::high_resolution_clock::now();
             bool recv1_success = false;
             bool recv2_success = false;
             std::string recv1_error_msg;
@@ -1705,6 +1782,12 @@ private:
 
             recv1_thread.join();
             recv2_thread.join();
+            
+            auto recv_end = std::chrono::high_resolution_clock::now();
+            double recv_time_ms = std::chrono::duration<double, std::milli>(recv_end - recv_start).count();
+            total_recv_time_ms_.store(total_recv_time_ms_.load() + recv_time_ms);
+            parity1_recv_xor_recv_time_ms_.store(parity1_recv_xor_recv_time_ms_.load() + recv_time_ms);
+            recv_count_++;
 
             // Bubble up failures
             if (recv1_exception) {
@@ -1725,6 +1808,7 @@ private:
             }
 
             // XOR after both recvs succeed
+            auto xor_start = std::chrono::high_resolution_clock::now();
             unsigned char* recv1_ptr = reinterpret_cast<unsigned char*>(task.recv1_addr);
             unsigned char* recv2_ptr = reinterpret_cast<unsigned char*>(task.recv2_addr);
             unsigned char* parity_ptr = reinterpret_cast<unsigned char*>(task.parity_addr);
@@ -1734,6 +1818,12 @@ private:
             xor_array[1] = recv2_ptr;
             xor_array[2] = parity_ptr;
             xor_gen(3, static_cast<int>(task.size), xor_array);
+            
+            auto xor_end = std::chrono::high_resolution_clock::now();
+            double xor_time_ms = std::chrono::duration<double, std::milli>(xor_end - xor_start).count();
+            total_xor_time_ms_.store(total_xor_time_ms_.load() + xor_time_ms);
+            parity1_recv_xor_xor_time_ms_.store(parity1_recv_xor_xor_time_ms_.load() + xor_time_ms);
+            xor_count_++;
 
             // Release recv buffers after XOR operation completes
             // Note: parity_addr is managed by Python, not released here
@@ -1756,6 +1846,9 @@ private:
 
     void parity1_send1_worker() {
         std::cout << "ECLATIN: Parity1_Send1 worker started" << std::endl;
+        std::chrono::high_resolution_clock::time_point worker_start_time;
+        bool worker_start_time_set = false;
+        
         while (!stop_) {
             SendTask task;
             {
@@ -1771,9 +1864,16 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(parity1_send1_mutex_);
                     if (parity1_send1_q_.empty()) {
+                        if (worker_start_time_set) {
+                            auto worker_end_time = std::chrono::high_resolution_clock::now();
+                            double worker_total_time_ms = std::chrono::duration<double, std::milli>(worker_end_time - worker_start_time).count();
+                            parity1_send1_total_time_ms_.store(worker_total_time_ms);
+                        }
                         parity1_send1_completed_ = true;
                         std::cout << "ECLATIN: Parity1_Send1 worker completed" << std::endl;
                         parity1_send1_sentinel_received_ = false;
+                        // Reset for next round
+                        worker_start_time_set = false;
                     }
                 }
                 continue;
@@ -1781,8 +1881,21 @@ private:
             if (task.size == 0 || task.addr == 0) {
                 continue;
             }
+            
+            // Record start time when first real task begins
+            if (!worker_start_time_set) {
+                worker_start_time = std::chrono::high_resolution_clock::now();
+                worker_start_time_set = true;
+            }
+            
             if (conn_.is_parity1_send1_connected()) {
+                auto send_start = std::chrono::high_resolution_clock::now();
                 send_with_size(conn_.get_parity1_send1_socket(), task.addr, task.size);
+                auto send_end = std::chrono::high_resolution_clock::now();
+                double send_time_ms = std::chrono::duration<double, std::milli>(send_end - send_start).count();
+                total_send_time_ms_.store(total_send_time_ms_.load() + send_time_ms);
+                parity1_send1_ops_time_ms_.store(parity1_send1_ops_time_ms_.load() + send_time_ms);
+                send_count_++;
             }
             // Release data buffer after send operation completes
             {
@@ -1803,6 +1916,9 @@ private:
 
     void parity1_send2_worker() {
         std::cout << "ECLATIN: Parity1_Send2 worker started" << std::endl;
+        std::chrono::high_resolution_clock::time_point worker_start_time;
+        bool worker_start_time_set = false;
+        
         while (!stop_) {
             SendTask task;
             {
@@ -1818,9 +1934,16 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(parity1_send2_mutex_);
                     if (parity1_send2_q_.empty()) {
+                        if (worker_start_time_set) {
+                            auto worker_end_time = std::chrono::high_resolution_clock::now();
+                            double worker_total_time_ms = std::chrono::duration<double, std::milli>(worker_end_time - worker_start_time).count();
+                            parity1_send2_total_time_ms_.store(worker_total_time_ms);
+                        }
                         parity1_send2_completed_ = true;
                         std::cout << "ECLATIN: Parity1_Send2 worker completed" << std::endl;
                         parity1_send2_sentinel_received_ = false;
+                        // Reset for next round
+                        worker_start_time_set = false;
                     }
                 }
                 continue;
@@ -1828,8 +1951,21 @@ private:
             if (task.size == 0 || task.addr == 0) {
                 continue;
             }
+            
+            // Record start time when first real task begins
+            if (!worker_start_time_set) {
+                worker_start_time = std::chrono::high_resolution_clock::now();
+                worker_start_time_set = true;
+            }
+            
             if (conn_.is_parity1_send2_connected()) {
+                auto send_start = std::chrono::high_resolution_clock::now();
                 send_with_size(conn_.get_parity1_send2_socket(), task.addr, task.size);
+                auto send_end = std::chrono::high_resolution_clock::now();
+                double send_time_ms = std::chrono::duration<double, std::milli>(send_end - send_start).count();
+                total_send_time_ms_.store(total_send_time_ms_.load() + send_time_ms);
+                parity1_send2_ops_time_ms_.store(parity1_send2_ops_time_ms_.load() + send_time_ms);
+                send_count_++;
             }
             // Release data buffer after send operation completes
             {
@@ -1851,6 +1987,9 @@ private:
     // Parity 2 workers (same logic as parity1)
     void parity2_recv_xor_worker() {
         std::cout << "ECLATIN: Parity2_RecvXor worker started" << std::endl;
+        std::chrono::high_resolution_clock::time_point worker_start_time;
+        bool worker_start_time_set = false;
+        
         while (!stop_) {
             RecvXorTask task;
             {
@@ -1867,9 +2006,16 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(parity2_recv_xor_mutex_);
                     if (parity2_recv_xor_q_.empty()) {
+                        if (worker_start_time_set) {
+                            auto worker_end_time = std::chrono::high_resolution_clock::now();
+                            double worker_total_time_ms = std::chrono::duration<double, std::milli>(worker_end_time - worker_start_time).count();
+                            parity2_recv_xor_total_time_ms_.store(worker_total_time_ms);
+                        }
                         parity2_recv_xor_completed_ = true;
                         std::cout << "ECLATIN: Parity2_RecvXor worker completed" << std::endl;
                         parity2_recv_xor_sentinel_received_ = false;
+                        // Reset for next round
+                        worker_start_time_set = false;
                     }
                 }
                 continue;
@@ -1889,6 +2035,13 @@ private:
                 throw std::runtime_error("ECLATIN: parity2_recv2 socket not connected");
             }
 
+            // Record start time when first real task begins
+            if (!worker_start_time_set) {
+                worker_start_time = std::chrono::high_resolution_clock::now();
+                worker_start_time_set = true;
+            }
+
+            auto recv_start = std::chrono::high_resolution_clock::now();
             bool recv1_success = false;
             bool recv2_success = false;
             std::string recv1_error_msg;
@@ -1938,6 +2091,12 @@ private:
 
             recv1_thread.join();
             recv2_thread.join();
+            
+            auto recv_end = std::chrono::high_resolution_clock::now();
+            double recv_time_ms = std::chrono::duration<double, std::milli>(recv_end - recv_start).count();
+            total_recv_time_ms_.store(total_recv_time_ms_.load() + recv_time_ms);
+            parity2_recv_xor_recv_time_ms_.store(parity2_recv_xor_recv_time_ms_.load() + recv_time_ms);
+            recv_count_++;
 
             // Bubble up failures
             if (recv1_exception) {
@@ -1958,6 +2117,7 @@ private:
             }
 
             // XOR after both recvs succeed
+            auto xor_start = std::chrono::high_resolution_clock::now();
             unsigned char* recv1_ptr = reinterpret_cast<unsigned char*>(task.recv1_addr);
             unsigned char* recv2_ptr = reinterpret_cast<unsigned char*>(task.recv2_addr);
             unsigned char* parity_ptr = reinterpret_cast<unsigned char*>(task.parity_addr);
@@ -1967,6 +2127,12 @@ private:
             xor_array[1] = recv2_ptr;
             xor_array[2] = parity_ptr;
             xor_gen(3, static_cast<int>(task.size), xor_array);
+            
+            auto xor_end = std::chrono::high_resolution_clock::now();
+            double xor_time_ms = std::chrono::duration<double, std::milli>(xor_end - xor_start).count();
+            total_xor_time_ms_.store(total_xor_time_ms_.load() + xor_time_ms);
+            parity2_recv_xor_xor_time_ms_.store(parity2_recv_xor_xor_time_ms_.load() + xor_time_ms);
+            xor_count_++;
 
             // Release recv buffers after XOR operation completes
             // Note: parity_addr is managed by Python, not released here
@@ -1989,6 +2155,9 @@ private:
 
     void parity2_send1_worker() {
         std::cout << "ECLATIN: Parity2_Send1 worker started" << std::endl;
+        std::chrono::high_resolution_clock::time_point worker_start_time;
+        bool worker_start_time_set = false;
+        
         while (!stop_) {
             SendTask task;
             {
@@ -2004,9 +2173,16 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(parity2_send1_mutex_);
                     if (parity2_send1_q_.empty()) {
+                        if (worker_start_time_set) {
+                            auto worker_end_time = std::chrono::high_resolution_clock::now();
+                            double worker_total_time_ms = std::chrono::duration<double, std::milli>(worker_end_time - worker_start_time).count();
+                            parity2_send1_total_time_ms_.store(worker_total_time_ms);
+                        }
                         parity2_send1_completed_ = true;
                         std::cout << "ECLATIN: Parity2_Send1 worker completed" << std::endl;
                         parity2_send1_sentinel_received_ = false;
+                        // Reset for next round
+                        worker_start_time_set = false;
                     }
                 }
                 continue;
@@ -2014,8 +2190,21 @@ private:
             if (task.size == 0 || task.addr == 0) {
                 continue;
             }
+            
+            // Record start time when first real task begins
+            if (!worker_start_time_set) {
+                worker_start_time = std::chrono::high_resolution_clock::now();
+                worker_start_time_set = true;
+            }
+            
             if (conn_.is_parity2_send1_connected()) {
+                auto send_start = std::chrono::high_resolution_clock::now();
                 send_with_size(conn_.get_parity2_send1_socket(), task.addr, task.size);
+                auto send_end = std::chrono::high_resolution_clock::now();
+                double send_time_ms = std::chrono::duration<double, std::milli>(send_end - send_start).count();
+                total_send_time_ms_.store(total_send_time_ms_.load() + send_time_ms);
+                parity2_send1_ops_time_ms_.store(parity2_send1_ops_time_ms_.load() + send_time_ms);
+                send_count_++;
             }
             // Release data buffer after send operation completes
             {
@@ -2036,6 +2225,9 @@ private:
 
     void parity2_send2_worker() {
         std::cout << "ECLATIN: Parity2_Send2 worker started" << std::endl;
+        std::chrono::high_resolution_clock::time_point worker_start_time;
+        bool worker_start_time_set = false;
+        
         while (!stop_) {
             SendTask task;
             {
@@ -2051,9 +2243,16 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(parity2_send2_mutex_);
                     if (parity2_send2_q_.empty()) {
+                        if (worker_start_time_set) {
+                            auto worker_end_time = std::chrono::high_resolution_clock::now();
+                            double worker_total_time_ms = std::chrono::duration<double, std::milli>(worker_end_time - worker_start_time).count();
+                            parity2_send2_total_time_ms_.store(worker_total_time_ms);
+                        }
                         parity2_send2_completed_ = true;
                         std::cout << "ECLATIN: Parity2_Send2 worker completed" << std::endl;
                         parity2_send2_sentinel_received_ = false;
+                        // Reset for next round
+                        worker_start_time_set = false;
                     }
                 }
                 continue;
@@ -2061,8 +2260,21 @@ private:
             if (task.size == 0 || task.addr == 0) {
                 continue;
             }
+            
+            // Record start time when first real task begins
+            if (!worker_start_time_set) {
+                worker_start_time = std::chrono::high_resolution_clock::now();
+                worker_start_time_set = true;
+            }
+            
             if (conn_.is_parity2_send2_connected()) {
+                auto send_start = std::chrono::high_resolution_clock::now();
                 send_with_size(conn_.get_parity2_send2_socket(), task.addr, task.size);
+                auto send_end = std::chrono::high_resolution_clock::now();
+                double send_time_ms = std::chrono::duration<double, std::milli>(send_end - send_start).count();
+                total_send_time_ms_.store(total_send_time_ms_.load() + send_time_ms);
+                parity2_send2_ops_time_ms_.store(parity2_send2_ops_time_ms_.load() + send_time_ms);
+                send_count_++;
             }
             // Release data buffer after send operation completes
             {
@@ -2079,6 +2291,133 @@ private:
                 }
             }
         }
+    }
+    
+    void reset_time_statistics() {
+        total_encoding_time_ms_ = 0.0;
+        total_send_time_ms_ = 0.0;
+        total_recv_time_ms_ = 0.0;
+        total_xor_time_ms_ = 0.0;
+        encoding_count_ = 0;
+        send_count_ = 0;
+        recv_count_ = 0;
+        xor_count_ = 0;
+        
+        // Reset per-worker time statistics
+        parity1_send1_total_time_ms_ = 0.0;
+        parity1_send2_total_time_ms_ = 0.0;
+        parity1_recv_xor_total_time_ms_ = 0.0;
+        parity2_send1_total_time_ms_ = 0.0;
+        parity2_send2_total_time_ms_ = 0.0;
+        parity2_recv_xor_total_time_ms_ = 0.0;
+        
+        parity1_send1_ops_time_ms_ = 0.0;
+        parity1_send2_ops_time_ms_ = 0.0;
+        parity1_recv_xor_recv_time_ms_ = 0.0;
+        parity1_recv_xor_xor_time_ms_ = 0.0;
+        parity2_send1_ops_time_ms_ = 0.0;
+        parity2_send2_ops_time_ms_ = 0.0;
+        parity2_recv_xor_recv_time_ms_ = 0.0;
+        parity2_recv_xor_xor_time_ms_ = 0.0;
+        
+        pipeline_timing_started_ = false;
+        std::cout << "ECLATIN: Reset time statistics" << std::endl;
+    }
+    
+    void print_time_statistics(double pipeline_wall_time_ms = 0.0) {
+        std::cout << "ECLATIN: Time Statistics:" << std::endl;
+        
+        // Find the bottleneck worker (the slowest one)
+        struct WorkerTime {
+            std::string name;
+            double total_time_ms;
+            double ops_time_ms;
+            std::string ops_type;
+        };
+        
+        std::vector<WorkerTime> worker_times;
+        worker_times.push_back({"parity1_send1", parity1_send1_total_time_ms_.load(), 
+                                parity1_send1_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity1_send2", parity1_send2_total_time_ms_.load(), 
+                                parity1_send2_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity1_recv_xor", parity1_recv_xor_total_time_ms_.load(), 
+                                parity1_recv_xor_recv_time_ms_.load() + parity1_recv_xor_xor_time_ms_.load(), "recv+xor"});
+        worker_times.push_back({"parity2_send1", parity2_send1_total_time_ms_.load(), 
+                                parity2_send1_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity2_send2", parity2_send2_total_time_ms_.load(), 
+                                parity2_send2_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity2_recv_xor", parity2_recv_xor_total_time_ms_.load(), 
+                                parity2_recv_xor_recv_time_ms_.load() + parity2_recv_xor_xor_time_ms_.load(), "recv+xor"});
+        
+        WorkerTime* bottleneck = nullptr;
+        double max_time = 0.0;
+        for (auto& wt : worker_times) {
+            if (wt.total_time_ms > max_time) {
+                max_time = wt.total_time_ms;
+                bottleneck = &wt;
+            }
+        }
+        
+        // Display bottleneck worker information
+        if (bottleneck && max_time > 0.0) {
+            std::cout << "  Bottleneck Worker: " << bottleneck->name 
+                      << " (wall-clock time=" << max_time << " ms, " << (max_time / 1000.0) << " s)" << std::endl;
+            
+            // Calculate task count for this worker
+            int task_count = 0;
+            if (bottleneck->name == "parity1_send1" || bottleneck->name == "parity1_send2" ||
+                bottleneck->name == "parity2_send1" || bottleneck->name == "parity2_send2") {
+                // For send workers, we can estimate task count from accumulated time vs avg time
+                // But we don't have per-worker count, so we'll just show the accumulated ops time
+                std::cout << "    Accumulated Operations (" << bottleneck->ops_type << "): " 
+                          << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+                if (bottleneck->ops_time_ms > max_time) {
+                    std::cout << "    Note: Accumulated time > wall-clock time indicates operations may include overhead" << std::endl;
+                }
+            } else if (bottleneck->name.find("recv_xor") != std::string::npos) {
+                if (bottleneck->name == "parity1_recv_xor") {
+                    std::cout << "    Accumulated Operations (recv+xor): " << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+                    std::cout << "      Recv (accumulated): " << parity1_recv_xor_recv_time_ms_.load() << " ms" << std::endl;
+                    std::cout << "      XOR (accumulated): " << parity1_recv_xor_xor_time_ms_.load() << " ms" << std::endl;
+                } else {
+                    std::cout << "    Accumulated Operations (recv+xor): " << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+                    std::cout << "      Recv (accumulated): " << parity2_recv_xor_recv_time_ms_.load() << " ms" << std::endl;
+                    std::cout << "      XOR (accumulated): " << parity2_recv_xor_xor_time_ms_.load() << " ms" << std::endl;
+                }
+                if (bottleneck->ops_time_ms > max_time) {
+                    std::cout << "    Note: Accumulated time > wall-clock time indicates operations may include overhead" << std::endl;
+                }
+            }
+        }
+        
+        if (pipeline_wall_time_ms > 0.0) {
+            std::cout << "  Pipeline Wall-Clock Time: " << pipeline_wall_time_ms << " ms (" 
+                      << (pipeline_wall_time_ms / 1000.0) << " s)" << std::endl;
+        }
+        
+        std::cout << "  Send (accumulated): total=" << total_send_time_ms_.load() << " ms, "
+                  << "count=" << send_count_.load() << ", "
+                  << "avg=" << (send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0) << " ms" << std::endl;
+        std::cout << "  Recv (accumulated): total=" << total_recv_time_ms_.load() << " ms, "
+                  << "count=" << recv_count_.load() << ", "
+                  << "avg=" << (recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0) << " ms" << std::endl;
+        std::cout << "  XOR (accumulated): total=" << total_xor_time_ms_.load() << " ms, "
+                  << "count=" << xor_count_.load() << ", "
+                  << "avg=" << (xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0) << " ms" << std::endl;
+    }
+    
+    std::map<std::string, double> get_time_statistics() {
+        std::map<std::string, double> stats;
+        stats["send_total_ms"] = total_send_time_ms_.load();
+        stats["send_count"] = static_cast<double>(send_count_.load());
+        stats["send_avg_ms"] = send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0;
+        stats["recv_total_ms"] = total_recv_time_ms_.load();
+        stats["recv_count"] = static_cast<double>(recv_count_.load());
+        stats["recv_avg_ms"] = recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0;
+        stats["xor_total_ms"] = total_xor_time_ms_.load();
+        stats["xor_count"] = static_cast<double>(xor_count_.load());
+        stats["xor_avg_ms"] = xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0;
+        return stats;
     }
 };
 

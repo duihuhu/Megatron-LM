@@ -2373,7 +2373,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             need_recover = bool(missing_any.item())
         else:
             need_recover = local_missing
-
+            
+        meta_start_time = time()
+        
         partner_rank = self._get_p2p_partner_rank(failed_rank, world_size)
         if need_recover and rank in (failed_rank, partner_rank):
             import pickle
@@ -2429,7 +2431,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             rank_metadata=rank_metadata,
             rank_non_tensor_data=rank_non_tensor_data
         )
-        
+        meta_end_time = time()
+        meta_time = meta_end_time - meta_start_time
+        logger.info(f"EC-CHECK: [Rank {rank}] Metadata exchange completed in {meta_time:.2f}s")
         # ===== Step 3: Prepare P2P buffers (own_buffer and partner_buffer) =====
         # Check if buffers exist in manager and can be reused, or allocate new ones
         if self.eccheck_manager.eccheck_p2p_buffers is not None:
@@ -2439,9 +2443,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             # Calculate required buffer sizes from registry
             own_metadata = registry.rank_metadata.get(rank, [])
-            own_total_size = sum(meta.size_bytes for meta in own_metadata)
+            # own_total_size = sum(meta.size_bytes for meta in own_metadata)
             partner_metadata = registry.rank_metadata.get(p2p_partner_rank, [])
-            partner_total_size = sum(meta.size_bytes for meta in partner_metadata)
+            # partner_total_size = sum(meta.size_bytes for meta in partner_metadata)
             
             # Calculate maximum size across all ranks (for pipeline synchronization)
             all_total_bytes_list = []
@@ -2459,24 +2463,24 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if (existing_own_size >= needed_own_size and 
                 existing_partner_size >= needed_partner_size):
                 # Reuse existing buffers
-                logger.info(
-                    f"EC-CHECK: Reusing existing P2P buffers from manager "
-                    f"(own: {existing_own_size / (1024**3):.2f} GB >= {needed_own_size / (1024**3):.2f} GB, "
-                    f"partner: {existing_partner_size / (1024**3):.2f} GB >= {needed_partner_size / (1024**3):.2f} GB)"
-                )
+                # logger.info(
+                #     f"EC-CHECK: Reusing existing P2P buffers from manager "
+                #     f"(own: {existing_own_size / (1024**3):.2f} GB >= {needed_own_size / (1024**3):.2f} GB, "
+                #     f"partner: {existing_partner_size / (1024**3):.2f} GB >= {needed_partner_size / (1024**3):.2f} GB)"
+                # )
                 self.eccheck_p2p_buffers = existing_buffers
             else:
                 # Existing buffers too small, reallocate
-                logger.info(
-                    f"EC-CHECK: Existing buffers too small, reallocating "
-                    f"(own: {existing_own_size / (1024**3):.2f} GB < {needed_own_size / (1024**3):.2f} GB or "
-                    f"partner: {existing_partner_size / (1024**3):.2f} GB < {needed_partner_size / (1024**3):.2f} GB)"
-                )
+                # logger.info(
+                #     f"EC-CHECK: Existing buffers too small, reallocating "
+                #     f"(own: {existing_own_size / (1024**3):.2f} GB < {needed_own_size / (1024**3):.2f} GB or "
+                #     f"partner: {existing_partner_size / (1024**3):.2f} GB < {needed_partner_size / (1024**3):.2f} GB)"
+                # )
                 self.eccheck_p2p_buffers = self._allocate_p2p_buffers(registry)
                 self.eccheck_manager.eccheck_p2p_buffers = self.eccheck_p2p_buffers
         else:
             # First-time allocation (e.g., after process restart)
-            logger.info("EC-CHECK: Allocating P2P buffers from checkpoint metadata")
+            # logger.info("EC-CHECK: Allocating P2P buffers from checkpoint metadata")
             self.eccheck_p2p_buffers = self._allocate_p2p_buffers(registry)
             self.eccheck_manager.eccheck_p2p_buffers = self.eccheck_p2p_buffers
         
@@ -2484,13 +2488,14 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # Get self metadata form peer rank in global registry
         metadata_in_peer = registry.rank_metadata.get(paired_rank, [])
-        meta_type = metadata_in_peer[0].chunk_type
+        # meta_type = metadata_in_peer[0].chunk_type
         recv_total_size = sum(meta.size_bytes for meta in metadata_in_peer)
     
         recv_own_buffer = torch.empty(recv_total_size, dtype=torch.uint8)
         
         # Simple P2P exchange placeholder. This will be extended into a full
         # EC-CHECK recovery pipeline (encoding + XOR + P2P) in later steps.
+        data_start_time = time()
         self._run_eccheck_p2p_pipeline_simple(
             rank=rank,
             world_size=world_size,
@@ -2500,7 +2505,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             recv_own_buffer=recv_own_buffer,
             recv_total_size=recv_total_size,
         )
-        
+        data_end_time = time()
+        data_time = data_end_time - data_start_time
+        logger.info(f"EC-CHECK: [Rank {rank}] Data exchange completed in {data_time:.2f}s")
         # For rank2 recovery: save recovered data for later use in _load_eccheck_checkpoint
         if rank == failed_rank:
             logger.info(f"EC-CHECK: [Rank {rank}] Saving recovered buffer for _load_eccheck_checkpoint")
@@ -2543,7 +2550,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         mapped_file_own = FileSystemWriterAsync.load_eclatin_bytes_from_file(
             str(eclatin_main_file), my_rank=rank
         )
-        
+        meta_start_time = time()
         # ===== Step 2: Metadata exchange (similar to EC-CHECK) =====
         local_package = {
             'tensor_metadata': mapped_file_own.local_metadata or [],
@@ -2570,7 +2577,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             rank_metadata=rank_metadata,
             rank_non_tensor_data=rank_non_tensor_data
         )
-        
+        meta_end_time = time()
+        meta_time = meta_end_time - meta_start_time
+        logger.info(f"ECLATIN: [Rank {rank}] Metadata exchange completed in {meta_time:.2f}s")
         # ===== Step 3: Allocate 4 blocks uniformly (reuse save phase logic) =====
         if self.eclatin_blocks is None:
             # Use the same _allocate_eclatin_blocks method as save phase
@@ -4389,10 +4398,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                                     ctypes.addressof(buffer_array.contents) + bytes_to_copy,
                                     ctypes.POINTER(ctypes.c_uint8)
                                 )
-                                ctypes.memset(padding_ptr, 0, padding_size)
-                        else:
-                            # Past actual data, fill with zeros
-                            ctypes.memset(buffer_array.contents, 0, take)
+                        #         ctypes.memset(padding_ptr, 0, padding_size)
+                        # else:
+                        #     # Past actual data, fill with zeros
+                        #     ctypes.memset(buffer_array.contents, 0, take)
                     elif mapped_file_own.memory_address is not None:
                         # Test mode: Copy directly from memory_address (no header offset for test data)
                         source_addr = mapped_file_own.memory_address + processed
@@ -4409,10 +4418,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                                     ctypes.addressof(buffer_array.contents) + bytes_to_copy,
                                     ctypes.POINTER(ctypes.c_uint8)
                                 )
-                                ctypes.memset(padding_ptr, 0, padding_size)
-                        else:
-                            # Past actual data, fill with zeros
-                            ctypes.memset(buffer_array.contents, 0, take)
+                                # ctypes.memset(padding_ptr, 0, padding_size)
+                        # else:
+                        #     # Past actual data, fill with zeros
+                        #     ctypes.memset(buffer_array.contents, 0, take)
                         logger.debug(f"EC-CHECK: [Rank {rank}] Test mode: Copied {bytes_to_copy} bytes from own_file to data_buffer")
                     else:
                         # No source data available, fill with zeros
@@ -5430,7 +5439,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             mapped_file_own, mapped_file_partner = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
             
             # _load_eccheck_checkpoint will use recovered data if available (rank2)
-            return self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
+            mcore_state_dict = self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
+            return mcore_state_dict
         
         if input_args.use_eclatin and (self._is_eclatin_checkpoint(checkpoint_dir) or rank == 2):
             logger.info(f"Detected ECLATIN format checkpoint at {checkpoint_dir}")
@@ -5438,8 +5448,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             mapped_file_own, mapped_file_partner = self._load_eclatin_block_checkpoint(checkpoint_dir)
             
             # _load_eclatin_checkpoint will use recovered data if available (rank2)
-            return self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)
-        
+            mcore_state_dict = self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)
+            return mcore_state_dict
         # Apply N-D tensors resharding
         reformulation_metadata = get_reformulation_metadata(sharded_state_dict, checkpoint_dir)
         sharded_state_dict, formulation_restore_data = apply_nd_flattened_tensors_reformulation(

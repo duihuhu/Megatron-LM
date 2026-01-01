@@ -605,7 +605,7 @@ class ECCHECKManager:
         for data_addr in data_buffers:
             try:
                 self._free_data_buffer_queue.put_nowait(data_addr)
-                logger.info(f"EC-CHECK: Released data buffer at address {data_addr}")
+                # logger.info(f"EC-CHECK: Released data buffer at address {data_addr}")
             except Exception:
                 logger.error(f"EC-CHECK: Data buffer queue is full, cannot release buffer {data_addr}")
         
@@ -614,7 +614,7 @@ class ECCHECKManager:
         for encoding_addr in encoding_buffers:
             try:
                 self._free_encoding_buffer_queue.put_nowait(encoding_addr)
-                logger.info(f"EC-CHECK: Released encoding buffer at address {encoding_addr}")
+                # logger.info(f"EC-CHECK: Released encoding buffer at address {encoding_addr}")
             except Exception:
                 logger.error(f"EC-CHECK: Encoding buffer queue is full, cannot release buffer {encoding_addr}")
         

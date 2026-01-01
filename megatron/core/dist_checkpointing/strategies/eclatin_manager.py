@@ -608,7 +608,7 @@ class ECLATINManager:
         for data_addr in data_buffers:
             try:
                 self._free_data_buffer_queue.put_nowait(data_addr)
-                logger.debug(f"ECLATIN: Released data buffer at address {data_addr}")
+                # logger.debug(f"ECLATIN: Released data buffer at address {data_addr}")
             except Exception:
                 logger.error(f"ECLATIN: Data buffer queue is full, cannot release buffer {data_addr}")
         
@@ -617,7 +617,7 @@ class ECLATINManager:
         for recv_addr in recv_buffers:
             try:
                 self._free_recv_buffer_queue.put_nowait(recv_addr)
-                logger.debug(f"ECLATIN: Released recv buffer at address {recv_addr}")
+                # logger.debug(f"ECLATIN: Released recv buffer at address {recv_addr}")
             except Exception:
                 logger.error(f"ECLATIN: Recv buffer queue is full, cannot release buffer {recv_addr}")
     

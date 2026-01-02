@@ -2401,6 +2401,133 @@ private:
         }
     }
     
+    void reset_time_statistics() {
+        total_encoding_time_ms_ = 0.0;
+        total_send_time_ms_ = 0.0;
+        total_recv_time_ms_ = 0.0;
+        total_xor_time_ms_ = 0.0;
+        encoding_count_ = 0;
+        send_count_ = 0;
+        recv_count_ = 0;
+        xor_count_ = 0;
+        
+        // Reset per-worker time statistics
+        parity1_send1_total_time_ms_ = 0.0;
+        parity1_send2_total_time_ms_ = 0.0;
+        parity1_recv_xor_total_time_ms_ = 0.0;
+        parity2_send1_total_time_ms_ = 0.0;
+        parity2_send2_total_time_ms_ = 0.0;
+        parity2_recv_xor_total_time_ms_ = 0.0;
+        
+        parity1_send1_ops_time_ms_ = 0.0;
+        parity1_send2_ops_time_ms_ = 0.0;
+        parity1_recv_xor_recv_time_ms_ = 0.0;
+        parity1_recv_xor_xor_time_ms_ = 0.0;
+        parity2_send1_ops_time_ms_ = 0.0;
+        parity2_send2_ops_time_ms_ = 0.0;
+        parity2_recv_xor_recv_time_ms_ = 0.0;
+        parity2_recv_xor_xor_time_ms_ = 0.0;
+        
+        pipeline_timing_started_ = false;
+        std::cout << "ECLATIN: Reset time statistics" << std::endl;
+    }
+    
+    void print_time_statistics(double pipeline_wall_time_ms = 0.0) {
+        std::cout << "ECLATIN: Time Statistics:" << std::endl;
+        
+        // Find the bottleneck worker (the slowest one)
+        struct WorkerTime {
+            std::string name;
+            double total_time_ms;
+            double ops_time_ms;
+            std::string ops_type;
+        };
+        
+        std::vector<WorkerTime> worker_times;
+        worker_times.push_back({"parity1_send1", parity1_send1_total_time_ms_.load(), 
+                                parity1_send1_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity1_send2", parity1_send2_total_time_ms_.load(), 
+                                parity1_send2_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity1_recv_xor", parity1_recv_xor_total_time_ms_.load(), 
+                                parity1_recv_xor_recv_time_ms_.load() + parity1_recv_xor_xor_time_ms_.load(), "recv+xor"});
+        worker_times.push_back({"parity2_send1", parity2_send1_total_time_ms_.load(), 
+                                parity2_send1_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity2_send2", parity2_send2_total_time_ms_.load(), 
+                                parity2_send2_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity2_recv_xor", parity2_recv_xor_total_time_ms_.load(), 
+                                parity2_recv_xor_recv_time_ms_.load() + parity2_recv_xor_xor_time_ms_.load(), "recv+xor"});
+        
+        WorkerTime* bottleneck = nullptr;
+        double max_time = 0.0;
+        for (auto& wt : worker_times) {
+            if (wt.total_time_ms > max_time) {
+                max_time = wt.total_time_ms;
+                bottleneck = &wt;
+            }
+        }
+        
+        // Display bottleneck worker information
+        if (bottleneck && max_time > 0.0) {
+            std::cout << "  Bottleneck Worker: " << bottleneck->name 
+                      << " (wall-clock time=" << max_time << " ms, " << (max_time / 1000.0) << " s)" << std::endl;
+            
+            // Calculate task count for this worker
+            int task_count = 0;
+            if (bottleneck->name == "parity1_send1" || bottleneck->name == "parity1_send2" ||
+                bottleneck->name == "parity2_send1" || bottleneck->name == "parity2_send2") {
+                // For send workers, we can estimate task count from accumulated time vs avg time
+                // But we don't have per-worker count, so we'll just show the accumulated ops time
+                std::cout << "    Accumulated Operations (" << bottleneck->ops_type << "): " 
+                          << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+                if (bottleneck->ops_time_ms > max_time) {
+                    std::cout << "    Note: Accumulated time > wall-clock time indicates operations may include overhead" << std::endl;
+                }
+            } else if (bottleneck->name.find("recv_xor") != std::string::npos) {
+                if (bottleneck->name == "parity1_recv_xor") {
+                    std::cout << "    Accumulated Operations (recv+xor): " << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+                    std::cout << "      Recv (accumulated): " << parity1_recv_xor_recv_time_ms_.load() << " ms" << std::endl;
+                    std::cout << "      XOR (accumulated): " << parity1_recv_xor_xor_time_ms_.load() << " ms" << std::endl;
+                } else {
+                    std::cout << "    Accumulated Operations (recv+xor): " << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+                    std::cout << "      Recv (accumulated): " << parity2_recv_xor_recv_time_ms_.load() << " ms" << std::endl;
+                    std::cout << "      XOR (accumulated): " << parity2_recv_xor_xor_time_ms_.load() << " ms" << std::endl;
+                }
+                if (bottleneck->ops_time_ms > max_time) {
+                    std::cout << "    Note: Accumulated time > wall-clock time indicates operations may include overhead" << std::endl;
+                }
+            }
+        }
+        
+        if (pipeline_wall_time_ms > 0.0) {
+            std::cout << "  Pipeline Wall-Clock Time: " << pipeline_wall_time_ms << " ms (" 
+                      << (pipeline_wall_time_ms / 1000.0) << " s)" << std::endl;
+        }
+        
+        std::cout << "  Send (accumulated): total=" << total_send_time_ms_.load() << " ms, "
+                  << "count=" << send_count_.load() << ", "
+                  << "avg=" << (send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0) << " ms" << std::endl;
+        std::cout << "  Recv (accumulated): total=" << total_recv_time_ms_.load() << " ms, "
+                  << "count=" << recv_count_.load() << ", "
+                  << "avg=" << (recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0) << " ms" << std::endl;
+        std::cout << "  XOR (accumulated): total=" << total_xor_time_ms_.load() << " ms, "
+                  << "count=" << xor_count_.load() << ", "
+                  << "avg=" << (xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0) << " ms" << std::endl;
+    }
+    
+    std::map<std::string, double> get_time_statistics() {
+        std::map<std::string, double> stats;
+        stats["send_total_ms"] = total_send_time_ms_.load();
+        stats["send_count"] = static_cast<double>(send_count_.load());
+        stats["send_avg_ms"] = send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0;
+        stats["recv_total_ms"] = total_recv_time_ms_.load();
+        stats["recv_count"] = static_cast<double>(recv_count_.load());
+        stats["recv_avg_ms"] = recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0;
+        stats["xor_total_ms"] = total_xor_time_ms_.load();
+        stats["xor_count"] = static_cast<double>(xor_count_.load());
+        stats["xor_avg_ms"] = xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0;
+        return stats;
+    }
+    
     void layerwise_worker() {
         std::cout << "ECLATIN: LayerWise worker started" << std::endl;
         while (!stop_) {

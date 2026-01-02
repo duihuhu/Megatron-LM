@@ -363,8 +363,13 @@ class ECLATINManager:
             # Initialize ECLATIN C++ module
             self._init_eclatin_native()
             
-            # Start persistent buffer poller thread
-            self._start_buffer_poller_thread()
+            # Start persistent buffer poller thread (only for non-layerwise mode)
+            # In layerwise mode, we don't use buffer pools, so no need for poller thread
+            use_eclatin_layerwise = getattr(args, 'use_eclatin_layerwise', False)
+            if not use_eclatin_layerwise:
+                self._start_buffer_poller_thread()
+            else:
+                logger.info("ECLATIN: Layerwise mode - skipping buffer poller thread (no buffer pools)")
             
         except Exception as e:
             logger.warning(f"ECLATIN: Failed to initialize during manager initialization: {e}")
@@ -458,8 +463,24 @@ class ECLATINManager:
                 logger.info(f"ECLATIN: C++ native module initialized successfully with ASIO (rank={rank}, world_size={world_size})")
                 print(f"ECLATIN: [Rank {rank}] C++ native module initialized - ASIO connections ready for data exchange")
                 
-                # Initialize ECLATIN buffers
-                self._init_eclatin_buffers()
+                # Initialize ECLATIN buffers (skip buffer pool for layerwise mode)
+                # In layerwise mode, we use continuous recv buffers allocated in strategy, not pooled buffers
+                from megatron.training import get_args
+                args = get_args()
+                use_eclatin_layerwise = getattr(args, 'use_eclatin_layerwise', False)
+                
+                if not use_eclatin_layerwise:
+                    # Only allocate buffer pools for non-layerwise mode
+                    self._init_eclatin_buffers()
+                else:
+                    # Layerwise mode: skip buffer pool allocation
+                    # Data buffers: not needed (directly send from layer_cpu_buffer)
+                    # Recv buffers: allocated in strategy as continuous buffers
+                    self.eclatin_data_buffers = []
+                    self.eclatin_recv_buffers = []
+                    self._free_data_buffer_queue = queue.Queue()
+                    self._free_recv_buffer_queue = queue.Queue()
+                    logger.info("ECLATIN: Layerwise mode - skipping buffer pool allocation (using continuous buffers from strategy)")
         
             except Exception as e:
                 logger.warning(f"ECLATIN: Failed to create C++ native module instance: {e}")
@@ -608,7 +629,7 @@ class ECLATINManager:
         for data_addr in data_buffers:
             try:
                 self._free_data_buffer_queue.put_nowait(data_addr)
-                logger.debug(f"ECLATIN: Released data buffer at address {data_addr}")
+                # logger.debug(f"ECLATIN: Released data buffer at address {data_addr}")
             except Exception:
                 logger.error(f"ECLATIN: Data buffer queue is full, cannot release buffer {data_addr}")
         
@@ -617,7 +638,7 @@ class ECLATINManager:
         for recv_addr in recv_buffers:
             try:
                 self._free_recv_buffer_queue.put_nowait(recv_addr)
-                logger.debug(f"ECLATIN: Released recv buffer at address {recv_addr}")
+                # logger.debug(f"ECLATIN: Released recv buffer at address {recv_addr}")
             except Exception:
                 logger.error(f"ECLATIN: Recv buffer queue is full, cannot release buffer {recv_addr}")
     

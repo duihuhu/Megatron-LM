@@ -163,6 +163,9 @@ for path in nccl_header_paths:
 if not nccl_available:
     print("Warning: NCCL not found, building without NCCL support")
 
+# Check if USE_CUDA should be enabled (from environment variable)
+use_cuda = os.environ.get('USE_CUDA', 'false').lower() == 'true'
+
 cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')
 cuda_include_dir = os.path.join(cuda_home, 'include')
 cuda_lib_dir = os.path.join(cuda_home, 'lib64')
@@ -189,6 +192,16 @@ else:
             print(f"Found CUDA lib: {alt_dir}")
             break
 
+# Build define_macros list
+define_macros = [
+    ("NCCL_AVAILABLE", "1") if nccl_available else ("NCCL_AVAILABLE", "0"),
+]
+if use_cuda:
+    define_macros.append(("USE_CUDA", "1"))
+    print("Building with USE_CUDA enabled (C++ will handle D2H transfers)")
+else:
+    print("Building without USE_CUDA (PyTorch mode - D2H handled by PyTorch)")
+
 # Define the extension
 ext_modules = [
     Pybind11Extension(
@@ -202,9 +215,7 @@ ext_modules = [
         ],
         libraries=nccl_libs + cuda_libs,
         library_dirs=nccl_lib_dirs + cuda_lib_dirs,
-        define_macros=[
-            ("NCCL_AVAILABLE", "1") if nccl_available else ("NCCL_AVAILABLE", "0"),
-        ],
+        define_macros=define_macros,
         cxx_std=17,
         language='c++',
         extra_compile_args=[

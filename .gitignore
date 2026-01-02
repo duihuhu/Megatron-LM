@@ -15,4 +15,5 @@ onelogger.err
 .venv
 test_cases/
 runs/
-nccl.log
+nccl.log.*
+*.log

@@ -93,7 +93,7 @@ void AsioConnectionManager::init_xor_send(const std::string& partner_ip, uint16_
         boost::asio::ip::tcp::resolver::results_type endpoints = 
             resolver.resolve(partner_ip, std::to_string(port));
         
-        std::cout << "ASIO: Connecting XOR send to " << partner_ip << ":" << port << "..." << std::endl;
+        // std::cout << "ASIO: Connecting XOR send to " << partner_ip << ":" << port << "..." << std::endl;
         
         // Use synchronous connect
         boost::asio::connect(xor_send_socket_, endpoints);
@@ -454,12 +454,10 @@ private:
     void sync_nccl_operation(const char* operation_name) {
         // Simply synchronize the default stream (stream 0) where NCCL operations execute
         // This ensures we wait for all operations on the default stream to complete
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] sync_nccl_operation: Starting sync for " 
-                  << operation_name << "..." << std::endl;
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] sync_nccl_operation: Starting sync for " << operation_name << "..." << std::endl;
         cudaError_t err = cudaStreamSynchronize(0);
         if (err != cudaSuccess) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Failed to synchronize stream for " 
-                      << operation_name << ": " << cudaGetErrorString(err) << std::endl;
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Failed to synchronize stream for " << operation_name << ": " << cudaGetErrorString(err) << std::endl;
         } else {
             std::cout << "EC-CHECK: [Rank " << rank_ << "] sync_nccl_operation: Sync completed for " 
                       << operation_name << std::endl;
@@ -1057,11 +1055,11 @@ private:
                         std::lock_guard<std::mutex> lock(recv_to_p2p_mutex_);
                         recv_to_p2p_[task.recv_addr] = {task.p2p_own_write_addr, task.p2p_partner_write_addr};
                     }
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread1 encoding completed, "
-                              << "pending XOR for recv_addr=" << task.recv_addr 
-                              << ", encoding_addr=" << task.encoding_addr 
-                              << ", p2p_own=" << task.p2p_own_write_addr
-                              << ", p2p_partner=" << task.p2p_partner_write_addr << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread1 encoding completed, "
+                    //           << "pending XOR for recv_addr=" << task.recv_addr 
+                    //           << ", encoding_addr=" << task.encoding_addr 
+                    //           << ", p2p_own=" << task.p2p_own_write_addr
+                    //           << ", p2p_partner=" << task.p2p_partner_write_addr << std::endl;
                     // Note: encoding buffer will be released by XOR worker after XOR completes
                 } else {
                     // This thread is sender: send encoding result immediately
@@ -1151,13 +1149,13 @@ private:
                 task.encoding_addr == 0 && task.recv_addr == 0 && task.recv_chunk_size == 0 &&
                 task.p2p_own_write_addr == 0 && task.p2p_partner_write_addr == 0) {
                 encoding_thread_2_sentinel_received_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 received sentinel, waiting for queue to empty" << std::endl;
+                // std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 received sentinel, waiting for queue to empty" << std::endl;
                 // Check if queue is empty now
                 {
                     std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_);
                     if (encoding_tasks_2_.empty()) {
                 encoding_thread_2_completed_ = true;
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 queue is empty, marking completed" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 queue is empty, marking completed" << std::endl;
                         // Submit sentinel to downstream workers
                         {
                             std::lock_guard<std::mutex> send_lock(send_queue_mutex_);
@@ -1237,22 +1235,22 @@ private:
                         std::lock_guard<std::mutex> lock(recv_to_p2p_mutex_);
                         recv_to_p2p_[task.recv_addr] = {task.p2p_own_write_addr, task.p2p_partner_write_addr};
                     }
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread2 encoding completed, "
-                              << "pending XOR for recv_addr=" << task.recv_addr 
-                              << ", encoding_addr=" << task.encoding_addr
-                              << ", p2p_own=" << task.p2p_own_write_addr
-                              << ", p2p_partner=" << task.p2p_partner_write_addr << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread2 encoding completed, "
+                    //           << "pending XOR for recv_addr=" << task.recv_addr 
+                    //           << ", encoding_addr=" << task.encoding_addr
+                    //           << ", p2p_own=" << task.p2p_own_write_addr
+                    //           << ", p2p_partner=" << task.p2p_partner_write_addr << std::endl;
                 } else {
                     // This thread is sender: send encoding result immediately
                 {
                     std::lock_guard<std::mutex> lock(send_queue_mutex_);
                     send_queue_.push({task.encoding_addr, task.size});
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 (sender): Pushed task to send_queue, "
-                              << "encoding_addr=" << task.encoding_addr << ", size=" << task.size 
-                              << ", queue_size=" << send_queue_.size() << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 (sender): Pushed task to send_queue, "
+                    //           << "encoding_addr=" << task.encoding_addr << ", size=" << task.size 
+                    //           << ", queue_size=" << send_queue_.size() << std::endl;
                 }
                 send_queue_cv_.notify_one();
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 (sender): Notified send_queue_cv" << std::endl;
+                // std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 (sender): Notified send_queue_cv" << std::endl;
                     
                     // Sender doesn't need parity buffer, release it immediately
                     if (task.parity_addr != 0) {
@@ -1279,7 +1277,7 @@ private:
                 std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_);
                 if (encoding_tasks_2_.empty()) {
                     encoding_thread_2_completed_ = true;
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 queue is empty after processing, marking completed" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 queue is empty after processing, marking completed" << std::endl;
                     // Submit sentinel to downstream workers
                     {
                         std::lock_guard<std::mutex> send_lock(send_queue_mutex_);
@@ -1306,7 +1304,7 @@ private:
     
     // Unified send worker (handles all encoded chunks that need to be sent)
     void send_worker() {
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker started" << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker started" << std::endl;
         
         while (!should_stop_threads_) {
             SendTask task;
@@ -1387,7 +1385,7 @@ private:
                         ncclSend(reinterpret_cast<void*>(task.encoding_addr), task.size, 
                                  ncclUint8, target_rank_in_comm, comm_to_use, 0);
                         ncclGroupEnd();
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker: NCCL GroupEnd completed, starting sync..." << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker: NCCL GroupEnd completed, starting sync..." << std::endl;
                         
                         sync_nccl_operation("Send worker: NCCL send");
                     }
@@ -1409,10 +1407,10 @@ private:
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
                 encoding_buffers_to_release_.push(task.encoding_addr);
             }
-            {
-                std::lock_guard<std::mutex> lock(release_queue_mutex_);
-                encoding_buffers_to_release_.push(task.encoding_addr);
-            }
+            // auto send_end = std::chrono::high_resolution_clock::now();
+            // double send_time_ms = std::chrono::duration<double, std::milli>(send_end - send_start).count();
+            // total_send_time_ms_.store(total_send_time_ms_.load() + send_time_ms);
+            // send_count_++;
             
             // After processing task, check if sentinel was received and queue is empty
             if (send_worker_sentinel_received_.load()) {
@@ -1427,7 +1425,7 @@ private:
     
     // Unified recv worker
     void recv_worker() {
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker started" << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker started" << std::endl;
         
         // Wait for initialization to complete
         if (use_asio_) {
@@ -1611,7 +1609,7 @@ private:
     }
     // Unified XOR worker
     void xor_worker() {
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker started" << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker started" << std::endl;
         
         auto submit_p2p_sentinel = [this]() {
             {
@@ -1624,7 +1622,7 @@ private:
                 p2p_recv_queue_.push({0, 0, false, 0});
             }
             p2p_recv_queue_cv_.notify_one();
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker: Sent sentinel to P2P workers" << std::endl;
+            // std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker: Sent sentinel to P2P workers" << std::endl;
         };
         
         while (!should_stop_threads_) {
@@ -1679,7 +1677,7 @@ private:
             xor_array[2] = dest;
             
             xor_gen(3, static_cast<int>(task.size), xor_array);
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker: XOR completed, parity addr=" << task.parity_addr << std::endl;
+            // std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker: XOR completed, parity addr=" << task.parity_addr << std::endl;
             
             if (task.p2p_own_write_addr != 0 && task.p2p_partner_write_addr != 0 && task.parity_addr != 0) {
                 if (is_load_mode_ && failed_rank_ == 2) {
@@ -1765,7 +1763,7 @@ private:
     
     // P2P Send Worker - 专门发送P2P数据（独立线程，类似 send_worker_1）
     void p2p_send_worker() {
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker started" << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker started" << std::endl;
         
         // NCCL is already initialized in main thread, no need to initialize here
         
@@ -1784,23 +1782,23 @@ private:
                 
                 task = p2p_send_queue_.front();
                 p2p_send_queue_.pop();
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Popped task, "
-                          << "send_buffer_addr=" << task.send_buffer_addr
-                          << ", p2p_own_write_addr=" << task.p2p_own_write_addr
-                          << ", size=" << task.size
-                          << ", queue_size_after_pop=" << p2p_send_queue_.size() << std::endl;
+                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Popped task, "
+                //           << "send_buffer_addr=" << task.send_buffer_addr
+                //           << ", p2p_own_write_addr=" << task.p2p_own_write_addr
+                //           << ", size=" << task.size
+                //           << ", queue_size_after_pop=" << p2p_send_queue_.size() << std::endl;
             }
             
             // Check for sentinel
             if (task.send_buffer_addr == 0 && task.p2p_own_write_addr == 0 && task.size == 0) {
                 p2p_send_worker_sentinel_received_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker received sentinel, waiting for queue to empty" << std::endl;
+                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker received sentinel, waiting for queue to empty" << std::endl;
                 // Check if queue is empty now
                 {
                     std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
                     if (p2p_send_queue_.empty()) {
                         p2p_send_worker_completed_ = true;
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker queue is empty, marking completed" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker queue is empty, marking completed" << std::endl;
                         // Reset sentinel flag and continue (don't exit)
                         p2p_send_worker_sentinel_received_ = false;
                         continue;
@@ -1814,17 +1812,18 @@ private:
                 std::memcpy(reinterpret_cast<void*>(task.p2p_own_write_addr),
                            reinterpret_cast<void*>(task.send_buffer_addr),
                            task.size);
-                if (rank_ % 2 == 0) {
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Copied own parity to own_buffer at "
-                              << task.p2p_own_write_addr << std::endl;
-                } else {
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Copied own data to own_buffer at "
-                              << task.p2p_own_write_addr << std::endl;
-                }
+                // if (rank_ % 2 == 0) {
+                //     std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Copied own parity to own_buffer at "
+                //               << task.p2p_own_write_addr << std::endl;
+                // } else {
+                //     std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Copied own data to own_buffer at "
+                //               << task.p2p_own_write_addr << std::endl;
+                // }
             } else if (task.p2p_own_write_addr == 0 && task.send_buffer_addr != 0 && task.size > 0) {
                 // Load path: direct send from provided buffer (typically mmap)
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Using provided buffer directly (no local copy)"
-                          << std::endl;
+                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Using provided buffer directly (no local copy)"
+                //           << std::endl;
+                continue;
             }
             
             // Step 2: Send data using ASIO or NCCL
@@ -1835,8 +1834,8 @@ private:
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));  // Network byte order
                     
                     const char* send_label = (rank_ % 2 == 0) ? "parity" : "data";
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Starting ASIO send ("
-                              << send_label << "), size=" << task.size << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Starting ASIO send ("
+                            //   << send_label << "), size=" << task.size << std::endl;
                     
                     try {
                         // Send message header (size) first
@@ -1852,19 +1851,19 @@ private:
                         );
                         
                         // Send completed successfully
-                        if (task.is_load_mode_transfer) {
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Sent partner_file chunk to Rank " 
-                                      << p2p_partner_rank_ << " (size=" << task.size << ")" << std::endl;
-                        } else {
-                            // Save mode or Step6: original log
-                            if (rank_ % 2 == 0) {
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent parity to Rank " 
-                                          << p2p_partner_rank_ << std::endl;
-                            } else {
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent data to Rank " 
-                                          << p2p_partner_rank_ << std::endl;
-                            }
-                        }
+                        // if (task.is_load_mode_transfer) {
+                        //     std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Sent partner_file chunk to Rank " 
+                        //               << p2p_partner_rank_ << " (size=" << task.size << ")" << std::endl;
+                        // } else {
+                        //     // Save mode or Step6: original log
+                        //     if (rank_ % 2 == 0) {
+                        //         std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent parity to Rank " 
+                        //                   << p2p_partner_rank_ << std::endl;
+                        //     } else {
+                        //         std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent data to Rank " 
+                        //                   << p2p_partner_rank_ << std::endl;
+                        //     }
+                        // }
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
                                   << "] P2P ASIO send failed: " << e.what() << std::endl;
@@ -1883,43 +1882,43 @@ private:
                         } else {
                             // Map global p2p_partner_rank to communicator-internal rank (0 or 1)
                             int partner_rank_in_comm = (rank_ < p2p_partner_rank_) ? 1 : 0;
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: partner_rank_in_comm=" 
-                                      << partner_rank_in_comm << " (from global rank " << p2p_partner_rank_ << ")" << std::endl;
+                            // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: partner_rank_in_comm=" 
+                            //           << partner_rank_in_comm << " (from global rank " << p2p_partner_rank_ << ")" << std::endl;
                             if (partner_rank_in_comm < 0 || partner_rank_in_comm >= 2) {
-                                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid partner_rank_in_comm=" 
-                                          << partner_rank_in_comm << " (must be 0 or 1 for 2-rank communicator)" << std::endl;
-                                std::cerr << "EC-CHECK: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
+                                // std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid partner_rank_in_comm=" 
+                                //           << partner_rank_in_comm << " (must be 0 or 1 for 2-rank communicator)" << std::endl;
+                                // std::cerr << "EC-CHECK: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
                                 std::cerr.flush();
                             } else {
                                 const char* send_label = (rank_ % 2 == 0) ? "parity" : "data";
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Starting NCCL send ("
-                                          << send_label << "), size=" << task.size
-                                          << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
+                                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Starting NCCL send ("
+                                //           << send_label << "), size=" << task.size
+                                //           << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
                                 std::cout.flush();
                                 
                                 ncclGroupStart();
                                 ncclSend(reinterpret_cast<void*>(task.send_buffer_addr), task.size,
                                          ncclUint8, partner_rank_in_comm, nccl_comm_p2p_send_, 0);
                                 ncclGroupEnd();
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: NCCL GroupEnd completed, starting sync..." << std::endl;
+                                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: NCCL GroupEnd completed, starting sync..." << std::endl;
                                 
                                 // Synchronize NCCL operation before releasing buffer
                                 sync_nccl_operation("P2P send worker: NCCL send");
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: NCCL sync completed" << std::endl;
+                                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: NCCL sync completed" << std::endl;
                                 
-                                if (task.is_load_mode_transfer) {
-                                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Sent partner_file chunk to Rank " 
-                                              << p2p_partner_rank_ << " (size=" << task.size << ")" << std::endl;
-                                } else {
-                                    // Save mode or Step6: original log
-                                    if (rank_ % 2 == 0) {
-                                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent parity to Rank " 
-                                                  << p2p_partner_rank_ << std::endl;
-                                    } else {
-                                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent data to Rank " 
-                                                  << p2p_partner_rank_ << std::endl;
-                                    }
-                                }
+                                // if (task.is_load_mode_transfer) {
+                                //     std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Sent partner_file chunk to Rank " 
+                                //               << p2p_partner_rank_ << " (size=" << task.size << ")" << std::endl;
+                                // } else {
+                                //     // Save mode or Step6: original log
+                                //     if (rank_ % 2 == 0) {
+                                //         std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent parity to Rank " 
+                                //                   << p2p_partner_rank_ << std::endl;
+                                //     } else {
+                                //         std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Sent data to Rank " 
+                                //                   << p2p_partner_rank_ << std::endl;
+                                //     }
+                                // }
                             }
                         }
                     } else if (DISABLE_P2P_NCCL) {
@@ -1968,8 +1967,8 @@ private:
                         encoding_task.recv_chunk_size, encoding_task.parity_addr2,
                         encoding_task.p2p_own_write_addr, encoding_task.p2p_partner_write_addr
                     );
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Step2 P2P send completed, submitted encoding task for data_addr=" 
-                              << encoding_task.data_addr << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Step2 P2P send completed, submitted encoding task for data_addr=" 
+                    //           << encoding_task.data_addr << std::endl;
                 } else {
                     std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: No pending encoding task found for data_addr=" 
                               << task.load_mode_data_addr << std::endl;
@@ -1984,8 +1983,8 @@ private:
                     // Load mode Step2: release send_buffer (this is temporary buffer from mmap read)
                     if (task.send_buffer_addr != 0) {
                         data_buffers_to_release_.push(task.send_buffer_addr);
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Released send_buffer " 
-                                  << task.send_buffer_addr << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Released send_buffer " 
+                        //           << task.send_buffer_addr << std::endl;
                     }
                 } else {
                     // Save mode or Step6: original logic
@@ -2011,7 +2010,7 @@ private:
                 std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
                 if (p2p_send_queue_.empty()) {
                     p2p_send_worker_completed_ = true;
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker queue is empty after processing, marking completed" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker queue is empty after processing, marking completed" << std::endl;
                     // Reset sentinel flag and continue (don't exit)
                     p2p_send_worker_sentinel_received_ = false;
                     continue;
@@ -2041,22 +2040,22 @@ private:
                 
                 task = p2p_recv_queue_.front();
                 p2p_recv_queue_.pop();
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Popped task, "
-                          << "recv_buffer_addr=" << task.recv_buffer_addr
-                          << ", size=" << task.size
-                          << ", queue_size_after_pop=" << p2p_recv_queue_.size() << std::endl;
+                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Popped task, "
+                //           << "recv_buffer_addr=" << task.recv_buffer_addr
+                //           << ", size=" << task.size
+                //           << ", queue_size_after_pop=" << p2p_recv_queue_.size() << std::endl;
             }
             
             // Check for sentinel
             if (task.recv_buffer_addr == 0 && task.size == 0) {
                 p2p_recv_worker_sentinel_received_ = true;
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker received sentinel, waiting for queue to empty" << std::endl;
+                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker received sentinel, waiting for queue to empty" << std::endl;
                 // Check if queue is empty now
                 {
                     std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
                     if (p2p_recv_queue_.empty()) {
                         p2p_recv_worker_completed_ = true;
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker queue is empty, marking completed" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker queue is empty, marking completed" << std::endl;
                         // Reset sentinel flag and continue (don't exit)
                         p2p_recv_worker_sentinel_received_ = false;
                         continue;
@@ -2066,8 +2065,7 @@ private:
             }
             
             // Receive data using ASIO or NCCL
-            // Track if task was processed (for sentinel check logic)
-            bool task_processed = false;
+            bool task_processed = false;  // Track whether task was successfully processed
             
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_recv_connected()) {
@@ -2076,8 +2074,8 @@ private:
                     uint32_t size_net;
                     
                     const char* recv_label = (rank_ % 2 == 0) ? "data" : "parity";
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Starting ASIO recv ("
-                              << recv_label << "), size=" << task.size << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Starting ASIO recv ("
+                    //           << recv_label << "), size=" << task.size << std::endl;
                     
                     try {
                         // Receive message header (size) first
@@ -2101,11 +2099,11 @@ private:
                         );
                         
                         // Receive completed successfully
-                        if (rank_ % 2 == 0) {
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received data from Rank " << p2p_partner_rank_ << std::endl;
-                        } else {
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received parity from Rank " << p2p_partner_rank_ << std::endl;
-                        }
+                        // if (rank_ % 2 == 0) {
+                        //     std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received data from Rank " << p2p_partner_rank_ << std::endl;
+                        // } else {
+                        //     std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received parity from Rank " << p2p_partner_rank_ << std::endl;
+                        // }
                         task_processed = true;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
@@ -2115,6 +2113,7 @@ private:
                 }
 #ifdef NCCL_AVAILABLE
                 else if (!use_asio_) {
+                    bool task_processed_nccl = false;  // Local flag for NCCL path
                     // NCCL recv path (fallback)
                     const bool DISABLE_P2P_NCCL = false;  // Set to true to disable P2P NCCL operations
                     
@@ -2151,19 +2150,20 @@ private:
                                 std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL sync completed" << std::endl;
                                 
                                 // Log will be handled in the common section after recv completes
-                                task_processed = true;
+                                task_processed_nccl = true;
                             }
                         }
                     } else if (DISABLE_P2P_NCCL) {
                         std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL DISABLED for debugging, task processed (no-op)" << std::endl;
                         // Even when NCCL is disabled, the task is considered processed
                         // This ensures sentinel check logic works correctly
-                        task_processed = true;
+                        task_processed_nccl = true;
                     } else {
                         std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Skipping NCCL (nccl_p2p_recv_initialized_=" 
                                   << (nccl_p2p_recv_initialized_ ? "true" : "false") << ", world_size_=" << world_size_ << ")" << std::endl;
-                        task_processed = true;
+                        task_processed_nccl = true;
                     }
+                    task_processed = task_processed_nccl;
                 }
 #endif
                 else {
@@ -2186,8 +2186,8 @@ private:
                         reinterpret_cast<void*>(task.recv_buffer_addr),
                         task.size
                     );
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: Copied received data to data_buffer at "
-                              << task.data_buffer_addr << " (size=" << task.size << ")" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: Copied received data to data_buffer at "
+                            //   << task.data_buffer_addr << " (size=" << task.size << ")" << std::endl;
                 } else {
                     // recv_buffer_addr == data_buffer_addr, data already in correct position, no copy needed
                     std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: Received partner_file chunk from Rank " 
@@ -2221,22 +2221,24 @@ private:
                         encoding_task.recv_chunk_size, encoding_task.parity_addr2,
                         encoding_task.p2p_own_write_addr, encoding_task.p2p_partner_write_addr
                     );
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Step2 P2P recv completed, submitted encoding task for data_addr=" 
-                              << encoding_task.data_addr << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Step2 P2P recv completed, submitted encoding task for data_addr=" 
+                            //   << encoding_task.data_addr << std::endl;
                 } else {
                     std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: No pending encoding task found for data_buffer=" 
                               << task.data_buffer_addr << std::endl;
                 }
-            } else if (task_processed && !task.is_load_mode_transfer) {
+            } 
+            // else if (task_processed && !task.is_load_mode_transfer) {
                 // Save mode or Step6: original log
-                if (rank_ % 2 == 0) {
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received data from Rank " 
-                              << p2p_partner_rank_ << std::endl;
-                } else {
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received parity from Rank " 
-                              << p2p_partner_rank_ << std::endl;
-                }
-            }
+                // if (rank_ % 2 == 0) {
+                //     std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received data from Rank " 
+                //               << p2p_partner_rank_ << std::endl;
+                // } else {
+                //     std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv: Received parity from Rank " 
+                //               << p2p_partner_rank_ << std::endl;
+                // }
+                
+            // }
             
             // Note: No buffer release needed here - recv buffer (p2p_partner_write_addr) is managed by Python
             
@@ -2245,7 +2247,7 @@ private:
                 std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
                 if (p2p_recv_queue_.empty()) {
                     p2p_recv_worker_completed_ = true;
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker queue is empty after processing, marking completed" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker queue is empty after processing, marking completed" << std::endl;
                     // Reset sentinel flag and continue (don't exit)
                     p2p_recv_worker_sentinel_received_ = false;
                     continue;
@@ -2593,7 +2595,7 @@ public:
             need_thread1 = false;
             // Mark thread1 as completed since it won't receive sentinel
             encoding_thread_1_completed_ = true;
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] Load mode: Skipping thread1 wait (rank2/3 only use thread2)" << std::endl;
+            // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load mode: Skipping thread1 wait (rank2/3 only use thread2)" << std::endl;
         }
         
         int encoding_wait_count = 0;
@@ -2746,9 +2748,9 @@ public:
     
     void submit_data_to_p2p_thread(uintptr_t data_addr, size_t size, std::string ops) {
         if (data_addr == 0 || size == 0) {
-            std::cerr << "EC-CHECK: [Rank " << rank_
-                      << "] submit_data_to_p2p_thread received invalid args: addr="
-                      << data_addr << ", size=" << size << std::endl;
+            // std::cerr << "EC-CHECK: [Rank " << rank_
+            //           << "] submit_data_to_p2p_thread received invalid args: addr="
+            //           << data_addr << ", size=" << size << std::endl;
             return;
         }
         
@@ -2759,18 +2761,18 @@ public:
                 p2p_send_queue_.push({data_addr, 0, size, 0, 0, false, 0});
             }
             p2p_send_queue_cv_.notify_one();
-            std::cout << "EC-CHECK: [Rank " << rank_
-                      << "] Queued P2P send task (addr=" << data_addr
-                      << ", size=" << size << ")" << std::endl;
+            // std::cout << "EC-CHECK: [Rank " << rank_
+            //           << "] Queued P2P send task (addr=" << data_addr
+            //           << ", size=" << size << ")" << std::endl;
         } else if (ops == "recv") {
             {
                 std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
                 p2p_recv_queue_.push({data_addr, size, false, 0});
             }
             p2p_recv_queue_cv_.notify_one();
-            std::cout << "EC-CHECK: [Rank " << rank_
-                      << "] Queued P2P recv task (addr=" << data_addr
-                      << ", size=" << size << ")" << std::endl;
+            // std::cout << "EC-CHECK: [Rank " << rank_
+            //           << "] Queued P2P recv task (addr=" << data_addr
+            //           << ", size=" << size << ")" << std::endl;
         } else {
             std::cerr << "EC-CHECK: [Rank " << rank_
                       << "] submit_data_to_p2p_thread received unknown op: "
@@ -2786,16 +2788,16 @@ public:
         uintptr_t load_mode_data_addr = 0 // load mode: corresponding data_addr (for finding encoding task)
     ) {
         if (size == 0) {
-            std::cerr << "EC-CHECK: [Rank " << rank_
-                      << "] submit_load_p2p_transfer received invalid size: " << size << std::endl;
+            // std::cerr << "EC-CHECK: [Rank " << rank_
+            //           << "] submit_load_p2p_transfer received invalid size: " << size << std::endl;
             return;
         }
         
         if (is_sender) {
             // Sender: 提交到p2p_send_queue_
             if (send_buffer_addr == 0) {
-                std::cerr << "EC-CHECK: [Rank " << rank_
-                          << "] submit_load_p2p_transfer: sender requires send_buffer_addr" << std::endl;
+                // std::cerr << "EC-CHECK: [Rank " << rank_
+                //           << "] submit_load_p2p_transfer: sender requires send_buffer_addr" << std::endl;
                 return;
             }
             
@@ -2812,13 +2814,13 @@ public:
                 });
             }
             p2p_send_queue_cv_.notify_one();
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] Queued load P2P send task (addr=" 
-                      << send_buffer_addr << ", size=" << size << ")" << std::endl;
+            // std::cout << "EC-CHECK: [Rank " << rank_ << "] Queued load P2P send task (addr=" 
+            //           << send_buffer_addr << ", size=" << size << ")" << std::endl;
         } else {
             // Receiver: 提交到p2p_recv_queue_
             if (recv_data_buffer_addr == 0) {
-                std::cerr << "EC-CHECK: [Rank " << rank_
-                          << "] submit_load_p2p_transfer: receiver requires recv_data_buffer_addr" << std::endl;
+                // std::cerr << "EC-CHECK: [Rank " << rank_
+                //           << "] submit_load_p2p_transfer: receiver requires recv_data_buffer_addr" << std::endl;
                 return;
             }
             
@@ -2832,8 +2834,8 @@ public:
                 });
             }
             p2p_recv_queue_cv_.notify_one();
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] Queued load P2P recv task (addr=" 
-                      << recv_data_buffer_addr << ", size=" << size << ")" << std::endl;
+            // std::cout << "EC-CHECK: [Rank " << rank_ << "] Queued load P2P recv task (addr=" 
+            //           << recv_data_buffer_addr << ", size=" << size << ")" << std::endl;
         }
     }
     
@@ -2887,8 +2889,8 @@ public:
                     std::lock_guard<std::mutex> lock(pending_encoding_tasks_mutex_);
                     pending_encoding_tasks_[data_addr] = encoding_task;
                 }
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Saved pending encoding task for data_addr=" 
-                          << data_addr << " (will submit after Step2 P2P send)" << std::endl;
+                // std::cout << "EC-CHECK: [Rank " << rank_ << "] Saved pending encoding task for data_addr=" 
+                //           << data_addr << " (will submit after Step2 P2P send)" << std::endl;
             }
         } else if (rank_ == 1 || rank_ == 2) {
             // Receiver: 提交Step 2 P2P接收任务，保存encoding任务信息
@@ -2901,8 +2903,8 @@ public:
                     std::lock_guard<std::mutex> lock(pending_encoding_tasks_mutex_);
                     pending_encoding_tasks_[step2_recv_data_addr] = encoding_task;
                 }
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Saved pending encoding task for data_buffer=" 
-                          << step2_recv_data_addr << " (will submit after Step2 P2P recv)" << std::endl;
+                // std::cout << "EC-CHECK: [Rank " << rank_ << "] Saved pending encoding task for data_buffer=" 
+                //           << step2_recv_data_addr << " (will submit after Step2 P2P recv)" << std::endl;
             }
         }
     }

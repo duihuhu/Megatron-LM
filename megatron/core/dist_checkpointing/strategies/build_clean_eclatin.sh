@@ -1,13 +1,27 @@
 #!/bin/bash
-# Clean build script for EC-CHECK native C++ module
+# Clean build script for ECLATIN native C++ module
+# This script compiles the C++ extension for ECLATIN checkpointing
+#
+# Usage:
+#   bash build_clean_eclatin.sh          # Build without CUDA (PyTorch mode)
+#   bash build_clean_eclatin.sh cuda     # Build with CUDA support
 
 set -e
+
+USE_CUDA=false
+if [ "$1" == "cuda" ]; then
+    USE_CUDA=true
+fi
 
 # Get the directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "Building EC-CHECK native C++ module (clean build)..."
+if [ "$USE_CUDA" == "true" ]; then
+    echo "Building ECLATIN native C++ module WITH CUDA support..."
+else
+    echo "Building ECLATIN native C++ module WITHOUT CUDA (PyTorch mode)..."
+fi
 
 # Clean previous builds
 echo "Cleaning previous builds..."
@@ -33,6 +47,19 @@ export PYTHONUSERBASE=""
 unset PYTHONPATH
 unset PYTHONUSERBASE
 
+# Set USE_CUDA environment variable for setup script
+if [ "$USE_CUDA" == "true" ]; then
+    export USE_CUDA=true
+    # Check if nvcc is available
+    if ! command -v nvcc &> /dev/null; then
+        echo "Error: nvcc not found. Please install CUDA toolkit or build without CUDA."
+        exit 1
+    fi
+    echo "CUDA compiler (nvcc) found: $(which nvcc)"
+else
+    export USE_CUDA=false
+fi
+
 # Build the module
 echo "Building in isolated environment..."
 python3 setup_simple_eclatin.py build_ext --inplace
@@ -44,6 +71,17 @@ cp "$TEMP_DIR"/eclatin_native*.pyd . 2>/dev/null || true
 
 # Clean up
 rm -rf "$TEMP_DIR"
+
+echo ""
+if [ "$USE_CUDA" == "true" ]; then
+    echo "✅ ECLATIN native module built successfully with CUDA support!"
+    echo "   C++ will handle GPU->CPU transfers directly"
+else
+    echo "✅ ECLATIN native module built successfully without CUDA!"
+    echo "   PyTorch will handle GPU->CPU transfers, C++ coordinates layer processing"
+    echo "   To build with CUDA support, run: bash build_clean_eclatin.sh cuda"
+fi
+echo "Module location: $(pwd)/eclatin_native*.so"
 << EOF
 # Test the built module
 echo "Testing built module..."

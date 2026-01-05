@@ -2291,6 +2291,14 @@ def _add_checkpointing_args(parser):
                             'Default: 3. Must be <= world_size. Higher values provide better fault tolerance '
                             'but require more storage space. For example, with num_replicas=3 and 4 ranks, '
                             'each rank stores 3 copies of its data (local + 2 remote).')
+    group.add_argument('--use-gemini-replicas-hardware-failure', action='store_true',
+                       help='Enable Gemini Replicas checkpointing for hardware failure recovery. '
+                            'When a rank fails (e.g., rank2), the failed rank recovers its data from other ranks '
+                            'using the multi-replica placement strategy. For rank2 failure with 3 replicas: '
+                            'rank0 and rank1 send their local data (backup data for rank2), rank3 sends its '
+                            'backup of rank2 original data. Uses mmap for zero-copy file access and C++ ASIO '
+                            'for efficient network transfer. Data sizes are broadcasted first, then C++ handles '
+                            'the actual data transfer for optimal performance.')
     return parser
 
 

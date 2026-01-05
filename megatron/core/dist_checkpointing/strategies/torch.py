@@ -2655,6 +2655,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Initialize Gemini manager (singleton instance shared with Save strategy)
         self.gemini_manager = GeminiManager()
         self.gemini_manager.init_gemini_if_enabled()
+        
+        # Initialize Gemini Replicas manager (singleton instance shared with Save strategy)
+        self.gemini_replicas_manager = GeminiReplicasManager()
+        self.gemini_replicas_manager.init_gemini_replicas_if_enabled()
+        
         # Initialize ECLATIN manager (singleton instance shared with Save strategy)
         self.eclatin_manager = ECLATINManager()
         self.eclatin_manager.init_eclatin_if_enabled()
@@ -3801,6 +3806,415 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info(f"rank: {rank}, successfully restored state_dict from rank0's replica data")
             return loaded_state_dict
     
+    def _init_gemini_replicas_recovery_native(self, rank: int, world_size: int):
+        """Initialize a temporary C++ ASIO module for recovery-specific topology.
+        
+        For rank2 recovery:
+        - rank0 sends to rank2
+        - rank1 sends to rank2
+        - rank3 sends to rank2
+        - rank2 receives from rank0, rank1, rank3
+        
+        Args:
+            rank: Current rank
+            world_size: Total number of ranks
+            
+        Returns:
+            C++ native module instance for recovery
+        """
+        import os
+        import socket
+        
+        logger.info(f"rank: {rank}, initializing Gemini Replicas recovery ASIO connections")
+        
+        # Load C++ module
+        try:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            import glob as _glob_module
+            so_files = _glob_module.glob(os.path.join(current_dir, "gemini_replicas_native*.so"))
+            
+            if not so_files:
+                raise RuntimeError(f"Gemini Replicas: No gemini_replicas_native.so file found in {current_dir}")
+            
+            import importlib.util as _importlib_util
+            so_path = so_files[0]
+            spec = _importlib_util.spec_from_file_location("gemini_replicas_native", so_path)
+            gemini_replicas_native = _importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(gemini_replicas_native)
+            logger.info(f"rank: {rank}, loaded gemini_replicas_native.so from {so_path}")
+        except Exception as e:
+            logger.error(f"rank: {rank}, failed to load gemini_replicas_native.so: {e}")
+            raise
+        
+        # Get network configuration
+        base_ip = os.environ.get('GEMINI_REPLICAS_BASE_IP')
+        if not base_ip:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(('8.8.8.8', 80))
+                base_ip = s.getsockname()[0]
+                s.close()
+            except Exception:
+                base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
+        
+        master_port = int(os.environ.get('MASTER_PORT', '6000'))
+        base_port = int(os.environ.get('GEMINI_REPLICAS_BASE_PORT', master_port + 30000))
+        recovery_base_port = base_port + 10000  # Use different port range for recovery
+        
+        # Port allocation strategy for recovery:
+        # rank2 listens on ONE port: recovery_base_port + 2
+        # All senders (rank0, rank1, rank3) connect to the same port
+        # The acceptor will handle multiple incoming connections sequentially
+        
+        rank2_recv_port = recovery_base_port + 2
+        
+        # Define recovery topology
+        if rank in [0, 1, 3]:
+            # Senders: send to rank2 only
+            target_ranks = [2]
+            target_ips = [base_ip]  # Assume single machine for now
+            # All senders connect to rank2's listening port
+            target_ports = [rank2_recv_port]
+            source_ranks = []  # Senders don't receive
+            num_source_ranks = 0
+            # Sender's recv port (not used but required by API)
+            my_recv_port = recovery_base_port + rank * 10
+        elif rank == 2:
+            # Receiver: receive from rank0, rank1, rank3
+            target_ranks = []  # Receiver doesn't send (or sends dummy)
+            target_ips = []
+            target_ports = []
+            source_ranks = [0, 1, 3]
+            num_source_ranks = 3
+            # rank2 listens on a single port for all incoming connections
+            my_recv_port = rank2_recv_port
+        else:
+            raise ValueError(f"rank: {rank}, invalid rank for recovery")
+        
+        my_ip = base_ip
+        
+        logger.info(
+            f"rank: {rank}, recovery ASIO config:\n"
+            f"  My IP: {my_ip}, My recv port: {my_recv_port}\n"
+            f"  Target ranks: {target_ranks}, Target IPs: {target_ips}, Target ports: {target_ports}\n"
+            f"  Source ranks: {source_ranks}, Num sources: {num_source_ranks}"
+        )
+        
+        # Phase 1: All ranks create C++ instances and start acceptors
+        logger.info(f"rank: {rank}, creating recovery C++ native module (Phase 1: acceptor)...")
+        
+        # Create C++ instance (this starts the acceptor for receiving connections)
+        recovery_native = gemini_replicas_native.GeminiReplicasNative(
+            rank, world_size,
+            target_ranks,
+            target_ips,
+            target_ports,
+            my_ip,
+            my_recv_port,
+            num_source_ranks
+        )
+        
+        logger.info(f"rank: {rank}, acceptor started, waiting for all ranks to start acceptors...")
+        
+        # CRITICAL: Wait for ALL ranks to start their acceptors before anyone tries to connect
+        torch.distributed.barrier()
+        
+        # Add a small delay to ensure acceptors are fully ready
+        import time
+        time.sleep(0.5)
+        
+        logger.info(f"rank: {rank}, all ranks ready, finalizing recovery connections (Phase 2: connect)...")
+        
+        # Phase 2: All ranks connect to their targets
+        recovery_native.finalize_connections()
+        
+        logger.info(f"rank: {rank}, connections finalized, waiting for all ranks to complete...")
+        
+        # Wait for all connections to be established
+        torch.distributed.barrier()
+        
+        logger.info(f"rank: {rank}, recovery ASIO connections initialized successfully")
+        return recovery_native
+    
+    def _load_gemini_replicas_checkpoint_recovery(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+        """Load checkpoint for Gemini Replicas hardware failure recovery (rank2 failure scenario).
+        
+        Recovery process when rank2 fails with 3 replicas and 4 ranks:
+        
+        Background - Normal Gemini Replicas topology:
+        - rank0 targets: [0, 1, 2] -> rank0 sends its data to rank1 and rank2
+        - rank1 targets: [1, 2, 3] -> rank1 sends its data to rank2 and rank3
+        - rank2 targets: [2, 3, 0] -> rank2 sends its data to rank3 and rank0
+        - rank3 targets: [3, 0, 1] -> rank3 sends its data to rank0 and rank1
+        
+        Saved files during normal checkpointing:
+        - rank0 saves: __0_0.distcp (local), __0_0_replica2_rank0.distcp (from rank2), __0_0_replica3_rank0.distcp (from rank3)
+        - rank1 saves: __1_0.distcp (local), __1_0_replica2_rank1.distcp (from rank2), __1_0_replica3_rank1.distcp (from rank3)
+        - rank2 saves: __2_0.distcp (local), __2_0_replica0_rank2.distcp (from rank0), __2_0_replica1_rank2.distcp (from rank1)
+        - rank3 saves: __3_0.distcp (local), __3_0_replica0_rank3.distcp (from rank0), __3_0_replica1_rank3.distcp (from rank1), __3_0_replica2_rank3.distcp (from rank2)
+        
+        Recovery when rank2 fails:
+        - rank0: sends its local data (__0_0.distcp) to rank2 (rank0's own data, which rank2 had as backup)
+        - rank1: sends its local data (__1_0.distcp) to rank2 (rank1's own data, which rank2 had as backup)
+        - rank3: sends rank2's replica (__3_0_replica2_rank3.distcp) to rank2 (rank2's original data)
+        - rank2: receives from rank0, rank1, rank3 and uses rank3's data to recover its own checkpoint
+        
+        Uses mmap for zero-copy file access and torch.distributed for network transfer.
+        Data sizes are broadcasted first using all_gather, then point-to-point send/recv for actual data.
+        
+        Args:
+            sharded_state_dict: Sharded state dict template for loading
+            checkpoint_dir: Checkpoint directory
+            
+        Returns:
+            StateDict: Loaded state dict
+        """
+        import mmap
+        import numpy as np
+        
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        logger.info(f"rank: {rank}, starting Gemini Replicas checkpoint recovery for rank2 failure")
+        
+        # Calculate which ranks participate in recovery
+        # rank0, rank1, rank3 are senders; rank2 is receiver
+        participating_ranks = [0, 1, 2, 3]
+        
+        if rank not in participating_ranks:
+            logger.info(f"rank: {rank}, not participating in rank2 recovery, loading from own checkpoint file")
+            return self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
+        
+        # For recovery, we need to set up special ASIO connections
+        # Create a temporary C++ native module instance with recovery-specific topology
+        recovery_native = self._init_gemini_replicas_recovery_native(rank, world_size)
+        
+        if rank in [0, 1, 3]:
+            # Sender ranks: Read replica files and send to rank2
+            logger.info(f"rank: {rank}, reading replica files for rank2 recovery")
+            
+            # Determine which file to read based on rank
+            # rank0: sends own local data (rank2 was in rank0's target list [0,1,2])
+            # rank1: sends own local data (rank2 was in rank1's target list [1,2,3])
+            # rank3: sends rank2's data that was replicated to rank3 (rank3 was in rank2's target list [2,3,0])
+            
+            if rank == 3:
+                # rank3 has rank2's replica data (because rank3 is in rank2's target list)
+                # File pattern: __3_0_replica2_rank3.distcp
+                replica_files = list(checkpoint_dir.glob(f"__{rank}_0_replica2_rank{rank}.distcp"))
+                if not replica_files:
+                    # Try alternative patterns
+                    replica_files = list(checkpoint_dir.glob(f"*_replica2_rank{rank}*.distcp"))
+            else:
+                # rank0, rank1 send their own local data (not replicas)
+                # Because rank2 was in their target lists, they send their primary data to rank2
+                replica_files = list(checkpoint_dir.glob(f"__{rank}_0.distcp"))
+            
+            if not replica_files:
+                logger.error(f"rank: {rank}, no replica file found for rank2 recovery")
+                raise FileNotFoundError(f"No replica file found for rank2 recovery at rank {rank}")
+            
+            replica_file_path = replica_files[0]
+            logger.info(f"rank: {rank}, found replica file: {replica_file_path}")
+            
+            # Step 1: Open file with mmap (zero-copy)
+            try:
+                f = open(replica_file_path, 'rb')
+                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                replica_file_size = len(mm)
+                
+                logger.info(f"rank: {rank}, opened replica file with mmap: {replica_file_size / (1024**2):.2f} MB")
+            except Exception as e:
+                logger.error(f"rank: {rank}, failed to open replica file: {e}", exc_info=True)
+                raise
+            
+            # Step 2: Broadcast file sizes to all ranks using torch.distributed
+            # (Still use torch.distributed for metadata sync, but ASIO for data)
+            # Need to use gloo backend for CPU tensors when NCCL is the default backend
+            from .async_utils import get_or_create_global_gloo_group
+            global_gloo_group = get_or_create_global_gloo_group()
+            
+            size_tensor = torch.tensor([replica_file_size], dtype=torch.int64, device='cpu')
+            
+            # Gather all sizes at all ranks using gloo group
+            all_sizes = [torch.zeros(1, dtype=torch.int64, device='cpu') for _ in range(world_size)]
+            torch.distributed.all_gather(all_sizes, size_tensor, group=global_gloo_group)
+            
+            logger.info(f"rank: {rank}, broadcasted size to all ranks: {replica_file_size / (1024**2):.2f} MB")
+            
+            # Step 3: Send data to rank2 using C++ ASIO (zero-copy from mmap)
+            try:
+                # Create numpy view of mmap (zero-copy, read-only)
+                mmap_np = np.frombuffer(mm, dtype=np.uint8)
+                mmap_addr = mmap_np.ctypes.data
+                
+                logger.info(f"rank: {rank}, sending data to rank2 via C++ ASIO (zero-copy from mmap)...")
+                logger.info(f"rank: {rank}, data size: {replica_file_size / (1024**2):.2f} MB")
+                
+                # Submit send buffer to C++ module
+                recovery_native.submit_send_buffer(mmap_addr, replica_file_size)
+                
+                # Execute exchange (this will send data via ASIO)
+                logger.info(f"rank: {rank}, executing ASIO exchange...")
+                recovery_native.execute_exchange()
+                
+                logger.info(f"rank: {rank}, data sent successfully to rank2 via C++ ASIO")
+                
+            except Exception as e:
+                logger.error(f"rank: {rank}, failed to send data via C++ ASIO: {e}", exc_info=True)
+                raise
+            finally:
+                # Clean up mmap (keep numpy view alive until after send)
+                del mmap_np
+                mm.close()
+                f.close()
+            
+            # Step 5: Load own checkpoint from file
+            logger.info(f"rank: {rank}, loading own checkpoint from saved file")
+            return self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
+            
+        elif rank == 2:
+            # Receiver rank: Receive data from rank0, rank1, rank3 and merge
+            logger.info(f"rank: {rank}, receiving replica data from rank0, rank1, rank3 for recovery")
+            
+            try:
+                # Step 1: Receive size information via broadcast
+                # Need to use gloo backend for CPU tensors when NCCL is the default backend
+                from .async_utils import get_or_create_global_gloo_group
+                global_gloo_group = get_or_create_global_gloo_group()
+                
+                size_tensor = torch.zeros(1, dtype=torch.int64, device='cpu')
+                all_sizes = [torch.zeros(1, dtype=torch.int64, device='cpu') for _ in range(world_size)]
+                torch.distributed.all_gather(all_sizes, size_tensor, group=global_gloo_group)
+                
+                # Extract sizes from sender ranks
+                rank0_size = int(all_sizes[0][0])
+                rank1_size = int(all_sizes[1][0])
+                rank3_size = int(all_sizes[3][0])
+                
+                logger.info(
+                    f"rank: {rank}, received sizes via broadcast:\n"
+                    f"  rank0: {rank0_size / (1024**2):.2f} MB\n"
+                    f"  rank1: {rank1_size / (1024**2):.2f} MB\n"
+                    f"  rank3: {rank3_size / (1024**2):.2f} MB"
+                )
+                
+                # Step 2: Receive data from rank0, rank1, rank3 using C++ ASIO
+                recv_buffers = {}
+                source_ranks_to_recv = [0, 1, 3]
+                
+                logger.info(f"rank: {rank}, expecting data from source ranks: {source_ranks_to_recv}")
+                
+                # Allocate buffers for each source
+                for src_rank in source_ranks_to_recv:
+                    src_size = int(all_sizes[src_rank][0].item())
+                    
+                    # Allocate receive buffer (pinned for faster transfer)
+                    if torch.cuda.is_available():
+                        recv_buffer = torch.empty(src_size, dtype=torch.uint8).pin_memory()
+                    else:
+                        recv_buffer = torch.empty(src_size, dtype=torch.uint8)
+                    
+                    recv_buffers[src_rank] = recv_buffer
+                    
+                    # Submit receive buffer to C++ module
+                    recv_addr = recv_buffer.data_ptr()
+                    recovery_native.submit_recv_buffer(src_rank, recv_addr, src_size)
+                    
+                    logger.info(f"rank: {rank}, allocated and submitted receive buffer for rank{src_rank}: {src_size / (1024**2):.2f} MB")
+                
+                # Step 3: Execute ASIO exchange (receive from all sources)
+                # Submit a dummy send buffer (rank2 doesn't send, but API may require it)
+                dummy_buffer = torch.zeros(8, dtype=torch.uint8)
+                recovery_native.submit_send_buffer(dummy_buffer.data_ptr(), 8)
+                
+                logger.info(f"rank: {rank}, executing C++ ASIO exchange to receive from all sources...")
+                recovery_native.execute_exchange()
+                
+                logger.info(f"rank: {rank}, data received successfully from all source ranks via C++ ASIO")
+                
+                # Step 4: Parse received data and reconstruct state_dict
+                # For Gemini Replicas recovery, we need to merge data from multiple sources
+                # Typically rank3's data is the primary data, rank0 and rank1 are backups
+                
+                # Check if Gemini optimized format is used
+                use_gemini_replicas_optimized = False
+                try:
+                    from megatron.training import get_args
+                    args = get_args()
+                    use_gemini_replicas_optimized = getattr(args, 'use_gemini_replicas_optimized', False)
+                except:
+                    pass
+                
+                # Use rank3's data as primary (rank3 has rank2's original data)
+                primary_rank = 3
+                if primary_rank in recv_buffers:
+                    primary_buffer = recv_buffers[primary_rank]
+                    logger.info(f"rank: {rank}, using rank{primary_rank}'s data as primary for recovery")
+                    
+                    if use_gemini_replicas_optimized and primary_buffer.numel() >= 8:
+                        # Parse as Gemini optimized format
+                        metadata_size_tensor = primary_buffer[:8]
+                        metadata_size = int.from_bytes(metadata_size_tensor.cpu().numpy().tobytes(), byteorder='little')
+                        
+                        logger.info(f"rank: {rank}, parsing as Gemini Replicas optimized format, metadata_size: {metadata_size / 1024:.2f} KB")
+                        
+                        # Extract metadata (Gemini Replicas uses pickle)
+                        metadata_tensor = primary_buffer[8:8+metadata_size]
+                        metadata_bytes = metadata_tensor.cpu().numpy().tobytes()
+                        import pickle
+                        gemini_metadata = pickle.loads(metadata_bytes)
+                        
+                        # Extract buffer (zero-copy)
+                        buffer_tensor = primary_buffer[8+metadata_size:]
+                        
+                        logger.info(
+                            f"rank: {rank}, parsed Gemini Replicas data: "
+                            f"metadata_size={metadata_size / 1024:.2f} KB, "
+                            f"buffer_size={buffer_tensor.numel() / (1024**2):.2f} MB"
+                        )
+                        
+                        # Create write_buckets structure
+                        replica_buckets = [(
+                            checkpoint_dir / f"__{rank}_0.distcp",
+                            'gemini_optimized_local',
+                            (
+                                [('gemini_metadata', gemini_metadata), ('gemini_buffer', buffer_tensor)],
+                                []
+                            )
+                        )]
+                        
+                        # Restore state_dict
+                        logger.info(f"rank: {rank}, restoring state_dict from Gemini Replicas format...")
+                        loaded_state_dict = self._restore_state_dict_from_gemini_format(
+                            replica_buckets, sharded_state_dict
+                        )
+                    else:
+                        # Standard pickle format
+                        logger.info(f"rank: {rank}, parsing as standard pickle format")
+                        primary_bytes = primary_buffer.cpu().numpy().tobytes()
+                        primary_data_io = io.BytesIO(primary_bytes)
+                        replica_buckets = torch.load(primary_data_io, weights_only=False)
+                        
+                        logger.info(f"rank: {rank}, deserialized replica data, restoring state_dict...")
+                        loaded_state_dict = self._restore_state_dict_from_write_buckets(
+                            replica_buckets, sharded_state_dict
+                        )
+                    
+                    logger.info(f"rank: {rank}, successfully restored state_dict from Gemini Replicas recovery")
+                    return loaded_state_dict
+                else:
+                    raise RuntimeError(f"rank: {rank}, primary rank {primary_rank} not in received buffers")
+                    
+            except Exception as e:
+                logger.error(f"rank: {rank}, Gemini Replicas recovery failed: {e}", exc_info=True)
+                raise
+        else:
+            # Should not reach here
+            logger.error(f"rank: {rank}, unexpected rank in Gemini Replicas recovery")
+            raise RuntimeError(f"Unexpected rank {rank} in Gemini Replicas recovery")
+    
     def _load_from_saved_checkpoint_file(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Load checkpoint from saved checkpoint file (OPTIMIZED for non-recovery ranks).
         
@@ -3862,35 +4276,50 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         try:
             # Priority 1: Check command-line flags to determine format
             use_gemini_optimized = False
+            use_gemini_replicas_optimized = False
             try:
                 from megatron.training import get_args
                 args = get_args()
                 use_gemini_optimized = getattr(args, 'use_gemini', False) and getattr(args, 'use_gemini_optimized', False)
+                use_gemini_replicas_optimized = getattr(args, 'use_gemini_replicas', False) and getattr(args, 'use_gemini_replicas_optimized', False)
+                
                 if use_gemini_optimized:
                     logger.info(f"rank: {rank}, using Gemini optimized format (from args flags)")
+                elif use_gemini_replicas_optimized:
+                    logger.info(f"rank: {rank}, using Gemini Replicas optimized format (from args flags)")
             except Exception as e:
                 # Args not available, will auto-detect format
                 logger.debug(f"rank: {rank}, cannot access args, will auto-detect format: {e}")
             
             # Parse checkpoint data based on format (OPTIMIZED)
-            if use_gemini_optimized or (not use_gemini_optimized and checkpoint_file_size >= 8):
-                # Try Gemini format first (if flag is set, or auto-detect)
+            # Support both Gemini and Gemini Replicas optimized formats
+            use_optimized_format = use_gemini_optimized or use_gemini_replicas_optimized
+            
+            if use_optimized_format or (not use_optimized_format and checkpoint_file_size >= 8):
+                # Try optimized format first (if flag is set, or auto-detect)
                 if checkpoint_file_size >= 8:
                     # Read only the header (8 bytes) to determine format
                     metadata_size = int.from_bytes(mm[:8], byteorder='little')
                     
                     # Sanity check: metadata_size should be reasonable (< 10MB for metadata)
-                    is_valid_gemini = (0 < metadata_size < 10 * 1024 * 1024 and 
-                                      (8 + metadata_size) <= checkpoint_file_size)
+                    is_valid_optimized = (0 < metadata_size < 10 * 1024 * 1024 and 
+                                         (8 + metadata_size) <= checkpoint_file_size)
                     
-                    if use_gemini_optimized or is_valid_gemini:
-                        # Parse as Gemini optimized format (ZERO-COPY)
-                        logger.info(f"rank: {rank}, parsing as Gemini optimized format (zero-copy), metadata_size: {metadata_size / 1024:.2f} KB")
+                    if use_optimized_format or is_valid_optimized:
+                        # Parse as optimized format (Gemini or Gemini Replicas) - ZERO-COPY
+                        format_name = "Gemini Replicas" if use_gemini_replicas_optimized else "Gemini"
+                        logger.info(f"rank: {rank}, parsing as {format_name} optimized format (zero-copy), metadata_size: {metadata_size / 1024:.2f} KB")
                         
                         # Extract metadata (only copy small metadata portion)
                         metadata_bytes = mm[8:8+metadata_size]
-                        metadata_buffer = io.BytesIO(metadata_bytes)
-                        gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
+                        
+                        # Gemini Replicas uses pickle, Gemini uses torch.save
+                        if use_gemini_replicas_optimized:
+                            import pickle
+                            gemini_metadata = pickle.loads(metadata_bytes)
+                        else:
+                            metadata_buffer = io.BytesIO(metadata_bytes)
+                            gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
                         
                         # Extract buffer (ZERO-COPY - use memoryview to avoid copy)
                         buffer_offset = 8 + metadata_size
@@ -3905,7 +4334,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         gemini_buffer = torch.from_numpy(np.array(buffer_np, copy=True))
                         
                         logger.info(
-                            f"rank: {rank}, loaded Gemini checkpoint (OPTIMIZED): "
+                            f"rank: {rank}, loaded {format_name} checkpoint (OPTIMIZED): "
                             f"metadata_size={metadata_size / 1024:.2f} KB, "
                             f"buffer_size={buffer_size / (1024**2):.2f} MB"
                         )
@@ -3931,9 +4360,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                             def __len__(self):
                                 return 3
                         
+                        # Use appropriate storage key based on format
+                        storage_key = 'gemini_replicas_optimized_local' if use_gemini_replicas_optimized else 'gemini_optimized_local'
+                        
                         write_bucket = WriteBucketWithRefs(
                             checkpoint_file_path,
-                            'gemini_optimized_local',
+                            storage_key,
                             (
                                 [('gemini_metadata', gemini_metadata), ('gemini_buffer', gemini_buffer)],
                                 []
@@ -5870,6 +6302,28 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             recovery_time = end_recovery_time - start_recovery_time
             logger.info(f"rank: {rank}, Gemini software failure recovery time: {recovery_time:.2f} seconds")
             return recovered_state_dict
+        
+        # Gemini Replicas checkpoint recovery for rank2 failure scenario
+        # rank0, rank1, rank3 send data to rank2; rank2 receives and recovers
+        if input_args.use_gemini_replicas and input_args.use_gemini_replicas_hardware_failure:
+            logger.info(f"rank: {rank}, using Gemini Replicas checkpoint recovery for rank2 failure")
+            start_recovery_time = time()
+            
+            # All participating ranks (0, 1, 2, 3) execute recovery logic
+            recovered_state_dict = self._load_gemini_replicas_checkpoint_recovery(sharded_state_dict, checkpoint_dir)
+            
+            # ALL ranks must synchronize here
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+                logger.info(f"rank: {rank}, synchronized after Gemini Replicas recovery")
+            
+            end_recovery_time = time()
+            recovery_time = end_recovery_time - start_recovery_time
+            logger.info(f"rank: {rank}, Gemini Replicas hardware failure recovery time: {recovery_time:.2f} seconds")
+            
+            if recovered_state_dict:
+                logger.info(f"rank: {rank}, returning loaded state dict from Gemini Replicas recovery")
+                return recovered_state_dict
         
         # Normal Gemini checkpoint load (mutual exchange between paired ranks, and all rank recovery from peer replication)
         # if input_args.use_gemini:

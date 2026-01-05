@@ -61,6 +61,7 @@ from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .eccheck_manager import ECCHECKManager
 from .eclatin_manager import ECLATINManager
 from .gemini_manager import GeminiManager
+from .gemini_replicas_manager import GeminiReplicasManager
 from .filesystem_async import FileSystemWriterAsync
 from .resharding import (
     TensorReformulationMetadata,
@@ -725,6 +726,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.gemini_manager = GeminiManager()
         self.gemini_manager.init_gemini_if_enabled()
         
+        # Initialize Gemini Replicas manager (singleton instance for multi-replica data transfer)
+        self.gemini_replicas_manager = GeminiReplicasManager()
+        self.gemini_replicas_manager.init_gemini_replicas_if_enabled()
+        
         # Initialize strategy-specific EC-CHECK state
         self.eccheck_preallocate_cpu_buffer = True  # Preallocate CPU buffer for tensor data
         self.eccheck_use_continuous_buffer = True  # Use continuous buffer for tensor data
@@ -1037,7 +1042,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         args = input_args()
         # Use PyT saving mechanism
 
-        # Create FileSystemWriterAsync with EC-CHECK, ECLATIN, or Gemini parameters
+        # Create FileSystemWriterAsync with EC-CHECK, ECLATIN, Gemini, or Gemini Replicas parameters
         if self.eclatin_manager.use_eclatin:
             writer = FileSystemWriterAsync(
                 checkpoint_dir,
@@ -1047,6 +1052,16 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 use_eclatin=self.eclatin_manager.use_eclatin,
                 eclatin_native=self.eclatin_manager._eclatin_native,  # Pass pre-initialized C++ module
                 eclatin_buffers=self._get_eclatin_buffers(),  # Pass pre-allocated buffers
+            )
+        elif self.gemini_replicas_manager.use_gemini_replicas and self.gemini_replicas_manager.use_gemini_replicas_optimized:
+            writer = FileSystemWriterAsync(
+                checkpoint_dir,
+                separation_hint=self.separation_hint,
+                thread_count=self.thread_count,
+                use_msc=MultiStorageClientFeature.is_enabled(),
+                use_gemini_replicas=self.gemini_replicas_manager.use_gemini_replicas,
+                gemini_replicas_native=self.gemini_replicas_manager.get_native_module(),  # Pass pre-initialized C++ module
+                gemini_replicas_num=self.gemini_replicas_manager.num_replicas,  # Pass number of replicas
             )
         elif self.gemini_manager.use_gemini and self.gemini_manager.use_gemini_optimized:
             writer = FileSystemWriterAsync(
@@ -1122,6 +1137,16 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             writer.ecl_write_buckets = self.ecl_write_buckets
             # In ECLATIN mode, call prepare_write_data to create write_buckets
             # It will use the metadata we just prepared
+            writer.prepare_write_data(self.cached_central_plan, planner)
+        # Gemini Replicas mode: decompose state_dict and preallocate CPU memory for multi-replica exchange
+        elif self.gemini_replicas_manager.use_gemini_replicas and self.gemini_replicas_manager.use_gemini_replicas_optimized:
+            self._prepare_gemini_replicas_data(self.cached_central_plan, planner)
+            # Pass Gemini Replicas state to writer if available
+            writer.decomposed_state_dict = self.decomposed_state_dict
+            writer.preallocated_cpu_buffer = self.preallocated_cpu_buffer
+            
+            # In Gemini Replicas mode, call prepare_write_data to create write_buckets
+            # It will use the decomposed state_dict we just prepared
             writer.prepare_write_data(self.cached_central_plan, planner)
         # Gemini mode: decompose state_dict and preallocate CPU memory for replica exchange
         elif self.gemini_manager.use_gemini and self.gemini_manager.use_gemini_optimized:
@@ -1312,6 +1337,138 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         total_time = time() - start_total
         logger.info(
             f"Gemini: [Rank {rank}] Preparation completed in {total_time:.2f}s"
+        )
+    
+    def _prepare_gemini_replicas_data(self, plan: SavePlan, planner: SavePlanner) -> None:
+        """
+        Gemini Replicas preparation: organize data for multi-replica transfer.
+        
+        This method performs the following steps:
+        1. Process plan items (separate bytes and tensors)
+        2. Create DecomposedStateDict for efficient GPU-to-CPU transfer
+        3. Preallocate CPU memory buffer for tensors
+        
+        Similar to Gemini but supports multiple replicas with round-robin placement.
+        
+        Args:
+            plan (SavePlan): save plan from PyTorch distributed checkpoint
+            planner (SavePlanner): save planner to resolve data
+        """
+        from torch.distributed.checkpoint.filesystem import _StoragePrefix
+        
+        start_total = time()
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        num_replicas = self.gemini_replicas_manager.num_replicas
+        logger.info(
+            f"Gemini Replicas: [Rank {rank}] Starting multi-replica checkpoint preparation "
+            f"({num_replicas} replicas)"
+        )
+        
+        # Step 1: Process plan items
+        storage_plan: _StoragePrefix = plan.storage_data
+        
+        # Separate items into BYTE_IO (non-tensor) and TENSOR
+        non_tensor_data = {}
+        tensor_infos = []
+        tensor_data_list = []
+        
+        logger.info(f"Gemini Replicas: [Rank {rank}] Processing {len(plan.items)} items from SavePlan")
+        byte_io_count = 0
+        tensor_count = 0
+        none_data_count = 0
+        
+        for item in plan.items:
+            data = planner.resolve_data(item)
+            
+            if data is None:
+                none_data_count += 1
+                continue
+            
+            if item.type == WriteItemType.BYTE_IO:
+                # Non-tensor data
+                # Convert BytesIO to bytes for proper serialization
+                if hasattr(data, 'getvalue'):  # BytesIO object
+                    data.seek(0)
+                    data_bytes = data.getvalue()
+                    non_tensor_data[item.index.fqn] = data_bytes
+                else:
+                    non_tensor_data[item.index.fqn] = data
+                byte_io_count += 1
+            else:
+                # Tensor data - create TensorInfo
+                from .state_dict_decomposer import TensorInfo
+                
+                tensor_info = TensorInfo(
+                    key=item.index.fqn,
+                    shape=tuple(data.shape),
+                    dtype=data.dtype,
+                    device=data.device,
+                    numel=data.numel(),
+                    size_bytes=data.numel() * data.element_size(),
+                    offset=0,  # Will be calculated below
+                    global_offset=tuple(item.index.offset) if hasattr(item.index, 'offset') else None,
+                    shard_index=item.index.index if hasattr(item.index, 'index') else None,
+                )
+                tensor_infos.append(tensor_info)
+                tensor_data_list.append(data)
+                tensor_count += 1
+        
+        logger.info(
+            f"Gemini Replicas: [Rank {rank}] Processed {byte_io_count} BytesIO items, {tensor_count} tensor items"
+            + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
+        )
+        
+        # Calculate offsets for tensor data
+        offset = 0
+        for info in tensor_infos:
+            info.offset = offset
+            offset += info.size_bytes
+        
+        # Create decomposed structure
+        self.decomposed_state_dict = DecomposedStateDict(
+            non_tensor_data=non_tensor_data,
+            tensor_infos=tensor_infos,
+            tensor_data=tensor_data_list,
+        )
+        
+        # Log statistics
+        stats = self.decomposed_state_dict.get_statistics()
+        logger.info(
+            f"Gemini Replicas: [Rank {rank}] Created DecomposedStateDict:\n"
+            f"  Non-tensor data: {stats['non_tensor_size_bytes'] / 1024:.2f} KB\n"
+            f"  Tensor data: {stats['tensor_data_size_bytes'] / (1024**3):.2f} GB\n"
+            f"  Total tensors: {stats['num_tensors']}"
+        )
+        
+        # Step 2: Preallocate CPU buffer
+        total_tensor_size = self.decomposed_state_dict.total_tensor_size_bytes
+        
+        if self.preallocated_cpu_buffer is None or self.preallocated_cpu_buffer.numel() < total_tensor_size:
+            logger.info(
+                f"Gemini Replicas: [Rank {rank}] Allocating preallocated CPU buffer: "
+                f"{total_tensor_size / (1024**3):.2f} GB"
+            )
+            
+            # Use pinned memory for faster GPU-to-CPU transfer
+            if torch.cuda.is_available():
+                self.preallocated_cpu_buffer = torch.empty(
+                    total_tensor_size, dtype=torch.uint8
+                ).pin_memory()
+                logger.info(f"Gemini Replicas: [Rank {rank}] Allocated pinned memory buffer")
+            else:
+                self.preallocated_cpu_buffer = torch.empty(
+                    total_tensor_size, dtype=torch.uint8
+                )
+                logger.info(f"Gemini Replicas: [Rank {rank}] Allocated regular CPU buffer")
+        else:
+            logger.info(
+                f"Gemini Replicas: [Rank {rank}] Reusing existing preallocated CPU buffer: "
+                f"{self.preallocated_cpu_buffer.numel() / (1024**3):.2f} GB"
+            )
+        
+        total_time = time() - start_total
+        logger.info(
+            f"Gemini Replicas: [Rank {rank}] Preparation completed in {total_time:.2f}s"
         )
 
     def _prepare_eccheck_data(self, plan: SavePlan, planner: SavePlanner) -> None:

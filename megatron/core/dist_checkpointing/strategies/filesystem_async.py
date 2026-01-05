@@ -153,10 +153,17 @@ class FileSystemWriterAsync(FileSystemWriter):
         eclatin_buffers: Optional[Dict] = None,  # Pre-allocated buffers
         use_gemini: bool = False,
         gemini_native: Optional[Any] = None,  # Pre-initialized C++ module
+        use_gemini_replicas: bool = False,
+        gemini_replicas_native: Optional[Any] = None,  # Pre-initialized C++ module
+        gemini_replicas_num: int = 3,  # Number of replicas
         **kwargs,
     ):
         self.checkpoint_dir = path
         self.use_msc = use_msc
+        
+        # Gemini Replicas configuration
+        self.use_gemini_replicas = use_gemini_replicas
+        self.gemini_replicas_num = gemini_replicas_num
         
         # EC-CHECK configuration
         self.use_eccheck = use_eccheck
@@ -175,6 +182,10 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Gemini configuration
         self.use_gemini = use_gemini
+        
+        # Gemini Replicas configuration
+        self.use_gemini_replicas = use_gemini_replicas
+        self.gemini_replicas_num = gemini_replicas_num
 
         super().__init__(path, *args, **kwargs)
         if not self.single_file_per_rank:
@@ -264,6 +275,20 @@ class FileSystemWriterAsync(FileSystemWriter):
         else:
             self._gemini_native = None
             self._gemini_shared = False
+        
+        # Gemini Replicas intermediate state
+        # Note: Gemini Replicas reuses decomposed_state_dict and preallocated_cpu_buffer
+        self.gemini_replicas_pin_memory = True
+        
+        # Initialize C++ native module if available
+        if gemini_replicas_native is not None:
+            # Use pre-initialized C++ module from strategy
+            self._gemini_replicas_native = gemini_replicas_native
+            self._gemini_replicas_shared = True  # Mark as shared module
+            logger.info("Gemini Replicas: Using pre-initialized C++ native module from strategy")
+        else:
+            self._gemini_replicas_native = None
+            self._gemini_replicas_shared = False
 
     def __del__(self):
         """
@@ -491,6 +516,16 @@ class FileSystemWriterAsync(FileSystemWriter):
             )
         from megatron.training import get_args
         args = get_args()
+        
+        # Gemini Replicas optimized mode: use continuous buffer preload for multi-replica
+        if hasattr(args, 'use_gemini_replicas') and args.use_gemini_replicas and \
+           hasattr(args, 'use_gemini_replicas_optimized') and args.use_gemini_replicas_optimized:
+            logger.info("Gemini Replicas: Using optimized preload (continuous buffer, multi-replica)")
+            return (
+                partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
+                partial(self._gemini_replicas_preload_to_continuous_buffer, self.write_buckets, True),
+                [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+            )
         
         # Gemini optimized mode: use continuous buffer preload to avoid serialization
         if hasattr(args, 'use_gemini') and args.use_gemini and \
@@ -874,6 +909,342 @@ class FileSystemWriterAsync(FileSystemWriter):
         )
         
         return [local_bucket, remote_bucket]
+
+    def _gemini_replicas_preload_to_continuous_buffer(self, write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
+        """
+        Gemini Replicas optimized preload: Transfer tensors to continuous CPU buffer and broadcast to multiple replicas.
+        
+        This method extends Gemini's approach to support multiple replicas (default: 3) with round-robin placement.
+        It performs the following operations:
+        1. GPU→CPU: Copy tensor data to continuous CPU buffer (no serialization)
+        2. Broadcast: Send buffer to (num_replicas - 1) target ranks simultaneously
+        3. Return: Multiple buckets for local and remote replicas
+        
+        Args:
+            write_buckets (List[WriteBucket]): Original write buckets with tensors
+            non_blocking (bool): Use non-blocking GPU-to-CPU transfer
+            
+        Returns:
+            List[WriteBucket]: Multiple buckets - [local_bucket, replica_bucket_1, replica_bucket_2, ...]
+        """
+        if not write_buckets or len(write_buckets) == 0:
+            return write_buckets
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        start_time = time()
+        
+        logger.info(f"Gemini Replicas rank {rank}: Starting optimized preload with {self.gemini_replicas_num} replicas...")
+        
+        # Phase 1: Use decomposed_state_dict (prepared by strategy)
+        if not hasattr(self, 'decomposed_state_dict') or self.decomposed_state_dict is None:
+            logger.error(f"Gemini Replicas rank {rank}: decomposed_state_dict not available")
+            return self.preload_tensors(write_buckets, non_blocking)
+        
+        # Get total size from decomposed_state_dict
+        total_size = self.decomposed_state_dict.total_tensor_size_bytes
+        
+        logger.info(
+            f"Gemini Replicas rank {rank}: Using decomposed_state_dict with {len(self.decomposed_state_dict.tensor_infos)} tensors, "
+            f"total size: {total_size / (1024**2):.2f} MB"
+        )
+        
+        # Phase 2: Allocate continuous buffer (reuse preallocated buffer if available)
+        if self.preallocated_cpu_buffer is not None:
+            buffer = self.preallocated_cpu_buffer
+            if buffer.numel() < total_size:
+                logger.warning(
+                    f"Gemini Replicas rank {rank}: Preallocated buffer too small, reallocating..."
+                )
+                if torch.cuda.is_available():
+                    buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
+            else:
+                buffer = buffer[:total_size]
+                logger.info(f"Gemini Replicas rank {rank}: Reusing preallocated buffer")
+        else:
+            if torch.cuda.is_available():
+                buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
+                logger.info(f"Gemini Replicas rank {rank}: Allocated new pinned memory buffer")
+            else:
+                buffer = torch.empty(total_size, dtype=torch.uint8)
+                logger.info(f"Gemini Replicas rank {rank}: Allocated new CPU buffer")
+        
+        # Phase 3: Copy tensor data to buffer
+        num_gpu_tensors = 0
+        
+        for info, tensor in zip(
+            self.decomposed_state_dict.tensor_infos,
+            self.decomposed_state_dict.tensor_data
+        ):
+            buffer_view = buffer[info.offset:info.offset + info.size_bytes]
+            tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
+            buffer_view.copy_(tensor_flat, non_blocking=non_blocking)
+            
+            if tensor.device.type != 'cpu':
+                num_gpu_tensors += 1
+        
+        if non_blocking and num_gpu_tensors > 0:
+            torch.cuda.synchronize()
+        
+        preload_time = time() - start_time
+        bandwidth = (total_size / (1024**3)) / preload_time if preload_time > 0 else 0
+        
+        logger.info(
+            f"Gemini Replicas rank {rank}: Preload completed in {preload_time:.4f}s, "
+            f"copied {total_size / (1024**2):.2f} MB, "
+            f"bandwidth: {bandwidth:.2f} GB/s"
+        )
+        
+        # Package local metadata
+        local_metadata = {
+            'total_size': total_size,
+            'num_tensors': len(self.decomposed_state_dict.tensor_infos),
+            'non_tensor_data': self.decomposed_state_dict.non_tensor_data,
+            'tensor_infos': [
+                {
+                    'key': info.key,
+                    'shape': list(info.shape),
+                    'dtype': str(info.dtype),
+                    'offset': info.offset,
+                    'size_bytes': info.size_bytes,
+                }
+                for info in self.decomposed_state_dict.tensor_infos
+            ],
+        }
+        
+        # ===== Phase 2: Broadcast buffer to replica ranks =====
+        from megatron.training import get_args
+        args = get_args()
+        
+        # Check if Gemini Replicas broadcast is enabled
+        if not (hasattr(args, 'use_gemini_replicas') and args.use_gemini_replicas):
+            # No broadcast needed, just return local data
+            result_bucket = (
+                write_buckets[0][0] if write_buckets else 'gemini_replicas_optimized.distcp',
+                'gemini_replicas_optimized',
+                (
+                    [('gemini_replicas_metadata', local_metadata), ('gemini_replicas_buffer', buffer)],
+                    []
+                )
+            )
+            return [result_bucket]
+        
+        # Perform broadcast to replica ranks
+        logger.info(f"Gemini Replicas rank {rank}: Starting buffer broadcast to {self.gemini_replicas_num - 1} replicas...")
+        broadcast_start = time()
+        
+        # Initialize variables for received data (will be populated if C++ module is used)
+        receive_buffers = []
+        source_ranks = []
+        
+        # Serialize metadata
+        import io
+        metadata_buffer = io.BytesIO()
+        torch.save(local_metadata, metadata_buffer)
+        local_metadata_bytes = metadata_buffer.getvalue()
+        local_metadata_size = len(local_metadata_bytes)
+        local_buffer_size = buffer.numel()
+        
+        logger.info(
+            f"Gemini Replicas rank {rank}: Local buffer size: {local_buffer_size / (1024**2):.2f} MB, "
+            f"metadata size: {local_metadata_size / 1024:.2f} KB"
+        )
+        
+        # Check if C++ native module is available
+        if self._gemini_replicas_native is not None:
+            # Use C++ ASIO-based broadcast (optimized path)
+            logger.info(f"Gemini Replicas rank {rank}: Using C++ ASIO-based broadcast with metadata exchange")
+            
+            try:                
+                # Get raw memory address and size from buffer
+                send_buffer_addr = buffer.data_ptr()
+                send_buffer_size = buffer.numel()
+                
+                # ===== Step 1: Exchange metadata (buffer sizes) via torch.distributed =====
+                from .gemini_replicas_manager import GeminiReplicasManager
+                manager = GeminiReplicasManager()
+                world_size = torch.distributed.get_world_size()
+                
+                # Calculate source ranks (ranks that have this rank as target)
+                source_ranks = []
+                for src_rank in range(world_size):
+                    if src_rank == rank:
+                        continue
+                    src_targets = manager._calculate_target_ranks(src_rank, world_size)
+                    if rank in src_targets:
+                        source_ranks.append(src_rank)
+                
+                logger.info(f"Gemini Replicas rank {rank}: Will receive from {len(source_ranks)} source ranks: {source_ranks}")
+                
+                # Exchange buffer sizes using all_gather with gloo backend (for CPU tensors)
+                logger.info(f"Gemini Replicas rank {rank}: Exchanging buffer sizes via torch.distributed.all_gather...")
+                
+                # Create or get global gloo group for CPU tensor communication
+                from ..strategies.async_utils import get_or_create_global_gloo_group
+                global_gloo_group = get_or_create_global_gloo_group()
+                
+                size_tensor = torch.tensor([send_buffer_size], dtype=torch.long, device='cpu')
+                all_sizes = [torch.zeros_like(size_tensor) for _ in range(world_size)]
+                torch.distributed.all_gather(all_sizes, size_tensor, group=global_gloo_group)
+                
+                # Extract sizes for all ranks
+                rank_sizes = {r: all_sizes[r][0].item() for r in range(world_size)}
+                logger.info(f"Gemini Replicas rank {rank}: All rank buffer sizes: {rank_sizes}")
+                
+                # ===== Step 2: Pre-allocate receive buffers based on source rank sizes =====
+                logger.info(f"Gemini Replicas rank {rank}: Pre-allocating receive buffers...")
+                receive_buffers = []
+                receive_buffer_addrs = []
+                
+                for src_rank in source_ranks:
+                    src_buffer_size = rank_sizes[src_rank]
+                    # Allocate buffer with exact size
+                    recv_buffer = torch.empty(src_buffer_size, dtype=torch.uint8)
+                    if torch.cuda.is_available():
+                        recv_buffer = recv_buffer.pin_memory()
+                    
+                    receive_buffers.append(recv_buffer)
+                    receive_buffer_addrs.append((recv_buffer.data_ptr(), recv_buffer.numel()))
+                    
+                    logger.info(
+                        f"Gemini Replicas rank {rank}: Allocated {src_buffer_size / (1024**2):.2f} MB "
+                        f"receive buffer for source rank {src_rank}"
+                    )
+                
+                # ===== Step 3: Synchronize all ranks before starting C++ data transfer =====
+                logger.info(f"Gemini Replicas rank {rank}: Synchronizing before C++ data transfer...")
+                torch.distributed.barrier()
+                
+                # ===== Step 4: Submit buffers to C++ and let it handle concurrent send/receive =====
+                logger.info(f"Gemini Replicas rank {rank}: Submitting buffers to C++ for send/receive...")
+                
+                # Submit send buffer to C++
+                logger.info(f"Gemini Replicas rank {rank}: Submitting send buffer ({send_buffer_size / (1024**2):.2f} MB)...")
+                self._gemini_replicas_native.submit_send_buffer(send_buffer_addr, send_buffer_size)
+                
+                # Submit receive buffers to C++ for each source rank
+                for i, (src_rank, (recv_addr, recv_size)) in enumerate(zip(source_ranks, receive_buffer_addrs)):
+                    logger.info(
+                        f"Gemini Replicas rank {rank}: Submitting receive buffer for source rank {src_rank} "
+                        f"({recv_size / (1024**2):.2f} MB, {i+1}/{len(source_ranks)})..."
+                    )
+                    self._gemini_replicas_native.submit_recv_buffer(src_rank, recv_addr, recv_size)
+                
+                # Start concurrent send/receive in C++ (blocking until all operations complete)
+                logger.info(f"Gemini Replicas rank {rank}: Starting C++ send/receive operations...")
+                exchange_start = time()
+                
+                self._gemini_replicas_native.execute_exchange()
+                
+                exchange_time = time() - exchange_start
+                
+                logger.info(
+                    f"Gemini Replicas rank {rank}: C++ send/receive completed in {exchange_time:.2f}s "
+                    f"(sent {send_buffer_size / (1024**2):.2f} MB, received from {len(source_ranks)} sources)"
+                )
+                
+                broadcast_time = time() - broadcast_start
+                broadcast_bandwidth = ((send_buffer_size * (self.gemini_replicas_num - 1)) / (1024**3)) / broadcast_time if broadcast_time > 0 else 0
+                
+                logger.info(
+                    f"Gemini Replicas rank {rank}: C++ ASIO broadcast completed in {broadcast_time:.4f}s, "
+                    f"sent: {send_buffer_size / (1024**2):.2f} MB to {self.gemini_replicas_num - 1} ranks, "
+                    f"received: {len(receive_buffers)} buffers, "
+                    f"total bandwidth: {broadcast_bandwidth:.2f} GB/s"
+                )
+                
+                # ===== Step 5: Synchronize all ranks after completing data transfer =====
+                logger.info(f"Gemini Replicas rank {rank}: Synchronizing after C++ data transfer...")
+                torch.distributed.barrier()
+                sync_time = time() - exchange_start
+                logger.info(f"Gemini Replicas rank {rank}: Synchronization completed in {sync_time:.4f}s")
+                
+            except Exception as e:
+                logger.error(f"Gemini Replicas rank {rank}: C++ ASIO broadcast failed: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+            
+        else:
+            # Fallback: not implemented (would need torch.distributed broadcast)
+            logger.warning(f"Gemini Replicas rank {rank}: C++ module not available, skipping broadcast")
+        
+        total_time = time() - start_time
+        logger.info(
+            f"Gemini Replicas rank {rank}: Total time: {total_time:.4f}s "
+            f"(preload: {preload_time:.4f}s, broadcast: {broadcast_time:.4f}s)"
+        )
+        
+        # Prepare write buckets: local bucket + replica buckets (for received data)
+        result_buckets = []
+        
+        # Local bucket (my own data)
+        local_file_path = write_buckets[0][0] if write_buckets else 'gemini_replicas_optimized.distcp'
+        local_bucket = (
+            local_file_path,
+            'gemini_replicas_optimized_local',
+            (
+                [('gemini_replicas_metadata', local_metadata), ('gemini_replicas_buffer', buffer)],
+                []
+            )
+        )
+        result_buckets.append(local_bucket)
+        
+        # Replica buckets (received data from source ranks) - similar to gemini naming
+        # File naming: original_file_replica{source_rank}_rank{my_rank}.distcp
+        if self._gemini_replicas_native is not None and len(receive_buffers) > 0:
+            import os
+            
+            # Extract directory and base filename
+            file_dir = os.path.dirname(str(local_file_path))
+            base_name = os.path.basename(str(local_file_path))
+            base_name_no_ext, ext = os.path.splitext(base_name)
+            
+            # Create metadata for each received buffer
+            # Note: We don't have the original metadata from source ranks, 
+            # so we create a simple metadata structure
+            for i, (src_rank, recv_buffer) in enumerate(zip(source_ranks, receive_buffers)):
+                # Generate replica file name: base_name_replica{src_rank}_rank{my_rank}.ext
+                replica_file_name = f"{base_name_no_ext}_replica{src_rank}_rank{rank}{ext}"
+                if file_dir:
+                    replica_file_path = os.path.join(file_dir, replica_file_name)
+                else:
+                    replica_file_path = replica_file_name
+                
+                # Create simple metadata for replica
+                replica_metadata = {
+                    'source_rank': src_rank,
+                    'target_rank': rank,
+                    'buffer_size': recv_buffer.numel(),
+                }
+                
+                # Create replica bucket with received data
+                replica_bucket = (
+                    replica_file_path,
+                    f'gemini_replicas_replica_from_{src_rank}',
+                    (
+                        [('gemini_replicas_metadata', replica_metadata), ('gemini_replicas_buffer', recv_buffer)],
+                        []
+                    )
+                )
+                result_buckets.append(replica_bucket)
+                
+                logger.info(
+                    f"Gemini Replicas rank {rank}: Prepared replica bucket {i+1}/{len(receive_buffers)} "
+                    f"from source rank {src_rank}, file: {replica_file_path}, "
+                    f"size: {recv_buffer.numel() / (1024**2):.2f} MB"
+                )
+        
+        logger.info(
+            f"Gemini Replicas rank {rank}: Returning {len(result_buckets)} buckets "
+            f"(1 local + {len(result_buckets) - 1} replicas)"
+        )
+        
+        # Update self.write_buckets so retrieve_write_results() can check the correct count
+        # This is consistent with ECLATIN and EC-CHECK modes
+        self.write_buckets = result_buckets
+        
+        return result_buckets
 
     @staticmethod
     def preload_tensors_layerwise_cpp(write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
@@ -1378,6 +1749,18 @@ class FileSystemWriterAsync(FileSystemWriter):
                     elif key == 'eclatin_continuous_buffer':
                         eclatin_continuous_buffer = value
             
+            # Check if this is Gemini Replicas mode by detecting special markers in bytes_data
+            gemini_replicas_metadata = None
+            gemini_replicas_buffer = None
+            if len(bytes_data) > 0 and bytes_data[0][0] == 'gemini_replicas_metadata':
+                # Gemini Replicas mode detected
+                logger.info(f"Gemini Replicas: Process {local_proc_idx} detected Gemini Replicas mode")
+                for key, value in bytes_data:
+                    if key == 'gemini_replicas_metadata':
+                        gemini_replicas_metadata = value
+                    elif key == 'gemini_replicas_buffer':
+                        gemini_replicas_buffer = value
+            
             # ECLATIN mode: save three components to ONE file (similar to ECCHECK)
             if eclatin_metadata is not None:
                 if use_msc:
@@ -1642,6 +2025,88 @@ class FileSystemWriterAsync(FileSystemWriter):
                     f"    Component 1: {non_tensor_size / 1024:.2f} KB ({comp1_time:.4f}s)\n"
                     f"    Component 2: {tensor_keys_size / 1024:.2f} KB ({comp2_time:.4f}s)\n"
                     f"    Component 3: {component3_size / (1024**3):.2f} GB ({component3_time:.2f}s)"
+                )
+                
+                # Create dummy results for compatibility
+                local_results = []
+            
+            # Gemini Replicas mode: save metadata and buffer to ONE file
+            elif gemini_replicas_metadata is not None:
+                if use_msc:
+                    import multistorageclient as msc
+                    open_file = msc.open
+                else:
+                    open_file = open
+                
+                write_start = time()
+                logger.info("Gemini Replicas: Saving metadata and buffer to single file...")
+                
+                # Get file path (file_name is the full path)
+                gemini_file_path = str(file_name)
+                
+                # Serialize metadata
+                import pickle
+                metadata_bytes = pickle.dumps(gemini_replicas_metadata)
+                metadata_size = len(metadata_bytes)
+                
+                # Prepare header: [metadata_size (8 bytes)]
+                import struct
+                header = struct.pack('<Q', metadata_size)
+                
+                # Write metadata and buffer to one file
+                with open_file(gemini_file_path, "wb") as f:
+                    # Write header
+                    f.write(header)
+                    logger.debug(f"Gemini Replicas: Wrote header (8 bytes)")
+                    
+                    # Write metadata
+                    metadata_start = time()
+                    f.write(metadata_bytes)
+                    metadata_time = time() - metadata_start
+                    logger.debug(f"Gemini Replicas: Wrote metadata ({metadata_size / 1024:.2f} KB) in {metadata_time:.4f}s")
+                    
+                    # Write buffer data
+                    buffer_start = time()
+                    buffer_size = 0
+                    
+                    if gemini_replicas_buffer is not None:
+                        import numpy as np
+                        np_array = gemini_replicas_buffer.numpy()  # Zero-copy view
+                        mv = memoryview(np_array)
+                        
+                        # Write buffer data
+                        f.write(mv)
+                        buffer_size = mv.nbytes
+                        
+                        buffer_time = time() - buffer_start
+                        bandwidth = (buffer_size / (1024**3)) / buffer_time if buffer_time > 0 else 0
+                        logger.info(
+                            f"Gemini Replicas: Wrote buffer ({buffer_size / (1024**3):.2f} GB) "
+                            f"in {buffer_time:.2f}s ({bandwidth:.2f} GB/s)"
+                        )
+                    else:
+                        logger.warning("Gemini Replicas: Buffer is None, skipping buffer write")
+                    
+                    # Flush to disk
+                    if use_fsync:
+                        if use_msc:
+                            f.fsync()
+                        else:
+                            os.fsync(f.fileno())
+                
+                total_size = len(header) + metadata_size + buffer_size
+                total_write_time = time() - write_start
+                overall_bandwidth = (total_size / (1024**3)) / total_write_time if total_write_time > 0 else 0
+                
+                logger.info(
+                    f"Gemini Replicas: Saved all components in {total_write_time:.2f}s:\n"
+                    f"  File: {gemini_file_path}\n"
+                    f"  Total size: {total_size / (1024**3):.2f} GB\n"
+                    f"  Overall bandwidth: {overall_bandwidth:.2f} GB/s\n"
+                    f"  Breakdown:\n"
+                    f"    Header: 8 bytes\n"
+                    f"    Metadata: {metadata_size / 1024:.2f} KB ({metadata_time:.4f}s)\n"
+                    f"    Buffer: {buffer_size / (1024**3):.2f} GB ({buffer_time:.2f}s)"
                 )
                 
                 # Create dummy results for compatibility

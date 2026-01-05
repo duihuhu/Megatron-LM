@@ -2269,6 +2269,25 @@ def _add_checkpointing_args(parser):
                             'This eliminates serialization/deserialization overhead and improves checkpoint exchange performance. '
                             'When enabled, tensors are copied directly to a continuous CPU buffer during preload phase, '
                             'avoiding expensive pickle serialization in torch.save.')
+    
+    # Gemini Replicas checkpointing arguments (multi-replica with round-robin placement)
+    group.add_argument('--use-gemini-replicas', action='store_true',
+                       help='Enable Gemini Replicas checkpointing for multi-replica fault tolerance. '
+                            'Uses round-robin placement strategy to distribute replicas across ranks. '
+                            'For example, with 3 replicas and 4 ranks: rank0 -> [0,1,2], rank1 -> [1,2,3], '
+                            'rank2 -> [2,3,0], rank3 -> [3,0,1]. This provides better fault tolerance than '
+                            'standard Gemini (2 replicas) at the cost of more storage overhead.')
+    group.add_argument('--use-gemini-replicas-optimized', action='store_true',
+                       help='Enable optimized Gemini Replicas checkpointing without torch.save serialization overhead. '
+                            'Similar to --use-gemini-optimized but supports multiple replicas (configurable via '
+                            '--gemini-replicas-num). Uses continuous buffer approach and ASIO-based network '
+                            'communication for efficient multi-target broadcast. When enabled, data is sent to '
+                            'multiple target ranks simultaneously using asynchronous I/O.')
+    group.add_argument('--gemini-replicas-num', type=int, default=3,
+                       help='Number of replicas for Gemini Replicas checkpointing (including local copy). '
+                            'Default: 3. Must be <= world_size. Higher values provide better fault tolerance '
+                            'but require more storage space. For example, with num_replicas=3 and 4 ranks, '
+                            'each rank stores 3 copies of its data (local + 2 remote).')
     return parser
 
 

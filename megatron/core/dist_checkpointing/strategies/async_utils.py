@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # Module-level cache for pair process groups
 _pair_process_groups_cache: Dict[int, torch.distributed.ProcessGroup] = {}
 _gloo_backend_initialized: bool = False
+_global_gloo_group: Optional[torch.distributed.ProcessGroup] = None
 
 
 def _ensure_gloo_backend_available() -> None:
@@ -44,6 +45,52 @@ def _ensure_gloo_backend_available() -> None:
         _gloo_backend_initialized = True
     except Exception as e:
         logger.warning(f"Could not verify gloo backend availability: {e}")
+
+
+def get_or_create_global_gloo_group() -> torch.distributed.ProcessGroup:
+    """Get or create a global gloo process group for CPU tensor communication.
+    
+    When the default process group uses NCCL backend (for GPU), we need a separate
+    gloo process group to handle CPU tensor operations like all_gather.
+    
+    Returns:
+        ProcessGroup for global gloo communication
+    """
+    global _global_gloo_group
+    
+    if _global_gloo_group is not None:
+        return _global_gloo_group
+    
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("torch.distributed is not initialized")
+    
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    
+    # Ensure gloo backend is available
+    _ensure_gloo_backend_available()
+    
+    # Check if default backend is gloo
+    current_backend = torch.distributed.get_backend()
+    if current_backend == 'gloo':
+        # Default group already uses gloo, just return it
+        _global_gloo_group = torch.distributed.group.WORLD
+        logger.info(f"rank: {rank}, using default gloo group")
+        return _global_gloo_group
+    
+    # Need to create a new gloo group with all ranks
+    logger.info(f"rank: {rank}, creating global gloo group with all {world_size} ranks")
+    
+    try:
+        # ALL ranks must call this
+        all_ranks = list(range(world_size))
+        _global_gloo_group = torch.distributed.new_group(ranks=all_ranks, backend='gloo')
+        logger.info(f"rank: {rank}, successfully created global gloo group")
+    except Exception as e:
+        logger.error(f"rank: {rank}, failed to create global gloo group: {e}", exc_info=True)
+        raise
+    
+    return _global_gloo_group
 
 
 def _create_all_pair_process_groups() -> None:

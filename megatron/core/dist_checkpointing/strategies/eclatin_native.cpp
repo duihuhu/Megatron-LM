@@ -2,6 +2,10 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include <boost/asio.hpp>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -827,6 +831,31 @@ struct RecvXorTask {
     size_t size{0};
 };
 
+struct TensorTransferInfo {
+    uintptr_t gpu_data_ptr{0};
+    size_t cpu_offset{0};
+    size_t size_bytes{0};
+    std::vector<int64_t> shape;
+    std::string name;
+};
+
+struct LayerWiseTask {
+    int layer_id{0};
+    std::vector<TensorTransferInfo> gpu_tensors;
+    uintptr_t cpu_buffer_addr{0};  // Direct send from this address, no data buffer needed
+    size_t aligned_layer_size{0};  // Aligned size for network transmission
+    size_t actual_layer_size{0};   // Actual data size for writing to data_block
+    uintptr_t data_block_1_addr{0};
+    uintptr_t data_block_2_addr{0};
+    uintptr_t parity_block_1_addr{0};
+    uintptr_t parity_block_2_addr{0};
+    // Recv buffer addresses (from continuous buffer pool allocated in strategy)
+    uintptr_t recv1_parity1_addr{0};
+    uintptr_t recv2_parity1_addr{0};
+    uintptr_t recv1_parity2_addr{0};
+    uintptr_t recv2_parity2_addr{0};
+};
+
 class ECLATINNative {
 public:
     ECLATINNative(const std::string& parity1_send1_ip, uint16_t parity1_send1_port,
@@ -1129,12 +1158,14 @@ public:
         parity2_send1_cv_.notify_all();
         parity2_send2_cv_.notify_all();
         parity2_recv_xor_cv_.notify_all();
+        layerwise_cv_.notify_all();
         if (parity1_recv_xor_thread_.joinable()) parity1_recv_xor_thread_.join();
         if (parity1_send1_thread_.joinable()) parity1_send1_thread_.join();
         if (parity1_send2_thread_.joinable()) parity1_send2_thread_.join();
         if (parity2_recv_xor_thread_.joinable()) parity2_recv_xor_thread_.join();
         if (parity2_send1_thread_.joinable()) parity2_send1_thread_.join();
         if (parity2_send2_thread_.joinable()) parity2_send2_thread_.join();
+        if (layerwise_worker_thread_.joinable()) layerwise_worker_thread_.join();
         conn_.cleanup();
     }
 
@@ -1518,6 +1549,72 @@ public:
         std::cout << "ECLATIN: Both blocks sent successfully" << std::endl;
     }
 
+    // Layer-wise processing functions
+    void submit_layer_wise(
+        int layer_id,
+        pybind11::list gpu_tensors_info,
+        uintptr_t cpu_buffer_addr,
+        size_t aligned_layer_size,
+        size_t actual_layer_size,
+        uintptr_t data_block_1_base,
+        uintptr_t data_block_2_base,
+        uintptr_t parity_block_1_base,
+        uintptr_t parity_block_2_base,
+        size_t data_block_1_offset,
+        size_t data_block_2_offset,
+        size_t parity_block_1_offset,
+        size_t parity_block_2_offset,
+        uintptr_t recv1_parity1_addr,
+        uintptr_t recv2_parity1_addr,
+        uintptr_t recv1_parity2_addr,
+        uintptr_t recv2_parity2_addr
+    ) {
+        LayerWiseTask task;
+        task.layer_id = layer_id;
+        task.cpu_buffer_addr = cpu_buffer_addr;
+        task.aligned_layer_size = aligned_layer_size;
+        task.actual_layer_size = actual_layer_size;
+        task.data_block_1_addr = data_block_1_base + data_block_1_offset;
+        task.data_block_2_addr = data_block_2_base + data_block_2_offset;
+        task.parity_block_1_addr = parity_block_1_base + parity_block_1_offset;
+        task.parity_block_2_addr = parity_block_2_base + parity_block_2_offset;
+        task.recv1_parity1_addr = recv1_parity1_addr;
+        task.recv2_parity1_addr = recv2_parity1_addr;
+        task.recv1_parity2_addr = recv1_parity2_addr;
+        task.recv2_parity2_addr = recv2_parity2_addr;
+        
+        // Parse GPU tensor info
+        for (auto item : gpu_tensors_info) {
+            pybind11::tuple tensor_tuple = item.cast<pybind11::tuple>();
+            if (tensor_tuple.size() != 5) {
+                throw std::runtime_error("Each tensor info must be (gpu_ptr, cpu_offset, size, shape, name)");
+            }
+            
+            TensorTransferInfo info;
+            info.gpu_data_ptr = tensor_tuple[0].cast<uintptr_t>();
+            info.cpu_offset = tensor_tuple[1].cast<size_t>();
+            info.size_bytes = tensor_tuple[2].cast<size_t>();
+            info.shape = tensor_tuple[3].cast<std::vector<int64_t>>();
+            info.name = tensor_tuple[4].cast<std::string>();
+            task.gpu_tensors.push_back(info);
+        }
+        
+        // Add to queue
+        {
+            std::lock_guard<std::mutex> lock(layerwise_mutex_);
+            layerwise_queue_.push(task);
+            layers_submitted_++;
+        }
+        layerwise_cv_.notify_one();
+    }
+    
+    void wait_all_layers_complete() {
+        std::unique_lock<std::mutex> lock(completion_mutex_);
+        completion_cv_.wait(lock, [this] {
+            return layers_completed_ >= layers_submitted_ && layerwise_queue_.empty();
+        });
+    }
+
 private:
     std::atomic<bool> stop_;
 
@@ -1626,6 +1723,16 @@ private:
     std::thread parity2_send2_thread_;
     std::thread parity2_recv_xor_thread_;
     
+    // Layer-wise processing
+    std::queue<LayerWiseTask> layerwise_queue_;
+    std::mutex layerwise_mutex_;
+    std::condition_variable layerwise_cv_;
+    std::thread layerwise_worker_thread_;
+    std::atomic<int> layers_submitted_{0};
+    std::atomic<int> layers_completed_{0};
+    std::mutex completion_mutex_;
+    std::condition_variable completion_cv_;
+    
     // Load mode flags
     std::atomic<bool> is_load_mode_{false};
     int failed_rank_{-1};
@@ -1638,6 +1745,7 @@ private:
         parity2_send1_thread_ = std::thread(&ECLATINNative::parity2_send1_worker, this);
         parity2_send2_thread_ = std::thread(&ECLATINNative::parity2_send2_worker, this);
         parity2_recv_xor_thread_ = std::thread(&ECLATINNative::parity2_recv_xor_worker, this);
+        layerwise_worker_thread_ = std::thread(&ECLATINNative::layerwise_worker, this);
         std::cout << "ECLATIN: All worker threads started" << std::endl;
     }
 
@@ -2419,6 +2527,263 @@ private:
         stats["xor_avg_ms"] = xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0;
         return stats;
     }
+    
+    void layerwise_worker() {
+        std::cout << "ECLATIN: LayerWise worker started" << std::endl;
+        while (!stop_) {
+            LayerWiseTask task;
+            {
+                std::unique_lock<std::mutex> lk(layerwise_mutex_);
+                layerwise_cv_.wait(lk, [this] { return stop_ || !layerwise_queue_.empty(); });
+                if (stop_) break;
+                task = layerwise_queue_.front();
+                layerwise_queue_.pop();
+            }
+            
+            std::cout << "ECLATIN: Processing layer " << task.layer_id 
+                      << " (actual_size=" << task.actual_layer_size 
+                      << ", aligned_size=" << task.aligned_layer_size << ")" << std::endl;
+            
+            // Validate base addresses before processing
+            if (task.cpu_buffer_addr == 0) {
+                std::cerr << "ECLATIN: ERROR: cpu_buffer_addr is 0 for layer " << task.layer_id << std::endl;
+                {
+                    std::lock_guard<std::mutex> lock(completion_mutex_);
+                    layers_completed_++;
+                }
+                completion_cv_.notify_all();
+                continue;
+            }
+            if (task.data_block_1_addr == 0 || task.data_block_2_addr == 0) {
+                std::cerr << "ECLATIN: ERROR: data_block address is 0 for layer " << task.layer_id << std::endl;
+                {
+                    std::lock_guard<std::mutex> lock(completion_mutex_);
+                    layers_completed_++;
+                }
+                completion_cv_.notify_all();
+                continue;
+            }
+            
+            // Step 1: D2H transfer (CUDA mode only - ECLATIN layerwise requires CUDA)
+            #ifdef USE_CUDA
+            for (const auto& tensor_info : task.gpu_tensors) {
+                uintptr_t gpu_ptr = tensor_info.gpu_data_ptr;
+                uintptr_t cpu_ptr = task.cpu_buffer_addr + tensor_info.cpu_offset;
+                size_t size = tensor_info.size_bytes;
+                
+                if (gpu_ptr == 0 || cpu_ptr == 0 || size == 0) {
+                    std::cerr << "ECLATIN: ERROR: Invalid tensor info for layer " << task.layer_id 
+                              << " (gpu_ptr=" << gpu_ptr << ", cpu_ptr=" << cpu_ptr 
+                              << ", size=" << size << ")" << std::endl;
+                    throw std::runtime_error("Invalid tensor info for D2H transfer");
+                }
+                
+                cudaError_t err = cudaMemcpy(
+                    reinterpret_cast<void*>(cpu_ptr), 
+                    reinterpret_cast<void*>(gpu_ptr), 
+                    size, 
+                    cudaMemcpyDeviceToHost
+                );
+                
+                if (err != cudaSuccess) {
+                    std::cerr << "ECLATIN: ERROR: cudaMemcpy failed for layer " << task.layer_id 
+                              << ": " << cudaGetErrorString(err) << std::endl;
+                    throw std::runtime_error(
+                        std::string("CUDA memcpy failed: ") + cudaGetErrorString(err)
+                    );
+                }
+            }
+            cudaError_t sync_err = cudaDeviceSynchronize();
+            if (sync_err != cudaSuccess) {
+                std::cerr << "ECLATIN: ERROR: cudaDeviceSynchronize failed for layer " << task.layer_id 
+                          << ": " << cudaGetErrorString(sync_err) << std::endl;
+                throw std::runtime_error(
+                    std::string("CUDA synchronize failed: ") + cudaGetErrorString(sync_err)
+                );
+            }
+            #else
+            // ECLATIN layerwise requires CUDA - this should not be reached
+            throw std::runtime_error(
+                "ECLATIN layerwise requires CUDA support. Please compile with USE_CUDA defined."
+            );
+            #endif
+            
+            // Step 2: Data splitting - write to data blocks (only actual data, no padding)
+            size_t half_actual = task.actual_layer_size / 2;
+            uintptr_t cpu_data = task.cpu_buffer_addr;
+            
+            // Write first half to data_block_1
+            if (half_actual > 0) {
+                std::memcpy(reinterpret_cast<void*>(task.data_block_1_addr),
+                           reinterpret_cast<void*>(cpu_data),
+                           half_actual);
+            }
+            
+            // Write second half to data_block_2
+            size_t second_half_actual = task.actual_layer_size - half_actual;
+            if (second_half_actual > 0) {
+                std::memcpy(reinterpret_cast<void*>(task.data_block_2_addr),
+                           reinterpret_cast<void*>(cpu_data + half_actual),
+                           second_half_actual);
+            }
+            
+            // Step 3: Submit to network pipelines (directly from layer_cpu_buffer, no data buffer copy)
+            // All ranks use the same aligned_layer_size, so half_aligned is consistent across ranks
+            size_t half_aligned = task.aligned_layer_size / 2;
+            
+            // Directly send from layer_cpu_buffer (no need to copy to data buffer)
+            // First half: send to parity1_send1 and parity2_send1
+            submit_parity1_send1(task.cpu_buffer_addr, half_aligned);
+            submit_parity2_send1(task.cpu_buffer_addr, half_aligned);
+            
+            // Second half: send to parity1_send2 and parity2_send2
+            submit_parity1_send2(task.cpu_buffer_addr + half_aligned, half_aligned);
+            submit_parity2_send2(task.cpu_buffer_addr + half_aligned, half_aligned);
+            
+            // Submit recv_xor tasks (recv buffers are from continuous buffer pool with offset)
+            submit_parity1_recv_xor(task.recv1_parity1_addr, task.recv2_parity1_addr, 
+                                   task.parity_block_1_addr, half_aligned);
+            submit_parity2_recv_xor(task.recv1_parity2_addr, task.recv2_parity2_addr, 
+                                   task.parity_block_2_addr, half_aligned);
+            
+            // Step 6: Update completion count
+            {
+                std::lock_guard<std::mutex> lock(completion_mutex_);
+                layers_completed_++;
+            }
+            completion_cv_.notify_all();
+            
+            std::cout << "ECLATIN: Layer " << task.layer_id << " processing completed" << std::endl;
+        }
+        std::cout << "ECLATIN: LayerWise worker stopped" << std::endl;
+    }
+    
+    void reset_time_statistics() {
+        total_encoding_time_ms_ = 0.0;
+        total_send_time_ms_ = 0.0;
+        total_recv_time_ms_ = 0.0;
+        total_xor_time_ms_ = 0.0;
+        encoding_count_ = 0;
+        send_count_ = 0;
+        recv_count_ = 0;
+        xor_count_ = 0;
+        
+        // Reset per-worker time statistics
+        parity1_send1_total_time_ms_ = 0.0;
+        parity1_send2_total_time_ms_ = 0.0;
+        parity1_recv_xor_total_time_ms_ = 0.0;
+        parity2_send1_total_time_ms_ = 0.0;
+        parity2_send2_total_time_ms_ = 0.0;
+        parity2_recv_xor_total_time_ms_ = 0.0;
+        
+        parity1_send1_ops_time_ms_ = 0.0;
+        parity1_send2_ops_time_ms_ = 0.0;
+        parity1_recv_xor_recv_time_ms_ = 0.0;
+        parity1_recv_xor_xor_time_ms_ = 0.0;
+        parity2_send1_ops_time_ms_ = 0.0;
+        parity2_send2_ops_time_ms_ = 0.0;
+        parity2_recv_xor_recv_time_ms_ = 0.0;
+        parity2_recv_xor_xor_time_ms_ = 0.0;
+        
+        pipeline_timing_started_ = false;
+        std::cout << "ECLATIN: Reset time statistics" << std::endl;
+    }
+    
+    void print_time_statistics(double pipeline_wall_time_ms = 0.0) {
+        std::cout << "ECLATIN: Time Statistics:" << std::endl;
+        
+        // Find the bottleneck worker (the slowest one)
+        struct WorkerTime {
+            std::string name;
+            double total_time_ms;
+            double ops_time_ms;
+            std::string ops_type;
+        };
+        
+        std::vector<WorkerTime> worker_times;
+        worker_times.push_back({"parity1_send1", parity1_send1_total_time_ms_.load(), 
+                                parity1_send1_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity1_send2", parity1_send2_total_time_ms_.load(), 
+                                parity1_send2_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity1_recv_xor", parity1_recv_xor_total_time_ms_.load(), 
+                                parity1_recv_xor_recv_time_ms_.load() + parity1_recv_xor_xor_time_ms_.load(), "recv+xor"});
+        worker_times.push_back({"parity2_send1", parity2_send1_total_time_ms_.load(), 
+                                parity2_send1_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity2_send2", parity2_send2_total_time_ms_.load(), 
+                                parity2_send2_ops_time_ms_.load(), "send"});
+        worker_times.push_back({"parity2_recv_xor", parity2_recv_xor_total_time_ms_.load(), 
+                                parity2_recv_xor_recv_time_ms_.load() + parity2_recv_xor_xor_time_ms_.load(), "recv+xor"});
+        
+        WorkerTime* bottleneck = nullptr;
+        double max_time = 0.0;
+        for (auto& wt : worker_times) {
+            if (wt.total_time_ms > max_time) {
+                max_time = wt.total_time_ms;
+                bottleneck = &wt;
+            }
+        }
+        
+        // Display bottleneck worker information
+        if (bottleneck && max_time > 0.0) {
+            std::cout << "  Bottleneck Worker: " << bottleneck->name 
+                      << " (wall-clock time=" << max_time << " ms, " << (max_time / 1000.0) << " s)" << std::endl;
+            
+            // Calculate task count for this worker
+            int task_count = 0;
+            if (bottleneck->name == "parity1_send1" || bottleneck->name == "parity1_send2" ||
+                bottleneck->name == "parity2_send1" || bottleneck->name == "parity2_send2") {
+                // For send workers, we can estimate task count from accumulated time vs avg time
+                // But we don't have per-worker count, so we'll just show the accumulated ops time
+                std::cout << "    Accumulated Operations (" << bottleneck->ops_type << "): " 
+                          << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+                if (bottleneck->ops_time_ms > max_time) {
+                    std::cout << "    Note: Accumulated time > wall-clock time indicates operations may include overhead" << std::endl;
+                }
+            } else if (bottleneck->name.find("recv_xor") != std::string::npos) {
+                if (bottleneck->name == "parity1_recv_xor") {
+                    std::cout << "    Accumulated Operations (recv+xor): " << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+                    std::cout << "      Recv (accumulated): " << parity1_recv_xor_recv_time_ms_.load() << " ms" << std::endl;
+                    std::cout << "      XOR (accumulated): " << parity1_recv_xor_xor_time_ms_.load() << " ms" << std::endl;
+                } else {
+                    std::cout << "    Accumulated Operations (recv+xor): " << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+                    std::cout << "      Recv (accumulated): " << parity2_recv_xor_recv_time_ms_.load() << " ms" << std::endl;
+                    std::cout << "      XOR (accumulated): " << parity2_recv_xor_xor_time_ms_.load() << " ms" << std::endl;
+                }
+                if (bottleneck->ops_time_ms > max_time) {
+                    std::cout << "    Note: Accumulated time > wall-clock time indicates operations may include overhead" << std::endl;
+                }
+            }
+        }
+        
+        if (pipeline_wall_time_ms > 0.0) {
+            std::cout << "  Pipeline Wall-Clock Time: " << pipeline_wall_time_ms << " ms (" 
+                      << (pipeline_wall_time_ms / 1000.0) << " s)" << std::endl;
+        }
+        
+        std::cout << "  Send (accumulated): total=" << total_send_time_ms_.load() << " ms, "
+                  << "count=" << send_count_.load() << ", "
+                  << "avg=" << (send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0) << " ms" << std::endl;
+        std::cout << "  Recv (accumulated): total=" << total_recv_time_ms_.load() << " ms, "
+                  << "count=" << recv_count_.load() << ", "
+                  << "avg=" << (recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0) << " ms" << std::endl;
+        std::cout << "  XOR (accumulated): total=" << total_xor_time_ms_.load() << " ms, "
+                  << "count=" << xor_count_.load() << ", "
+                  << "avg=" << (xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0) << " ms" << std::endl;
+    }
+    
+    std::map<std::string, double> get_time_statistics() {
+        std::map<std::string, double> stats;
+        stats["send_total_ms"] = total_send_time_ms_.load();
+        stats["send_count"] = static_cast<double>(send_count_.load());
+        stats["send_avg_ms"] = send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0;
+        stats["recv_total_ms"] = total_recv_time_ms_.load();
+        stats["recv_count"] = static_cast<double>(recv_count_.load());
+        stats["recv_avg_ms"] = recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0;
+        stats["xor_total_ms"] = total_xor_time_ms_.load();
+        stats["xor_count"] = static_cast<double>(xor_count_.load());
+        stats["xor_avg_ms"] = xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0;
+        return stats;
+    }
 };
 
 }  // namespace
@@ -2462,6 +2827,28 @@ PYBIND11_MODULE(eclatin_native, m) {
         .def("get_recv_buffers_to_release", &ECLATINNative::get_recv_buffers_to_release)
         .def("reset_encoding_completion_flags", &ECLATINNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECLATINNative::wait_for_encoding_completion)
+        // Layer-wise processing functions
+        .def("submit_layer_wise", &ECLATINNative::submit_layer_wise,
+             "Submit a layer for layer-wise processing",
+             pybind11::arg("layer_id"),
+             pybind11::arg("gpu_tensors_info"),
+             pybind11::arg("cpu_buffer_addr"),
+             pybind11::arg("aligned_layer_size"),
+             pybind11::arg("actual_layer_size"),
+             pybind11::arg("data_block_1_base"),
+             pybind11::arg("data_block_2_base"),
+             pybind11::arg("parity_block_1_base"),
+             pybind11::arg("parity_block_2_base"),
+             pybind11::arg("data_block_1_offset"),
+             pybind11::arg("data_block_2_offset"),
+             pybind11::arg("parity_block_1_offset"),
+             pybind11::arg("parity_block_2_offset"),
+             pybind11::arg("recv1_parity1_addr"),
+             pybind11::arg("recv2_parity1_addr"),
+             pybind11::arg("recv1_parity2_addr"),
+             pybind11::arg("recv2_parity2_addr"))
+        .def("wait_all_layers_complete", &ECLATINNative::wait_all_layers_complete,
+             "Wait for all layer-wise tasks to complete")
         // Parity 1 sentinels
         .def("submit_parity1_send1_sentinel", &ECLATINNative::submit_parity1_send1_sentinel)
         .def("submit_parity1_send2_sentinel", &ECLATINNative::submit_parity1_send2_sentinel)

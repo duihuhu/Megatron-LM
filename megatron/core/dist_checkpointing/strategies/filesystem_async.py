@@ -147,6 +147,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         eccheck_native: Optional[Any] = None,  # Pre-initialized C++ module
         eccheck_buffers: Optional[Dict] = None,  # Pre-allocated buffers
         use_eclatin: bool = False,
+        use_eclatin_layerwise: bool = False,
         eclatin_pin_memory: bool = True,
         eclatin_buffer_size: int = 64 * 1024 * 1024,
         eclatin_native: Optional[Any] = None,  # Pre-initialized C++ module
@@ -177,6 +178,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # ECLATIN configuration
         self.use_eclatin = use_eclatin
+        self.use_eclatin_layerwise = use_eclatin_layerwise
         self.eclatin_pin_memory = eclatin_pin_memory
         self.eclatin_buffer_size = eclatin_buffer_size  # Buffer size in bytes
         
@@ -242,6 +244,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.eclatin_global_registry = None  # GlobalMetadataRegistry from all ranks
         self.eclatin_data_buffers = None  # List of data buffers (pooled)
         self.eclatin_recv_buffers = None  # List of recv buffers (pooled)
+        self.eclatin_recv_buffers_layerwise = None  # 4 continuous recv buffers for layerwise mode (from strategy)
         # Note: 4 persistent blocks (data_block_1/2, parity_block_1/2) will be allocated in strategy
         
         # ECLATIN buffer poller thread (persistent, created once, shared with ECCHECK if both enabled)
@@ -492,6 +495,15 @@ class FileSystemWriterAsync(FileSystemWriter):
                     [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
                 )
             
+            # Layer-wise ECLATIN mode
+            if self.use_eclatin_layerwise:
+                return (
+                    partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
+                    partial(self._eclatin_preload_tensors_layerwise, True),
+                    [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+                )
+            
+            # Batch ECLATIN mode (existing)
             return (
                 partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
                 partial(self._eclatin_preload_tensors_to_buffer, True),
@@ -1247,6 +1259,144 @@ class FileSystemWriterAsync(FileSystemWriter):
         return result_buckets
 
     @staticmethod
+    def _extract_layer_groups(write_buckets: List[WriteBucket]) -> Dict[str, List[Tuple[int, int, Any, torch.Tensor]]]:
+        """
+        Extract and group tensors by layer from write_buckets.
+        
+        Args:
+            write_buckets: List of WriteBucket objects containing tensor data
+            
+        Returns:
+            Dictionary mapping layer_key (e.g., "layer_0", "layer_1", "non_layer") 
+            to list of (bucket_idx, tensor_idx, item, tensor) tuples
+        """
+        layer_groups = {}
+        
+        # Helper function to extract layer number from FQN
+        def extract_layer_number(fqn: str) -> int:
+            """Extract layer number from FQN like 'decoder.layers.0.weight' -> 0
+            Returns -1 for non-layer tensors (embeddings, output layers, etc.)
+            
+            Supports patterns:
+            - decoder.layers.N.
+            - encoder.layers.N.
+            - transformer.layers.N.
+            - model.layers.N.
+            - layers.N.
+            """
+            import re
+            # Match patterns like .layers.N. or .layer.N. (with or without leading component)
+            # Also match patterns at start of string or after underscore
+            patterns = [
+                r'\.layers\.(\d+)\.',      # .layers.N.
+                r'^layers\.(\d+)\.',       # layers.N. at start
+                r'\.layer\.(\d+)\.',       # .layer.N.
+                r'^layer\.(\d+)\.',        # layer.N. at start
+                r'_layers_(\d+)_',         # _layers_N_
+                r'_layer_(\d+)_',          # _layer_N_
+                r'\.blocks\.(\d+)\.',      # .blocks.N.
+                r'^blocks\.(\d+)\.',       # blocks.N. at start
+                r'_blocks_(\d+)_',         # _blocks_N_
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, fqn)
+                if match:
+                    return int(match.group(1))
+            return -1  # Non-layer tensor
+        
+        # Strategy: Since FQN doesn't contain layer number (e.g., "decoder.layers.xxx"),
+        # we need to infer layer number from tensor order and FQN patterns.
+        # For ShardedTensors, same FQN appears multiple times for different layers.
+        fqn_to_occurrences = {}  # Track how many times each FQN appears (indicates number of layers)
+        
+        for bucket_idx, bucket in enumerate(write_buckets):
+            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            
+            # First pass: count occurrences of each FQN pattern
+            for tensor_idx, (item, tensor) in enumerate(tensor_data):
+                if hasattr(item, 'index') and hasattr(item.index, 'fqn'):
+                    fqn = item.index.fqn
+                    # Extract base FQN pattern (normalize to pattern without layer number)
+                    import re
+                    base_fqn = fqn
+                    # If FQN contains .layers.N. (with number), remove the number
+                    if re.search(r'\.layers\.\d+\.', fqn):
+                        base_fqn = re.sub(r'\.layers\.\d+\.', '.layers.', fqn)
+                    elif re.search(r'^layers\.\d+\.', fqn):
+                        base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
+                    # If FQN contains .layers. but no number (like decoder.layers.xxx), use as-is
+                    # This is already the base pattern
+                    
+                    fqn_to_occurrences[base_fqn] = fqn_to_occurrences.get(base_fqn, 0) + 1
+        
+        # Determine if this is a layer-based FQN pattern
+        # If same FQN appears multiple times (e.g., 12 times for 12 layers), it's a layer tensor
+        layer_fqn_patterns = set()
+        for fqn, count in fqn_to_occurrences.items():
+            if count > 1 and ('layers.' in fqn or 'layer.' in fqn):
+                layer_fqn_patterns.add(fqn)
+        
+        logger.info(f"Found {len(layer_fqn_patterns)} layer FQN patterns (appearing multiple times)")
+        if layer_fqn_patterns and logger.isEnabledFor(logging.DEBUG):
+            for pattern in sorted(list(layer_fqn_patterns))[:5]:
+                logger.debug(f"  Layer pattern: {pattern} (appears {fqn_to_occurrences[pattern]} times)")
+        
+        # Second pass: assign layer numbers based on FQN pattern and occurrence order
+        fqn_to_layer_counter = {}  # Track current layer number for each FQN pattern
+        
+        for bucket_idx, bucket in enumerate(write_buckets):
+            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            
+            # Process each tensor in this bucket
+            for tensor_idx, (item, tensor) in enumerate(tensor_data):
+                # Extract layer number from FQN or infer from pattern
+                if hasattr(item, 'index') and hasattr(item.index, 'fqn'):
+                    fqn = item.index.fqn
+                    
+                    # Try direct extraction first
+                    layer_num = extract_layer_number(fqn)
+                    
+                    # If not found, try to infer from FQN pattern
+                    if layer_num == -1:
+                        import re
+                        base_fqn = fqn
+                        # Normalize to base pattern (remove layer number if present)
+                        if re.search(r'\.layers\.\d+\.', fqn):
+                            base_fqn = re.sub(r'\.layers\.\d+\.', '.layers.', fqn)
+                        elif re.search(r'^layers\.\d+\.', fqn):
+                            base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
+                        # If FQN contains .layers. but no number, use as-is
+                        
+                        # If this is a layer pattern (appears multiple times), assign layer number based on occurrence
+                        if base_fqn in layer_fqn_patterns:
+                            if base_fqn not in fqn_to_layer_counter:
+                                fqn_to_layer_counter[base_fqn] = 0
+                            layer_num = fqn_to_layer_counter[base_fqn]
+                            fqn_to_layer_counter[base_fqn] += 1
+                else:
+                    # Fallback if no FQN available
+                    layer_num = -1
+                
+                # Use layer number as key, group non-layer tensors together
+                layer_key = f"layer_{layer_num}" if layer_num >= 0 else "non_layer"
+                
+                if layer_key not in layer_groups:
+                    layer_groups[layer_key] = []
+                
+                # Store (bucket_idx, tensor_idx, item, tensor) for this layer
+                layer_groups[layer_key].append((bucket_idx, tensor_idx, item, tensor))
+        
+        total_tensors = sum(len(tensors) for tensors in layer_groups.values())
+        logger.info(f"Organized {total_tensors} tensors into {len(layer_groups)} layer groups")
+        
+        # Log layer distribution for debugging
+        if logger.isEnabledFor(logging.DEBUG):
+            for layer_key, tensors in sorted(layer_groups.items()):
+                logger.debug(f"  {layer_key}: {len(tensors)} tensors")
+        
+        return layer_groups
+
+    @staticmethod
     def preload_tensors_layerwise_cpp(write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
         """
         Preloads tensors layer-by-layer using C++ thread for coordination.
@@ -1330,149 +1480,10 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Organize tensors by layer for layer-wise transfer
         # Extract layer numbers from tensor FQNs (Fully Qualified Names)
-        layer_groups = {}
+        layer_groups = FileSystemWriterAsync._extract_layer_groups(write_buckets)
         
         # Map to store CPU tensors by (bucket_idx, tensor_idx)
         cpu_tensor_map = {}
-        
-        # Helper function to extract layer number from FQN
-        def extract_layer_number(fqn: str) -> int:
-            """Extract layer number from FQN like 'decoder.layers.0.weight' -> 0
-            Returns -1 for non-layer tensors (embeddings, output layers, etc.)
-            
-            Supports patterns:
-            - decoder.layers.N.
-            - encoder.layers.N.
-            - transformer.layers.N.
-            - model.layers.N.
-            - layers.N.
-            """
-            import re
-            # Match patterns like .layers.N. or .layer.N. (with or without leading component)
-            # Also match patterns at start of string or after underscore
-            patterns = [
-                r'\.layers\.(\d+)\.',      # .layers.N.
-                r'^layers\.(\d+)\.',       # layers.N. at start
-                r'\.layer\.(\d+)\.',       # .layer.N.
-                r'^layer\.(\d+)\.',        # layer.N. at start
-                r'_layers_(\d+)_',         # _layers_N_
-                r'_layer_(\d+)_',          # _layer_N_
-                r'\.blocks\.(\d+)\.',      # .blocks.N.
-                r'^blocks\.(\d+)\.',       # blocks.N. at start
-                r'_blocks_(\d+)_',         # _blocks_N_
-            ]
-            for pattern in patterns:
-                match = re.search(pattern, fqn)
-                if match:
-                    return int(match.group(1))
-            return -1  # Non-layer tensor
-        
-        # Group tensors within each bucket by layer
-        # Track sample FQNs and item attributes for debugging
-        sample_fqns = []
-        
-        # Strategy: Since FQN doesn't contain layer number (e.g., "decoder.layers.xxx"),
-        # we need to infer layer number from tensor order and FQN patterns.
-        # For ShardedTensors, same FQN appears multiple times for different layers.
-        fqn_to_occurrences = {}  # Track how many times each FQN appears (indicates number of layers)
-        
-        for bucket_idx, bucket in enumerate(write_buckets):
-            file_name, storage_key, (bytes_data, tensor_data) = bucket
-            
-            # First pass: count occurrences of each FQN pattern
-            for tensor_idx, (item, tensor) in enumerate(tensor_data):
-                if hasattr(item, 'index') and hasattr(item.index, 'fqn'):
-                    fqn = item.index.fqn
-                    # Extract base FQN pattern (normalize to pattern without layer number)
-                    import re
-                    base_fqn = fqn
-                    # If FQN contains .layers.N. (with number), remove the number
-                    if re.search(r'\.layers\.\d+\.', fqn):
-                        base_fqn = re.sub(r'\.layers\.\d+\.', '.layers.', fqn)
-                    elif re.search(r'^layers\.\d+\.', fqn):
-                        base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
-                    # If FQN contains .layers. but no number (like decoder.layers.xxx), use as-is
-                    # This is already the base pattern
-                    
-                    fqn_to_occurrences[base_fqn] = fqn_to_occurrences.get(base_fqn, 0) + 1
-        
-        # Determine if this is a layer-based FQN pattern
-        # If same FQN appears multiple times (e.g., 12 times for 12 layers), it's a layer tensor
-        layer_fqn_patterns = set()
-        for fqn, count in fqn_to_occurrences.items():
-            if count > 1 and ('layers.' in fqn or 'layer.' in fqn):
-                layer_fqn_patterns.add(fqn)
-        
-        logger.info(f"Found {len(layer_fqn_patterns)} layer FQN patterns (appearing multiple times)")
-        if layer_fqn_patterns and logger.isEnabledFor(logging.DEBUG):
-            for pattern in sorted(list(layer_fqn_patterns))[:5]:
-                logger.debug(f"  Layer pattern: {pattern} (appears {fqn_to_occurrences[pattern]} times)")
-        
-        # Second pass: assign layer numbers based on FQN pattern and occurrence order
-        fqn_to_layer_counter = {}  # Track current layer number for each FQN pattern
-        
-        for bucket_idx, bucket in enumerate(write_buckets):
-            file_name, storage_key, (bytes_data, tensor_data) = bucket
-            
-            # Process each tensor in this bucket
-            for tensor_idx, (item, tensor) in enumerate(tensor_data):
-                # Extract layer number from FQN or infer from pattern
-                if hasattr(item, 'index') and hasattr(item.index, 'fqn'):
-                    fqn = item.index.fqn
-                    
-                    # Try direct extraction first
-                    layer_num = extract_layer_number(fqn)
-                    
-                    # If not found, try to infer from FQN pattern
-                    if layer_num == -1:
-                        import re
-                        base_fqn = fqn
-                        # Normalize to base pattern (remove layer number if present)
-                        if re.search(r'\.layers\.\d+\.', fqn):
-                            base_fqn = re.sub(r'\.layers\.\d+\.', '.layers.', fqn)
-                        elif re.search(r'^layers\.\d+\.', fqn):
-                            base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
-                        # If FQN contains .layers. but no number, use as-is
-                        
-                        # If this is a layer pattern (appears multiple times), assign layer number based on occurrence
-                        if base_fqn in layer_fqn_patterns:
-                            if base_fqn not in fqn_to_layer_counter:
-                                fqn_to_layer_counter[base_fqn] = 0
-                            layer_num = fqn_to_layer_counter[base_fqn]
-                            fqn_to_layer_counter[base_fqn] += 1
-                    
-                    # Collect sample FQNs for debugging (first 10)
-                    if len(sample_fqns) < 10:
-                        sample_fqns.append(f"{fqn} -> layer_{layer_num}")
-                else:
-                    # Fallback if no FQN available
-                    fqn = str(item)
-                    layer_num = -1
-                    if len(sample_fqns) < 10:
-                        sample_fqns.append(f"{fqn} -> no FQN")
-                
-                # Use layer number as key, group non-layer tensors together
-                layer_key = f"layer_{layer_num}" if layer_num >= 0 else "non_layer"
-                
-                if layer_key not in layer_groups:
-                    layer_groups[layer_key] = []
-                
-                # Store (bucket_idx, tensor_idx, item, tensor) for this layer
-                layer_groups[layer_key].append((bucket_idx, tensor_idx, item, tensor))
-        
-        # Log sample FQNs for debugging
-        if sample_fqns:
-            logger.info(f"Sample tensor FQNs and layer extraction:")
-            for sample in sample_fqns:
-                logger.info(f"  {sample}")
-        
-        total_tensors = sum(len(tensors) for tensors in layer_groups.values())
-        logger.info(f"Organized {total_tensors} tensors into {len(layer_groups)} layer groups")
-        
-        # Log layer distribution for debugging
-        if logger.isEnabledFor(logging.DEBUG):
-            for layer_key, tensors in sorted(layer_groups.items()):
-                logger.debug(f"  {layer_key}: {len(tensors)} tensors")
         
         # Process each layer group - prepare tensors and submit to C++ thread
         # Sort layer groups by layer number for sequential processing
@@ -2189,9 +2200,21 @@ class FileSystemWriterAsync(FileSystemWriter):
         if isinstance(write_results_or_exc, Exception):
             raise RuntimeError(f"Worker failure: {write_results_or_exc}") from write_results_or_exc
         write_results: dict = write_results_or_exc
-        if len(write_results) != len(self.write_buckets):
+        
+        # For ECLATIN layerwise mode, use ecl_write_buckets count instead of write_buckets
+        # because write_buckets may not be updated in the main process, but the actual
+        # write_preloaded_data_multiproc receives the correct buckets from preload function return value
+        if hasattr(self, 'use_eclatin_layerwise') and self.use_eclatin_layerwise:
+            if hasattr(self, 'ecl_write_buckets') and self.ecl_write_buckets:
+                expected_count = len(self.ecl_write_buckets)
+            else:
+                expected_count = len(self.write_buckets)
+        else:
+            expected_count = len(self.write_buckets)
+        
+        if len(write_results) != expected_count:
             raise RuntimeError(
-                f"Incomplete worker results (expected {len(self.write_buckets)},"
+                f"Incomplete worker results (expected {expected_count},"
                 f" got {len(write_results)}. This probably indicates a worker failure."
             )
         return list(chain.from_iterable(write_results.values()))
@@ -3221,6 +3244,325 @@ class FileSystemWriterAsync(FileSystemWriter):
         self._eclatin_native.wait_for_encoding_completion()
         torch.cuda.synchronize()
         logger.info("ECLATIN: All pipelines completed and CUDA synchronized")
+    
+    def _eclatin_preload_tensors_layerwise(self, non_blocking: bool = True) -> List[WriteBucket]:
+        """
+        ECLATIN layer-wise version: Transfer tensors layer-by-layer from GPU to CPU and submit to C++ pipelines.
+        
+        This method organizes tensors by layer, calculates per-layer maximum sizes across all ranks,
+        prepares tensor information for C++ D2H transfer, and submits each layer to C++ for encoding and network transmission.
+        
+        Note: ECLATIN layerwise uses CUDA mode only - C++ performs the actual D2H transfer using cudaMemcpy.
+        Python only allocates buffers and prepares tensor information.
+        
+        Args:
+            non_blocking (bool): Not used in CUDA mode (C++ handles synchronization)
+            
+        Returns:
+            List[WriteBucket]: List of WriteBuckets for the 4 blocks
+            
+        Requires:
+            - C++ module compiled with USE_CUDA defined
+            - CUDA runtime available
+        """
+        if not self.decomposed_state_dict:
+            raise RuntimeError("ECLATIN: State dict not decomposed yet")
+        
+        logger.info("ECLATIN: Starting layer-wise GPU-to-CPU tensor transfer...")
+        start = time()
+        
+        # Step 1: Verify blocks and recv buffers are set
+        if not hasattr(self, 'eclatin_blocks') or self.eclatin_blocks is None:
+            raise RuntimeError(
+                "ECLATIN: Blocks not set. Should be passed from strategy "
+                "after _prepare_eclatin_data completes."
+            )
+        
+        if not hasattr(self, 'eclatin_recv_buffers_layerwise') or self.eclatin_recv_buffers_layerwise is None:
+            raise RuntimeError(
+                "ECLATIN: Layerwise recv buffers not set. Should be passed from strategy."
+            )
+        
+        # Get base addresses of 4 continuous recv buffers
+        recv1_parity1_base, recv2_parity1_base, recv1_parity2_base, recv2_parity2_base = self.eclatin_recv_buffers_layerwise
+        
+        # Validate buffer sizes (should not be zero)
+        if recv1_parity1_base.numel() == 0 or recv2_parity1_base.numel() == 0 or \
+           recv1_parity2_base.numel() == 0 or recv2_parity2_base.numel() == 0:
+            raise RuntimeError(
+                f"ECLATIN: Layerwise recv buffers have zero size. "
+                f"This may indicate an issue with layer extraction. "
+                f"Buffer sizes: {recv1_parity1_base.numel()}, {recv2_parity1_base.numel()}, "
+                f"{recv1_parity2_base.numel()}, {recv2_parity2_base.numel()}"
+            )
+        recv1_parity1_base_addr = int(recv1_parity1_base.data_ptr())
+        recv2_parity1_base_addr = int(recv2_parity1_base.data_ptr())
+        recv1_parity2_base_addr = int(recv1_parity2_base.data_ptr())
+        recv2_parity2_base_addr = int(recv2_parity2_base.data_ptr())
+        
+        # Initialize offset counters for recv buffers (all ranks use same offsets)
+        recv1_parity1_offset = 0
+        recv2_parity1_offset = 0
+        recv1_parity2_offset = 0
+        recv2_parity2_offset = 0
+        
+        # Step 2: Organize tensors by layer
+        layer_groups = FileSystemWriterAsync._extract_layer_groups(self.write_buckets)
+        
+        # Step 3: Calculate per-layer sizes (own sizes)
+        layer_sizes = {}  # layer_id -> own_size
+        for layer_key, tensor_list in layer_groups.items():
+            if layer_key == "non_layer":
+                continue
+            try:
+                layer_id = int(layer_key.split('_')[1])
+            except (ValueError, IndexError):
+                continue
+            
+            layer_size = 0
+            for bucket_idx, tensor_idx, item, tensor in tensor_list:
+                if tensor.is_cuda or tensor.device.type == 'cpu':
+                    tensor_size = tensor.numel() * tensor.element_size()
+                    layer_size += tensor_size
+            layer_sizes[layer_id] = layer_size
+        
+        # Step 4: All-gather per-layer sizes and calculate maximums
+        layer_max_sizes = {}
+        layer_aligned_sizes = {}
+        
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            
+            # Use all_gather_object instead of all_gather for CPU compatibility
+            # This directly passes Python objects without serialization
+            all_layer_sizes_list = [None] * world_size
+            torch.distributed.all_gather_object(all_layer_sizes_list, layer_sizes)
+            
+            # Calculate maximum for each layer
+            all_layer_sizes_dict = {}
+            for rank_layer_sizes in all_layer_sizes_list:
+                for layer_id, layer_size in rank_layer_sizes.items():
+                    if layer_id not in all_layer_sizes_dict:
+                        all_layer_sizes_dict[layer_id] = []
+                    all_layer_sizes_dict[layer_id].append(layer_size)
+            
+            # Calculate maximum for each layer
+            for layer_id, sizes_list in all_layer_sizes_dict.items():
+                layer_max_sizes[layer_id] = max(sizes_list)
+        else:
+            # Single rank: use own sizes
+            layer_max_sizes = layer_sizes.copy()
+        
+        # Step 5: Align per-layer sizes to buffer_size
+        eclatin_buffer_size = self.eclatin_buffer_size
+        for layer_id, max_size in layer_max_sizes.items():
+            aligned_size = ((max_size + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+            layer_aligned_sizes[layer_id] = aligned_size
+        
+        logger.info(
+            f"ECLATIN: Calculated layer sizes for {len(layer_max_sizes)} layers, "
+            f"max aligned size: {max(layer_aligned_sizes.values()) / (1024**3):.2f} GB"
+        )
+        
+        # Step 6: Calculate per-layer block offsets
+        layer_block_offsets = {}
+        current_data1 = 0
+        current_data2 = 0
+        current_parity1 = 0
+        current_parity2 = 0
+        
+        for layer_id in sorted(layer_max_sizes.keys()):
+            own_layer_size = layer_sizes.get(layer_id, 0)
+            aligned_layer_size = layer_aligned_sizes[layer_id]
+            half_aligned = aligned_layer_size // 2
+            half_actual = own_layer_size // 2
+            
+            layer_block_offsets[layer_id] = {
+                'data_block_1': current_data1,
+                'data_block_2': current_data2,
+                'parity_block_1': current_parity1,
+                'parity_block_2': current_parity2,
+                'aligned_size': aligned_layer_size,
+                'half_aligned': half_aligned,
+                'actual_size': own_layer_size,
+                'half_actual': half_actual,
+            }
+            
+            # Data blocks: accumulate based on actual data size
+            current_data1 += half_actual
+            current_data2 += (own_layer_size - half_actual)
+            
+            # Parity blocks: accumulate based on aligned size
+            current_parity1 += half_aligned
+            current_parity2 += half_aligned
+        
+        # Step 7: Get block base addresses
+        data_block_1 = self.eclatin_blocks['data_block_1']
+        data_block_2 = self.eclatin_blocks['data_block_2']
+        parity_block_1 = self.eclatin_blocks['parity_block_1']
+        parity_block_2 = self.eclatin_blocks['parity_block_2']
+        
+        data_block_1_base = int(data_block_1.data_ptr())
+        data_block_2_base = int(data_block_2.data_ptr())
+        parity_block_1_base = int(parity_block_1.data_ptr())
+        parity_block_2_base = int(parity_block_2.data_ptr())
+        
+        # Step 8: Process each layer
+        sorted_layer_keys = sorted(
+            [k for k in layer_groups.keys() if k != "non_layer"],
+            key=lambda x: int(x.split('_')[1]) if x != "non_layer" else -1
+        )
+        
+        for layer_key in sorted_layer_keys:
+            try:
+                layer_id = int(layer_key.split('_')[1])
+            except (ValueError, IndexError):
+                continue
+            
+            tensor_list = layer_groups[layer_key]
+            own_layer_size = layer_sizes.get(layer_id, 0)
+            aligned_layer_size = layer_aligned_sizes[layer_id]
+            
+            logger.info(
+                f"ECLATIN: Processing layer {layer_id}: "
+                f"{own_layer_size / (1024**2):.2f} MB (actual), "
+                f"{aligned_layer_size / (1024**2):.2f} MB (aligned)"
+            )
+            
+            # Allocate layer CPU buffer (aligned size)
+            # ECLATIN layerwise requires CUDA mode, so always use pinned memory if CUDA is available
+            # This matches the original layerwise implementation which always uses pinned memory
+            if torch.cuda.is_available():
+                layer_cpu_buffer = torch.empty(aligned_layer_size, dtype=torch.uint8).pin_memory()
+                if not layer_cpu_buffer.is_pinned():
+                    raise RuntimeError(
+                        f"ECLATIN: Failed to allocate pinned memory for layer {layer_id}. "
+                        "CUDA mode requires pinned memory for cudaMemcpy."
+                    )
+            else:
+                raise RuntimeError(
+                    "ECLATIN layerwise requires CUDA support. Please ensure CUDA is available."
+                )
+            
+            # D2H transfer: prepare tensor info for C++ CUDA transfer
+            # Note: ECLATIN layerwise uses CUDA mode only - C++ will perform D2H transfer
+            layer_cpu_offset = 0
+            gpu_tensors_info = []
+            num_gpu_tensors = 0
+            
+            for bucket_idx, tensor_idx, item, tensor in tensor_list:
+                if tensor.is_cuda:
+                    tensor_size = tensor.numel() * tensor.element_size()
+                    # CUDA mode: C++ will perform D2H transfer, Python only prepares info
+                    # No copy_() call here - buffer will be filled by C++ cudaMemcpy
+                    
+                    # Prepare info for C++
+                    gpu_ptr = int(tensor.data_ptr())
+                    cpu_offset = layer_cpu_offset
+                    shape = list(tensor.shape)
+                    fqn = item.index.fqn if hasattr(item, 'index') and hasattr(item.index, 'fqn') else str(item)
+                    
+                    gpu_tensors_info.append((gpu_ptr, cpu_offset, tensor_size, shape, fqn))
+                    layer_cpu_offset += tensor_size
+                    num_gpu_tensors += 1
+                elif tensor.device.type == 'cpu':
+                    # Already on CPU, just copy directly
+                    tensor_size = tensor.numel() * tensor.element_size()
+                    tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
+                    buffer_view = layer_cpu_buffer[layer_cpu_offset:layer_cpu_offset + tensor_size]
+                    buffer_view.copy_(tensor_flat, non_blocking=False)
+                    layer_cpu_offset += tensor_size
+            
+            # Padding: fill remaining space with zeros
+            if layer_cpu_offset < aligned_layer_size:
+                padding_size = aligned_layer_size - layer_cpu_offset
+                layer_cpu_buffer[layer_cpu_offset:].fill_(0)
+                logger.debug(
+                    f"ECLATIN: Layer {layer_id}: Filled {padding_size / (1024**2):.2f} MB with zeros "
+                    f"for pipeline synchronization"
+                )
+            
+            # Note: No torch.cuda.synchronize() here - C++ will handle synchronization after D2H
+            
+            # Get block offsets for this layer
+            offsets = layer_block_offsets[layer_id]
+            half_aligned = offsets['half_aligned']
+            
+            # Calculate recv buffer addresses using offset (all ranks use same offset increment)
+            # Align offset to buffer_size boundary for better performance
+            recv1_parity1_offset_aligned = ((recv1_parity1_offset + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+            recv2_parity1_offset_aligned = ((recv2_parity1_offset + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+            recv1_parity2_offset_aligned = ((recv1_parity2_offset + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+            recv2_parity2_offset_aligned = ((recv2_parity2_offset + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+            
+            recv1_parity1_addr = recv1_parity1_base_addr + recv1_parity1_offset_aligned
+            recv2_parity1_addr = recv2_parity1_base_addr + recv2_parity1_offset_aligned
+            recv1_parity2_addr = recv1_parity2_base_addr + recv1_parity2_offset_aligned
+            recv2_parity2_addr = recv2_parity2_base_addr + recv2_parity2_offset_aligned
+            
+            # Submit to C++ (no data buffers needed - directly send from layer_cpu_buffer)
+            layer_cpu_buffer_addr = int(layer_cpu_buffer.data_ptr())
+            self._eclatin_native.submit_layer_wise(
+                layer_id,
+                gpu_tensors_info,
+                layer_cpu_buffer_addr,
+                aligned_layer_size,
+                own_layer_size,
+                data_block_1_base,
+                data_block_2_base,
+                parity_block_1_base,
+                parity_block_2_base,
+                offsets['data_block_1'],
+                offsets['data_block_2'],
+                offsets['parity_block_1'],
+                offsets['parity_block_2'],
+                recv1_parity1_addr,
+                recv2_parity1_addr,
+                recv1_parity2_addr,
+                recv2_parity2_addr,
+            )
+            
+            # Update offsets for next layer (all ranks increment by same amount)
+            recv1_parity1_offset = recv1_parity1_offset_aligned + half_aligned
+            recv2_parity1_offset = recv2_parity1_offset_aligned + half_aligned
+            recv1_parity2_offset = recv1_parity2_offset_aligned + half_aligned
+            recv2_parity2_offset = recv2_parity2_offset_aligned + half_aligned
+            
+            # Keep reference to buffer to prevent garbage collection
+            if not hasattr(self, '_layer_buffers'):
+                self._layer_buffers = []
+            self._layer_buffers.append(layer_cpu_buffer)
+        
+        # Step 9: Wait for all layers to complete
+        logger.info("ECLATIN: Waiting for all layers to complete...")
+        self._eclatin_native.wait_all_layers_complete()
+        
+        # Step 10: Mark end of stream for all 6 pipelines (sentinels)
+        # This is required for workers to set their completed flags
+        logger.info("ECLATIN: Sending sentinels to all pipelines...")
+        self._eclatin_native.submit_parity1_send1_sentinel()
+        self._eclatin_native.submit_parity1_send2_sentinel()
+        self._eclatin_native.submit_parity1_recv_xor_sentinel()
+        self._eclatin_native.submit_parity2_send1_sentinel()
+        self._eclatin_native.submit_parity2_send2_sentinel()
+        self._eclatin_native.submit_parity2_recv_xor_sentinel()
+        
+        # Step 11: Wait for all pipelines to complete
+        logger.info("ECLATIN: Waiting for all pipelines to complete...")
+        self._eclatin_native.wait_for_encoding_completion()
+        torch.cuda.synchronize()
+        
+        transfer_time = time() - start
+        total_gb = sum(layer_sizes.values()) / (1024**3)
+        bandwidth = total_gb / transfer_time if transfer_time > 0 else 0
+        
+        logger.info(
+            f"ECLATIN: Layer-wise transfer completed: {total_gb:.2f} GB in {transfer_time:.2f}s "
+            f"({bandwidth:.2f} GB/s), {len(sorted_layer_keys)} layers"
+        )
+        
+        # Step 10: Return WriteBuckets (reuse existing 4 blocks)
+        return self.ecl_write_buckets
     
     def _eccheck_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
         """

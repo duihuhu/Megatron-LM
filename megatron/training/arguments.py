@@ -2255,6 +2255,9 @@ def _add_checkpointing_args(parser):
                        help='Enable ECLATIN (Erasure Coding Checkpoint with different pipeline) '
                             'for serialization-free checkpoint encoding. Similar to EC-CHECK but '
                             'uses a different internal pipeline structure for saving.')
+    group.add_argument('--use-eclatin-layerwise', action='store_true',
+                       help='Use layer-wise ECLATIN checkpointing mode. This enables layer-by-layer '
+                            'pipelined D2H transfer followed by encoding and network transmission.')
     
     # use gemini checkpointing arguments
     group.add_argument('--use-gemini', action='store_true',

@@ -9,6 +9,7 @@ from collections import ChainMap, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from itertools import product
+import logging
 from logging import getLogger
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast, get_args
@@ -749,6 +750,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.eclatin_global_registry = None
         self.eclatin_blocks = None  # 4 persistent blocks (data_block_1/2, parity_block_1/2)
         self.ecl_write_buckets = []  # WriteBuckets for 4 blocks
+        self.eclatin_recv_buffers_layerwise = None  # 4 recv buffers for layerwise mode (continuous, allocated in strategy)
 
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank using the shared manager."""
@@ -1044,15 +1046,24 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         # Create FileSystemWriterAsync with EC-CHECK, ECLATIN, Gemini, or Gemini Replicas parameters
         if self.eclatin_manager.use_eclatin:
+            from megatron.training import get_args
+            args = get_args()
+            use_eclatin_layerwise = getattr(args, 'use_eclatin_layerwise', False)
+            
             writer = FileSystemWriterAsync(
                 checkpoint_dir,
                 separation_hint=self.separation_hint,
                 thread_count=self.thread_count,
                 use_msc=MultiStorageClientFeature.is_enabled(),
                 use_eclatin=self.eclatin_manager.use_eclatin,
+                use_eclatin_layerwise=use_eclatin_layerwise,
                 eclatin_native=self.eclatin_manager._eclatin_native,  # Pass pre-initialized C++ module
                 eclatin_buffers=self._get_eclatin_buffers(),  # Pass pre-allocated buffers
             )
+            # Pass layerwise recv buffers if available
+            if use_eclatin_layerwise and self.eclatin_recv_buffers_layerwise is not None:
+                writer.eclatin_recv_buffers_layerwise = self.eclatin_recv_buffers_layerwise
+                
         elif self.gemini_replicas_manager.use_gemini_replicas and self.gemini_replicas_manager.use_gemini_replicas_optimized:
             writer = FileSystemWriterAsync(
                 checkpoint_dir,
@@ -1133,8 +1144,16 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             writer.eclatin_global_registry = self.eclatin_global_registry
             # Pass the 4 persistent blocks (data_block_1/2, parity_block_1/2)
             writer.eclatin_blocks = self.eclatin_blocks
-            
             writer.ecl_write_buckets = self.ecl_write_buckets
+            
+            # Pass layerwise recv buffers (allocated in _prepare_eclatin_data)
+            if use_eclatin_layerwise and self.eclatin_recv_buffers_layerwise is not None:
+                writer.eclatin_recv_buffers_layerwise = self.eclatin_recv_buffers_layerwise
+                logger.info(
+                    f"ECLATIN: Passed layerwise recv buffers to writer "
+                    f"(size: {self.eclatin_recv_buffers_layerwise[0].numel() / (1024**2):.0f} MB each)"
+                )
+            
             # In ECLATIN mode, call prepare_write_data to create write_buckets
             # It will use the metadata we just prepared
             writer.prepare_write_data(self.cached_central_plan, planner)
@@ -1810,6 +1829,21 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         block_alloc_time = time() - start
         logger.info(f"ECLATIN: Block allocation completed in {block_alloc_time:.2f}s")
         
+        # Step 7: For layerwise mode, allocate recv buffers based on layer sizes
+        from megatron.training import get_args
+        args = get_args()
+        use_eclatin_layerwise = getattr(args, 'use_eclatin_layerwise', False)
+        
+        recv_buffer_alloc_time = 0
+        if use_eclatin_layerwise:
+            start = time()
+            if self.eclatin_recv_buffers_layerwise is None:
+                self.eclatin_recv_buffers_layerwise = self._allocate_eclatin_layerwise_recv_buffers(
+                    self.eclatin_global_registry
+                )
+            recv_buffer_alloc_time = time() - start
+            logger.info(f"ECLATIN: Layerwise recv buffer allocation completed in {recv_buffer_alloc_time:.2f}s")
+        
         total_time = time() - start_total
         logger.info(
             f"ECLATIN: Preparation completed in {total_time:.2f}s\n"
@@ -1818,6 +1852,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             f"  Bucket prep: {bucket_time:.2f}s\n"
             f"  Metadata exchange: {metadata_time:.2f}s\n"
             f"  Block allocation: {block_alloc_time:.2f}s"
+            + (f"\n  Recv buffer allocation: {recv_buffer_alloc_time:.2f}s" if use_eclatin_layerwise else "")
         )
 
     def validate_eclatin_decomposition(self) -> bool:
@@ -2044,6 +2079,258 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         
         return blocks
+    
+    def _allocate_eclatin_layerwise_recv_buffers(self, global_registry):
+        """
+        Allocate 4 large continuous recv buffers for ECLATIN layerwise mode.
+        
+        Similar to EC-CHECK's recv encoding buffers, but for ECLATIN's 4 recv buffers:
+        - recv1_parity1: For receiving data for parity1 XOR encoding
+        - recv2_parity1: For receiving data for parity1 XOR encoding
+        - recv1_parity2: For receiving data for parity2 XOR encoding
+        - recv2_parity2: For receiving data for parity2 XOR encoding
+        
+        Each buffer size = global maximum of sum of all layers' half_aligned sizes (aligned to buffer_size).
+        All ranks use the same buffer size for pipeline synchronization.
+        
+        Args:
+            global_registry: GlobalMetadataRegistry from all ranks
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: 
+            4 recv buffers (recv1_parity1, recv2_parity1, recv1_parity2, recv2_parity2)
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        # Step 1: Organize tensors by layer from tensor_infos
+        # Extract layer groups from tensor_infos (using same logic as _extract_layer_groups)
+        layer_groups = {}
+        
+        def extract_layer_number(fqn: str) -> int:
+            """Extract layer number from FQN - using same patterns as _extract_layer_groups.
+            
+            Supports patterns:
+            - decoder.layers.N.
+            - encoder.layers.N.
+            - transformer.layers.N.
+            - model.layers.N.
+            - layers.N.
+            - .layer.N., _layers_N_, .blocks.N., etc.
+            """
+            import re
+            # Use the same patterns as _extract_layer_groups for consistency
+            patterns = [
+                r'\.layers\.(\d+)\.',      # .layers.N. (matches decoder.layers.0., module.decoder.layers.0., etc.)
+                r'^layers\.(\d+)\.',       # layers.N. at start
+                r'\.layer\.(\d+)\.',       # .layer.N.
+                r'^layer\.(\d+)\.',        # layer.N. at start
+                r'_layers_(\d+)_',         # _layers_N_
+                r'_layer_(\d+)_',          # _layer_N_
+                r'\.blocks\.(\d+)\.',      # .blocks.N.
+                r'^blocks\.(\d+)\.',       # blocks.N. at start
+                r'_blocks_(\d+)_',         # _blocks_N_
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, fqn)
+                if match:
+                    return int(match.group(1))
+            return -1  # Non-layer tensor
+        
+        # Add logging to see actual FQN formats (INFO level for troubleshooting)
+        sample_keys = [info.key for info in self.decomposed_state_dict.tensor_infos[:5]]
+        logger.info(f"ECLATIN: Sample tensor keys for layer extraction: {sample_keys}")
+        
+        # Strategy: Since FQN doesn't contain layer number (e.g., "decoder.layers.xxx"),
+        # we need to infer layer number from tensor order and FQN patterns.
+        # For ShardedTensors, same FQN appears multiple times for different layers.
+        # First pass: count occurrences of each FQN pattern (for inference)
+        import re
+        fqn_to_occurrences = {}
+        for tensor_info in self.decomposed_state_dict.tensor_infos:
+            fqn = tensor_info.key
+            # Normalize to base pattern (remove layer number if present)
+            base_fqn = fqn
+            if re.search(r'\.layers\.\d+\.', fqn):
+                base_fqn = re.sub(r'\.layers\.\d+\.', '.layers.', fqn)
+            elif re.search(r'^layers\.\d+\.', fqn):
+                base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
+            # If FQN contains .layers. but no number, use as-is
+            
+            fqn_to_occurrences[base_fqn] = fqn_to_occurrences.get(base_fqn, 0) + 1
+        
+        # Determine if this is a layer-based FQN pattern
+        # If same FQN appears multiple times (e.g., 6 times for 6 layers), it's a layer tensor
+        layer_fqn_patterns = set()
+        for fqn, count in fqn_to_occurrences.items():
+            if count > 1 and ('layers.' in fqn or 'layer.' in fqn):
+                layer_fqn_patterns.add(fqn)
+        
+        logger.info(f"ECLATIN: Found {len(layer_fqn_patterns)} layer FQN patterns (appearing multiple times)")
+        if layer_fqn_patterns and logger.isEnabledFor(logging.DEBUG):
+            for pattern in sorted(list(layer_fqn_patterns))[:5]:
+                logger.debug(f"  Layer pattern: {pattern} (appears {fqn_to_occurrences[pattern]} times)")
+        
+        # Second pass: assign layer numbers based on FQN pattern and occurrence order
+        fqn_to_layer_counter = {}  # Track current layer number for each FQN pattern
+        
+        # Group tensor_infos by layer
+        for tensor_info in self.decomposed_state_dict.tensor_infos:
+            fqn = tensor_info.key
+            
+            # Try direct extraction first
+            layer_num = extract_layer_number(fqn)
+            
+            # If not found, try to infer from FQN pattern
+            if layer_num == -1:
+                base_fqn = fqn
+                # Normalize to base pattern (remove layer number if present)
+                if re.search(r'\.layers\.\d+\.', fqn):
+                    base_fqn = re.sub(r'\.layers\.\d+\.', '.layers.', fqn)
+                elif re.search(r'^layers\.\d+\.', fqn):
+                    base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
+                
+                # If this is a layer pattern (appears multiple times), assign layer number based on occurrence
+                if base_fqn in layer_fqn_patterns:
+                    if base_fqn not in fqn_to_layer_counter:
+                        fqn_to_layer_counter[base_fqn] = 0
+                    layer_num = fqn_to_layer_counter[base_fqn]
+                    fqn_to_layer_counter[base_fqn] += 1
+            
+            layer_key = f"layer_{layer_num}" if layer_num >= 0 else "non_layer"
+            
+            if layer_key not in layer_groups:
+                layer_groups[layer_key] = []
+            layer_groups[layer_key].append(tensor_info)
+        
+        # Debug: log a few examples of layer extraction results
+        if logger.isEnabledFor(logging.DEBUG):
+            sample_extractions = []
+            for tensor_info in self.decomposed_state_dict.tensor_infos[:10]:
+                layer_num = extract_layer_number(tensor_info.key)
+                sample_extractions.append((tensor_info.key, layer_num))
+            logger.debug(f"ECLATIN: Sample layer extraction results: {sample_extractions}")
+        
+        # Log layer extraction results
+        layer_keys = [k for k in layer_groups.keys() if k != 'non_layer']
+        num_layers = len(layer_keys)
+        num_non_layer = len(layer_groups.get('non_layer', []))
+        logger.info(
+            f"ECLATIN: Extracted {num_layers} layers, {num_non_layer} non-layer tensors"
+        )
+        if logger.isEnabledFor(logging.DEBUG) and layer_keys:
+            logger.debug(f"ECLATIN: Layer keys found: {sorted(layer_keys)}")
+        
+        # Step 2: Calculate per-layer sizes (own sizes)
+        layer_sizes = {}
+        for layer_key, tensor_infos in layer_groups.items():
+            if layer_key == "non_layer":
+                continue
+            layer_id = int(layer_key.split('_')[1])
+            layer_size = sum(info.size_bytes for info in tensor_infos)
+            layer_sizes[layer_id] = layer_size
+        
+        # Step 3: All-gather per-layer sizes and calculate maximums
+        if torch.distributed.is_initialized():
+            # Use all_gather_object for CPU compatibility
+            all_layer_sizes_list = [None] * world_size
+            torch.distributed.all_gather_object(all_layer_sizes_list, layer_sizes)
+            
+            # Calculate maximum for each layer
+            all_layer_sizes_dict = {}
+            for rank_layer_sizes in all_layer_sizes_list:
+                for layer_id, layer_size in rank_layer_sizes.items():
+                    if layer_id not in all_layer_sizes_dict:
+                        all_layer_sizes_dict[layer_id] = []
+                    all_layer_sizes_dict[layer_id].append(layer_size)
+            
+            layer_max_sizes = {}
+            for layer_id, sizes_list in all_layer_sizes_dict.items():
+                layer_max_sizes[layer_id] = max(sizes_list)
+        else:
+            # Single rank: use own sizes
+            layer_max_sizes = layer_sizes.copy()
+        
+        # Step 4: Align per-layer sizes to buffer_size
+        eclatin_buffer_size = self.eclatin_manager.eclatin_buffer_size
+        layer_aligned_sizes = {}
+        for layer_id, max_size in layer_max_sizes.items():
+            aligned_size = ((max_size + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+            layer_aligned_sizes[layer_id] = aligned_size
+        
+        # Step 5: Calculate own total_half_aligned
+        own_total_half_aligned = sum(aligned_size // 2 for aligned_size in layer_aligned_sizes.values())
+        
+        # Step 6: All-gather all ranks' total_half_aligned and get maximum
+        if torch.distributed.is_initialized():
+            all_total_half_aligned_list = [None] * world_size
+            torch.distributed.all_gather_object(
+                all_total_half_aligned_list, 
+                own_total_half_aligned
+            )
+            
+            # Calculate global maximum
+            max_total_half_aligned = max(all_total_half_aligned_list)
+        else:
+            max_total_half_aligned = own_total_half_aligned
+        
+        # Step 7: Align global maximum to buffer_size
+        aligned_total_recv_size = ((max_total_half_aligned + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+        
+        # Handle zero size buffer case (when no layers detected)
+        if aligned_total_recv_size == 0:
+            logger.warning(
+                "ECLATIN: No layers detected or all layers have zero size. "
+                "This may indicate an issue with layer extraction. "
+                "Allocating minimum size buffers (1 buffer_size)."
+            )
+            # Allocate minimum size buffers (at least 1 buffer_size)
+            aligned_total_recv_size = eclatin_buffer_size
+        
+        logger.info(
+            f"ECLATIN: Allocating 4 continuous recv buffers for layerwise mode\n"
+            f"  Number of layers: {len(layer_aligned_sizes)}\n"
+            f"  Own total half_aligned: {own_total_half_aligned / (1024**3):.2f} GB\n"
+            f"  Global max total half_aligned: {max_total_half_aligned / (1024**3):.2f} GB\n"
+            f"  Aligned buffer size (per buffer): {aligned_total_recv_size / (1024**3):.2f} GB "
+            f"({aligned_total_recv_size / (1024**2):.0f} MB)\n"
+            f"  Total recv memory: {4 * aligned_total_recv_size / (1024**3):.2f} GB"
+        )
+        
+        # Step 8: Allocate 4 large continuous buffers (all ranks use same size)
+        recv_buffer_parity1_1 = torch.empty(
+            aligned_total_recv_size, 
+            dtype=torch.uint8, 
+            pin_memory=self.eclatin_manager.eclatin_pin_memory
+        )
+        recv_buffer_parity1_2 = torch.empty(
+            aligned_total_recv_size, 
+            dtype=torch.uint8, 
+            pin_memory=self.eclatin_manager.eclatin_pin_memory
+        )
+        recv_buffer_parity2_1 = torch.empty(
+            aligned_total_recv_size, 
+            dtype=torch.uint8, 
+            pin_memory=self.eclatin_manager.eclatin_pin_memory
+        )
+        recv_buffer_parity2_2 = torch.empty(
+            aligned_total_recv_size, 
+            dtype=torch.uint8, 
+            pin_memory=self.eclatin_manager.eclatin_pin_memory
+        )
+        
+        logger.info(
+            f"ECLATIN: Allocated 4 continuous recv buffers: "
+            f"{aligned_total_recv_size / (1024**3):.2f} GB each "
+            f"({aligned_total_recv_size / (1024**2):.0f} MB each)"
+        )
+        
+        return (
+            recv_buffer_parity1_1,
+            recv_buffer_parity1_2,
+            recv_buffer_parity2_1,
+            recv_buffer_parity2_2
+        )
         
     def _broadcast_and_exchange_metadata(self):
         """

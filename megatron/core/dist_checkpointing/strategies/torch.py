@@ -2221,20 +2221,29 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         if logger.isEnabledFor(logging.DEBUG) and layer_keys:
             logger.debug(f"ECLATIN: Layer keys found: {sorted(layer_keys)}")
         
-        # Step 2: Calculate per-layer sizes (own sizes)
+        # Step 2: Calculate per-layer sizes (own sizes) and non-layer size
         layer_sizes = {}
+        non_layer_size = 0
+        
         for layer_key, tensor_infos in layer_groups.items():
             if layer_key == "non_layer":
+                non_layer_size = sum(info.size_bytes for info in tensor_infos)
                 continue
             layer_id = int(layer_key.split('_')[1])
             layer_size = sum(info.size_bytes for info in tensor_infos)
             layer_sizes[layer_id] = layer_size
         
-        # Step 3: All-gather per-layer sizes and calculate maximums
+        # Step 3: All-gather per-layer sizes and non-layer sizes, then calculate maximums
+        max_non_layer_size = non_layer_size
+        avg_layer_size = 0
+        
         if torch.distributed.is_initialized():
-            # Use all_gather_object for CPU compatibility
+            # All-gather both layer sizes and non-layer sizes
             all_layer_sizes_list = [None] * world_size
+            all_non_layer_sizes_list = [None] * world_size
+            
             torch.distributed.all_gather_object(all_layer_sizes_list, layer_sizes)
+            torch.distributed.all_gather_object(all_non_layer_sizes_list, non_layer_size)
             
             # Calculate maximum for each layer
             all_layer_sizes_dict = {}
@@ -2247,9 +2256,18 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             layer_max_sizes = {}
             for layer_id, sizes_list in all_layer_sizes_dict.items():
                 layer_max_sizes[layer_id] = max(sizes_list)
+            
+            # Calculate maximum non-layer size across all ranks
+            max_non_layer_size = max(all_non_layer_sizes_list)
+            
+            # Calculate average layer size (for splitting non-layer data)
+            if layer_max_sizes:
+                avg_layer_size = sum(layer_max_sizes.values()) // len(layer_max_sizes)
         else:
             # Single rank: use own sizes
             layer_max_sizes = layer_sizes.copy()
+            if layer_max_sizes:
+                avg_layer_size = sum(layer_max_sizes.values()) // len(layer_max_sizes)
         
         # Step 4: Align per-layer sizes to buffer_size
         eclatin_buffer_size = self.eclatin_manager.eclatin_buffer_size
@@ -2257,6 +2275,75 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         for layer_id, max_size in layer_max_sizes.items():
             aligned_size = ((max_size + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
             layer_aligned_sizes[layer_id] = aligned_size
+        
+        # Step 4.1: Add virtual layers for non-layer data
+        if max_non_layer_size > 0 and avg_layer_size > 0:
+            # Calculate number of virtual layers needed based on avg_layer_size
+            num_virtual_layers = (max_non_layer_size + avg_layer_size - 1) // avg_layer_size
+            
+            # Calculate virtual layer capacity: max_non_layer_size / num_virtual_layers
+            # This ensures each virtual layer won't exceed its capacity
+            virtual_layer_capacity = (max_non_layer_size + num_virtual_layers - 1) // num_virtual_layers
+            
+            # Analyze non-layer tensor sizes
+            non_layer_tensors = layer_groups.get('non_layer', [])
+            non_layer_tensor_sizes = [(info.key, info.size_bytes) for info in non_layer_tensors]
+            non_layer_tensor_sizes_sorted = sorted(non_layer_tensor_sizes, key=lambda x: x[1], reverse=True)
+            max_single_tensor_size = non_layer_tensor_sizes_sorted[0][1] if non_layer_tensor_sizes_sorted else 0
+            
+            logger.info(
+                f"ECLATIN: Non-layer data size: {non_layer_size / (1024**2):.2f} MB (own), "
+                f"{max_non_layer_size / (1024**2):.2f} MB (max across ranks), "
+                f"splitting into {num_virtual_layers} virtual layers "
+                f"(capacity: {virtual_layer_capacity / (1024**2):.2f} MB per layer)"
+            )
+            
+            # Log top 10 largest non-layer tensors
+            # logger.info(f"ECLATIN: Top 10 largest non-layer tensors:")
+            # for i, (key, size) in enumerate(non_layer_tensor_sizes_sorted[:10]):
+            #     logger.info(f"  {i+1}. {key}: {size / (1024**2):.2f} MB ({size} bytes)")
+            
+            # Adjust capacity if single tensor exceeds it
+            original_virtual_layer_capacity = virtual_layer_capacity
+            if max_single_tensor_size > virtual_layer_capacity:
+                logger.warning(
+                    f"ECLATIN: Largest single non-layer tensor ({max_single_tensor_size / (1024**2):.2f} MB) "
+                    f"exceeds virtual layer capacity ({virtual_layer_capacity / (1024**2):.2f} MB). "
+                    f"Adjusting capacity to accommodate largest tensor."
+                )
+                # Set capacity to max single tensor size
+                virtual_layer_capacity = max_single_tensor_size
+                logger.info(
+                    f"ECLATIN: Adjusted virtual layer capacity: "
+                    f"{original_virtual_layer_capacity / (1024**2):.2f} MB -> {virtual_layer_capacity / (1024**2):.2f} MB"
+                )
+            
+            # Add virtual layers to layer_max_sizes and layer_aligned_sizes
+            # Use layer IDs starting after the last real layer
+            max_real_layer_id = max(layer_max_sizes.keys()) if layer_max_sizes else -1
+            virtual_layer_base_id = max_real_layer_id + 1
+            
+            # For buffer allocation, we need to accommodate both:
+            # 1. Large tensors (single large tensor per layer): use adjusted virtual_layer_capacity
+            # 2. Packed small tensors: use original_virtual_layer_capacity
+            # Use the larger of the two to be safe
+            large_layer_aligned_size = ((virtual_layer_capacity + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+            small_layer_aligned_size = ((original_virtual_layer_capacity + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+            max_virtual_layer_aligned_size = max(large_layer_aligned_size, small_layer_aligned_size)
+            
+            for vl_id in range(num_virtual_layers):
+                virtual_layer_id = virtual_layer_base_id + vl_id
+                
+                # Use max capacity to ensure buffer is large enough for any layer type
+                layer_max_sizes[virtual_layer_id] = virtual_layer_capacity
+                layer_aligned_sizes[virtual_layer_id] = max_virtual_layer_aligned_size
+            
+            logger.info(
+                f"ECLATIN: Created {num_virtual_layers} virtual layers (IDs {virtual_layer_base_id} to {virtual_layer_base_id + num_virtual_layers - 1}) "
+                f"for non-layer data in buffer allocation\n"
+                f"  Max aligned size per virtual layer: {max_virtual_layer_aligned_size / (1024**2):.2f} MB "
+                f"(supports both large tensors and packed small tensors)"
+            )
         
         # Step 5: Calculate own total_half_aligned
         own_total_half_aligned = sum(aligned_size // 2 for aligned_size in layer_aligned_sizes.values())

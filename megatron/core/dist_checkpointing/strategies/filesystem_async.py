@@ -3309,11 +3309,21 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Step 2: Organize tensors by layer
         layer_groups = FileSystemWriterAsync._extract_layer_groups(self.write_buckets)
         
-        # Step 3: Calculate per-layer sizes (own sizes)
+        # Step 3: Calculate per-layer sizes (own sizes) and non-layer size
         layer_sizes = {}  # layer_id -> own_size
+        non_layer_size = 0
+        non_layer_tensors = []
+        
         for layer_key, tensor_list in layer_groups.items():
             if layer_key == "non_layer":
+                # Calculate non-layer size
+                for bucket_idx, tensor_idx, item, tensor in tensor_list:
+                    if tensor.is_cuda or tensor.device.type == 'cpu':
+                        tensor_size = tensor.numel() * tensor.element_size()
+                        non_layer_size += tensor_size
+                        non_layer_tensors.append((bucket_idx, tensor_idx, item, tensor))
                 continue
+            
             try:
                 layer_id = int(layer_key.split('_')[1])
             except (ValueError, IndexError):
@@ -3326,17 +3336,21 @@ class FileSystemWriterAsync(FileSystemWriter):
                     layer_size += tensor_size
             layer_sizes[layer_id] = layer_size
         
-        # Step 4: All-gather per-layer sizes and calculate maximums
+        # Step 4: All-gather per-layer sizes and non-layer sizes, then calculate maximums
         layer_max_sizes = {}
         layer_aligned_sizes = {}
+        max_non_layer_size = non_layer_size
+        avg_layer_size = 0
         
         if torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
             
-            # Use all_gather_object instead of all_gather for CPU compatibility
-            # This directly passes Python objects without serialization
+            # All-gather both layer sizes and non-layer sizes
             all_layer_sizes_list = [None] * world_size
+            all_non_layer_sizes_list = [None] * world_size
+            
             torch.distributed.all_gather_object(all_layer_sizes_list, layer_sizes)
+            torch.distributed.all_gather_object(all_non_layer_sizes_list, non_layer_size)
             
             # Calculate maximum for each layer
             all_layer_sizes_dict = {}
@@ -3349,9 +3363,18 @@ class FileSystemWriterAsync(FileSystemWriter):
             # Calculate maximum for each layer
             for layer_id, sizes_list in all_layer_sizes_dict.items():
                 layer_max_sizes[layer_id] = max(sizes_list)
+            
+            # Calculate maximum non-layer size across all ranks
+            max_non_layer_size = max(all_non_layer_sizes_list)
+            
+            # Calculate average layer size (for splitting non-layer data)
+            if layer_max_sizes:
+                avg_layer_size = sum(layer_max_sizes.values()) // len(layer_max_sizes)
         else:
             # Single rank: use own sizes
             layer_max_sizes = layer_sizes.copy()
+            if layer_max_sizes:
+                avg_layer_size = sum(layer_max_sizes.values()) // len(layer_max_sizes)
         
         # Step 5: Align per-layer sizes to buffer_size
         eclatin_buffer_size = self.eclatin_buffer_size
@@ -3359,8 +3382,223 @@ class FileSystemWriterAsync(FileSystemWriter):
             aligned_size = ((max_size + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
             layer_aligned_sizes[layer_id] = aligned_size
         
+        # Step 5.1: Split non-layer data into virtual layers
+        virtual_layer_tensors = {}  # virtual_layer_id -> list of tensors
+        virtual_layer_sizes = {}  # virtual_layer_id -> own_size
+        
+        if max_non_layer_size > 0 and avg_layer_size > 0:
+            # Calculate number of virtual layers needed based on avg_layer_size
+            num_virtual_layers = (max_non_layer_size + avg_layer_size - 1) // avg_layer_size
+            
+            # Calculate virtual layer capacity: max_non_layer_size / num_virtual_layers
+            # This ensures each virtual layer won't exceed its capacity
+            virtual_layer_capacity = (max_non_layer_size + num_virtual_layers - 1) // num_virtual_layers
+            
+            # Analyze non-layer tensor sizes before splitting
+            non_layer_tensor_sizes = []
+            for bucket_idx, tensor_idx, item, tensor in non_layer_tensors:
+                tensor_size = tensor.numel() * tensor.element_size()
+                fqn = item.index.fqn if hasattr(item, 'index') and hasattr(item.index, 'fqn') else str(item)
+                non_layer_tensor_sizes.append((fqn, tensor_size))
+            
+            # Sort by size to find largest tensors
+            non_layer_tensor_sizes_sorted = sorted(non_layer_tensor_sizes, key=lambda x: x[1], reverse=True)
+            max_single_tensor_size = non_layer_tensor_sizes_sorted[0][1] if non_layer_tensor_sizes_sorted else 0
+            
+            logger.info(
+                f"ECLATIN: Non-layer data size: {non_layer_size / (1024**2):.2f} MB (own), "
+                f"{max_non_layer_size / (1024**2):.2f} MB (max across ranks), "
+                f"splitting into {num_virtual_layers} virtual layers "
+                f"(capacity: {virtual_layer_capacity / (1024**2):.2f} MB per layer)"
+            )
+            
+            # Log top 10 largest non-layer tensors
+            # logger.info(f"ECLATIN: Top 10 largest non-layer tensors:")
+            # for i, (fqn, size) in enumerate(non_layer_tensor_sizes_sorted[:10]):
+            #     logger.info(f"  {i+1}. {fqn}: {size / (1024**2):.2f} MB ({size} bytes)")
+            
+            # Adjust capacity if single tensor exceeds it
+            original_virtual_layer_capacity = virtual_layer_capacity
+            if max_single_tensor_size > virtual_layer_capacity:
+                logger.warning(
+                    f"ECLATIN: Largest single non-layer tensor ({max_single_tensor_size / (1024**2):.2f} MB) "
+                    f"exceeds virtual layer capacity ({virtual_layer_capacity / (1024**2):.2f} MB). "
+                    f"Adjusting capacity to accommodate largest tensor."
+                )
+                # Set capacity to max single tensor size
+                virtual_layer_capacity = max_single_tensor_size
+                logger.info(
+                    f"ECLATIN: Adjusted virtual layer capacity: "
+                    f"{original_virtual_layer_capacity / (1024**2):.2f} MB -> {virtual_layer_capacity / (1024**2):.2f} MB"
+                )
+            
+            # Sort non-layer tensors to ensure consistent ordering across ranks
+            non_layer_tensors.sort(key=lambda x: (
+                x[2].index.fqn if hasattr(x[2], 'index') and hasattr(x[2].index, 'fqn') else str(x[2])
+            ))
+            
+            # Smart splitting strategy:
+            # 1. Large tensors (>= original_capacity): each gets its own layer
+            # 2. Small tensors (< original_capacity): pack together up to original_capacity
+            
+            large_tensors = []  # Tensors that need their own layer
+            small_tensors = []  # Tensors that can be packed together
+            
+            for bucket_idx, tensor_idx, item, tensor in non_layer_tensors:
+                tensor_size = tensor.numel() * tensor.element_size()
+                if tensor_size >= original_virtual_layer_capacity:
+                    large_tensors.append((bucket_idx, tensor_idx, item, tensor, tensor_size))
+                else:
+                    small_tensors.append((bucket_idx, tensor_idx, item, tensor, tensor_size))
+            
+            logger.info(
+                f"ECLATIN: Split non-layer tensors: {len(large_tensors)} large tensors "
+                f"(>= {original_virtual_layer_capacity / (1024**2):.2f} MB), "
+                f"{len(small_tensors)} small tensors"
+            )
+            
+            # Assign virtual layers
+            current_virtual_layer = 0
+            
+            # First, assign large tensors (each gets its own layer)
+            for bucket_idx, tensor_idx, item, tensor, tensor_size in large_tensors:
+                virtual_layer_tensors[current_virtual_layer] = [(bucket_idx, tensor_idx, item, tensor)]
+                virtual_layer_sizes[current_virtual_layer] = tensor_size
+                logger.debug(
+                    f"ECLATIN: Virtual layer {current_virtual_layer}: Large tensor "
+                    f"{item.index.fqn if hasattr(item, 'index') and hasattr(item.index, 'fqn') else str(item)}, "
+                    f"size={tensor_size / (1024**2):.2f} MB"
+                )
+                current_virtual_layer += 1
+            
+            # Then, pack small tensors together
+            if small_tensors:
+                virtual_layer_tensors[current_virtual_layer] = []
+                current_virtual_size = 0
+                
+                for bucket_idx, tensor_idx, item, tensor, tensor_size in small_tensors:
+                    # If adding this tensor would exceed capacity, start new layer
+                    if current_virtual_size > 0 and current_virtual_size + tensor_size > original_virtual_layer_capacity:
+                        virtual_layer_sizes[current_virtual_layer] = current_virtual_size
+                        logger.debug(
+                            f"ECLATIN: Virtual layer {current_virtual_layer}: Packed {len(virtual_layer_tensors[current_virtual_layer])} "
+                            f"small tensors, total size={current_virtual_size / (1024**2):.2f} MB"
+                        )
+                        current_virtual_layer += 1
+                        virtual_layer_tensors[current_virtual_layer] = []
+                        current_virtual_size = 0
+                    
+                    virtual_layer_tensors[current_virtual_layer].append((bucket_idx, tensor_idx, item, tensor))
+                    current_virtual_size += tensor_size
+                
+                # Record last layer of small tensors
+                if virtual_layer_tensors[current_virtual_layer]:
+                    virtual_layer_sizes[current_virtual_layer] = current_virtual_size
+                    logger.debug(
+                        f"ECLATIN: Virtual layer {current_virtual_layer}: Packed {len(virtual_layer_tensors[current_virtual_layer])} "
+                        f"small tensors, total size={current_virtual_size / (1024**2):.2f} MB"
+                    )
+                    current_virtual_layer += 1
+            
+            # Update num_virtual_layers to actual number created
+            actual_num_virtual_layers = current_virtual_layer
+            
+            # Fill remaining virtual layers with empty lists if we created fewer than expected
+            for vl_id in range(actual_num_virtual_layers, num_virtual_layers):
+                virtual_layer_tensors[vl_id] = []
+                virtual_layer_sizes[vl_id] = 0
+            
+            logger.info(
+                f"ECLATIN: Created {actual_num_virtual_layers} actual virtual layers "
+                f"(allocated {num_virtual_layers} slots)"
+            )
+            
+            # CRITICAL: All ranks must use the same aligned_size for each virtual layer
+            # Step 1: Build local virtual layer size mapping
+            local_virtual_layer_config = {}
+            for vl_id in range(num_virtual_layers):
+                local_virtual_layer_config[vl_id] = virtual_layer_sizes.get(vl_id, 0)
+            
+            # Step 2: All-gather virtual layer configs from all ranks
+            if torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                all_virtual_layer_configs = [None] * world_size
+                torch.distributed.all_gather_object(all_virtual_layer_configs, local_virtual_layer_config)
+                
+                # Step 3: Calculate maximum size for each virtual layer across all ranks
+                global_virtual_layer_max_sizes = {}
+                for vl_id in range(num_virtual_layers):
+                    max_size_for_this_layer = 0
+                    for rank_config in all_virtual_layer_configs:
+                        if vl_id in rank_config:
+                            max_size_for_this_layer = max(max_size_for_this_layer, rank_config[vl_id])
+                    global_virtual_layer_max_sizes[vl_id] = max_size_for_this_layer
+                
+                logger.info(
+                    f"ECLATIN: Synchronized virtual layer sizes across {world_size} ranks:\n" +
+                    "\n".join([
+                        f"  Virtual layer {vl_id}: max={size / (1024**2):.2f} MB across all ranks"
+                        for vl_id, size in global_virtual_layer_max_sizes.items()
+                        if size > 0  # Only show non-empty layers
+                    ])
+                )
+            else:
+                global_virtual_layer_max_sizes = local_virtual_layer_config.copy()
+            
+            # Add virtual layers to layer_max_sizes and layer_aligned_sizes
+            # Use layer IDs starting after the last real layer
+            max_real_layer_id = max(layer_max_sizes.keys()) if layer_max_sizes else -1
+            virtual_layer_base_id = max_real_layer_id + 1
+            
+            # Step 4: Assign aligned sizes based on GLOBAL maximum for each layer
+            for vl_id in range(num_virtual_layers):
+                virtual_layer_id = virtual_layer_base_id + vl_id
+                
+                # Use global maximum size for this virtual layer
+                global_max_size = global_virtual_layer_max_sizes.get(vl_id, 0)
+                
+                if global_max_size == 0:
+                    # Empty layer across all ranks - skip it
+                    continue
+                
+                # Determine capacity based on global max size
+                if global_max_size >= original_virtual_layer_capacity:
+                    # Large tensor layer (at least one rank has large tensor)
+                    capacity = max(global_max_size, virtual_layer_capacity)
+                else:
+                    # Small tensors packed layer
+                    capacity = original_virtual_layer_capacity
+                
+                aligned_size = ((capacity + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+                
+                layer_max_sizes[virtual_layer_id] = capacity
+                layer_aligned_sizes[virtual_layer_id] = aligned_size
+                
+                # Update layer_sizes for this rank's virtual layer
+                layer_sizes[virtual_layer_id] = virtual_layer_sizes.get(vl_id, 0)
+                
+                # Add to layer_groups
+                layer_key = f"layer_{virtual_layer_id}"
+                layer_groups[layer_key] = virtual_layer_tensors.get(vl_id, [])
+                
+                logger.debug(
+                    f"ECLATIN: Virtual layer {vl_id} (ID={virtual_layer_id}): "
+                    f"global_max={global_max_size / (1024**2):.2f} MB, "
+                    f"own={layer_sizes[virtual_layer_id] / (1024**2):.2f} MB, "
+                    f"aligned={aligned_size / (1024**2):.2f} MB"
+                )
+            
+            # Count actual non-empty virtual layers
+            actual_non_empty_layers = sum(1 for vl_id in range(num_virtual_layers) 
+                                         if global_virtual_layer_max_sizes.get(vl_id, 0) > 0)
+            
+            logger.info(
+                f"ECLATIN: Created {actual_non_empty_layers} non-empty virtual layers "
+                f"(out of {num_virtual_layers} allocated slots) for non-layer data"
+            )
+        
         logger.info(
-            f"ECLATIN: Calculated layer sizes for {len(layer_max_sizes)} layers, "
+            f"ECLATIN: Calculated layer sizes for {len(layer_max_sizes)} layers (including virtual), "
             f"max aligned size: {max(layer_aligned_sizes.values()) / (1024**3):.2f} GB"
         )
         

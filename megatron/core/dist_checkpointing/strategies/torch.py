@@ -2823,6 +2823,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.eclatin_recovered_metadata = None
         self.eclatin_recovered_registry = None
         
+        # Pre-allocated ECLATIN load buffers (allocated on first load, reused on subsequent loads)
+        self.eclatin_preallocated_blocks = None  # Dict[str, torch.Tensor]: 4 blocks
+        self.eclatin_preallocated_recv_buffers = None  # Dict[str, torch.Tensor]: 6 recv buffers (rank2 only)
+        self.eclatin_preallocated_recovered_buffer = None  # torch.Tensor: recovered data buffer (rank2 only)
+        
         # Initialize Gemini recovery buffers (pre-allocated for rank2 recovery)
         self.gemini_recovery_buffer_replica = None  # Buffer for receiving replica data
         self.gemini_recovery_buffer_rank0 = None    # Buffer for receiving rank0 data
@@ -3416,7 +3421,29 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if self.eclatin_recovered_buffer is None:
                 own_metadata = registry.rank_metadata.get(rank, [])
                 total_size = sum(meta.size_bytes for meta in own_metadata)
-                self.eclatin_recovered_buffer = torch.empty(total_size, dtype=torch.uint8)
+                
+                # Check if pre-allocated recovered buffer exists and is large enough
+                if (self.eclatin_preallocated_recovered_buffer is not None and
+                    self.eclatin_preallocated_recovered_buffer.numel() >= total_size):
+                    # Reuse pre-allocated buffer (create view)
+                    self.eclatin_recovered_buffer = self.eclatin_preallocated_recovered_buffer[:total_size]
+                    logger.info(
+                        f"ECLATIN: [Rank {rank}] Reusing pre-allocated recovered buffer: "
+                        f"{total_size / (1024**3):.2f} GB / "
+                        f"{self.eclatin_preallocated_recovered_buffer.numel() / (1024**3):.2f} GB"
+                    )
+                else:
+                    # Allocate new buffer
+                    pin_memory = torch.cuda.is_available() and getattr(self.eclatin_manager, 'eclatin_pin_memory', False)
+                    self.eclatin_recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin_memory)
+                    
+                    # Store for future reuse
+                    self.eclatin_preallocated_recovered_buffer = self.eclatin_recovered_buffer
+                    
+                    logger.info(
+                        f"ECLATIN: [Rank {rank}] Allocated and cached recovered buffer: "
+                        f"{total_size / (1024**3):.2f} GB"
+                    )
         
         # ===== Step 6: Run recovery pipeline =====
         own_metadata = registry.rank_metadata.get(rank, [])
@@ -3549,8 +3576,29 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if self.eclatin_recovered_buffer is None:
                 own_metadata = registry.rank_metadata.get(rank, [])
                 total_size = sum(meta.size_bytes for meta in own_metadata)
-                self.eclatin_recovered_buffer = torch.empty(total_size, dtype=torch.uint8)
-                logger.info(f"ECLATIN Layerwise: [Rank {rank}] Allocated recovered buffer ({total_size / (1024**3):.2f} GB)")
+                
+                # Check if pre-allocated recovered buffer exists and is large enough
+                if (self.eclatin_preallocated_recovered_buffer is not None and
+                    self.eclatin_preallocated_recovered_buffer.numel() >= total_size):
+                    # Reuse pre-allocated buffer (create view)
+                    self.eclatin_recovered_buffer = self.eclatin_preallocated_recovered_buffer[:total_size]
+                    logger.info(
+                        f"ECLATIN Layerwise: [Rank {rank}] Reusing pre-allocated recovered buffer: "
+                        f"{total_size / (1024**3):.2f} GB / "
+                        f"{self.eclatin_preallocated_recovered_buffer.numel() / (1024**3):.2f} GB"
+                    )
+                else:
+                    # Allocate new buffer
+                    pin_memory = torch.cuda.is_available() and getattr(self.eclatin_manager, 'eclatin_pin_memory', False)
+                    self.eclatin_recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin_memory)
+                    
+                    # Store for future reuse
+                    self.eclatin_preallocated_recovered_buffer = self.eclatin_recovered_buffer
+                    
+                    logger.info(
+                        f"ECLATIN Layerwise: [Rank {rank}] Allocated and cached recovered buffer: "
+                        f"{total_size / (1024**3):.2f} GB"
+                    )
         
         # Store registry for later use in layerwise pipeline
         self.eclatin_recovered_metadata = mapped_file_own
@@ -3733,49 +3781,121 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         aligned_half_block_size = ((half_max_total_bytes + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
         
         logger.info(
-            f"ECLATIN: [Load] Allocating 4 persistent blocks based on metadata\n"
+            f"ECLATIN: [Load] Preparing 4 persistent blocks based on metadata\n"
             f"  Own data size: {own_total_size / (1024**3):.2f} GB (actual), "
             f"{max_total_bytes / (1024**3):.2f} GB (pipeline max), "
             f"{aligned_half_block_size / (1024**3):.2f} GB (aligned half block size)"
         )
         
-        # ===== Allocate 4 large continuous buffers =====
-        data_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        data_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        parity_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        parity_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        # ===== Check if pre-allocated buffers exist and are large enough =====
+        block_names = ['data_block_1', 'data_block_2', 'parity_block_1', 'parity_block_2']
         
-        logger.info(
-            f"ECLATIN: [Load] Allocated 4 persistent blocks:\n"
-            f"  data_block_1: {aligned_half_block_size / (1024**3):.2f} GB\n"
-            f"  data_block_2: {aligned_half_block_size / (1024**3):.2f} GB\n"
-            f"  parity_block_1: {aligned_half_block_size / (1024**3):.2f} GB\n"
-            f"  parity_block_2: {aligned_half_block_size / (1024**3):.2f} GB\n"
-            f"  Total memory: {4 * aligned_half_block_size / (1024**3):.2f} GB"
-        )
-        
-        # Return only blocks dictionary (no WriteBuckets needed for load)
-        blocks = {
-            'data_block_1': data_block_1,
-            'data_block_2': data_block_2,
-            'parity_block_1': parity_block_1,
-            'parity_block_2': parity_block_2,
-        }
+        if (self.eclatin_preallocated_blocks is not None and
+            all(name in self.eclatin_preallocated_blocks for name in block_names) and
+            all(self.eclatin_preallocated_blocks[name].numel() >= aligned_half_block_size for name in block_names)):
+            # Reuse pre-allocated buffers (create views)
+            blocks = {
+                name: self.eclatin_preallocated_blocks[name][:aligned_half_block_size]
+                for name in block_names
+            }
+            logger.info(
+                f"ECLATIN: [Load] Reusing pre-allocated blocks: "
+                f"{aligned_half_block_size / (1024**3):.2f} GB x 4 = "
+                f"{4 * aligned_half_block_size / (1024**3):.2f} GB"
+            )
+        else:
+            # Allocate new buffers
+            pin_memory = torch.cuda.is_available() and getattr(self.eclatin_manager, 'eclatin_pin_memory', False)
+            
+            data_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
+            data_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
+            parity_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
+            parity_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
+            
+            # Store for future reuse
+            self.eclatin_preallocated_blocks = {
+                'data_block_1': data_block_1,
+                'data_block_2': data_block_2,
+                'parity_block_1': parity_block_1,
+                'parity_block_2': parity_block_2,
+            }
+            
+            blocks = self.eclatin_preallocated_blocks
+            
+            logger.info(
+                f"ECLATIN: [Load] Allocated and cached 4 persistent blocks:\n"
+                f"  data_block_1: {aligned_half_block_size / (1024**3):.2f} GB\n"
+                f"  data_block_2: {aligned_half_block_size / (1024**3):.2f} GB\n"
+                f"  parity_block_1: {aligned_half_block_size / (1024**3):.2f} GB\n"
+                f"  parity_block_2: {aligned_half_block_size / (1024**3):.2f} GB\n"
+                f"  Total memory: {4 * aligned_half_block_size / (1024**3):.2f} GB"
+            )
         
         return blocks
     
     def _allocate_eclatin_load_recv_buffers(self, global_registry) -> Dict[str, torch.Tensor]:
-        """Allocate recv buffers for rank0 load recovery.
+        """Allocate recv buffers for rank2 load recovery.
         
-        Delegates to manager's allocate_eclatin_load_recv_buffers method.
+        Reuses pre-allocated buffers if available and large enough, otherwise allocates new ones.
         
         Args:
             global_registry: GlobalMetadataRegistry
             
         Returns:
-            Dict[str, torch.Tensor]: Dictionary with 6 recv buffers (rank0 only)
+            Dict[str, torch.Tensor]: Dictionary with 6 recv buffers (rank2 only)
         """
-        return self.eclatin_manager.allocate_eclatin_load_recv_buffers(global_registry)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        
+        if rank != 2:
+            return {}
+        
+        # Calculate required buffer size
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        max_total_bytes = 0
+        for r in range(world_size):
+            rank_metadata = global_registry.rank_metadata.get(r, [])
+            rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+            max_total_bytes = max(max_total_bytes, rank_total_size)
+        
+        eclatin_buffer_size = self.eclatin_manager.eclatin_buffer_size
+        half_max_total_bytes = max_total_bytes // 2
+        aligned_half_block_size = ((half_max_total_bytes + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+        
+        recv_buffer_names = ['rank0_data2', 'rank0_parity2', 'rank1_data1', 'rank1_parity1', 'rank3_data1', 'rank3_data2']
+        
+        # Check if pre-allocated buffers exist and are large enough
+        if (self.eclatin_preallocated_recv_buffers is not None and
+            all(name in self.eclatin_preallocated_recv_buffers for name in recv_buffer_names) and
+            all(self.eclatin_preallocated_recv_buffers[name].numel() >= aligned_half_block_size for name in recv_buffer_names)):
+            # Reuse pre-allocated buffers (create views)
+            recv_buffers = {
+                name: self.eclatin_preallocated_recv_buffers[name][:aligned_half_block_size]
+                for name in recv_buffer_names
+            }
+            logger.info(
+                f"ECLATIN: [Rank {rank}] Reusing pre-allocated recv buffers: "
+                f"{aligned_half_block_size / (1024**3):.2f} GB x 6 = "
+                f"{6 * aligned_half_block_size / (1024**3):.2f} GB"
+            )
+        else:
+            # Allocate new buffers
+            pin_memory = torch.cuda.is_available() and getattr(self.eclatin_manager, 'eclatin_pin_memory', False)
+            
+            recv_buffers = {
+                name: torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
+                for name in recv_buffer_names
+            }
+            
+            # Store for future reuse
+            self.eclatin_preallocated_recv_buffers = recv_buffers
+            
+            logger.info(
+                f"ECLATIN: [Rank {rank}] Allocated and cached 6 recv buffers:\n"
+                f"  Buffer size: {aligned_half_block_size / (1024**3):.2f} GB each\n"
+                f"  Total memory: {6 * aligned_half_block_size / (1024**3):.2f} GB"
+            )
+        
+        return recv_buffers
     
     def _extract_decomposed_from_buffer(
         self,
@@ -4286,6 +4406,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # Step 1: Create pair process group
             pair_group = get_or_create_pair_process_group(rank, 0)
             
+            data_start_time = time()
             # Step 2: Receive metadata (both file sizes)
             local_metadata_dummy = torch.zeros(2, dtype=torch.int64)
             remote_metadata = torch.zeros(2, dtype=torch.int64)
@@ -4312,20 +4433,22 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info(f"rank: {rank}, receiving rank0's checkpoint data (for backup)...")
             rank0_tensor = self._get_gemini_recovery_buffer('rank0', rank0_size)
             torch.distributed.broadcast(rank0_tensor, src=0, group=pair_group)
-            logger.info(f"rank: {rank}, received rank0's checkpoint data: {rank0_size / (1024**2):.2f} MB")
-            
+            data_end_time = time()
+            data_time = data_end_time - data_start_time
+            logger.info(f"rank: {rank}, receive from rank0 checkpoint data in {data_time:.2f} seconds")
+
             # Step 5: Save rank0's data as replica file
-            try:
-                replica_filename = checkpoint_dir / f"__{rank}_0_replica0_rank{rank}.distcp"
-                logger.info(f"rank: {rank}, saving rank0's backup to: {replica_filename}")
+            # try:
+            #     replica_filename = checkpoint_dir / f"__{rank}_0_replica0_rank{rank}.distcp"
+            #     logger.info(f"rank: {rank}, saving rank0's backup to: {replica_filename}")
                 
-                with open(replica_filename, 'wb') as f_replica:
-                    rank0_data_bytes = rank0_tensor.numpy().tobytes()
-                    f_replica.write(rank0_data_bytes)
+            #     with open(replica_filename, 'wb') as f_replica:
+            #         rank0_data_bytes = rank0_tensor.numpy().tobytes()
+            #         f_replica.write(rank0_data_bytes)
                 
-                logger.info(f"rank: {rank}, successfully saved rank0's backup data")
-            except Exception as e:
-                logger.warning(f"rank: {rank}, failed to save rank0's backup data: {e}")
+            #     logger.info(f"rank: {rank}, successfully saved rank0's backup data")
+            # except Exception as e:
+            #     logger.warning(f"rank: {rank}, failed to save rank0's backup data: {e}")
                 # Continue - this is optional
             
             # Step 6: Parse and restore state_dict from replica data
@@ -4379,16 +4502,21 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     replica_buckets, sharded_state_dict
                 )
             else:
+                deserialize_start_time = time()
                 # Standard pickle format
                 logger.info(f"rank: {rank}, parsing as standard pickle format")
                 replica_data_io = io.BytesIO(replica_bytes)
                 replica_buckets = torch.load(replica_data_io, weights_only=False)
-                
+                deserialize_end_time = time()
                 logger.info(f"rank: {rank}, restoring state_dict from replica data...")
+                deserialize_time = deserialize_end_time - deserialize_start_time
+                logger.info(f"rank: {rank}, deserialize state_dict from replica data in {deserialize_time:.2f} seconds")
                 loaded_state_dict = self._restore_state_dict_from_write_buckets(
                     replica_buckets, sharded_state_dict
                 )
-            
+                recovery_end_time = time()
+                recovery_time = recovery_end_time - deserialize_end_time
+                logger.info(f"rank: {rank}, recovery state_dict from replica data in {recovery_time:.2f} seconds")
             logger.info(f"rank: {rank}, successfully restored state_dict and saved rank0's backup")
             return loaded_state_dict
     
@@ -6115,6 +6243,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             half_actual_data = actual_tensor_buffer_size // 2  # Same split point as save phase
             
             if recovered_buffer.numel() >= total_size:
+                copy_start_time = time()
                 # Copy first half: from data_block_1[0:half_actual_data]
                 first_half_actual = min(half_actual_data, total_size)
                 recovered_buffer[:first_half_actual].copy_(
@@ -6127,15 +6256,16 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     recovered_buffer[first_half_actual:total_size].copy_(
                         eclatin_blocks['data_block_2'][:second_half_size]
                     )
-                
-                logger.info(
-                    f"ECLATIN: [Rank 2] Copied recovered data to buffer "
-                    f"({total_size / (1024**3):.2f} GB): "
-                    f"actual_tensor_buffer_size={actual_tensor_buffer_size / (1024**3):.2f} GB, "
-                    f"half_actual_data={half_actual_data / (1024**3):.2f} GB, "
-                    f"first half {first_half_actual / (1024**3):.2f} GB from data_block_1, "
-                    f"second half {(total_size - first_half_actual) / (1024**3):.2f} GB from data_block_2"
-                )
+                copy_end_time = time()
+                logger.info(f"ECLATIN: [Rank 2] Copied recovered data to buffer in {copy_end_time - copy_start_time:.2f} seconds")
+                # logger.info(
+                #     f"ECLATIN: [Rank 2] Copied recovered data to buffer "
+                #     f"({total_size / (1024**3):.2f} GB): "
+                #     f"actual_tensor_buffer_size={actual_tensor_buffer_size / (1024**3):.2f} GB, "
+                #     f"half_actual_data={half_actual_data / (1024**3):.2f} GB, "
+                #     f"first half {first_half_actual / (1024**3):.2f} GB from data_block_1, "
+                #     f"second half {(total_size - first_half_actual) / (1024**3):.2f} GB from data_block_2"
+                # )
             else:
                 logger.warning(
                     f"ECLATIN: [Rank 2] recovered_buffer too small "
@@ -7465,7 +7595,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                             logger.error(f"ECLATIN: Matched key {lookup_key} but tensor is None!")
                     else:
                         unmatched_count += 1
-                        logger.warning(f"ECLATIN: [Rank {rank}] Unmatched ShardedTensor: key={key}, global_offset={sh_offset}, lookup_key={lookup_key}")
+                        # logger.warning(f"ECLATIN: [Rank {rank}] Unmatched ShardedTensor: key={key}, global_offset={sh_offset}, lookup_key={lookup_key}")
         
         logger.info(f"ECLATIN: Matched {matched_count} ShardedBase objects")
         if unmatched_count > 0:
@@ -7612,9 +7742,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 logger.info(f"Using ECLATIN standard load mode")
                 # Load P2P checkpoint data (for rank2 recovery, this prepares the buffer)
                 mapped_file_own, mapped_file_partner = self._load_eclatin_block_checkpoint(checkpoint_dir, sharded_state_dict)
-                
+                eclatin_recovery_start_time = time()
                 # _load_eclatin_checkpoint will use recovered data if available (rank2)
                 mcore_state_dict = self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)
+                eclatin_recovery_end_time = time()
+                eclatin_recovery_time = eclatin_recovery_end_time - eclatin_recovery_start_time
+                logger.info(f"ECLATIN: [Rank {rank}] ECLATIN recovery time: {eclatin_recovery_time:.2f} seconds")
                 return mcore_state_dict
         # Apply N-D tensors resharding
         reformulation_metadata = get_reformulation_metadata(sharded_state_dict, checkpoint_dir)

@@ -138,16 +138,43 @@ class GeminiReplicasManager:
         base_ip = os.environ.get('GEMINI_REPLICAS_BASE_IP')
         
         if not base_ip:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(('8.8.8.8', 80))
-                base_ip = s.getsockname()[0]
-                s.close()
-                logger.info(f"Gemini Replicas: Auto-detected IP address: {base_ip}")
-            except Exception as e:
-                logger.warning(f"Gemini Replicas: Failed to auto-detect IP: {e}")
-                base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
-                logger.warning(f"Gemini Replicas: Using fallback IP: {base_ip}")
+            # Check if specific network interface is requested
+            interface_name = os.environ.get('GEMINI_REPLICAS_INTERFACE')
+            
+            if interface_name:
+                # Try to get IP from specific interface using netifaces
+                try:
+                    import netifaces
+                    addrs = netifaces.ifaddresses(interface_name)
+                    if netifaces.AF_INET in addrs:
+                        base_ip = addrs[netifaces.AF_INET][0]['addr']
+                        logger.info(f"Gemini Replicas: Using IP from interface {interface_name}: {base_ip}")
+                    else:
+                        logger.warning(f"Gemini Replicas: Interface {interface_name} has no IPv4 address")
+                        base_ip = None
+                except ImportError:
+                    logger.warning(
+                        "Gemini Replicas: netifaces module not installed. "
+                        "Install via 'pip install netifaces' to use GEMINI_REPLICAS_INTERFACE. "
+                        "Falling back to auto-detection."
+                    )
+                    base_ip = None
+                except Exception as e:
+                    logger.warning(f"Gemini Replicas: Failed to get IP from interface {interface_name}: {e}")
+                    base_ip = None
+            
+            if not base_ip:
+                # Fallback to auto-detection
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(('8.8.8.8', 80))
+                    base_ip = s.getsockname()[0]
+                    s.close()
+                    logger.info(f"Gemini Replicas: Auto-detected IP address: {base_ip}")
+                except Exception as e:
+                    logger.warning(f"Gemini Replicas: Failed to auto-detect IP: {e}")
+                    base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
+                    logger.warning(f"Gemini Replicas: Using fallback IP: {base_ip}")
         
         # Step 2: Get base port
         master_port = int(os.environ.get('MASTER_PORT', '6000'))

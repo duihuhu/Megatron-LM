@@ -109,25 +109,50 @@ class GeminiManager:
         import socket
         
         # Step 1: Get base IP address
-        # Priority: GEMINI_BASE_IP > auto-detect > MASTER_ADDR (fallback)
+        # Priority: GEMINI_BASE_IP > GEMINI_INTERFACE > auto-detect > MASTER_ADDR (fallback)
         base_ip = os.environ.get('GEMINI_BASE_IP')
         
         # If GEMINI_BASE_IP is not set, try to auto-detect actual IP
         if not base_ip:
-            try:
-                # Get IP of the interface used for distributed training
-                # Connect to a remote address (doesn't actually send data)
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                # Use a public DNS server IP to determine the default route interface
-                s.connect(('8.8.8.8', 80))
-                base_ip = s.getsockname()[0]
-                s.close()
-                logger.info(f"Gemini: Auto-detected IP address: {base_ip}")
-            except Exception as e:
-                logger.warning(f"Gemini: Failed to auto-detect IP: {e}")
-                # Fallback to MASTER_ADDR or localhost
-                base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
-                logger.warning(f"Gemini: Using fallback IP: {base_ip}")
+            # Check if specific network interface is requested
+            interface_name = os.environ.get('GEMINI_INTERFACE')
+            
+            if interface_name:
+                try:
+                    import netifaces
+                    addrs = netifaces.ifaddresses(interface_name)
+                    if netifaces.AF_INET in addrs:
+                        base_ip = addrs[netifaces.AF_INET][0]['addr']
+                        logger.info(f"Gemini: Using IP from interface {interface_name}: {base_ip}")
+                    else:
+                        logger.warning(f"Gemini: Interface {interface_name} has no IPv4 address")
+                        base_ip = None
+                except ImportError:
+                    logger.warning(
+                        "Gemini: netifaces module not installed. "
+                        "Install via 'pip install netifaces' to use GEMINI_INTERFACE. "
+                        "Falling back to auto-detection."
+                    )
+                    base_ip = None
+                except Exception as e:
+                    logger.warning(f"Gemini: Failed to get IP from interface {interface_name}: {e}")
+                    base_ip = None
+            
+            if not base_ip:
+                try:
+                    # Get IP of the interface used for distributed training
+                    # Connect to a remote address (doesn't actually send data)
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    # Use a public DNS server IP to determine the default route interface
+                    s.connect(('8.8.8.8', 80))
+                    base_ip = s.getsockname()[0]
+                    s.close()
+                    logger.info(f"Gemini: Auto-detected IP address: {base_ip}")
+                except Exception as e:
+                    logger.warning(f"Gemini: Failed to auto-detect IP: {e}")
+                    # Fallback to MASTER_ADDR or localhost
+                    base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
+                    logger.warning(f"Gemini: Using fallback IP: {base_ip}")
         
         # Step 2: Get base port
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
@@ -193,6 +218,29 @@ class GeminiManager:
             f"  Ports: {config['ports']}\n"
             f"  All rank IPs: {config['rank_ips']}"
         )
+        
+        # Print detailed IP information for C++ transmission between ranks
+        print(f"=" * 80)
+        print(f"[Gemini C++ Transmission] Rank {rank} Network Configuration:")
+        print(f"  Local Rank: {rank}")
+        print(f"  Local IP Address: {config['my_ip']}")
+        print(f"  Local Send Port: {config['ports']['send']}")
+        print(f"  Local Recv Port: {config['ports']['recv']}")
+        print(f"-" * 80)
+        print(f"  Partner Rank: {partner_rank}")
+        print(f"  Partner IP Address: {config['partner_ip']}")
+        print(f"  Partner Send Port: {base_port + partner_rank * 2 + 0}")
+        print(f"  Partner Recv Port: {base_port + partner_rank * 2 + 1}")
+        print(f"-" * 80)
+        print(f"  C++ Connection Details:")
+        print(f"    This rank will SEND to: {config['partner_ip']}:{base_port + partner_rank * 2 + 1}")
+        print(f"    This rank will RECV on: {config['my_ip']}:{config['ports']['recv']}")
+        print(f"-" * 80)
+        print(f"  All Ranks IP Mapping:")
+        for r, ip in config['rank_ips'].items():
+            marker = " <-- YOU" if r == rank else " <-- PARTNER" if r == partner_rank else ""
+            print(f"    Rank {r}: {ip}{marker}")
+        print(f"=" * 80)
         
         return config
     

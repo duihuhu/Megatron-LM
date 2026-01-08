@@ -208,25 +208,50 @@ class ECLATINManager:
         import socket
         
         # Step 1: Get base IP address
-        # Priority: ECLATIN_BASE_IP > auto-detect > MASTER_ADDR (fallback)
+        # Priority: ECLATIN_BASE_IP > ECLATIN_INTERFACE > auto-detect > MASTER_ADDR (fallback)
         base_ip = os.environ.get('ECLATIN_BASE_IP')
         
         # If ECLATIN_BASE_IP is not set, try to auto-detect actual IP
         if not base_ip:
-            try:
-                # Get IP of the interface used for distributed training
-                # Connect to a remote address (doesn't actually send data)
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                # Use a public DNS server IP to determine the default route interface
-                s.connect(('8.8.8.8', 80))
-                base_ip = s.getsockname()[0]
-                s.close()
-                logger.info(f"ECLATIN: Auto-detected IP address: {base_ip}")
-            except Exception as e:
-                logger.warning(f"ECLATIN: Failed to auto-detect IP: {e}")
-                # Fallback to MASTER_ADDR or localhost
-                base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
-                logger.warning(f"ECLATIN: Using fallback IP: {base_ip}")
+            # Check if specific network interface is requested
+            interface_name = os.environ.get('ECLATIN_INTERFACE')
+            
+            if interface_name:
+                try:
+                    import netifaces
+                    addrs = netifaces.ifaddresses(interface_name)
+                    if netifaces.AF_INET in addrs:
+                        base_ip = addrs[netifaces.AF_INET][0]['addr']
+                        logger.info(f"ECLATIN: Using IP from interface {interface_name}: {base_ip}")
+                    else:
+                        logger.warning(f"ECLATIN: Interface {interface_name} has no IPv4 address")
+                        base_ip = None
+                except ImportError:
+                    logger.warning(
+                        "ECLATIN: netifaces module not installed. "
+                        "Install via 'pip install netifaces' to use ECLATIN_INTERFACE. "
+                        "Falling back to auto-detection."
+                    )
+                    base_ip = None
+                except Exception as e:
+                    logger.warning(f"ECLATIN: Failed to get IP from interface {interface_name}: {e}")
+                    base_ip = None
+            
+            if not base_ip:
+                try:
+                    # Get IP of the interface used for distributed training
+                    # Connect to a remote address (doesn't actually send data)
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    # Use a public DNS server IP to determine the default route interface
+                    s.connect(('8.8.8.8', 80))
+                    base_ip = s.getsockname()[0]
+                    s.close()
+                    logger.info(f"ECLATIN: Auto-detected IP address: {base_ip}")
+                except Exception as e:
+                    logger.warning(f"ECLATIN: Failed to auto-detect IP: {e}")
+                    # Fallback to MASTER_ADDR or localhost
+                    base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
+                    logger.warning(f"ECLATIN: Using fallback IP: {base_ip}")
         
         # Step 2: Get base port
         # Priority: ECLATIN_BASE_PORT > MASTER_PORT + 10000 > default 16000

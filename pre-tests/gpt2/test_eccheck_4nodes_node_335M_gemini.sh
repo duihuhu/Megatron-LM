@@ -7,18 +7,21 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
+export NETIFACES_INTERFACE=enp65s0np0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
 
 GPUS_PER_NODE=1
-MASTER_ADDR=128.105.146.30
-export NCCL_SOCKET_IFNAME=eno33np0
-export GLOO_SOCKET_IFNAME=eno33np0
+MASTER_ADDR=10.10.1.1
+export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
+export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
 NNODES=4
+
+export GEMINI_INTERFACE=$NETIFACES_INTERFACE
 
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
@@ -107,7 +110,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH
+    # --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck

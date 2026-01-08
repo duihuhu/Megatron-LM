@@ -173,18 +173,43 @@ class ECCHECKManager:
         
         # If using localhost, try to get actual IP
         if base_ip == '127.0.0.1' or base_ip == 'localhost':
-            try:
-                # Get IP of the interface used for distributed training
-                # Connect to a remote address (doesn't actually send data)
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(('8.8.8.8', 80))
-                base_ip = s.getsockname()[0]
-                s.close()
-                logger.info(f"EC-CHECK: Auto-detected IP address: {base_ip}")
-            except Exception as e:
-                # Fallback to localhost
-                logger.warning(f"EC-CHECK: Failed to auto-detect IP, using localhost: {e}")
-                base_ip = '127.0.0.1'
+            # Check if specific network interface is requested
+            interface_name = os.environ.get('ECCHECK_INTERFACE')
+            
+            if interface_name:
+                try:
+                    import netifaces
+                    addrs = netifaces.ifaddresses(interface_name)
+                    if netifaces.AF_INET in addrs:
+                        base_ip = addrs[netifaces.AF_INET][0]['addr']
+                        logger.info(f"EC-CHECK: Using IP from interface {interface_name}: {base_ip}")
+                    else:
+                        logger.warning(f"EC-CHECK: Interface {interface_name} has no IPv4 address")
+                        base_ip = '127.0.0.1'
+                except ImportError:
+                    logger.warning(
+                        "EC-CHECK: netifaces module not installed. "
+                        "Install via 'pip install netifaces' to use ECCHECK_INTERFACE. "
+                        "Falling back to auto-detection."
+                    )
+                    base_ip = '127.0.0.1'
+                except Exception as e:
+                    logger.warning(f"EC-CHECK: Failed to get IP from interface {interface_name}: {e}")
+                    base_ip = '127.0.0.1'
+            
+            if base_ip == '127.0.0.1':
+                try:
+                    # Get IP of the interface used for distributed training
+                    # Connect to a remote address (doesn't actually send data)
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(('8.8.8.8', 80))
+                    base_ip = s.getsockname()[0]
+                    s.close()
+                    logger.info(f"EC-CHECK: Auto-detected IP address: {base_ip}")
+                except Exception as e:
+                    # Fallback to localhost
+                    logger.warning(f"EC-CHECK: Failed to auto-detect IP, using localhost: {e}")
+                    base_ip = '127.0.0.1'
         
         # Step 2: Get base port
         # Priority: ECCHECK_BASE_PORT > MASTER_PORT + 10000 > default 16000
@@ -213,19 +238,44 @@ class ECCHECKManager:
         if torch.distributed.is_initialized():
             try:
                 # Get actual IP address for each rank
-                # Priority: ECCHECK_RANK_IP_<rank> > auto-detect from network interface
+                # Priority: ECCHECK_RANK_IP_<rank> > ECCHECK_INTERFACE > auto-detect from network interface
                 my_actual_ip = os.environ.get(f'ECCHECK_RANK_IP_{rank}')
                 if not my_actual_ip:
-                    # Try to get actual IP from network interface
-                    try:
-                        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                        s.connect(('8.8.8.8', 80))
-                        my_actual_ip = s.getsockname()[0]
-                        s.close()
-                        logger.info(f"EC-CHECK: [Rank {rank}] Auto-detected my IP: {my_actual_ip}")
-                    except Exception as e:
-                        logger.warning(f"EC-CHECK: [Rank {rank}] Failed to auto-detect IP, using base_ip: {e}")
-                        my_actual_ip = base_ip
+                    # Check if specific network interface is requested
+                    interface_name = os.environ.get('ECCHECK_INTERFACE')
+                    
+                    if interface_name:
+                        try:
+                            import netifaces
+                            addrs = netifaces.ifaddresses(interface_name)
+                            if netifaces.AF_INET in addrs:
+                                my_actual_ip = addrs[netifaces.AF_INET][0]['addr']
+                                logger.info(f"EC-CHECK: [Rank {rank}] Using IP from interface {interface_name}: {my_actual_ip}")
+                            else:
+                                logger.warning(f"EC-CHECK: [Rank {rank}] Interface {interface_name} has no IPv4 address")
+                                my_actual_ip = None
+                        except ImportError:
+                            logger.warning(
+                                f"EC-CHECK: [Rank {rank}] netifaces module not installed. "
+                                "Install via 'pip install netifaces' to use ECCHECK_INTERFACE. "
+                                "Falling back to auto-detection."
+                            )
+                            my_actual_ip = None
+                        except Exception as e:
+                            logger.warning(f"EC-CHECK: [Rank {rank}] Failed to get IP from interface {interface_name}: {e}")
+                            my_actual_ip = None
+                    
+                    if not my_actual_ip:
+                        # Try to get actual IP from network interface
+                        try:
+                            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                            s.connect(('8.8.8.8', 80))
+                            my_actual_ip = s.getsockname()[0]
+                            s.close()
+                            logger.info(f"EC-CHECK: [Rank {rank}] Auto-detected my IP: {my_actual_ip}")
+                        except Exception as e:
+                            logger.warning(f"EC-CHECK: [Rank {rank}] Failed to auto-detect IP, using base_ip: {e}")
+                            my_actual_ip = base_ip
                 else:
                     logger.info(f"EC-CHECK: [Rank {rank}] Using IP from ECCHECK_RANK_IP_{rank}: {my_actual_ip}")
                 

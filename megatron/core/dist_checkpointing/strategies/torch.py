@@ -2526,6 +2526,63 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             local_metadata.append(data_meta)
         
         return local_metadata
+    
+    def _derive_metadata_from_sharded_state_dict(self, sharded_state_dict: ShardedStateDict, my_rank: int):
+        """
+        Derive tensor metadata from sharded_state_dict for failed rank recovery.
+        
+        This is used when a rank doesn't have its checkpoint file (e.g., after node failure)
+        but needs to participate in metadata exchange. The sharded_state_dict describes
+        what tensors this rank needs to load, including all necessary metadata.
+        
+        Args:
+            sharded_state_dict (ShardedStateDict): sharded state dict describing tensors to load
+            my_rank (int): current rank
+            
+        Returns:
+            Tuple[List[TensorMetadata], Dict]: (tensor_metadata_list, non_tensor_data_dict)
+        """
+        from .state_dict_decomposer import TensorMetadata
+        from ..mapping import ShardedTensor
+        from ..dict_utils import nested_values
+        
+        local_metadata = []
+        non_tensor_data = {}
+        
+        logger.info(f"[Rank {my_rank}] Deriving metadata from sharded_state_dict for failed node recovery")
+        
+        # Traverse sharded_state_dict to find all ShardedTensor objects
+        for sh_ten in nested_values(sharded_state_dict):
+            if not isinstance(sh_ten, ShardedTensor):
+                continue
+            
+            # Calculate size_bytes from shape and dtype
+            element_size = torch.tensor([], dtype=sh_ten.dtype).element_size()
+            numel = 1
+            for dim in sh_ten.local_shape:
+                numel *= dim
+            size_bytes = numel * element_size
+            
+            # Create TensorMetadata from ShardedTensor
+            meta = TensorMetadata(
+                key=sh_ten.key,
+                shape=sh_ten.local_shape,
+                dtype=str(sh_ten.dtype),
+                size_bytes=size_bytes,
+                global_offset=sh_ten.global_offset if sh_ten.global_offset is not None else (),
+                shard_index=sh_ten.replica_id if isinstance(sh_ten.replica_id, int) else 0,
+                chunk_type='data',
+                target_rank=my_rank,
+                source_rank=my_rank,
+            )
+            local_metadata.append(meta)
+        
+        logger.info(
+            f"[Rank {my_rank}] Derived {len(local_metadata)} tensor metadata entries from sharded_state_dict\n"
+            f"  Total size: {sum(m.size_bytes for m in local_metadata) / (1024**3):.2f} GB"
+        )
+        
+        return local_metadata, non_tensor_data
         
     def _prepare_eccheck_write_buckets(self, plan: SavePlan, checkpoint_dir: Optional[Path] = None) -> None:
         """
@@ -2765,8 +2822,204 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.eclatin_recovered_buffer = None
         self.eclatin_recovered_metadata = None
         self.eclatin_recovered_registry = None
+        
+        # Initialize Gemini recovery buffers (pre-allocated for rank2 recovery)
+        self.gemini_recovery_buffer_replica = None  # Buffer for receiving replica data
+        self.gemini_recovery_buffer_rank0 = None    # Buffer for receiving rank0 data
+        self._allocate_gemini_recovery_buffers()
+        
+        # Initialize Gemini Replicas recovery buffers (pre-allocated for rank2 recovery)
+        # Gemini Replicas needs to receive from multiple ranks (rank0, rank1, rank3)
+        self.gemini_replicas_recovery_buffers = {}  # Dict[int, torch.Tensor]: rank -> buffer
+        self._allocate_gemini_replicas_recovery_buffers()
     
         self.pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
+    
+    def _allocate_gemini_recovery_buffers(self):
+        """Pre-allocate large buffers for Gemini recovery to avoid allocation overhead.
+        
+        Only allocates for rank2 (the recovery rank). Allocates two buffers:
+        1. replica buffer: for receiving rank2's own backup data
+        2. rank0 buffer: for receiving rank0's checkpoint data
+        
+        Buffer size is set to 4GB by default, which should be enough for most models.
+        If the actual data size exceeds this, we'll fall back to dynamic allocation.
+        """
+        try:
+            from megatron.training import get_args
+            args = get_args()
+            
+            # Only allocate for rank2 and only if Gemini is enabled
+            if not (hasattr(args, 'use_gemini') and args.use_gemini):
+                return
+            
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank != 2:
+                return
+            
+            # Default buffer size: 4GB (adjustable via args if needed)
+            buffer_size_gb = getattr(args, 'gemini_recovery_buffer_size_gb', 2)
+            buffer_size_bytes = buffer_size_gb * 1024 * 1024 * 1024
+            
+            logger.info(f"rank: {rank}, allocating Gemini recovery buffers: {buffer_size_gb} GB each")
+            
+            # Allocate pinned memory buffers for faster GPU transfer
+            if torch.cuda.is_available():
+                self.gemini_recovery_buffer_replica = torch.empty(
+                    buffer_size_bytes, dtype=torch.uint8
+                ).pin_memory()
+                self.gemini_recovery_buffer_rank0 = torch.empty(
+                    buffer_size_bytes, dtype=torch.uint8
+                ).pin_memory()
+                logger.info(f"rank: {rank}, allocated pinned memory buffers for Gemini recovery")
+            else:
+                self.gemini_recovery_buffer_replica = torch.empty(
+                    buffer_size_bytes, dtype=torch.uint8
+                )
+                self.gemini_recovery_buffer_rank0 = torch.empty(
+                    buffer_size_bytes, dtype=torch.uint8
+                )
+                logger.info(f"rank: {rank}, allocated CPU buffers for Gemini recovery")
+            
+            logger.info(
+                f"rank: {rank}, Gemini recovery buffers allocated successfully: "
+                f"{buffer_size_bytes / (1024**3):.2f} GB x 2"
+            )
+            
+        except Exception as e:
+            logger.warning(f"Failed to allocate Gemini recovery buffers: {e}")
+            # Fall back to dynamic allocation
+            self.gemini_recovery_buffer_replica = None
+            self.gemini_recovery_buffer_rank0 = None
+    
+    def _get_gemini_recovery_buffer(self, buffer_type: str, required_size: int) -> torch.Tensor:
+        """Get pre-allocated buffer or allocate dynamically if needed.
+        
+        Args:
+            buffer_type: 'replica' or 'rank0'
+            required_size: Required buffer size in bytes
+            
+        Returns:
+            torch.Tensor: Buffer to use (either pre-allocated or newly allocated)
+        """
+        if buffer_type == 'replica':
+            preallocated_buffer = self.gemini_recovery_buffer_replica
+        elif buffer_type == 'rank0':
+            preallocated_buffer = self.gemini_recovery_buffer_rank0
+        else:
+            raise ValueError(f"Invalid buffer_type: {buffer_type}")
+        
+        # Check if pre-allocated buffer is available and large enough
+        if preallocated_buffer is not None and preallocated_buffer.numel() >= required_size:
+            logger.info(
+                f"Using pre-allocated {buffer_type} buffer: "
+                f"{required_size / (1024**2):.2f} MB / {preallocated_buffer.numel() / (1024**2):.2f} MB"
+            )
+            # Return a view of the required size
+            return preallocated_buffer[:required_size]
+        else:
+            # Fall back to dynamic allocation
+            logger.warning(
+                f"Pre-allocated {buffer_type} buffer not available or too small "
+                f"(required: {required_size / (1024**2):.2f} MB), allocating dynamically"
+            )
+            if torch.cuda.is_available():
+                return torch.empty(required_size, dtype=torch.uint8).pin_memory()
+            else:
+                return torch.empty(required_size, dtype=torch.uint8)
+    
+    def _allocate_gemini_replicas_recovery_buffers(self):
+        """Pre-allocate buffers for Gemini Replicas recovery.
+        
+        For rank2 recovery, we need to receive data from multiple ranks:
+        - rank0: sends its own data (rank2 had rank0's backup)
+        - rank1: sends its own data (rank2 had rank1's backup)
+        - rank3: sends rank2's replica (rank3 had rank2's backup)
+        
+        We allocate 3 buffers for rank2 to receive from these 3 sources.
+        """
+        try:
+            from megatron.training import get_args
+            args = get_args()
+            
+            # Only allocate for rank2 and only if Gemini Replicas is enabled
+            if not (hasattr(args, 'use_gemini_replicas') and args.use_gemini_replicas):
+                return
+            
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank != 2:
+                return
+            
+            # Default buffer size: 4GB per buffer (adjustable via args if needed)
+            buffer_size_gb = getattr(args, 'gemini_replicas_recovery_buffer_size_gb', 2)
+            buffer_size_bytes = buffer_size_gb * 1024 * 1024 * 1024
+            
+            # Ranks that will send data to rank2 during recovery
+            source_ranks = [0, 1, 3]
+            
+            logger.info(
+                f"rank: {rank}, allocating Gemini Replicas recovery buffers: "
+                f"{buffer_size_gb} GB x {len(source_ranks)} (for ranks {source_ranks})"
+            )
+            
+            # Allocate one buffer for each source rank
+            for src_rank in source_ranks:
+                if torch.cuda.is_available():
+                    self.gemini_replicas_recovery_buffers[src_rank] = torch.empty(
+                        buffer_size_bytes, dtype=torch.uint8
+                    ).pin_memory()
+                else:
+                    self.gemini_replicas_recovery_buffers[src_rank] = torch.empty(
+                        buffer_size_bytes, dtype=torch.uint8
+                    )
+            
+            if torch.cuda.is_available():
+                logger.info(f"rank: {rank}, allocated pinned memory buffers for Gemini Replicas recovery")
+            else:
+                logger.info(f"rank: {rank}, allocated CPU buffers for Gemini Replicas recovery")
+            
+            logger.info(
+                f"rank: {rank}, Gemini Replicas recovery buffers allocated successfully: "
+                f"{buffer_size_bytes / (1024**3):.2f} GB x {len(source_ranks)} = "
+                f"{buffer_size_bytes * len(source_ranks) / (1024**3):.2f} GB total"
+            )
+            
+        except Exception as e:
+            logger.warning(f"Failed to allocate Gemini Replicas recovery buffers: {e}")
+            # Fall back to dynamic allocation
+            self.gemini_replicas_recovery_buffers = {}
+    
+    def _get_gemini_replicas_recovery_buffer(self, source_rank: int, required_size: int) -> torch.Tensor:
+        """Get pre-allocated buffer for Gemini Replicas recovery or allocate dynamically.
+        
+        Args:
+            source_rank: The rank we're receiving from (0, 1, or 3)
+            required_size: Required buffer size in bytes
+            
+        Returns:
+            torch.Tensor: Buffer to use (either pre-allocated or newly allocated)
+        """
+        preallocated_recovery_buffer = self.gemini_replicas_recovery_buffers.get(source_rank)
+        
+        # Check if pre-allocated buffer is available and large enough
+        if preallocated_recovery_buffer is not None and preallocated_recovery_buffer.numel() >= required_size:
+            logger.info(
+                f"Using pre-allocated buffer for rank{source_rank}: "
+                f"{required_size / (1024**2):.2f} MB / {preallocated_recovery_buffer.numel() / (1024**2):.2f} MB"
+            )
+            # Return a view of the required size
+            return preallocated_recovery_buffer[:required_size]
+        else:
+            # Fall back to dynamic allocation
+            logger.warning(
+                f"Pre-allocated buffer for rank{source_rank} not available or too small "
+                f"(required: {required_size / (1024**2):.2f} MB), allocating dynamically"
+            )
+            if torch.cuda.is_available():
+                return torch.empty(required_size, dtype=torch.uint8).pin_memory()
+            else:
+                return torch.empty(required_size, dtype=torch.uint8)
+    
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank using the shared manager."""
         return self.eccheck_manager.get_p2p_partner_rank(my_rank, world_size)
@@ -3055,18 +3308,20 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Return EccheckMappedFile, non_tensor_data, and local_metadata for each file
         return mapped_file_own, mapped_file_partner
     
-    def _load_eclatin_block_checkpoint(self, checkpoint_dir: Path) -> Tuple:
+    def _load_eclatin_block_checkpoint(self, checkpoint_dir: Path, sharded_state_dict: ShardedStateDict = None) -> Tuple:
         """Load ECLATIN checkpoint data and recover rank2.
         
         Similar to EC-CHECK for rank2 recovery.
         
         Args:
             checkpoint_dir (Path): checkpoint directory
+            sharded_state_dict (ShardedStateDict): sharded state dict for failed rank to derive metadata
         
         Returns:
             Tuple: (mapped_file_own, None) - placeholder for compatibility
         """
         from .filesystem_async import FileSystemWriterAsync
+        from time import time
         
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -3078,14 +3333,39 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # ===== Step 1: Load main file to extract metadata =====
         eclatin_main_file = checkpoint_dir / f'__{rank}_0.distcp'
-        if not eclatin_main_file.exists():
-            logger.warning(f"ECLATIN: Main file not found for rank {rank}: {eclatin_main_file}")
-            return None, None
         
-        # Load main file, extract Component 1 and Component 2 (metadata)
-        mapped_file_own = FileSystemWriterAsync.load_eclatin_bytes_from_file(
-            str(eclatin_main_file), my_rank=rank
-        )
+        # Handle failed rank that doesn't have checkpoint file
+        if not eclatin_main_file.exists():
+            if rank == failed_rank:
+                logger.warning(f"ECLATIN: [Rank {rank}] Main file not found (failed node), deriving metadata from sharded_state_dict")
+                from .filesystem_async import EclatinMappedFile
+                
+                # Derive metadata from sharded_state_dict
+                if sharded_state_dict is not None:
+                    local_metadata, non_tensor_data = self._derive_metadata_from_sharded_state_dict(sharded_state_dict, rank)
+                    logger.info(f"ECLATIN: [Rank {rank}] Derived {len(local_metadata)} tensor metadata entries from sharded_state_dict")
+                else:
+                    logger.warning(f"ECLATIN: [Rank {rank}] sharded_state_dict is None, using empty metadata")
+                    local_metadata = []
+                    non_tensor_data = {}
+                
+                mapped_file_own = EclatinMappedFile(
+                    mmap_object=None,
+                    memory_address=None,
+                    file_size=None,
+                    local_metadata=local_metadata,
+                    non_tensor_data=non_tensor_data,
+                    tensor_infos=[]
+                )
+            else:
+                logger.error(f"ECLATIN: [Rank {rank}] Main file not found: {eclatin_main_file}")
+                return None, None
+        else:
+            # Load main file, extract Component 1 and Component 2 (metadata)
+            mapped_file_own = FileSystemWriterAsync.load_eclatin_bytes_from_file(
+                str(eclatin_main_file), my_rank=rank
+            )
+        
         meta_start_time = time()
         # ===== Step 2: Metadata exchange (similar to EC-CHECK) =====
         local_package = {
@@ -3157,6 +3437,126 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info(f"ECLATIN: [Rank {rank}] Saving recovered buffer for _load_eclatin_checkpoint")
             self.eclatin_recovered_metadata = mapped_file_own
             self.eclatin_recovered_registry = registry
+        
+        return mapped_file_own, None
+    
+    def _load_eclatin_layerwise_block_checkpoint(self, checkpoint_dir: Path, sharded_state_dict: ShardedStateDict = None) -> Tuple:
+        """Load ECLATIN checkpoint data for layerwise recovery.
+        
+        Similar to _load_eclatin_block_checkpoint but uses layerwise recovery pipeline.
+        
+        Args:
+            checkpoint_dir (Path): checkpoint directory
+            sharded_state_dict (ShardedStateDict): sharded state dict for failed rank to derive metadata
+        
+        Returns:
+            Tuple: (mapped_file_own, None) - placeholder for compatibility
+        """
+        from .filesystem_async import FileSystemWriterAsync
+        from time import time
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        # ECLATIN recovers rank2 (same as EC-CHECK)
+        failed_rank = 2
+        
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        logger.info(f"ECLATIN Layerwise: [Rank {rank}] Loading block checkpoint for layerwise recovery")
+        
+        # ===== Step 1: Load main file to extract metadata =====
+        eclatin_main_file = checkpoint_dir / f'__{rank}_0.distcp'
+        
+        # Handle failed rank that doesn't have checkpoint file
+        if not eclatin_main_file.exists():
+            if rank == failed_rank:
+                logger.warning(f"ECLATIN Layerwise: [Rank {rank}] Main file not found (failed node), deriving metadata from sharded_state_dict")
+                from .filesystem_async import EclatinMappedFile
+                
+                # Derive metadata from sharded_state_dict
+                if sharded_state_dict is not None:
+                    local_metadata, non_tensor_data = self._derive_metadata_from_sharded_state_dict(sharded_state_dict, rank)
+                    logger.info(f"ECLATIN Layerwise: [Rank {rank}] Derived {len(local_metadata)} tensor metadata entries from sharded_state_dict")
+                else:
+                    logger.warning(f"ECLATIN Layerwise: [Rank {rank}] sharded_state_dict is None, using empty metadata")
+                    local_metadata = []
+                    non_tensor_data = {}
+                
+                mapped_file_own = EclatinMappedFile(
+                    mmap_object=None,
+                    memory_address=None,
+                    file_size=None,
+                    local_metadata=local_metadata,
+                    non_tensor_data=non_tensor_data,
+                    tensor_infos=[]
+                )
+            else:
+                logger.error(f"ECLATIN Layerwise: [Rank {rank}] Main file not found: {eclatin_main_file}")
+                return None, None
+        else:
+            # Load main file, extract Component 1 and Component 2 (metadata)
+            mapped_file_own = FileSystemWriterAsync.load_eclatin_bytes_from_file(
+                str(eclatin_main_file), my_rank=rank
+            )
+        
+        # ===== Step 2: Metadata exchange =====
+        meta_start_time = time()
+        local_package = {
+            'tensor_metadata': mapped_file_own.local_metadata or [],
+            'non_tensor_data': mapped_file_own.non_tensor_data or {},
+        }
+        
+        if local_package['tensor_metadata'] is None or local_package['non_tensor_data'] is None:
+            logger.error(f"ECLATIN Layerwise: [Rank {rank}] Local metadata is None, skipping metadata exchange")
+            return mapped_file_own, None
+        
+        # All-gather complete metadata
+        all_packages = [None] * world_size
+        torch.distributed.all_gather_object(all_packages, local_package)
+        
+        rank_metadata = {}
+        rank_non_tensor_data = {}
+        for i, package in enumerate(all_packages):
+            rank_metadata[i] = package['tensor_metadata']
+            rank_non_tensor_data[i] = package['non_tensor_data']
+        
+        # Create registry
+        from .state_dict_decomposer import GlobalMetadataRegistry
+        registry = GlobalMetadataRegistry(
+            rank_metadata=rank_metadata,
+            rank_non_tensor_data=rank_non_tensor_data
+        )
+        meta_end_time = time()
+        logger.info(f"ECLATIN Layerwise: [Rank {rank}] Metadata exchange completed in {meta_end_time - meta_start_time:.2f}s")
+        
+        # ===== Step 3: Allocate 4 blocks =====
+        if self.eclatin_blocks is None:
+            self.eclatin_blocks = self._allocate_eclatin_blocks(registry)
+            logger.info(f"ECLATIN Layerwise: [Rank {rank}] Allocated 4 blocks")
+        
+        # ===== Step 4: rank0/1/3 load block data from files =====
+        if rank != 2:
+            self._load_eclatin_blocks_from_files(checkpoint_dir, rank)
+            logger.info(f"ECLATIN Layerwise: [Rank {rank}] Loaded blocks from files")
+        
+        # ===== Step 5: rank2 allocate recv buffers (per-layer) =====
+        if rank == 2:
+            if self.eclatin_recv_buffers is None:
+                self.eclatin_recv_buffers = self._allocate_eclatin_load_recv_buffers(registry)
+                logger.info(f"ECLATIN Layerwise: [Rank {rank}] Allocated recv buffers")
+            
+            if self.eclatin_recovered_buffer is None:
+                own_metadata = registry.rank_metadata.get(rank, [])
+                total_size = sum(meta.size_bytes for meta in own_metadata)
+                self.eclatin_recovered_buffer = torch.empty(total_size, dtype=torch.uint8)
+                logger.info(f"ECLATIN Layerwise: [Rank {rank}] Allocated recovered buffer ({total_size / (1024**3):.2f} GB)")
+        
+        # Store registry for later use in layerwise pipeline
+        self.eclatin_recovered_metadata = mapped_file_own
+        self.eclatin_recovered_registry = registry
+        
+        logger.info(f"ECLATIN Layerwise: [Rank {rank}] Block checkpoint loaded, ready for layerwise recovery")
         
         return mapped_file_own, None
     
@@ -3554,95 +3954,156 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # Only rank0 (pair_rank=2) and rank2 participate
         if rank == 0 and paired_rank == 2:
-            # Rank0: Read replica file and send to rank2 via ASIO
-            logger.info(f"rank: {rank}, reading replica file for rank2 recovery (ASIO OPTIMIZED mode)")
+            # Rank0: Read both files first, then send metadata and data to rank2
+            logger.info(f"rank: {rank}, starting rank2 recovery - reading both checkpoint files (ASIO OPTIMIZED mode)")
             
-            # Find replica file: __0_0_replica2_rank0.distcp
+            # Step 1: Find and open both files with mmap
+            # File 1: rank2's replica (for rank2 recovery)
             replica_files = list(checkpoint_dir.glob(f"*_replica{paired_rank}_rank{rank}*.distcp"))
-            
             if not replica_files:
                 logger.error(f"rank: {rank}, no replica file found for rank2 recovery")
                 raise FileNotFoundError(f"No replica file found for rank2 recovery")
-            
             replica_file_path = replica_files[0]
+            
+            # File 2: rank0's own checkpoint (for rank2 backup)
+            own_checkpoint_files = list(checkpoint_dir.glob(f"__{rank}_0.distcp"))
+            if not own_checkpoint_files:
+                logger.error(f"rank: {rank}, no own checkpoint file found")
+                raise FileNotFoundError(f"No own checkpoint file found for rank {rank}")
+            own_checkpoint_path = own_checkpoint_files[0]
+            
             logger.info(f"rank: {rank}, found replica file: {replica_file_path}")
+            logger.info(f"rank: {rank}, found own checkpoint file: {own_checkpoint_path}")
             
-            # Step 1: Open file with mmap (keep mmap alive for zero-copy send)
-            try:
-                f = open(replica_file_path, 'rb')
-                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-                replica_file_size = len(mm)
-                
-                logger.info(f"rank: {rank}, opened replica file with mmap: {replica_file_size / (1024**2):.2f} MB")
-            
-            except Exception as e:
-                logger.error(f"rank: {rank}, failed to open replica file: {e}", exc_info=True)
-                raise
-            
-            # Step 2: Send size information first
-            size_array = np.array([replica_file_size], dtype=np.int64)
-            logger.info(f"rank: {rank}, sending size to rank2 via ASIO: {replica_file_size / (1024**2):.2f} MB")
-            
-            # Create numpy array view of mmap (zero-copy, read-only)
-            # Do this before sending to ensure the view is created
-            mmap_np = np.frombuffer(mm, dtype=np.uint8)
+            # Open both files with mmap
+            f_replica = None
+            f_own = None
+            mm_replica = None
+            mm_own = None
+            mmap_replica_np = None
+            mmap_own_np = None
             
             try:
-                # Send size (8 bytes) using raw memory address
-                size_addr = size_array.ctypes.data
-                self.gemini_manager._gemini_native.send_buffer(size_addr, size_array.nbytes)
-                logger.info(f"rank: {rank}, size sent successfully")
+                f_replica = open(replica_file_path, 'rb')
+                mm_replica = mmap.mmap(f_replica.fileno(), 0, access=mmap.ACCESS_READ)
+                replica_file_size = len(mm_replica)
                 
-                # Step 3: Send replica data directly from mmap (ZERO-COPY)
-                logger.info(f"rank: {rank}, sending replica data to rank2 via ASIO (zero-copy from mmap)...")
+                f_own = open(own_checkpoint_path, 'rb')
+                mm_own = mmap.mmap(f_own.fileno(), 0, access=mmap.ACCESS_READ)
+                own_file_size = len(mm_own)
                 
-                # Get mmap buffer address from numpy array
-                mmap_addr = mmap_np.ctypes.data
-                self.gemini_manager._gemini_native.send_buffer(mmap_addr, replica_file_size)
+                logger.info(
+                    f"rank: {rank}, opened both files with mmap:\n"
+                    f"  replica (rank2): {replica_file_size / (1024**2):.2f} MB\n"
+                    f"  own (rank0): {own_file_size / (1024**2):.2f} MB"
+                )
                 
-                logger.info(f"rank: {rank}, replica data sent successfully via ASIO (zero-copy)")
+                # Step 2: Send metadata (both file sizes) to rank2
+                metadata_array = np.array([replica_file_size, own_file_size], dtype=np.int64)
+                metadata_addr = metadata_array.ctypes.data
+                self.gemini_manager._gemini_native.send_buffer(metadata_addr, metadata_array.nbytes)
+                logger.info(f"rank: {rank}, sent metadata (both file sizes) to rank2")
+                
+                # Step 3: Send replica data (rank2's backup) to rank2
+                logger.info(f"rank: {rank}, sending replica data (rank2's backup) to rank2...")
+                mmap_replica_np = np.frombuffer(mm_replica, dtype=np.uint8)
+                mmap_replica_addr = mmap_replica_np.ctypes.data
+                self.gemini_manager._gemini_native.send_buffer(mmap_replica_addr, replica_file_size)
+                logger.info(f"rank: {rank}, sent replica data to rank2: {replica_file_size / (1024**2):.2f} MB")
+                
+                # Delete numpy array reference before sending next buffer
+                del mmap_replica_np
+                mmap_replica_np = None
+                
+                # Step 4: Send own data (rank0's checkpoint) to rank2
+                logger.info(f"rank: {rank}, sending own checkpoint data (for rank2 backup) to rank2...")
+                mmap_own_np = np.frombuffer(mm_own, dtype=np.uint8)
+                mmap_own_addr = mmap_own_np.ctypes.data
+                self.gemini_manager._gemini_native.send_buffer(mmap_own_addr, own_file_size)
+                logger.info(f"rank: {rank}, sent own checkpoint data to rank2: {own_file_size / (1024**2):.2f} MB")
+                
+                # Delete numpy array reference before cleanup
+                del mmap_own_np
+                mmap_own_np = None
+                
+                logger.info(f"rank: {rank}, all data sent successfully to rank2")
                 
             except Exception as e:
                 logger.error(f"rank: {rank}, ASIO send failed: {e}", exc_info=True)
                 raise
             finally:
-                # Delete numpy array reference first to release mmap
-                del mmap_np
-                # Clean up mmap and file after send completes
-                mm.close()
-                f.close()
+                # Clean up all resources in reverse order
+                if mmap_replica_np is not None:
+                    del mmap_replica_np
+                if mmap_own_np is not None:
+                    del mmap_own_np
+                if mm_replica is not None:
+                    mm_replica.close()
+                if mm_own is not None:
+                    mm_own.close()
+                if f_replica is not None:
+                    f_replica.close()
+                if f_own is not None:
+                    f_own.close()
             
-            # Step 4: Rank0 also needs to load its own checkpoint from file
+            # Step 5: Rank0 loads its own checkpoint from file
             logger.info(f"rank: {rank}, loading own checkpoint from saved file")
             return self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
             
         elif rank == 2:
-            # Rank2: Receive data from rank0 via ASIO and restore state_dict
-            logger.info(f"rank: {rank}, receiving replica data from rank0 via ASIO (OPTIMIZED) for recovery")
+            # Rank2: Receive metadata and all data from rank0, then restore
+            logger.info(f"rank: {rank}, starting rank2 recovery - receiving data from rank0 via ASIO (OPTIMIZED)")
             
             try:
-                # Step 1: Receive size information first
-                size_buffer = np.zeros(1, dtype=np.int64)
-                size_addr = size_buffer.ctypes.data
-                self.gemini_manager._gemini_native.receive_buffer(size_addr, size_buffer.nbytes)
-                remote_size = int(size_buffer[0])
+                # Step 1: Receive metadata (both file sizes)
+                start_time = time()
+                metadata_buffer = np.zeros(2, dtype=np.int64)
+                metadata_addr = metadata_buffer.ctypes.data
+                self.gemini_manager._gemini_native.receive_buffer(metadata_addr, metadata_buffer.nbytes)
                 
-                logger.info(f"rank: {rank}, received size from rank0 via ASIO: {remote_size / (1024**2):.2f} MB")
+                replica_size = int(metadata_buffer[0])  # rank2's backup data size
+                rank0_size = int(metadata_buffer[1])    # rank0's checkpoint data size
                 
-                # Step 2: Create receive buffer as torch tensor (pinned for faster GPU transfer if needed)
-                if torch.cuda.is_available():
-                    remote_tensor = torch.empty(remote_size, dtype=torch.uint8).pin_memory()
-                    logger.info(f"rank: {rank}, allocated pinned memory tensor for receive")
-                else:
-                    remote_tensor = torch.empty(remote_size, dtype=torch.uint8)
+                logger.info(
+                    f"rank: {rank}, received metadata from rank0:\n"
+                    f"  replica (rank2 backup): {replica_size / (1024**2):.2f} MB\n"
+                    f"  rank0 checkpoint: {rank0_size / (1024**2):.2f} MB"
+                )
                 
-                # Step 3: Receive replica data via ASIO directly into tensor (ZERO-COPY)
-                logger.info(f"rank: {rank}, receiving replica data from rank0 via ASIO (zero-copy into tensor)...")
-                remote_addr = remote_tensor.data_ptr()
-                self.gemini_manager._gemini_native.receive_buffer(remote_addr, remote_size)
-                logger.info(f"rank: {rank}, received replica data via ASIO: {remote_size / (1024**2):.2f} MB")
+                # Step 2: Receive replica data (rank2's backup for recovery)
+                logger.info(f"rank: {rank}, receiving replica data (own backup) from rank0...")
+                replica_tensor = self._get_gemini_recovery_buffer('replica', replica_size)
                 
-                # Step 4: Parse received data (OPTIMIZED - avoid unnecessary copies)
+                replica_addr = replica_tensor.data_ptr()
+                self.gemini_manager._gemini_native.receive_buffer(replica_addr, replica_size)
+                logger.info(f"rank: {rank}, received replica data: {replica_size / (1024**2):.2f} MB")
+                
+                # Step 3: Receive rank0's checkpoint data (for rank2 backup)
+                logger.info(f"rank: {rank}, receiving rank0's checkpoint data (for backup)...")
+                rank0_tensor = self._get_gemini_recovery_buffer('rank0', rank0_size)
+                
+                rank0_addr = rank0_tensor.data_ptr()
+                self.gemini_manager._gemini_native.receive_buffer(rank0_addr, rank0_size)
+                recv_time = time()
+                logger.info(f"rank: {rank}, received rank0 and rank2's checkpoint data time: {recv_time - start_time}")
+                
+                # Step 4: Save rank0's data as replica file (optional, for future recovery)
+                # try:
+                #     replica_filename = checkpoint_dir / f"__{rank}_0_replica0_rank{rank}.distcp"
+                #     logger.info(f"rank: {rank}, saving rank0's backup to: {replica_filename}")
+                    
+                #     with open(replica_filename, 'wb') as f_replica:
+                #         rank0_data_bytes = rank0_tensor.cpu().numpy().tobytes()
+                #         f_replica.write(rank0_data_bytes)
+                    
+                #     logger.info(f"rank: {rank}, successfully saved rank0's backup data")
+                # except Exception as e:
+                #     logger.warning(f"rank: {rank}, failed to save rank0's backup data: {e}")
+                #     # Continue - this is optional
+                
+                # Step 5: Parse and restore state_dict from replica data
+                logger.info(f"rank: {rank}, parsing replica data for recovery...")
+                
                 # Check if this is Gemini optimized format
                 use_gemini_optimized = False
                 try:
@@ -3652,30 +4113,29 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 except:
                     pass
                 
-                if use_gemini_optimized and remote_size >= 8:
-                    # Parse as Gemini optimized format: [metadata_size(8)] + [metadata_bytes] + [buffer_bytes]
-                    # Use tensor slicing to avoid copies
-                    metadata_size_tensor = remote_tensor[:8]
+                if use_gemini_optimized and replica_size >= 8:
+                    # Parse as Gemini optimized format
+                    metadata_size_tensor = replica_tensor[:8]
                     metadata_size = int.from_bytes(metadata_size_tensor.cpu().numpy().tobytes(), byteorder='little')
                     
-                    logger.info(f"rank: {rank}, parsing received data as Gemini optimized format, metadata_size: {metadata_size / 1024:.2f} KB")
+                    logger.info(f"rank: {rank}, parsing as Gemini optimized format, metadata_size: {metadata_size / 1024:.2f} KB")
                     
-                    # Extract metadata (only copy small metadata portion)
-                    metadata_tensor = remote_tensor[8:8+metadata_size]
+                    # Extract metadata
+                    metadata_tensor = replica_tensor[8:8+metadata_size]
                     metadata_bytes = metadata_tensor.cpu().numpy().tobytes()
-                    metadata_buffer = io.BytesIO(metadata_bytes)
-                    gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
+                    metadata_buffer_io = io.BytesIO(metadata_bytes)
+                    gemini_metadata = torch.load(metadata_buffer_io, map_location='cpu', weights_only=False)
                     
-                    # Extract buffer (ZERO-COPY - use tensor slice directly)
-                    buffer_tensor = remote_tensor[8+metadata_size:]
+                    # Extract buffer (zero-copy)
+                    buffer_tensor = replica_tensor[8+metadata_size:]
                     
                     logger.info(
-                        f"rank: {rank}, parsed Gemini data (OPTIMIZED): "
+                        f"rank: {rank}, parsed Gemini data: "
                         f"metadata_size={metadata_size / 1024:.2f} KB, "
                         f"buffer_size={buffer_tensor.numel() / (1024**2):.2f} MB"
                     )
                     
-                    # Create write_buckets structure for Gemini format
+                    # Create write_buckets structure
                     replica_buckets = [(
                         checkpoint_dir / f"__{rank}_0.distcp",
                         'gemini_optimized_local',
@@ -3685,30 +4145,30 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         )
                     )]
                     
-                    # Step 5: Restore state_dict from Gemini format
-                    logger.info(f"rank: {rank}, restoring state_dict from Gemini format (zero-copy)...")
+                    # Restore state_dict
+                    logger.info(f"rank: {rank}, restoring state_dict from Gemini format...")
                     loaded_state_dict = self._restore_state_dict_from_gemini_format(
                         replica_buckets, sharded_state_dict
                     )
+                    end_time = time()
+                    logger.info(f"rank: {rank}, recovery rank2's checkpoint data time: {end_time - start_time}")
                 else:
-                    # Standard pickle format (need to convert to bytes)
-                    logger.info(f"rank: {rank}, parsing received data as standard pickle format")
-                    remote_bytes = remote_tensor.cpu().numpy().tobytes()
-                    remote_data_io = io.BytesIO(remote_bytes)
-                    replica_buckets = torch.load(remote_data_io, weights_only=False)
+                    # Standard pickle format
+                    logger.info(f"rank: {rank}, parsing as standard pickle format")
+                    replica_bytes = replica_tensor.cpu().numpy().tobytes()
+                    replica_data_io = io.BytesIO(replica_bytes)
+                    replica_buckets = torch.load(replica_data_io, weights_only=False)
                     
-                    logger.info(f"rank: {rank}, deserialized replica data, restoring state_dict from memory...")
-                    
-                    # Step 5: Restore state_dict from replica_buckets
+                    logger.info(f"rank: {rank}, restoring state_dict from replica data...")
                     loaded_state_dict = self._restore_state_dict_from_write_buckets(
                         replica_buckets, sharded_state_dict
                     )
                 
-                logger.info(f"rank: {rank}, successfully restored state_dict from rank0's replica data (ASIO OPTIMIZED)")
+                logger.info(f"rank: {rank}, successfully restored state_dict and saved rank0's backup")
                 return loaded_state_dict
                 
             except Exception as e:
-                logger.error(f"rank: {rank}, ASIO receive failed: {e}", exc_info=True)
+                logger.error(f"rank: {rank}, recovery failed: {e}", exc_info=True)
                 raise
         else:
             # Should not reach here
@@ -3746,92 +4206,133 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # Only rank0 (pair_rank=2) and rank2 participate
         if rank == 0 and paired_rank == 2:
-            # Rank0: Read replica file and send to rank2
-            logger.info(f"rank: {rank}, reading replica file for rank2 recovery")
+            # Rank0: Read both files first, then send metadata and data to rank2
+            logger.info(f"rank: {rank}, starting rank2 recovery - reading both checkpoint files")
             
-            # Find replica file: __0_0_replica2_rank0.distcp
+            # Step 1: Find both files
             replica_files = list(checkpoint_dir.glob(f"*_replica{paired_rank}_rank{rank}*.distcp"))
-            
             if not replica_files:
                 logger.error(f"rank: {rank}, no replica file found for rank2 recovery")
                 raise FileNotFoundError(f"No replica file found for rank2 recovery")
-            
             replica_file_path = replica_files[0]
-            logger.info(f"rank: {rank}, found replica file: {replica_file_path}")
             
-            # Step 1: Read replica file using mmap (zero-copy)
+            own_checkpoint_files = list(checkpoint_dir.glob(f"__{rank}_0.distcp"))
+            if not own_checkpoint_files:
+                logger.error(f"rank: {rank}, no own checkpoint file found")
+                raise FileNotFoundError(f"No own checkpoint file found for rank {rank}")
+            own_checkpoint_path = own_checkpoint_files[0]
+            
+            logger.info(f"rank: {rank}, found replica file: {replica_file_path}")
+            logger.info(f"rank: {rank}, found own checkpoint file: {own_checkpoint_path}")
+            
+            # Step 2: Read both files
             try:
                 with open(replica_file_path, 'rb') as f:
-                    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-                    replica_file_size = len(mm)
-                    replica_data_bytes = mm[:]
-                    mm.close()
+                    mm_replica = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                    replica_file_size = len(mm_replica)
+                    replica_data_bytes = mm_replica[:]
+                    mm_replica.close()
                 
-                logger.info(f"rank: {rank}, read replica file: {replica_file_size / (1024**2):.2f} MB")
-            
+                with open(own_checkpoint_path, 'rb') as f:
+                    mm_own = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                    own_file_size = len(mm_own)
+                    own_data_bytes = mm_own[:]
+                    mm_own.close()
+                
+                logger.info(
+                    f"rank: {rank}, read both files:\n"
+                    f"  replica (rank2): {replica_file_size / (1024**2):.2f} MB\n"
+                    f"  own (rank0): {own_file_size / (1024**2):.2f} MB"
+                )
             except Exception as e:
-                logger.error(f"rank: {rank}, failed to read replica file: {e}", exc_info=True)
+                logger.error(f"rank: {rank}, failed to read files: {e}", exc_info=True)
                 raise
             
-            # Step 2: Create pair process group for communication with rank2
+            # Step 3: Create pair process group
             pair_group = get_or_create_pair_process_group(rank, paired_rank)
             
-            # Step 3: Exchange file size with rank2
-            local_size_tensor = torch.tensor([replica_file_size], dtype=torch.int64)
-            remote_size_tensor = torch.tensor([0], dtype=torch.int64)
+            # Step 4: Send metadata (both file sizes) to rank2
+            metadata_tensor = torch.tensor([replica_file_size, own_file_size], dtype=torch.int64)
+            dummy_tensor = torch.zeros(2, dtype=torch.int64)
             
-            # Use all_gather to exchange sizes
-            size_list = [local_size_tensor, remote_size_tensor]
-            torch.distributed.all_gather(size_list, local_size_tensor, group=pair_group)
+            size_list = [metadata_tensor, dummy_tensor]
+            torch.distributed.all_gather(size_list, metadata_tensor, group=pair_group)
             
-            logger.info(f"rank: {rank}, exchanged size with rank2: {replica_file_size / (1024**2):.2f} MB")
+            logger.info(f"rank: {rank}, sent metadata (both file sizes) to rank2")
             
-            # Step 4: Convert replica data to tensor for broadcast
+            # Step 5: Send replica data to rank2
             replica_np = np.frombuffer(replica_data_bytes, dtype=np.uint8).copy()
             replica_tensor = torch.from_numpy(replica_np)
             
-            logger.info(f"rank: {rank}, prepared replica tensor: {replica_tensor.numel() / (1024**2):.2f} MB")
-            
-            # Step 5: Send replica data to rank2 using broadcast
-            # Rank0 is the source (src=0 in global ranks)
+            logger.info(f"rank: {rank}, sending replica data to rank2: {replica_tensor.numel() / (1024**2):.2f} MB")
             torch.distributed.broadcast(replica_tensor, src=rank, group=pair_group)
-            
             logger.info(f"rank: {rank}, sent replica data to rank2")
             
-            # Step 6: Rank0 also needs to load its own checkpoint from file
+            # Step 6: Send own data to rank2
+            own_np = np.frombuffer(own_data_bytes, dtype=np.uint8).copy()
+            own_tensor = torch.from_numpy(own_np)
+            
+            logger.info(f"rank: {rank}, sending own checkpoint data to rank2: {own_tensor.numel() / (1024**2):.2f} MB")
+            torch.distributed.broadcast(own_tensor, src=rank, group=pair_group)
+            logger.info(f"rank: {rank}, sent own checkpoint data to rank2")
+            
+            # Step 7: Rank0 loads its own checkpoint from file
             logger.info(f"rank: {rank}, loading own checkpoint from saved file")
             return self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
         elif rank == 2:
-            # Rank2: Receive data from rank0 and restore state_dict
-            logger.info(f"rank: {rank}, receiving replica data from rank0 for recovery")
+            # Rank2: Receive metadata and all data from rank0, then restore
+            logger.info(f"rank: {rank}, starting rank2 recovery - receiving data from rank0")
             
-            # Step 1: Create pair process group for communication with rank0
+            # Step 1: Create pair process group
             pair_group = get_or_create_pair_process_group(rank, 0)
             
-            # Step 2: Receive file size from rank0
-            local_size_tensor = torch.tensor([0], dtype=torch.int64)
-            remote_size_tensor = torch.tensor([0], dtype=torch.int64)
+            # Step 2: Receive metadata (both file sizes)
+            local_metadata_dummy = torch.zeros(2, dtype=torch.int64)
+            remote_metadata = torch.zeros(2, dtype=torch.int64)
             
-            # Use all_gather to exchange sizes
-            size_list = [remote_size_tensor, local_size_tensor]
-            torch.distributed.all_gather(size_list, local_size_tensor, group=pair_group)
+            metadata_list = [remote_metadata, local_metadata_dummy]
+            torch.distributed.all_gather(metadata_list, local_metadata_dummy, group=pair_group)
             
-            remote_size = size_list[0].item()
-            logger.info(f"rank: {rank}, received size from rank0: {remote_size / (1024**2):.2f} MB")
+            replica_size = int(metadata_list[0][0].item())
+            rank0_size = int(metadata_list[0][1].item())
             
-            # Step 3: Create receive buffer
-            remote_tensor = torch.empty(remote_size, dtype=torch.uint8)
+            logger.info(
+                f"rank: {rank}, received metadata from rank0:\n"
+                f"  replica (rank2 backup): {replica_size / (1024**2):.2f} MB\n"
+                f"  rank0 checkpoint: {rank0_size / (1024**2):.2f} MB"
+            )
             
-            # Step 4: Receive replica data from rank0 using broadcast
-            torch.distributed.broadcast(remote_tensor, src=0, group=pair_group)
+            # Step 3: Receive replica data (rank2's backup for recovery)
+            logger.info(f"rank: {rank}, receiving replica data (own backup) from rank0...")
+            replica_tensor = self._get_gemini_recovery_buffer('replica', replica_size)
+            torch.distributed.broadcast(replica_tensor, src=0, group=pair_group)
+            logger.info(f"rank: {rank}, received replica data: {replica_size / (1024**2):.2f} MB")
             
-            logger.info(f"rank: {rank}, received replica data from rank0: {remote_size / (1024**2):.2f} MB")
+            # Step 4: Receive rank0's checkpoint data (for rank2 backup)
+            logger.info(f"rank: {rank}, receiving rank0's checkpoint data (for backup)...")
+            rank0_tensor = self._get_gemini_recovery_buffer('rank0', rank0_size)
+            torch.distributed.broadcast(rank0_tensor, src=0, group=pair_group)
+            logger.info(f"rank: {rank}, received rank0's checkpoint data: {rank0_size / (1024**2):.2f} MB")
             
-            # Step 5: Deserialize received data
+            # Step 5: Save rank0's data as replica file
+            try:
+                replica_filename = checkpoint_dir / f"__{rank}_0_replica0_rank{rank}.distcp"
+                logger.info(f"rank: {rank}, saving rank0's backup to: {replica_filename}")
+                
+                with open(replica_filename, 'wb') as f_replica:
+                    rank0_data_bytes = rank0_tensor.numpy().tobytes()
+                    f_replica.write(rank0_data_bytes)
+                
+                logger.info(f"rank: {rank}, successfully saved rank0's backup data")
+            except Exception as e:
+                logger.warning(f"rank: {rank}, failed to save rank0's backup data: {e}")
+                # Continue - this is optional
+            
+            # Step 6: Parse and restore state_dict from replica data
+            logger.info(f"rank: {rank}, parsing replica data for recovery...")
+            replica_bytes = replica_tensor.numpy().tobytes()
+            
             # Check if this is Gemini optimized format
-            remote_bytes = remote_tensor.numpy().tobytes()
-            
-            # Try to detect Gemini optimized format
             use_gemini_optimized = False
             try:
                 from megatron.training import get_args
@@ -3840,19 +4341,19 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             except:
                 pass
             
-            if use_gemini_optimized and len(remote_bytes) >= 8:
-                # Parse as Gemini optimized format: [metadata_size(8)] + [metadata_bytes] + [buffer_bytes]
-                metadata_size = int.from_bytes(remote_bytes[:8], byteorder='little')
+            if use_gemini_optimized and len(replica_bytes) >= 8:
+                # Parse as Gemini optimized format
+                metadata_size = int.from_bytes(replica_bytes[:8], byteorder='little')
                 
-                logger.info(f"rank: {rank}, parsing received data as Gemini optimized format, metadata_size: {metadata_size / 1024:.2f} KB")
+                logger.info(f"rank: {rank}, parsing as Gemini optimized format, metadata_size: {metadata_size / 1024:.2f} KB")
                 
                 # Extract metadata
-                metadata_bytes = remote_bytes[8:8+metadata_size]
+                metadata_bytes = replica_bytes[8:8+metadata_size]
                 metadata_buffer = io.BytesIO(metadata_bytes)
                 gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
                 
                 # Extract buffer
-                buffer_bytes = remote_bytes[8+metadata_size:]
+                buffer_bytes = replica_bytes[8+metadata_size:]
                 buffer_np = np.frombuffer(buffer_bytes, dtype=np.uint8)
                 gemini_buffer = torch.from_numpy(buffer_np.copy())
                 
@@ -3862,7 +4363,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     f"buffer_size={len(buffer_bytes) / (1024**2):.2f} MB"
                 )
                 
-                # Create write_buckets structure for Gemini format
+                # Create write_buckets structure
                 replica_buckets = [(
                     checkpoint_dir / f"__{rank}_0.distcp",
                     'gemini_optimized_local',
@@ -3872,25 +4373,23 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     )
                 )]
                 
-                # Step 6: Restore state_dict from Gemini format
+                # Restore state_dict
                 logger.info(f"rank: {rank}, restoring state_dict from Gemini format...")
                 loaded_state_dict = self._restore_state_dict_from_gemini_format(
                     replica_buckets, sharded_state_dict
                 )
             else:
                 # Standard pickle format
-                logger.info(f"rank: {rank}, parsing received data as standard pickle format")
-                remote_data_io = io.BytesIO(remote_bytes)
-                replica_buckets = torch.load(remote_data_io, weights_only=False)
+                logger.info(f"rank: {rank}, parsing as standard pickle format")
+                replica_data_io = io.BytesIO(replica_bytes)
+                replica_buckets = torch.load(replica_data_io, weights_only=False)
                 
-                logger.info(f"rank: {rank}, deserialized replica data, restoring state_dict from memory...")
-                
-                # Step 6: Restore state_dict from replica_buckets
+                logger.info(f"rank: {rank}, restoring state_dict from replica data...")
                 loaded_state_dict = self._restore_state_dict_from_write_buckets(
                     replica_buckets, sharded_state_dict
                 )
             
-            logger.info(f"rank: {rank}, successfully restored state_dict from rank0's replica data")
+            logger.info(f"rank: {rank}, successfully restored state_dict and saved rank0's backup")
             return loaded_state_dict
     
     def _init_gemini_replicas_recovery_native(self, rank: int, world_size: int):
@@ -3948,6 +4447,30 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         base_port = int(os.environ.get('GEMINI_REPLICAS_BASE_PORT', master_port + 30000))
         recovery_base_port = base_port + 10000  # Use different port range for recovery
         
+        # Exchange IP addresses across all ranks via all_gather
+        rank_ips = {}
+        if torch.distributed.is_initialized():
+            try:
+                ip_list = [None] * world_size
+                torch.distributed.all_gather_object(ip_list, base_ip)
+                
+                for r, ip in enumerate(ip_list):
+                    rank_ips[r] = ip
+                
+                logger.info(
+                    f"rank: {rank}, IP exchange completed - All rank IPs: {rank_ips}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"rank: {rank}, failed to exchange IPs via all_gather, using local IP: {e}"
+                )
+                for r in range(world_size):
+                    rank_ips[r] = base_ip
+        else:
+            logger.warning(f"rank: {rank}, distributed not initialized, using local IP for all ranks")
+            for r in range(world_size):
+                rank_ips[r] = base_ip
+        
         # Port allocation strategy for recovery:
         # rank2 listens on ONE port: recovery_base_port + 2
         # All senders (rank0, rank1, rank3) connect to the same port
@@ -3959,7 +4482,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if rank in [0, 1, 3]:
             # Senders: send to rank2 only
             target_ranks = [2]
-            target_ips = [base_ip]  # Assume single machine for now
+            target_ips = [rank_ips[2]]  # Use rank2's actual IP from all_gather
             # All senders connect to rank2's listening port
             target_ports = [rank2_recv_port]
             source_ranks = []  # Senders don't receive
@@ -3978,7 +4501,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         else:
             raise ValueError(f"rank: {rank}, invalid rank for recovery")
         
-        my_ip = base_ip
+        my_ip = rank_ips[rank]  # Use this rank's IP from all_gather
         
         logger.info(
             f"rank: {rank}, recovery ASIO config:\n"
@@ -4188,28 +4711,25 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 )
                 
                 # Step 2: Receive data from rank0, rank1, rank3 using C++ ASIO
+                start_time = time()
                 recv_buffers = {}
                 source_ranks_to_recv = [0, 1, 3]
                 
                 logger.info(f"rank: {rank}, expecting data from source ranks: {source_ranks_to_recv}")
                 
-                # Allocate buffers for each source
+                # Use pre-allocated buffers for each source
                 for src_rank in source_ranks_to_recv:
                     src_size = int(all_sizes[src_rank][0].item())
                     
-                    # Allocate receive buffer (pinned for faster transfer)
-                    if torch.cuda.is_available():
-                        recv_buffer = torch.empty(src_size, dtype=torch.uint8).pin_memory()
-                    else:
-                        recv_buffer = torch.empty(src_size, dtype=torch.uint8)
-                    
+                    # Get pre-allocated buffer or allocate dynamically
+                    recv_buffer = self._get_gemini_replicas_recovery_buffer(src_rank, src_size)
                     recv_buffers[src_rank] = recv_buffer
                     
                     # Submit receive buffer to C++ module
                     recv_addr = recv_buffer.data_ptr()
                     recovery_native.submit_recv_buffer(src_rank, recv_addr, src_size)
                     
-                    logger.info(f"rank: {rank}, allocated and submitted receive buffer for rank{src_rank}: {src_size / (1024**2):.2f} MB")
+                    logger.info(f"rank: {rank}, submitted receive buffer for rank{src_rank}: {src_size / (1024**2):.2f} MB")
                 
                 # Step 3: Execute ASIO exchange (receive from all sources)
                 # Submit a dummy send buffer (rank2 doesn't send, but API may require it)
@@ -4219,8 +4739,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 logger.info(f"rank: {rank}, executing C++ ASIO exchange to receive from all sources...")
                 recovery_native.execute_exchange()
                 
-                logger.info(f"rank: {rank}, data received successfully from all source ranks via C++ ASIO")
-                
+                end_time = time() - start_time
+                logger.info(f"rank: {rank}, data received successfully from all source ranks via C++ ASIO , use time {end_time:.2f}s")
+
                 # Step 4: Parse received data and reconstruct state_dict
                 # For Gemini Replicas recovery, we need to merge data from multiple sources
                 # Typically rank3's data is the primary data, rank0 and rank1 are backups
@@ -5672,6 +6193,101 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.2f} seconds")
         logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed")
     
+    def _run_eclatin_layerwise_recovery_pipeline(
+        self,
+        rank: int,
+        world_size: int,
+        registry,
+        eclatin_blocks: Dict[str, torch.Tensor],
+        recv_buffers: Optional[Dict[str, torch.Tensor]],
+        layer_groups: Dict,
+        sharded_state_dict: ShardedStateDict,
+    ) -> None:
+        """
+        Run ECLATIN layerwise recovery pipeline to recover rank2 data layer-by-layer.
+        
+        This method sets up the infrastructure and submits layers to C++ for pipeline processing.
+        The C++ worker will handle: receive → recover → H2D in a pipelined manner.
+        
+        Args:
+            rank (int): Current rank
+            world_size (int): Total number of ranks
+            registry: GlobalMetadataRegistry
+            eclatin_blocks (Dict[str, torch.Tensor]): 4 allocated blocks (all ranks)
+            recv_buffers (Optional[Dict[str, torch.Tensor]]): 6 recv buffers (rank2 only)
+            layer_groups (Dict): Layer-organized tensors
+            sharded_state_dict: For extracting GPU tensor information
+        """
+        import ctypes
+        from time import time
+        
+        if not self.eclatin_manager.use_eclatin:
+            logger.warning("ECLATIN Layerwise: Manager not enabled, skipping recovery pipeline")
+            return
+        
+        if self.eclatin_manager._eclatin_native is None:
+            logger.error("ECLATIN Layerwise: Native module not initialized")
+            return
+        
+        logger.info(f"ECLATIN Layerwise: [Rank {rank}] Starting layerwise recovery pipeline")
+        
+        # === Step 1: Set load mode in C++ native module ===
+        failed_rank = 2  # ECLATIN recovers rank2
+        self.eclatin_manager._eclatin_native.set_load_mode(True, failed_rank)
+        
+        # === Step 2: Initialize load connections (same as standard ECLATIN) ===
+        net_config_rank2 = self.eclatin_manager._get_eclatin_network_config(2, world_size)
+        rank2_ip = net_config_rank2['rank_ips'].get(2, net_config_rank2['my_ip'])
+        
+        load_recv_rank0_data2_port = net_config_rank2['ports']['load_recv_rank0_data2']
+        load_recv_rank0_parity2_port = net_config_rank2['ports']['load_recv_rank0_parity2']
+        load_recv_rank1_data1_port = net_config_rank2['ports']['load_recv_rank1_data1']
+        load_recv_rank1_parity1_port = net_config_rank2['ports']['load_recv_rank1_parity1']
+        load_recv_rank3_data1_port = net_config_rank2['ports']['load_recv_rank3_data1']
+        load_recv_rank3_data2_port = net_config_rank2['ports']['load_recv_rank3_data2']
+        
+        if rank == 2:
+            logger.info(f"ECLATIN Layerwise: [Rank 2] Initializing load accept connections...")
+            self.eclatin_manager._eclatin_native.init_load_connections(
+                rank, rank2_ip,
+                load_recv_rank0_data2_port, load_recv_rank0_parity2_port,
+                load_recv_rank1_data1_port, load_recv_rank1_parity1_port,
+                load_recv_rank3_data1_port, load_recv_rank3_data2_port
+            )
+        
+        torch.distributed.barrier()
+        
+        if rank != 2:
+            logger.info(f"ECLATIN Layerwise: [Rank {rank}] Connecting load send sockets to rank2...")
+            self.eclatin_manager._eclatin_native.init_load_connections(
+                rank, rank2_ip,
+                load_recv_rank0_data2_port, load_recv_rank0_parity2_port,
+                load_recv_rank1_data1_port, load_recv_rank1_parity1_port,
+                load_recv_rank3_data1_port, load_recv_rank3_data2_port
+            )
+        
+        logger.info(f"ECLATIN Layerwise: [Rank {rank}] Waiting for load connections...")
+        self.eclatin_manager._eclatin_native.wait_for_load_connections(timeout_seconds=30)
+        torch.distributed.barrier()
+        
+        logger.info(f"ECLATIN Layerwise: [Rank {rank}] Load connections initialized")
+        
+        # === Step 3: Process each layer ===
+        start_time = time()
+        
+        # Note: In layerwise mode, actual recovery and H2D transfer happens in C++ worker
+        # Here we just submit tasks to the C++ pipeline
+        # For non-rank2, we still need to send data layer-by-layer (to be implemented)
+        
+        logger.info(f"ECLATIN Layerwise: [Rank {rank}] Layerwise recovery pipeline setup completed")
+        logger.info(f"ECLATIN Layerwise: Note - Actual recovery will happen in C++ layerwise_load_worker")
+        logger.info(f"ECLATIN Layerwise: [Rank {rank}] Pipeline will be driven by load() method's layer-by-layer processing")
+        
+        # Synchronize all ranks
+        torch.distributed.barrier()
+        end_time = time()
+        logger.info(f"ECLATIN Layerwise: [Rank {rank}] Pipeline setup completed in {end_time - start_time:.2f}s")
+    
     def prepare_for_load_pipeline_test(self):
         """
         Prepare environment for load pipeline testing.
@@ -6209,6 +6825,562 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # Assign data to ShardedBase object
             sh_base.data = value
 
+    def _load_eclatin_layerwise_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+        """Load checkpoint saved in ECLATIN layerwise format with pipelined recovery and model initialization.
+        
+        This method implements three-stage pipeline:
+        1. Network data reception (layer-by-layer)
+        2. Recovery computation (layer-by-layer)
+        3. Model initialization/CPU→GPU transfer (layer-by-layer)
+        
+        The pipeline allows overlapping these stages for improved performance.
+        """
+        from .filesystem_async import FileSystemWriterAsync
+        from time import time
+        import logging
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] Starting layerwise checkpoint loading")
+        start_time = time()
+        
+        # Step 1: Load block checkpoint data using layerwise-specific method
+        checkpoint_dir = Path(checkpoint_dir)
+        mapped_file_own, mapped_file_partner = self._load_eclatin_layerwise_block_checkpoint(checkpoint_dir, sharded_state_dict)
+        
+        # Step 2: Extract layer information from checkpoint metadata
+        # This will tell us how the data is organized into layers
+        logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] Extracting layer metadata")
+        
+        # Load metadata from the first block to understand layer organization
+        # In layerwise format, metadata includes layer offsets and sizes
+        eclatin_file = checkpoint_dir / f'__{rank}_0.distcp'
+        
+        # Handle failed rank that doesn't have checkpoint file
+        if not eclatin_file.exists():
+            if rank == 2:
+                logger.warning(f"ECLATIN Layerwise Load: [Rank {rank}] File not found (failed node), using recovered metadata")
+                # For failed rank, use the metadata from mapped_file_own (already derived from sharded_state_dict)
+                # Create a minimal DecomposedStateDict for layer organization
+                from .state_dict_decomposer import DecomposedStateDict, TensorInfo
+                
+                # Convert TensorMetadata back to TensorInfo for layer organization
+                tensor_infos = []
+                for meta in mapped_file_own.local_metadata:
+                    tensor_info = TensorInfo(
+                        key=meta.key,
+                        shape=meta.shape,
+                        dtype=torch.dtype(meta.dtype.replace('torch.', '')) if isinstance(meta.dtype, str) else meta.dtype,
+                        device=torch.device('cpu'),
+                        numel=meta.shape[0] if len(meta.shape) > 0 else 1,
+                        size_bytes=meta.size_bytes,
+                        offset=0,
+                        global_offset=meta.global_offset,
+                        shard_index=meta.shard_index,
+                    )
+                    tensor_infos.append(tensor_info)
+                
+                decomposed = DecomposedStateDict(
+                    non_tensor_data=mapped_file_own.non_tensor_data,
+                    tensor_infos=tensor_infos,
+                    tensor_data=[],  # No actual data yet
+                    total_tensor_size_bytes=sum(meta.size_bytes for meta in mapped_file_own.local_metadata)
+                )
+            else:
+                raise FileNotFoundError(f"ECLATIN file not found for rank {rank}: {eclatin_file}")
+        else:
+            # Parse file to extract layer metadata
+            # TODO: This needs to be implemented in FileSystemWriterAsync
+            # For now, use standard loading and organize by layers ourselves
+            decomposed = FileSystemWriterAsync.load_eclatin_components_from_file(str(eclatin_file))
+        
+        # Step 3: Organize tensors by layer (similar to save logic)
+        layer_groups = self._organize_tensors_by_layer_for_load(decomposed, sharded_state_dict)
+        
+        logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] Organized into {len(layer_groups)} layer groups")
+        
+        # Step 4: Run layerwise recovery pipeline (setup connections)
+        # This will initialize C++ for layerwise processing
+        self._run_eclatin_layerwise_recovery_pipeline(
+            rank=rank,
+            world_size=world_size,
+            registry=self.eclatin_recovered_registry,
+            eclatin_blocks=self.eclatin_blocks,
+            recv_buffers=self.eclatin_recv_buffers if rank == 2 else None,
+            layer_groups=layer_groups,
+            sharded_state_dict=sharded_state_dict,
+        )
+        
+        logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] Layerwise pipeline initialized")
+        
+        # Step 5: Process each layer with pipeline
+        # For non-recovery ranks: just organize and initialize model layer-by-layer
+        # For rank2: receive → recover → initialize (pipelined)
+        
+        orig_sharded_state_dict = sharded_state_dict
+        (keyed_state_dict, flat_mapping, rename_mapping) = (
+            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+        )
+        
+        # Count total ShardedBase objects for debugging
+        total_sharded_tensors = sum(1 for sh_base_list in keyed_state_dict.values() 
+                                    for sh_base in sh_base_list if isinstance(sh_base, ShardedTensor))
+        total_sharded_objects = sum(1 for sh_base_list in keyed_state_dict.values() 
+                                   for sh_base in sh_base_list if isinstance(sh_base, ShardedObject))
+        logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] Total ShardedBase objects: "
+                   f"{total_sharded_tensors + total_sharded_objects} "
+                   f"({total_sharded_tensors} tensors, {total_sharded_objects} objects)")
+        
+        # Load layer-by-layer using C++ pipeline for rank2 recovery
+        matched_count = 0
+        unmatched_count = 0
+        
+        # For rank2, use C++ layerwise load worker for pipelined recovery + H2D
+        use_cpp_pipeline = (rank == 2 and 
+                           self.eclatin_manager.use_eclatin and 
+                           self.eclatin_manager._eclatin_native is not None)
+        
+        for layer_key in sorted(layer_groups.keys()):
+            layer_tensors = layer_groups[layer_key]
+            
+            # Extract numeric layer_id from layer_key (e.g., "layer_0" -> 0)
+            # Note: Both real layers and virtual layers (for non-layer tensors) use "layer_N" format
+            if layer_key.startswith("layer_"):
+                layer_id = int(layer_key.split("_")[1])
+                logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] Processing layer {layer_id} ({len(layer_tensors)} tensors)")
+            else:
+                # This shouldn't happen in layerwise mode - all tensors should be in layer groups
+                logger.warning(f"ECLATIN Layerwise Load: [Rank {rank}] Unexpected non-layer group: {layer_key} ({len(layer_tensors)} tensors)")
+                
+                # Fallback: Handle as standard CPU->GPU transfer
+                index_to_data = {}
+                for info, tensor in layer_tensors:
+                    info_offset = info.global_offset
+                    if info_offset is None:
+                        info_offset = ()
+                    elif not isinstance(info_offset, tuple):
+                        info_offset = tuple(info_offset) if hasattr(info_offset, '__iter__') else (info_offset,)
+                    index_key = (info.key, info_offset)
+                    index_to_data[index_key] = (info, tensor)
+                
+                # Match and transfer non-layer tensors
+                for key, sh_base_list in keyed_state_dict.items():
+                    for sh_base in sh_base_list:
+                        if isinstance(sh_base, ShardedTensor):
+                            sh_offset = tuple(sh_base.global_offset) if hasattr(sh_base.global_offset, '__iter__') else (sh_base.global_offset,)
+                            lookup_key = (key, sh_offset)
+                            if lookup_key in index_to_data:
+                                _, tensor = index_to_data[lookup_key]
+                                # Standard CPU->GPU transfer for non-layer tensors
+                                if tensor is not None and tensor.device.type == 'cpu':
+                                    tensor = tensor.cuda(non_blocking=True)
+                                sh_base.data = tensor
+                                matched_count += 1
+                
+                # Skip to next group after processing non-layer tensors
+                continue
+            
+            # Continue with layer processing (both real layers and virtual layers for non-layer tensors)...
+            
+            # Build index map for this layer
+            index_to_data = {}
+            layer_size = 0
+            for info, tensor in layer_tensors:
+                info_offset = info.global_offset
+                if info_offset is None:
+                    info_offset = ()
+                elif not isinstance(info_offset, tuple):
+                    info_offset = tuple(info_offset) if hasattr(info_offset, '__iter__') else (info_offset,)
+                index_key = (info.key, info_offset)
+                index_to_data[index_key] = (info, tensor)
+                if tensor is not None:
+                    layer_size += tensor.numel() * tensor.element_size()
+            
+            if use_cpp_pipeline and layer_size > 0:
+                # Rank2: Use C++ pipeline for recovery + H2D transfer
+                # Prepare GPU tensor info for H2D transfer
+                gpu_tensors_info = []
+                cpu_offset = 0
+                
+                for key, sh_base_list in keyed_state_dict.items():
+                    for sh_base in sh_base_list:
+                        if isinstance(sh_base, ShardedTensor):
+                            sh_offset = tuple(sh_base.global_offset) if hasattr(sh_base.global_offset, '__iter__') else (sh_base.global_offset,)
+                            lookup_key = (key, sh_offset)
+                            if lookup_key in index_to_data:
+                                info, tensor = index_to_data[lookup_key]
+                                if tensor is not None and hasattr(sh_base, 'data') and isinstance(sh_base.data, torch.Tensor):
+                                    # Prepare info for C++ H2D transfer
+                                    gpu_ptr = int(sh_base.data.data_ptr()) if sh_base.data.is_cuda else 0
+                                    if gpu_ptr > 0:
+                                        tensor_size = tensor.numel() * tensor.element_size()
+                                        shape = list(tensor.shape)
+                                        fqn = info.key
+                                        gpu_tensors_info.append((gpu_ptr, cpu_offset, tensor_size, shape, fqn))
+                                        cpu_offset += tensor_size
+                
+                # Submit layer to C++ pipeline
+                if gpu_tensors_info:
+                    # Get buffer addresses (simplified - actual implementation needs proper buffer management)
+                    recv_rank0_data2_addr = int(self.eclatin_recv_buffers['rank0_data2'].data_ptr()) if self.eclatin_recv_buffers else 0
+                    recv_rank0_parity2_addr = int(self.eclatin_recv_buffers['rank0_parity2'].data_ptr()) if self.eclatin_recv_buffers else 0
+                    recv_rank1_data1_addr = int(self.eclatin_recv_buffers['rank1_data1'].data_ptr()) if self.eclatin_recv_buffers else 0
+                    recv_rank1_parity1_addr = int(self.eclatin_recv_buffers['rank1_parity1'].data_ptr()) if self.eclatin_recv_buffers else 0
+                    recv_rank3_data1_addr = int(self.eclatin_recv_buffers['rank3_data1'].data_ptr()) if self.eclatin_recv_buffers else 0
+                    recv_rank3_data2_addr = int(self.eclatin_recv_buffers['rank3_data2'].data_ptr()) if self.eclatin_recv_buffers else 0
+                    
+                    recovered_data1_addr = int(self.eclatin_blocks['data_block_1'].data_ptr())
+                    recovered_data2_addr = int(self.eclatin_blocks['data_block_2'].data_ptr())
+                    recovered_parity1_addr = int(self.eclatin_blocks['parity_block_1'].data_ptr())
+                    recovered_parity2_addr = int(self.eclatin_blocks['parity_block_2'].data_ptr())
+                    
+                    logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] Submitting layer {layer_id} to C++ pipeline")
+                    self.eclatin_manager._eclatin_native.submit_layer_wise_load(
+                        int(layer_id),
+                        gpu_tensors_info,
+                        int(recv_rank0_data2_addr),
+                        int(recv_rank0_parity2_addr),
+                        int(recv_rank1_data1_addr),
+                        int(recv_rank1_parity1_addr),
+                        int(recv_rank3_data1_addr),
+                        int(recv_rank3_data2_addr),
+                        int(recovered_data1_addr),
+                        int(recovered_data2_addr),
+                        int(recovered_parity1_addr),
+                        int(recovered_parity2_addr),
+                        int(layer_size)
+                    )
+            
+            # Match tensors with sharded_state_dict for this layer
+            for key, sh_base_list in keyed_state_dict.items():
+                for sh_base in sh_base_list:
+                    if isinstance(sh_base, ShardedTensor):
+                        sh_offset = tuple(sh_base.global_offset) if hasattr(sh_base.global_offset, '__iter__') else (sh_base.global_offset,)
+                        lookup_key = (key, sh_offset)
+                        if lookup_key in index_to_data:
+                            if use_cpp_pipeline:
+                                # Rank2: C++ pipeline has already written data directly to sh_base.data GPU memory
+                                # Do NOT overwrite with CPU tensor from index_to_data
+                                # sh_base.data already contains the recovered data on GPU
+                                matched_count += 1
+                            else:
+                                # Non-rank2 or fallback: Load CPU tensor and transfer to GPU
+                                _, tensor = index_to_data[lookup_key]
+                                if tensor is not None and tensor.device.type == 'cpu':
+                                    tensor = tensor.cuda(non_blocking=True)
+                                sh_base.data = tensor
+                                matched_count += 1
+        
+        # Wait for all C++ layerwise load tasks to complete
+        if use_cpp_pipeline:
+            logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] Waiting for C++ pipeline to complete...")
+            self.eclatin_manager._eclatin_native.wait_all_load_layers_complete()
+            logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] C++ pipeline completed")
+        
+        # Process non-layer tensors (similar to standard loading)
+        non_tensor_by_fqn = decomposed.non_tensor_data
+        for key, sh_base_list in keyed_state_dict.items():
+            for sh_base in sh_base_list:
+                if isinstance(sh_base, ShardedObject):
+                    if key in non_tensor_by_fqn:
+                        value = non_tensor_by_fqn[key]
+                        if isinstance(value, dict) and ('_eccheck_type' in value or '_eclatin_type' in value):
+                            wrapper_type = value.get('_eccheck_type') or value.get('_eclatin_type')
+                            if wrapper_type == 'BytesIO':
+                                bytes_data = value.get('_eccheck_data') or value.get('_eclatin_data')
+                                bytes_io = io.BytesIO(bytes_data)
+                                deserialized_list = torch.load(bytes_io, map_location='cpu', weights_only=False)
+                                value = deserialized_list[0] if isinstance(deserialized_list, list) else deserialized_list
+                        sh_base.data = value
+                        matched_count += 1
+                    else:
+                        unmatched_count += 1
+                        logger.warning(f"ECLATIN Layerwise Load: [Rank {rank}] Unmatched ShardedObject: key={key}, unique_key={sh_base.unique_key}")
+        
+        logger.info(f"ECLATIN Layerwise Load: Matched {matched_count} ShardedBase objects")
+        if unmatched_count > 0:
+            logger.warning(f"ECLATIN Layerwise Load: {unmatched_count} ShardedBase objects were not matched")
+        
+        # Unwrap to plain state_dict
+        unwrapped_state_dict = {}
+        for key, sh_base_list in keyed_state_dict.items():
+            if len(sh_base_list) == 0:
+                continue
+            sh_base = sh_base_list[0]
+            if isinstance(sh_base, ShardedTensor):
+                tensors = []
+                for sh in sh_base_list:
+                    ten = sh.data
+                    if ten is None:
+                        tensors.append(None)
+                        continue
+                    if sh.flattened_range is not None:
+                        assert ten.shape[:-1] == (1,) * (len(ten.shape) - 1), ten.shape
+                        ten = ten.view(-1)
+                    else:
+                        for _ in range(sh.prepend_axis_num):
+                            if ten.size(0) == 1:
+                                ten = ten[0]
+                    tensors.append(ten)
+                unwrapped_state_dict[key] = tensors
+            elif isinstance(sh_base, ShardedObject):
+                unwrapped_state_dict[key] = [sh.data for sh in sh_base_list]
+        
+        mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
+            unwrapped_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
+        )
+        self._restore_dict_types_lenient(mcore_state_dict, orig_sharded_state_dict)
+        
+        end_time = time()
+        logger.info(
+            f"ECLATIN Layerwise Load: [Rank {rank}] Completed in {end_time - start_time:.2f}s, "
+            f"loaded {matched_count} tensors"
+        )
+        
+        return mcore_state_dict
+    
+    def _organize_tensors_by_layer_for_load(self, decomposed, sharded_state_dict):
+        """Organize loaded tensors by layer for layerwise processing.
+        
+        This mirrors the layer extraction logic used during save, including FQN pattern inference.
+        MUST use exactly the same logic as _allocate_eclatin_layerwise_recv_buffers to ensure consistency.
+        """
+        import re
+        
+        layer_groups = {}  # layer_id -> list of (info, tensor)
+        
+        def extract_layer_number(fqn: str) -> int:
+            """Extract layer number from FQN - using same patterns as save mode.
+            
+            Supports patterns:
+            - decoder.layers.N.
+            - encoder.layers.N.
+            - transformer.layers.N.
+            - model.layers.N.
+            - layers.N.
+            - .layer.N., _layers_N_, .blocks.N., etc.
+            """
+            # Use the same patterns as save mode for consistency
+            patterns = [
+                r'\.layers\.(\d+)\.',      # .layers.N. (matches decoder.layers.0., module.decoder.layers.0., etc.)
+                r'^layers\.(\d+)\.',       # layers.N. at start
+                r'\.layer\.(\d+)\.',       # .layer.N.
+                r'^layer\.(\d+)\.',        # layer.N. at start
+                r'_layers_(\d+)_',         # _layers_N_
+                r'_layer_(\d+)_',          # _layer_N_
+                r'\.blocks\.(\d+)\.',      # .blocks.N.
+                r'^blocks\.(\d+)\.',       # blocks.N. at start
+                r'_blocks_(\d+)_',         # _blocks_N_
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, fqn)
+                if match:
+                    return int(match.group(1))
+            return -1  # Non-layer tensor
+        
+        # First pass: count occurrences of each FQN pattern (for inference)
+        # This is critical to match save mode behavior
+        fqn_to_occurrences = {}
+        for info in decomposed.tensor_infos:
+            fqn = info.key
+            # Normalize to base pattern (remove layer number if present)
+            base_fqn = fqn
+            if re.search(r'\.layers\.\d+\.', fqn):
+                base_fqn = re.sub(r'\.layers\.\d+\.', '.layers.', fqn)
+            elif re.search(r'^layers\.\d+\.', fqn):
+                base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
+            
+            fqn_to_occurrences[base_fqn] = fqn_to_occurrences.get(base_fqn, 0) + 1
+        
+        # Determine if this is a layer-based FQN pattern
+        # If same FQN appears multiple times (e.g., 6 times for 6 layers), it's a layer tensor
+        layer_fqn_patterns = set()
+        for fqn, count in fqn_to_occurrences.items():
+            if count > 1 and ('layers.' in fqn or 'layer.' in fqn):
+                layer_fqn_patterns.add(fqn)
+        
+        logger.info(f"ECLATIN Load: Found {len(layer_fqn_patterns)} layer FQN patterns (appearing multiple times)")
+        if layer_fqn_patterns and logger.isEnabledFor(logging.DEBUG):
+            for pattern in sorted(list(layer_fqn_patterns))[:5]:
+                logger.debug(f"  Layer pattern: {pattern} (appears {fqn_to_occurrences[pattern]} times)")
+        
+        # Second pass: assign layer numbers based on FQN pattern and occurrence order
+        fqn_to_layer_counter = {}  # Track current layer number for each FQN pattern
+        
+        # Group tensors by layer using SAME logic as save mode
+        for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
+            fqn = info.key
+            
+            # Try direct extraction first
+            layer_num = extract_layer_number(fqn)
+            
+            # If not found, try to infer from FQN pattern (SAME as save mode)
+            if layer_num == -1:
+                base_fqn = fqn
+                # Normalize to base pattern (remove layer number if present)
+                if re.search(r'\.layers\.\d+\.', fqn):
+                    base_fqn = re.sub(r'\.layers\.\d+\.', '.layers.', fqn)
+                elif re.search(r'^layers\.\d+\.', fqn):
+                    base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
+                
+                # If this is a layer pattern (appears multiple times), assign layer number based on occurrence
+                if base_fqn in layer_fqn_patterns:
+                    if base_fqn not in fqn_to_layer_counter:
+                        fqn_to_layer_counter[base_fqn] = 0
+                    layer_num = fqn_to_layer_counter[base_fqn]
+                    fqn_to_layer_counter[base_fqn] += 1
+            
+            layer_key = f"layer_{layer_num}" if layer_num >= 0 else "non_layer"
+            
+            if layer_key not in layer_groups:
+                layer_groups[layer_key] = []
+            layer_groups[layer_key].append((info, tensor))
+        
+        # Log layer extraction results (same as save mode)
+        layer_keys = [k for k in layer_groups.keys() if k != 'non_layer']
+        num_layers = len(layer_keys)
+        num_non_layer = len(layer_groups.get('non_layer', []))
+        logger.info(
+            f"ECLATIN Load: Organized into {num_layers} layers, {num_non_layer} non-layer tensors (before virtual layer splitting)"
+        )
+        if logger.isEnabledFor(logging.DEBUG) and layer_keys:
+            logger.debug(f"ECLATIN Load: Layer keys found: {sorted(layer_keys)}")
+        
+        # Split non-layer tensors into virtual layers (SAME as save mode)
+        if num_non_layer > 0:
+            logger.info(f"ECLATIN Load: Splitting {num_non_layer} non-layer tensors into virtual layers...")
+            layer_groups = self._split_non_layer_into_virtual_layers_for_load(layer_groups, layer_keys)
+        
+        return layer_groups
+    
+    def _split_non_layer_into_virtual_layers_for_load(self, layer_groups, real_layer_keys):
+        """Split non-layer tensors into virtual layers for load.
+        
+        This MUST use the SAME algorithm as save mode to ensure consistency.
+        The algorithm splits based on tensor sizes and capacity limits.
+        
+        Args:
+            layer_groups: Dict with layer_groups including "non_layer"
+            real_layer_keys: List of real layer keys (for determining virtual layer base ID)
+        
+        Returns:
+            Updated layer_groups with virtual layers added
+        """
+        non_layer_tensors = layer_groups.get('non_layer', [])
+        if not non_layer_tensors:
+            return layer_groups
+        
+        # Calculate average layer size and virtual layer capacity (SAME as save mode)
+        total_non_layer_size = sum(
+            info.size_bytes for info, tensor in non_layer_tensors
+        )
+        
+        # Get average real layer size
+        real_layer_sizes = []
+        for layer_key in real_layer_keys:
+            if layer_key in layer_groups:
+                layer_size = sum(info.size_bytes for info, tensor in layer_groups[layer_key])
+                real_layer_sizes.append(layer_size)
+        
+        avg_layer_size = sum(real_layer_sizes) // len(real_layer_sizes) if real_layer_sizes else total_non_layer_size
+        
+        # Calculate number of virtual layers needed
+        num_virtual_layers = (total_non_layer_size + avg_layer_size - 1) // avg_layer_size
+        original_virtual_layer_capacity = (total_non_layer_size + num_virtual_layers - 1) // num_virtual_layers
+        
+        logger.info(
+            f"ECLATIN Load: Splitting non-layer data ({total_non_layer_size / (1024**2):.2f} MB) "
+            f"into {num_virtual_layers} virtual layers "
+            f"(capacity: {original_virtual_layer_capacity / (1024**2):.2f} MB per layer)"
+        )
+        
+        # Sort tensors by size (largest first) - SAME as save mode
+        non_layer_tensors_sorted = sorted(
+            non_layer_tensors,
+            key=lambda x: x[0].size_bytes,  # info.size_bytes
+            reverse=True
+        )
+        
+        # Split into large and small tensors
+        large_tensors = []
+        small_tensors = []
+        
+        for info, tensor in non_layer_tensors_sorted:
+            if info.size_bytes >= original_virtual_layer_capacity:
+                large_tensors.append((info, tensor))
+            else:
+                small_tensors.append((info, tensor))
+        
+        logger.info(
+            f"ECLATIN Load: {len(large_tensors)} large tensors, {len(small_tensors)} small tensors"
+        )
+        
+        # Assign virtual layers
+        virtual_layer_tensors = {}
+        current_virtual_layer = 0
+        
+        # First, assign large tensors (each gets its own layer)
+        for info, tensor in large_tensors:
+            virtual_layer_tensors[current_virtual_layer] = [(info, tensor)]
+            logger.debug(
+                f"ECLATIN Load: Virtual layer {current_virtual_layer}: Large tensor {info.key}, "
+                f"size={info.size_bytes / (1024**2):.2f} MB"
+            )
+            current_virtual_layer += 1
+        
+        # Then, pack small tensors together
+        if small_tensors:
+            virtual_layer_tensors[current_virtual_layer] = []
+            current_virtual_size = 0
+            
+            for info, tensor in small_tensors:
+                # If adding this tensor would exceed capacity, start new layer
+                if current_virtual_size > 0 and current_virtual_size + info.size_bytes > original_virtual_layer_capacity:
+                    logger.debug(
+                        f"ECLATIN Load: Virtual layer {current_virtual_layer}: Packed "
+                        f"{len(virtual_layer_tensors[current_virtual_layer])} tensors, "
+                        f"size={current_virtual_size / (1024**2):.2f} MB"
+                    )
+                    current_virtual_layer += 1
+                    virtual_layer_tensors[current_virtual_layer] = []
+                    current_virtual_size = 0
+                
+                virtual_layer_tensors[current_virtual_layer].append((info, tensor))
+                current_virtual_size += info.size_bytes
+            
+            # Record last layer
+            if virtual_layer_tensors[current_virtual_layer]:
+                logger.debug(
+                    f"ECLATIN Load: Virtual layer {current_virtual_layer}: Packed "
+                    f"{len(virtual_layer_tensors[current_virtual_layer])} tensors, "
+                    f"size={current_virtual_size / (1024**2):.2f} MB"
+                )
+        
+        # Add virtual layers to layer_groups
+        max_real_layer_id = max(
+            [int(k.split('_')[1]) for k in real_layer_keys if k.startswith('layer_')],
+            default=-1
+        )
+        virtual_layer_base_id = max_real_layer_id + 1
+        
+        for vl_id, tensors in virtual_layer_tensors.items():
+            virtual_layer_id = virtual_layer_base_id + vl_id
+            layer_key = f"layer_{virtual_layer_id}"
+            layer_groups[layer_key] = tensors
+            logger.debug(f"ECLATIN Load: Created virtual layer {layer_key} with {len(tensors)} tensors")
+        
+        # Remove non_layer group
+        if 'non_layer' in layer_groups:
+            del layer_groups['non_layer']
+        
+        logger.info(
+            f"ECLATIN Load: Created {len(virtual_layer_tensors)} virtual layers "
+            f"(IDs {virtual_layer_base_id} to {virtual_layer_base_id + len(virtual_layer_tensors) - 1})"
+        )
+        
+        return layer_groups
+    
     def _load_eclatin_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Load checkpoint saved in ECLATIN format (mirror EC-CHECK flow)."""
         from .filesystem_async import FileSystemWriterAsync
@@ -6429,12 +7601,21 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         if input_args.use_eclatin and (self._is_eclatin_checkpoint(checkpoint_dir) or rank == 2):
             logger.info(f"Detected ECLATIN format checkpoint at {checkpoint_dir}")
-            # Load P2P checkpoint data (for rank2 recovery, this prepares the buffer)
-            mapped_file_own, mapped_file_partner = self._load_eclatin_block_checkpoint(checkpoint_dir)
             
-            # _load_eclatin_checkpoint will use recovered data if available (rank2)
-            mcore_state_dict = self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)
-            return mcore_state_dict
+            # Check if this is a layerwise checkpoint
+            if input_args.use_eclatin_layerwise:
+                logger.info(f"Using ECLATIN layerwise load mode")
+                # Layerwise loading with pipelined recovery and model initialization
+                mcore_state_dict = self._load_eclatin_layerwise_checkpoint(sharded_state_dict, checkpoint_dir)
+                return mcore_state_dict
+            else:
+                logger.info(f"Using ECLATIN standard load mode")
+                # Load P2P checkpoint data (for rank2 recovery, this prepares the buffer)
+                mapped_file_own, mapped_file_partner = self._load_eclatin_block_checkpoint(checkpoint_dir, sharded_state_dict)
+                
+                # _load_eclatin_checkpoint will use recovered data if available (rank2)
+                mcore_state_dict = self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)
+                return mcore_state_dict
         # Apply N-D tensors resharding
         reformulation_metadata = get_reformulation_metadata(sharded_state_dict, checkpoint_dir)
         sharded_state_dict, formulation_restore_data = apply_nd_flattened_tensors_reformulation(

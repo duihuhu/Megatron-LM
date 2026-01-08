@@ -2201,16 +2201,9 @@ class FileSystemWriterAsync(FileSystemWriter):
             raise RuntimeError(f"Worker failure: {write_results_or_exc}") from write_results_or_exc
         write_results: dict = write_results_or_exc
         
-        # For ECLATIN layerwise mode, use ecl_write_buckets count instead of write_buckets
-        # because write_buckets may not be updated in the main process, but the actual
-        # write_preloaded_data_multiproc receives the correct buckets from preload function return value
-        if hasattr(self, 'use_eclatin_layerwise') and self.use_eclatin_layerwise:
-            if hasattr(self, 'ecl_write_buckets') and self.ecl_write_buckets:
-                expected_count = len(self.ecl_write_buckets)
-            else:
-                expected_count = len(self.write_buckets)
-        else:
-            expected_count = len(self.write_buckets)
+        # Always use write_buckets count as it's updated by preload function
+        # The preload function returns the correct bucket list (including main file for ECLATIN)
+        expected_count = len(self.write_buckets)
         
         if len(write_results) != expected_count:
             raise RuntimeError(
@@ -3799,8 +3792,73 @@ class FileSystemWriterAsync(FileSystemWriter):
             f"({bandwidth:.2f} GB/s), {len(sorted_layer_keys)} layers"
         )
         
-        # Step 10: Return WriteBuckets (reuse existing 4 blocks)
-        return self.ecl_write_buckets
+        # Step 10: Update WriteBucket paths with current checkpoint_dir before returning
+        # This ensures paths are updated for each iteration
+        if self.ecl_write_buckets is not None:
+            result_buckets = []
+            
+            # Extract metadata from first block (all blocks use the same metadata)
+            first_bucket = self.ecl_write_buckets[0]
+            _, _, (first_bytes_data, _) = first_bucket
+            
+            # Extract metadata for main file
+            main_file_metadata = None
+            for key, value in first_bytes_data:
+                if key == 'eclatin_metadata':
+                    main_file_metadata = value
+                    break
+            
+            # In layerwise mode, create main file by concatenating data_block_1 and data_block_2
+            # After all layers are processed, these two blocks contain the complete original data
+            if main_file_metadata:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                eclatin_main_file = f"__{rank}_0.distcp"
+                eclatin_main_path = Path(self.checkpoint_dir) / eclatin_main_file
+                
+                # Get data blocks
+                data_block_1 = self.eclatin_blocks['data_block_1']
+                data_block_2 = self.eclatin_blocks['data_block_2']
+                
+                # Calculate actual data size from metadata
+                actual_size = self.eclatin_blocks.get('actual_size', 0)
+                
+                # Create continuous buffer by concatenating data_block_1 and data_block_2
+                # Note: data_block_1 contains first half, data_block_2 contains second half
+                half_size = actual_size // 2
+                second_half_size = actual_size - half_size
+                
+                # Create a continuous buffer with actual size
+                continuous_buffer = torch.empty(actual_size, dtype=torch.uint8)
+                continuous_buffer[:half_size].copy_(data_block_1[:half_size])
+                continuous_buffer[half_size:].copy_(data_block_2[:second_half_size])
+                
+                # Create main file bytes data
+                eclatin_main_bytes_data = [
+                    ('eclatin_metadata', main_file_metadata),
+                    ('eclatin_continuous_buffer', continuous_buffer),
+                ]
+                result_buckets.append((eclatin_main_path, eclatin_main_file, (eclatin_main_bytes_data, [])))
+                logger.info(f"ECLATIN Layerwise: Created main file bucket: {eclatin_main_path} ({actual_size / (1024**3):.2f} GB)")
+            
+            # Add 4 block buckets with updated paths
+            for bucket in self.ecl_write_buckets:
+                file_path, storage_key, data = bucket
+                # Extract file name from path
+                if isinstance(file_path, (str, Path)):
+                    file_path_obj = Path(file_path)
+                    file_name = file_path_obj.name
+                else:
+                    file_name = str(file_path).split('/')[-1] if '/' in str(file_path) else str(file_path)
+                
+                # Build new path with current checkpoint_dir
+                new_file_path = Path(self.checkpoint_dir) / file_name
+                result_buckets.append((new_file_path, storage_key, data))
+            
+            # Update self.write_buckets so retrieve_write_results() can check the correct count
+            self.write_buckets = result_buckets
+            return result_buckets
+        else:
+            return []
     
     def _eccheck_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
         """

@@ -13,7 +13,7 @@ export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
 
 GPUS_PER_NODE=1
-MASTER_ADDR=128.105.146.31
+MASTER_ADDR=128.105.146.30
 export NCCL_SOCKET_IFNAME=eno33np0
 export GLOO_SOCKET_IFNAME=eno33np0
 export ECCHECK_USE_ASIO=true
@@ -107,7 +107,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    # --load $CHECKPOINT_PATH
+    --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck

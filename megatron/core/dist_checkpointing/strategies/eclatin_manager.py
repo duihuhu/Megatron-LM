@@ -446,6 +446,14 @@ class ECLATINManager:
                 parity2_send1_partner_recv_port = base_port + parity2_send1_partner_rank * 8 + 7  # recv2 offset (4+3)
                 parity2_send2_partner_recv_port = base_port + parity2_send2_partner_rank * 8 + 6  # recv1 offset (4+2)
                 
+                # Get CUDA stream configuration from environment or args
+                from megatron.training import get_args
+                args = get_args()
+                num_cuda_streams = int(os.environ.get('ECLATIN_NUM_CUDA_STREAMS', 
+                                                      getattr(args, 'eclatin_num_cuda_streams', 4)))
+                
+                logger.info(f"ECLATIN: [Rank {rank}] Using {num_cuda_streams} CUDA streams for async transfers")
+                
                 self._eclatin_native = eclatin_native.ECLATINNative(
                     # Parity 1: send1, send2, recv1, recv2
                     rank_ips.get(parity1_send1_partner_rank, net_config['my_ip']), parity1_send1_partner_recv_port,
@@ -456,7 +464,9 @@ class ECLATINManager:
                     rank_ips.get(parity2_send1_partner_rank, net_config['my_ip']), parity2_send1_partner_recv_port,
                     rank_ips.get(parity2_send2_partner_rank, net_config['my_ip']), parity2_send2_partner_recv_port,
                     net_config['my_ip'], net_config['ports']['parity2_recv1'],
-                    net_config['my_ip'], net_config['ports']['parity2_recv2']
+                    net_config['my_ip'], net_config['ports']['parity2_recv2'],
+                    # CUDA streams configuration
+                    num_cuda_streams
                 )
                 
                 # If we reach here, ASIO connections are ready and threads are running

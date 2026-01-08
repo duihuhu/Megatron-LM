@@ -3,6 +3,8 @@
 # Script to run a single node in 4-node simulation (1 GPU per node)
 # Usage: ./test_eccheck_4nodes_node.sh <node_rank> [additional_args...]
 # Example: ./test_eccheck_4nodes_node.sh 0
+export ECLATIN_NUM_CUDA_STREAMS=4
+
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
@@ -107,7 +109,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    # --load $CHECKPOINT_PATH
+    --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck

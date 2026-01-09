@@ -1082,6 +1082,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 use_msc=MultiStorageClientFeature.is_enabled(),
                 use_gemini=self.gemini_manager.use_gemini,
                 gemini_native=self.gemini_manager.get_native_module(),  # Pass pre-initialized C++ module
+                use_rdma=self.gemini_manager.use_rdma,  # Pass RDMA flag for transport selection
             )
         else:
             writer = FileSystemWriterAsync(
@@ -1337,6 +1338,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # Step 2: Preallocate CPU buffer
         total_tensor_size = self.decomposed_state_dict.total_tensor_size_bytes
         
+        send_buffer_needs_registration = False
         if self.preallocated_cpu_buffer is None or self.preallocated_cpu_buffer.numel() < total_tensor_size:
             logger.info(
                 f"Gemini: [Rank {rank}] Allocating preallocated CPU buffer: "
@@ -1354,11 +1356,17 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                     total_tensor_size, dtype=torch.uint8
                 )
                 logger.info(f"Gemini: [Rank {rank}] Allocated regular CPU buffer")
+            send_buffer_needs_registration = True
         else:
             logger.info(
                 f"Gemini: [Rank {rank}] Reusing existing preallocated CPU buffer: "
                 f"{self.preallocated_cpu_buffer.numel() / (1024**3):.2f} GB"
             )
+        
+        # Register send buffer for RDMA if enabled (on first allocation)
+        if self.gemini_manager.use_rdma and send_buffer_needs_registration:
+            logger.info(f"Gemini: [Rank {rank}] Registering preallocated_cpu_buffer (send buffer) for RDMA")
+            self.gemini_manager.register_buffer(self.preallocated_cpu_buffer)
         
         # Step 3: Exchange buffer sizes and preallocate remote buffers (receive buffers)
         # This optimization moves buffer allocation from _gemini_preload_to_continuous_buffer
@@ -1401,6 +1409,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 )
                 
                 # Allocate remote buffer if needed (or reuse existing)
+                recv_buffer_needs_registration = False
                 if not hasattr(self, 'gemini_remote_buffer') or self.gemini_remote_buffer is None or \
                    self.gemini_remote_buffer.numel() < remote_buffer_size:
                     self.gemini_remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
@@ -1408,6 +1417,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                         f"Gemini: [Rank {rank}] Allocated remote buffer: "
                         f"{remote_buffer_size / (1024**2):.2f} MB"
                     )
+                    recv_buffer_needs_registration = True
                 else:
                     logger.info(
                         f"Gemini: [Rank {rank}] Reusing existing remote buffer: "
@@ -1416,6 +1426,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 
                 # Store remote buffer size for later use
                 self.gemini_remote_buffer_size = remote_buffer_size
+                
+                # Register recv buffer for RDMA if enabled (on first allocation)
+                if self.gemini_manager.use_rdma and recv_buffer_needs_registration:
+                    logger.info(f"Gemini: [Rank {rank}] Registering gemini_remote_buffer (recv buffer) for RDMA")
+                    self.gemini_manager.register_buffer(self.gemini_remote_buffer)
             else:
                 logger.warning(f"Gemini: [Rank {rank}] No paired rank found for buffer exchange")
         

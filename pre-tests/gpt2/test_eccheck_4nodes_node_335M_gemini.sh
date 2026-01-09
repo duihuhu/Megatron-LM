@@ -117,6 +117,8 @@ EVAL_AND_LOGGING_ARGS=(
 
     --use-gemini
     --use-gemini-optimized
+    --use-rdma
+    
     # --use-gemini-software-failure
     --use-gemini-hardware-failure
 

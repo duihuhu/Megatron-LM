@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
-"""Gemini manager for replica-level data transfer with C++ ASIO implementation."""
+"""Gemini manager for replica-level data transfer with C++ ASIO or RDMA implementation."""
 
 import os
 import queue
@@ -19,12 +19,13 @@ class GeminiManager:
     """Shared manager for Gemini replica-level data transfer.
     
     This class provides a singleton instance that manages:
-    - Gemini C++ native module (_gemini_native) for ASIO-based communication
+    - Gemini C++ native module (_gemini_native) for ASIO or RDMA communication
     - Buffer allocation and management for replica data exchange
     - Decomposed state dict for efficient GPU-to-CPU transfer
+    - Buffer registration for RDMA (when use_rdma is enabled)
     
     Similar to ECCHECKManager, but focused on replica-level data exchange
-    between paired ranks (0<->2, 1<->3) using ASIO for network communication.
+    between paired ranks (0<->2, 1<->3) using ASIO or RDMA for network communication.
     """
     
     _instance: Optional['GeminiManager'] = None
@@ -47,6 +48,7 @@ class GeminiManager:
         self._gemini_native = None
         self.use_gemini = False
         self.use_gemini_optimized = False
+        self.use_rdma = False
         
         # Buffer configuration
         self.gemini_pin_memory = True
@@ -58,6 +60,10 @@ class GeminiManager:
         # Replica data buffers (for received data from peer)
         self.replica_buffer: Optional[torch.Tensor] = None
         self.replica_metadata: Optional[dict] = None
+        
+        # Track registered buffers (for RDMA)
+        self.registered_buffers: Dict[int, Tuple[int, int]] = {}  # {buffer_addr: (size, iteration)}
+        self.current_iteration: int = 0
         
         self._initialized = True
     
@@ -232,6 +238,7 @@ class GeminiManager:
             args = input_args()
             self.use_gemini = getattr(args, 'use_gemini', False)
             self.use_gemini_optimized = getattr(args, 'use_gemini_optimized', False)
+            self.use_rdma = getattr(args, 'use_rdma', False)
             
             if not self.use_gemini or not self.use_gemini_optimized:
                 return
@@ -249,7 +256,7 @@ class GeminiManager:
             self._gemini_native = None
     
     def _init_gemini_native(self):
-        """Initialize Gemini C++ native module with ASIO."""
+        """Initialize Gemini C++ native module with ASIO or RDMA."""
         gemini_native = None
         try:
             # Load .so file
@@ -270,6 +277,27 @@ class GeminiManager:
             spec.loader.exec_module(gemini_native)
             logger.debug(f"Gemini: Loaded .so file from {so_path}")
             
+            # Check RDMA availability if RDMA mode is requested (strict mode: fail if not available)
+            if self.use_rdma:
+                try:
+                    rdma_available = gemini_native.is_rdma_available()
+                    if not rdma_available:
+                        raise RuntimeError(
+                            "RDMA mode requested (--use-rdma) but RDMA is not available on this system.\n"
+                            "Possible causes:\n"
+                            "  1. No RDMA devices installed (check: ibv_devices)\n"
+                            "  2. RDMA drivers not loaded (try: modprobe rdma_cm ib_uverbs)\n"
+                            "  3. Insufficient permissions\n"
+                            "  4. RDMA services not running (check: systemctl status rdma)\n"
+                            "\n"
+                            "To use standard TCP/IP networking instead, remove --use-rdma from your training script."
+                        )
+                except RuntimeError:
+                    raise  # Re-raise the RuntimeError we just created
+                except Exception as check_err:
+                    logger.warning(f"Gemini: Could not check RDMA availability: {check_err}")
+                    logger.warning("Gemini: Will attempt to initialize RDMA anyway...")
+            
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
             partner_rank = self._get_gemini_paired_rank(rank, world_size)
@@ -278,44 +306,63 @@ class GeminiManager:
             net_config = self._get_gemini_network_config(rank, world_size)
             
             # Synchronize all ranks before creating C++ instances
-            logger.info(f"Gemini: [Rank {rank}] Synchronizing all ranks before creating C++ native module...")
+            transport_mode = "RDMA" if self.use_rdma else "ASIO"
+            logger.info(f"Gemini: [Rank {rank}] Synchronizing all ranks before creating C++ native module ({transport_mode})...")
             torch.distributed.barrier()
-            logger.info(f"Gemini: [Rank {rank}] All ranks synchronized, creating C++ native module with ASIO...")
+            logger.info(f"Gemini: [Rank {rank}] All ranks synchronized, creating C++ native module with {transport_mode}...")
             
             # Calculate partner's recv port (where we send to)
             base_port = net_config['base_port']
             partner_recv_port = base_port + partner_rank * 2 + 1  # partner's recv port
             
-            # Create C++ instance with ASIO parameters (Phase 1: start acceptor only)
-            logger.info(f"Gemini: Creating C++ native module with ASIO (Phase 1: acceptor)...")
-            print(f"Gemini: [Rank {rank}] Creating C++ native module (Phase 1: starting acceptor)...")
+            # Create C++ instance (Phase 1: start listener only)
+            logger.info(f"Gemini: Creating C++ native module with {transport_mode} (Phase 1: listener)...")
+            print(f"Gemini: [Rank {rank}] Creating C++ native module with {transport_mode} (Phase 1: starting listener)...")
             
             self._gemini_native = gemini_native.GeminiNative(
                 rank, world_size, partner_rank,
-                # Connection: (partner_ip, partner_recv_port, my_ip, my_recv_port)
+                # Connection: (partner_ip, partner_recv_port, my_ip, my_recv_port, use_rdma)
                 net_config['partner_ip'], partner_recv_port,
-                net_config['my_ip'], net_config['ports']['recv']
+                net_config['my_ip'], net_config['ports']['recv'],
+                self.use_rdma
             )
             
-            logger.info(f"Gemini: C++ native module created (acceptor ready) for rank {rank}")
-            print(f"Gemini: [Rank {rank}] Acceptor ready, waiting for all ranks...")
+            logger.info(f"Gemini: C++ native module created (listener ready) for rank {rank}")
+            print(f"Gemini: [Rank {rank}] Listener ready, waiting for all ranks...")
             
             # Synchronize all ranks before connecting (Phase 2)
             torch.distributed.barrier()
             logger.info(f"Gemini: [Rank {rank}] All ranks ready, starting Phase 2 (connecting)...")
-            print(f"Gemini: [Rank {rank}] Phase 2: Connecting to partner rank {partner_rank}...")
+            print(f"Gemini: [Rank {rank}] Phase 2: Connecting to partner rank {partner_rank} via {transport_mode}...")
             
             # Phase 2: Connect to partner
             self._gemini_native.finalize_connections()
             
-            logger.info(f"Gemini: C++ native module fully initialized (rank={rank}, partner_rank={partner_rank})")
-            print(f"Gemini: [Rank {rank}] C++ native module fully initialized - ASIO connection ready")
+            logger.info(f"Gemini: C++ native module fully initialized (rank={rank}, partner_rank={partner_rank}, transport={transport_mode})")
+            print(f"Gemini: [Rank {rank}] C++ native module fully initialized - {transport_mode} connection ready")
             
         except Exception as e:
-            logger.error(f"Gemini: Failed to initialize C++ native module: {e}")
+            error_msg = str(e)
+            logger.error(f"Gemini: Failed to initialize C++ native module: {error_msg}")
+            
+            # Provide helpful guidance for RDMA-specific errors
+            if "RDMA" in error_msg and "event channel" in error_msg:
+                logger.error("")
+                logger.error("=" * 80)
+                logger.error("RDMA INITIALIZATION FAILED")
+                logger.error("=" * 80)
+                logger.error("Diagnostic steps:")
+                logger.error("  1. Check RDMA devices: ibv_devices")
+                logger.error("  2. Check RDMA links: rdma link")
+                logger.error("  3. Check kernel modules: lsmod | grep -E '(rdma|ib_)'")
+                logger.error("  4. Load modules if needed: modprobe rdma_cm ib_uverbs ib_core")
+                logger.error("  5. Check RDMA service: systemctl status rdma")
+                logger.error("=" * 80)
+            
             import traceback
             traceback.print_exc()
             self._gemini_native = None
+            raise  # Re-raise the exception to fail fast
     
     def prepare_decomposed_state_dict(self, plan, planner):
         """
@@ -432,6 +479,66 @@ class GeminiManager:
         else:
             self.preallocated_cpu_buffer = torch.empty(size_bytes, dtype=torch.uint8)
             logger.info(f"Gemini: [Rank {rank}] Allocated regular CPU buffer")
+        
+        # Register buffer for RDMA if enabled
+        if self.use_rdma and self._gemini_native is not None:
+            self.register_buffer(self.preallocated_cpu_buffer)
+    
+    def register_buffer(self, buffer: torch.Tensor):
+        """Register buffer for RDMA operations (called on first allocation in save phase).
+        
+        Args:
+            buffer: PyTorch tensor to register
+        """
+        if not self.use_rdma or self._gemini_native is None:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        buffer_addr = buffer.data_ptr()
+        buffer_size = buffer.numel() * buffer.element_size()
+        
+        # Check if already registered
+        if buffer_addr in self.registered_buffers:
+            logger.debug(f"Gemini: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} (size: {buffer_size / (1024**2):.2f} MB)")
+            return
+        
+        try:
+            logger.info(f"Gemini: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
+            self._gemini_native.register_buffer(buffer_addr, buffer_size)
+            self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
+            logger.info(f"Gemini: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
+            
+            # Print all registered buffers
+            logger.info(f"Gemini: [Rank {rank}] All registered buffers:")
+            for addr, (size, iteration) in self.registered_buffers.items():
+                logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
+        except Exception as e:
+            logger.error(f"Gemini: [Rank {rank}] Failed to register buffer: {e}")
+            raise
+    
+    def unregister_buffer(self, buffer: torch.Tensor):
+        """Unregister buffer for RDMA operations.
+        
+        Args:
+            buffer: PyTorch tensor to unregister
+        """
+        if not self.use_rdma or self._gemini_native is None:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        buffer_addr = buffer.data_ptr()
+        
+        if buffer_addr not in self.registered_buffers:
+            logger.debug(f"Gemini: [Rank {rank}] Buffer not registered at 0x{buffer_addr:x}")
+            return
+        
+        try:
+            logger.info(f"Gemini: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
+            self._gemini_native.unregister_buffer(buffer_addr)
+            del self.registered_buffers[buffer_addr]
+            logger.info(f"Gemini: [Rank {rank}] Buffer unregistered successfully")
+        except Exception as e:
+            logger.error(f"Gemini: [Rank {rank}] Failed to unregister buffer: {e}")
     
     def get_native_module(self):
         """Get the C++ native module instance."""
@@ -443,6 +550,18 @@ class GeminiManager:
     
     def cleanup(self):
         """Cleanup resources."""
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        
+        # Unregister all buffers for RDMA
+        if self.use_rdma and self._gemini_native is not None:
+            for buffer_addr in list(self.registered_buffers.keys()):
+                try:
+                    logger.info(f"Gemini: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x} during cleanup")
+                    self._gemini_native.unregister_buffer(buffer_addr)
+                except Exception as e:
+                    logger.warning(f"Gemini: [Rank {rank}] Failed to unregister buffer during cleanup: {e}")
+            self.registered_buffers.clear()
+        
         if self._gemini_native is not None:
             logger.info("Gemini: Cleaning up native module")
             self._gemini_native = None

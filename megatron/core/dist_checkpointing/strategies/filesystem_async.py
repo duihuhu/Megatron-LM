@@ -154,6 +154,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         eclatin_buffers: Optional[Dict] = None,  # Pre-allocated buffers
         use_gemini: bool = False,
         gemini_native: Optional[Any] = None,  # Pre-initialized C++ module
+        use_rdma: bool = False,  # Use RDMA transport for Gemini
         use_gemini_replicas: bool = False,
         gemini_replicas_native: Optional[Any] = None,  # Pre-initialized C++ module
         gemini_replicas_num: int = 3,  # Number of replicas
@@ -184,6 +185,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Gemini configuration
         self.use_gemini = use_gemini
+        self.use_rdma = use_rdma  # RDMA transport flag for Gemini
         
         # Gemini Replicas configuration
         self.use_gemini_replicas = use_gemini_replicas
@@ -633,6 +635,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         )
         
         # Phase 2: Allocate continuous buffer (reuse preallocated buffer if available)
+        buffer_needs_registration = False
         if self.preallocated_cpu_buffer is not None:
             buffer = self.preallocated_cpu_buffer
             # If preallocated buffer exists, ensure it's large enough
@@ -643,10 +646,12 @@ class FileSystemWriterAsync(FileSystemWriter):
                 )
                 if torch.cuda.is_available():
                     buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
+                buffer_needs_registration = True
             else:
                 # Use slice of preallocated buffer
                 buffer = buffer[:total_size]
                 logger.info(f"Gemini rank {rank}: Reusing preallocated buffer")
+                # Buffer should already be registered (if RDMA is enabled)
         else:
             # Allocate new buffer with pinned memory for faster GPU-CPU transfer
             if torch.cuda.is_available():
@@ -655,6 +660,19 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 buffer = torch.empty(total_size, dtype=torch.uint8)
                 logger.info(f"Gemini rank {rank}: Allocated new CPU buffer")
+            buffer_needs_registration = True
+        
+        # Register buffer for RDMA if enabled (on first allocation)
+        if self.use_rdma and buffer_needs_registration and self._gemini_native is not None:
+            try:
+                buffer_addr = buffer.data_ptr()
+                buffer_size = buffer.numel()
+                logger.info(f"Gemini rank {rank}: Registering buffer for RDMA at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB")
+                self._gemini_native.register_buffer(buffer_addr, buffer_size)
+                logger.info(f"Gemini rank {rank}: Buffer registered for RDMA successfully")
+            except Exception as e:
+                logger.error(f"Gemini rank {rank}: Failed to register buffer for RDMA: {e}")
+                # Continue without RDMA registration
         
         # Phase 3: Copy tensor data to buffer using decomposed_state_dict (EC-CHECK style)
         num_gpu_tensors = 0
@@ -782,11 +800,11 @@ class FileSystemWriterAsync(FileSystemWriter):
                 torch.distributed.all_gather(gathered_sizes_full, size_tensor_full, group=pair_group)
                 remote_buffer_size = gathered_sizes_full[paired_idx][0].item()
                 remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
-                logger.info(
-                    f"Gemini rank {rank}: Allocated remote buffer: "
-                    f"{remote_buffer_size / (1024**2):.2f} MB, "
-                    f"metadata size: {remote_metadata_size / 1024:.2f} KB"
-                )
+                # logger.info(
+                #     f"Gemini rank {rank}: Allocated remote buffer: "
+                #     f"{remote_buffer_size / (1024**2):.2f} MB, "
+                #     f"metadata size: {remote_metadata_size / 1024:.2f} KB"
+                # )
             
             # Step 3: Exchange buffers using C++ ASIO (simultaneous send/recv)
             logger.info(f"Gemini rank {rank}: Starting C++ ASIO buffer exchange...")
@@ -894,11 +912,11 @@ class FileSystemWriterAsync(FileSystemWriter):
                 torch.distributed.all_gather(gathered_sizes_full, size_tensor_full, group=pair_group)
                 remote_buffer_size = gathered_sizes_full[paired_idx][0].item()
                 remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
-                logger.info(
-                    f"Gemini rank {rank}: Allocated remote buffer: "
-                    f"local={local_buffer_size / (1024**2):.2f} MB, "
-                    f"remote={remote_buffer_size / (1024**2):.2f} MB"
-                )
+                # logger.info(
+                #     f"Gemini rank {rank}: Allocated remote buffer: "
+                #     f"local={local_buffer_size / (1024**2):.2f} MB, "
+                #     f"remote={remote_buffer_size / (1024**2):.2f} MB"
+                # )
             
             # Allocate remote metadata tensor (small, acceptable overhead)
             remote_metadata_tensor = torch.empty(remote_metadata_size, dtype=torch.uint8, device='cpu')

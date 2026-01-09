@@ -2272,6 +2272,13 @@ def _add_checkpointing_args(parser):
                             'This eliminates serialization/deserialization overhead and improves checkpoint exchange performance. '
                             'When enabled, tensors are copied directly to a continuous CPU buffer during preload phase, '
                             'avoiding expensive pickle serialization in torch.save.')
+    group.add_argument('--use-rdma', action='store_true',
+                       help='Enable RDMA transport for Gemini checkpointing data exchange. '
+                            'When enabled, uses InfiniBand RDMA (via libibverbs) instead of TCP/ASIO for '
+                            'network communication between paired ranks. Requires InfiniBand hardware and '
+                            'RDMA support. Buffers are automatically registered on first allocation during save phase. '
+                            'This can provide lower latency and higher bandwidth compared to TCP, especially for '
+                            'large checkpoint transfers. Only effective when used with --use-gemini-optimized.')
     
     # Gemini Replicas checkpointing arguments (multi-replica with round-robin placement)
     group.add_argument('--use-gemini-replicas', action='store_true',

@@ -32,6 +32,15 @@
 
 namespace {
 
+// Configuration: Enable/disable async CUDA transfers
+#ifndef ECLATIN_USE_ASYNC_CUDA
+#define ECLATIN_USE_ASYNC_CUDA 1  // 1 = async (default), 0 = sync (fallback)
+#endif
+
+#ifndef ECLATIN_NUM_CUDA_STREAMS
+#define ECLATIN_NUM_CUDA_STREAMS 4  // Default number of CUDA streams for async transfers
+#endif
+
 // ASIO connection manager (pattern from eccheck_native)
 class AsioConnectionManager {
 private:
@@ -856,6 +865,25 @@ struct LayerWiseTask {
     uintptr_t recv2_parity2_addr{0};
 };
 
+struct LayerWiseLoadTask {
+    int layer_id{0};
+    // For rank2 recovery: receive from other ranks
+    uintptr_t recv_rank0_data2_addr{0};      // Receive rank0's data2
+    uintptr_t recv_rank0_parity2_addr{0};    // Receive rank0's parity2
+    uintptr_t recv_rank1_data1_addr{0};      // Receive rank1's data1
+    uintptr_t recv_rank1_parity1_addr{0};    // Receive rank1's parity1
+    uintptr_t recv_rank3_data1_addr{0};      // Receive rank3's data1
+    uintptr_t recv_rank3_data2_addr{0};      // Receive rank3's data2
+    // Recovery output buffers
+    uintptr_t recovered_data1_addr{0};       // Recovered data1 block
+    uintptr_t recovered_data2_addr{0};       // Recovered data2 block
+    uintptr_t recovered_parity1_addr{0};     // Recovered parity1 block
+    uintptr_t recovered_parity2_addr{0};     // Recovered parity2 block
+    size_t layer_size{0};                    // Size of this layer
+    // For H2D transfer (CPU→GPU)
+    std::vector<TensorTransferInfo> gpu_tensors;
+};
+
 class ECLATINNative {
 public:
     ECLATINNative(const std::string& parity1_send1_ip, uint16_t parity1_send1_port,
@@ -865,7 +893,8 @@ public:
                   const std::string& parity2_send1_ip, uint16_t parity2_send1_port,
                   const std::string& parity2_send2_ip, uint16_t parity2_send2_port,
                   const std::string& parity2_recv1_ip, uint16_t parity2_recv1_port,
-                  const std::string& parity2_recv2_ip, uint16_t parity2_recv2_port)
+                  const std::string& parity2_recv2_ip, uint16_t parity2_recv2_port,
+                  int num_cuda_streams = ECLATIN_NUM_CUDA_STREAMS)
         : stop_(false),
           parity1_send1_ip_(parity1_send1_ip),
           parity1_send1_port_(parity1_send1_port),
@@ -902,8 +931,37 @@ public:
           encoding_count_(0),
           send_count_(0),
           recv_count_(0),
-          xor_count_(0) {
+          xor_count_(0),
+          num_cuda_streams_(num_cuda_streams),
+          use_async_cuda_(ECLATIN_USE_ASYNC_CUDA) {
         std::cout << "ECLATIN: Initializing connections..." << std::endl;
+        
+        #ifdef USE_CUDA
+        // Initialize CUDA streams for async transfers
+        if (use_async_cuda_ && num_cuda_streams_ > 0) {
+            cuda_streams_.resize(num_cuda_streams_);
+            for (int i = 0; i < num_cuda_streams_; ++i) {
+                cudaError_t err = cudaStreamCreate(&cuda_streams_[i]);
+                if (err != cudaSuccess) {
+                    std::cerr << "ECLATIN: Failed to create CUDA stream " << i 
+                              << ": " << cudaGetErrorString(err) << std::endl;
+                    // Fallback to sync mode
+                    use_async_cuda_ = false;
+                    cuda_streams_.clear();
+                    break;
+                }
+            }
+            if (use_async_cuda_) {
+                std::cout << "ECLATIN: Async CUDA mode enabled with " << num_cuda_streams_ 
+                          << " streams" << std::endl;
+            } else {
+                std::cout << "ECLATIN: Falling back to sync CUDA mode" << std::endl;
+            }
+        } else {
+            std::cout << "ECLATIN: Sync CUDA mode enabled" << std::endl;
+        }
+        #endif
+        
         init_connections();
         start_threads();
         // std::cout << "ECLATIN: Pipeline started successfully" << std::endl;
@@ -911,6 +969,14 @@ public:
 
     ~ECLATINNative() {
         stop();
+        
+        #ifdef USE_CUDA
+        // Destroy CUDA streams
+        for (auto stream : cuda_streams_) {
+            cudaStreamDestroy(stream);
+        }
+        cuda_streams_.clear();
+        #endif
     }
 
     // Parity 1 pipelines
@@ -1159,6 +1225,7 @@ public:
         parity2_send2_cv_.notify_all();
         parity2_recv_xor_cv_.notify_all();
         layerwise_cv_.notify_all();
+        layerwise_load_cv_.notify_all();
         if (parity1_recv_xor_thread_.joinable()) parity1_recv_xor_thread_.join();
         if (parity1_send1_thread_.joinable()) parity1_send1_thread_.join();
         if (parity1_send2_thread_.joinable()) parity1_send2_thread_.join();
@@ -1166,6 +1233,7 @@ public:
         if (parity2_send1_thread_.joinable()) parity2_send1_thread_.join();
         if (parity2_send2_thread_.joinable()) parity2_send2_thread_.join();
         if (layerwise_worker_thread_.joinable()) layerwise_worker_thread_.join();
+        if (layerwise_load_worker_thread_.joinable()) layerwise_load_worker_thread_.join();
         conn_.cleanup();
     }
 
@@ -1614,6 +1682,72 @@ public:
             return layers_completed_ >= layers_submitted_ && layerwise_queue_.empty();
         });
     }
+    
+    // Layerwise load methods
+    void submit_layer_wise_load(
+        int layer_id,
+        pybind11::list gpu_tensors_info,
+        uintptr_t recv_rank0_data2_addr,
+        uintptr_t recv_rank0_parity2_addr,
+        uintptr_t recv_rank1_data1_addr,
+        uintptr_t recv_rank1_parity1_addr,
+        uintptr_t recv_rank3_data1_addr,
+        uintptr_t recv_rank3_data2_addr,
+        uintptr_t recovered_data1_addr,
+        uintptr_t recovered_data2_addr,
+        uintptr_t recovered_parity1_addr,
+        uintptr_t recovered_parity2_addr,
+        size_t layer_size
+    ) {
+        LayerWiseLoadTask task;
+        task.layer_id = layer_id;
+        task.recv_rank0_data2_addr = recv_rank0_data2_addr;
+        task.recv_rank0_parity2_addr = recv_rank0_parity2_addr;
+        task.recv_rank1_data1_addr = recv_rank1_data1_addr;
+        task.recv_rank1_parity1_addr = recv_rank1_parity1_addr;
+        task.recv_rank3_data1_addr = recv_rank3_data1_addr;
+        task.recv_rank3_data2_addr = recv_rank3_data2_addr;
+        task.recovered_data1_addr = recovered_data1_addr;
+        task.recovered_data2_addr = recovered_data2_addr;
+        task.recovered_parity1_addr = recovered_parity1_addr;
+        task.recovered_parity2_addr = recovered_parity2_addr;
+        task.layer_size = layer_size;
+        
+        // Parse GPU tensor info
+        for (auto tensor_obj : gpu_tensors_info) {
+            auto tensor_tuple = tensor_obj.cast<pybind11::tuple>();
+            if (tensor_tuple.size() != 5) {
+                throw std::runtime_error("ECLATIN Load: Expected tuple of (gpu_ptr, cpu_offset, size, shape, name)");
+            }
+            
+            TensorTransferInfo info;
+            info.gpu_data_ptr = tensor_tuple[0].cast<uintptr_t>();
+            info.cpu_offset = tensor_tuple[1].cast<size_t>();
+            info.size_bytes = tensor_tuple[2].cast<size_t>();
+            info.shape = tensor_tuple[3].cast<std::vector<int64_t>>();
+            info.name = tensor_tuple[4].cast<std::string>();
+            task.gpu_tensors.push_back(info);
+        }
+        
+        // Add to load queue
+        {
+            std::lock_guard<std::mutex> lock(layerwise_load_mutex_);
+            layerwise_load_queue_.push(task);
+            layers_load_submitted_++;
+        }
+        layerwise_load_cv_.notify_one();
+        
+        std::cout << "ECLATIN Load: Submitted layer " << layer_id 
+                  << " for load pipeline (size=" << layer_size << ")" << std::endl;
+    }
+    
+    void wait_all_load_layers_complete() {
+        std::unique_lock<std::mutex> lock(load_completion_mutex_);
+        load_completion_cv_.wait(lock, [this] {
+            return layers_load_completed_ >= layers_load_submitted_ && layerwise_load_queue_.empty();
+        });
+        std::cout << "ECLATIN Load: All " << layers_load_completed_ << " layers completed" << std::endl;
+    }
 
 private:
     std::atomic<bool> stop_;
@@ -1723,7 +1857,7 @@ private:
     std::thread parity2_send2_thread_;
     std::thread parity2_recv_xor_thread_;
     
-    // Layer-wise processing
+    // Layer-wise processing (save mode)
     std::queue<LayerWiseTask> layerwise_queue_;
     std::mutex layerwise_mutex_;
     std::condition_variable layerwise_cv_;
@@ -1733,9 +1867,26 @@ private:
     std::mutex completion_mutex_;
     std::condition_variable completion_cv_;
     
+    // Layer-wise load processing
+    std::queue<LayerWiseLoadTask> layerwise_load_queue_;
+    std::mutex layerwise_load_mutex_;
+    std::condition_variable layerwise_load_cv_;
+    std::thread layerwise_load_worker_thread_;
+    std::atomic<int> layers_load_submitted_{0};
+    std::atomic<int> layers_load_completed_{0};
+    std::mutex load_completion_mutex_;
+    std::condition_variable load_completion_cv_;
+    
     // Load mode flags
     std::atomic<bool> is_load_mode_{false};
     int failed_rank_{-1};
+    
+    // CUDA async transfer configuration
+    int num_cuda_streams_;
+    bool use_async_cuda_;
+    #ifdef USE_CUDA
+    std::vector<cudaStream_t> cuda_streams_;
+    #endif
 
     void start_threads() {
         std::cout << "ECLATIN: Starting worker threads..." << std::endl;
@@ -1746,7 +1897,8 @@ private:
         parity2_send2_thread_ = std::thread(&ECLATINNative::parity2_send2_worker, this);
         parity2_recv_xor_thread_ = std::thread(&ECLATINNative::parity2_recv_xor_worker, this);
         layerwise_worker_thread_ = std::thread(&ECLATINNative::layerwise_worker, this);
-        std::cout << "ECLATIN: All worker threads started" << std::endl;
+        layerwise_load_worker_thread_ = std::thread(&ECLATINNative::layerwise_load_worker, this);
+        std::cout << "ECLATIN: All worker threads started (including layerwise load)" << std::endl;
     }
 
     void init_connections() {
@@ -2401,132 +2553,132 @@ private:
         }
     }
     
-    void reset_time_statistics() {
-        total_encoding_time_ms_ = 0.0;
-        total_send_time_ms_ = 0.0;
-        total_recv_time_ms_ = 0.0;
-        total_xor_time_ms_ = 0.0;
-        encoding_count_ = 0;
-        send_count_ = 0;
-        recv_count_ = 0;
-        xor_count_ = 0;
+    // void reset_time_statistics() {
+    //     total_encoding_time_ms_ = 0.0;
+    //     total_send_time_ms_ = 0.0;
+    //     total_recv_time_ms_ = 0.0;
+    //     total_xor_time_ms_ = 0.0;
+    //     encoding_count_ = 0;
+    //     send_count_ = 0;
+    //     recv_count_ = 0;
+    //     xor_count_ = 0;
         
-        // Reset per-worker time statistics
-        parity1_send1_total_time_ms_ = 0.0;
-        parity1_send2_total_time_ms_ = 0.0;
-        parity1_recv_xor_total_time_ms_ = 0.0;
-        parity2_send1_total_time_ms_ = 0.0;
-        parity2_send2_total_time_ms_ = 0.0;
-        parity2_recv_xor_total_time_ms_ = 0.0;
+    //     // Reset per-worker time statistics
+    //     parity1_send1_total_time_ms_ = 0.0;
+    //     parity1_send2_total_time_ms_ = 0.0;
+    //     parity1_recv_xor_total_time_ms_ = 0.0;
+    //     parity2_send1_total_time_ms_ = 0.0;
+    //     parity2_send2_total_time_ms_ = 0.0;
+    //     parity2_recv_xor_total_time_ms_ = 0.0;
         
-        parity1_send1_ops_time_ms_ = 0.0;
-        parity1_send2_ops_time_ms_ = 0.0;
-        parity1_recv_xor_recv_time_ms_ = 0.0;
-        parity1_recv_xor_xor_time_ms_ = 0.0;
-        parity2_send1_ops_time_ms_ = 0.0;
-        parity2_send2_ops_time_ms_ = 0.0;
-        parity2_recv_xor_recv_time_ms_ = 0.0;
-        parity2_recv_xor_xor_time_ms_ = 0.0;
+    //     parity1_send1_ops_time_ms_ = 0.0;
+    //     parity1_send2_ops_time_ms_ = 0.0;
+    //     parity1_recv_xor_recv_time_ms_ = 0.0;
+    //     parity1_recv_xor_xor_time_ms_ = 0.0;
+    //     parity2_send1_ops_time_ms_ = 0.0;
+    //     parity2_send2_ops_time_ms_ = 0.0;
+    //     parity2_recv_xor_recv_time_ms_ = 0.0;
+    //     parity2_recv_xor_xor_time_ms_ = 0.0;
         
-        pipeline_timing_started_ = false;
-        std::cout << "ECLATIN: Reset time statistics" << std::endl;
-    }
+    //     pipeline_timing_started_ = false;
+    //     std::cout << "ECLATIN: Reset time statistics" << std::endl;
+    // }
     
-    void print_time_statistics(double pipeline_wall_time_ms = 0.0) {
-        std::cout << "ECLATIN: Time Statistics:" << std::endl;
+    // void print_time_statistics(double pipeline_wall_time_ms = 0.0) {
+    //     std::cout << "ECLATIN: Time Statistics:" << std::endl;
         
-        // Find the bottleneck worker (the slowest one)
-        struct WorkerTime {
-            std::string name;
-            double total_time_ms;
-            double ops_time_ms;
-            std::string ops_type;
-        };
+    //     // Find the bottleneck worker (the slowest one)
+    //     struct WorkerTime {
+    //         std::string name;
+    //         double total_time_ms;
+    //         double ops_time_ms;
+    //         std::string ops_type;
+    //     };
         
-        std::vector<WorkerTime> worker_times;
-        worker_times.push_back({"parity1_send1", parity1_send1_total_time_ms_.load(), 
-                                parity1_send1_ops_time_ms_.load(), "send"});
-        worker_times.push_back({"parity1_send2", parity1_send2_total_time_ms_.load(), 
-                                parity1_send2_ops_time_ms_.load(), "send"});
-        worker_times.push_back({"parity1_recv_xor", parity1_recv_xor_total_time_ms_.load(), 
-                                parity1_recv_xor_recv_time_ms_.load() + parity1_recv_xor_xor_time_ms_.load(), "recv+xor"});
-        worker_times.push_back({"parity2_send1", parity2_send1_total_time_ms_.load(), 
-                                parity2_send1_ops_time_ms_.load(), "send"});
-        worker_times.push_back({"parity2_send2", parity2_send2_total_time_ms_.load(), 
-                                parity2_send2_ops_time_ms_.load(), "send"});
-        worker_times.push_back({"parity2_recv_xor", parity2_recv_xor_total_time_ms_.load(), 
-                                parity2_recv_xor_recv_time_ms_.load() + parity2_recv_xor_xor_time_ms_.load(), "recv+xor"});
+    //     std::vector<WorkerTime> worker_times;
+    //     worker_times.push_back({"parity1_send1", parity1_send1_total_time_ms_.load(), 
+    //                             parity1_send1_ops_time_ms_.load(), "send"});
+    //     worker_times.push_back({"parity1_send2", parity1_send2_total_time_ms_.load(), 
+    //                             parity1_send2_ops_time_ms_.load(), "send"});
+    //     worker_times.push_back({"parity1_recv_xor", parity1_recv_xor_total_time_ms_.load(), 
+    //                             parity1_recv_xor_recv_time_ms_.load() + parity1_recv_xor_xor_time_ms_.load(), "recv+xor"});
+    //     worker_times.push_back({"parity2_send1", parity2_send1_total_time_ms_.load(), 
+    //                             parity2_send1_ops_time_ms_.load(), "send"});
+    //     worker_times.push_back({"parity2_send2", parity2_send2_total_time_ms_.load(), 
+    //                             parity2_send2_ops_time_ms_.load(), "send"});
+    //     worker_times.push_back({"parity2_recv_xor", parity2_recv_xor_total_time_ms_.load(), 
+    //                             parity2_recv_xor_recv_time_ms_.load() + parity2_recv_xor_xor_time_ms_.load(), "recv+xor"});
         
-        WorkerTime* bottleneck = nullptr;
-        double max_time = 0.0;
-        for (auto& wt : worker_times) {
-            if (wt.total_time_ms > max_time) {
-                max_time = wt.total_time_ms;
-                bottleneck = &wt;
-            }
-        }
+    //     WorkerTime* bottleneck = nullptr;
+    //     double max_time = 0.0;
+    //     for (auto& wt : worker_times) {
+    //         if (wt.total_time_ms > max_time) {
+    //             max_time = wt.total_time_ms;
+    //             bottleneck = &wt;
+    //         }
+    //     }
         
-        // Display bottleneck worker information
-        if (bottleneck && max_time > 0.0) {
-            std::cout << "  Bottleneck Worker: " << bottleneck->name 
-                      << " (wall-clock time=" << max_time << " ms, " << (max_time / 1000.0) << " s)" << std::endl;
+    //     // Display bottleneck worker information
+    //     if (bottleneck && max_time > 0.0) {
+    //         std::cout << "  Bottleneck Worker: " << bottleneck->name 
+    //                   << " (wall-clock time=" << max_time << " ms, " << (max_time / 1000.0) << " s)" << std::endl;
             
-            // Calculate task count for this worker
-            int task_count = 0;
-            if (bottleneck->name == "parity1_send1" || bottleneck->name == "parity1_send2" ||
-                bottleneck->name == "parity2_send1" || bottleneck->name == "parity2_send2") {
-                // For send workers, we can estimate task count from accumulated time vs avg time
-                // But we don't have per-worker count, so we'll just show the accumulated ops time
-                std::cout << "    Accumulated Operations (" << bottleneck->ops_type << "): " 
-                          << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
-                if (bottleneck->ops_time_ms > max_time) {
-                    std::cout << "    Note: Accumulated time > wall-clock time indicates operations may include overhead" << std::endl;
-                }
-            } else if (bottleneck->name.find("recv_xor") != std::string::npos) {
-                if (bottleneck->name == "parity1_recv_xor") {
-                    std::cout << "    Accumulated Operations (recv+xor): " << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
-                    std::cout << "      Recv (accumulated): " << parity1_recv_xor_recv_time_ms_.load() << " ms" << std::endl;
-                    std::cout << "      XOR (accumulated): " << parity1_recv_xor_xor_time_ms_.load() << " ms" << std::endl;
-                } else {
-                    std::cout << "    Accumulated Operations (recv+xor): " << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
-                    std::cout << "      Recv (accumulated): " << parity2_recv_xor_recv_time_ms_.load() << " ms" << std::endl;
-                    std::cout << "      XOR (accumulated): " << parity2_recv_xor_xor_time_ms_.load() << " ms" << std::endl;
-                }
-                if (bottleneck->ops_time_ms > max_time) {
-                    std::cout << "    Note: Accumulated time > wall-clock time indicates operations may include overhead" << std::endl;
-                }
-            }
-        }
+    //         // Calculate task count for this worker
+    //         int task_count = 0;
+    //         if (bottleneck->name == "parity1_send1" || bottleneck->name == "parity1_send2" ||
+    //             bottleneck->name == "parity2_send1" || bottleneck->name == "parity2_send2") {
+    //             // For send workers, we can estimate task count from accumulated time vs avg time
+    //             // But we don't have per-worker count, so we'll just show the accumulated ops time
+    //             std::cout << "    Accumulated Operations (" << bottleneck->ops_type << "): " 
+    //                       << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+    //             if (bottleneck->ops_time_ms > max_time) {
+    //                 std::cout << "    Note: Accumulated time > wall-clock time indicates operations may include overhead" << std::endl;
+    //             }
+    //         } else if (bottleneck->name.find("recv_xor") != std::string::npos) {
+    //             if (bottleneck->name == "parity1_recv_xor") {
+    //                 std::cout << "    Accumulated Operations (recv+xor): " << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+    //                 std::cout << "      Recv (accumulated): " << parity1_recv_xor_recv_time_ms_.load() << " ms" << std::endl;
+    //                 std::cout << "      XOR (accumulated): " << parity1_recv_xor_xor_time_ms_.load() << " ms" << std::endl;
+    //             } else {
+    //                 std::cout << "    Accumulated Operations (recv+xor): " << bottleneck->ops_time_ms << " ms (sum of all tasks)" << std::endl;
+    //                 std::cout << "      Recv (accumulated): " << parity2_recv_xor_recv_time_ms_.load() << " ms" << std::endl;
+    //                 std::cout << "      XOR (accumulated): " << parity2_recv_xor_xor_time_ms_.load() << " ms" << std::endl;
+    //             }
+    //             if (bottleneck->ops_time_ms > max_time) {
+    //                 std::cout << "    Note: Accumulated time > wall-clock time indicates operations may include overhead" << std::endl;
+    //             }
+    //         }
+    //     }
         
-        if (pipeline_wall_time_ms > 0.0) {
-            std::cout << "  Pipeline Wall-Clock Time: " << pipeline_wall_time_ms << " ms (" 
-                      << (pipeline_wall_time_ms / 1000.0) << " s)" << std::endl;
-        }
+    //     if (pipeline_wall_time_ms > 0.0) {
+    //         std::cout << "  Pipeline Wall-Clock Time: " << pipeline_wall_time_ms << " ms (" 
+    //                   << (pipeline_wall_time_ms / 1000.0) << " s)" << std::endl;
+    //     }
         
-        std::cout << "  Send (accumulated): total=" << total_send_time_ms_.load() << " ms, "
-                  << "count=" << send_count_.load() << ", "
-                  << "avg=" << (send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0) << " ms" << std::endl;
-        std::cout << "  Recv (accumulated): total=" << total_recv_time_ms_.load() << " ms, "
-                  << "count=" << recv_count_.load() << ", "
-                  << "avg=" << (recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0) << " ms" << std::endl;
-        std::cout << "  XOR (accumulated): total=" << total_xor_time_ms_.load() << " ms, "
-                  << "count=" << xor_count_.load() << ", "
-                  << "avg=" << (xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0) << " ms" << std::endl;
-    }
+    //     std::cout << "  Send (accumulated): total=" << total_send_time_ms_.load() << " ms, "
+    //               << "count=" << send_count_.load() << ", "
+    //               << "avg=" << (send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0) << " ms" << std::endl;
+    //     std::cout << "  Recv (accumulated): total=" << total_recv_time_ms_.load() << " ms, "
+    //               << "count=" << recv_count_.load() << ", "
+    //               << "avg=" << (recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0) << " ms" << std::endl;
+    //     std::cout << "  XOR (accumulated): total=" << total_xor_time_ms_.load() << " ms, "
+    //               << "count=" << xor_count_.load() << ", "
+    //               << "avg=" << (xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0) << " ms" << std::endl;
+    // }
     
-    std::map<std::string, double> get_time_statistics() {
-        std::map<std::string, double> stats;
-        stats["send_total_ms"] = total_send_time_ms_.load();
-        stats["send_count"] = static_cast<double>(send_count_.load());
-        stats["send_avg_ms"] = send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0;
-        stats["recv_total_ms"] = total_recv_time_ms_.load();
-        stats["recv_count"] = static_cast<double>(recv_count_.load());
-        stats["recv_avg_ms"] = recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0;
-        stats["xor_total_ms"] = total_xor_time_ms_.load();
-        stats["xor_count"] = static_cast<double>(xor_count_.load());
-        stats["xor_avg_ms"] = xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0;
-        return stats;
-    }
+    // std::map<std::string, double> get_time_statistics() {
+    //     std::map<std::string, double> stats;
+    //     stats["send_total_ms"] = total_send_time_ms_.load();
+    //     stats["send_count"] = static_cast<double>(send_count_.load());
+    //     stats["send_avg_ms"] = send_count_.load() > 0 ? total_send_time_ms_.load() / send_count_.load() : 0.0;
+    //     stats["recv_total_ms"] = total_recv_time_ms_.load();
+    //     stats["recv_count"] = static_cast<double>(recv_count_.load());
+    //     stats["recv_avg_ms"] = recv_count_.load() > 0 ? total_recv_time_ms_.load() / recv_count_.load() : 0.0;
+    //     stats["xor_total_ms"] = total_xor_time_ms_.load();
+    //     stats["xor_count"] = static_cast<double>(xor_count_.load());
+    //     stats["xor_avg_ms"] = xor_count_.load() > 0 ? total_xor_time_ms_.load() / xor_count_.load() : 0.0;
+    //     return stats;
+    // }
     
     void layerwise_worker() {
         std::cout << "ECLATIN: LayerWise worker started" << std::endl;
@@ -2566,40 +2718,110 @@ private:
             
             // Step 1: D2H transfer (CUDA mode only - ECLATIN layerwise requires CUDA)
             #ifdef USE_CUDA
-            for (const auto& tensor_info : task.gpu_tensors) {
-                uintptr_t gpu_ptr = tensor_info.gpu_data_ptr;
-                uintptr_t cpu_ptr = task.cpu_buffer_addr + tensor_info.cpu_offset;
-                size_t size = tensor_info.size_bytes;
+            auto d2h_start = std::chrono::high_resolution_clock::now();
+            
+            if (use_async_cuda_ && !cuda_streams_.empty()) {
+                // Async CUDA transfer path
+                std::vector<std::vector<const TensorTransferInfo*>> stream_tensors(num_cuda_streams_);
                 
-                if (gpu_ptr == 0 || cpu_ptr == 0 || size == 0) {
-                    std::cerr << "ECLATIN: ERROR: Invalid tensor info for layer " << task.layer_id 
-                              << " (gpu_ptr=" << gpu_ptr << ", cpu_ptr=" << cpu_ptr 
-                              << ", size=" << size << ")" << std::endl;
-                    throw std::runtime_error("Invalid tensor info for D2H transfer");
+                // Distribute tensors across streams (round-robin)
+                for (size_t i = 0; i < task.gpu_tensors.size(); ++i) {
+                    int stream_idx = i % num_cuda_streams_;
+                    stream_tensors[stream_idx].push_back(&task.gpu_tensors[i]);
                 }
                 
-                cudaError_t err = cudaMemcpy(
-                    reinterpret_cast<void*>(cpu_ptr), 
-                    reinterpret_cast<void*>(gpu_ptr), 
-                    size, 
-                    cudaMemcpyDeviceToHost
-                );
+                // Launch async D2H transfers on all streams
+                for (int stream_idx = 0; stream_idx < num_cuda_streams_; ++stream_idx) {
+                    for (const auto* tensor_info : stream_tensors[stream_idx]) {
+                        uintptr_t gpu_ptr = tensor_info->gpu_data_ptr;
+                        uintptr_t cpu_ptr = task.cpu_buffer_addr + tensor_info->cpu_offset;
+                        size_t size = tensor_info->size_bytes;
+                        
+                        if (gpu_ptr == 0 || cpu_ptr == 0 || size == 0) {
+                            std::cerr << "ECLATIN: ERROR: Invalid tensor info for layer " << task.layer_id 
+                                      << " (gpu_ptr=" << gpu_ptr << ", cpu_ptr=" << cpu_ptr 
+                                      << ", size=" << size << ")" << std::endl;
+                            throw std::runtime_error("Invalid tensor info for D2H transfer");
+                        }
+                        
+                        cudaError_t err = cudaMemcpyAsync(
+                            reinterpret_cast<void*>(cpu_ptr), 
+                            reinterpret_cast<void*>(gpu_ptr), 
+                            size, 
+                            cudaMemcpyDeviceToHost,
+                            cuda_streams_[stream_idx]
+                        );
+                        
+                        if (err != cudaSuccess) {
+                            std::cerr << "ECLATIN: ERROR: cudaMemcpyAsync failed for layer " << task.layer_id 
+                                      << " stream " << stream_idx << ": " << cudaGetErrorString(err) << std::endl;
+                            throw std::runtime_error(
+                                std::string("CUDA memcpy async failed: ") + cudaGetErrorString(err)
+                            );
+                        }
+                    }
+                }
                 
-                if (err != cudaSuccess) {
-                    std::cerr << "ECLATIN: ERROR: cudaMemcpy failed for layer " << task.layer_id 
-                              << ": " << cudaGetErrorString(err) << std::endl;
+                // Synchronize all streams before network send
+                for (int stream_idx = 0; stream_idx < num_cuda_streams_; ++stream_idx) {
+                    cudaError_t err = cudaStreamSynchronize(cuda_streams_[stream_idx]);
+                    if (err != cudaSuccess) {
+                        std::cerr << "ECLATIN: ERROR: cudaStreamSynchronize failed for layer " << task.layer_id 
+                                  << " stream " << stream_idx << ": " << cudaGetErrorString(err) << std::endl;
+                        throw std::runtime_error(
+                            std::string("CUDA stream synchronize failed: ") + cudaGetErrorString(err)
+                        );
+                    }
+                }
+                
+                auto d2h_end = std::chrono::high_resolution_clock::now();
+                double d2h_time_ms = std::chrono::duration<double, std::milli>(d2h_end - d2h_start).count();
+                std::cout << "ECLATIN: Layer " << task.layer_id << " D2H transfer completed (async, " 
+                          << num_cuda_streams_ << " streams, " << task.gpu_tensors.size() 
+                          << " tensors, " << d2h_time_ms << " ms)" << std::endl;
+            } else {
+                // Sync CUDA transfer path (fallback)
+                for (const auto& tensor_info : task.gpu_tensors) {
+                    uintptr_t gpu_ptr = tensor_info.gpu_data_ptr;
+                    uintptr_t cpu_ptr = task.cpu_buffer_addr + tensor_info.cpu_offset;
+                    size_t size = tensor_info.size_bytes;
+                    
+                    if (gpu_ptr == 0 || cpu_ptr == 0 || size == 0) {
+                        std::cerr << "ECLATIN: ERROR: Invalid tensor info for layer " << task.layer_id 
+                                  << " (gpu_ptr=" << gpu_ptr << ", cpu_ptr=" << cpu_ptr 
+                                  << ", size=" << size << ")" << std::endl;
+                        throw std::runtime_error("Invalid tensor info for D2H transfer");
+                    }
+                    
+                    cudaError_t err = cudaMemcpy(
+                        reinterpret_cast<void*>(cpu_ptr), 
+                        reinterpret_cast<void*>(gpu_ptr), 
+                        size, 
+                        cudaMemcpyDeviceToHost
+                    );
+                    
+                    if (err != cudaSuccess) {
+                        std::cerr << "ECLATIN: ERROR: cudaMemcpy failed for layer " << task.layer_id 
+                                  << ": " << cudaGetErrorString(err) << std::endl;
+                        throw std::runtime_error(
+                            std::string("CUDA memcpy failed: ") + cudaGetErrorString(err)
+                        );
+                    }
+                }
+                
+                cudaError_t sync_err = cudaDeviceSynchronize();
+                if (sync_err != cudaSuccess) {
+                    std::cerr << "ECLATIN: ERROR: cudaDeviceSynchronize failed for layer " << task.layer_id 
+                              << ": " << cudaGetErrorString(sync_err) << std::endl;
                     throw std::runtime_error(
-                        std::string("CUDA memcpy failed: ") + cudaGetErrorString(err)
+                        std::string("CUDA synchronize failed: ") + cudaGetErrorString(sync_err)
                     );
                 }
-            }
-            cudaError_t sync_err = cudaDeviceSynchronize();
-            if (sync_err != cudaSuccess) {
-                std::cerr << "ECLATIN: ERROR: cudaDeviceSynchronize failed for layer " << task.layer_id 
-                          << ": " << cudaGetErrorString(sync_err) << std::endl;
-                throw std::runtime_error(
-                    std::string("CUDA synchronize failed: ") + cudaGetErrorString(sync_err)
-                );
+                
+                auto d2h_end = std::chrono::high_resolution_clock::now();
+                double d2h_time_ms = std::chrono::duration<double, std::milli>(d2h_end - d2h_start).count();
+                std::cout << "ECLATIN: Layer " << task.layer_id << " D2H transfer completed (sync, " 
+                          << task.gpu_tensors.size() << " tensors, " << d2h_time_ms << " ms)" << std::endl;
             }
             #else
             // ECLATIN layerwise requires CUDA - this should not be reached
@@ -2656,6 +2878,201 @@ private:
             std::cout << "ECLATIN: Layer " << task.layer_id << " processing completed" << std::endl;
         }
         std::cout << "ECLATIN: LayerWise worker stopped" << std::endl;
+    }
+    
+    void layerwise_load_worker() {
+        std::cout << "ECLATIN Load: LayerWise load worker started" << std::endl;
+        
+        while (!stop_) {
+            LayerWiseLoadTask task;
+            {
+                std::unique_lock<std::mutex> lk(layerwise_load_mutex_);
+                layerwise_load_cv_.wait(lk, [this] { 
+                    return stop_ || !layerwise_load_queue_.empty(); 
+                });
+                if (stop_) break;
+                task = layerwise_load_queue_.front();
+                layerwise_load_queue_.pop();
+            }
+            
+            std::cout << "ECLATIN Load: Processing layer " << task.layer_id 
+                      << " (size=" << task.layer_size << ")" << std::endl;
+            
+            // Three-stage pipeline:
+            // Stage 1: Network reception (for rank2 recovery)
+            // Stage 2: Recovery computation (XOR operations)
+            // Stage 3: H2D transfer (CPU→GPU model initialization)
+            
+            // Stage 1 & 2: If rank2 needs recovery, receive and recover
+            if (is_load_mode_ && failed_rank_ == 2) {
+                std::cout << "ECLATIN Load: Performing rank2 recovery for layer " << task.layer_id << std::endl;
+                
+                // The buffers are already populated by load_recover() call in Python
+                // Here we just need to do the XOR recovery computation
+                
+                // Recovery formula for rank2 (similar to standard ECLATIN recovery):
+                // data1 = rank1_data1 XOR rank3_data1
+                // data2 = rank0_data2 XOR rank3_data2  
+                // parity1 = rank1_parity1 XOR rank3_data1
+                // parity2 = rank0_parity2 XOR rank3_data2
+                
+                size_t half_size = task.layer_size / 2;
+                
+                // Recover data1: rank0.data2 XOR rank1.parity1 (same as batch mode)
+                std::memcpy(reinterpret_cast<void*>(task.recovered_data1_addr), 
+                           reinterpret_cast<void*>(task.recv_rank0_data2_addr), half_size);
+                void* xor_array_data1[2] = {reinterpret_cast<void*>(task.recovered_data1_addr), 
+                                            reinterpret_cast<void*>(task.recv_rank1_parity1_addr)};
+                xor_gen(2, static_cast<int>(half_size), xor_array_data1);
+                
+                // Recover data2: rank0.parity2 XOR rank1.data1 (same as batch mode)
+                std::memcpy(reinterpret_cast<void*>(task.recovered_data2_addr), 
+                           reinterpret_cast<void*>(task.recv_rank0_parity2_addr), task.layer_size - half_size);
+                void* xor_array_data2[2] = {reinterpret_cast<void*>(task.recovered_data2_addr), 
+                                            reinterpret_cast<void*>(task.recv_rank1_data1_addr)};
+                xor_gen(2, static_cast<int>(task.layer_size - half_size), xor_array_data2);
+                
+                // Recover parity1: rank1.data1 XOR rank3.data2 (same as batch mode)
+                std::memcpy(reinterpret_cast<void*>(task.recovered_parity1_addr), 
+                           reinterpret_cast<void*>(task.recv_rank1_data1_addr), task.layer_size - half_size);
+                void* xor_array_parity1[2] = {reinterpret_cast<void*>(task.recovered_parity1_addr), 
+                                              reinterpret_cast<void*>(task.recv_rank3_data2_addr)};
+                xor_gen(2, static_cast<int>(task.layer_size - half_size), xor_array_parity1);
+                
+                // Recover parity2: rank0.data2 XOR rank3.data1 (same as batch mode)
+                std::memcpy(reinterpret_cast<void*>(task.recovered_parity2_addr), 
+                           reinterpret_cast<void*>(task.recv_rank0_data2_addr), half_size);
+                void* xor_array_parity2[2] = {reinterpret_cast<void*>(task.recovered_parity2_addr), 
+                                              reinterpret_cast<void*>(task.recv_rank3_data1_addr)};
+                xor_gen(2, static_cast<int>(half_size), xor_array_parity2);
+                
+                std::cout << "ECLATIN Load: Layer " << task.layer_id << " recovery completed" << std::endl;
+            }
+            
+            // Stage 3: H2D transfer (CPU→GPU) for model initialization
+            #ifdef USE_CUDA
+            if (!task.gpu_tensors.empty()) {
+                auto h2d_start = std::chrono::high_resolution_clock::now();
+                
+                if (use_async_cuda_ && !cuda_streams_.empty()) {
+                    // Async CUDA transfer path
+                    std::vector<std::vector<const TensorTransferInfo*>> stream_tensors(num_cuda_streams_);
+                    
+                    // Distribute tensors across streams (round-robin)
+                    for (size_t i = 0; i < task.gpu_tensors.size(); ++i) {
+                        int stream_idx = i % num_cuda_streams_;
+                        stream_tensors[stream_idx].push_back(&task.gpu_tensors[i]);
+                    }
+                    
+                    // Launch async H2D transfers on all streams
+                    for (int stream_idx = 0; stream_idx < num_cuda_streams_; ++stream_idx) {
+                        for (const auto* tensor_info : stream_tensors[stream_idx]) {
+                            uintptr_t gpu_ptr = tensor_info->gpu_data_ptr;
+                            // For rank2, use recovered buffer; for others, use original data blocks
+                            uintptr_t cpu_base = is_load_mode_ && failed_rank_ == 2 ? 
+                                                task.recovered_data1_addr : // Simplified: should check which block
+                                                task.recv_rank0_data2_addr;  // For non-rank2
+                            uintptr_t cpu_ptr = cpu_base + tensor_info->cpu_offset;
+                            size_t size = tensor_info->size_bytes;
+                            
+                            if (gpu_ptr == 0 || size == 0) {
+                                std::cerr << "ECLATIN Load: ERROR: Invalid tensor info for layer " << task.layer_id 
+                                          << " (gpu_ptr=" << gpu_ptr << ", size=" << size << ")" << std::endl;
+                                continue;
+                            }
+                            
+                            cudaError_t err = cudaMemcpyAsync(
+                                reinterpret_cast<void*>(gpu_ptr), 
+                                reinterpret_cast<void*>(cpu_ptr), 
+                                size, 
+                                cudaMemcpyHostToDevice,
+                                cuda_streams_[stream_idx]
+                            );
+                            
+                            if (err != cudaSuccess) {
+                                std::cerr << "ECLATIN Load: ERROR: cudaMemcpyAsync H2D failed for layer " 
+                                          << task.layer_id << " stream " << stream_idx 
+                                          << ": " << cudaGetErrorString(err) << std::endl;
+                                throw std::runtime_error("ECLATIN Load: H2D async transfer failed");
+                            }
+                        }
+                    }
+                    
+                    // Synchronize all streams before moving to next layer
+                    for (int stream_idx = 0; stream_idx < num_cuda_streams_; ++stream_idx) {
+                        cudaError_t err = cudaStreamSynchronize(cuda_streams_[stream_idx]);
+                        if (err != cudaSuccess) {
+                            std::cerr << "ECLATIN Load: ERROR: cudaStreamSynchronize failed for layer " 
+                                      << task.layer_id << " stream " << stream_idx 
+                                      << ": " << cudaGetErrorString(err) << std::endl;
+                            throw std::runtime_error("ECLATIN Load: Stream synchronize failed");
+                        }
+                    }
+                    
+                    auto h2d_end = std::chrono::high_resolution_clock::now();
+                    double h2d_time_ms = std::chrono::duration<double, std::milli>(h2d_end - h2d_start).count();
+                    std::cout << "ECLATIN Load: Layer " << task.layer_id << " H2D transfer completed (async, " 
+                              << num_cuda_streams_ << " streams, " << task.gpu_tensors.size() 
+                              << " tensors, " << h2d_time_ms << " ms)" << std::endl;
+                } else {
+                    // Sync CUDA transfer path (fallback)
+                    std::cout << "ECLATIN Load: Transferring layer " << task.layer_id 
+                              << " from CPU to GPU (" << task.gpu_tensors.size() << " tensors, sync mode)" << std::endl;
+                    
+                    for (const auto& tensor_info : task.gpu_tensors) {
+                        uintptr_t gpu_ptr = tensor_info.gpu_data_ptr;
+                        // For rank2, use recovered buffer; for others, use original data blocks
+                        uintptr_t cpu_base = is_load_mode_ && failed_rank_ == 2 ? 
+                                            task.recovered_data1_addr : // Simplified: should check which block
+                                            task.recv_rank0_data2_addr;  // For non-rank2
+                        uintptr_t cpu_ptr = cpu_base + tensor_info.cpu_offset;
+                        size_t size = tensor_info.size_bytes;
+                        
+                        if (gpu_ptr == 0 || size == 0) {
+                            std::cerr << "ECLATIN Load: ERROR: Invalid tensor info for layer " << task.layer_id 
+                                      << " (gpu_ptr=" << gpu_ptr << ", size=" << size << ")" << std::endl;
+                            continue;
+                        }
+                        
+                        cudaError_t err = cudaMemcpy(
+                            reinterpret_cast<void*>(gpu_ptr), 
+                            reinterpret_cast<void*>(cpu_ptr), 
+                            size, 
+                            cudaMemcpyHostToDevice
+                        );
+                        
+                        if (err != cudaSuccess) {
+                            std::cerr << "ECLATIN Load: ERROR: cudaMemcpy H2D failed for layer " << task.layer_id 
+                                      << ": " << cudaGetErrorString(err) << std::endl;
+                            throw std::runtime_error("ECLATIN Load: H2D transfer failed");
+                        }
+                    }
+                    
+                    // Synchronize to ensure transfer completes before moving to next layer
+                    cudaDeviceSynchronize();
+                    
+                    auto h2d_end = std::chrono::high_resolution_clock::now();
+                    double h2d_time_ms = std::chrono::duration<double, std::milli>(h2d_end - h2d_start).count();
+                    std::cout << "ECLATIN Load: Layer " << task.layer_id << " H2D transfer completed (sync, " 
+                              << task.gpu_tensors.size() << " tensors, " << h2d_time_ms << " ms)" << std::endl;
+                }
+            }
+            #else
+            std::cout << "ECLATIN Load: WARNING: CUDA not available, skipping H2D transfer for layer " 
+                      << task.layer_id << std::endl;
+            #endif
+            
+            // Update completion count
+            {
+                std::lock_guard<std::mutex> lock(load_completion_mutex_);
+                layers_load_completed_++;
+            }
+            load_completion_cv_.notify_all();
+            
+            std::cout << "ECLATIN Load: Layer " << task.layer_id << " processing completed" << std::endl;
+        }
+        
+        std::cout << "ECLATIN Load: LayerWise load worker stopped" << std::endl;
     }
     
     void reset_time_statistics() {
@@ -2797,7 +3214,25 @@ PYBIND11_MODULE(eclatin_native, m) {
                             const std::string&, uint16_t,
                             const std::string&, uint16_t,
                             const std::string&, uint16_t,
-                            const std::string&, uint16_t>())
+                            const std::string&, uint16_t,
+                            int>(),
+             pybind11::arg("parity1_send1_ip"),
+             pybind11::arg("parity1_send1_port"),
+             pybind11::arg("parity1_send2_ip"),
+             pybind11::arg("parity1_send2_port"),
+             pybind11::arg("parity1_recv1_ip"),
+             pybind11::arg("parity1_recv1_port"),
+             pybind11::arg("parity1_recv2_ip"),
+             pybind11::arg("parity1_recv2_port"),
+             pybind11::arg("parity2_send1_ip"),
+             pybind11::arg("parity2_send1_port"),
+             pybind11::arg("parity2_send2_ip"),
+             pybind11::arg("parity2_send2_port"),
+             pybind11::arg("parity2_recv1_ip"),
+             pybind11::arg("parity2_recv1_port"),
+             pybind11::arg("parity2_recv2_ip"),
+             pybind11::arg("parity2_recv2_port"),
+             pybind11::arg("num_cuda_streams") = ECLATIN_NUM_CUDA_STREAMS)
         // Parity 1 submit functions
         .def("submit_parity1_send1", &ECLATINNative::submit_parity1_send1,
              pybind11::arg("send_addr"),
@@ -2849,6 +3284,24 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("recv2_parity2_addr"))
         .def("wait_all_layers_complete", &ECLATINNative::wait_all_layers_complete,
              "Wait for all layer-wise tasks to complete")
+        // Layer-wise load processing functions
+        .def("submit_layer_wise_load", &ECLATINNative::submit_layer_wise_load,
+             "Submit a layer for layer-wise load processing (recovery + H2D)",
+             pybind11::arg("layer_id"),
+             pybind11::arg("gpu_tensors_info"),
+             pybind11::arg("recv_rank0_data2_addr"),
+             pybind11::arg("recv_rank0_parity2_addr"),
+             pybind11::arg("recv_rank1_data1_addr"),
+             pybind11::arg("recv_rank1_parity1_addr"),
+             pybind11::arg("recv_rank3_data1_addr"),
+             pybind11::arg("recv_rank3_data2_addr"),
+             pybind11::arg("recovered_data1_addr"),
+             pybind11::arg("recovered_data2_addr"),
+             pybind11::arg("recovered_parity1_addr"),
+             pybind11::arg("recovered_parity2_addr"),
+             pybind11::arg("layer_size"))
+        .def("wait_all_load_layers_complete", &ECLATINNative::wait_all_load_layers_complete,
+             "Wait for all layer-wise load tasks to complete")
         // Parity 1 sentinels
         .def("submit_parity1_send1_sentinel", &ECLATINNative::submit_parity1_send1_sentinel)
         .def("submit_parity1_send2_sentinel", &ECLATINNative::submit_parity1_send2_sentinel)

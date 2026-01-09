@@ -154,6 +154,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         eclatin_buffers: Optional[Dict] = None,  # Pre-allocated buffers
         use_gemini: bool = False,
         gemini_native: Optional[Any] = None,  # Pre-initialized C++ module
+        use_rdma: bool = False,  # Use RDMA transport for Gemini
         use_gemini_replicas: bool = False,
         gemini_replicas_native: Optional[Any] = None,  # Pre-initialized C++ module
         gemini_replicas_num: int = 3,  # Number of replicas
@@ -184,6 +185,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Gemini configuration
         self.use_gemini = use_gemini
+        self.use_rdma = use_rdma  # RDMA transport flag for Gemini
         
         # Gemini Replicas configuration
         self.use_gemini_replicas = use_gemini_replicas
@@ -633,6 +635,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         )
         
         # Phase 2: Allocate continuous buffer (reuse preallocated buffer if available)
+        buffer_needs_registration = False
         if self.preallocated_cpu_buffer is not None:
             buffer = self.preallocated_cpu_buffer
             # If preallocated buffer exists, ensure it's large enough
@@ -643,10 +646,12 @@ class FileSystemWriterAsync(FileSystemWriter):
                 )
                 if torch.cuda.is_available():
                     buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
+                buffer_needs_registration = True
             else:
                 # Use slice of preallocated buffer
                 buffer = buffer[:total_size]
                 logger.info(f"Gemini rank {rank}: Reusing preallocated buffer")
+                # Buffer should already be registered (if RDMA is enabled)
         else:
             # Allocate new buffer with pinned memory for faster GPU-CPU transfer
             if torch.cuda.is_available():
@@ -655,6 +660,19 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 buffer = torch.empty(total_size, dtype=torch.uint8)
                 logger.info(f"Gemini rank {rank}: Allocated new CPU buffer")
+            buffer_needs_registration = True
+        
+        # Register buffer for RDMA if enabled (on first allocation)
+        if self.use_rdma and buffer_needs_registration and self._gemini_native is not None:
+            try:
+                buffer_addr = buffer.data_ptr()
+                buffer_size = buffer.numel()
+                logger.info(f"Gemini rank {rank}: Registering buffer for RDMA at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB")
+                self._gemini_native.register_buffer(buffer_addr, buffer_size)
+                logger.info(f"Gemini rank {rank}: Buffer registered for RDMA successfully")
+            except Exception as e:
+                logger.error(f"Gemini rank {rank}: Failed to register buffer for RDMA: {e}")
+                # Continue without RDMA registration
         
         # Phase 3: Copy tensor data to buffer using decomposed_state_dict (EC-CHECK style)
         num_gpu_tensors = 0
@@ -743,30 +761,50 @@ class FileSystemWriterAsync(FileSystemWriter):
             # Use C++ ASIO-based exchange (optimized path)
             logger.info(f"Gemini rank {rank}: Using C++ ASIO-based exchange")
             
-            # Step 1: Exchange buffer sizes first via torch.distributed
-            # (needed to allocate remote buffer before C++ exchange)
+            # Step 1: Exchange metadata size (buffer size already exchanged in _prepare_gemini_data)
             paired_rank = self._gemini_native.get_partner_rank()
             
-            from ..strategies.async_utils import get_or_create_pair_process_group
-            pair_group = get_or_create_pair_process_group(rank, paired_rank)
+            # Reuse cached pair_group from _prepare_gemini_data if available (optimization)
+            if hasattr(self, 'gemini_pair_group') and self.gemini_pair_group is not None:
+                pair_group = self.gemini_pair_group
+                logger.debug(f"Gemini rank {rank}: Reusing cached pair process group")
+            else:
+                from ..strategies.async_utils import get_or_create_pair_process_group
+                pair_group = get_or_create_pair_process_group(rank, paired_rank)
+                logger.debug(f"Gemini rank {rank}: Created new pair process group (fallback)")
             
-            size_tensor = torch.tensor([local_buffer_size, local_metadata_size], dtype=torch.long, device='cpu')
+            # Only exchange metadata size (buffer size was already exchanged in _prepare_gemini_data)
+            size_tensor = torch.tensor([local_metadata_size], dtype=torch.long, device='cpu')
             gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(2)]
             torch.distributed.all_gather(gathered_sizes, size_tensor, group=pair_group)
             
             pair_ranks = [min(rank, paired_rank), max(rank, paired_rank)]
             my_idx = pair_ranks.index(rank)
             paired_idx = 1 - my_idx
-            remote_buffer_size = gathered_sizes[paired_idx][0].item()
-            remote_metadata_size = gathered_sizes[paired_idx][1].item()
+            remote_metadata_size = gathered_sizes[paired_idx][0].item()
             
-            logger.info(
-                f"Gemini rank {rank}: Remote buffer size: {remote_buffer_size / (1024**2):.2f} MB, "
-                f"metadata size: {remote_metadata_size / 1024:.2f} KB"
-            )
-            
-            # Step 2: Allocate remote buffer
-            remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
+            # Step 2: Reuse preallocated remote buffer from _prepare_gemini_data
+            if hasattr(self, 'gemini_remote_buffer') and self.gemini_remote_buffer is not None:
+                remote_buffer = self.gemini_remote_buffer[:self.gemini_remote_buffer_size]
+                remote_buffer_size = self.gemini_remote_buffer_size
+                logger.info(
+                    f"Gemini rank {rank}: Reusing preallocated remote buffer: "
+                    f"{remote_buffer_size / (1024**2):.2f} MB, "
+                    f"metadata size: {remote_metadata_size / 1024:.2f} KB"
+                )
+            else:
+                # Fallback: allocate if not preallocated (shouldn't happen in optimized mode)
+                logger.warning(f"Gemini rank {rank}: Remote buffer not preallocated, allocating now")
+                size_tensor_full = torch.tensor([local_buffer_size, local_metadata_size], dtype=torch.long, device='cpu')
+                gathered_sizes_full = [torch.zeros_like(size_tensor_full) for _ in range(2)]
+                torch.distributed.all_gather(gathered_sizes_full, size_tensor_full, group=pair_group)
+                remote_buffer_size = gathered_sizes_full[paired_idx][0].item()
+                remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
+                # logger.info(
+                #     f"Gemini rank {rank}: Allocated remote buffer: "
+                #     f"{remote_buffer_size / (1024**2):.2f} MB, "
+                #     f"metadata size: {remote_metadata_size / 1024:.2f} KB"
+                # )
             
             # Step 3: Exchange buffers using C++ ASIO (simultaneous send/recv)
             logger.info(f"Gemini rank {rank}: Starting C++ ASIO buffer exchange...")
@@ -837,12 +875,17 @@ class FileSystemWriterAsync(FileSystemWriter):
                 )
                 return [result_bucket]
             
-            # Create or get pair process group
-            from ..strategies.async_utils import get_or_create_pair_process_group
-            pair_group = get_or_create_pair_process_group(rank, paired_rank)
+            # Reuse cached pair_group from _prepare_gemini_data if available (optimization)
+            if hasattr(self, 'gemini_pair_group') and self.gemini_pair_group is not None:
+                pair_group = self.gemini_pair_group
+                logger.debug(f"Gemini rank {rank}: Reusing cached pair process group (fallback path)")
+            else:
+                from ..strategies.async_utils import get_or_create_pair_process_group
+                pair_group = get_or_create_pair_process_group(rank, paired_rank)
+                logger.debug(f"Gemini rank {rank}: Created new pair process group (fallback)")
             
-            # Exchange sizes (buffer size + metadata size)
-            size_tensor = torch.tensor([local_buffer_size, local_metadata_size], dtype=torch.long, device='cpu')
+            # Only exchange metadata size (buffer size was already exchanged in _prepare_gemini_data)
+            size_tensor = torch.tensor([local_metadata_size], dtype=torch.long, device='cpu')
             gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(2)]
             torch.distributed.all_gather(gathered_sizes, size_tensor, group=pair_group)
             
@@ -850,17 +893,32 @@ class FileSystemWriterAsync(FileSystemWriter):
             pair_ranks = [min(rank, paired_rank), max(rank, paired_rank)]
             my_idx = pair_ranks.index(rank)
             paired_idx = 1 - my_idx
-            remote_buffer_size = gathered_sizes[paired_idx][0].item()
-            remote_metadata_size = gathered_sizes[paired_idx][1].item()
+            remote_metadata_size = gathered_sizes[paired_idx][0].item()
             
-            logger.info(
-                f"Gemini rank {rank}: Exchanging with rank {paired_rank}, "
-                f"local: {local_buffer_size / (1024**2):.2f} MB, "
-                f"remote: {remote_buffer_size / (1024**2):.2f} MB"
-            )
+            # Reuse preallocated remote buffer from _prepare_gemini_data
+            if hasattr(self, 'gemini_remote_buffer') and self.gemini_remote_buffer is not None:
+                remote_buffer = self.gemini_remote_buffer[:self.gemini_remote_buffer_size]
+                remote_buffer_size = self.gemini_remote_buffer_size
+                logger.info(
+                    f"Gemini rank {rank}: Reusing preallocated remote buffer: "
+                    f"local={local_buffer_size / (1024**2):.2f} MB, "
+                    f"remote={remote_buffer_size / (1024**2):.2f} MB"
+                )
+            else:
+                # Fallback: allocate if not preallocated (shouldn't happen in optimized mode)
+                logger.warning(f"Gemini rank {rank}: Remote buffer not preallocated, allocating now")
+                size_tensor_full = torch.tensor([local_buffer_size, local_metadata_size], dtype=torch.long, device='cpu')
+                gathered_sizes_full = [torch.zeros_like(size_tensor_full) for _ in range(2)]
+                torch.distributed.all_gather(gathered_sizes_full, size_tensor_full, group=pair_group)
+                remote_buffer_size = gathered_sizes_full[paired_idx][0].item()
+                remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
+                # logger.info(
+                #     f"Gemini rank {rank}: Allocated remote buffer: "
+                #     f"local={local_buffer_size / (1024**2):.2f} MB, "
+                #     f"remote={remote_buffer_size / (1024**2):.2f} MB"
+                # )
             
-            # Allocate remote buffers
-            remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
+            # Allocate remote metadata tensor (small, acceptable overhead)
             remote_metadata_tensor = torch.empty(remote_metadata_size, dtype=torch.uint8, device='cpu')
             
             # Convert local metadata to tensor
@@ -2201,16 +2259,9 @@ class FileSystemWriterAsync(FileSystemWriter):
             raise RuntimeError(f"Worker failure: {write_results_or_exc}") from write_results_or_exc
         write_results: dict = write_results_or_exc
         
-        # For ECLATIN layerwise mode, use ecl_write_buckets count instead of write_buckets
-        # because write_buckets may not be updated in the main process, but the actual
-        # write_preloaded_data_multiproc receives the correct buckets from preload function return value
-        if hasattr(self, 'use_eclatin_layerwise') and self.use_eclatin_layerwise:
-            if hasattr(self, 'ecl_write_buckets') and self.ecl_write_buckets:
-                expected_count = len(self.ecl_write_buckets)
-            else:
-                expected_count = len(self.write_buckets)
-        else:
-            expected_count = len(self.write_buckets)
+        # Always use write_buckets count as it's updated by preload function
+        # The preload function returns the correct bucket list (including main file for ECLATIN)
+        expected_count = len(self.write_buckets)
         
         if len(write_results) != expected_count:
             raise RuntimeError(
@@ -3309,11 +3360,21 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Step 2: Organize tensors by layer
         layer_groups = FileSystemWriterAsync._extract_layer_groups(self.write_buckets)
         
-        # Step 3: Calculate per-layer sizes (own sizes)
+        # Step 3: Calculate per-layer sizes (own sizes) and non-layer size
         layer_sizes = {}  # layer_id -> own_size
+        non_layer_size = 0
+        non_layer_tensors = []
+        
         for layer_key, tensor_list in layer_groups.items():
             if layer_key == "non_layer":
+                # Calculate non-layer size
+                for bucket_idx, tensor_idx, item, tensor in tensor_list:
+                    if tensor.is_cuda or tensor.device.type == 'cpu':
+                        tensor_size = tensor.numel() * tensor.element_size()
+                        non_layer_size += tensor_size
+                        non_layer_tensors.append((bucket_idx, tensor_idx, item, tensor))
                 continue
+            
             try:
                 layer_id = int(layer_key.split('_')[1])
             except (ValueError, IndexError):
@@ -3326,17 +3387,21 @@ class FileSystemWriterAsync(FileSystemWriter):
                     layer_size += tensor_size
             layer_sizes[layer_id] = layer_size
         
-        # Step 4: All-gather per-layer sizes and calculate maximums
+        # Step 4: All-gather per-layer sizes and non-layer sizes, then calculate maximums
         layer_max_sizes = {}
         layer_aligned_sizes = {}
+        max_non_layer_size = non_layer_size
+        avg_layer_size = 0
         
         if torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
             
-            # Use all_gather_object instead of all_gather for CPU compatibility
-            # This directly passes Python objects without serialization
+            # All-gather both layer sizes and non-layer sizes
             all_layer_sizes_list = [None] * world_size
+            all_non_layer_sizes_list = [None] * world_size
+            
             torch.distributed.all_gather_object(all_layer_sizes_list, layer_sizes)
+            torch.distributed.all_gather_object(all_non_layer_sizes_list, non_layer_size)
             
             # Calculate maximum for each layer
             all_layer_sizes_dict = {}
@@ -3349,9 +3414,18 @@ class FileSystemWriterAsync(FileSystemWriter):
             # Calculate maximum for each layer
             for layer_id, sizes_list in all_layer_sizes_dict.items():
                 layer_max_sizes[layer_id] = max(sizes_list)
+            
+            # Calculate maximum non-layer size across all ranks
+            max_non_layer_size = max(all_non_layer_sizes_list)
+            
+            # Calculate average layer size (for splitting non-layer data)
+            if layer_max_sizes:
+                avg_layer_size = sum(layer_max_sizes.values()) // len(layer_max_sizes)
         else:
             # Single rank: use own sizes
             layer_max_sizes = layer_sizes.copy()
+            if layer_max_sizes:
+                avg_layer_size = sum(layer_max_sizes.values()) // len(layer_max_sizes)
         
         # Step 5: Align per-layer sizes to buffer_size
         eclatin_buffer_size = self.eclatin_buffer_size
@@ -3359,8 +3433,223 @@ class FileSystemWriterAsync(FileSystemWriter):
             aligned_size = ((max_size + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
             layer_aligned_sizes[layer_id] = aligned_size
         
+        # Step 5.1: Split non-layer data into virtual layers
+        virtual_layer_tensors = {}  # virtual_layer_id -> list of tensors
+        virtual_layer_sizes = {}  # virtual_layer_id -> own_size
+        
+        if max_non_layer_size > 0 and avg_layer_size > 0:
+            # Calculate number of virtual layers needed based on avg_layer_size
+            num_virtual_layers = (max_non_layer_size + avg_layer_size - 1) // avg_layer_size
+            
+            # Calculate virtual layer capacity: max_non_layer_size / num_virtual_layers
+            # This ensures each virtual layer won't exceed its capacity
+            virtual_layer_capacity = (max_non_layer_size + num_virtual_layers - 1) // num_virtual_layers
+            
+            # Analyze non-layer tensor sizes before splitting
+            non_layer_tensor_sizes = []
+            for bucket_idx, tensor_idx, item, tensor in non_layer_tensors:
+                tensor_size = tensor.numel() * tensor.element_size()
+                fqn = item.index.fqn if hasattr(item, 'index') and hasattr(item.index, 'fqn') else str(item)
+                non_layer_tensor_sizes.append((fqn, tensor_size))
+            
+            # Sort by size to find largest tensors
+            non_layer_tensor_sizes_sorted = sorted(non_layer_tensor_sizes, key=lambda x: x[1], reverse=True)
+            max_single_tensor_size = non_layer_tensor_sizes_sorted[0][1] if non_layer_tensor_sizes_sorted else 0
+            
+            logger.info(
+                f"ECLATIN: Non-layer data size: {non_layer_size / (1024**2):.2f} MB (own), "
+                f"{max_non_layer_size / (1024**2):.2f} MB (max across ranks), "
+                f"splitting into {num_virtual_layers} virtual layers "
+                f"(capacity: {virtual_layer_capacity / (1024**2):.2f} MB per layer)"
+            )
+            
+            # Log top 10 largest non-layer tensors
+            # logger.info(f"ECLATIN: Top 10 largest non-layer tensors:")
+            # for i, (fqn, size) in enumerate(non_layer_tensor_sizes_sorted[:10]):
+            #     logger.info(f"  {i+1}. {fqn}: {size / (1024**2):.2f} MB ({size} bytes)")
+            
+            # Adjust capacity if single tensor exceeds it
+            original_virtual_layer_capacity = virtual_layer_capacity
+            if max_single_tensor_size > virtual_layer_capacity:
+                logger.warning(
+                    f"ECLATIN: Largest single non-layer tensor ({max_single_tensor_size / (1024**2):.2f} MB) "
+                    f"exceeds virtual layer capacity ({virtual_layer_capacity / (1024**2):.2f} MB). "
+                    f"Adjusting capacity to accommodate largest tensor."
+                )
+                # Set capacity to max single tensor size
+                virtual_layer_capacity = max_single_tensor_size
+                logger.info(
+                    f"ECLATIN: Adjusted virtual layer capacity: "
+                    f"{original_virtual_layer_capacity / (1024**2):.2f} MB -> {virtual_layer_capacity / (1024**2):.2f} MB"
+                )
+            
+            # Sort non-layer tensors to ensure consistent ordering across ranks
+            non_layer_tensors.sort(key=lambda x: (
+                x[2].index.fqn if hasattr(x[2], 'index') and hasattr(x[2].index, 'fqn') else str(x[2])
+            ))
+            
+            # Smart splitting strategy:
+            # 1. Large tensors (>= original_capacity): each gets its own layer
+            # 2. Small tensors (< original_capacity): pack together up to original_capacity
+            
+            large_tensors = []  # Tensors that need their own layer
+            small_tensors = []  # Tensors that can be packed together
+            
+            for bucket_idx, tensor_idx, item, tensor in non_layer_tensors:
+                tensor_size = tensor.numel() * tensor.element_size()
+                if tensor_size >= original_virtual_layer_capacity:
+                    large_tensors.append((bucket_idx, tensor_idx, item, tensor, tensor_size))
+                else:
+                    small_tensors.append((bucket_idx, tensor_idx, item, tensor, tensor_size))
+            
+            logger.info(
+                f"ECLATIN: Split non-layer tensors: {len(large_tensors)} large tensors "
+                f"(>= {original_virtual_layer_capacity / (1024**2):.2f} MB), "
+                f"{len(small_tensors)} small tensors"
+            )
+            
+            # Assign virtual layers
+            current_virtual_layer = 0
+            
+            # First, assign large tensors (each gets its own layer)
+            for bucket_idx, tensor_idx, item, tensor, tensor_size in large_tensors:
+                virtual_layer_tensors[current_virtual_layer] = [(bucket_idx, tensor_idx, item, tensor)]
+                virtual_layer_sizes[current_virtual_layer] = tensor_size
+                logger.debug(
+                    f"ECLATIN: Virtual layer {current_virtual_layer}: Large tensor "
+                    f"{item.index.fqn if hasattr(item, 'index') and hasattr(item.index, 'fqn') else str(item)}, "
+                    f"size={tensor_size / (1024**2):.2f} MB"
+                )
+                current_virtual_layer += 1
+            
+            # Then, pack small tensors together
+            if small_tensors:
+                virtual_layer_tensors[current_virtual_layer] = []
+                current_virtual_size = 0
+                
+                for bucket_idx, tensor_idx, item, tensor, tensor_size in small_tensors:
+                    # If adding this tensor would exceed capacity, start new layer
+                    if current_virtual_size > 0 and current_virtual_size + tensor_size > original_virtual_layer_capacity:
+                        virtual_layer_sizes[current_virtual_layer] = current_virtual_size
+                        logger.debug(
+                            f"ECLATIN: Virtual layer {current_virtual_layer}: Packed {len(virtual_layer_tensors[current_virtual_layer])} "
+                            f"small tensors, total size={current_virtual_size / (1024**2):.2f} MB"
+                        )
+                        current_virtual_layer += 1
+                        virtual_layer_tensors[current_virtual_layer] = []
+                        current_virtual_size = 0
+                    
+                    virtual_layer_tensors[current_virtual_layer].append((bucket_idx, tensor_idx, item, tensor))
+                    current_virtual_size += tensor_size
+                
+                # Record last layer of small tensors
+                if virtual_layer_tensors[current_virtual_layer]:
+                    virtual_layer_sizes[current_virtual_layer] = current_virtual_size
+                    logger.debug(
+                        f"ECLATIN: Virtual layer {current_virtual_layer}: Packed {len(virtual_layer_tensors[current_virtual_layer])} "
+                        f"small tensors, total size={current_virtual_size / (1024**2):.2f} MB"
+                    )
+                    current_virtual_layer += 1
+            
+            # Update num_virtual_layers to actual number created
+            actual_num_virtual_layers = current_virtual_layer
+            
+            # Fill remaining virtual layers with empty lists if we created fewer than expected
+            for vl_id in range(actual_num_virtual_layers, num_virtual_layers):
+                virtual_layer_tensors[vl_id] = []
+                virtual_layer_sizes[vl_id] = 0
+            
+            logger.info(
+                f"ECLATIN: Created {actual_num_virtual_layers} actual virtual layers "
+                f"(allocated {num_virtual_layers} slots)"
+            )
+            
+            # CRITICAL: All ranks must use the same aligned_size for each virtual layer
+            # Step 1: Build local virtual layer size mapping
+            local_virtual_layer_config = {}
+            for vl_id in range(num_virtual_layers):
+                local_virtual_layer_config[vl_id] = virtual_layer_sizes.get(vl_id, 0)
+            
+            # Step 2: All-gather virtual layer configs from all ranks
+            if torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                all_virtual_layer_configs = [None] * world_size
+                torch.distributed.all_gather_object(all_virtual_layer_configs, local_virtual_layer_config)
+                
+                # Step 3: Calculate maximum size for each virtual layer across all ranks
+                global_virtual_layer_max_sizes = {}
+                for vl_id in range(num_virtual_layers):
+                    max_size_for_this_layer = 0
+                    for rank_config in all_virtual_layer_configs:
+                        if vl_id in rank_config:
+                            max_size_for_this_layer = max(max_size_for_this_layer, rank_config[vl_id])
+                    global_virtual_layer_max_sizes[vl_id] = max_size_for_this_layer
+                
+                logger.info(
+                    f"ECLATIN: Synchronized virtual layer sizes across {world_size} ranks:\n" +
+                    "\n".join([
+                        f"  Virtual layer {vl_id}: max={size / (1024**2):.2f} MB across all ranks"
+                        for vl_id, size in global_virtual_layer_max_sizes.items()
+                        if size > 0  # Only show non-empty layers
+                    ])
+                )
+            else:
+                global_virtual_layer_max_sizes = local_virtual_layer_config.copy()
+            
+            # Add virtual layers to layer_max_sizes and layer_aligned_sizes
+            # Use layer IDs starting after the last real layer
+            max_real_layer_id = max(layer_max_sizes.keys()) if layer_max_sizes else -1
+            virtual_layer_base_id = max_real_layer_id + 1
+            
+            # Step 4: Assign aligned sizes based on GLOBAL maximum for each layer
+            for vl_id in range(num_virtual_layers):
+                virtual_layer_id = virtual_layer_base_id + vl_id
+                
+                # Use global maximum size for this virtual layer
+                global_max_size = global_virtual_layer_max_sizes.get(vl_id, 0)
+                
+                if global_max_size == 0:
+                    # Empty layer across all ranks - skip it
+                    continue
+                
+                # Determine capacity based on global max size
+                if global_max_size >= original_virtual_layer_capacity:
+                    # Large tensor layer (at least one rank has large tensor)
+                    capacity = max(global_max_size, virtual_layer_capacity)
+                else:
+                    # Small tensors packed layer
+                    capacity = original_virtual_layer_capacity
+                
+                aligned_size = ((capacity + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+                
+                layer_max_sizes[virtual_layer_id] = capacity
+                layer_aligned_sizes[virtual_layer_id] = aligned_size
+                
+                # Update layer_sizes for this rank's virtual layer
+                layer_sizes[virtual_layer_id] = virtual_layer_sizes.get(vl_id, 0)
+                
+                # Add to layer_groups
+                layer_key = f"layer_{virtual_layer_id}"
+                layer_groups[layer_key] = virtual_layer_tensors.get(vl_id, [])
+                
+                logger.debug(
+                    f"ECLATIN: Virtual layer {vl_id} (ID={virtual_layer_id}): "
+                    f"global_max={global_max_size / (1024**2):.2f} MB, "
+                    f"own={layer_sizes[virtual_layer_id] / (1024**2):.2f} MB, "
+                    f"aligned={aligned_size / (1024**2):.2f} MB"
+                )
+            
+            # Count actual non-empty virtual layers
+            actual_non_empty_layers = sum(1 for vl_id in range(num_virtual_layers) 
+                                         if global_virtual_layer_max_sizes.get(vl_id, 0) > 0)
+            
+            logger.info(
+                f"ECLATIN: Created {actual_non_empty_layers} non-empty virtual layers "
+                f"(out of {num_virtual_layers} allocated slots) for non-layer data"
+            )
+        
         logger.info(
-            f"ECLATIN: Calculated layer sizes for {len(layer_max_sizes)} layers, "
+            f"ECLATIN: Calculated layer sizes for {len(layer_max_sizes)} layers (including virtual), "
             f"max aligned size: {max(layer_aligned_sizes.values()) / (1024**3):.2f} GB"
         )
         
@@ -3561,8 +3850,73 @@ class FileSystemWriterAsync(FileSystemWriter):
             f"({bandwidth:.2f} GB/s), {len(sorted_layer_keys)} layers"
         )
         
-        # Step 10: Return WriteBuckets (reuse existing 4 blocks)
-        return self.ecl_write_buckets
+        # Step 10: Update WriteBucket paths with current checkpoint_dir before returning
+        # This ensures paths are updated for each iteration
+        if self.ecl_write_buckets is not None:
+            result_buckets = []
+            
+            # Extract metadata from first block (all blocks use the same metadata)
+            first_bucket = self.ecl_write_buckets[0]
+            _, _, (first_bytes_data, _) = first_bucket
+            
+            # Extract metadata for main file
+            main_file_metadata = None
+            for key, value in first_bytes_data:
+                if key == 'eclatin_metadata':
+                    main_file_metadata = value
+                    break
+            
+            # In layerwise mode, create main file by concatenating data_block_1 and data_block_2
+            # After all layers are processed, these two blocks contain the complete original data
+            if main_file_metadata:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                eclatin_main_file = f"__{rank}_0.distcp"
+                eclatin_main_path = Path(self.checkpoint_dir) / eclatin_main_file
+                
+                # Get data blocks
+                data_block_1 = self.eclatin_blocks['data_block_1']
+                data_block_2 = self.eclatin_blocks['data_block_2']
+                
+                # Calculate actual data size from metadata
+                actual_size = self.eclatin_blocks.get('actual_size', 0)
+                
+                # Create continuous buffer by concatenating data_block_1 and data_block_2
+                # Note: data_block_1 contains first half, data_block_2 contains second half
+                half_size = actual_size // 2
+                second_half_size = actual_size - half_size
+                
+                # Create a continuous buffer with actual size
+                continuous_buffer = torch.empty(actual_size, dtype=torch.uint8)
+                continuous_buffer[:half_size].copy_(data_block_1[:half_size])
+                continuous_buffer[half_size:].copy_(data_block_2[:second_half_size])
+                
+                # Create main file bytes data
+                eclatin_main_bytes_data = [
+                    ('eclatin_metadata', main_file_metadata),
+                    ('eclatin_continuous_buffer', continuous_buffer),
+                ]
+                result_buckets.append((eclatin_main_path, eclatin_main_file, (eclatin_main_bytes_data, [])))
+                logger.info(f"ECLATIN Layerwise: Created main file bucket: {eclatin_main_path} ({actual_size / (1024**3):.2f} GB)")
+            
+            # Add 4 block buckets with updated paths
+            for bucket in self.ecl_write_buckets:
+                file_path, storage_key, data = bucket
+                # Extract file name from path
+                if isinstance(file_path, (str, Path)):
+                    file_path_obj = Path(file_path)
+                    file_name = file_path_obj.name
+                else:
+                    file_name = str(file_path).split('/')[-1] if '/' in str(file_path) else str(file_path)
+                
+                # Build new path with current checkpoint_dir
+                new_file_path = Path(self.checkpoint_dir) / file_name
+                result_buckets.append((new_file_path, storage_key, data))
+            
+            # Update self.write_buckets so retrieve_write_results() can check the correct count
+            self.write_buckets = result_buckets
+            return result_buckets
+        else:
+            return []
     
     def _eccheck_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
         """

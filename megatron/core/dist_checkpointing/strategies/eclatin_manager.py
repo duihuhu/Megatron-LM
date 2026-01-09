@@ -208,25 +208,50 @@ class ECLATINManager:
         import socket
         
         # Step 1: Get base IP address
-        # Priority: ECLATIN_BASE_IP > auto-detect > MASTER_ADDR (fallback)
+        # Priority: ECLATIN_BASE_IP > ECLATIN_INTERFACE > auto-detect > MASTER_ADDR (fallback)
         base_ip = os.environ.get('ECLATIN_BASE_IP')
         
         # If ECLATIN_BASE_IP is not set, try to auto-detect actual IP
         if not base_ip:
-            try:
-                # Get IP of the interface used for distributed training
-                # Connect to a remote address (doesn't actually send data)
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                # Use a public DNS server IP to determine the default route interface
-                s.connect(('8.8.8.8', 80))
-                base_ip = s.getsockname()[0]
-                s.close()
-                logger.info(f"ECLATIN: Auto-detected IP address: {base_ip}")
-            except Exception as e:
-                logger.warning(f"ECLATIN: Failed to auto-detect IP: {e}")
-                # Fallback to MASTER_ADDR or localhost
-                base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
-                logger.warning(f"ECLATIN: Using fallback IP: {base_ip}")
+            # Check if specific network interface is requested
+            interface_name = os.environ.get('ECLATIN_INTERFACE')
+            
+            if interface_name:
+                try:
+                    import netifaces
+                    addrs = netifaces.ifaddresses(interface_name)
+                    if netifaces.AF_INET in addrs:
+                        base_ip = addrs[netifaces.AF_INET][0]['addr']
+                        logger.info(f"ECLATIN: Using IP from interface {interface_name}: {base_ip}")
+                    else:
+                        logger.warning(f"ECLATIN: Interface {interface_name} has no IPv4 address")
+                        base_ip = None
+                except ImportError:
+                    logger.warning(
+                        "ECLATIN: netifaces module not installed. "
+                        "Install via 'pip install netifaces' to use ECLATIN_INTERFACE. "
+                        "Falling back to auto-detection."
+                    )
+                    base_ip = None
+                except Exception as e:
+                    logger.warning(f"ECLATIN: Failed to get IP from interface {interface_name}: {e}")
+                    base_ip = None
+            
+            if not base_ip:
+                try:
+                    # Get IP of the interface used for distributed training
+                    # Connect to a remote address (doesn't actually send data)
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    # Use a public DNS server IP to determine the default route interface
+                    s.connect(('8.8.8.8', 80))
+                    base_ip = s.getsockname()[0]
+                    s.close()
+                    logger.info(f"ECLATIN: Auto-detected IP address: {base_ip}")
+                except Exception as e:
+                    logger.warning(f"ECLATIN: Failed to auto-detect IP: {e}")
+                    # Fallback to MASTER_ADDR or localhost
+                    base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
+                    logger.warning(f"ECLATIN: Using fallback IP: {base_ip}")
         
         # Step 2: Get base port
         # Priority: ECLATIN_BASE_PORT > MASTER_PORT + 10000 > default 16000
@@ -446,6 +471,14 @@ class ECLATINManager:
                 parity2_send1_partner_recv_port = base_port + parity2_send1_partner_rank * 8 + 7  # recv2 offset (4+3)
                 parity2_send2_partner_recv_port = base_port + parity2_send2_partner_rank * 8 + 6  # recv1 offset (4+2)
                 
+                # Get CUDA stream configuration from environment or args
+                from megatron.training import get_args
+                args = get_args()
+                num_cuda_streams = int(os.environ.get('ECLATIN_NUM_CUDA_STREAMS', 
+                                                      getattr(args, 'eclatin_num_cuda_streams', 4)))
+                
+                logger.info(f"ECLATIN: [Rank {rank}] Using {num_cuda_streams} CUDA streams for async transfers")
+                
                 self._eclatin_native = eclatin_native.ECLATINNative(
                     # Parity 1: send1, send2, recv1, recv2
                     rank_ips.get(parity1_send1_partner_rank, net_config['my_ip']), parity1_send1_partner_recv_port,
@@ -456,7 +489,9 @@ class ECLATINManager:
                     rank_ips.get(parity2_send1_partner_rank, net_config['my_ip']), parity2_send1_partner_recv_port,
                     rank_ips.get(parity2_send2_partner_rank, net_config['my_ip']), parity2_send2_partner_recv_port,
                     net_config['my_ip'], net_config['ports']['parity2_recv1'],
-                    net_config['my_ip'], net_config['ports']['parity2_recv2']
+                    net_config['my_ip'], net_config['ports']['parity2_recv2'],
+                    # CUDA streams configuration
+                    num_cuda_streams
                 )
                 
                 # If we reach here, ASIO connections are ready and threads are running

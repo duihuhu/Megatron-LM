@@ -3,11 +3,13 @@
 # Script to run a single node in 4-node simulation (1 GPU per node)
 # Usage: ./test_eccheck_4nodes_node.sh <node_rank> [additional_args...]
 # Example: ./test_eccheck_4nodes_node.sh 0
+export ECLATIN_NUM_CUDA_STREAMS=1
+
+export NETIFACES_INTERFACE=eno33np0
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=enp65s0np0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
@@ -18,12 +20,9 @@ MASTER_ADDR=10.10.1.1
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_USE_ASIO=true
-
-# Set base IP for Gemini Replicas to use the high-speed network interface
-export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
-
 MASTER_PORT=6000
 NNODES=4
+export ECCHECK_INTERFACE=$NETIFACES_INTERFACE
 
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
@@ -45,7 +44,7 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-gemini-repicas" #<Specify path>
+CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-eclatin-layerwise" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -97,7 +96,7 @@ GPT_ARGS=(
     --use-mcore-models 
     --transformer-impl transformer_engine 
     --no-scatter-gather-tensors-in-pipeline 
-    --num-layers 24 
+    --num-layers 12
     --optimizer adam
     --loss-scale 8192
 )
@@ -117,16 +116,15 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
 
-    --use-gemini-replicas 
-    --use-gemini-replicas-optimized 
-    --use-gemini-replicas-hardware-failure
-    # --gemini-replicas-num 4
     # --use-gemini
     # --use-gemini-optimized
     # --use-gemini-software-failure
     # --use-gemini-hardware-failure
 
-    # --use-eclatin
+    --use-eclatin
+    --use-eclatin-layerwise
+    # --data-parallel-sharding-strategy optim_grads_params
+    # --use-distributed-optimizer
     --ckpt-format torch_dist
 )
 

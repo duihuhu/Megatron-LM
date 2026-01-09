@@ -2272,6 +2272,13 @@ def _add_checkpointing_args(parser):
                             'This eliminates serialization/deserialization overhead and improves checkpoint exchange performance. '
                             'When enabled, tensors are copied directly to a continuous CPU buffer during preload phase, '
                             'avoiding expensive pickle serialization in torch.save.')
+    group.add_argument('--use-rdma', action='store_true',
+                       help='Enable RDMA transport for Gemini checkpointing data exchange. '
+                            'When enabled, uses InfiniBand RDMA (via libibverbs) instead of TCP/ASIO for '
+                            'network communication between paired ranks. Requires InfiniBand hardware and '
+                            'RDMA support. Buffers are automatically registered on first allocation during save phase. '
+                            'This can provide lower latency and higher bandwidth compared to TCP, especially for '
+                            'large checkpoint transfers. Only effective when used with --use-gemini-optimized.')
     
     # Gemini Replicas checkpointing arguments (multi-replica with round-robin placement)
     group.add_argument('--use-gemini-replicas', action='store_true',
@@ -2291,6 +2298,14 @@ def _add_checkpointing_args(parser):
                             'Default: 3. Must be <= world_size. Higher values provide better fault tolerance '
                             'but require more storage space. For example, with num_replicas=3 and 4 ranks, '
                             'each rank stores 3 copies of its data (local + 2 remote).')
+    group.add_argument('--use-gemini-replicas-hardware-failure', action='store_true',
+                       help='Enable Gemini Replicas checkpointing for hardware failure recovery. '
+                            'When a rank fails (e.g., rank2), the failed rank recovers its data from other ranks '
+                            'using the multi-replica placement strategy. For rank2 failure with 3 replicas: '
+                            'rank0 and rank1 send their local data (backup data for rank2), rank3 sends its '
+                            'backup of rank2 original data. Uses mmap for zero-copy file access and C++ ASIO '
+                            'for efficient network transfer. Data sizes are broadcasted first, then C++ handles '
+                            'the actual data transfer for optimal performance.')
     return parser
 
 

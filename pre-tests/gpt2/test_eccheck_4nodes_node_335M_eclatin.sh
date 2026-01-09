@@ -7,19 +7,21 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
+export NETIFACES_INTERFACE=enp65s0np0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-
 GPUS_PER_NODE=1
-MASTER_ADDR=128.105.146.31
-export NCCL_SOCKET_IFNAME=eno33np0
-export GLOO_SOCKET_IFNAME=eno33np0
+MASTER_ADDR=10.10.1.1
+
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
 NNODES=4
 
+export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
+export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
+export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -116,7 +118,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-gemini-optimized
     # --use-gemini-software-failure
     # --use-gemini-hardware-failure
-
+    # --use-distributed-optimizer
     --use-eclatin
     --ckpt-format torch_dist
 )

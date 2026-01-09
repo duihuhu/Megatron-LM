@@ -743,30 +743,50 @@ class FileSystemWriterAsync(FileSystemWriter):
             # Use C++ ASIO-based exchange (optimized path)
             logger.info(f"Gemini rank {rank}: Using C++ ASIO-based exchange")
             
-            # Step 1: Exchange buffer sizes first via torch.distributed
-            # (needed to allocate remote buffer before C++ exchange)
+            # Step 1: Exchange metadata size (buffer size already exchanged in _prepare_gemini_data)
             paired_rank = self._gemini_native.get_partner_rank()
             
-            from ..strategies.async_utils import get_or_create_pair_process_group
-            pair_group = get_or_create_pair_process_group(rank, paired_rank)
+            # Reuse cached pair_group from _prepare_gemini_data if available (optimization)
+            if hasattr(self, 'gemini_pair_group') and self.gemini_pair_group is not None:
+                pair_group = self.gemini_pair_group
+                logger.debug(f"Gemini rank {rank}: Reusing cached pair process group")
+            else:
+                from ..strategies.async_utils import get_or_create_pair_process_group
+                pair_group = get_or_create_pair_process_group(rank, paired_rank)
+                logger.debug(f"Gemini rank {rank}: Created new pair process group (fallback)")
             
-            size_tensor = torch.tensor([local_buffer_size, local_metadata_size], dtype=torch.long, device='cpu')
+            # Only exchange metadata size (buffer size was already exchanged in _prepare_gemini_data)
+            size_tensor = torch.tensor([local_metadata_size], dtype=torch.long, device='cpu')
             gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(2)]
             torch.distributed.all_gather(gathered_sizes, size_tensor, group=pair_group)
             
             pair_ranks = [min(rank, paired_rank), max(rank, paired_rank)]
             my_idx = pair_ranks.index(rank)
             paired_idx = 1 - my_idx
-            remote_buffer_size = gathered_sizes[paired_idx][0].item()
-            remote_metadata_size = gathered_sizes[paired_idx][1].item()
+            remote_metadata_size = gathered_sizes[paired_idx][0].item()
             
-            logger.info(
-                f"Gemini rank {rank}: Remote buffer size: {remote_buffer_size / (1024**2):.2f} MB, "
-                f"metadata size: {remote_metadata_size / 1024:.2f} KB"
-            )
-            
-            # Step 2: Allocate remote buffer
-            remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
+            # Step 2: Reuse preallocated remote buffer from _prepare_gemini_data
+            if hasattr(self, 'gemini_remote_buffer') and self.gemini_remote_buffer is not None:
+                remote_buffer = self.gemini_remote_buffer[:self.gemini_remote_buffer_size]
+                remote_buffer_size = self.gemini_remote_buffer_size
+                logger.info(
+                    f"Gemini rank {rank}: Reusing preallocated remote buffer: "
+                    f"{remote_buffer_size / (1024**2):.2f} MB, "
+                    f"metadata size: {remote_metadata_size / 1024:.2f} KB"
+                )
+            else:
+                # Fallback: allocate if not preallocated (shouldn't happen in optimized mode)
+                logger.warning(f"Gemini rank {rank}: Remote buffer not preallocated, allocating now")
+                size_tensor_full = torch.tensor([local_buffer_size, local_metadata_size], dtype=torch.long, device='cpu')
+                gathered_sizes_full = [torch.zeros_like(size_tensor_full) for _ in range(2)]
+                torch.distributed.all_gather(gathered_sizes_full, size_tensor_full, group=pair_group)
+                remote_buffer_size = gathered_sizes_full[paired_idx][0].item()
+                remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
+                logger.info(
+                    f"Gemini rank {rank}: Allocated remote buffer: "
+                    f"{remote_buffer_size / (1024**2):.2f} MB, "
+                    f"metadata size: {remote_metadata_size / 1024:.2f} KB"
+                )
             
             # Step 3: Exchange buffers using C++ ASIO (simultaneous send/recv)
             logger.info(f"Gemini rank {rank}: Starting C++ ASIO buffer exchange...")
@@ -837,12 +857,17 @@ class FileSystemWriterAsync(FileSystemWriter):
                 )
                 return [result_bucket]
             
-            # Create or get pair process group
-            from ..strategies.async_utils import get_or_create_pair_process_group
-            pair_group = get_or_create_pair_process_group(rank, paired_rank)
+            # Reuse cached pair_group from _prepare_gemini_data if available (optimization)
+            if hasattr(self, 'gemini_pair_group') and self.gemini_pair_group is not None:
+                pair_group = self.gemini_pair_group
+                logger.debug(f"Gemini rank {rank}: Reusing cached pair process group (fallback path)")
+            else:
+                from ..strategies.async_utils import get_or_create_pair_process_group
+                pair_group = get_or_create_pair_process_group(rank, paired_rank)
+                logger.debug(f"Gemini rank {rank}: Created new pair process group (fallback)")
             
-            # Exchange sizes (buffer size + metadata size)
-            size_tensor = torch.tensor([local_buffer_size, local_metadata_size], dtype=torch.long, device='cpu')
+            # Only exchange metadata size (buffer size was already exchanged in _prepare_gemini_data)
+            size_tensor = torch.tensor([local_metadata_size], dtype=torch.long, device='cpu')
             gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(2)]
             torch.distributed.all_gather(gathered_sizes, size_tensor, group=pair_group)
             
@@ -850,17 +875,32 @@ class FileSystemWriterAsync(FileSystemWriter):
             pair_ranks = [min(rank, paired_rank), max(rank, paired_rank)]
             my_idx = pair_ranks.index(rank)
             paired_idx = 1 - my_idx
-            remote_buffer_size = gathered_sizes[paired_idx][0].item()
-            remote_metadata_size = gathered_sizes[paired_idx][1].item()
+            remote_metadata_size = gathered_sizes[paired_idx][0].item()
             
-            logger.info(
-                f"Gemini rank {rank}: Exchanging with rank {paired_rank}, "
-                f"local: {local_buffer_size / (1024**2):.2f} MB, "
-                f"remote: {remote_buffer_size / (1024**2):.2f} MB"
-            )
+            # Reuse preallocated remote buffer from _prepare_gemini_data
+            if hasattr(self, 'gemini_remote_buffer') and self.gemini_remote_buffer is not None:
+                remote_buffer = self.gemini_remote_buffer[:self.gemini_remote_buffer_size]
+                remote_buffer_size = self.gemini_remote_buffer_size
+                logger.info(
+                    f"Gemini rank {rank}: Reusing preallocated remote buffer: "
+                    f"local={local_buffer_size / (1024**2):.2f} MB, "
+                    f"remote={remote_buffer_size / (1024**2):.2f} MB"
+                )
+            else:
+                # Fallback: allocate if not preallocated (shouldn't happen in optimized mode)
+                logger.warning(f"Gemini rank {rank}: Remote buffer not preallocated, allocating now")
+                size_tensor_full = torch.tensor([local_buffer_size, local_metadata_size], dtype=torch.long, device='cpu')
+                gathered_sizes_full = [torch.zeros_like(size_tensor_full) for _ in range(2)]
+                torch.distributed.all_gather(gathered_sizes_full, size_tensor_full, group=pair_group)
+                remote_buffer_size = gathered_sizes_full[paired_idx][0].item()
+                remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
+                logger.info(
+                    f"Gemini rank {rank}: Allocated remote buffer: "
+                    f"local={local_buffer_size / (1024**2):.2f} MB, "
+                    f"remote={remote_buffer_size / (1024**2):.2f} MB"
+                )
             
-            # Allocate remote buffers
-            remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
+            # Allocate remote metadata tensor (small, acceptable overhead)
             remote_metadata_tensor = torch.empty(remote_metadata_size, dtype=torch.uint8, device='cpu')
             
             # Convert local metadata to tensor

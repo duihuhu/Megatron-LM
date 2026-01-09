@@ -219,29 +219,6 @@ class GeminiManager:
             f"  All rank IPs: {config['rank_ips']}"
         )
         
-        # Print detailed IP information for C++ transmission between ranks
-        print(f"=" * 80)
-        print(f"[Gemini C++ Transmission] Rank {rank} Network Configuration:")
-        print(f"  Local Rank: {rank}")
-        print(f"  Local IP Address: {config['my_ip']}")
-        print(f"  Local Send Port: {config['ports']['send']}")
-        print(f"  Local Recv Port: {config['ports']['recv']}")
-        print(f"-" * 80)
-        print(f"  Partner Rank: {partner_rank}")
-        print(f"  Partner IP Address: {config['partner_ip']}")
-        print(f"  Partner Send Port: {base_port + partner_rank * 2 + 0}")
-        print(f"  Partner Recv Port: {base_port + partner_rank * 2 + 1}")
-        print(f"-" * 80)
-        print(f"  C++ Connection Details:")
-        print(f"    This rank will SEND to: {config['partner_ip']}:{base_port + partner_rank * 2 + 1}")
-        print(f"    This rank will RECV on: {config['my_ip']}:{config['ports']['recv']}")
-        print(f"-" * 80)
-        print(f"  All Ranks IP Mapping:")
-        for r, ip in config['rank_ips'].items():
-            marker = " <-- YOU" if r == rank else " <-- PARTNER" if r == partner_rank else ""
-            print(f"    Rank {r}: {ip}{marker}")
-        print(f"=" * 80)
-        
         return config
     
     def init_gemini_if_enabled(self):

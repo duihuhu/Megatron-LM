@@ -1173,6 +1173,13 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             # Pass Gemini state to writer if available
             writer.decomposed_state_dict = self.decomposed_state_dict
             writer.preallocated_cpu_buffer = self.preallocated_cpu_buffer
+            # Pass preallocated remote buffers (optimization: only allocate once)
+            if hasattr(self, 'gemini_remote_buffer'):
+                writer.gemini_remote_buffer = self.gemini_remote_buffer
+                writer.gemini_remote_buffer_size = self.gemini_remote_buffer_size
+            # Pass cached pair process group (optimization: avoid repeated lookups)
+            if hasattr(self, 'gemini_pair_group'):
+                writer.gemini_pair_group = self.gemini_pair_group
             
             # In Gemini mode, call prepare_write_data to create write_buckets
             # It will use the decomposed state_dict we just prepared
@@ -1352,6 +1359,65 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 f"Gemini: [Rank {rank}] Reusing existing preallocated CPU buffer: "
                 f"{self.preallocated_cpu_buffer.numel() / (1024**3):.2f} GB"
             )
+        
+        # Step 3: Exchange buffer sizes and preallocate remote buffers (receive buffers)
+        # This optimization moves buffer allocation from _gemini_preload_to_continuous_buffer
+        # to here, so it only happens once in the first iteration
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        if world_size >= 4:  # Gemini requires at least 4 ranks
+            # Get paired rank
+            pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
+            paired_rank = pairing_map.get(rank, None)
+            
+            if paired_rank is not None:
+                from ..strategies.async_utils import get_or_create_pair_process_group
+                # Cache pair_group for reuse (optimization: avoid repeated lookups)
+                if not hasattr(self, 'gemini_pair_group') or self.gemini_pair_group is None:
+                    self.gemini_pair_group = get_or_create_pair_process_group(rank, paired_rank)
+                    logger.info(f"Gemini: [Rank {rank}] Created and cached pair process group")
+                else:
+                    logger.debug(f"Gemini: [Rank {rank}] Reusing cached pair process group")
+                
+                pair_group = self.gemini_pair_group
+                
+                # Exchange buffer sizes (local_buffer_size)
+                # Note: metadata size will be exchanged later in _gemini_preload_to_continuous_buffer
+                # because metadata is generated there
+                local_buffer_size = total_tensor_size
+                size_tensor = torch.tensor([local_buffer_size], dtype=torch.long, device='cpu')
+                gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(2)]
+                torch.distributed.all_gather(gathered_sizes, size_tensor, group=pair_group)
+                
+                pair_ranks = [min(rank, paired_rank), max(rank, paired_rank)]
+                my_idx = pair_ranks.index(rank)
+                paired_idx = 1 - my_idx
+                remote_buffer_size = gathered_sizes[paired_idx][0].item()
+                
+                logger.info(
+                    f"Gemini: [Rank {rank}] Exchanged buffer sizes with rank {paired_rank}: "
+                    f"local={local_buffer_size / (1024**2):.2f} MB, "
+                    f"remote={remote_buffer_size / (1024**2):.2f} MB"
+                )
+                
+                # Allocate remote buffer if needed (or reuse existing)
+                if not hasattr(self, 'gemini_remote_buffer') or self.gemini_remote_buffer is None or \
+                   self.gemini_remote_buffer.numel() < remote_buffer_size:
+                    self.gemini_remote_buffer = torch.empty(remote_buffer_size, dtype=torch.uint8, device='cpu')
+                    logger.info(
+                        f"Gemini: [Rank {rank}] Allocated remote buffer: "
+                        f"{remote_buffer_size / (1024**2):.2f} MB"
+                    )
+                else:
+                    logger.info(
+                        f"Gemini: [Rank {rank}] Reusing existing remote buffer: "
+                        f"{self.gemini_remote_buffer.numel() / (1024**2):.2f} MB"
+                    )
+                
+                # Store remote buffer size for later use
+                self.gemini_remote_buffer_size = remote_buffer_size
+            else:
+                logger.warning(f"Gemini: [Rank {rank}] No paired rank found for buffer exchange")
         
         total_time = time() - start_total
         logger.info(

@@ -4695,7 +4695,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         max_total_bytes = max(all_total_bytes_list)
         eccheck_buffer_size = self.eccheck_manager.eccheck_buffer_size
         total_bytes = max_total_bytes
-        
+        logger.info(f"EC-CHECK: load pipeline total_bytes: {total_bytes}")
         # === Step 5: Determine data source based on rank role ===
         # For rank2 recovery scenario:
         # - rank0/3: read from mapped_file_own (their own data/parity)
@@ -4768,41 +4768,37 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         try:
             # === Step 8: Main pipeline loop ===
             processed = 0
-            
+            #total_bytes = 20 * eccheck_buffer_size
             while processed < total_bytes:
                 take = min(eccheck_buffer_size, total_bytes - processed)
                 
                 # Get free buffers
                 cur_buffer_addr = get_free_data_buffer()
-                enc_addr1 = get_free_encoding_buffer()
+                # Load mode only needs thread2 encoding buffer (parity index 1)
                 enc_addr2 = get_free_encoding_buffer()
-                parity_addr1 = get_free_parity_buffer()
-                parity_addr2 = get_free_parity_buffer()
+                # Load mode only needs parity buffer for rank2/3 (receiver)
+                if rank == 2 or rank == 3:
+                    parity_addr2 = get_free_parity_buffer()
+                else:
+                    parity_addr2 = 0
                 
-                # Calculate recv addresses (64-byte aligned)
-                recv_buffer_offset_thread1_aligned = ((recv_buffer_offset_thread1 + 63) // 64) * 64
-                recv_buffer_offset_thread2_aligned = ((recv_buffer_offset_thread2 + 63) // 64) * 64
+                # Calculate recv addresses (64-byte aligned) - only needed for rank2/3
+                if rank == 2 or rank == 3:
+                    recv_buffer_offset_thread2_aligned = ((recv_buffer_offset_thread2 + 63) // 64) * 64
+                    recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2_aligned
+                    recv_chunk_size = take
+                    recv_buffer_offset_thread2 = recv_buffer_offset_thread2_aligned + recv_chunk_size
+                else:
+                    recv_addr_thread2 = 0
+                    recv_chunk_size = 0
                 
-                recv_addr_thread1 = recv_buffer_base_addr_thread1 + recv_buffer_offset_thread1_aligned
-                recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2_aligned
-                recv_chunk_size = take
-                
-                recv_buffer_offset_thread1 = recv_buffer_offset_thread1_aligned + recv_chunk_size
-                recv_buffer_offset_thread2 = recv_buffer_offset_thread2_aligned + recv_chunk_size
-                
-                # Calculate P2P write addresses (64-byte aligned)
-                if p2p_own_buffer_base_addr != 0:
-                    p2p_own_buffer_offset_aligned = ((p2p_own_buffer_offset + 63) // 64) * 64
+                # Calculate P2P write addresses for Step6 (rank2 needs partner_buffer for receiving d3)
+                if rank == 2 and p2p_partner_buffer_base_addr != 0:
                     p2p_partner_buffer_offset_aligned = ((p2p_partner_buffer_offset + 63) // 64) * 64
-                    
-                    p2p_own_write_addr = p2p_own_buffer_base_addr + p2p_own_buffer_offset_aligned
                     p2p_partner_write_addr = p2p_partner_buffer_base_addr + p2p_partner_buffer_offset_aligned
-                    
-                    p2p_own_buffer_offset = p2p_own_buffer_offset_aligned + take
                     p2p_partner_buffer_offset = p2p_partner_buffer_offset_aligned + take
                 else:
-                    p2p_own_write_addr = 0
-                    p2p_partner_write_addr = 0
+                    p2p_partner_write_addr = 0  # Not needed for rank0/1/3
                 
                 # Prepare Step 2 P2P transfer parameters
                 step2_send_addr = 0
@@ -4877,37 +4873,93 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     step2_size = take
                 
                 # Submit complete load pipeline chunk (Step2 P2P -> Encoding -> XOR -> Step6 P2P)
-                # This single call handles the entire pipeline internally in C++
-                self.eccheck_manager._eccheck_native.submit_load_pipeline_chunk(
-                    step2_send_addr=step2_send_addr,           # rank0/3: partner_file chunk addr; rank1/2: 0
-                    step2_recv_data_addr=step2_recv_data_addr,  # rank1/2: data_buffer addr; rank0/3: 0
-                    step2_size=step2_size,                      # Step 2 transfer size
-                    data_addr=cur_buffer_addr,                  # Data buffer address (own_file for rank0/3, received for rank1/2)
-                    size=take,                                  # Data size
-                    encoding_addr1=enc_addr1,                   # Thread1 encoding buffer
-                    encoding_addr2=enc_addr2,                   # Thread2 encoding buffer
-                    recv_addr_thread1=recv_addr_thread1,        # Thread1 receive address
-                    recv_addr_thread2=recv_addr_thread2,        # Thread2 receive address
-                    recv_chunk_size=recv_chunk_size,            # Receive chunk size
-                    parity_addr1=parity_addr1,                  # Thread1 parity buffer
-                    parity_addr2=parity_addr2,                  # Thread2 parity buffer
-                    p2p_own_write_addr=p2p_own_write_addr,       # P2P own buffer write address
-                    p2p_partner_write_addr=p2p_partner_write_addr  # P2P partner buffer write address
+                # Simplified interface: only pass necessary parameters based on rank
+                if rank == 0:
+                    # rank0: Step2 send, then encoding and send
+                    # Only need thread2 encoding buffer (parity index 1)
+                    self.eccheck_manager._eccheck_native.submit_load_pipeline_chunk(
+                        step2_send_addr=step2_send_addr,
+                        step2_recv_data_addr=0,
+                        step2_size=step2_size,
+                        data_addr=cur_buffer_addr,
+                        size=take,
+                        encoding_addr=enc_addr2,  # Only thread2 encoding buffer
+                        recv_addr=0,              # Sender doesn't need recv
+                        recv_chunk_size=0,
+                        parity_addr=0,            # Sender doesn't need parity buffer
+                        p2p_partner_write_addr=0   # Not needed for sender
+                    )
+                elif rank == 1:
+                    # rank1: Step2 recv, then encoding and send
+                    self.eccheck_manager._eccheck_native.submit_load_pipeline_chunk(
+                        step2_send_addr=0,
+                        step2_recv_data_addr=step2_recv_data_addr,
+                        step2_size=step2_size,
+                        data_addr=cur_buffer_addr,
+                        size=take,
+                        encoding_addr=enc_addr2,  # Only thread2 encoding buffer
+                        recv_addr=0,
+                        recv_chunk_size=0,
+                        parity_addr=0,
+                        p2p_partner_write_addr=0  # Not needed for rank1
+                    )
+                elif rank == 2:
+                    # rank2: Step2 recv, then encoding, receive rank0's encoding and do XOR
+                    self.eccheck_manager._eccheck_native.submit_load_pipeline_chunk(
+                        step2_send_addr=0,
+                        step2_recv_data_addr=step2_recv_data_addr,
+                        step2_size=step2_size,
+                        data_addr=cur_buffer_addr,
+                        size=take,
+                        encoding_addr=enc_addr2,  # Only thread2 encoding buffer
+                        recv_addr=recv_addr_thread2,  # Receive rank0's encoding
+                        recv_chunk_size=recv_chunk_size,
+                        parity_addr=parity_addr2,     # Store XOR result d2
+                        p2p_partner_write_addr=p2p_partner_write_addr  # For Step6: receive d3
+                    )
+                elif rank == 3:
+                    # rank3: Step2 send, then encoding, receive rank1's encoding and do XOR
+                    self.eccheck_manager._eccheck_native.submit_load_pipeline_chunk(
+                        step2_send_addr=step2_send_addr,
+                        step2_recv_data_addr=0,
+                        step2_size=step2_size,
+                        data_addr=cur_buffer_addr,
+                        size=take,
+                        encoding_addr=enc_addr2,  # Only thread2 encoding buffer
+                        recv_addr=recv_addr_thread2,  # Receive rank1's encoding
+                        recv_chunk_size=recv_chunk_size,
+                        parity_addr=parity_addr2,     # Store XOR result d3
+                        p2p_partner_write_addr=0      # Not needed for rank3
                 )
                 
                 processed += take
             
             # === Step 8: Send sentinel and wait for completion ===
-            logger.info("EC-CHECK: Load pipeline: Sending sentinel to encoding threads")
-            # For rank 2 and rank 3 in load mode, only submit sentinel to thread2
-            # (thread1 doesn't process any tasks in load mode for these ranks)
-            if rank in [2, 3]:
-                self.eccheck_manager._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0, 0, 0)
-            else:
-                self.eccheck_manager._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0, 0, 0)
-                self.eccheck_manager._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0, 0, 0)
+            logger.info("EC-CHECK: Load pipeline: Sending sentinel to load encoder worker")
+            # All ranks submit sentinel to load encoder worker
+            self.eccheck_manager._eccheck_native.submit_load_encoding_sentinel()
             
-            logger.info("EC-CHECK: Load pipeline: Waiting for encoding threads to complete...")
+            logger.info("EC-CHECK: Load pipeline: Waiting for XOR worker to complete (Step6 tasks will be submitted)...")
+            # Wait for XOR worker to complete (which will submit all Step6 tasks)
+            # Note: wait_for_encoding_completion waits for all workers including Step6,
+            # so we need to wait twice: first for XOR, then send Step6 sentinel, then wait again
+            import time
+            while True:
+                # Check if XOR worker is completed (but not Step6 workers yet)
+                # We'll use a simple polling approach: wait a bit, then check
+                time.sleep(0.1)
+                # Try to wait, but this will wait for all workers including Step6
+                # So we'll just wait once and send Step6 sentinel before the final wait
+                break
+            
+            # Wait for XOR to complete (all Step6 tasks should be submitted by now)
+            # Note: This will also wait for Step6, but Step6 sentinel hasn't been sent yet
+            # So we need to send Step6 sentinel first, then wait
+            if rank == 2 or rank == 3:
+                logger.info("EC-CHECK: Load pipeline: Sending sentinel to Step6 P2P workers")
+                self.eccheck_manager._eccheck_native.submit_load_step6_p2p_sentinel()
+            
+            logger.info("EC-CHECK: Load pipeline: Waiting for all load workers to complete...")
             self.eccheck_manager._eccheck_native.wait_for_encoding_completion()
             
             # Wait for P2P workers to complete

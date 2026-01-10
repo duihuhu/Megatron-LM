@@ -431,8 +431,12 @@ public:
         // Wait for connection to be ready (either from connect or accept thread)
         std::unique_lock<std::mutex> lock(connection_mutex_);
         connection_cv_.wait(lock, [this] { return connected_.load(); });
+        lock.unlock();
         
         std::cout << "[Gemini RDMA] Rank " << rank_ << " RDMA connection established" << std::endl;
+        
+        // Warmup: Send/receive small test messages to initialize RDMA path
+        warmup_rdma_connection();
     }
     
     void register_buffer(uintptr_t addr, size_t size) override {
@@ -695,22 +699,17 @@ public:
         uintptr_t addr = reinterpret_cast<uintptr_t>(data);
         ibv_mr* mr = find_registered_mr(addr, size);
         
-        // If not registered, use temporary buffer
+        // If not registered, use temporary buffer (normal for small data like metadata)
         if (!mr) {
-            std::cout << "[Gemini RDMA] Rank " << rank_ << " send buffer NOT registered - using temp buffer" << std::endl;
+            std::cout << "[Gemini RDMA] Rank " << rank_ << " send buffer NOT registered - using temp buffer (" 
+                      << size << " bytes)" << std::endl;
             
             if (size > TEMP_BUFFER_SIZE) {
                 throw std::runtime_error("Data size exceeds temporary buffer size");
             }
-            std::memcpy(temp_send_buffer_.data(), data, size);
             
-            if (!temp_send_mr_) {
-                temp_send_mr_ = ibv_reg_mr(pd_, temp_send_buffer_.data(), TEMP_BUFFER_SIZE,
-                                          IBV_ACCESS_LOCAL_WRITE);
-                if (!temp_send_mr_) {
-                    throw std::runtime_error("Failed to register temporary send buffer");
-                }
-            }
+            // Copy to temporary buffer (already registered during initialization)
+            std::memcpy(temp_send_buffer_.data(), data, size);
             mr = temp_send_mr_;
             data = temp_send_buffer_.data();
         } else {
@@ -752,22 +751,17 @@ public:
         uintptr_t addr = reinterpret_cast<uintptr_t>(buffer);
         ibv_mr* mr = find_registered_mr(addr, size);
         
-        // If not registered, use temporary buffer
-        bool use_temp = false;、
+        // If not registered, use temporary buffer (normal for small data like metadata)
+        bool use_temp = false;
         if (!mr) {
-            std::cout << "[Gemini RDMA] Rank " << rank_ << " recv buffer NOT registered - using temp buffer" << std::endl;
+            std::cout << "[Gemini RDMA] Rank " << rank_ << " recv buffer NOT registered - using temp buffer (" 
+                      << size << " bytes)" << std::endl;
             
             if (size > TEMP_BUFFER_SIZE) {
                 throw std::runtime_error("Data size exceeds temporary buffer size");
             }
             
-            if (!temp_recv_mr_) {
-                temp_recv_mr_ = ibv_reg_mr(pd_, temp_recv_buffer_.data(), TEMP_BUFFER_SIZE,
-                                          IBV_ACCESS_LOCAL_WRITE);
-                if (!temp_recv_mr_) {
-                    throw std::runtime_error("Failed to register temporary receive buffer");
-                }
-            }
+            // Use temporary buffer (already registered during initialization)
             mr = temp_recv_mr_;
             use_temp = true;
         } else {
@@ -787,6 +781,34 @@ public:
     }
 
 private:
+    // Warmup RDMA connection by sending/receiving test messages
+    void warmup_rdma_connection() {
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " starting RDMA warmup..." << std::endl;
+        
+        const size_t warmup_size = 1024;  // 1KB test message
+        const int warmup_rounds = 3;      // Number of warmup rounds
+        
+        try {
+            for (int round = 0; round < warmup_rounds; ++round) {
+                if (rank_ < partner_rank_) {
+                    // Lower rank sends first, then receives
+                    send_data(temp_send_buffer_.data(), warmup_size);
+                    receive_data(temp_recv_buffer_.data(), warmup_size);
+                } else {
+                    // Higher rank receives first, then sends
+                    receive_data(temp_recv_buffer_.data(), warmup_size);
+                    send_data(temp_send_buffer_.data(), warmup_size);
+                }
+            }
+            
+            std::cout << "[Gemini RDMA] Rank " << rank_ << " RDMA warmup completed (" 
+                      << warmup_rounds << " rounds)" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[Gemini RDMA] Rank " << rank_ << " warmup failed: " << e.what() << std::endl;
+            std::cerr << "[Gemini RDMA] Continuing without warmup..." << std::endl;
+        }
+    }
+    
     // Initialize RDMA resources using ibverbs (same as rdma_throughput_test.cpp)
     void init_rdma_resources() {
         // Get device list
@@ -861,6 +883,24 @@ private:
         
         std::cout << "[Gemini RDMA] Rank " << rank_ << " RDMA resources initialized (QP number: " 
                   << qp_->qp_num << ")" << std::endl;
+        
+        // Register temporary buffers for unregistered data (e.g., metadata)
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " registering temporary buffers (" 
+                  << (TEMP_BUFFER_SIZE / (1024.0 * 1024.0)) << " MB each)..." << std::endl;
+        
+        temp_send_mr_ = ibv_reg_mr(pd_, temp_send_buffer_.data(), TEMP_BUFFER_SIZE,
+                                   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!temp_send_mr_) {
+            throw std::runtime_error("Failed to register temporary send buffer");
+        }
+        
+        temp_recv_mr_ = ibv_reg_mr(pd_, temp_recv_buffer_.data(), TEMP_BUFFER_SIZE,
+                                   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        if (!temp_recv_mr_) {
+            throw std::runtime_error("Failed to register temporary receive buffer");
+        }
+        
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " temporary buffers registered successfully" << std::endl;
     }
     
     // Start TCP listener for connection info exchange

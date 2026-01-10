@@ -2869,7 +2869,14 @@ def get_reformulation_metadata(
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self):
+    def __init__(self, checkpoint_dir: Optional[Path] = None):
+        """Initialize load strategy.
+        
+        Args:
+            checkpoint_dir: Optional checkpoint directory. If provided, RDMA buffers
+                          will be prepared during initialization (for rank0 only).
+                          If None, buffers will be prepared on first load() call.
+        """
         self.cached_global_metadata: Optional[Metadata] = None
         super().__init__()
         
@@ -2918,8 +2925,236 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Gemini Replicas needs to receive from multiple ranks (rank0, rank1, rank3)
         self.gemini_replicas_recovery_buffers = {}  # Dict[int, torch.Tensor]: rank -> buffer
         self._allocate_gemini_replicas_recovery_buffers()
+        
+        # Initialize Gemini RDMA send buffers for rank0 (mmap files + RDMA-friendly buffers)
+        self.gemini_rdma_send_buffers = {}  # Dict[str, dict]: 'replica' and 'own' -> {mmap, buffer, registered}
+        self.gemini_mmap_files = {}  # Dict[str, tuple]: 'replica' and 'own' -> (file_handle, mmap_handle)
+        self.gemini_rdma_checkpoint_dir = checkpoint_dir  # Track which checkpoint_dir buffers are prepared for
     
         self.pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
+        
+        # If checkpoint_dir provided, prepare RDMA buffers now (rank0 only)
+        # # this is desgin for use ,but checkpoint_dir can not be pass
+        # if checkpoint_dir is not None:
+        #     self._prepare_gemini_rdma_buffers_if_needed(checkpoint_dir)
+    
+    def _prepare_gemini_rdma_buffers_if_needed(self, checkpoint_dir: Path):
+        """Prepare send buffers if needed (wrapper function).
+        
+        This function checks if buffers need to be prepared and calls the actual
+        preparation function. Buffers are always prepared (for ASIO/RDMA), but
+        RDMA registration only happens when use_rdma is enabled.
+        Can be called from __init__ or load().
+        
+        Args:
+            checkpoint_dir: Checkpoint directory
+        """
+        if not torch.distributed.is_initialized():
+            return  # Skip if distributed not initialized
+        
+        rank = torch.distributed.get_rank()
+        if rank != 0:
+            return  # Only rank0 needs send buffers
+        
+        checkpoint_dir_str = str(checkpoint_dir)
+        
+        # Check if buffers already prepared for this checkpoint_dir
+        if self.gemini_rdma_checkpoint_dir == checkpoint_dir_str:
+            logger.debug(f"rank: {rank}, send buffers already prepared for {checkpoint_dir_str}")
+            return
+        
+        # Cleanup old buffers if checkpoint_dir changed
+        if self.gemini_rdma_send_buffers:
+            logger.info(f"rank: {rank}, checkpoint_dir changed, cleaning up old send buffers...")
+            self._cleanup_gemini_rdma_send_buffers()
+        
+        # Prepare new buffers (always prepare, RDMA registration happens inside based on use_rdma flag)
+        logger.info(f"rank: {rank}, preparing send buffers for {checkpoint_dir_str}...")
+        self._prepare_gemini_rdma_send_buffers(checkpoint_dir)
+        self.gemini_rdma_checkpoint_dir = checkpoint_dir_str
+    
+    def _prepare_gemini_rdma_send_buffers(self, checkpoint_dir: Path):
+        """Prepare send buffers for Gemini load (rank0 only).
+        
+        This method:
+        1. Opens checkpoint files with mmap
+        2. If RDMA enabled: Attempts to register mmap buffers with RDMA
+        3. If RDMA registration fails: Allocates aligned C++ buffers and copies data
+        4. If RDMA enabled: Registers the aligned buffers with RDMA
+        
+        Buffers are always prepared (for ASIO/RDMA), but RDMA registration only
+        happens when use_rdma is enabled.
+        
+        Args:
+            checkpoint_dir: Checkpoint directory containing replica files
+        """
+        import mmap
+        import numpy as np
+        
+        rank = torch.distributed.get_rank()
+        if rank != 0:
+            return  # Only rank0 needs send buffers
+        
+        paired_rank = self.pairing_map.get(rank, None)
+        if paired_rank != 2:
+            return  # Only for rank0->rank2 recovery
+        
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        # Check if RDMA is enabled
+        use_rdma = self.gemini_manager.use_rdma if hasattr(self.gemini_manager, 'use_rdma') else False
+        transport_mode = "RDMA" if use_rdma else "ASIO"
+        
+        logger.info(f"rank: {rank}, preparing send buffers for Gemini load ({transport_mode} mode)")
+        
+        try:
+            # Find checkpoint files
+            replica_files = list(checkpoint_dir.glob(f"*_replica{paired_rank}_rank{rank}*.distcp"))
+            own_checkpoint_files = list(checkpoint_dir.glob(f"__{rank}_0.distcp"))
+            
+            if not replica_files or not own_checkpoint_files:
+                logger.warning(f"rank: {rank}, checkpoint files not found, skipping RDMA buffer preparation")
+                return
+            
+            replica_file_path = replica_files[0]
+            own_checkpoint_path = own_checkpoint_files[0]
+            
+            logger.info(f"rank: {rank}, found checkpoint files:\n"
+                       f"  replica: {replica_file_path}\n"
+                       f"  own: {own_checkpoint_path}")
+            
+            # Process replica file
+            self._prepare_single_rdma_send_buffer('replica', replica_file_path)
+            
+            # Process own checkpoint file
+            self._prepare_single_rdma_send_buffer('own', own_checkpoint_path)
+            
+            logger.info(f"rank: {rank}, RDMA send buffers prepared successfully")
+            
+        except Exception as e:
+            logger.error(f"rank: {rank}, failed to prepare RDMA send buffers: {e}", exc_info=True)
+            # Clean up any partial allocations
+            self._cleanup_gemini_rdma_send_buffers()
+    
+    def _prepare_single_rdma_send_buffer(self, buffer_name: str, file_path: Path):
+        """Prepare a single send buffer from a checkpoint file.
+        
+        If RDMA is enabled, attempts to register the buffer for RDMA operations.
+        If RDMA is disabled, just prepares the buffer for ASIO operations.
+        
+        Args:
+            buffer_name: 'replica' or 'own'
+            file_path: Path to checkpoint file
+        """
+        import mmap
+        import numpy as np
+        import ctypes
+        
+        rank = torch.distributed.get_rank()
+        
+        # Check if RDMA is enabled
+        use_rdma = self.gemini_manager.use_rdma if hasattr(self.gemini_manager, 'use_rdma') else False
+        has_register_func = hasattr(self.gemini_manager._gemini_native, 'register_buffer')
+        
+        try:
+            # Open file with mmap
+            f = open(file_path, 'rb')
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            file_size = len(mm)
+            
+            logger.info(f"rank: {rank}, opened {buffer_name} file with mmap: {file_size / (1024**2):.2f} MB")
+            
+            # Get mmap buffer address
+            mmap_np = np.frombuffer(mm, dtype=np.uint8)
+            mmap_addr = mmap_np.ctypes.data
+            
+            # Try to register mmap buffer for RDMA if enabled
+            registered = False
+            use_copy = False
+            
+            if use_rdma and has_register_func:
+                try:
+                    self.gemini_manager._gemini_native.register_buffer(mmap_addr, file_size)
+                    logger.info(f"rank: {rank}, successfully registered mmap buffer for {buffer_name} (RDMA zero-copy)")
+                    registered = True
+                    
+                except Exception as e:
+                    logger.warning(f"rank: {rank}, failed to register mmap buffer for {buffer_name}: {e}")
+                    logger.info(f"rank: {rank}, allocating aligned buffer for {buffer_name}")
+                    
+                    # Allocate aligned buffer (page-aligned for RDMA)
+                    aligned_buffer = torch.empty(file_size, dtype=torch.uint8, pin_memory=True)
+                    
+                    # Copy data from mmap to aligned buffer
+                    logger.info(f"rank: {rank}, copying {file_size / (1024**2):.2f} MB from mmap to aligned buffer...")
+                    aligned_buffer_np = aligned_buffer.numpy()
+                    aligned_buffer_np[:] = mmap_np[:]
+                    logger.info(f"rank: {rank}, copy completed for {buffer_name}")
+                    
+                    # Register aligned buffer
+                    aligned_addr = aligned_buffer.data_ptr()
+                    self.gemini_manager._gemini_native.register_buffer(aligned_addr, file_size)
+                    logger.info(f"rank: {rank}, successfully registered aligned buffer for {buffer_name} (RDMA)")
+                    
+                    # Use aligned buffer
+                    mmap_addr = aligned_addr
+                    registered = True
+                    use_copy = True
+                    
+                    # Store aligned buffer
+                    self.gemini_rdma_send_buffers[buffer_name] = {
+                        'addr': mmap_addr,
+                        'size': file_size,
+                        'registered': registered,
+                        'use_copy': use_copy,
+                        'buffer': aligned_buffer,  # Keep tensor alive
+                        'numpy_ref': None
+                    }
+                    self.gemini_mmap_files[buffer_name] = (f, mm)
+                    return
+            
+            # Store mmap handles (RDMA registered or ASIO mode)
+            self.gemini_mmap_files[buffer_name] = (f, mm)
+            self.gemini_rdma_send_buffers[buffer_name] = {
+                'addr': mmap_addr,
+                'size': file_size,
+                'registered': registered,
+                'use_copy': use_copy,
+                'buffer': None,
+                'numpy_ref': mmap_np  # Keep reference to prevent GC
+            }
+            
+            if not use_rdma:
+                logger.info(f"rank: {rank}, prepared {buffer_name} buffer for ASIO (no RDMA registration)")
+                
+        except Exception as e:
+            logger.error(f"rank: {rank}, failed to prepare {buffer_name} buffer: {e}", exc_info=True)
+            raise
+    
+    def _cleanup_gemini_rdma_send_buffers(self):
+        """Clean up RDMA send buffers and mmap files."""
+        rank = torch.distributed.get_rank()
+        
+        # Unregister RDMA buffers
+        for buffer_name, buffer_info in self.gemini_rdma_send_buffers.items():
+            if buffer_info.get('registered', False):
+                try:
+                    self.gemini_manager._gemini_native.unregister_buffer(buffer_info['addr'])
+                    logger.info(f"rank: {rank}, unregistered RDMA buffer for {buffer_name}")
+                except Exception as e:
+                    logger.warning(f"rank: {rank}, failed to unregister {buffer_name}: {e}")
+        
+        # Close mmap files
+        for buffer_name, (f, mm) in self.gemini_mmap_files.items():
+            try:
+                mm.close()
+                f.close()
+                logger.info(f"rank: {rank}, closed mmap file for {buffer_name}")
+            except Exception as e:
+                logger.warning(f"rank: {rank}, failed to close mmap for {buffer_name}: {e}")
+        
+        self.gemini_rdma_send_buffers.clear()
+        self.gemini_mmap_files.clear()
     
     def _allocate_gemini_recovery_buffers(self):
         """Pre-allocate large buffers for Gemini recovery to avoid allocation overhead.
@@ -2971,6 +3206,25 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 f"rank: {rank}, Gemini recovery buffers allocated successfully: "
                 f"{buffer_size_bytes / (1024**3):.2f} GB x 2"
             )
+            
+            # Register buffers for RDMA if enabled (check both use_rdma flag and native module capability)
+            use_rdma = getattr(args, 'use_rdma', False) if hasattr(args, 'use_rdma') else False
+            if use_rdma and hasattr(self.gemini_manager._gemini_native, 'register_buffer'):
+                try:
+                    replica_addr = self.gemini_recovery_buffer_replica.data_ptr()
+                    rank0_addr = self.gemini_recovery_buffer_rank0.data_ptr()
+                    
+                    self.gemini_manager._gemini_native.register_buffer(replica_addr, buffer_size_bytes)
+                    logger.info(f"rank: {rank}, registered replica recovery buffer for RDMA ({buffer_size_gb} GB)")
+                    
+                    self.gemini_manager._gemini_native.register_buffer(rank0_addr, buffer_size_bytes)
+                    logger.info(f"rank: {rank}, registered rank0 recovery buffer for RDMA ({buffer_size_gb} GB)")
+                    
+                except Exception as e:
+                    logger.warning(f"rank: {rank}, failed to register recovery buffers for RDMA: {e}")
+                    logger.warning(f"rank: {rank}, will use unregistered buffers (may fall back to temp buffers)")
+            elif use_rdma:
+                logger.info(f"rank: {rank}, RDMA enabled but native module not available, skipping buffer registration")
             
         except Exception as e:
             logger.warning(f"Failed to allocate Gemini recovery buffers: {e}")
@@ -4114,9 +4368,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             raise
     
     def _load_gemini_checkpoint_recovery_asio(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
-        """Load checkpoint for rank2 failure recovery using ASIO for data transfer (OPTIMIZED).
+        """Load checkpoint for rank2 failure recovery using ASIO/RDMA for data transfer (OPTIMIZED).
         
-        This method uses Gemini's ASIO-based communication for efficient data transfer
+        This method uses Gemini's ASIO or RDMA-based communication for efficient data transfer
         between rank0 and rank2 during recovery. Optimized to minimize data copies.
         
         Optimizations:
@@ -4124,12 +4378,21 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         2. Direct tensor receive: Receive into torch tensor, avoid numpy->bytes conversion
         3. Memoryview parsing: Use memoryview to avoid bytes slicing copies
         4. Shared memory: Use from_numpy without copy() when safe
+        5. RDMA buffer registration: Register mmap and tensor buffers for zero-copy RDMA transfer
         
         Process:
         1. Rank0 reads replica file via mmap and sends directly (zero-copy)
-        2. Rank0 sends data to rank2 using ASIO (non-blocking, high-performance)
+        2. Rank0 sends data to rank2 using ASIO/RDMA (non-blocking, high-performance)
+           - If RDMA enabled: Registers mmap buffers for zero-copy RDMA transfer
         3. Rank2 receives into torch tensor directly (zero-copy)
+           - If RDMA enabled: Registers tensor buffers for zero-copy RDMA receive
         4. Both ranks restore their state_dict with minimal copies
+        
+        RDMA Support:
+        - Automatically detects if RDMA is enabled via gemini_native module
+        - Registers send/receive buffers for RDMA operations
+        - Falls back to ASIO if RDMA registration fails
+        - Unregisters buffers after transfer to free RDMA resources
         
         Args:
             sharded_state_dict: Sharded state dict template for loading
@@ -4138,65 +4401,57 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         Returns:
             StateDict: Loaded state dict
         """
-        import mmap
         import numpy as np
-        import ctypes
         
         rank = torch.distributed.get_rank()
         paired_rank = self.pairing_map.get(rank, None)
         checkpoint_dir = Path(checkpoint_dir)
         
-        logger.info(f"rank: {rank}, starting Gemini checkpoint recovery with ASIO (OPTIMIZED) for rank2 failure")
+        # Detect if RDMA is enabled
+        use_rdma = hasattr(self.gemini_manager._gemini_native, 'register_buffer')
+        transport_mode = "RDMA" if use_rdma else "ASIO"
+        logger.info(f"rank: {rank}, starting Gemini checkpoint recovery with {transport_mode} (OPTIMIZED) for rank2 failure")
+        
+        if use_rdma:
+            logger.info(f"rank: {rank}, RDMA buffer registration enabled for load operations")
         
         # Ensure Gemini native module is initialized
         if self.gemini_manager._gemini_native is None:
             logger.warning(f"rank: {rank}, Gemini native module not initialized, falling back to standard recovery")
             return self._load_gemini_checkpoint_recovery(sharded_state_dict, checkpoint_dir)
         
+        # Prepare RDMA send buffers for rank0 (if not already prepared or checkpoint_dir changed)
+        # Note: If checkpoint_dir was provided during __init__, buffers are already prepared.
+        # This is a fast check (string comparison only) if buffers are ready.
+        # Only prepare if: (1) not initialized with checkpoint_dir, or (2) checkpoint_dir changed
+        # if use_rdma and str(checkpoint_dir) != self.gemini_rdma_checkpoint_dir:
+        #     self._prepare_gemini_rdma_buffers_if_needed(checkpoint_dir)
+        
         # Only rank0 (pair_rank=2) and rank2 participate
         if rank == 0 and paired_rank == 2:
-            # Rank0: Read both files first, then send metadata and data to rank2
-            logger.info(f"rank: {rank}, starting rank2 recovery - reading both checkpoint files (ASIO OPTIMIZED mode)")
-            
-            # Step 1: Find and open both files with mmap
-            # File 1: rank2's replica (for rank2 recovery)
-            replica_files = list(checkpoint_dir.glob(f"*_replica{paired_rank}_rank{rank}*.distcp"))
-            if not replica_files:
-                logger.error(f"rank: {rank}, no replica file found for rank2 recovery")
-                raise FileNotFoundError(f"No replica file found for rank2 recovery")
-            replica_file_path = replica_files[0]
-            
-            # File 2: rank0's own checkpoint (for rank2 backup)
-            own_checkpoint_files = list(checkpoint_dir.glob(f"__{rank}_0.distcp"))
-            if not own_checkpoint_files:
-                logger.error(f"rank: {rank}, no own checkpoint file found")
-                raise FileNotFoundError(f"No own checkpoint file found for rank {rank}")
-            own_checkpoint_path = own_checkpoint_files[0]
-            
-            logger.info(f"rank: {rank}, found replica file: {replica_file_path}")
-            logger.info(f"rank: {rank}, found own checkpoint file: {own_checkpoint_path}")
-            
-            # Open both files with mmap
-            f_replica = None
-            f_own = None
-            mm_replica = None
-            mm_own = None
-            mmap_replica_np = None
-            mmap_own_np = None
+            # Rank0: Use pre-prepared RDMA buffers to send data to rank2
+            logger.info(f"rank: {rank}, starting rank2 recovery - using pre-prepared {transport_mode} buffers")
             
             try:
-                f_replica = open(replica_file_path, 'rb')
-                mm_replica = mmap.mmap(f_replica.fileno(), 0, access=mmap.ACCESS_READ)
-                replica_file_size = len(mm_replica)
+                # Get buffer info from pre-prepared buffers
+                if not self.gemini_rdma_send_buffers:
+                    logger.error(f"rank: {rank}, RDMA send buffers not prepared")
+                    raise RuntimeError("RDMA send buffers not prepared")
                 
-                f_own = open(own_checkpoint_path, 'rb')
-                mm_own = mmap.mmap(f_own.fileno(), 0, access=mmap.ACCESS_READ)
-                own_file_size = len(mm_own)
+                replica_info = self.gemini_rdma_send_buffers.get('replica')
+                own_info = self.gemini_rdma_send_buffers.get('own')
+                
+                if not replica_info or not own_info:
+                    logger.error(f"rank: {rank}, incomplete RDMA send buffers")
+                    raise RuntimeError("Incomplete RDMA send buffers")
+                
+                replica_file_size = replica_info['size']
+                own_file_size = own_info['size']
                 
                 logger.info(
-                    f"rank: {rank}, opened both files with mmap:\n"
-                    f"  replica (rank2): {replica_file_size / (1024**2):.2f} MB\n"
-                    f"  own (rank0): {own_file_size / (1024**2):.2f} MB"
+                    f"rank: {rank}, using pre-prepared buffers:\n"
+                    f"  replica (rank2): {replica_file_size / (1024**2):.2f} MB (registered: {replica_info['registered']}, use_copy: {replica_info['use_copy']})\n"
+                    f"  own (rank0): {own_file_size / (1024**2):.2f} MB (registered: {own_info['registered']}, use_copy: {own_info['use_copy']})"
                 )
                 
                 # Step 2: Send metadata (both file sizes) to rank2
@@ -4207,45 +4462,19 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 
                 # Step 3: Send replica data (rank2's backup) to rank2
                 logger.info(f"rank: {rank}, sending replica data (rank2's backup) to rank2...")
-                mmap_replica_np = np.frombuffer(mm_replica, dtype=np.uint8)
-                mmap_replica_addr = mmap_replica_np.ctypes.data
-                self.gemini_manager._gemini_native.send_buffer(mmap_replica_addr, replica_file_size)
+                self.gemini_manager._gemini_native.send_buffer(replica_info['addr'], replica_file_size)
                 logger.info(f"rank: {rank}, sent replica data to rank2: {replica_file_size / (1024**2):.2f} MB")
-                
-                # Delete numpy array reference before sending next buffer
-                del mmap_replica_np
-                mmap_replica_np = None
                 
                 # Step 4: Send own data (rank0's checkpoint) to rank2
                 logger.info(f"rank: {rank}, sending own checkpoint data (for rank2 backup) to rank2...")
-                mmap_own_np = np.frombuffer(mm_own, dtype=np.uint8)
-                mmap_own_addr = mmap_own_np.ctypes.data
-                self.gemini_manager._gemini_native.send_buffer(mmap_own_addr, own_file_size)
+                self.gemini_manager._gemini_native.send_buffer(own_info['addr'], own_file_size)
                 logger.info(f"rank: {rank}, sent own checkpoint data to rank2: {own_file_size / (1024**2):.2f} MB")
-                
-                # Delete numpy array reference before cleanup
-                del mmap_own_np
-                mmap_own_np = None
                 
                 logger.info(f"rank: {rank}, all data sent successfully to rank2")
                 
             except Exception as e:
-                logger.error(f"rank: {rank}, ASIO send failed: {e}", exc_info=True)
+                logger.error(f"rank: {rank}, {transport_mode} send failed: {e}", exc_info=True)
                 raise
-            finally:
-                # Clean up all resources in reverse order
-                if mmap_replica_np is not None:
-                    del mmap_replica_np
-                if mmap_own_np is not None:
-                    del mmap_own_np
-                if mm_replica is not None:
-                    mm_replica.close()
-                if mm_own is not None:
-                    mm_own.close()
-                if f_replica is not None:
-                    f_replica.close()
-                if f_own is not None:
-                    f_own.close()
             
             # Step 5: Rank0 loads its own checkpoint from file
             logger.info(f"rank: {rank}, loading own checkpoint from saved file")
@@ -4253,7 +4482,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
         elif rank == 2:
             # Rank2: Receive metadata and all data from rank0, then restore
-            logger.info(f"rank: {rank}, starting rank2 recovery - receiving data from rank0 via ASIO (OPTIMIZED)")
+            logger.info(f"rank: {rank}, starting rank2 recovery - receiving data from rank0 via {transport_mode} (OPTIMIZED)")
             
             try:
                 # Step 1: Receive metadata (both file sizes)
@@ -4272,6 +4501,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 )
                 
                 # Step 2: Receive replica data (rank2's backup for recovery)
+                # Note: Buffer is already registered for RDMA during initialization (_allocate_gemini_recovery_buffers)
                 logger.info(f"rank: {rank}, receiving replica data (own backup) from rank0...")
                 replica_tensor = self._get_gemini_recovery_buffer('replica', replica_size)
                 
@@ -4280,6 +4510,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 logger.info(f"rank: {rank}, received replica data: {replica_size / (1024**2):.2f} MB")
                 
                 # Step 3: Receive rank0's checkpoint data (for rank2 backup)
+                # Note: Buffer is already registered for RDMA during initialization (_allocate_gemini_recovery_buffers)
                 logger.info(f"rank: {rank}, receiving rank0's checkpoint data (for backup)...")
                 rank0_tensor = self._get_gemini_recovery_buffer('rank0', rank0_size)
                 
@@ -7729,6 +7960,17 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         from megatron.training import get_args as use_args
         input_args = use_args()
         
+        # Prepare RDMA send buffers early for Gemini recovery (rank0 only)
+        # This ensures buffers are ready BEFORE rank2 starts waiting, eliminating the 2.9s delay
+        if input_args.use_gemini and input_args.use_gemini_hardware_failure and input_args.use_gemini_optimized:
+            if rank == 0 and pair_rank == 2:
+                # Prepare buffers now if not already prepared
+                # This includes: opening mmap, allocating aligned buffers, copying data, registering RDMA
+                prepare_start = time()
+                self._prepare_gemini_rdma_buffers_if_needed(checkpoint_dir)
+                prepare_end = time()
+                logger.info(f"rank: {rank}, RDMA send buffers preparation time: {(prepare_end - prepare_start)*1000:.2f}ms")
+        torch.distributed.barrier()
         # Gemini checkpoint recovery for rank2 failure scenario
         # Only rank0 and rank2 participate in recovery, but ALL ranks must synchronize
         recovered_state_dict = None

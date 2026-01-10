@@ -143,7 +143,7 @@ class ECCHECKManager:
         
         This function:
         1. Gets base IP address (from ECCHECK_BASE_IP env var, MASTER_ADDR, or auto-detect)
-        2. Calculates ports for this rank (base_port + rank * 4 + offset)
+        2. Calculates ports for this rank (base_port + rank * 6 + offset)
         3. Exchanges IP addresses with all ranks via torch.distributed.all_gather
         4. Returns configuration dictionary
         
@@ -217,13 +217,15 @@ class ECCHECKManager:
         base_port = int(os.environ.get('ECCHECK_BASE_PORT', master_port + 10000))
         
         # Step 3: Calculate ports for this rank
-        # Port allocation: base_port + rank * 4 + offset
-        # offset: 0=xor_send, 1=xor_recv, 2=p2p_send, 3=p2p_recv
+        # Port allocation: base_port + rank * 6 + offset
+        # offset: 0=xor_send, 1=xor_recv, 2=p2p_send, 3=p2p_recv, 4=step6_p2p_send, 5=step6_p2p_recv
         ports = {
-            'xor_send': base_port + rank * 4 + 0,
-            'xor_recv': base_port + rank * 4 + 1,
-            'p2p_send': base_port + rank * 4 + 2,
-            'p2p_recv': base_port + rank * 4 + 3,
+            'xor_send': base_port + rank * 6 + 0,
+            'xor_recv': base_port + rank * 6 + 1,
+            'p2p_send': base_port + rank * 6 + 2,
+            'p2p_recv': base_port + rank * 6 + 3,
+            'step6_p2p_send': base_port + rank * 6 + 4,  # rank3 uses this to send to rank2
+            'step6_p2p_recv': base_port + rank * 6 + 5,   # rank2 uses this to receive from rank3
         }
         
         # Step 4: Get partner ranks
@@ -427,8 +429,16 @@ class ECCHECKManager:
                     
                     # Partner's recv ports (where we send to)
                     base_port = net_config['base_port']
-                    xor_partner_recv_port = base_port + xor_partner * 4 + 1  # partner's xor_recv port
-                    p2p_partner_recv_port = base_port + p2p_partner * 4 + 3  # partner's p2p_recv port
+                    xor_partner_recv_port = base_port + xor_partner * 6 + 1  # partner's xor_recv port
+                    p2p_partner_recv_port = base_port + p2p_partner * 6 + 3  # partner's p2p_recv port
+                    
+                    # Step6 P2P: rank3 sends to rank2's step6_p2p_recv port
+                    # rank2 listens on step6_p2p_recv port
+                    step6_p2p_partner_rank = 2 if rank == 3 else -1  # rank3's partner is rank2
+                    step6_p2p_partner_ip = net_config['p2p_partner_ip'] if rank == 3 else ""
+                    step6_p2p_send_port = base_port + step6_p2p_partner_rank * 6 + 5 if rank == 3 else 0  # rank2's step6_p2p_recv port
+                    step6_p2p_listen_ip = net_config['my_ip'] if rank == 2 else ""
+                    step6_p2p_recv_port = net_config['ports']['step6_p2p_recv'] if rank == 2 else 0
                     
                     self._eccheck_native = eccheck_native.ECCHECKNative(
                         rank, world_size, paired_rank,
@@ -437,7 +447,11 @@ class ECCHECKManager:
                         net_config['my_ip'], net_config['ports']['xor_recv'],
                         # P2P connections: (partner_ip, partner_recv_port, my_ip, my_recv_port)
                         net_config['p2p_partner_ip'], p2p_partner_recv_port,
-                        net_config['my_ip'], net_config['ports']['p2p_recv']
+                        net_config['my_ip'], net_config['ports']['p2p_recv'],
+                        # Step6 P2P connections: (partner_ip, partner_recv_port, my_ip, my_recv_port)
+                        # Only rank2/3 use these (rank2 recv, rank3 send)
+                        step6_p2p_partner_ip, step6_p2p_send_port,
+                        step6_p2p_listen_ip, step6_p2p_recv_port
                     )
                     
                     # If we reach here, ASIO connections are ready and threads are running

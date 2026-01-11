@@ -152,6 +152,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         eclatin_buffer_size: int = 64 * 1024 * 1024,
         eclatin_native: Optional[Any] = None,  # Pre-initialized C++ module
         eclatin_buffers: Optional[Dict] = None,  # Pre-allocated buffers
+        use_ecnaive: bool = False,
+        ecnaive_native: Optional[Any] = None,  # Pre-initialized C++ module
+        ecnaive_buffers: Optional[Dict] = None,  # Pre-allocated buffers
         use_gemini: bool = False,
         gemini_native: Optional[Any] = None,  # Pre-initialized C++ module
         use_rdma: bool = False,  # Use RDMA transport for Gemini
@@ -182,6 +185,19 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.use_eclatin_layerwise = use_eclatin_layerwise
         self.eclatin_pin_memory = eclatin_pin_memory
         self.eclatin_buffer_size = eclatin_buffer_size  # Buffer size in bytes
+        
+        # EC-NAIVE configuration
+        self.use_ecnaive = use_ecnaive
+        self.ecnaive_native = ecnaive_native
+        self.ecnaive_buffers = ecnaive_buffers
+        self.ecnaive_buffer_size = 64 * 1024 * 1024  # 64MB
+        self.ecnaive_pin_memory = True  # Can be obtained from manager if needed
+        
+        # EC-NAIVE state variables (will be set by strategy)
+        self.ecnaive_blocks = None
+        self.ecnaive_serialized_metadata = None
+        self.ecnaive_global_registry = None
+        self.ec_write_buckets = None
         
         # Gemini configuration
         self.use_gemini = use_gemini
@@ -373,6 +389,36 @@ class FileSystemWriterAsync(FileSystemWriter):
             f"Recv: {len(self.eclatin_recv_buffers)}, "
             f"Buffer poller: {'shared from strategy' if self._eclatin_buffer_poller_active_event else 'will create own'}"
         )
+    
+    def _setup_ecnaive_buffers_from_strategy(self, buffers):
+        """Set up EC-NAIVE buffers from pre-allocated strategy buffers.
+        
+        Note: Sets up data and parity buffers (pooled) from strategy.
+        The 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1) will be allocated
+        in strategy after metadata exchange.
+        """
+        self.ecnaive_data_buffers = buffers['data_buffers']
+        self.ecnaive_parity_buffers = buffers['parity_buffers']
+        self._free_ecnaive_data_buffer_queue = buffers['free_data_buffer_queue']
+        self._free_ecnaive_parity_buffer_queue = buffers['free_parity_buffer_queue']
+        
+        # Use buffer poller from strategy (already running)
+        self._ecnaive_buffer_poller_active_event = buffers.get('buffer_poller_active_event')
+        # Store the strategy's poll method with a different name to avoid conflict
+        self._ecnaive_strategy_poll_and_release_buffers = buffers.get('poll_and_release_buffers')
+        
+        # Mark that we're using shared buffer poller (don't start our own)
+        self._ecnaive_buffer_poller_shared = True
+        
+        # Persistent blocks are NOT set here
+        # They will be allocated in strategy after metadata exchange
+        
+        logger.info(
+            f"EC-NAIVE: Using pre-allocated buffers from strategy - "
+            f"Data: {len(self.ecnaive_data_buffers)}, "
+            f"Parity: {len(self.ecnaive_parity_buffers)}, "
+            f"Buffer poller: {'shared from strategy' if self._ecnaive_buffer_poller_active_event else 'will create own'}"
+        )
 
 
     def prepare_write_data(self, plan: SavePlan, planner: SavePlanner) -> None:
@@ -391,6 +437,19 @@ class FileSystemWriterAsync(FileSystemWriter):
             # by the strategy layer (torch.py). We just need to prepare write_buckets.
             self._prepare_eccheck_write_buckets(plan)
             return
+        
+        # EC-NAIVE mode: initialize buffers if provided
+        if self.use_ecnaive:
+            # Initialize EC-NAIVE buffer queues
+            if self.ecnaive_buffers:
+                self._setup_ecnaive_buffers_from_strategy(self.ecnaive_buffers)
+                
+                # Activate buffer poller
+                if self._ecnaive_buffer_poller_active_event:
+                    self._ecnaive_buffer_poller_active_event.set()
+                    logger.info("EC-NAIVE: Buffer poller activated")
+            else:
+                raise RuntimeError("EC-NAIVE: ecnaive_buffers not provided")
         
         storage_plan: _StoragePrefix = plan.storage_data
         start = time()
@@ -509,6 +568,25 @@ class FileSystemWriterAsync(FileSystemWriter):
             return (
                 partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
                 partial(self._eclatin_preload_tensors_to_buffer, True),
+                [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+            )
+        
+        # EC-NAIVE mode: use special preload function
+        # The preload function will embed EC-NAIVE data in write_buckets
+        if self.use_ecnaive:
+            # Ensure ecnaive blocks are available
+            if self.ecnaive_blocks is None:
+                logger.warning("EC-NAIVE: ecnaive_blocks not set, falling back to normal mode")
+                return (
+                    partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
+                    partial(self.preload_tensors, self.write_buckets, True),
+                    [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+                )
+            
+            # EC-NAIVE mode (batch mode, no layerwise)
+            return (
+                partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
+                partial(self._ecnaive_preload_tensors_to_buffer, True),
                 [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
             )
         
@@ -1830,6 +1908,18 @@ class FileSystemWriterAsync(FileSystemWriter):
                     elif key == 'gemini_replicas_buffer':
                         gemini_replicas_buffer = value
             
+            # Check if this is EC-NAIVE mode by detecting special markers in bytes_data
+            ecnaive_metadata = None
+            ecnaive_continuous_buffer = None
+            if len(bytes_data) > 0 and bytes_data[0][0] == 'ecnaive_metadata':
+                # EC-NAIVE mode detected
+                logger.info(f"EC-NAIVE: Process {local_proc_idx} detected EC-NAIVE mode")
+                for key, value in bytes_data:
+                    if key == 'ecnaive_metadata':
+                        ecnaive_metadata = value
+                    elif key == 'ecnaive_continuous_buffer':
+                        ecnaive_continuous_buffer = value
+            
             # ECLATIN mode: save three components to ONE file (similar to ECCHECK)
             if eclatin_metadata is not None:
                 if use_msc:
@@ -1975,6 +2065,122 @@ class FileSystemWriterAsync(FileSystemWriter):
                     )
                 else:
                     logger.error("ECLATIN: Continuous buffer is None, cannot write Component 3")
+                
+                # Create dummy results for compatibility
+                local_results = []
+            
+            # EC-NAIVE mode: save three components to ONE file (similar to ECLATIN)
+            elif ecnaive_metadata is not None:
+                if use_msc:
+                    import multistorageclient as msc
+                    open_file = msc.open
+                else:
+                    open_file = open
+                
+                write_start = time()
+                logger.info("EC-NAIVE: Saving three components to single file...")
+                
+                # Get file path (file_name is the full path)
+                ecnaive_file_path = str(file_name)
+                
+                # Prepare header with component sizes
+                import struct
+                non_tensor_size = ecnaive_metadata['non_tensor_size']
+                tensor_keys_size = ecnaive_metadata['tensor_keys_size']
+                tensor_buffer_size = ecnaive_metadata['tensor_buffer_size']
+                
+                # Determine block type from storage_key
+                is_data0 = 'data0' in storage_key
+                is_recv_parity1 = 'recv_parity1' in storage_key
+                is_recv_parity0 = 'recv_parity0' in storage_key
+                is_recv_data1 = 'recv_data1' in storage_key
+                block_type = "data0" if is_data0 else ("recv_parity1" if is_recv_parity1 else ("recv_parity0" if is_recv_parity0 else ("recv_data1" if is_recv_data1 else "unknown")))
+                
+                if ecnaive_continuous_buffer is not None:
+                    buffer_size = ecnaive_continuous_buffer.numel()
+                    
+                    # All blocks use aligned half size (same as ECLATIN parity blocks)
+                    write_size = buffer_size
+                    
+                    # Header format: magic(4) + padding(4) + 3 sizes(8 each) = 32 bytes
+                    # Magic number: 'ECNV' (EC-NAIVE)
+                    header = struct.pack(
+                        '4sQQQ',
+                        b'ECNV',              # Magic number
+                        non_tensor_size,      # Component 1 size
+                        tensor_keys_size,     # Component 2 size
+                        write_size,           # Component 3 size (aligned half block size)
+                    )
+                    
+                    # Write all three components to one file
+                    with open_file(ecnaive_file_path, "wb") as f:
+                        # Write header
+                        header_start = time()
+                        f.write(header)
+                        logger.debug(f"EC-NAIVE: Wrote header in {time() - header_start:.4f}s")
+                        
+                        # Write Component 1: Non-tensor key-value pairs
+                        comp1_start = time()
+                        f.write(ecnaive_metadata['non_tensor_data'])
+                        comp1_time = time() - comp1_start
+                        logger.debug(f"EC-NAIVE: Wrote Component 1 ({non_tensor_size / 1024:.2f} KB) in {comp1_time:.4f}s")
+                        
+                        # Write Component 2: Tensor keys
+                        comp2_start = time()
+                        f.write(ecnaive_metadata['tensor_keys_data'])
+                        comp2_time = time() - comp2_start
+                        logger.debug(f"EC-NAIVE: Wrote Component 2 ({tensor_keys_size / 1024:.2f} KB) in {comp2_time:.4f}s")
+                        
+                        # Write Component 3: Block data
+                        component3_start = time()
+                        import numpy as np
+                        np_array = ecnaive_continuous_buffer[:write_size].numpy()  # Zero-copy view
+                        mv = memoryview(np_array)
+                        
+                        # Write data at once
+                        f.write(mv)
+                        component3_size = mv.nbytes
+                        
+                        # Verify size matches
+                        if component3_size != write_size:
+                            logger.warning(
+                                f"EC-NAIVE: Size mismatch: wrote {component3_size} bytes, "
+                                f"expected {write_size} bytes"
+                            )
+                        
+                        component3_time = time() - component3_start
+                        bandwidth = (component3_size / (1024**3)) / component3_time if component3_time > 0 else 0
+                        logger.info(
+                            f"EC-NAIVE: Wrote Component 3 ({component3_size / (1024**3):.2f} GB) "
+                            f"in {component3_time:.2f}s ({bandwidth:.2f} GB/s), "
+                            f"{block_type} block"
+                        )
+                        
+                        # Flush to disk
+                        if use_fsync:
+                            if use_msc:
+                                f.fsync()
+                            else:
+                                os.fsync(f.fileno())
+                    
+                    total_size = len(header) + non_tensor_size + tensor_keys_size + component3_size
+                    total_write_time = time() - write_start
+                    overall_bandwidth = (total_size / (1024**3)) / total_write_time if total_write_time > 0 else 0
+                    
+                    logger.info(
+                        f"EC-NAIVE: Saved all components in {total_write_time:.2f}s:\n"
+                        f"  File: {ecnaive_file_path}\n"
+                        f"  Block type: {block_type}\n"
+                        f"  Total size: {total_size / (1024**3):.2f} GB\n"
+                        f"  Overall bandwidth: {overall_bandwidth:.2f} GB/s\n"
+                        f"  Breakdown:\n"
+                        f"    Header: 32 bytes\n"
+                        f"    Component 1: {non_tensor_size / 1024:.2f} KB ({comp1_time:.4f}s)\n"
+                        f"    Component 2: {tensor_keys_size / 1024:.2f} KB ({comp2_time:.4f}s)\n"
+                        f"    Component 3: {component3_size / (1024**3):.2f} GB ({component3_time:.2f}s)"
+                    )
+                else:
+                    logger.error("EC-NAIVE: Continuous buffer is None, cannot write Component 3")
                 
                 # Create dummy results for compatibility
                 local_results = []
@@ -3296,6 +3502,434 @@ class FileSystemWriterAsync(FileSystemWriter):
         torch.cuda.synchronize()
         logger.info("ECLATIN: All pipelines completed and CUDA synchronized")
     
+    def _ecnaive_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
+        """
+        EC-NAIVE version: Transfer tensors from GPU to preallocated CPU buffer and submit to C++ pipeline.
+        
+        This method transfers tensor data from GPU to the preallocated CPU buffer
+        in a pipelined manner, enabling overlap with subsequent encoding operations.
+        
+        Args:
+            non_blocking (bool): if True, use non-blocking GPU-to-CPU transfer
+        
+        Returns:
+            List[WriteBucket]: List of WriteBuckets for the 4 blocks
+        """
+        if not self.decomposed_state_dict:
+            raise RuntimeError("EC-NAIVE: State dict not decomposed yet")
+        
+        logger.info("EC-NAIVE: Starting GPU-to-CPU tensor transfer...")
+        start = time()
+        
+        # Step 1: Get actual data size for this rank
+        actual_total_size = self.decomposed_state_dict.total_tensor_size_bytes
+        
+        # Step 2: Calculate maximum data size across all ranks
+        if (torch.distributed.is_initialized() and 
+            hasattr(self, 'ecnaive_global_registry') and 
+            self.ecnaive_global_registry is not None):
+            all_total_bytes_list = []
+            for r in range(torch.distributed.get_world_size()):
+                rank_metadata = self.ecnaive_global_registry.rank_metadata.get(r, [])
+                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                all_total_bytes_list.append(rank_total_size)
+            max_total_bytes = max(all_total_bytes_list)
+        else:
+            max_total_bytes = actual_total_size
+        
+        # Step 3: Allocate buffer with maximum size (for pipeline synchronization)
+        if self.preallocated_cpu_buffer is not None:
+            buffer = self.preallocated_cpu_buffer
+            if buffer.numel() < max_total_bytes:
+                logger.warning(
+                    f"EC-NAIVE: Preallocated buffer ({buffer.numel() / (1024**3):.2f} GB) "
+                    f"is smaller than max_total_bytes ({max_total_bytes / (1024**3):.2f} GB). "
+                    f"Reallocating..."
+                )
+                if self.ecnaive_pin_memory and torch.cuda.is_available():
+                    buffer = torch.empty(max_total_bytes, dtype=torch.uint8).pin_memory()
+                else:
+                    buffer = torch.empty(max_total_bytes, dtype=torch.uint8)
+        else:
+            if self.ecnaive_pin_memory and torch.cuda.is_available():
+                buffer = torch.empty(max_total_bytes, dtype=torch.uint8).pin_memory()
+            else:
+                buffer = torch.empty(max_total_bytes, dtype=torch.uint8)
+        
+        logger.info(
+            f"EC-NAIVE: Allocated continuous CPU buffer: {max_total_bytes / (1024**3):.2f} GB "
+            f"(actual data: {actual_total_size / (1024**3):.2f} GB, "
+            f"padding: {(max_total_bytes - actual_total_size) / (1024**3):.2f} GB)"
+        )
+        
+        # Step 4: Transfer tensors from GPU to continuous CPU buffer
+        num_gpu_tensors = 0
+        offset = 0
+        for info, tensor in zip(
+            self.decomposed_state_dict.tensor_infos,
+            self.decomposed_state_dict.tensor_data
+        ):
+            tensor_size = info.size_bytes
+            buffer_view = buffer[offset:offset + tensor_size]
+            tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
+            buffer_view.copy_(tensor_flat, non_blocking=non_blocking)
+            
+            if tensor.device.type != 'cpu':
+                num_gpu_tensors += 1
+            
+            info.offset = offset
+            info.device = torch.device('cpu')
+            offset += tensor_size
+        
+        # Step 5: Fill remaining space with zeros (for pipeline synchronization)
+        if offset < max_total_bytes:
+            padding_size = max_total_bytes - offset
+            buffer[offset:max_total_bytes].fill_(0)
+            logger.debug(
+                f"EC-NAIVE: Filled {padding_size / (1024**2):.2f} MB with zeros "
+                f"for pipeline synchronization"
+            )
+        
+        # Synchronize if using non-blocking transfers
+        if non_blocking and num_gpu_tensors > 0:
+            torch.cuda.synchronize()
+        
+        # Step 6: Store the continuous buffer
+        self.tensor_buffer = buffer
+        self.actual_tensor_buffer_size = actual_total_size
+        self.pipeline_total_bytes = max_total_bytes
+        
+        transfer_time = time() - start
+        total_gb = actual_total_size / (1024**3)
+        bandwidth = total_gb / transfer_time if transfer_time > 0 else 0
+        
+        logger.info(
+            f"EC-NAIVE: Transferred {total_gb:.2f} GB in {transfer_time:.2f}s "
+            f"({bandwidth:.2f} GB/s), {num_gpu_tensors} tensors from GPU to CPU"
+        )
+        
+        # Step 7: Verify blocks and buffers are set
+        if not hasattr(self, 'ecnaive_blocks') or self.ecnaive_blocks is None:
+            raise RuntimeError(
+                "EC-NAIVE: Blocks not set. Should be passed from strategy "
+                "after _prepare_ecnaive_data completes."
+            )
+        
+        if not hasattr(self, 'ecnaive_data_buffers') or self.ecnaive_data_buffers is None:
+            raise RuntimeError(
+                "EC-NAIVE: Data buffers not set. Should be passed from strategy."
+            )
+        
+        if not hasattr(self, 'ecnaive_parity_buffers') or self.ecnaive_parity_buffers is None:
+            raise RuntimeError(
+                "EC-NAIVE: Parity buffers not set. Should be passed from strategy."
+            )
+        
+        # Step 8: Execute pipelines
+        exec_start = time()
+        self._execute_ecnaive_pipelines()
+        exec_time = time() - exec_start
+        
+        logger.info(f"EC-NAIVE: Pipeline execution completed in {exec_time:.2f}s")
+        duration = time() - start
+        logger.warning(f"EC-NAIVE: Pipeline execution completed in {duration:.2f}s")
+
+        # Step 9: Update self.write_buckets and return (consistent with ECLATIN)
+        # This ensures retrieve_write_results() can check the correct count
+        if hasattr(self, 'ec_write_buckets') and self.ec_write_buckets:
+            # Update paths with current checkpoint_dir (similar to ECLATIN)
+            result_buckets = []
+            
+            # Extract metadata from first block (all blocks use the same metadata)
+            first_bucket = self.ec_write_buckets[0]
+            _, _, (first_bytes_data, _) = first_bucket
+            
+            # Extract metadata for main file
+            main_file_metadata = None
+            for key, value in first_bytes_data:
+                if key == 'ecnaive_metadata':
+                    main_file_metadata = value
+                    break
+            
+            # Add main file bucket (similar to ECLATIN)
+            if main_file_metadata:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                ecnaive_main_file = f"__{rank}_0.distcp"
+                ecnaive_main_path = Path(self.checkpoint_dir) / ecnaive_main_file
+                
+                # Use same metadata but with full tensor_buffer instead of block tensor
+                ecnaive_main_bytes_data = [
+                    ('ecnaive_metadata', main_file_metadata),
+                    ('ecnaive_continuous_buffer', self.tensor_buffer),  # Full tensor_buffer
+                ]
+                result_buckets.append((ecnaive_main_path, ecnaive_main_file, (ecnaive_main_bytes_data, [])))
+                logger.debug(f"EC-NAIVE: Added main file bucket: {ecnaive_main_path}")
+            
+            # Add 4 block buckets
+            for bucket in self.ec_write_buckets:
+                file_path, storage_key, data = bucket
+                # Extract file name from path
+                if isinstance(file_path, (str, Path)):
+                    file_path_obj = Path(file_path)
+                    file_name = file_path_obj.name
+                else:
+                    file_name = str(file_path).split('/')[-1] if '/' in str(file_path) else str(file_path)
+                
+                # Build new path with current checkpoint_dir
+                new_file_path = Path(self.checkpoint_dir) / file_name
+                result_buckets.append((new_file_path, storage_key, data))
+            
+            # Update self.write_buckets so retrieve_write_results() can check the correct count
+            self.write_buckets = result_buckets
+            return result_buckets
+        else:
+            return []
+
+    def _execute_ecnaive_pipelines(self) -> None:
+        """
+        Execute EC-NAIVE pipelines: Copy data to blocks and submit to C++ pipeline.
+        """
+        logger.info("EC-NAIVE: Starting pipeline execution...")
+        self.ecnaive_native.reset_encoding_completion_flags()
+
+        # Activate buffer poller if available
+        if hasattr(self, '_ecnaive_buffer_poller_active_event'):
+            if self._ecnaive_buffer_poller_active_event is not None:
+                self._ecnaive_buffer_poller_active_event.set()
+                logger.debug("EC-NAIVE: Activated buffer poller")
+        
+        try:
+            # Copy tensor data to blocks and submit to pipelines
+            self._copy_tensor_data_to_ecnaive_blocks()
+        finally:
+            # Deactivate buffer poller
+            if hasattr(self, '_ecnaive_buffer_poller_active_event'):
+                if self._ecnaive_buffer_poller_active_event is not None:
+                    self._ecnaive_buffer_poller_active_event.clear()
+                    logger.debug("EC-NAIVE: Deactivated buffer poller")
+
+    def _copy_tensor_data_to_ecnaive_blocks(self) -> None:
+        """Copy tensor data to 4 blocks and submit to C++ pipeline using round-robin."""
+        
+        def get_free_data_buffer():
+            """Get a free data buffer address, blocking if none available."""
+            if hasattr(self, '_ecnaive_strategy_poll_and_release_buffers'):
+                self._ecnaive_strategy_poll_and_release_buffers()
+            
+            try:
+                return self._free_ecnaive_data_buffer_queue.get(timeout=5.0)
+            except queue.Empty:
+                logger.error("EC-NAIVE: TIMEOUT waiting for free data buffer!")
+                logger.error(f"EC-NAIVE: Data buffer queue size: {self._free_ecnaive_data_buffer_queue.qsize()}")
+                return self._free_ecnaive_data_buffer_queue.get()
+        
+        def get_free_parity_buffer():
+            """Get a free parity buffer address, blocking if none available."""
+            if hasattr(self, '_ecnaive_strategy_poll_and_release_buffers'):
+                self._ecnaive_strategy_poll_and_release_buffers()
+            
+            try:
+                return self._free_ecnaive_parity_buffer_queue.get(timeout=5.0)
+            except queue.Empty:
+                logger.error("EC-NAIVE: TIMEOUT waiting for free parity buffer!")
+                return self._free_ecnaive_parity_buffer_queue.get()
+        
+        # Get 4 blocks from ecnaive_blocks
+        data0 = self.ecnaive_blocks['data0']
+        recv_parity1 = self.ecnaive_blocks['recv_parity1']
+        recv_parity0 = self.ecnaive_blocks['recv_parity0']
+        recv_data1 = self.ecnaive_blocks['recv_data1']
+        
+        # Calculate base addresses
+        data0_base = int(data0.data_ptr())
+        recv_parity1_base = int(recv_parity1.data_ptr())
+        recv_parity0_base = int(recv_parity0.data_ptr())
+        recv_data1_base = int(recv_data1.data_ptr())
+        
+        # Initialize offsets (will be 64-byte aligned when used)
+        data0_offset = 0
+        recv_parity1_offset = 0
+        recv_parity0_offset = 0
+        recv_data1_offset = 0
+        
+        # Get block sizes (all should be the same - aligned_size)
+        aligned_block_size = self.ecnaive_blocks['aligned_size']
+        block_size = aligned_block_size
+        
+        # Process continuous tensor buffer sequentially
+        # Use pipeline_total_bytes (padded size) to ensure all ranks have same iterations
+        total_bytes = self.pipeline_total_bytes
+        actual_data_bytes = self.actual_tensor_buffer_size
+        
+        # Split total_bytes into two halves
+        half_total = total_bytes // 2  # Divide pipeline_total_bytes into two halves
+        
+        src_pos = 0  # Current position in continuous tensor buffer (for iteration)
+        
+        logger.info(
+            f"EC-NAIVE: Processing {total_bytes / (1024**3):.2f} GB "
+            f"(actual: {actual_data_bytes / (1024**3):.2f} GB) "
+            f"in chunks of {self.ecnaive_buffer_size / (1024**2):.0f} MB, "
+            f"split into two halves of {half_total / (1024**3):.2f} GB each"
+        )
+        
+        import ctypes
+        
+        while src_pos < half_total:
+            # Calculate chunk size
+            remaining_in_source = total_bytes - src_pos
+            take = min(self.ecnaive_buffer_size, remaining_in_source)
+            
+            # Get temporary buffers from pools
+            data1_addr = get_free_data_buffer()  # For sending d_{i1}
+            parity0_addr = get_free_parity_buffer()  # For sending p_{i0}
+            parity1_addr = get_free_parity_buffer()  # For sending p_{i1}
+            
+            # Copy from first half to data1 (temporary buffer, will be sent)
+            data1_ptr = ctypes.cast(data1_addr, ctypes.POINTER(ctypes.c_uint8))
+            data1_array = ctypes.cast(data1_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
+            
+            # Source position in first half
+            src_pos_half1 = src_pos  # Position in first half
+            if src_pos_half1 < half_total:
+                bytes_to_copy_half1 = min(take, half_total - src_pos_half1)
+                if src_pos_half1 < actual_data_bytes:
+                    actual_bytes_half1 = min(bytes_to_copy_half1, actual_data_bytes - src_pos_half1)
+                    
+                    # Zero-copy optimization: directly use tensor's data pointer
+                    src_base_ptr = self.tensor_buffer.data_ptr()
+                    src_addr_half1 = src_base_ptr + src_pos_half1
+                    
+                    ctypes.memmove(data1_array.contents, src_addr_half1, actual_bytes_half1)
+                    
+                    if bytes_to_copy_half1 > actual_bytes_half1:
+                        padding_size = bytes_to_copy_half1 - actual_bytes_half1
+                        padding_ptr = ctypes.cast(
+                            ctypes.addressof(data1_array.contents) + actual_bytes_half1,
+                            ctypes.POINTER(ctypes.c_uint8)
+                        )
+                        ctypes.memset(padding_ptr, 0, padding_size)
+                    
+                    if take > bytes_to_copy_half1:
+                        # Fill remaining with zeros
+                        remaining_padding = take - bytes_to_copy_half1
+                        remaining_ptr = ctypes.cast(
+                            ctypes.addressof(data1_array.contents) + bytes_to_copy_half1,
+                            ctypes.POINTER(ctypes.c_uint8)
+                        )
+                        ctypes.memset(remaining_ptr, 0, remaining_padding)
+                else:
+                    # Past actual data, fill with zeros
+                    ctypes.memset(data1_array.contents, 0, take)
+            else:
+                # Past first half, fill with zeros
+                ctypes.memset(data1_array.contents, 0, take)
+            
+            # Copy from second half similarly (for encoding, but data1 is already copied)
+            # Note: The second half will be used for encoding in C++, but we only need to copy data1 here
+            # The encoding will use both halves from tensor_buffer directly in C++
+            
+            # Write to data0 (persistent block, local, not sent)
+            # Calculate aligned offsets for persistent blocks
+            data0_offset_aligned = ((data0_offset + 63) // 64) * 64
+            recv_parity1_offset_aligned = ((recv_parity1_offset + 63) // 64) * 64
+            recv_parity0_offset_aligned = ((recv_parity0_offset + 63) // 64) * 64
+            recv_data1_offset_aligned = ((recv_data1_offset + 63) // 64) * 64
+            
+            # Check bounds
+            if data0_offset_aligned + take > block_size:
+                logger.warning(f"EC-NAIVE: data0 exhausted")
+                break
+            if recv_parity1_offset_aligned + take > block_size:
+                logger.warning(f"EC-NAIVE: recv_parity1 exhausted")
+                break
+            if recv_parity0_offset_aligned + take > block_size:
+                logger.warning(f"EC-NAIVE: recv_parity0 exhausted")
+                break
+            if recv_data1_offset_aligned + take > block_size:
+                logger.warning(f"EC-NAIVE: recv_data1 exhausted")
+                break
+            
+            # Calculate write addresses
+            data0_write_addr = data0_base + data0_offset_aligned
+            recv_parity1_write_addr = recv_parity1_base + recv_parity1_offset_aligned
+            recv_parity0_write_addr = recv_parity0_base + recv_parity0_offset_aligned
+            recv_data1_write_addr = recv_data1_base + recv_data1_offset_aligned
+            
+            # Copy data0 to persistent block (local, not sent)
+            # CRITICAL: Use actual_data_bytes // 2 as split point for data blocks
+            # Pipeline uses half_total (pipeline_total_bytes // 2) for synchronization,
+            # but data blocks should split actual data at actual_data_bytes // 2
+            half_actual_data = actual_data_bytes // 2  # Split point for actual data
+            
+            data0_ptr = ctypes.cast(data0_write_addr, ctypes.POINTER(ctypes.c_uint8))
+            
+            # Copy from first half to data0 (only the actual data portion)
+            if src_pos_half1 < half_actual_data:
+                bytes_to_write_half1 = min(take, half_actual_data - src_pos_half1)
+                if src_pos_half1 < actual_data_bytes:
+                    actual_write_half1 = min(bytes_to_write_half1, actual_data_bytes - src_pos_half1)
+                    
+                    # Copy from tensor_buffer directly
+                    src_base_ptr = self.tensor_buffer.data_ptr()
+                    src_addr_half1 = src_base_ptr + src_pos_half1
+                    ctypes.memmove(data0_ptr, src_addr_half1, actual_write_half1)
+                else:
+                    ctypes.memset(data0_ptr, 0, take)
+            else:
+                # Past first half of actual data, no data for data0
+                ctypes.memset(data0_ptr, 0, take)
+            
+            # Verify address alignment
+            assert data0_write_addr % 64 == 0
+            assert recv_parity1_write_addr % 64 == 0
+            assert recv_parity0_write_addr % 64 == 0
+            assert recv_data1_write_addr % 64 == 0
+            
+            # Submit to C++ pipeline using unified function
+            # Note: data0 is already written to persistent block above
+            # C++ will encode data0 and data1 to get parity0 and parity1, then send/receive
+            self.ecnaive_native.submit_ecnaive_save(
+                data0_addr=data0_write_addr,  # Persistent block address (local, not sent)
+                data1_addr=data1_addr,  # Temporary buffer (will be sent)
+                parity0_addr=parity0_addr,  # Temporary buffer (will be sent, encoded from data0+data1)
+                parity1_addr=parity1_addr,  # Temporary buffer (will be sent, encoded from data0+data1)
+                recv_parity1_addr=recv_parity1_write_addr,  # Persistent block address (receive from rank i+1)
+                recv_parity0_addr=recv_parity0_write_addr,  # Persistent block address (receive from rank i+2)
+                recv_data1_addr=recv_data1_write_addr,  # Persistent block address (receive from rank i+3)
+                size=take
+            )
+            
+            # Update offsets
+            data0_offset = data0_offset_aligned + take
+            recv_parity1_offset = recv_parity1_offset_aligned + take
+            recv_parity0_offset = recv_parity0_offset_aligned + take
+            recv_data1_offset = recv_data1_offset_aligned + take
+            
+            src_pos += take
+        
+        logger.info(
+            f"EC-NAIVE: Processed {src_pos / (1024**3):.2f} GB\n"
+            f"  data0 used: {data0_offset / (1024**3):.2f} GB\n"
+            f"  recv_parity1 used: {recv_parity1_offset / (1024**3):.2f} GB\n"
+            f"  recv_parity0 used: {recv_parity0_offset / (1024**3):.2f} GB\n"
+            f"  recv_data1 used: {recv_data1_offset / (1024**3):.2f} GB"
+        )
+        
+        # Submit sentinels
+        self.ecnaive_native.submit_send_data1_sentinel()
+        self.ecnaive_native.submit_send_parity0_sentinel()
+        self.ecnaive_native.submit_send_parity1_sentinel()
+        self.ecnaive_native.submit_recv_parity1_sentinel()
+        self.ecnaive_native.submit_recv_parity0_sentinel()
+        self.ecnaive_native.submit_recv_data1_sentinel()
+        
+        # Wait for completion
+        logger.info("EC-NAIVE: Waiting for all pipelines to complete...")
+        self.ecnaive_native.wait_for_encoding_completion()
+        torch.cuda.synchronize()
+        logger.info("EC-NAIVE: All pipelines completed and CUDA synchronized")
+
     def _eclatin_preload_tensors_layerwise(self, non_blocking: bool = True) -> List[WriteBucket]:
         """
         ECLATIN layer-wise version: Transfer tensors layer-by-layer from GPU to CPU and submit to C++ pipelines.

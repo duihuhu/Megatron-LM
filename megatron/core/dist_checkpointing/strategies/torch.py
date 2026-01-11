@@ -61,6 +61,7 @@ from .base import (
 from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .eccheck_manager import ECCHECKManager
 from .eclatin_manager import ECLATINManager
+from .ecnaive_manager import ECNAIVEManager
 from .gemini_manager import GeminiManager
 from .gemini_replicas_manager import GeminiReplicasManager
 from .filesystem_async import FileSystemWriterAsync
@@ -722,6 +723,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.eclatin_manager = ECLATINManager()
         self.eclatin_manager.init_eclatin_if_enabled()
         
+        # Initialize EC-NAIVE manager (singleton instance shared with Load strategy)
+        self.ecnaive_manager = ECNAIVEManager()
+        self.ecnaive_manager.init_ecnaive_if_enabled()
+        
         # Initialize Gemini manager (singleton instance for replica-level data transfer)
         from .gemini_manager import GeminiManager
         self.gemini_manager = GeminiManager()
@@ -751,6 +756,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.eclatin_blocks = None  # 4 persistent blocks (data_block_1/2, parity_block_1/2)
         self.ecl_write_buckets = []  # WriteBuckets for 4 blocks
         self.eclatin_recv_buffers_layerwise = None  # 4 recv buffers for layerwise mode (continuous, allocated in strategy)
+        
+        # Initialize strategy-specific EC-NAIVE state
+        self.ecnaive_preallocate_cpu_buffer = True  # Preallocate CPU buffer for tensor data
+        self.ecnaive_use_continuous_buffer = True  # Use continuous buffer for tensor data
+        # Note: decomposed_state_dict and preallocated_cpu_buffer are shared with ECCHECK/ECLATIN
+        self.ecnaive_serialized_metadata = None
+        self.ecnaive_global_registry = None
+        self.ecnaive_blocks = None  # 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1)
+        self.ec_write_buckets = []  # WriteBuckets for 4 blocks
 
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank using the shared manager."""
@@ -1010,6 +1024,17 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         in _allocate_eclatin_blocks after metadata exchange.
         """
         return self.eclatin_manager.get_eclatin_buffers()
+    
+    def _get_ecnaive_buffers(self):
+        """Get EC-NAIVE buffers for FileSystemWriterAsync.
+        
+        Note: Returns data and parity buffers (pooled).
+        The 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1) are allocated
+        in _allocate_ecnaive_blocks after metadata exchange.
+        """
+        if not self.ecnaive_manager.use_ecnaive:
+            return None
+        return self.ecnaive_manager.get_ecnaive_buffers()
 
     def __del__(self):
         """Cleanup EC-CHECK resources when strategy is destroyed.
@@ -1044,7 +1069,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         args = input_args()
         # Use PyT saving mechanism
 
-        # Create FileSystemWriterAsync with EC-CHECK, ECLATIN, Gemini, or Gemini Replicas parameters
+        # Create FileSystemWriterAsync with EC-CHECK, ECLATIN, EC-NAIVE, Gemini, or Gemini Replicas parameters
         if self.eclatin_manager.use_eclatin:
             from megatron.training import get_args
             args = get_args()
@@ -1063,6 +1088,20 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             # Pass layerwise recv buffers if available
             if use_eclatin_layerwise and self.eclatin_recv_buffers_layerwise is not None:
                 writer.eclatin_recv_buffers_layerwise = self.eclatin_recv_buffers_layerwise
+                
+        elif self.ecnaive_manager.use_ecnaive:
+            from megatron.training import get_args
+            args = get_args()
+            
+            writer = FileSystemWriterAsync(
+                checkpoint_dir,
+                separation_hint=self.separation_hint,
+                thread_count=self.thread_count,
+                use_msc=MultiStorageClientFeature.is_enabled(),
+                use_ecnaive=self.ecnaive_manager.use_ecnaive,
+                ecnaive_native=self.ecnaive_manager._ecnaive_native,  # Pass pre-initialized C++ module
+                ecnaive_buffers=self._get_ecnaive_buffers(),  # Pass pre-allocated buffers
+            )
                 
         elif self.gemini_replicas_manager.use_gemini_replicas and self.gemini_replicas_manager.use_gemini_replicas_optimized:
             writer = FileSystemWriterAsync(
@@ -1156,6 +1195,21 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 )
             
             # In ECLATIN mode, call prepare_write_data to create write_buckets
+            # It will use the metadata we just prepared
+            writer.prepare_write_data(self.cached_central_plan, planner)
+        # EC-NAIVE mode: decompose state_dict and preallocate CPU memory
+        elif self.ecnaive_manager.use_ecnaive:
+            self._prepare_ecnaive_data(self.cached_central_plan, planner)
+            # Pass EC-NAIVE state to writer if available
+            writer.decomposed_state_dict = self.decomposed_state_dict
+            writer.preallocated_cpu_buffer = self.preallocated_cpu_buffer
+            writer.ecnaive_serialized_metadata = self.ecnaive_serialized_metadata
+            writer.ecnaive_global_registry = self.ecnaive_global_registry
+            # Pass the 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1)
+            writer.ecnaive_blocks = self.ecnaive_blocks
+            writer.ec_write_buckets = self.ec_write_buckets
+            
+            # In EC-NAIVE mode, call prepare_write_data to create write_buckets
             # It will use the metadata we just prepared
             writer.prepare_write_data(self.cached_central_plan, planner)
         # Gemini Replicas mode: decompose state_dict and preallocate CPU memory for multi-replica exchange
@@ -2003,7 +2057,403 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         logger.debug("ECLATIN: Decomposition validation passed")
         return True
 
-    def _allocate_eclatin_blocks(self, global_registry):
+    def _prepare_ecnaive_data(self, plan: SavePlan, planner: SavePlanner) -> None:
+        """
+        EC-NAIVE preparation: organize data for serialization-free checkpointing.
+        
+        This method performs the following steps:
+        1. Process plan items like normal mode (separate bytes and tensors)
+        2. Organize tensors for EC-NAIVE (extract metadata and data)
+        3. Preallocate CPU memory buffer for tensors
+        4. Prepare write buckets for async transfer
+        5. Broadcast and exchange metadata
+        6. Allocate 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1)
+        
+        Args:
+            plan (SavePlan): save plan from PyTorch distributed checkpoint
+            planner (SavePlanner): save planner to resolve data
+        """
+        from torch.distributed.checkpoint.filesystem import _StoragePrefix
+        from time import time
+        
+        start_total = time()
+        logger.info("EC-NAIVE: Starting serialization-free checkpoint preparation")
+        
+        # Step 1: Process plan items (similar to ECLATIN)
+        start = time()
+        storage_plan: _StoragePrefix = plan.storage_data
+        
+        # Separate items into BYTE_IO (non-tensor) and TENSOR
+        non_tensor_data = {}
+        tensor_infos = []
+        tensor_data_list = []
+        
+        logger.info(f"EC-NAIVE: Processing {len(plan.items)} items from SavePlan")
+        byte_io_count = 0
+        tensor_count = 0
+        none_data_count = 0
+        
+        for item in plan.items:
+            data = planner.resolve_data(item)
+            
+            # Debug: check for None data
+            if data is None:
+                none_data_count += 1
+                if none_data_count <= 5:
+                    logger.warning(f"EC-NAIVE SAVE: Found None data for item: fqn={item.index.fqn}, type={item.type}")
+                continue  # Skip None data items
+            
+            if item.type == WriteItemType.BYTE_IO:
+                # Non-tensor data (e.g., extra_state)
+                import io
+                if isinstance(data, io.BytesIO):
+                    non_tensor_data[item.index.fqn] = {
+                        '_ecnaive_type': 'BytesIO',
+                        '_ecnaive_data': data.getvalue()
+                    }
+                else:
+                    non_tensor_data[item.index.fqn] = data
+                byte_io_count += 1
+            else:
+                # Tensor data - create TensorInfo
+                from .state_dict_decomposer import TensorInfo
+                
+                tensor_info = TensorInfo(
+                    key=item.index.fqn,
+                    shape=tuple(data.shape),
+                    dtype=data.dtype,
+                    device=data.device,
+                    numel=data.numel(),
+                    size_bytes=data.numel() * data.element_size(),
+                    offset=0,  # Will be calculated below
+                    global_offset=tuple(item.index.offset),
+                    shard_index=item.index.index,
+                )
+                tensor_infos.append(tensor_info)
+                tensor_data_list.append(data)
+                tensor_count += 1
+        
+        logger.info(
+            f"EC-NAIVE: Processed {byte_io_count} BytesIO items, {tensor_count} tensor items"
+            + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
+        )
+        
+        # Calculate offsets for tensor data
+        offset = 0
+        for info in tensor_infos:
+            info.offset = offset
+            offset += info.size_bytes
+        
+        # Create decomposed structure (reuse from ECCHECK/ECLATIN if available, otherwise create new)
+        if self.decomposed_state_dict is None:
+            from .state_dict_decomposer import DecomposedStateDict
+            self.decomposed_state_dict = DecomposedStateDict(
+                non_tensor_data=non_tensor_data,
+                tensor_infos=tensor_infos,
+                tensor_data=tensor_data_list,
+            )
+        else:
+            # Update existing decomposed_state_dict
+            self.decomposed_state_dict.non_tensor_data = non_tensor_data
+            self.decomposed_state_dict.tensor_infos = tensor_infos
+            self.decomposed_state_dict.tensor_data = tensor_data_list
+        
+        process_time = time() - start
+        
+        # Log statistics
+        stats = self.decomposed_state_dict.get_statistics()
+        logger.info(
+            f"EC-NAIVE: Processed plan items in {process_time:.2f}s\n"
+            f"  Non-tensor items: {len(non_tensor_data)}\n"
+            f"  Tensor items: {len(tensor_data_list)}\n"
+            f"  Non-tensor data: {stats['non_tensor_size_bytes'] / 1024:.2f} KB "
+            f"({stats['non_tensor_percentage']:.4f}%)\n"
+            f"  Tensor keys: {stats['tensor_keys_size_bytes'] / 1024:.2f} KB "
+            f"({stats['tensor_keys_percentage']:.4f}%)\n"
+            f"  Tensor data: {stats['tensor_data_size_bytes'] / (1024**3):.2f} GB "
+            f"({stats['tensor_data_percentage']:.2f}%)"
+        )
+        
+        # Step 2: Preallocate CPU memory buffer if enabled
+        if self.ecnaive_preallocate_cpu_buffer:
+            start = time()
+            total_size = self.decomposed_state_dict.total_tensor_size_bytes
+            logger.info(f"EC-NAIVE: Preallocating CPU buffer of {total_size / (1024**3):.2f} GB")
+            
+            if self.preallocated_cpu_buffer is None:
+                if self.ecnaive_manager.ecnaive_pin_memory and torch.cuda.is_available():
+                    self.preallocated_cpu_buffer = torch.empty(
+                        total_size, dtype=torch.uint8).pin_memory()
+                    logger.info("EC-NAIVE: Using pinned memory for CPU buffer")
+                else:
+                    self.preallocated_cpu_buffer = torch.empty(
+                        total_size, dtype=torch.uint8
+                    )
+                    logger.info("EC-NAIVE: Using non-pinned memory for CPU buffer")
+            
+            prealloc_time = time() - start
+            logger.debug(f"EC-NAIVE: CPU buffer preallocation took {prealloc_time:.2f}s")
+        else:
+            prealloc_time = 0
+        
+        # Step 3: Prepare write buckets for async transfer
+        # Note: WriteBuckets for 4 blocks will be created in _allocate_ecnaive_blocks
+        # This step is a placeholder for consistency with ECLATIN flow
+        start = time()
+        bucket_time = time() - start
+        logger.debug(f"EC-NAIVE: Write bucket preparation (will be done in block allocation)")
+        
+        # Step 4: Validate decomposition
+        if not self.validate_ecnaive_decomposition():
+            raise RuntimeError("EC-NAIVE: Decomposition validation failed")
+        
+        # Step 5: Broadcast and exchange metadata (reuse ECCHECK method)
+        start = time()
+        self.ecnaive_global_registry = self._broadcast_and_exchange_metadata()
+        metadata_time = time() - start
+        logger.info(f"EC-NAIVE: Metadata exchange completed in {metadata_time:.2f}s")
+        
+        # Step 6: Allocate 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1)
+        start = time()
+        if self.ecnaive_blocks is None:
+            self.ecnaive_blocks = self._allocate_ecnaive_blocks(self.ecnaive_global_registry)
+        block_alloc_time = time() - start
+        logger.info(f"EC-NAIVE: Block allocation completed in {block_alloc_time:.2f}s")
+        
+        total_time = time() - start_total
+        logger.info(
+            f"EC-NAIVE: Preparation completed in {total_time:.2f}s\n"
+            f"  Item processing: {process_time:.2f}s\n"
+            f"  Preallocation: {prealloc_time:.2f}s\n"
+            f"  Bucket prep: {bucket_time:.2f}s\n"
+            f"  Metadata exchange: {metadata_time:.2f}s\n"
+            f"  Block allocation: {block_alloc_time:.2f}s"
+        )
+
+    def validate_ecnaive_decomposition(self) -> bool:
+        """
+        Validate EC-NAIVE decomposition structure.
+        
+        Validates:
+        1. non_tensor_data is a dict
+        2. tensor_infos is a list (tensor keys)
+        3. tensor_data is a list of tensors
+        4. Counts match between tensor_infos and tensor_data
+        
+        Returns:
+            bool: True if decomposition is valid, False otherwise
+        """
+        if not self.ecnaive_manager.use_ecnaive:
+            logger.warning("EC-NAIVE: Validation skipped - EC-NAIVE is not enabled")
+            return False
+        
+        if not self.decomposed_state_dict:
+            logger.error("EC-NAIVE: Validation failed - State dict not decomposed yet")
+            return False
+        
+        decomposed = self.decomposed_state_dict
+        
+        # Check 1: Non-tensor key-value pairs (dict)
+        if not isinstance(decomposed.non_tensor_data, dict):
+            logger.error(
+                f"EC-NAIVE: Component 1 failed - non_tensor_data should be dict, "
+                f"got {type(decomposed.non_tensor_data).__name__}"
+            )
+            return False
+        
+        # Check 2: Tensor keys (list)
+        if not isinstance(decomposed.tensor_infos, list):
+            logger.error(
+                f"EC-NAIVE: Component 2 failed - tensor_infos should be list, "
+                f"got {type(decomposed.tensor_infos).__name__}"
+            )
+            return False
+        
+        # Check 3: Tensor data (list)
+        if not isinstance(decomposed.tensor_data, list):
+            logger.error(
+                f"EC-NAIVE: Component 3 failed - tensor_data should be list, "
+                f"got {type(decomposed.tensor_data).__name__}"
+            )
+            return False
+        
+        # Check 4: Counts match
+        if len(decomposed.tensor_infos) != len(decomposed.tensor_data):
+            logger.error(
+                f"EC-NAIVE: Component count mismatch - tensor_infos has {len(decomposed.tensor_infos)} items, "
+                f"tensor_data has {len(decomposed.tensor_data)} items"
+            )
+            return False
+        
+        # Check 5: Total size matches
+        calculated_size = sum(info.size_bytes for info in decomposed.tensor_infos)
+        if calculated_size != decomposed.total_tensor_size_bytes:
+            logger.warning(
+                f"EC-NAIVE: Size mismatch - calculated {calculated_size} bytes, "
+                f"but total_tensor_size_bytes is {decomposed.total_tensor_size_bytes} bytes"
+            )
+            # This is a warning, not an error, as it might be due to rounding
+        
+        logger.debug("EC-NAIVE: Decomposition validation passed")
+        return True
+
+    def _allocate_ecnaive_blocks(self, global_registry):
+        """
+        Allocate 4 persistent blocks for EC-NAIVE:
+        - data0: Local data block (kept, not sent)
+        - recv_parity1: Receive p_{(i+1),1} from rank (i+1)
+        - recv_parity0: Receive p_{(i+2),0} from rank (i+2)
+        - recv_data1: Receive d_{(i+3),1} from rank (i+3)
+        
+        All blocks are aligned to the maximum size across all ranks for pipeline synchronization.
+        This ensures all ranks use the same block sizes.
+        
+        Args:
+            global_registry: GlobalMetadataRegistry from all ranks
+            
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary with 'data0', 'recv_parity1', 
+                                    'recv_parity0', 'recv_data1'
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        # ===== Get own data size from metadata =====
+        own_metadata = global_registry.rank_metadata.get(rank, [])
+        own_total_size = sum(meta.size_bytes for meta in own_metadata)
+        
+        # ===== Calculate maximum data size across all ranks =====
+        if torch.distributed.is_initialized():
+            # Get all ranks' data sizes from global_registry and compute max locally
+            all_total_bytes_list = []
+            for r in range(world_size):
+                rank_metadata = global_registry.rank_metadata.get(r, [])
+                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                all_total_bytes_list.append(rank_total_size)
+            
+            # Compute maximum locally (all ranks have the same global_registry)
+            max_total_bytes = max(all_total_bytes_list)
+        else:
+            max_total_bytes = own_total_size
+        
+        # ===== Align block size to buffer_size (64MB) using half of maximum =====
+        ecnaive_buffer_size = self.ecnaive_manager.ecnaive_buffer_size
+        # Each block only needs half of max_total_bytes (data is split into two halves)
+        half_max_total_bytes = max_total_bytes // 2
+        aligned_half_block_size = ((half_max_total_bytes + ecnaive_buffer_size - 1) // ecnaive_buffer_size) * ecnaive_buffer_size
+        
+        logger.info(
+            f"EC-NAIVE: Allocating 4 persistent blocks based on metadata\n"
+            f"  Own data size: {own_total_size / (1024**3):.2f} GB (actual), "
+            f"{max_total_bytes / (1024**3):.2f} GB (pipeline max), "
+            f"{aligned_half_block_size / (1024**3):.2f} GB (aligned half block size)\n"
+            f"  All blocks will use aligned half size: {aligned_half_block_size / (1024**3):.2f} GB "
+            f"({aligned_half_block_size / (1024**2):.0f} MB)"
+        )
+        
+        # ===== Allocate 4 large continuous buffers =====
+        # All blocks use the same aligned half size (each block stores half of the data)
+        data0 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        recv_parity1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        recv_parity0 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        recv_data1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        
+        logger.info(
+            f"EC-NAIVE: Allocated 4 persistent blocks:\n"
+            f"  data0: {aligned_half_block_size / (1024**3):.2f} GB "
+            f"({aligned_half_block_size / (1024**2):.0f} MB)\n"
+            f"  recv_parity1: {aligned_half_block_size / (1024**3):.2f} GB "
+            f"({aligned_half_block_size / (1024**2):.0f} MB)\n"
+            f"  recv_parity0: {aligned_half_block_size / (1024**3):.2f} GB "
+            f"({aligned_half_block_size / (1024**2):.0f} MB)\n"
+            f"  recv_data1: {aligned_half_block_size / (1024**3):.2f} GB "
+            f"({aligned_half_block_size / (1024**2):.0f} MB)\n"
+            f"  Total memory: {4 * aligned_half_block_size / (1024**3):.2f} GB"
+        )
+        
+        # ===== Package blocks with metadata =====
+        # Align with EC-CHECK/ECLATIN: use decomposed_state_dict.non_tensor_data directly
+        own_non_tensor_data = self.decomposed_state_dict.non_tensor_data
+        tensor_infos = self.decomposed_state_dict.tensor_infos  # List[TensorInfo] with offsets
+        own_non_tensor_data_bytes = pickle.dumps(own_non_tensor_data)
+        own_tensor_keys_data_bytes = pickle.dumps(tensor_infos)
+        own_non_tensor_size = len(own_non_tensor_data_bytes)
+        own_tensor_keys_size = len(own_tensor_keys_data_bytes)
+        own_tensor_buffer_size = self.decomposed_state_dict.total_tensor_size_bytes
+        
+        # Create serialized metadata for all blocks (same metadata for all)
+        block_serialized_metadata = {
+            'non_tensor_data': own_non_tensor_data_bytes,
+            'tensor_keys_data': own_tensor_keys_data_bytes,
+            'non_tensor_size': own_non_tensor_size,
+            'tensor_keys_size': own_tensor_keys_size,
+            'tensor_buffer_size': own_tensor_buffer_size,
+        }
+        
+        # Store actual size and pipeline size for later use
+        own_actual_size = own_total_size
+        block_pipeline_total_bytes = max_total_bytes
+        
+        # ===== Package blocks into WriteBucket format =====
+        # Similar to ECCHECK/ECLATIN's P2P buffers, create WriteBuckets for each block
+        from pathlib import Path
+        
+        # Get checkpoint_dir
+        checkpoint_dir = getattr(self, 'current_checkpoint_dir', None)
+        if checkpoint_dir is None:
+            logger.warning("EC-NAIVE: checkpoint_dir not available, using file_name as path")
+            checkpoint_dir = Path(".")
+        else:
+            checkpoint_dir = Path(checkpoint_dir)
+        
+        # Create WriteBuckets for 4 blocks
+        # Format: (file_path, storage_key, (bytes_data, tensor_data))
+        block_names = ['data0', 'recv_parity1', 'recv_parity0', 'recv_data1']
+        block_tensors = [data0, recv_parity1, recv_parity0, recv_data1]
+        
+        for block_name, block_tensor in zip(block_names, block_tensors):
+            # Create ecnaive_bytes_data format (reuse ECLATIN format for compatibility)
+            block_ecnaive_bytes_data = [
+                ('ecnaive_metadata', block_serialized_metadata),
+                ('ecnaive_continuous_buffer', block_tensor),
+            ]
+            
+            # Generate file name
+            file_name = f'__{rank}_{block_name}.distcp'
+            file_path = checkpoint_dir / file_name
+            
+            # Create WriteBucket
+            write_bucket = (
+                file_path,              # file_path (full path with checkpoint_dir)
+                file_name,              # storage_key (used in metadata)
+                (block_ecnaive_bytes_data, []),  # (bytes_data, tensor_data)
+            )
+            
+            self.ec_write_buckets.append(write_bucket)
+        
+        # Package blocks into dictionary
+        blocks = {
+            'data0': data0,
+            'recv_parity1': recv_parity1,
+            'recv_parity0': recv_parity0,
+            'recv_data1': recv_data1,
+            'metadata': block_serialized_metadata,
+            'actual_size': own_actual_size,
+            'pipeline_size': block_pipeline_total_bytes,
+            'aligned_size': aligned_half_block_size,
+        }
+        
+        logger.info(
+            f"EC-NAIVE: Packaged 4 blocks with metadata and WriteBuckets:\n"
+            f"  Metadata: {own_non_tensor_size / 1024:.2f} KB (non-tensor) + "
+            f"{own_tensor_keys_size / 1024:.2f} KB (tensor keys), "
+            f"{own_tensor_buffer_size / (1024**3):.2f} GB (buffer actual size)\n"
+            f"  Pipeline size: {block_pipeline_total_bytes / (1024**3):.2f} GB\n"
+            f"  Aligned half block size: {aligned_half_block_size / (1024**3):.2f} GB\n"
+            f"  Created {len(block_names)} WriteBuckets"
+        )
+        
+        return blocks
         """
         Allocate 4 persistent blocks for ECLATIN:
         - data_block_1: First data block

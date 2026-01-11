@@ -2259,6 +2259,12 @@ def _add_checkpointing_args(parser):
                        help='Use layer-wise ECLATIN checkpointing mode. This enables layer-by-layer '
                             'pipelined D2H transfer followed by encoding and network transmission.')
     
+    # EC-NAIVE (Erasure Coding Checkpoint with naive Reed-Solomon encoding) arguments
+    group.add_argument('--use-ecnaive', action='store_true',
+                       help='Enable EC-NAIVE (Erasure Coding Checkpoint with naive Reed-Solomon encoding) '
+                            'for serialization-free checkpoint encoding. Uses ISA-L for Reed-Solomon '
+                            'erasure coding with round-robin distribution of data and parity blocks.')
+    
     # use gemini checkpointing arguments
     group.add_argument('--use-gemini', action='store_true',
                        help='Enable Gemini checkpointing. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')

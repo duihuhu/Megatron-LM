@@ -105,7 +105,7 @@ class ECNAIVEManager:
             'recv_parity0_from': (rank + 2) % world_size,
             'recv_data1_from': (rank + 3) % world_size,
         }
-
+    
     def _get_ecnaive_network_config(self, rank: int, world_size: int) -> dict:
         """
         Get network configuration for EC-NAIVE ASIO connections.
@@ -255,6 +255,263 @@ class ECNAIVEManager:
         )
         
         return config
+    
+    def _get_ecnaive_load_network_config(self, rank: int, world_size: int) -> dict:
+        """
+        Get network configuration for EC-NAIVE load mode (rank2 recovery).
+        
+        EC-NAIVE load mode only needs 2 ports (vs ECLATIN's 6):
+        - load_recv_rank3_data1_port: rank2 listens, rank3 connects (for d_{3,1})
+        - load_recv_rank0_parity0_port: rank2 listens, rank0 connects (for p_{0,0})
+        
+        Args:
+            rank (int): Current rank (should be 2 for receiver, 0/3 for senders)
+            world_size (int): Total number of ranks
+            
+        Returns:
+            dict: Network configuration with keys:
+                - 'my_ip': str - This rank's IP address
+                - 'base_port': int - Base port number
+                - 'rank_ips': dict - IP addresses for all ranks
+                - 'ports': dict - Port numbers for load mode connections
+                    - 'load_recv_rank3_data1': int (rank2 only)
+                    - 'load_recv_rank0_parity0': int (rank2 only)
+        """
+        import socket
+        
+        # Reuse the same IP detection logic as save mode
+        base_ip = os.environ.get('ECNAIVE_BASE_IP')
+        
+        if not base_ip:
+            interface_name = os.environ.get('ECNAIVE_INTERFACE')
+            
+            if interface_name:
+                try:
+                    import netifaces
+                    addrs = netifaces.ifaddresses(interface_name)
+                    if netifaces.AF_INET in addrs:
+                        base_ip = addrs[netifaces.AF_INET][0]['addr']
+                        logger.info(f"EC-NAIVE: Using IP from interface {interface_name}: {base_ip}")
+                    else:
+                        logger.warning(f"EC-NAIVE: Interface {interface_name} has no IPv4 address")
+                        base_ip = None
+                except ImportError:
+                    logger.warning(
+                        "EC-NAIVE: netifaces module not installed. "
+                        "Install via 'pip install netifaces' to use ECNAIVE_INTERFACE. "
+                        "Falling back to auto-detection."
+                    )
+                    base_ip = None
+                except Exception as e:
+                    logger.warning(f"EC-NAIVE: Failed to get IP from interface {interface_name}: {e}")
+                    base_ip = None
+            
+            if not base_ip:
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(('8.8.8.8', 80))
+                    base_ip = s.getsockname()[0]
+                    s.close()
+                    logger.info(f"EC-NAIVE: Auto-detected IP address: {base_ip}")
+                except Exception as e:
+                    logger.warning(f"EC-NAIVE: Failed to auto-detect IP: {e}")
+                    base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
+                    logger.warning(f"EC-NAIVE: Using fallback IP: {base_ip}")
+        
+        # Get base port (same as save mode)
+        master_port = int(os.environ.get('MASTER_PORT', '6000'))
+        base_port = int(os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000))
+        
+        # Load mode ports (rank2 only needs 2 recv ports)
+        # Port allocation: base_port + 1000 + offset (to avoid conflict with save mode)
+        load_base_port = base_port + 1000
+        ports = {}
+        
+        if rank == 2:
+            # rank2: 2 recv ports
+            ports.update({
+                'load_recv_rank3_data1': load_base_port + 0,
+                'load_recv_rank0_parity0': load_base_port + 1,
+            })
+        # Note: rank0/3 don't need ports in config, they connect to rank2's ports
+        
+        # Exchange IP addresses via torch.distributed.all_gather
+        rank_ips = {}
+        
+        if torch.distributed.is_initialized():
+            try:
+                my_ip_bytes = socket.inet_aton(base_ip)
+                my_ip_tensor = torch.tensor(
+                    [int(b) for b in my_ip_bytes], 
+                    dtype=torch.uint8
+                )
+                
+                if torch.cuda.is_available():
+                    my_ip_tensor = my_ip_tensor.cuda()
+                
+                ip_list = [torch.zeros_like(my_ip_tensor) for _ in range(world_size)]
+                torch.distributed.all_gather(ip_list, my_ip_tensor)
+                
+                for r, ip_tensor in enumerate(ip_list):
+                    ip_bytes = bytes(ip_tensor.cpu().tolist())
+                    rank_ips[r] = socket.inet_ntoa(ip_bytes)
+                
+                logger.info(
+                    f"EC-NAIVE: [Rank {rank}] Load mode IP exchange completed - "
+                    f"All rank IPs: {rank_ips}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"EC-NAIVE: Failed to exchange IPs via all_gather, using local IP: {e}"
+                )
+                for r in range(world_size):
+                    rank_ips[r] = base_ip
+        else:
+            logger.info("EC-NAIVE: Distributed not initialized, using local IP for all ranks")
+            rank_ips[0] = base_ip
+        
+        config = {
+            'my_ip': base_ip,
+            'base_port': base_port,
+            'rank_ips': rank_ips,
+            'ports': ports,
+        }
+        
+        logger.info(
+            f"EC-NAIVE: [Rank {rank}] Load mode network config:\n"
+            f"  My IP: {config['my_ip']}\n"
+            f"  Base port: {config['base_port']}\n"
+            f"  Load mode ports: {config['ports']}\n"
+            f"  All rank IPs: {config['rank_ips']}"
+        )
+        
+        return config
+    
+    def init_ecnaive_load(self, rank: int, world_size: int) -> None:
+        """Initialize EC-NAIVE load mode for rank2 recovery.
+        
+        This method:
+        1. Sets load mode in C++ native module
+        2. Gets network configuration for load mode
+        3. Initializes load connections in C++
+        4. Waits for connections to be established
+        
+        Args:
+            rank: Current rank
+            world_size: Total number of ranks
+        """
+        if self._ecnaive_native is None:
+            logger.error("EC-NAIVE: Native module not initialized, cannot initialize load mode")
+            return
+        
+        if not self.use_ecnaive:
+            logger.warning("EC-NAIVE: Manager not enabled, skipping load initialization")
+            return
+        
+        # Step 1: Set load mode in C++ native module
+        failed_rank = 2  # EC-NAIVE recovers rank2
+        self._ecnaive_native.set_load_mode(True, failed_rank, rank)
+        logger.info(f"EC-NAIVE: [Rank {rank}] Set load mode (failed_rank={failed_rank})")
+        
+        # Step 2: Get network configuration for load mode
+        # All ranks need rank2's network config to get the correct ports
+        net_config_rank2 = self._get_ecnaive_load_network_config(2, world_size)
+        rank2_ip = net_config_rank2['rank_ips'].get(2, net_config_rank2['my_ip'])
+        
+        # Get load mode ports from rank2's config
+        load_recv_rank3_data1_port = net_config_rank2['ports'].get('load_recv_rank3_data1', 0)
+        load_recv_rank0_parity0_port = net_config_rank2['ports'].get('load_recv_rank0_parity0', 0)
+        
+        # Step 3: Initialize load connections
+        # Similar to ECLATIN: rank2 starts accept operations first, then other ranks connect
+        if rank == 2:
+            # rank2: Initialize accept operations (will start accept threads)
+            logger.info(f"EC-NAIVE: [Rank 2] Initializing load accept connections...")
+            self._ecnaive_native.init_ecnaive_load_connections(
+                rank,
+                rank2_ip,
+                load_recv_rank3_data1_port,
+                load_recv_rank0_parity0_port
+            )
+            logger.info(f"EC-NAIVE: [Rank 2] Accept operations started, waiting for other ranks...")
+        
+        # Synchronize: ensure rank2's acceptors are ready before other ranks connect
+        torch.distributed.barrier()
+        
+        if rank != 2:
+            # rank0/3: Connect to rank2 (will block until connected)
+            logger.info(f"EC-NAIVE: [Rank {rank}] Connecting load send sockets to rank2...")
+            self._ecnaive_native.init_ecnaive_load_connections(
+                rank,
+                rank2_ip,
+                load_recv_rank3_data1_port,
+                load_recv_rank0_parity0_port
+            )
+            logger.info(f"EC-NAIVE: [Rank {rank}] Load send sockets connected")
+        
+        # Note: EC-NAIVE doesn't have wait_for_load_connections() like ECLATIN
+        # Connections are established synchronously in init_ecnaive_load_connections()
+        
+        # Synchronize to ensure all connections are established
+        torch.distributed.barrier()
+        logger.info(f"EC-NAIVE: [Rank {rank}] Load connections initialized")
+    
+    def allocate_ecnaive_load_recv_buffers(self, global_registry: GlobalMetadataRegistry) -> Dict[str, torch.Tensor]:
+        """
+        Allocate recv buffers for rank2 load recovery.
+        
+        EC-NAIVE only needs 2 recv buffers (vs ECLATIN's 6):
+        - recv_data1: for d_{3,1} from rank3 (directly to final position)
+        - recv_parity0: for p_{0,0} from rank0 (temporary buffer)
+        
+        Each buffer size is aligned_block_size (max_total_bytes).
+        
+        Args:
+            global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
+            
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary with 2 recv buffers:
+                - 'recv_data1': torch.Tensor - Buffer for d_{3,1} (final position)
+                - 'recv_parity0': torch.Tensor - Buffer for p_{0,0} (temporary)
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        if rank != 2:
+            logger.warning("EC-NAIVE: allocate_ecnaive_load_recv_buffers called on non-rank2, returning empty dict")
+            return {}
+        
+        # Calculate maximum data size across all ranks
+        max_total_bytes = 0
+        for r in range(world_size):
+            rank_metadata = global_registry.rank_metadata.get(r, [])
+            rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+            if rank_total_size > max_total_bytes:
+                max_total_bytes = rank_total_size
+        
+        # Calculate aligned block size (same as save phase)
+        # EC-NAIVE uses full block size (not half like ECLATIN)
+        aligned_block_size = ((max_total_bytes + self.ecnaive_buffer_size - 1) // self.ecnaive_buffer_size) * self.ecnaive_buffer_size
+        
+        logger.info(
+            f"EC-NAIVE: Allocating 2 recv buffers for rank2 load recovery\n"
+            f"  Pipeline max size: {max_total_bytes / (1024**3):.2f} GB\n"
+            f"  Aligned block size (per buffer): {aligned_block_size / (1024**3):.2f} GB\n"
+            f"  Total recv memory: {2 * aligned_block_size / (1024**3):.2f} GB"
+        )
+        
+        # Allocate 2 recv buffers
+        recv_buffers = {
+            'recv_data1': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),
+            'recv_parity0': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),
+        }
+        
+        logger.info(
+            f"EC-NAIVE: Allocated 2 recv buffers for rank2: "
+            f"{aligned_block_size / (1024**3):.2f} GB each"
+        )
+        
+        return recv_buffers
     
     def init_ecnaive_if_enabled(self):
         """Initialize EC-NAIVE C++ module if enabled and distributed environment is ready."""

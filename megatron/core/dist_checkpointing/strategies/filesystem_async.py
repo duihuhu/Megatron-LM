@@ -5075,6 +5075,141 @@ class FileSystemWriterAsync(FileSystemWriter):
             raise RuntimeError(f"ECLATIN: Failed to map file {file_path}: {e}") from e
     
     @staticmethod
+    def load_ecnaive_bytes_from_file(file_path: Union[str, os.PathLike], my_rank: int = 0) -> EclatinMappedFile:
+        """
+        Load EC-NAIVE file using mmap and extract metadata.
+        
+        Similar to load_eclatin_bytes_from_file but for EC-NAIVE format (ECNV magic).
+        
+        File structure:
+        [Header: 32 bytes] [Component 1] [Component 2] [Component 3]
+        
+        Args:
+            file_path: path to the EC-NAIVE file
+            my_rank: current rank (used for preparing local_metadata), default 0
+        
+        Returns:
+            EclatinMappedFile: dataclass containing mmap object, memory address, file size,
+                              local_metadata, and non_tensor_data
+        """
+        import mmap
+        import struct
+        import pickle
+        from .state_dict_decomposer import TensorMetadata
+        
+        # Open file and get size
+        f = open(file_path, "rb")
+        mm = None
+        try:
+            # Get file size
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            f.seek(0)  # Seek back to start
+            
+            # Memory-map the entire file
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            
+            # Close file handle - mmap is independent of the file handle
+            f.close()
+            f = None
+            
+            # Parse header to extract Component 1 (non_tensor_data) and Component 2 (tensor_infos)
+            header_bytes = mm[:32]
+            if len(header_bytes) != 32:
+                raise RuntimeError(f"EC-NAIVE: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+            
+            # Parse header
+            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            
+            # Validate magic number
+            if magic != b'ECNV':
+                raise RuntimeError(f"EC-NAIVE: Invalid magic number (expected b'ECNV', got {magic})")
+            
+            # Extract Component 1: non_tensor_data
+            offset = 32  # After header
+            
+            non_tensor_bytes = mm[offset:offset + non_tensor_size]
+            if len(non_tensor_bytes) != non_tensor_size:
+                raise RuntimeError(
+                    f"EC-NAIVE: Failed to read Component 1 "
+                    f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
+                )
+            
+            # Deserialize non_tensor_data
+            non_tensor_data = pickle.loads(non_tensor_bytes)
+            logger.debug(f"EC-NAIVE: Extracted non_tensor_data from Component 1 ({non_tensor_size / 1024:.2f} KB)")
+            
+            offset += non_tensor_size  # Move to Component 2
+            
+            # Extract Component 2: tensor_infos (for preparing local_metadata)
+            tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
+            if len(tensor_keys_bytes) != tensor_keys_size:
+                raise RuntimeError(
+                    f"EC-NAIVE: Failed to read Component 2 "
+                    f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
+                )
+            
+            # Deserialize tensor_infos
+            tensor_infos = pickle.loads(tensor_keys_bytes)
+            logger.debug(f"EC-NAIVE: Extracted {len(tensor_infos)} tensor infos from Component 2")
+            
+            # Convert tensor_infos to local_metadata (List[TensorMetadata])
+            # Saved objects may be TensorInfo (no chunk_type/target/source), so fill defaults.
+            local_metadata = []
+            for info in tensor_infos:
+                chunk_type = getattr(info, "chunk_type", "data")
+                target_rank = getattr(info, "target_rank", my_rank)
+                source_rank = getattr(info, "source_rank", my_rank)
+                data_meta = TensorMetadata(
+                    key=info.key,
+                    shape=info.shape,
+                    dtype=str(info.dtype),
+                    size_bytes=info.size_bytes,
+                    global_offset=info.global_offset if info.global_offset is not None else (),
+                    shard_index=info.shard_index if info.shard_index is not None else 0,
+                    chunk_type=chunk_type,
+                    target_rank=target_rank,
+                    source_rank=source_rank,
+                )
+                local_metadata.append(data_meta)
+            
+            logger.debug(f"EC-NAIVE: Prepared {len(local_metadata)} TensorMetadata entries for local_metadata")
+            
+            # Get memory address
+            import numpy as np
+            np_view = np.frombuffer(mm, dtype=np.uint8, count=min(1, file_size))
+            memory_address = np_view.ctypes.data
+            
+            logger.info(
+                f"EC-NAIVE: Mapped file {file_path}\n"
+                f"  File size: {file_size / (1024**3):.2f} GB\n"
+                f"  Memory address: {hex(memory_address)}\n"
+                f"  Non-tensor data: {len(non_tensor_data)} keys\n"
+                f"  Tensor metadata: {len(local_metadata)} entries"
+            )
+            
+            mapped_file = EclatinMappedFile(
+                mmap_object=mm,
+                memory_address=memory_address,
+                file_size=file_size,
+                local_metadata=local_metadata,
+                non_tensor_data=non_tensor_data,
+                tensor_infos=tensor_infos  # Preserve original tensor_infos with offset information
+            )
+            
+            return mapped_file
+            
+        except Exception as e:
+            if mm is not None:
+                try:
+                    mm.close()
+                except:
+                    pass
+            if f is not None:
+                f.close()
+            raise RuntimeError(f"EC-NAIVE: Failed to map file {file_path}: {e}") from e
+    
+    @staticmethod
     def load_eccheck_components_from_file(file_path: Union[str, os.PathLike]) -> DecomposedStateDict:
         """
         Load three components from a single EC-CHECK file.
@@ -5345,6 +5480,140 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         logger.info(
             f"ECLATIN: Successfully loaded all components from {file_path}\n"
+            f"  Component 1: {len(non_tensor_data)} keys\n"
+            f"  Component 2: {len(tensor_infos)} tensor infos\n"
+            f"  Component 3: {len(tensor_data)} tensors"
+        )
+        
+        return decomposed
+    
+    @staticmethod
+    def load_ecnaive_components_from_file(file_path: Union[str, os.PathLike]) -> DecomposedStateDict:
+        """
+        Load three components from a single EC-NAIVE file.
+        
+        Similar to load_eclatin_components_from_file but for EC-NAIVE format (ECNV magic).
+        
+        File structure:
+        [Header: 32 bytes] [Component 1] [Component 2] [Component 3]
+        
+        Args:
+            file_path: path to the EC-NAIVE file
+        
+        Returns:
+            DecomposedStateDict: reconstructed decomposed structure
+        """
+        import struct
+        import numpy as np
+        import mmap
+        import pickle
+        from .state_dict_decomposer import DecomposedStateDict
+        
+        # Optimization for /dev/shm: Use mmap for zero-copy access
+        with open(file_path, "rb") as f:
+            # Get file size
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            f.seek(0)  # Seek back to start
+            
+            # Memory-map the entire file (zero-copy for /dev/shm)
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            
+            try:
+                # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
+                header_bytes = mm[:32]
+                if len(header_bytes) != 32:
+                    raise RuntimeError(f"EC-NAIVE: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+                
+                # Parse header
+                magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+                
+                # Validate magic number
+                if magic != b'ECNV':
+                    raise RuntimeError(f"EC-NAIVE: Invalid magic number (expected b'ECNV', got {magic})")
+                
+                logger.info(
+                    f"EC-NAIVE: Loading from {file_path}\n"
+                    f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
+                    f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
+                    f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
+                )
+                
+                # Calculate offsets for each component
+                offset = 32  # After header
+                
+                # Component 1: Non-tensor key-value pairs
+                non_tensor_bytes = mm[offset:offset + non_tensor_size]
+                if len(non_tensor_bytes) != non_tensor_size:
+                    raise RuntimeError(
+                        f"EC-NAIVE: Failed to read Component 1 "
+                        f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
+                    )
+                offset += non_tensor_size
+                
+                non_tensor_data = pickle.loads(non_tensor_bytes)
+                logger.debug(f"EC-NAIVE: Loaded Component 1 ({non_tensor_size / 1024:.2f} KB)")
+            
+                # Component 2: Tensor keys
+                tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
+                if len(tensor_keys_bytes) != tensor_keys_size:
+                    raise RuntimeError(
+                        f"EC-NAIVE: Failed to read Component 2 "
+                        f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
+                    )
+                offset += tensor_keys_size
+                
+                tensor_infos = pickle.loads(tensor_keys_bytes)
+                logger.debug(f"EC-NAIVE: Loaded Component 2 ({tensor_keys_size / 1024:.2f} KB, {len(tensor_infos)} tensor infos)")
+            
+                # Component 3: Tensor data (continuous buffer)
+                tensor_data = []
+                if tensor_buffer_size > 0:
+                    # Create numpy view of the buffer (zero-copy)
+                    buffer_np = np.frombuffer(mm[offset:offset + tensor_buffer_size], dtype=np.uint8)
+                    
+                    # Extract each tensor from the buffer
+                    current_offset = 0
+                    for info in tensor_infos:
+                        tensor_size_bytes = info.size_bytes
+                        start = current_offset
+                        end = current_offset + tensor_size_bytes
+                        
+                        if end > len(buffer_np):
+                            raise RuntimeError(
+                                f"EC-NAIVE: Buffer overflow when extracting tensor {info.key} "
+                                f"(offset {current_offset}, size {tensor_size_bytes}, buffer size {len(buffer_np)})"
+                            )
+                        
+                        # Extract numpy slice (view, not copy) from buffer
+                        tensor_bytes_np = buffer_np[start:end]
+                        
+                        # Create torch tensor directly from bytes
+                        tensor_view = torch.frombuffer(
+                            memoryview(tensor_bytes_np), 
+                            dtype=info.dtype
+                        )
+                        # Clone to create writable copy and reshape to original shape
+                        tensor = tensor_view.clone().reshape(info.shape)
+                        tensor_data.append(tensor)
+                        
+                        current_offset += tensor_size_bytes
+                    
+                    logger.debug(f"EC-NAIVE: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB) and extracted {len(tensor_data)} tensors")
+            
+            finally:
+                # Close mmap
+                pass
+        
+        # Create DecomposedStateDict
+        decomposed = DecomposedStateDict(
+            non_tensor_data=non_tensor_data,
+            tensor_infos=tensor_infos,
+            tensor_data=tensor_data,
+        )
+        
+        logger.info(
+            f"EC-NAIVE: Successfully loaded all components from {file_path}\n"
             f"  Component 1: {len(non_tensor_data)} keys\n"
             f"  Component 2: {len(tensor_infos)} tensor infos\n"
             f"  Component 3: {len(tensor_data)} tensors"

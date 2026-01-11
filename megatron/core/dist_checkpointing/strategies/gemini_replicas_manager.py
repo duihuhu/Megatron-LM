@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
-"""Gemini Replicas manager for multi-replica data transfer with C++ ASIO implementation."""
+"""Gemini Replicas manager for multi-replica data transfer with C++ ASIO or RDMA implementation."""
 
 import os
 import queue
@@ -19,9 +19,10 @@ class GeminiReplicasManager:
     """Shared manager for Gemini Replicas multi-replica data transfer.
     
     This class provides a singleton instance that manages:
-    - Gemini Replicas C++ native module (_gemini_replicas_native) for ASIO-based communication
+    - Gemini Replicas C++ native module (_gemini_replicas_native) for ASIO or RDMA communication
     - Buffer allocation and management for multi-replica data exchange
     - Decomposed state dict for efficient GPU-to-CPU transfer
+    - Buffer registration for RDMA (when use_rdma is enabled)
     
     Unlike Gemini (2 replicas), this supports configurable number of replicas (default: 3)
     with round-robin placement strategy:
@@ -48,6 +49,7 @@ class GeminiReplicasManager:
         self._gemini_replicas_native = None
         self.use_gemini_replicas = False
         self.use_gemini_replicas_optimized = False
+        self.use_rdma = False
         
         # Replica configuration
         self.num_replicas = 3  # Default: 3 replicas (including local)
@@ -65,6 +67,10 @@ class GeminiReplicasManager:
         # Replica data buffers (for received data from peers)
         self.replica_buffers: List[torch.Tensor] = []
         self.replica_metadata: List[dict] = []
+        
+        # Track registered buffers (for RDMA)
+        self.registered_buffers: Dict[int, Tuple[int, int]] = {}  # {buffer_addr: (size, iteration)}
+        self.current_iteration: int = 0
         
         self._initialized = True
     
@@ -284,6 +290,7 @@ class GeminiReplicasManager:
             self.use_gemini_replicas = getattr(args, 'use_gemini_replicas', False)
             self.use_gemini_replicas_optimized = getattr(args, 'use_gemini_replicas_optimized', False)
             self.num_replicas = getattr(args, 'gemini_replicas_num', 3)
+            self.use_rdma = getattr(args, 'use_rdma', False)
             
             if not self.use_gemini_replicas or not self.use_gemini_replicas_optimized:
                 return
@@ -301,7 +308,7 @@ class GeminiReplicasManager:
             self._gemini_replicas_native = None
     
     def _init_gemini_replicas_native(self):
-        """Initialize Gemini Replicas C++ native module with ASIO."""
+        """Initialize Gemini Replicas C++ native module with ASIO or RDMA."""
         gemini_replicas_native = None
         try:
             # Load .so file
@@ -332,9 +339,10 @@ class GeminiReplicasManager:
             self.target_ranks = net_config['target_ranks']
             
             # Synchronize all ranks before creating C++ instances
+            mode_str = "RDMA" if self.use_rdma else "ASIO"
             logger.info(f"Gemini Replicas: [Rank {rank}] Synchronizing all ranks before creating C++ native module...")
             torch.distributed.barrier()
-            logger.info(f"Gemini Replicas: [Rank {rank}] All ranks synchronized, creating C++ native module with ASIO...")
+            logger.info(f"Gemini Replicas: [Rank {rank}] All ranks synchronized, creating C++ native module with {mode_str}...")
             
             # Use the prepared target_ips and target_ports from config
             target_ips = net_config['target_ips']
@@ -347,9 +355,9 @@ class GeminiReplicasManager:
             # Calculate number of source ranks
             num_source_ranks = len(net_config['source_ranks'])
             
-            # Create C++ instance with ASIO parameters (Phase 1: start acceptor only)
-            logger.info(f"Gemini Replicas: Creating C++ native module with ASIO (Phase 1: acceptor)...")
-            print(f"Gemini Replicas: [Rank {rank}] Creating C++ native module (Phase 1: starting acceptor)...")
+            # Create C++ instance (Phase 1: start acceptor only)
+            logger.info(f"Gemini Replicas: Creating C++ native module with {mode_str} (Phase 1: acceptor)...")
+            print(f"Gemini Replicas: [Rank {rank}] Creating C++ native module (Phase 1: starting acceptor, mode: {mode_str})...")
             print(f"Gemini Replicas: [Rank {rank}] Target ranks: {net_config['target_ranks']}")
             print(f"Gemini Replicas: [Rank {rank}] Target IPs: {target_ips}")
             print(f"Gemini Replicas: [Rank {rank}] Target ports for sending: {target_ports}")
@@ -362,7 +370,8 @@ class GeminiReplicasManager:
                 target_ports,  # List of target ports
                 net_config['my_ip'],  # My IP for acceptor
                 my_recv_port,  # My recv port
-                num_source_ranks  # Number of expected incoming connections
+                num_source_ranks,  # Number of expected incoming connections
+                self.use_rdma  # Use RDMA or ASIO
             )
             
             logger.info(f"Gemini Replicas: C++ native module created (acceptor ready) for rank {rank}")
@@ -376,8 +385,8 @@ class GeminiReplicasManager:
             # Phase 2: Connect to all targets
             self._gemini_replicas_native.finalize_connections()
             
-            logger.info(f"Gemini Replicas: C++ native module fully initialized (rank={rank}, targets={net_config['target_ranks']})")
-            print(f"Gemini Replicas: [Rank {rank}] C++ native module fully initialized - ASIO connections ready")
+            logger.info(f"Gemini Replicas: C++ native module fully initialized (rank={rank}, targets={net_config['target_ranks']}, mode={mode_str})")
+            print(f"Gemini Replicas: [Rank {rank}] C++ native module fully initialized - {mode_str} connections ready")
             
         except Exception as e:
             logger.error(f"Gemini Replicas: Failed to initialize C++ native module: {e}")
@@ -496,6 +505,62 @@ class GeminiReplicasManager:
             self.preallocated_cpu_buffer = torch.empty(size_bytes, dtype=torch.uint8)
             logger.info(f"Gemini Replicas: [Rank {rank}] Allocated regular CPU buffer")
     
+    def register_buffer(self, buffer: torch.Tensor):
+        """Register buffer for RDMA operations (called on first allocation in save phase).
+        
+        Args:
+            buffer: PyTorch tensor to register
+        """
+        if not self.use_rdma or self._gemini_replicas_native is None:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        buffer_addr = buffer.data_ptr()
+        buffer_size = buffer.numel() * buffer.element_size()
+        
+        # Check if already registered
+        if buffer_addr in self.registered_buffers:
+            logger.debug(f"Gemini Replicas: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} (size: {buffer_size / (1024**2):.2f} MB)")
+            return
+        
+        try:
+            logger.info(f"Gemini Replicas: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
+            self._gemini_replicas_native.register_buffer(buffer_addr, buffer_size)
+            self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
+            logger.info(f"Gemini Replicas: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
+            
+            # Print all registered buffers
+            logger.info(f"Gemini Replicas: [Rank {rank}] All registered buffers:")
+            for addr, (size, iteration) in self.registered_buffers.items():
+                logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
+        except Exception as e:
+            logger.error(f"Gemini Replicas: [Rank {rank}] Failed to register buffer: {e}")
+            raise
+    
+    def unregister_buffer(self, buffer: torch.Tensor):
+        """Unregister buffer for RDMA operations.
+        
+        Args:
+            buffer: PyTorch tensor to unregister
+        """
+        if not self.use_rdma or self._gemini_replicas_native is None:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        buffer_addr = buffer.data_ptr()
+        
+        if buffer_addr not in self.registered_buffers:
+            logger.debug(f"Gemini Replicas: [Rank {rank}] Buffer not registered at 0x{buffer_addr:x}")
+            return
+        
+        try:
+            logger.info(f"Gemini Replicas: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
+            self._gemini_replicas_native.unregister_buffer(buffer_addr)
+            del self.registered_buffers[buffer_addr]
+            logger.info(f"Gemini Replicas: [Rank {rank}] Buffer unregistered successfully")
+        except Exception as e:
+            logger.error(f"Gemini Replicas: [Rank {rank}] Failed to unregister buffer: {e}")
+    
     def get_native_module(self):
         """Get the C++ native module instance."""
         return self._gemini_replicas_native
@@ -506,6 +571,18 @@ class GeminiReplicasManager:
     
     def cleanup(self):
         """Cleanup resources."""
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        
+        # Unregister all buffers for RDMA
+        if self.use_rdma and self._gemini_replicas_native is not None:
+            for buffer_addr in list(self.registered_buffers.keys()):
+                try:
+                    logger.info(f"Gemini Replicas: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x} during cleanup")
+                    self._gemini_replicas_native.unregister_buffer(buffer_addr)
+                except Exception as e:
+                    logger.warning(f"Gemini Replicas: [Rank {rank}] Failed to unregister buffer during cleanup: {e}")
+            self.registered_buffers.clear()
+        
         if self._gemini_replicas_native is not None:
             logger.info("Gemini Replicas: Cleaning up native module")
             self._gemini_replicas_native = None

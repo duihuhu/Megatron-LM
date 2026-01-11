@@ -119,6 +119,7 @@ EVAL_AND_LOGGING_ARGS=(
 
     --use-gemini-replicas 
     --use-gemini-replicas-optimized 
+    --use-rdma
     --use-gemini-replicas-hardware-failure
     # --gemini-replicas-num 4
     # --use-gemini

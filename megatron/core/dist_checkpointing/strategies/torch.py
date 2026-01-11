@@ -1073,6 +1073,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 use_gemini_replicas=self.gemini_replicas_manager.use_gemini_replicas,
                 gemini_replicas_native=self.gemini_replicas_manager.get_native_module(),  # Pass pre-initialized C++ module
                 gemini_replicas_num=self.gemini_replicas_manager.num_replicas,  # Pass number of replicas
+                use_rdma=self.gemini_replicas_manager.use_rdma,  # Pass RDMA flag for buffer registration
             )
         elif self.gemini_manager.use_gemini and self.gemini_manager.use_gemini_optimized:
             writer = FileSystemWriterAsync(
@@ -1164,6 +1165,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             # Pass Gemini Replicas state to writer if available
             writer.decomposed_state_dict = self.decomposed_state_dict
             writer.preallocated_cpu_buffer = self.preallocated_cpu_buffer
+            # Pass preallocated remote buffers (optimization: only allocate once)
+            if hasattr(self, 'gemini_replicas_remote_buffers'):
+                writer.gemini_replicas_remote_buffers = self.gemini_replicas_remote_buffers
+                writer.gemini_replicas_remote_buffer_sizes = self.gemini_replicas_remote_buffer_sizes
             
             # In Gemini Replicas mode, call prepare_write_data to create write_buckets
             # It will use the decomposed state_dict we just prepared
@@ -1540,9 +1545,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             f"  Total tensors: {stats['num_tensors']}"
         )
         
-        # Step 2: Preallocate CPU buffer
+        # Step 2: Preallocate CPU buffer (send buffer)
         total_tensor_size = self.decomposed_state_dict.total_tensor_size_bytes
         
+        send_buffer_needs_registration = False
         if self.preallocated_cpu_buffer is None or self.preallocated_cpu_buffer.numel() < total_tensor_size:
             logger.info(
                 f"Gemini Replicas: [Rank {rank}] Allocating preallocated CPU buffer: "
@@ -1560,11 +1566,91 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                     total_tensor_size, dtype=torch.uint8
                 )
                 logger.info(f"Gemini Replicas: [Rank {rank}] Allocated regular CPU buffer")
+            send_buffer_needs_registration = True
         else:
             logger.info(
                 f"Gemini Replicas: [Rank {rank}] Reusing existing preallocated CPU buffer: "
                 f"{self.preallocated_cpu_buffer.numel() / (1024**3):.2f} GB"
             )
+        
+        # Register send buffer for RDMA if enabled (on first allocation)
+        if self.gemini_replicas_manager.use_rdma and send_buffer_needs_registration:
+            logger.info(f"Gemini Replicas: [Rank {rank}] Registering preallocated_cpu_buffer (send buffer) for RDMA")
+            self.gemini_replicas_manager.register_buffer(self.preallocated_cpu_buffer)
+        
+        # Step 3: Exchange buffer sizes and preallocate remote buffers (receive buffers)
+        # This optimization moves buffer allocation from _gemini_replicas_preload_to_continuous_buffer
+        # to here, so it only happens once in the first iteration
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        if world_size > 1:
+            # Calculate source ranks (ranks that will send data to this rank)
+            source_ranks = []
+            for src_rank in range(world_size):
+                if src_rank == rank:
+                    continue
+                src_targets = self.gemini_replicas_manager._calculate_target_ranks(src_rank, world_size)
+                if rank in src_targets:
+                    source_ranks.append(src_rank)
+            
+            if len(source_ranks) > 0:
+                # Create or get global gloo group for CPU tensor communication
+                from ..strategies.async_utils import get_or_create_global_gloo_group
+                global_gloo_group = get_or_create_global_gloo_group()
+                
+                # Exchange buffer sizes using all_gather
+                local_buffer_size = total_tensor_size
+                size_tensor = torch.tensor([local_buffer_size], dtype=torch.long, device='cpu')
+                all_sizes = [torch.zeros_like(size_tensor) for _ in range(world_size)]
+                torch.distributed.all_gather(all_sizes, size_tensor, group=global_gloo_group)
+                
+                # Extract sizes for all ranks
+                rank_sizes = {r: all_sizes[r][0].item() for r in range(world_size)}
+                logger.info(
+                    f"Gemini Replicas: [Rank {rank}] Exchanged buffer sizes with all ranks: "
+                    f"local={local_buffer_size / (1024**2):.2f} MB, "
+                    f"sources={source_ranks}"
+                )
+                
+                # Initialize remote buffers dict if not exists
+                if not hasattr(self, 'gemini_replicas_remote_buffers'):
+                    self.gemini_replicas_remote_buffers = {}
+                if not hasattr(self, 'gemini_replicas_remote_buffer_sizes'):
+                    self.gemini_replicas_remote_buffer_sizes = {}
+                
+                # Allocate remote buffer for each source rank
+                for src_rank in source_ranks:
+                    remote_buffer_size = rank_sizes[src_rank]
+                    
+                    # Allocate remote buffer if needed (or reuse existing)
+                    recv_buffer_needs_registration = False
+                    if src_rank not in self.gemini_replicas_remote_buffers or \
+                       self.gemini_replicas_remote_buffers[src_rank] is None or \
+                       self.gemini_replicas_remote_buffers[src_rank].numel() < remote_buffer_size:
+                        self.gemini_replicas_remote_buffers[src_rank] = torch.empty(
+                            remote_buffer_size, dtype=torch.uint8, device='cpu'
+                        )
+                        logger.info(
+                            f"Gemini Replicas: [Rank {rank}] Allocated remote buffer for source rank {src_rank}: "
+                            f"{remote_buffer_size / (1024**2):.2f} MB"
+                        )
+                        recv_buffer_needs_registration = True
+                    else:
+                        logger.info(
+                            f"Gemini Replicas: [Rank {rank}] Reusing existing remote buffer for source rank {src_rank}: "
+                            f"{self.gemini_replicas_remote_buffers[src_rank].numel() / (1024**2):.2f} MB"
+                        )
+                    
+                    # Store remote buffer size for later use
+                    self.gemini_replicas_remote_buffer_sizes[src_rank] = remote_buffer_size
+                    
+                    # Register recv buffer for RDMA if enabled (on first allocation)
+                    if self.gemini_replicas_manager.use_rdma and recv_buffer_needs_registration:
+                        logger.info(
+                            f"Gemini Replicas: [Rank {rank}] Registering remote buffer for source rank {src_rank} "
+                            f"(recv buffer) for RDMA"
+                        )
+                        self.gemini_replicas_manager.register_buffer(self.gemini_replicas_remote_buffers[src_rank])
         
         total_time = time() - start_total
         logger.info(
@@ -2930,6 +3016,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.gemini_rdma_send_buffers = {}  # Dict[str, dict]: 'replica' and 'own' -> {mmap, buffer, registered}
         self.gemini_mmap_files = {}  # Dict[str, tuple]: 'replica' and 'own' -> (file_handle, mmap_handle)
         self.gemini_rdma_checkpoint_dir = checkpoint_dir  # Track which checkpoint_dir buffers are prepared for
+        
+        # Initialize Gemini Replicas RDMA send buffers for sender ranks (rank0, rank1, rank3)
+        # Each rank sends one file to rank2 during recovery
+        self.gemini_replicas_rdma_send_buffers = {}  # Dict[str, dict]: buffer_name -> {mmap, buffer, registered}
+        self.gemini_replicas_mmap_files = {}  # Dict[str, tuple]: buffer_name -> (file_handle, mmap_handle)
+        self.gemini_replicas_rdma_checkpoint_dir = None  # Track which checkpoint_dir buffers are prepared for
     
         self.pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
         
@@ -3156,6 +3248,205 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.gemini_rdma_send_buffers.clear()
         self.gemini_mmap_files.clear()
     
+    def _prepare_gemini_replicas_rdma_send_buffers_if_needed(self, checkpoint_dir: Path):
+        """Prepare Gemini Replicas send buffers if needed (wrapper function).
+        
+        This function checks if buffers need to be prepared and calls the actual
+        preparation function. Buffers are always prepared (for ASIO/RDMA), but
+        RDMA registration only happens when use_rdma is enabled.
+        
+        For Gemini Replicas recovery, sender ranks are:
+        - rank0: sends own data to rank2
+        - rank1: sends own data to rank2  
+        - rank3: sends rank2's replica to rank2
+        
+        Args:
+            checkpoint_dir: Checkpoint directory
+        """
+        if not torch.distributed.is_initialized():
+            return
+        
+        rank = torch.distributed.get_rank()
+        
+        # Only sender ranks (0, 1, 3) need send buffers
+        if rank not in [0, 1, 3]:
+            return
+        
+        checkpoint_dir_str = str(checkpoint_dir)
+        
+        # Check if buffers already prepared for this checkpoint_dir
+        if self.gemini_replicas_rdma_checkpoint_dir == checkpoint_dir_str:
+            logger.debug(f"rank: {rank}, Gemini Replicas send buffers already prepared for {checkpoint_dir_str}")
+            return
+        
+        # Cleanup old buffers if checkpoint_dir changed
+        if self.gemini_replicas_rdma_send_buffers:
+            logger.info(f"rank: {rank}, checkpoint_dir changed, cleaning up old Gemini Replicas send buffers...")
+            self._cleanup_gemini_replicas_rdma_send_buffers()
+        
+        # Prepare new buffers
+        self._prepare_gemini_replicas_rdma_send_buffers(checkpoint_dir)
+        self.gemini_replicas_rdma_checkpoint_dir = checkpoint_dir_str
+    
+    def _prepare_gemini_replicas_rdma_send_buffers(self, checkpoint_dir: Path):
+        """Prepare Gemini Replicas send buffers for recovery.
+        
+        Each sender rank prepares one file:
+        - rank0: __0_0.distcp (own data)
+        - rank1: __1_0.distcp (own data)
+        - rank3: __3_0_replica2_rank3.distcp (rank2's replica)
+        
+        Args:
+            checkpoint_dir: Checkpoint directory
+        """
+        rank = torch.distributed.get_rank()
+        checkpoint_dir = Path(checkpoint_dir)
+        
+        # Check if RDMA is enabled
+        use_rdma = self.gemini_replicas_manager.use_rdma if hasattr(self.gemini_replicas_manager, 'use_rdma') else False
+        transport_mode = "RDMA" if use_rdma else "ASIO"
+        
+        logger.info(f"rank: {rank}, preparing Gemini Replicas send buffers ({transport_mode} mode)")
+        
+        try:
+            # Determine which file to send based on rank
+            if rank == 3:
+                # rank3 sends rank2's replica
+                send_files = list(checkpoint_dir.glob(f"__{rank}_0_replica2_rank{rank}.distcp"))
+                if not send_files:
+                    send_files = list(checkpoint_dir.glob(f"*_replica2_rank{rank}*.distcp"))
+            else:
+                # rank0, rank1 send their own data
+                send_files = list(checkpoint_dir.glob(f"__{rank}_0.distcp"))
+            
+            if not send_files:
+                logger.warning(f"rank: {rank}, checkpoint file not found, skipping buffer preparation")
+                return
+            
+            send_file_path = send_files[0]
+            
+            logger.info(f"rank: {rank}, found checkpoint file: {send_file_path}")
+            
+            # Prepare send buffer
+            self._prepare_single_gemini_replicas_rdma_send_buffer('send', send_file_path)
+            
+            logger.info(f"rank: {rank}, Gemini Replicas send buffer prepared successfully")
+            
+        except Exception as e:
+            logger.error(f"rank: {rank}, failed to prepare Gemini Replicas send buffers: {e}", exc_info=True)
+            # Clean up any partial allocations
+            self._cleanup_gemini_replicas_rdma_send_buffers()
+    
+    def _prepare_single_gemini_replicas_rdma_send_buffer(self, buffer_name: str, file_path: Path):
+        """Prepare a single Gemini Replicas send buffer from a checkpoint file.
+        
+        Similar to Gemini's _prepare_single_rdma_send_buffer, but for Gemini Replicas.
+        
+        Args:
+            buffer_name: Buffer identifier (e.g., 'send')
+            file_path: Path to checkpoint file
+        """
+        import mmap
+        import numpy as np
+        
+        rank = torch.distributed.get_rank()
+        
+        try:
+            # Open file with mmap (zero-copy read)
+            f = open(file_path, 'rb')
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            file_size = len(mm)
+            
+            logger.info(f"rank: {rank}, opened file with mmap: {file_size / (1024**2):.2f} MB")
+            
+            # Store mmap reference
+            self.gemini_replicas_mmap_files[buffer_name] = (f, mm)
+            
+            # Check if RDMA is enabled
+            use_rdma = self.gemini_replicas_manager.use_rdma if hasattr(self.gemini_replicas_manager, 'use_rdma') else False
+            
+            if use_rdma and self.gemini_replicas_manager.is_initialized():
+                # For RDMA: Create aligned buffer, copy data, register
+                logger.info(f"rank: {rank}, preparing RDMA buffer for {buffer_name}...")
+                
+                # Allocate aligned buffer (pinned memory for better RDMA performance)
+                if torch.cuda.is_available():
+                    aligned_buffer = torch.empty(file_size, dtype=torch.uint8).pin_memory()
+                else:
+                    aligned_buffer = torch.empty(file_size, dtype=torch.uint8)
+                
+                # Copy data from mmap to buffer
+                mmap_np = np.frombuffer(mm, dtype=np.uint8)
+                aligned_buffer_np = aligned_buffer.numpy()
+                np.copyto(aligned_buffer_np, mmap_np)
+                
+                logger.info(f"rank: {rank}, copied {file_size / (1024**2):.2f} MB to aligned buffer")
+                
+                # Register buffer for RDMA
+                buffer_addr = aligned_buffer.data_ptr()
+                try:
+                    self.gemini_replicas_manager.register_buffer(aligned_buffer)
+                    logger.info(f"rank: {rank}, registered {buffer_name} buffer for RDMA")
+                    
+                    # Store buffer info
+                    self.gemini_replicas_rdma_send_buffers[buffer_name] = {
+                        'buffer': aligned_buffer,
+                        'addr': buffer_addr,
+                        'size': file_size,
+                        'registered': True
+                    }
+                except Exception as e:
+                    logger.error(f"rank: {rank}, failed to register {buffer_name} for RDMA: {e}")
+                    raise
+                    
+            else:
+                # For ASIO: Just keep mmap reference
+                logger.info(f"rank: {rank}, prepared {buffer_name} buffer for ASIO (no RDMA registration)")
+                
+                # Create numpy view of mmap (for ASIO send)
+                mmap_np = np.frombuffer(mm, dtype=np.uint8)
+                mmap_addr = mmap_np.ctypes.data
+                
+                # Store buffer info (ASIO will use mmap directly)
+                self.gemini_replicas_rdma_send_buffers[buffer_name] = {
+                    'addr': mmap_addr,
+                    'size': file_size,
+                    'registered': False,
+                    'mmap_np': mmap_np  # Keep numpy view alive
+                }
+                
+        except Exception as e:
+            logger.error(f"rank: {rank}, failed to prepare {buffer_name} buffer: {e}", exc_info=True)
+            raise
+    
+    def _cleanup_gemini_replicas_rdma_send_buffers(self):
+        """Clean up Gemini Replicas RDMA send buffers and mmap files."""
+        rank = torch.distributed.get_rank()
+        
+        # Unregister RDMA buffers
+        for buffer_name, buffer_info in self.gemini_replicas_rdma_send_buffers.items():
+            if buffer_info.get('registered', False):
+                try:
+                    buffer = buffer_info.get('buffer')
+                    if buffer is not None:
+                        self.gemini_replicas_manager.unregister_buffer(buffer)
+                    logger.info(f"rank: {rank}, unregistered Gemini Replicas RDMA buffer for {buffer_name}")
+                except Exception as e:
+                    logger.warning(f"rank: {rank}, failed to unregister {buffer_name}: {e}")
+        
+        # Close mmap files
+        for buffer_name, (f, mm) in self.gemini_replicas_mmap_files.items():
+            try:
+                mm.close()
+                f.close()
+                logger.info(f"rank: {rank}, closed Gemini Replicas mmap file for {buffer_name}")
+            except Exception as e:
+                logger.warning(f"rank: {rank}, failed to close mmap for {buffer_name}: {e}")
+        
+        self.gemini_replicas_rdma_send_buffers.clear()
+        self.gemini_replicas_mmap_files.clear()
+        self.gemini_replicas_rdma_checkpoint_dir = None
+    
     def _allocate_gemini_recovery_buffers(self):
         """Pre-allocate large buffers for Gemini recovery to avoid allocation overhead.
         
@@ -3324,6 +3615,28 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 f"{buffer_size_bytes * len(source_ranks) / (1024**3):.2f} GB total"
             )
             
+            # Register buffers for RDMA if enabled
+            use_rdma = getattr(args, 'use_rdma', False) if hasattr(args, 'use_rdma') else False
+            if use_rdma and self.gemini_replicas_manager.is_initialized():
+                try:
+                    for src_rank in source_ranks:
+                        buffer = self.gemini_replicas_recovery_buffers[src_rank]
+                        buffer_addr = buffer.data_ptr()
+                        
+                        self.gemini_replicas_manager.register_buffer(buffer)
+                        logger.info(
+                            f"rank: {rank}, registered recovery buffer for source rank {src_rank} "
+                            f"for RDMA ({buffer_size_gb} GB)"
+                        )
+                    
+                    logger.info(f"rank: {rank}, all Gemini Replicas recovery buffers registered for RDMA")
+                    
+                except Exception as e:
+                    logger.warning(f"rank: {rank}, failed to register recovery buffers for RDMA: {e}")
+                    logger.warning(f"rank: {rank}, will use unregistered buffers (may fall back to temp buffers)")
+            elif use_rdma:
+                logger.info(f"rank: {rank}, RDMA enabled but Gemini Replicas not initialized, skipping buffer registration")
+            
         except Exception as e:
             logger.warning(f"Failed to allocate Gemini Replicas recovery buffers: {e}")
             # Fall back to dynamic allocation
@@ -3356,9 +3669,22 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 f"(required: {required_size / (1024**2):.2f} MB), allocating dynamically"
             )
             if torch.cuda.is_available():
-                return torch.empty(required_size, dtype=torch.uint8).pin_memory()
+                buffer = torch.empty(required_size, dtype=torch.uint8).pin_memory()
             else:
-                return torch.empty(required_size, dtype=torch.uint8)
+                buffer = torch.empty(required_size, dtype=torch.uint8)
+            
+            # Register buffer for RDMA if needed
+            from .gemini_replicas_manager import GeminiReplicasManager
+            manager = GeminiReplicasManager()
+            if manager.use_rdma and manager.is_initialized():
+                try:
+                    logger.info(f"Registering Gemini Replicas recovery buffer for source rank {source_rank} (RDMA)...")
+                    manager.register_buffer(buffer)
+                    logger.info(f"Gemini Replicas recovery buffer for source rank {source_rank} registered for RDMA")
+                except Exception as e:
+                    logger.warning(f"Failed to register Gemini Replicas recovery buffer for RDMA: {e}")
+            
+            return buffer
     
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank using the shared manager."""
@@ -8066,6 +8392,18 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             recovery_time = end_recovery_time - start_recovery_time
             logger.info(f"rank: {rank}, Gemini software failure recovery time: {recovery_time:.2f} seconds")
             return recovered_state_dict
+        
+        # Prepare Gemini Replicas RDMA send buffers early for recovery (sender ranks only)
+        # This ensures buffers are ready BEFORE rank2 starts waiting
+        if input_args.use_gemini_replicas and input_args.use_gemini_replicas_hardware_failure and input_args.use_gemini_replicas_optimized:
+            if rank in [0, 1, 3]:
+                # Prepare buffers now if not already prepared
+                # This includes: opening mmap, allocating aligned buffers, copying data, registering RDMA
+                prepare_start = time()
+                self._prepare_gemini_replicas_rdma_send_buffers_if_needed(checkpoint_dir)
+                prepare_end = time()
+                logger.info(f"rank: {rank}, Gemini Replicas RDMA send buffers preparation time: {(prepare_end - prepare_start)*1000:.2f}ms")
+        torch.distributed.barrier()
         
         # Gemini Replicas checkpoint recovery for rank2 failure scenario
         # rank0, rank1, rank3 send data to rank2; rank2 receives and recovers

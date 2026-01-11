@@ -310,6 +310,7 @@ class TemporalAsyncCaller(AsyncCaller):
     def __init__(self):
         self.process: Optional[mp.Process] = None
         self.replica_process: Optional[mp.Process] = None
+        self.replica_processes: Optional[List[mp.Process]] = None  # For Gemini Replicas
         self.start_time: Optional[float] = None
         
         # Reusable buffers for data exchange to avoid repeated allocations
@@ -618,13 +619,150 @@ class TemporalAsyncCaller(AsyncCaller):
                 else:
                     self.replica_process = None
                 
+        # Handle Gemini Replicas optimized mode (similar to Gemini)
+        replica_processes = []
+        if hasattr(args, 'use_gemini_replicas') and args.use_gemini_replicas and \
+           hasattr(args, 'use_gemini_replicas_optimized') and args.use_gemini_replicas_optimized:
+            logger.info(f"Gemini Replicas rank {rank}: Using optimized mode (exchange completed in preload)")
+            
+            write_buckets = async_fn_args[1]
+            
+            # Process replica buckets (all except the first local bucket)
+            if len(write_buckets) > 1:
+                for replica_idx, replica_bucket in enumerate(write_buckets[1:], start=1):
+                    # Extract buffer and metadata from replica bucket
+                    file_path, storage_key, (bytes_data, _) = replica_bucket
+                    
+                    replica_metadata = None
+                    replica_buffer = None
+                    
+                    for item in bytes_data:
+                        if isinstance(item, tuple) and len(item) == 2:
+                            key, value = item
+                            if key == 'gemini_replicas_metadata':
+                                replica_metadata = value
+                            elif key == 'gemini_replicas_buffer':
+                                replica_buffer = value
+                    
+                    if replica_buffer is not None and replica_metadata is not None:
+                        # Serialize metadata
+                        metadata_buffer = io.BytesIO()
+                        torch.save(replica_metadata, metadata_buffer)
+                        replica_metadata_bytes = metadata_buffer.getvalue()
+                        
+                        # Convert buffer to bytes (CRITICAL for RDMA compatibility)
+                        replica_buffer_bytes = replica_buffer.numpy().tobytes()
+                        
+                        # Combine: [metadata_size (8 bytes)] + [metadata_bytes] + [buffer_bytes]
+                        metadata_size = len(replica_metadata_bytes)
+                        header = metadata_size.to_bytes(8, byteorder='little')
+                        combined_bytes = header + replica_metadata_bytes + replica_buffer_bytes
+                        
+                        # Start process to write replica checkpoint
+                        replica_process = ctx.Process(
+                            target=self._write_bytes_to_file,
+                            args=(combined_bytes, file_path)
+                        )
+                        replica_process.start()
+                        replica_processes.append(replica_process)
+                        
+                        logger.info(
+                            f"Gemini Replicas rank {rank}: Started replica {replica_idx} save process to {file_path}, "
+                            f"buffer: {len(replica_buffer_bytes) / (1024**2):.2f} MB, "
+                            f"metadata: {metadata_size / 1024:.2f} KB"
+                        )
+                    else:
+                        logger.warning(
+                            f"Gemini Replicas rank {rank}: Failed to extract buffer/metadata for replica {replica_idx}"
+                        )
+            else:
+                logger.warning(f"Gemini Replicas rank {rank}: Expected multiple buckets, got {len(write_buckets)}")
+        
+        # Store replica processes for later joining
+        if replica_processes:
+            self.replica_processes = replica_processes
+        
         # exchange_end = time()
         # logger.info(f"rank: {rank}, total exchange (size + data) took {exchange_end - exchange_start:.2f}s")
 
         self.start_time = time()
         
         # Start process to save original checkpoint
-        if args.use_gemini:
+        if hasattr(args, 'use_gemini_replicas') and args.use_gemini_replicas and \
+           hasattr(args, 'use_gemini_replicas_optimized') and args.use_gemini_replicas_optimized:
+            # Gemini Replicas optimized mode: handle local bucket
+            logger.info(f"Gemini Replicas rank {rank}: Preparing optimized original checkpoint save")
+            
+            write_buckets = async_fn_args[1]
+            
+            # Get global_results_queue from async_fn_args
+            global_results_queue = async_fn_args[2] if len(async_fn_args) > 2 else None
+            
+            if len(write_buckets) >= 1:
+                local_bucket = write_buckets[0]
+                original_file_path = local_bucket[0]
+                
+                # Extract local buffer and metadata
+                if local_bucket[1] == 'gemini_replicas_optimized_local':
+                    _, _, (bytes_data, _) = local_bucket
+                    
+                    original_metadata = None
+                    original_buffer = None
+                    
+                    for item in bytes_data:
+                        if isinstance(item, tuple) and len(item) == 2:
+                            key, value = item
+                            if key == 'gemini_replicas_metadata':
+                                original_metadata = value
+                            elif key == 'gemini_replicas_buffer':
+                                original_buffer = value
+                    
+                    if original_buffer is not None and original_metadata is not None:
+                        # Serialize metadata
+                        metadata_buffer = io.BytesIO()
+                        torch.save(original_metadata, metadata_buffer)
+                        original_metadata_bytes = metadata_buffer.getvalue()
+                        
+                        # Convert buffer to bytes (CRITICAL for RDMA compatibility)
+                        original_buffer_bytes = original_buffer.numpy().tobytes()
+                        
+                        # Combine: [metadata_size (8 bytes)] + [metadata_bytes] + [buffer_bytes]
+                        metadata_size = len(original_metadata_bytes)
+                        header = metadata_size.to_bytes(8, byteorder='little')
+                        original_bytes = header + original_metadata_bytes + original_buffer_bytes
+                        
+                        logger.info(
+                            f"Gemini Replicas rank {rank}: Original checkpoint prepared, "
+                            f"buffer: {len(original_buffer_bytes) / (1024**2):.2f} MB, "
+                            f"metadata: {metadata_size / 1024:.2f} KB"
+                        )
+                    else:
+                        # Fallback to serialization
+                        logger.warning(f"Gemini Replicas rank {rank}: Failed to extract buffer/metadata, falling back to serialization")
+                        original_buffer_obj = io.BytesIO()
+                        torch.save(async_fn_args[1], original_buffer_obj)
+                        original_bytes = original_buffer_obj.getvalue()
+                else:
+                    # Not in optimized format, fallback to serialization
+                    logger.warning(f"Gemini Replicas rank {rank}: Local bucket not in expected format, falling back to serialization")
+                    original_buffer_obj = io.BytesIO()
+                    torch.save(async_fn_args[1], original_buffer_obj)
+                    original_bytes = original_buffer_obj.getvalue()
+            else:
+                # Empty write_buckets, fallback to serialization
+                logger.warning(f"Gemini Replicas rank {rank}: Empty write_buckets, falling back to serialization")
+                original_buffer_obj = io.BytesIO()
+                torch.save(async_fn_args[1], original_buffer_obj)
+                original_bytes = original_buffer_obj.getvalue()
+            
+            # Start process to write original checkpoint
+            self.process = ctx.Process(
+                target=self._write_bytes_to_file_with_queue,
+                args=(original_bytes, original_file_path, len(async_fn_args[1]), global_results_queue, 
+                      False, False)  # use_gemini=False for Gemini Replicas
+            )
+            self.process.start()
+        elif args.use_gemini:
             # Get original checkpoint file path
             original_file_path = self._get_original_file_path(async_fn_args[1])
             
@@ -905,9 +1043,15 @@ class TemporalAsyncCaller(AsyncCaller):
         # as torch.distributed.barrier (single integer all-reduce)
         is_alive = int(self.process.is_alive()) if self.process is not None else 0
         
-        # Also check replica process if it exists
+        # Also check replica process if it exists (for Gemini single replica)
         if hasattr(self, 'replica_process') and self.replica_process is not None:
             is_alive = max(is_alive, int(self.replica_process.is_alive()))
+        
+        # Also check all replica processes (for Gemini Replicas multiple replicas)
+        if hasattr(self, 'replica_processes') and self.replica_processes is not None:
+            for replica_process in self.replica_processes:
+                if replica_process is not None:
+                    is_alive = max(is_alive, int(replica_process.is_alive()))
         
         is_done = not is_alive if no_dist else self.sync_all_async_calls(is_alive)
 
@@ -936,12 +1080,23 @@ class TemporalAsyncCaller(AsyncCaller):
                 f"after {time() - self.start_time:.2f}s from forking"
             )
         
-        # Also join replica process if it exists
+        # Also join replica process if it exists (for Gemini single replica)
         if hasattr(self, 'replica_process') and self.replica_process is not None:
             logger.debug(f"rank: {torch.distributed.get_rank()}, joining replica_process")
             self.replica_process.join()
             self.replica_process = None
             logger.debug(f"rank: {torch.distributed.get_rank()}, replica process join finished")
+        
+        # Also join all replica processes (for Gemini Replicas multiple replicas)
+        if hasattr(self, 'replica_processes') and self.replica_processes is not None:
+            logger.debug(f"rank: {torch.distributed.get_rank()}, joining {len(self.replica_processes)} replica processes")
+            for i, replica_process in enumerate(self.replica_processes):
+                if replica_process is not None:
+                    logger.debug(f"rank: {torch.distributed.get_rank()}, joining replica process {i+1}/{len(self.replica_processes)}")
+                    replica_process.join()
+                    logger.debug(f"rank: {torch.distributed.get_rank()}, replica process {i+1} join finished")
+            self.replica_processes = None
+            logger.debug(f"rank: {torch.distributed.get_rank()}, all replica processes joined")
         
         self.start_time = None
 

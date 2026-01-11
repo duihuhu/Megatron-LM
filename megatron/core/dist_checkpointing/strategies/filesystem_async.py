@@ -1020,24 +1020,47 @@ class FileSystemWriterAsync(FileSystemWriter):
         )
         
         # Phase 2: Allocate continuous buffer (reuse preallocated buffer if available)
+        buffer_needs_registration = False
         if self.preallocated_cpu_buffer is not None:
             buffer = self.preallocated_cpu_buffer
+            # If preallocated buffer exists, ensure it's large enough
             if buffer.numel() < total_size:
                 logger.warning(
-                    f"Gemini Replicas rank {rank}: Preallocated buffer too small, reallocating..."
+                    f"Gemini Replicas rank {rank}: Preallocated buffer ({buffer.numel() / (1024**3):.2f} GB) "
+                    f"is smaller than total_size ({total_size / (1024**3):.2f} GB). Reallocating..."
                 )
                 if torch.cuda.is_available():
                     buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
+                buffer_needs_registration = True
             else:
+                # Use slice of preallocated buffer
                 buffer = buffer[:total_size]
                 logger.info(f"Gemini Replicas rank {rank}: Reusing preallocated buffer")
+                # Buffer should already be registered (if RDMA is enabled)
         else:
+            # Allocate new buffer with pinned memory for faster GPU-CPU transfer
             if torch.cuda.is_available():
                 buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
                 logger.info(f"Gemini Replicas rank {rank}: Allocated new pinned memory buffer")
             else:
                 buffer = torch.empty(total_size, dtype=torch.uint8)
                 logger.info(f"Gemini Replicas rank {rank}: Allocated new CPU buffer")
+            buffer_needs_registration = True
+        
+        # Register buffer for RDMA if enabled (on first allocation)
+        if self.use_rdma and buffer_needs_registration and self._gemini_replicas_native is not None:
+            try:
+                buffer_addr = buffer.data_ptr()
+                buffer_size = buffer.numel()
+                logger.info(
+                    f"Gemini Replicas rank {rank}: Registering send buffer for RDMA "
+                    f"at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB"
+                )
+                self._gemini_replicas_native.register_buffer(buffer_addr, buffer_size)
+                logger.info(f"Gemini Replicas rank {rank}: Send buffer registered for RDMA successfully")
+            except Exception as e:
+                logger.error(f"Gemini Replicas rank {rank}: Failed to register send buffer for RDMA: {e}")
+                # Continue without RDMA registration
         
         # Phase 3: Copy tensor data to buffer
         num_gpu_tensors = 0
@@ -1161,25 +1184,63 @@ class FileSystemWriterAsync(FileSystemWriter):
                 rank_sizes = {r: all_sizes[r][0].item() for r in range(world_size)}
                 logger.info(f"Gemini Replicas rank {rank}: All rank buffer sizes: {rank_sizes}")
                 
-                # ===== Step 2: Pre-allocate receive buffers based on source rank sizes =====
-                logger.info(f"Gemini Replicas rank {rank}: Pre-allocating receive buffers...")
+                # ===== Step 2: Get or allocate receive buffers based on source rank sizes =====
+                logger.info(f"Gemini Replicas rank {rank}: Preparing receive buffers...")
                 receive_buffers = []
                 receive_buffer_addrs = []
                 
                 for src_rank in source_ranks:
                     src_buffer_size = rank_sizes[src_rank]
-                    # Allocate buffer with exact size
-                    recv_buffer = torch.empty(src_buffer_size, dtype=torch.uint8)
-                    if torch.cuda.is_available():
-                        recv_buffer = recv_buffer.pin_memory()
+                    
+                    # Try to reuse preallocated remote buffer from strategy (similar to Gemini)
+                    if hasattr(self, 'gemini_replicas_remote_buffers') and \
+                       src_rank in self.gemini_replicas_remote_buffers and \
+                       self.gemini_replicas_remote_buffers[src_rank] is not None:
+                        # Reuse preallocated buffer (slice to actual size)
+                        remote_buffer_size = self.gemini_replicas_remote_buffer_sizes[src_rank]
+                        recv_buffer = self.gemini_replicas_remote_buffers[src_rank][:remote_buffer_size]
+                        logger.info(
+                            f"Gemini Replicas rank {rank}: Reusing preallocated remote buffer for source rank {src_rank}: "
+                            f"required={src_buffer_size / (1024**2):.2f} MB, "
+                            f"allocated={remote_buffer_size / (1024**2):.2f} MB"
+                        )
+                    else:
+                        # Fallback: allocate buffer dynamically (shouldn't happen in optimized mode)
+                        # Note: Do NOT use pin_memory() because buffers will be passed to multiprocessing
+                        logger.warning(
+                            f"Gemini Replicas rank {rank}: Remote buffer for source rank {src_rank} not preallocated, "
+                            f"allocating now"
+                        )
+                        recv_buffer = torch.empty(src_buffer_size, dtype=torch.uint8, device='cpu')
+                        
+                        logger.info(
+                            f"Gemini Replicas rank {rank}: Allocated {src_buffer_size / (1024**2):.2f} MB "
+                            f"receive buffer for source rank {src_rank} (regular CPU memory)"
+                        )
+                        
+                        # Register buffer for RDMA if enabled (only for newly allocated buffers)
+                        if self.use_rdma and self._gemini_replicas_native is not None:
+                            try:
+                                recv_buffer_addr = recv_buffer.data_ptr()
+                                recv_buffer_size = recv_buffer.numel()
+                                logger.info(
+                                    f"Gemini Replicas rank {rank}: Registering receive buffer for source rank {src_rank} "
+                                    f"for RDMA at 0x{recv_buffer_addr:x}, size: {recv_buffer_size / (1024**2):.2f} MB"
+                                )
+                                self._gemini_replicas_native.register_buffer(recv_buffer_addr, recv_buffer_size)
+                                logger.info(f"Gemini Replicas rank {rank}: Receive buffer registered for RDMA successfully")
+                            except Exception as e:
+                                logger.warning(f"Gemini Replicas rank {rank}: Failed to register receive buffer for RDMA: {e}")
+                                # Continue without RDMA registration
+                        
+                        # Register receive buffer for RDMA if needed (only for dynamically allocated)
+                        if manager.use_rdma:
+                            logger.info(f"Gemini Replicas rank {rank}: Registering receive buffer for source {src_rank} (RDMA)...")
+                            manager.register_buffer(recv_buffer)
+                            logger.info(f"Gemini Replicas rank {rank}: Receive buffer for source {src_rank} registered for RDMA")
                     
                     receive_buffers.append(recv_buffer)
                     receive_buffer_addrs.append((recv_buffer.data_ptr(), recv_buffer.numel()))
-                    
-                    logger.info(
-                        f"Gemini Replicas rank {rank}: Allocated {src_buffer_size / (1024**2):.2f} MB "
-                        f"receive buffer for source rank {src_rank}"
-                    )
                 
                 # ===== Step 3: Synchronize all ranks before starting C++ data transfer =====
                 logger.info(f"Gemini Replicas rank {rank}: Synchronizing before C++ data transfer...")
@@ -1217,7 +1278,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 broadcast_bandwidth = ((send_buffer_size * (self.gemini_replicas_num - 1)) / (1024**3)) / broadcast_time if broadcast_time > 0 else 0
                 
                 logger.info(
-                    f"Gemini Replicas rank {rank}: C++ ASIO broadcast completed in {broadcast_time:.4f}s, "
+                    f"Gemini Replicas rank {rank}: C++ broadcast completed in {broadcast_time:.4f}s, "
                     f"sent: {send_buffer_size / (1024**2):.2f} MB to {self.gemini_replicas_num - 1} ranks, "
                     f"received: {len(receive_buffers)} buffers, "
                     f"total bandwidth: {broadcast_bandwidth:.2f} GB/s"
@@ -1675,9 +1736,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         Returns: None
         """
         import sys
-        # print(f"EC-CHECK: Write preloaded data multiproc started", file=sys.stdout)
         logger = logging.getLogger(__name__)
-        # logger.info(f"EC-CHECK: Write preloaded data multiproc started")
         w_start = time()
         write_results_or_exc: Union[dict, Exception] = dict()
         ctx = mp.get_context("fork")
@@ -1716,17 +1775,13 @@ class FileSystemWriterAsync(FileSystemWriter):
                 write_results_or_exc = RuntimeError(err_msg)
 
         if not isinstance(write_results_or_exc, Exception):
-            # logger.info(f"EC-CHECK: Starting {len(p_list)} write processes...")
             for p in p_list:
                 p.start()
-                logger.info(f"EC-CHECK: Started process {p.pid}")
 
             # logger.debug("FileSystemWriterAsync: collecting worker results...")
 
             # To make sure all nodes are completed
-            # logger.info("EC-CHECK: Waiting for all processes to complete (count_queue.join)...")
             count_queue.join()
-            # logger.info("EC-CHECK: All processes completed (count_queue.join returned)")
 
             # At this point, all workers completed, so the queue should have exactly
             # `len(write_buckets)` items

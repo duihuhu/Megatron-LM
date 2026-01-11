@@ -1,14 +1,15 @@
 #!/bin/bash
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
-# Build script for Gemini Replicas Native C++ Module with ASIO
+# Build script for Gemini Replicas Native C++ Module with ASIO and RDMA
 # 
 # This script compiles the gemini_replicas_native.cpp file into a Python extension module
-# using pybind11 and Boost.ASIO.
+# using pybind11, Boost.ASIO, and InfiniBand verbs (for RDMA support).
 #
 # Requirements:
 #   - Python 3.x with pybind11
 #   - Boost libraries (for ASIO)
+#   - InfiniBand verbs library (libibverbs-dev) for RDMA support
 #   - C++17 compiler (g++ or clang++)
 #
 # Usage:
@@ -80,7 +81,8 @@ else
 fi
 
 # Boost library linking (ASIO is header-only, but we need system libraries)
-BOOST_LIBS="-lboost_system -lpthread"
+# Also link InfiniBand verbs library for RDMA support
+BOOST_LIBS="-lboost_system -lpthread -libverbs"
 
 # Output file
 OUTPUT_FILE="gemini_replicas_native${PYTHON_EXT_SUFFIX}"

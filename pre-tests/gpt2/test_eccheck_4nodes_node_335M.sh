@@ -117,8 +117,8 @@ EVAL_AND_LOGGING_ARGS=(
     --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --use-eccheck
-    
+    #--use-eccheck
+    --use-ecnaive
     # --use-gemini
     # --use-gemini-optimized
     # --use-gemini-software-failure

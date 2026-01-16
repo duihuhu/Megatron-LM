@@ -7,14 +7,14 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=enp65s0np0
+export NETIFACES_INTERFACE=eno33np0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
 
 GPUS_PER_NODE=1
-MASTER_ADDR=10.10.1.1
+MASTER_ADDR=128.105.146.30
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_USE_ASIO=true
@@ -119,7 +119,7 @@ EVAL_AND_LOGGING_ARGS=(
 
     --use-gemini-replicas 
     --use-gemini-replicas-optimized 
-    --use-rdma
+    # --use-rdma
     --use-gemini-replicas-hardware-failure
     # --gemini-replicas-num 4
     # --use-gemini

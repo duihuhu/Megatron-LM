@@ -991,8 +991,8 @@ public:
 
     // Save mode pipelines: 3 sends + 3 receives
     void submit_send_data1(uintptr_t send_addr, size_t size) {
-        std::cout << "ECNAIVE: Submitting send_data1 task: send_addr=" << send_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECNAIVE: Submitting send_data1 task: send_addr=" << send_addr
+        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(send_data1_mutex_);
             send_data1_q_.push({send_addr, size});
@@ -1001,8 +1001,8 @@ public:
     }
 
     void submit_send_parity0(uintptr_t send_addr, size_t size) {
-        std::cout << "ECNAIVE: Submitting send_parity0 task: send_addr=" << send_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECNAIVE: Submitting send_parity0 task: send_addr=" << send_addr
+        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(send_parity0_mutex_);
             send_parity0_q_.push({send_addr, size});
@@ -1011,8 +1011,7 @@ public:
     }
 
     void submit_send_parity1(uintptr_t send_addr, size_t size) {
-        std::cout << "ECNAIVE: Submitting send_parity1 task: send_addr=" << send_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECNAIVE: Submitting send_parity1 task: send_addr=" << send_addr << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(send_parity1_mutex_);
             send_parity1_q_.push({send_addr, size});
@@ -1021,8 +1020,8 @@ public:
     }
 
     void submit_recv_parity1(uintptr_t recv_addr, size_t size) {
-        std::cout << "ECNAIVE: Submitting recv_parity1 task: recv_addr=" << recv_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECNAIVE: Submitting recv_parity1 task: recv_addr=" << recv_addr
+        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_parity1_mutex_);
             recv_parity1_q_.push({recv_addr, size});
@@ -1031,8 +1030,8 @@ public:
     }
 
     void submit_recv_parity0(uintptr_t recv_addr, size_t size) {
-        std::cout << "ECNAIVE: Submitting recv_parity0 task: recv_addr=" << recv_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECNAIVE: Submitting recv_parity0 task: recv_addr=" << recv_addr
+        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_parity0_mutex_);
             recv_parity0_q_.push({recv_addr, size});
@@ -1041,8 +1040,8 @@ public:
     }
 
     void submit_recv_data1(uintptr_t recv_addr, size_t size) {
-        std::cout << "ECNAIVE: Submitting recv_data1 task: recv_addr=" << recv_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECNAIVE: Submitting recv_data1 task: recv_addr=" << recv_addr
+        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_data1_mutex_);
             recv_data1_q_.push({recv_addr, size});
@@ -1061,14 +1060,14 @@ public:
                              uintptr_t recv_parity0_addr, // recv p_{i+2,0} from rank i+2
                              uintptr_t recv_data1_addr,   // recv d_{i+3,1} from rank i+3
                              size_t size) {
-        std::cout << "ECNAIVE: Submitting save task: data0=" << data0_addr
-                  << ", data1=" << data1_addr
-                  << ", parity0=" << parity0_addr
-                  << ", parity1=" << parity1_addr
-                  << ", recv_p1=" << recv_parity1_addr
-                  << ", recv_p0=" << recv_parity0_addr
-                  << ", recv_d1=" << recv_data1_addr
-                  << ", size=" << size << std::endl;
+        // std::cout << "ECNAIVE: Submitting save task: data0=" << data0_addr
+        //           << ", data1=" << data1_addr
+        //           << ", parity0=" << parity0_addr
+        //           << ", parity1=" << parity1_addr
+        //           << ", recv_p1=" << recv_parity1_addr
+        //           << ", recv_p0=" << recv_parity0_addr
+        //           << ", recv_d1=" << recv_data1_addr
+        //           << ", size=" << size << std::endl;
         
         // Step 1: Encode data blocks to get parity blocks
         encode_ec_blocks(data0_addr, data1_addr, parity0_addr, parity1_addr, size);
@@ -1095,7 +1094,7 @@ public:
     }
 
     void submit_send_parity0_sentinel() {
-        std::cout << "ECNAIVE: Submitting sentinel to send_parity0 pipeline" << std::endl;
+        // std::cout << "ECNAIVE: Submitting sentinel to send_parity0 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(send_parity0_mutex_);
             send_parity0_q_.push({0, 0});
@@ -1104,7 +1103,7 @@ public:
     }
 
     void submit_send_parity1_sentinel() {
-        std::cout << "ECNAIVE: Submitting sentinel to send_parity1 pipeline" << std::endl;
+        // std::cout << "ECNAIVE: Submitting sentinel to send_parity1 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(send_parity1_mutex_);
             send_parity1_q_.push({0, 0});
@@ -1113,7 +1112,7 @@ public:
     }
 
     void submit_recv_parity1_sentinel() {
-        std::cout << "ECNAIVE: Submitting sentinel to recv_parity1 pipeline" << std::endl;
+        // std::cout << "ECNAIVE: Submitting sentinel to recv_parity1 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_parity1_mutex_);
             recv_parity1_q_.push({0, 0});
@@ -1122,7 +1121,7 @@ public:
     }
 
     void submit_recv_parity0_sentinel() {
-        std::cout << "ECNAIVE: Submitting sentinel to recv_parity0 pipeline" << std::endl;
+        // std::cout << "ECNAIVE: Submitting sentinel to recv_parity0 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_parity0_mutex_);
             recv_parity0_q_.push({0, 0});
@@ -1131,7 +1130,7 @@ public:
     }
 
     void submit_recv_data1_sentinel() {
-        std::cout << "ECNAIVE: Submitting sentinel to recv_data1 pipeline" << std::endl;
+        // std::cout << "ECNAIVE: Submitting sentinel to recv_data1 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_data1_mutex_);
             recv_data1_q_.push({0, 0});

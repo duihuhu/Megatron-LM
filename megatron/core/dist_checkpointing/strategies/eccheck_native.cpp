@@ -3595,8 +3595,8 @@ public:
                     }
                     
                     load_encoding_sentinel_received_ = false;
-                    std::cout << "EC-CHECK: [Rank " << rank_ 
-                              << "] Load encoder: All tasks completed, sentinel sent to downstream workers" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ 
+                    //           << "] Load encoder: All tasks completed, sentinel sent to downstream workers" << std::endl;
                 }
             }
         }
@@ -3709,20 +3709,20 @@ public:
                 
                 try {
                     // Send message header (size) first
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send: About to send header (size=" << task.size << ")" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send: About to send header (size=" << task.size << ")" << std::endl;
                     boost::asio::write(
                         asio_conn_mgr_.get_xor_send_socket(),
                         boost::asio::buffer(&size_net, sizeof(uint32_t))
                     );
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send: Header sent successfully" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send: Header sent successfully" << std::endl;
                     
                     // Send data
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send: About to send data (size=" << task.size << ")" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send: About to send data (size=" << task.size << ")" << std::endl;
                     boost::asio::write(
                         asio_conn_mgr_.get_xor_send_socket(),
                         boost::asio::buffer(buffer_ptr, task.size)
                     );
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send: Data sent successfully" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send: Data sent successfully" << std::endl;
                     
                     // Send completed successfully, release buffer
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
@@ -3810,12 +3810,12 @@ public:
                 
                 try {
                     // Receive message header (size) first
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv: About to receive header (expected_size=" << task.size << ")" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv: About to receive header (expected_size=" << task.size << ")" << std::endl;
                     boost::asio::read(
                         asio_conn_mgr_.get_xor_recv_socket(),
                         boost::asio::buffer(&size_net, sizeof(uint32_t))
                     );
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv: Header received successfully" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv: Header received successfully" << std::endl;
                     
                     uint32_t size = ntohl(size_net);
                     if (size != task.size) {
@@ -3826,12 +3826,12 @@ public:
                     }
                     
                     // Receive data
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv: About to receive data (size=" << size << ")" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv: About to receive data (size=" << size << ")" << std::endl;
                     boost::asio::read(
                         asio_conn_mgr_.get_xor_recv_socket(),
                         boost::asio::buffer(buffer_ptr, size)
                     );
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv: Data received successfully" << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv: Data received successfully" << std::endl;
                     
                     // Receive completed successfully, continue with XOR processing below
                 } catch (const boost::system::system_error& e) {
@@ -4047,19 +4047,19 @@ public:
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));
                     
                     try {
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: About to send header (size=" << task.size << ")" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: About to send header (size=" << task.size << ")" << std::endl;
                         boost::asio::write(
                             asio_conn_mgr_.get_p2p_send_socket(),
                             boost::asio::buffer(&size_net, sizeof(uint32_t))
                         );
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Header sent successfully" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Header sent successfully" << std::endl;
                         
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: About to send data (size=" << task.size << ")" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: About to send data (size=" << task.size << ")" << std::endl;
                         boost::asio::write(
                             asio_conn_mgr_.get_p2p_send_socket(),
                             boost::asio::buffer(buffer_ptr, task.size)
                         );
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Data sent successfully" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Data sent successfully" << std::endl;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
                                   << "] Load P2P ASIO send failed: " << e.what() << std::endl;
@@ -4153,12 +4153,12 @@ public:
                     uint32_t size_net;
                     
                     try {
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: About to receive header (expected_size=" << task.size << ")" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: About to receive header (expected_size=" << task.size << ")" << std::endl;
                         boost::asio::read(
                             asio_conn_mgr_.get_p2p_recv_socket(),
                             boost::asio::buffer(&size_net, sizeof(uint32_t))
                         );
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: Header received successfully" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: Header received successfully" << std::endl;
                         
                         uint32_t size = ntohl(size_net);
                         if (size != task.size) {
@@ -4168,12 +4168,12 @@ public:
                             continue;
                         }
                         
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: About to receive data (size=" << size << ")" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: About to receive data (size=" << size << ")" << std::endl;
                         boost::asio::read(
                             asio_conn_mgr_.get_p2p_recv_socket(),
                             boost::asio::buffer(buffer_ptr, size)
                         );
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: Data received successfully" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: Data received successfully" << std::endl;
                         task_processed = true;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
@@ -4281,19 +4281,19 @@ public:
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));
                     
                     try {
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P send: About to send header (size=" << task.size << ")" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P send: About to send header (size=" << task.size << ")" << std::endl;
                         boost::asio::write(
                             asio_conn_mgr_.get_step6_p2p_send_socket(),
                             boost::asio::buffer(&size_net, sizeof(uint32_t))
                         );
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P send: Header sent successfully" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P send: Header sent successfully" << std::endl;
                         
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P send: About to send data (size=" << task.size << ")" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P send: About to send data (size=" << task.size << ")" << std::endl;
                         boost::asio::write(
                             asio_conn_mgr_.get_step6_p2p_send_socket(),
                             boost::asio::buffer(buffer_ptr, task.size)
                         );
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P send: Data sent successfully" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P send: Data sent successfully" << std::endl;
                         send_success = true;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
@@ -4368,12 +4368,12 @@ public:
                     uint32_t size_net;
                     
                     try {
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P recv: About to receive header (expected_size=" << task.size << ")" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P recv: About to receive header (expected_size=" << task.size << ")" << std::endl;
                         boost::asio::read(
                             asio_conn_mgr_.get_step6_p2p_recv_socket(),
                             boost::asio::buffer(&size_net, sizeof(uint32_t))
                         );
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P recv: Header received successfully" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P recv: Header received successfully" << std::endl;
                         
                         uint32_t size = ntohl(size_net);
                         if (size != task.size) {
@@ -4383,12 +4383,12 @@ public:
                             continue;
                         }
                         
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P recv: About to receive data (size=" << size << ")" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P recv: About to receive data (size=" << size << ")" << std::endl;
                         boost::asio::read(
                             asio_conn_mgr_.get_step6_p2p_recv_socket(),
                             boost::asio::buffer(buffer_ptr, size)
                         );
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P recv: Data received successfully" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P recv: Data received successfully" << std::endl;
                         task_processed = true;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 

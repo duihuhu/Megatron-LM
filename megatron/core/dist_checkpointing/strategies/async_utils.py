@@ -511,6 +511,7 @@ class TemporalAsyncCaller(AsyncCaller):
         rank = torch.distributed.get_rank()
         # logger.info(f"EC-CHECK: Synchronizing CUDA")
         torch.cuda.synchronize()
+        torch.distributed.barrier()
         # logger.info(f"EC-CHECK: CUDA synchronized")
         end_sync = time()
         logger.info(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")

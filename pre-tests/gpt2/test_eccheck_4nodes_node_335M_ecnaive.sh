@@ -12,17 +12,16 @@ export NETIFACES_INTERFACE=eno33np0
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-
 GPUS_PER_NODE=1
 MASTER_ADDR=128.105.146.30
-export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
-export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
+
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
 NNODES=4
 
-export GEMINI_INTERFACE=$NETIFACES_INTERFACE
-
+export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
+export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
+export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -43,7 +42,7 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-gemini" #<Specify path>
+CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-naive" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -115,14 +114,12 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
 
-    --use-gemini
-    --use-gemini-optimized
-    # --use-rdma
-    
+    # --use-gemini
+    # --use-gemini-optimized
     # --use-gemini-software-failure
-    --use-gemini-hardware-failure
-
-    # --use-eclatin
+    # --use-gemini-hardware-failure
+    # --use-distributed-optimizer
+    --use-ecnaive
     --ckpt-format torch_dist
 )
 

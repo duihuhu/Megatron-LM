@@ -2383,6 +2383,165 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         logger.debug("EC-NAIVE: Decomposition validation passed")
         return True
 
+    def _allocate_eclatin_blocks(self, global_registry):
+        """
+        Allocate 4 persistent blocks for ECLATIN:
+        - data_block_1: First data block
+        - data_block_2: Second data block
+        - parity_block_1: First parity block (from parity1 pipeline)
+        - parity_block_2: Second parity block (from parity2 pipeline)
+        
+        All blocks are aligned to the maximum size across all ranks for pipeline synchronization.
+        This ensures all ranks use the same block sizes.
+        
+        Args:
+            global_registry: GlobalMetadataRegistry from all ranks
+            
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary with 'data_block_1', 'data_block_2', 
+                                    'parity_block_1', 'parity_block_2'
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        # ===== Get own data size from metadata =====
+        own_metadata = global_registry.rank_metadata.get(rank, [])
+        own_total_size = sum(meta.size_bytes for meta in own_metadata)
+        
+        # ===== Calculate maximum data size across all ranks =====
+        if torch.distributed.is_initialized():
+            # Get all ranks' data sizes from global_registry and compute max locally
+            all_total_bytes_list = []
+            for r in range(world_size):
+                rank_metadata = global_registry.rank_metadata.get(r, [])
+                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                all_total_bytes_list.append(rank_total_size)
+            
+            # Compute maximum locally (all ranks have the same global_registry)
+            max_total_bytes = max(all_total_bytes_list)
+        else:
+            max_total_bytes = own_total_size
+        
+        # ===== Align block size to buffer_size (64MB) using half of maximum =====
+        eclatin_buffer_size = self.eclatin_manager.eclatin_buffer_size
+        # Each block only needs half of max_total_bytes (data is split into two halves)
+        half_max_total_bytes = max_total_bytes // 2
+        aligned_half_block_size = ((half_max_total_bytes + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+        
+        logger.info(
+            f"ECLATIN: Allocating 4 persistent blocks based on metadata\n"
+            f"  Own data size: {own_total_size / (1024**3):.2f} GB (actual), "
+            f"{max_total_bytes / (1024**3):.2f} GB (pipeline max), "
+            f"{aligned_half_block_size / (1024**3):.2f} GB (aligned half block size)\n"
+            f"  All blocks will use aligned half size: {aligned_half_block_size / (1024**3):.2f} GB "
+            f"({aligned_half_block_size / (1024**2):.0f} MB)"
+        )
+        
+        # ===== Allocate 4 large continuous buffers =====
+        # All blocks use the same aligned half size (each block stores half of the data)
+        data_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        data_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        parity_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        parity_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        
+        logger.info(
+            f"ECLATIN: Allocated 4 persistent blocks:\n"
+            f"  data_block_1: {aligned_half_block_size / (1024**3):.2f} GB "
+            f"({aligned_half_block_size / (1024**2):.0f} MB)\n"
+            f"  data_block_2: {aligned_half_block_size / (1024**3):.2f} GB "
+            f"({aligned_half_block_size / (1024**2):.0f} MB)\n"
+            f"  parity_block_1: {aligned_half_block_size / (1024**3):.2f} GB "
+            f"({aligned_half_block_size / (1024**2):.0f} MB)\n"
+            f"  parity_block_2: {aligned_half_block_size / (1024**3):.2f} GB "
+            f"({aligned_half_block_size / (1024**2):.0f} MB)\n"
+            f"  Total memory: {4 * aligned_half_block_size / (1024**3):.2f} GB"
+        )
+        
+        # ===== Package blocks with metadata =====
+        # Align with EC-CHECK: use decomposed_state_dict.non_tensor_data directly
+        own_non_tensor_data = self.decomposed_state_dict.non_tensor_data
+        tensor_infos = self.decomposed_state_dict.tensor_infos  # List[TensorInfo] with offsets
+        own_non_tensor_data_bytes = pickle.dumps(own_non_tensor_data)
+        own_tensor_keys_data_bytes = pickle.dumps(tensor_infos)
+        own_non_tensor_size = len(own_non_tensor_data_bytes)
+        own_tensor_keys_size = len(own_tensor_keys_data_bytes)
+        own_tensor_buffer_size = self.decomposed_state_dict.total_tensor_size_bytes
+        
+        # Create serialized metadata for all blocks (same metadata for all)
+        block_serialized_metadata = {
+            'non_tensor_data': own_non_tensor_data_bytes,
+            'tensor_keys_data': own_tensor_keys_data_bytes,
+            'non_tensor_size': own_non_tensor_size,
+            'tensor_keys_size': own_tensor_keys_size,
+            'tensor_buffer_size': own_tensor_buffer_size,
+        }
+        
+        # Store actual size and pipeline size for later use
+        own_actual_size = own_total_size
+        block_pipeline_total_bytes = max_total_bytes
+        
+        # ===== Package blocks into WriteBucket format =====
+        # Similar to ECCHECK's P2P buffers, create WriteBuckets for each block
+        from pathlib import Path
+        
+        # Get checkpoint_dir
+        checkpoint_dir = getattr(self, 'current_checkpoint_dir', None)
+        if checkpoint_dir is None:
+            logger.warning("ECLATIN: checkpoint_dir not available, using file_name as path")
+            checkpoint_dir = Path(".")
+        else:
+            checkpoint_dir = Path(checkpoint_dir)
+        
+        # Create WriteBuckets for 4 blocks
+        # Format: (file_path, storage_key, (bytes_data, tensor_data))
+        block_names = ['data_block_1', 'data_block_2', 'parity_block_1', 'parity_block_2']
+        block_tensors = [data_block_1, data_block_2, parity_block_1, parity_block_2]
+        
+        for block_name, block_tensor in zip(block_names, block_tensors):
+            # Create eccheck_bytes_data format (reuse ECCHECK format for compatibility)
+            block_eclatin_bytes_data = [
+                ('eclatin_metadata', block_serialized_metadata),
+                ('eclatin_continuous_buffer', block_tensor),
+            ]
+            
+            # Generate file name
+            file_name = f'__{rank}_{block_name}.distcp'
+            file_path = checkpoint_dir / file_name
+            
+            # Create WriteBucket
+            write_bucket = (
+                file_path,              # file_path (full path with checkpoint_dir)
+                file_name,              # storage_key (used in metadata)
+                (block_eclatin_bytes_data, []),  # (bytes_data, tensor_data)
+            )
+            
+            self.ecl_write_buckets.append(write_bucket)
+        
+        # Package blocks into dictionary
+        blocks = {
+            'data_block_1': data_block_1,
+            'data_block_2': data_block_2,
+            'parity_block_1': parity_block_1,
+            'parity_block_2': parity_block_2,
+            'metadata': block_serialized_metadata,
+            'actual_size': own_actual_size,
+            'pipeline_size': block_pipeline_total_bytes,
+            'aligned_size': aligned_half_block_size,
+        }
+        
+        logger.info(
+            f"ECLATIN: Packaged 4 blocks with metadata and WriteBuckets:\n"
+            f"  Metadata: {own_non_tensor_size / 1024:.2f} KB (non-tensor) + "
+            f"{own_tensor_keys_size / 1024:.2f} KB (tensor keys), "
+            f"{own_tensor_buffer_size / (1024**3):.2f} GB (buffer actual size)\n"
+            f"  Pipeline size: {block_pipeline_total_bytes / (1024**3):.2f} GB\n"
+            f"  Aligned half block size: {aligned_half_block_size / (1024**3):.2f} GB\n"
+            f"  Created {len(block_names)} WriteBuckets"
+        )
+        
+        return blocks
+   
+
     def _allocate_ecnaive_blocks(self, global_registry):
         """
         Allocate 4 persistent blocks for EC-NAIVE:

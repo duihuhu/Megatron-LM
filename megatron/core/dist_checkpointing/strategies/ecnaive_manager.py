@@ -50,6 +50,7 @@ class ECNAIVEManager:
         
         self._ecnaive_native = None
         self.use_ecnaive = False
+        self.use_rdma = False  # New: RDMA support flag
         
         # Buffer configuration
         self.ecnaive_data_buffers_count = 12
@@ -70,6 +71,10 @@ class ECNAIVEManager:
         self._buffer_poller_thread: Optional[threading.Thread] = None
         self._buffer_poller_stop_event: Optional[threading.Event] = None
         self._buffer_poller_active_event: Optional[threading.Event] = None
+        
+        # RDMA buffer registry (similar to Gemini)
+        self.registered_buffers = {}  # {addr: (size, iteration)}
+        self.current_iteration = 0
         
         self._initialized = True
 
@@ -506,6 +511,13 @@ class ECNAIVEManager:
             'recv_parity0': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),
         }
         
+        # Register buffers for RDMA if enabled
+        if self.use_rdma and self._ecnaive_native is not None:
+            logger.info(f"EC-NAIVE: [Rank {rank}] Registering load recv buffers for RDMA...")
+            for buffer_name, buffer in recv_buffers.items():
+                self.register_buffer(buffer)
+            logger.info(f"EC-NAIVE: [Rank {rank}] Load recv buffers registered for RDMA")
+        
         logger.info(
             f"EC-NAIVE: Allocated 2 recv buffers for rank2: "
             f"{aligned_block_size / (1024**3):.2f} GB each"
@@ -525,6 +537,10 @@ class ECNAIVEManager:
             self.use_ecnaive = args.use_ecnaive
             if not getattr(args, 'use_ecnaive', False):
                 return
+            
+            # Check RDMA flag
+            self.use_rdma = getattr(args, 'use_rdma', False)
+            logger.info(f"EC-NAIVE: RDMA support {'enabled' if self.use_rdma else 'disabled'}")
                 
             # Check if distributed environment is initialized
             if not torch.distributed.is_initialized():
@@ -606,7 +622,7 @@ class ECNAIVEManager:
                 send_parity0_partner_port = base_port + partner_ranks['send_parity0_to'] * 6 + 4  # recv_parity0
                 send_parity1_partner_port = base_port + partner_ranks['send_parity1_to'] * 6 + 5  # recv_data1
                 
-                # Create C++ instance with ASIO parameters (12 parameters: 6 pairs of ip:port)
+                # Create C++ instance with ASIO parameters (12 parameters: 6 pairs of ip:port + use_rdma flag)
                 self._ecnaive_native = ecnaive_native.ECNaiveNative(
                     # Send connections
                     rank_ips.get(partner_ranks['send_data1_to'], net_config['my_ip']), send_data1_partner_port,
@@ -616,6 +632,8 @@ class ECNAIVEManager:
                     net_config['my_ip'], net_config['ports']['recv_parity1'],
                     net_config['my_ip'], net_config['ports']['recv_parity0'],
                     net_config['my_ip'], net_config['ports']['recv_data1'],
+                    # RDMA flag
+                    self.use_rdma
                 )
                 
                 # If we reach here, ASIO connections are ready and threads are running
@@ -660,6 +678,15 @@ class ECNAIVEManager:
         
         # Allocate parity buffers (pooled) for parity blocks
         self.ecnaive_parity_buffers = self._allocate_parity_buffers()
+        
+        # Register buffers for RDMA if enabled
+        if self.use_rdma and self._ecnaive_native is not None:
+            logger.info(f"EC-NAIVE: [Rank {rank}] Registering data and parity buffers for RDMA...")
+            for buffer in self.ecnaive_data_buffers:
+                self.register_buffer(buffer)
+            for buffer in self.ecnaive_parity_buffers:
+                self.register_buffer(buffer)
+            logger.info(f"EC-NAIVE: [Rank {rank}] All pooled buffers registered for RDMA")
         
         # Initialize free buffer queues
         self._free_data_buffer_queue = queue.Queue()
@@ -808,6 +835,62 @@ class ECNAIVEManager:
             # Note: The 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1) 
             # will be allocated in strategy after metadata exchange
         }
+    
+    def register_buffer(self, buffer: torch.Tensor):
+        """Register buffer for RDMA operations (similar to Gemini).
+        
+        Args:
+            buffer: PyTorch tensor to register for RDMA
+        """
+        if not self.use_rdma or self._ecnaive_native is None:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        buffer_addr = buffer.data_ptr()
+        buffer_size = buffer.numel() * buffer.element_size()
+        
+        # Check if already registered
+        if buffer_addr in self.registered_buffers:
+            logger.debug(f"EC-NAIVE: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} (size: {buffer_size / (1024**2):.2f} MB)")
+            return
+        
+        try:
+            logger.info(f"EC-NAIVE: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
+            self._ecnaive_native.register_buffer(buffer_addr, buffer_size)
+            self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
+            logger.info(f"EC-NAIVE: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
+            
+            # Print all registered buffers
+            logger.info(f"EC-NAIVE: [Rank {rank}] All registered buffers:")
+            for addr, (size, iteration) in self.registered_buffers.items():
+                logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
+        except Exception as e:
+            logger.error(f"EC-NAIVE: [Rank {rank}] Failed to register buffer: {e}")
+            raise
+    
+    def unregister_buffer(self, buffer: torch.Tensor):
+        """Unregister buffer from RDMA.
+        
+        Args:
+            buffer: PyTorch tensor to unregister
+        """
+        if not self.use_rdma or self._ecnaive_native is None:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        buffer_addr = buffer.data_ptr()
+        
+        if buffer_addr not in self.registered_buffers:
+            return
+        
+        try:
+            logger.info(f"EC-NAIVE: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
+            self._ecnaive_native.unregister_buffer(buffer_addr)
+            del self.registered_buffers[buffer_addr]
+            logger.info(f"EC-NAIVE: [Rank {rank}] Buffer unregistered successfully (remaining: {len(self.registered_buffers)})")
+        except Exception as e:
+            logger.error(f"EC-NAIVE: [Rank {rank}] Failed to unregister buffer: {e}")
+            raise
     
     def cleanup(self):
         """Cleanup EC-NAIVE resources when manager is destroyed."""

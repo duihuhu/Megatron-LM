@@ -2603,6 +2603,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         recv_parity0 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
         recv_data1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
         
+        # Register buffers for RDMA if enabled
+        if self.ecnaive_manager.use_rdma:
+            logger.info(f"EC-NAIVE: [Rank {rank}] Registering 4 persistent blocks for RDMA...")
+            self.ecnaive_manager.register_buffer(data0)
+            self.ecnaive_manager.register_buffer(recv_parity1)
+            self.ecnaive_manager.register_buffer(recv_parity0)
+            self.ecnaive_manager.register_buffer(recv_data1)
+            logger.info(f"EC-NAIVE: [Rank {rank}] 4 persistent blocks registered for RDMA")
+        
         logger.info(
             f"EC-NAIVE: Allocated 4 persistent blocks:\n"
             f"  data0: {aligned_half_block_size / (1024**3):.2f} GB "
@@ -3638,6 +3647,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.gemini_replicas_recovery_buffers = {}  # Dict[int, torch.Tensor]: rank -> buffer
         self._allocate_gemini_replicas_recovery_buffers()
         
+        # Initialize EC-NAIVE recovery buffers (pre-allocated for rank2 recovery)
+        self.ecnaive_recovery_buffer_recv_data1 = None  # Buffer for receiving d_{3,1}
+        self.ecnaive_recovery_buffer_recv_parity0 = None  # Buffer for receiving p_{0,0}
+        self._allocate_ecnaive_recovery_buffers()
+        
         # Initialize Gemini RDMA send buffers for rank0 (mmap files + RDMA-friendly buffers)
         self.gemini_rdma_send_buffers = {}  # Dict[str, dict]: 'replica' and 'own' -> {mmap, buffer, registered}
         self.gemini_mmap_files = {}  # Dict[str, tuple]: 'replica' and 'own' -> (file_handle, mmap_handle)
@@ -4311,6 +4325,84 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     logger.warning(f"Failed to register Gemini Replicas recovery buffer for RDMA: {e}")
             
             return buffer
+    
+    def _allocate_ecnaive_recovery_buffers(self):
+        """Pre-allocate buffers for EC-NAIVE recovery (rank2 only).
+        
+        EC-NAIVE rank2 needs 2 receive buffers:
+        - recv_data1: for receiving d_{3,1} from rank3
+        - recv_parity0: for receiving p_{0,0} from rank0
+        
+        These buffers are pre-allocated and registered for RDMA if enabled.
+        """
+        try:
+            from megatron.training import get_args
+            args = get_args()
+            
+            # Only allocate for rank2 and only if EC-NAIVE is enabled
+            if not (hasattr(args, 'use_ecnaive') and args.use_ecnaive):
+                return
+            
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank != 2:
+                return
+            
+            # Default buffer size: 2GB per buffer (adjustable via args if needed)
+            buffer_size_gb = getattr(args, 'ecnaive_recovery_buffer_size_gb', 2)
+            buffer_size_bytes = buffer_size_gb * 1024 * 1024 * 1024
+            
+            logger.info(
+                f"rank: {rank}, allocating EC-NAIVE recovery buffers: {buffer_size_gb} GB x 2 "
+                f"(recv_data1, recv_parity0)"
+            )
+            
+            # Allocate pinned memory buffers for faster GPU transfer
+            if torch.cuda.is_available():
+                self.ecnaive_recovery_buffer_recv_data1 = torch.empty(
+                    buffer_size_bytes, dtype=torch.uint8
+                ).pin_memory()
+                self.ecnaive_recovery_buffer_recv_parity0 = torch.empty(
+                    buffer_size_bytes, dtype=torch.uint8
+                ).pin_memory()
+                logger.info(f"rank: {rank}, allocated pinned memory buffers for EC-NAIVE recovery")
+            else:
+                self.ecnaive_recovery_buffer_recv_data1 = torch.empty(
+                    buffer_size_bytes, dtype=torch.uint8
+                )
+                self.ecnaive_recovery_buffer_recv_parity0 = torch.empty(
+                    buffer_size_bytes, dtype=torch.uint8
+                )
+                logger.info(f"rank: {rank}, allocated CPU buffers for EC-NAIVE recovery")
+            
+            logger.info(
+                f"rank: {rank}, EC-NAIVE recovery buffers allocated successfully: "
+                f"{buffer_size_bytes / (1024**3):.2f} GB x 2"
+            )
+            
+            # Register buffers for RDMA if enabled
+            use_rdma = getattr(args, 'use_rdma', False) if hasattr(args, 'use_rdma') else False
+            if use_rdma and self.ecnaive_manager._ecnaive_native is not None:
+                try:
+                    recv_data1_addr = self.ecnaive_recovery_buffer_recv_data1.data_ptr()
+                    recv_parity0_addr = self.ecnaive_recovery_buffer_recv_parity0.data_ptr()
+                    
+                    self.ecnaive_manager._ecnaive_native.register_buffer(recv_data1_addr, buffer_size_bytes)
+                    logger.info(f"rank: {rank}, registered recv_data1 recovery buffer for RDMA ({buffer_size_gb} GB)")
+                    
+                    self.ecnaive_manager._ecnaive_native.register_buffer(recv_parity0_addr, buffer_size_bytes)
+                    logger.info(f"rank: {rank}, registered recv_parity0 recovery buffer for RDMA ({buffer_size_gb} GB)")
+                    
+                except Exception as e:
+                    logger.warning(f"rank: {rank}, failed to register EC-NAIVE recovery buffers for RDMA: {e}")
+                    logger.warning(f"rank: {rank}, will use unregistered buffers (may fall back to temp buffers)")
+            elif use_rdma:
+                logger.info(f"rank: {rank}, RDMA enabled but EC-NAIVE native module not available, skipping buffer registration")
+            
+        except Exception as e:
+            logger.warning(f"Failed to allocate EC-NAIVE recovery buffers: {e}")
+            # Fall back to dynamic allocation
+            self.ecnaive_recovery_buffer_recv_data1 = None
+            self.ecnaive_recovery_buffer_recv_parity0 = None
     
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank using the shared manager."""

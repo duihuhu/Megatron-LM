@@ -19,12 +19,456 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <map>
+#include <memory>
 
 #include <isa-l/erasure_code.h>
 #include <isa-l/raid.h>
 
+// RDMA headers
+#include <infiniband/verbs.h>
+
 
 namespace {
+
+// RDMA structures (similar to Gemini)
+struct RdmaConnInfo {
+    uint32_t qp_num;
+    uint16_t lid;
+    uint8_t gid[16];
+} __attribute__((packed));
+
+struct RdmaBuffer {
+    ibv_mr* mr;
+    uintptr_t addr;
+    size_t size;
+};
+
+// Connection interface for abstraction
+class IConnectionChannel {
+public:
+    virtual ~IConnectionChannel() = default;
+    virtual void send_data(const uint8_t* data, size_t size) = 0;
+    virtual size_t receive_data(uint8_t* buffer, size_t buffer_size) = 0;
+    virtual bool is_connected() const = 0;
+};
+
+// Forward declarations
+class AsioConnectionChannel;
+class RdmaConnectionChannel;
+
+// ASIO Connection Channel Implementation
+class AsioConnectionChannel : public IConnectionChannel {
+private:
+    boost::asio::ip::tcp::socket& socket_;
+    std::mutex send_mutex_;
+    std::mutex recv_mutex_;
+
+public:
+    explicit AsioConnectionChannel(boost::asio::ip::tcp::socket& socket)
+        : socket_(socket) {}
+
+    void send_data(const uint8_t* data, size_t size) override {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        uint32_t sz_net = htonl(static_cast<uint32_t>(size));
+        boost::asio::write(socket_, boost::asio::buffer(&sz_net, sizeof(uint32_t)));
+        boost::asio::write(socket_, boost::asio::buffer(data, size));
+    }
+
+    size_t receive_data(uint8_t* buffer, size_t buffer_size) override {
+        std::lock_guard<std::mutex> lock(recv_mutex_);
+        uint32_t sz_net;
+        boost::asio::read(socket_, boost::asio::buffer(&sz_net, sizeof(uint32_t)));
+        uint32_t size = ntohl(sz_net);
+        if (size > buffer_size) {
+            throw std::runtime_error("Received size exceeds buffer size");
+        }
+        boost::asio::read(socket_, boost::asio::buffer(buffer, size));
+        return size;
+    }
+
+    bool is_connected() const override {
+        return socket_.is_open();
+    }
+};
+
+// RDMA Connection Channel Implementation
+class RdmaConnectionChannel : public IConnectionChannel {
+private:
+    // RDMA resources (shared across channels)
+    ibv_context* context_;
+    ibv_pd* pd_;
+    ibv_cq* send_cq_;
+    ibv_cq* recv_cq_;
+    ibv_qp* qp_;
+    
+    // TCP control sockets for coordination
+    int control_sock_send_;  // For sending size notifications
+    int control_sock_recv_;  // For receiving size notifications
+    
+    // Buffer registry (shared)
+    std::map<uintptr_t, RdmaBuffer>* registered_buffers_;
+    std::mutex* buffer_mutex_;
+    
+    // Temporary buffers for unregistered data
+    std::vector<uint8_t> temp_send_buffer_;
+    std::vector<uint8_t> temp_recv_buffer_;
+    ibv_mr* temp_send_mr_;
+    ibv_mr* temp_recv_mr_;
+    
+    int rank_;
+    int peer_rank_;
+    bool connected_;
+    std::mutex send_mutex_;
+    std::mutex recv_mutex_;
+    
+    static const size_t TEMP_BUFFER_SIZE = 1ULL * 1024 * 1024 * 1024;  // 1 GB
+    static const size_t CHUNK_SIZE = 64 * 1024 * 1024;  // 64 MB per RDMA operation
+    static const int MAX_WR = 64;
+    static const int MAX_BATCH_WR = 32;
+
+public:
+    RdmaConnectionChannel(
+        ibv_context* context,
+        ibv_pd* pd,
+        ibv_cq* send_cq,
+        ibv_cq* recv_cq,
+        int control_sock_send,
+        int control_sock_recv,
+        std::map<uintptr_t, RdmaBuffer>* registered_buffers,
+        std::mutex* buffer_mutex,
+        int rank,
+        int peer_rank
+    )
+        : context_(context),
+          pd_(pd),
+          send_cq_(send_cq),
+          recv_cq_(recv_cq),
+          qp_(nullptr),
+          control_sock_send_(control_sock_send),
+          control_sock_recv_(control_sock_recv),
+          registered_buffers_(registered_buffers),
+          buffer_mutex_(buffer_mutex),
+          temp_send_mr_(nullptr),
+          temp_recv_mr_(nullptr),
+          rank_(rank),
+          peer_rank_(peer_rank),
+          connected_(false)
+    {
+        // Create QP
+        ibv_qp_init_attr qp_attr{};
+        qp_attr.send_cq = send_cq_;
+        qp_attr.recv_cq = recv_cq_;
+        qp_attr.qp_type = IBV_QPT_RC;
+        qp_attr.cap.max_send_wr = MAX_WR;
+        qp_attr.cap.max_recv_wr = MAX_WR;
+        qp_attr.cap.max_send_sge = 1;
+        qp_attr.cap.max_recv_sge = 1;
+        
+        qp_ = ibv_create_qp(pd_, &qp_attr);
+        if (!qp_) {
+            throw std::runtime_error("Failed to create QP for RDMA channel");
+        }
+        
+        // Allocate temporary buffers
+        temp_send_buffer_.resize(TEMP_BUFFER_SIZE);
+        temp_recv_buffer_.resize(TEMP_BUFFER_SIZE);
+        
+        temp_send_mr_ = ibv_reg_mr(pd_, temp_send_buffer_.data(), TEMP_BUFFER_SIZE,
+                                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        temp_recv_mr_ = ibv_reg_mr(pd_, temp_recv_buffer_.data(), TEMP_BUFFER_SIZE,
+                                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        
+        if (!temp_send_mr_ || !temp_recv_mr_) {
+            throw std::runtime_error("Failed to register temporary buffers");
+        }
+    }
+    
+    ~RdmaConnectionChannel() {
+        if (temp_send_mr_) ibv_dereg_mr(temp_send_mr_);
+        if (temp_recv_mr_) ibv_dereg_mr(temp_recv_mr_);
+        if (qp_) ibv_destroy_qp(qp_);
+    }
+    
+    void connect_qp(const RdmaConnInfo& remote_info) {
+        // Transition QP to INIT
+        ibv_qp_attr attr{};
+        attr.qp_state = IBV_QPS_INIT;
+        attr.port_num = 1;
+        attr.pkey_index = 0;
+        attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
+        
+        if (ibv_modify_qp(qp_, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+            throw std::runtime_error("Failed to transition QP to INIT");
+        }
+        
+        // Transition QP to RTR
+        attr = {};
+        attr.qp_state = IBV_QPS_RTR;
+        attr.path_mtu = IBV_MTU_4096;
+        attr.dest_qp_num = remote_info.qp_num;
+        attr.rq_psn = 0;
+        attr.max_dest_rd_atomic = 1;
+        attr.min_rnr_timer = 12;
+        attr.ah_attr.is_global = 1;
+        attr.ah_attr.port_num = 1;
+        attr.ah_attr.sl = 0;
+        attr.ah_attr.dlid = remote_info.lid;
+        memcpy(&attr.ah_attr.grh.dgid, remote_info.gid, 16);
+        attr.ah_attr.grh.sgid_index = 0;
+        attr.ah_attr.grh.hop_limit = 64;
+        
+        if (ibv_modify_qp(qp_, &attr, 
+            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+            IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
+            throw std::runtime_error("Failed to transition QP to RTR");
+        }
+        
+        // Transition QP to RTS
+        attr = {};
+        attr.qp_state = IBV_QPS_RTS;
+        attr.timeout = 14;
+        attr.retry_cnt = 7;
+        attr.rnr_retry = 7;
+        attr.sq_psn = 0;
+        attr.max_rd_atomic = 1;
+        
+        if (ibv_modify_qp(qp_, &attr,
+            IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC)) {
+            throw std::runtime_error("Failed to transition QP to RTS");
+        }
+        
+        connected_ = true;
+    }
+    
+    RdmaConnInfo get_local_conn_info() {
+        RdmaConnInfo info{};
+        info.qp_num = qp_->qp_num;
+        
+        ibv_port_attr port_attr;
+        if (ibv_query_port(context_, 1, &port_attr)) {
+            throw std::runtime_error("Failed to query port");
+        }
+        info.lid = port_attr.lid;
+        
+        ibv_gid gid;
+        if (ibv_query_gid(context_, 1, 0, &gid)) {
+            throw std::runtime_error("Failed to query GID");
+        }
+        memcpy(info.gid, &gid, 16);
+        
+        return info;
+    }
+    
+    void send_data(const uint8_t* data, size_t size) override {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        
+        if (!connected_) {
+            throw std::runtime_error("RDMA channel not connected");
+        }
+        
+        // Send size via control socket
+        uint64_t size_network = htobe64(size);
+        if (send(control_sock_send_, &size_network, sizeof(size_network), 0) != sizeof(size_network)) {
+            throw std::runtime_error("Failed to send size via control socket");
+        }
+        
+        // Wait for ACK
+        uint8_t ack;
+        if (recv(control_sock_send_, &ack, sizeof(ack), MSG_WAITALL) != sizeof(ack)) {
+            throw std::runtime_error("Failed to receive ACK");
+        }
+        
+        // Find registered MR or use temp buffer
+        ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(data), size);
+        bool use_temp = false;
+        
+        if (!mr) {
+            if (size > TEMP_BUFFER_SIZE) {
+                throw std::runtime_error("Data size exceeds temporary buffer size");
+            }
+            memcpy(temp_send_buffer_.data(), data, size);
+            mr = temp_send_mr_;
+            data = temp_send_buffer_.data();
+            use_temp = true;
+        }
+        
+        // Send data in chunks
+        send_data_chunked(data, size, mr);
+    }
+    
+    size_t receive_data(uint8_t* buffer, size_t buffer_size) override {
+        std::lock_guard<std::mutex> lock(recv_mutex_);
+        
+        if (!connected_) {
+            throw std::runtime_error("RDMA channel not connected");
+        }
+        
+        // Receive size via control socket
+        uint64_t size_network;
+        if (recv(control_sock_recv_, &size_network, sizeof(size_network), MSG_WAITALL) != sizeof(size_network)) {
+            throw std::runtime_error("Failed to receive size via control socket");
+        }
+        size_t size = be64toh(size_network);
+        
+        if (size > buffer_size) {
+            throw std::runtime_error("Received size exceeds buffer size");
+        }
+        
+        // Send immediate ACK
+        uint8_t ack = 1;
+        if (send(control_sock_recv_, &ack, sizeof(ack), 0) != sizeof(ack)) {
+            throw std::runtime_error("Failed to send ACK");
+        }
+        
+        // Find registered MR or use temp buffer
+        ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(buffer), size);
+        bool use_temp = false;
+        
+        if (!mr) {
+            if (size > TEMP_BUFFER_SIZE) {
+                throw std::runtime_error("Data size exceeds temporary buffer size");
+            }
+            mr = temp_recv_mr_;
+            use_temp = true;
+        }
+        
+        // Receive data in chunks
+        uint8_t* recv_ptr = use_temp ? temp_recv_buffer_.data() : buffer;
+        receive_data_chunked(recv_ptr, size, mr);
+        
+        // Copy from temp buffer if needed
+        if (use_temp) {
+            memcpy(buffer, temp_recv_buffer_.data(), size);
+        }
+        
+        return size;
+    }
+    
+    bool is_connected() const override {
+        return connected_;
+    }
+
+private:
+    ibv_mr* find_registered_mr(uintptr_t addr, size_t size) {
+        std::lock_guard<std::mutex> lock(*buffer_mutex_);
+        
+        for (auto& [reg_addr, buf] : *registered_buffers_) {
+            if (addr >= reg_addr && (addr + size) <= (reg_addr + buf.size)) {
+                return buf.mr;
+            }
+        }
+        return nullptr;
+    }
+    
+    void send_data_chunked(const uint8_t* data, size_t total_size, ibv_mr* mr) {
+        size_t remaining = total_size;
+        size_t offset = 0;
+        
+        while (remaining > 0) {
+            size_t chunk_size = std::min(remaining, CHUNK_SIZE);
+            size_t chunk_count = (chunk_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            
+            std::vector<ibv_sge> sges;
+            std::vector<ibv_send_wr> wrs;
+            
+            for (size_t i = 0; i < chunk_count; ++i) {
+                size_t current_size = std::min(CHUNK_SIZE, remaining);
+                
+                ibv_sge sge{};
+                sge.addr = reinterpret_cast<uint64_t>(data + offset);
+                sge.length = current_size;
+                sge.lkey = mr->lkey;
+                sges.push_back(sge);
+                
+                ibv_send_wr wr{};
+                wr.wr_id = i;
+                wr.sg_list = &sges[i];
+                wr.num_sge = 1;
+                wr.opcode = IBV_WR_SEND;
+                wr.send_flags = IBV_SEND_SIGNALED;
+                if (i < chunk_count - 1) {
+                    wr.next = &wrs[i + 1];
+                }
+                wrs.push_back(wr);
+                
+                offset += current_size;
+                remaining -= current_size;
+            }
+            
+            // Post send work requests
+            ibv_send_wr* bad_wr = nullptr;
+            if (ibv_post_send(qp_, &wrs[0], &bad_wr)) {
+                throw std::runtime_error("Failed to post send work request");
+            }
+            
+            // Poll for completions
+            poll_completion(send_cq_, chunk_count);
+        }
+    }
+    
+    void receive_data_chunked(uint8_t* buffer, size_t total_size, ibv_mr* mr) {
+        size_t remaining = total_size;
+        size_t offset = 0;
+        
+        while (remaining > 0) {
+            size_t chunk_count = std::min(remaining, CHUNK_SIZE * MAX_BATCH_WR) / CHUNK_SIZE;
+            if (chunk_count == 0) chunk_count = 1;
+            
+            std::vector<ibv_sge> sges;
+            std::vector<ibv_recv_wr> wrs;
+            
+            for (size_t i = 0; i < chunk_count; ++i) {
+                size_t current_size = std::min(CHUNK_SIZE, remaining);
+                
+                ibv_sge sge{};
+                sge.addr = reinterpret_cast<uint64_t>(buffer + offset);
+                sge.length = current_size;
+                sge.lkey = mr->lkey;
+                sges.push_back(sge);
+                
+                ibv_recv_wr wr{};
+                wr.wr_id = i;
+                wr.sg_list = &sges[i];
+                wr.num_sge = 1;
+                if (i < chunk_count - 1) {
+                    wr.next = &wrs[i + 1];
+                }
+                wrs.push_back(wr);
+                
+                offset += current_size;
+                remaining -= current_size;
+            }
+            
+            // Post receive work requests
+            ibv_recv_wr* bad_wr = nullptr;
+            if (ibv_post_recv(qp_, &wrs[0], &bad_wr)) {
+                throw std::runtime_error("Failed to post receive work request");
+            }
+            
+            // Poll for completions
+            poll_completion(recv_cq_, chunk_count);
+        }
+    }
+    
+    void poll_completion(ibv_cq* cq, int num_completions) {
+        int completed = 0;
+        while (completed < num_completions) {
+            ibv_wc wc;
+            int ret = ibv_poll_cq(cq, 1, &wc);
+            if (ret < 0) {
+                throw std::runtime_error("Failed to poll CQ");
+            }
+            if (ret > 0) {
+                if (wc.status != IBV_WC_SUCCESS) {
+                    throw std::runtime_error("Work completion failed");
+                }
+                completed++;
+            }
+        }
+    }
+};
 
 // ASIO connection manager (pattern from eccheck_native)
 class AsioConnectionManager {
@@ -947,7 +1391,8 @@ public:
                   const std::string& send_parity1_ip, uint16_t send_parity1_port,
                   const std::string& recv_parity1_ip, uint16_t recv_parity1_port,
                   const std::string& recv_parity0_ip, uint16_t recv_parity0_port,
-                  const std::string& recv_data1_ip, uint16_t recv_data1_port)
+                  const std::string& recv_data1_ip, uint16_t recv_data1_port,
+                  bool use_rdma = false)
         : stop_(false),
           send_data1_ip_(send_data1_ip),
           send_data1_port_(send_data1_port),
@@ -961,6 +1406,11 @@ public:
           recv_parity0_port_(recv_parity0_port),
           recv_data1_ip_(recv_data1_ip),
           recv_data1_port_(recv_data1_port),
+          use_rdma_(use_rdma),
+          rdma_context_(nullptr),
+          rdma_pd_(nullptr),
+          rdma_send_cq_(nullptr),
+          rdma_recv_cq_(nullptr),
           k_(2),
           rows_(2),
           a_mat_(nullptr),
@@ -969,7 +1419,19 @@ public:
         // Initialize EC encoding tables
         init_ec_encoding();
         
-        std::cout << "ECNAIVE: Initializing connections..." << std::endl;
+        std::cout << "ECNAIVE: Initializing connections (RDMA: " << (use_rdma_ ? "enabled" : "disabled") << ")..." << std::endl;
+        
+        // Initialize RDMA resources if enabled
+        if (use_rdma_) {
+            try {
+                init_rdma_resources();
+            } catch (const std::exception& e) {
+                std::cerr << "ECNAIVE: RDMA initialization failed: " << e.what() << std::endl;
+                std::cerr << "ECNAIVE: Falling back to ASIO" << std::endl;
+                use_rdma_ = false;
+            }
+        }
+        
         init_connections();
         start_threads();
         std::cout << "ECNAIVE: Pipeline started successfully" << std::endl;
@@ -977,6 +1439,9 @@ public:
 
     ~ECNaiveNative() {
         stop();
+        
+        // Clean up RDMA resources
+        cleanup_rdma_resources();
         
         // Free EC encoding tables
         if (g_tbls_ != nullptr) {
@@ -986,6 +1451,49 @@ public:
         if (a_mat_ != nullptr) {
             free(a_mat_);
             a_mat_ = nullptr;
+        }
+    }
+    
+    // Buffer registration methods for RDMA
+    void register_buffer(uintptr_t addr, size_t size) {
+        if (!use_rdma_ || !rdma_pd_) {
+            return;
+        }
+        
+        std::lock_guard<std::mutex> lock(rdma_buffer_mutex_);
+        
+        // Check if already registered
+        if (rdma_registered_buffers_.find(addr) != rdma_registered_buffers_.end()) {
+            std::cout << "[ECNAIVE RDMA] Buffer already registered at 0x" << std::hex << addr << std::dec << std::endl;
+            return;
+        }
+        
+        std::cout << "[ECNAIVE RDMA] Registering buffer at 0x" << std::hex << addr << std::dec 
+                  << ", size: " << (size / (1024.0 * 1024.0)) << " MB" << std::endl;
+        
+        ibv_mr* mr = ibv_reg_mr(rdma_pd_, reinterpret_cast<void*>(addr), size,
+                                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        
+        if (!mr) {
+            throw std::runtime_error("Failed to register memory region for RDMA");
+        }
+        
+        rdma_registered_buffers_[addr] = {mr, addr, size};
+        std::cout << "[ECNAIVE RDMA] Buffer registered successfully (total: " << rdma_registered_buffers_.size() << ")" << std::endl;
+    }
+    
+    void unregister_buffer(uintptr_t addr) {
+        if (!use_rdma_) {
+            return;
+        }
+        
+        std::lock_guard<std::mutex> lock(rdma_buffer_mutex_);
+        
+        auto it = rdma_registered_buffers_.find(addr);
+        if (it != rdma_registered_buffers_.end()) {
+            ibv_dereg_mr(it->second.mr);
+            rdma_registered_buffers_.erase(it);
+            std::cout << "[ECNAIVE RDMA] Buffer unregistered at 0x" << std::hex << addr << std::dec << std::endl;
         }
     }
 
@@ -1891,6 +2399,29 @@ private:
     // ASIO connections for pipelines
     AsioConnectionManager conn_;
     
+    // RDMA configuration and resources
+    bool use_rdma_;
+    ibv_context* rdma_context_;
+    ibv_pd* rdma_pd_;
+    ibv_cq* rdma_send_cq_;
+    ibv_cq* rdma_recv_cq_;
+    std::map<uintptr_t, RdmaBuffer> rdma_registered_buffers_;
+    std::mutex rdma_buffer_mutex_;
+    
+    // Connection channels (ASIO or RDMA)
+    std::unique_ptr<IConnectionChannel> send_data1_channel_;
+    std::unique_ptr<IConnectionChannel> send_parity0_channel_;
+    std::unique_ptr<IConnectionChannel> send_parity1_channel_;
+    std::unique_ptr<IConnectionChannel> recv_parity1_channel_;
+    std::unique_ptr<IConnectionChannel> recv_parity0_channel_;
+    std::unique_ptr<IConnectionChannel> recv_data1_channel_;
+    
+    // Load mode connection channels (for rank2 receiver and rank0/3 sender)
+    std::unique_ptr<IConnectionChannel> load_recv_rank3_data1_channel_;
+    std::unique_ptr<IConnectionChannel> load_recv_rank0_parity0_channel_;
+    std::unique_ptr<IConnectionChannel> load_send_rank0_parity0_channel_;
+    std::unique_ptr<IConnectionChannel> load_send_rank3_data1_channel_;
+    
     // Save mode network config
     std::string send_data1_ip_;
     uint16_t send_data1_port_;
@@ -2044,6 +2575,86 @@ private:
         
         // Use isa-l ec_encode_data: encode 2 data blocks to 2 parity blocks
         ec_encode_data((int)size, k_, rows_, g_tbls_, srcs, dests);
+    }
+    
+    // RDMA initialization
+    void init_rdma_resources() {
+        std::cout << "[ECNAIVE RDMA] Initializing RDMA resources..." << std::endl;
+        
+        // Get device list
+        int num_devices;
+        ibv_device** device_list = ibv_get_device_list(&num_devices);
+        if (!device_list || num_devices == 0) {
+            throw std::runtime_error("No RDMA devices found");
+        }
+        
+        // Use first device
+        rdma_context_ = ibv_open_device(device_list[0]);
+        if (!rdma_context_) {
+            ibv_free_device_list(device_list);
+            throw std::runtime_error("Failed to open RDMA device");
+        }
+        
+        ibv_free_device_list(device_list);
+        
+        // Allocate protection domain
+        rdma_pd_ = ibv_alloc_pd(rdma_context_);
+        if (!rdma_pd_) {
+            throw std::runtime_error("Failed to allocate protection domain");
+        }
+        
+        // Create completion queues
+        rdma_send_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+        rdma_recv_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+        
+        if (!rdma_send_cq_ || !rdma_recv_cq_) {
+            throw std::runtime_error("Failed to create completion queues");
+        }
+        
+        std::cout << "[ECNAIVE RDMA] RDMA resources initialized successfully" << std::endl;
+    }
+    
+    void cleanup_rdma_resources() {
+        if (!use_rdma_) {
+            return;
+        }
+        
+        std::cout << "[ECNAIVE RDMA] Cleaning up RDMA resources..." << std::endl;
+        
+        // Unregister all buffers
+        {
+            std::lock_guard<std::mutex> lock(rdma_buffer_mutex_);
+            for (auto& [addr, buf] : rdma_registered_buffers_) {
+                if (buf.mr) {
+                    ibv_dereg_mr(buf.mr);
+                }
+            }
+            rdma_registered_buffers_.clear();
+        }
+        
+        // Destroy CQs
+        if (rdma_send_cq_) {
+            ibv_destroy_cq(rdma_send_cq_);
+            rdma_send_cq_ = nullptr;
+        }
+        if (rdma_recv_cq_) {
+            ibv_destroy_cq(rdma_recv_cq_);
+            rdma_recv_cq_ = nullptr;
+        }
+        
+        // Dealloc PD
+        if (rdma_pd_) {
+            ibv_dealloc_pd(rdma_pd_);
+            rdma_pd_ = nullptr;
+        }
+        
+        // Close device
+        if (rdma_context_) {
+            ibv_close_device(rdma_context_);
+            rdma_context_ = nullptr;
+        }
+        
+        std::cout << "[ECNAIVE RDMA] RDMA resources cleaned up" << std::endl;
     }
 
     void start_threads() {
@@ -2660,7 +3271,29 @@ PYBIND11_MODULE(ecnaive_native, m) {
                             const std::string&, uint16_t,
                             const std::string&, uint16_t,
                             const std::string&, uint16_t,
-                            const std::string&, uint16_t>())
+                            const std::string&, uint16_t,
+                            bool>(),
+             pybind11::arg("send_data1_ip"),
+             pybind11::arg("send_data1_port"),
+             pybind11::arg("send_parity0_ip"),
+             pybind11::arg("send_parity0_port"),
+             pybind11::arg("send_parity1_ip"),
+             pybind11::arg("send_parity1_port"),
+             pybind11::arg("recv_parity1_ip"),
+             pybind11::arg("recv_parity1_port"),
+             pybind11::arg("recv_parity0_ip"),
+             pybind11::arg("recv_parity0_port"),
+             pybind11::arg("recv_data1_ip"),
+             pybind11::arg("recv_data1_port"),
+             pybind11::arg("use_rdma") = false)
+        // RDMA buffer management
+        .def("register_buffer", &ECNaiveNative::register_buffer,
+             "Register buffer for RDMA operations",
+             pybind11::arg("addr"),
+             pybind11::arg("size"))
+        .def("unregister_buffer", &ECNaiveNative::unregister_buffer,
+             "Unregister buffer from RDMA",
+             pybind11::arg("addr"))
         // Unified save mode submit function
         .def("submit_ecnaive_save", &ECNaiveNative::submit_ecnaive_save,
              "Unified save mode function: encode and submit send/recv tasks",

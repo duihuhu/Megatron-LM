@@ -18,6 +18,12 @@
 #include <cstdlib>
 #include <arpa/inet.h>  // For htonl/ntohl
 
+// RDMA includes (ibverbs)
+#ifdef __linux__
+#include <infiniband/verbs.h>
+#include <map>
+#endif
+
 // NCCL includes
 #ifdef NCCL_AVAILABLE
 #include <nccl.h>
@@ -32,6 +38,38 @@ std::vector<uint8_t> generate_nccl_id() {
     return std::vector<uint8_t>(id_bytes, id_bytes + sizeof(ncclUniqueId));
 }
 #endif
+
+// ========== RDMA Helper Structures and Functions ==========
+#ifdef __linux__
+
+// RDMA buffer registration info
+struct RdmaBufferInfo {
+    ibv_mr* mr;
+    uintptr_t addr;
+    size_t size;
+};
+
+// Check if RDMA is available on this system
+bool is_rdma_available() {
+    int num_devices = 0;
+    ibv_device** device_list = ibv_get_device_list(&num_devices);
+    
+    if (device_list == nullptr || num_devices == 0) {
+        return false;
+    }
+    
+    ibv_free_device_list(device_list);
+    return true;
+}
+
+#else  // Not Linux
+
+// Stub for non-Linux systems
+bool is_rdma_available() {
+    return false;
+}
+
+#endif  // __linux__
 
 // ========== ASIO Connection Manager ==========
 class AsioConnectionManager {
@@ -619,6 +657,28 @@ private:
     AsioConnectionManager asio_conn_mgr_;
     bool asio_initialized_;
     bool use_asio_;  // Flag to indicate if using ASIO instead of NCCL
+    bool use_rdma_;  // Flag to indicate if using RDMA (ibverbs) instead of ASIO/NCCL
+    
+#ifdef __linux__
+    // RDMA resources (ibverbs)
+    ibv_context* rdma_context_;
+    ibv_pd* rdma_pd_;
+    ibv_cq* rdma_xor_send_cq_;
+    ibv_cq* rdma_xor_recv_cq_;
+    ibv_cq* rdma_p2p_send_cq_;
+    ibv_cq* rdma_p2p_recv_cq_;
+    ibv_qp* rdma_xor_qp_;
+    ibv_qp* rdma_p2p_qp_;
+    
+    // RDMA registered buffers
+    std::map<uintptr_t, RdmaBufferInfo> rdma_registered_buffers_;
+    std::mutex rdma_buffer_mutex_;
+    
+    // TCP sockets for RDMA connection setup (control plane)
+    int rdma_listen_sock_;
+    int rdma_xor_control_sock_;
+    int rdma_p2p_control_sock_;
+#endif
     
     // Helper function to synchronize NCCL operation
 #ifdef NCCL_AVAILABLE
@@ -2557,14 +2617,15 @@ public:
         if (g_tbls_) { free(g_tbls_); g_tbls_ = nullptr; }
     }
     
-    // ASIO constructor (new, accepts IP/Port parameters)
+    // ASIO/RDMA constructor (accepts IP/Port parameters and RDMA flag)
     ECCHECKNative(int rank, int world_size, int paired_rank,
                   const std::string& xor_partner_ip, uint16_t xor_send_port,
                   const std::string& xor_listen_ip, uint16_t xor_recv_port,
                   const std::string& p2p_partner_ip, uint16_t p2p_send_port,
                   const std::string& p2p_listen_ip, uint16_t p2p_recv_port,
                   const std::string& step6_p2p_partner_ip, uint16_t step6_p2p_send_port,
-                  const std::string& step6_p2p_listen_ip, uint16_t step6_p2p_recv_port)
+                  const std::string& step6_p2p_listen_ip, uint16_t step6_p2p_recv_port,
+                  bool use_rdma = false)
         : rank_(rank), world_size_(world_size), paired_rank_(paired_rank),
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_completed_(false), recv_worker_completed_(false),
@@ -2589,9 +2650,17 @@ public:
           decode_coefficient_0_(1), decode_coefficient_1_(1),  // Initialize to 1 for simplified version
           p2p_partner_rank_(-1),
           is_load_mode_(false), failed_rank_(-1),
-          asio_initialized_(false), use_asio_(true) {
+          asio_initialized_(false), use_asio_(true), use_rdma_(use_rdma)
+#ifdef __linux__
+          , rdma_context_(nullptr), rdma_pd_(nullptr),
+          rdma_xor_send_cq_(nullptr), rdma_xor_recv_cq_(nullptr),
+          rdma_p2p_send_cq_(nullptr), rdma_p2p_recv_cq_(nullptr),
+          rdma_xor_qp_(nullptr), rdma_p2p_qp_(nullptr),
+          rdma_listen_sock_(-1), rdma_xor_control_sock_(-1), rdma_p2p_control_sock_(-1)
+#endif
+    {
 
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] ASIO Constructor called, initializing EC tables and ASIO connections..." << std::endl;
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] ASIO/RDMA Constructor called (use_rdma=" << use_rdma_ << "), initializing EC tables..." << std::endl;
         
         // Build XOR configuration
         build_xor_config();
@@ -4526,9 +4595,76 @@ public:
             throw;
         }
     }
+    
+    // RDMA buffer registration methods
+    void register_buffer(uintptr_t addr, size_t size) {
+#ifdef __linux__
+        if (!use_rdma_ || rdma_pd_ == nullptr) {
+            // Skip registration if not using RDMA or PD not initialized
+            return;
+        }
+        
+        std::lock_guard<std::mutex> lock(rdma_buffer_mutex_);
+        
+        // Check if already registered
+        if (rdma_registered_buffers_.find(addr) != rdma_registered_buffers_.end()) {
+            std::cout << "[EC-CHECK RDMA] Rank " << rank_ << " buffer already registered at " 
+                      << std::hex << "0x" << addr << std::dec 
+                      << " (size: " << (size / (1024.0 * 1024.0)) << " MB)" << std::endl;
+            return;
+        }
+        
+        std::cout << "[EC-CHECK RDMA] Rank " << rank_ << " registering buffer at " 
+                  << std::hex << "0x" << addr << std::dec 
+                  << ", size: " << (size / (1024.0 * 1024.0)) << " MB (" << size << " bytes)" << std::endl;
+        
+        ibv_mr* mr = ibv_reg_mr(rdma_pd_, (void*)addr, size,
+                                IBV_ACCESS_LOCAL_WRITE | 
+                                IBV_ACCESS_REMOTE_WRITE | 
+                                IBV_ACCESS_REMOTE_READ);
+        
+        if (!mr) {
+            throw std::runtime_error("Failed to register memory region for RDMA");
+        }
+        
+        rdma_registered_buffers_[addr] = {mr, addr, size};
+        
+        std::cout << "[EC-CHECK RDMA] Rank " << rank_ << " buffer registered successfully "
+                  << "(total registered: " << rdma_registered_buffers_.size() << ")" << std::endl;
+#else
+        // No-op on non-Linux systems
+        (void)addr;
+        (void)size;
+#endif
+    }
+    
+    void unregister_buffer(uintptr_t addr) {
+#ifdef __linux__
+        if (!use_rdma_ || rdma_pd_ == nullptr) {
+            return;
+        }
+        
+        std::lock_guard<std::mutex> lock(rdma_buffer_mutex_);
+        
+        auto it = rdma_registered_buffers_.find(addr);
+        if (it != rdma_registered_buffers_.end()) {
+            ibv_dereg_mr(it->second.mr);
+            rdma_registered_buffers_.erase(it);
+            std::cout << "[EC-CHECK RDMA] Rank " << rank_ << " buffer unregistered at " 
+                      << std::hex << addr << std::dec << std::endl;
+        }
+#else
+        // No-op on non-Linux systems
+        (void)addr;
+#endif
+    }
 };
 
 PYBIND11_MODULE(eccheck_native, m) {
+    // Module-level function: Check RDMA availability
+    m.def("is_rdma_available", &is_rdma_available, 
+          "Check if RDMA is available on this system");
+    
     // Module-level function: Generate NCCL ID (can be called without creating an instance)
 #ifdef NCCL_AVAILABLE
     m.def("generate_nccl_id", &generate_nccl_id, 
@@ -4539,14 +4675,23 @@ PYBIND11_MODULE(eccheck_native, m) {
     pybind11::class_<ECCHECKNative>(m, "ECCHECKNative")
         // NCCL constructor (original)
         .def(pybind11::init<int, int, int, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&>())
-        // ASIO constructor (new)
+        // ASIO/RDMA constructor (with use_rdma flag)
         .def(pybind11::init<int, int, int,
              const std::string&, uint16_t,
              const std::string&, uint16_t,
              const std::string&, uint16_t,
              const std::string&, uint16_t,
              const std::string&, uint16_t,
-             const std::string&, uint16_t>())
+             const std::string&, uint16_t,
+             bool>(),
+             pybind11::arg("rank"), pybind11::arg("world_size"), pybind11::arg("paired_rank"),
+             pybind11::arg("xor_partner_ip"), pybind11::arg("xor_send_port"),
+             pybind11::arg("xor_listen_ip"), pybind11::arg("xor_recv_port"),
+             pybind11::arg("p2p_partner_ip"), pybind11::arg("p2p_send_port"),
+             pybind11::arg("p2p_listen_ip"), pybind11::arg("p2p_recv_port"),
+             pybind11::arg("step6_p2p_partner_ip"), pybind11::arg("step6_p2p_send_port"),
+             pybind11::arg("step6_p2p_listen_ip"), pybind11::arg("step6_p2p_recv_port"),
+             pybind11::arg("use_rdma") = false)
         .def("set_buffer_addresses", &ECCHECKNative::set_buffer_addresses)
         .def("reset_encoding_completion_flags", &ECCHECKNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECCHECKNative::wait_for_encoding_completion)
@@ -4597,5 +4742,11 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("buffer_addr"), pybind11::arg("size"))
         .def("simple_p2p_recv", &ECCHECKNative::simple_p2p_recv,
              "Simple synchronous P2P recv for rank1 software failure recovery",
-             pybind11::arg("buffer_addr"), pybind11::arg("size"));
+             pybind11::arg("buffer_addr"), pybind11::arg("size"))
+        .def("register_buffer", &ECCHECKNative::register_buffer,
+             "Register buffer for RDMA operations",
+             pybind11::arg("addr"), pybind11::arg("size"))
+        .def("unregister_buffer", &ECCHECKNative::unregister_buffer,
+             "Unregister buffer for RDMA operations",
+             pybind11::arg("addr"));
 }

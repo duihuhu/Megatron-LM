@@ -47,6 +47,7 @@ class ECCHECKManager:
         
         self._eccheck_native = None
         self.use_eccheck = False
+        self.use_rdma = False
         
         # Buffer configuration
         self.eccheck_data_buffers_count = 12
@@ -70,6 +71,10 @@ class ECCHECKManager:
         self._buffer_poller_thread: Optional[threading.Thread] = None
         self._buffer_poller_stop_event: Optional[threading.Event] = None
         self._buffer_poller_active_event: Optional[threading.Event] = None
+        
+        # RDMA buffer tracking (similar to Gemini)
+        self.registered_buffers: Dict[int, Tuple[int, int]] = {}  # {buffer_addr: (size, iteration)}
+        self.current_iteration: int = 0
         
         self._initialized = True
 
@@ -356,6 +361,8 @@ class ECCHECKManager:
             from megatron.training import get_args as input_args
             args = input_args()
             self.use_eccheck = args.use_eccheck
+            self.use_rdma = getattr(args, 'use_rdma', False)
+            
             if not getattr(args, 'use_eccheck', False):
                 return
                 
@@ -400,26 +407,48 @@ class ECCHECKManager:
             world_size = torch.distributed.get_world_size()
             paired_rank = self._get_xor_paired_rank(rank, world_size)
             
-            # Check if using ASIO (via environment variable)
+            # Check if using ASIO or RDMA (via environment variable or args)
             use_asio = os.environ.get('ECCHECK_USE_ASIO', 'false').lower() in ('true', '1', 'yes')
             
             # Create instance with error handling
             try:
-                if use_asio:
-                    # ===== ASIO Initialization Path =====
-                    logger.info(f"EC-CHECK: [Rank {rank}] Using ASIO for communication")
+                if use_asio or self.use_rdma:
+                    # ===== ASIO/RDMA Initialization Path =====
+                    transport_mode = "RDMA" if self.use_rdma else "ASIO"
+                    logger.info(f"EC-CHECK: [Rank {rank}] Using {transport_mode} for communication")
+                    
+                    # Check RDMA availability if RDMA mode is requested
+                    if self.use_rdma:
+                        try:
+                            rdma_available = eccheck_native.is_rdma_available()
+                            if not rdma_available:
+                                raise RuntimeError(
+                                    "RDMA mode requested (--use-rdma) but RDMA is not available on this system.\n"
+                                    "Possible causes:\n"
+                                    "  1. No RDMA devices installed (check: ibv_devices)\n"
+                                    "  2. RDMA drivers not loaded (try: modprobe rdma_cm ib_uverbs)\n"
+                                    "  3. Insufficient permissions\n"
+                                    "  4. RDMA services not running (check: systemctl status rdma)\n"
+                                    "\n"
+                                    "To use standard TCP/IP networking instead, remove --use-rdma from your training script."
+                                )
+                        except RuntimeError:
+                            raise  # Re-raise the RuntimeError we just created
+                        except Exception as check_err:
+                            logger.warning(f"EC-CHECK: Could not check RDMA availability: {check_err}")
+                            logger.warning("EC-CHECK: Will attempt to initialize RDMA anyway...")
                     
                     # Get network configuration
                     net_config = self._get_eccheck_network_config(rank, world_size)
                     
                     # Synchronize all ranks before creating C++ instances
-                    logger.info(f"EC-CHECK: [Rank {rank}] Synchronizing all ranks before creating C++ native module (ASIO)...")
+                    logger.info(f"EC-CHECK: [Rank {rank}] Synchronizing all ranks before creating C++ native module ({transport_mode})...")
                     torch.distributed.barrier()
-                    logger.info(f"EC-CHECK: [Rank {rank}] All ranks synchronized, creating C++ native module with ASIO...")
+                    logger.info(f"EC-CHECK: [Rank {rank}] All ranks synchronized, creating C++ native module with {transport_mode}...")
                     
-                    # Create C++ instance with ASIO parameters
-                    logger.info(f"EC-CHECK: Creating C++ native module with ASIO (this will block until ASIO connections are established)...")
-                    print(f"EC-CHECK: [Rank {rank}] Creating C++ native module with ASIO (blocking until ASIO initialization completes)...")
+                    # Create C++ instance with ASIO/RDMA parameters
+                    logger.info(f"EC-CHECK: Creating C++ native module with {transport_mode} (this will block until connections are established)...")
+                    print(f"EC-CHECK: [Rank {rank}] Creating C++ native module with {transport_mode} (blocking until initialization completes)...")
                     
                     # Calculate partner ports (send connects to partner's recv port)
                     # For XOR: rank 0 sends to rank 2's recv port, rank 2 sends to rank 0's recv port
@@ -442,21 +471,23 @@ class ECCHECKManager:
                     
                     self._eccheck_native = eccheck_native.ECCHECKNative(
                         rank, world_size, paired_rank,
-                        # XOR connections: (partner_ip, partner_recv_port, my_ip, my_recv_port)
+                        # XOR connections: (partner_ip, partner_recv_port, my_ip, my_recv_port, use_rdma)
                         net_config['xor_partner_ip'], xor_partner_recv_port,
                         net_config['my_ip'], net_config['ports']['xor_recv'],
-                        # P2P connections: (partner_ip, partner_recv_port, my_ip, my_recv_port)
+                        # P2P connections: (partner_ip, partner_recv_port, my_ip, my_recv_port, use_rdma)
                         net_config['p2p_partner_ip'], p2p_partner_recv_port,
                         net_config['my_ip'], net_config['ports']['p2p_recv'],
                         # Step6 P2P connections: (partner_ip, partner_recv_port, my_ip, my_recv_port)
                         # Only rank2/3 use these (rank2 recv, rank3 send)
                         step6_p2p_partner_ip, step6_p2p_send_port,
-                        step6_p2p_listen_ip, step6_p2p_recv_port
+                        step6_p2p_listen_ip, step6_p2p_recv_port,
+                        # RDMA flag
+                        self.use_rdma
                     )
                     
-                    # If we reach here, ASIO connections are ready and threads are running
-                    logger.info(f"EC-CHECK: C++ native module initialized successfully with ASIO (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
-                    print(f"EC-CHECK: [Rank {rank}] C++ native module initialized - ASIO connections ready for data exchange")
+                    # If we reach here, ASIO/RDMA connections are ready and threads are running
+                    logger.info(f"EC-CHECK: C++ native module initialized successfully with {transport_mode} (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
+                    print(f"EC-CHECK: [Rank {rank}] C++ native module initialized - {transport_mode} connections ready for data exchange")
                     
                     # Initialize EC-CHECK buffers (same for both ASIO and NCCL)
                     self._init_eccheck_buffers()
@@ -612,6 +643,10 @@ class ECCHECKManager:
               f"Data buffers: {len(self.eccheck_data_buffers)}, "
               f"Encoding buffers: {len(self.eccheck_encoding_buffers)}, "
               f"Parity buffers: {len(self.eccheck_parity_buffers)}")
+        
+        # Register all buffers for RDMA if RDMA is enabled
+        if self.use_rdma:
+            self.register_all_buffers_for_rdma()
     
     def _allocate_data_buffers(self):
         """Allocate data buffers for storing original tensor data."""
@@ -825,11 +860,121 @@ class ECCHECKManager:
         )
         
         self.eccheck_recv_encoding_buffers = (recv_buffer_thread1, recv_buffer_thread2)
+        
+        # Register receive buffers for RDMA if RDMA is enabled
+        if self.use_rdma:
+            logger.info(f"EC-CHECK: [Rank {rank}] Registering receive buffers for RDMA...")
+            self.register_buffer(recv_buffer_thread1)
+            self.register_buffer(recv_buffer_thread2)
+        
         return (recv_buffer_thread1, recv_buffer_thread2)
+    
+    def register_buffer(self, buffer: torch.Tensor):
+        """Register buffer for RDMA operations (called during buffer allocation).
+        
+        Args:
+            buffer: PyTorch tensor to register
+        """
+        if not self.use_rdma or self._eccheck_native is None:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        buffer_addr = buffer.data_ptr()
+        buffer_size = buffer.numel() * buffer.element_size()
+        
+        # Check if already registered
+        if buffer_addr in self.registered_buffers:
+            logger.debug(f"EC-CHECK: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} (size: {buffer_size / (1024**2):.2f} MB)")
+            return
+        
+        try:
+            logger.info(f"EC-CHECK: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
+            self._eccheck_native.register_buffer(buffer_addr, buffer_size)
+            self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
+            logger.info(f"EC-CHECK: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
+            
+            # Print all registered buffers
+            logger.info(f"EC-CHECK: [Rank {rank}] All registered buffers:")
+            for addr, (size, iteration) in self.registered_buffers.items():
+                logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
+        except Exception as e:
+            logger.error(f"EC-CHECK: [Rank {rank}] Failed to register buffer: {e}")
+            raise
+    
+    def unregister_buffer(self, buffer: torch.Tensor):
+        """Unregister buffer for RDMA operations.
+        
+        Args:
+            buffer: PyTorch tensor to unregister
+        """
+        if not self.use_rdma or self._eccheck_native is None:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        buffer_addr = buffer.data_ptr()
+        
+        if buffer_addr not in self.registered_buffers:
+            logger.debug(f"EC-CHECK: [Rank {rank}] Buffer not registered at 0x{buffer_addr:x}")
+            return
+        
+        try:
+            logger.info(f"EC-CHECK: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
+            self._eccheck_native.unregister_buffer(buffer_addr)
+            del self.registered_buffers[buffer_addr]
+            logger.info(f"EC-CHECK: [Rank {rank}] Buffer unregistered successfully")
+        except Exception as e:
+            logger.error(f"EC-CHECK: [Rank {rank}] Failed to unregister buffer: {e}")
+    
+    def register_all_buffers_for_rdma(self):
+        """Register all allocated buffers for RDMA operations.
+        
+        This should be called during initialization after all buffers are allocated.
+        """
+        if not self.use_rdma or self._eccheck_native is None:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logger.info(f"EC-CHECK: [Rank {rank}] Registering all buffers for RDMA...")
+        
+        # Register data buffers
+        if self.eccheck_data_buffers:
+            for i, buffer in enumerate(self.eccheck_data_buffers):
+                self.register_buffer(buffer)
+        
+        # Register encoding buffers
+        if self.eccheck_encoding_buffers:
+            for i, buffer in enumerate(self.eccheck_encoding_buffers):
+                self.register_buffer(buffer)
+        
+        # Register parity buffers
+        if self.eccheck_parity_buffers:
+            for i, buffer in enumerate(self.eccheck_parity_buffers):
+                self.register_buffer(buffer)
+        
+        # Register receive encoding buffers (if already allocated)
+        if self.eccheck_recv_encoding_buffers:
+            recv_buffer_thread1, recv_buffer_thread2 = self.eccheck_recv_encoding_buffers
+            self.register_buffer(recv_buffer_thread1)
+            self.register_buffer(recv_buffer_thread2)
+        
+        logger.info(f"EC-CHECK: [Rank {rank}] All buffers registered for RDMA (total: {len(self.registered_buffers)})")
+    
     
     def cleanup(self):
         """Cleanup EC-CHECK resources when manager is destroyed."""
         try:
+            # Unregister all RDMA buffers
+            if self.use_rdma and self._eccheck_native is not None:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                logger.info(f"EC-CHECK: [Rank {rank}] Unregistering all RDMA buffers...")
+                for buffer_addr in list(self.registered_buffers.keys()):
+                    try:
+                        logger.info(f"EC-CHECK: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x} during cleanup")
+                        self._eccheck_native.unregister_buffer(buffer_addr)
+                    except Exception as e:
+                        logger.warning(f"EC-CHECK: [Rank {rank}] Failed to unregister buffer during cleanup: {e}")
+                self.registered_buffers.clear()
+            
             # Stop buffer poller thread
             self._stop_buffer_poller_thread()
             

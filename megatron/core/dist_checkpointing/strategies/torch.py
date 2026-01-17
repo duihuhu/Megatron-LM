@@ -1133,6 +1133,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 use_eccheck=self.eccheck_manager.use_eccheck,
                 eccheck_native=self.eccheck_manager._eccheck_native,  # Pass pre-initialized C++ module
                 eccheck_buffers=self._get_eccheck_buffers(),  # Pass pre-allocated buffers
+                use_rdma=self.eccheck_manager.use_rdma,  # Pass RDMA flag for EC-CHECK transport
             )
 
         # This should be set differently if we run in a smaller process group than the default

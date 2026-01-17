@@ -4542,8 +4542,16 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         p2p_partner_rank = self._get_p2p_partner_rank(rank, world_size)
-        # Temporary hardcoding for rank2 failure recovery
-        failed_rank = 2
+        
+        # Determine failed_rank based on flags
+        from megatron.training import get_args as use_args
+        input_args = use_args()
+        if input_args.use_eccheck_software_failure:
+            failed_rank = 1  # rank1 software failure
+            logger.info(f"EC-CHECK: [Rank {rank}] Software failure recovery mode (failed_rank=1)")
+        else:
+            failed_rank = 2  # Default: rank2 hardware failure
+            logger.info(f"EC-CHECK: [Rank {rank}] Hardware failure recovery mode (failed_rank=2)")
         
         checkpoint_dir = Path(checkpoint_dir)
         eccheck_p2p_own_file = checkpoint_dir / f"__{rank}_p2p_own.distcp"
@@ -4702,6 +4710,14 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Simple P2P exchange placeholder. This will be extended into a full
         # EC-CHECK recovery pipeline (encoding + XOR + P2P) in later steps.
         data_start_time = time()
+        # Get failed_rank from args (same logic as above)
+        from megatron.training import get_args as use_args
+        input_args = use_args()
+        if input_args.use_eccheck_software_failure:
+            failed_rank = 1
+        else:
+            failed_rank = 2
+        
         self._run_eccheck_p2p_pipeline_simple(
             rank=rank,
             world_size=world_size,
@@ -4710,6 +4726,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             mapped_file_partner=mapped_file_partner,
             recv_own_buffer=recv_own_buffer,
             recv_total_size=recv_total_size,
+            failed_rank=failed_rank,  # Pass failed_rank parameter
         )
         data_end_time = time()
         data_time = data_end_time - data_start_time
@@ -7467,8 +7484,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         mapped_file_partner,
         recv_own_buffer: torch.Tensor,
         recv_total_size: int,
+        failed_rank: int = 2,  # Add failed_rank parameter, default to 2 for backward compatibility
     ) -> None:
-        """EC-CHECK recovery pipeline for rank2 single-failure scenario.
+        """EC-CHECK recovery pipeline for single-failure scenario.
 
         This implements a chunked pipeline that drives C++ encoding, XOR, and P2P
         workers to recover lost data. The pipeline structure mirrors the save-side
@@ -7531,9 +7549,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             p2p_partner_buffer_base_addr = int(partner_buffer.data_ptr())
         
         # === Step 4: Set load mode in C++ native module ===
-        # For rank2 recovery scenario, set failed_rank=2
-        # TODO: In the future, this could be determined dynamically based on which rank failed
-        failed_rank = 2  # Hardcoded for now
+        # Use failed_rank parameter passed from caller
         self.eccheck_manager._eccheck_native.set_load_mode(True, failed_rank)
         logger.info(f"EC-CHECK: Set load mode (failed_rank={failed_rank})")
         
@@ -7551,16 +7567,35 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         eccheck_buffer_size = self.eccheck_manager.eccheck_buffer_size
         total_bytes = max_total_bytes
         logger.info(f"EC-CHECK: load pipeline total_bytes: {total_bytes}")
-        # === Step 5: Determine data source based on rank role ===
+        # === Step 5: Determine data source based on rank role and failed_rank ===
         # For rank2 recovery scenario:
-        # - rank0/3: read from mapped_file_own (their own data/parity)
-        # - rank1/2: read from mapped_file_partner (received from step2)
-        if rank == 0 or rank == 3:
-            source_mmap = mapped_file_own.mmap_object if mapped_file_own.mmap_object is not None else None
-            source_file_size = mapped_file_own.file_size if mapped_file_own.file_size is not None else 0
+        #   - rank0/3: read from mapped_file_own (their own data/parity)
+        #   - rank1/2: read from mapped_file_partner (received from step2)
+        # For rank1 recovery scenario:
+        #   - rank0: read from mapped_file_own (d0 data to send to rank1)
+        #   - rank1: will receive d0 from rank0 via ASIO (no file read needed)
+        #   - rank2/3: read from mapped_file_own (their own data)
+        if failed_rank == 1:
+            # rank1 software failure: rank0 sends d0 to rank1
+            if rank == 0:
+                source_mmap = mapped_file_own.mmap_object if mapped_file_own.mmap_object is not None else None
+                source_file_size = mapped_file_own.file_size if mapped_file_own.file_size is not None else 0
+            elif rank == 1:
+                # rank1 doesn't read from file, will receive from rank0 via ASIO
+                source_mmap = None
+                source_file_size = 0
+            else:
+                # rank2/3 read from own file
+                source_mmap = mapped_file_own.mmap_object if mapped_file_own.mmap_object is not None else None
+                source_file_size = mapped_file_own.file_size if mapped_file_own.file_size is not None else 0
         else:
-            source_mmap = mapped_file_partner.mmap_object if mapped_file_partner.mmap_object is not None else None
-            source_file_size = mapped_file_partner.file_size if mapped_file_partner.file_size is not None else 0
+            # rank2 hardware failure (original logic)
+            if rank == 0 or rank == 3:
+                source_mmap = mapped_file_own.mmap_object if mapped_file_own.mmap_object is not None else None
+                source_file_size = mapped_file_own.file_size if mapped_file_own.file_size is not None else 0
+            else:
+                source_mmap = mapped_file_partner.mmap_object if mapped_file_partner.mmap_object is not None else None
+                source_file_size = mapped_file_partner.file_size if mapped_file_partner.file_size is not None else 0
         
         # Calculate actual data size (skip header: 32 bytes + Component 1 + Component 2)
         # Component 3 (tensor buffer) starts after header + Component 1 + Component 2
@@ -7614,14 +7649,94 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         f"({padding_size / (1024**2):.2f} MB padding)"
                     )
         
-        # === Step 7: Reset encoding completion flags and activate buffer poller ===
+        # === Step 7: Early exit for rank1 software failure - simple P2P transfer (no encoding/XOR buffers needed) ===
+        # rank1 software failure recovery only needs simple P2P transfer, no encoding/XOR pipeline needed
+        if failed_rank == 1:
+            logger.info(f"EC-CHECK: [Rank {rank}] rank1 software failure recovery - using simple synchronous P2P send/recv (no worker queue)")
+            
+            if rank == 0:
+                # Rank0: Send d0 directly to rank1 via simple synchronous P2P send
+                logger.info(f"EC-CHECK: [Rank {rank}] Sending d0 to rank1 via simple synchronous P2P send (one-time transfer)")
+                
+                # Read d0 from own file and send all at once via simple P2P send
+                if source_mmap is not None:
+                    # Get rank0's own data size from registry (to match rank1's recv_total_size calculation)
+                    rank0_metadata = registry.rank_metadata.get(rank, [])
+                    send_total_size = sum(meta.size_bytes for meta in rank0_metadata)
+                    
+                    # Calculate tensor buffer size and offset from file header
+                    header_bytes = source_mmap[:32]
+                    import struct
+                    magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+                    tensor_buffer_start_offset = 32 + non_tensor_size + tensor_keys_size
+                    
+                    # Verify that registry size matches file header size
+                    if send_total_size != tensor_buffer_size:
+                        logger.warning(
+                            f"EC-CHECK: [Rank {rank}] Size mismatch: registry={send_total_size}, "
+                            f"file_header={tensor_buffer_size}, using registry size to match rank1's recv_total_size"
+                        )
+                    
+                    # Allocate buffer for send_total_size data (rank0's own data size)
+                    send_buffer = torch.empty(send_total_size, dtype=torch.uint8)
+                    send_addr = int(send_buffer.data_ptr())
+                    
+                    # Copy all data from mmap to buffer at once
+                    chunk_data = source_mmap[tensor_buffer_start_offset:tensor_buffer_start_offset + send_total_size]
+                    import ctypes
+                    ctypes.memmove(
+                        ctypes.cast(send_addr, ctypes.POINTER(ctypes.c_uint8)),
+                        chunk_data,
+                        send_total_size
+                    )
+                    
+                    # Send all data at once via simple synchronous P2P send (no worker queue)
+                    logger.info(f"EC-CHECK: [Rank {rank}] Sending {send_total_size / (1024**2):.2f} MB in one transfer")
+                    self.eccheck_manager._eccheck_native.simple_p2p_send(
+                        buffer_addr=send_addr,
+                        size=send_total_size
+                    )
+                    
+                    logger.info(f"EC-CHECK: [Rank {rank}] Finished sending d0 to rank1: {send_total_size / (1024**2):.2f} MB")
+                else:
+                    logger.error(f"EC-CHECK: [Rank {rank}] No source mmap available for sending d0")
+                    
+            elif rank == 1:
+                # Rank1: Receive d0 from rank0 via simple synchronous P2P recv
+                logger.info(f"EC-CHECK: [Rank {rank}] Receiving d0 from rank0 via simple synchronous P2P recv (one-time transfer)")
+                
+                # Receive all data at once directly into recv_own_buffer
+                recv_addr = int(recv_own_buffer.data_ptr())
+                
+                # Receive all data at once via simple synchronous P2P recv (no worker queue)
+                logger.info(f"EC-CHECK: [Rank {rank}] Receiving {recv_total_size / (1024**2):.2f} MB in one transfer")
+                self.eccheck_manager._eccheck_native.simple_p2p_recv(
+                    buffer_addr=recv_addr,
+                    size=recv_total_size
+                )
+                
+                logger.info(f"EC-CHECK: [Rank {rank}] Finished receiving d0 from rank0: {recv_total_size / (1024**2):.2f} MB")
+                
+            else:
+                # rank2/3: No action needed for rank1 recovery
+                logger.info(f"EC-CHECK: [Rank {rank}] No action needed for rank1 recovery")
+            
+            # Synchronize all ranks and return early (skip full encoding/XOR pipeline)
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+                logger.info(f"EC-CHECK: [Rank {rank}] Synchronized after simple P2P transfer")
+            
+            logger.info(f"EC-CHECK: [Rank {rank}] rank1 software failure recovery completed (simple synchronous P2P, no worker queue)")
+            return
+        
+        # === Step 7: Reset encoding completion flags and activate buffer poller (for rank2 hardware failure) ===
         self.eccheck_manager._eccheck_native.reset_encoding_completion_flags()
         if mgr._buffer_poller_active_event:
             mgr._buffer_poller_active_event.set()
             logger.info("EC-CHECK: Activated buffer poller for load pipeline")
         
         try:
-            # === Step 8: Main pipeline loop ===
+            # === Step 8: Main pipeline loop (for rank2 hardware failure recovery) ===
             processed = 0
             #total_bytes = 20 * eccheck_buffer_size
             while processed < total_bytes:
@@ -7631,14 +7746,32 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 cur_buffer_addr = get_free_data_buffer()
                 # Load mode only needs thread2 encoding buffer (parity index 1)
                 enc_addr2 = get_free_encoding_buffer()
-                # Load mode only needs parity buffer for rank2/3 (receiver)
-                if rank == 2 or rank == 3:
-                    parity_addr2 = get_free_parity_buffer()
+                # Load mode parity buffer allocation based on failed_rank
+                if failed_rank == 1:
+                    # rank1 recovery: only rank1 needs to receive, no parity needed
+                    if rank == 1:
+                        parity_addr2 = 0  # rank1 receives d0 directly, no XOR needed
+                    else:
+                        parity_addr2 = 0
                 else:
-                    parity_addr2 = 0
+                    # rank2 recovery: rank2/3 need parity buffer
+                    if rank == 2 or rank == 3:
+                        parity_addr2 = get_free_parity_buffer()
+                    else:
+                        parity_addr2 = 0
                 
-                # Calculate recv addresses (64-byte aligned) - only needed for rank2/3
-                if rank == 2 or rank == 3:
+                # Calculate recv addresses (64-byte aligned) - based on failed_rank
+                if failed_rank == 1:
+                    # rank1 recovery: only rank1 receives
+                    if rank == 1:
+                        recv_buffer_offset_thread2_aligned = ((recv_buffer_offset_thread2 + 63) // 64) * 64
+                        recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2_aligned
+                        recv_chunk_size = take
+                        recv_buffer_offset_thread2 = recv_buffer_offset_thread2_aligned + recv_chunk_size
+                    else:
+                        recv_addr_thread2 = 0
+                        recv_chunk_size = 0
+                elif rank == 2 or rank == 3:
                     recv_buffer_offset_thread2_aligned = ((recv_buffer_offset_thread2 + 63) // 64) * 64
                     recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2_aligned
                     recv_chunk_size = take
@@ -7647,8 +7780,16 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     recv_addr_thread2 = 0
                     recv_chunk_size = 0
                 
-                # Calculate P2P write addresses for Step6 (rank2 needs partner_buffer for receiving d3)
-                if rank == 2 and p2p_partner_buffer_base_addr != 0:
+                # Calculate P2P write addresses for Step6 (based on failed_rank)
+                if failed_rank == 1:
+                    # rank1 recovery: rank1 needs partner_buffer for receiving d0
+                    if rank == 1 and p2p_partner_buffer_base_addr != 0:
+                        p2p_partner_buffer_offset_aligned = ((p2p_partner_buffer_offset + 63) // 64) * 64
+                        p2p_partner_write_addr = p2p_partner_buffer_base_addr + p2p_partner_buffer_offset_aligned
+                        p2p_partner_buffer_offset = p2p_partner_buffer_offset_aligned + take
+                    else:
+                        p2p_partner_write_addr = 0
+                elif rank == 2 and p2p_partner_buffer_base_addr != 0:
                     p2p_partner_buffer_offset_aligned = ((p2p_partner_buffer_offset + 63) // 64) * 64
                     p2p_partner_write_addr = p2p_partner_buffer_base_addr + p2p_partner_buffer_offset_aligned
                     p2p_partner_buffer_offset = p2p_partner_buffer_offset_aligned + take
@@ -7810,8 +7951,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # Wait for XOR to complete (all Step6 tasks should be submitted by now)
             # Note: This will also wait for Step6, but Step6 sentinel hasn't been sent yet
             # So we need to send Step6 sentinel first, then wait
-            if rank == 2 or rank == 3:
-                logger.info("EC-CHECK: Load pipeline: Sending sentinel to Step6 P2P workers")
+            # Send sentinel to Step6 P2P workers based on failed_rank
+            if failed_rank == 1:
+                # rank1 recovery: only rank1 sends sentinel
+                if rank == 1:
+                    logger.info("EC-CHECK: Load pipeline: Sending sentinel to Step6 P2P workers (rank1 recovery)")
+                    self.eccheck_manager._eccheck_native.submit_load_step6_p2p_sentinel()
+            elif rank == 2 or rank == 3:
+                # rank2 recovery: rank2/3 send sentinel
+                logger.info("EC-CHECK: Load pipeline: Sending sentinel to Step6 P2P workers (rank2 recovery)")
                 self.eccheck_manager._eccheck_native.submit_load_step6_p2p_sentinel()
             
             logger.info("EC-CHECK: Load pipeline: Waiting for all load workers to complete...")
@@ -9751,7 +9899,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         #     # Load directly from backup data and return the state_dict
         #     return self._load_gemini_checkpoint(sharded_state_dict, checkpoint_dir)
         
-        if input_args.use_eccheck and (self._is_eccheck_checkpoint(checkpoint_dir) or rank == 2):
+        # Check if this is EC-CHECK checkpoint or recovery scenario
+        is_eccheck_checkpoint = self._is_eccheck_checkpoint(checkpoint_dir)
+        is_recovery_scenario = (rank == 2) or (input_args.use_eccheck_software_failure and rank == 1)
+        
+        if input_args.use_eccheck and (is_eccheck_checkpoint or is_recovery_scenario):
             logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
             # Load P2P checkpoint data (for rank2 recovery, this prepares the buffer)
             mapped_file_own, mapped_file_partner = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)

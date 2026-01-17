@@ -2261,6 +2261,9 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-eclatin-layerwise', action='store_true',
                        help='Use layer-wise ECLATIN checkpointing mode. This enables layer-by-layer '
                             'pipelined D2H transfer followed by encoding and network transmission.')
+    group.add_argument('--use-eclatin-software-failure', action='store_true',
+                       help='Enable ECLATIN checkpointing for software failure recovery. '
+                            'When enabled, rank2 reads data_block_1 and data_block_2 from local files directly.')
     
     # EC-NAIVE (Erasure Coding Checkpoint with naive Reed-Solomon encoding) arguments
     group.add_argument('--use-ecnaive', action='store_true',

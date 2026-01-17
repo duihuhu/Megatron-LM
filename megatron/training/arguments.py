@@ -2249,6 +2249,9 @@ def _add_checkpointing_args(parser):
                        dest='eccheck_preallocate_cpu_buffer',
                        help='Disable CPU memory buffer preallocation for EC-CHECK mode. '
                             'Use this if system memory is limited.')
+    group.add_argument('--use-eccheck-software-failure', action='store_true',
+                       help='Enable EC-CHECK checkpointing for software failure recovery. '
+                            'When enabled, rank1 recovers d0 data block from rank0 using ASIO P2P communication.')
     
     # ECLATIN (Erasure Coding Checkpoint with different pipeline) arguments
     group.add_argument('--use-eclatin', action='store_true',

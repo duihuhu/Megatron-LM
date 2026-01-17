@@ -4457,6 +4457,75 @@ public:
             load_step6_p2p_recv_queue_cv_.notify_one();
         }
     }
+    
+    // Simple synchronous P2P send/recv for rank1 software failure recovery (no worker queue)
+    void simple_p2p_send(uintptr_t buffer_addr, size_t size) {
+        if (!use_asio_ || !asio_initialized_ || !asio_conn_mgr_.is_p2p_send_connected()) {
+            throw std::runtime_error("ASIO P2P send not initialized");
+        }
+        
+        uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(buffer_addr);
+        uint32_t size_net = htonl(static_cast<uint32_t>(size));
+        
+        try {
+            // Send size header
+            boost::asio::write(
+                asio_conn_mgr_.get_p2p_send_socket(),
+                boost::asio::buffer(&size_net, sizeof(uint32_t))
+            );
+            
+            // Send data
+            boost::asio::write(
+                asio_conn_mgr_.get_p2p_send_socket(),
+                boost::asio::buffer(buffer_ptr, size)
+            );
+            
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Simple P2P send: " 
+                      << size / (1024*1024) << " MB" << std::endl;
+        } catch (const boost::system::system_error& e) {
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Simple P2P send failed: " 
+                      << e.what() << std::endl;
+            throw;
+        }
+    }
+    
+    void simple_p2p_recv(uintptr_t buffer_addr, size_t size) {
+        if (!use_asio_ || !asio_initialized_ || !asio_conn_mgr_.is_p2p_recv_connected()) {
+            throw std::runtime_error("ASIO P2P recv not initialized");
+        }
+        
+        uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(buffer_addr);
+        uint32_t size_net;
+        
+        try {
+            // Receive size header
+            boost::asio::read(
+                asio_conn_mgr_.get_p2p_recv_socket(),
+                boost::asio::buffer(&size_net, sizeof(uint32_t))
+            );
+            
+            uint32_t received_size = ntohl(size_net);
+            if (static_cast<size_t>(received_size) != size) {
+                throw std::runtime_error(
+                    "Size mismatch: expected " + std::to_string(size) + 
+                    ", got " + std::to_string(received_size)
+                );
+            }
+            
+            // Receive data
+            boost::asio::read(
+                asio_conn_mgr_.get_p2p_recv_socket(),
+                boost::asio::buffer(buffer_ptr, size)
+            );
+            
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Simple P2P recv: " 
+                      << size / (1024*1024) << " MB" << std::endl;
+        } catch (const boost::system::system_error& e) {
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Simple P2P recv failed: " 
+                      << e.what() << std::endl;
+            throw;
+        }
+    }
 };
 
 PYBIND11_MODULE(eccheck_native, m) {
@@ -4522,5 +4591,11 @@ PYBIND11_MODULE(eccheck_native, m) {
         .def("submit_load_encoding_sentinel", &ECCHECKNative::submit_load_encoding_sentinel,
              "Submit sentinel to load encoder worker")
         .def("submit_load_step6_p2p_sentinel", &ECCHECKNative::submit_load_step6_p2p_sentinel,
-             "Submit sentinel to Step6 P2P workers (rank2/3 only)");
+             "Submit sentinel to Step6 P2P workers (rank2/3 only)")
+        .def("simple_p2p_send", &ECCHECKNative::simple_p2p_send,
+             "Simple synchronous P2P send for rank1 software failure recovery",
+             pybind11::arg("buffer_addr"), pybind11::arg("size"))
+        .def("simple_p2p_recv", &ECCHECKNative::simple_p2p_recv,
+             "Simple synchronous P2P recv for rank1 software failure recovery",
+             pybind11::arg("buffer_addr"), pybind11::arg("size"));
 }

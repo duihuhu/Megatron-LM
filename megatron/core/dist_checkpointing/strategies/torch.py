@@ -4819,25 +4819,135 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     
     def _load_ecnaive_block_checkpoint(self, checkpoint_dir: Path, sharded_state_dict: ShardedStateDict = None) -> Tuple:
         """Load EC-NAIVE checkpoint data and recover rank2.
-        
+
         Similar to ECLATIN but simplified:
         - rank2: Receives 2 blocks (d_{3,1} from rank3, p_{0,0} from rank0)
         - rank2: Recovers d_{2,0} using XOR: d_{2,0} = d_{3,1} XOR p_{0,0}
         - rank0/3: Send their blocks to rank2
-        
+
         Args:
             checkpoint_dir (Path): checkpoint directory
             sharded_state_dict (ShardedStateDict): sharded state dict for failed rank to derive metadata
-        
+
         Returns:
             Tuple: (mapped_file_own, None) - placeholder for compatibility
         """
         from .filesystem_async import FileSystemWriterAsync
         from time import time
-        
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        
+
+        # Check for software failure mode
+        from megatron.training import get_args
+        input_args = get_args()
+        if input_args.use_ecnaive_software_failure:
+            failed_rank = 2
+            logger.info("EC-NAIVE: Software failure recovery mode")
+
+            from .state_dict_decomposer import GlobalMetadataRegistry
+
+            # Get metadata (reuse existing logic)
+            checkpoint_dir = Path(checkpoint_dir)
+
+            # Load main file to extract metadata
+            ecnaive_main_file = checkpoint_dir / f'__{rank}_0.distcp'
+
+            # Handle failed rank that doesn't have checkpoint file
+            if not ecnaive_main_file.exists():
+                if rank == failed_rank:
+                    logger.warning(f"EC-NAIVE: [Rank {rank}] Main file not found (failed node), deriving metadata from sharded_state_dict")
+                    from .filesystem_async import EclatinMappedFile
+
+                    if sharded_state_dict is not None:
+                        local_metadata, non_tensor_data = self._derive_metadata_from_sharded_state_dict(sharded_state_dict, rank)
+                        logger.info(f"EC-NAIVE: [Rank {rank}] Derived {len(local_metadata)} tensor metadata entries from sharded_state_dict")
+                    else:
+                        logger.warning(f"EC-NAIVE: [Rank {rank}] sharded_state_dict is None, using empty metadata")
+                        local_metadata = []
+                        non_tensor_data = {}
+
+                    mapped_file_own = EclatinMappedFile(
+                        mmap_object=None,
+                        memory_address=None,
+                        file_size=None,
+                        local_metadata=local_metadata,
+                        non_tensor_data=non_tensor_data,
+                        tensor_infos=[]
+                    )
+                else:
+                    logger.error(f"EC-NAIVE: [Rank {rank}] Main file not found: {ecnaive_main_file}")
+                    return None, None
+            else:
+                # Load main file, extract Component 1 and Component 2 (metadata)
+                mapped_file_own = FileSystemWriterAsync.load_ecnaive_bytes_from_file(
+                    str(ecnaive_main_file), my_rank=rank
+                )
+
+            # Metadata exchange
+            local_package = {
+                'tensor_metadata': mapped_file_own.local_metadata or [],
+                'non_tensor_data': mapped_file_own.non_tensor_data or {},
+            }
+
+            if local_package['tensor_metadata'] is None or local_package['non_tensor_data'] is None:
+                logger.error(f"EC-NAIVE: [Rank {rank}] Local metadata is None, skipping metadata exchange")
+                return mapped_file_own, None
+
+            # All-gather complete metadata using all_gather_object
+            all_metadata = [{}] * world_size
+            if torch.distributed.is_initialized():
+                torch.distributed.all_gather_object(all_metadata, local_package)
+
+            # Build rank_metadata and rank_non_tensor_data dicts for GlobalMetadataRegistry
+            rank_metadata = {}
+            rank_non_tensor_data = {}
+            for r in range(world_size):
+                rank_metadata[r] = all_metadata[r]['tensor_metadata']
+                rank_non_tensor_data[r] = all_metadata[r]['non_tensor_data']
+
+            # Create registry with both tensor and non-tensor metadata
+            registry = GlobalMetadataRegistry(
+                rank_metadata=rank_metadata,
+                rank_non_tensor_data=rank_non_tensor_data
+            )
+
+            # Software failure recovery: only rank 2 performs data transfer using existing connections
+            if rank == 2:
+                # Read local d20
+                d20_path = checkpoint_dir / "__2_data0.distcp"
+                with open(d20_path, 'rb') as f:
+                    d20_data = f.read()
+                d20_size = len(d20_data)
+
+                # Receive d21
+                d21_buffer = torch.zeros(d20_size, dtype=torch.uint8)
+                d21_addr = d21_buffer.data_ptr()
+                self.ecnaive_manager._ecnaive_native.software_recv_data1(d21_addr, d20_size)
+
+                # Create merged buffer (align with hardware version)
+                total_size = d20_size + d20_size
+                self.ecnaive_recovered_buffer = torch.zeros(total_size, dtype=torch.uint8)
+
+                # Data layout: first half d20, second half d21
+                self.ecnaive_recovered_buffer[:d20_size] = torch.frombuffer(d20_data, dtype=torch.uint8)
+                self.ecnaive_recovered_buffer[d20_size:] = d21_buffer
+
+                # Save metadata (align with hardware version)
+                self.ecnaive_recovered_metadata = mapped_file_own
+                self.ecnaive_recovered_registry = registry
+
+                logger.info(f"EC-NAIVE: [Rank 2] Software recovery completed: d20_size={d20_size}, total={total_size}")
+
+            elif rank == 3:
+                # Rank 3: Ready for software failure recovery but doesn't actively send
+                # The connection is already established, rank 2 will initiate the transfer
+                logger.info(f"EC-NAIVE: [Rank 3] Ready for software failure recovery data transfer")
+
+            # All ranks return metadata (rank 2 will use recovered buffer, others use normal loading)
+            return mapped_file_own, registry
+
+        # If not software failure mode, proceed with normal hardware recovery
         # EC-NAIVE recovers rank2 (same as ECLATIN)
         failed_rank = 2
         

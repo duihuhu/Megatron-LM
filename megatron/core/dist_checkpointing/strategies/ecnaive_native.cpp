@@ -1771,6 +1771,44 @@ public:
         load_send_queue_cv_.notify_one();
     }
 
+    // Software failure mode interfaces (direct send/recv without pipeline)
+
+    // rank3 software failure mode send d21 (once complete transmission)
+    void software_send_rank3_data1(uintptr_t send_addr, size_t size) {
+        if (rank_ != 3) return;
+
+        // check connection status
+        if (!conn_.is_ecnaive_load_send_rank3_data1_connected()) {
+            std::cerr << "EC-NAIVE: [Rank 3] Software send socket not connected" << std::endl;
+            return;
+        }
+
+        auto& socket = conn_.get_ecnaive_load_send_rank3_data1_socket();
+        if (!send_with_size(socket, send_addr, size)) {
+            std::cerr << "EC-NAIVE: [Rank 3] Software send failed" << std::endl;
+        } else {
+            std::cout << "EC-NAIVE: [Rank 3] Software sent d21 (size=" << size << ")" << std::endl;
+        }
+    }
+
+    // rank2 software failure mode receive d21 (once complete transmission)
+    void software_recv_data1(uintptr_t recv_addr, size_t size) {
+        if (rank_ != 2) return;
+
+        // check connection status
+        if (!conn_.is_ecnaive_load_recv_rank3_data1_connected()) {
+            std::cerr << "EC-NAIVE: [Rank 2] Software recv socket not connected" << std::endl;
+            return;
+        }
+
+        auto& socket = conn_.get_ecnaive_load_recv_rank3_data1_socket();
+        if (!recv_with_size_bool(socket, reinterpret_cast<void*>(recv_addr), size)) {
+            std::cerr << "EC-NAIVE: [Rank 2] Software recv failed" << std::endl;
+        } else {
+            std::cout << "EC-NAIVE: [Rank 2] Software received d21 (size=" << size << ")" << std::endl;
+        }
+    }
+
     // Wait for load completion (rank2 only)
     void wait_for_load_completion() {
         if (rank_ != 2 || !is_load_mode_) return;
@@ -3371,6 +3409,15 @@ PYBIND11_MODULE(ecnaive_native, m) {
              "Submit sentinel to load send worker (rank0/3 only)")
         .def("wait_for_load_completion", &ECNaiveNative::wait_for_load_completion,
              "Wait for load workers to complete (rank2 only)")
+        // Software failure mode functions
+        .def("software_send_rank3_data1", &ECNaiveNative::software_send_rank3_data1,
+             "Software failure mode: rank3 send d21 to rank2",
+             pybind11::arg("send_addr"),
+             pybind11::arg("size"))
+        .def("software_recv_data1", &ECNaiveNative::software_recv_data1,
+             "Software failure mode: rank2 receive d21 from rank3",
+             pybind11::arg("recv_addr"),
+             pybind11::arg("size"))
         // Old load mode functions (kept for compatibility, may be removed later)
         .def("init_load_connections", &ECNaiveNative::init_load_connections,
              "Initialize load mode connections (rank0 recv, rank1/2/3 send)",

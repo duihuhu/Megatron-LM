@@ -2270,7 +2270,10 @@ def _add_checkpointing_args(parser):
                        help='Enable EC-NAIVE (Erasure Coding Checkpoint with naive Reed-Solomon encoding) '
                             'for serialization-free checkpoint encoding. Uses ISA-L for Reed-Solomon '
                             'erasure coding with round-robin distribution of data and parity blocks.')
-    
+    group.add_argument('--use-ecnaive-software-failure', action='store_true',
+                       help='Enable EC-NAIVE checkpointing for software failure recovery. '
+                            'When enabled, rank2 reads d21 from rank3 via network and merges with local d20.')
+
     # use gemini checkpointing arguments
     group.add_argument('--use-gemini', action='store_true',
                        help='Enable Gemini checkpointing. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')

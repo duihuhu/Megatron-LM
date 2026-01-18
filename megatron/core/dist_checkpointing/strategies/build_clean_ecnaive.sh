@@ -25,13 +25,6 @@ if ! python3 -c "import pybind11" 2>/dev/null; then
 fi
 echo "✓ pybind11 found"
 
-# Check for PyTorch
-if ! python3 -c "import torch" 2>/dev/null; then
-    echo "❌ Error: PyTorch not found. Please install PyTorch first."
-    echo "   pip install torch"
-    exit 1
-fi
-echo "✓ PyTorch found"
 
 # Check for Boost (required for ASIO)
 if ! python3 -c "import os; exit(0 if os.path.exists('/usr/include/boost/asio.hpp') or os.path.exists('/usr/local/include/boost/asio.hpp') or os.path.exists('/opt/homebrew/include/boost/asio.hpp') else 1)" 2>/dev/null; then

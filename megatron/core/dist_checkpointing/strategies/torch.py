@@ -2604,15 +2604,6 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         recv_parity0 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
         recv_data1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
         
-        # Register buffers for RDMA if enabled
-        if self.ecnaive_manager.use_rdma:
-            logger.info(f"EC-NAIVE: [Rank {rank}] Registering 4 persistent blocks for RDMA...")
-            self.ecnaive_manager.register_buffer(data0)
-            self.ecnaive_manager.register_buffer(recv_parity1)
-            self.ecnaive_manager.register_buffer(recv_parity0)
-            self.ecnaive_manager.register_buffer(recv_data1)
-            logger.info(f"EC-NAIVE: [Rank {rank}] 4 persistent blocks registered for RDMA")
-        
         logger.info(
             f"EC-NAIVE: Allocated 4 persistent blocks:\n"
             f"  data0: {aligned_half_block_size / (1024**3):.2f} GB "
@@ -3648,11 +3639,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.gemini_replicas_recovery_buffers = {}  # Dict[int, torch.Tensor]: rank -> buffer
         self._allocate_gemini_replicas_recovery_buffers()
         
-        # Initialize EC-NAIVE recovery buffers (pre-allocated for rank2 recovery)
-        self.ecnaive_recovery_buffer_recv_data1 = None  # Buffer for receiving d_{3,1}
-        self.ecnaive_recovery_buffer_recv_parity0 = None  # Buffer for receiving p_{0,0}
-        self._allocate_ecnaive_recovery_buffers()
-        
         # Initialize Gemini RDMA send buffers for rank0 (mmap files + RDMA-friendly buffers)
         self.gemini_rdma_send_buffers = {}  # Dict[str, dict]: 'replica' and 'own' -> {mmap, buffer, registered}
         self.gemini_mmap_files = {}  # Dict[str, tuple]: 'replica' and 'own' -> (file_handle, mmap_handle)
@@ -4327,84 +4313,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             return buffer
     
-    def _allocate_ecnaive_recovery_buffers(self):
-        """Pre-allocate buffers for EC-NAIVE recovery (rank2 only).
-        
-        EC-NAIVE rank2 needs 2 receive buffers:
-        - recv_data1: for receiving d_{3,1} from rank3
-        - recv_parity0: for receiving p_{0,0} from rank0
-        
-        These buffers are pre-allocated and registered for RDMA if enabled.
-        """
-        try:
-            from megatron.training import get_args
-            args = get_args()
-            
-            # Only allocate for rank2 and only if EC-NAIVE is enabled
-            if not (hasattr(args, 'use_ecnaive') and args.use_ecnaive):
-                return
-            
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            if rank != 2:
-                return
-            
-            # Default buffer size: 2GB per buffer (adjustable via args if needed)
-            buffer_size_gb = getattr(args, 'ecnaive_recovery_buffer_size_gb', 2)
-            buffer_size_bytes = buffer_size_gb * 1024 * 1024 * 1024
-            
-            logger.info(
-                f"rank: {rank}, allocating EC-NAIVE recovery buffers: {buffer_size_gb} GB x 2 "
-                f"(recv_data1, recv_parity0)"
-            )
-            
-            # Allocate pinned memory buffers for faster GPU transfer
-            if torch.cuda.is_available():
-                self.ecnaive_recovery_buffer_recv_data1 = torch.empty(
-                    buffer_size_bytes, dtype=torch.uint8
-                ).pin_memory()
-                self.ecnaive_recovery_buffer_recv_parity0 = torch.empty(
-                    buffer_size_bytes, dtype=torch.uint8
-                ).pin_memory()
-                logger.info(f"rank: {rank}, allocated pinned memory buffers for EC-NAIVE recovery")
-            else:
-                self.ecnaive_recovery_buffer_recv_data1 = torch.empty(
-                    buffer_size_bytes, dtype=torch.uint8
-                )
-                self.ecnaive_recovery_buffer_recv_parity0 = torch.empty(
-                    buffer_size_bytes, dtype=torch.uint8
-                )
-                logger.info(f"rank: {rank}, allocated CPU buffers for EC-NAIVE recovery")
-            
-            logger.info(
-                f"rank: {rank}, EC-NAIVE recovery buffers allocated successfully: "
-                f"{buffer_size_bytes / (1024**3):.2f} GB x 2"
-            )
-            
-            # Register buffers for RDMA if enabled
-            use_rdma = getattr(args, 'use_rdma', False) if hasattr(args, 'use_rdma') else False
-            if use_rdma and self.ecnaive_manager._ecnaive_native is not None:
-                try:
-                    recv_data1_addr = self.ecnaive_recovery_buffer_recv_data1.data_ptr()
-                    recv_parity0_addr = self.ecnaive_recovery_buffer_recv_parity0.data_ptr()
-                    
-                    self.ecnaive_manager._ecnaive_native.register_buffer(recv_data1_addr, buffer_size_bytes)
-                    logger.info(f"rank: {rank}, registered recv_data1 recovery buffer for RDMA ({buffer_size_gb} GB)")
-                    
-                    self.ecnaive_manager._ecnaive_native.register_buffer(recv_parity0_addr, buffer_size_bytes)
-                    logger.info(f"rank: {rank}, registered recv_parity0 recovery buffer for RDMA ({buffer_size_gb} GB)")
-                    
-                except Exception as e:
-                    logger.warning(f"rank: {rank}, failed to register EC-NAIVE recovery buffers for RDMA: {e}")
-                    logger.warning(f"rank: {rank}, will use unregistered buffers (may fall back to temp buffers)")
-            elif use_rdma:
-                logger.info(f"rank: {rank}, RDMA enabled but EC-NAIVE native module not available, skipping buffer registration")
-            
-        except Exception as e:
-            logger.warning(f"Failed to allocate EC-NAIVE recovery buffers: {e}")
-            # Fall back to dynamic allocation
-            self.ecnaive_recovery_buffer_recv_data1 = None
-            self.ecnaive_recovery_buffer_recv_parity0 = None
-    
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank using the shared manager."""
         return self.eccheck_manager.get_p2p_partner_rank(my_rank, world_size)
@@ -4761,10 +4669,20 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         
-        # ECLATIN recovers rank2 (same as EC-CHECK)
-        failed_rank = 2
+        # Determine failed_rank based on flags
+        from megatron.training import get_args as use_args
+        input_args = use_args()
+        if input_args.use_eclatin_software_failure:
+            failed_rank = 2  # rank2 software failure (can read local files)
+            logger.info(f"ECLATIN: [Rank {rank}] Software failure recovery mode (failed_rank=2, reading local files)")
+        else:
+            failed_rank = 2  # Default: rank2 hardware failure (needs network recovery)
+            logger.info(f"ECLATIN: [Rank {rank}] Hardware failure recovery mode (failed_rank=2, network recovery)")
         
         checkpoint_dir = Path(checkpoint_dir)
+        
+        # Store checkpoint_dir for software failure recovery
+        self._current_checkpoint_dir = checkpoint_dir
         
         # ===== Step 1: Load main file to extract metadata =====
         eclatin_main_file = checkpoint_dir / f'__{rank}_0.distcp'
@@ -4878,7 +4796,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # ===== Step 6: Run recovery pipeline =====
         own_metadata = registry.rank_metadata.get(rank, [])
         total_size = sum(meta.size_bytes for meta in own_metadata)
-        
+
+        # Store mapped_file_own for software failure recovery (needed in early exit)
+        self._eclatin_mapped_file_own = mapped_file_own
+
         self._run_eclatin_recovery_pipeline(
             rank=rank,
             world_size=world_size,
@@ -4894,30 +4815,140 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info(f"ECLATIN: [Rank {rank}] Saving recovered buffer for _load_eclatin_checkpoint")
             self.eclatin_recovered_metadata = mapped_file_own
             self.eclatin_recovered_registry = registry
-        
+
         return mapped_file_own, None
     
     def _load_ecnaive_block_checkpoint(self, checkpoint_dir: Path, sharded_state_dict: ShardedStateDict = None) -> Tuple:
         """Load EC-NAIVE checkpoint data and recover rank2.
-        
+
         Similar to ECLATIN but simplified:
         - rank2: Receives 2 blocks (d_{3,1} from rank3, p_{0,0} from rank0)
         - rank2: Recovers d_{2,0} using XOR: d_{2,0} = d_{3,1} XOR p_{0,0}
         - rank0/3: Send their blocks to rank2
-        
+
         Args:
             checkpoint_dir (Path): checkpoint directory
             sharded_state_dict (ShardedStateDict): sharded state dict for failed rank to derive metadata
-        
+
         Returns:
             Tuple: (mapped_file_own, None) - placeholder for compatibility
         """
         from .filesystem_async import FileSystemWriterAsync
         from time import time
-        
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        
+
+        # Check for software failure mode
+        from megatron.training import get_args
+        input_args = get_args()
+        if input_args.use_ecnaive_software_failure:
+            failed_rank = 2
+            logger.info("EC-NAIVE: Software failure recovery mode")
+
+            from .state_dict_decomposer import GlobalMetadataRegistry
+
+            # Get metadata (reuse existing logic)
+            checkpoint_dir = Path(checkpoint_dir)
+
+            # Load main file to extract metadata
+            ecnaive_main_file = checkpoint_dir / f'__{rank}_0.distcp'
+
+            # Handle failed rank that doesn't have checkpoint file
+            if not ecnaive_main_file.exists():
+                if rank == failed_rank:
+                    logger.warning(f"EC-NAIVE: [Rank {rank}] Main file not found (failed node), deriving metadata from sharded_state_dict")
+                    from .filesystem_async import EclatinMappedFile
+
+                    if sharded_state_dict is not None:
+                        local_metadata, non_tensor_data = self._derive_metadata_from_sharded_state_dict(sharded_state_dict, rank)
+                        logger.info(f"EC-NAIVE: [Rank {rank}] Derived {len(local_metadata)} tensor metadata entries from sharded_state_dict")
+                    else:
+                        logger.warning(f"EC-NAIVE: [Rank {rank}] sharded_state_dict is None, using empty metadata")
+                        local_metadata = []
+                        non_tensor_data = {}
+
+                    mapped_file_own = EclatinMappedFile(
+                        mmap_object=None,
+                        memory_address=None,
+                        file_size=None,
+                        local_metadata=local_metadata,
+                        non_tensor_data=non_tensor_data,
+                        tensor_infos=[]
+                    )
+                else:
+                    logger.error(f"EC-NAIVE: [Rank {rank}] Main file not found: {ecnaive_main_file}")
+                    return None, None
+            else:
+                # Load main file, extract Component 1 and Component 2 (metadata)
+                mapped_file_own = FileSystemWriterAsync.load_ecnaive_bytes_from_file(
+                    str(ecnaive_main_file), my_rank=rank
+                )
+
+            # Metadata exchange
+            local_package = {
+                'tensor_metadata': mapped_file_own.local_metadata or [],
+                'non_tensor_data': mapped_file_own.non_tensor_data or {},
+            }
+
+            if local_package['tensor_metadata'] is None or local_package['non_tensor_data'] is None:
+                logger.error(f"EC-NAIVE: [Rank {rank}] Local metadata is None, skipping metadata exchange")
+                return mapped_file_own, None
+
+            # All-gather complete metadata using all_gather_object
+            all_metadata = [{}] * world_size
+            if torch.distributed.is_initialized():
+                torch.distributed.all_gather_object(all_metadata, local_package)
+
+            # Build rank_metadata and rank_non_tensor_data dicts for GlobalMetadataRegistry
+            rank_metadata = {}
+            rank_non_tensor_data = {}
+            for r in range(world_size):
+                rank_metadata[r] = all_metadata[r]['tensor_metadata']
+                rank_non_tensor_data[r] = all_metadata[r]['non_tensor_data']
+
+            # Create registry with both tensor and non-tensor metadata
+            registry = GlobalMetadataRegistry(
+                rank_metadata=rank_metadata,
+                rank_non_tensor_data=rank_non_tensor_data
+            )
+
+            # Software failure recovery: only rank 2 performs data transfer using existing connections
+            if rank == 2:
+                # Read local d20
+                d20_path = checkpoint_dir / "__2_data0.distcp"
+                with open(d20_path, 'rb') as f:
+                    d20_data = f.read()
+                d20_size = len(d20_data)
+
+                # Receive d21
+                d21_buffer = torch.zeros(d20_size, dtype=torch.uint8)
+                d21_addr = d21_buffer.data_ptr()
+                self.ecnaive_manager._ecnaive_native.software_recv_data1(d21_addr, d20_size)
+
+                # Create merged buffer (align with hardware version)
+                total_size = d20_size + d20_size
+                self.ecnaive_recovered_buffer = torch.zeros(total_size, dtype=torch.uint8)
+
+                # Data layout: first half d20, second half d21
+                self.ecnaive_recovered_buffer[:d20_size] = torch.frombuffer(d20_data, dtype=torch.uint8)
+                self.ecnaive_recovered_buffer[d20_size:] = d21_buffer
+
+                # Save metadata (align with hardware version)
+                self.ecnaive_recovered_metadata = mapped_file_own
+                self.ecnaive_recovered_registry = registry
+
+                logger.info(f"EC-NAIVE: [Rank 2] Software recovery completed: d20_size={d20_size}, total={total_size}")
+
+            elif rank == 3:
+                # Rank 3: Ready for software failure recovery but doesn't actively send
+                # The connection is already established, rank 2 will initiate the transfer
+                logger.info(f"EC-NAIVE: [Rank 3] Ready for software failure recovery data transfer")
+
+            # All ranks return metadata (rank 2 will use recovered buffer, others use normal loading)
+            return mapped_file_own, registry
+
+        # If not software failure mode, proceed with normal hardware recovery
         # EC-NAIVE recovers rank2 (same as ECLATIN)
         failed_rank = 2
         
@@ -5082,10 +5113,20 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         
-        # ECLATIN recovers rank2 (same as EC-CHECK)
-        failed_rank = 2
+        # Determine failed_rank based on flags
+        from megatron.training import get_args as use_args
+        input_args = use_args()
+        if input_args.use_eclatin_software_failure:
+            failed_rank = 2  # rank2 software failure (can read local files)
+            logger.info(f"ECLATIN: [Rank {rank}] Software failure recovery mode (failed_rank=2, reading local files)")
+        else:
+            failed_rank = 2  # Default: rank2 hardware failure (needs network recovery)
+            logger.info(f"ECLATIN: [Rank {rank}] Hardware failure recovery mode (failed_rank=2, network recovery)")
         
         checkpoint_dir = Path(checkpoint_dir)
+        
+        # Store checkpoint_dir for software failure recovery
+        self._current_checkpoint_dir = checkpoint_dir
         
         logger.info(f"ECLATIN Layerwise: [Rank {rank}] Loading block checkpoint for layerwise recovery")
         
@@ -8011,8 +8052,121 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.error("ECLATIN: Native module not initialized")
             return
         
-        # === Step 1: Set load mode in C++ native module ===
+        # === Step 0: Check for software failure mode ===
+        from megatron.training import get_args as use_args
+        from time import time
+        from pathlib import Path
+        input_args = use_args()
         failed_rank = 2  # ECLATIN recovers rank2
+        
+        # Early exit for rank2 software failure - read local files directly (no network/XOR needed)
+        if input_args.use_eclatin_software_failure:
+            if rank == failed_rank:
+                logger.info(f"ECLATIN: [Rank {rank}] rank2 software failure recovery - reading local files directly (no network/XOR)")
+                logger.info(f"ECLATIN: [Rank {rank}] recovered_buffer size: {recovered_buffer.numel() if recovered_buffer is not None else 'None'}")
+
+                if recovered_buffer is None:
+                    logger.error(f"ECLATIN: [Rank {rank}] recovered_buffer is None")
+                    return
+                
+                if eclatin_blocks is None:
+                    logger.error(f"ECLATIN: [Rank {rank}] eclatin_blocks is None")
+                    return
+                
+                # Get checkpoint_dir
+                checkpoint_dir = getattr(self, '_current_checkpoint_dir', None)
+                if checkpoint_dir is None:
+                    logger.error(f"ECLATIN: [Rank {rank}] checkpoint_dir not available")
+                    return
+                
+                checkpoint_dir = Path(checkpoint_dir)
+                start_time = time()
+                
+                # Step 1: Load data_block_1 from local file
+                logger.info(f"ECLATIN: [Rank {rank}] Loading data_block_1 from local file")
+                self._load_block_data_from_file(
+                    checkpoint_dir, rank, 'data_block_1', eclatin_blocks['data_block_1']
+                )
+                
+                # Step 2: Load data_block_2 from local file
+                logger.info(f"ECLATIN: [Rank {rank}] Loading data_block_2 from local file")
+                self._load_block_data_from_file(
+                    checkpoint_dir, rank, 'data_block_2', eclatin_blocks['data_block_2']
+                )
+                
+                # Step 3: Combine data_block_1 and data_block_2 into recovered_buffer
+                # Calculate split point (same as hardware recovery)
+                actual_tensor_buffer_size = 0
+                for r in range(world_size):
+                    rank_metadata = registry.rank_metadata.get(r, [])
+                    rank_actual_size = sum(meta.size_bytes for meta in rank_metadata)
+                    if rank_actual_size > actual_tensor_buffer_size:
+                        actual_tensor_buffer_size = rank_actual_size
+                
+                half_actual_data = actual_tensor_buffer_size // 2
+                
+                if recovered_buffer.numel() >= total_size:
+                    copy_start_time = time()
+                    # Copy first half: from data_block_1[0:half_actual_data]
+                    first_half_actual = min(half_actual_data, total_size)
+                    recovered_buffer[:first_half_actual].copy_(
+                        eclatin_blocks['data_block_1'][:first_half_actual]
+                    )
+                    
+                    # Copy second half: from data_block_2[0:remaining_data] if total_size > half_actual_data
+                    if total_size > half_actual_data:
+                        second_half_size = total_size - half_actual_data
+                        recovered_buffer[first_half_actual:total_size].copy_(
+                            eclatin_blocks['data_block_2'][:second_half_size]
+                        )
+                    
+                    copy_end_time = time()
+                    logger.info(
+                        f"ECLATIN: [Rank {rank}] Combined data_block_1 and data_block_2 into recovered_buffer "
+                        f"({total_size / (1024**2):.2f} MB) in {copy_end_time - copy_start_time:.2f} seconds"
+                    )
+                else:
+                    logger.warning(
+                        f"ECLATIN: [Rank {rank}] recovered_buffer too small "
+                        f"({recovered_buffer.numel()} < {total_size})"
+                    )
+                
+                end_time = time()
+                logger.info(f"ECLATIN: [Rank {rank}] rank2 software failure recovery completed in {end_time - start_time:.2f} seconds")
+
+                # Save recovered buffer info for _load_eclatin_checkpoint
+                logger.info(f"ECLATIN: [Rank {rank}] Starting to save recovered buffer info")
+                mapped_file_own = getattr(self, '_eclatin_mapped_file_own', None)
+                logger.info(f"ECLATIN: [Rank {rank}] mapped_file_own available: {mapped_file_own is not None}")
+                if mapped_file_own is not None:
+                    self.eclatin_recovered_metadata = mapped_file_own
+                    self.eclatin_recovered_registry = registry
+                    # Save the recovered buffer content
+                    if recovered_buffer is not None:
+                        logger.info(f"ECLATIN: [Rank {rank}] Cloning recovered_buffer of size {recovered_buffer.numel()}")
+                        self.eclatin_recovered_buffer = recovered_buffer.clone()
+                        logger.info(f"ECLATIN: [Rank {rank}] Successfully saved eclatin_recovered_buffer of size {self.eclatin_recovered_buffer.numel()}")
+                    else:
+                        logger.error(f"ECLATIN: [Rank {rank}] recovered_buffer is None, cannot save!")
+                    logger.info(f"ECLATIN: [Rank {rank}] Saved recovered buffer info for _load_eclatin_checkpoint")
+                else:
+                    logger.error(f"ECLATIN: [Rank {rank}] mapped_file_own not available, cannot save recovery info!")
+
+                # Synchronize all ranks and return early (skip network/XOR pipeline)
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                    logger.info(f"ECLATIN: [Rank {rank}] Synchronized after software failure recovery")
+
+                return
+            else:
+                # rank0/1/3: No action needed for software failure recovery
+                logger.info(f"ECLATIN: [Rank {rank}] No action needed for rank2 software failure recovery")
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                return
+        
+        # === Step 1: Set load mode in C++ native module ===
+        # Continue with normal hardware failure recovery pipeline
         self.eclatin_manager._eclatin_native.set_load_mode(True, failed_rank)
         logger.info(f"ECLATIN: [Rank {rank}] Set load mode (failed_rank={failed_rank})")
         
@@ -9572,29 +9726,38 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         """Load checkpoint saved in ECLATIN format (mirror EC-CHECK flow)."""
         from .filesystem_async import FileSystemWriterAsync
         from .state_dict_decomposer import reconstruct_state_dict
-        
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logger.info(f"ECLATIN: [Rank {rank}] _load_eclatin_checkpoint called")
+        logger.info(f"ECLATIN: [Rank {rank}] Checking recovery buffers - eclatin_recovered_buffer: {hasattr(self, 'eclatin_recovered_buffer') and self.eclatin_recovered_buffer is not None}")
+        logger.info(f"ECLATIN: [Rank {rank}] Checking recovery buffers - eclatin_recovered_metadata: {hasattr(self, 'eclatin_recovered_metadata') and self.eclatin_recovered_metadata is not None}")
         
         # Recovery path: rank2 may have recovered buffer
         #if (False):
+        logger.info(f"ECLATIN: [Rank {rank}] Checking if should use recovery path: rank==2: {rank == 2}, has_buffer: {hasattr(self, 'eclatin_recovered_buffer')}, buffer_not_none: {self.eclatin_recovered_buffer is not None if hasattr(self, 'eclatin_recovered_buffer') else False}")
         if (rank == 2 and hasattr(self, 'eclatin_recovered_buffer')
             and self.eclatin_recovered_buffer is not None):
             logger.info(f"ECLATIN: [Rank {rank}] Using recovered data from recovery pipeline")
+            logger.info(f"ECLATIN: [Rank {rank}] Recovery buffer size: {self.eclatin_recovered_buffer.numel()}")
             decomposed = self._extract_decomposed_from_buffer(
                 self.eclatin_recovered_buffer,
                 self.eclatin_recovered_metadata,
                 self.eclatin_recovered_registry
             )
+            logger.info(f"ECLATIN: [Rank {rank}] Successfully extracted decomposed data from recovery buffer")
             self.eclatin_recovered_buffer = None
             self.eclatin_recovered_metadata = None
             self.eclatin_recovered_registry = None
         else:
             checkpoint_dir = Path(checkpoint_dir)
             eclatin_file = checkpoint_dir / f'__{rank}_0.distcp'
+            logger.info(f"ECLATIN: [Rank {rank}] Using fallback path - loading from file {eclatin_file}")
             if not eclatin_file.exists():
+                logger.error(f"ECLATIN: [Rank {rank}] ECLATIN file not found: {eclatin_file}")
                 raise FileNotFoundError(f"ECLATIN file not found for rank {rank}: {eclatin_file}")
-            logger.info(f"Loading ECLATIN checkpoint from {eclatin_file}")
+            logger.info(f"ECLATIN: [Rank {rank}] Loading ECLATIN checkpoint from {eclatin_file}")
             decomposed = FileSystemWriterAsync.load_eclatin_components_from_file(str(eclatin_file))
+            logger.info(f"ECLATIN: [Rank {rank}] Successfully loaded ECLATIN checkpoint from file")
         
         # Build index map: (key, global_offset) -> (info, tensor)
         logger.info(f"ECLATIN: Building index map from {len(decomposed.tensor_infos)} tensor infos")
@@ -9611,11 +9774,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         non_tensor_by_fqn = decomposed.non_tensor_data
         logger.info(
-            f"Successfully loaded ECLATIN checkpoint for rank {rank} "
+            f"ECLATIN: [Rank {rank}] Successfully loaded ECLATIN checkpoint "
             f"({len(decomposed.tensor_data)} tensors, "
             f"{decomposed.total_tensor_size_bytes / (1024**3):.2f} GB)"
         )
-        
+
         orig_sharded_state_dict = sharded_state_dict
         (keyed_state_dict, flat_mapping, rename_mapping) = (
             _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
@@ -9924,8 +10087,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 return mcore_state_dict
             else:
                 logger.info(f"Using ECLATIN standard load mode")
-                # Load P2P checkpoint data (for rank2 recovery, this prepares the buffer)
-                mapped_file_own, mapped_file_partner = self._load_eclatin_block_checkpoint(checkpoint_dir, sharded_state_dict)
+                # Prepare checkpoint data (for rank2 recovery, this prepares the buffer)
+                self._load_eclatin_block_checkpoint(checkpoint_dir, sharded_state_dict)
                 eclatin_recovery_start_time = time()
                 # _load_eclatin_checkpoint will use recovered data if available (rank2)
                 mcore_state_dict = self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)

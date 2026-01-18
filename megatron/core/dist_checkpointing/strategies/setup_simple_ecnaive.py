@@ -66,7 +66,36 @@ for path in isa_header_paths:
 if not isa_available:
     print("Warning: isa-l not found, building without isa-l support")
 
-# Wrap setuptools.setup so we can inject isa-l include/libs into ext_modules at call time.
+# Check for RDMA availability
+rdma_available = False
+rdma_lib_dirs = []
+rdma_libs = []
+
+# Try to find RDMA libraries
+rdma_lib_paths = [
+    "/usr/lib",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/local/lib",
+    "/lib",
+    "/lib64",
+    "/usr/lib64",
+]
+
+for path in rdma_lib_paths:
+    # Check for libibverbs (could be libibverbs.so or libibverbs.so.1)
+    if (os.path.exists(os.path.join(path, "libibverbs.so")) or
+        os.path.exists(os.path.join(path, "libibverbs.so.1")) or
+        os.path.exists(os.path.join(path, "libibverbs"))):
+        rdma_lib_dirs.append(path)
+        rdma_libs.extend(["ibverbs", "rdmacm"])
+        rdma_available = True
+        print(f"Found RDMA library at: {path}")
+        break
+
+if not rdma_available:
+    print("Warning: RDMA libraries not found, building without RDMA support")
+
+# Wrap setuptools.setup so we can inject isa-l and rdma include/libs into ext_modules at call time.
 _original_setup = setup
 
 def setup(*args, **kwargs):
@@ -100,6 +129,22 @@ def setup(*args, **kwargs):
                         if p not in existing:
                             existing.append(p)
                     ext.include_dirs = existing
+                if rdma_libs:
+                    existing = list(getattr(ext, "libraries", []) or [])
+                    for lib in rdma_libs:
+                        if lib not in existing:
+                            existing.append(lib)
+                    ext.libraries = existing
+                if rdma_lib_dirs:
+                    existing = list(getattr(ext, "library_dirs", []) or [])
+                    for d in rdma_lib_dirs:
+                        if d not in existing:
+                            existing.append(d)
+                    ext.library_dirs = existing
+                if rdma_available:
+                    existing = list(getattr(ext, "define_macros", []) or [])
+                    existing.append(("RDMA_AVAILABLE", "1"))
+                    ext.define_macros = existing
             except Exception:
                 # If anything goes wrong, fall back to original behavior
                 pass
@@ -139,8 +184,11 @@ ext_modules = [
             pybind11_include,
             *boost_include_dirs,
         ],
-        libraries=isa_libs,
-        library_dirs=isa_lib_dirs,
+        libraries=isa_libs + rdma_libs,
+        library_dirs=isa_lib_dirs + rdma_lib_dirs,
+        define_macros=[
+            ("RDMA_AVAILABLE", "1") if rdma_available else ("RDMA_AVAILABLE", "0"),
+        ],
         cxx_std=17,
         language='c++',
         extra_compile_args=[

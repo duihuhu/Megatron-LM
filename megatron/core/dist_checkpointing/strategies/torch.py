@@ -119,6 +119,53 @@ def register_default_torch_strategies():
 logger = getLogger(__name__)
 
 
+def filter_embeddings_from_sharded_state_dict(sharded_state_dict: ShardedStateDict) -> ShardedStateDict:
+    """
+    Filter out embedding layers from sharded state dict for redundancy backup.
+    
+    This function removes word_embeddings and position_embeddings from the state dict
+    to reduce network traffic and storage when using redundancy backup strategies
+    (Gemini/EC series). The embeddings are saved separately by rank 0.
+    
+    Args:
+        sharded_state_dict: The sharded state dict to filter
+        
+    Returns:
+        Filtered sharded state dict without embedding layers
+    """
+    try:
+        from megatron.training import get_args
+        args = get_args()
+        save_embeddings_separately = getattr(args, 'save_embeddings_separately', False)
+        
+        if not save_embeddings_separately:
+            return sharded_state_dict
+        
+        filtered = {}
+        embedding_keys_filtered = []
+        
+        for key, value in sharded_state_dict.items():
+            # Filter out word_embeddings and position_embeddings
+            if 'embedding.word_embeddings.weight' in key or \
+               'embedding.position_embeddings.weight' in key:
+                embedding_keys_filtered.append(key)
+                continue
+            filtered[key] = value
+        
+        if embedding_keys_filtered:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            logger.info(
+                f"Rank {rank}: Filtered {len(embedding_keys_filtered)} embedding keys for redundancy backup"
+            )
+            logger.debug(f"Rank {rank}: Filtered keys: {embedding_keys_filtered}")
+        
+        return filtered
+    except Exception as e:
+        # If any error occurs (e.g., get_args() fails), just return original state dict
+        logger.warning(f"Failed to filter embeddings: {e}, returning original state dict")
+        return sharded_state_dict
+
+
 def flatten_state_dict(
     state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, Dict[str, OBJ_PATH]]:
@@ -1065,6 +1112,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             )
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
+        
+        # Filter embeddings for backup strategies (Gemini/EC)
+        # This reduces network traffic and storage in redundancy backups
+        pyt_state_dict = filter_embeddings_from_sharded_state_dict(pyt_state_dict)
+        
         from megatron.training import get_args as input_args
         args = input_args()
         # Use PyT saving mechanism

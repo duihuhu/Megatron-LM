@@ -129,6 +129,7 @@ EVAL_AND_LOGGING_ARGS=(
     --use-eclatin
     # --use-eclatin-software-failure
     --ckpt-format torch_dist
+    --save-embeddings-separately
 )
 
 mkdir -p logs

@@ -124,8 +124,9 @@ EVAL_AND_LOGGING_ARGS=(
 
     # --use-eclatin
     --ckpt-format torch_dist
-    --no-save-optim
-    --no-load-optim
+    # --no-save-optim
+    # --no-load-optim
+    --save-embeddings-separately
 )
 
 mkdir -p logs

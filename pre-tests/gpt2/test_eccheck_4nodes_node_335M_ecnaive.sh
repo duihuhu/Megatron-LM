@@ -129,6 +129,7 @@ EVAL_AND_LOGGING_ARGS=(
     #--use-ecnaive-software-failure
     --use-ecnaive
     --ckpt-format torch_dist
+    --save-embeddings-separately
 )
 
 mkdir -p logs

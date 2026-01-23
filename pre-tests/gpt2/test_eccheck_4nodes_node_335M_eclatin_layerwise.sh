@@ -127,6 +127,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --data-parallel-sharding-strategy optim_grads_params
     # --use-distributed-optimizer
     --ckpt-format torch_dist
+    --save-embeddings-separately
 )
 
 mkdir -p logs

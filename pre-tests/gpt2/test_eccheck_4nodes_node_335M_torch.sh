@@ -121,6 +121,7 @@ EVAL_AND_LOGGING_ARGS=(
 
     # --use-eclatin
     --ckpt-format torch
+    --save-embeddings-separately
 )
 
 mkdir -p logs

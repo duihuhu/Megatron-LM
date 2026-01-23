@@ -671,6 +671,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         print_rank_0('  scheduled an async checkpoint save at iteration {:7d} to {}' \
                      .format(iteration, save_dir))
 
+    # Save embeddings separately if requested (only for dist checkpointing)
+    if args.save_embeddings_separately and ckpt_type == CheckpointType.GLOBAL:
+        save_embeddings_separately(model, checkpoint_name)
+
     # Wait so everyone is done (not necessary)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -799,6 +803,88 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
     if not args.no_save_rng and rng_state:
         state_dict["rng_state"] = rng_state
     return state_dict
+
+
+def save_embeddings_separately(model, checkpoint_dir):
+    """
+    Save embedding layers to a separate shared file.
+    
+    Only rank 0 performs the actual save to avoid race conditions.
+    This function extracts word_embeddings and position_embeddings from
+    the model and saves them to embeddings_shared.pt.
+    
+    Args:
+        model: List of model modules (unwrapped)
+        checkpoint_dir (str): checkpoint directory path
+    """
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    
+    # Only rank 0 saves
+    if rank != 0:
+        return
+    
+    from megatron.core.utils import unwrap_model
+    
+    embeddings_dict = {}
+    model_list = unwrap_model(model)
+    
+    # Make sure model_list is iterable
+    if not isinstance(model_list, list):
+        model_list = [model_list]
+    
+    for i, model_module in enumerate(model_list):
+        if hasattr(model_module, 'embedding'):
+            key_prefix = f"model{i}" if len(model_list) > 1 else "model"
+            
+            # Save word embeddings
+            if hasattr(model_module.embedding, 'word_embeddings'):
+                emb_key = f'{key_prefix}.embedding.word_embeddings.weight'
+                embeddings_dict[emb_key] = model_module.embedding.word_embeddings.weight.detach().cpu()
+            
+            # Save position embeddings
+            if hasattr(model_module.embedding, 'position_embeddings'):
+                pos_key = f'{key_prefix}.embedding.position_embeddings.weight'
+                embeddings_dict[pos_key] = model_module.embedding.position_embeddings.weight.detach().cpu()
+    
+    if embeddings_dict:
+        emb_path = os.path.join(checkpoint_dir, 'embeddings_shared.pt')
+        ensure_directory_exists(emb_path)
+        torch.save(embeddings_dict, emb_path)
+        
+        total_size_mb = sum(v.numel() * v.element_size() for v in embeddings_dict.values()) / (1024**2)
+        print_rank_0(f'  saved {total_size_mb:.2f} MB of embeddings to embeddings_shared.pt')
+        print_rank_0(f'  embedding keys: {list(embeddings_dict.keys())}')
+
+
+def load_embeddings_separately(checkpoint_dir):
+    """
+    Load embedding layers from separate shared file.
+    
+    This function loads embeddings_shared.pt if it exists and returns
+    the embedding dictionary. All ranks load the same file.
+    
+    Args:
+        checkpoint_dir (str): checkpoint directory path
+        
+    Returns:
+        dict: Embedding dictionary or None if file doesn't exist
+    """
+    emb_path = os.path.join(checkpoint_dir, 'embeddings_shared.pt')
+    
+    if not os.path.exists(emb_path):
+        return None
+    
+    try:
+        embeddings = torch.load(emb_path, map_location='cpu')
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            total_size_mb = sum(v.numel() * v.element_size() for v in embeddings.values()) / (1024**2)
+            print_rank_0(f'  loaded {total_size_mb:.2f} MB of embeddings from embeddings_shared.pt')
+            print_rank_0(f'  embedding keys: {list(embeddings.keys())}')
+        return embeddings
+    except Exception as e:
+        print_rank_0(f'  warning: failed to load embeddings_shared.pt: {e}')
+        return None
 
 
 def _transpose_first_dim(t, num_splits, num_splits_first, model):

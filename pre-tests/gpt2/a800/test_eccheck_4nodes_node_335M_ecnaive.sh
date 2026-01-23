@@ -7,13 +7,13 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=eth0
+export NETIFACES_INTERFACE=bond0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
 GPUS_PER_NODE=1
-MASTER_ADDR=172.16.0.1
+MASTER_ADDR=10.0.0.62
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
@@ -42,11 +42,10 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 #     CUDA_VISIBLE_DEVICES=$NODE_RANK
 # fi
 # export CUDA_VISIBLE_DEVICES
-# export CUDA_VISIBLE_DEVICES=$NODE_RANK
+export CUDA_VISIBLE_DEVICES=$NODE_RANK
 
-export CUDA_VISIBLE_DEVICES=0
-VOCAB_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
-MERGE_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
+VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
+MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
 CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-naive" #<Specify path>
@@ -116,7 +115,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH
+    # --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
@@ -129,6 +128,9 @@ EVAL_AND_LOGGING_ARGS=(
     #--use-ecnaive-software-failure
     --use-ecnaive
     --ckpt-format torch_dist
+    # --no-save-optim
+    # --no-load-optim
+    --save-embeddings-separately
 )
 
 mkdir -p logs

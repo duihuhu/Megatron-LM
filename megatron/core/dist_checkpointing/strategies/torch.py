@@ -7852,9 +7852,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 logger.info(f"EC-CHECK: [Rank {rank}] No action needed for rank1 recovery")
             
             # Synchronize all ranks and return early (skip full encoding/XOR pipeline)
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
-                logger.info(f"EC-CHECK: [Rank {rank}] Synchronized after simple P2P transfer")
+            # if torch.distributed.is_initialized():
+            #     torch.distributed.barrier()
+            #     logger.info(f"EC-CHECK: [Rank {rank}] Synchronized after simple P2P transfer")
             
             logger.info(f"EC-CHECK: [Rank {rank}] rank1 software failure recovery completed (simple synchronous P2P, no worker queue)")
             return
@@ -8356,7 +8356,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             logger.info("ECLATIN: [Rank 2] Recovery pipeline completed")
             end_time = time()
-            logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.2f} seconds")
+            logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.4f} seconds")
             # Copy recovered blocks to recovered_buffer (combine data_block_1 and data_block_2)
             # CRITICAL FIX: Use actual_tensor_buffer_size // 2 as split point (same as save phase's actual_data_bytes // 2)
             # Save phase splits actual data at actual_data_bytes // 2, not pipeline_total_bytes // 2
@@ -10148,7 +10148,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             end_recovery_time = time()
             recovery_time = end_recovery_time - start_recovery_time
-            logger.info(f"rank: {rank}, Gemini Replicas hardware failure recovery time: {recovery_time:.2f} seconds")
+            logger.info(f"rank: {rank}, Gemini Replicas hardware failure recovery time: {recovery_time:.4f} seconds")
             
             if recovered_state_dict:
                 logger.info(f"rank: {rank}, returning loaded state dict from Gemini Replicas recovery")
@@ -10194,10 +10194,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 eclatin_recovery_start_time = time()
                 # _load_eclatin_checkpoint will use recovered data if available (rank2)
                 mcore_state_dict = self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
                 eclatin_recovery_end_time = time()
                 eclatin_recovery_time = eclatin_recovery_end_time - eclatin_recovery_start_time
-                logger.info(f"ECLATIN: [Rank {rank}] ECLATIN recovery time: {eclatin_recovery_time:.2f} seconds")
+                logger.info(f"ECLATIN: [Rank {rank}] ECLATIN recovery time: {eclatin_recovery_time:.4f} seconds")
                 return mcore_state_dict
         
         if input_args.use_ecnaive and (self._is_ecnaive_checkpoint(checkpoint_dir) or rank == 2):

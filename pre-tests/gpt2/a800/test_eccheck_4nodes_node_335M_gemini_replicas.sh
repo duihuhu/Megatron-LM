@@ -18,10 +18,12 @@ MASTER_ADDR=172.16.0.1
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_USE_ASIO=true
+
+# Set base IP for Gemini Replicas to use the high-speed network interface
+export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
+
 MASTER_PORT=6000
 NNODES=4
-
-export GEMINI_INTERFACE=$NETIFACES_INTERFACE
 
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
@@ -44,7 +46,7 @@ VOCAB_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-gemini" #<Specify path>
+CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-gemini-repicas" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -111,22 +113,23 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    # --load $CHECKPOINT_PATH
+    --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
 
-    --use-gemini
-    --use-gemini-optimized
+    --use-gemini-replicas 
+    --use-gemini-replicas-optimized 
     # --use-rdma
-    
+    --use-gemini-replicas-hardware-failure
+    # --gemini-replicas-num 4
+    # --use-gemini
+    # --use-gemini-optimized
     # --use-gemini-software-failure
-    --use-gemini-hardware-failure
+    # --use-gemini-hardware-failure
 
     # --use-eclatin
     --ckpt-format torch_dist
-    --no-save-optim
-    --no-load-optim
 )
 
 mkdir -p logs

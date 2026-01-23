@@ -7,14 +7,14 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=eno33np0
+export NETIFACES_INTERFACE=eth0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
 
 GPUS_PER_NODE=1
-MASTER_ADDR=128.105.146.30
+MASTER_ADDR=172.16.0.1
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_USE_ASIO=true
@@ -39,10 +39,11 @@ export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 # Set CUDA_VISIBLE_DEVICES for each node
-export CUDA_VISIBLE_DEVICES=0
+# export CUDA_VISIBLE_DEVICES=$NODE_RANK
 
-VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
-MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
+export CUDA_VISIBLE_DEVICES=0
+VOCAB_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
+MERGE_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
 CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-gemini-repicas" #<Specify path>
@@ -112,7 +113,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    # --load $CHECKPOINT_PATH
+    --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck

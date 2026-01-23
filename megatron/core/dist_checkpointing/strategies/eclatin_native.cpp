@@ -12,6 +12,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+// RDMA headers (ibverbs) - only if RDMA libraries are available
+#if RDMA_AVAILABLE
+#include <infiniband/verbs.h>
+#endif
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -25,6 +30,7 @@
 #include <vector>
 #include <chrono>
 #include <map>
+#include <sstream>
 
 #include <isa-l/erasure_code.h>
 #include <isa-l/raid.h>
@@ -39,6 +45,63 @@ namespace {
 
 #ifndef ECLATIN_NUM_CUDA_STREAMS
 #define ECLATIN_NUM_CUDA_STREAMS 4  // Default number of CUDA streams for async transfers
+#endif
+
+// ============================================================================
+// Connection Manager Interface
+// ============================================================================
+
+class IConnectionManager {
+public:
+    virtual ~IConnectionManager() = default;
+    
+    // Connection initialization
+    virtual void init_connections() = 0;
+    
+    // Send/receive operations for parity 1
+    virtual void send_parity1_send1(const uint8_t* data, size_t size) = 0;
+    virtual void send_parity1_send2(const uint8_t* data, size_t size) = 0;
+    virtual bool recv_parity1_recv1(uint8_t* buffer, size_t size) = 0;
+    virtual bool recv_parity1_recv2(uint8_t* buffer, size_t size) = 0;
+    
+    // Send/receive operations for parity 2
+    virtual void send_parity2_send1(const uint8_t* data, size_t size) = 0;
+    virtual void send_parity2_send2(const uint8_t* data, size_t size) = 0;
+    virtual bool recv_parity2_recv1(uint8_t* buffer, size_t size) = 0;
+    virtual bool recv_parity2_recv2(uint8_t* buffer, size_t size) = 0;
+    
+    // Load mode operations
+    virtual bool recv_load_data(const std::string& socket_name, uint8_t* buffer, size_t size) = 0;
+    virtual void send_load_data(const std::string& socket_name, const uint8_t* data, size_t size) = 0;
+    
+    // Connection status
+    virtual bool is_connected() const = 0;
+    
+    // RDMA-specific methods (no-op for ASIO)
+    virtual void register_buffer(uintptr_t addr, size_t size) {}
+    virtual void unregister_buffer(uintptr_t addr) {}
+    
+    // Cleanup
+    virtual void cleanup() = 0;
+};
+
+// ============================================================================
+// RDMA Connection Info (for ibverbs)
+// ============================================================================
+
+#if RDMA_AVAILABLE
+// RDMA connection info exchanged via TCP (same as gemini_native.cpp)
+struct RdmaConnInfo {
+    uint32_t qp_num;
+    uint16_t lid;
+    uint8_t gid[16];
+} __attribute__((packed));
+
+struct RdmaBuffer {
+    ibv_mr* mr;
+    uintptr_t addr;
+    size_t size;
+};
 #endif
 
 // ASIO connection manager (pattern from eccheck_native)
@@ -894,7 +957,8 @@ public:
                   const std::string& parity2_send2_ip, uint16_t parity2_send2_port,
                   const std::string& parity2_recv1_ip, uint16_t parity2_recv1_port,
                   const std::string& parity2_recv2_ip, uint16_t parity2_recv2_port,
-                  int num_cuda_streams = ECLATIN_NUM_CUDA_STREAMS)
+                  int num_cuda_streams = ECLATIN_NUM_CUDA_STREAMS,
+                  bool use_rdma = false)
         : stop_(false),
           parity1_send1_ip_(parity1_send1_ip),
           parity1_send1_port_(parity1_send1_port),
@@ -933,8 +997,17 @@ public:
           recv_count_(0),
           xor_count_(0),
           num_cuda_streams_(num_cuda_streams),
-          use_async_cuda_(ECLATIN_USE_ASYNC_CUDA) {
-        std::cout << "ECLATIN: Initializing connections..." << std::endl;
+          use_async_cuda_(ECLATIN_USE_ASYNC_CUDA),
+          use_rdma_(use_rdma) {
+        const char* mode_str = use_rdma_ ? "RDMA" : "ASIO";
+        std::cout << "ECLATIN: Initializing connections (mode: " << mode_str << ")..." << std::endl;
+        
+        if (use_rdma_) {
+            std::cout << "ECLATIN: WARNING - RDMA mode requested but not yet fully implemented" << std::endl;
+            std::cout << "ECLATIN: Falling back to ASIO mode for now" << std::endl;
+            std::cout << "ECLATIN: RDMA support will be added in future updates" << std::endl;
+            // TODO: Initialize RDMA connection manager when fully implemented
+        }
         
         #ifdef USE_CUDA
         // Initialize CUDA streams for async transfers
@@ -1235,6 +1308,38 @@ public:
         if (layerwise_worker_thread_.joinable()) layerwise_worker_thread_.join();
         if (layerwise_load_worker_thread_.joinable()) layerwise_load_worker_thread_.join();
         conn_.cleanup();
+    }
+
+    // RDMA buffer registration (no-op for ASIO mode, actual implementation for RDMA mode)
+    void register_buffer(uintptr_t buffer_addr, size_t buffer_size) {
+        if (!use_rdma_) {
+            // ASIO mode: no-op
+            return;
+        }
+        
+        // RDMA mode: To be implemented with full RDMA connection manager
+        // For now, just log the registration request
+        std::cout << "ECLATIN: register_buffer called (buffer_addr=0x" << std::hex << buffer_addr << std::dec
+                  << ", size=" << (buffer_size / (1024.0 * 1024.0)) << " MB)" << std::endl;
+        std::cout << "ECLATIN: Note - RDMA buffer registration not yet implemented, no-op" << std::endl;
+        
+        // TODO: When RDMA connection manager is implemented:
+        // rdma_conn_->register_buffer(buffer_addr, buffer_size);
+    }
+    
+    void unregister_buffer(uintptr_t buffer_addr) {
+        if (!use_rdma_) {
+            // ASIO mode: no-op
+            return;
+        }
+        
+        // RDMA mode: To be implemented with full RDMA connection manager
+        // For now, just log the unregistration request
+        std::cout << "ECLATIN: unregister_buffer called (buffer_addr=0x" << std::hex << buffer_addr << std::dec << ")" << std::endl;
+        std::cout << "ECLATIN: Note - RDMA buffer unregistration not yet implemented, no-op" << std::endl;
+        
+        // TODO: When RDMA connection manager is implemented:
+        // rdma_conn_->unregister_buffer(buffer_addr);
     }
 
     // Load mode functions
@@ -1887,6 +1992,9 @@ private:
     #ifdef USE_CUDA
     std::vector<cudaStream_t> cuda_streams_;
     #endif
+    
+    // RDMA configuration
+    bool use_rdma_;
 
     void start_threads() {
         std::cout << "ECLATIN: Starting worker threads..." << std::endl;
@@ -3206,6 +3314,28 @@ private:
 }  // namespace
 
 PYBIND11_MODULE(eclatin_native, m) {
+    m.doc() = "ECLATIN Native C++ Module for erasure coding with ASIO or RDMA";
+    
+    // Static utility functions
+    m.def("is_rdma_available", []() {
+#if RDMA_AVAILABLE
+        // Check for RDMA devices using ibverbs
+        int num_devices;
+        ibv_device** device_list = ibv_get_device_list(&num_devices);
+        if (!device_list || num_devices == 0) {
+            if (device_list) {
+                ibv_free_device_list(device_list);
+            }
+            return false;
+        }
+        ibv_free_device_list(device_list);
+        return true;
+#else
+        // RDMA libraries not available at compile time
+        return false;
+#endif
+    }, "Check if RDMA is available on the system");
+    
     pybind11::class_<ECLATINNative>(m, "ECLATINNative")
         .def(pybind11::init<const std::string&, uint16_t,
                             const std::string&, uint16_t,
@@ -3215,7 +3345,8 @@ PYBIND11_MODULE(eclatin_native, m) {
                             const std::string&, uint16_t,
                             const std::string&, uint16_t,
                             const std::string&, uint16_t,
-                            int>(),
+                            int,
+                            bool>(),
              pybind11::arg("parity1_send1_ip"),
              pybind11::arg("parity1_send1_port"),
              pybind11::arg("parity1_send2_ip"),
@@ -3232,7 +3363,34 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("parity2_recv1_port"),
              pybind11::arg("parity2_recv2_ip"),
              pybind11::arg("parity2_recv2_port"),
-             pybind11::arg("num_cuda_streams") = ECLATIN_NUM_CUDA_STREAMS)
+             pybind11::arg("num_cuda_streams") = ECLATIN_NUM_CUDA_STREAMS,
+             pybind11::arg("use_rdma") = false,
+             "Initialize ECLATIN native module with ASIO or RDMA transport.\n\n"
+             "Args:\n"
+             "    parity1_send1_ip, parity1_send1_port: Parity 1 send1 connection\n"
+             "    parity1_send2_ip, parity1_send2_port: Parity 1 send2 connection\n"
+             "    parity1_recv1_ip, parity1_recv1_port: Parity 1 recv1 connection\n"
+             "    parity1_recv2_ip, parity1_recv2_port: Parity 1 recv2 connection\n"
+             "    parity2_send1_ip, parity2_send1_port: Parity 2 send1 connection\n"
+             "    parity2_send2_ip, parity2_send2_port: Parity 2 send2 connection\n"
+             "    parity2_recv1_ip, parity2_recv1_port: Parity 2 recv1 connection\n"
+             "    parity2_recv2_ip, parity2_recv2_port: Parity 2 recv2 connection\n"
+             "    num_cuda_streams: Number of CUDA streams for async transfers\n"
+             "    use_rdma: Use RDMA transport (default: False, uses ASIO)\n")
+        // RDMA buffer registration (no-op for ASIO mode)
+        .def("register_buffer", &ECLATINNative::register_buffer,
+             pybind11::arg("buffer_addr"),
+             pybind11::arg("buffer_size"),
+             "Register buffer for RDMA operations (no-op for ASIO).\n\n"
+             "For RDMA: Register buffer during first allocation in save phase.\n"
+             "Args:\n"
+             "    buffer_addr: Memory address of the buffer (uintptr_t)\n"
+             "    buffer_size: Size of the buffer in bytes\n")
+        .def("unregister_buffer", &ECLATINNative::unregister_buffer,
+             pybind11::arg("buffer_addr"),
+             "Unregister buffer (no-op for ASIO).\n\n"
+             "Args:\n"
+             "    buffer_addr: Memory address of the buffer (uintptr_t)\n")
         // Parity 1 submit functions
         .def("submit_parity1_send1", &ECLATINNative::submit_parity1_send1,
              pybind11::arg("send_addr"),

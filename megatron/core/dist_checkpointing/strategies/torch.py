@@ -2458,6 +2458,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             f"  Total memory: {4 * aligned_half_block_size / (1024**3):.2f} GB"
         )
         
+        # ===== Register buffers for RDMA if enabled =====
+        if self.eclatin_manager.use_rdma:
+            logger.info("ECLATIN: Registering 4 persistent blocks for RDMA...")
+            self.eclatin_manager.register_buffer(data_block_1)
+            self.eclatin_manager.register_buffer(data_block_2)
+            self.eclatin_manager.register_buffer(parity_block_1)
+            self.eclatin_manager.register_buffer(parity_block_2)
+            logger.info("ECLATIN: RDMA buffer registration complete")
+        
         # ===== Package blocks with metadata =====
         # Align with EC-CHECK: use decomposed_state_dict.non_tensor_data directly
         own_non_tensor_data = self.decomposed_state_dict.non_tensor_data
@@ -2772,6 +2781,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             f"({aligned_half_block_size / (1024**2):.0f} MB)\n"
             f"  Total memory: {4 * aligned_half_block_size / (1024**3):.2f} GB"
         )
+        
+        # ===== Register buffers for RDMA if enabled =====
+        if self.eclatin_manager.use_rdma:
+            logger.info("ECLATIN: Registering 4 persistent blocks for RDMA...")
+            self.eclatin_manager.register_buffer(data_block_1)
+            self.eclatin_manager.register_buffer(data_block_2)
+            self.eclatin_manager.register_buffer(parity_block_1)
+            self.eclatin_manager.register_buffer(parity_block_2)
+            logger.info("ECLATIN: RDMA buffer registration complete")
         
         # ===== Package blocks with metadata =====
         # Align with EC-CHECK: use decomposed_state_dict.non_tensor_data directly
@@ -3188,6 +3206,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             f"{aligned_total_recv_size / (1024**3):.2f} GB each "
             f"({aligned_total_recv_size / (1024**2):.0f} MB each)"
         )
+        
+        # Register buffers for RDMA if enabled
+        if self.eclatin_manager.use_rdma:
+            logger.info("ECLATIN: Registering 4 layerwise recv buffers for RDMA...")
+            self.eclatin_manager.register_buffer(recv_buffer_parity1_1)
+            self.eclatin_manager.register_buffer(recv_buffer_parity1_2)
+            self.eclatin_manager.register_buffer(recv_buffer_parity2_1)
+            self.eclatin_manager.register_buffer(recv_buffer_parity2_2)
+            logger.info("ECLATIN: RDMA recv buffer registration complete")
         
         return (
             recv_buffer_parity1_1,
@@ -5482,6 +5509,18 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 f"{aligned_half_block_size / (1024**3):.2f} GB x 4 = "
                 f"{4 * aligned_half_block_size / (1024**3):.2f} GB"
             )
+            # Register buffers for RDMA if enabled (reused buffers should already be registered)
+            # But we check and register if not already done
+            if self.eclatin_manager.use_rdma:
+                logger.info("ECLATIN: [Load] Verifying RDMA registration for reused blocks...")
+                for block_name in block_names:
+                    block_tensor = self.eclatin_preallocated_blocks[block_name]
+                    # Check if already registered by looking at buffer address
+                    buffer_addr = block_tensor.data_ptr()
+                    if buffer_addr not in self.eclatin_manager.registered_buffers:
+                        logger.info(f"ECLATIN: [Load] Registering reused block {block_name} for RDMA...")
+                        self.eclatin_manager.register_buffer(block_tensor)
+                logger.info("ECLATIN: [Load] RDMA registration verification complete")
         else:
             # Allocate new buffers
             pin_memory = torch.cuda.is_available() and getattr(self.eclatin_manager, 'eclatin_pin_memory', False)
@@ -5509,6 +5548,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 f"  parity_block_2: {aligned_half_block_size / (1024**3):.2f} GB\n"
                 f"  Total memory: {4 * aligned_half_block_size / (1024**3):.2f} GB"
             )
+            
+            # Register buffers for RDMA if enabled
+            if self.eclatin_manager.use_rdma:
+                logger.info("ECLATIN: [Load] Registering 4 persistent blocks for RDMA...")
+                self.eclatin_manager.register_buffer(data_block_1)
+                self.eclatin_manager.register_buffer(data_block_2)
+                self.eclatin_manager.register_buffer(parity_block_1)
+                self.eclatin_manager.register_buffer(parity_block_2)
+                logger.info("ECLATIN: [Load] RDMA buffer registration complete")
         
         return blocks
     
@@ -5842,7 +5890,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         checkpoint_dir = Path(checkpoint_dir)
         
         # Detect if RDMA is enabled
-        use_rdma = hasattr(self.gemini_manager._gemini_native, 'register_buffer')
+        from megatron.training import get_args as use_args
+        input_args = use_args()
+        use_rdma = input_args.use_rdma
         transport_mode = "RDMA" if use_rdma else "ASIO"
         logger.info(f"rank: {rank}, starting Gemini checkpoint recovery with {transport_mode} (OPTIMIZED) for rank2 failure")
         
@@ -5887,7 +5937,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     f"  replica (rank2): {replica_file_size / (1024**2):.2f} MB (registered: {replica_info['registered']}, use_copy: {replica_info['use_copy']})\n"
                     f"  own (rank0): {own_file_size / (1024**2):.2f} MB (registered: {own_info['registered']}, use_copy: {own_info['use_copy']})"
                 )
-                
+                send_start_time = time()
                 # Step 2: Send metadata (both file sizes) to rank2
                 metadata_array = np.array([replica_file_size, own_file_size], dtype=np.int64)
                 metadata_addr = metadata_array.ctypes.data
@@ -5903,8 +5953,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 logger.info(f"rank: {rank}, sending own checkpoint data (for rank2 backup) to rank2...")
                 self.gemini_manager._gemini_native.send_buffer(own_info['addr'], own_file_size)
                 logger.info(f"rank: {rank}, sent own checkpoint data to rank2: {own_file_size / (1024**2):.2f} MB")
-                
-                logger.info(f"rank: {rank}, all data sent successfully to rank2")
+                send_end_time = time()
+                send_time = send_end_time - send_start_time
+                logger.info(f"rank: {rank}, all data sent successfully to rank2 in {send_time:.2f}s")
                 
             except Exception as e:
                 logger.error(f"rank: {rank}, {transport_mode} send failed: {e}", exc_info=True)
@@ -5912,7 +5963,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             # Step 5: Rank0 loads its own checkpoint from file
             logger.info(f"rank: {rank}, loading own checkpoint from saved file")
-            return self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
+            loaded_state_dict = self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
+            return loaded_state_dict
             
         elif rank == 2:
             # Rank2: Receive metadata and all data from rank0, then restore
@@ -5951,7 +6003,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 rank0_addr = rank0_tensor.data_ptr()
                 self.gemini_manager._gemini_native.receive_buffer(rank0_addr, rank0_size)
                 recv_time = time()
-                logger.info(f"rank: {rank}, received rank0 and rank2's checkpoint data time: {recv_time - start_time}")
+                logger.info(f"rank: {rank}, gemini asio received rank0 and rank2's checkpoint data time: {recv_time - start_time}")
                 
                 # Step 4: Save rank0's data as replica file (optional, for future recovery)
                 # try:
@@ -6017,7 +6069,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         replica_buckets, sharded_state_dict
                     )
                     end_time = time()
-                    logger.info(f"rank: {rank}, recovery rank2's checkpoint data time: {end_time - start_time}")
+                    logger.info(f"rank: {rank}, gemini asio recovery rank2's checkpoint data time: {end_time - start_time}")
                 else:
                     # Standard pickle format
                     logger.info(f"rank: {rank}, parsing as standard pickle format")
@@ -6030,7 +6082,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         replica_buckets, sharded_state_dict
                     )
                 
-                logger.info(f"rank: {rank}, successfully restored state_dict and saved rank0's backup")
+                logger.info(f"rank: {rank}, gemini asio successfully restored state_dict and saved rank0's backup")
                 return loaded_state_dict
                 
             except Exception as e:
@@ -6646,7 +6698,39 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         metadata_tensor = primary_buffer[8:8+metadata_size]
                         metadata_bytes = metadata_tensor.cpu().numpy().tobytes()
                         import pickle
-                        gemini_metadata = pickle.loads(metadata_bytes)
+                        import io
+                        
+                        # Create custom Unpickler to handle torch objects with persistent IDs
+                        class TorchUnpickler(pickle.Unpickler):
+                            def find_class(self, module, name):
+                                # Handle torch classes normally
+                                if module == 'torch':
+                                    return getattr(torch, name)
+                                return super().find_class(module, name)
+                            
+                            def persistent_load(self, pid):
+                                # Handle persistent IDs for torch objects
+                                logger.debug(f"rank: {rank}, persistent_load called with pid: {pid}")
+                                
+                                if isinstance(pid, tuple):
+                                    typename = pid[0] if len(pid) > 0 else None
+                                    if typename and 'Storage' in typename:
+                                        raise pickle.UnpicklingError(
+                                            f"Unexpected storage object in metadata: {pid}"
+                                        )
+                                
+                                logger.warning(f"rank: {rank}, unhandled persistent_load pid: {pid}, returning as-is")
+                                return pid
+                        
+                        try:
+                            metadata_buffer = io.BytesIO(metadata_bytes)
+                            unpickler = TorchUnpickler(metadata_buffer)
+                            gemini_metadata = unpickler.load()
+                        except Exception as e:
+                            logger.error(f"rank: {rank}, failed to unpickle metadata: {e}")
+                            # Fallback: try torch.load
+                            metadata_buffer = io.BytesIO(metadata_bytes)
+                            gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
                         
                         # Extract buffer (zero-copy)
                         buffer_tensor = primary_buffer[8+metadata_size:]
@@ -6797,8 +6881,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         
                         # Gemini Replicas uses pickle, Gemini uses torch.save
                         if use_gemini_replicas_optimized:
-                            import pickle
-                            gemini_metadata = pickle.loads(metadata_bytes)
+                            # import pickle
+                            # gemini_metadata = pickle.loads(metadata_bytes)
+                            # Use torch.load instead of pickle.loads to properly handle torch objects
+                            # torch.load internally provides persistent_load for torch.dtype, torch.device, etc.
+                            metadata_buffer = io.BytesIO(metadata_bytes)
+                            gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
                         else:
                             metadata_buffer = io.BytesIO(metadata_bytes)
                             gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
@@ -9978,7 +10066,19 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 self._prepare_gemini_rdma_buffers_if_needed(checkpoint_dir)
                 prepare_end = time()
                 logger.info(f"rank: {rank}, RDMA send buffers preparation time: {(prepare_end - prepare_start)*1000:.2f}ms")
-        torch.distributed.barrier()
+        
+            # Prepare Gemini Replicas RDMA send buffers early for recovery (sender ranks only)
+        # This ensures buffers are ready BEFORE rank2 starts waiting
+        if input_args.use_gemini_replicas and input_args.use_gemini_replicas_hardware_failure and input_args.use_gemini_replicas_optimized:
+            if rank in [0, 1, 3]:
+                # Prepare buffers now if not already prepared
+                # This includes: opening mmap, allocating aligned buffers, copying data, registering RDMA
+                prepare_start = time()
+                self._prepare_gemini_replicas_rdma_send_buffers_if_needed(checkpoint_dir)
+                prepare_end = time()
+                logger.info(f"rank: {rank}, Gemini Replicas RDMA send buffers preparation time: {(prepare_end - prepare_start)*1000:.2f}ms")
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         # Gemini checkpoint recovery for rank2 failure scenario
         # Only rank0 and rank2 participate in recovery, but ALL ranks must synchronize
         recovered_state_dict = None
@@ -9993,14 +10093,22 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 if input_args.use_gemini_optimized:
                     logger.info(f"rank: {rank}, using ASIO-based recovery for rank2 failure")
                     recovered_state_dict = self._load_gemini_checkpoint_recovery_asio(sharded_state_dict, checkpoint_dir)
+                    end_recovery_time = time()
+                    recovery_time = end_recovery_time - start_recovery_time
+                    logger.info(f"rank: {rank}, gemini asio recovery time: {recovery_time:.2f} seconds")
                 else:
                     logger.info(f"rank: {rank}, using standard recovery for rank2 failure")
                     recovered_state_dict = self._load_gemini_checkpoint_recovery(sharded_state_dict, checkpoint_dir)
+                    end_recovery_time = time()
+                    recovery_time = end_recovery_time - start_recovery_time
+                    logger.info(f"rank: {rank}, gemini standard recovery time: {recovery_time:.2f} seconds")
             else:
                 logger.info(f"rank: {rank}, not participating in rank2 recovery, loading from own checkpoint file")
                 # Other ranks (rank1, rank3) load from their own saved checkpoint files
                 recovered_state_dict = self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
-            
+                load_end_time = time()
+                load_time = load_end_time - start_recovery_time
+                logger.info(f"rank: {rank}, gemini asio load time: {load_time:.2f} seconds")
             # ALL ranks must synchronize here (including rank1 and rank3)
             # This ensures no rank proceeds to collective operations while others are still in recovery
             if torch.distributed.is_initialized():
@@ -10018,23 +10126,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info(f"rank: {rank}, using Gemini checkpoint recovery for software failure")
             start_recovery_time = time()
             recovered_state_dict = self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
+            # torch.distributed.barrier()
             end_recovery_time = time()
             recovery_time = end_recovery_time - start_recovery_time
             logger.info(f"rank: {rank}, Gemini software failure recovery time: {recovery_time:.2f} seconds")
             return recovered_state_dict
-        
-        # Prepare Gemini Replicas RDMA send buffers early for recovery (sender ranks only)
-        # This ensures buffers are ready BEFORE rank2 starts waiting
-        if input_args.use_gemini_replicas and input_args.use_gemini_replicas_hardware_failure and input_args.use_gemini_replicas_optimized:
-            if rank in [0, 1, 3]:
-                # Prepare buffers now if not already prepared
-                # This includes: opening mmap, allocating aligned buffers, copying data, registering RDMA
-                prepare_start = time()
-                self._prepare_gemini_replicas_rdma_send_buffers_if_needed(checkpoint_dir)
-                prepare_end = time()
-                logger.info(f"rank: {rank}, Gemini Replicas RDMA send buffers preparation time: {(prepare_end - prepare_start)*1000:.2f}ms")
-        torch.distributed.barrier()
-        
+                
         # Gemini Replicas checkpoint recovery for rank2 failure scenario
         # rank0, rank1, rank3 send data to rank2; rank2 receives and recovers
         if input_args.use_gemini_replicas and input_args.use_gemini_replicas_hardware_failure:
@@ -10045,9 +10142,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             recovered_state_dict = self._load_gemini_replicas_checkpoint_recovery(sharded_state_dict, checkpoint_dir)
             
             # ALL ranks must synchronize here
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
-                logger.info(f"rank: {rank}, synchronized after Gemini Replicas recovery")
+            # if torch.distributed.is_initialized():
+            #     torch.distributed.barrier()
+            #     logger.info(f"rank: {rank}, synchronized after Gemini Replicas recovery")
             
             end_recovery_time = time()
             recovery_time = end_recovery_time - start_recovery_time
@@ -10070,10 +10167,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if input_args.use_eccheck and (is_eccheck_checkpoint or is_recovery_scenario):
             logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
             # Load P2P checkpoint data (for rank2 recovery, this prepares the buffer)
+            start_recovery_time = time()
             mapped_file_own, mapped_file_partner = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
             
             # _load_eccheck_checkpoint will use recovered data if available (rank2)
             mcore_state_dict = self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
+            torch.distributed.barrier()
+            end_recovery_time = time()
+            recovery_time = end_recovery_time - start_recovery_time
+            logger.info(f"rank: {rank}, EC-CHECK recovery time: {recovery_time:.2f} seconds")
             return mcore_state_dict
         
         if input_args.use_eclatin and (self._is_eclatin_checkpoint(checkpoint_dir) or rank == 2):
@@ -10092,6 +10194,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 eclatin_recovery_start_time = time()
                 # _load_eclatin_checkpoint will use recovered data if available (rank2)
                 mcore_state_dict = self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)
+                torch.distributed.barrier()
                 eclatin_recovery_end_time = time()
                 eclatin_recovery_time = eclatin_recovery_end_time - eclatin_recovery_start_time
                 logger.info(f"ECLATIN: [Rank {rank}] ECLATIN recovery time: {eclatin_recovery_time:.2f} seconds")
@@ -10105,6 +10208,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             ecnaive_recovery_start_time = time()
             # _load_ecnaive_checkpoint will use recovered data if available (rank2)
             mcore_state_dict = self._load_ecnaive_checkpoint(sharded_state_dict, checkpoint_dir)
+            # torch.distributed.barrier()
             ecnaive_recovery_end_time = time()
             ecnaive_recovery_time = ecnaive_recovery_end_time - ecnaive_recovery_start_time
             logger.info(f"EC-NAIVE: [Rank {rank}] EC-NAIVE recovery time: {ecnaive_recovery_time:.2f} seconds")

@@ -1297,12 +1297,12 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(send_queue_mutex_);
                     send_queue_.push({task.encoding_addr, task.size});
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 (sender): Pushed task to send_queue, "
-                              << "encoding_addr=" << task.encoding_addr << ", size=" << task.size 
-                              << ", queue_size=" << send_queue_.size() << std::endl;
+                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 (sender): Pushed task to send_queue, "
+                    //           << "encoding_addr=" << task.encoding_addr << ", size=" << task.size 
+                    //           << ", queue_size=" << send_queue_.size() << std::endl;
                 }
                 send_queue_cv_.notify_one();
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 (sender): Notified send_queue_cv" << std::endl;
+                // std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 (sender): Notified send_queue_cv" << std::endl;
                     
                     // Sender doesn't need parity buffer, release it immediately
                     if (task.parity_addr != 0) {

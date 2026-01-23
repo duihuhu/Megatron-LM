@@ -163,6 +163,49 @@ for path in nccl_header_paths:
 if not nccl_available:
     print("Warning: NCCL not found, building without NCCL support")
 
+# Check for RDMA libraries (libibverbs, librdmacm)
+rdma_available = False
+rdma_lib_dirs = []
+rdma_libs = []
+rdma_include_dirs = []
+
+# Try to find RDMA libraries
+rdma_lib_paths = [
+    "/usr/lib",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/opt/lib",
+]
+
+for path in rdma_lib_paths:
+    has_verbs = os.path.exists(os.path.join(path, "libibverbs.so")) or os.path.exists(os.path.join(path, "libibverbs.a"))
+    has_rdmacm = os.path.exists(os.path.join(path, "librdmacm.so")) or os.path.exists(os.path.join(path, "librdmacm.a"))
+    if has_verbs and has_rdmacm:
+        rdma_lib_dirs.append(path)
+        rdma_libs.extend(["ibverbs", "rdmacm"])
+        rdma_available = True
+        print(f"Found RDMA libraries at: {path}")
+        break
+
+# Try to find RDMA headers
+rdma_header_paths = [
+    "/usr/include",
+    "/usr/local/include",
+    "/opt/include",
+]
+
+for path in rdma_header_paths:
+    if os.path.exists(os.path.join(path, "infiniband", "verbs.h")):
+        rdma_include_dirs.append(path)
+        print(f"Found RDMA headers at: {path}")
+        break
+
+if not rdma_available:
+    print("Warning: RDMA libraries not found, building without RDMA support")
+    print("         Module will build but RDMA transport will not work at runtime")
+    print("         Install: sudo apt-get install libibverbs-dev librdmacm-dev")
+
 # Check if USE_CUDA should be enabled (from environment variable)
 use_cuda = os.environ.get('USE_CUDA', 'false').lower() == 'true'
 
@@ -195,12 +238,18 @@ else:
 # Build define_macros list
 define_macros = [
     ("NCCL_AVAILABLE", "1") if nccl_available else ("NCCL_AVAILABLE", "0"),
+    ("RDMA_AVAILABLE", "1") if rdma_available else ("RDMA_AVAILABLE", "0"),
 ]
 if use_cuda:
     define_macros.append(("USE_CUDA", "1"))
     print("Building with USE_CUDA enabled (C++ will handle D2H transfers)")
 else:
     print("Building without USE_CUDA (PyTorch mode - D2H handled by PyTorch)")
+
+if rdma_available:
+    print("Building with RDMA support enabled")
+else:
+    print("Building without RDMA support (ASIO/TCP only)")
 
 # Define the extension
 ext_modules = [
@@ -211,10 +260,11 @@ ext_modules = [
             *torch_include,
             pybind11_include,
             *nccl_include_dirs,
+            *rdma_include_dirs,
             *cuda_include,
         ],
-        libraries=nccl_libs + cuda_libs,
-        library_dirs=nccl_lib_dirs + cuda_lib_dirs,
+        libraries=nccl_libs + rdma_libs + cuda_libs,
+        library_dirs=nccl_lib_dirs + rdma_lib_dirs + cuda_lib_dirs,
         define_macros=define_macros,
         cxx_std=17,
         language='c++',

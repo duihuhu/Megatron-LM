@@ -497,8 +497,10 @@ class TemporalAsyncCaller(AsyncCaller):
         """
         if async_req.async_fn is None:
             return  # nothing to do
+        rank = torch.distributed.get_rank()
 
         async_fn_args = list(async_req.async_fn_args)
+        torch.distributed.barrier()
         start_sync = time()
         if async_req.preload_fn:
             # If there's a preload_fn in `async_req`, we call this func
@@ -508,7 +510,6 @@ class TemporalAsyncCaller(AsyncCaller):
         
         # print("preload_fn preload_fn ")
         
-        rank = torch.distributed.get_rank()
         # logger.info(f"EC-CHECK: Synchronizing CUDA")
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -600,7 +601,7 @@ class TemporalAsyncCaller(AsyncCaller):
                 # Use original version with serialization
                 logger.info(f"Gemini rank {rank}: Using original exchange (with serialization)")
                 remote_bytes, local_size, remote_size = self.exchange_checkpoint_data(async_fn_args[1])
-                
+                torch.distributed.barrier()
                 exchange_end = time()
                 logger.info(f"rank: {rank}, takes {exchange_end - start_sync} to schedule async ckpt {exchange_end} {start_sync}")
 

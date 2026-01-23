@@ -66,7 +66,17 @@ for path in isa_header_paths:
 if not isa_available:
     print("Warning: isa-l not found, building without isa-l support")
 
-# Wrap setuptools.setup so we can inject isa-l include/libs into ext_modules at call time.
+# Initialize RDMA variables (will be populated later)
+rdma_available = False
+rdma_lib_dirs = []
+rdma_libs = []
+rdma_include_dirs = []
+
+# Initialize Boost system library (required for ASIO)
+boost_libs = []
+boost_lib_dirs = []
+
+# Wrap setuptools.setup so we can inject isa-l and RDMA include/libs into ext_modules at call time.
 _original_setup = setup
 
 def setup(*args, **kwargs):
@@ -75,6 +85,7 @@ def setup(*args, **kwargs):
         for ext in ext_modules:
             # Pybind11Extension exposes include_dirs, libraries, library_dirs attributes
             try:
+                # Inject ISA-L configuration
                 if isa_include_dirs:
                     existing = list(getattr(ext, "include_dirs", []) or [])
                     # avoid duplicates
@@ -91,6 +102,40 @@ def setup(*args, **kwargs):
                 if isa_lib_dirs:
                     existing = list(getattr(ext, "library_dirs", []) or [])
                     for d in isa_lib_dirs:
+                        if d not in existing:
+                            existing.append(d)
+                    ext.library_dirs = existing
+                
+                # Inject RDMA configuration
+                if rdma_include_dirs:
+                    existing = list(getattr(ext, "include_dirs", []) or [])
+                    for p in rdma_include_dirs:
+                        if p not in existing:
+                            existing.append(p)
+                    ext.include_dirs = existing
+                if rdma_libs:
+                    existing = list(getattr(ext, "libraries", []) or [])
+                    for lib in rdma_libs:
+                        if lib not in existing:
+                            existing.append(lib)
+                    ext.libraries = existing
+                if rdma_lib_dirs:
+                    existing = list(getattr(ext, "library_dirs", []) or [])
+                    for d in rdma_lib_dirs:
+                        if d not in existing:
+                            existing.append(d)
+                    ext.library_dirs = existing
+                
+                # Inject Boost configuration
+                if boost_libs:
+                    existing = list(getattr(ext, "libraries", []) or [])
+                    for lib in boost_libs:
+                        if lib not in existing:
+                            existing.append(lib)
+                    ext.libraries = existing
+                if boost_lib_dirs:
+                    existing = list(getattr(ext, "library_dirs", []) or [])
+                    for d in boost_lib_dirs:
                         if d not in existing:
                             existing.append(d)
                     ext.library_dirs = existing
@@ -163,6 +208,84 @@ for path in nccl_header_paths:
 if not nccl_available:
     print("Warning: NCCL not found, building without NCCL support")
 
+# Check for RDMA libraries (optional, for InfiniBand support)
+# Try to find RDMA libraries (libibverbs and librdmacm)
+rdma_lib_paths = [
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+    "/usr/local/lib",
+]
+
+# Check for libibverbs
+ibverbs_found = False
+for path in rdma_lib_paths:
+    if os.path.exists(os.path.join(path, "libibverbs.so")) or os.path.exists(os.path.join(path, "libibverbs.a")):
+        if path not in rdma_lib_dirs:
+            rdma_lib_dirs.append(path)
+        if "ibverbs" not in rdma_libs:
+            rdma_libs.append("ibverbs")
+        ibverbs_found = True
+        print(f"Found libibverbs at: {path}")
+        break
+
+# Check for librdmacm
+rdmacm_found = False
+for path in rdma_lib_paths:
+    if os.path.exists(os.path.join(path, "librdmacm.so")) or os.path.exists(os.path.join(path, "librdmacm.a")):
+        if path not in rdma_lib_dirs:
+            rdma_lib_dirs.append(path)
+        if "rdmacm" not in rdma_libs:
+            rdma_libs.append("rdmacm")
+        rdmacm_found = True
+        print(f"Found librdmacm at: {path}")
+        break
+
+# Try to find RDMA headers
+rdma_header_paths = [
+    "/usr/include",
+    "/usr/local/include",
+]
+
+for path in rdma_header_paths:
+    if os.path.exists(os.path.join(path, "infiniband/verbs.h")):
+        rdma_include_dirs.append(path)
+        print(f"Found RDMA headers at: {path}")
+        break
+
+# RDMA is considered available only if both libibverbs and librdmacm are found
+if ibverbs_found and rdmacm_found:
+    rdma_available = True
+    print("✓ RDMA support enabled (libibverbs + librdmacm)")
+else:
+    print("Warning: RDMA libraries not found, building without RDMA support")
+    if not ibverbs_found:
+        print("  - libibverbs not found")
+    if not rdmacm_found:
+        print("  - librdmacm not found")
+
+# Check for Boost system library (required for ASIO)
+boost_lib_paths = [
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+    "/usr/local/lib",
+]
+
+for path in boost_lib_paths:
+    if os.path.exists(os.path.join(path, "libboost_system.so")) or os.path.exists(os.path.join(path, "libboost_system.a")):
+        if path not in boost_lib_dirs:
+            boost_lib_dirs.append(path)
+        if "boost_system" not in boost_libs:
+            boost_libs.append("boost_system")
+        print(f"Found libboost_system at: {path}")
+        break
+
+# Add pthread (required for threading)
+if "pthread" not in boost_libs:
+    boost_libs.append("pthread")
+    print("Adding pthread library")
+
 cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')
 cuda_include_dir = os.path.join(cuda_home, 'include')
 cuda_lib_dir = os.path.join(cuda_home, 'lib64')
@@ -199,11 +322,13 @@ ext_modules = [
             pybind11_include,
             *nccl_include_dirs,
             *cuda_include,
+            *rdma_include_dirs,
         ],
-        libraries=nccl_libs + cuda_libs,
-        library_dirs=nccl_lib_dirs + cuda_lib_dirs,
+        libraries=nccl_libs + cuda_libs + rdma_libs + boost_libs,
+        library_dirs=nccl_lib_dirs + cuda_lib_dirs + rdma_lib_dirs + boost_lib_dirs,
         define_macros=[
             ("NCCL_AVAILABLE", "1") if nccl_available else ("NCCL_AVAILABLE", "0"),
+            ("RDMA_AVAILABLE", "1") if rdma_available else ("RDMA_AVAILABLE", "0"),
         ],
         cxx_std=17,
         language='c++',

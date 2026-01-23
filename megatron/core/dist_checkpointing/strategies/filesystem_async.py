@@ -1364,7 +1364,6 @@ class FileSystemWriterAsync(FileSystemWriter):
                 
                 # ===== Step 5: Synchronize all ranks after completing data transfer =====
                 logger.info(f"Gemini Replicas rank {rank}: Synchronizing after C++ data transfer...")
-                torch.distributed.barrier()
                 sync_time = time() - exchange_start
                 logger.info(f"Gemini Replicas rank {rank}: Synchronization completed in {sync_time:.4f}s")
                 

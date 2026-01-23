@@ -50,6 +50,7 @@ class ECLATINManager:
         
         self._eclatin_native = None
         self.use_eclatin = False
+        self.use_rdma = False  # RDMA support flag
         
         # Buffer configuration
         self.eclatin_data_buffers_count = 12
@@ -70,6 +71,10 @@ class ECLATINManager:
         self._buffer_poller_thread: Optional[threading.Thread] = None
         self._buffer_poller_stop_event: Optional[threading.Event] = None
         self._buffer_poller_active_event: Optional[threading.Event] = None
+        
+        # Track registered buffers (for RDMA)
+        self.registered_buffers: Dict[int, Tuple[int, int]] = {}  # {buffer_addr: (size, iteration)}
+        self.current_iteration: int = 0
         
         self._initialized = True
 
@@ -308,31 +313,28 @@ class ECLATINManager:
                     'load_send_rank3_data2': load_base_port + 5,  # connects to rank2's load_recv_rank3_data2
                 })
         
-        # Step 4: Exchange IP addresses via torch.distributed.all_gather
-        # TODO: Determine partner ranks for send1/send2/recv1/recv2 based on ECLATIN pairing logic
+        # Step 4: Exchange IP addresses via broadcast (more reliable than all_gather_object with NCCL)
+        # Use sequential broadcast to avoid NCCL issues with Python objects
         rank_ips = {}
         
         if torch.distributed.is_initialized():
             try:
-                # Convert IP to bytes, then to int list for tensor
-                my_ip_bytes = socket.inet_aton(base_ip)
-                my_ip_tensor = torch.tensor(
-                    [int(b) for b in my_ip_bytes], 
-                    dtype=torch.uint8
-                )
-                
-                # Move to CUDA if available (for NCCL backend compatibility)
-                if torch.cuda.is_available():
-                    my_ip_tensor = my_ip_tensor.cuda()
-                
-                # Gather all IPs
-                ip_list = [torch.zeros_like(my_ip_tensor) for _ in range(world_size)]
-                torch.distributed.all_gather(ip_list, my_ip_tensor)
-                
-                # Convert back to IP strings
-                for r, ip_tensor in enumerate(ip_list):
-                    ip_bytes = bytes(ip_tensor.cpu().tolist())
-                    rank_ips[r] = socket.inet_ntoa(ip_bytes)
+                # Method: Each rank broadcasts its IP to all other ranks sequentially
+                # This avoids NCCL backend issues with all_gather_object
+                for src_rank in range(world_size):
+                    if src_rank == rank:
+                        # Broadcast my IP to all ranks
+                        ip_to_broadcast = base_ip
+                    else:
+                        # Prepare to receive IP from src_rank
+                        ip_to_broadcast = ""
+                    
+                    # Create a list with single element for broadcast_object_list
+                    ip_list = [ip_to_broadcast]
+                    torch.distributed.broadcast_object_list(ip_list, src=src_rank)
+                    
+                    # Store the received IP
+                    rank_ips[src_rank] = ip_list[0]
                 
                 logger.info(
                     f"ECLATIN: [Rank {rank}] IP exchange completed - "
@@ -340,7 +342,7 @@ class ECLATINManager:
                 )
             except Exception as e:
                 logger.warning(
-                    f"ECLATIN: Failed to exchange IPs via all_gather, using local IP: {e}"
+                    f"ECLATIN: Failed to exchange IPs via broadcast, using local IP: {e}"
                 )
                 # Fallback to using local IP for all ranks
                 for r in range(world_size):
@@ -377,6 +379,7 @@ class ECLATINManager:
             from megatron.training import get_args as input_args
             args = input_args()
             self.use_eclatin = args.use_eclatin
+            self.use_rdma = getattr(args, 'use_rdma', False)
             if not getattr(args, 'use_eclatin', False):
                 return
                 
@@ -422,26 +425,48 @@ class ECLATINManager:
             spec.loader.exec_module(eclatin_native)
             logger.debug(f"ECLATIN: Loaded .so file from {so_path}")
             
+            # Check RDMA availability if RDMA mode is requested (strict mode: fail if not available)
+            if self.use_rdma:
+                try:
+                    rdma_available = eclatin_native.is_rdma_available()
+                    if not rdma_available:
+                        raise RuntimeError(
+                            "RDMA mode requested (--use-rdma) but RDMA is not available on this system.\n"
+                            "Possible causes:\n"
+                            "  1. No RDMA devices installed (check: ibv_devices)\n"
+                            "  2. RDMA drivers not loaded (try: modprobe rdma_cm ib_uverbs)\n"
+                            "  3. Insufficient permissions\n"
+                            "  4. RDMA services not running (check: systemctl status rdma)\n"
+                            "\n"
+                            "To use standard TCP/IP networking instead, remove --use-rdma from your training script."
+                        )
+                except RuntimeError:
+                    raise  # Re-raise the RuntimeError we just created
+                except Exception as check_err:
+                    logger.warning(f"ECLATIN: Could not check RDMA availability: {check_err}")
+                    logger.warning("ECLATIN: Will attempt to initialize RDMA anyway...")
+            
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
             
-            # ECLATIN only uses ASIO (no NCCL support)
+            # ECLATIN uses ASIO or RDMA (based on use_rdma flag)
             # Create instance with error handling
             try:
-                # ===== ASIO Initialization Path =====
-                logger.info(f"ECLATIN: [Rank {rank}] Using ASIO for communication")
+                # ===== Network Initialization Path (ASIO or RDMA) =====
+                transport_mode = "RDMA" if self.use_rdma else "ASIO"
+                logger.info(f"ECLATIN: [Rank {rank}] Using {transport_mode} for communication")
                 
                 # Get network configuration
                 net_config = self._get_eclatin_network_config(rank, world_size)
                 
                 # Synchronize all ranks before creating C++ instances
-                logger.info(f"ECLATIN: [Rank {rank}] Synchronizing all ranks before creating C++ native module (ASIO)...")
+                logger.info(f"ECLATIN: [Rank {rank}] Synchronizing all ranks before creating C++ native module ({transport_mode})...")
                 torch.distributed.barrier()
-                logger.info(f"ECLATIN: [Rank {rank}] All ranks synchronized, creating C++ native module with ASIO...")
+                logger.info(f"ECLATIN: [Rank {rank}] All ranks synchronized, creating C++ native module with {transport_mode}...")
                 
-                # Create C++ instance with ASIO parameters
-                logger.info(f"ECLATIN: Creating C++ native module with ASIO (this will block until ASIO connections are established)...")
-                print(f"ECLATIN: [Rank {rank}] Creating C++ native module with ASIO (blocking until ASIO initialization completes)...")
+                # Create C++ instance with network parameters
+                logger.info(f"ECLATIN: Creating C++ native module with {transport_mode} (this will block until connections are established)...")
+                print(f"ECLATIN: [Rank {rank}] Creating C++ native module with {transport_mode} (blocking until initialization completes)...")
                 
                 # ECLATIN requires 16 parameters (8 per parity):
                 # Parity 1: send1_ip, send1_port, send2_ip, send2_port, recv1_ip, recv1_port, recv2_ip, recv2_port
@@ -491,12 +516,14 @@ class ECLATINManager:
                     net_config['my_ip'], net_config['ports']['parity2_recv1'],
                     net_config['my_ip'], net_config['ports']['parity2_recv2'],
                     # CUDA streams configuration
-                    num_cuda_streams
+                    num_cuda_streams,
+                    # RDMA flag
+                    self.use_rdma
                 )
                 
-                # If we reach here, ASIO connections are ready and threads are running
-                logger.info(f"ECLATIN: C++ native module initialized successfully with ASIO (rank={rank}, world_size={world_size})")
-                print(f"ECLATIN: [Rank {rank}] C++ native module initialized - ASIO connections ready for data exchange")
+                # If we reach here, connections are ready and threads are running
+                logger.info(f"ECLATIN: C++ native module initialized successfully with {transport_mode} (rank={rank}, world_size={world_size})")
+                print(f"ECLATIN: [Rank {rank}] C++ native module initialized - {transport_mode} connections ready for data exchange")
                 
                 # Initialize ECLATIN buffers (skip buffer pool for layerwise mode)
                 # In layerwise mode, we use continuous recv buffers allocated in strategy, not pooled buffers
@@ -518,7 +545,23 @@ class ECLATINManager:
                     logger.info("ECLATIN: Layerwise mode - skipping buffer pool allocation (using continuous buffers from strategy)")
         
             except Exception as e:
-                logger.warning(f"ECLATIN: Failed to create C++ native module instance: {e}")
+                error_msg = str(e)
+                logger.error(f"ECLATIN: Failed to create C++ native module instance: {error_msg}")
+                
+                # Provide helpful guidance for RDMA-specific errors
+                if "RDMA" in error_msg and "event channel" in error_msg:
+                    logger.error("")
+                    logger.error("=" * 80)
+                    logger.error("RDMA INITIALIZATION FAILED")
+                    logger.error("=" * 80)
+                    logger.error("Diagnostic steps:")
+                    logger.error("  1. Check RDMA devices: ibv_devices")
+                    logger.error("  2. Check RDMA links: rdma link")
+                    logger.error("  3. Check kernel modules: lsmod | grep -E '(rdma|ib_)'")
+                    logger.error("  4. Load modules if needed: modprobe rdma_cm ib_uverbs ib_core")
+                    logger.error("  5. Check RDMA service: systemctl status rdma")
+                    logger.error("=" * 80)
+                
                 # Try to stop the pipeline if it was partially created
                 try:
                     if hasattr(self, '_eclatin_native') and self._eclatin_native is not None:
@@ -567,6 +610,15 @@ class ECLATINManager:
         print(f"ECLATIN: Buffer initialization completed (rank={rank}) - "
               f"Data buffers: {len(self.eclatin_data_buffers)}, "
               f"Recv buffers: {len(self.eclatin_recv_buffers)}")
+        
+        # Register buffers for RDMA if enabled
+        if self.use_rdma:
+            logger.info(f"ECLATIN: [Rank {rank}] Registering buffer pools for RDMA...")
+            for buffer in self.eclatin_data_buffers:
+                self.register_buffer(buffer)
+            for buffer in self.eclatin_recv_buffers:
+                self.register_buffer(buffer)
+            logger.info(f"ECLATIN: [Rank {rank}] Buffer pools registered for RDMA")
     
     def _allocate_data_buffers(self):
         """Allocate data buffers for storing original tensor data."""
@@ -759,9 +811,77 @@ class ECLATINManager:
             # will be allocated in strategy after metadata exchange
         }
     
+    def register_buffer(self, buffer: torch.Tensor):
+        """Register buffer for RDMA operations (called on first allocation in save phase).
+        
+        Args:
+            buffer: PyTorch tensor to register
+        """
+        if not self.use_rdma or self._eclatin_native is None:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        buffer_addr = buffer.data_ptr()
+        buffer_size = buffer.numel() * buffer.element_size()
+        
+        # Check if already registered
+        if buffer_addr in self.registered_buffers:
+            logger.debug(f"ECLATIN: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} (size: {buffer_size / (1024**2):.2f} MB)")
+            return
+        
+        try:
+            logger.info(f"ECLATIN: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
+            self._eclatin_native.register_buffer(buffer_addr, buffer_size)
+            self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
+            logger.info(f"ECLATIN: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
+            
+            # Print all registered buffers
+            logger.info(f"ECLATIN: [Rank {rank}] All registered buffers:")
+            for addr, (size, iteration) in self.registered_buffers.items():
+                logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
+        except Exception as e:
+            logger.error(f"ECLATIN: [Rank {rank}] Failed to register buffer: {e}")
+            raise
+    
+    def unregister_buffer(self, buffer: torch.Tensor):
+        """Unregister buffer for RDMA operations.
+        
+        Args:
+            buffer: PyTorch tensor to unregister
+        """
+        if not self.use_rdma or self._eclatin_native is None:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        buffer_addr = buffer.data_ptr()
+        
+        if buffer_addr not in self.registered_buffers:
+            logger.debug(f"ECLATIN: [Rank {rank}] Buffer not registered at 0x{buffer_addr:x}")
+            return
+        
+        try:
+            logger.info(f"ECLATIN: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
+            self._eclatin_native.unregister_buffer(buffer_addr)
+            del self.registered_buffers[buffer_addr]
+            logger.info(f"ECLATIN: [Rank {rank}] Buffer unregistered successfully")
+        except Exception as e:
+            logger.error(f"ECLATIN: [Rank {rank}] Failed to unregister buffer: {e}")
+    
     def cleanup(self):
         """Cleanup ECLATIN resources when manager is destroyed."""
         try:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            
+            # Unregister all buffers for RDMA
+            if self.use_rdma and self._eclatin_native is not None:
+                for buffer_addr in list(self.registered_buffers.keys()):
+                    try:
+                        logger.info(f"ECLATIN: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x} during cleanup")
+                        self._eclatin_native.unregister_buffer(buffer_addr)
+                    except Exception as e:
+                        logger.warning(f"ECLATIN: [Rank {rank}] Failed to unregister buffer during cleanup: {e}")
+                self.registered_buffers.clear()
+            
             # Stop buffer poller thread
             self._stop_buffer_poller_thread()
             

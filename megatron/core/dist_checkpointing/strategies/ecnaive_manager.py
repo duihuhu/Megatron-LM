@@ -265,12 +265,18 @@ class ECNAIVEManager:
         """
         Get network configuration for EC-NAIVE load mode (rank2 recovery).
         
-        EC-NAIVE load mode only needs 2 ports (vs ECLATIN's 6):
-        - load_recv_rank3_data1_port: rank2 listens, rank3 connects (for d_{3,1})
-        - load_recv_rank0_parity0_port: rank2 listens, rank0 connects (for p_{0,0})
+        EC-NAIVE load mode needs 8 ports for full recovery:
+        - load_recv_rank3_data1: rank2 listens, rank3 connects (for d_{3,1})
+        - load_recv_rank0_parity0: rank2 listens, rank0 connects (for p_{2,0})
+        - load_recv_rank0_data0: rank2 listens, rank0 connects (for d_{0,0})
+        - load_recv_rank1_data1: rank2 listens, rank1 connects (for d_{0,1})
+        - load_recv_rank1_data0: rank2 listens, rank1 connects (for d_{1,0})
+        - load_recv_rank1_parity1: rank2 listens, rank1 connects (for p_{1,1})
+        - load_recv_rank3_data0: rank2 listens, rank3 connects (for d_{3,0})
+        - load_recv_rank0_data1: rank2 listens, rank0 connects (for d_{3,1})
         
         Args:
-            rank (int): Current rank (should be 2 for receiver, 0/3 for senders)
+            rank (int): Current rank (should be 2 for receiver, 0/1/3 for senders)
             world_size (int): Total number of ranks
             
         Returns:
@@ -278,9 +284,7 @@ class ECNAIVEManager:
                 - 'my_ip': str - This rank's IP address
                 - 'base_port': int - Base port number
                 - 'rank_ips': dict - IP addresses for all ranks
-                - 'ports': dict - Port numbers for load mode connections
-                    - 'load_recv_rank3_data1': int (rank2 only)
-                    - 'load_recv_rank0_parity0': int (rank2 only)
+                - 'ports': dict - Port numbers for load mode connections (8 ports for rank2)
         """
         import socket
         
@@ -327,18 +331,31 @@ class ECNAIVEManager:
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
         base_port = int(os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000))
         
-        # Load mode ports (rank2 only needs 2 recv ports)
+        # Load mode ports (rank2 needs 8 recv ports for full recovery)
         # Port allocation: base_port + 1000 + offset (to avoid conflict with save mode)
         load_base_port = base_port + 1000
         ports = {}
         
         if rank == 2:
-            # rank2: 2 recv ports
+            # rank2: 8 recv ports for full recovery
             ports.update({
-                'load_recv_rank3_data1': load_base_port + 0,
-                'load_recv_rank0_parity0': load_base_port + 1,
+                # For recovering data0: d_{2,0} = p_{2,0} ⊕ d_{2,1}
+                'load_recv_rank3_data1': load_base_port + 0,   # d_{2,1} from rank3
+                'load_recv_rank0_parity0': load_base_port + 1, # p_{2,0} from rank0
+                
+                # For recovering recv_parity0: p_{0,0} = d_{0,0} ⊕ d_{0,1}
+                'load_recv_rank0_data0': load_base_port + 2,   # d_{0,0} from rank0
+                'load_recv_rank1_data1': load_base_port + 3,   # d_{0,1} from rank1
+                
+                # For recovering recv_data1: d_{1,1} = d_{1,0} ⊕ p_{1,1}
+                'load_recv_rank1_data0': load_base_port + 4,   # d_{1,0} from rank1
+                'load_recv_rank1_parity1': load_base_port + 5,  # p_{1,1} from rank1
+                
+                # For recovering recv_parity1: p_{3,1} = d_{3,0} ⊕ d_{3,1}
+                'load_recv_rank3_data0': load_base_port + 6,   # d_{3,0} from rank3
+                'load_recv_rank0_data1': load_base_port + 7,    # d_{3,1} from rank0
             })
-        # Note: rank0/3 don't need ports in config, they connect to rank2's ports
+        # Note: rank0/1/3 don't need ports in config, they connect to rank2's ports
         
         # Exchange IP addresses via torch.distributed.all_gather
         rank_ips = {}
@@ -397,12 +414,16 @@ class ECNAIVEManager:
         
         This method:
         1. Sets load mode in C++ native module
-        2. Gets network configuration for load mode
+        2. Gets network configuration for load mode (8 ports for full recovery)
         3. Initializes load connections in C++
+           - rank2: bind+listen on 8 ports, accept connections
+           - rank0: connect to 3 ports (parity0, data0, data1)
+           - rank1: connect to 3 ports (data1, data0, parity1)
+           - rank3: connect to 2 ports (data1, data0)
         4. Waits for connections to be established
         
         Args:
-            rank: Current rank
+            rank: Current rank (0, 1, 2, or 3)
             world_size: Total number of ranks
         """
         if self._ecnaive_native is None:
@@ -423,34 +444,66 @@ class ECNAIVEManager:
         net_config_rank2 = self._get_ecnaive_load_network_config(2, world_size)
         rank2_ip = net_config_rank2['rank_ips'].get(2, net_config_rank2['my_ip'])
         
-        # Get load mode ports from rank2's config
-        load_recv_rank3_data1_port = net_config_rank2['ports'].get('load_recv_rank3_data1', 0)
-        load_recv_rank0_parity0_port = net_config_rank2['ports'].get('load_recv_rank0_parity0', 0)
+        # Get all load mode ports from rank2's config (8 ports for full recovery)
+        ports = net_config_rank2['ports']
+        load_ports = {
+            'recv_rank3_data1': ports.get('load_recv_rank3_data1', 0),   # d_{2,1} from rank3
+            'recv_rank0_parity0': ports.get('load_recv_rank0_parity0', 0), # p_{2,0} from rank0
+            'recv_rank0_data0': ports.get('load_recv_rank0_data0', 0),    # d_{0,0} from rank0
+            'recv_rank1_data1': ports.get('load_recv_rank1_data1', 0),    # d_{0,1} from rank1
+            'recv_rank1_data0': ports.get('load_recv_rank1_data0', 0),    # d_{1,0} from rank1
+            'recv_rank1_parity1': ports.get('load_recv_rank1_parity1', 0), # p_{1,1} from rank1
+            'recv_rank3_data0': ports.get('load_recv_rank3_data0', 0),    # d_{3,0} from rank3
+            'recv_rank0_data1': ports.get('load_recv_rank0_data1', 0),    # d_{3,1} from rank0
+        }
         
         # Step 3: Initialize load connections
         # Similar to ECLATIN: rank2 starts accept operations first, then other ranks connect
         if rank == 2:
-            # rank2: Initialize accept operations (will start accept threads)
-            logger.info(f"EC-NAIVE: [Rank 2] Initializing load accept connections...")
+            # rank2: Initialize accept operations for all 8 ports (will start accept threads)
+            logger.info(f"EC-NAIVE: [Rank 2] Initializing load accept connections for 8 ports...")
             self._ecnaive_native.init_ecnaive_load_connections(
                 rank,
                 rank2_ip,
-                load_recv_rank3_data1_port,
-                load_recv_rank0_parity0_port
+                load_ports['recv_rank3_data1'],    # port 0
+                load_ports['recv_rank0_parity0'],  # port 1
+                load_ports['recv_rank0_data0'],    # port 2
+                load_ports['recv_rank1_data1'],    # port 3
+                load_ports['recv_rank1_data0'],    # port 4
+                load_ports['recv_rank1_parity1'],  # port 5
+                load_ports['recv_rank3_data0'],    # port 6
+                load_ports['recv_rank0_data1']     # port 7
             )
-            logger.info(f"EC-NAIVE: [Rank 2] Accept operations started, waiting for other ranks...")
+            logger.info(f"EC-NAIVE: [Rank 2] Accept operations started for 8 ports, waiting for other ranks...")
         
         # Synchronize: ensure rank2's acceptors are ready before other ranks connect
         torch.distributed.barrier()
         
         if rank != 2:
-            # rank0/3: Connect to rank2 (will block until connected)
+            # rank0/1/3: Connect to rank2 (will block until connected)
+            # Note: All ranks must pass all 8 ports to match C++ function signature
+            # C++ function will use only the ports needed for each rank
             logger.info(f"EC-NAIVE: [Rank {rank}] Connecting load send sockets to rank2...")
+            # All ranks pass all 8 ports in the order expected by C++ function:
+            # port 0: load_recv_rank3_data1_port
+            # port 1: load_recv_rank0_parity0_port
+            # port 2: load_recv_rank0_data0_port
+            # port 3: load_recv_rank1_data1_port
+            # port 4: load_recv_rank1_data0_port
+            # port 5: load_recv_rank1_parity1_port
+            # port 6: load_recv_rank3_data0_port
+            # port 7: load_recv_rank0_data1_port
             self._ecnaive_native.init_ecnaive_load_connections(
                 rank,
                 rank2_ip,
-                load_recv_rank3_data1_port,
-                load_recv_rank0_parity0_port
+                load_ports['recv_rank3_data1'],    # port 0
+                load_ports['recv_rank0_parity0'],  # port 1
+                load_ports['recv_rank0_data0'],    # port 2
+                load_ports['recv_rank1_data1'],    # port 3
+                load_ports['recv_rank1_data0'],    # port 4
+                load_ports['recv_rank1_parity1'],  # port 5
+                load_ports['recv_rank3_data0'],    # port 6
+                load_ports['recv_rank0_data1']      # port 7
             )
             logger.info(f"EC-NAIVE: [Rank {rank}] Load send sockets connected")
         
@@ -465,9 +518,15 @@ class ECNAIVEManager:
         """
         Allocate recv buffers for rank2 load recovery.
         
-        EC-NAIVE only needs 2 recv buffers (vs ECLATIN's 6):
-        - recv_data1: for d_{3,1} from rank3 (directly to final position)
-        - recv_parity0: for p_{0,0} from rank0 (temporary buffer)
+        EC-NAIVE needs 8 recv buffers for full recovery:
+        - p20_from_rank0: for p_{2,0} from rank0 (for recovering data0)
+        - d21_from_rank3: for d_{2,1} from rank3 (for recovering data0)
+        - d00_from_rank0: for d_{0,0} from rank0 (for recovering recv_parity0)
+        - d01_from_rank1: for d_{0,1} from rank1 (for recovering recv_parity0)
+        - d10_from_rank1: for d_{1,0} from rank1 (for recovering recv_data1)
+        - p11_from_rank1: for p_{1,1} from rank1 (for recovering recv_data1)
+        - d30_from_rank3: for d_{3,0} from rank3 (for recovering recv_parity1)
+        - d31_from_rank0: for d_{3,1} from rank0 (for recovering recv_parity1)
         
         Each buffer size is aligned_block_size (max_total_bytes).
         
@@ -475,9 +534,7 @@ class ECNAIVEManager:
             global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
             
         Returns:
-            Dict[str, torch.Tensor]: Dictionary with 2 recv buffers:
-                - 'recv_data1': torch.Tensor - Buffer for d_{3,1} (final position)
-                - 'recv_parity0': torch.Tensor - Buffer for p_{0,0} (temporary)
+            Dict[str, torch.Tensor]: Dictionary with 8 recv buffers for rank2
         """
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -499,16 +556,29 @@ class ECNAIVEManager:
         aligned_block_size = ((max_total_bytes + self.ecnaive_buffer_size - 1) // self.ecnaive_buffer_size) * self.ecnaive_buffer_size
         
         logger.info(
-            f"EC-NAIVE: Allocating 2 recv buffers for rank2 load recovery\n"
+            f"EC-NAIVE: Allocating 8 recv buffers for rank2 load recovery\n"
             f"  Pipeline max size: {max_total_bytes / (1024**3):.2f} GB\n"
             f"  Aligned block size (per buffer): {aligned_block_size / (1024**3):.2f} GB\n"
-            f"  Total recv memory: {2 * aligned_block_size / (1024**3):.2f} GB"
+            f"  Total recv memory: {8 * aligned_block_size / (1024**3):.2f} GB"
         )
         
-        # Allocate 2 recv buffers
+        # Allocate 8 recv buffers for full recovery
         recv_buffers = {
-            'recv_data1': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),
-            'recv_parity0': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),
+            # For recovering data0: d_{2,0} = p_{2,0} ⊕ d_{2,1}
+            'p20_from_rank0': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # p_{2,0}
+            'd21_from_rank3': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{2,1}
+            
+            # For recovering recv_parity0: p_{0,0} = d_{0,0} ⊕ d_{0,1}
+            'd00_from_rank0': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{0,0}
+            'd01_from_rank1': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{0,1}
+            
+            # For recovering recv_data1: d_{1,1} = d_{1,0} ⊕ p_{1,1}
+            'd10_from_rank1': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{1,0}
+            'p11_from_rank1': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # p_{1,1}
+            
+            # For recovering recv_parity1: p_{3,1} = d_{3,0} ⊕ d_{3,1}
+            'd30_from_rank3': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{3,0}
+            'd31_from_rank0': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{3,1}
         }
         
         # Register buffers for RDMA if enabled
@@ -519,7 +589,7 @@ class ECNAIVEManager:
             logger.info(f"EC-NAIVE: [Rank {rank}] Load recv buffers registered for RDMA")
         
         logger.info(
-            f"EC-NAIVE: Allocated 2 recv buffers for rank2: "
+            f"EC-NAIVE: Allocated 8 recv buffers for rank2: "
             f"{aligned_block_size / (1024**3):.2f} GB each"
         )
         

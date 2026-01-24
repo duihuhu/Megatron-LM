@@ -5113,12 +5113,14 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             self.ecnaive_blocks = self._allocate_ecnaive_blocks(registry)
             logger.info(f"EC-NAIVE: [Rank {rank}] Allocated 4 blocks using registry metadata")
         
-        # ===== Step 4: rank0/3 load block data from files =====
+        # ===== Step 4: rank0/1/3 load block data from files =====
         if rank != 2:
-            # rank0/3: Load block data from files into allocated blocks
-            # rank1 doesn't participate in load mode
-            if rank == 0 or rank == 3:
-                self._load_ecnaive_blocks_from_files(checkpoint_dir, rank)
+            # rank0/1/3: Load block data from files into allocated blocks
+            # rank0: loads 3 blocks (recv_parity0, data0, recv_data1)
+            # rank1: loads 3 blocks (recv_data1, data0, recv_parity1)
+            # rank3: loads 2 blocks (recv_data1, data0)
+            # rank2: no blocks to load (failed node)
+            self._load_ecnaive_blocks_from_files(checkpoint_dir, rank)
         
         # ===== Step 5: rank2 allocate recv buffers =====
         if rank == 2:
@@ -5365,41 +5367,95 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # rank2: No need to load blocks (will receive from others)
     
     def _load_ecnaive_blocks_from_files(self, checkpoint_dir: Path, rank: int) -> None:
-        """Load EC-NAIVE block data from files into allocated blocks.
+        """Load EC-NAIVE block data from files into allocated blocks (full recovery mode).
         
-        EC-NAIVE load mode:
-        - rank0: Load data0 (p_{0,0} will be recalculated in recovery pipeline)
-        - rank3: Load data0 (d_{3,1} will be recalculated in recovery pipeline)
-        - rank1/2: No blocks to load (rank2 is failed, rank1 doesn't participate)
+        EC-NAIVE load mode (full recovery):
+        - rank0: Load recv_parity0 (p_{2,0}), data0 (d_{0,0}), recv_data1 (d_{3,1})
+          These blocks will be sent to rank2 for recovery
+        - rank1: Load recv_data1 (d_{0,1}), data0 (d_{1,0}), recv_parity1 (p_{1,1})
+          These blocks will be sent to rank2 for recovery
+        - rank3: Load recv_data1 (d_{2,1}), data0 (d_{3,0})
+          These blocks will be sent to rank2 for recovery
+        - rank2: No blocks to load (failed node, will receive and recover from others)
         
-        Note: In save mode, rank0 sends p_{0,0} to rank2 and rank3 sends d_{3,1} to rank0,
-        but neither rank saves these blocks directly. They need to be recalculated in the
-        recovery pipeline from data0 and the second half of data (from main file).
+        Note: Each rank loads the blocks that it stored during save phase.
+        These blocks contain the data needed for rank2's full recovery:
+        - rank2 recovers 4 blocks: data0 (d_{2,0}), recv_parity0 (p_{0,0}), 
+          recv_data1 (d_{1,1}), recv_parity1 (p_{3,1})
         
         Args:
             checkpoint_dir (Path): checkpoint directory
             rank (int): current rank
         """
         if rank == 0:
-            # rank0: Load data0 (needed for recalculating p_{0,0})
-            # p_{0,0} will be recalculated in recovery pipeline from data0 and data1 (second half)
-            logger.info(f"EC-NAIVE: [Rank 0] Loading data0 block from file")
+            # rank0: Load 3 blocks needed for sending to rank2
+            # p_{2,0} stored in recv_parity0 (received from rank2 during save)
+            # d_{0,0} stored in data0 (own data)
+            # d_{3,1} stored in recv_data1 (received from rank3 during save)
+            logger.info(f"EC-NAIVE: [Rank 0] Loading 3 blocks for full recovery: recv_parity0 (p_{2,0}), data0 (d_{0,0}), recv_data1 (d_{3,1})")
+            
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'recv_parity0', self.ecnaive_blocks['recv_parity0']
+            )
+            logger.info(f"EC-NAIVE: [Rank 0] Loaded recv_parity0 (p_{2,0})")
+            
             self._load_block_data_from_file(
                 checkpoint_dir, rank, 'data0', self.ecnaive_blocks['data0']
             )
-            logger.info(f"EC-NAIVE: [Rank 0] data0 loaded, p_{0,0} will be recalculated in recovery pipeline")
+            logger.info(f"EC-NAIVE: [Rank 0] Loaded data0 (d_{0,0})")
+            
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'recv_data1', self.ecnaive_blocks['recv_data1']
+            )
+            logger.info(f"EC-NAIVE: [Rank 0] Loaded recv_data1 (d_{3,1})")
+            
+            logger.info(f"EC-NAIVE: [Rank 0] All 3 blocks loaded, ready to send to rank2")
+        
+        elif rank == 1:
+            # rank1: Load 3 blocks needed for sending to rank2
+            # d_{0,1} stored in recv_data1 (received from rank0 during save)
+            # d_{1,0} stored in data0 (own data)
+            # p_{1,1} stored in recv_parity1 (received from rank1+1=rank2, but actually own parity)
+            logger.info(f"EC-NAIVE: [Rank 1] Loading 3 blocks for full recovery: recv_data1 (d_{0,1}), data0 (d_{1,0}), recv_parity1 (p_{1,1})")
+            
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'recv_data1', self.ecnaive_blocks['recv_data1']
+            )
+            logger.info(f"EC-NAIVE: [Rank 1] Loaded recv_data1 (d_{0,1})")
+            
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'data0', self.ecnaive_blocks['data0']
+            )
+            logger.info(f"EC-NAIVE: [Rank 1] Loaded data0 (d_{1,0})")
+            
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'recv_parity1', self.ecnaive_blocks['recv_parity1']
+            )
+            logger.info(f"EC-NAIVE: [Rank 1] Loaded recv_parity1 (p_{1,1})")
+            
+            logger.info(f"EC-NAIVE: [Rank 1] All 3 blocks loaded, ready to send to rank2")
         
         elif rank == 3:
-            # rank3: Load data0 (needed for recalculating d_{3,1})
-            # d_{3,1} will be recalculated in recovery pipeline from data0 and the second half
-            logger.info(f"EC-NAIVE: [Rank 3] Loading data0 block from file")
+            # rank3: Load 2 blocks needed for sending to rank2
+            # d_{2,1} stored in recv_data1 (received from rank2 during save)
+            # d_{3,0} stored in data0 (own data)
+            logger.info(f"EC-NAIVE: [Rank 3] Loading 2 blocks for full recovery: recv_data1 (d_{2,1}), data0 (d_{3,0})")
+            
+            self._load_block_data_from_file(
+                checkpoint_dir, rank, 'recv_data1', self.ecnaive_blocks['recv_data1']
+            )
+            logger.info(f"EC-NAIVE: [Rank 3] Loaded recv_data1 (d_{2,1})")
+            
             self._load_block_data_from_file(
                 checkpoint_dir, rank, 'data0', self.ecnaive_blocks['data0']
             )
-            logger.info(f"EC-NAIVE: [Rank 3] data0 loaded, d_{3,1} will be recalculated in recovery pipeline")
+            logger.info(f"EC-NAIVE: [Rank 3] Loaded data0 (d_{3,0})")
+            
+            logger.info(f"EC-NAIVE: [Rank 3] All 2 blocks loaded, ready to send to rank2")
         
-        # rank1/2: No blocks to load
-        # rank2 is failed, rank1 doesn't participate in load mode
+        # rank2: No blocks to load (failed node, will receive and recover from others)
+        elif rank == 2:
+            logger.info(f"EC-NAIVE: [Rank 2] No blocks to load (failed node), will receive and recover from other ranks")
     
     def _load_block_data_from_file(
         self, checkpoint_dir: Path, rank: int, block_name: str, block_tensor: torch.Tensor
@@ -8516,20 +8572,25 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         total_size: int,
     ) -> None:
         """
-        Run EC-NAIVE recovery pipeline to recover rank2 data.
+        Run EC-NAIVE recovery pipeline to recover rank2 data (full recovery).
         
-        EC-NAIVE load mode:
-        - rank2: Receives d_{3,1} from rank3 and p_{0,0} from rank0, then XOR recovers d_{2,0}
-        - rank0: Recalculates p_{0,0} from data0 and data1, then sends to rank2
-        - rank3: Recalculates d_{3,1} from data0 and second half, then sends to rank2
+        EC-NAIVE load mode (full recovery):
+        - rank2: Receives 8 blocks from other ranks, performs 4 XOR operations to recover:
+          * data0 (d_{2,0}) = p_{2,0} ⊕ d_{2,1}
+          * recv_parity0 (p_{0,0}) = d_{0,0} ⊕ d_{0,1}
+          * recv_data1 (d_{1,1}) = d_{1,0} ⊕ p_{1,1}
+          * recv_parity1 (p_{3,1}) = d_{3,0} ⊕ d_{3,1}
+        - rank0: Sends p_{2,0}, d_{0,0}, d_{3,1} to rank2
+        - rank1: Sends d_{0,1}, d_{1,0}, p_{1,1} to rank2
+        - rank3: Sends d_{2,1}, d_{3,0} to rank2
         
         Args:
             rank (int): Current rank
             world_size (int): Total number of ranks
             registry: GlobalMetadataRegistry
             ecnaive_blocks (Dict[str, torch.Tensor]): 4 allocated blocks (all ranks)
-            recv_buffers (Optional[Dict[str, torch.Tensor]]): 2 recv buffers (rank2 only)
-            recovered_buffer (Optional[torch.Tensor]): Buffer to store recovered data (rank2 only)
+            recv_buffers (Optional[Dict[str, torch.Tensor]]): 8 recv buffers (rank2 only)
+            recovered_buffer (Optional[torch.Tensor]): Buffer to store recovered data (rank2 only, optional for compatibility)
             total_size (int): Total size of data to recover
         """
         from time import time
@@ -8546,44 +8607,90 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Load mode should already be initialized in _load_ecnaive_block_checkpoint
         # But we check here to be safe
         failed_rank = 2  # EC-NAIVE recovers rank2
-        logger.info(f"EC-NAIVE: [Rank {rank}] Starting recovery pipeline (failed_rank={failed_rank})")
+        logger.info(f"EC-NAIVE: [Rank {rank}] Starting full recovery pipeline (failed_rank={failed_rank})")
         
         start_time = time()
         
-        # === Step 2: rank2: Receive blocks and recover ===
+        # === Step 2: rank2: Receive blocks and recover (full recovery) ===
         if rank == 2:
-            if recv_buffers is None or recovered_buffer is None:
-                logger.error("EC-NAIVE: [Rank 2] recv_buffers or recovered_buffer is None")
+            if recv_buffers is None:
+                logger.error("EC-NAIVE: [Rank 2] recv_buffers is None")
                 return
             
-            # Get base addresses for recv buffers
-            recv_data1_addr = int(recv_buffers['recv_data1'].data_ptr())  # For d_{3,1}
-            recv_parity0_addr = int(recv_buffers['recv_parity0'].data_ptr())  # For p_{0,0}
+            # Validate recv_buffers contains all 8 required buffers
+            required_keys = [
+                'p20_from_rank0', 'd21_from_rank3',
+                'd00_from_rank0', 'd01_from_rank1',
+                'd10_from_rank1', 'p11_from_rank1',
+                'd30_from_rank3', 'd31_from_rank0'
+            ]
+            missing_keys = [key for key in required_keys if key not in recv_buffers]
+            if missing_keys:
+                logger.error(f"EC-NAIVE: [Rank 2] Missing recv_buffers keys: {missing_keys}")
+                return
             
-            # Get base address for recovered buffer (d_{2,0})
-            # Note: recv_data1 will be directly written to recovered_buffer position
-            recovered_data0_addr = int(recovered_buffer.data_ptr())
+            # Validate ecnaive_blocks contains all 4 required blocks
+            required_blocks = ['data0', 'recv_parity0', 'recv_data1', 'recv_parity1']
+            missing_blocks = [key for key in required_blocks if key not in ecnaive_blocks]
+            if missing_blocks:
+                logger.error(f"EC-NAIVE: [Rank 2] Missing ecnaive_blocks keys: {missing_blocks}")
+                return
+            
+            # Get base addresses for all 8 recv buffers
+            recv_addrs = {
+                'p20': int(recv_buffers['p20_from_rank0'].data_ptr()),  # p_{2,0} from rank0
+                'd21': int(recv_buffers['d21_from_rank3'].data_ptr()),  # d_{2,1} from rank3
+                'd00': int(recv_buffers['d00_from_rank0'].data_ptr()),  # d_{0,0} from rank0
+                'd01': int(recv_buffers['d01_from_rank1'].data_ptr()),  # d_{0,1} from rank1
+                'd10': int(recv_buffers['d10_from_rank1'].data_ptr()),  # d_{1,0} from rank1
+                'p11': int(recv_buffers['p11_from_rank1'].data_ptr()),  # p_{1,1} from rank1
+                'd30': int(recv_buffers['d30_from_rank3'].data_ptr()),  # d_{3,0} from rank3
+                'd31': int(recv_buffers['d31_from_rank0'].data_ptr()),  # d_{3,1} from rank0
+            }
+            
+            # Get base addresses for 4 output blocks (zero-copy: XOR results directly written here)
+            output_addrs = {
+                'data0': int(ecnaive_blocks['data0'].data_ptr()),           # d_{2,0} = p_{2,0} ⊕ d_{2,1}
+                'recv_parity0': int(ecnaive_blocks['recv_parity0'].data_ptr()), # p_{0,0} = d_{0,0} ⊕ d_{0,1}
+                'recv_data1': int(ecnaive_blocks['recv_data1'].data_ptr()),     # d_{1,1} = d_{1,0} ⊕ p_{1,1}
+                'recv_parity1': int(ecnaive_blocks['recv_parity1'].data_ptr()), # p_{3,1} = d_{3,0} ⊕ d_{3,1}
+            }
             
             # Calculate aligned block size (same as save phase)
             # EC-NAIVE uses full block size (not half like ECLATIN)
             aligned_block_size = ecnaive_blocks['data0'].numel()
             
             logger.info(
-                f"EC-NAIVE: [Rank 2] Starting recovery pipeline\n"
-                f"  Recv buffers: {aligned_block_size / (1024**3):.2f} GB each\n"
-                f"  Recovered buffer: {total_size / (1024**3):.2f} GB"
+                f"EC-NAIVE: [Rank 2] Starting full recovery pipeline\n"
+                f"  Recv buffers: 8 buffers, {aligned_block_size / (1024**3):.2f} GB each\n"
+                f"  Output blocks: 4 blocks (ecnaive_blocks), {aligned_block_size / (1024**3):.2f} GB each\n"
+                f"  Total recovery: {4 * aligned_block_size / (1024**3):.2f} GB"
             )
             
-            # Submit recovery tasks to C++ pipeline
+            # Submit full recovery tasks to C++ pipeline
             # The C++ pipeline will:
-            # 1. Receive d_{3,1} from rank3 (directly to recovered_buffer)
-            # 2. Receive p_{0,0} from rank0 (to recv_parity0 buffer)
-            # 3. Perform XOR: d_{2,0} = d_{3,1} XOR p_{0,0}
-            # Note: recv_data1_addr and recovered_data0_addr should be the same for zero-copy
-            self.ecnaive_manager._ecnaive_native.submit_ecnaive_load_recovery(
-                recv_data1_addr=recovered_data0_addr,  # d_{3,1} directly to final position
-                recv_parity0_addr=recv_parity0_addr,    # p_{0,0} temporary buffer
-                recovered_data0_addr=recovered_data0_addr,  # d_{2,0} output (same as recv_data1)
+            # 1. Receive 8 blocks from rank0/1/3 in parallel
+            # 2. Perform 4 XOR operations:
+            #    - d_{2,0} = p_{2,0} ⊕ d_{2,1} → ecnaive_blocks['data0']
+            #    - p_{0,0} = d_{0,0} ⊕ d_{0,1} → ecnaive_blocks['recv_parity0']
+            #    - d_{1,1} = d_{1,0} ⊕ p_{1,1} → ecnaive_blocks['recv_data1']
+            #    - p_{3,1} = d_{3,0} ⊕ d_{3,1} → ecnaive_blocks['recv_parity1']
+            # Note: All XOR results are written directly to ecnaive_blocks (zero-copy)
+            self.ecnaive_manager._ecnaive_native.submit_ecnaive_load_recovery_full(
+                # 8 recv buffer addresses
+                recv_p20_addr=recv_addrs['p20'],
+                recv_d21_addr=recv_addrs['d21'],
+                recv_d00_addr=recv_addrs['d00'],
+                recv_d01_addr=recv_addrs['d01'],
+                recv_d10_addr=recv_addrs['d10'],
+                recv_p11_addr=recv_addrs['p11'],
+                recv_d30_addr=recv_addrs['d30'],
+                recv_d31_addr=recv_addrs['d31'],
+                # 4 output addresses (directly write to ecnaive_blocks)
+                output_data0_addr=output_addrs['data0'],
+                output_recv_parity0_addr=output_addrs['recv_parity0'],
+                output_recv_data1_addr=output_addrs['recv_data1'],
+                output_recv_parity1_addr=output_addrs['recv_parity1'],
                 size=aligned_block_size
             )
             
@@ -8591,45 +8698,53 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             self.ecnaive_manager._ecnaive_native.submit_load_recv_sentinel()
             
             # Wait for recovery to complete
-            logger.info("EC-NAIVE: [Rank 2] Waiting for recovery pipeline to complete...")
+            logger.info("EC-NAIVE: [Rank 2] Waiting for full recovery pipeline to complete...")
             self.ecnaive_manager._ecnaive_native.wait_for_load_completion()
             
-            logger.info("EC-NAIVE: [Rank 2] Recovery pipeline completed")
+            logger.info("EC-NAIVE: [Rank 2] Full recovery pipeline completed")
+            logger.info(
+                f"EC-NAIVE: [Rank 2] Recovered 4 blocks:\n"
+                f"  - data0 (d_{2,0})\n"
+                f"  - recv_parity0 (p_{0,0})\n"
+                f"  - recv_data1 (d_{1,1})\n"
+                f"  - recv_parity1 (p_{3,1})"
+            )
             end_time = time()
-            logger.info(f"EC-NAIVE: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.2f} seconds")
+            logger.info(f"EC-NAIVE: [Rank {rank}] Full recovery pipeline completed in {end_time - start_time:.2f} seconds")
             
-            # Note: recovered_buffer already contains d_{2,0} (no need to copy)
-            # The C++ pipeline writes directly to recovered_buffer
+            # Note: All 4 blocks are now recovered and stored in ecnaive_blocks (zero-copy)
+            # No need to copy - C++ pipeline wrote directly to ecnaive_blocks
         
-        # === Step 3: rank0/3: Recalculate and send blocks ===
+        # === Step 3: rank0/1/3: Send blocks to rank2 ===
         else:
             aligned_block_size = ecnaive_blocks['data0'].numel()
             
             if rank == 0:
-                # rank0: Recalculate p_{0,0} from data0 and data1, then send
-                # For now, we'll use data0 as a placeholder and send it
-                # TODO: Actually recalculate p_{0,0} from data0 and data1 (second half from main file)
-                # This requires loading the second half from the main file and encoding
+                # rank0: Sends p_{2,0}, d_{0,0}, d_{3,1} to rank2
+                # These blocks are already loaded into ecnaive_blocks from files
+                send_addrs = {
+                    'p20': int(ecnaive_blocks['recv_parity0'].data_ptr()),  # p_{2,0}
+                    'd00': int(ecnaive_blocks['data0'].data_ptr()),          # d_{0,0}
+                    'd31': int(ecnaive_blocks['recv_data1'].data_ptr()),    # d_{3,1}
+                }
                 
-                # Get data0 address (p_{0,0} should be recalculated, but for now use data0)
-                # In a full implementation, we'd need to:
-                # 1. Load second half from main file
-                # 2. Encode data0 and second half to get p_{0,0}
-                # 3. Send p_{0,0}
+                logger.info(f"EC-NAIVE: [Rank 0] Sending 3 blocks to rank2: p_{2,0}, d_{0,0}, d_{3,1}")
                 
-                # For now, use a temporary buffer or recalculate
-                # Actually, we can use recv_parity0 block as temporary buffer for encoding
-                parity0_addr = int(ecnaive_blocks['recv_parity0'].data_ptr())
-                data0_addr = int(ecnaive_blocks['data0'].data_ptr())
-                
-                # TODO: Recalculate p_{0,0} = encode(data0, data1)[0]
-                # For now, we'll assume p_{0,0} is already in recv_parity0 (if saved separately)
-                # Or we need to recalculate it here
-                
-                logger.info(f"EC-NAIVE: [Rank 0] Sending p_{0,0} to rank2")
-                # Note: This is a placeholder - in full implementation, p_{0,0} should be recalculated
+                # Send p_{2,0}
                 self.ecnaive_manager._ecnaive_native.submit_load_send_rank0_parity0(
-                    send_addr=parity0_addr,  # TODO: Should be recalculated p_{0,0}
+                    send_addr=send_addrs['p20'],
+                    size=aligned_block_size
+                )
+                
+                # Send d_{0,0}
+                self.ecnaive_manager._ecnaive_native.submit_load_send_rank0_data0(
+                    send_addr=send_addrs['d00'],
+                    size=aligned_block_size
+                )
+                
+                # Send d_{3,1}
+                self.ecnaive_manager._ecnaive_native.submit_load_send_rank0_data1(
+                    send_addr=send_addrs['d31'],
                     size=aligned_block_size
                 )
                 
@@ -8637,28 +8752,62 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
                 
                 end_time = time()
-                logger.info(f"EC-NAIVE: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.2f} seconds")
+                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 3 blocks to rank2 in {end_time - start_time:.2f} seconds")
+            
+            elif rank == 1:
+                # rank1: Sends d_{0,1}, d_{1,0}, p_{1,1} to rank2
+                # These blocks are already loaded into ecnaive_blocks from files
+                send_addrs = {
+                    'd01': int(ecnaive_blocks['recv_data1'].data_ptr()),    # d_{0,1}
+                    'd10': int(ecnaive_blocks['data0'].data_ptr()),          # d_{1,0}
+                    'p11': int(ecnaive_blocks['recv_parity1'].data_ptr()),   # p_{1,1}
+                }
+                
+                logger.info(f"EC-NAIVE: [Rank 1] Sending 3 blocks to rank2: d_{0,1}, d_{1,0}, p_{1,1}")
+                
+                # Send d_{0,1}
+                self.ecnaive_manager._ecnaive_native.submit_load_send_rank1_data1(
+                    send_addr=send_addrs['d01'],
+                    size=aligned_block_size
+                )
+                
+                # Send d_{1,0}
+                self.ecnaive_manager._ecnaive_native.submit_load_send_rank1_data0(
+                    send_addr=send_addrs['d10'],
+                    size=aligned_block_size
+                )
+                
+                # Send p_{1,1}
+                self.ecnaive_manager._ecnaive_native.submit_load_send_rank1_parity1(
+                    send_addr=send_addrs['p11'],
+                    size=aligned_block_size
+                )
+                
+                # Submit sentinel
+                self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
+                
+                end_time = time()
+                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 3 blocks to rank2 in {end_time - start_time:.2f} seconds")
             
             elif rank == 3:
-                # rank3: Recalculate d_{3,1} from data0 and second half, then send
-                # For now, we'll use recv_data1 block as placeholder
-                # TODO: Actually recalculate d_{3,1} from data0 and second half
+                # rank3: Sends d_{2,1}, d_{3,0} to rank2
+                # These blocks are already loaded into ecnaive_blocks from files
+                send_addrs = {
+                    'd21': int(ecnaive_blocks['recv_data1'].data_ptr()),  # d_{2,1}
+                    'd30': int(ecnaive_blocks['data0'].data_ptr()),         # d_{3,0}
+                }
                 
-                # Get recv_data1 address (d_{3,1} should be recalculated, but for now use recv_data1)
-                # In a full implementation, we'd need to:
-                # 1. Load second half from main file
-                # 2. Use second half as d_{3,1}
+                logger.info(f"EC-NAIVE: [Rank 3] Sending 2 blocks to rank2: d_{2,1}, d_{3,0}")
                 
-                data1_addr = int(ecnaive_blocks['recv_data1'].data_ptr())
-                
-                # TODO: Recalculate d_{3,1} = second half of rank3's data
-                # For now, we'll assume d_{3,1} is already in recv_data1 (if saved separately)
-                # Or we need to recalculate it here
-                
-                logger.info(f"EC-NAIVE: [Rank 3] Sending d_{3,1} to rank2")
-                # Note: This is a placeholder - in full implementation, d_{3,1} should be recalculated
+                # Send d_{2,1}
                 self.ecnaive_manager._ecnaive_native.submit_load_send_rank3_data1(
-                    send_addr=data1_addr,  # TODO: Should be recalculated d_{3,1}
+                    send_addr=send_addrs['d21'],
+                    size=aligned_block_size
+                )
+                
+                # Send d_{3,0}
+                self.ecnaive_manager._ecnaive_native.submit_load_send_rank3_data0(
+                    send_addr=send_addrs['d30'],
                     size=aligned_block_size
                 )
                 
@@ -8666,7 +8815,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
                 
                 end_time = time()
-                logger.info(f"EC-NAIVE: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.2f} seconds")
+                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 2 blocks to rank2 in {end_time - start_time:.2f} seconds")
             
             logger.info(f"EC-NAIVE: [Rank {rank}] Sent blocks to rank2")
         

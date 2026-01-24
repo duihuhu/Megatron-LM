@@ -510,16 +510,39 @@ private:
     boost::asio::ip::tcp::socket load_send_rank3_data1_socket_;
     boost::asio::ip::tcp::socket load_send_rank3_data2_socket_;
 
-    // EC-NAIVE load mode sockets (rank2 recovery: only 2 recv + 2 send)
-    // rank2 receiver sockets
-    boost::asio::ip::tcp::socket ecnaive_load_recv_rank3_data1_socket_;  // rank2接收d_{3,1}
-    boost::asio::ip::tcp::socket ecnaive_load_recv_rank0_parity0_socket_; // rank2接收p_{0,0}
+    // EC-NAIVE load mode sockets (rank2 recovery: 8 recv + multiple send)
+    // rank2 receiver sockets (8 sockets for full recovery)
+    boost::asio::ip::tcp::socket ecnaive_load_recv_rank3_data1_socket_;  // rank2接收d_{2,1} from rank3
+    boost::asio::ip::tcp::socket ecnaive_load_recv_rank0_parity0_socket_; // rank2接收p_{2,0} from rank0
+    boost::asio::ip::tcp::socket ecnaive_load_recv_rank0_data0_socket_; // rank2接收d_{0,0} from rank0
+    boost::asio::ip::tcp::socket ecnaive_load_recv_rank1_data1_socket_; // rank2接收d_{0,1} from rank1
+    boost::asio::ip::tcp::socket ecnaive_load_recv_rank1_data0_socket_; // rank2接收d_{1,0} from rank1
+    boost::asio::ip::tcp::socket ecnaive_load_recv_rank1_parity1_socket_; // rank2接收p_{1,1} from rank1
+    boost::asio::ip::tcp::socket ecnaive_load_recv_rank3_data0_socket_; // rank2接收d_{3,0} from rank3
+    boost::asio::ip::tcp::socket ecnaive_load_recv_rank0_data1_socket_; // rank2接收d_{3,1} from rank0
+    
     boost::asio::ip::tcp::acceptor ecnaive_load_recv_rank3_data1_acceptor_;
     boost::asio::ip::tcp::acceptor ecnaive_load_recv_rank0_parity0_acceptor_;
+    boost::asio::ip::tcp::acceptor ecnaive_load_recv_rank0_data0_acceptor_;
+    boost::asio::ip::tcp::acceptor ecnaive_load_recv_rank1_data1_acceptor_;
+    boost::asio::ip::tcp::acceptor ecnaive_load_recv_rank1_data0_acceptor_;
+    boost::asio::ip::tcp::acceptor ecnaive_load_recv_rank1_parity1_acceptor_;
+    boost::asio::ip::tcp::acceptor ecnaive_load_recv_rank3_data0_acceptor_;
+    boost::asio::ip::tcp::acceptor ecnaive_load_recv_rank0_data1_acceptor_;
     
-    // rank0/3 sender sockets
-    boost::asio::ip::tcp::socket ecnaive_load_send_rank0_parity0_socket_; // rank0发送p_{0,0}
-    boost::asio::ip::tcp::socket ecnaive_load_send_rank3_data1_socket_;  // rank3发送d_{3,1}
+    // rank0 sender sockets (3 sockets: p_{2,0}, d_{0,0}, d_{3,1})
+    boost::asio::ip::tcp::socket ecnaive_load_send_rank0_parity0_socket_; // rank0发送p_{2,0}
+    boost::asio::ip::tcp::socket ecnaive_load_send_rank0_data0_socket_; // rank0发送d_{0,0}
+    boost::asio::ip::tcp::socket ecnaive_load_send_rank0_data1_socket_; // rank0发送d_{3,1}
+    
+    // rank1 sender sockets (3 sockets: d_{0,1}, d_{1,0}, p_{1,1})
+    boost::asio::ip::tcp::socket ecnaive_load_send_rank1_data1_socket_; // rank1发送d_{0,1}
+    boost::asio::ip::tcp::socket ecnaive_load_send_rank1_data0_socket_; // rank1发送d_{1,0}
+    boost::asio::ip::tcp::socket ecnaive_load_send_rank1_parity1_socket_; // rank1发送p_{1,1}
+    
+    // rank3 sender sockets (2 sockets: d_{2,1}, d_{3,0})
+    boost::asio::ip::tcp::socket ecnaive_load_send_rank3_data1_socket_;  // rank3发送d_{2,1}
+    boost::asio::ip::tcp::socket ecnaive_load_send_rank3_data0_socket_;  // rank3发送d_{3,0}
 
     // Save mode connection flags
     std::atomic<bool> send_data1_connected_{false};
@@ -545,11 +568,29 @@ private:
     std::atomic<bool> load_send_rank3_data1_connected_{false};
     std::atomic<bool> load_send_rank3_data2_connected_{false};
     
-    // EC-NAIVE load mode connection flags
-    std::atomic<bool> ecnaive_load_recv_rank3_data1_connected_{false};
-    std::atomic<bool> ecnaive_load_recv_rank0_parity0_connected_{false};
-    std::atomic<bool> ecnaive_load_send_rank0_parity0_connected_{false};
-    std::atomic<bool> ecnaive_load_send_rank3_data1_connected_{false};
+    // EC-NAIVE load mode connection flags (rank2 receiver: 8 flags)
+    std::atomic<bool> ecnaive_load_recv_rank3_data1_connected_{false};  // d_{2,1} from rank3
+    std::atomic<bool> ecnaive_load_recv_rank0_parity0_connected_{false}; // p_{2,0} from rank0
+    std::atomic<bool> ecnaive_load_recv_rank0_data0_connected_{false};  // d_{0,0} from rank0
+    std::atomic<bool> ecnaive_load_recv_rank1_data1_connected_{false};  // d_{0,1} from rank1
+    std::atomic<bool> ecnaive_load_recv_rank1_data0_connected_{false};  // d_{1,0} from rank1
+    std::atomic<bool> ecnaive_load_recv_rank1_parity1_connected_{false}; // p_{1,1} from rank1
+    std::atomic<bool> ecnaive_load_recv_rank3_data0_connected_{false};  // d_{3,0} from rank3
+    std::atomic<bool> ecnaive_load_recv_rank0_data1_connected_{false};  // d_{3,1} from rank0
+    
+    // EC-NAIVE load mode connection flags (rank0 sender: 3 flags)
+    std::atomic<bool> ecnaive_load_send_rank0_parity0_connected_{false}; // p_{2,0}
+    std::atomic<bool> ecnaive_load_send_rank0_data0_connected_{false};  // d_{0,0}
+    std::atomic<bool> ecnaive_load_send_rank0_data1_connected_{false};  // d_{3,1}
+    
+    // EC-NAIVE load mode connection flags (rank1 sender: 3 flags)
+    std::atomic<bool> ecnaive_load_send_rank1_data1_connected_{false};  // d_{0,1}
+    std::atomic<bool> ecnaive_load_send_rank1_data0_connected_{false};  // d_{1,0}
+    std::atomic<bool> ecnaive_load_send_rank1_parity1_connected_{false}; // p_{1,1}
+    
+    // EC-NAIVE load mode connection flags (rank3 sender: 2 flags)
+    std::atomic<bool> ecnaive_load_send_rank3_data1_connected_{false};  // d_{2,1}
+    std::atomic<bool> ecnaive_load_send_rank3_data0_connected_{false};  // d_{3,0}
 
     std::mutex connection_mutex_;
     std::condition_variable connection_cv_;
@@ -586,10 +627,28 @@ public:
           load_send_rank3_data2_socket_(io_context_),
           ecnaive_load_recv_rank3_data1_socket_(io_context_),
           ecnaive_load_recv_rank0_parity0_socket_(io_context_),
+          ecnaive_load_recv_rank0_data0_socket_(io_context_),
+          ecnaive_load_recv_rank1_data1_socket_(io_context_),
+          ecnaive_load_recv_rank1_data0_socket_(io_context_),
+          ecnaive_load_recv_rank1_parity1_socket_(io_context_),
+          ecnaive_load_recv_rank3_data0_socket_(io_context_),
+          ecnaive_load_recv_rank0_data1_socket_(io_context_),
           ecnaive_load_recv_rank3_data1_acceptor_(io_context_),
           ecnaive_load_recv_rank0_parity0_acceptor_(io_context_),
+          ecnaive_load_recv_rank0_data0_acceptor_(io_context_),
+          ecnaive_load_recv_rank1_data1_acceptor_(io_context_),
+          ecnaive_load_recv_rank1_data0_acceptor_(io_context_),
+          ecnaive_load_recv_rank1_parity1_acceptor_(io_context_),
+          ecnaive_load_recv_rank3_data0_acceptor_(io_context_),
+          ecnaive_load_recv_rank0_data1_acceptor_(io_context_),
           ecnaive_load_send_rank0_parity0_socket_(io_context_),
-          ecnaive_load_send_rank3_data1_socket_(io_context_) {}
+          ecnaive_load_send_rank0_data0_socket_(io_context_),
+          ecnaive_load_send_rank0_data1_socket_(io_context_),
+          ecnaive_load_send_rank1_data1_socket_(io_context_),
+          ecnaive_load_send_rank1_data0_socket_(io_context_),
+          ecnaive_load_send_rank1_parity1_socket_(io_context_),
+          ecnaive_load_send_rank3_data1_socket_(io_context_),
+          ecnaive_load_send_rank3_data0_socket_(io_context_) {}
 
     // Save mode getters
     boost::asio::ip::tcp::socket& get_send_data1_socket() { return send_data1_socket_; }
@@ -616,19 +675,60 @@ public:
     boost::asio::ip::tcp::socket& get_load_send_rank3_data2_socket() { return load_send_rank3_data2_socket_; }
 
     // EC-NAIVE load mode getters (rank2 receiver)
+    // EC-NAIVE load mode getters (rank2 receiver: 8 sockets)
     boost::asio::ip::tcp::socket& get_ecnaive_load_recv_rank3_data1_socket() { 
         return ecnaive_load_recv_rank3_data1_socket_; 
     }
     boost::asio::ip::tcp::socket& get_ecnaive_load_recv_rank0_parity0_socket() { 
         return ecnaive_load_recv_rank0_parity0_socket_; 
     }
+    boost::asio::ip::tcp::socket& get_ecnaive_load_recv_rank0_data0_socket() { 
+        return ecnaive_load_recv_rank0_data0_socket_; 
+    }
+    boost::asio::ip::tcp::socket& get_ecnaive_load_recv_rank1_data1_socket() { 
+        return ecnaive_load_recv_rank1_data1_socket_; 
+    }
+    boost::asio::ip::tcp::socket& get_ecnaive_load_recv_rank1_data0_socket() { 
+        return ecnaive_load_recv_rank1_data0_socket_; 
+    }
+    boost::asio::ip::tcp::socket& get_ecnaive_load_recv_rank1_parity1_socket() { 
+        return ecnaive_load_recv_rank1_parity1_socket_; 
+    }
+    boost::asio::ip::tcp::socket& get_ecnaive_load_recv_rank3_data0_socket() { 
+        return ecnaive_load_recv_rank3_data0_socket_; 
+    }
+    boost::asio::ip::tcp::socket& get_ecnaive_load_recv_rank0_data1_socket() { 
+        return ecnaive_load_recv_rank0_data1_socket_; 
+    }
     
-    // EC-NAIVE load mode getters (rank0/3 sender)
+    // EC-NAIVE load mode getters (rank0 sender: 3 sockets)
     boost::asio::ip::tcp::socket& get_ecnaive_load_send_rank0_parity0_socket() { 
         return ecnaive_load_send_rank0_parity0_socket_; 
     }
+    boost::asio::ip::tcp::socket& get_ecnaive_load_send_rank0_data0_socket() { 
+        return ecnaive_load_send_rank0_data0_socket_; 
+    }
+    boost::asio::ip::tcp::socket& get_ecnaive_load_send_rank0_data1_socket() { 
+        return ecnaive_load_send_rank0_data1_socket_; 
+    }
+    
+    // EC-NAIVE load mode getters (rank1 sender: 3 sockets)
+    boost::asio::ip::tcp::socket& get_ecnaive_load_send_rank1_data1_socket() { 
+        return ecnaive_load_send_rank1_data1_socket_; 
+    }
+    boost::asio::ip::tcp::socket& get_ecnaive_load_send_rank1_data0_socket() { 
+        return ecnaive_load_send_rank1_data0_socket_; 
+    }
+    boost::asio::ip::tcp::socket& get_ecnaive_load_send_rank1_parity1_socket() { 
+        return ecnaive_load_send_rank1_parity1_socket_; 
+    }
+    
+    // EC-NAIVE load mode getters (rank3 sender: 2 sockets)
     boost::asio::ip::tcp::socket& get_ecnaive_load_send_rank3_data1_socket() { 
         return ecnaive_load_send_rank3_data1_socket_; 
+    }
+    boost::asio::ip::tcp::socket& get_ecnaive_load_send_rank3_data0_socket() { 
+        return ecnaive_load_send_rank3_data0_socket_; 
     }
 
     // Save mode connection checks
@@ -682,25 +782,89 @@ public:
     // EC-NAIVE load mode init functions (rank2 receiver)
     void bind_listen_ecnaive_load_recv_rank3_data1(const std::string& listen_ip, uint16_t port);
     void bind_listen_ecnaive_load_recv_rank0_parity0(const std::string& listen_ip, uint16_t port);
+    void bind_listen_ecnaive_load_recv_rank0_data0(const std::string& listen_ip, uint16_t port);
+    void bind_listen_ecnaive_load_recv_rank1_data1(const std::string& listen_ip, uint16_t port);
+    void bind_listen_ecnaive_load_recv_rank1_data0(const std::string& listen_ip, uint16_t port);
+    void bind_listen_ecnaive_load_recv_rank1_parity1(const std::string& listen_ip, uint16_t port);
+    void bind_listen_ecnaive_load_recv_rank3_data0(const std::string& listen_ip, uint16_t port);
+    void bind_listen_ecnaive_load_recv_rank0_data1(const std::string& listen_ip, uint16_t port);
     void accept_ecnaive_load_recv_rank3_data1();
     void accept_ecnaive_load_recv_rank0_parity0();
+    void accept_ecnaive_load_recv_rank0_data0();
+    void accept_ecnaive_load_recv_rank1_data1();
+    void accept_ecnaive_load_recv_rank1_data0();
+    void accept_ecnaive_load_recv_rank1_parity1();
+    void accept_ecnaive_load_recv_rank3_data0();
+    void accept_ecnaive_load_recv_rank0_data1();
     
-    // EC-NAIVE load mode init functions (rank0/3 sender)
+    // EC-NAIVE load mode init functions (rank0 sender: 3 connections)
     void init_ecnaive_load_send_rank0_parity0(const std::string& rank2_ip, uint16_t port);
-    void init_ecnaive_load_send_rank3_data1(const std::string& rank2_ip, uint16_t port);
+    void init_ecnaive_load_send_rank0_data0(const std::string& rank2_ip, uint16_t port);
+    void init_ecnaive_load_send_rank0_data1(const std::string& rank2_ip, uint16_t port);
     
-    // EC-NAIVE load mode connection checks
+    // EC-NAIVE load mode init functions (rank1 sender: 3 connections)
+    void init_ecnaive_load_send_rank1_data1(const std::string& rank2_ip, uint16_t port);
+    void init_ecnaive_load_send_rank1_data0(const std::string& rank2_ip, uint16_t port);
+    void init_ecnaive_load_send_rank1_parity1(const std::string& rank2_ip, uint16_t port);
+    
+    // EC-NAIVE load mode init functions (rank3 sender: 2 connections)
+    void init_ecnaive_load_send_rank3_data1(const std::string& rank2_ip, uint16_t port);
+    void init_ecnaive_load_send_rank3_data0(const std::string& rank2_ip, uint16_t port);
+    
+    // EC-NAIVE load mode connection checks (rank2 receiver: 8 flags)
     bool is_ecnaive_load_recv_rank3_data1_connected() const { 
         return ecnaive_load_recv_rank3_data1_connected_; 
     }
     bool is_ecnaive_load_recv_rank0_parity0_connected() const { 
         return ecnaive_load_recv_rank0_parity0_connected_; 
     }
+    bool is_ecnaive_load_recv_rank0_data0_connected() const { 
+        return ecnaive_load_recv_rank0_data0_connected_; 
+    }
+    bool is_ecnaive_load_recv_rank1_data1_connected() const { 
+        return ecnaive_load_recv_rank1_data1_connected_; 
+    }
+    bool is_ecnaive_load_recv_rank1_data0_connected() const { 
+        return ecnaive_load_recv_rank1_data0_connected_; 
+    }
+    bool is_ecnaive_load_recv_rank1_parity1_connected() const { 
+        return ecnaive_load_recv_rank1_parity1_connected_; 
+    }
+    bool is_ecnaive_load_recv_rank3_data0_connected() const { 
+        return ecnaive_load_recv_rank3_data0_connected_; 
+    }
+    bool is_ecnaive_load_recv_rank0_data1_connected() const { 
+        return ecnaive_load_recv_rank0_data1_connected_; 
+    }
+    
+    // EC-NAIVE load mode connection checks (rank0 sender: 3 flags)
     bool is_ecnaive_load_send_rank0_parity0_connected() const { 
         return ecnaive_load_send_rank0_parity0_connected_; 
     }
+    bool is_ecnaive_load_send_rank0_data0_connected() const { 
+        return ecnaive_load_send_rank0_data0_connected_; 
+    }
+    bool is_ecnaive_load_send_rank0_data1_connected() const { 
+        return ecnaive_load_send_rank0_data1_connected_; 
+    }
+    
+    // EC-NAIVE load mode connection checks (rank1 sender: 3 flags)
+    bool is_ecnaive_load_send_rank1_data1_connected() const { 
+        return ecnaive_load_send_rank1_data1_connected_; 
+    }
+    bool is_ecnaive_load_send_rank1_data0_connected() const { 
+        return ecnaive_load_send_rank1_data0_connected_; 
+    }
+    bool is_ecnaive_load_send_rank1_parity1_connected() const { 
+        return ecnaive_load_send_rank1_parity1_connected_; 
+    }
+    
+    // EC-NAIVE load mode connection checks (rank3 sender: 2 flags)
     bool is_ecnaive_load_send_rank3_data1_connected() const { 
         return ecnaive_load_send_rank3_data1_connected_; 
+    }
+    bool is_ecnaive_load_send_rank3_data0_connected() const { 
+        return ecnaive_load_send_rank3_data0_connected_; 
     }
     
     void wait_for_connections(int timeout_seconds = 30);
@@ -1225,6 +1389,96 @@ void AsioConnectionManager::bind_listen_ecnaive_load_recv_rank0_parity0(const st
     }
 }
 
+void AsioConnectionManager::bind_listen_ecnaive_load_recv_rank0_data0(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        ecnaive_load_recv_rank0_data0_acceptor_.open(endpoint.protocol());
+        ecnaive_load_recv_rank0_data0_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        ecnaive_load_recv_rank0_data0_acceptor_.bind(endpoint);
+        ecnaive_load_recv_rank0_data0_acceptor_.listen();
+        std::cout << "EC-NAIVE: [Rank 2] Bound and listening on ecnaive_load_recv_rank0_data0 port " 
+                  << port << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: bind_listen_ecnaive_load_recv_rank0_data0 error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+void AsioConnectionManager::bind_listen_ecnaive_load_recv_rank1_data1(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        ecnaive_load_recv_rank1_data1_acceptor_.open(endpoint.protocol());
+        ecnaive_load_recv_rank1_data1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        ecnaive_load_recv_rank1_data1_acceptor_.bind(endpoint);
+        ecnaive_load_recv_rank1_data1_acceptor_.listen();
+        std::cout << "EC-NAIVE: [Rank 2] Bound and listening on ecnaive_load_recv_rank1_data1 port " 
+                  << port << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: bind_listen_ecnaive_load_recv_rank1_data1 error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+void AsioConnectionManager::bind_listen_ecnaive_load_recv_rank1_data0(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        ecnaive_load_recv_rank1_data0_acceptor_.open(endpoint.protocol());
+        ecnaive_load_recv_rank1_data0_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        ecnaive_load_recv_rank1_data0_acceptor_.bind(endpoint);
+        ecnaive_load_recv_rank1_data0_acceptor_.listen();
+        std::cout << "EC-NAIVE: [Rank 2] Bound and listening on ecnaive_load_recv_rank1_data0 port " 
+                  << port << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: bind_listen_ecnaive_load_recv_rank1_data0 error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+void AsioConnectionManager::bind_listen_ecnaive_load_recv_rank1_parity1(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        ecnaive_load_recv_rank1_parity1_acceptor_.open(endpoint.protocol());
+        ecnaive_load_recv_rank1_parity1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        ecnaive_load_recv_rank1_parity1_acceptor_.bind(endpoint);
+        ecnaive_load_recv_rank1_parity1_acceptor_.listen();
+        std::cout << "EC-NAIVE: [Rank 2] Bound and listening on ecnaive_load_recv_rank1_parity1 port " 
+                  << port << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: bind_listen_ecnaive_load_recv_rank1_parity1 error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+void AsioConnectionManager::bind_listen_ecnaive_load_recv_rank3_data0(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        ecnaive_load_recv_rank3_data0_acceptor_.open(endpoint.protocol());
+        ecnaive_load_recv_rank3_data0_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        ecnaive_load_recv_rank3_data0_acceptor_.bind(endpoint);
+        ecnaive_load_recv_rank3_data0_acceptor_.listen();
+        std::cout << "EC-NAIVE: [Rank 2] Bound and listening on ecnaive_load_recv_rank3_data0 port " 
+                  << port << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: bind_listen_ecnaive_load_recv_rank3_data0 error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+void AsioConnectionManager::bind_listen_ecnaive_load_recv_rank0_data1(const std::string& listen_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+        ecnaive_load_recv_rank0_data1_acceptor_.open(endpoint.protocol());
+        ecnaive_load_recv_rank0_data1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        ecnaive_load_recv_rank0_data1_acceptor_.bind(endpoint);
+        ecnaive_load_recv_rank0_data1_acceptor_.listen();
+        std::cout << "EC-NAIVE: [Rank 2] Bound and listening on ecnaive_load_recv_rank0_data1 port " 
+                  << port << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: bind_listen_ecnaive_load_recv_rank0_data1 error: " << e.what() << std::endl;
+        throw;
+    }
+}
+
 // EC-NAIVE load mode accept helpers (for rank2, after bind+listen)
 void AsioConnectionManager::accept_ecnaive_load_recv_rank3_data1() {
     try {
@@ -1252,7 +1506,85 @@ void AsioConnectionManager::accept_ecnaive_load_recv_rank0_parity0() {
     }
 }
 
-// EC-NAIVE load mode init functions (rank0/3 sender)
+void AsioConnectionManager::accept_ecnaive_load_recv_rank0_data0() {
+    try {
+        ecnaive_load_recv_rank0_data0_acceptor_.accept(ecnaive_load_recv_rank0_data0_socket_);
+        ecnaive_load_recv_rank0_data0_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 2] Accepted ecnaive_load_recv_rank0_data0 connection" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: accept_ecnaive_load_recv_rank0_data0 error: " << e.what() << std::endl;
+        ecnaive_load_recv_rank0_data0_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_ecnaive_load_recv_rank1_data1() {
+    try {
+        ecnaive_load_recv_rank1_data1_acceptor_.accept(ecnaive_load_recv_rank1_data1_socket_);
+        ecnaive_load_recv_rank1_data1_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 2] Accepted ecnaive_load_recv_rank1_data1 connection" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: accept_ecnaive_load_recv_rank1_data1 error: " << e.what() << std::endl;
+        ecnaive_load_recv_rank1_data1_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_ecnaive_load_recv_rank1_data0() {
+    try {
+        ecnaive_load_recv_rank1_data0_acceptor_.accept(ecnaive_load_recv_rank1_data0_socket_);
+        ecnaive_load_recv_rank1_data0_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 2] Accepted ecnaive_load_recv_rank1_data0 connection" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: accept_ecnaive_load_recv_rank1_data0 error: " << e.what() << std::endl;
+        ecnaive_load_recv_rank1_data0_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_ecnaive_load_recv_rank1_parity1() {
+    try {
+        ecnaive_load_recv_rank1_parity1_acceptor_.accept(ecnaive_load_recv_rank1_parity1_socket_);
+        ecnaive_load_recv_rank1_parity1_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 2] Accepted ecnaive_load_recv_rank1_parity1 connection" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: accept_ecnaive_load_recv_rank1_parity1 error: " << e.what() << std::endl;
+        ecnaive_load_recv_rank1_parity1_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_ecnaive_load_recv_rank3_data0() {
+    try {
+        ecnaive_load_recv_rank3_data0_acceptor_.accept(ecnaive_load_recv_rank3_data0_socket_);
+        ecnaive_load_recv_rank3_data0_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 2] Accepted ecnaive_load_recv_rank3_data0 connection" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: accept_ecnaive_load_recv_rank3_data0 error: " << e.what() << std::endl;
+        ecnaive_load_recv_rank3_data0_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_ecnaive_load_recv_rank0_data1() {
+    try {
+        ecnaive_load_recv_rank0_data1_acceptor_.accept(ecnaive_load_recv_rank0_data1_socket_);
+        ecnaive_load_recv_rank0_data1_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 2] Accepted ecnaive_load_recv_rank0_data1 connection" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: accept_ecnaive_load_recv_rank0_data1 error: " << e.what() << std::endl;
+        ecnaive_load_recv_rank0_data1_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+// EC-NAIVE load mode init functions (rank0/1/3 sender)
 void AsioConnectionManager::init_ecnaive_load_send_rank0_parity0(const std::string& rank2_ip, uint16_t port) {
     try {
         boost::asio::ip::tcp::resolver resolver(io_context_);
@@ -1279,6 +1611,99 @@ void AsioConnectionManager::init_ecnaive_load_send_rank3_data1(const std::string
     } catch (const std::exception& e) {
         std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank3_data1 error: " << e.what() << std::endl;
         ecnaive_load_send_rank3_data1_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+// EC-NAIVE load mode init functions (rank0 sender: 3 connections)
+void AsioConnectionManager::init_ecnaive_load_send_rank0_data0(const std::string& rank2_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank2_ip, std::to_string(port));
+        boost::asio::connect(ecnaive_load_send_rank0_data0_socket_, endpoints);
+        ecnaive_load_send_rank0_data0_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 0] Connected ecnaive_load_send_rank0_data0 to rank2" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank0_data0 error: " << e.what() << std::endl;
+        ecnaive_load_send_rank0_data0_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::init_ecnaive_load_send_rank0_data1(const std::string& rank2_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank2_ip, std::to_string(port));
+        boost::asio::connect(ecnaive_load_send_rank0_data1_socket_, endpoints);
+        ecnaive_load_send_rank0_data1_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 0] Connected ecnaive_load_send_rank0_data1 to rank2" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank0_data1 error: " << e.what() << std::endl;
+        ecnaive_load_send_rank0_data1_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+// EC-NAIVE load mode init functions (rank1 sender: 3 connections)
+void AsioConnectionManager::init_ecnaive_load_send_rank1_data1(const std::string& rank2_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank2_ip, std::to_string(port));
+        boost::asio::connect(ecnaive_load_send_rank1_data1_socket_, endpoints);
+        ecnaive_load_send_rank1_data1_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 1] Connected ecnaive_load_send_rank1_data1 to rank2" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank1_data1 error: " << e.what() << std::endl;
+        ecnaive_load_send_rank1_data1_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::init_ecnaive_load_send_rank1_data0(const std::string& rank2_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank2_ip, std::to_string(port));
+        boost::asio::connect(ecnaive_load_send_rank1_data0_socket_, endpoints);
+        ecnaive_load_send_rank1_data0_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 1] Connected ecnaive_load_send_rank1_data0 to rank2" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank1_data0 error: " << e.what() << std::endl;
+        ecnaive_load_send_rank1_data0_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::init_ecnaive_load_send_rank1_parity1(const std::string& rank2_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank2_ip, std::to_string(port));
+        boost::asio::connect(ecnaive_load_send_rank1_parity1_socket_, endpoints);
+        ecnaive_load_send_rank1_parity1_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 1] Connected ecnaive_load_send_rank1_parity1 to rank2" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank1_parity1 error: " << e.what() << std::endl;
+        ecnaive_load_send_rank1_parity1_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+// EC-NAIVE load mode init functions (rank3 sender: 2 connections)
+void AsioConnectionManager::init_ecnaive_load_send_rank3_data0(const std::string& rank2_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank2_ip, std::to_string(port));
+        boost::asio::connect(ecnaive_load_send_rank3_data0_socket_, endpoints);
+        ecnaive_load_send_rank3_data0_connected_ = true;
+        std::cout << "EC-NAIVE: [Rank 3] Connected ecnaive_load_send_rank3_data0 to rank2" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank3_data0 error: " << e.what() << std::endl;
+        ecnaive_load_send_rank3_data0_connected_ = false;
         connection_cv_.notify_all();
     }
 }
@@ -1365,16 +1790,42 @@ struct RecvTask {
 
 // EC-NAIVE load mode task structures
 struct LoadRecvTask {
-    uintptr_t recv_data1_addr;      // d_{3,1} 直接放到最终位置（data0连续内存）
-    uintptr_t recv_parity0_addr;    // p_{0,0} 临时recv buffer地址
-    uintptr_t recovered_data0_addr; // d_{2,0} 输出地址（与recv_data1_addr相同）
+    // 8个接收缓冲区地址（rank2接收）
+    uintptr_t recv_p20_addr;   // p_{2,0} from rank0
+    uintptr_t recv_d21_addr;   // d_{2,1} from rank3
+    uintptr_t recv_d00_addr;   // d_{0,0} from rank0
+    uintptr_t recv_d01_addr;   // d_{0,1} from rank1
+    uintptr_t recv_d10_addr;   // d_{1,0} from rank1
+    uintptr_t recv_p11_addr;   // p_{1,1} from rank1
+    uintptr_t recv_d30_addr;   // d_{3,0} from rank3
+    uintptr_t recv_d31_addr;   // d_{3,1} from rank0
+    
+    // 4个输出地址（直接写入ecnaive_blocks，零拷贝）
+    uintptr_t output_data0_addr;           // d_{2,0} = p_{2,0} ⊕ d_{2,1}
+    uintptr_t output_recv_parity0_addr;    // p_{0,0} = d_{0,0} ⊕ d_{0,1}
+    uintptr_t output_recv_data1_addr;      // d_{1,1} = d_{1,0} ⊕ p_{1,1}
+    uintptr_t output_recv_parity1_addr;    // p_{3,1} = d_{3,0} ⊕ d_{3,1}
+    
     size_t size;
 };
 
 struct LoadXORTask {
-    uintptr_t data1_addr;      // d_{3,1} (已经是最终位置)
-    uintptr_t parity0_addr;    // p_{0,0} (临时recv buffer)
-    uintptr_t recovered_addr;  // d_{2,0} (与data1_addr相同，覆盖写入)
+    // 8个输入地址（接收缓冲区）
+    uintptr_t recv_p20_addr;   // p_{2,0} from rank0
+    uintptr_t recv_d21_addr;   // d_{2,1} from rank3
+    uintptr_t recv_d00_addr;   // d_{0,0} from rank0
+    uintptr_t recv_d01_addr;   // d_{0,1} from rank1
+    uintptr_t recv_d10_addr;   // d_{1,0} from rank1
+    uintptr_t recv_p11_addr;   // p_{1,1} from rank1
+    uintptr_t recv_d30_addr;   // d_{3,0} from rank3
+    uintptr_t recv_d31_addr;   // d_{3,1} from rank0
+    
+    // 4个输出地址（直接写入ecnaive_blocks，零拷贝）
+    uintptr_t output_data0_addr;           // d_{2,0} = p_{2,0} ⊕ d_{2,1}
+    uintptr_t output_recv_parity0_addr;    // p_{0,0} = d_{0,0} ⊕ d_{0,1}
+    uintptr_t output_recv_data1_addr;      // d_{1,1} = d_{1,0} ⊕ p_{1,1}
+    uintptr_t output_recv_parity1_addr;    // p_{3,1} = d_{3,0} ⊕ d_{3,1}
+    
     size_t size;
 };
 
@@ -1382,6 +1833,7 @@ struct LoadSendTask {
     uintptr_t send_addr;  // mmap地址或buffer地址
     size_t size;
     bool is_mmap;         // 标记是否为mmap（不需要释放）
+    int socket_type;      // Socket类型标识: 0=parity0, 1=data0, 2=data1, 3=parity1 (用于区分不同socket)
 };
 
 class ECNaiveNative {
@@ -1660,15 +2112,32 @@ public:
             return;
         }
         
-        std::cout << "EC-NAIVE: [Rank 2] Submitting load recovery task: recv_data1=" << recv_data1_addr
+        std::cout << "EC-NAIVE: [Rank 2] Submitting load recovery task (legacy): recv_data1=" << recv_data1_addr
                   << ", recv_parity0=" << recv_parity0_addr
                   << ", recovered_data0=" << recovered_data0_addr
                   << ", size=" << size << std::endl;
         
+        // Map old interface to new structure
+        // Old logic: d_{2,0} = d_{3,1} XOR p_{0,0}
+        // Note: This doesn't match ECNAIVE encoding (d_{2,0} = p_{2,0} XOR d_{2,1})
+        // For backward compatibility, map old parameters to new structure
+        // Since old interface only provides 2 addresses, we map them and set others to 0
         LoadRecvTask task;
-        task.recv_data1_addr = recv_data1_addr;
-        task.recv_parity0_addr = recv_parity0_addr;
-        task.recovered_data0_addr = recovered_data0_addr;
+        // Map old parameters - assuming old code meant p_{2,0} instead of p_{0,0} for recovery
+        task.recv_p20_addr = recv_parity0_addr;       // p_{2,0} from rank0 (mapped from old p_{0,0})
+        task.recv_d31_addr = recv_data1_addr;         // d_{3,1} from rank0
+        // Set other addresses to 0 (not used in legacy mode)
+        task.recv_d21_addr = 0;
+        task.recv_d00_addr = 0;
+        task.recv_d01_addr = 0;
+        task.recv_d10_addr = 0;
+        task.recv_p11_addr = 0;
+        task.recv_d30_addr = 0;
+        // Output addresses - only data0 is recovered in legacy mode
+        task.output_data0_addr = recovered_data0_addr;
+        task.output_recv_parity0_addr = 0;
+        task.output_recv_data1_addr = 0;
+        task.output_recv_parity1_addr = 0;
         task.size = size;
         
         {
@@ -1678,20 +2147,62 @@ public:
         load_recv_queue_cv_.notify_one();
     }
 
-    // Rank0 send interface
+    // Full recovery interface (8 recv + 4 XOR)
+    void submit_ecnaive_load_recovery_full(
+        uintptr_t recv_p20_addr, uintptr_t recv_d21_addr,
+        uintptr_t recv_d00_addr, uintptr_t recv_d01_addr,
+        uintptr_t recv_d10_addr, uintptr_t recv_p11_addr,
+        uintptr_t recv_d30_addr, uintptr_t recv_d31_addr,
+        uintptr_t output_data0_addr,
+        uintptr_t output_recv_parity0_addr,
+        uintptr_t output_recv_data1_addr,
+        uintptr_t output_recv_parity1_addr,
+        size_t size
+    ) {
+        if (rank_ != 2 || !is_load_mode_) {
+            std::cerr << "EC-NAIVE: submit_ecnaive_load_recovery_full called but rank != 2 or not in load mode" << std::endl;
+            return;
+        }
+        
+        std::cout << "EC-NAIVE: [Rank 2] Submitting full recovery task (8 recv + 4 XOR): size=" << size << std::endl;
+        
+        LoadRecvTask task;
+        task.recv_p20_addr = recv_p20_addr;
+        task.recv_d21_addr = recv_d21_addr;
+        task.recv_d00_addr = recv_d00_addr;
+        task.recv_d01_addr = recv_d01_addr;
+        task.recv_d10_addr = recv_d10_addr;
+        task.recv_p11_addr = recv_p11_addr;
+        task.recv_d30_addr = recv_d30_addr;
+        task.recv_d31_addr = recv_d31_addr;
+        task.output_data0_addr = output_data0_addr;
+        task.output_recv_parity0_addr = output_recv_parity0_addr;
+        task.output_recv_data1_addr = output_recv_data1_addr;
+        task.output_recv_parity1_addr = output_recv_parity1_addr;
+        task.size = size;
+        
+        {
+            std::lock_guard<std::mutex> lock(load_recv_queue_mutex_);
+            load_recv_queue_.push(task);
+        }
+        load_recv_queue_cv_.notify_one();
+    }
+
+    // Rank0 send interfaces (3 blocks: p_{2,0}, d_{0,0}, d_{3,1})
     void submit_load_send_rank0_parity0(uintptr_t send_addr, size_t size) {
         if (rank_ != 0 || !is_load_mode_) {
             std::cerr << "EC-NAIVE: submit_load_send_rank0_parity0 called but rank != 0 or not in load mode" << std::endl;
             return;
         }
         
-        std::cout << "EC-NAIVE: [Rank 0] Submitting load send task: send_addr=" << send_addr
+        std::cout << "EC-NAIVE: [Rank 0] Submitting load send task (p_{2,0}): send_addr=" << send_addr
                   << ", size=" << size << std::endl;
         
         LoadSendTask task;
-        task.send_addr = send_addr;  // mmap地址或buffer地址
+        task.send_addr = send_addr;
         task.size = size;
-        task.is_mmap = false;  // Python层决定
+        task.is_mmap = false;
+        task.socket_type = 0;  // parity0 socket
         
         {
             std::lock_guard<std::mutex> lock(load_send_queue_mutex_);
@@ -1700,20 +2211,154 @@ public:
         load_send_queue_cv_.notify_one();
     }
 
-    // Rank3 send interface
-    void submit_load_send_rank3_data1(uintptr_t send_addr, size_t size) {
-        if (rank_ != 3 || !is_load_mode_) {
-            std::cerr << "EC-NAIVE: submit_load_send_rank3_data1 called but rank != 3 or not in load mode" << std::endl;
+    void submit_load_send_rank0_data0(uintptr_t send_addr, size_t size) {
+        if (rank_ != 0 || !is_load_mode_) {
+            std::cerr << "EC-NAIVE: submit_load_send_rank0_data0 called but rank != 0 or not in load mode" << std::endl;
             return;
         }
         
-        std::cout << "EC-NAIVE: [Rank 3] Submitting load send task: send_addr=" << send_addr
+        std::cout << "EC-NAIVE: [Rank 0] Submitting load send task (d_{0,0}): send_addr=" << send_addr
                   << ", size=" << size << std::endl;
         
         LoadSendTask task;
         task.send_addr = send_addr;
         task.size = size;
         task.is_mmap = false;
+        task.socket_type = 1;  // data0 socket
+        
+        {
+            std::lock_guard<std::mutex> lock(load_send_queue_mutex_);
+            load_send_queue_.push(task);
+        }
+        load_send_queue_cv_.notify_one();
+    }
+
+    void submit_load_send_rank0_data1(uintptr_t send_addr, size_t size) {
+        if (rank_ != 0 || !is_load_mode_) {
+            std::cerr << "EC-NAIVE: submit_load_send_rank0_data1 called but rank != 0 or not in load mode" << std::endl;
+            return;
+        }
+        
+        std::cout << "EC-NAIVE: [Rank 0] Submitting load send task (d_{3,1}): send_addr=" << send_addr
+                  << ", size=" << size << std::endl;
+        
+        LoadSendTask task;
+        task.send_addr = send_addr;
+        task.size = size;
+        task.is_mmap = false;
+        task.socket_type = 2;  // data1 socket
+        
+        {
+            std::lock_guard<std::mutex> lock(load_send_queue_mutex_);
+            load_send_queue_.push(task);
+        }
+        load_send_queue_cv_.notify_one();
+    }
+
+    // Rank1 send interfaces (3 blocks: d_{0,1}, d_{1,0}, p_{1,1})
+    void submit_load_send_rank1_data1(uintptr_t send_addr, size_t size) {
+        if (rank_ != 1 || !is_load_mode_) {
+            std::cerr << "EC-NAIVE: submit_load_send_rank1_data1 called but rank != 1 or not in load mode" << std::endl;
+            return;
+        }
+        
+        std::cout << "EC-NAIVE: [Rank 1] Submitting load send task (d_{0,1}): send_addr=" << send_addr
+                  << ", size=" << size << std::endl;
+        
+        LoadSendTask task;
+        task.send_addr = send_addr;
+        task.size = size;
+        task.is_mmap = false;
+        task.socket_type = 2;  // data1 socket
+        
+        {
+            std::lock_guard<std::mutex> lock(load_send_queue_mutex_);
+            load_send_queue_.push(task);
+        }
+        load_send_queue_cv_.notify_one();
+    }
+
+    void submit_load_send_rank1_data0(uintptr_t send_addr, size_t size) {
+        if (rank_ != 1 || !is_load_mode_) {
+            std::cerr << "EC-NAIVE: submit_load_send_rank1_data0 called but rank != 1 or not in load mode" << std::endl;
+            return;
+        }
+        
+        std::cout << "EC-NAIVE: [Rank 1] Submitting load send task (d_{1,0}): send_addr=" << send_addr
+                  << ", size=" << size << std::endl;
+        
+        LoadSendTask task;
+        task.send_addr = send_addr;
+        task.size = size;
+        task.is_mmap = false;
+        task.socket_type = 1;  // data0 socket
+        
+        {
+            std::lock_guard<std::mutex> lock(load_send_queue_mutex_);
+            load_send_queue_.push(task);
+        }
+        load_send_queue_cv_.notify_one();
+    }
+
+    void submit_load_send_rank1_parity1(uintptr_t send_addr, size_t size) {
+        if (rank_ != 1 || !is_load_mode_) {
+            std::cerr << "EC-NAIVE: submit_load_send_rank1_parity1 called but rank != 1 or not in load mode" << std::endl;
+            return;
+        }
+        
+        std::cout << "EC-NAIVE: [Rank 1] Submitting load send task (p_{1,1}): send_addr=" << send_addr
+                  << ", size=" << size << std::endl;
+        
+        LoadSendTask task;
+        task.send_addr = send_addr;
+        task.size = size;
+        task.is_mmap = false;
+        task.socket_type = 3;  // parity1 socket
+        
+        {
+            std::lock_guard<std::mutex> lock(load_send_queue_mutex_);
+            load_send_queue_.push(task);
+        }
+        load_send_queue_cv_.notify_one();
+    }
+
+    // Rank3 send interfaces (2 blocks: d_{2,1}, d_{3,0})
+    void submit_load_send_rank3_data1(uintptr_t send_addr, size_t size) {
+        if (rank_ != 3 || !is_load_mode_) {
+            std::cerr << "EC-NAIVE: submit_load_send_rank3_data1 called but rank != 3 or not in load mode" << std::endl;
+            return;
+        }
+        
+        std::cout << "EC-NAIVE: [Rank 3] Submitting load send task (d_{2,1}): send_addr=" << send_addr
+                  << ", size=" << size << std::endl;
+        
+        LoadSendTask task;
+        task.send_addr = send_addr;
+        task.size = size;
+        task.is_mmap = false;
+        task.socket_type = 2;  // data1 socket
+        
+        {
+            std::lock_guard<std::mutex> lock(load_send_queue_mutex_);
+            load_send_queue_.push(task);
+        }
+        load_send_queue_cv_.notify_one();
+    }
+
+    void submit_load_send_rank3_data0(uintptr_t send_addr, size_t size) {
+        if (rank_ != 3 || !is_load_mode_) {
+            std::cerr << "EC-NAIVE: submit_load_send_rank3_data0 called but rank != 3 or not in load mode" << std::endl;
+            return;
+        }
+        
+        std::cout << "EC-NAIVE: [Rank 3] Submitting load send task (d_{3,0}): send_addr=" << send_addr
+                  << ", size=" << size << std::endl;
+        
+        LoadSendTask task;
+        task.send_addr = send_addr;
+        task.size = size;
+        task.is_mmap = false;
+        task.socket_type = 1;  // data0 socket
         
         {
             std::lock_guard<std::mutex> lock(load_send_queue_mutex_);
@@ -1729,7 +2374,14 @@ public:
         std::cout << "EC-NAIVE: [Rank 2] Submitting sentinel to load recv worker" << std::endl;
         
         LoadRecvTask sentinel;
-        sentinel.recv_data1_addr = 0;
+        sentinel.recv_p20_addr = 0;
+        sentinel.recv_d21_addr = 0;
+        sentinel.recv_d00_addr = 0;
+        sentinel.recv_d01_addr = 0;
+        sentinel.recv_d10_addr = 0;
+        sentinel.recv_p11_addr = 0;
+        sentinel.recv_d30_addr = 0;
+        sentinel.recv_d31_addr = 0;
         sentinel.size = 0;
         
         {
@@ -1745,7 +2397,14 @@ public:
         std::cout << "EC-NAIVE: [Rank 2] Submitting sentinel to load xor worker" << std::endl;
         
         LoadXORTask sentinel;
-        sentinel.data1_addr = 0;
+        sentinel.recv_p20_addr = 0;
+        sentinel.recv_d21_addr = 0;
+        sentinel.recv_d00_addr = 0;
+        sentinel.recv_d01_addr = 0;
+        sentinel.recv_d10_addr = 0;
+        sentinel.recv_p11_addr = 0;
+        sentinel.recv_d30_addr = 0;
+        sentinel.recv_d31_addr = 0;
         sentinel.size = 0;
         
         {
@@ -1756,13 +2415,14 @@ public:
     }
 
     void submit_load_send_sentinel() {
-        if ((rank_ != 0 && rank_ != 3) || !is_load_mode_) return;
+        if ((rank_ != 0 && rank_ != 1 && rank_ != 3) || !is_load_mode_) return;
         
         std::cout << "EC-NAIVE: [Rank " << rank_ << "] Submitting sentinel to load send worker" << std::endl;
         
         LoadSendTask sentinel;
         sentinel.send_addr = 0;
         sentinel.size = 0;
+        sentinel.socket_type = -1;  // Sentinel marker
         
         {
             std::lock_guard<std::mutex> lock(load_send_queue_mutex_);
@@ -1949,7 +2609,7 @@ public:
             if (load_xor_worker_.joinable()) {
                 load_xor_worker_.join();
             }
-        } else if (is_load_mode_ && (rank_ == 0 || rank_ == 3)) {
+        } else if (is_load_mode_ && (rank_ == 0 || rank_ == 1 || rank_ == 3)) {
             if (load_send_worker_.joinable()) {
                 load_send_worker_.join();
             }
@@ -1987,8 +2647,8 @@ public:
                 if (!load_xor_worker_.joinable()) {
                     load_xor_worker_ = std::thread(&ECNaiveNative::load_xor_worker, this);
                 }
-            } else if (rank_ == 0 || rank_ == 3) {
-                // rank0/3: start send worker
+            } else if (rank_ == 0 || rank_ == 1 || rank_ == 3) {
+                // rank0/1/3: start send worker
                 if (!load_send_worker_.joinable()) {
                     load_send_worker_ = std::thread(&ECNaiveNative::load_send_worker, this);
                 }
@@ -2095,8 +2755,14 @@ public:
     void init_ecnaive_load_connections(
         int rank,
         const std::string& rank2_ip,
-        uint16_t load_recv_rank3_data1_port,
-        uint16_t load_recv_rank0_parity0_port
+        uint16_t load_recv_rank3_data1_port,      // port 0: d_{2,1} from rank3
+        uint16_t load_recv_rank0_parity0_port,    // port 1: p_{2,0} from rank0
+        uint16_t load_recv_rank0_data0_port,      // port 2: d_{0,0} from rank0
+        uint16_t load_recv_rank1_data1_port,      // port 3: d_{0,1} from rank1
+        uint16_t load_recv_rank1_data0_port,      // port 4: d_{1,0} from rank1
+        uint16_t load_recv_rank1_parity1_port,    // port 5: p_{1,1} from rank1
+        uint16_t load_recv_rank3_data0_port,      // port 6: d_{3,0} from rank3
+        uint16_t load_recv_rank0_data1_port       // port 7: d_{3,1} from rank0
     ) {
         if (!is_load_mode_) {
             std::cerr << "EC-NAIVE: init_ecnaive_load_connections called but not in load mode" << std::endl;
@@ -2105,52 +2771,91 @@ public:
         
         rank_ = rank;  // Set rank for worker threads
         
-        std::cout << "EC-NAIVE: [Rank " << rank << "] Initializing load connections..." << std::endl;
+        std::cout << "EC-NAIVE: [Rank " << rank << "] Initializing load connections (full recovery: 8 ports)..." << std::endl;
         
         if (rank == 2) {
-            // rank2: bind, listen, and accept
+            // rank2: bind, listen, and accept on 8 ports
             try {
+                // Bind and listen all 8 acceptors
                 conn_.bind_listen_ecnaive_load_recv_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
                 conn_.bind_listen_ecnaive_load_recv_rank0_parity0(rank2_ip, load_recv_rank0_parity0_port);
+                conn_.bind_listen_ecnaive_load_recv_rank0_data0(rank2_ip, load_recv_rank0_data0_port);
+                conn_.bind_listen_ecnaive_load_recv_rank1_data1(rank2_ip, load_recv_rank1_data1_port);
+                conn_.bind_listen_ecnaive_load_recv_rank1_data0(rank2_ip, load_recv_rank1_data0_port);
+                conn_.bind_listen_ecnaive_load_recv_rank1_parity1(rank2_ip, load_recv_rank1_parity1_port);
+                conn_.bind_listen_ecnaive_load_recv_rank3_data0(rank2_ip, load_recv_rank3_data0_port);
+                conn_.bind_listen_ecnaive_load_recv_rank0_data1(rank2_ip, load_recv_rank0_data1_port);
                 
-                std::cout << "EC-NAIVE: [Rank 2] Acceptors bound and listening, starting accept threads..." << std::endl;
+                std::cout << "EC-NAIVE: [Rank 2] All 8 acceptors bound and listening, starting accept threads..." << std::endl;
                 
-                // Start accept operations in separate threads (similar to ECLATIN)
+                // Start accept operations in separate threads
                 // These threads will block on accept() until connections arrive
                 std::thread recv_init_thread([this]() {
-                    std::thread accept_data1([this]() {
+                    std::thread accept_threads[8];
+                    
+                    accept_threads[0] = std::thread([this]() {
                         conn_.accept_ecnaive_load_recv_rank3_data1();
                     });
-                    std::thread accept_parity0([this]() {
+                    accept_threads[1] = std::thread([this]() {
                         conn_.accept_ecnaive_load_recv_rank0_parity0();
                     });
+                    accept_threads[2] = std::thread([this]() {
+                        conn_.accept_ecnaive_load_recv_rank0_data0();
+                    });
+                    accept_threads[3] = std::thread([this]() {
+                        conn_.accept_ecnaive_load_recv_rank1_data1();
+                    });
+                    accept_threads[4] = std::thread([this]() {
+                        conn_.accept_ecnaive_load_recv_rank1_data0();
+                    });
+                    accept_threads[5] = std::thread([this]() {
+                        conn_.accept_ecnaive_load_recv_rank1_parity1();
+                    });
+                    accept_threads[6] = std::thread([this]() {
+                        conn_.accept_ecnaive_load_recv_rank3_data0();
+                    });
+                    accept_threads[7] = std::thread([this]() {
+                        conn_.accept_ecnaive_load_recv_rank0_data1();
+                    });
                     
-                    accept_data1.join();
-                    accept_parity0.join();
+                    // Join all accept threads
+                    for (auto& t : accept_threads) {
+                        t.join();
+                    }
                 });
                 
                 // Small delay to ensure accept sockets are bound and listening
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 
                 // Detach the recv_init_thread so it runs in background
-                // The accept operations will block until connections arrive from rank0/3
+                // The accept operations will block until connections arrive from rank0/1/3
                 recv_init_thread.detach();
                 
-                std::cout << "EC-NAIVE: [Rank 2] Accept threads started, waiting for connections..." << std::endl;
+                std::cout << "EC-NAIVE: [Rank 2] All 8 accept threads started, waiting for connections..." << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "EC-NAIVE: [Rank 2] Failed to initialize load connections: " << e.what() << std::endl;
                 throw;
             }
         } else if (rank == 0) {
-            // rank0: connect to rank2
-            std::cout << "EC-NAIVE: [Rank 0] Connecting to rank2..." << std::endl;
-            conn_.init_ecnaive_load_send_rank0_parity0(rank2_ip, load_recv_rank0_parity0_port);
-            std::cout << "EC-NAIVE: [Rank 0] Load connection established" << std::endl;
+            // rank0: connect to rank2 on 3 ports (p_{2,0}, d_{0,0}, d_{3,1})
+            std::cout << "EC-NAIVE: [Rank 0] Connecting to rank2 on 3 ports..." << std::endl;
+            conn_.init_ecnaive_load_send_rank0_parity0(rank2_ip, load_recv_rank0_parity0_port);  // p_{2,0}
+            conn_.init_ecnaive_load_send_rank0_data0(rank2_ip, load_recv_rank0_data0_port);      // d_{0,0}
+            conn_.init_ecnaive_load_send_rank0_data1(rank2_ip, load_recv_rank0_data1_port);      // d_{3,1}
+            std::cout << "EC-NAIVE: [Rank 0] All 3 load connections established" << std::endl;
+        } else if (rank == 1) {
+            // rank1: connect to rank2 on 3 ports (d_{0,1}, d_{1,0}, p_{1,1})
+            std::cout << "EC-NAIVE: [Rank 1] Connecting to rank2 on 3 ports..." << std::endl;
+            conn_.init_ecnaive_load_send_rank1_data1(rank2_ip, load_recv_rank1_data1_port);      // d_{0,1}
+            conn_.init_ecnaive_load_send_rank1_data0(rank2_ip, load_recv_rank1_data0_port);      // d_{1,0}
+            conn_.init_ecnaive_load_send_rank1_parity1(rank2_ip, load_recv_rank1_parity1_port);  // p_{1,1}
+            std::cout << "EC-NAIVE: [Rank 1] All 3 load connections established" << std::endl;
         } else if (rank == 3) {
-            // rank3: connect to rank2
-            std::cout << "EC-NAIVE: [Rank 3] Connecting to rank2..." << std::endl;
-            conn_.init_ecnaive_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
-            std::cout << "EC-NAIVE: [Rank 3] Load connection established" << std::endl;
+            // rank3: connect to rank2 on 2 ports (d_{2,1}, d_{3,0})
+            std::cout << "EC-NAIVE: [Rank 3] Connecting to rank2 on 2 ports..." << std::endl;
+            conn_.init_ecnaive_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);     // d_{2,1}
+            conn_.init_ecnaive_load_send_rank3_data0(rank2_ip, load_recv_rank3_data0_port);     // d_{3,0}
+            std::cout << "EC-NAIVE: [Rank 3] All 2 load connections established" << std::endl;
         }
     }
     
@@ -3042,16 +3747,24 @@ private:
 
     // ========== EC-NAIVE Load Mode Workers ==========
 
-    // Load recv worker (rank2 only): parallel receive d_{3,1} and p_{0,0}
+    // Load recv worker (rank2 only): parallel receive 8 blocks for full recovery
     void load_recv_worker() {
-        std::cout << "EC-NAIVE: [Rank 2] Load recv worker started" << std::endl;
+        std::cout << "EC-NAIVE: [Rank 2] Load recv worker started (full recovery: 8 blocks)" << std::endl;
         
-        // Wait for connections
+        // Wait for all 8 connections
         while (!stop_ && 
                (!conn_.is_ecnaive_load_recv_rank3_data1_connected() || 
-                !conn_.is_ecnaive_load_recv_rank0_parity0_connected())) {
+                !conn_.is_ecnaive_load_recv_rank0_parity0_connected() ||
+                !conn_.is_ecnaive_load_recv_rank0_data0_connected() ||
+                !conn_.is_ecnaive_load_recv_rank1_data1_connected() ||
+                !conn_.is_ecnaive_load_recv_rank1_data0_connected() ||
+                !conn_.is_ecnaive_load_recv_rank1_parity1_connected() ||
+                !conn_.is_ecnaive_load_recv_rank3_data0_connected() ||
+                !conn_.is_ecnaive_load_recv_rank0_data1_connected())) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        
+        std::cout << "EC-NAIVE: [Rank 2] All 8 connections established" << std::endl;
         
         while (!stop_) {
             LoadRecvTask task;
@@ -3070,18 +3783,28 @@ private:
                 load_recv_queue_.pop();
             }
             
-            // Check sentinel
-            if (task.recv_data1_addr == 0 && task.size == 0) {
+            // Check sentinel (all addresses are 0)
+            if (task.recv_p20_addr == 0 && task.recv_d21_addr == 0 && 
+                task.recv_d00_addr == 0 && task.recv_d01_addr == 0 &&
+                task.recv_d10_addr == 0 && task.recv_p11_addr == 0 &&
+                task.recv_d30_addr == 0 && task.recv_d31_addr == 0 && 
+                task.size == 0) {
                 load_recv_sentinel_received_ = true;
                 {
                     std::lock_guard<std::mutex> lock(load_recv_queue_mutex_);
                     if (load_recv_queue_.empty()) {
                         load_recv_worker_completed_ = true;
                         load_recv_sentinel_received_ = false;
-                        // FIX: Submit XOR sentinel before exiting (match EC-CHECK behavior)
-                        // When recv worker completes, all XOR tasks should have been submitted
+                        // Submit XOR sentinel before exiting
                         LoadXORTask xor_sentinel;
-                        xor_sentinel.data1_addr = 0;
+                        xor_sentinel.recv_p20_addr = 0;
+                        xor_sentinel.recv_d21_addr = 0;
+                        xor_sentinel.recv_d00_addr = 0;
+                        xor_sentinel.recv_d01_addr = 0;
+                        xor_sentinel.recv_d10_addr = 0;
+                        xor_sentinel.recv_p11_addr = 0;
+                        xor_sentinel.recv_d30_addr = 0;
+                        xor_sentinel.recv_d31_addr = 0;
                         xor_sentinel.size = 0;
                         {
                             std::lock_guard<std::mutex> xor_lock(load_xor_queue_mutex_);
@@ -3095,61 +3818,148 @@ private:
                 continue;
             }
             
-            // Parallel receive two blocks using two threads
-            std::atomic<bool> recv_data1_done(false);
-            std::atomic<bool> recv_parity0_done(false);
-            std::exception_ptr recv_data1_exception = nullptr;
-            std::exception_ptr recv_parity0_exception = nullptr;
+            // Parallel receive 8 blocks using 8 threads
+            std::vector<std::thread> recv_threads(8);
+            std::vector<std::exception_ptr> recv_exceptions(8);
             
-            // Thread 1: Receive d_{3,1} from rank3 -> directly to final position
-            std::thread recv_data1_thread([&]() {
-                try {
-                    if (!recv_with_size_bool(
-                            conn_.get_ecnaive_load_recv_rank3_data1_socket(),
-                            reinterpret_cast<void*>(task.recv_data1_addr),
-                            task.size)) {
-                        throw std::runtime_error("Failed to receive d_{3,1} from rank3");
-                    }
-                    recv_data1_done = true;
-                } catch (...) {
-                    recv_data1_exception = std::current_exception();
-                    recv_data1_done = true;
-                }
-            });
-
-            // Thread 2: Receive p_{0,0} from rank0 -> temporary recv buffer
-            std::thread recv_parity0_thread([&]() {
+            // Thread 1: Receive p_{2,0} from rank0
+            recv_threads[0] = std::thread([&]() {
                 try {
                     if (!recv_with_size_bool(
                             conn_.get_ecnaive_load_recv_rank0_parity0_socket(),
-                            reinterpret_cast<void*>(task.recv_parity0_addr),
+                            reinterpret_cast<void*>(task.recv_p20_addr),
                             task.size)) {
-                        throw std::runtime_error("Failed to receive p_{0,0} from rank0");
+                        throw std::runtime_error("Failed to receive p_{2,0} from rank0");
                     }
-                    recv_parity0_done = true;
                 } catch (...) {
-                    recv_parity0_exception = std::current_exception();
-                    recv_parity0_done = true;
+                    recv_exceptions[0] = std::current_exception();
+                }
+            });
+
+            // Thread 2: Receive d_{2,1} from rank3
+            recv_threads[1] = std::thread([&]() {
+                try {
+                    if (!recv_with_size_bool(
+                            conn_.get_ecnaive_load_recv_rank3_data1_socket(),
+                            reinterpret_cast<void*>(task.recv_d21_addr),
+                            task.size)) {
+                        throw std::runtime_error("Failed to receive d_{2,1} from rank3");
+                    }
+                } catch (...) {
+                    recv_exceptions[1] = std::current_exception();
+                }
+            });
+
+            // Thread 3: Receive d_{0,0} from rank0
+            recv_threads[2] = std::thread([&]() {
+                try {
+                    if (!recv_with_size_bool(
+                            conn_.get_ecnaive_load_recv_rank0_data0_socket(),
+                            reinterpret_cast<void*>(task.recv_d00_addr),
+                            task.size)) {
+                        throw std::runtime_error("Failed to receive d_{0,0} from rank0");
+                    }
+                } catch (...) {
+                    recv_exceptions[2] = std::current_exception();
+                }
+            });
+
+            // Thread 4: Receive d_{0,1} from rank1
+            recv_threads[3] = std::thread([&]() {
+                try {
+                    if (!recv_with_size_bool(
+                            conn_.get_ecnaive_load_recv_rank1_data1_socket(),
+                            reinterpret_cast<void*>(task.recv_d01_addr),
+                            task.size)) {
+                        throw std::runtime_error("Failed to receive d_{0,1} from rank1");
+                    }
+                } catch (...) {
+                    recv_exceptions[3] = std::current_exception();
+                }
+            });
+
+            // Thread 5: Receive d_{1,0} from rank1
+            recv_threads[4] = std::thread([&]() {
+                try {
+                    if (!recv_with_size_bool(
+                            conn_.get_ecnaive_load_recv_rank1_data0_socket(),
+                            reinterpret_cast<void*>(task.recv_d10_addr),
+                            task.size)) {
+                        throw std::runtime_error("Failed to receive d_{1,0} from rank1");
+                    }
+                } catch (...) {
+                    recv_exceptions[4] = std::current_exception();
+                }
+            });
+
+            // Thread 6: Receive p_{1,1} from rank1
+            recv_threads[5] = std::thread([&]() {
+                try {
+                    if (!recv_with_size_bool(
+                            conn_.get_ecnaive_load_recv_rank1_parity1_socket(),
+                            reinterpret_cast<void*>(task.recv_p11_addr),
+                            task.size)) {
+                        throw std::runtime_error("Failed to receive p_{1,1} from rank1");
+                    }
+                } catch (...) {
+                    recv_exceptions[5] = std::current_exception();
+                }
+            });
+
+            // Thread 7: Receive d_{3,0} from rank3
+            recv_threads[6] = std::thread([&]() {
+                try {
+                    if (!recv_with_size_bool(
+                            conn_.get_ecnaive_load_recv_rank3_data0_socket(),
+                            reinterpret_cast<void*>(task.recv_d30_addr),
+                            task.size)) {
+                        throw std::runtime_error("Failed to receive d_{3,0} from rank3");
+                    }
+                } catch (...) {
+                    recv_exceptions[6] = std::current_exception();
+                }
+            });
+
+            // Thread 8: Receive d_{3,1} from rank0
+            recv_threads[7] = std::thread([&]() {
+                try {
+                    if (!recv_with_size_bool(
+                            conn_.get_ecnaive_load_recv_rank0_data1_socket(),
+                            reinterpret_cast<void*>(task.recv_d31_addr),
+                            task.size)) {
+                        throw std::runtime_error("Failed to receive d_{3,1} from rank0");
+                    }
+                } catch (...) {
+                    recv_exceptions[7] = std::current_exception();
                 }
             });
             
-            // Join both threads
-            recv_data1_thread.join();
-            recv_parity0_thread.join();
+            // Join all 8 threads
+            for (auto& t : recv_threads) {
+                t.join();
+            }
             
             // Check for exceptions
-            if (recv_data1_exception) {
-                std::rethrow_exception(recv_data1_exception);
-            }
-            if (recv_parity0_exception) {
-                std::rethrow_exception(recv_parity0_exception);
+            for (size_t i = 0; i < 8; i++) {
+                if (recv_exceptions[i]) {
+                    std::rethrow_exception(recv_exceptions[i]);
+                }
             }
             
-            // After both blocks are received, automatically submit XOR task
+            // After all 8 blocks are received, submit XOR task
             LoadXORTask xor_task;
-            xor_task.data1_addr = task.recv_data1_addr;      // d_{3,1} (already in final position)
-            xor_task.parity0_addr = task.recv_parity0_addr;   // p_{0,0} (temporary buffer)
-            xor_task.recovered_addr = task.recovered_data0_addr; // d_{2,0} (same as data1_addr)
+            xor_task.recv_p20_addr = task.recv_p20_addr;
+            xor_task.recv_d21_addr = task.recv_d21_addr;
+            xor_task.recv_d00_addr = task.recv_d00_addr;
+            xor_task.recv_d01_addr = task.recv_d01_addr;
+            xor_task.recv_d10_addr = task.recv_d10_addr;
+            xor_task.recv_p11_addr = task.recv_p11_addr;
+            xor_task.recv_d30_addr = task.recv_d30_addr;
+            xor_task.recv_d31_addr = task.recv_d31_addr;
+            xor_task.output_data0_addr = task.output_data0_addr;
+            xor_task.output_recv_parity0_addr = task.output_recv_parity0_addr;
+            xor_task.output_recv_data1_addr = task.output_recv_data1_addr;
+            xor_task.output_recv_parity1_addr = task.output_recv_parity1_addr;
             xor_task.size = task.size;
             
             {
@@ -3158,23 +3968,26 @@ private:
             }
             load_xor_queue_cv_.notify_one();
             
-            std::cout << "EC-NAIVE: [Rank 2] Received both blocks, submitted XOR task (size=" 
+            std::cout << "EC-NAIVE: [Rank 2] Received all 8 blocks, submitted XOR task (size=" 
                       << task.size << ")" << std::endl;
         }
         
         std::cout << "EC-NAIVE: [Rank 2] Load recv worker completed" << std::endl;
     }
 
-    // Load XOR worker (rank2 only): d_{2,0} = d_{3,1} XOR p_{0,0}
+    // Load XOR worker (rank2 only): Perform 4 XOR operations for full recovery
+    // XOR 1: d_{2,0} = p_{2,0} ⊕ d_{2,1} -> output_data0_addr
+    // XOR 2: p_{0,0} = d_{0,0} ⊕ d_{0,1} -> output_recv_parity0_addr
+    // XOR 3: d_{1,1} = d_{1,0} ⊕ p_{1,1} -> output_recv_data1_addr
+    // XOR 4: p_{3,1} = d_{3,0} ⊕ d_{3,1} -> output_recv_parity1_addr
     void load_xor_worker() {
-        std::cout << "EC-NAIVE: [Rank 2] Load XOR worker started" << std::endl;
+        std::cout << "EC-NAIVE: [Rank 2] Load XOR worker started (full recovery: 4 XOR operations)" << std::endl;
         
         while (!stop_) {
             LoadXORTask task;
             
             {
                 std::unique_lock<std::mutex> lock(load_xor_queue_mutex_);
-                // FIX: Add sentinel check to wait condition, match EC-CHECK behavior
                 load_xor_queue_cv_.wait(lock, [this] {
                     return stop_ || !load_xor_queue_.empty() || load_xor_sentinel_received_.load();
                 });
@@ -3183,7 +3996,7 @@ private:
                     break;
                 }
                 
-                // FIX: Check if sentinel received and queue is empty (before popping)
+                // Check if sentinel received and queue is empty (before popping)
                 if (load_xor_sentinel_received_.load() && load_xor_queue_.empty()) {
                     load_xor_worker_completed_ = true;
                     load_xor_sentinel_received_ = false;
@@ -3194,8 +4007,12 @@ private:
                 load_xor_queue_.pop();
             }
             
-            // Check sentinel
-            if (task.data1_addr == 0 && task.size == 0) {
+            // Check sentinel (all addresses are 0)
+            if (task.recv_p20_addr == 0 && task.recv_d21_addr == 0 && 
+                task.recv_d00_addr == 0 && task.recv_d01_addr == 0 &&
+                task.recv_d10_addr == 0 && task.recv_p11_addr == 0 &&
+                task.recv_d30_addr == 0 && task.recv_d31_addr == 0 && 
+                task.size == 0) {
                 load_xor_sentinel_received_ = true;
                 {
                     std::lock_guard<std::mutex> lock(load_xor_queue_mutex_);
@@ -3208,19 +4025,54 @@ private:
                 continue;
             }
             
-            // XOR recovery: d_{2,0} = d_{3,1} XOR p_{0,0}
-            // data1_addr is already in final position, XOR directly overwrite
-            void* xor_array[2] = {
-                reinterpret_cast<void*>(task.data1_addr),    // d_{3,1} (final position)
-                reinterpret_cast<void*>(task.parity0_addr)  // p_{0,0} (temporary buffer)
-            };
-            xor_gen(2, static_cast<int>(task.size), xor_array);
-            // Result is written directly to data1_addr (i.e., recovered_addr), overwriting d_{3,1}
+            // Perform 4 XOR operations (zero-copy: results written directly to output addresses)
+            // Note: xor_gen modifies the first parameter in-place, so we copy first operand to output first
             
-            std::cout << "EC-NAIVE: [Rank 2] XOR recovery completed for chunk (size=" 
+            // XOR 1: d_{2,0} = p_{2,0} ⊕ d_{2,1} -> output_data0_addr
+            // Copy p_{2,0} to output first, then XOR with d_{2,1}
+            memcpy(reinterpret_cast<void*>(task.output_data0_addr), 
+                   reinterpret_cast<void*>(task.recv_p20_addr), task.size);
+            void* xor1_srcs[2] = {
+                reinterpret_cast<void*>(task.output_data0_addr),  // destination (contains p_{2,0})
+                reinterpret_cast<void*>(task.recv_d21_addr)       // d_{2,1}
+            };
+            xor_gen(2, static_cast<int>(task.size), xor1_srcs);
+            // Result is now in output_data0_addr (zero-copy)
+            
+            // XOR 2: p_{0,0} = d_{0,0} ⊕ d_{0,1} -> output_recv_parity0_addr
+            memcpy(reinterpret_cast<void*>(task.output_recv_parity0_addr), 
+                   reinterpret_cast<void*>(task.recv_d00_addr), task.size);
+            void* xor2_srcs[2] = {
+                reinterpret_cast<void*>(task.output_recv_parity0_addr),  // destination (contains d_{0,0})
+                reinterpret_cast<void*>(task.recv_d01_addr)              // d_{0,1}
+            };
+            xor_gen(2, static_cast<int>(task.size), xor2_srcs);
+            // Result is now in output_recv_parity0_addr (zero-copy)
+            
+            // XOR 3: d_{1,1} = d_{1,0} ⊕ p_{1,1} -> output_recv_data1_addr
+            memcpy(reinterpret_cast<void*>(task.output_recv_data1_addr), 
+                   reinterpret_cast<void*>(task.recv_d10_addr), task.size);
+            void* xor3_srcs[2] = {
+                reinterpret_cast<void*>(task.output_recv_data1_addr),  // destination (contains d_{1,0})
+                reinterpret_cast<void*>(task.recv_p11_addr)            // p_{1,1}
+            };
+            xor_gen(2, static_cast<int>(task.size), xor3_srcs);
+            // Result is now in output_recv_data1_addr (zero-copy)
+            
+            // XOR 4: p_{3,1} = d_{3,0} ⊕ d_{3,1} -> output_recv_parity1_addr
+            memcpy(reinterpret_cast<void*>(task.output_recv_parity1_addr), 
+                   reinterpret_cast<void*>(task.recv_d30_addr), task.size);
+            void* xor4_srcs[2] = {
+                reinterpret_cast<void*>(task.output_recv_parity1_addr),  // destination (contains d_{3,0})
+                reinterpret_cast<void*>(task.recv_d31_addr)               // d_{3,1}
+            };
+            xor_gen(2, static_cast<int>(task.size), xor4_srcs);
+            // Result is now in output_recv_parity1_addr (zero-copy)
+            
+            std::cout << "EC-NAIVE: [Rank 2] All 4 XOR operations completed for chunk (size=" 
                       << task.size << ")" << std::endl;
             
-            // FIX: After processing task, check if sentinel was received and queue is empty
+            // After processing task, check if sentinel was received and queue is empty
             if (load_xor_sentinel_received_.load()) {
                 std::lock_guard<std::mutex> lock(load_xor_queue_mutex_);
                 if (load_xor_queue_.empty()) {
@@ -3234,24 +4086,36 @@ private:
         std::cout << "EC-NAIVE: [Rank 2] Load XOR worker completed" << std::endl;
     }
 
-    // Load send worker (rank0/3 only): send blocks to rank2
+    // Load send worker (rank0/1/3): send blocks to rank2 (multiple sockets)
     void load_send_worker() {
         std::cout << "EC-NAIVE: [Rank " << rank_ << "] Load send worker started" << std::endl;
         
-        // Wait for connection
-        boost::asio::ip::tcp::socket* send_socket = nullptr;
+        // Wait for all connections based on rank
         if (rank_ == 0) {
-            while (!stop_ && !conn_.is_ecnaive_load_send_rank0_parity0_connected()) {
+            while (!stop_ && 
+                   (!conn_.is_ecnaive_load_send_rank0_parity0_connected() ||
+                    !conn_.is_ecnaive_load_send_rank0_data0_connected() ||
+                    !conn_.is_ecnaive_load_send_rank0_data1_connected())) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
-            send_socket = &conn_.get_ecnaive_load_send_rank0_parity0_socket();
+            std::cout << "EC-NAIVE: [Rank 0] All 3 connections established" << std::endl;
+        } else if (rank_ == 1) {
+            while (!stop_ && 
+                   (!conn_.is_ecnaive_load_send_rank1_data1_connected() ||
+                    !conn_.is_ecnaive_load_send_rank1_data0_connected() ||
+                    !conn_.is_ecnaive_load_send_rank1_parity1_connected())) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            std::cout << "EC-NAIVE: [Rank 1] All 3 connections established" << std::endl;
         } else if (rank_ == 3) {
-            while (!stop_ && !conn_.is_ecnaive_load_send_rank3_data1_connected()) {
+            while (!stop_ && 
+                   (!conn_.is_ecnaive_load_send_rank3_data1_connected() ||
+                    !conn_.is_ecnaive_load_send_rank3_data0_connected())) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
-            send_socket = &conn_.get_ecnaive_load_send_rank3_data1_socket();
+            std::cout << "EC-NAIVE: [Rank 3] All 2 connections established" << std::endl;
         } else {
-            return;  // rank1/2 don't use this worker
+            return;  // rank2 doesn't use this worker
         }
         
         while (!stop_) {
@@ -3285,12 +4149,47 @@ private:
                 continue;
             }
             
+            // Select socket based on rank and socket_type
+            boost::asio::ip::tcp::socket* send_socket = nullptr;
+            if (rank_ == 0) {
+                if (task.socket_type == 0) {
+                    send_socket = &conn_.get_ecnaive_load_send_rank0_parity0_socket();  // p_{2,0}
+                } else if (task.socket_type == 1) {
+                    send_socket = &conn_.get_ecnaive_load_send_rank0_data0_socket();   // d_{0,0}
+                } else if (task.socket_type == 2) {
+                    send_socket = &conn_.get_ecnaive_load_send_rank0_data1_socket();   // d_{3,1}
+                } else {
+                    std::cerr << "EC-NAIVE: [Rank 0] Invalid socket_type: " << task.socket_type << std::endl;
+                    continue;
+                }
+            } else if (rank_ == 1) {
+                if (task.socket_type == 1) {
+                    send_socket = &conn_.get_ecnaive_load_send_rank1_data0_socket();   // d_{1,0}
+                } else if (task.socket_type == 2) {
+                    send_socket = &conn_.get_ecnaive_load_send_rank1_data1_socket();   // d_{0,1}
+                } else if (task.socket_type == 3) {
+                    send_socket = &conn_.get_ecnaive_load_send_rank1_parity1_socket(); // p_{1,1}
+                } else {
+                    std::cerr << "EC-NAIVE: [Rank 1] Invalid socket_type: " << task.socket_type << std::endl;
+                    continue;
+                }
+            } else if (rank_ == 3) {
+                if (task.socket_type == 1) {
+                    send_socket = &conn_.get_ecnaive_load_send_rank3_data0_socket();   // d_{3,0}
+                } else if (task.socket_type == 2) {
+                    send_socket = &conn_.get_ecnaive_load_send_rank3_data1_socket();   // d_{2,1}
+                } else {
+                    std::cerr << "EC-NAIVE: [Rank 3] Invalid socket_type: " << task.socket_type << std::endl;
+                    continue;
+                }
+            }
+            
             // Send data (zero-copy from mmap or buffer)
             try {
                 send_with_size(*send_socket, task.send_addr, task.size);
                 
-                std::cout << "EC-NAIVE: [Rank " << rank_ << "] Sent chunk (size=" 
-                          << task.size << ")" << std::endl;
+                std::cout << "EC-NAIVE: [Rank " << rank_ << "] Sent chunk (socket_type=" 
+                          << task.socket_type << ", size=" << task.size << ")" << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "EC-NAIVE: [Rank " << rank_ << "] Send error: " << e.what() << std::endl;
             }
@@ -3382,23 +4281,68 @@ PYBIND11_MODULE(ecnaive_native, m) {
              pybind11::arg("rank") = -1)
         // EC-NAIVE load mode functions (rank2 recovery)
         .def("init_ecnaive_load_connections", &ECNaiveNative::init_ecnaive_load_connections,
-             "Initialize EC-NAIVE load mode connections (rank2 acceptor, rank0/3 connectors)",
+             "Initialize EC-NAIVE load mode connections (rank2 acceptor: 8 ports, rank0/1/3 connectors)",
              pybind11::arg("rank"),
              pybind11::arg("rank2_ip"),
              pybind11::arg("load_recv_rank3_data1_port"),
-             pybind11::arg("load_recv_rank0_parity0_port"))
+             pybind11::arg("load_recv_rank0_parity0_port"),
+             pybind11::arg("load_recv_rank0_data0_port"),
+             pybind11::arg("load_recv_rank1_data1_port"),
+             pybind11::arg("load_recv_rank1_data0_port"),
+             pybind11::arg("load_recv_rank1_parity1_port"),
+             pybind11::arg("load_recv_rank3_data0_port"),
+             pybind11::arg("load_recv_rank0_data1_port"))
         .def("submit_ecnaive_load_recovery", &ECNaiveNative::submit_ecnaive_load_recovery,
-             "Submit load recovery task for rank2 (recv + XOR)",
+             "Submit load recovery task for rank2 (recv + XOR) - legacy interface",
              pybind11::arg("recv_data1_addr"),
              pybind11::arg("recv_parity0_addr"),
              pybind11::arg("recovered_data0_addr"),
              pybind11::arg("size"))
+        .def("submit_ecnaive_load_recovery_full", &ECNaiveNative::submit_ecnaive_load_recovery_full,
+             "Submit full recovery task for rank2 (8 recv + 4 XOR)",
+             pybind11::arg("recv_p20_addr"),
+             pybind11::arg("recv_d21_addr"),
+             pybind11::arg("recv_d00_addr"),
+             pybind11::arg("recv_d01_addr"),
+             pybind11::arg("recv_d10_addr"),
+             pybind11::arg("recv_p11_addr"),
+             pybind11::arg("recv_d30_addr"),
+             pybind11::arg("recv_d31_addr"),
+             pybind11::arg("output_data0_addr"),
+             pybind11::arg("output_recv_parity0_addr"),
+             pybind11::arg("output_recv_data1_addr"),
+             pybind11::arg("output_recv_parity1_addr"),
+             pybind11::arg("size"))
         .def("submit_load_send_rank0_parity0", &ECNaiveNative::submit_load_send_rank0_parity0,
-             "Submit load send task for rank0 (send p_{0,0} to rank2)",
+             "Submit load send task for rank0 (send p_{2,0} to rank2)",
+             pybind11::arg("send_addr"),
+             pybind11::arg("size"))
+        .def("submit_load_send_rank0_data0", &ECNaiveNative::submit_load_send_rank0_data0,
+             "Submit load send task for rank0 (send d_{0,0} to rank2)",
+             pybind11::arg("send_addr"),
+             pybind11::arg("size"))
+        .def("submit_load_send_rank0_data1", &ECNaiveNative::submit_load_send_rank0_data1,
+             "Submit load send task for rank0 (send d_{3,1} to rank2)",
+             pybind11::arg("send_addr"),
+             pybind11::arg("size"))
+        .def("submit_load_send_rank1_data1", &ECNaiveNative::submit_load_send_rank1_data1,
+             "Submit load send task for rank1 (send d_{0,1} to rank2)",
+             pybind11::arg("send_addr"),
+             pybind11::arg("size"))
+        .def("submit_load_send_rank1_data0", &ECNaiveNative::submit_load_send_rank1_data0,
+             "Submit load send task for rank1 (send d_{1,0} to rank2)",
+             pybind11::arg("send_addr"),
+             pybind11::arg("size"))
+        .def("submit_load_send_rank1_parity1", &ECNaiveNative::submit_load_send_rank1_parity1,
+             "Submit load send task for rank1 (send p_{1,1} to rank2)",
              pybind11::arg("send_addr"),
              pybind11::arg("size"))
         .def("submit_load_send_rank3_data1", &ECNaiveNative::submit_load_send_rank3_data1,
-             "Submit load send task for rank3 (send d_{3,1} to rank2)",
+             "Submit load send task for rank3 (send d_{2,1} to rank2)",
+             pybind11::arg("send_addr"),
+             pybind11::arg("size"))
+        .def("submit_load_send_rank3_data0", &ECNaiveNative::submit_load_send_rank3_data0,
+             "Submit load send task for rank3 (send d_{3,0} to rank2)",
              pybind11::arg("send_addr"),
              pybind11::arg("size"))
         .def("submit_load_recv_sentinel", &ECNaiveNative::submit_load_recv_sentinel,
@@ -3406,7 +4350,7 @@ PYBIND11_MODULE(ecnaive_native, m) {
         .def("submit_load_xor_sentinel", &ECNaiveNative::submit_load_xor_sentinel,
              "Submit sentinel to load xor worker (rank2 only)")
         .def("submit_load_send_sentinel", &ECNaiveNative::submit_load_send_sentinel,
-             "Submit sentinel to load send worker (rank0/3 only)")
+             "Submit sentinel to load send worker (rank0/1/3 only)")
         .def("wait_for_load_completion", &ECNaiveNative::wait_for_load_completion,
              "Wait for load workers to complete (rank2 only)")
         // Software failure mode functions

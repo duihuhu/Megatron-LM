@@ -75,6 +75,7 @@ from .resharding import (
 from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
 from .state_dict_decomposer import DecomposedStateDict, TensorMetadata
 from time import time
+from time import sleep
 
 try:
     if not torch.cuda.is_available():
@@ -5158,6 +5159,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         own_metadata = registry.rank_metadata.get(rank, [])
         total_size = sum(meta.size_bytes for meta in own_metadata)
         
+        # torch.distributed.barrier()
         self._run_ecnaive_recovery_pipeline(
             rank=rank,
             world_size=world_size,
@@ -6564,8 +6566,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         torch.distributed.barrier()
         
         # Add a small delay to ensure acceptors are fully ready
-        import time
-        time.sleep(0.5)
+        # import time
+        sleep(0.5)
         
         logger.info(f"rank: {rank}, all ranks ready, finalizing recovery connections (Phase 2: connect)...")
         
@@ -6830,15 +6832,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                                 logger.warning(f"rank: {rank}, unhandled persistent_load pid: {pid}, returning as-is")
                                 return pid
                         
-                        try:
-                            metadata_buffer = io.BytesIO(metadata_bytes)
-                            unpickler = TorchUnpickler(metadata_buffer)
-                            gemini_metadata = unpickler.load()
-                        except Exception as e:
-                            logger.error(f"rank: {rank}, failed to unpickle metadata: {e}")
-                            # Fallback: try torch.load
-                            metadata_buffer = io.BytesIO(metadata_bytes)
-                            gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
+                        # try:
+                        #     metadata_buffer = io.BytesIO(metadata_bytes)
+                        #     unpickler = TorchUnpickler(metadata_buffer)
+                        #     gemini_metadata = unpickler.load()
+                        # except Exception as e:
+                        #     logger.error(f"rank: {rank}, failed to unpickle metadata: {e}")
+                        #     # Fallback: try torch.load
+                        metadata_buffer = io.BytesIO(metadata_bytes)
+                        gemini_metadata = torch.load(metadata_buffer, map_location='cpu', weights_only=False)
                         
                         # Extract buffer (zero-copy)
                         buffer_tensor = primary_buffer[8+metadata_size:]
@@ -6864,6 +6866,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         loaded_state_dict = self._restore_state_dict_from_gemini_format(
                             replica_buckets, sharded_state_dict
                         )
+                        end_time = time()
+                        logger.info(f"rank: {rank}, gemini replicas asio recovery rank2's checkpoint data time: {end_time - start_time:.4f}s")
                     else:
                         # Standard pickle format
                         logger.info(f"rank: {rank}, parsing as standard pickle format")
@@ -7801,6 +7805,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if len(all_total_bytes_list) == 0:
             return
         
+        
         max_total_bytes = max(all_total_bytes_list)
         eccheck_buffer_size = self.eccheck_manager.eccheck_buffer_size
         total_bytes = max_total_bytes
@@ -7974,6 +7979,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info("EC-CHECK: Activated buffer poller for load pipeline")
         
         try:
+            send_start_time = time()
             # === Step 8: Main pipeline loop (for rank2 hardware failure recovery) ===
             processed = 0
             #total_bytes = 20 * eccheck_buffer_size
@@ -8177,11 +8183,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # Wait for XOR worker to complete (which will submit all Step6 tasks)
             # Note: wait_for_encoding_completion waits for all workers including Step6,
             # so we need to wait twice: first for XOR, then send Step6 sentinel, then wait again
-            import time
+            
+            # import time
             while True:
                 # Check if XOR worker is completed (but not Step6 workers yet)
                 # We'll use a simple polling approach: wait a bit, then check
-                time.sleep(0.1)
+                sleep(0.01)
                 # Try to wait, but this will wait for all workers including Step6
                 # So we'll just wait once and send Step6 sentinel before the final wait
                 break
@@ -8207,6 +8214,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # Note: C++ should have wait_for_p2p_workers or similar, but for now we'll rely on
             # the encoding completion which should ensure P2P is done
             torch.cuda.synchronize()
+            end_time = time()
+            logger.info(f"EC-CHECK: Load pipeline: Pipeline completed in {end_time - send_start_time:.4f} seconds")
             logger.info("EC-CHECK: Load pipeline: Pipeline completed")
             
         finally:
@@ -8701,16 +8710,16 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info("EC-NAIVE: [Rank 2] Waiting for full recovery pipeline to complete...")
             self.ecnaive_manager._ecnaive_native.wait_for_load_completion()
             
-            logger.info("EC-NAIVE: [Rank 2] Full recovery pipeline completed")
-            logger.info(
-                f"EC-NAIVE: [Rank 2] Recovered 4 blocks:\n"
-                f"  - data0 (d_{2,0})\n"
-                f"  - recv_parity0 (p_{0,0})\n"
-                f"  - recv_data1 (d_{1,1})\n"
-                f"  - recv_parity1 (p_{3,1})"
-            )
+            # logger.info("EC-NAIVE: [Rank 2] Full recovery pipeline completed")
+            # logger.info(
+            #     f"EC-NAIVE: [Rank 2] Recovered 4 blocks:\n"
+            #     f"  - data0 (d_{2,0})\n"
+            #     f"  - recv_parity0 (p_{0,0})\n"
+            #     f"  - recv_data1 (d_{1,1})\n"
+            #     f"  - recv_parity1 (p_{3,1})"
+            # )
             end_time = time()
-            logger.info(f"EC-NAIVE: [Rank {rank}] Full recovery pipeline completed in {end_time - start_time:.2f} seconds")
+            logger.info(f"EC-NAIVE: [Rank {rank}] Full recovery pipeline completed in {end_time - start_time:.4f} seconds")
             
             # Note: All 4 blocks are now recovered and stored in ecnaive_blocks (zero-copy)
             # No need to copy - C++ pipeline wrote directly to ecnaive_blocks
@@ -8998,166 +9007,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         logger.info(f"EC-CHECK TEST: Preparation complete for rank {rank}")
         return True
     
-    def test_load_pipeline(self, test_data_size: int = 64 * 1024 * 1024):
-        """
-        Test load pipeline without requiring actual checkpoint files.
-        
-        This function creates mock data structures and directly calls the load pipeline
-        to test the rank2 recovery flow. All 4 ranks will participate, but the pipeline
-        will simulate rank2 failure recovery.
-        
-        Args:
-            test_data_size (int): Size of test data in bytes (default: 64MB)
-        """
-        import mmap
-        import ctypes
-        import struct
-        from .filesystem_async import EccheckMappedFile
-        from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
-        
-        # === Preparation ===
-        if not self.prepare_for_load_pipeline_test():
-            logger.error("EC-CHECK TEST: Preparation failed, aborting test")
-            return False
-        
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 4
-        
-        if world_size < 4:
-            logger.warning(f"EC-CHECK TEST: World size {world_size} < 4, test may not work correctly")
-        
-        logger.info(f"EC-CHECK TEST: Starting load pipeline test (rank={rank}, world_size={world_size}, test_data_size={test_data_size} bytes)")
-        
-        # === Step 1: Create mock TensorMetadata for all ranks ===
-        # For simplicity, each rank has one tensor chunk
-        rank_metadata = {}
-        for r in range(world_size):
-            # Create metadata for this rank
-            # In real scenario, rank0/1 have data, rank2/3 have parity
-            # For test, we'll create data for all ranks
-            chunk_type = 'data' if r < 2 else 'parity'
-            metadata = TensorMetadata(
-                key=f"test_tensor_rank_{r}",
-                shape=(test_data_size,),
-                dtype='torch.uint8',
-                size_bytes=test_data_size,
-                global_offset=(0,),
-                shard_index=0,
-                chunk_type=chunk_type,
-                target_rank=r,
-                source_rank=r
-            )
-            rank_metadata[r] = [metadata]
-        
-        # Create GlobalMetadataRegistry
-        registry = GlobalMetadataRegistry(
-            rank_metadata=rank_metadata,
-            rank_non_tensor_data={r: {} for r in range(world_size)}
-        )
-        
-        logger.info(f"EC-CHECK TEST: Created registry with {len(rank_metadata)} ranks")
-        
-        # === Step 2: Create mock EccheckMappedFile for own_file and partner_file ===
-        # We'll use torch tensors as data source, then create mmap-like objects
-        
-        # For own_file: rank0/3 have their own data/parity
-        # For partner_file: rank0/3 have partner's data/parity (for Step2 P2P send)
-        p2p_partner_rank = self._get_p2p_partner_rank(rank, world_size)
-        
-        # Create test data: fill with rank-specific pattern for verification
-        own_data = torch.full((test_data_size,), rank, dtype=torch.uint8)
-        partner_data = torch.full((test_data_size,), p2p_partner_rank, dtype=torch.uint8)
-        
-        # Create mmap-like objects from torch tensors
-        # Use PyTorch's data_ptr() to get the actual memory address
-        # This is more reliable than ctypes.addressof for torch tensors
-        own_memory_address = int(own_data.data_ptr())
-        partner_memory_address = int(partner_data.data_ptr())
-        
-        # Create EccheckMappedFile objects
-        # Note: We use None for mmap_object since we're using torch tensor memory
-        # The memory_address points to the actual data
-        mapped_file_own = EccheckMappedFile(
-            mmap_object=None,  # Not a real mmap, but we keep data in torch tensor
-            memory_address=own_memory_address,
-            file_size=test_data_size,
-            local_metadata=rank_metadata.get(rank, []),
-            non_tensor_data={}
-        )
-        
-        mapped_file_partner = EccheckMappedFile(
-            mmap_object=None,  # Not a real mmap, but we keep data in torch tensor
-            memory_address=partner_memory_address,
-            file_size=test_data_size,
-            local_metadata=rank_metadata.get(p2p_partner_rank, []),
-            non_tensor_data={}
-        )
-        
-        # Keep references to prevent garbage collection
-        mapped_file_own._data_ref = own_data
-        mapped_file_partner._data_ref = partner_data
-        
-        logger.info(f"EC-CHECK TEST: Created mock mapped files (own_addr={own_memory_address}, partner_addr={partner_memory_address})")
-        
-        # === Step 3: Create recv_own_buffer ===
-        # This is where rank2 will receive the recovered data
-        recv_own_buffer = torch.empty(test_data_size, dtype=torch.uint8)
-        recv_total_size = test_data_size
-        
-        logger.info(f"EC-CHECK TEST: Created recv_own_buffer (size={recv_total_size} bytes)")
-        
-        # === Step 4: Call the pipeline ===
-        try:
-            logger.info(f"EC-CHECK TEST: Calling _run_eccheck_p2p_pipeline_simple...")
-            self._run_eccheck_p2p_pipeline_simple(
-                rank=rank,
-                world_size=world_size,
-                registry=registry,
-                mapped_file_own=mapped_file_own,
-                mapped_file_partner=mapped_file_partner,
-                recv_own_buffer=recv_own_buffer,
-                recv_total_size=recv_total_size,
-            )
-            logger.info(f"EC-CHECK TEST: Pipeline completed successfully for rank {rank}")
-            
-            # === Step 5: Verify results (for rank2) ===
-            if rank == 2:
-                # Check if own_buffer contains recovered d2
-                if self.eccheck_p2p_buffers is not None:
-                    own_buffer = self.eccheck_p2p_buffers['own_buffer']
-                    partner_buffer = self.eccheck_p2p_buffers['partner_buffer']
-                    
-                    logger.info(f"EC-CHECK TEST: Rank2 verification:")
-                    logger.info(f"  own_buffer shape: {own_buffer.shape}, dtype: {own_buffer.dtype}")
-                    logger.info(f"  partner_buffer shape: {partner_buffer.shape}, dtype: {partner_buffer.dtype}")
-                    
-                    # Check if buffers are not all zeros (basic sanity check)
-                    own_nonzero = torch.count_nonzero(own_buffer).item()
-                    partner_nonzero = torch.count_nonzero(partner_buffer).item()
-                    
-                    logger.info(f"  own_buffer non-zero elements: {own_nonzero} / {own_buffer.numel()}")
-                    logger.info(f"  partner_buffer non-zero elements: {partner_nonzero} / {partner_buffer.numel()}")
-                    
-                    if own_nonzero == 0:
-                        logger.warning("EC-CHECK TEST: WARNING - own_buffer is all zeros!")
-                    if partner_nonzero == 0:
-                        logger.warning("EC-CHECK TEST: WARNING - partner_buffer is all zeros!")
-                else:
-                    logger.warning("EC-CHECK TEST: Rank2 - eccheck_p2p_buffers is None")
-            
-            logger.info(f"EC-CHECK TEST: Test completed successfully for rank {rank}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"EC-CHECK TEST: Pipeline failed with error: {e}", exc_info=True)
-            raise
-            if mgr._buffer_poller_active_event:
-                mgr._buffer_poller_active_event.clear()
-                logger.info("EC-CHECK: Deactivated buffer poller after load pipeline completion")
-            
-            # Final poll to ensure all buffers are released
-            mgr._poll_and_release_buffers()
-
     def _allocate_p2p_buffers(self, global_registry):
         """
         Allocate TWO large continuous buffers for P2P stage (load phase).
@@ -10368,15 +10217,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if input_args.use_eccheck and (is_eccheck_checkpoint or is_recovery_scenario):
             logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")
             # Load P2P checkpoint data (for rank2 recovery, this prepares the buffer)
-            start_recovery_time = time()
             mapped_file_own, mapped_file_partner = self._load_ecccheck_p2p_checkpoint(checkpoint_dir)
             
             # _load_eccheck_checkpoint will use recovered data if available (rank2)
+            start_recovery_time = time()
             mcore_state_dict = self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
             torch.distributed.barrier()
             end_recovery_time = time()
             recovery_time = end_recovery_time - start_recovery_time
-            logger.info(f"rank: {rank}, EC-CHECK recovery time: {recovery_time:.2f} seconds")
+            logger.info(f"rank: {rank}, EC-CHECK recovery load to time: {recovery_time:.4f} seconds")
             return mcore_state_dict
         
         if input_args.use_eclatin and (self._is_eclatin_checkpoint(checkpoint_dir) or rank == 2):
@@ -10412,7 +10261,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # torch.distributed.barrier()
             ecnaive_recovery_end_time = time()
             ecnaive_recovery_time = ecnaive_recovery_end_time - ecnaive_recovery_start_time
-            logger.info(f"EC-NAIVE: [Rank {rank}] EC-NAIVE recovery time: {ecnaive_recovery_time:.2f} seconds")
+            logger.info(f"EC-NAIVE: [Rank {rank}] EC-NAIVE recovery time: {ecnaive_recovery_time:.4f} seconds")
             return mcore_state_dict
         
         # Apply N-D tensors resharding

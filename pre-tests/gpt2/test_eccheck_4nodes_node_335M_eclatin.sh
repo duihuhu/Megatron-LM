@@ -127,11 +127,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-gemini-hardware-failure
     # --use-distributed-optimizer
     --use-eclatin
-<<<<<<< Updated upstream
     # --use-eclatin-software-failure
-=======
-    #--use-eclatin-software-failure
->>>>>>> Stashed changes
     --ckpt-format torch_dist
     --save-embeddings-separately
 )

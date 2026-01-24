@@ -10147,20 +10147,20 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     recovered_state_dict = self._load_gemini_checkpoint_recovery_asio(sharded_state_dict, checkpoint_dir)
                     end_recovery_time = time()
                     recovery_time = end_recovery_time - start_recovery_time
-                    logger.info(f"rank: {rank}, gemini asio recovery time: {recovery_time:.2f} seconds")
+                    logger.info(f"rank: {rank}, gemini asio recovery time: {recovery_time:.4f} seconds")
                 else:
                     logger.info(f"rank: {rank}, using standard recovery for rank2 failure")
                     recovered_state_dict = self._load_gemini_checkpoint_recovery(sharded_state_dict, checkpoint_dir)
                     end_recovery_time = time()
                     recovery_time = end_recovery_time - start_recovery_time
-                    logger.info(f"rank: {rank}, gemini standard recovery time: {recovery_time:.2f} seconds")
+                    logger.info(f"rank: {rank}, gemini standard recovery time: {recovery_time:.4f} seconds")
             else:
                 logger.info(f"rank: {rank}, not participating in rank2 recovery, loading from own checkpoint file")
                 # Other ranks (rank1, rank3) load from their own saved checkpoint files
                 recovered_state_dict = self._load_from_saved_checkpoint_file(sharded_state_dict, checkpoint_dir)
                 load_end_time = time()
                 load_time = load_end_time - start_recovery_time
-                logger.info(f"rank: {rank}, gemini asio load time: {load_time:.2f} seconds")
+                logger.info(f"rank: {rank}, gemini asio load time: {load_time:.4f} seconds")
             # ALL ranks must synchronize here (including rank1 and rank3)
             # This ensures no rank proceeds to collective operations while others are still in recovery
             if torch.distributed.is_initialized():

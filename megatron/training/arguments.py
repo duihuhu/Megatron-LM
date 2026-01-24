@@ -2126,6 +2126,10 @@ def _add_checkpointing_args(parser):
                        'checkpoints _except the last checkpoint_ are automatically deleted).')
     group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
+    group.add_argument('--save-embeddings-separately', action='store_true', default=False,
+                       help='Save embedding layers (word_embeddings and position_embeddings) to a separate '
+                       'shared file (embeddings_shared.pt) and exclude them from redundancy backups '
+                       '(Gemini/EC). Reduces network traffic and balances storage across ranks.')
     group.add_argument('--no-save-rng', action='store_true', default=None,
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,

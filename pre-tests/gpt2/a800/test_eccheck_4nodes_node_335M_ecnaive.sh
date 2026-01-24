@@ -7,22 +7,21 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=eth0
+export NETIFACES_INTERFACE=bond0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-
 GPUS_PER_NODE=1
-MASTER_ADDR=172.16.0.1
-export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
-export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
+MASTER_ADDR=10.0.0.62
+
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
 NNODES=4
 
-export GEMINI_INTERFACE=$NETIFACES_INTERFACE
-
+export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
+export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
+export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -37,14 +36,19 @@ export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 # Set CUDA_VISIBLE_DEVICES for each node
-# export CUDA_VISIBLE_DEVICES=$NODE_RANK
+# if ! nvidia-smi -L | grep -q "GPU ${NODE_RANK}:"; then
+#     CUDA_VISIBLE_DEVICES=0
+# else
+#     CUDA_VISIBLE_DEVICES=$NODE_RANK
+# fi
+# export CUDA_VISIBLE_DEVICES
+export CUDA_VISIBLE_DEVICES=$NODE_RANK
 
-export CUDA_VISIBLE_DEVICES=0
-VOCAB_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
-MERGE_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
+VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
+MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-gemini-naive" #<Specify path>
+CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-naive" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -111,18 +115,21 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH
+    # --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
 
-    --use-gemini
+    # --use-gemini
     # --use-gemini-optimized
     # --use-gemini-software-failure
-    --use-gemini-hardware-failure
-
-    # --use-eclatin
+    # --use-gemini-hardware-failure
+    # --use-distributed-optimizer
+    #--use-ecnaive-software-failure
+    --use-ecnaive
     --ckpt-format torch_dist
+    # --no-save-optim
+    # --no-load-optim
     --save-embeddings-separately
 )
 

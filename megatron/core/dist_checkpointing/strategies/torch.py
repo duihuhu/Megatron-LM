@@ -119,6 +119,53 @@ def register_default_torch_strategies():
 logger = getLogger(__name__)
 
 
+def filter_embeddings_from_sharded_state_dict(sharded_state_dict: ShardedStateDict) -> ShardedStateDict:
+    """
+    Filter out embedding layers from sharded state dict for redundancy backup.
+    
+    This function removes word_embeddings and position_embeddings from the state dict
+    to reduce network traffic and storage when using redundancy backup strategies
+    (Gemini/EC series). The embeddings are saved separately by rank 0.
+    
+    Args:
+        sharded_state_dict: The sharded state dict to filter
+        
+    Returns:
+        Filtered sharded state dict without embedding layers
+    """
+    try:
+        from megatron.training import get_args
+        args = get_args()
+        save_embeddings_separately = getattr(args, 'save_embeddings_separately', False)
+        
+        if not save_embeddings_separately:
+            return sharded_state_dict
+        
+        filtered = {}
+        embedding_keys_filtered = []
+        
+        for key, value in sharded_state_dict.items():
+            # Filter out word_embeddings and position_embeddings
+            if 'embedding.word_embeddings.weight' in key or \
+               'embedding.position_embeddings.weight' in key:
+                embedding_keys_filtered.append(key)
+                continue
+            filtered[key] = value
+        
+        if embedding_keys_filtered:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            logger.info(
+                f"Rank {rank}: Filtered {len(embedding_keys_filtered)} embedding keys for redundancy backup"
+            )
+            logger.debug(f"Rank {rank}: Filtered keys: {embedding_keys_filtered}")
+        
+        return filtered
+    except Exception as e:
+        # If any error occurs (e.g., get_args() fails), just return original state dict
+        logger.warning(f"Failed to filter embeddings: {e}, returning original state dict")
+        return sharded_state_dict
+
+
 def flatten_state_dict(
     state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, Dict[str, OBJ_PATH]]:
@@ -1065,6 +1112,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             )
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
+        
+        # Filter embeddings for backup strategies (Gemini/EC)
+        # This reduces network traffic and storage in redundancy backups
+        pyt_state_dict = filter_embeddings_from_sharded_state_dict(pyt_state_dict)
+        
         from megatron.training import get_args as input_args
         args = input_args()
         # Use PyT saving mechanism
@@ -7908,9 +7960,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 logger.info(f"EC-CHECK: [Rank {rank}] No action needed for rank1 recovery")
             
             # Synchronize all ranks and return early (skip full encoding/XOR pipeline)
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
-                logger.info(f"EC-CHECK: [Rank {rank}] Synchronized after simple P2P transfer")
+            # if torch.distributed.is_initialized():
+            #     torch.distributed.barrier()
+            #     logger.info(f"EC-CHECK: [Rank {rank}] Synchronized after simple P2P transfer")
             
             logger.info(f"EC-CHECK: [Rank {rank}] rank1 software failure recovery completed (simple synchronous P2P, no worker queue)")
             return
@@ -8412,7 +8464,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             logger.info("ECLATIN: [Rank 2] Recovery pipeline completed")
             end_time = time()
-            logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.2f} seconds")
+            logger.info(f"ECLATIN: [Rank {rank}] Recovery pipeline completed in {end_time - start_time:.4f} seconds")
             # Copy recovered blocks to recovered_buffer (combine data_block_1 and data_block_2)
             # CRITICAL FIX: Use actual_tensor_buffer_size // 2 as split point (same as save phase's actual_data_bytes // 2)
             # Save phase splits actual data at actual_data_bytes // 2, not pipeline_total_bytes // 2
@@ -10297,7 +10349,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             end_recovery_time = time()
             recovery_time = end_recovery_time - start_recovery_time
-            logger.info(f"rank: {rank}, Gemini Replicas hardware failure recovery time: {recovery_time:.2f} seconds")
+            logger.info(f"rank: {rank}, Gemini Replicas hardware failure recovery time: {recovery_time:.4f} seconds")
             
             if recovered_state_dict:
                 logger.info(f"rank: {rank}, returning loaded state dict from Gemini Replicas recovery")
@@ -10343,10 +10395,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 eclatin_recovery_start_time = time()
                 # _load_eclatin_checkpoint will use recovered data if available (rank2)
                 mcore_state_dict = self._load_eclatin_checkpoint(sharded_state_dict, checkpoint_dir)
-                torch.distributed.barrier()
+                # torch.distributed.barrier()
                 eclatin_recovery_end_time = time()
                 eclatin_recovery_time = eclatin_recovery_end_time - eclatin_recovery_start_time
-                logger.info(f"ECLATIN: [Rank {rank}] ECLATIN recovery time: {eclatin_recovery_time:.2f} seconds")
+                logger.info(f"ECLATIN: [Rank {rank}] ECLATIN recovery time: {eclatin_recovery_time:.4f} seconds")
                 return mcore_state_dict
         
         if input_args.use_ecnaive and (self._is_ecnaive_checkpoint(checkpoint_dir) or rank == 2):

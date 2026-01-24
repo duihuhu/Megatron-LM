@@ -111,7 +111,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH
+    # --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
@@ -125,6 +125,9 @@ EVAL_AND_LOGGING_ARGS=(
 
     # --use-eclatin
     --ckpt-format torch_dist
+    # --no-save-optim
+    # --no-load-optim
+    --save-embeddings-separately
 )
 
 mkdir -p logs

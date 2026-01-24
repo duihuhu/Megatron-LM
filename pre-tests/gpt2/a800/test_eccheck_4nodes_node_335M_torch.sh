@@ -21,8 +21,6 @@ export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
 NNODES=4
 
-export GEMINI_INTERFACE=$NETIFACES_INTERFACE
-
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -44,7 +42,7 @@ VOCAB_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-gemini-naive" #<Specify path>
+CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -111,19 +109,18 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH
+    # --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
 
-    --use-gemini
+    # --use-gemini
     # --use-gemini-optimized
     # --use-gemini-software-failure
-    --use-gemini-hardware-failure
+    # --use-gemini-hardware-failure
 
     # --use-eclatin
-    --ckpt-format torch_dist
-    --save-embeddings-separately
+    --ckpt-format torch
 )
 
 mkdir -p logs

@@ -16,11 +16,7 @@ export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
 
 GPUS_PER_NODE=1
-<<<<<<< Updated upstream
-MASTER_ADDR=172.16.0.1
-=======
 MASTER_ADDR=127.0.0.1
->>>>>>> Stashed changes
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_USE_ASIO=true
@@ -42,16 +38,7 @@ export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 # Set CUDA_VISIBLE_DEVICES for each node
-<<<<<<< Updated upstream
 # export CUDA_VISIBLE_DEVICES=$NODE_RANK
-=======
-if ! nvidia-smi -L | grep -q "GPU ${NODE_RANK}:"; then
-    CUDA_VISIBLE_DEVICES=0
-else
-    CUDA_VISIBLE_DEVICES=$NODE_RANK
-fi
-export CUDA_VISIBLE_DEVICES
->>>>>>> Stashed changes
 
 export CUDA_VISIBLE_DEVICES=0
 VOCAB_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"

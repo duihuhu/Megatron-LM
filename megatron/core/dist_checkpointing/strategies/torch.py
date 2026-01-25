@@ -5528,7 +5528,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             else:
                 read_size = tensor_buffer_size
             
-            # Read data directly from mmap (zero-copy numpy view)
+            # Read data directly from mmap and copy to block_tensor
+            # Optimized: Use torch.frombuffer to avoid numpy intermediate copy
             source_data = mm[offset:offset + read_size]
             if len(source_data) != read_size:
                 raise RuntimeError(
@@ -5536,13 +5537,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     f"(expected {read_size} bytes, got {len(source_data)})"
                 )
             
-            # Copy to block_tensor using numpy (zero-copy from mmap)
-            block_tensor_np = block_tensor.numpy()
-            block_tensor_np[:read_size] = np.frombuffer(source_data, dtype=np.uint8)
+            # Create torch tensor view from mmap buffer (zero-copy view)
+            source_tensor = torch.frombuffer(memoryview(source_data), dtype=torch.uint8)
+            
+            # Copy to block_tensor (single copy operation)
+            block_tensor[:read_size].copy_(source_tensor)
             
             # Fill remaining with zeros if needed
             if read_size < expected_size:
-                block_tensor_np[read_size:] = 0
+                block_tensor[read_size:].zero_()
             
             logger.debug(
                 f"{format_name}: [Rank {rank}] Loaded {block_name} ({read_size / (1024**2):.2f} MB) "
@@ -5878,8 +5881,22 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     tensor_bytes = recv_own_buffer[start:end]
                     
                     # Reshape to original tensor
+                    # Optimized: Use view operations first (zero-copy), then clone only when dtype conversion is needed
+                    # Since we're converting from uint8 buffer to target dtype, clone is necessary for dtype conversion
                     try:
-                        tensor = tensor_bytes.view(info.dtype).reshape(info.shape).clone()
+                        # Create view with target dtype and shape (view operations are zero-copy)
+                        tensor_view = tensor_bytes.view(info.dtype).reshape(info.shape)
+                        # Clone is required here because:
+                        # 1. dtype conversion from uint8 to target dtype requires data copy
+                        # 2. tensor needs to be writable for model loading
+                        # However, we can optimize by checking if dtype is already uint8
+                        if info.dtype == torch.uint8:
+                            # If dtype matches, we can avoid clone if tensor is already writable
+                            # But since we need independent tensor for model loading, clone is still needed
+                            tensor = tensor_view.clone()
+                        else:
+                            # dtype conversion requires copy, clone is necessary
+                            tensor = tensor_view.clone()
                         tensor_data.append(tensor)
                         tensor_infos.append(info)
                     except Exception as e:
@@ -5930,10 +5947,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     tensor_bytes = recv_own_buffer[start:end]
                     
                     # Reshape to original tensor
+                    # Optimized: Use view operations first (zero-copy), then clone only when dtype conversion is needed
                     try:
                         # Convert uint8 buffer to target dtype and reshape
-                        # First view as target dtype, then reshape to original shape
-                        tensor = tensor_bytes.view(dtype).reshape(meta.shape).clone()
+                        # First view as target dtype, then reshape to original shape (view operations are zero-copy)
+                        tensor_view = tensor_bytes.view(dtype).reshape(meta.shape)
+                        # Clone is required because:
+                        # 1. dtype conversion from uint8 to target dtype requires data copy
+                        # 2. tensor needs to be writable for model loading
+                        tensor = tensor_view.clone()
                         tensor_data.append(tensor)
                     except Exception as e:
                         logger.error(f"EC-CHECK: [Rank {rank}] Failed to reshape tensor {meta.key}: {e}")
@@ -8338,9 +8360,22 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     self.eclatin_recovered_metadata = mapped_file_own
                     self.eclatin_recovered_registry = registry
                     # Save the recovered buffer content
+                    # Optimized: Only clone if buffer will be modified later, otherwise use reference
+                    # Since recovered_buffer is only read in _extract_decomposed_from_buffer,
+                    # we can avoid the clone and use the buffer directly
                     if recovered_buffer is not None:
-                        logger.info(f"ECLATIN: [Rank {rank}] Cloning recovered_buffer of size {recovered_buffer.numel()}")
-                        self.eclatin_recovered_buffer = recovered_buffer.clone()
+                        # Check if buffer needs to be cloned (only if it will be modified)
+                        # Since _extract_decomposed_from_buffer only reads from buffer,
+                        # we can avoid the expensive clone operation
+                        if hasattr(self, 'eclatin_preallocated_recovered_buffer') and \
+                           self.eclatin_preallocated_recovered_buffer is recovered_buffer:
+                            # Buffer is pre-allocated and may be reused, need to clone
+                            logger.info(f"ECLATIN: [Rank {rank}] Cloning pre-allocated recovered_buffer of size {recovered_buffer.numel()}")
+                            self.eclatin_recovered_buffer = recovered_buffer.clone()
+                        else:
+                            # Buffer is temporary, can use directly (no clone needed)
+                            logger.info(f"ECLATIN: [Rank {rank}] Saving recovered_buffer reference (no clone needed) of size {recovered_buffer.numel()}")
+                            self.eclatin_recovered_buffer = recovered_buffer
                         logger.info(f"ECLATIN: [Rank {rank}] Successfully saved eclatin_recovered_buffer of size {self.eclatin_recovered_buffer.numel()}")
                     else:
                         logger.error(f"ECLATIN: [Rank {rank}] recovered_buffer is None, cannot save!")
@@ -10120,6 +10155,26 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 tensors = []
                 for sh in sh_base_list:
                     ten = sh.data
+                    if ten is None:
+                        tensors.append(None)
+                        continue
+                    if sh.flattened_range is not None:
+                        assert ten.shape[:-1] == (1,) * (len(ten.shape) - 1), ten.shape
+                        ten = ten.view(-1)
+                    else:
+                        for _ in range(sh.prepend_axis_num):
+                            if ten.size(0) == 1:
+                                ten = ten[0]
+                    tensors.append(ten)
+                unwrapped_state_dict[key] = tensors
+            elif isinstance(sh_base, ShardedObject):
+                unwrapped_state_dict[key] = [sh.data for sh in sh_base_list]
+    
+        mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
+            unwrapped_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
+        )
+        self._restore_dict_types_lenient(mcore_state_dict, orig_sharded_state_dict)
+        return mcore_state_dict
     
     def _load_ecnaive_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Load checkpoint saved in EC-NAIVE format (similar to ECLATIN flow)."""

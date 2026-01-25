@@ -21,7 +21,7 @@ export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
 NNODES=4
 
-export ECCHECK_INTERFACE=$NETIFACES_INTERFACE
+export GEMINI_INTERFACE=$NETIFACES_INTERFACE
 
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
@@ -37,21 +37,14 @@ export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 # Set CUDA_VISIBLE_DEVICES for each node
-# if ! nvidia-smi -L | grep -q "GPU ${NODE_RANK}:"; then
-#     CUDA_VISIBLE_DEVICES=0
-# else
-#     CUDA_VISIBLE_DEVICES=$NODE_RANK
-# fi
-# export CUDA_VISIBLE_DEVICES
 # export CUDA_VISIBLE_DEVICES=$NODE_RANK
 
 export CUDA_VISIBLE_DEVICES=0
-
 VOCAB_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-eccheck" #<Specify path>
+CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-gemini-naive" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -121,12 +114,12 @@ EVAL_AND_LOGGING_ARGS=(
     --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --use-eccheck
-    --use-eccheck-software-failure
-    # --use-gemini
+    # --use-eccheck
+
+    --use-gemini
     # --use-gemini-optimized
     # --use-gemini-software-failure
-    # --use-gemini-hardware-failure
+    --use-gemini-hardware-failure
 
     # --use-eclatin
     --ckpt-format torch_dist
@@ -151,7 +144,6 @@ echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \
 
-export ECCHECK_USE_ASIO=true
 PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     pretrain_gpt.py \
     ${GPT_ARGS[@]} \

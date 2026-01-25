@@ -1911,7 +1911,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         start = time()
         self.eccheck_global_registry = self._broadcast_and_exchange_metadata()
         metadata_time = time() - start
-        logger.info(f"EC-CHECK: Metadata exchange completed in {metadata_time:.2f}s")
+        logger.info(f"EC-CHECK: Metadata exchange completed in {metadata_time:.4f}s")
         
         # Step 5: Allocate receive buffers based on peer data size
         start = time()
@@ -4719,7 +4719,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         )
         data_end_time = time()
         data_time = data_end_time - data_start_time
-        logger.info(f"EC-CHECK: [Rank {rank}] Data exchange completed in {data_time:.2f}s")
+        logger.info(f"EC-CHECK: [Rank {rank}] Data exchange completed in {data_time:.4f}s")
         # For rank2 recovery: save recovered data for later use in _load_eccheck_checkpoint
         if rank == failed_rank:
             logger.info(f"EC-CHECK: [Rank {rank}] Saving recovered buffer for _load_eccheck_checkpoint")
@@ -4974,7 +4974,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if local_package['tensor_metadata'] is None or local_package['non_tensor_data'] is None:
                 logger.error(f"EC-NAIVE: [Rank {rank}] Local metadata is None, skipping metadata exchange")
                 return mapped_file_own, None
-
+            send_start_time = time()
             # All-gather complete metadata using all_gather_object
             all_metadata = [{}] * world_size
             if torch.distributed.is_initialized():
@@ -5017,7 +5017,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 # Save metadata (align with hardware version)
                 self.ecnaive_recovered_metadata = mapped_file_own
                 self.ecnaive_recovered_registry = registry
-
+                send_end_time = time()
+                logger.info(f"EC-NAIVE: [Rank 2] Software recovery load to time: {send_end_time - send_start_time:.4f} seconds")
                 logger.info(f"EC-NAIVE: [Rank 2] Software recovery completed: d20_size={d20_size}, total={total_size}")
 
             elif rank == 3:
@@ -7094,6 +7095,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 pass
             raise
         
+        soft_start_time = time()
         # Restore state_dict from write_buckets
         # Check if this is Gemini optimized format
         # Priority 1: Check command-line flags if available
@@ -7129,8 +7131,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             loaded_state_dict = self._restore_state_dict_from_write_buckets(
                 write_buckets, sharded_state_dict
             )
-        
-        logger.info(f"rank: {rank}, successfully restored state_dict from saved checkpoint file")
+            
+        soft_end_time = time()
+        logger.info(f"rank: {rank}, successfully restored state_dict from saved checkpoint file {soft_end_time - soft_start_time:.4f}s.")
         return loaded_state_dict
     
     def _load_gemini_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
@@ -10179,7 +10182,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # torch.distributed.barrier()
             end_recovery_time = time()
             recovery_time = end_recovery_time - start_recovery_time
-            logger.info(f"rank: {rank}, Gemini software failure recovery time: {recovery_time:.2f} seconds")
+            logger.info(f"rank: {rank}, Gemini software failure recovery time: {recovery_time:.4f} seconds")
             return recovered_state_dict
                 
         # Gemini Replicas checkpoint recovery for rank2 failure scenario
@@ -10222,7 +10225,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # _load_eccheck_checkpoint will use recovered data if available (rank2)
             start_recovery_time = time()
             mcore_state_dict = self._load_eccheck_checkpoint(sharded_state_dict, checkpoint_dir)
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
             end_recovery_time = time()
             recovery_time = end_recovery_time - start_recovery_time
             logger.info(f"rank: {rank}, EC-CHECK recovery load to time: {recovery_time:.4f} seconds")

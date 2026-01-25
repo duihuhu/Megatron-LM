@@ -3,24 +3,29 @@
 # Script to run a single node in 4-node simulation (1 GPU per node)
 # Usage: ./test_eccheck_4nodes_node.sh <node_rank> [additional_args...]
 # Example: ./test_eccheck_4nodes_node.sh 0
+export ECLATIN_NUM_CUDA_STREAMS=1
+
+export NETIFACES_INTERFACE=eth0
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=eth0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
 
 GPUS_PER_NODE=1
+<<<<<<< Updated upstream
 MASTER_ADDR=172.16.0.1
+=======
+MASTER_ADDR=127.0.0.1
+>>>>>>> Stashed changes
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
 NNODES=4
-
 export ECCHECK_INTERFACE=$NETIFACES_INTERFACE
 
 # If first argument is a numeric node rank use it, otherwise default to 0
@@ -37,21 +42,23 @@ export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 # Set CUDA_VISIBLE_DEVICES for each node
-# if ! nvidia-smi -L | grep -q "GPU ${NODE_RANK}:"; then
-#     CUDA_VISIBLE_DEVICES=0
-# else
-#     CUDA_VISIBLE_DEVICES=$NODE_RANK
-# fi
-# export CUDA_VISIBLE_DEVICES
+<<<<<<< Updated upstream
 # export CUDA_VISIBLE_DEVICES=$NODE_RANK
+=======
+if ! nvidia-smi -L | grep -q "GPU ${NODE_RANK}:"; then
+    CUDA_VISIBLE_DEVICES=0
+else
+    CUDA_VISIBLE_DEVICES=$NODE_RANK
+fi
+export CUDA_VISIBLE_DEVICES
+>>>>>>> Stashed changes
 
 export CUDA_VISIBLE_DEVICES=0
-
 VOCAB_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-eccheck" #<Specify path>
+CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-eclatin-layerwise" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -103,7 +110,7 @@ GPT_ARGS=(
     --use-mcore-models 
     --transformer-impl transformer_engine 
     --no-scatter-gather-tensors-in-pipeline 
-    --num-layers 24 
+    --num-layers 12
     --optimizer adam
     --loss-scale 8192
 )
@@ -118,17 +125,20 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH
+    # --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --use-eccheck
-    --use-eccheck-software-failure
+    # --use-eccheck
+
     # --use-gemini
     # --use-gemini-optimized
     # --use-gemini-software-failure
     # --use-gemini-hardware-failure
 
-    # --use-eclatin
+    --use-eclatin
+    --use-eclatin-layerwise
+    # --data-parallel-sharding-strategy optim_grads_params
+    # --use-distributed-optimizer
     --ckpt-format torch_dist
     --save-embeddings-separately
 )
@@ -151,7 +161,6 @@ echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \
 
-export ECCHECK_USE_ASIO=true
 PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     pretrain_gpt.py \
     ${GPT_ARGS[@]} \

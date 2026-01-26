@@ -4177,7 +4177,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 return
             
             # Default buffer size: 4GB (adjustable via args if needed)
-            buffer_size_gb = getattr(args, 'gemini_recovery_buffer_size_gb', 2)
+            buffer_size_gb = getattr(args, 'gemini_recovery_buffer_size_gb', 5)
             buffer_size_bytes = buffer_size_gb * 1024 * 1024 * 1024
             
             logger.info(f"rank: {rank}, allocating Gemini recovery buffers: {buffer_size_gb} GB each")
@@ -5861,7 +5861,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 logger.warning(f"EC-CHECK: [Rank {rank}] No local_metadata available for reconstruction")
                 return None
             
-            logger.info(f"EC-CHECK: [Rank {rank}] Reconstructing from {len(local_metadata)} tensor metadata entries")
+            # logger.info(f"EC-CHECK: [Rank {rank}] Reconstructing from {len(local_metadata)} tensor metadata entries")
             
             # CRITICAL FIX: Use original tensor_infos with offset if available
             # The recovered buffer contains data in the order saved (with proper offsets),
@@ -5871,7 +5871,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             # Check if mapped_file_own has original tensor_infos with offset information
             if hasattr(mapped_file_own, 'tensor_infos') and mapped_file_own.tensor_infos:
-                logger.info(f"EC-CHECK: [Rank {rank}] Using tensor_infos with offset from mapped_file")
+                # logger.info(f"EC-CHECK: [Rank {rank}] Using tensor_infos with offset from mapped_file")
                 # Use original tensor_infos with correct offset
                 for info in mapped_file_own.tensor_infos:
                     start = info.offset  # Use offset from TensorInfo (from save phase)
@@ -5907,7 +5907,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         return None
             else:
                 # Fallback: sequential extraction (may cause mismatches if data order differs)
-                logger.warning(f"EC-CHECK: [Rank {rank}] No tensor_infos with offset found, using sequential extraction (may cause mismatches)")
+                # logger.warning(f"EC-CHECK: [Rank {rank}] No tensor_infos with offset found, using sequential extraction (may cause mismatches)")
                 current_offset = 0
                 
                 for meta in local_metadata:
@@ -9175,7 +9175,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Build index map from loaded tensor_infos
         # Map: (fqn, global_offset) → (tensor_info, tensor_data)
         logger.info(f"EC-CHECK: Building index map from {len(decomposed.tensor_infos)} tensor infos")
-        
+        start_restruct_eccheck_time = time()
         index_to_data = {}
         for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
             # Use (fqn, global_offset) as unique key
@@ -9297,7 +9297,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Step 3: Restore dict types (convert string keys back to original types if needed)
         # Note: Use a lenient version that skips missing keys
         self._restore_dict_types_lenient(mcore_state_dict, orig_sharded_state_dict)
-        
+        end_restruct_eccheck_time = time()
+        logger.info(f"load eccheck checkpoint software restruct {end_restruct_eccheck_time-start_restruct_eccheck_time:.4f}")
         return mcore_state_dict
     
     def _populate_sharded_base_objects(self, sharded_state_dict: ShardedStateDict, flat_state_dict: Dict[str, Any]) -> None:
@@ -9904,39 +9905,39 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         from .state_dict_decomposer import reconstruct_state_dict
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        logger.info(f"ECLATIN: [Rank {rank}] _load_eclatin_checkpoint called")
-        logger.info(f"ECLATIN: [Rank {rank}] Checking recovery buffers - eclatin_recovered_buffer: {hasattr(self, 'eclatin_recovered_buffer') and self.eclatin_recovered_buffer is not None}")
-        logger.info(f"ECLATIN: [Rank {rank}] Checking recovery buffers - eclatin_recovered_metadata: {hasattr(self, 'eclatin_recovered_metadata') and self.eclatin_recovered_metadata is not None}")
+        # logger.info(f"ECLATIN: [Rank {rank}] _load_eclatin_checkpoint called")
+        # logger.info(f"ECLATIN: [Rank {rank}] Checking recovery buffers - eclatin_recovered_buffer: {hasattr(self, 'eclatin_recovered_buffer') and self.eclatin_recovered_buffer is not None}")
+        # logger.info(f"ECLATIN: [Rank {rank}] Checking recovery buffers - eclatin_recovered_metadata: {hasattr(self, 'eclatin_recovered_metadata') and self.eclatin_recovered_metadata is not None}")
         
         # Recovery path: rank2 may have recovered buffer
         #if (False):
-        logger.info(f"ECLATIN: [Rank {rank}] Checking if should use recovery path: rank==2: {rank == 2}, has_buffer: {hasattr(self, 'eclatin_recovered_buffer')}, buffer_not_none: {self.eclatin_recovered_buffer is not None if hasattr(self, 'eclatin_recovered_buffer') else False}")
+        # logger.info(f"ECLATIN: [Rank {rank}] Checking if should use recovery path: rank==2: {rank == 2}, has_buffer: {hasattr(self, 'eclatin_recovered_buffer')}, buffer_not_none: {self.eclatin_recovered_buffer is not None if hasattr(self, 'eclatin_recovered_buffer') else False}")
         if (rank == 2 and hasattr(self, 'eclatin_recovered_buffer')
             and self.eclatin_recovered_buffer is not None):
-            logger.info(f"ECLATIN: [Rank {rank}] Using recovered data from recovery pipeline")
-            logger.info(f"ECLATIN: [Rank {rank}] Recovery buffer size: {self.eclatin_recovered_buffer.numel()}")
+            # logger.info(f"ECLATIN: [Rank {rank}] Using recovered data from recovery pipeline")
+            # logger.info(f"ECLATIN: [Rank {rank}] Recovery buffer size: {self.eclatin_recovered_buffer.numel()}")
             decomposed = self._extract_decomposed_from_buffer(
                 self.eclatin_recovered_buffer,
                 self.eclatin_recovered_metadata,
                 self.eclatin_recovered_registry
             )
-            logger.info(f"ECLATIN: [Rank {rank}] Successfully extracted decomposed data from recovery buffer")
+            # logger.info(f"ECLATIN: [Rank {rank}] Successfully extracted decomposed data from recovery buffer")
             self.eclatin_recovered_buffer = None
             self.eclatin_recovered_metadata = None
             self.eclatin_recovered_registry = None
         else:
             checkpoint_dir = Path(checkpoint_dir)
             eclatin_file = checkpoint_dir / f'__{rank}_0.distcp'
-            logger.info(f"ECLATIN: [Rank {rank}] Using fallback path - loading from file {eclatin_file}")
+            # logger.info(f"ECLATIN: [Rank {rank}] Using fallback path - loading from file {eclatin_file}")
             if not eclatin_file.exists():
                 logger.error(f"ECLATIN: [Rank {rank}] ECLATIN file not found: {eclatin_file}")
                 raise FileNotFoundError(f"ECLATIN file not found for rank {rank}: {eclatin_file}")
             logger.info(f"ECLATIN: [Rank {rank}] Loading ECLATIN checkpoint from {eclatin_file}")
             decomposed = FileSystemWriterAsync.load_eclatin_components_from_file(str(eclatin_file))
             logger.info(f"ECLATIN: [Rank {rank}] Successfully loaded ECLATIN checkpoint from file")
-        
+        start_restruct_eclatin_time = time()
         # Build index map: (key, global_offset) -> (info, tensor)
-        logger.info(f"ECLATIN: Building index map from {len(decomposed.tensor_infos)} tensor infos")
+        # logger.info(f"ECLATIN: Building index map from {len(decomposed.tensor_infos)} tensor infos")
         index_to_data = {}
         for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
             # Normalize global_offset to tuple format for consistent matching
@@ -9949,11 +9950,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             index_to_data[index_key] = (info, tensor)
         
         non_tensor_by_fqn = decomposed.non_tensor_data
-        logger.info(
-            f"ECLATIN: [Rank {rank}] Successfully loaded ECLATIN checkpoint "
-            f"({len(decomposed.tensor_data)} tensors, "
-            f"{decomposed.total_tensor_size_bytes / (1024**3):.2f} GB)"
-        )
+        # logger.info(
+        #     f"ECLATIN: [Rank {rank}] Successfully loaded ECLATIN checkpoint "
+        #     f"({len(decomposed.tensor_data)} tensors, "
+        #     f"{decomposed.total_tensor_size_bytes / (1024**3):.2f} GB)"
+        # )
 
         orig_sharded_state_dict = sharded_state_dict
         (keyed_state_dict, flat_mapping, rename_mapping) = (
@@ -9993,7 +9994,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         unmatched_count += 1
                         # logger.warning(f"ECLATIN: [Rank {rank}] Unmatched ShardedTensor: key={key}, global_offset={sh_offset}, lookup_key={lookup_key}")
         
-        logger.info(f"ECLATIN: Matched {matched_count} ShardedBase objects")
+        # logger.info(f"ECLATIN: Matched {matched_count} ShardedBase objects")
         if unmatched_count > 0:
             logger.warning(f"ECLATIN: {unmatched_count} ShardedBase objects were not matched - this may cause NaN after several iterations!")
         
@@ -10026,6 +10027,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             unwrapped_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
         )
         self._restore_dict_types_lenient(mcore_state_dict, orig_sharded_state_dict)
+        end_restruct_eclatin_time = time()
+        logger.info(f"load eclatin checkpoint software restruct {end_restruct_eclatin_time-start_restruct_eclatin_time:.4f}")
         return mcore_state_dict
     
     def _load_ecnaive_checkpoint(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
@@ -10058,6 +10061,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # Build index map: (key, global_offset) -> (info, tensor)
         logger.info(f"EC-NAIVE: Building index map from {len(decomposed.tensor_infos)} tensor infos")
+        start_restruct_ecnaive_time = time()
         index_to_data = {}
         for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
             # Normalize global_offset to tuple format for consistent matching
@@ -10146,6 +10150,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             unwrapped_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
         )
         self._restore_dict_types_lenient(mcore_state_dict, orig_sharded_state_dict)
+        end_restruct_ecnaive_time = time()
+        logger.info(f"load ecnaive checkpoint software restruct {end_restruct_ecnaive_time-start_restruct_ecnaive_time:.4f}")
         return mcore_state_dict
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:

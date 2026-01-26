@@ -52,12 +52,15 @@ SHM_PKT="/dev/shm/shm_pkt"
 ARGS_TO_PASS=("$@")
 
 # fixed Model related configuration here, pls not overlap with json config
-HIDDEN_SIZE=1024
-NUM_ATTENTION_HEADS=16
+HIDDEN_SIZE=1600
+NUM_ATTENTION_HEADS=25
+NUM_LAYERS=48 
+
+
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
-MICRO_BATCH_SIZE=4
-GLOBAL_BATCH_SIZE=16
+MICRO_BATCH_SIZE=2
+GLOBAL_BATCH_SIZE=4
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE 
@@ -82,22 +85,25 @@ GPT_ARGS=(
     --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
-    --lr 0.00015 
+    --lr 0.00005 
     --train-iters 20
     --lr-decay-iters 320000 
     --lr-decay-style cosine 
     --min-lr 1.0e-5 
     --weight-decay 1e-2 
-    --lr-warmup-fraction .01 
+    --lr-warmup-fraction .05 
     --clip-grad 1.0 
     --fp16 
     --tokenizer-type GPT2BPETokenizer 
     --use-mcore-models 
     --transformer-impl transformer_engine 
     --no-scatter-gather-tensors-in-pipeline 
-    --num-layers 24 
+    --num-layers $NUM_LAYERS 
     --optimizer adam
-    --loss-scale 8192
+    --loss-scale-window 100
+    --initial-loss-scale 4096
+    --min-loss-scale 1.0
+    --hysteresis 2
 )
 
 MODEL_PARALLEL_ARGS=(

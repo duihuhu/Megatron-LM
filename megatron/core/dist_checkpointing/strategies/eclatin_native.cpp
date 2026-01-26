@@ -12,6 +12,25 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+// 64-bit network byte order conversion functions (for large data transfers > 4GB)
+inline uint64_t htonll(uint64_t value) {
+    // Check if system is little-endian
+    static const int num = 1;
+    if (*reinterpret_cast<const char*>(&num) == 1) {
+        // Little-endian: swap bytes
+        return ((static_cast<uint64_t>(htonl(value & 0xFFFFFFFF)) << 32) | 
+                htonl(value >> 32));
+    } else {
+        // Big-endian: no swap needed
+        return value;
+    }
+}
+
+inline uint64_t ntohll(uint64_t value) {
+    // ntohll is the same as htonll (symmetric operation)
+    return htonll(value);
+}
+
 // RDMA headers (ibverbs) - only if RDMA libraries are available
 #if RDMA_AVAILABLE
 #include <infiniband/verbs.h>
@@ -867,8 +886,9 @@ void AsioConnectionManager::cleanup() {
 
 bool send_with_size(boost::asio::ip::tcp::socket& sock, uintptr_t addr, size_t size) {
     try {
-        uint32_t sz_net = htonl(static_cast<uint32_t>(size));
-        boost::asio::write(sock, boost::asio::buffer(&sz_net, sizeof(uint32_t)));
+        // Use uint64_t to support data transfers > 4GB
+        uint64_t sz_net = htonll(static_cast<uint64_t>(size));
+        boost::asio::write(sock, boost::asio::buffer(&sz_net, sizeof(uint64_t)));
         boost::asio::write(sock, boost::asio::buffer(reinterpret_cast<void*>(addr), size));
         return true;
     } catch (...) {
@@ -878,9 +898,10 @@ bool send_with_size(boost::asio::ip::tcp::socket& sock, uintptr_t addr, size_t s
 
 bool recv_with_size_bool(boost::asio::ip::tcp::socket& sock, void* buf, size_t size) {
     try {
-        uint32_t sz_net = 0;
-        boost::asio::read(sock, boost::asio::buffer(&sz_net, sizeof(uint32_t)));
-        if (ntohl(sz_net) != size) {
+        // Use uint64_t to support data transfers > 4GB
+        uint64_t sz_net = 0;
+        boost::asio::read(sock, boost::asio::buffer(&sz_net, sizeof(uint64_t)));
+        if (ntohll(sz_net) != static_cast<uint64_t>(size)) {
             return false;
         }
         boost::asio::read(sock, boost::asio::buffer(buf, size));

@@ -18,6 +18,25 @@
 #include <cstdlib>
 #include <arpa/inet.h>  // For htonl/ntohl
 
+// 64-bit network byte order conversion functions (for large data transfers > 4GB)
+inline uint64_t htonll(uint64_t value) {
+    // Check if system is little-endian
+    static const int num = 1;
+    if (*reinterpret_cast<const char*>(&num) == 1) {
+        // Little-endian: swap bytes
+        return ((static_cast<uint64_t>(htonl(value & 0xFFFFFFFF)) << 32) | 
+                htonl(value >> 32));
+    } else {
+        // Big-endian: no swap needed
+        return value;
+    }
+}
+
+inline uint64_t ntohll(uint64_t value) {
+    // ntohll is the same as htonll (symmetric operation)
+    return htonll(value);
+}
+
 // RDMA includes (ibverbs)
 #ifdef __linux__
 #include <infiniband/verbs.h>
@@ -4534,13 +4553,14 @@ public:
         }
         
         uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(buffer_addr);
-        uint32_t size_net = htonl(static_cast<uint32_t>(size));
+        // Use uint64_t to support data transfers > 4GB
+        uint64_t size_net = htonll(static_cast<uint64_t>(size));
         
         try {
-            // Send size header
+            // Send size header (8 bytes for uint64_t)
             boost::asio::write(
                 asio_conn_mgr_.get_p2p_send_socket(),
-                boost::asio::buffer(&size_net, sizeof(uint32_t))
+                boost::asio::buffer(&size_net, sizeof(uint64_t))
             );
             
             // Send data
@@ -4564,16 +4584,17 @@ public:
         }
         
         uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(buffer_addr);
-        uint32_t size_net;
+        // Use uint64_t to support data transfers > 4GB
+        uint64_t size_net;
         
         try {
-            // Receive size header
+            // Receive size header (8 bytes for uint64_t)
             boost::asio::read(
                 asio_conn_mgr_.get_p2p_recv_socket(),
-                boost::asio::buffer(&size_net, sizeof(uint32_t))
+                boost::asio::buffer(&size_net, sizeof(uint64_t))
             );
             
-            uint32_t received_size = ntohl(size_net);
+            uint64_t received_size = ntohll(size_net);
             if (static_cast<size_t>(received_size) != size) {
                 throw std::runtime_error(
                     "Size mismatch: expected " + std::to_string(size) + 

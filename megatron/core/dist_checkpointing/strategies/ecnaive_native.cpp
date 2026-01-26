@@ -8,6 +8,25 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+// 64-bit network byte order conversion functions (for large data transfers > 4GB)
+inline uint64_t htonll(uint64_t value) {
+    // Check if system is little-endian
+    static const int num = 1;
+    if (*reinterpret_cast<const char*>(&num) == 1) {
+        // Little-endian: swap bytes
+        return ((static_cast<uint64_t>(htonl(value & 0xFFFFFFFF)) << 32) | 
+                htonl(value >> 32));
+    } else {
+        // Big-endian: no swap needed
+        return value;
+    }
+}
+
+inline uint64_t ntohll(uint64_t value) {
+    // ntohll is the same as htonll (symmetric operation)
+    return htonll(value);
+}
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -70,21 +89,23 @@ public:
 
     void send_data(const uint8_t* data, size_t size) override {
         std::lock_guard<std::mutex> lock(send_mutex_);
-        uint32_t sz_net = htonl(static_cast<uint32_t>(size));
-        boost::asio::write(socket_, boost::asio::buffer(&sz_net, sizeof(uint32_t)));
+        // Use uint64_t to support data transfers > 4GB
+        uint64_t sz_net = htonll(static_cast<uint64_t>(size));
+        boost::asio::write(socket_, boost::asio::buffer(&sz_net, sizeof(uint64_t)));
         boost::asio::write(socket_, boost::asio::buffer(data, size));
     }
 
     size_t receive_data(uint8_t* buffer, size_t buffer_size) override {
         std::lock_guard<std::mutex> lock(recv_mutex_);
-        uint32_t sz_net;
-        boost::asio::read(socket_, boost::asio::buffer(&sz_net, sizeof(uint32_t)));
-        uint32_t size = ntohl(sz_net);
-        if (size > buffer_size) {
+        // Use uint64_t to support data transfers > 4GB
+        uint64_t sz_net;
+        boost::asio::read(socket_, boost::asio::buffer(&sz_net, sizeof(uint64_t)));
+        uint64_t size = ntohll(sz_net);
+        if (size > static_cast<uint64_t>(buffer_size)) {
             throw std::runtime_error("Received size exceeds buffer size");
         }
         boost::asio::read(socket_, boost::asio::buffer(buffer, size));
-        return size;
+        return static_cast<size_t>(size);
     }
 
     bool is_connected() const override {
@@ -1754,8 +1775,9 @@ void AsioConnectionManager::cleanup() {
 
 bool send_with_size(boost::asio::ip::tcp::socket& sock, uintptr_t addr, size_t size) {
     try {
-        uint32_t sz_net = htonl(static_cast<uint32_t>(size));
-        boost::asio::write(sock, boost::asio::buffer(&sz_net, sizeof(uint32_t)));
+        // Use uint64_t to support data transfers > 4GB
+        uint64_t sz_net = htonll(static_cast<uint64_t>(size));
+        boost::asio::write(sock, boost::asio::buffer(&sz_net, sizeof(uint64_t)));
         boost::asio::write(sock, boost::asio::buffer(reinterpret_cast<void*>(addr), size));
         return true;
     } catch (...) {
@@ -1765,9 +1787,10 @@ bool send_with_size(boost::asio::ip::tcp::socket& sock, uintptr_t addr, size_t s
 
 bool recv_with_size_bool(boost::asio::ip::tcp::socket& sock, void* buf, size_t size) {
     try {
-        uint32_t sz_net = 0;
-        boost::asio::read(sock, boost::asio::buffer(&sz_net, sizeof(uint32_t)));
-        if (ntohl(sz_net) != size) {
+        // Use uint64_t to support data transfers > 4GB
+        uint64_t sz_net = 0;
+        boost::asio::read(sock, boost::asio::buffer(&sz_net, sizeof(uint64_t)));
+        if (ntohll(sz_net) != static_cast<uint64_t>(size)) {
             return false;
         }
         boost::asio::read(sock, boost::asio::buffer(buf, size));

@@ -16,7 +16,7 @@ export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
 
 GPUS_PER_NODE=1
-MASTER_ADDR=172.20.0.2
+MASTER_ADDR=127.0.0.1
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_USE_ASIO=true
@@ -38,30 +38,28 @@ export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 # Set CUDA_VISIBLE_DEVICES for each node
-export CUDA_VISIBLE_DEVICES=$NODE_RANK
+# export CUDA_VISIBLE_DEVICES=$NODE_RANK
 
 export CUDA_VISIBLE_DEVICES=0
-#VOCAB_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
-#MERGE_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
-VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
-MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
+VOCAB_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
+MERGE_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-eclatin-layerwise" #<Specify path>
+CHECKPOINT_PATH="/dev/shm/models/gpt2-345m-0-eclatin-layerwise" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
-
-SHM_PKT="/dev/shm/shm_pkt"
 
 # Remaining args after optional node-rank are passed to the training script
 ARGS_TO_PASS=("$@")
 
 # fixed Model related configuration here, pls not overlap with json config
-HIDDEN_SIZE=1024
-NUM_ATTENTION_HEADS=16
+HIDDEN_SIZE=1600
+NUM_ATTENTION_HEADS=25
+NUM_LAYERS=48 
+
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
-MICRO_BATCH_SIZE=4
-GLOBAL_BATCH_SIZE=16
+MICRO_BATCH_SIZE=2
+GLOBAL_BATCH_SIZE=4
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE 
@@ -86,23 +84,27 @@ GPT_ARGS=(
     --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
-    --lr 0.00015 
+    --lr 0.00005 
     --train-iters 20
     --lr-decay-iters 320000 
     --lr-decay-style cosine 
     --min-lr 1.0e-5 
     --weight-decay 1e-2 
-    --lr-warmup-fraction .01 
+    --lr-warmup-fraction .05 
     --clip-grad 1.0 
     --fp16 
     --tokenizer-type GPT2BPETokenizer 
     --use-mcore-models 
     --transformer-impl transformer_engine 
     --no-scatter-gather-tensors-in-pipeline 
-    --num-layers 12
+    --num-layers $NUM_LAYERS 
     --optimizer adam
-    --loss-scale 8192
+    --loss-scale-window 100
+    --initial-loss-scale 4096
+    --min-loss-scale 1.0
+    --hysteresis 2
 )
+
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1

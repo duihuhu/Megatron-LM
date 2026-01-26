@@ -217,10 +217,21 @@ rdma_lib_paths = [
     "/usr/local/lib",
 ]
 
-# Check for libibverbs
+# Check for libibverbs (also check versioned .so.1, .so.2, etc.)
 ibverbs_found = False
 for path in rdma_lib_paths:
+    # Check for libibverbs.so, libibverbs.a, or versioned libibverbs.so.*
+    found = False
     if os.path.exists(os.path.join(path, "libibverbs.so")) or os.path.exists(os.path.join(path, "libibverbs.a")):
+        found = True
+    else:
+        # Check for versioned library files (libibverbs.so.1, libibverbs.so.2, etc.)
+        import glob
+        versioned_libs = glob.glob(os.path.join(path, "libibverbs.so.*"))
+        if versioned_libs:
+            found = True
+    
+    if found:
         if path not in rdma_lib_dirs:
             rdma_lib_dirs.append(path)
         if "ibverbs" not in rdma_libs:
@@ -229,10 +240,21 @@ for path in rdma_lib_paths:
         print(f"Found libibverbs at: {path}")
         break
 
-# Check for librdmacm
+# Check for librdmacm (also check versioned .so.1, .so.2, etc.)
 rdmacm_found = False
 for path in rdma_lib_paths:
+    # Check for librdmacm.so, librdmacm.a, or versioned librdmacm.so.*
+    found = False
     if os.path.exists(os.path.join(path, "librdmacm.so")) or os.path.exists(os.path.join(path, "librdmacm.a")):
+        found = True
+    else:
+        # Check for versioned library files (librdmacm.so.1, librdmacm.so.2, etc.)
+        import glob
+        versioned_libs = glob.glob(os.path.join(path, "librdmacm.so.*"))
+        if versioned_libs:
+            found = True
+    
+    if found:
         if path not in rdma_lib_dirs:
             rdma_lib_dirs.append(path)
         if "rdmacm" not in rdma_libs:

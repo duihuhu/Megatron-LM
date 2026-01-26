@@ -1880,16 +1880,26 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         if self.eccheck_preallocate_cpu_buffer:
             start = time()
             total_size = self.decomposed_state_dict.total_tensor_size_bytes
-            logger.info(f"EC-CHECK: Preallocating CPU buffer of {total_size / (1024**3):.2f} GB")
+            
+            # Add safety margin to handle potential size differences between ranks
+            # Use max(1% or buffer_size) to ensure sufficient space
+            eccheck_buffer_size = self.eccheck_manager.eccheck_buffer_size
+            safety_margin = max(int(total_size * 0.01), eccheck_buffer_size)
+            total_size_with_margin = total_size + safety_margin
+            
+            logger.info(
+                f"EC-CHECK: Preallocating CPU buffer of {total_size_with_margin / (1024**3):.2f} GB "
+                f"(data: {total_size / (1024**3):.2f} GB + safety: {safety_margin / (1024**2):.0f} MB)"
+            )
             
             if self.preallocated_cpu_buffer == None:
                 if self.eccheck_manager.eccheck_pin_memory and torch.cuda.is_available():
                     self.preallocated_cpu_buffer = torch.empty(
-                        total_size, dtype=torch.uint8).pin_memory()
+                        total_size_with_margin, dtype=torch.uint8).pin_memory()
                     logger.debug("EC-CHECK: Using pinned memory for CPU buffer")
                 else:
                     self.preallocated_cpu_buffer = torch.empty(
-                        total_size, dtype=torch.uint8
+                        total_size_with_margin, dtype=torch.uint8
                     )
                 
             prealloc_time = time() - start
@@ -2062,16 +2072,26 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         if self.eclatin_preallocate_cpu_buffer:
             start = time()
             total_size = self.decomposed_state_dict.total_tensor_size_bytes
-            logger.info(f"ECLATIN: Preallocating CPU buffer of {total_size / (1024**3):.2f} GB")
+            
+            # Add safety margin to handle potential size differences between ranks
+            # Use max(1% or buffer_size) to ensure sufficient space
+            eclatin_buffer_size = self.eclatin_manager.eclatin_buffer_size
+            safety_margin = max(int(total_size * 0.01), eclatin_buffer_size)
+            total_size_with_margin = total_size + safety_margin
+            
+            logger.info(
+                f"ECLATIN: Preallocating CPU buffer of {total_size_with_margin / (1024**3):.2f} GB "
+                f"(data: {total_size / (1024**3):.2f} GB + safety: {safety_margin / (1024**2):.0f} MB)"
+            )
             
             if self.preallocated_cpu_buffer is None:
                 if self.eclatin_manager.eclatin_pin_memory and torch.cuda.is_available():
                     self.preallocated_cpu_buffer = torch.empty(
-                        total_size, dtype=torch.uint8).pin_memory()
+                        total_size_with_margin, dtype=torch.uint8).pin_memory()
                     logger.info("ECLATIN: Using pinned memory for CPU buffer")
                 else:
                     self.preallocated_cpu_buffer = torch.empty(
-                        total_size, dtype=torch.uint8
+                        total_size_with_margin, dtype=torch.uint8
                     )
                     logger.info("ECLATIN: Using non-pinned memory for CPU buffer")
             
@@ -2318,16 +2338,26 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         if self.ecnaive_preallocate_cpu_buffer:
             start = time()
             total_size = self.decomposed_state_dict.total_tensor_size_bytes
-            logger.info(f"EC-NAIVE: Preallocating CPU buffer of {total_size / (1024**3):.2f} GB")
+            
+            # Add safety margin to handle potential size differences between ranks
+            # Use max(1% or buffer_size) to ensure sufficient space
+            ecnaive_buffer_size = self.ecnaive_manager.ecnaive_buffer_size
+            safety_margin = max(int(total_size * 0.01), ecnaive_buffer_size)
+            total_size_with_margin = total_size + safety_margin
+            
+            logger.info(
+                f"EC-NAIVE: Preallocating CPU buffer of {total_size_with_margin / (1024**3):.2f} GB "
+                f"(data: {total_size / (1024**3):.2f} GB + safety: {safety_margin / (1024**2):.0f} MB)"
+            )
             
             if self.preallocated_cpu_buffer is None:
                 if self.ecnaive_manager.ecnaive_pin_memory and torch.cuda.is_available():
                     self.preallocated_cpu_buffer = torch.empty(
-                        total_size, dtype=torch.uint8).pin_memory()
+                        total_size_with_margin, dtype=torch.uint8).pin_memory()
                     logger.info("EC-NAIVE: Using pinned memory for CPU buffer")
                 else:
                     self.preallocated_cpu_buffer = torch.empty(
-                        total_size, dtype=torch.uint8
+                        total_size_with_margin, dtype=torch.uint8
                     )
                     logger.info("EC-NAIVE: Using non-pinned memory for CPU buffer")
             
@@ -4177,7 +4207,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 return
             
             # Default buffer size: 4GB (adjustable via args if needed)
-            buffer_size_gb = getattr(args, 'gemini_recovery_buffer_size_gb', 5)
+            buffer_size_gb = getattr(args, 'gemini_recovery_buffer_size_gb', 10)
             buffer_size_bytes = buffer_size_gb * 1024 * 1024 * 1024
             
             logger.info(f"rank: {rank}, allocating Gemini recovery buffers: {buffer_size_gb} GB each")

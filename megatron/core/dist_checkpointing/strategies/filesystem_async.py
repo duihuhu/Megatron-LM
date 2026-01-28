@@ -4008,6 +4008,9 @@ class FileSystemWriterAsync(FileSystemWriter):
             raise RuntimeError("ECLATIN: State dict not decomposed yet")
         
         logger.info("ECLATIN: Starting layer-wise GPU-to-CPU tensor transfer...")
+        # Reset C++ side completion flags and time statistics before starting a new transfer.
+        # Without this, per-iteration timing can be inconsistent (e.g., iter1 too short in Python logs).
+        self._eclatin_native.reset_encoding_completion_flags()
         start = time()
         
         # Step 1: Verify blocks and recv buffers are set

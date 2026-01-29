@@ -8236,21 +8236,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             logger.info("EC-CHECK: Load pipeline: Waiting for XOR worker to complete (Step6 tasks will be submitted)...")
             # Wait for XOR worker to complete (which will submit all Step6 tasks)
-            # Note: wait_for_encoding_completion waits for all workers including Step6,
-            # so we need to wait twice: first for XOR, then send Step6 sentinel, then wait again
+            # This ensures all Step6 tasks are submitted before we send Step6 sentinel
+            self.eccheck_manager._eccheck_native.wait_for_xor_worker_completion()
             
-            # import time
-            while True:
-                # Check if XOR worker is completed (but not Step6 workers yet)
-                # We'll use a simple polling approach: wait a bit, then check
-                sleep(0.01)
-                # Try to wait, but this will wait for all workers including Step6
-                # So we'll just wait once and send Step6 sentinel before the final wait
-                break
-            
-            # Wait for XOR to complete (all Step6 tasks should be submitted by now)
-            # Note: This will also wait for Step6, but Step6 sentinel hasn't been sent yet
-            # So we need to send Step6 sentinel first, then wait
+            # Now that XOR worker is complete, all Step6 tasks should be submitted
             # Send sentinel to Step6 P2P workers based on failed_rank
             if failed_rank == 1:
                 # rank1 recovery: only rank1 sends sentinel
@@ -9391,6 +9380,16 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         
         logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] Starting layerwise checkpoint loading")
+        
+        # Determine if using C++ pipeline (for rank2 recovery)
+        use_cpp_pipeline = (rank == 2 and 
+                           self.eclatin_manager.use_eclatin and 
+                           self.eclatin_manager._eclatin_native is not None)
+        
+        # Reset C++ statistics before starting load
+        if use_cpp_pipeline:
+            self.eclatin_manager._eclatin_native.reset_layerwise_load_statistics()
+        
         start_time = time()
         
         # Step 1: Load block checkpoint data using layerwise-specific method
@@ -9483,11 +9482,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Load layer-by-layer using C++ pipeline for rank2 recovery
         matched_count = 0
         unmatched_count = 0
-        
-        # For rank2, use C++ layerwise load worker for pipelined recovery + H2D
-        use_cpp_pipeline = (rank == 2 and 
-                           self.eclatin_manager.use_eclatin and 
-                           self.eclatin_manager._eclatin_native is not None)
         
         for layer_key in sorted(layer_groups.keys()):
             layer_tensors = layer_groups[layer_key]
@@ -9681,10 +9675,38 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self._restore_dict_types_lenient(mcore_state_dict, orig_sharded_state_dict)
         
         end_time = time()
+        overall_time = end_time - start_time
+        
         logger.info(
-            f"ECLATIN Layerwise Load: [Rank {rank}] Completed in {end_time - start_time:.2f}s, "
+            f"ECLATIN Layerwise Load: [Rank {rank}] Completed in {overall_time:.2f}s, "
             f"loaded {matched_count} tensors"
         )
+        
+        # Get and print C++ statistics if using C++ pipeline
+        if use_cpp_pipeline:
+            cpp_stats = self.eclatin_manager._eclatin_native.get_layerwise_load_statistics()
+            
+            # Print C++ statistics
+            self.eclatin_manager._eclatin_native.print_layerwise_load_statistics()
+            
+            # Log summary
+            total_recovery_ms = cpp_stats.get("total_recovery_ms", 0.0)
+            total_h2d_ms = cpp_stats.get("total_h2d_ms", 0.0)
+            critical_path_ms = cpp_stats.get("critical_path_ms", 0.0)
+            
+            logger.info(
+                f"ECLATIN Layerwise Load Breakdown [Rank {rank}]:\n"
+                f"  Total Recovery Time: {total_recovery_ms:.2f} ms ({total_recovery_ms/1000:.4f} s)\n"
+                f"  Total H2D Time: {total_h2d_ms:.2f} ms ({total_h2d_ms/1000:.4f} s)\n"
+                f"  Critical Path Time: {critical_path_ms:.2f} ms ({critical_path_ms/1000:.4f} s)\n"
+                f"  Overall Python Time: {overall_time:.4f} s"
+            )
+        else:
+            # For non-rank2 ranks, log basic timing
+            logger.info(
+                f"ECLATIN Layerwise Load Breakdown [Rank {rank}]:\n"
+                f"  Overall Python Time: {overall_time:.4f} s"
+            )
         
         return mcore_state_dict
     

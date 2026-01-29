@@ -1874,6 +1874,86 @@ public:
         });
         std::cout << "ECLATIN Load: All " << layers_load_completed_ << " layers completed" << std::endl;
     }
+    
+    // Reset layerwise load statistics
+    void reset_layerwise_load_statistics() {
+        std::lock_guard<std::mutex> lock(layerwise_stats_mutex_);
+        per_layer_recovery_time_ms_.clear();
+        per_layer_h2d_time_ms_.clear();
+        per_layer_total_time_ms_.clear();
+        total_layerwise_recovery_time_ms_ = 0.0;
+        total_layerwise_h2d_time_ms_ = 0.0;
+        layerwise_critical_path_time_ms_ = 0.0;
+        layerwise_first_layer_started_ = false;
+        std::cout << "ECLATIN: Reset layerwise load statistics" << std::endl;
+    }
+    
+    // Get layerwise load statistics (return as map for Python)
+    std::map<std::string, pybind11::object> get_layerwise_load_statistics() {
+        std::lock_guard<std::mutex> lock(layerwise_stats_mutex_);
+        std::map<std::string, pybind11::object> stats;
+        
+        // Per-layer statistics
+        pybind11::dict per_layer_recovery;
+        pybind11::dict per_layer_h2d;
+        pybind11::dict per_layer_total;
+        
+        for (const auto& [layer_id, time_ms] : per_layer_recovery_time_ms_) {
+            per_layer_recovery[pybind11::str(std::to_string(layer_id))] = time_ms;
+        }
+        for (const auto& [layer_id, time_ms] : per_layer_h2d_time_ms_) {
+            per_layer_h2d[pybind11::str(std::to_string(layer_id))] = time_ms;
+        }
+        for (const auto& [layer_id, time_ms] : per_layer_total_time_ms_) {
+            per_layer_total[pybind11::str(std::to_string(layer_id))] = time_ms;
+        }
+        
+        stats["per_layer_recovery_ms"] = per_layer_recovery;
+        stats["per_layer_h2d_ms"] = per_layer_h2d;
+        stats["per_layer_total_ms"] = per_layer_total;
+        stats["total_recovery_ms"] = pybind11::cast(total_layerwise_recovery_time_ms_.load());
+        stats["total_h2d_ms"] = pybind11::cast(total_layerwise_h2d_time_ms_.load());
+        stats["critical_path_ms"] = pybind11::cast(layerwise_critical_path_time_ms_.load());
+        
+        return stats;
+    }
+    
+    // Print layerwise load statistics
+    void print_layerwise_load_statistics() {
+        std::lock_guard<std::mutex> lock(layerwise_stats_mutex_);
+        
+        std::cout << "ECLATIN Layerwise Load: Time Statistics" << std::endl;
+        
+        if (!per_layer_total_time_ms_.empty()) {
+            std::cout << "  Per-Layer Breakdown:" << std::endl;
+            for (const auto& [layer_id, total_time] : per_layer_total_time_ms_) {
+                std::cout << "    Layer " << layer_id << ":" << std::endl;
+                std::cout << "      Total Time: " << total_time << " ms (" << (total_time / 1000.0) << " s)" << std::endl;
+                
+                auto recovery_it = per_layer_recovery_time_ms_.find(layer_id);
+                if (recovery_it != per_layer_recovery_time_ms_.end()) {
+                    double recovery_time = recovery_it->second;
+                    std::cout << "      Recovery Time: " << recovery_time << " ms (" << (recovery_time / 1000.0) << " s)" << std::endl;
+                }
+                
+                auto h2d_it = per_layer_h2d_time_ms_.find(layer_id);
+                if (h2d_it != per_layer_h2d_time_ms_.end()) {
+                    double h2d_time = h2d_it->second;
+                    std::cout << "      H2D Time: " << h2d_time << " ms (" << (h2d_time / 1000.0) << " s)" << std::endl;
+                }
+            }
+        }
+        
+        std::cout << "  Accumulated Statistics:" << std::endl;
+        if (total_layerwise_recovery_time_ms_.load() > 0.0) {
+            std::cout << "    Total Recovery Time: " << total_layerwise_recovery_time_ms_.load() 
+                      << " ms (" << (total_layerwise_recovery_time_ms_.load() / 1000.0) << " s)" << std::endl;
+        }
+        std::cout << "    Total H2D Time: " << total_layerwise_h2d_time_ms_.load() 
+                  << " ms (" << (total_layerwise_h2d_time_ms_.load() / 1000.0) << " s)" << std::endl;
+        std::cout << "    Critical Path Time: " << layerwise_critical_path_time_ms_.load() 
+                  << " ms (" << (layerwise_critical_path_time_ms_.load() / 1000.0) << " s)" << std::endl;
+    }
 
 private:
     std::atomic<bool> stop_;
@@ -2006,6 +2086,18 @@ private:
     // Load mode flags
     std::atomic<bool> is_load_mode_{false};
     int failed_rank_{-1};
+    
+    // Layerwise load time statistics
+    std::mutex layerwise_stats_mutex_;
+    std::map<int, double> per_layer_recovery_time_ms_;      // layer_id -> recovery time (Rank 2 only)
+    std::map<int, double> per_layer_h2d_time_ms_;            // layer_id -> H2D time (all ranks)
+    std::map<int, double> per_layer_total_time_ms_;          // layer_id -> total time (all ranks)
+    std::atomic<double> total_layerwise_recovery_time_ms_{0.0};  // Accumulated (Rank 2 only)
+    std::atomic<double> total_layerwise_h2d_time_ms_{0.0};       // Accumulated (all ranks)
+    std::atomic<double> layerwise_critical_path_time_ms_{0.0};   // From first layer start to last layer end
+    std::chrono::high_resolution_clock::time_point layerwise_first_layer_start_;
+    std::chrono::high_resolution_clock::time_point layerwise_last_layer_end_;
+    std::atomic<bool> layerwise_first_layer_started_{false};
     
     // CUDA async transfer configuration
     int num_cuda_streams_;
@@ -3024,6 +3116,13 @@ private:
                 layerwise_load_queue_.pop();
             }
             
+            // Record first layer start time for critical path calculation
+            bool is_first_layer = !layerwise_first_layer_started_.exchange(true);
+            auto layer_start = std::chrono::high_resolution_clock::now();
+            if (is_first_layer) {
+                layerwise_first_layer_start_ = layer_start;
+            }
+            
             std::cout << "ECLATIN Load: Processing layer " << task.layer_id 
                       << " (size=" << task.layer_size << ")" << std::endl;
             
@@ -3032,12 +3131,17 @@ private:
             // Stage 2: Recovery computation (XOR operations)
             // Stage 3: H2D transfer (CPU→GPU model initialization)
             
+            double recovery_time_ms = 0.0;
+            double h2d_time_ms = 0.0;
+            
             // Stage 1 & 2: If rank2 needs recovery, receive and recover
             if (is_load_mode_ && failed_rank_ == 2) {
                 std::cout << "ECLATIN Load: Performing rank2 recovery for layer " << task.layer_id << std::endl;
                 
                 // The buffers are already populated by load_recover() call in Python
                 // Here we just need to do the XOR recovery computation
+                
+                auto recovery_start = std::chrono::high_resolution_clock::now();
                 
                 // Recovery formula for rank2 (similar to standard ECLATIN recovery):
                 // data1 = rank1_data1 XOR rank3_data1
@@ -3075,7 +3179,19 @@ private:
                                               reinterpret_cast<void*>(task.recv_rank3_data1_addr)};
                 xor_gen(2, static_cast<int>(half_size), xor_array_parity2);
                 
-                std::cout << "ECLATIN Load: Layer " << task.layer_id << " recovery completed" << std::endl;
+                auto recovery_end = std::chrono::high_resolution_clock::now();
+                recovery_time_ms = std::chrono::duration<double, std::milli>(recovery_end - recovery_start).count();
+                
+                // Record recovery time statistics
+                {
+                    std::lock_guard<std::mutex> lock(layerwise_stats_mutex_);
+                    per_layer_recovery_time_ms_[task.layer_id] = recovery_time_ms;
+                }
+                double old_recovery = total_layerwise_recovery_time_ms_.load();
+                total_layerwise_recovery_time_ms_.store(old_recovery + recovery_time_ms);
+                
+                std::cout << "ECLATIN Load: Layer " << task.layer_id << " recovery completed (" 
+                          << recovery_time_ms << " ms)" << std::endl;
             }
             
             // Stage 3: H2D transfer (CPU→GPU) for model initialization
@@ -3139,7 +3255,16 @@ private:
                     }
                     
                     auto h2d_end = std::chrono::high_resolution_clock::now();
-                    double h2d_time_ms = std::chrono::duration<double, std::milli>(h2d_end - h2d_start).count();
+                    h2d_time_ms = std::chrono::duration<double, std::milli>(h2d_end - h2d_start).count();
+                    
+                    // Record H2D time statistics
+                    {
+                        std::lock_guard<std::mutex> lock(layerwise_stats_mutex_);
+                        per_layer_h2d_time_ms_[task.layer_id] = h2d_time_ms;
+                    }
+                    double old_h2d = total_layerwise_h2d_time_ms_.load();
+                    total_layerwise_h2d_time_ms_.store(old_h2d + h2d_time_ms);
+                    
                     std::cout << "ECLATIN Load: Layer " << task.layer_id << " H2D transfer completed (async, " 
                               << num_cuda_streams_ << " streams, " << task.gpu_tensors.size() 
                               << " tensors, " << h2d_time_ms << " ms)" << std::endl;
@@ -3181,7 +3306,16 @@ private:
                     cudaDeviceSynchronize();
                     
                     auto h2d_end = std::chrono::high_resolution_clock::now();
-                    double h2d_time_ms = std::chrono::duration<double, std::milli>(h2d_end - h2d_start).count();
+                    h2d_time_ms = std::chrono::duration<double, std::milli>(h2d_end - h2d_start).count();
+                    
+                    // Record H2D time statistics
+                    {
+                        std::lock_guard<std::mutex> lock(layerwise_stats_mutex_);
+                        per_layer_h2d_time_ms_[task.layer_id] = h2d_time_ms;
+                    }
+                    double old_h2d = total_layerwise_h2d_time_ms_.load();
+                    total_layerwise_h2d_time_ms_.store(old_h2d + h2d_time_ms);
+                    
                     std::cout << "ECLATIN Load: Layer " << task.layer_id << " H2D transfer completed (sync, " 
                               << task.gpu_tensors.size() << " tensors, " << h2d_time_ms << " ms)" << std::endl;
                 }
@@ -3191,6 +3325,21 @@ private:
                       << task.layer_id << std::endl;
             #endif
             
+            // Record layer total time and update critical path
+            auto layer_end = std::chrono::high_resolution_clock::now();
+            double layer_total_time_ms = std::chrono::duration<double, std::milli>(layer_end - layer_start).count();
+            
+            {
+                std::lock_guard<std::mutex> lock(layerwise_stats_mutex_);
+                per_layer_total_time_ms_[task.layer_id] = layer_total_time_ms;
+                layerwise_last_layer_end_ = layer_end;
+            }
+            
+            // Calculate critical path time (from first layer start to last layer end)
+            double critical_path_ms = std::chrono::duration<double, std::milli>(
+                layerwise_last_layer_end_ - layerwise_first_layer_start_).count();
+            layerwise_critical_path_time_ms_ = critical_path_ms;
+            
             // Update completion count
             {
                 std::lock_guard<std::mutex> lock(load_completion_mutex_);
@@ -3198,7 +3347,8 @@ private:
             }
             load_completion_cv_.notify_all();
             
-            std::cout << "ECLATIN Load: Layer " << task.layer_id << " processing completed" << std::endl;
+            std::cout << "ECLATIN Load: Layer " << task.layer_id << " processing completed "
+                      << "(total: " << layer_total_time_ms << " ms)" << std::endl;
         }
         
         std::cout << "ECLATIN Load: LayerWise load worker stopped" << std::endl;
@@ -3481,6 +3631,12 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("layer_size"))
         .def("wait_all_load_layers_complete", &ECLATINNative::wait_all_load_layers_complete,
              "Wait for all layer-wise load tasks to complete")
+        .def("reset_layerwise_load_statistics", &ECLATINNative::reset_layerwise_load_statistics,
+             "Reset layerwise load time statistics")
+        .def("get_layerwise_load_statistics", &ECLATINNative::get_layerwise_load_statistics,
+             "Get layerwise load time statistics as a dictionary")
+        .def("print_layerwise_load_statistics", &ECLATINNative::print_layerwise_load_statistics,
+             "Print layerwise load time statistics")
         // Parity 1 sentinels
         .def("submit_parity1_send1_sentinel", &ECLATINNative::submit_parity1_send1_sentinel)
         .def("submit_parity1_send2_sentinel", &ECLATINNative::submit_parity1_send2_sentinel)

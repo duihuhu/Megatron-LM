@@ -3147,6 +3147,26 @@ public:
         std::cout << "EC-CHECK: [Rank " << rank_ << "] All threads completed (encoding + send + recv + XOR + P2P)" << std::endl;
     }
     
+    // Wait only for XOR worker completion (used before sending Step6 sentinel)
+    void wait_for_xor_worker_completion() {
+        if (!is_load_mode_) {
+            std::cerr << "EC-CHECK: [Rank " << rank_ 
+                      << "] wait_for_xor_worker_completion called but not in load mode" << std::endl;
+            return;
+        }
+        
+        int wait_count = 0;
+        while (!load_xor_worker_completed_.load()) {
+            if (wait_count % 100 == 0) {
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Waiting for XOR worker to complete: "
+                          << "xor=" << (load_xor_worker_completed_.load() ? "true" : "false") << std::endl;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            wait_count++;
+        }
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker completed" << std::endl;
+    }
+    
     void stop_pipeline() {
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Stopping pipeline..." << std::endl;
         
@@ -4758,6 +4778,8 @@ PYBIND11_MODULE(eccheck_native, m) {
              "Submit sentinel to load encoder worker")
         .def("submit_load_step6_p2p_sentinel", &ECCHECKNative::submit_load_step6_p2p_sentinel,
              "Submit sentinel to Step6 P2P workers (rank2/3 only)")
+        .def("wait_for_xor_worker_completion", &ECCHECKNative::wait_for_xor_worker_completion,
+             "Wait for XOR worker to complete (used before sending Step6 sentinel)")
         .def("simple_p2p_send", &ECCHECKNative::simple_p2p_send,
              "Simple synchronous P2P send for rank1 software failure recovery",
              pybind11::arg("buffer_addr"), pybind11::arg("size"))

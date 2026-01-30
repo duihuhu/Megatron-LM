@@ -15,6 +15,9 @@ from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
 
 logger = getLogger(__name__)
 
+# Number of ranks per EC group (each group behaves like the original 4-rank setup)
+RANKS_PER_GROUP = 4
+
 
 class ECLATINManager:
     """Shared manager for ECLATIN C++ module initialization and buffer management.
@@ -78,111 +81,92 @@ class ECLATINManager:
         
         self._initialized = True
 
+    @staticmethod
+    def _get_group_id(rank: int, world_size: int) -> int:
+        """Get group id for multi-rank. Groups: 0,2,4,6 -> group 0; 1,3,5,7 -> group 1 (8 ranks)."""
+        num_groups = max(1, world_size // RANKS_PER_GROUP)
+        return rank % num_groups
+
+    @staticmethod
+    def _get_rank_in_group(rank: int, world_size: int) -> int:
+        """Get rank index within group (0..3). Same group logic as _get_group_id."""
+        num_groups = max(1, world_size // RANKS_PER_GROUP)
+        return rank // num_groups
 
     def _get_xor_paired_rank(self, my_rank: int, world_size: int) -> int:
-        """Get the paired rank for parity exchange."""
-        if world_size % 2 != 0:
-            raise ValueError(f"ECLATIN: World size must be even for pairing, got {world_size}")
-        
-        if my_rank == 0:
-            return 2
-        if my_rank == 1:
-            return 3
-        if my_rank == 2:
-            return 0
-        if my_rank == 3:
-            return 1
-        
-        # half_size = world_size // 2
-        
-        # if my_rank < half_size:
-        #     # First half pairs with second half
-        #     paired_rank = my_rank + half_size
-        # else:
-        #     # Second half pairs with first half
-        #     paired_rank = my_rank - half_size
-        
-        # logger.debug(f"ECLATIN: Rank {my_rank} paired with Rank {paired_rank}")
-        # return paired_rank
+        """Get the paired rank for parity exchange (XOR pairing within group).
+
+        Multi-rank: world_size must be divisible by 4. Each group of 4 ranks uses
+        same pairing as original 4-rank: in-group 0<->2, 1<->3 (by position).
+        E.g. 8 ranks: group0={0,2,4,6} -> 0<->4, 2<->6; group1={1,3,5,7} -> 1<->5, 3<->7.
+        """
+        if world_size % RANKS_PER_GROUP != 0:
+            raise ValueError(
+                f"ECLATIN: World size must be divisible by {RANKS_PER_GROUP} for multi-rank, got {world_size}"
+            )
+        num_groups = world_size // RANKS_PER_GROUP
+        group_id = self._get_group_id(my_rank, world_size)
+        rank_in_group = self._get_rank_in_group(my_rank, world_size)
+        # In-group XOR pairing: position 0<->2, 1<->3
+        paired_rank_in_group = (rank_in_group + 2) % RANKS_PER_GROUP
+        paired_rank = group_id + num_groups * paired_rank_in_group
+        logger.debug(
+            f"ECLATIN: Rank {my_rank} (group_id={group_id}, rank_in_group={rank_in_group}) "
+            f"XOR paired with Rank {paired_rank}"
+        )
+        return paired_rank
 
     def get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank for data/parity exchange.
-        
-        P2P pairing rules (different from XOR pairing):
-        - Rank 0 ↔ Rank 1 (P2P)
-        - Rank 2 ↔ Rank 3 (P2P)
-        
-        XOR pairing (for reference):
-        - Rank 0 ↔ Rank 2 (XOR)
-        - Rank 1 ↔ Rank 3 (XOR)
-        
-        Args:
-            my_rank (int): Current rank
-            world_size (int): Total number of ranks
-            
-        Returns:
-            int: P2P partner rank
+
+        Multi-rank: within each group, rank_in_group 0<->1, 2<->3 (same as 4-rank).
         """
-        if world_size % 2 != 0:
-            raise ValueError(f"ECLATIN: World size must be even for P2P pairing, got {world_size}")
-        
-        # P2P pairing: adjacent ranks in pairs
-        # For 4-rank setup: (0,1) and (2,3)
-        if my_rank % 2 == 0:
-            # Even rank: pair with next rank
-            p2p_partner_rank = my_rank + 1
-        else:
-            # Odd rank: pair with previous rank
-            p2p_partner_rank = my_rank - 1
-        
-        # Ensure partner rank is valid
-        if p2p_partner_rank < 0 or p2p_partner_rank >= world_size:
-            raise ValueError(f"ECLATIN: Invalid P2P partner rank {p2p_partner_rank} for rank {my_rank}")
-        
+        if world_size % RANKS_PER_GROUP != 0:
+            raise ValueError(
+                f"ECLATIN: World size must be divisible by {RANKS_PER_GROUP} for multi-rank, got {world_size}"
+            )
+        num_groups = world_size // RANKS_PER_GROUP
+        group_id = self._get_group_id(my_rank, world_size)
+        rank_in_group = self._get_rank_in_group(my_rank, world_size)
+        # In-group P2P: 0<->1, 2<->3
+        partner_rank_in_group = rank_in_group ^ 1
+        p2p_partner_rank = group_id + num_groups * partner_rank_in_group
         logger.debug(f"ECLATIN: Rank {my_rank} P2P partner is Rank {p2p_partner_rank}")
         return p2p_partner_rank
     
     def get_parity2_send1_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get Parity2 send1 partner rank.
-        
-        Parity2 send1 pairing rules:
-        - Rank 0 → Rank 3
-        - Rank 1 → Rank 2
-        - Rank 2 → Rank 1
-        - Rank 3 → Rank 0
-        
-        Formula: (world_size - my_rank) % world_size
-        
-        Args:
-            my_rank (int): Current rank
-            world_size (int): Total number of ranks
-            
-        Returns:
-            int: Parity2 send1 partner rank
+
+        Multi-rank: within each group, rank_in_group 0<->3, 1<->2 (same as 4-rank).
         """
-        partner_rank = (world_size - my_rank) % world_size
+        if world_size % RANKS_PER_GROUP != 0:
+            raise ValueError(
+                f"ECLATIN: World size must be divisible by {RANKS_PER_GROUP} for multi-rank, got {world_size}"
+            )
+        num_groups = world_size // RANKS_PER_GROUP
+        group_id = self._get_group_id(my_rank, world_size)
+        rank_in_group = self._get_rank_in_group(my_rank, world_size)
+        # In-group: 0<->3, 1<->2
+        partner_rank_in_group = (3 - rank_in_group) % RANKS_PER_GROUP
+        partner_rank = group_id + num_groups * partner_rank_in_group
         logger.debug(f"ECLATIN: Rank {my_rank} Parity2 send1 partner is Rank {partner_rank}")
         return partner_rank
     
     def get_parity2_send2_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get Parity2 send2 partner rank.
-        
-        Parity2 send2 pairing rules:
-        - Rank 0 → Rank 2
-        - Rank 1 → Rank 3
-        - Rank 2 → Rank 0
-        - Rank 3 → Rank 1
-        
-        Formula: (my_rank + world_size // 2) % world_size
-        
-        Args:
-            my_rank (int): Current rank
-            world_size (int): Total number of ranks
-            
-        Returns:
-            int: Parity2 send2 partner rank
+
+        Multi-rank: within each group, rank_in_group 0<->2, 1<->3 (same as 4-rank).
         """
-        partner_rank = (my_rank + world_size // 2) % world_size
+        if world_size % RANKS_PER_GROUP != 0:
+            raise ValueError(
+                f"ECLATIN: World size must be divisible by {RANKS_PER_GROUP} for multi-rank, got {world_size}"
+            )
+        num_groups = world_size // RANKS_PER_GROUP
+        group_id = self._get_group_id(my_rank, world_size)
+        rank_in_group = self._get_rank_in_group(my_rank, world_size)
+        # In-group: 0<->2, 1<->3
+        partner_rank_in_group = (rank_in_group + 2) % RANKS_PER_GROUP
+        partner_rank = group_id + num_groups * partner_rank_in_group
         logger.debug(f"ECLATIN: Rank {my_rank} Parity2 send2 partner is Rank {partner_rank}")
         return partner_rank
     
@@ -280,13 +264,14 @@ class ECLATINManager:
             'parity2_recv2': base_port + rank * 8 + 7,
         }
         
-        # Load mode ports (for rank2 recovery)
-        # rank2 needs 6 recv sockets (from rank0/1/3)
-        # rank0/1/3 need 2 send sockets each (to rank2)
-        # Port allocation: base_port + 1000 + offset (to avoid conflict with save mode)
-        load_base_port = base_port + 1000
-        if rank == 2:
-            # rank2: 6 recv ports
+        # Multi-rank: group_id and rank_in_group for load mode ports
+        num_groups = world_size // RANKS_PER_GROUP if world_size >= RANKS_PER_GROUP else 1
+        group_id = self._get_group_id(rank, world_size)
+        rank_in_group = self._get_rank_in_group(rank, world_size)
+        # Load mode ports (for rank_in_group 2 recovery): per-group base to avoid port conflict
+        load_base_port = base_port + 1000 + group_id * 100
+        if rank_in_group == 2:
+            # rank_in_group 2: 6 recv ports (receiver in load recovery)
             ports.update({
                 'load_recv_rank0_data2': load_base_port + 0,
                 'load_recv_rank0_parity2': load_base_port + 1,
@@ -296,21 +281,21 @@ class ECLATINManager:
                 'load_recv_rank3_data2': load_base_port + 5,
             })
         else:
-            # rank0/1/3: 2 send ports each
-            if rank == 0:
+            # rank_in_group 0/1/3: 2 send ports each (connect to group's rank_in_group 2)
+            if rank_in_group == 0:
                 ports.update({
-                    'load_send_rank0_data2': load_base_port + 0,  # connects to rank2's load_recv_rank0_data2
-                    'load_send_rank0_parity2': load_base_port + 1,  # connects to rank2's load_recv_rank0_parity2
+                    'load_send_rank0_data2': load_base_port + 0,
+                    'load_send_rank0_parity2': load_base_port + 1,
                 })
-            elif rank == 1:
+            elif rank_in_group == 1:
                 ports.update({
-                    'load_send_rank1_data1': load_base_port + 2,  # connects to rank2's load_recv_rank1_data1
-                    'load_send_rank1_parity1': load_base_port + 3,  # connects to rank2's load_recv_rank1_parity1
+                    'load_send_rank1_data1': load_base_port + 2,
+                    'load_send_rank1_parity1': load_base_port + 3,
                 })
-            elif rank == 3:
+            elif rank_in_group == 3:
                 ports.update({
-                    'load_send_rank3_data1': load_base_port + 4,  # connects to rank2's load_recv_rank3_data1
-                    'load_send_rank3_data2': load_base_port + 5,  # connects to rank2's load_recv_rank3_data2
+                    'load_send_rank3_data1': load_base_port + 4,
+                    'load_send_rank3_data2': load_base_port + 5,
                 })
         
         # Step 4: Exchange IP addresses via broadcast (more reliable than all_gather_object with NCCL)
@@ -352,17 +337,23 @@ class ECLATINManager:
             logger.info("ECLATIN: Distributed not initialized, using local IP for all ranks")
             rank_ips[0] = base_ip
         
+        # load_receiver_rank: global rank of rank_in_group 2 in this group (for init_load_connections)
+        load_receiver_rank = group_id + num_groups * 2 if world_size >= RANKS_PER_GROUP else 2
         config = {
             'my_ip': base_ip,
             'base_port': base_port,
             'rank_ips': rank_ips,
             'ports': ports,
+            'rank_in_group': rank_in_group,
+            'group_id': group_id,
+            'load_receiver_rank': load_receiver_rank,
         }
         
         logger.info(
             f"ECLATIN: [Rank {rank}] Network config:\n"
             f"  My IP: {config['my_ip']}\n"
             f"  Base port: {config['base_port']}\n"
+            f"  rank_in_group: {config['rank_in_group']}, load_receiver_rank: {config['load_receiver_rank']}\n"
             f"  Ports: {config['ports']}\n"
             f"  All rank IPs: {config['rank_ips']}"
         )
@@ -518,7 +509,11 @@ class ECLATINManager:
                     # CUDA streams configuration
                     num_cuda_streams,
                     # RDMA flag
-                    self.use_rdma
+                    self.use_rdma,
+                    # Multi-rank support: rank, world_size, rank_in_group
+                    rank,
+                    world_size,
+                    net_config['rank_in_group'],
                 )
                 
                 # If we reach here, connections are ready and threads are running
@@ -665,9 +660,12 @@ class ECLATINManager:
         """
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        rank_in_group = self._get_rank_in_group(rank, world_size)
         
-        if rank != 2:
-            logger.warning("ECLATIN: allocate_eclatin_load_recv_buffers called on non-rank2, returning empty dict")
+        if rank_in_group != 2:
+            logger.warning(
+                "ECLATIN: allocate_eclatin_load_recv_buffers called on non rank_in_group 2, returning empty dict"
+            )
             return {}
         
         # Calculate maximum data size across all ranks
@@ -683,7 +681,7 @@ class ECLATINManager:
         aligned_half_block_size = ((half_max_total_bytes + self.eclatin_buffer_size - 1) // self.eclatin_buffer_size) * self.eclatin_buffer_size
         
         logger.info(
-            f"ECLATIN: Allocating 6 recv buffers for rank2 load recovery\n"
+            f"ECLATIN: Allocating 6 recv buffers for rank_in_group 2 load recovery\n"
             f"  Pipeline max size: {max_total_bytes / (1024**3):.2f} GB\n"
             f"  Aligned half block size (per buffer): {aligned_half_block_size / (1024**3):.2f} GB\n"
             f"  Total recv memory: {6 * aligned_half_block_size / (1024**3):.2f} GB"
@@ -700,7 +698,7 @@ class ECLATINManager:
         }
         
         logger.info(
-            f"ECLATIN: Allocated 6 recv buffers for rank2: "
+            f"ECLATIN: Allocated 6 recv buffers for rank_in_group 2: "
             f"{aligned_half_block_size / (1024**3):.2f} GB each"
         )
         

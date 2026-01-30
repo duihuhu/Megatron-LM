@@ -66,6 +66,10 @@ namespace {
 #define ECLATIN_NUM_CUDA_STREAMS 4  // Default number of CUDA streams for async transfers
 #endif
 
+#ifndef ECLATIN_RANKS_PER_GROUP
+#define ECLATIN_RANKS_PER_GROUP 4  // Ranks per ECLATIN group (multi-rank support)
+#endif
+
 // ============================================================================
 // Connection Manager Interface
 // ============================================================================
@@ -979,7 +983,10 @@ public:
                   const std::string& parity2_recv1_ip, uint16_t parity2_recv1_port,
                   const std::string& parity2_recv2_ip, uint16_t parity2_recv2_port,
                   int num_cuda_streams = ECLATIN_NUM_CUDA_STREAMS,
-                  bool use_rdma = false)
+                  bool use_rdma = false,
+                  int rank = -1,
+                  int world_size = -1,
+                  int rank_in_group = -1)
         : stop_(false),
           parity1_send1_ip_(parity1_send1_ip),
           parity1_send1_port_(parity1_send1_port),
@@ -1019,7 +1026,10 @@ public:
           xor_count_(0),
           num_cuda_streams_(num_cuda_streams),
           use_async_cuda_(ECLATIN_USE_ASYNC_CUDA),
-          use_rdma_(use_rdma) {
+          use_rdma_(use_rdma),
+          rank_(rank),
+          world_size_(world_size),
+          rank_in_group_(rank_in_group) {
         const char* mode_str = use_rdma_ ? "RDMA" : "ASIO";
         std::cout << "ECLATIN: Initializing connections (mode: " << mode_str << ")..." << std::endl;
         
@@ -1367,12 +1377,16 @@ public:
     void set_load_mode(bool is_load, int failed_rank) {
         is_load_mode_ = is_load;
         failed_rank_ = failed_rank;
-        std::cout << "ECLATIN: Set load mode: " 
-                  << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank << std::endl;
+        failed_rank_in_group_ = (failed_rank >= 0)
+            ? (failed_rank % ECLATIN_RANKS_PER_GROUP)
+            : -1;
+        std::cout << "ECLATIN: Set load mode: "
+                  << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank
+                  << ", failed_rank_in_group=" << failed_rank_in_group_ << std::endl;
     }
 
     void init_load_connections(
-        int rank,
+        int rank_in_group,
         const std::string& rank2_ip,
         uint16_t load_recv_rank0_data2_port,
         uint16_t load_recv_rank0_parity2_port,
@@ -1386,12 +1400,12 @@ public:
             return;
         }
         
-        std::cout << "ECLATIN: [Rank " << rank << "] Initializing load connections..." << std::endl;
+        std::cout << "ECLATIN: [Rank_in_group " << rank_in_group << "] Initializing load connections..." << std::endl;
         
-        if (rank == 2) {
-            // rank2: Initialize 6 recv sockets (accept connections from rank0/1/3)
+        if (rank_in_group == 2) {
+            // rank_in_group 2 (receiver): Initialize 6 recv sockets (accept connections from 0/1/3 in group)
             // Step 1: First, bind and listen all acceptors synchronously (before accept)
-            std::cout << "ECLATIN: [Rank 2] Binding and listening all acceptors..." << std::endl;
+            std::cout << "ECLATIN: [Rank_in_group 2] Binding and listening all acceptors..." << std::endl;
             try {
                 conn_.bind_listen_load_recv_rank0_data2(rank2_ip, load_recv_rank0_data2_port);
                 conn_.bind_listen_load_recv_rank0_parity2(rank2_ip, load_recv_rank0_parity2_port);
@@ -1400,9 +1414,9 @@ public:
                 conn_.bind_listen_load_recv_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
                 conn_.bind_listen_load_recv_rank3_data2(rank2_ip, load_recv_rank3_data2_port);
                 
-                std::cout << "ECLATIN: [Rank 2] All acceptors bound and listening" << std::endl;
+                std::cout << "ECLATIN: [Rank_in_group 2] All acceptors bound and listening" << std::endl;
             } catch (const std::exception& e) {
-                std::cerr << "ECLATIN: [Rank 2] Failed to bind/listen acceptors: " << e.what() << std::endl;
+                std::cerr << "ECLATIN: [Rank_in_group 2] Failed to bind/listen acceptors: " << e.what() << std::endl;
                 throw;
             }
             
@@ -1442,28 +1456,28 @@ public:
             // The accept operations will block until connections arrive from rank0/1/3
             recv_init_thread.detach();
             
-            std::cout << "ECLATIN: [Rank 2] Accept threads started, waiting for connections..." << std::endl;
+            std::cout << "ECLATIN: [Rank_in_group 2] Accept threads started, waiting for connections..." << std::endl;
         } else {
-            // rank0/1/3: Initialize 2 send sockets each (connect to rank2)
-            if (rank == 0) {
-                std::cout << "ECLATIN: [Rank 0] Connecting load send sockets to rank2..." << std::endl;
+            // rank_in_group 0/1/3: Initialize 2 send sockets each (connect to receiver in group)
+            if (rank_in_group == 0) {
+                std::cout << "ECLATIN: [Rank_in_group 0] Connecting load send sockets to receiver..." << std::endl;
                 conn_.init_load_send_rank0_data2(rank2_ip, load_recv_rank0_data2_port);
                 conn_.init_load_send_rank0_parity2(rank2_ip, load_recv_rank0_parity2_port);
-                std::cout << "ECLATIN: [Rank 0] Load send sockets connected" << std::endl;
-            } else if (rank == 1) {
-                std::cout << "ECLATIN: [Rank 1] Connecting load send sockets to rank2..." << std::endl;
+                std::cout << "ECLATIN: [Rank_in_group 0] Load send sockets connected" << std::endl;
+            } else if (rank_in_group == 1) {
+                std::cout << "ECLATIN: [Rank_in_group 1] Connecting load send sockets to receiver..." << std::endl;
                 conn_.init_load_send_rank1_data1(rank2_ip, load_recv_rank1_data1_port);
                 conn_.init_load_send_rank1_parity1(rank2_ip, load_recv_rank1_parity1_port);
-                std::cout << "ECLATIN: [Rank 1] Load send sockets connected" << std::endl;
-            } else if (rank == 3) {
-                std::cout << "ECLATIN: [Rank 3] Connecting load send sockets to rank2..." << std::endl;
+                std::cout << "ECLATIN: [Rank_in_group 1] Load send sockets connected" << std::endl;
+            } else if (rank_in_group == 3) {
+                std::cout << "ECLATIN: [Rank_in_group 3] Connecting load send sockets to receiver..." << std::endl;
                 conn_.init_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
                 conn_.init_load_send_rank3_data2(rank2_ip, load_recv_rank3_data2_port);
-                std::cout << "ECLATIN: [Rank 3] Load send sockets connected" << std::endl;
+                std::cout << "ECLATIN: [Rank_in_group 3] Load send sockets connected" << std::endl;
             }
         }
         
-            std::cout << "ECLATIN: [Rank " << rank << "] Load connections initialized" << std::endl;
+        std::cout << "ECLATIN: [Rank_in_group " << rank_in_group << "] Load connections initialized" << std::endl;
     }
     
     void wait_for_load_connections(int timeout_seconds = 30) {
@@ -2086,7 +2100,13 @@ private:
     // Load mode flags
     std::atomic<bool> is_load_mode_{false};
     int failed_rank_{-1};
-    
+    int failed_rank_in_group_{-1};  // failed rank within 4-rank group (for multi-group support)
+
+    // Multi-rank: global rank, world size, rank within group (0..3 per group)
+    int rank_{-1};
+    int world_size_{-1};
+    int rank_in_group_{-1};
+
     // Layerwise load time statistics
     std::mutex layerwise_stats_mutex_;
     std::map<int, double> per_layer_recovery_time_ms_;      // layer_id -> recovery time (Rank 2 only)
@@ -3134,9 +3154,9 @@ private:
             double recovery_time_ms = 0.0;
             double h2d_time_ms = 0.0;
             
-            // Stage 1 & 2: If rank2 needs recovery, receive then XOR
-            if (is_load_mode_ && failed_rank_ == 2) {
-                std::cout << "ECLATIN Load: Performing rank2 recovery for layer " << task.layer_id << std::endl;
+            // Stage 1 & 2: If rank_in_group 2 (receiver) needs recovery, receive then XOR
+            if (is_load_mode_ && failed_rank_in_group_ == 2) {
+                std::cout << "ECLATIN Load: Performing rank_in_group 2 recovery for layer " << task.layer_id << std::endl;
                 
                 // Stage 1: Parallel receive 6 blocks for this layer (same as load_recover but per-layer)
                 std::vector<std::exception_ptr> recv_exceptions(6);
@@ -3276,7 +3296,7 @@ private:
                 size_t half_layer = task.layer_size / 2;
                 uintptr_t base1 = task.recovered_data1_addr;
                 uintptr_t base2 = task.recovered_data2_addr;
-                bool use_two_blocks = (is_load_mode_ && failed_rank_ == 2);
+                bool use_two_blocks = (is_load_mode_ && failed_rank_in_group_ == 2);
                 
                 if (use_async_cuda_ && !cuda_streams_.empty()) {
                     // Async CUDA transfer path
@@ -3665,7 +3685,10 @@ PYBIND11_MODULE(eclatin_native, m) {
                             const std::string&, uint16_t,
                             const std::string&, uint16_t,
                             int,
-                            bool>(),
+                            bool,
+                            int,
+                            int,
+                            int>(),
              pybind11::arg("parity1_send1_ip"),
              pybind11::arg("parity1_send1_port"),
              pybind11::arg("parity1_send2_ip"),
@@ -3684,6 +3707,9 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("parity2_recv2_port"),
              pybind11::arg("num_cuda_streams") = ECLATIN_NUM_CUDA_STREAMS,
              pybind11::arg("use_rdma") = false,
+             pybind11::arg("rank") = -1,
+             pybind11::arg("world_size") = -1,
+             pybind11::arg("rank_in_group") = -1,
              "Initialize ECLATIN native module with ASIO or RDMA transport.\n\n"
              "Args:\n"
              "    parity1_send1_ip, parity1_send1_port: Parity 1 send1 connection\n"
@@ -3695,7 +3721,10 @@ PYBIND11_MODULE(eclatin_native, m) {
              "    parity2_recv1_ip, parity2_recv1_port: Parity 2 recv1 connection\n"
              "    parity2_recv2_ip, parity2_recv2_port: Parity 2 recv2 connection\n"
              "    num_cuda_streams: Number of CUDA streams for async transfers\n"
-             "    use_rdma: Use RDMA transport (default: False, uses ASIO)\n")
+             "    use_rdma: Use RDMA transport (default: False, uses ASIO)\n"
+             "    rank: Global rank (for multi-rank support)\n"
+             "    world_size: World size (for multi-rank support)\n"
+             "    rank_in_group: Rank within 4-rank group (0..3)\n")
         // RDMA buffer registration (no-op for ASIO mode)
         .def("register_buffer", &ECLATINNative::register_buffer,
              pybind11::arg("buffer_addr"),
@@ -3799,15 +3828,15 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("is_load"),
              pybind11::arg("failed_rank") = -1)
         .def("init_load_connections", &ECLATINNative::init_load_connections,
-             "Initialize load mode connections (rank0 recv, rank1/2/3 send)",
-             pybind11::arg("rank"),
-             pybind11::arg("rank0_ip"),
+             "Initialize load mode connections (rank_in_group 2 recv, 0/1/3 send)",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("rank2_ip"),
+             pybind11::arg("load_recv_rank0_data2_port"),
+             pybind11::arg("load_recv_rank0_parity2_port"),
              pybind11::arg("load_recv_rank1_data1_port"),
-             pybind11::arg("load_recv_rank1_data2_port"),
-             pybind11::arg("load_recv_rank2_data2_port"),
-             pybind11::arg("load_recv_rank2_parity2_port"),
+             pybind11::arg("load_recv_rank1_parity1_port"),
              pybind11::arg("load_recv_rank3_data1_port"),
-             pybind11::arg("load_recv_rank3_parity1_port"))
+             pybind11::arg("load_recv_rank3_data2_port"))
         .def("wait_for_load_connections", &ECLATINNative::wait_for_load_connections,
              "Wait for load mode connections to be established",
              pybind11::arg("timeout_seconds") = 30)

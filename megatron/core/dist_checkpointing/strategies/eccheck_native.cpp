@@ -334,6 +334,8 @@ private:
     int rank_;
     int world_size_;
     int paired_rank_;
+    int rank_in_group_;        // Rank within EC group (0-3), for multi-rank same logic as 4-rank
+    int failed_rank_in_group_; // Failed rank's position in group (0-3) for load mode
     
     // Buffer management
     std::vector<uintptr_t> data_buffer_addrs_;
@@ -718,65 +720,42 @@ private:
     // ========== XOR配置构建函数 ==========
     
     void build_xor_config() {
-        if (is_load_mode_ && failed_rank_ == 2) {
-            // Load mode: rank2 recovery scenario
-            // XOR pairing is same as save: 0<->2, 1<->3
-            // But behavior differs: only rank2 and rank3 do XOR for recovery
-            // rank0 thread1: send to rank2 (for recovery)
-            // rank1 thread1: send to rank3 (for recovery)
-            // rank2 thread1: receive from rank0, do XOR to get d2
-            // rank3 thread1: receive from rank1, do XOR to get d3
-            if (rank_ == 0) {
-                xor_config_.xor_partner_rank = 2;
-                xor_config_.thread0_is_receiver = true;   // thread0接收rank2的encode（但load模式下可能不需要）
-                xor_config_.thread1_is_receiver = false;  // thread1发送encode给rank2（用于恢复）
-            } else if (rank_ == 1) {
-                xor_config_.xor_partner_rank = 3;
-                xor_config_.thread0_is_receiver = true;   // thread0接收rank3的encode（但load模式下可能不需要）
-                xor_config_.thread1_is_receiver = false;  // thread1发送encode给rank3（用于恢复）
-            } else if (rank_ == 2) {
-                xor_config_.xor_partner_rank = 0;
-                xor_config_.thread0_is_receiver = false;  // thread0发送encode给rank0（但load模式下不需要）
-                xor_config_.thread1_is_receiver = true;   // thread1接收rank0的encode，做XOR得到d2
-            } else if (rank_ == 3) {
-                xor_config_.xor_partner_rank = 1;
-                xor_config_.thread0_is_receiver = false;  // thread0发送encode给rank1（但load模式下不需要）
-                xor_config_.thread1_is_receiver = true;    // thread1接收rank1的encode，做XOR得到d3
+        xor_config_.xor_partner_rank = paired_rank_;
+        // Use rank_in_group_ (0-3) for XOR role; xor_partner_rank is global (set by Python).
+        if (is_load_mode_ && failed_rank_in_group_ == 2) {
+            // Load mode: rank_in_group 2 recovery scenario (same logic as 4-rank)
+            if (rank_in_group_ == 0) {
+                xor_config_.thread0_is_receiver = true;
+                xor_config_.thread1_is_receiver = false;  // thread1 send to rank_in_group 2
+            } else if (rank_in_group_ == 1) {
+                xor_config_.thread0_is_receiver = true;
+                xor_config_.thread1_is_receiver = false;  // thread1 send to rank_in_group 3
+            } else if (rank_in_group_ == 2) {
+                xor_config_.thread0_is_receiver = false;
+                xor_config_.thread1_is_receiver = true;   // thread1 recv from rank_in_group 0, XOR to get d2
+            } else if (rank_in_group_ == 3) {
+                xor_config_.thread0_is_receiver = false;
+                xor_config_.thread1_is_receiver = true;   // thread1 recv from rank_in_group 1, XOR to get d3
             } else {
                 xor_config_.xor_partner_rank = -1;
                 xor_config_.thread0_is_receiver = false;
                 xor_config_.thread1_is_receiver = false;
             }
         } else {
-            // Save mode: original logic
-            // Hardcoded XOR configuration for 2+2 setup
-            // Pairing: rank0<->rank2, rank1<->rank3
-            // rank0 thread0: receive from rank2 thread0, do XOR
-            // rank0 thread1: send to rank2 thread1
-            // rank2 thread0: send to rank0 thread0
-            // rank2 thread1: receive from rank0 thread1, do XOR
-            // rank1 thread0: receive from rank3 thread0, do XOR
-            // rank1 thread1: send to rank3 thread1
-            // rank3 thread0: send to rank1 thread0
-            // rank3 thread1: receive from rank1 thread1, do XOR
-            if (rank_ == 0) {
-                xor_config_.xor_partner_rank = 2;
-                xor_config_.thread0_is_receiver = true;   // thread0接收rank2的encode，做XOR
-                xor_config_.thread1_is_receiver = false;  // thread1发送encode给rank2
-            } else if (rank_ == 1) {
-                xor_config_.xor_partner_rank = 3;
-                xor_config_.thread0_is_receiver = true;   // thread0接收rank3的encode，做XOR
-                xor_config_.thread1_is_receiver = false;  // thread1发送encode给rank3
-            } else if (rank_ == 2) {
-                xor_config_.xor_partner_rank = 0;
-                xor_config_.thread0_is_receiver = false;  // thread0发送encode给rank0
-                xor_config_.thread1_is_receiver = true;   // thread1接收rank0的encode，做XOR
-            } else if (rank_ == 3) {
-                xor_config_.xor_partner_rank = 1;
-                xor_config_.thread0_is_receiver = false;  // thread0发送encode给rank1
-                xor_config_.thread1_is_receiver = true;    // thread1接收rank1的encode，做XOR
+            // Save mode: role by rank_in_group (0-3)
+            if (rank_in_group_ == 0) {
+                xor_config_.thread0_is_receiver = true;   // thread0 recv from partner, XOR
+                xor_config_.thread1_is_receiver = false;   // thread1 send to partner
+            } else if (rank_in_group_ == 1) {
+                xor_config_.thread0_is_receiver = true;
+                xor_config_.thread1_is_receiver = false;
+            } else if (rank_in_group_ == 2) {
+                xor_config_.thread0_is_receiver = false;   // thread0 send to partner
+                xor_config_.thread1_is_receiver = true;    // thread1 recv from partner, XOR
+            } else if (rank_in_group_ == 3) {
+                xor_config_.thread0_is_receiver = false;
+                xor_config_.thread1_is_receiver = true;
             } else {
-                // For other ranks, no XOR (fallback)
                 xor_config_.xor_partner_rank = -1;
                 xor_config_.thread0_is_receiver = false;
                 xor_config_.thread1_is_receiver = false;
@@ -853,18 +832,11 @@ private:
         return -1; // Error
     }
     
-    // Helper function to get peer rank in communicator for P2P
+    // Helper function to get peer rank in communicator for P2P (works for multi-rank: comm has rank_ and p2p_partner_rank_)
     int get_peer_rank_in_p2p_comm(int peer_rank) const {
-        if (rank_ == 0 || rank_ == 1) {
-            // p2p_0_1 communicator
-            if (peer_rank == 0) return 0;
-            if (peer_rank == 1) return 1;
-        } else if (rank_ == 2 || rank_ == 3) {
-            // p2p_2_3 communicator
-            if (peer_rank == 2) return 0;
-            if (peer_rank == 3) return 1;
-        }
-        return -1; // Error
+        if (peer_rank == rank_) return 0;
+        if (peer_rank == p2p_partner_rank_) return 1;
+        return -1;  // Error
     }
     
     void init_nccl_xor_send() {
@@ -1152,18 +1124,15 @@ private:
         // In load mode, use decode coefficients for decoding operation
         // TODO: Compute decode coefficients from inverse matrix of submatrix
         // For now, use coefficient 1 for all ranks (simplified version)
-        if (is_load_mode_ && failed_rank_ == 2) {
-            // Use decode coefficients based on rank
-            // These coefficients should be computed from inverse matrix, but temporarily set to 1
-            if (rank_ < 2) {
-                // rank 0/1: use first decode coefficient
+        if (is_load_mode_ && failed_rank_in_group_ == 2) {
+            // Use decode coefficients based on rank_in_group
+            if (rank_in_group_ < 2) {
                 parity_idx = decode_coefficient_0_;
-            } else if (rank_ < 4) {
-                // rank 2/3: use second decode coefficient
+            } else if (rank_in_group_ < 4) {
                 parity_idx = decode_coefficient_1_;
             } else {
-                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid rank " << rank_ << " for load mode (expected 0-3)" << std::endl;
-                parity_idx = 1;  // Fallback
+                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid rank_in_group " << rank_in_group_ << " for load mode (expected 0-3)" << std::endl;
+                parity_idx = 1;
             }
             
             // Validation check
@@ -1268,7 +1237,7 @@ private:
                         // In load mode, rank 1 and rank 2 don't send data, so data buffer should be released immediately
                         // In save mode, even ranks release immediately, odd ranks release in P2P worker
                         bool should_release = false;
-                        if (is_load_mode_ && failed_rank_ == 2 && (rank_ == 1 || rank_ == 2)) {
+                        if (is_load_mode_ && failed_rank_in_group_ == 2 && (rank_in_group_ == 1 || rank_in_group_ == 2)) {
                             // Load mode: rank 1 and rank 2 release data buffer immediately
                             should_release = true;
                         } else if (rank_ % 2 == 0) {
@@ -1449,7 +1418,7 @@ private:
                         // In load mode, rank 1 and rank 2 don't send data, so data buffer should be released immediately
                         // In save mode, even ranks release immediately, odd ranks release in P2P worker
                         bool should_release = false;
-                        if (is_load_mode_ && failed_rank_ == 2 && (rank_ == 1 || rank_ == 2)) {
+                        if (is_load_mode_ && failed_rank_in_group_ == 2 && (rank_in_group_ == 1 || rank_in_group_ == 2)) {
                             // Load mode: rank 1 and rank 2 release data buffer immediately
                             should_release = true;
                         } else if (rank_ % 2 == 0) {
@@ -1930,24 +1899,24 @@ private:
             // std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker: XOR completed, parity addr=" << task.parity_addr << std::endl;
             
             if (task.p2p_own_write_addr != 0 && task.p2p_partner_write_addr != 0 && task.parity_addr != 0) {
-                if (is_load_mode_ && failed_rank_ == 2) {
-                    // Load mode: special handling for rank2 and rank3
-                    if (rank_ == 2) {
-                        // rank2: XOR 完成后得到 d2，提交 Step6 recv 任务
+                if (is_load_mode_ && failed_rank_in_group_ == 2) {
+                    // Load mode: special handling for rank_in_group 2 and 3
+                    if (rank_in_group_ == 2) {
+                        // rank_in_group 2: after XOR get d2, submit Step6 recv task
                         if (task.p2p_partner_write_addr != 0) {
                             submit_load_step6_p2p_recv(task.p2p_partner_write_addr, task.size);
                         }
-                        // 释放 parity buffer (d2 已经写入 own_buffer)
+                        // Release parity buffer (d2 already written to own_buffer)
                         if (task.parity_addr != 0) {
                             std::lock_guard<std::mutex> lock(release_queue_mutex_);
                             parity_buffers_to_release_.push(task.parity_addr);
                         }
-                    } else if (rank_ == 3) {
-                        // rank3: XOR 完成后得到 d3，提交 Step6 send 任务
+                    } else if (rank_in_group_ == 3) {
+                        // rank_in_group 3: after XOR get d3, submit Step6 send task
                         if (task.parity_addr != 0) {
                             submit_load_step6_p2p_send(task.parity_addr, task.size);
                         }
-                        // 不在这里释放 parity buffer，等 Step6 send 完成后释放
+                        // Do not release parity buffer here, wait for Step6 send completion
                     } else {
                         // Other ranks (0, 1) in load mode: release parity buffer
                         if (task.parity_addr != 0) {
@@ -2001,7 +1970,7 @@ private:
                 // Parity buffer release logic
                 // Note: For load mode, parity buffer release is already handled above (line 1641-1689)
                 // Only handle save mode here to avoid duplicate release
-                if (!(is_load_mode_ && failed_rank_ == 2)) {
+                if (!(is_load_mode_ && failed_rank_in_group_ == 2)) {
                     // Save mode: original logic
                 if (rank_ % 2 == 1 && task.parity_addr != 0) {
                     parity_buffers_to_release_.push(task.parity_addr);
@@ -2531,8 +2500,11 @@ public:
                   const std::vector<uint8_t>& nccl_id_xor_send,
                   const std::vector<uint8_t>& nccl_id_xor_recv,
                   const std::vector<uint8_t>& nccl_id_p2p_send,
-                  const std::vector<uint8_t>& nccl_id_p2p_recv) 
+                  const std::vector<uint8_t>& nccl_id_p2p_recv,
+                  int rank_in_group = -1)
         : rank_(rank), world_size_(world_size), paired_rank_(paired_rank),
+          rank_in_group_(rank_in_group >= 0 ? rank_in_group : rank),
+          failed_rank_in_group_(-1),
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_completed_(false), recv_worker_completed_(false),
           xor_worker_completed_(false), p2p_send_worker_completed_(false), p2p_recv_worker_completed_(false),
@@ -2572,14 +2544,10 @@ public:
         // Build P2P configuration
         build_p2p_config();
 
-        // Initialize EC params: k = world_size / 2, rows = 2, data_block_index = rank / 2
+        // Initialize EC params: k=2 per group, rows=2, data_block_index = rank_in_group / 2
         rows_ = 2;
-        if (world_size_ <= 0) {
-            k_ = 0;
-        } else {
-            k_ = world_size_ / 2;
-        }
-        data_block_index_ = rank_ / 2;
+        k_ = 2;
+        data_block_index_ = rank_in_group_ / 2;
 
         if (k_ > 0) {
             int m = k_ + rows_;
@@ -2602,7 +2570,7 @@ public:
                 } else {
                     // initialize tables using isa-l
                     ec_init_tables(k_, rows_, a_mat_, g_tbls_);
-                    std::cout << "EC-CHECK: [Rank " << rank_ << "] EC tables initialized (k=" << k_ << ", rows=" << rows_ << ", data_idx=" << data_block_index_ << ")" << std::endl;
+                    std::cout << "EC-CHECK: [Rank " << rank_ << "] EC tables initialized (k=" << k_ << ", rows=" << rows_ << ", data_idx=" << data_block_index_ << ", rank_in_group=" << rank_in_group_ << ")" << std::endl;
                 }
             }
         } else {
@@ -2644,8 +2612,10 @@ public:
                   const std::string& p2p_listen_ip, uint16_t p2p_recv_port,
                   const std::string& step6_p2p_partner_ip, uint16_t step6_p2p_send_port,
                   const std::string& step6_p2p_listen_ip, uint16_t step6_p2p_recv_port,
-                  bool use_rdma = false)
+                  bool use_rdma = false, int rank_in_group = -1)
         : rank_(rank), world_size_(world_size), paired_rank_(paired_rank),
+          rank_in_group_(rank_in_group >= 0 ? rank_in_group : rank),
+          failed_rank_in_group_(-1),
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_completed_(false), recv_worker_completed_(false),
           xor_worker_completed_(false), p2p_send_worker_completed_(false), p2p_recv_worker_completed_(false),
@@ -2742,9 +2712,9 @@ public:
                 asio_conn_mgr_.init_p2p_recv(p2p_listen_ip, p2p_recv_port);
             });
             
-            // Step6 P2P recv: only rank2 needs to listen
+            // Step6 P2P recv: only rank_in_group 2 needs to listen
             std::thread step6_p2p_recv_thread([this, step6_p2p_listen_ip, step6_p2p_recv_port]() {
-                if (rank_ == 2) {
+                if (rank_in_group_ == 2) {
                     asio_conn_mgr_.init_step6_p2p_recv(step6_p2p_listen_ip, step6_p2p_recv_port);
                 }
             });
@@ -2762,8 +2732,8 @@ public:
         asio_conn_mgr_.init_xor_send(xor_partner_ip, xor_send_port);
         asio_conn_mgr_.init_p2p_send(p2p_partner_ip, p2p_send_port);
         
-        // Step6 P2P send: only rank3 needs to connect
-        if (rank_ == 3) {
+        // Step6 P2P send: only rank_in_group 3 needs to connect
+        if (rank_in_group_ == 3) {
             asio_conn_mgr_.init_step6_p2p_send(step6_p2p_partner_ip, step6_p2p_send_port);
         }
         
@@ -2772,9 +2742,9 @@ public:
         
         // Verify all connections are established
         bool step6_ok = true;
-        if (rank_ == 2) {
+        if (rank_in_group_ == 2) {
             step6_ok = asio_conn_mgr_.is_step6_p2p_recv_connected();
-        } else if (rank_ == 3) {
+        } else if (rank_in_group_ == 3) {
             step6_ok = asio_conn_mgr_.is_step6_p2p_send_connected();
         }
         
@@ -3025,13 +2995,13 @@ public:
                     all_used_workers_completed = false;
                 }
                 
-                // send: 只有 rank0/1 使用
-                if ((rank_ == 0 || rank_ == 1) && !load_send_worker_completed_.load()) {
+                // send: only rank_in_group 0/1 use it
+                if ((rank_in_group_ == 0 || rank_in_group_ == 1) && !load_send_worker_completed_.load()) {
                     all_used_workers_completed = false;
                 }
                 
-                // recv: 只有 rank2/3 使用
-                if ((rank_ == 2 || rank_ == 3) && !load_recv_worker_completed_.load()) {
+                // recv: only rank_in_group 2/3 use it
+                if ((rank_in_group_ == 2 || rank_in_group_ == 3) && !load_recv_worker_completed_.load()) {
                     all_used_workers_completed = false;
                 }
                 
@@ -3041,22 +3011,22 @@ public:
                 }
                 
                 // p2p_send: 只有 rank0/3 使用
-                if ((rank_ == 0 || rank_ == 3) && !load_p2p_send_worker_completed_.load()) {
+                if ((rank_in_group_ == 0 || rank_in_group_ == 3) && !load_p2p_send_worker_completed_.load()) {
                     all_used_workers_completed = false;
                 }
                 
                 // p2p_recv: 只有 rank1/2 使用
-                if ((rank_ == 1 || rank_ == 2) && !load_p2p_recv_worker_completed_.load()) {
+                if ((rank_in_group_ == 1 || rank_in_group_ == 2) && !load_p2p_recv_worker_completed_.load()) {
                     all_used_workers_completed = false;
                 }
                 
-                // step6_p2p_send: 只有 rank3 使用
-                if (rank_ == 3 && !load_step6_p2p_send_worker_completed_.load()) {
+                // step6_p2p_send: only rank_in_group 3 uses it
+                if (rank_in_group_ == 3 && !load_step6_p2p_send_worker_completed_.load()) {
                     all_used_workers_completed = false;
                 }
                 
-                // step6_p2p_recv: 只有 rank2 使用
-                if (rank_ == 2 && !load_step6_p2p_recv_worker_completed_.load()) {
+                // step6_p2p_recv: only rank_in_group 2 uses it
+                if (rank_in_group_ == 2 && !load_step6_p2p_recv_worker_completed_.load()) {
                     all_used_workers_completed = false;
                 }
                 
@@ -3200,23 +3170,23 @@ public:
         if (p2p_send_worker_.joinable()) p2p_send_worker_.join();
         if (p2p_recv_worker_.joinable()) p2p_recv_worker_.join();
         if (load_encoder_worker_.joinable()) load_encoder_worker_.join();
-        if (rank_ == 0 || rank_ == 1) {
+        if (rank_in_group_ == 0 || rank_in_group_ == 1) {
             if (load_send_worker_.joinable()) load_send_worker_.join();
         }
-        if (rank_ == 2 || rank_ == 3) {
+        if (rank_in_group_ == 2 || rank_in_group_ == 3) {
             if (load_recv_worker_.joinable()) load_recv_worker_.join();
         }
         if (load_xor_worker_.joinable()) load_xor_worker_.join();
-        if (rank_ == 0 || rank_ == 3) {
+        if (rank_in_group_ == 0 || rank_in_group_ == 3) {
             if (load_p2p_send_worker_.joinable()) load_p2p_send_worker_.join();
         }
-        if (rank_ == 1 || rank_ == 2) {
+        if (rank_in_group_ == 1 || rank_in_group_ == 2) {
             if (load_p2p_recv_worker_.joinable()) load_p2p_recv_worker_.join();
         }
-        if (rank_ == 3) {
+        if (rank_in_group_ == 3) {
             if (load_step6_p2p_send_worker_.joinable()) load_step6_p2p_send_worker_.join();
         }
-        if (rank_ == 2) {
+        if (rank_in_group_ == 2) {
             if (load_step6_p2p_recv_worker_.joinable()) load_step6_p2p_recv_worker_.join();
         }
         
@@ -3410,19 +3380,18 @@ public:
             // Start load encoder worker (all ranks use it)
             load_encoder_worker_ = std::thread(&ECCHECKNative::load_encoder_worker, this);
             
-            // Start load send worker (only rank0/1 use it)
-            if (rank_ == 0 || rank_ == 1) {
+            // Start load send worker (only rank_in_group 0/1 use it)
+            if (rank_in_group_ == 0 || rank_in_group_ == 1) {
                 load_send_worker_ = std::thread(&ECCHECKNative::load_send_worker, this);
             } else {
-                // rank2/3 don't use load_send_queue_, mark as completed immediately
+                // rank_in_group 2/3 don't use load_send_queue_, mark as completed immediately
                 load_send_worker_completed_ = true;
             }
             
-            // Start load recv worker (only rank2/3 use it)
-            if (rank_ == 2 || rank_ == 3) {
+            // Start load recv worker (only rank_in_group 2/3 use it)
+            if (rank_in_group_ == 2 || rank_in_group_ == 3) {
                 load_recv_worker_ = std::thread(&ECCHECKNative::load_recv_worker, this);
             } else {
-                // rank0/1 don't use load_recv_queue_, mark as completed immediately
                 load_recv_worker_completed_ = true;
             }
             
@@ -3430,44 +3399,44 @@ public:
             load_xor_worker_ = std::thread(&ECCHECKNative::load_xor_worker, this);
             
             // Start load P2P send worker (only rank0/3 use it)
-            if (rank_ == 0 || rank_ == 3) {
+            if (rank_in_group_ == 0 || rank_in_group_ == 3) {
                 load_p2p_send_worker_ = std::thread(&ECCHECKNative::load_p2p_send_worker, this);
             } else {
                 // rank1/2 don't use load_p2p_send_queue_, mark as completed immediately
                 load_p2p_send_worker_completed_ = true;
             }
             
-            // Start load P2P recv worker (only rank1/2 use it)
-            if (rank_ == 1 || rank_ == 2) {
+            // Start load P2P recv worker (only rank_in_group 1/2 use it)
+            if (rank_in_group_ == 1 || rank_in_group_ == 2) {
                 load_p2p_recv_worker_ = std::thread(&ECCHECKNative::load_p2p_recv_worker, this);
             } else {
                 // rank0/3 don't use load_p2p_recv_queue_, mark as completed immediately
                 load_p2p_recv_worker_completed_ = true;
             }
             
-            // Start load Step6 P2P send worker (only rank3 uses it)
-            if (rank_ == 3) {
+            // Start load Step6 P2P send worker (only rank_in_group 3 uses it)
+            if (rank_in_group_ == 3) {
                 load_step6_p2p_send_worker_ = std::thread(&ECCHECKNative::load_step6_p2p_send_worker, this);
             } else {
-                // rank0/1/2 don't use load_step6_p2p_send_queue_, mark as completed immediately
+                // rank_in_group 0/1/2 don't use load_step6_p2p_send_queue_, mark as completed immediately
                 load_step6_p2p_send_worker_completed_ = true;
             }
             
-            // Start load Step6 P2P recv worker (only rank2 uses it)
-            if (rank_ == 2) {
+            // Start load Step6 P2P recv worker (only rank_in_group 2 uses it)
+            if (rank_in_group_ == 2) {
                 load_step6_p2p_recv_worker_ = std::thread(&ECCHECKNative::load_step6_p2p_recv_worker, this);
             } else {
-                // rank0/1/3 don't use load_step6_p2p_recv_queue_, mark as completed immediately
+                // rank_in_group 0/1/3 don't use load_step6_p2p_recv_queue_, mark as completed immediately
                 load_step6_p2p_recv_worker_completed_ = true;
             }
             
             std::cout << "EC-CHECK: [Rank " << rank_ << "] Started load workers (encoder, send=" 
-                      << (rank_ == 0 || rank_ == 1 ? "yes" : "no")
-                      << ", recv=" << (rank_ == 2 || rank_ == 3 ? "yes" : "no")
-                      << ", xor, p2p_send=" << (rank_ == 0 || rank_ == 3 ? "yes" : "no")
-                      << ", p2p_recv=" << (rank_ == 1 || rank_ == 2 ? "yes" : "no")
-                      << ", step6_p2p_send=" << (rank_ == 3 ? "yes" : "no")
-                      << ", step6_p2p_recv=" << (rank_ == 2 ? "yes" : "no") << ")" << std::endl;
+                      << (rank_in_group_ == 0 || rank_in_group_ == 1 ? "yes" : "no")
+                      << ", recv=" << (rank_in_group_ == 2 || rank_in_group_ == 3 ? "yes" : "no")
+                      << ", xor, p2p_send=" << (rank_in_group_ == 0 || rank_in_group_ == 3 ? "yes" : "no")
+                      << ", p2p_recv=" << (rank_in_group_ == 1 || rank_in_group_ == 2 ? "yes" : "no")
+                      << ", step6_p2p_send=" << (rank_in_group_ == 3 ? "yes" : "no")
+                      << ", step6_p2p_recv=" << (rank_in_group_ == 2 ? "yes" : "no") << ")" << std::endl;
         }
     }
     
@@ -3489,8 +3458,8 @@ public:
             return;
         }
         
-        // 根据 rank 判断是 sender 还是 receiver
-        bool is_receiver = (rank_ == 2 || rank_ == 3);
+        // Determine sender vs receiver by rank_in_group
+        bool is_receiver = (rank_in_group_ == 2 || rank_in_group_ == 3);
         
         // 准备 load encoding 任务
         LoadEncodingTask load_task = {
@@ -3500,7 +3469,7 @@ public:
             p2p_partner_write_addr  // For Step6: rank2 needs this to receive d3
         };
         
-        if (rank_ == 0 || rank_ == 3) {
+        if (rank_in_group_ == 0 || rank_in_group_ == 3) {
             // Sender: 提交 Step2 P2P 发送任务
             if (step2_send_addr != 0 && step2_size > 0) {
                 submit_load_p2p_transfer(step2_send_addr, 0, step2_size, true, data_addr);
@@ -3511,7 +3480,7 @@ public:
                     pending_load_encoding_tasks_[data_addr] = load_task;
                 }
             }
-        } else if (rank_ == 1 || rank_ == 2) {
+        } else if (rank_in_group_ == 1 || rank_in_group_ == 2) {
             // Receiver: 提交 Step2 P2P 接收任务
             if (step2_recv_data_addr != 0 && step2_size > 0) {
                 submit_load_p2p_transfer(0, step2_recv_data_addr, step2_size, false, 0);
@@ -3659,8 +3628,8 @@ public:
                 if (can_send_sentinel) {
                     load_encoding_completed_ = true;
                     // Submit sentinel to downstream load workers (only to queues used by this rank)
-                    // rank0/1: use load_send_queue_ (send encoding to rank2/3)
-                    if (rank_ == 0 || rank_ == 1) {
+                    // rank_in_group 0/1: use load_send_queue_ (send encoding to rank_in_group 2/3)
+                    if (rank_in_group_ == 0 || rank_in_group_ == 1) {
                         {
                             std::lock_guard<std::mutex> send_lock(load_send_queue_mutex_);
                             load_send_queue_.push({0, 0});
@@ -3668,8 +3637,8 @@ public:
                         load_send_queue_cv_.notify_one();
                     }
                     
-                    // rank2/3: use load_recv_queue_ (receive encoding from rank0/1)
-                    if (rank_ == 2 || rank_ == 3) {
+                    // rank_in_group 2/3: use load_recv_queue_ (receive encoding from rank_in_group 0/1)
+                    if (rank_in_group_ == 2 || rank_in_group_ == 3) {
                         {
                             std::lock_guard<std::mutex> recv_lock(load_recv_queue_mutex_);
                             load_recv_queue_.push({0, 0, 0});
@@ -3685,7 +3654,7 @@ public:
                     load_xor_queue_cv_.notify_one();
                     
                     // rank0/3: use load_p2p_send_queue_ (Step2 and Step6 P2P send)
-                    if (rank_ == 0 || rank_ == 3) {
+                    if (rank_in_group_ == 0 || rank_in_group_ == 3) {
                         {
                             std::lock_guard<std::mutex> p2p_send_lock(load_p2p_send_queue_mutex_);
                             load_p2p_send_queue_.push({0, 0, 0, 0, 0, true, false, 0});
@@ -3694,7 +3663,7 @@ public:
                     }
                     
                     // rank1/2: use load_p2p_recv_queue_ (Step2 and Step6 P2P recv)
-                    if (rank_ == 1 || rank_ == 2) {
+                    if (rank_in_group_ == 1 || rank_in_group_ == 2) {
                         {
                             std::lock_guard<std::mutex> p2p_recv_lock(load_p2p_recv_queue_mutex_);
                             load_p2p_recv_queue_.push({0, 0, true, false, 0});
@@ -4075,10 +4044,10 @@ public:
                 }
             }
             
-            // Handle Step6 P2P for rank2 and rank3
-            if (is_load_mode_ && failed_rank_ == 2) {
-                if (rank_ == 2) {
-                    // rank2: XOR completed, get d2, submit Step6 recv task
+            // Handle Step6 P2P for rank_in_group 2 and 3
+            if (is_load_mode_ && failed_rank_in_group_ == 2) {
+                if (rank_in_group_ == 2) {
+                    // rank_in_group 2: XOR completed, get d2, submit Step6 recv task
                     if (task.p2p_partner_write_addr != 0) {
                         submit_load_step6_p2p_recv(task.p2p_partner_write_addr, task.size);
                     }
@@ -4087,8 +4056,8 @@ public:
                         std::lock_guard<std::mutex> lock(release_queue_mutex_);
                         parity_buffers_to_release_.push(task.parity_addr);
                     }
-                } else if (rank_ == 3) {
-                    // rank3: XOR completed, get d3, submit Step6 send task
+                } else if (rank_in_group_ == 3) {
+                    // rank_in_group 3: XOR completed, get d3, submit Step6 send task
                     if (task.parity_addr != 0) {
                         submit_load_step6_p2p_send(task.parity_addr, task.size);
                     }
@@ -4550,14 +4519,14 @@ public:
         }
         
         // Send sentinel to Step6 P2P workers if needed
-        if (rank_ == 3) {
+        if (rank_in_group_ == 3) {
             {
                 std::lock_guard<std::mutex> step6_send_lock(load_step6_p2p_send_queue_mutex_);
                 load_step6_p2p_send_queue_.push({0, 0, 0, 0, 0, true, true, 0});
             }
             load_step6_p2p_send_queue_cv_.notify_one();
         }
-        if (rank_ == 2) {
+        if (rank_in_group_ == 2) {
             {
                 std::lock_guard<std::mutex> step6_recv_lock(load_step6_p2p_recv_queue_mutex_);
                 load_step6_p2p_recv_queue_.push({0, 0, true, true, 0});
@@ -4714,8 +4683,12 @@ PYBIND11_MODULE(eccheck_native, m) {
     
     // Class definition
     pybind11::class_<ECCHECKNative>(m, "ECCHECKNative")
-        // NCCL constructor (original)
-        .def(pybind11::init<int, int, int, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&>())
+        // NCCL constructor (with optional rank_in_group for multi-rank)
+        .def(pybind11::init<int, int, int, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&, int>(),
+             pybind11::arg("rank"), pybind11::arg("world_size"), pybind11::arg("paired_rank"),
+             pybind11::arg("nccl_id_xor_send"), pybind11::arg("nccl_id_xor_recv"),
+             pybind11::arg("nccl_id_p2p_send"), pybind11::arg("nccl_id_p2p_recv"),
+             pybind11::arg("rank_in_group") = -1)
         // ASIO/RDMA constructor (with use_rdma flag)
         .def(pybind11::init<int, int, int,
              const std::string&, uint16_t,
@@ -4724,7 +4697,7 @@ PYBIND11_MODULE(eccheck_native, m) {
              const std::string&, uint16_t,
              const std::string&, uint16_t,
              const std::string&, uint16_t,
-             bool>(),
+             bool, int>(),
              pybind11::arg("rank"), pybind11::arg("world_size"), pybind11::arg("paired_rank"),
              pybind11::arg("xor_partner_ip"), pybind11::arg("xor_send_port"),
              pybind11::arg("xor_listen_ip"), pybind11::arg("xor_recv_port"),
@@ -4732,7 +4705,7 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("p2p_listen_ip"), pybind11::arg("p2p_recv_port"),
              pybind11::arg("step6_p2p_partner_ip"), pybind11::arg("step6_p2p_send_port"),
              pybind11::arg("step6_p2p_listen_ip"), pybind11::arg("step6_p2p_recv_port"),
-             pybind11::arg("use_rdma") = false)
+             pybind11::arg("use_rdma") = false, pybind11::arg("rank_in_group") = -1)
         .def("set_buffer_addresses", &ECCHECKNative::set_buffer_addresses)
         .def("reset_encoding_completion_flags", &ECCHECKNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECCHECKNative::wait_for_encoding_completion)

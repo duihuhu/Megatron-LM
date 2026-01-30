@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# Script to run a single node in 4-node simulation (1 GPU per node)
-# Usage: ./test_eccheck_4nodes_node.sh <node_rank> [additional_args...]
+# Script to run a single node in 4-node simulation (default 1 GPU per node)
+# Usage: ./test_eccheck_4nodes_node.sh <node_rank> [gpus_per_node] [additional_args...]
 # Example: ./test_eccheck_4nodes_node.sh 0
+# Example (2 GPUs per container): ./test_eccheck_4nodes_node.sh 0 2
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
@@ -29,12 +30,19 @@ if [ -n "$1" ]; then
     fi
 fi
 
+# Optional second argument: GPUs per node (default 1). E.g. 2 => container 0 uses 0,1; container 1 uses 2,3; ...
+if [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+    GPUS_PER_NODE=$1
+    shift
+fi
+
 # Set NCCL_DEBUG_FILE after NODE_RANK is determined
 export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-# Set CUDA_VISIBLE_DEVICES for each node
-export CUDA_VISIBLE_DEVICES=$NODE_RANK
+# Set CUDA_VISIBLE_DEVICES: by node rank when 1 GPU/node; when GPUs per node > 1, use contiguous block (e.g. node 0 => 0,1; node 1 => 2,3)
+START_GPU=$(($NODE_RANK * $GPUS_PER_NODE))
+export CUDA_VISIBLE_DEVICES=$(seq -s, $START_GPU $((START_GPU + GPUS_PER_NODE - 1)))
 
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
@@ -135,7 +143,7 @@ if [ "${PRINT_CMD:-0}" != "0" ]; then
 fi
 # -------------------------------------------------------------------------
 
-echo "Starting Node $NODE_RANK with GPU $NODE_RANK"
+echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 
 export USE_FLASH_ATTN=1 && \

@@ -15,6 +15,9 @@ from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
 
 logger = getLogger(__name__)
 
+# Number of ranks per EC group (each group behaves like the original 4-rank setup)
+RANKS_PER_GROUP = 4
+
 
 class ECCHECKManager:
     """Shared manager for EC-CHECK C++ module initialization and buffer management.
@@ -78,32 +81,40 @@ class ECCHECKManager:
         
         self._initialized = True
 
+    @staticmethod
+    def _get_group_id(rank: int, world_size: int) -> int:
+        """Get group id for multi-rank. Groups: 0,2,4,6 -> group 0; 1,3,5,7 -> group 1 (8 ranks)."""
+        num_groups = world_size // RANKS_PER_GROUP
+        return rank % num_groups
+
+    @staticmethod
+    def _get_rank_in_group(rank: int, world_size: int) -> int:
+        """Get rank index within group (0..3). Same group logic as _get_group_id."""
+        num_groups = world_size // RANKS_PER_GROUP
+        return rank // num_groups
 
     def _get_xor_paired_rank(self, my_rank: int, world_size: int) -> int:
-        """Get the paired rank for parity exchange."""
-        if world_size % 2 != 0:
-            raise ValueError(f"EC-CHECK: World size must be even for pairing, got {world_size}")
-        
-        if my_rank == 0:
-            return 2
-        if my_rank == 1:
-            return 3
-        if my_rank == 2:
-            return 0
-        if my_rank == 3:
-            return 1
-        
-        # half_size = world_size // 2
-        
-        # if my_rank < half_size:
-        #     # First half pairs with second half
-        #     paired_rank = my_rank + half_size
-        # else:
-        #     # Second half pairs with first half
-        #     paired_rank = my_rank - half_size
-        
-        # logger.debug(f"EC-CHECK: Rank {my_rank} paired with Rank {paired_rank}")
-        # return paired_rank
+        """Get the paired rank for parity exchange (XOR pairing within group).
+
+        Multi-rank: world_size must be divisible by 4. Each group of 4 ranks uses
+        same pairing as original 4-rank: in-group 0<->2, 1<->3 (by position).
+        E.g. 8 ranks: group0={0,2,4,6} -> 0<->4, 2<->6; group1={1,3,5,7} -> 1<->5, 3<->7.
+        """
+        if world_size % RANKS_PER_GROUP != 0:
+            raise ValueError(
+                f"EC-CHECK: World size must be divisible by {RANKS_PER_GROUP} for multi-rank, got {world_size}"
+            )
+        num_groups = world_size // RANKS_PER_GROUP
+        group_id = self._get_group_id(my_rank, world_size)
+        rank_in_group = self._get_rank_in_group(my_rank, world_size)
+        # In-group XOR pairing: position 0<->2, 1<->3
+        paired_rank_in_group = (rank_in_group + 2) % RANKS_PER_GROUP
+        paired_rank = group_id + num_groups * paired_rank_in_group
+        logger.debug(
+            f"EC-CHECK: Rank {my_rank} (group_id={group_id}, rank_in_group={rank_in_group}) "
+            f"XOR paired with Rank {paired_rank}"
+        )
+        return paired_rank
 
     def get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank for data/parity exchange.
@@ -328,16 +339,19 @@ class ECCHECKManager:
                 # Fallback to using local IP for all partners
                 xor_partner_ip = base_ip
                 p2p_partner_ip = base_ip
+                rank_ips = {r: base_ip for r in range(world_size)}
         else:
             # Single rank mode - use local IP
             logger.info("EC-CHECK: Distributed not initialized, using local IP for all partners")
-        
+            rank_ips = {r: base_ip for r in range(world_size)}
+
         config = {
             'my_ip': base_ip,
             'base_port': base_port,
             'xor_partner_ip': xor_partner_ip,
             'p2p_partner_ip': p2p_partner_ip,
             'ports': ports,
+            'rank_ips': rank_ips,
         }
         
         logger.info(
@@ -461,13 +475,30 @@ class ECCHECKManager:
                     xor_partner_recv_port = base_port + xor_partner * 6 + 1  # partner's xor_recv port
                     p2p_partner_recv_port = base_port + p2p_partner * 6 + 3  # partner's p2p_recv port
                     
-                    # Step6 P2P: rank3 sends to rank2's step6_p2p_recv port
-                    # rank2 listens on step6_p2p_recv port
-                    step6_p2p_partner_rank = 2 if rank == 3 else -1  # rank3's partner is rank2
-                    step6_p2p_partner_ip = net_config['p2p_partner_ip'] if rank == 3 else ""
-                    step6_p2p_send_port = base_port + step6_p2p_partner_rank * 6 + 5 if rank == 3 else 0  # rank2's step6_p2p_recv port
-                    step6_p2p_listen_ip = net_config['my_ip'] if rank == 2 else ""
-                    step6_p2p_recv_port = net_config['ports']['step6_p2p_recv'] if rank == 2 else 0
+                    # Step6 P2P: rank_in_group 3 sends to rank_in_group 2 in same group
+                    # rank_in_group 2 listens on step6_p2p_recv port (multi-rank: per-group)
+                    num_groups = world_size // RANKS_PER_GROUP
+                    group_id = self._get_group_id(rank, world_size)
+                    rank_in_group = self._get_rank_in_group(rank, world_size)
+                    rank_ips = net_config.get('rank_ips', {})
+                    if rank_in_group == 3:
+                        step6_p2p_partner_rank = group_id + num_groups * 2
+                        step6_p2p_partner_ip = rank_ips.get(step6_p2p_partner_rank, net_config['my_ip'])
+                        step6_p2p_send_port = base_port + step6_p2p_partner_rank * 6 + 5
+                        step6_p2p_listen_ip = ""
+                        step6_p2p_recv_port = 0
+                    elif rank_in_group == 2:
+                        step6_p2p_partner_rank = -1
+                        step6_p2p_partner_ip = ""
+                        step6_p2p_send_port = 0
+                        step6_p2p_listen_ip = net_config['my_ip']
+                        step6_p2p_recv_port = net_config['ports']['step6_p2p_recv']
+                    else:
+                        step6_p2p_partner_rank = -1
+                        step6_p2p_partner_ip = ""
+                        step6_p2p_send_port = 0
+                        step6_p2p_listen_ip = ""
+                        step6_p2p_recv_port = 0
                     
                     self._eccheck_native = eccheck_native.ECCHECKNative(
                         rank, world_size, paired_rank,
@@ -481,8 +512,8 @@ class ECCHECKManager:
                         # Only rank2/3 use these (rank2 recv, rank3 send)
                         step6_p2p_partner_ip, step6_p2p_send_port,
                         step6_p2p_listen_ip, step6_p2p_recv_port,
-                        # RDMA flag
-                        self.use_rdma
+                        self.use_rdma,
+                        rank_in_group,
                     )
                     
                     # If we reach here, ASIO/RDMA connections are ready and threads are running
@@ -563,12 +594,14 @@ class ECCHECKManager:
                     logger.info(f"EC-CHECK: Creating C++ native module (this will block until NCCL is initialized)...")
                     print(f"EC-CHECK: [Rank {rank}] Creating C++ native module (blocking until NCCL initialization completes)...")
                     
+                    rank_in_group = self._get_rank_in_group(rank, world_size)
                     self._eccheck_native = eccheck_native.ECCHECKNative(
                         rank, world_size, paired_rank,
                         nccl_id_thread1,    # rank0↔rank2 XOR
                         nccl_id_thread2,    # rank1↔rank3 XOR
                         nccl_id_p2p_0_1,   # rank0↔rank1 P2P
-                        nccl_id_p2p_2_3    # rank2↔rank3 P2P
+                        nccl_id_p2p_2_3,   # rank2↔rank3 P2P
+                        rank_in_group,
                     )
                     
                     # If we reach here, NCCL communicators are ready and threads are running

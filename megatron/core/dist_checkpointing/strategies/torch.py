@@ -9461,6 +9461,84 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] Layerwise pipeline initialized")
         
+        # Step 4.5: Compute layer sizes and block offsets (same formula as save) for per-layer send/recv
+        # This must match filesystem_async._eclatin_preload_tensors_layerwise and layer_block_offsets
+        layer_sizes = {}  # layer_id -> own size in bytes
+        for layer_key, tensor_list in layer_groups.items():
+            if layer_key == "non_layer":
+                continue
+            try:
+                layer_id = int(layer_key.split("_")[1])
+            except (ValueError, IndexError):
+                continue
+            own_size = 0
+            for info, tensor in tensor_list:
+                if tensor is not None:
+                    own_size += tensor.numel() * tensor.element_size()
+                else:
+                    own_size += getattr(info, 'size_bytes', 0)
+            layer_sizes[layer_id] = own_size
+
+        # All-gather per-layer sizes and compute max + aligned (same as save)
+        layer_max_sizes = {}
+        layer_aligned_sizes = {}
+        if torch.distributed.is_initialized():
+            all_layer_sizes_list = [None] * world_size
+            torch.distributed.all_gather_object(all_layer_sizes_list, layer_sizes)
+            all_layer_sizes_dict = {}
+            for rank_layer_sizes in all_layer_sizes_list:
+                for lid, sz in rank_layer_sizes.items():
+                    if lid not in all_layer_sizes_dict:
+                        all_layer_sizes_dict[lid] = []
+                    all_layer_sizes_dict[lid].append(sz)
+            for lid, sizes_list in all_layer_sizes_dict.items():
+                layer_max_sizes[lid] = max(sizes_list)
+        else:
+            layer_max_sizes = layer_sizes.copy()
+
+        eclatin_buffer_size = getattr(self.eclatin_manager, 'eclatin_buffer_size', 64 * 1024 * 1024)
+        for lid, max_size in layer_max_sizes.items():
+            aligned_size = ((max_size + eclatin_buffer_size - 1) // eclatin_buffer_size) * eclatin_buffer_size
+            layer_aligned_sizes[lid] = aligned_size
+
+        # Per-layer block offsets (same accumulation as save: data by actual half, parity by aligned half)
+        layer_block_offsets = {}
+        current_data1 = 0
+        current_data2 = 0
+        current_parity1 = 0
+        current_parity2 = 0
+        for layer_id in sorted(layer_max_sizes.keys()):
+            own_layer_size = layer_sizes.get(layer_id, 0)
+            aligned_layer_size = layer_aligned_sizes[layer_id]
+            half_aligned = aligned_layer_size // 2
+            half_actual = own_layer_size // 2
+            layer_block_offsets[layer_id] = {
+                'data_block_1': current_data1,
+                'data_block_2': current_data2,
+                'parity_block_1': current_parity1,
+                'parity_block_2': current_parity2,
+                'aligned_size': aligned_layer_size,
+                'half_aligned': half_aligned,
+                'actual_size': own_layer_size,
+                'half_actual': half_actual,
+            }
+            current_data1 += half_actual
+            current_data2 += (own_layer_size - half_actual)
+            current_parity1 += half_aligned
+            current_parity2 += half_aligned
+
+        # Recv buffer offset per layer: cumulative aligned size before this layer (for rank2)
+        recv_offset_per_layer = {}
+        cum = 0
+        for layer_id in sorted(layer_max_sizes.keys()):
+            recv_offset_per_layer[layer_id] = cum
+            cum += layer_aligned_sizes[layer_id]
+
+        logger.info(
+            f"ECLATIN Layerwise Load: [Rank {rank}] Computed layer_block_offsets and recv_offset for "
+            f"{len(layer_block_offsets)} layers (aligned sizes: {len(layer_aligned_sizes)})"
+        )
+
         # Step 5: Process each layer with pipeline
         # For non-recovery ranks: just organize and initialize model layer-by-layer
         # For rank2: receive → recover → initialize (pipelined)
@@ -9538,7 +9616,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 index_to_data[index_key] = (info, tensor)
                 if tensor is not None:
                     layer_size += tensor.numel() * tensor.element_size()
-            
+                else:
+                    layer_size += getattr(info, 'size_bytes', 0)
+
+            # Rank2 submit first so C++ worker posts recv before 0/1/3 send (avoid send/recv deadlock)
+            do_submit = False
             if use_cpp_pipeline and layer_size > 0:
                 # Rank2: Use C++ pipeline for recovery + H2D transfer
                 # Prepare GPU tensor info for H2D transfer
@@ -9561,22 +9643,36 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                                         fqn = info.key
                                         gpu_tensors_info.append((gpu_ptr, cpu_offset, tensor_size, shape, fqn))
                                         cpu_offset += tensor_size
+                                elif getattr(info, 'size_bytes', 0) > 0 and hasattr(sh_base, 'data') and isinstance(sh_base.data, torch.Tensor):
+                                    gpu_ptr = int(sh_base.data.data_ptr()) if sh_base.data.is_cuda else 0
+                                    if gpu_ptr > 0:
+                                        tensor_size = getattr(info, 'size_bytes', 0)
+                                        shape = list(info.shape) if hasattr(info, 'shape') else []
+                                        fqn = info.key
+                                        gpu_tensors_info.append((gpu_ptr, cpu_offset, tensor_size, shape, fqn))
+                                        cpu_offset += tensor_size
                 
-                # Submit layer to C++ pipeline
-                if gpu_tensors_info:
-                    # Get buffer addresses (simplified - actual implementation needs proper buffer management)
-                    recv_rank0_data2_addr = int(self.eclatin_recv_buffers['rank0_data2'].data_ptr()) if self.eclatin_recv_buffers else 0
-                    recv_rank0_parity2_addr = int(self.eclatin_recv_buffers['rank0_parity2'].data_ptr()) if self.eclatin_recv_buffers else 0
-                    recv_rank1_data1_addr = int(self.eclatin_recv_buffers['rank1_data1'].data_ptr()) if self.eclatin_recv_buffers else 0
-                    recv_rank1_parity1_addr = int(self.eclatin_recv_buffers['rank1_parity1'].data_ptr()) if self.eclatin_recv_buffers else 0
-                    recv_rank3_data1_addr = int(self.eclatin_recv_buffers['rank3_data1'].data_ptr()) if self.eclatin_recv_buffers else 0
-                    recv_rank3_data2_addr = int(self.eclatin_recv_buffers['rank3_data2'].data_ptr()) if self.eclatin_recv_buffers else 0
-                    
-                    recovered_data1_addr = int(self.eclatin_blocks['data_block_1'].data_ptr())
-                    recovered_data2_addr = int(self.eclatin_blocks['data_block_2'].data_ptr())
-                    recovered_parity1_addr = int(self.eclatin_blocks['parity_block_1'].data_ptr())
-                    recovered_parity2_addr = int(self.eclatin_blocks['parity_block_2'].data_ptr())
-                    
+                # Submit layer to C++ pipeline (Rank2 only when we have offsets = we sent this layer)
+                do_submit = (
+                    use_cpp_pipeline and rank == 2
+                    and layer_id in layer_block_offsets
+                    and layer_id in recv_offset_per_layer
+                )
+                if do_submit:
+                    offs = layer_block_offsets[layer_id]
+                    layer_aligned_size = layer_aligned_sizes[layer_id]
+                    recv_off = recv_offset_per_layer[layer_id]
+                    recv_rank0_data2_addr = int(self.eclatin_recv_buffers['rank0_data2'].data_ptr()) + recv_off
+                    recv_rank0_parity2_addr = int(self.eclatin_recv_buffers['rank0_parity2'].data_ptr()) + recv_off
+                    recv_rank1_data1_addr = int(self.eclatin_recv_buffers['rank1_data1'].data_ptr()) + recv_off
+                    recv_rank1_parity1_addr = int(self.eclatin_recv_buffers['rank1_parity1'].data_ptr()) + recv_off
+                    recv_rank3_data1_addr = int(self.eclatin_recv_buffers['rank3_data1'].data_ptr()) + recv_off
+                    recv_rank3_data2_addr = int(self.eclatin_recv_buffers['rank3_data2'].data_ptr()) + recv_off
+                    recovered_data1_addr = int(self.eclatin_blocks['data_block_1'].data_ptr()) + offs['data_block_1']
+                    recovered_data2_addr = int(self.eclatin_blocks['data_block_2'].data_ptr()) + offs['data_block_2']
+                    recovered_parity1_addr = int(self.eclatin_blocks['parity_block_1'].data_ptr()) + offs['parity_block_1']
+                    recovered_parity2_addr = int(self.eclatin_blocks['parity_block_2'].data_ptr()) + offs['parity_block_2']
+                    submit_layer_size = layer_aligned_size
                     logger.info(f"ECLATIN Layerwise Load: [Rank {rank}] Submitting layer {layer_id} to C++ pipeline")
                     self.eclatin_manager._eclatin_native.submit_layer_wise_load(
                         int(layer_id),
@@ -9591,8 +9687,37 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         int(recovered_data2_addr),
                         int(recovered_parity1_addr),
                         int(recovered_parity2_addr),
-                        int(layer_size)
+                        int(submit_layer_size)
                     )
+            
+            # Per-layer send (rank0/1/3) then barrier
+            if layer_id in layer_block_offsets and layer_id in layer_aligned_sizes:
+                layer_aligned_size = layer_aligned_sizes[layer_id]
+                offs = layer_block_offsets[layer_id]
+                if self.eclatin_blocks is not None:
+                    data_block_1_base = int(self.eclatin_blocks['data_block_1'].data_ptr())
+                    data_block_2_base = int(self.eclatin_blocks['data_block_2'].data_ptr())
+                    parity_block_1_base = int(self.eclatin_blocks['parity_block_1'].data_ptr())
+                    parity_block_2_base = int(self.eclatin_blocks['parity_block_2'].data_ptr())
+                    if rank == 0:
+                        self.eclatin_manager._eclatin_native.load_send_blocks(
+                            'rank0_data2', data_block_2_base + offs['data_block_2'],
+                            'rank0_parity2', parity_block_2_base + offs['parity_block_2'],
+                            layer_aligned_size
+                        )
+                    elif rank == 1:
+                        self.eclatin_manager._eclatin_native.load_send_blocks(
+                            'rank1_data1', data_block_1_base + offs['data_block_1'],
+                            'rank1_parity1', parity_block_1_base + offs['parity_block_1'],
+                            layer_aligned_size
+                        )
+                    elif rank == 3:
+                        self.eclatin_manager._eclatin_native.load_send_blocks(
+                            'rank3_data1', data_block_1_base + offs['data_block_1'],
+                            'rank3_data2', data_block_2_base + offs['data_block_2'],
+                            layer_aligned_size
+                        )
+                torch.distributed.barrier()
             
             # Match tensors with sharded_state_dict for this layer
             for key, sh_base_list in keyed_state_dict.items():
@@ -9601,13 +9726,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         sh_offset = tuple(sh_base.global_offset) if hasattr(sh_base.global_offset, '__iter__') else (sh_base.global_offset,)
                         lookup_key = (key, sh_offset)
                         if lookup_key in index_to_data:
-                            if use_cpp_pipeline:
-                                # Rank2: C++ pipeline has already written data directly to sh_base.data GPU memory
-                                # Do NOT overwrite with CPU tensor from index_to_data
-                                # sh_base.data already contains the recovered data on GPU
+                            if use_cpp_pipeline and do_submit:
+                                # Rank2: C++ pipeline wrote recovered data to sh_base.data
                                 matched_count += 1
                             else:
-                                # Non-rank2 or fallback: Load CPU tensor and transfer to GPU
+                                # Non-rank2 or rank2 when this layer was not submitted: load from CPU
                                 _, tensor = index_to_data[lookup_key]
                                 if tensor is not None and tensor.device.type == 'cpu':
                                     tensor = tensor.cuda(non_blocking=True)
@@ -9817,10 +9940,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if logger.isEnabledFor(logging.DEBUG) and layer_keys:
             logger.debug(f"ECLATIN Load: Layer keys found: {sorted(layer_keys)}")
         
-        # Split non-layer tensors into virtual layers (SAME as save mode)
+        # Split non-layer tensors into virtual layers (SAME as save mode).
+        # All ranks must call (function contains all_gather); ranks with no non_layer return early inside.
         if num_non_layer > 0:
             logger.info(f"ECLATIN Load: Splitting {num_non_layer} non-layer tensors into virtual layers...")
-            layer_groups = self._split_non_layer_into_virtual_layers_for_load(layer_groups, layer_keys)
+        layer_groups = self._split_non_layer_into_virtual_layers_for_load(layer_groups, layer_keys)
         
         return layer_groups
     
@@ -9828,7 +9952,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         """Split non-layer tensors into virtual layers for load.
         
         This MUST use the SAME algorithm as save mode to ensure consistency.
-        The algorithm splits based on tensor sizes and capacity limits.
+        Uses max_non_layer_size (max across ranks) and avg_layer_size (from real layer max sizes),
+        and sorts by FQN to match save-side assignment.
         
         Args:
             layer_groups: Dict with layer_groups including "non_layer"
@@ -9838,38 +9963,73 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             Updated layer_groups with virtual layers added
         """
         non_layer_tensors = layer_groups.get('non_layer', [])
+        # Local sizes (ALL ranks must compute and participate in all_gather to avoid deadlock)
+        total_non_layer_size = (
+            sum(info.size_bytes for info, tensor in non_layer_tensors)
+            if non_layer_tensors else 0
+        )
+        layer_sizes = {}
+        for layer_key in real_layer_keys:
+            if layer_key in layer_groups:
+                layer_id = int(layer_key.split('_')[1])
+                layer_sizes[layer_id] = sum(
+                    info.size_bytes for info, tensor in layer_groups[layer_key]
+                )
+        
+        # All-gather to get max_non_layer_size and avg_layer_size (SAME as save mode)
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            all_non_layer_sizes_list = [None] * world_size
+            all_layer_sizes_list = [None] * world_size
+            torch.distributed.all_gather_object(all_non_layer_sizes_list, total_non_layer_size)
+            torch.distributed.all_gather_object(all_layer_sizes_list, layer_sizes)
+            max_non_layer_size = max(all_non_layer_sizes_list)
+            all_layer_sizes_dict = {}
+            for rank_layer_sizes in all_layer_sizes_list:
+                for lid, sz in rank_layer_sizes.items():
+                    if lid not in all_layer_sizes_dict:
+                        all_layer_sizes_dict[lid] = []
+                    all_layer_sizes_dict[lid].append(sz)
+            layer_max_sizes = {
+                lid: max(sizes_list) for lid, sizes_list in all_layer_sizes_dict.items()
+            }
+            avg_layer_size = (
+                sum(layer_max_sizes.values()) // len(layer_max_sizes)
+                if layer_max_sizes else max_non_layer_size
+            )
+        else:
+            max_non_layer_size = total_non_layer_size
+            avg_layer_size = (
+                sum(layer_sizes.values()) // len(layer_sizes)
+                if layer_sizes else total_non_layer_size
+            )
+        
+        # Early return only after all_gather so all ranks participate in collective
         if not non_layer_tensors:
             return layer_groups
         
-        # Calculate average layer size and virtual layer capacity (SAME as save mode)
-        total_non_layer_size = sum(
-            info.size_bytes for info, tensor in non_layer_tensors
+        # Calculate num_virtual_layers and capacity (SAME formula as save mode)
+        if avg_layer_size <= 0:
+            avg_layer_size = max_non_layer_size
+        num_virtual_layers = max(
+            1,
+            (max_non_layer_size + avg_layer_size - 1) // avg_layer_size
         )
-        
-        # Get average real layer size
-        real_layer_sizes = []
-        for layer_key in real_layer_keys:
-            if layer_key in layer_groups:
-                layer_size = sum(info.size_bytes for info, tensor in layer_groups[layer_key])
-                real_layer_sizes.append(layer_size)
-        
-        avg_layer_size = sum(real_layer_sizes) // len(real_layer_sizes) if real_layer_sizes else total_non_layer_size
-        
-        # Calculate number of virtual layers needed
-        num_virtual_layers = (total_non_layer_size + avg_layer_size - 1) // avg_layer_size
-        original_virtual_layer_capacity = (total_non_layer_size + num_virtual_layers - 1) // num_virtual_layers
+        original_virtual_layer_capacity = (
+            max_non_layer_size + num_virtual_layers - 1
+        ) // num_virtual_layers
         
         logger.info(
-            f"ECLATIN Load: Splitting non-layer data ({total_non_layer_size / (1024**2):.2f} MB) "
+            f"ECLATIN Load: Non-layer data (own: {total_non_layer_size / (1024**2):.2f} MB, "
+            f"max across ranks: {max_non_layer_size / (1024**2):.2f} MB) "
             f"into {num_virtual_layers} virtual layers "
             f"(capacity: {original_virtual_layer_capacity / (1024**2):.2f} MB per layer)"
         )
         
-        # Sort tensors by size (largest first) - SAME as save mode
+        # Sort by FQN to ensure same assignment order as save (filesystem_async)
         non_layer_tensors_sorted = sorted(
             non_layer_tensors,
-            key=lambda x: x[0].size_bytes,  # info.size_bytes
-            reverse=True
+            key=lambda x: x[0].key
         )
         
         # Split into large and small tensors

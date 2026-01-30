@@ -3134,13 +3134,87 @@ private:
             double recovery_time_ms = 0.0;
             double h2d_time_ms = 0.0;
             
-            // Stage 1 & 2: If rank2 needs recovery, receive and recover
+            // Stage 1 & 2: If rank2 needs recovery, receive then XOR
             if (is_load_mode_ && failed_rank_ == 2) {
                 std::cout << "ECLATIN Load: Performing rank2 recovery for layer " << task.layer_id << std::endl;
                 
-                // The buffers are already populated by load_recover() call in Python
-                // Here we just need to do the XOR recovery computation
+                // Stage 1: Parallel receive 6 blocks for this layer (same as load_recover but per-layer)
+                std::vector<std::exception_ptr> recv_exceptions(6);
+                std::vector<std::thread> recv_threads;
+                size_t recv_size = task.layer_size;
                 
+                recv_threads.emplace_back([&]() {
+                    try {
+                        if (!recv_with_size_bool(conn_.get_load_recv_rank0_data2_socket(),
+                                                reinterpret_cast<void*>(task.recv_rank0_data2_addr), recv_size)) {
+                            throw std::runtime_error("Failed to receive rank0_data2");
+                        }
+                    } catch (...) {
+                        recv_exceptions[0] = std::current_exception();
+                    }
+                });
+                recv_threads.emplace_back([&]() {
+                    try {
+                        if (!recv_with_size_bool(conn_.get_load_recv_rank0_parity2_socket(),
+                                                reinterpret_cast<void*>(task.recv_rank0_parity2_addr), recv_size)) {
+                            throw std::runtime_error("Failed to receive rank0_parity2");
+                        }
+                    } catch (...) {
+                        recv_exceptions[1] = std::current_exception();
+                    }
+                });
+                recv_threads.emplace_back([&]() {
+                    try {
+                        if (!recv_with_size_bool(conn_.get_load_recv_rank1_data1_socket(),
+                                                reinterpret_cast<void*>(task.recv_rank1_data1_addr), recv_size)) {
+                            throw std::runtime_error("Failed to receive rank1_data1");
+                        }
+                    } catch (...) {
+                        recv_exceptions[2] = std::current_exception();
+                    }
+                });
+                recv_threads.emplace_back([&]() {
+                    try {
+                        if (!recv_with_size_bool(conn_.get_load_recv_rank1_parity1_socket(),
+                                                reinterpret_cast<void*>(task.recv_rank1_parity1_addr), recv_size)) {
+                            throw std::runtime_error("Failed to receive rank1_parity1");
+                        }
+                    } catch (...) {
+                        recv_exceptions[3] = std::current_exception();
+                    }
+                });
+                recv_threads.emplace_back([&]() {
+                    try {
+                        if (!recv_with_size_bool(conn_.get_load_recv_rank3_data1_socket(),
+                                                reinterpret_cast<void*>(task.recv_rank3_data1_addr), recv_size)) {
+                            throw std::runtime_error("Failed to receive rank3_data1");
+                        }
+                    } catch (...) {
+                        recv_exceptions[4] = std::current_exception();
+                    }
+                });
+                recv_threads.emplace_back([&]() {
+                    try {
+                        if (!recv_with_size_bool(conn_.get_load_recv_rank3_data2_socket(),
+                                                reinterpret_cast<void*>(task.recv_rank3_data2_addr), recv_size)) {
+                            throw std::runtime_error("Failed to receive rank3_data2");
+                        }
+                    } catch (...) {
+                        recv_exceptions[5] = std::current_exception();
+                    }
+                });
+                
+                for (auto& t : recv_threads) {
+                    t.join();
+                }
+                for (size_t i = 0; i < recv_exceptions.size(); ++i) {
+                    if (recv_exceptions[i]) {
+                        std::rethrow_exception(recv_exceptions[i]);
+                    }
+                }
+                std::cout << "ECLATIN Load: Layer " << task.layer_id << " received 6 blocks" << std::endl;
+                
+                // Stage 2: XOR recovery (same formula as standard ECLATIN)
                 auto recovery_start = std::chrono::high_resolution_clock::now();
                 
                 // Recovery formula for rank2 (similar to standard ECLATIN recovery):
@@ -3195,9 +3269,14 @@ private:
             }
             
             // Stage 3: H2D transfer (CPU→GPU) for model initialization
+            // For rank2 layerwise: data is split - first half in recovered_data1, second in recovered_data2
             #ifdef USE_CUDA
             if (!task.gpu_tensors.empty()) {
                 auto h2d_start = std::chrono::high_resolution_clock::now();
+                size_t half_layer = task.layer_size / 2;
+                uintptr_t base1 = task.recovered_data1_addr;
+                uintptr_t base2 = task.recovered_data2_addr;
+                bool use_two_blocks = (is_load_mode_ && failed_rank_ == 2);
                 
                 if (use_async_cuda_ && !cuda_streams_.empty()) {
                     // Async CUDA transfer path
@@ -3213,11 +3292,7 @@ private:
                     for (int stream_idx = 0; stream_idx < num_cuda_streams_; ++stream_idx) {
                         for (const auto* tensor_info : stream_tensors[stream_idx]) {
                             uintptr_t gpu_ptr = tensor_info->gpu_data_ptr;
-                            // For rank2, use recovered buffer; for others, use original data blocks
-                            uintptr_t cpu_base = is_load_mode_ && failed_rank_ == 2 ? 
-                                                task.recovered_data1_addr : // Simplified: should check which block
-                                                task.recv_rank0_data2_addr;  // For non-rank2
-                            uintptr_t cpu_ptr = cpu_base + tensor_info->cpu_offset;
+                            size_t cpu_offset = tensor_info->cpu_offset;
                             size_t size = tensor_info->size_bytes;
                             
                             if (gpu_ptr == 0 || size == 0) {
@@ -3226,19 +3301,59 @@ private:
                                 continue;
                             }
                             
-                            cudaError_t err = cudaMemcpyAsync(
-                                reinterpret_cast<void*>(gpu_ptr), 
-                                reinterpret_cast<void*>(cpu_ptr), 
-                                size, 
-                                cudaMemcpyHostToDevice,
-                                cuda_streams_[stream_idx]
-                            );
-                            
-                            if (err != cudaSuccess) {
-                                std::cerr << "ECLATIN Load: ERROR: cudaMemcpyAsync H2D failed for layer " 
-                                          << task.layer_id << " stream " << stream_idx 
-                                          << ": " << cudaGetErrorString(err) << std::endl;
-                                throw std::runtime_error("ECLATIN Load: H2D async transfer failed");
+                            if (use_two_blocks) {
+                                // Rank2: copy from recovered_data1 (first half) and/or recovered_data2 (second half)
+                                if (cpu_offset + size <= half_layer) {
+                                    uintptr_t cpu_ptr = base1 + cpu_offset;
+                                    cudaError_t err = cudaMemcpyAsync(
+                                        reinterpret_cast<void*>(gpu_ptr),
+                                        reinterpret_cast<void*>(cpu_ptr),
+                                        size, cudaMemcpyHostToDevice, cuda_streams_[stream_idx]);
+                                    if (err != cudaSuccess) {
+                                        std::cerr << "ECLATIN Load: ERROR: cudaMemcpyAsync H2D failed: " << cudaGetErrorString(err) << std::endl;
+                                        throw std::runtime_error("ECLATIN Load: H2D async transfer failed");
+                                    }
+                                } else if (cpu_offset >= half_layer) {
+                                    uintptr_t cpu_ptr = base2 + (cpu_offset - half_layer);
+                                    cudaError_t err = cudaMemcpyAsync(
+                                        reinterpret_cast<void*>(gpu_ptr),
+                                        reinterpret_cast<void*>(cpu_ptr),
+                                        size, cudaMemcpyHostToDevice, cuda_streams_[stream_idx]);
+                                    if (err != cudaSuccess) {
+                                        std::cerr << "ECLATIN Load: ERROR: cudaMemcpyAsync H2D failed: " << cudaGetErrorString(err) << std::endl;
+                                        throw std::runtime_error("ECLATIN Load: H2D async transfer failed");
+                                    }
+                                } else {
+                                    size_t first_len = half_layer - cpu_offset;
+                                    size_t second_len = size - first_len;
+                                    cudaError_t err = cudaMemcpyAsync(
+                                        reinterpret_cast<void*>(gpu_ptr),
+                                        reinterpret_cast<void*>(base1 + cpu_offset),
+                                        first_len, cudaMemcpyHostToDevice, cuda_streams_[stream_idx]);
+                                    if (err != cudaSuccess) {
+                                        std::cerr << "ECLATIN Load: ERROR: cudaMemcpyAsync H2D (first segment) failed: " << cudaGetErrorString(err) << std::endl;
+                                        throw std::runtime_error("ECLATIN Load: H2D async transfer failed");
+                                    }
+                                    err = cudaMemcpyAsync(
+                                        reinterpret_cast<void*>(gpu_ptr + first_len),
+                                        reinterpret_cast<void*>(base2),
+                                        second_len, cudaMemcpyHostToDevice, cuda_streams_[stream_idx]);
+                                    if (err != cudaSuccess) {
+                                        std::cerr << "ECLATIN Load: ERROR: cudaMemcpyAsync H2D (second segment) failed: " << cudaGetErrorString(err) << std::endl;
+                                        throw std::runtime_error("ECLATIN Load: H2D async transfer failed");
+                                    }
+                                }
+                            } else {
+                                uintptr_t cpu_base = task.recv_rank0_data2_addr;
+                                uintptr_t cpu_ptr = cpu_base + cpu_offset;
+                                cudaError_t err = cudaMemcpyAsync(
+                                    reinterpret_cast<void*>(gpu_ptr),
+                                    reinterpret_cast<void*>(cpu_ptr),
+                                    size, cudaMemcpyHostToDevice, cuda_streams_[stream_idx]);
+                                if (err != cudaSuccess) {
+                                    std::cerr << "ECLATIN Load: ERROR: cudaMemcpyAsync H2D failed: " << cudaGetErrorString(err) << std::endl;
+                                    throw std::runtime_error("ECLATIN Load: H2D async transfer failed");
+                                }
                             }
                         }
                     }
@@ -3275,11 +3390,7 @@ private:
                     
                     for (const auto& tensor_info : task.gpu_tensors) {
                         uintptr_t gpu_ptr = tensor_info.gpu_data_ptr;
-                        // For rank2, use recovered buffer; for others, use original data blocks
-                        uintptr_t cpu_base = is_load_mode_ && failed_rank_ == 2 ? 
-                                            task.recovered_data1_addr : // Simplified: should check which block
-                                            task.recv_rank0_data2_addr;  // For non-rank2
-                        uintptr_t cpu_ptr = cpu_base + tensor_info.cpu_offset;
+                        size_t cpu_offset = tensor_info.cpu_offset;
                         size_t size = tensor_info.size_bytes;
                         
                         if (gpu_ptr == 0 || size == 0) {
@@ -3288,17 +3399,54 @@ private:
                             continue;
                         }
                         
-                        cudaError_t err = cudaMemcpy(
-                            reinterpret_cast<void*>(gpu_ptr), 
-                            reinterpret_cast<void*>(cpu_ptr), 
-                            size, 
-                            cudaMemcpyHostToDevice
-                        );
-                        
-                        if (err != cudaSuccess) {
-                            std::cerr << "ECLATIN Load: ERROR: cudaMemcpy H2D failed for layer " << task.layer_id 
-                                      << ": " << cudaGetErrorString(err) << std::endl;
-                            throw std::runtime_error("ECLATIN Load: H2D transfer failed");
+                        if (use_two_blocks) {
+                            if (cpu_offset + size <= half_layer) {
+                                uintptr_t cpu_ptr = base1 + cpu_offset;
+                                cudaError_t err = cudaMemcpy(
+                                    reinterpret_cast<void*>(gpu_ptr), reinterpret_cast<void*>(cpu_ptr),
+                                    size, cudaMemcpyHostToDevice);
+                                if (err != cudaSuccess) {
+                                    std::cerr << "ECLATIN Load: ERROR: cudaMemcpy H2D failed: " << cudaGetErrorString(err) << std::endl;
+                                    throw std::runtime_error("ECLATIN Load: H2D transfer failed");
+                                }
+                            } else if (cpu_offset >= half_layer) {
+                                uintptr_t cpu_ptr = base2 + (cpu_offset - half_layer);
+                                cudaError_t err = cudaMemcpy(
+                                    reinterpret_cast<void*>(gpu_ptr), reinterpret_cast<void*>(cpu_ptr),
+                                    size, cudaMemcpyHostToDevice);
+                                if (err != cudaSuccess) {
+                                    std::cerr << "ECLATIN Load: ERROR: cudaMemcpy H2D failed: " << cudaGetErrorString(err) << std::endl;
+                                    throw std::runtime_error("ECLATIN Load: H2D transfer failed");
+                                }
+                            } else {
+                                size_t first_len = half_layer - cpu_offset;
+                                size_t second_len = size - first_len;
+                                cudaError_t err = cudaMemcpy(
+                                    reinterpret_cast<void*>(gpu_ptr),
+                                    reinterpret_cast<void*>(base1 + cpu_offset),
+                                    first_len, cudaMemcpyHostToDevice);
+                                if (err != cudaSuccess) {
+                                    std::cerr << "ECLATIN Load: ERROR: cudaMemcpy H2D (first segment) failed: " << cudaGetErrorString(err) << std::endl;
+                                    throw std::runtime_error("ECLATIN Load: H2D transfer failed");
+                                }
+                                err = cudaMemcpy(
+                                    reinterpret_cast<void*>(gpu_ptr + first_len),
+                                    reinterpret_cast<void*>(base2),
+                                    second_len, cudaMemcpyHostToDevice);
+                                if (err != cudaSuccess) {
+                                    std::cerr << "ECLATIN Load: ERROR: cudaMemcpy H2D (second segment) failed: " << cudaGetErrorString(err) << std::endl;
+                                    throw std::runtime_error("ECLATIN Load: H2D transfer failed");
+                                }
+                            }
+                        } else {
+                            uintptr_t cpu_ptr = task.recv_rank0_data2_addr + cpu_offset;
+                            cudaError_t err = cudaMemcpy(
+                                reinterpret_cast<void*>(gpu_ptr), reinterpret_cast<void*>(cpu_ptr),
+                                size, cudaMemcpyHostToDevice);
+                            if (err != cudaSuccess) {
+                                std::cerr << "ECLATIN Load: ERROR: cudaMemcpy H2D failed: " << cudaGetErrorString(err) << std::endl;
+                                throw std::runtime_error("ECLATIN Load: H2D transfer failed");
+                            }
                         }
                     }
                     

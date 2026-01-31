@@ -15,6 +15,9 @@ from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
 
 logger = getLogger(__name__)
 
+# Number of ranks per EC-NAIVE group (each group behaves like the original 4-rank setup)
+RANKS_PER_GROUP = 4
+
 
 class ECNAIVEManager:
     """Shared manager for EC-NAIVE C++ module initialization and buffer management.
@@ -78,30 +81,48 @@ class ECNAIVEManager:
         
         self._initialized = True
 
+    @staticmethod
+    def _get_group_id(rank: int, world_size: int) -> int:
+        """Get group id for multi-rank. Same logic as ECLATIN: group 0 has ranks 0,2,4,6 (8 ranks)."""
+        num_groups = max(1, world_size // RANKS_PER_GROUP)
+        return rank % num_groups
+
+    @staticmethod
+    def _get_rank_in_group(rank: int, world_size: int) -> int:
+        """Get rank index within group (0..3). Same group logic as _get_group_id."""
+        num_groups = max(1, world_size // RANKS_PER_GROUP)
+        return rank // num_groups
+
     def _get_round_robin_ranks(self, rank: int, world_size: int) -> dict:
         """Calculate round-robin partner ranks for EC-NAIVE.
         
-        Round-robin distribution:
-        - Rank i sends d_{i1} to rank (i+1) % world_size
-        - Rank i sends p_{i0} to rank (i+2) % world_size
-        - Rank i sends p_{i1} to rank (i+3) % world_size
-        - Rank i receives p_{(i+1)%world_size,1} from rank (i+1) % world_size
-        - Rank i receives p_{(i+2)%world_size,0} from rank (i+2) % world_size
-        - Rank i receives d_{(i+3)%world_size,1} from rank (i+3) % world_size
+        Multi-rank: when world_size is divisible by 4, each group of 4 ranks uses
+        in-group round-robin (same as original 4-rank). Otherwise single ring over world_size.
+        - Rank i sends d_{i1} to (i+1) within group
+        - Rank i sends p_{i0} to (i+2) within group
+        - Rank i sends p_{i1} to (i+3) within group
+        - Same for recv partners.
         
-        Args:
-            rank (int): Current rank
-            world_size (int): Total number of ranks
-            
         Returns:
-            dict: Partner ranks for each connection with keys:
-                - 'send_data1_to': int - Rank to send d_{i1} to
-                - 'send_parity0_to': int - Rank to send p_{i0} to
-                - 'send_parity1_to': int - Rank to send p_{i1} to
-                - 'recv_parity1_from': int - Rank to receive p_{(i+1),1} from
-                - 'recv_parity0_from': int - Rank to receive p_{(i+2),0} from
-                - 'recv_data1_from': int - Rank to receive d_{(i+3),1} from
+            dict: Partner ranks for each connection (global rank).
         """
+        if world_size >= RANKS_PER_GROUP and world_size % RANKS_PER_GROUP == 0:
+            num_groups = world_size // RANKS_PER_GROUP
+            group_id = self._get_group_id(rank, world_size)
+            rank_in_group = self._get_rank_in_group(rank, world_size)
+            # In-group round-robin: +1, +2, +3 (mod 4)
+            send_data1_to_in_group = (rank_in_group + 1) % RANKS_PER_GROUP
+            send_parity0_to_in_group = (rank_in_group + 2) % RANKS_PER_GROUP
+            send_parity1_to_in_group = (rank_in_group + 3) % RANKS_PER_GROUP
+            # Global rank = group_id + num_groups * rank_in_group
+            return {
+                'send_data1_to': group_id + num_groups * send_data1_to_in_group,
+                'send_parity0_to': group_id + num_groups * send_parity0_to_in_group,
+                'send_parity1_to': group_id + num_groups * send_parity1_to_in_group,
+                'recv_parity1_from': group_id + num_groups * send_data1_to_in_group,
+                'recv_parity0_from': group_id + num_groups * send_parity0_to_in_group,
+                'recv_data1_from': group_id + num_groups * send_parity1_to_in_group,
+            }
         return {
             'send_data1_to': (rank + 1) % world_size,
             'send_parity0_to': (rank + 2) % world_size,
@@ -190,17 +211,22 @@ class ECNAIVEManager:
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
         base_port = int(os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000))
         
-        # Step 3: Calculate ports for this rank
-        # Port allocation: base_port + rank * 6 + offset
-        # offset: 0=send_data1, 1=send_parity0, 2=send_parity1,
-        #         3=recv_parity1, 4=recv_parity0, 5=recv_data1
+        # Step 3: Calculate ports for this rank (per-group to avoid conflict in multi-rank)
+        # When world_size divisible by 4: base_port + group_id * (4*6) + rank_in_group * 6 + offset
+        # Otherwise: base_port + rank * 6 + offset
+        if world_size >= RANKS_PER_GROUP and world_size % RANKS_PER_GROUP == 0:
+            group_id = self._get_group_id(rank, world_size)
+            rank_in_group = self._get_rank_in_group(rank, world_size)
+            port_base = base_port + group_id * (RANKS_PER_GROUP * 6) + rank_in_group * 6
+        else:
+            port_base = base_port + rank * 6
         ports = {
-            'send_data1': base_port + rank * 6 + 0,
-            'send_parity0': base_port + rank * 6 + 1,
-            'send_parity1': base_port + rank * 6 + 2,
-            'recv_parity1': base_port + rank * 6 + 3,
-            'recv_parity0': base_port + rank * 6 + 4,
-            'recv_data1': base_port + rank * 6 + 5,
+            'send_data1': port_base + 0,
+            'send_parity0': port_base + 1,
+            'send_parity1': port_base + 2,
+            'recv_parity1': port_base + 3,
+            'recv_parity0': port_base + 4,
+            'recv_data1': port_base + 5,
         }
         
         # Step 4: Exchange IP addresses via torch.distributed.all_gather
@@ -331,31 +357,28 @@ class ECNAIVEManager:
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
         base_port = int(os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000))
         
-        # Load mode ports (rank2 needs 8 recv ports for full recovery)
-        # Port allocation: base_port + 1000 + offset (to avoid conflict with save mode)
-        load_base_port = base_port + 1000
-        ports = {}
-        
-        if rank == 2:
-            # rank2: 8 recv ports for full recovery
-            ports.update({
-                # For recovering data0: d_{2,0} = p_{2,0} ⊕ d_{2,1}
-                'load_recv_rank3_data1': load_base_port + 0,   # d_{2,1} from rank3
-                'load_recv_rank0_parity0': load_base_port + 1, # p_{2,0} from rank0
-                
-                # For recovering recv_parity0: p_{0,0} = d_{0,0} ⊕ d_{0,1}
-                'load_recv_rank0_data0': load_base_port + 2,   # d_{0,0} from rank0
-                'load_recv_rank1_data1': load_base_port + 3,   # d_{0,1} from rank1
-                
-                # For recovering recv_data1: d_{1,1} = d_{1,0} ⊕ p_{1,1}
-                'load_recv_rank1_data0': load_base_port + 4,   # d_{1,0} from rank1
-                'load_recv_rank1_parity1': load_base_port + 5,  # p_{1,1} from rank1
-                
-                # For recovering recv_parity1: p_{3,1} = d_{3,0} ⊕ d_{3,1}
-                'load_recv_rank3_data0': load_base_port + 6,   # d_{3,0} from rank3
-                'load_recv_rank0_data1': load_base_port + 7,    # d_{3,1} from rank0
-            })
-        # Note: rank0/1/3 don't need ports in config, they connect to rank2's ports
+        # Multi-rank: per-group load ports to avoid conflict
+        num_groups = max(1, world_size // RANKS_PER_GROUP) if world_size >= RANKS_PER_GROUP else 1
+        group_id = self._get_group_id(rank, world_size)
+        rank_in_group = self._get_rank_in_group(rank, world_size)
+        # load_receiver_rank: global rank of rank_in_group 2 in this group (for init_ecnaive_load)
+        load_receiver_rank = (
+            group_id + num_groups * 2
+            if world_size >= RANKS_PER_GROUP
+            else 2
+        )
+        load_base_port = base_port + 1000 + group_id * 100
+        # All ranks in group get same 8 ports (receiver binds, others connect)
+        ports = {
+            'load_recv_rank3_data1': load_base_port + 0,
+            'load_recv_rank0_parity0': load_base_port + 1,
+            'load_recv_rank0_data0': load_base_port + 2,
+            'load_recv_rank1_data1': load_base_port + 3,
+            'load_recv_rank1_data0': load_base_port + 4,
+            'load_recv_rank1_parity1': load_base_port + 5,
+            'load_recv_rank3_data0': load_base_port + 6,
+            'load_recv_rank0_data1': load_base_port + 7,
+        }
         
         # Exchange IP addresses via torch.distributed.all_gather
         rank_ips = {}
@@ -397,12 +420,16 @@ class ECNAIVEManager:
             'base_port': base_port,
             'rank_ips': rank_ips,
             'ports': ports,
+            'rank_in_group': rank_in_group,
+            'group_id': group_id,
+            'load_receiver_rank': load_receiver_rank,
         }
         
         logger.info(
             f"EC-NAIVE: [Rank {rank}] Load mode network config:\n"
             f"  My IP: {config['my_ip']}\n"
             f"  Base port: {config['base_port']}\n"
+            f"  rank_in_group: {rank_in_group}, group_id: {group_id}, load_receiver_rank: {load_receiver_rank}\n"
             f"  Load mode ports: {config['ports']}\n"
             f"  All rank IPs: {config['rank_ips']}"
         )
@@ -439,71 +466,56 @@ class ECNAIVEManager:
         self._ecnaive_native.set_load_mode(True, failed_rank, rank)
         logger.info(f"EC-NAIVE: [Rank {rank}] Set load mode (failed_rank={failed_rank})")
         
-        # Step 2: Get network configuration for load mode
-        # All ranks need rank2's network config to get the correct ports
-        net_config_rank2 = self._get_ecnaive_load_network_config(2, world_size)
-        rank2_ip = net_config_rank2['rank_ips'].get(2, net_config_rank2['my_ip'])
+        # Step 2: Get network config for current rank (per-group: rank_in_group 2 is receiver)
+        net_config = self._get_ecnaive_load_network_config(rank, world_size)
+        rank_in_group = net_config['rank_in_group']
+        load_receiver_rank = net_config['load_receiver_rank']
+        rank2_ip = net_config['rank_ips'].get(load_receiver_rank, net_config['my_ip'])
         
-        # Get all load mode ports from rank2's config (8 ports for full recovery)
-        ports = net_config_rank2['ports']
+        ports = net_config['ports']
         load_ports = {
-            'recv_rank3_data1': ports.get('load_recv_rank3_data1', 0),   # d_{2,1} from rank3
-            'recv_rank0_parity0': ports.get('load_recv_rank0_parity0', 0), # p_{2,0} from rank0
-            'recv_rank0_data0': ports.get('load_recv_rank0_data0', 0),    # d_{0,0} from rank0
-            'recv_rank1_data1': ports.get('load_recv_rank1_data1', 0),    # d_{0,1} from rank1
-            'recv_rank1_data0': ports.get('load_recv_rank1_data0', 0),    # d_{1,0} from rank1
-            'recv_rank1_parity1': ports.get('load_recv_rank1_parity1', 0), # p_{1,1} from rank1
-            'recv_rank3_data0': ports.get('load_recv_rank3_data0', 0),    # d_{3,0} from rank3
-            'recv_rank0_data1': ports.get('load_recv_rank0_data1', 0),    # d_{3,1} from rank0
+            'recv_rank3_data1': ports.get('load_recv_rank3_data1', 0),
+            'recv_rank0_parity0': ports.get('load_recv_rank0_parity0', 0),
+            'recv_rank0_data0': ports.get('load_recv_rank0_data0', 0),
+            'recv_rank1_data1': ports.get('load_recv_rank1_data1', 0),
+            'recv_rank1_data0': ports.get('load_recv_rank1_data0', 0),
+            'recv_rank1_parity1': ports.get('load_recv_rank1_parity1', 0),
+            'recv_rank3_data0': ports.get('load_recv_rank3_data0', 0),
+            'recv_rank0_data1': ports.get('load_recv_rank0_data1', 0),
         }
         
-        # Step 3: Initialize load connections
-        # Similar to ECLATIN: rank2 starts accept operations first, then other ranks connect
-        if rank == 2:
-            # rank2: Initialize accept operations for all 8 ports (will start accept threads)
-            logger.info(f"EC-NAIVE: [Rank 2] Initializing load accept connections for 8 ports...")
+        # Step 3: rank_in_group 2 (receiver) starts accept first, then 0/1/3 connect
+        if rank_in_group == 2:
+            logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group 2) Initializing load accept connections for 8 ports...")
             self._ecnaive_native.init_ecnaive_load_connections(
-                rank,
+                rank_in_group,
                 rank2_ip,
-                load_ports['recv_rank3_data1'],    # port 0
-                load_ports['recv_rank0_parity0'],  # port 1
-                load_ports['recv_rank0_data0'],    # port 2
-                load_ports['recv_rank1_data1'],    # port 3
-                load_ports['recv_rank1_data0'],    # port 4
-                load_ports['recv_rank1_parity1'],  # port 5
-                load_ports['recv_rank3_data0'],    # port 6
-                load_ports['recv_rank0_data1']     # port 7
+                load_ports['recv_rank3_data1'],
+                load_ports['recv_rank0_parity0'],
+                load_ports['recv_rank0_data0'],
+                load_ports['recv_rank1_data1'],
+                load_ports['recv_rank1_data0'],
+                load_ports['recv_rank1_parity1'],
+                load_ports['recv_rank3_data0'],
+                load_ports['recv_rank0_data1']
             )
-            logger.info(f"EC-NAIVE: [Rank 2] Accept operations started for 8 ports, waiting for other ranks...")
+            logger.info(f"EC-NAIVE: [Rank {rank}] Accept operations started for 8 ports, waiting for other ranks in group...")
         
-        # Synchronize: ensure rank2's acceptors are ready before other ranks connect
         torch.distributed.barrier()
         
-        if rank != 2:
-            # rank0/1/3: Connect to rank2 (will block until connected)
-            # Note: All ranks must pass all 8 ports to match C++ function signature
-            # C++ function will use only the ports needed for each rank
-            logger.info(f"EC-NAIVE: [Rank {rank}] Connecting load send sockets to rank2...")
-            # All ranks pass all 8 ports in the order expected by C++ function:
-            # port 0: load_recv_rank3_data1_port
-            # port 1: load_recv_rank0_parity0_port
-            # port 2: load_recv_rank0_data0_port
-            # port 3: load_recv_rank1_data1_port
-            # port 4: load_recv_rank1_data0_port
-            # port 5: load_recv_rank1_parity1_port
-            # port 6: load_recv_rank3_data0_port
-            # port 7: load_recv_rank0_data1_port
+        if rank_in_group != 2:
+            logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group {rank_in_group}) Connecting load send sockets to receiver...")
             self._ecnaive_native.init_ecnaive_load_connections(
-                rank,
+                rank_in_group,
                 rank2_ip,
-                load_ports['recv_rank3_data1'],    # port 0
-                load_ports['recv_rank0_parity0'],  # port 1
-                load_ports['recv_rank0_data0'],    # port 2
-                load_ports['recv_rank1_data1'],    # port 3
-                load_ports['recv_rank1_data0'],    # port 4
-                load_ports['recv_rank1_parity1'],  # port 5
-                load_ports['recv_rank3_data0'],    # port 6
-                load_ports['recv_rank0_data1']      # port 7
+                load_ports['recv_rank3_data1'],
+                load_ports['recv_rank0_parity0'],
+                load_ports['recv_rank0_data0'],
+                load_ports['recv_rank1_data1'],
+                load_ports['recv_rank1_data0'],
+                load_ports['recv_rank1_parity1'],
+                load_ports['recv_rank3_data0'],
+                load_ports['recv_rank0_data1']
             )
             logger.info(f"EC-NAIVE: [Rank {rank}] Load send sockets connected")
         
@@ -538,9 +550,12 @@ class ECNAIVEManager:
         """
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        rank_in_group = self._get_rank_in_group(rank, world_size)
         
-        if rank != 2:
-            logger.warning("EC-NAIVE: allocate_ecnaive_load_recv_buffers called on non-rank2, returning empty dict")
+        if rank_in_group != 2:
+            logger.warning(
+                "EC-NAIVE: allocate_ecnaive_load_recv_buffers called on non rank_in_group 2, returning empty dict"
+            )
             return {}
         
         # Calculate maximum data size across all ranks
@@ -682,15 +697,22 @@ class ECNAIVEManager:
                 base_port = net_config['base_port']
                 rank_ips = net_config['rank_ips']
                 
-                # Calculate partner ports (send connects to partner's recv port)
-                # Port allocation: base_port + rank * 6 + offset
+                # Calculate partner ports (send connects to partner's recv port).
+                # Must use the same per-group port formula as _get_ecnaive_network_config,
+                # otherwise multi-group (e.g. 8 ranks) would connect to wrong ports.
+                def _port_base_for_rank(r: int) -> int:
+                    if world_size >= RANKS_PER_GROUP and world_size % RANKS_PER_GROUP == 0:
+                        gid = self._get_group_id(r, world_size)
+                        rig = self._get_rank_in_group(r, world_size)
+                        return base_port + gid * (RANKS_PER_GROUP * 6) + rig * 6
+                    return base_port + r * 6
                 # For send connections, we connect to the partner's recv port:
                 # - send_data1 connects to partner's recv_parity1 (offset 3)
                 # - send_parity0 connects to partner's recv_parity0 (offset 4)
                 # - send_parity1 connects to partner's recv_data1 (offset 5)
-                send_data1_partner_port = base_port + partner_ranks['send_data1_to'] * 6 + 3  # recv_parity1
-                send_parity0_partner_port = base_port + partner_ranks['send_parity0_to'] * 6 + 4  # recv_parity0
-                send_parity1_partner_port = base_port + partner_ranks['send_parity1_to'] * 6 + 5  # recv_data1
+                send_data1_partner_port = _port_base_for_rank(partner_ranks['send_data1_to']) + 3
+                send_parity0_partner_port = _port_base_for_rank(partner_ranks['send_parity0_to']) + 4
+                send_parity1_partner_port = _port_base_for_rank(partner_ranks['send_parity1_to']) + 5
                 
                 # Create C++ instance with ASIO parameters (12 parameters: 6 pairs of ip:port + use_rdma flag)
                 self._ecnaive_native = ecnaive_native.ECNaiveNative(

@@ -50,6 +50,10 @@ inline uint64_t ntohll(uint64_t value) {
 
 namespace {
 
+#ifndef ECNAIVE_RANKS_PER_GROUP
+#define ECNAIVE_RANKS_PER_GROUP 4  // Ranks per EC-NAIVE group (multi-rank support)
+#endif
+
 // RDMA structures (similar to Gemini)
 struct RdmaConnInfo {
     uint32_t qp_num;
@@ -2645,14 +2649,17 @@ public:
     void set_load_mode(bool is_load, int failed_rank, int rank = -1) {
         is_load_mode_ = is_load;
         failed_rank_ = failed_rank;
+        failed_rank_in_group_ = (failed_rank >= 0)
+            ? (failed_rank % ECNAIVE_RANKS_PER_GROUP)
+            : -1;
         if (rank >= 0) {
             rank_ = rank;
         }
-        std::cout << "EC-NAIVE: Set load mode: " 
-                  << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank 
-                  << ", rank=" << rank_ << std::endl;
+        std::cout << "EC-NAIVE: Set load mode: "
+                  << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank
+                  << ", failed_rank_in_group=" << failed_rank_in_group_ << ", rank=" << rank_ << std::endl;
         
-        if (is_load && failed_rank == 2) {
+        if (is_load && failed_rank_in_group_ == 2) {
             // Reset flags
             load_recv_worker_completed_ = false;
             load_xor_worker_completed_ = false;
@@ -2661,7 +2668,7 @@ public:
             load_xor_sentinel_received_ = false;
             load_send_sentinel_received_ = false;
             
-            // Start workers based on rank
+            // Start workers based on rank_in_group (rank_ is set in init_ecnaive_load_connections)
             if (rank_ == 2) {
                 // rank2: start recv and xor workers
                 if (!load_recv_worker_.joinable()) {
@@ -2774,9 +2781,9 @@ public:
             std::cout << "ECLATIN: [Rank " << rank << "] Load connections initialized" << std::endl;
     }
 
-    // EC-NAIVE load mode connection initialization (for rank2 recovery)
+    // EC-NAIVE load mode connection initialization (rank_in_group 2 is receiver per group)
     void init_ecnaive_load_connections(
-        int rank,
+        int rank_in_group,
         const std::string& rank2_ip,
         uint16_t load_recv_rank3_data1_port,      // port 0: d_{2,1} from rank3
         uint16_t load_recv_rank0_parity0_port,    // port 1: p_{2,0} from rank0
@@ -2792,11 +2799,11 @@ public:
             return;
         }
         
-        rank_ = rank;  // Set rank for worker threads
+        rank_ = rank_in_group;  // For worker threads (receiver/sender role)
         
-        std::cout << "EC-NAIVE: [Rank " << rank << "] Initializing load connections (full recovery: 8 ports)..." << std::endl;
+        std::cout << "EC-NAIVE: [Rank_in_group " << rank_in_group << "] Initializing load connections (full recovery: 8 ports)..." << std::endl;
         
-        if (rank == 2) {
+        if (rank_in_group == 2) {
             // rank2: bind, listen, and accept on 8 ports
             try {
                 // Bind and listen all 8 acceptors
@@ -2809,7 +2816,7 @@ public:
                 conn_.bind_listen_ecnaive_load_recv_rank3_data0(rank2_ip, load_recv_rank3_data0_port);
                 conn_.bind_listen_ecnaive_load_recv_rank0_data1(rank2_ip, load_recv_rank0_data1_port);
                 
-                std::cout << "EC-NAIVE: [Rank 2] All 8 acceptors bound and listening, starting accept threads..." << std::endl;
+                std::cout << "EC-NAIVE: [Rank_in_group 2] All 8 acceptors bound and listening, starting accept threads..." << std::endl;
                 
                 // Start accept operations in separate threads
                 // These threads will block on accept() until connections arrive
@@ -2854,31 +2861,31 @@ public:
                 // The accept operations will block until connections arrive from rank0/1/3
                 recv_init_thread.detach();
                 
-                std::cout << "EC-NAIVE: [Rank 2] All 8 accept threads started, waiting for connections..." << std::endl;
+                std::cout << "EC-NAIVE: [Rank_in_group 2] All 8 accept threads started, waiting for connections..." << std::endl;
             } catch (const std::exception& e) {
-                std::cerr << "EC-NAIVE: [Rank 2] Failed to initialize load connections: " << e.what() << std::endl;
+                std::cerr << "EC-NAIVE: [Rank_in_group 2] Failed to initialize load connections: " << e.what() << std::endl;
                 throw;
             }
-        } else if (rank == 0) {
-            // rank0: connect to rank2 on 3 ports (p_{2,0}, d_{0,0}, d_{3,1})
-            std::cout << "EC-NAIVE: [Rank 0] Connecting to rank2 on 3 ports..." << std::endl;
+        } else if (rank_in_group == 0) {
+            // rank_in_group 0: connect to receiver on 3 ports (p_{2,0}, d_{0,0}, d_{3,1})
+            std::cout << "EC-NAIVE: [Rank_in_group 0] Connecting to receiver on 3 ports..." << std::endl;
             conn_.init_ecnaive_load_send_rank0_parity0(rank2_ip, load_recv_rank0_parity0_port);  // p_{2,0}
             conn_.init_ecnaive_load_send_rank0_data0(rank2_ip, load_recv_rank0_data0_port);      // d_{0,0}
             conn_.init_ecnaive_load_send_rank0_data1(rank2_ip, load_recv_rank0_data1_port);      // d_{3,1}
-            std::cout << "EC-NAIVE: [Rank 0] All 3 load connections established" << std::endl;
-        } else if (rank == 1) {
-            // rank1: connect to rank2 on 3 ports (d_{0,1}, d_{1,0}, p_{1,1})
-            std::cout << "EC-NAIVE: [Rank 1] Connecting to rank2 on 3 ports..." << std::endl;
+            std::cout << "EC-NAIVE: [Rank_in_group 0] All 3 load connections established" << std::endl;
+        } else if (rank_in_group == 1) {
+            // rank_in_group 1: connect to receiver on 3 ports (d_{0,1}, d_{1,0}, p_{1,1})
+            std::cout << "EC-NAIVE: [Rank_in_group 1] Connecting to receiver on 3 ports..." << std::endl;
             conn_.init_ecnaive_load_send_rank1_data1(rank2_ip, load_recv_rank1_data1_port);      // d_{0,1}
             conn_.init_ecnaive_load_send_rank1_data0(rank2_ip, load_recv_rank1_data0_port);      // d_{1,0}
             conn_.init_ecnaive_load_send_rank1_parity1(rank2_ip, load_recv_rank1_parity1_port);  // p_{1,1}
-            std::cout << "EC-NAIVE: [Rank 1] All 3 load connections established" << std::endl;
-        } else if (rank == 3) {
-            // rank3: connect to rank2 on 2 ports (d_{2,1}, d_{3,0})
-            std::cout << "EC-NAIVE: [Rank 3] Connecting to rank2 on 2 ports..." << std::endl;
+            std::cout << "EC-NAIVE: [Rank_in_group 1] All 3 load connections established" << std::endl;
+        } else if (rank_in_group == 3) {
+            // rank_in_group 3: connect to receiver on 2 ports (d_{2,1}, d_{3,0})
+            std::cout << "EC-NAIVE: [Rank_in_group 3] Connecting to receiver on 2 ports..." << std::endl;
             conn_.init_ecnaive_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);     // d_{2,1}
             conn_.init_ecnaive_load_send_rank3_data0(rank2_ip, load_recv_rank3_data0_port);     // d_{3,0}
-            std::cout << "EC-NAIVE: [Rank 3] All 2 load connections established" << std::endl;
+            std::cout << "EC-NAIVE: [Rank_in_group 3] All 2 load connections established" << std::endl;
         }
     }
     
@@ -3260,7 +3267,8 @@ private:
     // Load mode flags
     std::atomic<bool> is_load_mode_{false};
     int failed_rank_{-1};
-    int rank_;  // Current rank (needed for load mode)
+    int failed_rank_in_group_{-1};  // failed rank within 4-rank group (for multi-group support)
+    int rank_;  // Current rank_in_group (0..3) for load mode, set in init_ecnaive_load_connections
 
     // EC-NAIVE load mode queues (rank2 only)
     std::queue<LoadRecvTask> load_recv_queue_;
@@ -4304,8 +4312,8 @@ PYBIND11_MODULE(ecnaive_native, m) {
              pybind11::arg("rank") = -1)
         // EC-NAIVE load mode functions (rank2 recovery)
         .def("init_ecnaive_load_connections", &ECNaiveNative::init_ecnaive_load_connections,
-             "Initialize EC-NAIVE load mode connections (rank2 acceptor: 8 ports, rank0/1/3 connectors)",
-             pybind11::arg("rank"),
+             "Initialize EC-NAIVE load mode connections (rank_in_group 2 acceptor: 8 ports, 0/1/3 connectors)",
+             pybind11::arg("rank_in_group"),
              pybind11::arg("rank2_ip"),
              pybind11::arg("load_recv_rank3_data1_port"),
              pybind11::arg("load_recv_rank0_parity0_port"),

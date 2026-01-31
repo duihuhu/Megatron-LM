@@ -5151,17 +5151,17 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             self.ecnaive_blocks = self._allocate_ecnaive_blocks(registry)
             logger.info(f"EC-NAIVE: [Rank {rank}] Allocated 4 blocks using registry metadata")
         
-        # ===== Step 4: rank0/1/3 load block data from files =====
-        if rank != 2:
-            # rank0/1/3: Load block data from files into allocated blocks
-            # rank0: loads 3 blocks (recv_parity0, data0, recv_data1)
-            # rank1: loads 3 blocks (recv_data1, data0, recv_parity1)
-            # rank3: loads 2 blocks (recv_data1, data0)
-            # rank2: no blocks to load (failed node)
-            self._load_ecnaive_blocks_from_files(checkpoint_dir, rank)
+        # Per-group role: rank_in_group 2 is receiver (same as save phase)
+        net_config = self.ecnaive_manager._get_ecnaive_load_network_config(rank, world_size)
+        rank_in_group = net_config['rank_in_group']
         
-        # ===== Step 5: rank2 allocate recv buffers =====
-        if rank == 2:
+        # ===== Step 4: rank_in_group 0/1/3 load block data from files =====
+        if rank_in_group != 2:
+            # rank0/1/3: Load block data from files into allocated blocks
+            self._load_ecnaive_blocks_from_files(checkpoint_dir, rank, rank_in_group)
+        
+        # ===== Step 5: rank_in_group 2 allocate recv buffers =====
+        if rank_in_group == 2:
             if self.ecnaive_recv_buffers is None:
                 self.ecnaive_recv_buffers = self.ecnaive_manager.allocate_ecnaive_load_recv_buffers(registry)
             
@@ -5202,13 +5202,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             world_size=world_size,
             registry=registry,
             ecnaive_blocks=self.ecnaive_blocks,
-            recv_buffers=self.ecnaive_recv_buffers if rank == 2 else None,
-            recovered_buffer=self.ecnaive_recovered_buffer if rank == 2 else None,
+            recv_buffers=self.ecnaive_recv_buffers if rank_in_group == 2 else None,
+            recovered_buffer=self.ecnaive_recovered_buffer if rank_in_group == 2 else None,
             total_size=total_size,
         )
         
-        # ===== Step 7: rank2 save recovered buffer =====
-        if rank == failed_rank:
+        # ===== Step 7: receiver (rank_in_group 2) in failed rank's group save recovered buffer =====
+        from .ecnaive_manager import RANKS_PER_GROUP
+        failed_group_id = failed_rank // RANKS_PER_GROUP
+        if rank_in_group == 2 and net_config['group_id'] == failed_group_id:
             logger.info(f"EC-NAIVE: [Rank {rank}] Saving recovered buffer for _load_ecnaive_checkpoint")
             self.ecnaive_recovered_metadata = mapped_file_own
             self.ecnaive_recovered_registry = registry
@@ -5405,28 +5407,18 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # rank2: No need to load blocks (will receive from others)
     
-    def _load_ecnaive_blocks_from_files(self, checkpoint_dir: Path, rank: int) -> None:
+    def _load_ecnaive_blocks_from_files(self, checkpoint_dir: Path, rank: int, rank_in_group: int) -> None:
         """Load EC-NAIVE block data from files into allocated blocks (full recovery mode).
         
-        EC-NAIVE load mode (full recovery):
-        - rank0: Load recv_parity0 (p_{2,0}), data0 (d_{0,0}), recv_data1 (d_{3,1})
-          These blocks will be sent to rank2 for recovery
-        - rank1: Load recv_data1 (d_{0,1}), data0 (d_{1,0}), recv_parity1 (p_{1,1})
-          These blocks will be sent to rank2 for recovery
-        - rank3: Load recv_data1 (d_{2,1}), data0 (d_{3,0})
-          These blocks will be sent to rank2 for recovery
-        - rank2: No blocks to load (failed node, will receive and recover from others)
-        
-        Note: Each rank loads the blocks that it stored during save phase.
-        These blocks contain the data needed for rank2's full recovery:
-        - rank2 recovers 4 blocks: data0 (d_{2,0}), recv_parity0 (p_{0,0}), 
-          recv_data1 (d_{1,1}), recv_parity1 (p_{3,1})
+        rank_in_group 0/1/3 load blocks to send to receiver; rank_in_group 2 (receiver) loads nothing.
+        File paths use global rank; branching uses rank_in_group for multi-rank support.
         
         Args:
             checkpoint_dir (Path): checkpoint directory
-            rank (int): current rank
+            rank (int): global rank (for file paths)
+            rank_in_group (int): rank within 4-rank group (0..3)
         """
-        if rank == 0:
+        if rank_in_group == 0:
             # rank0: Load 3 blocks needed for sending to rank2
             # p_{2,0} stored in recv_parity0 (received from rank2 during save)
             # d_{0,0} stored in data0 (own data)
@@ -5448,9 +5440,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             )
             logger.info(f"EC-NAIVE: [Rank 0] Loaded recv_data1 (d_{3,1})")
             
-            logger.info(f"EC-NAIVE: [Rank 0] All 3 blocks loaded, ready to send to rank2")
+            logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group 0) All 3 blocks loaded, ready to send to receiver")
         
-        elif rank == 1:
+        elif rank_in_group == 1:
             # rank1: Load 3 blocks needed for sending to rank2
             # d_{0,1} stored in recv_data1 (received from rank0 during save)
             # d_{1,0} stored in data0 (own data)
@@ -5472,9 +5464,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             )
             logger.info(f"EC-NAIVE: [Rank 1] Loaded recv_parity1 (p_{1,1})")
             
-            logger.info(f"EC-NAIVE: [Rank 1] All 3 blocks loaded, ready to send to rank2")
+            logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group 1) All 3 blocks loaded, ready to send to receiver")
         
-        elif rank == 3:
+        elif rank_in_group == 3:
             # rank3: Load 2 blocks needed for sending to rank2
             # d_{2,1} stored in recv_data1 (received from rank2 during save)
             # d_{3,0} stored in data0 (own data)
@@ -5490,11 +5482,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             )
             logger.info(f"EC-NAIVE: [Rank 3] Loaded data0 (d_{3,0})")
             
-            logger.info(f"EC-NAIVE: [Rank 3] All 2 blocks loaded, ready to send to rank2")
+            logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group 3) All 2 blocks loaded, ready to send to receiver")
         
-        # rank2: No blocks to load (failed node, will receive and recover from others)
-        elif rank == 2:
-            logger.info(f"EC-NAIVE: [Rank 2] No blocks to load (failed node), will receive and recover from other ranks")
+        # rank_in_group 2 (receiver): No blocks to load (failed node, will receive and recover from others)
+        elif rank_in_group == 2:
+            logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group 2) No blocks to load (failed node), will receive and recover from other ranks")
     
     def _load_block_data_from_file(
         self, checkpoint_dir: Path, rank: int, block_name: str, block_tensor: torch.Tensor
@@ -8674,17 +8666,17 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             return
         
         # === Step 1: Ensure load mode is initialized ===
-        # Load mode should already be initialized in _load_ecnaive_block_checkpoint
-        # But we check here to be safe
-        failed_rank = 2  # EC-NAIVE recovers rank2
-        logger.info(f"EC-NAIVE: [Rank {rank}] Starting full recovery pipeline (failed_rank={failed_rank})")
+        failed_rank = 2  # EC-NAIVE recovers rank_in_group 2
+        net_config = self.ecnaive_manager._get_ecnaive_load_network_config(rank, world_size)
+        rank_in_group = net_config['rank_in_group']
+        logger.info(f"EC-NAIVE: [Rank {rank}] Starting full recovery pipeline (failed_rank={failed_rank}, rank_in_group={rank_in_group})")
         
         start_time = time()
         
-        # === Step 2: rank2: Receive blocks and recover (full recovery) ===
-        if rank == 2:
+        # === Step 2: rank_in_group 2 (receiver): Receive blocks and recover (full recovery) ===
+        if rank_in_group == 2:
             if recv_buffers is None:
-                logger.error("EC-NAIVE: [Rank 2] recv_buffers is None")
+                logger.error(f"EC-NAIVE: [Rank {rank}] (rank_in_group 2) recv_buffers is None")
                 return
             
             # Validate recv_buffers contains all 8 required buffers
@@ -8696,14 +8688,14 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             ]
             missing_keys = [key for key in required_keys if key not in recv_buffers]
             if missing_keys:
-                logger.error(f"EC-NAIVE: [Rank 2] Missing recv_buffers keys: {missing_keys}")
+                logger.error(f"EC-NAIVE: [Rank {rank}] Missing recv_buffers keys: {missing_keys}")
                 return
             
             # Validate ecnaive_blocks contains all 4 required blocks
             required_blocks = ['data0', 'recv_parity0', 'recv_data1', 'recv_parity1']
             missing_blocks = [key for key in required_blocks if key not in ecnaive_blocks]
             if missing_blocks:
-                logger.error(f"EC-NAIVE: [Rank 2] Missing ecnaive_blocks keys: {missing_blocks}")
+                logger.error(f"EC-NAIVE: [Rank {rank}] Missing ecnaive_blocks keys: {missing_blocks}")
                 return
             
             # Get base addresses for all 8 recv buffers
@@ -8731,7 +8723,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             aligned_block_size = ecnaive_blocks['data0'].numel()
             
             logger.info(
-                f"EC-NAIVE: [Rank 2] Starting full recovery pipeline\n"
+                f"EC-NAIVE: [Rank {rank}] (rank_in_group 2) Starting full recovery pipeline\n"
                 f"  Recv buffers: 8 buffers, {aligned_block_size / (1024**3):.2f} GB each\n"
                 f"  Output blocks: 4 blocks (ecnaive_blocks), {aligned_block_size / (1024**3):.2f} GB each\n"
                 f"  Total recovery: {4 * aligned_block_size / (1024**3):.2f} GB"
@@ -8768,7 +8760,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             self.ecnaive_manager._ecnaive_native.submit_load_recv_sentinel()
             
             # Wait for recovery to complete
-            logger.info("EC-NAIVE: [Rank 2] Waiting for full recovery pipeline to complete...")
+            logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group 2) Waiting for full recovery pipeline to complete...")
             self.ecnaive_manager._ecnaive_native.wait_for_load_completion()
             
             # logger.info("EC-NAIVE: [Rank 2] Full recovery pipeline completed")
@@ -8785,12 +8777,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # Note: All 4 blocks are now recovered and stored in ecnaive_blocks (zero-copy)
             # No need to copy - C++ pipeline wrote directly to ecnaive_blocks
         
-        # === Step 3: rank0/1/3: Send blocks to rank2 ===
+        # === Step 3: rank_in_group 0/1/3: Send blocks to receiver ===
         else:
             aligned_block_size = ecnaive_blocks['data0'].numel()
             
-            if rank == 0:
-                # rank0: Sends p_{2,0}, d_{0,0}, d_{3,1} to rank2
+            if rank_in_group == 0:
+                # rank_in_group 0: Sends p_{2,0}, d_{0,0}, d_{3,1} to receiver
                 # These blocks are already loaded into ecnaive_blocks from files
                 send_addrs = {
                     'p20': int(ecnaive_blocks['recv_parity0'].data_ptr()),  # p_{2,0}
@@ -8798,7 +8790,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     'd31': int(ecnaive_blocks['recv_data1'].data_ptr()),    # d_{3,1}
                 }
                 
-                logger.info(f"EC-NAIVE: [Rank 0] Sending 3 blocks to rank2: p_{2,0}, d_{0,0}, d_{3,1}")
+                logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group 0) Sending 3 blocks to receiver: p_{{2,0}}, d_{{0,0}}, d_{{3,1}}")
                 
                 # Send p_{2,0}
                 self.ecnaive_manager._ecnaive_native.submit_load_send_rank0_parity0(
@@ -8822,10 +8814,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
                 
                 end_time = time()
-                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 3 blocks to rank2 in {end_time - start_time:.2f} seconds")
+                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 3 blocks to receiver in {end_time - start_time:.2f} seconds")
             
-            elif rank == 1:
-                # rank1: Sends d_{0,1}, d_{1,0}, p_{1,1} to rank2
+            elif rank_in_group == 1:
+                # rank_in_group 1: Sends d_{0,1}, d_{1,0}, p_{1,1} to receiver
                 # These blocks are already loaded into ecnaive_blocks from files
                 send_addrs = {
                     'd01': int(ecnaive_blocks['recv_data1'].data_ptr()),    # d_{0,1}
@@ -8857,10 +8849,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
                 
                 end_time = time()
-                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 3 blocks to rank2 in {end_time - start_time:.2f} seconds")
+                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 3 blocks to receiver in {end_time - start_time:.2f} seconds")
             
-            elif rank == 3:
-                # rank3: Sends d_{2,1}, d_{3,0} to rank2
+            elif rank_in_group == 3:
+                # rank_in_group 3: Sends d_{2,1}, d_{3,0} to receiver
                 # These blocks are already loaded into ecnaive_blocks from files
                 send_addrs = {
                     'd21': int(ecnaive_blocks['recv_data1'].data_ptr()),  # d_{2,1}
@@ -8885,9 +8877,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
                 
                 end_time = time()
-                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 2 blocks to rank2 in {end_time - start_time:.2f} seconds")
+                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 2 blocks to receiver in {end_time - start_time:.2f} seconds")
             
-            logger.info(f"EC-NAIVE: [Rank {rank}] Sent blocks to rank2")
+            logger.info(f"EC-NAIVE: [Rank {rank}] Sent blocks to receiver")
         
         # Synchronize all ranks
         torch.distributed.barrier()
@@ -10254,9 +10246,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         from .state_dict_decomposer import reconstruct_state_dict
         
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        
-        # Recovery path: rank2 may have recovered buffer
-        if (rank == 2 and hasattr(self, 'ecnaive_recovered_buffer')
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        net_config = self.ecnaive_manager._get_ecnaive_load_network_config(rank, world_size)
+        rank_in_group = net_config['rank_in_group']
+        # Recovery path: rank_in_group 2 (receiver) may have recovered buffer
+        if (rank_in_group == 2 and hasattr(self, 'ecnaive_recovered_buffer')
             and self.ecnaive_recovered_buffer is not None):
             logger.info(f"EC-NAIVE: [Rank {rank}] Using recovered data from recovery pipeline")
             decomposed = self._extract_decomposed_from_buffer(
@@ -10536,7 +10530,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 logger.info(f"ECLATIN: [Rank {rank}] ECLATIN recovery time: {eclatin_recovery_time:.4f} seconds")
                 return mcore_state_dict
         
-        if input_args.use_ecnaive and (self._is_ecnaive_checkpoint(checkpoint_dir) or rank == 2):
+        # EC-NAIVE: run load path if checkpoint detected or we are receiver (rank_in_group 2)
+        if input_args.use_ecnaive:
+            _ecnaive_world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            _ecnaive_net_config = self.ecnaive_manager._get_ecnaive_load_network_config(rank, _ecnaive_world_size)
+            _ecnaive_rank_in_group = _ecnaive_net_config['rank_in_group']
+        if input_args.use_ecnaive and (self._is_ecnaive_checkpoint(checkpoint_dir) or _ecnaive_rank_in_group == 2):
             logger.info(f"Detected EC-NAIVE format checkpoint at {checkpoint_dir}")
             logger.info(f"Using EC-NAIVE load mode")
             # Load block checkpoint data (for rank2 recovery, this prepares the buffer)

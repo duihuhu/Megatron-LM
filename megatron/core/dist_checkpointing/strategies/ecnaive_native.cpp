@@ -2646,7 +2646,7 @@ public:
     }
 
     // Load mode functions
-    void set_load_mode(bool is_load, int failed_rank, int rank = -1) {
+    void set_load_mode(bool is_load, int failed_rank, int rank = -1, bool is_software_only = false) {
         is_load_mode_ = is_load;
         failed_rank_ = failed_rank;
         failed_rank_in_group_ = (failed_rank >= 0)
@@ -2657,9 +2657,11 @@ public:
         }
         std::cout << "EC-NAIVE: Set load mode: "
                   << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank
-                  << ", failed_rank_in_group=" << failed_rank_in_group_ << ", rank=" << rank_ << std::endl;
+                  << ", failed_rank_in_group=" << failed_rank_in_group_ << ", rank=" << rank_
+                  << ", is_software_only=" << (is_software_only ? "true" : "false") << std::endl;
         
-        if (is_load && failed_rank_in_group_ == 2) {
+        // In software-only mode, do not start full recovery worker threads (rank 0/1 need not participate)
+        if (is_load && failed_rank_in_group_ == 2 && !is_software_only) {
             // Reset flags
             load_recv_worker_completed_ = false;
             load_xor_worker_completed_ = false;
@@ -2886,6 +2888,28 @@ public:
             conn_.init_ecnaive_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);     // d_{2,1}
             conn_.init_ecnaive_load_send_rank3_data0(rank2_ip, load_recv_rank3_data0_port);     // d_{3,0}
             std::cout << "EC-NAIVE: [Rank_in_group 3] All 2 load connections established" << std::endl;
+        }
+    }
+
+    // Software failure only: 1 port (rank3_data1), no workers; rank_ = rank_in_group
+    void init_ecnaive_load_connections_software_only(
+        int rank_in_group,
+        const std::string& rank2_ip,
+        uint16_t load_recv_rank3_data1_port
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "EC-NAIVE: init_ecnaive_load_connections_software_only called but not in load mode" << std::endl;
+            return;
+        }
+        rank_ = rank_in_group;
+        std::cout << "EC-NAIVE: [Rank_in_group " << rank_in_group << "] Software-only load: 1 port (rank3_data1)" << std::endl;
+        if (rank_in_group == 2) {
+            conn_.bind_listen_ecnaive_load_recv_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
+            conn_.accept_ecnaive_load_recv_rank3_data1();
+            std::cout << "EC-NAIVE: [Rank_in_group 2] Software-only accept done" << std::endl;
+        } else if (rank_in_group == 3) {
+            conn_.init_ecnaive_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
+            std::cout << "EC-NAIVE: [Rank_in_group 3] Software-only connect done" << std::endl;
         }
     }
     
@@ -4309,7 +4333,8 @@ PYBIND11_MODULE(ecnaive_native, m) {
              "Set load mode for recovery",
              pybind11::arg("is_load"),
              pybind11::arg("failed_rank") = -1,
-             pybind11::arg("rank") = -1)
+             pybind11::arg("rank") = -1,
+             pybind11::arg("is_software_only") = false)
         // EC-NAIVE load mode functions (rank2 recovery)
         .def("init_ecnaive_load_connections", &ECNaiveNative::init_ecnaive_load_connections,
              "Initialize EC-NAIVE load mode connections (rank_in_group 2 acceptor: 8 ports, 0/1/3 connectors)",
@@ -4323,6 +4348,11 @@ PYBIND11_MODULE(ecnaive_native, m) {
              pybind11::arg("load_recv_rank1_parity1_port"),
              pybind11::arg("load_recv_rank3_data0_port"),
              pybind11::arg("load_recv_rank0_data1_port"))
+        .def("init_ecnaive_load_connections_software_only", &ECNaiveNative::init_ecnaive_load_connections_software_only,
+             "Software failure only: 1 port (rank3_data1), rank_ = rank_in_group",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("rank2_ip"),
+             pybind11::arg("load_recv_rank3_data1_port"))
         .def("submit_ecnaive_load_recovery", &ECNaiveNative::submit_ecnaive_load_recovery,
              "Submit load recovery task for rank2 (recv + XOR) - legacy interface",
              pybind11::arg("recv_data1_addr"),

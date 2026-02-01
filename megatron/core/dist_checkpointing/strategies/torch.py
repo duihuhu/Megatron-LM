@@ -5022,12 +5022,18 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # Get metadata (reuse existing logic)
             checkpoint_dir = Path(checkpoint_dir)
 
+            # Per-group role and init load connections (software-only: 1 port, 1 barrier; no full 8-port init)
+            net_config = self.ecnaive_manager._get_ecnaive_load_network_config(rank, world_size)
+            rank_in_group = net_config['rank_in_group']
+            if self.ecnaive_manager.use_ecnaive:
+                self.ecnaive_manager.init_ecnaive_load_software_only(rank, world_size)
+
             # Load main file to extract metadata
             ecnaive_main_file = checkpoint_dir / f'__{rank}_0.distcp'
 
             # Handle failed rank that doesn't have checkpoint file
             if not ecnaive_main_file.exists():
-                if rank == failed_rank:
+                if rank_in_group == 2:
                     logger.warning(f"EC-NAIVE: [Rank {rank}] Main file not found (failed node), deriving metadata from sharded_state_dict")
                     from .filesystem_async import EclatinMappedFile
 
@@ -5084,40 +5090,103 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 rank_non_tensor_data=rank_non_tensor_data
             )
 
-            # Software failure recovery: only rank 2 performs data transfer using existing connections
-            if rank == 2:
-                # Read local d20
-                d20_path = checkpoint_dir / "__2_data0.distcp"
+            # Software failure recovery: only rank_in_group 2 performs data transfer using existing connections
+            if rank_in_group == 2:
+                # Use same size as rank 3 send (registry total_size // 2) so recv size matches exactly
+                import struct
+                load_receiver_rank = net_config['load_receiver_rank']
+                d20_size = sum(meta.size_bytes for meta in registry.rank_metadata.get(load_receiver_rank, [])) // 2
+                d20_path = checkpoint_dir / f"__{rank}_data0.distcp"
+                d20_data = None
                 with open(d20_path, 'rb') as f:
-                    d20_data = f.read()
-                d20_size = len(d20_data)
+                    header_bytes = f.read(32)
+                    if len(header_bytes) != 32:
+                        logger.error(f"EC-NAIVE: [Rank {rank}] Invalid data0 block file header (expected 32 bytes)")
+                        d20_size = 0
+                    else:
+                        magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
+                            '4sQQQ', header_bytes
+                        )
+                        if magic not in (b'ECLT', b'ECNV'):
+                            logger.error(f"EC-NAIVE: [Rank {rank}] Invalid magic in data0 block file: {magic}")
+                            d20_size = 0
+                        else:
+                            offset = 32 + non_tensor_size + tensor_keys_size
+                            f.seek(offset)
+                            d20_data = f.read(d20_size)
+                            if len(d20_data) != d20_size:
+                                logger.error(
+                                    f"EC-NAIVE: [Rank {rank}] Short read from data0: "
+                                    f"got {len(d20_data)}, expected {d20_size}"
+                                )
+                                d20_size = 0
 
-                # Receive d21
-                d21_buffer = torch.zeros(d20_size, dtype=torch.uint8)
-                d21_addr = d21_buffer.data_ptr()
-                self.ecnaive_manager._ecnaive_native.software_recv_data1(d21_addr, d20_size)
+                if d20_size > 0:
+                    # Receive d21 (same size as d20 tensor so protocol matches rank 3 send)
+                    d21_buffer = torch.zeros(d20_size, dtype=torch.uint8)
+                    d21_addr = int(d21_buffer.data_ptr())
+                    self.ecnaive_manager._ecnaive_native.software_recv_data1(d21_addr, d20_size)
 
-                # Create merged buffer (align with hardware version)
-                total_size = d20_size + d20_size
-                self.ecnaive_recovered_buffer = torch.zeros(total_size, dtype=torch.uint8)
+                    # Create merged buffer (align with hardware version)
+                    total_size = d20_size + d20_size
+                    self.ecnaive_recovered_buffer = torch.zeros(total_size, dtype=torch.uint8)
 
-                # Data layout: first half d20, second half d21
-                self.ecnaive_recovered_buffer[:d20_size] = torch.frombuffer(d20_data, dtype=torch.uint8)
-                self.ecnaive_recovered_buffer[d20_size:] = d21_buffer
+                    # Data layout: first half d20 (tensor only), second half d21
+                    self.ecnaive_recovered_buffer[:d20_size].copy_(
+                        torch.frombuffer(memoryview(d20_data), dtype=torch.uint8).clone()
+                    )
+                    self.ecnaive_recovered_buffer[d20_size:] = d21_buffer
 
-                # Save metadata (align with hardware version)
-                self.ecnaive_recovered_metadata = mapped_file_own
-                self.ecnaive_recovered_registry = registry
-                send_end_time = time()
-                logger.info(f"EC-NAIVE: [Rank 2] Software recovery load to time: {send_end_time - send_start_time:.4f} seconds")
-                logger.info(f"EC-NAIVE: [Rank 2] Software recovery completed: d20_size={d20_size}, total={total_size}")
+                    # Save metadata (align with hardware version)
+                    self.ecnaive_recovered_metadata = mapped_file_own
+                    self.ecnaive_recovered_registry = registry
+                    send_end_time = time()
+                    logger.info(f"EC-NAIVE: [Rank {rank}] Software recovery load time: {send_end_time - send_start_time:.4f} seconds")
+                    logger.info(f"EC-NAIVE: [Rank {rank}] Software recovery completed: d20_size={d20_size}, total={total_size}")
 
-            elif rank == 3:
-                # Rank 3: Ready for software failure recovery but doesn't actively send
-                # The connection is already established, rank 2 will initiate the transfer
-                logger.info(f"EC-NAIVE: [Rank 3] Ready for software failure recovery data transfer")
+            elif rank_in_group == 3:
+                # rank_in_group 3: Load d21 from file and send to receiver (rank_in_group 2)
+                import struct
+                load_receiver_rank = net_config['load_receiver_rank']
+                send_size = sum(meta.size_bytes for meta in registry.rank_metadata.get(load_receiver_rank, [])) // 2
+                d21_path = checkpoint_dir / f'__{rank}_recv_data1.distcp'
+                if not d21_path.exists():
+                    logger.error(f"EC-NAIVE: [Rank {rank}] Block file not found: {d21_path}")
+                else:
+                    with open(d21_path, 'rb') as f:
+                        header_bytes = f.read(32)
+                        if len(header_bytes) != 32:
+                            logger.error(f"EC-NAIVE: [Rank {rank}] Invalid block file header (expected 32 bytes)")
+                        else:
+                            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
+                                '4sQQQ', header_bytes
+                            )
+                            if magic not in (b'ECLT', b'ECNV'):
+                                logger.error(f"EC-NAIVE: [Rank {rank}] Invalid magic in block file: {magic}")
+                            else:
+                                offset = 32 + non_tensor_size + tensor_keys_size
+                                read_size = min(tensor_buffer_size, send_size)
+                                f.seek(offset)
+                                data = f.read(read_size)
+                                if len(data) != read_size:
+                                    logger.error(
+                                        f"EC-NAIVE: [Rank {rank}] Short read from block file: "
+                                        f"got {len(data)}, expected {read_size}"
+                                    )
+                                else:
+                                    send_buffer = torch.frombuffer(
+                                        memoryview(data), dtype=torch.uint8
+                                    ).clone()
+                                    send_addr = int(send_buffer.data_ptr())
+                                    self.ecnaive_manager._ecnaive_native.software_send_rank3_data1(
+                                        send_addr, read_size
+                                    )
+                                    logger.info(
+                                        f"EC-NAIVE: [Rank {rank}] (rank_in_group 3) Sent d21 to receiver, "
+                                        f"size={read_size / (1024**2):.2f} MB"
+                                    )
 
-            # All ranks return metadata (rank 2 will use recovered buffer, others use normal loading)
+            # All ranks return metadata (rank_in_group 2 will use recovered buffer, others use normal loading)
             return mapped_file_own, registry
 
         # If not software failure mode, proceed with normal hardware recovery

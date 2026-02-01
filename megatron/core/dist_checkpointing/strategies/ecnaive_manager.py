@@ -461,9 +461,9 @@ class ECNAIVEManager:
             logger.warning("EC-NAIVE: Manager not enabled, skipping load initialization")
             return
         
-        # Step 1: Set load mode in C++ native module
+        # Step 1: Set load mode in C++ native module (full recovery: start worker threads)
         failed_rank = 2  # EC-NAIVE recovers rank2
-        self._ecnaive_native.set_load_mode(True, failed_rank, rank)
+        self._ecnaive_native.set_load_mode(True, failed_rank, rank, is_software_only=False)
         logger.info(f"EC-NAIVE: [Rank {rank}] Set load mode (failed_rank={failed_rank})")
         
         # Step 2: Get network config for current rank (per-group: rank_in_group 2 is receiver)
@@ -525,6 +525,30 @@ class ECNAIVEManager:
         # Synchronize to ensure all connections are established
         torch.distributed.barrier()
         logger.info(f"EC-NAIVE: [Rank {rank}] Load connections initialized")
+
+    def init_ecnaive_load_software_only(self, rank: int, world_size: int) -> None:
+        """Initialize EC-NAIVE load for software failure only: 1 port (rank3_data1), 1 barrier.
+        Use instead of init_ecnaive_load when use_ecnaive_software_failure to avoid 8-port + 2-barrier overhead.
+        """
+        if self._ecnaive_native is None:
+            logger.error("EC-NAIVE: Native module not initialized, cannot initialize load mode")
+            return
+        if not self.use_ecnaive:
+            logger.warning("EC-NAIVE: Manager not enabled, skipping load initialization")
+            return
+        failed_rank = 2
+        self._ecnaive_native.set_load_mode(True, failed_rank, rank, is_software_only=True)
+        logger.info(f"EC-NAIVE: [Rank {rank}] Set load mode (failed_rank={failed_rank}) for software-only")
+        net_config = self._get_ecnaive_load_network_config(rank, world_size)
+        rank_in_group = net_config['rank_in_group']
+        load_receiver_rank = net_config['load_receiver_rank']
+        rank2_ip = net_config['rank_ips'].get(load_receiver_rank, net_config['my_ip'])
+        port = net_config['ports'].get('load_recv_rank3_data1', 0)
+        torch.distributed.barrier()
+        self._ecnaive_native.init_ecnaive_load_connections_software_only(
+            rank_in_group, rank2_ip, port
+        )
+        logger.info(f"EC-NAIVE: [Rank {rank}] Software-only load connection initialized (1 port)")
     
     def allocate_ecnaive_load_recv_buffers(self, global_registry: GlobalMetadataRegistry) -> Dict[str, torch.Tensor]:
         """

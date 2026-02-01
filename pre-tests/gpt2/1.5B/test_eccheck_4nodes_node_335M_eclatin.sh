@@ -12,7 +12,7 @@ export NETIFACES_INTERFACE=eth0
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-GPUS_PER_NODE=1
+GPUS_PER_NODE=2
 MASTER_ADDR=172.16.0.1
 
 export ECCHECK_USE_ASIO=true
@@ -44,7 +44,7 @@ fi
 # export CUDA_VISIBLE_DEVICES
 # export CUDA_VISIBLE_DEVICES=$NODE_RANK
 
-export CUDA_VISIBLE_DEVICES=0
+# export CUDA_VISIBLE_DEVICES=0
 VOCAB_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
@@ -111,7 +111,7 @@ GPT_ARGS=(
 
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 1
+    --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 4
 )
 
@@ -121,7 +121,7 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-interval 100
     --save $CHECKPOINT_PATH 
     --load $CHECKPOINT_PATH
-    --eval-iters 1
+    # --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
 

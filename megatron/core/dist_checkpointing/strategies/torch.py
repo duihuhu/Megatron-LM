@@ -8425,8 +8425,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # Early exit for rank2 software failure - read local files directly (no network/XOR needed)
         if input_args.use_eclatin_software_failure:
-            if rank == failed_rank:
-                logger.info(f"ECLATIN: [Rank {rank}] rank2 software failure recovery - reading local files directly (no network/XOR)")
+            net_config = self.eclatin_manager._get_eclatin_network_config(rank, world_size)
+            rank_in_group = net_config['rank_in_group']
+            if rank_in_group == 2:
+                logger.info(f"ECLATIN: [Rank {rank}] rank2 (rank_in_group 2) software failure recovery - reading local files directly (no network/XOR)")
                 logger.info(f"ECLATIN: [Rank {rank}] recovered_buffer size: {recovered_buffer.numel() if recovered_buffer is not None else 'None'}")
 
                 if recovered_buffer is None:
@@ -8536,8 +8538,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
                 return
             else:
-                # rank0/1/3: No action needed for software failure recovery
-                logger.info(f"ECLATIN: [Rank {rank}] No action needed for rank2 software failure recovery")
+                # rank_in_group 0/1/3: No action needed for software failure recovery
+                logger.info(f"ECLATIN: [Rank {rank}] (rank_in_group {rank_in_group}) No action needed for rank2 software failure recovery")
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
                 return

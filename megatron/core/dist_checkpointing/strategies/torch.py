@@ -4566,12 +4566,16 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         from megatron.training import get_args as use_args
         input_args = use_args()
         if input_args.use_eccheck_software_failure:
-            failed_rank = 1  # rank1 software failure
-            logger.info(f"EC-CHECK: [Rank {rank}] Software failure recovery mode (failed_rank=1)")
+            failed_rank = 1  # rank_in_group=1 software failure
+            logger.info(f"EC-CHECK: [Rank {rank}] Software failure recovery mode (failed_rank=1, rank_in_group=1)")
         else:
             failed_rank = 2  # Default: rank2 hardware failure
             logger.info(f"EC-CHECK: [Rank {rank}] Hardware failure recovery mode (failed_rank=2)")
         
+        # Per-group rank for multi-rank: receiver is rank_in_group=1 (software) or rank==failed_rank (hardware)
+        num_groups = max(1, world_size // 4)
+        rank_in_group = rank // num_groups if world_size >= 4 and world_size % 4 == 0 else rank
+
         checkpoint_dir = Path(checkpoint_dir)
         eccheck_p2p_own_file = checkpoint_dir / f"__{rank}_p2p_own.distcp"
         eccheck_p2p_partner_file = checkpoint_dir / f"__{p2p_partner_rank}_p2p_partner.distcp"
@@ -4592,13 +4596,20 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 str(eccheck_p2p_partner_file), my_rank=p2p_partner_rank
             )
         
-        # 如果 failed_rank 缺失 partner 文件，则 partner 点对点 send 元数据给 failed_rank，避免大对象广播
-        # 仅当 failed_rank 缺失 partner 文件时触发点对点补元数据
-        local_missing = (
-            failed_rank >= 0
-            and rank == failed_rank
-            and not eccheck_p2p_partner_file.exists()
-        )
+        # If failed rank misses partner file, partner sends metadata via P2P.
+        # Software (rank_in_group=1): any rank with rank_in_group==1 missing partner file.
+        # Hardware: single failed_rank missing partner file.
+        if input_args.use_eccheck_software_failure:
+            local_missing = (
+                rank_in_group == 1
+                and not eccheck_p2p_partner_file.exists()
+            )
+        else:
+            local_missing = (
+                failed_rank >= 0
+                and rank == failed_rank
+                and not eccheck_p2p_partner_file.exists()
+            )
         if torch.distributed.is_initialized():
             device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
             missing_any = torch.tensor(int(local_missing), device=device)
@@ -4609,32 +4620,72 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
         meta_start_time = time()
         
-        partner_rank = self._get_p2p_partner_rank(failed_rank, world_size)
-        if need_recover and rank in (failed_rank, partner_rank):
+        # Metadata P2P: sender sends to receiver. Software (rank_in_group=1): rank_in_group 0 sends to partner (r_i_g 1) in 4-rank; in multi-rank only rank_in_group 1 pair exchange (one send, one recv by local_missing). Hardware: partner_rank sends to failed_rank.
+        if need_recover:
             import pickle
             device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-            if rank == partner_rank:
-                payload = pickle.dumps({
-                    'tensor_metadata': mapped_file_own.local_metadata or [],
-                    'non_tensor_data': mapped_file_own.non_tensor_data or {},
-                })
-                buf = torch.tensor(list(payload), dtype=torch.uint8, device=device)
-                size = torch.tensor([buf.numel()], dtype=torch.int64, device=device)
-                torch.distributed.send(size, dst=failed_rank)
-                torch.distributed.send(buf, dst=failed_rank)
-            elif rank == failed_rank:
-                size = torch.empty(1, dtype=torch.int64, device=device)
-                torch.distributed.recv(size, src=partner_rank)
-                buf = torch.empty(int(size.item()), dtype=torch.uint8, device=device)
-                torch.distributed.recv(buf, src=partner_rank)
-                obj = pickle.loads(bytes(buf.cpu().tolist()))
-                mapped_file_partner = EccheckMappedFile(
-                    mmap_object=None,
-                    memory_address=None,
-                    file_size=None,
-                    local_metadata=obj.get('tensor_metadata'),
-                    non_tensor_data=obj.get('non_tensor_data'),
+            if input_args.use_eccheck_software_failure:
+                partner_rank_in_group = (
+                    p2p_partner_rank // num_groups
+                    if world_size >= 4 and world_size % 4 == 0
+                    else p2p_partner_rank
                 )
+                if rank_in_group == 0 and partner_rank_in_group == 1:
+                    payload = pickle.dumps({
+                        'tensor_metadata': mapped_file_own.local_metadata or [],
+                        'non_tensor_data': mapped_file_own.non_tensor_data or {},
+                    })
+                    buf = torch.tensor(list(payload), dtype=torch.uint8, device=device)
+                    size = torch.tensor([buf.numel()], dtype=torch.int64, device=device)
+                    torch.distributed.send(size, dst=p2p_partner_rank)
+                    torch.distributed.send(buf, dst=p2p_partner_rank)
+                elif rank_in_group == 1 and local_missing:
+                    size = torch.empty(1, dtype=torch.int64, device=device)
+                    torch.distributed.recv(size, src=p2p_partner_rank)
+                    buf = torch.empty(int(size.item()), dtype=torch.uint8, device=device)
+                    torch.distributed.recv(buf, src=p2p_partner_rank)
+                    obj = pickle.loads(bytes(buf.cpu().tolist()))
+                    mapped_file_partner = EccheckMappedFile(
+                        mmap_object=None,
+                        memory_address=None,
+                        file_size=None,
+                        local_metadata=obj.get('tensor_metadata'),
+                        non_tensor_data=obj.get('non_tensor_data'),
+                    )
+                elif rank_in_group == 1 and not local_missing:
+                    payload = pickle.dumps({
+                        'tensor_metadata': mapped_file_own.local_metadata or [],
+                        'non_tensor_data': mapped_file_own.non_tensor_data or {},
+                    })
+                    buf = torch.tensor(list(payload), dtype=torch.uint8, device=device)
+                    size = torch.tensor([buf.numel()], dtype=torch.int64, device=device)
+                    torch.distributed.send(size, dst=p2p_partner_rank)
+                    torch.distributed.send(buf, dst=p2p_partner_rank)
+            else:
+                partner_rank = self._get_p2p_partner_rank(failed_rank, world_size)
+                if rank in (failed_rank, partner_rank):
+                    if rank == partner_rank:
+                        payload = pickle.dumps({
+                            'tensor_metadata': mapped_file_own.local_metadata or [],
+                            'non_tensor_data': mapped_file_own.non_tensor_data or {},
+                        })
+                        buf = torch.tensor(list(payload), dtype=torch.uint8, device=device)
+                        size = torch.tensor([buf.numel()], dtype=torch.int64, device=device)
+                        torch.distributed.send(size, dst=failed_rank)
+                        torch.distributed.send(buf, dst=failed_rank)
+                    elif rank == failed_rank:
+                        size = torch.empty(1, dtype=torch.int64, device=device)
+                        torch.distributed.recv(size, src=partner_rank)
+                        buf = torch.empty(int(size.item()), dtype=torch.uint8, device=device)
+                        torch.distributed.recv(buf, src=partner_rank)
+                        obj = pickle.loads(bytes(buf.cpu().tolist()))
+                        mapped_file_partner = EccheckMappedFile(
+                            mmap_object=None,
+                            memory_address=None,
+                            file_size=None,
+                            local_metadata=obj.get('tensor_metadata'),
+                            non_tensor_data=obj.get('non_tensor_data'),
+                        )
 
         # Package both together
         local_package = {
@@ -4745,13 +4796,17 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             mapped_file_partner=mapped_file_partner,
             recv_own_buffer=recv_own_buffer,
             recv_total_size=recv_total_size,
-            failed_rank=failed_rank,  # Pass failed_rank parameter
+            failed_rank=failed_rank,
+            rank_in_group=rank_in_group,
+            local_missing=local_missing,
         )
         data_end_time = time()
         data_time = data_end_time - data_start_time
         logger.info(f"EC-CHECK: [Rank {rank}] Data exchange completed in {data_time:.4f}s")
-        # For rank2 recovery: save recovered data for later use in _load_eccheck_checkpoint
-        if rank == failed_rank:
+        # Save recovered data for later use in _load_eccheck_checkpoint. Software: rank_in_group=1; hardware: rank==failed_rank.
+        if (input_args.use_eccheck_software_failure and rank_in_group == 1) or (
+            not input_args.use_eccheck_software_failure and rank == failed_rank
+        ):
             logger.info(f"EC-CHECK: [Rank {rank}] Saving recovered buffer for _load_eccheck_checkpoint")
             # Store recovered data in instance variables for _load_eccheck_checkpoint to use
             self.eccheck_recovered_buffer = recv_own_buffer
@@ -7779,7 +7834,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         mapped_file_partner,
         recv_own_buffer: torch.Tensor,
         recv_total_size: int,
-        failed_rank: int = 2,  # Add failed_rank parameter, default to 2 for backward compatibility
+        failed_rank: int = 2,
+        rank_in_group: int = -1,
+        local_missing: bool = False,
     ) -> None:
         """EC-CHECK recovery pipeline for single-failure scenario.
 
@@ -7790,6 +7847,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         import queue
         import ctypes
         import mmap
+        
+        num_groups = max(1, world_size // 4)
+        if rank_in_group < 0:
+            rank_in_group = rank // num_groups if world_size >= 4 and world_size % 4 == 0 else rank
         
         # === Step 1: Prepare recv_encoding_buffers (if not already allocated) ===
         if self.eccheck_manager.eccheck_recv_encoding_buffers is None:
@@ -7872,18 +7933,14 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         #   - rank1: will receive d0 from rank0 via ASIO (no file read needed)
         #   - rank2/3: read from mapped_file_own (their own data)
         if failed_rank == 1:
-            # rank1 software failure: rank0 sends d0 to rank1
-            if rank == 0:
+            # rank_in_group=1 software failure: rank_in_group 0 sends; rank_in_group 1 recvs (if local_missing) or sends (if partner missing)
+            if rank_in_group == 0 or (rank_in_group == 1 and not local_missing):
                 source_mmap = mapped_file_own.mmap_object if mapped_file_own.mmap_object is not None else None
                 source_file_size = mapped_file_own.file_size if mapped_file_own.file_size is not None else 0
-            elif rank == 1:
-                # rank1 doesn't read from file, will receive from rank0 via ASIO
+            else:
+                # rank_in_group == 1 and local_missing: will receive via ASIO
                 source_mmap = None
                 source_file_size = 0
-            else:
-                # rank2/3 read from own file
-                source_mmap = mapped_file_own.mmap_object if mapped_file_own.mmap_object is not None else None
-                source_file_size = mapped_file_own.file_size if mapped_file_own.file_size is not None else 0
         else:
             # rank2 hardware failure (original logic)
             if rank == 0 or rank == 3:
@@ -7945,77 +8002,68 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         f"({padding_size / (1024**2):.2f} MB padding)"
                     )
         
-        # === Step 7: Early exit for rank1 software failure - simple P2P transfer (no encoding/XOR buffers needed) ===
-        # rank1 software failure recovery only needs simple P2P transfer, no encoding/XOR pipeline needed
+        # === Step 7: Early exit for rank_in_group=1 software failure - simple P2P transfer (no encoding/XOR buffers needed) ===
+        # rank_in_group=1 software failure: only rank_in_group 1 participates in P2P (one send, one recv by local_missing).
+        # rank_in_group 0 sends only when partner has rank_in_group 1 (4-rank: rank 0 sends to rank 1; 8-rank: (0,1) both r_i_g 0 so neither sends).
         if failed_rank == 1:
-            logger.info(f"EC-CHECK: [Rank {rank}] rank1 software failure recovery - using simple synchronous P2P send/recv (no worker queue)")
+            p2p_partner_rank = self._get_p2p_partner_rank(rank, world_size)
+            partner_rank_in_group = (
+                p2p_partner_rank // num_groups
+                if world_size >= 4 and world_size % 4 == 0
+                else p2p_partner_rank
+            )
+            logger.info(f"EC-CHECK: [Rank {rank}] rank_in_group=1 software failure recovery - simple P2P send/recv (rank_in_group={rank_in_group})")
             
-            if rank == 0:
-                # Rank0: Send d0 directly to rank1 via simple synchronous P2P send
-                logger.info(f"EC-CHECK: [Rank {rank}] Sending d0 to rank1 via simple synchronous P2P send (one-time transfer)")
-                
-                # Read d0 from own file and send all at once via simple P2P send
-                if source_mmap is not None:
-                    # Get rank0's own data size from registry (to match rank1's recv_total_size calculation)
-                    rank0_metadata = registry.rank_metadata.get(rank, [])
-                    send_total_size = sum(meta.size_bytes for meta in rank0_metadata)
-                    
-                    # Calculate tensor buffer size and offset from file header
-                    header_bytes = source_mmap[:32]
-                    import struct
-                    magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
-                    tensor_buffer_start_offset = 32 + non_tensor_size + tensor_keys_size
-                    
-                    # Verify that registry size matches file header size
-                    if send_total_size != tensor_buffer_size:
-                        logger.warning(
-                            f"EC-CHECK: [Rank {rank}] Size mismatch: registry={send_total_size}, "
-                            f"file_header={tensor_buffer_size}, using registry size to match rank1's recv_total_size"
-                        )
-                    
-                    # Allocate buffer for send_total_size data (rank0's own data size)
-                    send_buffer = torch.empty(send_total_size, dtype=torch.uint8)
-                    send_addr = int(send_buffer.data_ptr())
-                    
-                    # Copy all data from mmap to buffer at once
-                    chunk_data = source_mmap[tensor_buffer_start_offset:tensor_buffer_start_offset + send_total_size]
-                    import ctypes
-                    ctypes.memmove(
-                        ctypes.cast(send_addr, ctypes.POINTER(ctypes.c_uint8)),
-                        chunk_data,
-                        send_total_size
+            def _do_send():
+                if source_mmap is None:
+                    logger.error(f"EC-CHECK: [Rank {rank}] No source mmap available for sending")
+                    return
+                send_rank_metadata = registry.rank_metadata.get(rank, [])
+                send_total_size = sum(meta.size_bytes for meta in send_rank_metadata)
+                header_bytes = source_mmap[:32]
+                import struct
+                magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+                tensor_buffer_start_offset = 32 + non_tensor_size + tensor_keys_size
+                if send_total_size != tensor_buffer_size:
+                    logger.warning(
+                        f"EC-CHECK: [Rank {rank}] Size mismatch: registry={send_total_size}, "
+                        f"file_header={tensor_buffer_size}, using registry size"
                     )
-                    
-                    # Send all data at once via simple synchronous P2P send (no worker queue)
-                    logger.info(f"EC-CHECK: [Rank {rank}] Sending {send_total_size / (1024**2):.2f} MB in one transfer")
-                    self.eccheck_manager._eccheck_native.simple_p2p_send(
-                        buffer_addr=send_addr,
-                        size=send_total_size
-                    )
-                    
-                    logger.info(f"EC-CHECK: [Rank {rank}] Finished sending d0 to rank1: {send_total_size / (1024**2):.2f} MB")
-                else:
-                    logger.error(f"EC-CHECK: [Rank {rank}] No source mmap available for sending d0")
-                    
-            elif rank == 1:
-                # Rank1: Receive d0 from rank0 via simple synchronous P2P recv
-                logger.info(f"EC-CHECK: [Rank {rank}] Receiving d0 from rank0 via simple synchronous P2P recv (one-time transfer)")
-                
-                # Receive all data at once directly into recv_own_buffer
-                recv_addr = int(recv_own_buffer.data_ptr())
-                
-                # Receive all data at once via simple synchronous P2P recv (no worker queue)
-                logger.info(f"EC-CHECK: [Rank {rank}] Receiving {recv_total_size / (1024**2):.2f} MB in one transfer")
-                self.eccheck_manager._eccheck_native.simple_p2p_recv(
-                    buffer_addr=recv_addr,
-                    size=recv_total_size
+                send_buffer = torch.empty(send_total_size, dtype=torch.uint8)
+                send_addr = int(send_buffer.data_ptr())
+                chunk_data = source_mmap[tensor_buffer_start_offset:tensor_buffer_start_offset + send_total_size]
+                import ctypes
+                ctypes.memmove(
+                    ctypes.cast(send_addr, ctypes.POINTER(ctypes.c_uint8)),
+                    chunk_data,
+                    send_total_size
                 )
-                
-                logger.info(f"EC-CHECK: [Rank {rank}] Finished receiving d0 from rank0: {recv_total_size / (1024**2):.2f} MB")
-                
+                logger.info(f"EC-CHECK: [Rank {rank}] Sending {send_total_size / (1024**2):.2f} MB in one transfer")
+                self.eccheck_manager._eccheck_native.simple_p2p_send(buffer_addr=send_addr, size=send_total_size)
+                logger.info(f"EC-CHECK: [Rank {rank}] Finished sending: {send_total_size / (1024**2):.2f} MB")
+            
+            if rank_in_group == 0 and partner_rank_in_group == 1:
+                logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 0, partner r_i_g 1) Sending to partner via simple P2P send")
+                _do_send()
+            elif rank_in_group == 1 and local_missing:
+                logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 1, missing) Receiving from partner via simple P2P recv")
+                recv_addr = int(recv_own_buffer.data_ptr())
+                logger.info(f"EC-CHECK: [Rank {rank}] Receiving {recv_total_size / (1024**2):.2f} MB in one transfer")
+                self.eccheck_manager._eccheck_native.simple_p2p_recv(buffer_addr=recv_addr, size=recv_total_size)
+                logger.info(f"EC-CHECK: [Rank {rank}] Finished receiving: {recv_total_size / (1024**2):.2f} MB")
+            elif rank_in_group == 1 and not local_missing:
+                # Fixed roles by rank order so one sends and one receives (avoids deadlock when both have data)
+                if rank < p2p_partner_rank:
+                    logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 1, has data) Sending to partner via simple P2P send")
+                    _do_send()
+                else:
+                    logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 1, has data) Receiving from partner via simple P2P recv")
+                    recv_addr = int(recv_own_buffer.data_ptr())
+                    logger.info(f"EC-CHECK: [Rank {rank}] Receiving {recv_total_size / (1024**2):.2f} MB in one transfer")
+                    self.eccheck_manager._eccheck_native.simple_p2p_recv(buffer_addr=recv_addr, size=recv_total_size)
+                    logger.info(f"EC-CHECK: [Rank {rank}] Finished receiving: {recv_total_size / (1024**2):.2f} MB")
             else:
-                # rank2/3: No action needed for rank1 recovery
-                logger.info(f"EC-CHECK: [Rank {rank}] No action needed for rank1 recovery")
+                logger.info(f"EC-CHECK: [Rank {rank}] No action needed for rank_in_group=1 recovery (rank_in_group={rank_in_group})")
             
             # Synchronize all ranks and return early (skip full encoding/XOR pipeline)
             # if torch.distributed.is_initialized():
@@ -9152,10 +9200,21 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         from .state_dict_decomposer import reconstruct_state_dict
         
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        
-        # Check if rank2 has recovered data from P2P pipeline
-        if (rank == 2 and hasattr(self, 'eccheck_recovered_buffer') 
-            and self.eccheck_recovered_buffer is not None):
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        num_groups = max(1, world_size // 4)
+        rank_in_group = rank // num_groups if world_size >= 4 and world_size % 4 == 0 else rank
+        from megatron.training import get_args as _get_args
+        _args = _get_args()
+        use_recovered = (
+            hasattr(self, 'eccheck_recovered_buffer')
+            and self.eccheck_recovered_buffer is not None
+            and (
+                (_args.use_eccheck_software_failure and rank_in_group == 1)
+                or (not _args.use_eccheck_software_failure and rank == 2)
+            )
+        )
+        # Check if this rank has recovered data from P2P pipeline (software: rank_in_group=1; hardware: rank=2)
+        if use_recovered:
             logger.info(f"EC-CHECK: [Rank {rank}] Using recovered data from P2P pipeline")
             
             # Extract tensors from recovered buffer using saved metadata

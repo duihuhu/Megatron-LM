@@ -5022,11 +5022,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # Get metadata (reuse existing logic)
             checkpoint_dir = Path(checkpoint_dir)
 
-            # Per-group role and init load connections (software-only: 1 port, 1 barrier; no full 8-port init)
+            # Per-group role (init moved after size exchange so send/recv is not blocked by full metadata)
             net_config = self.ecnaive_manager._get_ecnaive_load_network_config(rank, world_size)
             rank_in_group = net_config['rank_in_group']
-            if self.ecnaive_manager.use_ecnaive:
-                self.ecnaive_manager.init_ecnaive_load_software_only(rank, world_size)
 
             # Load main file to extract metadata
             ecnaive_main_file = checkpoint_dir / f'__{rank}_0.distcp'
@@ -5071,33 +5069,27 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if local_package['tensor_metadata'] is None or local_package['non_tensor_data'] is None:
                 logger.error(f"EC-NAIVE: [Rank {rank}] Local metadata is None, skipping metadata exchange")
                 return mapped_file_own, None
-            send_start_time = time()
-            # All-gather complete metadata using all_gather_object
-            all_metadata = [{}] * world_size
+
+            # Phase 1: Exchange only per-rank tensor sizes (small all_gather) so send/recv can run before full metadata
+            my_size = sum(meta.size_bytes for meta in local_package['tensor_metadata'])
+            sizes_list = [0] * world_size
             if torch.distributed.is_initialized():
-                torch.distributed.all_gather_object(all_metadata, local_package)
+                torch.distributed.all_gather_object(sizes_list, my_size)
+            else:
+                sizes_list[rank] = my_size
+            load_receiver_rank = net_config['load_receiver_rank']
+            d20_size = send_size = sizes_list[load_receiver_rank] // 2
 
-            # Build rank_metadata and rank_non_tensor_data dicts for GlobalMetadataRegistry
-            rank_metadata = {}
-            rank_non_tensor_data = {}
-            for r in range(world_size):
-                rank_metadata[r] = all_metadata[r]['tensor_metadata']
-                rank_non_tensor_data[r] = all_metadata[r]['non_tensor_data']
+            # Init connections after size exchange (so recovery is not blocked by full metadata all_gather)
+            if self.ecnaive_manager.use_ecnaive:
+                self.ecnaive_manager.init_ecnaive_load_software_only(rank, world_size, net_config=net_config)
 
-            # Create registry with both tensor and non-tensor metadata
-            registry = GlobalMetadataRegistry(
-                rank_metadata=rank_metadata,
-                rank_non_tensor_data=rank_non_tensor_data
-            )
-
-            # Software failure recovery: only rank_in_group 2 performs data transfer using existing connections
+            # Software failure recovery: rank2 recv / rank3 send (using d20_size, send_size from phase 1)
             if rank_in_group == 2:
-                # Use same size as rank 3 send (registry total_size // 2) so recv size matches exactly
                 import struct
-                load_receiver_rank = net_config['load_receiver_rank']
-                d20_size = sum(meta.size_bytes for meta in registry.rank_metadata.get(load_receiver_rank, [])) // 2
+                send_start_time = time()
                 d20_path = checkpoint_dir / f"__{rank}_data0.distcp"
-                d20_data = None
+                recovered_buffer = None
                 with open(d20_path, 'rb') as f:
                     header_bytes = f.read(32)
                     if len(header_bytes) != 32:
@@ -5113,42 +5105,30 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         else:
                             offset = 32 + non_tensor_size + tensor_keys_size
                             f.seek(offset)
-                            d20_data = f.read(d20_size)
-                            if len(d20_data) != d20_size:
+                            recovered_buffer = torch.zeros(2 * d20_size, dtype=torch.uint8)
+                            n_read = f.readinto(
+                                memoryview(recovered_buffer[:d20_size].numpy())
+                            )
+                            if n_read != d20_size:
                                 logger.error(
                                     f"EC-NAIVE: [Rank {rank}] Short read from data0: "
-                                    f"got {len(d20_data)}, expected {d20_size}"
+                                    f"got {n_read}, expected {d20_size}"
                                 )
                                 d20_size = 0
 
-                if d20_size > 0:
-                    # Receive d21 (same size as d20 tensor so protocol matches rank 3 send)
-                    d21_buffer = torch.zeros(d20_size, dtype=torch.uint8)
-                    d21_addr = int(d21_buffer.data_ptr())
-                    self.ecnaive_manager._ecnaive_native.software_recv_data1(d21_addr, d20_size)
-
-                    # Create merged buffer (align with hardware version)
-                    total_size = d20_size + d20_size
-                    self.ecnaive_recovered_buffer = torch.zeros(total_size, dtype=torch.uint8)
-
-                    # Data layout: first half d20 (tensor only), second half d21
-                    self.ecnaive_recovered_buffer[:d20_size].copy_(
-                        torch.frombuffer(memoryview(d20_data), dtype=torch.uint8).clone()
+                if d20_size > 0 and recovered_buffer is not None:
+                    self.ecnaive_manager._ecnaive_native.software_recv_data1(
+                        int(recovered_buffer[d20_size:].data_ptr()), d20_size
                     )
-                    self.ecnaive_recovered_buffer[d20_size:] = d21_buffer
-
-                    # Save metadata (align with hardware version)
+                    self.ecnaive_recovered_buffer = recovered_buffer
                     self.ecnaive_recovered_metadata = mapped_file_own
-                    self.ecnaive_recovered_registry = registry
+                    total_size = d20_size + d20_size
                     send_end_time = time()
-                    logger.info(f"EC-NAIVE: [Rank {rank}] Software recovery load time: {send_end_time - send_start_time:.4f} seconds")
+                    logger.info(f"EC-NAIVE: [Rank {rank}] Software recovery (send/recv) completed in {send_end_time - send_start_time:.4f} seconds")
                     logger.info(f"EC-NAIVE: [Rank {rank}] Software recovery completed: d20_size={d20_size}, total={total_size}")
 
             elif rank_in_group == 3:
-                # rank_in_group 3: Load d21 from file and send to receiver (rank_in_group 2)
                 import struct
-                load_receiver_rank = net_config['load_receiver_rank']
-                send_size = sum(meta.size_bytes for meta in registry.rank_metadata.get(load_receiver_rank, [])) // 2
                 d21_path = checkpoint_dir / f'__{rank}_recv_data1.distcp'
                 if not d21_path.exists():
                     logger.error(f"EC-NAIVE: [Rank {rank}] Block file not found: {d21_path}")
@@ -5186,7 +5166,62 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                                         f"size={read_size / (1024**2):.2f} MB"
                                     )
 
-            # All ranks return metadata (rank_in_group 2 will use recovered buffer, others use normal loading)
+            # Phase 2: Full metadata all_gather (for registry and return; happens after send/recv)
+            all_metadata = [{}] * world_size
+            if torch.distributed.is_initialized():
+                import pickle
+                try:
+                    local_bytes = pickle.dumps(local_package)
+                    local_len = len(local_bytes)
+                    len_list = [0] * world_size
+                    torch.distributed.all_gather_object(len_list, local_len)
+                    max_len = max(len_list)
+                    if max_len == 0:
+                        for r in range(world_size):
+                            all_metadata[r] = {'tensor_metadata': [], 'non_tensor_data': {}}
+                    else:
+                        device = (
+                            torch.device('cuda', torch.cuda.current_device())
+                            if torch.cuda.is_available()
+                            else torch.device('cpu')
+                        )
+                        local_tensor = torch.zeros(max_len, dtype=torch.uint8, device=device)
+                        local_tensor[:local_len] = torch.frombuffer(
+                            memoryview(local_bytes), dtype=torch.uint8
+                        ).clone().to(device)
+                        tensor_list = [
+                            torch.empty(max_len, dtype=torch.uint8, device=device)
+                            for _ in range(world_size)
+                        ]
+                        torch.distributed.all_gather(tensor_list, local_tensor)
+                        for r in range(world_size):
+                            if len_list[r] == 0:
+                                all_metadata[r] = {'tensor_metadata': [], 'non_tensor_data': {}}
+                            else:
+                                raw = tensor_list[r].cpu().numpy()[: len_list[r]].tobytes()
+                                all_metadata[r] = pickle.loads(raw)
+                except Exception as e:
+                    logger.warning(
+                        f"EC-NAIVE: [Rank {rank}] Tensor all_gather failed ({e}), falling back to all_gather_object"
+                    )
+                    torch.distributed.all_gather_object(all_metadata, local_package)
+            else:
+                all_metadata[rank] = local_package
+
+            rank_metadata = {}
+            rank_non_tensor_data = {}
+            for r in range(world_size):
+                rank_metadata[r] = all_metadata[r]['tensor_metadata']
+                rank_non_tensor_data[r] = all_metadata[r]['non_tensor_data']
+
+            registry = GlobalMetadataRegistry(
+                rank_metadata=rank_metadata,
+                rank_non_tensor_data=rank_non_tensor_data
+            )
+
+            if rank_in_group == 2 and getattr(self, 'ecnaive_recovered_buffer', None) is not None:
+                self.ecnaive_recovered_registry = registry
+
             return mapped_file_own, registry
 
         # If not software failure mode, proceed with normal hardware recovery

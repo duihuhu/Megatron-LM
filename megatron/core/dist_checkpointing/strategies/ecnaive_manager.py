@@ -526,9 +526,13 @@ class ECNAIVEManager:
         torch.distributed.barrier()
         logger.info(f"EC-NAIVE: [Rank {rank}] Load connections initialized")
 
-    def init_ecnaive_load_software_only(self, rank: int, world_size: int) -> None:
+    def init_ecnaive_load_software_only(
+        self, rank: int, world_size: int, net_config: Optional[dict] = None
+    ) -> None:
         """Initialize EC-NAIVE load for software failure only: 1 port (rank3_data1), 1 barrier.
         Use instead of init_ecnaive_load when use_ecnaive_software_failure to avoid 8-port + 2-barrier overhead.
+        If net_config is provided (e.g. from caller who already called _get_ecnaive_load_network_config),
+        reuse it to avoid duplicate IP all_gather.
         """
         if self._ecnaive_native is None:
             logger.error("EC-NAIVE: Native module not initialized, cannot initialize load mode")
@@ -539,7 +543,8 @@ class ECNAIVEManager:
         failed_rank = 2
         self._ecnaive_native.set_load_mode(True, failed_rank, rank, is_software_only=True)
         logger.info(f"EC-NAIVE: [Rank {rank}] Set load mode (failed_rank={failed_rank}) for software-only")
-        net_config = self._get_ecnaive_load_network_config(rank, world_size)
+        if net_config is None:
+            net_config = self._get_ecnaive_load_network_config(rank, world_size)
         rank_in_group = net_config['rank_in_group']
         load_receiver_rank = net_config['load_receiver_rank']
         rank2_ip = net_config['rank_ips'].get(load_receiver_rank, net_config['my_ip'])

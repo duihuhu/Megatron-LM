@@ -67,31 +67,39 @@ class GeminiManager:
         
         self._initialized = True
     
+    RANKS_PER_GROUP = 4
+
     def _get_gemini_paired_rank(self, my_rank: int, world_size: int) -> int:
         """Get the paired rank for Gemini replica exchange.
-        
-        Pairing rules (same as EC-CHECK XOR pairing):
-        - Rank 0 ↔ Rank 2
-        - Rank 1 ↔ Rank 3
-        
+
+        Pairing rules (same as EC grouping: one group spans different nodes).
+        Within each 4-rank group: rank_in_group 0<->2, 1<->3.
+        Formula: group_id = rank % num_groups, rank_in_group = rank // num_groups,
+        paired_rank_in_group = (rank_in_group + 2) % 4, paired_rank = group_id + num_groups * paired_rank_in_group.
+
         Args:
             my_rank (int): Current rank
             world_size (int): Total number of ranks
-            
+
         Returns:
             int: Paired rank for replica exchange
         """
         if world_size < 4:
             raise ValueError(f"Gemini: World size must be at least 4, got {world_size}")
-        
-        pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
-        
-        if my_rank in pairing_map:
-            paired_rank = pairing_map[my_rank]
-            logger.debug(f"Gemini: Rank {my_rank} paired with Rank {paired_rank}")
-            return paired_rank
-        else:
-            raise ValueError(f"Gemini: Unsupported rank {my_rank} for 4-rank setup")
+        if world_size % self.RANKS_PER_GROUP != 0:
+            raise ValueError(
+                f"Gemini: World size must be divisible by {self.RANKS_PER_GROUP}, got {world_size}"
+            )
+        num_groups = world_size // self.RANKS_PER_GROUP
+        group_id = my_rank % num_groups
+        rank_in_group = my_rank // num_groups
+        paired_rank_in_group = (rank_in_group + 2) % self.RANKS_PER_GROUP
+        paired_rank = group_id + num_groups * paired_rank_in_group
+        logger.debug(
+            f"Gemini: Rank {my_rank} (group_id={group_id}, rank_in_group={rank_in_group}) "
+            f"paired with Rank {paired_rank}"
+        )
+        return paired_rank
     
     def _get_gemini_network_config(self, rank: int, world_size: int) -> dict:
         """

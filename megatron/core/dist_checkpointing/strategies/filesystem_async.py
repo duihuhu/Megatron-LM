@@ -937,9 +937,16 @@ class FileSystemWriterAsync(FileSystemWriter):
             # Fallback to torch.distributed broadcast (original path)
             logger.info(f"Gemini rank {rank}: Using torch.distributed broadcast (C++ module not available)")
             
-            # Get paired rank (rank 0<->2, 1<->3)
-            pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
-            paired_rank = pairing_map.get(rank, None)
+            # Get paired rank (EC-style: group 0<->2, 1<->3 within each 4-rank group)
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 4
+            if world_size >= 4 and world_size % 4 == 0:
+                num_groups = world_size // 4
+                group_id = rank % num_groups
+                rank_in_group = rank // num_groups
+                paired_rank_in_group = (rank_in_group + 2) % 4
+                paired_rank = group_id + num_groups * paired_rank_in_group
+            else:
+                paired_rank = None
             
             if paired_rank is None:
                 logger.warning(f"Gemini rank {rank}: No paired rank found, skipping exchange")

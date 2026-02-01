@@ -8,7 +8,7 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=bond0
+export NETIFACES_INTERFACE=eth0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
@@ -61,7 +61,7 @@ ARGS_TO_PASS=("$@")
 
 # fixed Model related configuration here, pls not overlap with json config
 HIDDEN_SIZE=1600
-NUM_ATTENTION_HEADS=25
+NUM_ATTENTION_HEADS=16
 NUM_LAYERS=48 
 
 
@@ -134,7 +134,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-rdma
     
     # --use-gemini-software-failure
-    --use-gemini-hardware-failure
+    #--use-gemini-hardware-failure
 
     # --use-eclatin
     --ckpt-format torch_dist

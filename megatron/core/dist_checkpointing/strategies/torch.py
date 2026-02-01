@@ -1487,8 +1487,12 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         
         if world_size >= 4:  # Gemini requires at least 4 ranks
-            # Get paired rank
-            pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
+            # Build pairing map from Gemini EC formula (supports 4, 8, 12, ... ranks)
+            pairing_map = {
+                r: self.gemini_manager._get_gemini_paired_rank(r, world_size)
+                for r in range(world_size)
+            }
+            self.pairing_map = pairing_map
             paired_rank = pairing_map.get(rank, None)
             
             if paired_rank is not None:
@@ -3760,12 +3764,28 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.gemini_replicas_mmap_files = {}  # Dict[str, tuple]: buffer_name -> (file_handle, mmap_handle)
         self.gemini_replicas_rdma_checkpoint_dir = None  # Track which checkpoint_dir buffers are prepared for
     
-        self.pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
+        # Set lazily in _prepare_gemini_data from gemini_manager (supports 4, 8, 12, ... ranks)
+        self.pairing_map = None
         
         # If checkpoint_dir provided, prepare RDMA buffers now (rank0 only)
         # # this is desgin for use ,but checkpoint_dir can not be pass
         # if checkpoint_dir is not None:
         #     self._prepare_gemini_rdma_buffers_if_needed(checkpoint_dir)
+    
+    def _get_gemini_pairing_map(self):
+        """Return Gemini EC pairing map (rank -> paired_rank). Build from gemini_manager on first use."""
+        if self.pairing_map is not None:
+            return self.pairing_map
+        if not torch.distributed.is_initialized():
+            return {}
+        world_size = torch.distributed.get_world_size()
+        if world_size < 4 or world_size % 4 != 0:
+            return {}
+        self.pairing_map = {
+            r: self.gemini_manager._get_gemini_paired_rank(r, world_size)
+            for r in range(world_size)
+        }
+        return self.pairing_map
     
     def _prepare_gemini_rdma_buffers_if_needed(self, checkpoint_dir: Path):
         """Prepare send buffers if needed (wrapper function).
@@ -3824,9 +3844,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if rank != 0:
             return  # Only rank0 needs send buffers
         
-        paired_rank = self.pairing_map.get(rank, None)
+        pairing_map = self._get_gemini_pairing_map()
+        paired_rank = pairing_map.get(rank, None)
         if paired_rank != 2:
-            return  # Only for rank0->rank2 recovery
+            return  # Only for rank0->rank2 recovery (4-rank case)
         
         checkpoint_dir = Path(checkpoint_dir)
         
@@ -6206,7 +6227,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         import numpy as np
         
         rank = torch.distributed.get_rank()
-        paired_rank = self.pairing_map.get(rank, None)
+        pairing_map = self._get_gemini_pairing_map()
+        paired_rank = pairing_map.get(rank, None)
         checkpoint_dir = Path(checkpoint_dir)
         
         # Detect if RDMA is enabled
@@ -6437,7 +6459,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         from .async_utils import get_or_create_pair_process_group
         
         rank = torch.distributed.get_rank()
-        paired_rank = self.pairing_map.get(rank, None)
+        pairing_map = self._get_gemini_pairing_map()
+        paired_rank = pairing_map.get(rank, None)
         checkpoint_dir = Path(checkpoint_dir)
         
         logger.info(f"rank: {rank}, starting Gemini checkpoint recovery for rank2 failure")
@@ -7368,8 +7391,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         rank = torch.distributed.get_rank()
         
         # Get pairing map (same as in async_utils)
-
-        paired_rank = self.pairing_map.get(rank, None)
+        pairing_map = self._get_gemini_pairing_map()
+        paired_rank = pairing_map.get(rank, None)
         
         checkpoint_dir = Path(checkpoint_dir)
         
@@ -10542,7 +10565,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         """
         # Check if this is an EC-CHECK format checkpoint
         rank = torch.distributed.get_rank()
-        pair_rank = self.pairing_map.get(rank, None)
+        pairing_map = self._get_gemini_pairing_map()
+        pair_rank = pairing_map.get(rank, None)
         from megatron.training import get_args as use_args
         input_args = use_args()
         

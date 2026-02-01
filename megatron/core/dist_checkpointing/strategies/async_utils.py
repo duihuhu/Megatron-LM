@@ -93,12 +93,49 @@ def get_or_create_global_gloo_group() -> torch.distributed.ProcessGroup:
     return _global_gloo_group
 
 
+def _get_gemini_pair_ranks(world_size: int) -> List[List[int]]:
+    """Compute all Gemini EC pair ranks for the given world_size.
+
+    Pairing formula (same as gemini_manager._get_gemini_paired_rank):
+    group_id = rank % num_groups, rank_in_group = rank // num_groups,
+    paired_rank_in_group = (rank_in_group + 2) % 4,
+    paired_rank = group_id + num_groups * paired_rank_in_group.
+    For world_size=4: pairs (0,2), (1,3). For world_size=8: pairs (0,4), (1,5), (2,6), (3,7).
+    """
+    RANKS_PER_GROUP = 4
+    if world_size < 4 or world_size % RANKS_PER_GROUP != 0:
+        return []
+    num_groups = world_size // RANKS_PER_GROUP
+    pairs_set = set()
+    for r in range(world_size):
+        group_id = r % num_groups
+        rank_in_group = r // num_groups
+        paired_rank_in_group = (rank_in_group + 2) % RANKS_PER_GROUP
+        paired_rank = group_id + num_groups * paired_rank_in_group
+        pair = (min(r, paired_rank), max(r, paired_rank))
+        pairs_set.add(pair)
+    return [list(p) for p in sorted(pairs_set)]
+
+
+def _get_gemini_pairing_map_dict(world_size: int) -> Dict[int, int]:
+    """Build rank -> paired_rank dict from Gemini EC formula (for use when gemini_manager not available)."""
+    pairs = _get_gemini_pair_ranks(world_size)
+    result: Dict[int, int] = {}
+    for pair in pairs:
+        if len(pair) == 2:
+            a, b = pair[0], pair[1]
+            result[a] = b
+            result[b] = a
+    return result
+
+
 def _create_all_pair_process_groups() -> None:
     """Create all pair process groups at once.
     
     IMPORTANT: torch.distributed.new_group requires ALL ranks to call it,
     not just the ranks participating in the group. This function ensures
     all ranks call new_group for all pair groups.
+    Pairs are computed from Gemini EC formula (0<->4, 1<->5, 2<->6, 3<->7 for 8 ranks).
     """
     global _pair_process_groups_cache
     
@@ -106,14 +143,20 @@ def _create_all_pair_process_groups() -> None:
         return  # Already created
     
     rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
     
     # Ensure gloo backend is available
     _ensure_gloo_backend_available()
     
-    # Define all pairs: rank 0<->2, rank 1<->3
-    all_pairs = [[0, 2], [1, 3]]
+    # Build all pairs from Gemini pairing formula (supports 4, 8, 12, ... ranks)
+    all_pairs = _get_gemini_pair_ranks(world_size)
+    if not all_pairs:
+        logger.warning(
+            f"rank: {rank}, no Gemini pairs for world_size={world_size}, skipping pair group creation"
+        )
+        return
     
-    logger.info(f"rank: {rank}, creating all pair process groups")
+    logger.info(f"rank: {rank}, creating all pair process groups (pairs: {all_pairs})")
     
     # All ranks must call new_group for each pair, even if they're not in that pair
     for pair_ranks in all_pairs:
@@ -321,7 +364,18 @@ class TemporalAsyncCaller(AsyncCaller):
         self._last_local_size: int = 0
         self._last_remote_size: int = 0
         
-        self.pairing_map = {0: 2, 2: 0, 1: 3, 3: 1}
+        # Built lazily from Gemini EC formula (supports 4, 8, 12, ... ranks)
+        self._pairing_map_cache: Optional[Dict[int, int]] = None
+
+    def _get_pairing_map(self) -> Dict[int, int]:
+        """Return Gemini EC pairing map (rank -> paired_rank). Build on first use."""
+        if self._pairing_map_cache is not None:
+            return self._pairing_map_cache
+        if not torch.distributed.is_initialized():
+            return {}
+        world_size = torch.distributed.get_world_size()
+        self._pairing_map_cache = _get_gemini_pairing_map_dict(world_size)
+        return self._pairing_map_cache
 
     def calculate_buckets_data_size(self, write_buckets):
         """Calculate data size by traversing write_buckets structure.
@@ -906,7 +960,8 @@ class TemporalAsyncCaller(AsyncCaller):
         
         # Get the first bucket's file name (assuming all buckets are in the same directory)
         first_bucket = write_buckets[0]
-        pair_rank = self.pairing_map.get(rank)
+        pairing_map = self._get_pairing_map()
+        pair_rank = pairing_map.get(rank)
         if isinstance(first_bucket, tuple) and len(first_bucket) >= 3:
             file_name, _, _ = first_bucket
             

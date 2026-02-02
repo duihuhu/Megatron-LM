@@ -1941,6 +1941,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             self.eccheck_p2p_buffers = self._allocate_p2p_buffers(self.eccheck_global_registry)
             # Store to manager for reuse in load phase
             self.eccheck_manager.eccheck_p2p_buffers = self.eccheck_p2p_buffers
+            # Register P2P buffers for RDMA if enabled (same as Gemini send/recv buffer registration)
+            if self.eccheck_manager.use_rdma:
+                logger.info("EC-CHECK: Registering P2P buffers (own_buffer, partner_buffer) for RDMA")
+                self.eccheck_manager.register_buffer(self.eccheck_p2p_buffers['own_buffer'])
+                self.eccheck_manager.register_buffer(self.eccheck_p2p_buffers['partner_buffer'])
             
         p2p_buffer_alloc_time = time() - start
         logger.info(f"EC-CHECK: P2P buffer allocation completed in {p2p_buffer_alloc_time:.2f}s")
@@ -2104,6 +2109,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             logger.debug(f"ECLATIN: CPU buffer preallocation took {prealloc_time:.2f}s")
         else:
             prealloc_time = 0
+        
+        # Register preallocated_cpu_buffer for RDMA if enabled (same as Gemini send buffer registration)
+        if self.eclatin_manager.use_rdma and self.preallocated_cpu_buffer is not None:
+            logger.info("ECLATIN: Registering preallocated_cpu_buffer for RDMA")
+            self.eclatin_manager.register_buffer(self.preallocated_cpu_buffer)
         
         # Step 3: Prepare write buckets for async transfer
         # Note: WriteBuckets for 4 blocks will be created in _allocate_eclatin_blocks
@@ -2370,6 +2380,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             logger.debug(f"EC-NAIVE: CPU buffer preallocation took {prealloc_time:.2f}s")
         else:
             prealloc_time = 0
+        
+        # Register preallocated_cpu_buffer for RDMA if enabled (same as ECLATIN/Gemini send buffer registration)
+        if self.ecnaive_manager.use_rdma and self.preallocated_cpu_buffer is not None:
+            logger.info("EC-NAIVE: Registering preallocated_cpu_buffer for RDMA")
+            self.ecnaive_manager.register_buffer(self.preallocated_cpu_buffer)
         
         # Step 3: Prepare write buckets for async transfer
         # Note: WriteBuckets for 4 blocks will be created in _allocate_ecnaive_blocks
@@ -2713,6 +2728,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             f"({aligned_half_block_size / (1024**2):.0f} MB)\n"
             f"  Total memory: {4 * aligned_half_block_size / (1024**3):.2f} GB"
         )
+        
+        # ===== Register 4 persistent blocks for RDMA if enabled =====
+        if self.ecnaive_manager.use_rdma:
+            logger.info("EC-NAIVE: Registering 4 persistent blocks for RDMA...")
+            self.ecnaive_manager.register_buffer(data0)
+            self.ecnaive_manager.register_buffer(recv_parity1)
+            self.ecnaive_manager.register_buffer(recv_parity0)
+            self.ecnaive_manager.register_buffer(recv_data1)
+            logger.info("EC-NAIVE: RDMA buffer registration complete")
         
         # ===== Package blocks with metadata =====
         # Align with EC-CHECK/ECLATIN: use decomposed_state_dict.non_tensor_data directly

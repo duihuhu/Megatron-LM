@@ -3378,7 +3378,15 @@ private:
     // RDMA initialization
     void init_rdma_resources() {
         std::cout << "[ECNAIVE RDMA] Initializing RDMA resources..." << std::endl;
-        
+
+        // Must be called before any RDMA memory registration when the process may fork (e.g. multiprocessing
+        // write workers). Without this, child processes get EFAULT (Bad address) when accessing RDMA-registered
+        // memory or when writing from buffers that were registered in the parent.
+        if (ibv_fork_init() != 0) {
+            std::cerr << "[ECNAIVE RDMA] WARNING: ibv_fork_init() failed. Forked processes may get Bad address."
+                      << std::endl;
+        }
+
         // Get device list
         int num_devices;
         ibv_device** device_list = ibv_get_device_list(&num_devices);

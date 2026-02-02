@@ -3719,16 +3719,24 @@ class FileSystemWriterAsync(FileSystemWriter):
                 ecnaive_main_path = Path(self.checkpoint_dir) / ecnaive_main_file
                 
                 # Use same metadata but with full tensor_buffer instead of block tensor
+                # Clone: fork-safe (RDMA-registered buffer not accessible in child process)
                 ecnaive_main_bytes_data = [
                     ('ecnaive_metadata', main_file_metadata),
-                    ('ecnaive_continuous_buffer', self.tensor_buffer),  # Full tensor_buffer
+                    ('ecnaive_continuous_buffer', self.tensor_buffer.clone()),
                 ]
                 result_buckets.append((ecnaive_main_path, ecnaive_main_file, (ecnaive_main_bytes_data, [])))
                 logger.debug(f"EC-NAIVE: Added main file bucket: {ecnaive_main_path}")
             
-            # Add 4 block buckets
+            # Add 4 block buckets (clone RDMA-registered buffers so fork workers can access them)
             for bucket in self.ec_write_buckets:
                 file_path, storage_key, data = bucket
+                bytes_data, tensor_data = data
+                new_bytes_data = []
+                for key, value in bytes_data:
+                    if key == 'ecnaive_continuous_buffer':
+                        new_bytes_data.append((key, value.clone()))
+                    else:
+                        new_bytes_data.append((key, value))
                 # Extract file name from path
                 if isinstance(file_path, (str, Path)):
                     file_path_obj = Path(file_path)
@@ -3738,7 +3746,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 
                 # Build new path with current checkpoint_dir
                 new_file_path = Path(self.checkpoint_dir) / file_name
-                result_buckets.append((new_file_path, storage_key, data))
+                result_buckets.append((new_file_path, storage_key, (new_bytes_data, tensor_data)))
             
             # Update self.write_buckets so retrieve_write_results() can check the correct count
             self.write_buckets = result_buckets

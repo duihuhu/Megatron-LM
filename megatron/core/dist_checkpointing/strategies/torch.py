@@ -8165,7 +8165,36 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             )
             logger.info(f"EC-CHECK: [Rank {rank}] rank_in_group=1 software failure recovery - simple P2P send/recv (rank_in_group={rank_in_group})")
             
-            def _do_send():
+            def _do_send(send_addr, send_total_size):
+                # if source_mmap is None:
+                #     logger.error(f"EC-CHECK: [Rank {rank}] No source mmap available for sending")
+                #     return
+                # send_rank_metadata = registry.rank_metadata.get(rank, [])
+                # send_total_size = sum(meta.size_bytes for meta in send_rank_metadata)
+                # header_bytes = source_mmap[:32]
+                # magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+                # tensor_buffer_start_offset = 32 + non_tensor_size + tensor_keys_size
+                # if send_total_size != tensor_buffer_size:
+                #     logger.warning(
+                #         f"EC-CHECK: [Rank {rank}] Size mismatch: registry={send_total_size}, "
+                #         f"file_header={tensor_buffer_size}, using registry size"
+                #     )
+                # send_buffer = torch.empty(send_total_size, dtype=torch.uint8)
+                # send_addr = int(send_buffer.data_ptr())
+                # chunk_data = source_mmap[tensor_buffer_start_offset:tensor_buffer_start_offset + send_total_size]
+                # import ctypes
+                # ctypes.memmove(
+                #     ctypes.cast(send_addr, ctypes.POINTER(ctypes.c_uint8)),
+                #     chunk_data,
+                #     send_total_size
+                # )
+                # logger.info(f"EC-CHECK: [Rank {rank}] Sending {send_total_size / (1024**2):.2f} MB in one transfer")
+                rank1_send_start_time = time()
+                self.eccheck_manager._eccheck_native.simple_p2p_send(buffer_addr=send_addr, size=send_total_size)
+                rank1_send_end_time = time()
+                logger.info(f"EC-CHECK: [Rank {rank}] Finished sending: {send_total_size / (1024**2):.2f} MB in {rank1_send_end_time - rank1_send_start_time:.4f} seconds")
+            
+            def _do_allocate():
                 if source_mmap is None:
                     logger.error(f"EC-CHECK: [Rank {rank}] No source mmap available for sending")
                     return
@@ -8188,30 +8217,43 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     chunk_data,
                     send_total_size
                 )
-                logger.info(f"EC-CHECK: [Rank {rank}] Sending {send_total_size / (1024**2):.2f} MB in one transfer")
-                self.eccheck_manager._eccheck_native.simple_p2p_send(buffer_addr=send_addr, size=send_total_size)
-                logger.info(f"EC-CHECK: [Rank {rank}] Finished sending: {send_total_size / (1024**2):.2f} MB")
+                return send_addr, send_total_size
+            buffer_addr = 0
+            size = 0
+            if rank_in_group == 0 and partner_rank_in_group == 1:
+                logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 0, partner r_i_g 1) Sending to partner via simple P2P send")
+                buffer_addr, size = _do_allocate()
+            
+            if rank_in_group == 1 and not local_missing:
+                # Fixed roles by rank order so one sends and one receives (avoids deadlock when both have data)
+                if rank < p2p_partner_rank:
+                    logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 1, has data) Sending to partner via simple P2P send")
+                    buffer_addr, size = _do_allocate()
             
             if rank_in_group == 0 and partner_rank_in_group == 1:
                 logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 0, partner r_i_g 1) Sending to partner via simple P2P send")
-                _do_send()
+                _do_send(buffer_addr, size)
             elif rank_in_group == 1 and local_missing:
                 logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 1, missing) Receiving from partner via simple P2P recv")
                 recv_addr = int(recv_own_buffer.data_ptr())
                 logger.info(f"EC-CHECK: [Rank {rank}] Receiving {recv_total_size / (1024**2):.2f} MB in one transfer")
+                rank1_recv_start_time = time()
                 self.eccheck_manager._eccheck_native.simple_p2p_recv(buffer_addr=recv_addr, size=recv_total_size)
-                logger.info(f"EC-CHECK: [Rank {rank}] Finished receiving: {recv_total_size / (1024**2):.2f} MB")
+                rank1_recv_end_time = time()
+                logger.info(f"EC-CHECK: [Rank {rank}] Finished receiving: {recv_total_size / (1024**2):.2f} MB in {rank1_recv_end_time - rank1_recv_start_time:.4f} seconds")
             elif rank_in_group == 1 and not local_missing:
                 # Fixed roles by rank order so one sends and one receives (avoids deadlock when both have data)
                 if rank < p2p_partner_rank:
                     logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 1, has data) Sending to partner via simple P2P send")
-                    _do_send()
+                    _do_send(buffer_addr, size)
                 else:
                     logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 1, has data) Receiving from partner via simple P2P recv")
                     recv_addr = int(recv_own_buffer.data_ptr())
                     logger.info(f"EC-CHECK: [Rank {rank}] Receiving {recv_total_size / (1024**2):.2f} MB in one transfer")
+                    rank1_recv_start_time = time()
                     self.eccheck_manager._eccheck_native.simple_p2p_recv(buffer_addr=recv_addr, size=recv_total_size)
-                    logger.info(f"EC-CHECK: [Rank {rank}] Finished receiving: {recv_total_size / (1024**2):.2f} MB")
+                    rank1_recv_end_time = time()
+                    logger.info(f"EC-CHECK: [Rank {rank}] Finished receiving: {recv_total_size / (1024**2):.2f} MB in {rank1_recv_end_time - rank1_recv_start_time:.4f} seconds")
             else:
                 logger.info(f"EC-CHECK: [Rank {rank}] No action needed for rank_in_group=1 recovery (rank_in_group={rank_in_group})")
             

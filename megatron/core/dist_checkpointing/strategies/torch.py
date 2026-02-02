@@ -4596,9 +4596,19 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         num_groups = max(1, world_size // 4)
         rank_in_group = rank // num_groups if world_size >= 4 and world_size % 4 == 0 else rank
 
+        # rank_in_group=1 software failure: use recovery partner (same EC group 0<->1); 4-rank same as P2P
+        if input_args.use_eccheck_software_failure:
+            recovery_partner_rank = self.eccheck_manager.get_recovery_partner_rank_for_rank1_software(
+                rank, world_size
+            )
+            partner_rank_for_p2p = recovery_partner_rank if recovery_partner_rank >= 0 else p2p_partner_rank
+        else:
+            recovery_partner_rank = -1
+            partner_rank_for_p2p = p2p_partner_rank
+
         checkpoint_dir = Path(checkpoint_dir)
         eccheck_p2p_own_file = checkpoint_dir / f"__{rank}_p2p_own.distcp"
-        eccheck_p2p_partner_file = checkpoint_dir / f"__{p2p_partner_rank}_p2p_partner.distcp"
+        eccheck_p2p_partner_file = checkpoint_dir / f"__{partner_rank_for_p2p}_p2p_partner.distcp"
 
         # Default placeholders
         mapped_file_own = EccheckMappedFile(None, None, None, None, None)
@@ -4613,7 +4623,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Load partner file if present
         if eccheck_p2p_partner_file.exists():
             mapped_file_partner = FileSystemWriterAsync.load_eccheck_bytes_from_file(
-                str(eccheck_p2p_partner_file), my_rank=p2p_partner_rank
+                str(eccheck_p2p_partner_file), my_rank=partner_rank_for_p2p
             )
         
         # If failed rank misses partner file, partner sends metadata via P2P.
@@ -4645,25 +4655,21 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             import pickle
             device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
             if input_args.use_eccheck_software_failure:
-                partner_rank_in_group = (
-                    p2p_partner_rank // num_groups
-                    if world_size >= 4 and world_size % 4 == 0
-                    else p2p_partner_rank
-                )
-                if rank_in_group == 0 and partner_rank_in_group == 1:
+                # Use recovery partner (same EC group 0<->1): 4-rank (0<->1), 8-rank (0->2),(1->3)
+                if rank_in_group == 0 and partner_rank_for_p2p >= 0:
                     payload = pickle.dumps({
                         'tensor_metadata': mapped_file_own.local_metadata or [],
                         'non_tensor_data': mapped_file_own.non_tensor_data or {},
                     })
                     buf = torch.tensor(list(payload), dtype=torch.uint8, device=device)
                     size = torch.tensor([buf.numel()], dtype=torch.int64, device=device)
-                    torch.distributed.send(size, dst=p2p_partner_rank)
-                    torch.distributed.send(buf, dst=p2p_partner_rank)
+                    torch.distributed.send(size, dst=partner_rank_for_p2p)
+                    torch.distributed.send(buf, dst=partner_rank_for_p2p)
                 elif rank_in_group == 1 and local_missing:
                     size = torch.empty(1, dtype=torch.int64, device=device)
-                    torch.distributed.recv(size, src=p2p_partner_rank)
+                    torch.distributed.recv(size, src=partner_rank_for_p2p)
                     buf = torch.empty(int(size.item()), dtype=torch.uint8, device=device)
-                    torch.distributed.recv(buf, src=p2p_partner_rank)
+                    torch.distributed.recv(buf, src=partner_rank_for_p2p)
                     obj = pickle.loads(bytes(buf.cpu().tolist()))
                     mapped_file_partner = EccheckMappedFile(
                         mmap_object=None,
@@ -4679,8 +4685,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     })
                     buf = torch.tensor(list(payload), dtype=torch.uint8, device=device)
                     size = torch.tensor([buf.numel()], dtype=torch.int64, device=device)
-                    torch.distributed.send(size, dst=p2p_partner_rank)
-                    torch.distributed.send(buf, dst=p2p_partner_rank)
+                    torch.distributed.send(size, dst=partner_rank_for_p2p)
+                    torch.distributed.send(buf, dst=partner_rank_for_p2p)
             else:
                 partner_rank = self._get_p2p_partner_rank(failed_rank, world_size)
                 if rank in (failed_rank, partner_rank):
@@ -4788,15 +4794,16 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             self.eccheck_p2p_buffers = self._allocate_p2p_buffers(registry)
             self.eccheck_manager.eccheck_p2p_buffers = self.eccheck_p2p_buffers
         
-        paired_rank = self._get_p2p_partner_rank(rank, world_size)
-        
-        # Get self metadata form peer rank in global registry
-        metadata_in_peer = registry.rank_metadata.get(paired_rank, [])
-        # meta_type = metadata_in_peer[0].chunk_type
+        # For rank_in_group=1 software failure, receiver gets data from recovery sender (partner_rank_for_p2p), so recv size = sender's size; otherwise use P2P partner
+        if input_args.use_eccheck_software_failure and rank_in_group == 1 and partner_rank_for_p2p >= 0:
+            paired_rank_for_recv = partner_rank_for_p2p
+        else:
+            paired_rank_for_recv = self._get_p2p_partner_rank(rank, world_size)
+        metadata_in_peer = registry.rank_metadata.get(paired_rank_for_recv, [])
         recv_total_size = sum(meta.size_bytes for meta in metadata_in_peer)
-    
+
         recv_own_buffer = torch.empty(recv_total_size, dtype=torch.uint8)
-        
+
         # Simple P2P exchange placeholder. This will be extended into a full
         # EC-CHECK recovery pipeline (encoding + XOR + P2P) in later steps.
         data_start_time = time()
@@ -8157,11 +8164,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # rank_in_group=1 software failure: only rank_in_group 1 participates in P2P (one send, one recv by local_missing).
         # rank_in_group 0 sends only when partner has rank_in_group 1 (4-rank: rank 0 sends to rank 1; 8-rank: (0,1) both r_i_g 0 so neither sends).
         if failed_rank == 1:
-            p2p_partner_rank = self._get_p2p_partner_rank(rank, world_size)
-            partner_rank_in_group = (
-                p2p_partner_rank // num_groups
-                if world_size >= 4 and world_size % 4 == 0
-                else p2p_partner_rank
+            # Use recovery partner (same EC group 0<->1): 4-rank (0<->1), 8-rank (0->2),(1->3); C++ P2P already connected to recovery partner when use_eccheck_software_failure
+            recovery_partner_rank = self.eccheck_manager.get_recovery_partner_rank_for_rank1_software(
+                rank, world_size
             )
             logger.info(f"EC-CHECK: [Rank {rank}] rank_in_group=1 software failure recovery - simple P2P send/recv (rank_in_group={rank_in_group})")
             
@@ -8194,11 +8199,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 rank1_send_end_time = time()
                 logger.info(f"EC-CHECK: [Rank {rank}] Finished sending: {send_total_size / (1024**2):.2f} MB in {rank1_send_end_time - rank1_send_start_time:.4f} seconds")
             
-            if rank_in_group == 0 and partner_rank_in_group == 1:
-                logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 0, partner r_i_g 1) Sending to partner via simple P2P send")
+            if rank_in_group == 0 and recovery_partner_rank >= 0:
+                logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 0) Sending to recovery partner {recovery_partner_rank} via simple P2P send")
                 _do_send()
             elif rank_in_group == 1 and local_missing:
-                logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 1, missing) Receiving from partner via simple P2P recv")
+                logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 1, missing) Receiving from recovery partner {recovery_partner_rank} via simple P2P recv")
                 recv_addr = int(recv_own_buffer.data_ptr())
                 logger.info(f"EC-CHECK: [Rank {rank}] Receiving {recv_total_size / (1024**2):.2f} MB in one transfer")
                 rank1_recv_start_time = time()
@@ -8206,8 +8211,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 rank1_recv_end_time = time()
                 logger.info(f"EC-CHECK: [Rank {rank}] Finished receiving: {recv_total_size / (1024**2):.2f} MB in {rank1_recv_end_time - rank1_recv_start_time:.4f} seconds")
             elif rank_in_group == 1 and not local_missing:
-                # Fixed roles by rank order so one sends and one receives (avoids deadlock when both have data)
-                if rank < p2p_partner_rank:
+                # 4-rank only: fixed roles by rank order so one sends and one receives
+                if rank < recovery_partner_rank:
                     logger.info(f"EC-CHECK: [Rank {rank}] (rank_in_group 1, has data) Sending to partner via simple P2P send")
                     _do_send()
                 else:
@@ -10705,7 +10710,16 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # Check if this is EC-CHECK checkpoint or recovery scenario
         is_eccheck_checkpoint = self._is_eccheck_checkpoint(checkpoint_dir)
-        is_recovery_scenario = (rank == 2) or (input_args.use_eccheck_software_failure and rank == 1)
+        _eccheck_world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        _eccheck_num_groups = max(1, _eccheck_world_size // 4)
+        _eccheck_rank_in_group = (
+            rank // _eccheck_num_groups
+            if _eccheck_world_size >= 4 and _eccheck_world_size % 4 == 0
+            else rank
+        )
+        is_recovery_scenario = (rank == 2) or (
+            input_args.use_eccheck_software_failure and _eccheck_rank_in_group == 1
+        )
         
         if input_args.use_eccheck and (is_eccheck_checkpoint or is_recovery_scenario):
             logger.info(f"Detected EC-CHECK format checkpoint at {checkpoint_dir}")

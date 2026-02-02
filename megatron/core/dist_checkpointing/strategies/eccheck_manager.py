@@ -152,7 +152,34 @@ class ECCHECKManager:
         
         logger.debug(f"EC-CHECK: Rank {my_rank} P2P partner is Rank {p2p_partner_rank}")
         return p2p_partner_rank
-    
+
+    def get_recovery_partner_rank_for_rank1_software(self, my_rank: int, world_size: int) -> int:
+        """Get recovery partner for rank_in_group=1 software failure (node1 failure).
+
+        Recovery pairing: same EC group, rank_in_group 0 sends to rank_in_group 1.
+        - rank_in_group 0: partner = rank + num_groups (receiver to send to).
+        - rank_in_group 1: partner = rank % num_groups (sender to recv from).
+        For 4-rank: same as P2P (0<->1). For 8-rank: (0->2), (1->3).
+
+        Args:
+            my_rank (int): Current rank
+            world_size (int): Total number of ranks
+
+        Returns:
+            int: Recovery partner rank, or -1 if not participating (rank_in_group 2/3).
+        """
+        if world_size < 4 or world_size % 4 != 0:
+            raise ValueError(
+                f"EC-CHECK: world_size must be >=4 and divisible by 4 for recovery, got {world_size}"
+            )
+        num_groups = world_size // 4
+        rank_in_group = my_rank // num_groups
+        if rank_in_group == 0:
+            return my_rank + num_groups
+        if rank_in_group == 1:
+            return my_rank % num_groups
+        return -1
+
     def _get_eccheck_network_config(self, rank: int, world_size: int) -> dict:
         """
         Get network configuration for EC-CHECK ASIO connections.
@@ -469,7 +496,23 @@ class ECCHECKManager:
                     # For P2P: rank 0 sends to rank 1's recv port, rank 1 sends to rank 0's recv port
                     xor_partner = self._get_xor_paired_rank(rank, world_size)
                     p2p_partner = self.get_p2p_partner_rank(rank, world_size)
-                    
+                    # rank_in_group=1 software failure: use recovery partner (same EC group 0<->1) so 8-rank gets (0->2),(1->3); 4-rank unchanged
+                    try:
+                        from megatron.training import get_args as _get_args
+                        _args = _get_args()
+                        if getattr(_args, 'use_eccheck_software_failure', False):
+                            recovery_partner = self.get_recovery_partner_rank_for_rank1_software(
+                                rank, world_size
+                            )
+                            if recovery_partner >= 0:
+                                p2p_partner = recovery_partner
+                                rank_ips = net_config.get('rank_ips', {})
+                                net_config['p2p_partner_ip'] = rank_ips.get(
+                                    p2p_partner, net_config['my_ip']
+                                )
+                    except Exception:
+                        pass
+
                     # Partner's recv ports (where we send to)
                     base_port = net_config['base_port']
                     xor_partner_recv_port = base_port + xor_partner * 6 + 1  # partner's xor_recv port

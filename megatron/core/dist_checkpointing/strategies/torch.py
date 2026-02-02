@@ -76,6 +76,7 @@ from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_as
 from .state_dict_decomposer import DecomposedStateDict, TensorMetadata
 from time import time
 from time import sleep
+import struct
 
 try:
     if not torch.cuda.is_available():
@@ -4458,9 +4459,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
         Returns:
             bool: True if this is an EC-CHECK checkpoint
-        """
-        import struct
-        
+        """        
         checkpoint_dir = Path(checkpoint_dir)
         if not checkpoint_dir.exists():
             return False
@@ -5091,26 +5090,14 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 logger.error(f"EC-NAIVE: [Rank {rank}] Local metadata is None, skipping metadata exchange")
                 return mapped_file_own, None
 
-            # Phase 1: Exchange only per-rank tensor sizes (small all_gather) so send/recv can run before full metadata
-            my_size = sum(meta.size_bytes for meta in local_package['tensor_metadata'])
-            sizes_list = [0] * world_size
-            if torch.distributed.is_initialized():
-                torch.distributed.all_gather_object(sizes_list, my_size)
-            else:
-                sizes_list[rank] = my_size
-            load_receiver_rank = net_config['load_receiver_rank']
-            d20_size = send_size = sizes_list[load_receiver_rank] // 2
-
             # Init connections after size exchange (so recovery is not blocked by full metadata all_gather)
             if self.ecnaive_manager.use_ecnaive:
                 self.ecnaive_manager.init_ecnaive_load_software_only(rank, world_size, net_config=net_config)
 
-            # Software failure recovery: rank2 recv / rank3 send (using d20_size, send_size from phase 1)
+            d20_size = 0
+            recovered_buffer = None
             if rank_in_group == 2:
-                import struct
-                send_start_time = time()
                 d20_path = checkpoint_dir / f"__{rank}_data0.distcp"
-                recovered_buffer = None
                 with open(d20_path, 'rb') as f:
                     header_bytes = f.read(32)
                     if len(header_bytes) != 32:
@@ -5137,6 +5124,47 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                                 )
                                 d20_size = 0
 
+            # Phase 1: Exchange only per-rank tensor sizes (small all_gather) so send/recv can run before full metadata
+            send_start_time = time()
+            my_size = sum(meta.size_bytes for meta in local_package['tensor_metadata'])
+            sizes_list = [0] * world_size
+            if torch.distributed.is_initialized():
+                torch.distributed.all_gather_object(sizes_list, my_size)
+            else:
+                sizes_list[rank] = my_size
+            load_receiver_rank = net_config['load_receiver_rank']
+            d20_size = send_size = sizes_list[load_receiver_rank] // 2
+
+            # Software failure recovery: rank2 recv / rank3 send (using d20_size, send_size from phase 1)
+            if rank_in_group == 2:
+                # d20_path = checkpoint_dir / f"__{rank}_data0.distcp"
+                # recovered_buffer = None
+                # with open(d20_path, 'rb') as f:
+                #     header_bytes = f.read(32)
+                #     if len(header_bytes) != 32:
+                #         logger.error(f"EC-NAIVE: [Rank {rank}] Invalid data0 block file header (expected 32 bytes)")
+                #         d20_size = 0
+                #     else:
+                #         magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
+                #             '4sQQQ', header_bytes
+                #         )
+                #         if magic not in (b'ECLT', b'ECNV'):
+                #             logger.error(f"EC-NAIVE: [Rank {rank}] Invalid magic in data0 block file: {magic}")
+                #             d20_size = 0
+                #         else:
+                #             offset = 32 + non_tensor_size + tensor_keys_size
+                #             f.seek(offset)
+                #             recovered_buffer = torch.zeros(2 * d20_size, dtype=torch.uint8)
+                #             n_read = f.readinto(
+                #                 memoryview(recovered_buffer[:d20_size].numpy())
+                #             )
+                #             if n_read != d20_size:
+                #                 logger.error(
+                #                     f"EC-NAIVE: [Rank {rank}] Short read from data0: "
+                #                     f"got {n_read}, expected {d20_size}"
+                #                 )
+                #                 d20_size = 0
+
                 if d20_size > 0 and recovered_buffer is not None:
                     self.ecnaive_manager._ecnaive_native.software_recv_data1(
                         int(recovered_buffer[d20_size:].data_ptr()), d20_size
@@ -5149,7 +5177,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     logger.info(f"EC-NAIVE: [Rank {rank}] Software recovery completed: d20_size={d20_size}, total={total_size}")
 
             elif rank_in_group == 3:
-                import struct
                 d21_path = checkpoint_dir / f'__{rank}_recv_data1.distcp'
                 if not d21_path.exists():
                     logger.error(f"EC-NAIVE: [Rank {rank}] Block file not found: {d21_path}")
@@ -5684,7 +5711,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             block_name (str): block name (e.g., 'data_block_1')
             block_tensor (torch.Tensor): pre-allocated tensor to load data into
         """
-        import struct
         import numpy as np
         import mmap
         
@@ -8086,7 +8112,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if source_mmap is not None:
             # Parse header to get Component 1 and Component 2 sizes
             header_bytes = source_mmap[:32]
-            import struct
             magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
             tensor_buffer_start_offset = 32 + non_tensor_size + tensor_keys_size
         
@@ -8096,7 +8121,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if (rank == 0 or rank == 3) and mapped_file_partner.mmap_object is not None:
             # Parse partner_file header to get tensor buffer info
             partner_header_bytes = mapped_file_partner.mmap_object[:32]
-            import struct
             partner_magic, partner_non_tensor_size, partner_tensor_keys_size, partner_tensor_buffer_size = struct.unpack('4sQQQ', partner_header_bytes)
             partner_tensor_buffer_start_offset = 32 + partner_non_tensor_size + partner_tensor_keys_size
             
@@ -8148,7 +8172,6 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 send_rank_metadata = registry.rank_metadata.get(rank, [])
                 send_total_size = sum(meta.size_bytes for meta in send_rank_metadata)
                 header_bytes = source_mmap[:32]
-                import struct
                 magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
                 tensor_buffer_start_offset = 32 + non_tensor_size + tensor_keys_size
                 if send_total_size != tensor_buffer_size:

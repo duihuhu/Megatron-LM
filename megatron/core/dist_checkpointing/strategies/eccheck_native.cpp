@@ -4737,7 +4737,26 @@ public:
         if (!use_asio_ || !asio_initialized_ || !asio_conn_mgr_.is_p2p_send_connected()) {
             throw std::runtime_error("ASIO P2P send not initialized");
         }
-        
+#ifdef __linux__
+        if (use_rdma_ && rdma_p2p_qp_) {
+            bool temp_reg = false;
+            if (!rdma_find_mr(buffer_addr, size) && size > rdma_temp_send_buffer_.size()) {
+                register_buffer(buffer_addr, size);
+                temp_reg = true;
+            }
+            try {
+                rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_control_sock(),
+                    rdma_p2p_control_mutex_, reinterpret_cast<const uint8_t*>(buffer_addr), size);
+            } catch (...) {
+                if (temp_reg) unregister_buffer(buffer_addr);
+                throw;
+            }
+            if (temp_reg) unregister_buffer(buffer_addr);
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Simple P2P send (RDMA): "
+                      << size / (1024*1024) << " MB" << std::endl;
+            return;
+        }
+#endif
         uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(buffer_addr);
         // Use uint64_t to support data transfers > 4GB
         uint64_t size_net = htonll(static_cast<uint64_t>(size));
@@ -4768,7 +4787,26 @@ public:
         if (!use_asio_ || !asio_initialized_ || !asio_conn_mgr_.is_p2p_recv_connected()) {
             throw std::runtime_error("ASIO P2P recv not initialized");
         }
-        
+#ifdef __linux__
+        if (use_rdma_ && rdma_p2p_qp_) {
+            bool temp_reg = false;
+            if (!rdma_find_mr(buffer_addr, size) && size > rdma_temp_recv_buffer_.size()) {
+                register_buffer(buffer_addr, size);
+                temp_reg = true;
+            }
+            try {
+                rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_, get_rdma_p2p_control_sock(),
+                    rdma_p2p_control_mutex_, reinterpret_cast<uint8_t*>(buffer_addr), size);
+            } catch (...) {
+                if (temp_reg) unregister_buffer(buffer_addr);
+                throw;
+            }
+            if (temp_reg) unregister_buffer(buffer_addr);
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Simple P2P recv (RDMA): "
+                      << size / (1024*1024) << " MB" << std::endl;
+            return;
+        }
+#endif
         uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(buffer_addr);
         // Use uint64_t to support data transfers > 4GB
         uint64_t size_net;

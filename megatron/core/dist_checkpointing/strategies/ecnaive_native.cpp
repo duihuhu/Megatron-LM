@@ -1922,6 +1922,8 @@ public:
           rdma_recv_cq_{},
           rdma_load_send_cq_{},
           rdma_load_recv_cq_{},
+          rdma_software_load_send_cq_(nullptr),
+          rdma_software_load_recv_cq_(nullptr),
           k_(2),
           rows_(2),
           a_mat_(nullptr),
@@ -2499,9 +2501,14 @@ public:
     void software_send_rank3_data1(uintptr_t send_addr, size_t size) {
         if (rank_ != 3) return;
 
-        // check connection status
         if (!conn_.is_ecnaive_load_send_rank3_data1_connected()) {
             std::cerr << "EC-NAIVE: [Rank 3] Software send socket not connected" << std::endl;
+            return;
+        }
+
+        if (use_rdma_ && rdma_software_load_channel_) {
+            rdma_software_load_channel_->send_data(reinterpret_cast<const uint8_t*>(send_addr), size);
+            std::cout << "EC-NAIVE: [Rank 3] Software sent d21 (RDMA, size=" << size << ")" << std::endl;
             return;
         }
 
@@ -2517,9 +2524,14 @@ public:
     void software_recv_data1(uintptr_t recv_addr, size_t size) {
         if (rank_ != 2) return;
 
-        // check connection status
         if (!conn_.is_ecnaive_load_recv_rank3_data1_connected()) {
             std::cerr << "EC-NAIVE: [Rank 2] Software recv socket not connected" << std::endl;
+            return;
+        }
+
+        if (use_rdma_ && rdma_software_load_channel_) {
+            rdma_software_load_channel_->receive_data(reinterpret_cast<uint8_t*>(recv_addr), size);
+            std::cout << "EC-NAIVE: [Rank 2] Software received d21 (RDMA, size=" << size << ")" << std::endl;
             return;
         }
 
@@ -2962,6 +2974,15 @@ public:
             conn_.init_ecnaive_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
             std::cout << "EC-NAIVE: [Rank_in_group 3] Software-only connect done" << std::endl;
         }
+        if (use_rdma_ && (rank_ == 2 || rank_ == 3)) {
+            try {
+                init_rdma_software_load_resources();
+                init_rdma_software_load_channel();
+            } catch (const std::exception& e) {
+                std::cerr << "EC-NAIVE: Software-only load RDMA init failed: " << e.what() << std::endl;
+                throw;
+            }
+        }
     }
     
     void wait_for_load_connections(int timeout_seconds = 30) {
@@ -3270,6 +3291,10 @@ private:
     
     // Load mode RDMA channels (8 channels: rank2 recv all, rank0/1/3 send subset)
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_LOAD_CHANNELS> rdma_load_channels_;
+    // Software-only load RDMA: 1 channel (rank3_data1)
+    ibv_cq* rdma_software_load_send_cq_;
+    ibv_cq* rdma_software_load_recv_cq_;
+    std::unique_ptr<RdmaConnectionChannel> rdma_software_load_channel_;
     
     // Save mode network config
     std::string send_data1_ip_;
@@ -3622,6 +3647,78 @@ private:
             throw;
         }
     }
+
+    // Software-only load RDMA: 1 CQ pair and 1 channel (rank3_data1). Call after init_ecnaive_load_connections_software_only.
+    void init_rdma_software_load_resources() {
+        if (!use_rdma_) return;
+        if (rdma_software_load_send_cq_ || rdma_software_load_recv_cq_) return;  // already inited
+        std::cout << "[ECNAIVE RDMA] Initializing software-only load RDMA resources (1 CQ pair)..." << std::endl;
+        if (!rdma_context_) {
+            if (ibv_fork_init() != 0) {
+                std::cerr << "[ECNAIVE RDMA] WARNING: ibv_fork_init() failed." << std::endl;
+            }
+            int num_devices;
+            ibv_device** device_list = ibv_get_device_list(&num_devices);
+            if (!device_list || num_devices == 0) {
+                throw std::runtime_error("No RDMA devices found");
+            }
+            rdma_context_ = ibv_open_device(device_list[0]);
+            if (!rdma_context_) {
+                ibv_free_device_list(device_list);
+                throw std::runtime_error("Failed to open RDMA device");
+            }
+            ibv_free_device_list(device_list);
+        }
+        if (!rdma_pd_) {
+            rdma_pd_ = ibv_alloc_pd(rdma_context_);
+            if (!rdma_pd_) {
+                throw std::runtime_error("Failed to allocate protection domain");
+            }
+        }
+        rdma_software_load_send_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+        rdma_software_load_recv_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+        if (!rdma_software_load_send_cq_ || !rdma_software_load_recv_cq_) {
+            if (rdma_software_load_send_cq_) {
+                ibv_destroy_cq(rdma_software_load_send_cq_);
+                rdma_software_load_send_cq_ = nullptr;
+            }
+            if (rdma_software_load_recv_cq_) {
+                ibv_destroy_cq(rdma_software_load_recv_cq_);
+                rdma_software_load_recv_cq_ = nullptr;
+            }
+            throw std::runtime_error("Failed to create software-only load completion queues");
+        }
+        std::cout << "[ECNAIVE RDMA] Software-only load RDMA resources initialized (1 CQ pair)" << std::endl;
+    }
+
+    void init_rdma_software_load_channel() {
+        if (!use_rdma_ || !rdma_pd_ || !rdma_software_load_send_cq_ || !rdma_software_load_recv_cq_) return;
+        if (rdma_software_load_channel_) return;  // already inited
+        int rank_for_log = (rank_ >= 0) ? rank_ : 0;
+        try {
+            if (rank_ == 2) {
+                std::cout << "[ECNAIVE RDMA] Creating software-only load channel (rank2 recv)..." << std::endl;
+                int sock = conn_.get_ecnaive_load_recv_rank3_data1_socket().native_handle();
+                rdma_software_load_channel_ = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_software_load_send_cq_, rdma_software_load_recv_cq_,
+                    sock, sock, &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 3);
+                rdma_software_load_channel_->exchange_and_connect(false);
+                std::cout << "[ECNAIVE RDMA] Software-only load channel connected (rank2)" << std::endl;
+            } else if (rank_ == 3) {
+                std::cout << "[ECNAIVE RDMA] Creating software-only load channel (rank3 send)..." << std::endl;
+                int sock = conn_.get_ecnaive_load_send_rank3_data1_socket().native_handle();
+                rdma_software_load_channel_ = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_software_load_send_cq_, rdma_software_load_recv_cq_,
+                    sock, sock, &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
+                rdma_software_load_channel_->exchange_and_connect(true);
+                std::cout << "[ECNAIVE RDMA] Software-only load channel connected (rank3)" << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[ECNAIVE RDMA] Failed to init software-only load channel: " << e.what() << std::endl;
+            rdma_software_load_channel_.reset();
+            throw;
+        }
+    }
     
     void cleanup_rdma_resources() {
         if (!use_rdma_) {
@@ -3639,6 +3736,15 @@ private:
         recv_data1_channel_.reset();
         for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS; ++i) {
             rdma_load_channels_[i].reset();
+        }
+        rdma_software_load_channel_.reset();
+        if (rdma_software_load_send_cq_) {
+            ibv_destroy_cq(rdma_software_load_send_cq_);
+            rdma_software_load_send_cq_ = nullptr;
+        }
+        if (rdma_software_load_recv_cq_) {
+            ibv_destroy_cq(rdma_software_load_recv_cq_);
+            rdma_software_load_recv_cq_ = nullptr;
         }
         for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS; ++i) {
             if (rdma_load_send_cq_[i]) { ibv_destroy_cq(rdma_load_send_cq_[i]); rdma_load_send_cq_[i] = nullptr; }

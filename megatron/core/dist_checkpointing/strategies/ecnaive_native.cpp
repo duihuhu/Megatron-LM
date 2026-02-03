@@ -27,6 +27,7 @@ inline uint64_t ntohll(uint64_t value) {
     return htonll(value);
 }
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -74,6 +75,8 @@ public:
     virtual void send_data(const uint8_t* data, size_t size) = 0;
     virtual size_t receive_data(uint8_t* buffer, size_t buffer_size) = 0;
     virtual bool is_connected() const = 0;
+    // RDMA-only: exchange QP info and connect; no-op for ASIO channels
+    virtual void exchange_and_connect(bool we_send_first) { (void)we_send_first; }
 };
 
 // Forward declarations
@@ -284,6 +287,33 @@ public:
         memcpy(info.gid, &gid, 16);
         
         return info;
+    }
+    
+    // Exchange RdmaConnInfo with peer over control socket and connect QP (for 4-rank save RDMA).
+    // we_send_first: true if this side initiates (e.g. send channel); false if this side accepts (e.g. recv channel).
+    void exchange_and_connect(bool we_send_first) override {
+        RdmaConnInfo local_info = get_local_conn_info();
+        RdmaConnInfo remote_info;
+        std::memset(&remote_info, 0, sizeof(remote_info));
+        
+        int sock = control_sock_send_;  // Use same socket for both directions
+        if (we_send_first) {
+            if (send(sock, &local_info, sizeof(local_info), 0) != static_cast<ssize_t>(sizeof(local_info))) {
+                throw std::runtime_error("RdmaConnectionChannel: failed to send local RdmaConnInfo");
+            }
+            if (recv(sock, &remote_info, sizeof(remote_info), MSG_WAITALL) != static_cast<ssize_t>(sizeof(remote_info))) {
+                throw std::runtime_error("RdmaConnectionChannel: failed to receive remote RdmaConnInfo");
+            }
+        } else {
+            if (recv(sock, &remote_info, sizeof(remote_info), MSG_WAITALL) != static_cast<ssize_t>(sizeof(remote_info))) {
+                throw std::runtime_error("RdmaConnectionChannel: failed to receive remote RdmaConnInfo");
+            }
+            if (send(sock, &local_info, sizeof(local_info), 0) != static_cast<ssize_t>(sizeof(local_info))) {
+                throw std::runtime_error("RdmaConnectionChannel: failed to send local RdmaConnInfo");
+            }
+        }
+        
+        connect_qp(remote_info);
     }
     
     void send_data(const uint8_t* data, size_t size) override {
@@ -1888,8 +1918,10 @@ public:
           use_rdma_(use_rdma),
           rdma_context_(nullptr),
           rdma_pd_(nullptr),
-          rdma_send_cq_(nullptr),
-          rdma_recv_cq_(nullptr),
+          rdma_send_cq_{},
+          rdma_recv_cq_{},
+          rdma_load_send_cq_{},
+          rdma_load_recv_cq_{},
           k_(2),
           rows_(2),
           a_mat_(nullptr),
@@ -1912,6 +1944,9 @@ public:
         }
         
         init_connections();
+        if (use_rdma_) {
+            init_rdma_save_channels();
+        }
         start_threads();
         std::cout << "ECNAIVE: Pipeline started successfully" << std::endl;
     }
@@ -2802,6 +2837,14 @@ public:
         }
         
         rank_ = rank_in_group;  // For worker threads (receiver/sender role)
+
+        if (use_rdma_) {
+            try {
+                init_rdma_load_resources();
+            } catch (const std::exception& e) {
+                std::cerr << "EC-NAIVE: Load RDMA resources init failed: " << e.what() << std::endl;
+            }
+        }
         
         std::cout << "EC-NAIVE: [Rank_in_group " << rank_in_group << "] Initializing load connections (full recovery: 8 ports)..." << std::endl;
         
@@ -2859,11 +2902,10 @@ public:
                 // Small delay to ensure accept sockets are bound and listening
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 
-                // Detach the recv_init_thread so it runs in background
-                // The accept operations will block until connections arrive from rank0/1/3
-                recv_init_thread.detach();
+                // Join so all 8 TCP connections are established before we create RDMA channels
+                recv_init_thread.join();
                 
-                std::cout << "EC-NAIVE: [Rank_in_group 2] All 8 accept threads started, waiting for connections..." << std::endl;
+                std::cout << "EC-NAIVE: [Rank_in_group 2] All 8 load connections accepted" << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "EC-NAIVE: [Rank_in_group 2] Failed to initialize load connections: " << e.what() << std::endl;
                 throw;
@@ -2888,6 +2930,15 @@ public:
             conn_.init_ecnaive_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);     // d_{2,1}
             conn_.init_ecnaive_load_send_rank3_data0(rank2_ip, load_recv_rank3_data0_port);     // d_{3,0}
             std::cout << "EC-NAIVE: [Rank_in_group 3] All 2 load connections established" << std::endl;
+        }
+
+        if (use_rdma_ && rdma_pd_) {
+            try {
+                init_rdma_load_channels();
+            } catch (const std::exception& e) {
+                std::cerr << "EC-NAIVE: Load RDMA channels init failed: " << e.what() << std::endl;
+                throw;
+            }
         }
     }
 
@@ -3196,12 +3247,16 @@ private:
     // ASIO connections for pipelines
     AsioConnectionManager conn_;
     
-    // RDMA configuration and resources
+    // RDMA configuration and resources (6 channels for 4-rank save: 3 send + 3 recv)
+    static const int RDMA_NUM_SAVE_CHANNELS = 6;
+    static const int RDMA_NUM_LOAD_CHANNELS = 8;  // rank2 recovery: 8 recv channels
     bool use_rdma_;
     ibv_context* rdma_context_;
     ibv_pd* rdma_pd_;
-    ibv_cq* rdma_send_cq_;
-    ibv_cq* rdma_recv_cq_;
+    ibv_cq* rdma_send_cq_[RDMA_NUM_SAVE_CHANNELS];
+    ibv_cq* rdma_recv_cq_[RDMA_NUM_SAVE_CHANNELS];
+    ibv_cq* rdma_load_send_cq_[RDMA_NUM_LOAD_CHANNELS];
+    ibv_cq* rdma_load_recv_cq_[RDMA_NUM_LOAD_CHANNELS];
     std::map<uintptr_t, RdmaBuffer> rdma_registered_buffers_;
     std::mutex rdma_buffer_mutex_;
     
@@ -3213,11 +3268,8 @@ private:
     std::unique_ptr<IConnectionChannel> recv_parity0_channel_;
     std::unique_ptr<IConnectionChannel> recv_data1_channel_;
     
-    // Load mode connection channels (for rank2 receiver and rank0/3 sender)
-    std::unique_ptr<IConnectionChannel> load_recv_rank3_data1_channel_;
-    std::unique_ptr<IConnectionChannel> load_recv_rank0_parity0_channel_;
-    std::unique_ptr<IConnectionChannel> load_send_rank0_parity0_channel_;
-    std::unique_ptr<IConnectionChannel> load_send_rank3_data1_channel_;
+    // Load mode RDMA channels (8 channels: rank2 recv all, rank0/1/3 send subset)
+    std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_LOAD_CHANNELS> rdma_load_channels_;
     
     // Save mode network config
     std::string send_data1_ip_;
@@ -3409,15 +3461,166 @@ private:
             throw std::runtime_error("Failed to allocate protection domain");
         }
         
-        // Create completion queues
-        rdma_send_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
-        rdma_recv_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
-        
-        if (!rdma_send_cq_ || !rdma_recv_cq_) {
-            throw std::runtime_error("Failed to create completion queues");
+        // Create 6 pairs of completion queues (one send_cq + one recv_cq per channel for 4-rank save)
+        for (int i = 0; i < RDMA_NUM_SAVE_CHANNELS; ++i) {
+            rdma_send_cq_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            rdma_recv_cq_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            if (!rdma_send_cq_[i] || !rdma_recv_cq_[i]) {
+                // Clean up already created CQs on failure
+                for (int j = 0; j < i; ++j) {
+                    if (rdma_send_cq_[j]) { ibv_destroy_cq(rdma_send_cq_[j]); rdma_send_cq_[j] = nullptr; }
+                    if (rdma_recv_cq_[j]) { ibv_destroy_cq(rdma_recv_cq_[j]); rdma_recv_cq_[j] = nullptr; }
+                }
+                throw std::runtime_error("Failed to create completion queues for RDMA channel " + std::to_string(i));
+            }
         }
         
-        std::cout << "[ECNAIVE RDMA] RDMA resources initialized successfully" << std::endl;
+        std::cout << "[ECNAIVE RDMA] RDMA resources initialized successfully (6 CQ pairs for save channels)" << std::endl;
+    }
+
+    // Load mode RDMA: 8 CQ pairs for rank2 recovery (8 recv channels). Call when init_ecnaive_load_connections.
+    void init_rdma_load_resources() {
+        if (!use_rdma_ || rdma_pd_ == nullptr) return;
+        std::cout << "[ECNAIVE RDMA] Initializing load RDMA resources (8 CQ pairs)..." << std::endl;
+        for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS; ++i) {
+            rdma_load_send_cq_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            rdma_load_recv_cq_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            if (!rdma_load_send_cq_[i] || !rdma_load_recv_cq_[i]) {
+                for (int j = 0; j < i; ++j) {
+                    if (rdma_load_send_cq_[j]) { ibv_destroy_cq(rdma_load_send_cq_[j]); rdma_load_send_cq_[j] = nullptr; }
+                    if (rdma_load_recv_cq_[j]) { ibv_destroy_cq(rdma_load_recv_cq_[j]); rdma_load_recv_cq_[j] = nullptr; }
+                }
+                throw std::runtime_error("Failed to create load completion queues for channel " + std::to_string(i));
+            }
+        }
+        std::cout << "[ECNAIVE RDMA] Load RDMA resources initialized (8 CQ pairs)" << std::endl;
+    }
+
+    // Create 8 RDMA load channels and connect QPs (after ASIO load connections are established).
+    // rank2: 8 recv channels (we_send_first=false); rank0: ch 1,2,7; rank1: ch 3,4,5; rank3: ch 0,6.
+    void init_rdma_load_channels() {
+        if (!use_rdma_ || !rdma_pd_) return;
+        int rank_for_log = (rank_ >= 0) ? rank_ : 0;
+        try {
+            if (rank_ == 2) {
+                std::cout << "[ECNAIVE RDMA] Creating 8 RDMA load channels (rank2 recv)..." << std::endl;
+                const int peer[] = {3, 0, 0, 1, 1, 1, 3, 0};
+                auto& c = conn_;
+                rdma_load_channels_[0] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[0], rdma_load_recv_cq_[0],
+                    c.get_ecnaive_load_recv_rank3_data1_socket().native_handle(),
+                    c.get_ecnaive_load_recv_rank3_data1_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[0]);
+                rdma_load_channels_[0]->exchange_and_connect(false);
+                rdma_load_channels_[1] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[1], rdma_load_recv_cq_[1],
+                    c.get_ecnaive_load_recv_rank0_parity0_socket().native_handle(),
+                    c.get_ecnaive_load_recv_rank0_parity0_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[1]);
+                rdma_load_channels_[1]->exchange_and_connect(false);
+                rdma_load_channels_[2] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[2], rdma_load_recv_cq_[2],
+                    c.get_ecnaive_load_recv_rank0_data0_socket().native_handle(),
+                    c.get_ecnaive_load_recv_rank0_data0_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[2]);
+                rdma_load_channels_[2]->exchange_and_connect(false);
+                rdma_load_channels_[3] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[3], rdma_load_recv_cq_[3],
+                    c.get_ecnaive_load_recv_rank1_data1_socket().native_handle(),
+                    c.get_ecnaive_load_recv_rank1_data1_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[3]);
+                rdma_load_channels_[3]->exchange_and_connect(false);
+                rdma_load_channels_[4] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[4], rdma_load_recv_cq_[4],
+                    c.get_ecnaive_load_recv_rank1_data0_socket().native_handle(),
+                    c.get_ecnaive_load_recv_rank1_data0_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[4]);
+                rdma_load_channels_[4]->exchange_and_connect(false);
+                rdma_load_channels_[5] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[5], rdma_load_recv_cq_[5],
+                    c.get_ecnaive_load_recv_rank1_parity1_socket().native_handle(),
+                    c.get_ecnaive_load_recv_rank1_parity1_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[5]);
+                rdma_load_channels_[5]->exchange_and_connect(false);
+                rdma_load_channels_[6] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[6], rdma_load_recv_cq_[6],
+                    c.get_ecnaive_load_recv_rank3_data0_socket().native_handle(),
+                    c.get_ecnaive_load_recv_rank3_data0_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[6]);
+                rdma_load_channels_[6]->exchange_and_connect(false);
+                rdma_load_channels_[7] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[7], rdma_load_recv_cq_[7],
+                    c.get_ecnaive_load_recv_rank0_data1_socket().native_handle(),
+                    c.get_ecnaive_load_recv_rank0_data1_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[7]);
+                rdma_load_channels_[7]->exchange_and_connect(false);
+                std::cout << "[ECNAIVE RDMA] All 8 load channels connected (rank2)" << std::endl;
+            } else if (rank_ == 0) {
+                std::cout << "[ECNAIVE RDMA] Creating 3 RDMA load channels (rank0 send)..." << std::endl;
+                auto& c = conn_;
+                rdma_load_channels_[1] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[1], rdma_load_recv_cq_[1],
+                    c.get_ecnaive_load_send_rank0_parity0_socket().native_handle(),
+                    c.get_ecnaive_load_send_rank0_parity0_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
+                rdma_load_channels_[1]->exchange_and_connect(true);
+                rdma_load_channels_[2] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[2], rdma_load_recv_cq_[2],
+                    c.get_ecnaive_load_send_rank0_data0_socket().native_handle(),
+                    c.get_ecnaive_load_send_rank0_data0_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
+                rdma_load_channels_[2]->exchange_and_connect(true);
+                rdma_load_channels_[7] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[7], rdma_load_recv_cq_[7],
+                    c.get_ecnaive_load_send_rank0_data1_socket().native_handle(),
+                    c.get_ecnaive_load_send_rank0_data1_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
+                rdma_load_channels_[7]->exchange_and_connect(true);
+                std::cout << "[ECNAIVE RDMA] All 3 load channels connected (rank0)" << std::endl;
+            } else if (rank_ == 1) {
+                std::cout << "[ECNAIVE RDMA] Creating 3 RDMA load channels (rank1 send)..." << std::endl;
+                auto& c = conn_;
+                rdma_load_channels_[3] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[3], rdma_load_recv_cq_[3],
+                    c.get_ecnaive_load_send_rank1_data1_socket().native_handle(),
+                    c.get_ecnaive_load_send_rank1_data1_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
+                rdma_load_channels_[3]->exchange_and_connect(true);
+                rdma_load_channels_[4] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[4], rdma_load_recv_cq_[4],
+                    c.get_ecnaive_load_send_rank1_data0_socket().native_handle(),
+                    c.get_ecnaive_load_send_rank1_data0_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
+                rdma_load_channels_[4]->exchange_and_connect(true);
+                rdma_load_channels_[5] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[5], rdma_load_recv_cq_[5],
+                    c.get_ecnaive_load_send_rank1_parity1_socket().native_handle(),
+                    c.get_ecnaive_load_send_rank1_parity1_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
+                rdma_load_channels_[5]->exchange_and_connect(true);
+                std::cout << "[ECNAIVE RDMA] All 3 load channels connected (rank1)" << std::endl;
+            } else if (rank_ == 3) {
+                std::cout << "[ECNAIVE RDMA] Creating 2 RDMA load channels (rank3 send)..." << std::endl;
+                auto& c = conn_;
+                rdma_load_channels_[0] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[0], rdma_load_recv_cq_[0],
+                    c.get_ecnaive_load_send_rank3_data1_socket().native_handle(),
+                    c.get_ecnaive_load_send_rank3_data1_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
+                rdma_load_channels_[0]->exchange_and_connect(true);
+                rdma_load_channels_[6] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, rdma_load_send_cq_[6], rdma_load_recv_cq_[6],
+                    c.get_ecnaive_load_send_rank3_data0_socket().native_handle(),
+                    c.get_ecnaive_load_send_rank3_data0_socket().native_handle(),
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
+                rdma_load_channels_[6]->exchange_and_connect(true);
+                std::cout << "[ECNAIVE RDMA] All 2 load channels connected (rank3)" << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[ECNAIVE RDMA] Failed to init load channels: " << e.what() << std::endl;
+            for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS; ++i) rdma_load_channels_[i].reset();
+            throw;
+        }
     }
     
     void cleanup_rdma_resources() {
@@ -3426,6 +3629,21 @@ private:
         }
         
         std::cout << "[ECNAIVE RDMA] Cleaning up RDMA resources..." << std::endl;
+        
+        // Destroy RDMA channels first (each channel destroys its QP)
+        send_data1_channel_.reset();
+        send_parity0_channel_.reset();
+        send_parity1_channel_.reset();
+        recv_parity1_channel_.reset();
+        recv_parity0_channel_.reset();
+        recv_data1_channel_.reset();
+        for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS; ++i) {
+            rdma_load_channels_[i].reset();
+        }
+        for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS; ++i) {
+            if (rdma_load_send_cq_[i]) { ibv_destroy_cq(rdma_load_send_cq_[i]); rdma_load_send_cq_[i] = nullptr; }
+            if (rdma_load_recv_cq_[i]) { ibv_destroy_cq(rdma_load_recv_cq_[i]); rdma_load_recv_cq_[i] = nullptr; }
+        }
         
         // Unregister all buffers
         {
@@ -3438,14 +3656,16 @@ private:
             rdma_registered_buffers_.clear();
         }
         
-        // Destroy CQs
-        if (rdma_send_cq_) {
-            ibv_destroy_cq(rdma_send_cq_);
-            rdma_send_cq_ = nullptr;
-        }
-        if (rdma_recv_cq_) {
-            ibv_destroy_cq(rdma_recv_cq_);
-            rdma_recv_cq_ = nullptr;
+        // Destroy 6 pairs of CQs
+        for (int i = 0; i < RDMA_NUM_SAVE_CHANNELS; ++i) {
+            if (rdma_send_cq_[i]) {
+                ibv_destroy_cq(rdma_send_cq_[i]);
+                rdma_send_cq_[i] = nullptr;
+            }
+            if (rdma_recv_cq_[i]) {
+                ibv_destroy_cq(rdma_recv_cq_[i]);
+                rdma_recv_cq_[i] = nullptr;
+            }
         }
         
         // Dealloc PD
@@ -3503,6 +3723,71 @@ private:
         std::cout << "ECNAIVE: All connections established" << std::endl;
     }
 
+    // Create 6 RDMA channels and connect QPs for 4-rank save (after ASIO connections are up).
+    void init_rdma_save_channels() {
+        if (!use_rdma_ || !rdma_pd_) {
+            return;
+        }
+        std::cout << "[ECNAIVE RDMA] Creating 6 RDMA channels for save..." << std::endl;
+        int rank_for_log = (rank_ >= 0) ? rank_ : 0;
+        int peer = 0;
+        try {
+            // Send channels (we initiate: send RdmaConnInfo first)
+            send_data1_channel_ = std::make_unique<RdmaConnectionChannel>(
+                rdma_context_, rdma_pd_, rdma_send_cq_[0], rdma_recv_cq_[0],
+                conn_.get_send_data1_socket().native_handle(),
+                conn_.get_send_data1_socket().native_handle(),
+                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
+            send_data1_channel_->exchange_and_connect(true);
+
+            send_parity0_channel_ = std::make_unique<RdmaConnectionChannel>(
+                rdma_context_, rdma_pd_, rdma_send_cq_[1], rdma_recv_cq_[1],
+                conn_.get_send_parity0_socket().native_handle(),
+                conn_.get_send_parity0_socket().native_handle(),
+                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
+            send_parity0_channel_->exchange_and_connect(true);
+
+            send_parity1_channel_ = std::make_unique<RdmaConnectionChannel>(
+                rdma_context_, rdma_pd_, rdma_send_cq_[2], rdma_recv_cq_[2],
+                conn_.get_send_parity1_socket().native_handle(),
+                conn_.get_send_parity1_socket().native_handle(),
+                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
+            send_parity1_channel_->exchange_and_connect(true);
+
+            // Recv channels (we accept: receive RdmaConnInfo first)
+            recv_parity1_channel_ = std::make_unique<RdmaConnectionChannel>(
+                rdma_context_, rdma_pd_, rdma_send_cq_[3], rdma_recv_cq_[3],
+                conn_.get_recv_parity1_socket().native_handle(),
+                conn_.get_recv_parity1_socket().native_handle(),
+                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
+            recv_parity1_channel_->exchange_and_connect(false);
+
+            recv_parity0_channel_ = std::make_unique<RdmaConnectionChannel>(
+                rdma_context_, rdma_pd_, rdma_send_cq_[4], rdma_recv_cq_[4],
+                conn_.get_recv_parity0_socket().native_handle(),
+                conn_.get_recv_parity0_socket().native_handle(),
+                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
+            recv_parity0_channel_->exchange_and_connect(false);
+
+            recv_data1_channel_ = std::make_unique<RdmaConnectionChannel>(
+                rdma_context_, rdma_pd_, rdma_send_cq_[5], rdma_recv_cq_[5],
+                conn_.get_recv_data1_socket().native_handle(),
+                conn_.get_recv_data1_socket().native_handle(),
+                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
+            recv_data1_channel_->exchange_and_connect(false);
+
+            std::cout << "[ECNAIVE RDMA] All 6 save channels connected" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[ECNAIVE RDMA] Failed to init RDMA save channels: " << e.what() << std::endl;
+            send_data1_channel_.reset();
+            send_parity0_channel_.reset();
+            send_parity1_channel_.reset();
+            recv_parity1_channel_.reset();
+            recv_parity0_channel_.reset();
+            recv_data1_channel_.reset();
+            throw;
+        }
+    }
 
     // Save mode workers: 3 sends + 3 receives
     void recv_parity1_worker() {
@@ -3539,11 +3824,12 @@ private:
                 throw std::runtime_error("ECNAIVE: recv_parity1 socket not connected");
             }
 
-            // Receive data directly into persistent buffer (no release needed)
-                    if (!recv_with_size_bool(
+            if (use_rdma_ && recv_parity1_channel_) {
+                recv_parity1_channel_->receive_data(reinterpret_cast<uint8_t*>(task.addr), task.size);
+            } else if (!recv_with_size_bool(
                     conn_.get_recv_parity1_socket(),
                     reinterpret_cast<void*>(task.addr),
-                            task.size)) {
+                    task.size)) {
                 std::cerr << "ECNAIVE: recv_parity1_with_size_bool returned false" << std::endl;
                 throw std::runtime_error("ECNAIVE: recv_parity1_with_size_bool returned false");
             }
@@ -3593,11 +3879,12 @@ private:
                 throw std::runtime_error("ECNAIVE: recv_parity0 socket not connected");
             }
 
-            // Receive data directly into persistent buffer (no release needed)
-                    if (!recv_with_size_bool(
+            if (use_rdma_ && recv_parity0_channel_) {
+                recv_parity0_channel_->receive_data(reinterpret_cast<uint8_t*>(task.addr), task.size);
+            } else if (!recv_with_size_bool(
                     conn_.get_recv_parity0_socket(),
                     reinterpret_cast<void*>(task.addr),
-                            task.size)) {
+                    task.size)) {
                 std::cerr << "ECNAIVE: recv_parity0_with_size_bool returned false" << std::endl;
                 throw std::runtime_error("ECNAIVE: recv_parity0_with_size_bool returned false");
             }
@@ -3647,8 +3934,9 @@ private:
                 throw std::runtime_error("ECNAIVE: recv_data1 socket not connected");
             }
 
-            // Receive data directly into persistent buffer (no release needed)
-            if (!recv_with_size_bool(
+            if (use_rdma_ && recv_data1_channel_) {
+                recv_data1_channel_->receive_data(reinterpret_cast<uint8_t*>(task.addr), task.size);
+            } else if (!recv_with_size_bool(
                     conn_.get_recv_data1_socket(),
                     reinterpret_cast<void*>(task.addr),
                     task.size)) {
@@ -3695,7 +3983,11 @@ private:
                 continue;
             }
             if (conn_.is_send_data1_connected()) {
-                send_with_size(conn_.get_send_data1_socket(), task.addr, task.size);
+                if (use_rdma_ && send_data1_channel_) {
+                    send_data1_channel_->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
+                } else {
+                    send_with_size(conn_.get_send_data1_socket(), task.addr, task.size);
+                }
             }
             // Release data buffer after send operation completes
             {
@@ -3742,7 +4034,11 @@ private:
                 continue;
             }
             if (conn_.is_send_parity0_connected()) {
-                send_with_size(conn_.get_send_parity0_socket(), task.addr, task.size);
+                if (use_rdma_ && send_parity0_channel_) {
+                    send_parity0_channel_->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
+                } else {
+                    send_with_size(conn_.get_send_parity0_socket(), task.addr, task.size);
+                }
             }
             // Release parity buffer after send operation completes
             {
@@ -3789,7 +4085,11 @@ private:
                 continue;
             }
             if (conn_.is_send_parity1_connected()) {
-                send_with_size(conn_.get_send_parity1_socket(), task.addr, task.size);
+                if (use_rdma_ && send_parity1_channel_) {
+                    send_parity1_channel_->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
+                } else {
+                    send_with_size(conn_.get_send_parity1_socket(), task.addr, task.size);
+                }
             }
             // Release parity buffer after send operation completes
             {
@@ -3885,10 +4185,14 @@ private:
             std::vector<std::thread> recv_threads(8);
             std::vector<std::exception_ptr> recv_exceptions(8);
             
-            // Thread 1: Receive p_{2,0} from rank0
+            // Channel index per thread: 1,0,2,3,4,5,6,7 (matches socket order on rank2)
+            static const int recv_ch[] = {1, 0, 2, 3, 4, 5, 6, 7};
+            // Thread 1: Receive p_{2,0} from rank0 (channel 1)
             recv_threads[0] = std::thread([&]() {
                 try {
-                    if (!recv_with_size_bool(
+                    if (use_rdma_ && rdma_load_channels_[recv_ch[0]]) {
+                        rdma_load_channels_[recv_ch[0]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_p20_addr), task.size);
+                    } else if (!recv_with_size_bool(
                             conn_.get_ecnaive_load_recv_rank0_parity0_socket(),
                             reinterpret_cast<void*>(task.recv_p20_addr),
                             task.size)) {
@@ -3899,10 +4203,12 @@ private:
                 }
             });
 
-            // Thread 2: Receive d_{2,1} from rank3
+            // Thread 2: Receive d_{2,1} from rank3 (channel 0)
             recv_threads[1] = std::thread([&]() {
                 try {
-                    if (!recv_with_size_bool(
+                    if (use_rdma_ && rdma_load_channels_[recv_ch[1]]) {
+                        rdma_load_channels_[recv_ch[1]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d21_addr), task.size);
+                    } else if (!recv_with_size_bool(
                             conn_.get_ecnaive_load_recv_rank3_data1_socket(),
                             reinterpret_cast<void*>(task.recv_d21_addr),
                             task.size)) {
@@ -3913,10 +4219,12 @@ private:
                 }
             });
 
-            // Thread 3: Receive d_{0,0} from rank0
+            // Thread 3: Receive d_{0,0} from rank0 (channel 2)
             recv_threads[2] = std::thread([&]() {
                 try {
-                    if (!recv_with_size_bool(
+                    if (use_rdma_ && rdma_load_channels_[recv_ch[2]]) {
+                        rdma_load_channels_[recv_ch[2]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d00_addr), task.size);
+                    } else if (!recv_with_size_bool(
                             conn_.get_ecnaive_load_recv_rank0_data0_socket(),
                             reinterpret_cast<void*>(task.recv_d00_addr),
                             task.size)) {
@@ -3927,10 +4235,12 @@ private:
                 }
             });
 
-            // Thread 4: Receive d_{0,1} from rank1
+            // Thread 4: Receive d_{0,1} from rank1 (channel 3)
             recv_threads[3] = std::thread([&]() {
                 try {
-                    if (!recv_with_size_bool(
+                    if (use_rdma_ && rdma_load_channels_[recv_ch[3]]) {
+                        rdma_load_channels_[recv_ch[3]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d01_addr), task.size);
+                    } else if (!recv_with_size_bool(
                             conn_.get_ecnaive_load_recv_rank1_data1_socket(),
                             reinterpret_cast<void*>(task.recv_d01_addr),
                             task.size)) {
@@ -3941,10 +4251,12 @@ private:
                 }
             });
 
-            // Thread 5: Receive d_{1,0} from rank1
+            // Thread 5: Receive d_{1,0} from rank1 (channel 4)
             recv_threads[4] = std::thread([&]() {
                 try {
-                    if (!recv_with_size_bool(
+                    if (use_rdma_ && rdma_load_channels_[recv_ch[4]]) {
+                        rdma_load_channels_[recv_ch[4]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d10_addr), task.size);
+                    } else if (!recv_with_size_bool(
                             conn_.get_ecnaive_load_recv_rank1_data0_socket(),
                             reinterpret_cast<void*>(task.recv_d10_addr),
                             task.size)) {
@@ -3955,10 +4267,12 @@ private:
                 }
             });
 
-            // Thread 6: Receive p_{1,1} from rank1
+            // Thread 6: Receive p_{1,1} from rank1 (channel 5)
             recv_threads[5] = std::thread([&]() {
                 try {
-                    if (!recv_with_size_bool(
+                    if (use_rdma_ && rdma_load_channels_[recv_ch[5]]) {
+                        rdma_load_channels_[recv_ch[5]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_p11_addr), task.size);
+                    } else if (!recv_with_size_bool(
                             conn_.get_ecnaive_load_recv_rank1_parity1_socket(),
                             reinterpret_cast<void*>(task.recv_p11_addr),
                             task.size)) {
@@ -3969,10 +4283,12 @@ private:
                 }
             });
 
-            // Thread 7: Receive d_{3,0} from rank3
+            // Thread 7: Receive d_{3,0} from rank3 (channel 6)
             recv_threads[6] = std::thread([&]() {
                 try {
-                    if (!recv_with_size_bool(
+                    if (use_rdma_ && rdma_load_channels_[recv_ch[6]]) {
+                        rdma_load_channels_[recv_ch[6]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d30_addr), task.size);
+                    } else if (!recv_with_size_bool(
                             conn_.get_ecnaive_load_recv_rank3_data0_socket(),
                             reinterpret_cast<void*>(task.recv_d30_addr),
                             task.size)) {
@@ -3983,10 +4299,12 @@ private:
                 }
             });
 
-            // Thread 8: Receive d_{3,1} from rank0
+            // Thread 8: Receive d_{3,1} from rank0 (channel 7)
             recv_threads[7] = std::thread([&]() {
                 try {
-                    if (!recv_with_size_bool(
+                    if (use_rdma_ && rdma_load_channels_[recv_ch[7]]) {
+                        rdma_load_channels_[recv_ch[7]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d31_addr), task.size);
+                    } else if (!recv_with_size_bool(
                             conn_.get_ecnaive_load_recv_rank0_data1_socket(),
                             reinterpret_cast<void*>(task.recv_d31_addr),
                             task.size)) {
@@ -4212,46 +4530,57 @@ private:
                 continue;
             }
             
-            // Select socket based on rank and socket_type
+            // Select socket and RDMA channel index based on rank and socket_type
             boost::asio::ip::tcp::socket* send_socket = nullptr;
+            int rdma_ch = -1;
             if (rank_ == 0) {
                 if (task.socket_type == 0) {
-                    send_socket = &conn_.get_ecnaive_load_send_rank0_parity0_socket();  // p_{2,0}
+                    send_socket = &conn_.get_ecnaive_load_send_rank0_parity0_socket();  // p_{2,0} -> ch 1
+                    rdma_ch = 1;
                 } else if (task.socket_type == 1) {
-                    send_socket = &conn_.get_ecnaive_load_send_rank0_data0_socket();   // d_{0,0}
+                    send_socket = &conn_.get_ecnaive_load_send_rank0_data0_socket();   // d_{0,0} -> ch 2
+                    rdma_ch = 2;
                 } else if (task.socket_type == 2) {
-                    send_socket = &conn_.get_ecnaive_load_send_rank0_data1_socket();   // d_{3,1}
+                    send_socket = &conn_.get_ecnaive_load_send_rank0_data1_socket();   // d_{3,1} -> ch 7
+                    rdma_ch = 7;
                 } else {
                     std::cerr << "EC-NAIVE: [Rank 0] Invalid socket_type: " << task.socket_type << std::endl;
                     continue;
                 }
             } else if (rank_ == 1) {
                 if (task.socket_type == 1) {
-                    send_socket = &conn_.get_ecnaive_load_send_rank1_data0_socket();   // d_{1,0}
+                    send_socket = &conn_.get_ecnaive_load_send_rank1_data0_socket();   // d_{1,0} -> ch 4
+                    rdma_ch = 4;
                 } else if (task.socket_type == 2) {
-                    send_socket = &conn_.get_ecnaive_load_send_rank1_data1_socket();   // d_{0,1}
+                    send_socket = &conn_.get_ecnaive_load_send_rank1_data1_socket();   // d_{0,1} -> ch 3
+                    rdma_ch = 3;
                 } else if (task.socket_type == 3) {
-                    send_socket = &conn_.get_ecnaive_load_send_rank1_parity1_socket(); // p_{1,1}
+                    send_socket = &conn_.get_ecnaive_load_send_rank1_parity1_socket(); // p_{1,1} -> ch 5
+                    rdma_ch = 5;
                 } else {
                     std::cerr << "EC-NAIVE: [Rank 1] Invalid socket_type: " << task.socket_type << std::endl;
                     continue;
                 }
             } else if (rank_ == 3) {
                 if (task.socket_type == 1) {
-                    send_socket = &conn_.get_ecnaive_load_send_rank3_data0_socket();   // d_{3,0}
+                    send_socket = &conn_.get_ecnaive_load_send_rank3_data0_socket();   // d_{3,0} -> ch 6
+                    rdma_ch = 6;
                 } else if (task.socket_type == 2) {
-                    send_socket = &conn_.get_ecnaive_load_send_rank3_data1_socket();   // d_{2,1}
+                    send_socket = &conn_.get_ecnaive_load_send_rank3_data1_socket();   // d_{2,1} -> ch 0
+                    rdma_ch = 0;
                 } else {
                     std::cerr << "EC-NAIVE: [Rank 3] Invalid socket_type: " << task.socket_type << std::endl;
                     continue;
                 }
             }
             
-            // Send data (zero-copy from mmap or buffer)
             try {
-                send_with_size(*send_socket, task.send_addr, task.size);
-                
-                std::cout << "EC-NAIVE: [Rank " << rank_ << "] Sent chunk (socket_type=" 
+                if (use_rdma_ && rdma_ch >= 0 && rdma_load_channels_[rdma_ch]) {
+                    rdma_load_channels_[rdma_ch]->send_data(reinterpret_cast<const uint8_t*>(task.send_addr), task.size);
+                } else {
+                    send_with_size(*send_socket, task.send_addr, task.size);
+                }
+                std::cout << "EC-NAIVE: [Rank " << rank_ << "] Sent chunk (socket_type="
                           << task.socket_type << ", size=" << task.size << ")" << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "EC-NAIVE: [Rank " << rank_ << "] Send error: " << e.what() << std::endl;

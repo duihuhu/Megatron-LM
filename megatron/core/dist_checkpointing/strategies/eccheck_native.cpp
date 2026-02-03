@@ -41,6 +41,7 @@ inline uint64_t ntohll(uint64_t value) {
 #ifdef __linux__
 #include <infiniband/verbs.h>
 #include <map>
+#include <sys/socket.h>
 #endif
 
 // NCCL includes
@@ -60,6 +61,13 @@ std::vector<uint8_t> generate_nccl_id() {
 
 // ========== RDMA Helper Structures and Functions ==========
 #ifdef __linux__
+
+// RDMA connection info for QP setup (exchanged over control socket)
+struct RdmaConnInfo {
+    uint32_t qp_num;
+    uint16_t lid;
+    uint8_t gid[16];
+} __attribute__((packed));
 
 // RDMA buffer registration info
 struct RdmaBufferInfo {
@@ -694,6 +702,20 @@ private:
     // RDMA registered buffers
     std::map<uintptr_t, RdmaBufferInfo> rdma_registered_buffers_;
     std::mutex rdma_buffer_mutex_;
+    
+    // RDMA temp buffers for unregistered memory (send/recv)
+    std::vector<uint8_t> rdma_temp_send_buffer_;
+    std::vector<uint8_t> rdma_temp_recv_buffer_;
+    ibv_mr* rdma_temp_send_mr_;
+    ibv_mr* rdma_temp_recv_mr_;
+    std::mutex rdma_xor_control_mutex_;
+    std::mutex rdma_p2p_control_mutex_;
+    
+    // Step6 P2P (Load: rank2<->rank3 only)
+    ibv_cq* rdma_step6_p2p_send_cq_;
+    ibv_cq* rdma_step6_p2p_recv_cq_;
+    ibv_qp* rdma_step6_p2p_qp_;
+    std::mutex rdma_step6_p2p_control_mutex_;
     
     // TCP sockets for RDMA connection setup (control plane)
     int rdma_listen_sock_;
@@ -1555,7 +1577,21 @@ private:
                 continue;
             }
             
-            // Send data using ASIO or NCCL
+            // Send data using RDMA, ASIO, or NCCL
+#ifdef __linux__
+            if (use_rdma_ && rdma_xor_qp_) {
+                try {
+                    rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_control_sock(),
+                        rdma_xor_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    encoding_buffers_to_release_.push(task.encoding_addr);
+                } catch (const std::exception& e) {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA XOR send failed: " << e.what() << std::endl;
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    encoding_buffers_to_release_.push(task.encoding_addr);
+                }
+            } else
+#endif
             if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_send_connected()) {
                 // ASIO send path (synchronous)
                 uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.encoding_addr);
@@ -1697,7 +1733,24 @@ private:
                 continue;
             }
             
-            // Receive data using ASIO or NCCL
+            // Receive data using RDMA, ASIO, or NCCL
+#ifdef __linux__
+            if (use_rdma_ && rdma_xor_qp_) {
+                try {
+                    size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
+                        get_rdma_xor_control_sock(), rdma_xor_control_mutex_,
+                        reinterpret_cast<uint8_t*>(task.recv_addr), task.size);
+                    if (recv_size != task.size) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA XOR recv size mismatch: expected "
+                                  << task.size << ", got " << recv_size << std::endl;
+                        continue;
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA XOR recv failed: " << e.what() << std::endl;
+                    continue;
+                }
+            } else
+#endif
             if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_recv_connected()) {
                 // ASIO recv path (synchronous)
                 uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_addr);
@@ -2054,8 +2107,18 @@ private:
                 continue;
             }
             
-            // Step 2: Send data using ASIO or NCCL
+            // Step 2: Send data using RDMA, ASIO, or NCCL
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
+#ifdef __linux__
+                if (use_rdma_ && rdma_p2p_qp_) {
+                    try {
+                        rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_control_sock(),
+                            rdma_p2p_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
+                    } catch (const std::exception& e) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA P2P send failed: " << e.what() << std::endl;
+                    }
+                } else
+#endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_send_connected()) {
                     // ASIO send path (synchronous)
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.send_buffer_addr);
@@ -2291,10 +2354,27 @@ private:
                 continue;
             }
             
-            // Receive data using ASIO or NCCL
+            // Receive data using RDMA, ASIO, or NCCL
             bool task_processed = false;  // Track whether task was successfully processed
             
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
+#ifdef __linux__
+                if (use_rdma_ && rdma_p2p_qp_) {
+                    try {
+                        size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
+                            get_rdma_p2p_control_sock(), rdma_p2p_control_mutex_,
+                            reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size);
+                        if (recv_size == task.size) task_processed = true;
+                        else {
+                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] P2P RDMA recv size mismatch: expected "
+                                      << task.size << ", got " << recv_size << std::endl;
+                        }
+                    } catch (const std::exception& e) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA P2P recv failed: " << e.what() << std::endl;
+                    }
+                    if (!task_processed) continue;
+                } else
+#endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_recv_connected()) {
                     // ASIO recv path (synchronous)
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_buffer_addr);
@@ -2595,6 +2675,9 @@ public:
     ~ECCHECKNative() {
         stop_pipeline();
         if (use_asio_) {
+#ifdef __linux__
+            if (use_rdma_) cleanup_rdma_resources();
+#endif
             asio_conn_mgr_.cleanup();
             // No need to stop IO context thread since we're using synchronous I/O
         } else {
@@ -2645,6 +2728,8 @@ public:
           rdma_xor_send_cq_(nullptr), rdma_xor_recv_cq_(nullptr),
           rdma_p2p_send_cq_(nullptr), rdma_p2p_recv_cq_(nullptr),
           rdma_xor_qp_(nullptr), rdma_p2p_qp_(nullptr),
+          rdma_step6_p2p_send_cq_(nullptr), rdma_step6_p2p_recv_cq_(nullptr), rdma_step6_p2p_qp_(nullptr),
+          rdma_temp_send_mr_(nullptr), rdma_temp_recv_mr_(nullptr),
           rdma_listen_sock_(-1), rdma_xor_control_sock_(-1), rdma_p2p_control_sock_(-1)
 #endif
     {
@@ -2751,6 +2836,31 @@ public:
         if (asio_conn_mgr_.is_xor_send_connected() && asio_conn_mgr_.is_xor_recv_connected() &&
             asio_conn_mgr_.is_p2p_send_connected() && asio_conn_mgr_.is_p2p_recv_connected() &&
             step6_ok) {
+#ifdef __linux__
+            if (use_rdma_) {
+                init_rdma_resources();
+                int sock_xor = (rank_in_group_ == 0 || rank_in_group_ == 1)
+                    ? asio_conn_mgr_.get_xor_send_socket().native_handle()
+                    : asio_conn_mgr_.get_xor_recv_socket().native_handle();
+                bool xor_first = (rank_in_group_ == 0 || rank_in_group_ == 1);
+                exchange_and_connect_qp(sock_xor, rdma_xor_qp_, xor_first);
+                int sock_p2p = (rank_ % 2 == 0)
+                    ? asio_conn_mgr_.get_p2p_send_socket().native_handle()
+                    : asio_conn_mgr_.get_p2p_recv_socket().native_handle();
+                bool p2p_first = (rank_ % 2 == 0);
+                exchange_and_connect_qp(sock_p2p, rdma_p2p_qp_, p2p_first);
+                if (rank_in_group_ == 2 || rank_in_group_ == 3) {
+                    int sock_step6 = (rank_in_group_ == 3)
+                        ? asio_conn_mgr_.get_step6_p2p_send_socket().native_handle()
+                        : asio_conn_mgr_.get_step6_p2p_recv_socket().native_handle();
+                    bool step6_first = (rank_in_group_ == 3);
+                    exchange_and_connect_qp(sock_step6, rdma_step6_p2p_qp_, step6_first);
+                    std::cout << "[EC-CHECK RDMA] XOR, P2P and Step6 P2P QPs connected" << std::endl;
+                } else {
+                    std::cout << "[EC-CHECK RDMA] XOR and P2P QPs connected" << std::endl;
+                }
+            }
+#endif
             asio_initialized_ = true;
             std::cout << "EC-CHECK: [Rank " << rank_ << "] ASIO connections initialization completed" << std::endl;
         } else {
@@ -3779,7 +3889,21 @@ public:
                 continue;  // Continue processing remaining tasks if queue is not empty
             }
             
-            // Send encoding using ASIO (load mode only uses ASIO)
+            // Send encoding using RDMA or ASIO (load mode)
+#ifdef __linux__
+            if (use_rdma_ && rdma_xor_qp_) {
+                try {
+                    rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_control_sock(),
+                        rdma_xor_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    encoding_buffers_to_release_.push(task.encoding_addr);
+                } catch (const std::exception& e) {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA XOR send failed: " << e.what() << std::endl;
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    encoding_buffers_to_release_.push(task.encoding_addr);
+                }
+            } else
+#endif
             if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_send_connected()) {
                 uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.encoding_addr);
                 uint32_t size_net = htonl(static_cast<uint32_t>(task.size));
@@ -3880,7 +4004,24 @@ public:
                 continue;
             }
             
-            // Receive encoding using ASIO (load mode only uses ASIO)
+            // Receive encoding using RDMA or ASIO (load mode)
+#ifdef __linux__
+            if (use_rdma_ && rdma_xor_qp_) {
+                try {
+                    size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
+                        get_rdma_xor_control_sock(), rdma_xor_control_mutex_,
+                        reinterpret_cast<uint8_t*>(task.recv_addr), task.size);
+                    if (recv_size != task.size) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA XOR recv size mismatch: expected "
+                                  << task.size << ", got " << recv_size << std::endl;
+                        continue;
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA XOR recv failed: " << e.what() << std::endl;
+                    continue;
+                }
+            } else
+#endif
             if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_recv_connected()) {
                 uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_addr);
                 uint32_t size_net;
@@ -4117,8 +4258,18 @@ public:
                 continue;
             }
             
-            // Send data using ASIO (load mode only uses ASIO)
+            // Send data using RDMA or ASIO (load mode)
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
+#ifdef __linux__
+                if (use_rdma_ && rdma_p2p_qp_) {
+                    try {
+                        rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_control_sock(),
+                            rdma_p2p_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
+                    } catch (const std::exception& e) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA P2P send failed: " << e.what() << std::endl;
+                    }
+                } else
+#endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_send_connected()) {
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.send_buffer_addr);
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));
@@ -4222,9 +4373,26 @@ public:
                 continue;
             }
             
-            // Receive data using ASIO (load mode only uses ASIO)
+            // Receive data using RDMA or ASIO (load mode)
             bool task_processed = false;
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
+#ifdef __linux__
+                if (use_rdma_ && rdma_p2p_qp_) {
+                    try {
+                        size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
+                            get_rdma_p2p_control_sock(), rdma_p2p_control_mutex_,
+                            reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size);
+                        if (recv_size == task.size) task_processed = true;
+                        else {
+                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load P2P RDMA recv size mismatch: expected "
+                                      << task.size << ", got " << recv_size << std::endl;
+                        }
+                    } catch (const std::exception& e) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA P2P recv failed: " << e.what() << std::endl;
+                        continue;
+                    }
+                } else
+#endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_recv_connected()) {
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_buffer_addr);
                     uint32_t size_net;
@@ -4350,9 +4518,21 @@ public:
                 continue;
             }
             
-            // Send data using ASIO (load mode only uses ASIO)
+            // Send data using RDMA or ASIO (load mode)
             bool send_success = false;
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
+#ifdef __linux__
+                if (use_rdma_ && rdma_step6_p2p_qp_) {
+                    try {
+                        rdma_send_data_via_qp(rdma_step6_p2p_qp_, rdma_step6_p2p_send_cq_,
+                            get_rdma_step6_p2p_control_sock(), rdma_step6_p2p_control_mutex_,
+                            reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
+                        send_success = true;
+                    } catch (const std::exception& e) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA send failed: " << e.what() << std::endl;
+                    }
+                } else
+#endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_step6_p2p_send_connected()) {
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.send_buffer_addr);
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));
@@ -4437,9 +4617,26 @@ public:
                 continue;  // Continue processing remaining tasks if queue is not empty
             }
             
-            // Receive data using ASIO (load mode only uses ASIO)
+            // Receive data using RDMA or ASIO (load mode)
             bool task_processed = false;
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
+#ifdef __linux__
+                if (use_rdma_ && rdma_step6_p2p_qp_) {
+                    try {
+                        size_t recv_size = rdma_receive_data_via_qp(rdma_step6_p2p_qp_, rdma_step6_p2p_recv_cq_,
+                            get_rdma_step6_p2p_control_sock(), rdma_step6_p2p_control_mutex_,
+                            reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size);
+                        if (recv_size == task.size) task_processed = true;
+                        else {
+                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA recv size mismatch: expected "
+                                      << task.size << ", got " << recv_size << std::endl;
+                        }
+                    } catch (const std::exception& e) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA recv failed: " << e.what() << std::endl;
+                        continue;
+                    }
+                } else
+#endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_step6_p2p_recv_connected()) {
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_buffer_addr);
                     uint32_t size_net;
@@ -4606,6 +4803,396 @@ public:
         }
     }
     
+#ifdef __linux__
+    void init_rdma_resources() {
+        if (!use_rdma_) return;
+        std::cout << "[EC-CHECK RDMA] Initializing RDMA resources..." << std::endl;
+
+        if (ibv_fork_init() != 0) {
+            std::cerr << "[EC-CHECK RDMA] WARNING: ibv_fork_init() failed. Forked processes may get Bad address."
+                      << std::endl;
+        }
+
+        int num_devices;
+        ibv_device** device_list = ibv_get_device_list(&num_devices);
+        if (!device_list || num_devices == 0) {
+            throw std::runtime_error("No RDMA devices found");
+        }
+
+        rdma_context_ = ibv_open_device(device_list[0]);
+        if (!rdma_context_) {
+            ibv_free_device_list(device_list);
+            throw std::runtime_error("Failed to open RDMA device");
+        }
+        ibv_free_device_list(device_list);
+
+        rdma_pd_ = ibv_alloc_pd(rdma_context_);
+        if (!rdma_pd_) {
+            throw std::runtime_error("Failed to allocate protection domain");
+        }
+
+        rdma_xor_send_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+        rdma_xor_recv_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+        if (!rdma_xor_send_cq_ || !rdma_xor_recv_cq_) {
+            if (rdma_xor_send_cq_) { ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr; }
+            if (rdma_xor_recv_cq_) { ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr; }
+            ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr;
+            ibv_close_device(rdma_context_); rdma_context_ = nullptr;
+            throw std::runtime_error("Failed to create XOR completion queues");
+        }
+
+        rdma_p2p_send_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+        rdma_p2p_recv_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+        if (!rdma_p2p_send_cq_ || !rdma_p2p_recv_cq_) {
+            ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr;
+            ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr;
+            if (rdma_p2p_send_cq_) { ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr; }
+            if (rdma_p2p_recv_cq_) { ibv_destroy_cq(rdma_p2p_recv_cq_); rdma_p2p_recv_cq_ = nullptr; }
+            ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr;
+            ibv_close_device(rdma_context_); rdma_context_ = nullptr;
+            throw std::runtime_error("Failed to create P2P completion queues");
+        }
+
+        const int MAX_WR = 64;
+        ibv_qp_init_attr qp_attr{};
+        qp_attr.send_cq = rdma_xor_send_cq_;
+        qp_attr.recv_cq = rdma_xor_recv_cq_;
+        qp_attr.qp_type = IBV_QPT_RC;
+        qp_attr.cap.max_send_wr = MAX_WR;
+        qp_attr.cap.max_recv_wr = MAX_WR;
+        qp_attr.cap.max_send_sge = 1;
+        qp_attr.cap.max_recv_sge = 1;
+        rdma_xor_qp_ = ibv_create_qp(rdma_pd_, &qp_attr);
+        if (!rdma_xor_qp_) {
+            ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr;
+            ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr;
+            ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr;
+            ibv_destroy_cq(rdma_p2p_recv_cq_); rdma_p2p_recv_cq_ = nullptr;
+            ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr;
+            ibv_close_device(rdma_context_); rdma_context_ = nullptr;
+            throw std::runtime_error("Failed to create XOR QP");
+        }
+
+        qp_attr.send_cq = rdma_p2p_send_cq_;
+        qp_attr.recv_cq = rdma_p2p_recv_cq_;
+        rdma_p2p_qp_ = ibv_create_qp(rdma_pd_, &qp_attr);
+        if (!rdma_p2p_qp_) {
+            ibv_destroy_qp(rdma_xor_qp_); rdma_xor_qp_ = nullptr;
+            ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr;
+            ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr;
+            ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr;
+            ibv_destroy_cq(rdma_p2p_recv_cq_); rdma_p2p_recv_cq_ = nullptr;
+            ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr;
+            ibv_close_device(rdma_context_); rdma_context_ = nullptr;
+            throw std::runtime_error("Failed to create P2P QP");
+        }
+
+        if (rank_in_group_ == 2 || rank_in_group_ == 3) {
+            rdma_step6_p2p_send_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            rdma_step6_p2p_recv_cq_ = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            if (!rdma_step6_p2p_send_cq_ || !rdma_step6_p2p_recv_cq_) {
+                if (rdma_step6_p2p_send_cq_) { ibv_destroy_cq(rdma_step6_p2p_send_cq_); rdma_step6_p2p_send_cq_ = nullptr; }
+                if (rdma_step6_p2p_recv_cq_) { ibv_destroy_cq(rdma_step6_p2p_recv_cq_); rdma_step6_p2p_recv_cq_ = nullptr; }
+                ibv_destroy_qp(rdma_xor_qp_); rdma_xor_qp_ = nullptr;
+                ibv_destroy_qp(rdma_p2p_qp_); rdma_p2p_qp_ = nullptr;
+                ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr;
+                ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr;
+                ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr;
+                ibv_destroy_cq(rdma_p2p_recv_cq_); rdma_p2p_recv_cq_ = nullptr;
+                ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr;
+                ibv_close_device(rdma_context_); rdma_context_ = nullptr;
+                throw std::runtime_error("Failed to create Step6 P2P completion queues");
+            }
+            qp_attr.send_cq = rdma_step6_p2p_send_cq_;
+            qp_attr.recv_cq = rdma_step6_p2p_recv_cq_;
+            rdma_step6_p2p_qp_ = ibv_create_qp(rdma_pd_, &qp_attr);
+            if (!rdma_step6_p2p_qp_) {
+                ibv_destroy_cq(rdma_step6_p2p_send_cq_); rdma_step6_p2p_send_cq_ = nullptr;
+                ibv_destroy_cq(rdma_step6_p2p_recv_cq_); rdma_step6_p2p_recv_cq_ = nullptr;
+                ibv_destroy_qp(rdma_xor_qp_); rdma_xor_qp_ = nullptr;
+                ibv_destroy_qp(rdma_p2p_qp_); rdma_p2p_qp_ = nullptr;
+                ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr;
+                ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr;
+                ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr;
+                ibv_destroy_cq(rdma_p2p_recv_cq_); rdma_p2p_recv_cq_ = nullptr;
+                ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr;
+                ibv_close_device(rdma_context_); rdma_context_ = nullptr;
+                throw std::runtime_error("Failed to create Step6 P2P QP");
+            }
+        }
+
+        static const size_t TEMP_BUFFER_SIZE = 64ULL * 1024 * 1024;  // 64 MB
+        rdma_temp_send_buffer_.resize(TEMP_BUFFER_SIZE);
+        rdma_temp_recv_buffer_.resize(TEMP_BUFFER_SIZE);
+        rdma_temp_send_mr_ = ibv_reg_mr(rdma_pd_, rdma_temp_send_buffer_.data(), TEMP_BUFFER_SIZE,
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        rdma_temp_recv_mr_ = ibv_reg_mr(rdma_pd_, rdma_temp_recv_buffer_.data(), TEMP_BUFFER_SIZE,
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        if (!rdma_temp_send_mr_ || !rdma_temp_recv_mr_) {
+            if (rdma_temp_send_mr_) { ibv_dereg_mr(rdma_temp_send_mr_); rdma_temp_send_mr_ = nullptr; }
+            if (rdma_temp_recv_mr_) { ibv_dereg_mr(rdma_temp_recv_mr_); rdma_temp_recv_mr_ = nullptr; }
+            ibv_destroy_qp(rdma_xor_qp_); rdma_xor_qp_ = nullptr;
+            ibv_destroy_qp(rdma_p2p_qp_); rdma_p2p_qp_ = nullptr;
+            ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr;
+            ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr;
+            ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr;
+            ibv_destroy_cq(rdma_p2p_recv_cq_); rdma_p2p_recv_cq_ = nullptr;
+            ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr;
+            ibv_close_device(rdma_context_); rdma_context_ = nullptr;
+            throw std::runtime_error("Failed to register RDMA temp buffers");
+        }
+
+        std::cout << "[EC-CHECK RDMA] RDMA resources initialized (PD + 2 CQ pairs + 2 QPs + temp buffers)" << std::endl;
+    }
+
+    void exchange_and_connect_qp(int control_sock, ibv_qp* qp, bool we_send_first) {
+        RdmaConnInfo local_info{};
+        local_info.qp_num = qp->qp_num;
+        ibv_port_attr port_attr;
+        if (ibv_query_port(rdma_context_, 1, &port_attr)) {
+            throw std::runtime_error("EC-CHECK RDMA: failed to query port");
+        }
+        local_info.lid = port_attr.lid;
+        ibv_gid gid;
+        if (ibv_query_gid(rdma_context_, 1, 0, &gid)) {
+            throw std::runtime_error("EC-CHECK RDMA: failed to query GID");
+        }
+        std::memcpy(local_info.gid, &gid, 16);
+
+        RdmaConnInfo remote_info;
+        std::memset(&remote_info, 0, sizeof(remote_info));
+        if (we_send_first) {
+            if (::send(control_sock, &local_info, sizeof(local_info), 0) != static_cast<ssize_t>(sizeof(local_info))) {
+                throw std::runtime_error("EC-CHECK RDMA: failed to send local RdmaConnInfo");
+            }
+            if (::recv(control_sock, &remote_info, sizeof(remote_info), MSG_WAITALL) != static_cast<ssize_t>(sizeof(remote_info))) {
+                throw std::runtime_error("EC-CHECK RDMA: failed to receive remote RdmaConnInfo");
+            }
+        } else {
+            if (::recv(control_sock, &remote_info, sizeof(remote_info), MSG_WAITALL) != static_cast<ssize_t>(sizeof(remote_info))) {
+                throw std::runtime_error("EC-CHECK RDMA: failed to receive remote RdmaConnInfo");
+            }
+            if (::send(control_sock, &local_info, sizeof(local_info), 0) != static_cast<ssize_t>(sizeof(local_info))) {
+                throw std::runtime_error("EC-CHECK RDMA: failed to send local RdmaConnInfo");
+            }
+        }
+
+        ibv_qp_attr attr{};
+        attr.qp_state = IBV_QPS_INIT;
+        attr.port_num = 1;
+        attr.pkey_index = 0;
+        attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
+        if (ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+            throw std::runtime_error("EC-CHECK RDMA: failed to transition QP to INIT");
+        }
+        attr = {};
+        attr.qp_state = IBV_QPS_RTR;
+        attr.path_mtu = IBV_MTU_4096;
+        attr.dest_qp_num = remote_info.qp_num;
+        attr.rq_psn = 0;
+        attr.max_dest_rd_atomic = 1;
+        attr.min_rnr_timer = 12;
+        attr.ah_attr.is_global = 1;
+        attr.ah_attr.port_num = 1;
+        attr.ah_attr.sl = 0;
+        attr.ah_attr.dlid = remote_info.lid;
+        std::memcpy(&attr.ah_attr.grh.dgid, remote_info.gid, 16);
+        attr.ah_attr.grh.sgid_index = 0;
+        attr.ah_attr.grh.hop_limit = 64;
+        if (ibv_modify_qp(qp, &attr,
+            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+            IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
+            throw std::runtime_error("EC-CHECK RDMA: failed to transition QP to RTR");
+        }
+        attr = {};
+        attr.qp_state = IBV_QPS_RTS;
+        attr.timeout = 14;
+        attr.retry_cnt = 7;
+        attr.rnr_retry = 7;
+        attr.sq_psn = 0;
+        attr.max_rd_atomic = 1;
+        if (ibv_modify_qp(qp, &attr,
+            IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC)) {
+            throw std::runtime_error("EC-CHECK RDMA: failed to transition QP to RTS");
+        }
+    }
+
+    ibv_mr* rdma_find_mr(uintptr_t addr, size_t size) {
+        std::lock_guard<std::mutex> lock(rdma_buffer_mutex_);
+        for (auto& kv : rdma_registered_buffers_) {
+            if (addr >= kv.first && (addr + size) <= (kv.first + kv.second.size)) {
+                return kv.second.mr;
+            }
+        }
+        return nullptr;
+    }
+
+    int get_rdma_xor_control_sock() {
+        return (rank_in_group_ == 0 || rank_in_group_ == 1)
+            ? asio_conn_mgr_.get_xor_send_socket().native_handle()
+            : asio_conn_mgr_.get_xor_recv_socket().native_handle();
+    }
+    int get_rdma_p2p_control_sock() {
+        return (rank_ % 2 == 0)
+            ? asio_conn_mgr_.get_p2p_send_socket().native_handle()
+            : asio_conn_mgr_.get_p2p_recv_socket().native_handle();
+    }
+    int get_rdma_step6_p2p_control_sock() {
+        return (rank_in_group_ == 3)
+            ? asio_conn_mgr_.get_step6_p2p_send_socket().native_handle()
+            : asio_conn_mgr_.get_step6_p2p_recv_socket().native_handle();
+    }
+
+    void rdma_poll_completion(ibv_cq* cq, int num_completions) {
+        int completed = 0;
+        while (completed < num_completions) {
+            ibv_wc wc;
+            int ret = ibv_poll_cq(cq, 1, &wc);
+            if (ret < 0) throw std::runtime_error("EC-CHECK RDMA: failed to poll CQ");
+            if (ret > 0) {
+                if (wc.status != IBV_WC_SUCCESS) throw std::runtime_error("EC-CHECK RDMA: work completion failed");
+                completed++;
+            }
+        }
+    }
+
+    void rdma_send_data_via_qp(ibv_qp* qp, ibv_cq* send_cq, int control_sock, std::mutex& control_mutex,
+                               const uint8_t* data, size_t size) {
+        static const size_t CHUNK_SIZE = 64ULL * 1024 * 1024;
+        uint64_t size_net = htonll(static_cast<uint64_t>(size));
+        {
+            std::lock_guard<std::mutex> lock(control_mutex);
+            if (::send(control_sock, &size_net, sizeof(size_net), 0) != sizeof(size_net))
+                throw std::runtime_error("EC-CHECK RDMA: failed to send size");
+            uint8_t ack;
+            if (::recv(control_sock, &ack, sizeof(ack), MSG_WAITALL) != sizeof(ack))
+                throw std::runtime_error("EC-CHECK RDMA: failed to receive ACK");
+        }
+        ibv_mr* mr = rdma_find_mr(reinterpret_cast<uintptr_t>(data), size);
+        const uint8_t* send_ptr = data;
+        if (!mr) {
+            if (size > rdma_temp_send_buffer_.size())
+                throw std::runtime_error("EC-CHECK RDMA: data size exceeds temp buffer");
+            std::memcpy(rdma_temp_send_buffer_.data(), data, size);
+            mr = rdma_temp_send_mr_;
+            send_ptr = rdma_temp_send_buffer_.data();
+        }
+        size_t remaining = size;
+        size_t offset = 0;
+        while (remaining > 0) {
+            size_t cur = std::min(remaining, CHUNK_SIZE);
+            ibv_sge sge{};
+            sge.addr = reinterpret_cast<uint64_t>(send_ptr + offset);
+            sge.length = cur;
+            sge.lkey = mr->lkey;
+            ibv_send_wr wr{};
+            wr.wr_id = 0;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.opcode = IBV_WR_SEND;
+            wr.send_flags = IBV_SEND_SIGNALED;
+            ibv_send_wr* bad_wr = nullptr;
+            if (ibv_post_send(qp, &wr, &bad_wr))
+                throw std::runtime_error("EC-CHECK RDMA: failed to post send");
+            rdma_poll_completion(send_cq, 1);
+            offset += cur;
+            remaining -= cur;
+        }
+    }
+
+    size_t rdma_receive_data_via_qp(ibv_qp* qp, ibv_cq* recv_cq, int control_sock, std::mutex& control_mutex,
+                                    uint8_t* buffer, size_t buffer_size) {
+        static const size_t CHUNK_SIZE = 64ULL * 1024 * 1024;
+        static const int MAX_BATCH_WR = 32;
+        uint64_t size_net;
+        {
+            std::lock_guard<std::mutex> lock(control_mutex);
+            if (::recv(control_sock, &size_net, sizeof(size_net), MSG_WAITALL) != sizeof(size_net))
+                throw std::runtime_error("EC-CHECK RDMA: failed to receive size");
+            uint8_t ack = 1;
+            if (::send(control_sock, &ack, sizeof(ack), 0) != sizeof(ack))
+                throw std::runtime_error("EC-CHECK RDMA: failed to send ACK");
+        }
+        size_t size = ntohll(size_net);
+        if (size > buffer_size) throw std::runtime_error("EC-CHECK RDMA: received size exceeds buffer");
+        ibv_mr* mr = rdma_find_mr(reinterpret_cast<uintptr_t>(buffer), size);
+        uint8_t* recv_ptr = buffer;
+        bool use_temp = false;
+        if (!mr) {
+            if (size > rdma_temp_recv_buffer_.size())
+                throw std::runtime_error("EC-CHECK RDMA: size exceeds temp buffer");
+            mr = rdma_temp_recv_mr_;
+            recv_ptr = rdma_temp_recv_buffer_.data();
+            use_temp = true;
+        }
+        size_t remaining = size;
+        size_t offset = 0;
+        while (remaining > 0) {
+            int chunk_count = static_cast<int>(std::min(static_cast<size_t>(MAX_BATCH_WR),
+                (remaining + CHUNK_SIZE - 1) / CHUNK_SIZE));
+            if (chunk_count == 0) chunk_count = 1;
+            std::vector<ibv_sge> sges(chunk_count);
+            std::vector<ibv_recv_wr> wrs(chunk_count);
+            int num_wrs = 0;
+            for (int i = 0; i < chunk_count && remaining > 0; ++i) {
+                size_t cur = std::min(CHUNK_SIZE, remaining);
+                sges[i].addr = reinterpret_cast<uint64_t>(recv_ptr + offset);
+                sges[i].length = cur;
+                sges[i].lkey = mr->lkey;
+                wrs[i].wr_id = i;
+                wrs[i].sg_list = &sges[i];
+                wrs[i].num_sge = 1;
+                wrs[i].next = (i < chunk_count - 1) ? &wrs[i + 1] : nullptr;
+                offset += cur;
+                remaining -= cur;
+                num_wrs++;
+            }
+            if (num_wrs > 0) wrs[num_wrs - 1].next = nullptr;
+            ibv_recv_wr* bad_wr = nullptr;
+            if (ibv_post_recv(qp, &wrs[0], &bad_wr))
+                throw std::runtime_error("EC-CHECK RDMA: failed to post recv");
+            rdma_poll_completion(recv_cq, num_wrs);
+        }
+        if (use_temp) std::memcpy(buffer, rdma_temp_recv_buffer_.data(), size);
+        return size;
+    }
+
+    void cleanup_rdma_resources() {
+        if (!use_rdma_) return;
+        std::cout << "[EC-CHECK RDMA] Cleaning up RDMA resources..." << std::endl;
+
+        if (rdma_temp_send_mr_) { ibv_dereg_mr(rdma_temp_send_mr_); rdma_temp_send_mr_ = nullptr; }
+        if (rdma_temp_recv_mr_) { ibv_dereg_mr(rdma_temp_recv_mr_); rdma_temp_recv_mr_ = nullptr; }
+        rdma_temp_send_buffer_.clear();
+        rdma_temp_recv_buffer_.clear();
+
+        {
+            std::lock_guard<std::mutex> lock(rdma_buffer_mutex_);
+            for (auto& kv : rdma_registered_buffers_) {
+                if (kv.second.mr) ibv_dereg_mr(kv.second.mr);
+            }
+            rdma_registered_buffers_.clear();
+        }
+
+        if (rdma_xor_qp_) { ibv_destroy_qp(rdma_xor_qp_); rdma_xor_qp_ = nullptr; }
+        if (rdma_p2p_qp_) { ibv_destroy_qp(rdma_p2p_qp_); rdma_p2p_qp_ = nullptr; }
+        if (rdma_step6_p2p_qp_) { ibv_destroy_qp(rdma_step6_p2p_qp_); rdma_step6_p2p_qp_ = nullptr; }
+
+        if (rdma_xor_send_cq_) { ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr; }
+        if (rdma_xor_recv_cq_) { ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr; }
+        if (rdma_p2p_send_cq_) { ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr; }
+        if (rdma_p2p_recv_cq_) { ibv_destroy_cq(rdma_p2p_recv_cq_); rdma_p2p_recv_cq_ = nullptr; }
+        if (rdma_step6_p2p_send_cq_) { ibv_destroy_cq(rdma_step6_p2p_send_cq_); rdma_step6_p2p_send_cq_ = nullptr; }
+        if (rdma_step6_p2p_recv_cq_) { ibv_destroy_cq(rdma_step6_p2p_recv_cq_); rdma_step6_p2p_recv_cq_ = nullptr; }
+
+        if (rdma_pd_) { ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr; }
+        if (rdma_context_) { ibv_close_device(rdma_context_); rdma_context_ = nullptr; }
+
+        std::cout << "[EC-CHECK RDMA] RDMA resources cleaned up" << std::endl;
+    }
+#endif
+
     // RDMA buffer registration methods
     void register_buffer(uintptr_t addr, size_t size) {
 #ifdef __linux__

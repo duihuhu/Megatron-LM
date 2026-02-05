@@ -2534,46 +2534,79 @@ private:
         std::cout << "[ECLATIN RDMA] Creating 8 RDMA save channels..." << std::endl;
         int rank_for_log = (rank_in_group_ >= 0) ? rank_in_group_ : 0;
         auto& c = conn_;
+        // Create all 8 channel objects (no exchange yet)
         rdma_save_channels_[0] = std::make_unique<RdmaConnectionChannel>(
             rdma_context_, rdma_pd_, rdma_send_cq_[0], rdma_recv_cq_[0],
             c.get_parity1_send1_socket().native_handle(), c.get_parity1_send1_socket().native_handle(),
             &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 0);
-        rdma_save_channels_[0]->exchange_and_connect(true);
         rdma_save_channels_[1] = std::make_unique<RdmaConnectionChannel>(
             rdma_context_, rdma_pd_, rdma_send_cq_[1], rdma_recv_cq_[1],
             c.get_parity1_send2_socket().native_handle(), c.get_parity1_send2_socket().native_handle(),
             &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 0);
-        rdma_save_channels_[1]->exchange_and_connect(true);
         rdma_save_channels_[2] = std::make_unique<RdmaConnectionChannel>(
             rdma_context_, rdma_pd_, rdma_send_cq_[2], rdma_recv_cq_[2],
             c.get_parity1_recv1_socket().native_handle(), c.get_parity1_recv1_socket().native_handle(),
             &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 0);
-        rdma_save_channels_[2]->exchange_and_connect(false);
         rdma_save_channels_[3] = std::make_unique<RdmaConnectionChannel>(
             rdma_context_, rdma_pd_, rdma_send_cq_[3], rdma_recv_cq_[3],
             c.get_parity1_recv2_socket().native_handle(), c.get_parity1_recv2_socket().native_handle(),
             &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 0);
-        rdma_save_channels_[3]->exchange_and_connect(false);
         rdma_save_channels_[4] = std::make_unique<RdmaConnectionChannel>(
             rdma_context_, rdma_pd_, rdma_send_cq_[4], rdma_recv_cq_[4],
             c.get_parity2_send1_socket().native_handle(), c.get_parity2_send1_socket().native_handle(),
             &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 0);
-        rdma_save_channels_[4]->exchange_and_connect(true);
         rdma_save_channels_[5] = std::make_unique<RdmaConnectionChannel>(
             rdma_context_, rdma_pd_, rdma_send_cq_[5], rdma_recv_cq_[5],
             c.get_parity2_send2_socket().native_handle(), c.get_parity2_send2_socket().native_handle(),
             &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 0);
-        rdma_save_channels_[5]->exchange_and_connect(true);
         rdma_save_channels_[6] = std::make_unique<RdmaConnectionChannel>(
             rdma_context_, rdma_pd_, rdma_send_cq_[6], rdma_recv_cq_[6],
             c.get_parity2_recv1_socket().native_handle(), c.get_parity2_recv1_socket().native_handle(),
             &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 0);
-        rdma_save_channels_[6]->exchange_and_connect(false);
         rdma_save_channels_[7] = std::make_unique<RdmaConnectionChannel>(
             rdma_context_, rdma_pd_, rdma_send_cq_[7], rdma_recv_cq_[7],
             c.get_parity2_recv2_socket().native_handle(), c.get_parity2_recv2_socket().native_handle(),
             &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 0);
-        rdma_save_channels_[7]->exchange_and_connect(false);
+
+        // Run exchanges by connection-pair (like eccheck): on each TCP connection exactly one side
+        // sends first and one recvs first to avoid deadlock.
+        if (rank_in_group_ < 0) {
+            // Fallback: original order (may deadlock)
+            rdma_save_channels_[0]->exchange_and_connect(true);
+            rdma_save_channels_[1]->exchange_and_connect(true);
+            rdma_save_channels_[2]->exchange_and_connect(false);
+            rdma_save_channels_[3]->exchange_and_connect(false);
+            rdma_save_channels_[4]->exchange_and_connect(true);
+            rdma_save_channels_[5]->exchange_and_connect(true);
+            rdma_save_channels_[6]->exchange_and_connect(false);
+            rdma_save_channels_[7]->exchange_and_connect(false);
+        } else {
+            const int r = rank_in_group_;
+            // Round 1: parity1 (0 send1, 2 recv2)
+            if (r == 0) rdma_save_channels_[0]->exchange_and_connect(true);
+            if (r == 2) rdma_save_channels_[3]->exchange_and_connect(false);
+            // Round 2: parity1 (1 send1, 3 recv2)
+            if (r == 1) rdma_save_channels_[0]->exchange_and_connect(true);
+            if (r == 3) rdma_save_channels_[3]->exchange_and_connect(false);
+            // Round 3: parity1 (0 send2, 1 recv1)
+            if (r == 0) rdma_save_channels_[1]->exchange_and_connect(true);
+            if (r == 1) rdma_save_channels_[2]->exchange_and_connect(false);
+            // Round 4: parity1 (2 send2, 3 recv1)
+            if (r == 2) rdma_save_channels_[1]->exchange_and_connect(true);
+            if (r == 3) rdma_save_channels_[2]->exchange_and_connect(false);
+            // Round 5: parity2 (0 send1, 3 recv2)
+            if (r == 0) rdma_save_channels_[4]->exchange_and_connect(true);
+            if (r == 3) rdma_save_channels_[7]->exchange_and_connect(false);
+            // Round 6: parity2 (1 send1, 2 recv2)
+            if (r == 1) rdma_save_channels_[4]->exchange_and_connect(true);
+            if (r == 2) rdma_save_channels_[7]->exchange_and_connect(false);
+            // Round 7: parity2 (0 send2, 2 recv1)
+            if (r == 0) rdma_save_channels_[5]->exchange_and_connect(true);
+            if (r == 2) rdma_save_channels_[6]->exchange_and_connect(false);
+            // Round 8: parity2 (1 send2, 3 recv1)
+            if (r == 1) rdma_save_channels_[5]->exchange_and_connect(true);
+            if (r == 3) rdma_save_channels_[6]->exchange_and_connect(false);
+        }
         std::cout << "[ECLATIN RDMA] All 8 save channels connected" << std::endl;
     }
 

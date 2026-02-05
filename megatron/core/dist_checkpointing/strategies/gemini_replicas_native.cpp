@@ -1277,7 +1277,7 @@ private:
         info.lid = port_attr.lid;
         
         ibv_gid gid;
-        if (ibv_query_gid(context_, 1, 0, &gid) == 0) {
+        if (ibv_query_gid(context_, 1, 1, &gid) == 0) {
             std::memcpy(info.gid, &gid, 16);
         } else {
             std::memset(info.gid, 0, 16);
@@ -1337,7 +1337,7 @@ private:
             attr.ah_attr.is_global = 1;
             attr.ah_attr.grh.dgid = *reinterpret_cast<const ibv_gid*>(remote_info.gid);
             attr.ah_attr.grh.flow_label = 0;
-            attr.ah_attr.grh.sgid_index = 0;
+            attr.ah_attr.grh.sgid_index = 1; // GID index 1 for erdma (RoCE v2)
             attr.ah_attr.grh.hop_limit = 255;
             attr.ah_attr.grh.traffic_class = 0;
         } else {

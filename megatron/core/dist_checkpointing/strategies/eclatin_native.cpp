@@ -176,7 +176,7 @@ private:
         attr.ah_attr.sl = 0;
         attr.ah_attr.dlid = remote_info.lid;
         memcpy(&attr.ah_attr.grh.dgid, remote_info.gid, 16);
-        attr.ah_attr.grh.sgid_index = 0;
+        attr.ah_attr.grh.sgid_index = 1; // GID index 1 for erdma (RoCE v2)
         attr.ah_attr.grh.hop_limit = 64;
         if (ibv_modify_qp(qp_, &attr,
             IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
@@ -205,7 +205,7 @@ private:
         if (ibv_query_port(context_, 1, &port_attr)) throw std::runtime_error("ECLATIN RDMA: Failed to query port");
         info.lid = port_attr.lid;
         ibv_gid gid;
-        if (ibv_query_gid(context_, 1, 0, &gid)) throw std::runtime_error("ECLATIN RDMA: Failed to query GID");
+        if (ibv_query_gid(context_, 1, 1, &gid)) throw std::runtime_error("ECLATIN RDMA: Failed to query GID");
         memcpy(info.gid, &gid, 16);
         return info;
     }
@@ -1330,10 +1330,16 @@ public:
         if (use_rdma_) {
             try {
                 init_rdma_resources();
+                // Initialize RDMA save channels after resources are ready
+                if (rdma_pd_) {
+                    init_rdma_save_channels();
+                }
             } catch (const std::exception& e) {
                 std::cerr << "ECLATIN: RDMA initialization failed: " << e.what() << std::endl;
                 std::cerr << "ECLATIN: Falling back to ASIO" << std::endl;
                 use_rdma_ = false;
+                // Clear any partially initialized channels
+                for (int i = 0; i < RDMA_NUM_SAVE_CHANNELS; ++i) rdma_save_channels_[i].reset();
             }
         }
 #endif
@@ -2053,10 +2059,12 @@ public:
 #if RDMA_AVAILABLE
                 int ch2 = get_load_rdma_ch(block2_name);
                 if (use_rdma_ && ch2 >= 0 && rdma_load_channels_[ch2]) {
+                    std::cout << "[ECLATIN RDMA] Load: Sending " << block2_name << " (" << size << " bytes) via RDMA" << std::endl;
                     rdma_load_channels_[ch2]->send_data(reinterpret_cast<const uint8_t*>(block2_addr), size);
                 } else
 #endif
                 {
+                    std::cout << "[ECLATIN ASIO] Load: Sending " << block2_name << " (" << size << " bytes) via ASIO" << std::endl;
                     boost::asio::ip::tcp::socket* sock = get_socket(block2_name);
                     if (sock == nullptr || !sock->is_open()) {
                         throw std::runtime_error("ECLATIN: load_send_blocks socket not available for " + block2_name);
@@ -2517,17 +2525,7 @@ private:
         std::cout << "ECLATIN: Waiting for all connections..." << std::endl;
         conn_.wait_for_connections();
         std::cout << "ECLATIN: All connections established" << std::endl;
-#if RDMA_AVAILABLE
-        if (use_rdma_ && rdma_pd_) {
-            try {
-                init_rdma_save_channels();
-            } catch (const std::exception& e) {
-                std::cerr << "ECLATIN: RDMA save channels init failed: " << e.what() << std::endl;
-                for (int i = 0; i < RDMA_NUM_SAVE_CHANNELS; ++i) rdma_save_channels_[i].reset();
-                throw;
-            }
-        }
-#endif
+        // Note: init_rdma_save_channels() is called after init_rdma_resources() in constructor
     }
 
 #if RDMA_AVAILABLE
@@ -2833,18 +2831,22 @@ private:
                 try {
 #if RDMA_AVAILABLE
                     if (use_rdma_ && rdma_save_channels_[2]) {
+                        std::cout << "[ECLATIN RDMA] Parity1_Recv1: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_save_channels_[2]->receive_data(reinterpret_cast<uint8_t*>(task.recv1_addr), task.size);
                         recv1_success = true;
                     } else
 #endif
-                    if (!recv_with_size_bool(
-                            conn_.get_parity1_recv1_socket(),
-                            reinterpret_cast<void*>(task.recv1_addr),
-                            task.size)) {
-                        recv1_error_msg = "ECLATIN: parity1_recv1_with_size_bool returned false";
-                        recv1_success = false;
-                    } else {
-                        recv1_success = true;
+                    {
+                        std::cout << "[ECLATIN ASIO] Parity1_Recv1: Receiving " << task.size << " bytes via ASIO" << std::endl;
+                        if (!recv_with_size_bool(
+                                conn_.get_parity1_recv1_socket(),
+                                reinterpret_cast<void*>(task.recv1_addr),
+                                task.size)) {
+                            recv1_error_msg = "ECLATIN: parity1_recv1_with_size_bool returned false";
+                            recv1_success = false;
+                        } else {
+                            recv1_success = true;
+                        }
                     }
                 } catch (const std::exception& e) {
                     recv1_exception = std::current_exception();
@@ -2859,18 +2861,22 @@ private:
                 try {
 #if RDMA_AVAILABLE
                     if (use_rdma_ && rdma_save_channels_[3]) {
+                        std::cout << "[ECLATIN RDMA] Parity1_Recv2: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_save_channels_[3]->receive_data(reinterpret_cast<uint8_t*>(task.recv2_addr), task.size);
                         recv2_success = true;
                     } else
 #endif
-                    if (!recv_with_size_bool(
-                            conn_.get_parity1_recv2_socket(),
-                            reinterpret_cast<void*>(task.recv2_addr),
-                            task.size)) {
-                        recv2_error_msg = "ECLATIN: parity1_recv2_with_size_bool returned false";
-                        recv2_success = false;
-                    } else {
-                        recv2_success = true;
+                    {
+                        std::cout << "[ECLATIN ASIO] Parity1_Recv2: Receiving " << task.size << " bytes via ASIO" << std::endl;
+                        if (!recv_with_size_bool(
+                                conn_.get_parity1_recv2_socket(),
+                                reinterpret_cast<void*>(task.recv2_addr),
+                                task.size)) {
+                            recv2_error_msg = "ECLATIN: parity1_recv2_with_size_bool returned false";
+                            recv2_success = false;
+                        } else {
+                            recv2_success = true;
+                        }
                     }
                 } catch (const std::exception& e) {
                     recv2_exception = std::current_exception();
@@ -2993,10 +2999,14 @@ private:
                 auto send_start = std::chrono::high_resolution_clock::now();
 #if RDMA_AVAILABLE
                 if (use_rdma_ && rdma_save_channels_[0]) {
+                    std::cout << "[ECLATIN RDMA] Parity1_Send1: Sending " << task.size << " bytes via RDMA" << std::endl;
                     rdma_save_channels_[0]->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else
 #endif
-                send_with_size(conn_.get_parity1_send1_socket(), task.addr, task.size);
+                {
+                    std::cout << "[ECLATIN ASIO] Parity1_Send1: Sending " << task.size << " bytes via ASIO" << std::endl;
+                    send_with_size(conn_.get_parity1_send1_socket(), task.addr, task.size);
+                }
                 auto send_end = std::chrono::high_resolution_clock::now();
                 double send_time_ms = std::chrono::duration<double, std::milli>(send_end - send_start).count();
                 total_send_time_ms_.store(total_send_time_ms_.load() + send_time_ms);
@@ -3068,10 +3078,14 @@ private:
                 auto send_start = std::chrono::high_resolution_clock::now();
 #if RDMA_AVAILABLE
                 if (use_rdma_ && rdma_save_channels_[1]) {
+                    std::cout << "[ECLATIN RDMA] Parity1_Send2: Sending " << task.size << " bytes via RDMA" << std::endl;
                     rdma_save_channels_[1]->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else
 #endif
-                send_with_size(conn_.get_parity1_send2_socket(), task.addr, task.size);
+                {
+                    std::cout << "[ECLATIN ASIO] Parity1_Send2: Sending " << task.size << " bytes via ASIO" << std::endl;
+                    send_with_size(conn_.get_parity1_send2_socket(), task.addr, task.size);
+                }
                 auto send_end = std::chrono::high_resolution_clock::now();
                 double send_time_ms = std::chrono::duration<double, std::milli>(send_end - send_start).count();
                 total_send_time_ms_.store(total_send_time_ms_.load() + send_time_ms);
@@ -3164,18 +3178,22 @@ private:
                 try {
 #if RDMA_AVAILABLE
                     if (use_rdma_ && rdma_save_channels_[6]) {
+                        std::cout << "[ECLATIN RDMA] Parity2_Recv1: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_save_channels_[6]->receive_data(reinterpret_cast<uint8_t*>(task.recv1_addr), task.size);
                         recv1_success = true;
                     } else
 #endif
-                    if (!recv_with_size_bool(
-                            conn_.get_parity2_recv1_socket(),
-                            reinterpret_cast<void*>(task.recv1_addr),
-                            task.size)) {
-                        recv1_error_msg = "ECLATIN: parity2_recv1_with_size_bool returned false";
-                        recv1_success = false;
-                    } else {
-                        recv1_success = true;
+                    {
+                        std::cout << "[ECLATIN ASIO] Parity2_Recv1: Receiving " << task.size << " bytes via ASIO" << std::endl;
+                        if (!recv_with_size_bool(
+                                conn_.get_parity2_recv1_socket(),
+                                reinterpret_cast<void*>(task.recv1_addr),
+                                task.size)) {
+                            recv1_error_msg = "ECLATIN: parity2_recv1_with_size_bool returned false";
+                            recv1_success = false;
+                        } else {
+                            recv1_success = true;
+                        }
                     }
                 } catch (const std::exception& e) {
                     recv1_exception = std::current_exception();
@@ -3190,18 +3208,22 @@ private:
                 try {
 #if RDMA_AVAILABLE
                     if (use_rdma_ && rdma_save_channels_[7]) {
+                        std::cout << "[ECLATIN RDMA] Parity2_Recv2: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_save_channels_[7]->receive_data(reinterpret_cast<uint8_t*>(task.recv2_addr), task.size);
                         recv2_success = true;
                     } else
 #endif
-                    if (!recv_with_size_bool(
-                            conn_.get_parity2_recv2_socket(),
-                            reinterpret_cast<void*>(task.recv2_addr),
-                            task.size)) {
-                        recv2_error_msg = "ECLATIN: parity2_recv2_with_size_bool returned false";
-                        recv2_success = false;
-                    } else {
-                        recv2_success = true;
+                    {
+                        std::cout << "[ECLATIN ASIO] Parity2_Recv2: Receiving " << task.size << " bytes via ASIO" << std::endl;
+                        if (!recv_with_size_bool(
+                                conn_.get_parity2_recv2_socket(),
+                                reinterpret_cast<void*>(task.recv2_addr),
+                                task.size)) {
+                            recv2_error_msg = "ECLATIN: parity2_recv2_with_size_bool returned false";
+                            recv2_success = false;
+                        } else {
+                            recv2_success = true;
+                        }
                     }
                 } catch (const std::exception& e) {
                     recv2_exception = std::current_exception();
@@ -3324,10 +3346,14 @@ private:
                 auto send_start = std::chrono::high_resolution_clock::now();
 #if RDMA_AVAILABLE
                 if (use_rdma_ && rdma_save_channels_[4]) {
+                    std::cout << "[ECLATIN RDMA] Parity2_Send1: Sending " << task.size << " bytes via RDMA" << std::endl;
                     rdma_save_channels_[4]->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else
 #endif
-                send_with_size(conn_.get_parity2_send1_socket(), task.addr, task.size);
+                {
+                    std::cout << "[ECLATIN ASIO] Parity2_Send1: Sending " << task.size << " bytes via ASIO" << std::endl;
+                    send_with_size(conn_.get_parity2_send1_socket(), task.addr, task.size);
+                }
                 auto send_end = std::chrono::high_resolution_clock::now();
                 double send_time_ms = std::chrono::duration<double, std::milli>(send_end - send_start).count();
                 total_send_time_ms_.store(total_send_time_ms_.load() + send_time_ms);
@@ -3399,10 +3425,14 @@ private:
                 auto send_start = std::chrono::high_resolution_clock::now();
 #if RDMA_AVAILABLE
                 if (use_rdma_ && rdma_save_channels_[5]) {
+                    std::cout << "[ECLATIN RDMA] Parity2_Send2: Sending " << task.size << " bytes via RDMA" << std::endl;
                     rdma_save_channels_[5]->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else
 #endif
-                send_with_size(conn_.get_parity2_send2_socket(), task.addr, task.size);
+                {
+                    std::cout << "[ECLATIN ASIO] Parity2_Send2: Sending " << task.size << " bytes via ASIO" << std::endl;
+                    send_with_size(conn_.get_parity2_send2_socket(), task.addr, task.size);
+                }
                 auto send_end = std::chrono::high_resolution_clock::now();
                 double send_time_ms = std::chrono::duration<double, std::milli>(send_end - send_start).count();
                 total_send_time_ms_.store(total_send_time_ms_.load() + send_time_ms);

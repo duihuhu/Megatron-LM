@@ -13,7 +13,7 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
 GPUS_PER_NODE=1
-MASTER_ADDR=172.16.0.1
+MASTER_ADDR=172.30.134.120
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
@@ -50,7 +50,7 @@ MERGE_FILE="/root/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 # VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 # MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/workspace/data/checkpoint/models/gpt2-345m-0-naive" #<Specify path>
+CHECKPOINT_PATH="/dev/shm/models/gpt2-345m-0-naive" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -117,7 +117,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH
+    # --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
@@ -131,6 +131,7 @@ EVAL_AND_LOGGING_ARGS=(
     --use-ecnaive
     --ckpt-format torch_dist
     --save-embeddings-separately
+    --use-rdma
 )
 
 mkdir -p logs

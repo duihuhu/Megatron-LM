@@ -168,15 +168,14 @@ public:
         }
         
         try {
+            std::cout << "[Gemini ASIO] Rank " << rank_ << " sending " << size << " bytes via ASIO to rank " 
+                      << partner_rank_ << std::endl;
             // Send size first (8 bytes)
             uint64_t size_network = htobe64(size);
             boost::asio::write(send_socket_, boost::asio::buffer(&size_network, sizeof(size_network)));
             
             // Send data
             boost::asio::write(send_socket_, boost::asio::buffer(data, size));
-            
-            std::cout << "[Gemini] Rank " << rank_ << " sent " << size << " bytes to rank " 
-                      << partner_rank_ << std::endl;
         } catch (const std::exception& e) {
             throw std::runtime_error(std::string("Failed to send data: ") + e.what());
         }
@@ -189,6 +188,8 @@ public:
         }
         
         try {
+            std::cout << "[Gemini ASIO] Rank " << rank_ << " receiving via ASIO from rank " 
+                      << partner_rank_ << " (buffer_size=" << buffer_size << ")" << std::endl;
             // Receive size first (8 bytes)
             uint64_t size_network;
             boost::asio::read(recv_socket_, boost::asio::buffer(&size_network, sizeof(size_network)));
@@ -200,9 +201,6 @@ public:
             
             // Receive data
             boost::asio::read(recv_socket_, boost::asio::buffer(buffer, size));
-            
-            std::cout << "[Gemini ASIO] Rank " << rank_ << " received " << size << " bytes from rank " 
-                      << partner_rank_ << std::endl;
             
             return size;
         } catch (const std::exception& e) {
@@ -580,7 +578,7 @@ private:
     
     // Helper: Receive data in chunks
     // Optimized version: pre-post recv work requests in groups, then poll completions
-    void receive_data_chunked(uint8_t* buffer, size_t total_size, ibv_mr* mr, bool use_temp) {
+    void receive_data_chunked(uint8_t* buffer, size_t total_size, ibv_mr* mr, bool use_temp, size_t already_posted = 0) {
         auto start_time = std::chrono::steady_clock::now();
         
         size_t offset = 0;
@@ -591,60 +589,72 @@ private:
                   << " bytes (" << (total_size / (1024.0 * 1024.0)) << " MB) in " 
                   << chunk_count << " chunks, " << batch_count << " batches" << std::endl;
         
-        // Prepare all SGEs and work requests
-        std::vector<ibv_sge> sges(chunk_count);
-        std::vector<ibv_recv_wr> wrs(chunk_count);
+        // Post remaining work requests if any, then poll all completions
+        size_t remaining_chunks = chunk_count - already_posted;
+        size_t total_posted = already_posted;
         
-        size_t chunk_idx = 0;
-        while (offset < total_size) {
-            size_t chunk_size = std::min(CHUNK_SIZE, total_size - offset);
+        if (remaining_chunks > 0) {
+            std::vector<ibv_sge> sges(remaining_chunks);
+            std::vector<ibv_recv_wr> wrs(remaining_chunks);
             
-            // Prepare SGE for this chunk
-            sges[chunk_idx].addr = use_temp ? reinterpret_cast<uint64_t>(temp_recv_buffer_.data() + offset)
-                                            : reinterpret_cast<uint64_t>(buffer + offset);
-            sges[chunk_idx].length = chunk_size;
-            sges[chunk_idx].lkey = mr->lkey;
+            // Calculate offset for remaining chunks
+            offset = already_posted * CHUNK_SIZE;
+            size_t chunk_idx = 0;
+            while (offset < total_size && chunk_idx < remaining_chunks) {
+                size_t chunk_size = std::min(CHUNK_SIZE, total_size - offset);
+                
+                // Prepare SGE for this chunk
+                sges[chunk_idx].addr = use_temp ? reinterpret_cast<uint64_t>(temp_recv_buffer_.data() + offset)
+                                                : reinterpret_cast<uint64_t>(buffer + offset);
+                sges[chunk_idx].length = chunk_size;
+                sges[chunk_idx].lkey = mr->lkey;
+                
+                // Prepare receive work request
+                memset(&wrs[chunk_idx], 0, sizeof(ibv_recv_wr));
+                wrs[chunk_idx].wr_id = reinterpret_cast<uint64_t>(this) + offset;
+                wrs[chunk_idx].sg_list = &sges[chunk_idx];
+                wrs[chunk_idx].num_sge = 1;
+                wrs[chunk_idx].next = nullptr;  // Will be set when chaining
+                
+                offset += chunk_size;
+                chunk_idx++;
+            }
             
-            // Prepare receive work request
-            memset(&wrs[chunk_idx], 0, sizeof(ibv_recv_wr));
-            wrs[chunk_idx].wr_id = reinterpret_cast<uint64_t>(this) + offset;
-            wrs[chunk_idx].sg_list = &sges[chunk_idx];
-            wrs[chunk_idx].num_sge = 1;
-            wrs[chunk_idx].next = nullptr;  // Will be set when chaining
-            
-            offset += chunk_size;
-            chunk_idx++;
+            // Post remaining work requests in batches
+            while (total_posted < chunk_count) {
+                size_t batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), chunk_count - total_posted);
+                size_t batch_start_idx = total_posted - already_posted;
+                
+                // Chain work requests in this batch
+                for (size_t i = batch_start_idx; i < batch_start_idx + batch_size - 1; ++i) {
+                    wrs[i].next = &wrs[i + 1];
+                }
+                wrs[batch_start_idx + batch_size - 1].next = nullptr;
+                
+                std::cout << "[Gemini RDMA] Rank " << rank_ << " posting batch " << (total_posted / MAX_BATCH_WR + 1)
+                          << ": " << batch_size << " recv work requests (total: " << (total_posted + batch_size) 
+                          << "/" << chunk_count << ")" << std::endl;
+                
+                // Post this batch
+                ibv_recv_wr* bad_wr;
+                int post_ret = ibv_post_recv(qp_, &wrs[batch_start_idx], &bad_wr);
+                if (post_ret != 0) {
+                    std::cerr << "[Gemini RDMA] ibv_post_recv batch failed at offset " << total_posted 
+                              << " with error: " << post_ret << " (" << strerror(post_ret) << ")" << std::endl;
+                    throw std::runtime_error("Failed to post RDMA receive batch");
+                }
+                
+                total_posted += batch_size;
+            }
+        } else {
+            std::cout << "[Gemini RDMA] Rank " << rank_ << " all recv WRs already posted, polling completions..." << std::endl;
         }
         
-        // Post work requests in batches with pipelined completion polling
-        // Strategy: post batch -> wait for completion -> post next batch
-        // This ensures QP capacity is not exceeded
-        size_t total_posted = 0;
-        
+        // Poll completions for all chunks (including already posted first batch)
+        total_posted = 0;
         while (total_posted < chunk_count) {
             size_t batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), chunk_count - total_posted);
             
-            // Chain work requests in this batch
-            for (size_t i = total_posted; i < total_posted + batch_size - 1; ++i) {
-                wrs[i].next = &wrs[i + 1];
-            }
-            wrs[total_posted + batch_size - 1].next = nullptr;
-            
-            std::cout << "[Gemini RDMA] Rank " << rank_ << " posting batch " << (total_posted / MAX_BATCH_WR + 1)
-                      << ": " << batch_size << " recv work requests (total: " << (total_posted + batch_size) 
-                      << "/" << chunk_count << ")" << std::endl;
-            
-            // Post this batch
-            ibv_recv_wr* bad_wr;
-            int post_ret = ibv_post_recv(qp_, &wrs[total_posted], &bad_wr);
-            if (post_ret != 0) {
-                std::cerr << "[Gemini RDMA] ibv_post_recv batch failed at offset " << total_posted 
-                          << " with error: " << post_ret << " (" << strerror(post_ret) << ")" << std::endl;
-                throw std::runtime_error("Failed to post RDMA receive batch");
-            }
-            
-            // Wait for this batch to complete before posting next batch
-            // This ensures QP capacity is freed up
             std::cout << "[Gemini RDMA] Rank " << rank_ << " waiting for batch " << (total_posted / MAX_BATCH_WR + 1)
                       << " completions (" << batch_size << " WRs)..." << std::endl;
             
@@ -740,13 +750,6 @@ public:
         
         std::cout << "[Gemini RDMA] Rank " << rank_ << " expecting " << size << " bytes" << std::endl;
         
-        // Send immediate ACK (before posting recv WRs) to avoid deadlock in exchange_buffers
-        uint8_t ack = 1;
-        if (send(control_sock_recv_, &ack, sizeof(ack), 0) != sizeof(ack)) {
-            throw std::runtime_error("Failed to send immediate ACK to sender");
-        }
-        std::cout << "[Gemini RDMA] Rank " << rank_ << " sent immediate ACK to sender" << std::endl;
-        
         // Check if buffer is registered
         uintptr_t addr = reinterpret_cast<uintptr_t>(buffer);
         ibv_mr* mr = find_registered_mr(addr, size);
@@ -768,8 +771,56 @@ public:
             std::cout << "[Gemini RDMA] Rank " << rank_ << " recv buffer IS registered" << std::endl;
         }
         
-        // Receive data in chunks to avoid RDMA message size limits
-        receive_data_chunked(buffer, size, mr, use_temp);
+        // Step 1: Prepare and post all recv WRs BEFORE sending ACK
+        // This ensures receiver is ready when sender receives ACK and posts send WRs
+        size_t chunk_count = (size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        size_t first_batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), chunk_count);
+        
+        // Prepare SGEs and work requests for first batch
+        std::vector<ibv_sge> first_batch_sges(first_batch_size);
+        std::vector<ibv_recv_wr> first_batch_wrs(first_batch_size);
+        
+        size_t offset = 0;
+        for (size_t i = 0; i < first_batch_size; ++i) {
+            size_t chunk_size = std::min(CHUNK_SIZE, size - offset);
+            
+            first_batch_sges[i].addr = use_temp ? reinterpret_cast<uint64_t>(temp_recv_buffer_.data() + offset)
+                                                : reinterpret_cast<uint64_t>(buffer + offset);
+            first_batch_sges[i].length = chunk_size;
+            first_batch_sges[i].lkey = mr->lkey;
+            
+            memset(&first_batch_wrs[i], 0, sizeof(ibv_recv_wr));
+            first_batch_wrs[i].wr_id = reinterpret_cast<uint64_t>(this) + offset;
+            first_batch_wrs[i].sg_list = &first_batch_sges[i];
+            first_batch_wrs[i].num_sge = 1;
+            first_batch_wrs[i].next = (i < first_batch_size - 1) ? &first_batch_wrs[i + 1] : nullptr;
+            
+            offset += chunk_size;
+        }
+        first_batch_wrs[first_batch_size - 1].next = nullptr;
+        
+        // Post first batch of recv WRs
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " posting first batch of " << first_batch_size 
+                  << " recv WRs before sending ACK..." << std::endl;
+        ibv_recv_wr* bad_wr;
+        int post_ret = ibv_post_recv(qp_, &first_batch_wrs[0], &bad_wr);
+        if (post_ret != 0) {
+            std::cerr << "[Gemini RDMA] ibv_post_recv first batch failed with error: " << post_ret 
+                      << " (" << strerror(post_ret) << ")" << std::endl;
+            throw std::runtime_error("Failed to post first batch of RDMA receive WRs");
+        }
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " posted first batch of recv WRs" << std::endl;
+        
+        // Step 2: Send ACK AFTER posting recv WRs
+        // This tells sender that receiver is ready to receive data
+        uint8_t ack = 1;
+        if (send(control_sock_recv_, &ack, sizeof(ack), 0) != sizeof(ack)) {
+            throw std::runtime_error("Failed to send ACK to sender");
+        }
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " sent ACK to sender (after posting recv WRs)" << std::endl;
+        
+        // Step 3: Receive data in chunks (will handle remaining batches and polling)
+        receive_data_chunked(buffer, size, mr, use_temp, first_batch_size);
         
         std::cout << "[Gemini RDMA] Rank " << rank_ << " received total " << size << " bytes" << std::endl;
         
@@ -1075,7 +1126,7 @@ private:
         
         // Try to get GID for RoCE
         ibv_gid gid;
-        if (ibv_query_gid(context_, 1, 0, &gid) == 0) {
+        if (ibv_query_gid(context_, 1, 1, &gid) == 0) {
             std::memcpy(info.gid, &gid, 16);
         }
         
@@ -1140,7 +1191,7 @@ private:
         if (use_gid) {
             std::memcpy(&qp_attr.ah_attr.grh.dgid, remote_info.gid, 16);
             qp_attr.ah_attr.grh.flow_label = 0;
-            qp_attr.ah_attr.grh.sgid_index = 0;
+            qp_attr.ah_attr.grh.sgid_index = 1; // GID index 1 for erdma (RoCE v2)
             qp_attr.ah_attr.grh.hop_limit = 255;
             qp_attr.ah_attr.grh.traffic_class = 0;
         }

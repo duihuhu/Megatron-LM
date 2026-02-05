@@ -1580,6 +1580,7 @@ private:
             // Send data using RDMA, ASIO, or NCCL
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_qp_) {
+                std::cout << "[EC-CHECK RDMA] Save_XOR_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                 try {
                     rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_control_sock(),
                         rdma_xor_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
@@ -1594,6 +1595,7 @@ private:
 #endif
             if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_send_connected()) {
                 // ASIO send path (synchronous)
+                std::cout << "[EC-CHECK ASIO] XOR_Send: Sending " << task.size << " bytes via ASIO" << std::endl;
                 uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.encoding_addr);
                 uint32_t size_net = htonl(static_cast<uint32_t>(task.size));  // Network byte order
                 
@@ -1736,6 +1738,7 @@ private:
             // Receive data using RDMA, ASIO, or NCCL
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_qp_) {
+                std::cout << "[EC-CHECK RDMA] Save_XOR_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                 try {
                     size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
                         get_rdma_xor_control_sock(), rdma_xor_control_mutex_,
@@ -1753,6 +1756,7 @@ private:
 #endif
             if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_recv_connected()) {
                 // ASIO recv path (synchronous)
+                std::cout << "[EC-CHECK ASIO] XOR_Recv: Receiving " << task.size << " bytes via ASIO" << std::endl;
                 uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_addr);
                 uint32_t size_net;
                 
@@ -2111,6 +2115,7 @@ private:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_p2p_qp_) {
+                    std::cout << "[EC-CHECK RDMA] Save_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_control_sock(),
                             rdma_p2p_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
@@ -2121,12 +2126,10 @@ private:
 #endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_send_connected()) {
                     // ASIO send path (synchronous)
+                    const char* send_label = (rank_ % 2 == 0) ? "parity" : "data";
+                    std::cout << "[EC-CHECK ASIO] P2P_Send: Sending " << task.size << " bytes (" << send_label << ") via ASIO" << std::endl;
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.send_buffer_addr);
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));  // Network byte order
-                    
-                    const char* send_label = (rank_ % 2 == 0) ? "parity" : "data";
-                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Starting ASIO send ("
-                            //   << send_label << "), size=" << task.size << std::endl;
                     
                     try {
                         // Send message header (size) first
@@ -2360,6 +2363,7 @@ private:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_p2p_qp_) {
+                    std::cout << "[EC-CHECK RDMA] Save_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
                             get_rdma_p2p_control_sock(), rdma_p2p_control_mutex_,
@@ -2377,12 +2381,10 @@ private:
 #endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_recv_connected()) {
                     // ASIO recv path (synchronous)
+                    const char* recv_label = (rank_ % 2 == 0) ? "data" : "parity";
+                    std::cout << "[EC-CHECK ASIO] P2P_Recv: Receiving " << task.size << " bytes (" << recv_label << ") via ASIO" << std::endl;
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_buffer_addr);
                     uint32_t size_net;
-                    
-                    const char* recv_label = (rank_ % 2 == 0) ? "data" : "parity";
-                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Starting ASIO recv ("
-                    //           << recv_label << "), size=" << task.size << std::endl;
                     
                     try {
                         // Receive message header (size) first
@@ -3892,6 +3894,7 @@ public:
             // Send encoding using RDMA or ASIO (load mode)
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_qp_) {
+                std::cout << "[EC-CHECK RDMA] Load_XOR_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                 try {
                     rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_control_sock(),
                         rdma_xor_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
@@ -3905,6 +3908,7 @@ public:
             } else
 #endif
             if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_send_connected()) {
+                std::cout << "[EC-CHECK ASIO] Load_XOR_Send: Sending " << task.size << " bytes via ASIO" << std::endl;
                 uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.encoding_addr);
                 uint32_t size_net = htonl(static_cast<uint32_t>(task.size));
                 
@@ -4007,6 +4011,7 @@ public:
             // Receive encoding using RDMA or ASIO (load mode)
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_qp_) {
+                std::cout << "[EC-CHECK RDMA] Load_XOR_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                 try {
                     size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
                         get_rdma_xor_control_sock(), rdma_xor_control_mutex_,
@@ -4262,6 +4267,7 @@ public:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_p2p_qp_) {
+                    std::cout << "[EC-CHECK RDMA] Load_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_control_sock(),
                             rdma_p2p_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
@@ -4271,6 +4277,7 @@ public:
                 } else
 #endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_send_connected()) {
+                    std::cout << "[EC-CHECK ASIO] Load_P2P_Send: Sending " << task.size << " bytes via ASIO" << std::endl;
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.send_buffer_addr);
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));
                     
@@ -4378,6 +4385,7 @@ public:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_p2p_qp_) {
+                    std::cout << "[EC-CHECK RDMA] Load_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
                             get_rdma_p2p_control_sock(), rdma_p2p_control_mutex_,
@@ -4394,6 +4402,7 @@ public:
                 } else
 #endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_recv_connected()) {
+                    std::cout << "[EC-CHECK ASIO] Load_P2P_Recv: Receiving " << task.size << " bytes via ASIO" << std::endl;
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_buffer_addr);
                     uint32_t size_net;
                     
@@ -4523,6 +4532,7 @@ public:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_step6_p2p_qp_) {
+                    std::cout << "[EC-CHECK RDMA] Load_Step6_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         rdma_send_data_via_qp(rdma_step6_p2p_qp_, rdma_step6_p2p_send_cq_,
                             get_rdma_step6_p2p_control_sock(), rdma_step6_p2p_control_mutex_,
@@ -4534,6 +4544,7 @@ public:
                 } else
 #endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_step6_p2p_send_connected()) {
+                    std::cout << "[EC-CHECK ASIO] Step6_P2P_Send: Sending " << task.size << " bytes via ASIO" << std::endl;
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.send_buffer_addr);
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));
                     
@@ -4622,6 +4633,7 @@ public:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_step6_p2p_qp_) {
+                    std::cout << "[EC-CHECK RDMA] Load_Step6_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_step6_p2p_qp_, rdma_step6_p2p_recv_cq_,
                             get_rdma_step6_p2p_control_sock(), rdma_step6_p2p_control_mutex_,
@@ -4638,6 +4650,7 @@ public:
                 } else
 #endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_step6_p2p_recv_connected()) {
+                    std::cout << "[EC-CHECK ASIO] Step6_P2P_Recv: Receiving " << task.size << " bytes via ASIO" << std::endl;
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_buffer_addr);
                     uint32_t size_net;
                     
@@ -4744,6 +4757,7 @@ public:
                 register_buffer(buffer_addr, size);
                 temp_reg = true;
             }
+            std::cout << "[EC-CHECK RDMA] Simple_P2P_Send: Sending " << size << " bytes via RDMA" << std::endl;
             try {
                 rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_control_sock(),
                     rdma_p2p_control_mutex_, reinterpret_cast<const uint8_t*>(buffer_addr), size);
@@ -4752,11 +4766,10 @@ public:
                 throw;
             }
             if (temp_reg) unregister_buffer(buffer_addr);
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] Simple P2P send (RDMA): "
-                      << size / (1024*1024) << " MB" << std::endl;
             return;
         }
 #endif
+        std::cout << "[EC-CHECK ASIO] Simple_P2P_Send: Sending " << size << " bytes via ASIO" << std::endl;
         uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(buffer_addr);
         // Use uint64_t to support data transfers > 4GB
         uint64_t size_net = htonll(static_cast<uint64_t>(size));
@@ -4794,6 +4807,7 @@ public:
                 register_buffer(buffer_addr, size);
                 temp_reg = true;
             }
+            std::cout << "[EC-CHECK RDMA] Simple_P2P_Recv: Receiving " << size << " bytes via RDMA" << std::endl;
             try {
                 rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_, get_rdma_p2p_control_sock(),
                     rdma_p2p_control_mutex_, reinterpret_cast<uint8_t*>(buffer_addr), size);
@@ -4802,11 +4816,10 @@ public:
                 throw;
             }
             if (temp_reg) unregister_buffer(buffer_addr);
-            std::cout << "EC-CHECK: [Rank " << rank_ << "] Simple P2P recv (RDMA): "
-                      << size / (1024*1024) << " MB" << std::endl;
             return;
         }
 #endif
+        std::cout << "[EC-CHECK ASIO] Simple_P2P_Recv: Receiving via ASIO (buffer_size=" << size << ")" << std::endl;
         uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(buffer_addr);
         // Use uint64_t to support data transfers > 4GB
         uint64_t size_net;
@@ -4992,7 +5005,7 @@ public:
         }
         local_info.lid = port_attr.lid;
         ibv_gid gid;
-        if (ibv_query_gid(rdma_context_, 1, 0, &gid)) {
+        if (ibv_query_gid(rdma_context_, 1, 1, &gid)) {
             throw std::runtime_error("EC-CHECK RDMA: failed to query GID");
         }
         std::memcpy(local_info.gid, &gid, 16);
@@ -5035,7 +5048,7 @@ public:
         attr.ah_attr.sl = 0;
         attr.ah_attr.dlid = remote_info.lid;
         std::memcpy(&attr.ah_attr.grh.dgid, remote_info.gid, 16);
-        attr.ah_attr.grh.sgid_index = 0;
+        attr.ah_attr.grh.sgid_index = 1; // GID index 1 for erdma (RoCE v2)
         attr.ah_attr.grh.hop_limit = 64;
         if (ibv_modify_qp(qp, &attr,
             IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
@@ -5097,6 +5110,7 @@ public:
 
     void rdma_send_data_via_qp(ibv_qp* qp, ibv_cq* send_cq, int control_sock, std::mutex& control_mutex,
                                const uint8_t* data, size_t size) {
+        std::cout << "[EC-CHECK RDMA] Sending " << size << " bytes via RDMA" << std::endl;
         static const size_t CHUNK_SIZE = 64ULL * 1024 * 1024;
         uint64_t size_net = htonll(static_cast<uint64_t>(size));
         {
@@ -5144,16 +5158,19 @@ public:
         static const size_t CHUNK_SIZE = 64ULL * 1024 * 1024;
         static const int MAX_BATCH_WR = 32;
         uint64_t size_net;
+        size_t size;
+        
+        // Step 1: Receive size via control channel
+        std::cout << "[EC-CHECK RDMA] Receiving data via RDMA (buffer_size=" << buffer_size << ")" << std::endl;
         {
             std::lock_guard<std::mutex> lock(control_mutex);
             if (::recv(control_sock, &size_net, sizeof(size_net), MSG_WAITALL) != sizeof(size_net))
                 throw std::runtime_error("EC-CHECK RDMA: failed to receive size");
-            uint8_t ack = 1;
-            if (::send(control_sock, &ack, sizeof(ack), 0) != sizeof(ack))
-                throw std::runtime_error("EC-CHECK RDMA: failed to send ACK");
         }
-        size_t size = ntohll(size_net);
+        size = ntohll(size_net);
         if (size > buffer_size) throw std::runtime_error("EC-CHECK RDMA: received size exceeds buffer");
+        
+        // Step 2: Prepare buffer and memory region
         ibv_mr* mr = rdma_find_mr(reinterpret_cast<uintptr_t>(buffer), size);
         uint8_t* recv_ptr = buffer;
         bool use_temp = false;
@@ -5164,15 +5181,24 @@ public:
             recv_ptr = rdma_temp_recv_buffer_.data();
             use_temp = true;
         }
+        
+        // Step 3: Pre-post all recv WRs BEFORE sending ACK
+        // This ensures sender can post send WRs immediately after receiving ACK
         size_t remaining = size;
         size_t offset = 0;
+        std::vector<std::vector<ibv_sge>> all_sges;
+        std::vector<std::vector<ibv_recv_wr>> all_wrs;
+        std::vector<int> all_num_wrs;
+        
         while (remaining > 0) {
             int chunk_count = static_cast<int>(std::min(static_cast<size_t>(MAX_BATCH_WR),
                 (remaining + CHUNK_SIZE - 1) / CHUNK_SIZE));
             if (chunk_count == 0) chunk_count = 1;
+            
             std::vector<ibv_sge> sges(chunk_count);
             std::vector<ibv_recv_wr> wrs(chunk_count);
             int num_wrs = 0;
+            
             for (int i = 0; i < chunk_count && remaining > 0; ++i) {
                 size_t cur = std::min(CHUNK_SIZE, remaining);
                 sges[i].addr = reinterpret_cast<uint64_t>(recv_ptr + offset);
@@ -5187,11 +5213,33 @@ public:
                 num_wrs++;
             }
             if (num_wrs > 0) wrs[num_wrs - 1].next = nullptr;
-            ibv_recv_wr* bad_wr = nullptr;
-            if (ibv_post_recv(qp, &wrs[0], &bad_wr))
-                throw std::runtime_error("EC-CHECK RDMA: failed to post recv");
-            rdma_poll_completion(recv_cq, num_wrs);
+            
+            all_sges.push_back(std::move(sges));
+            all_wrs.push_back(std::move(wrs));
+            all_num_wrs.push_back(num_wrs);
         }
+        
+        // Step 4: Post all recv WRs before sending ACK
+        for (size_t i = 0; i < all_wrs.size(); ++i) {
+            ibv_recv_wr* bad_wr = nullptr;
+            if (ibv_post_recv(qp, &all_wrs[i][0], &bad_wr))
+                throw std::runtime_error("EC-CHECK RDMA: failed to post recv");
+        }
+        
+        // Step 5: Send ACK after all recv WRs are posted
+        // This tells sender that receiver is ready to receive data
+        {
+            std::lock_guard<std::mutex> lock(control_mutex);
+            uint8_t ack = 1;
+            if (::send(control_sock, &ack, sizeof(ack), 0) != sizeof(ack))
+                throw std::runtime_error("EC-CHECK RDMA: failed to send ACK");
+        }
+        
+        // Step 6: Poll for completions
+        for (size_t i = 0; i < all_num_wrs.size(); ++i) {
+            rdma_poll_completion(recv_cq, all_num_wrs[i]);
+        }
+        
         if (use_temp) std::memcpy(buffer, rdma_temp_recv_buffer_.data(), size);
         return size;
     }

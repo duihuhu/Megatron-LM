@@ -17,6 +17,9 @@ logger = getLogger(__name__)
 
 # Number of ranks per EC-NAIVE group (each group behaves like the original 4-rank setup)
 RANKS_PER_GROUP = 4
+# Ports per rank: 6 for ASIO (send_data1, send_parity0, send_parity1, recv_parity1, recv_parity0, recv_data1)
+# + 3 for RDMA exchange only (rdma_recv_parity1, rdma_recv_parity0, rdma_recv_data1)
+PORTS_PER_RANK = 9
 
 
 class ECNAIVEManager:
@@ -212,14 +215,14 @@ class ECNAIVEManager:
         base_port = int(os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000))
         
         # Step 3: Calculate ports for this rank (per-group to avoid conflict in multi-rank)
-        # When world_size divisible by 4: base_port + group_id * (4*6) + rank_in_group * 6 + offset
-        # Otherwise: base_port + rank * 6 + offset
+        # When world_size divisible by 4: base_port + group_id * (4*PORTS_PER_RANK) + rank_in_group * PORTS_PER_RANK
+        # PORTS_PER_RANK = 9: 6 ASIO + 3 RDMA exchange
         if world_size >= RANKS_PER_GROUP and world_size % RANKS_PER_GROUP == 0:
             group_id = self._get_group_id(rank, world_size)
             rank_in_group = self._get_rank_in_group(rank, world_size)
-            port_base = base_port + group_id * (RANKS_PER_GROUP * 6) + rank_in_group * 6
+            port_base = base_port + group_id * (RANKS_PER_GROUP * PORTS_PER_RANK) + rank_in_group * PORTS_PER_RANK
         else:
-            port_base = base_port + rank * 6
+            port_base = base_port + rank * PORTS_PER_RANK
         ports = {
             'send_data1': port_base + 0,
             'send_parity0': port_base + 1,
@@ -227,6 +230,9 @@ class ECNAIVEManager:
             'recv_parity1': port_base + 3,
             'recv_parity0': port_base + 4,
             'recv_data1': port_base + 5,
+            'rdma_recv_parity1': port_base + 6,
+            'rdma_recv_parity0': port_base + 7,
+            'rdma_recv_data1': port_base + 8,
         }
         
         # Step 4: Exchange IP addresses via torch.distributed.all_gather
@@ -733,8 +739,8 @@ class ECNAIVEManager:
                     if world_size >= RANKS_PER_GROUP and world_size % RANKS_PER_GROUP == 0:
                         gid = self._get_group_id(r, world_size)
                         rig = self._get_rank_in_group(r, world_size)
-                        return base_port + gid * (RANKS_PER_GROUP * 6) + rig * 6
-                    return base_port + r * 6
+                        return base_port + gid * (RANKS_PER_GROUP * PORTS_PER_RANK) + rig * PORTS_PER_RANK
+                    return base_port + r * PORTS_PER_RANK
                 # For send connections, we connect to the partner's recv port:
                 # - send_data1 connects to partner's recv_parity1 (offset 3)
                 # - send_parity0 connects to partner's recv_parity0 (offset 4)
@@ -742,19 +748,33 @@ class ECNAIVEManager:
                 send_data1_partner_port = _port_base_for_rank(partner_ranks['send_data1_to']) + 3
                 send_parity0_partner_port = _port_base_for_rank(partner_ranks['send_parity0_to']) + 4
                 send_parity1_partner_port = _port_base_for_rank(partner_ranks['send_parity1_to']) + 5
+                # RDMA exchange: dedicated TCP ports (offset 6,7,8) - connect to partner's RDMA listen ports
+                # send_data1/send_parity1 both connect to partner's rdma_recv_parity1 (offset 6)
+                rdma_send_data1_port = _port_base_for_rank(partner_ranks['send_data1_to']) + 6
+                rdma_send_parity0_port = _port_base_for_rank(partner_ranks['send_parity0_to']) + 7
+                rdma_send_parity1_port = _port_base_for_rank(partner_ranks['send_parity1_to']) + 6
                 
-                # Create C++ instance with ASIO parameters (12 parameters: 6 pairs of ip:port + use_rdma flag)
+                # Get rank_in_group for RDMA connection ordering
+                rank_in_group = self._get_rank_in_group(rank, world_size)
+                
+                # Create C++ instance: 6 ASIO ip:port + 6 RDMA exchange ports + use_rdma + rank_in_group
                 self._ecnaive_native = ecnaive_native.ECNaiveNative(
-                    # Send connections
+                    # ASIO send connections
                     rank_ips.get(partner_ranks['send_data1_to'], net_config['my_ip']), send_data1_partner_port,
                     rank_ips.get(partner_ranks['send_parity0_to'], net_config['my_ip']), send_parity0_partner_port,
                     rank_ips.get(partner_ranks['send_parity1_to'], net_config['my_ip']), send_parity1_partner_port,
-                    # Recv connections (listen on local IP)
+                    # ASIO recv connections (listen on local IP)
                     net_config['my_ip'], net_config['ports']['recv_parity1'],
                     net_config['my_ip'], net_config['ports']['recv_parity0'],
                     net_config['my_ip'], net_config['ports']['recv_data1'],
-                    # RDMA flag
-                    self.use_rdma
+                    # RDMA exchange ports (dedicated TCP for RdmaConnInfo): 3 partner + 3 local
+                    rdma_send_data1_port, rdma_send_parity0_port, rdma_send_parity1_port,
+                    net_config['ports']['rdma_recv_parity1'],
+                    net_config['ports']['rdma_recv_parity0'],
+                    net_config['ports']['rdma_recv_data1'],
+                    # RDMA flag and rank_in_group
+                    self.use_rdma,
+                    rank_in_group
                 )
                 
                 # If we reach here, ASIO connections are ready and threads are running
@@ -764,6 +784,11 @@ class ECNAIVEManager:
                 # Initialize EC-NAIVE buffers
                 # EC-NAIVE does not use layerwise mode
                 self._init_ecnaive_buffers()
+                
+                # Synchronize all ranks after RDMA/ASIO and buffers are ready
+                logger.info(f"EC-NAIVE: [Rank {rank}] Synchronizing all ranks after native module init...")
+                torch.distributed.barrier()
+                logger.info(f"EC-NAIVE: [Rank {rank}] All ranks synchronized after EC-NAIVE init")
         
             except Exception as e:
                 logger.warning(f"EC-NAIVE: Failed to create C++ native module instance: {e}")

@@ -107,7 +107,7 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 2
+    --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 4
 )
 
@@ -116,7 +116,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH
+    #--load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
@@ -132,6 +132,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --no-save-optim
     # --no-load-optim
     #--save-embeddings-separately
+    --timing-log-level 1
 )
 
 mkdir -p logs

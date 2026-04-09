@@ -44,7 +44,12 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_b
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
-from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
+from .optimizer import (
+    MixedPrecisionOptimizer,
+    _optimizer_state_tensor_bytes_for_params,
+    _zero_grad_group_helper,
+    param_group_identifier_keys,
+)
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
@@ -2327,7 +2332,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 f"[Layer-wise Update] [Distributed] Updating layer {layer_idx}/{len(layer_params_groups)-1} "
                 f"with {len(layer_shard_params)} shard parameters"
             )
-            
+
+            other_group_index = getattr(self, "_layer_wise_other_group_index", None)
+            if other_group_index is not None and layer_idx == other_group_index:
+                layer_timer_name = "optimizer-layer-other-step"
+                layer_full_timer_name = "optimizer-layer-other-full"
+            else:
+                layer_timer_name = f"optimizer-layer-{layer_idx}-step"
+                layer_full_timer_name = f"optimizer-layer-{layer_idx}-full"
+
+            if timers is not None:
+                timers(layer_full_timer_name, log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
+
             # Create temporary param groups for this layer
             saved_param_groups = []
             for param_group in self.optimizer.param_groups:
@@ -2337,16 +2355,40 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # Filter to only include this layer's shard params
                 layer_shard_param_ids = set(id(p) for p in layer_shard_params)
                 param_group['params'] = [p for p in original_params if id(p) in layer_shard_param_ids]
-            
+
+            if timers is not None:
+                timers(layer_timer_name, log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
             # Step optimizer for this layer only
             self.optimizer.step()
-            
+            if timers is not None:
+                timers(layer_timer_name).stop()
+
+            state_bytes = _optimizer_state_tensor_bytes_for_params(
+                self.optimizer, layer_shard_params
+            )
+            param_numel = sum(p.numel() for p in layer_shard_params)
+            group_label = (
+                "other"
+                if other_group_index is not None and layer_idx == other_group_index
+                else f"layer-{layer_idx}"
+            )
+            logger.info(
+                f"[Layer-wise Update] [Distributed] optimizer state tensor bytes | {group_label} | "
+                f"optimizer_params={len(layer_shard_params)} | param_numel={param_numel} | "
+                f"state_bytes={state_bytes}"
+            )
+
             # Copy updated shard params back to model params for this layer
             self._copy_shard_main_params_to_model_params_for_layer(layer_model_params)
             
             # Restore original param groups
             for param_group, original_params in zip(self.optimizer.param_groups, saved_param_groups):
                 param_group['params'] = original_params
+
+            if timers is not None:
+                timers(layer_full_timer_name).stop()
         
         if timers is not None:
             timers('optimizer-layer-by-layer-inner-step').stop()

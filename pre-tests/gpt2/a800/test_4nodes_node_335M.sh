@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Script to run a single node in 4-node simulation (default 1 GPU per node)
-# Usage: ./test_eccheck_4nodes_node.sh <node_rank> [gpus_per_node] [additional_args...]
-# Example: ./test_eccheck_4nodes_node.sh 0
-# Example (2 GPUs per container): ./test_eccheck_4nodes_node.sh 0 2
+# Usage: ./test_4nodes_node_335M.sh <node_rank> <global_gpu_rank> [additional_args...]
+# Example: ./test_4nodes_node_335M.sh 0 0
+# Example: ./test_4nodes_node_335M.sh 1 3
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
@@ -14,18 +14,20 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
 
-GPUS_PER_NODE=1
 MASTER_ADDR=172.21.0.2 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
 NNODES=4
+GPUS_PER_NODE=1
 
 export ECCHECK_INTERFACE=$NETIFACES_INTERFACE
 
-# If first argument is a numeric node rank use it, otherwise default to 0
+# Parse node_rank and global_gpu_rank
 NODE_RANK=0
+GLOBAL_GPU_RANK=0
+
 if [ -n "$1" ]; then
     if [[ "$1" =~ ^[0-9]+$ ]]; then
         NODE_RANK=$1
@@ -33,34 +35,32 @@ if [ -n "$1" ]; then
     fi
 fi
 
-# Optional second argument: GPUs per node (default 1). E.g. 2 => container 0 uses 0,1; container 1 uses 2,3; ...
-if [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; then
-    GPUS_PER_NODE=$1
-    shift
+if [ -n "$1" ]; then
+    if [[ "$1" =~ ^[0-9]+$ ]]; then
+        GLOBAL_GPU_RANK=$1
+        shift
+    fi
 fi
 
-# Set NCCL_DEBUG_FILE after NODE_RANK is determined
 export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
-WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+WORLD_SIZE=$((GPUS_PER_NODE * NNODES))
 
-# Set CUDA_VISIBLE_DEVICES: by node rank when 1 GPU/node; when GPUs per node > 1, use contiguous block (e.g. node 0 => 0,1; node 1 => 2,3)
-START_GPU=$(($NODE_RANK * $GPUS_PER_NODE))
-export CUDA_VISIBLE_DEVICES=$(seq -s, $START_GPU $((START_GPU + GPUS_PER_NODE - 1)))
-
+# Set CUDA_VISIBLE_DEVICES using global_gpu_rank
+export CUDA_VISIBLE_DEVICES=$GLOBAL_GPU_RANK
 
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/workspace/Megatron-LM/data/checkpoint/models/gpt2-345m-0-eccheck" #<Specify path>
-DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
+TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs"
+CHECKPOINT_PATH="/workspace/Megatron-LM/data/checkpoint/models/gpt2-345m-0"
+DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
-# Remaining args after optional node-rank are passed to the training script
+# Remaining arguments after node_rank and global_gpu_rank are passed to the training script
 ARGS_TO_PASS=("$@")
 
-# fixed Model related configuration here, pls not overlap with json config
+# Fixed model configuration
 HIDDEN_SIZE=1024
 NUM_ATTENTION_HEADS=16
 SEQ_LENGTH=1024
@@ -82,7 +82,6 @@ DATA_ARGS=(
     --mock-data 
 )
 
-# Model related configuration here, pls not overlap with json config
 GPT_ARGS=(
     --no-async-tensor-model-parallel-allreduce 
     --hidden-size $HIDDEN_SIZE 
@@ -92,7 +91,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
     --lr 0.00015 
-    --train-iters 20
+    --train-iters 10
     --lr-decay-iters 320000 
     --lr-decay-style cosine 
     --min-lr 1.0e-5 
@@ -122,8 +121,8 @@ EVAL_AND_LOGGING_ARGS=(
     #--load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --use-eccheck
-    --use-eccheck-software-failure
+    #--use-eccheck
+    #--use-eccheck-software-failure
     # --use-gemini
     # --use-gemini-optimized
     # --use-gemini-software-failure
@@ -135,6 +134,8 @@ EVAL_AND_LOGGING_ARGS=(
     # --no-load-optim
     --save-embeddings-separately
     --timing-log-level 1
+    #--layer-wise-optimizer-update
+    --no-barrier-with-level-1-timing
 )
 
 mkdir -p logs
@@ -144,16 +145,16 @@ mkdir -p logs/csv
 # Print command if PRINT_CMD is set
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK, Global GPU Rank $GLOBAL_GPU_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
 
-echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES"
+echo "Starting Node $NODE_RANK with visible global GPU rank $CUDA_VISIBLE_DEVICES"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 
-export USE_FLASH_ATTN=1 && \
-export NVTE_SYNC_P2P=1 && \
+export USE_FLASH_ATTN=1
+export NVTE_SYNC_P2P=1
 
 export ECCHECK_USE_ASIO=true
 PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \

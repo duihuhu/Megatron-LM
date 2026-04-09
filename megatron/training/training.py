@@ -1698,6 +1698,14 @@ def training_log(
         'optimizer-copy-main-to-model-params',
         'optimizer',
     ]
+    if getattr(args, 'layer_wise_optimizer_update', False):
+        timers_to_log.append('optimizer-layer-wise-before-layers')
+        timers_to_log.append('optimizer-layer-by-layer-inner-step')
+        for layer_idx in range(args.num_layers):
+            timers_to_log.append(f'optimizer-layer-{layer_idx}-step')
+            timers_to_log.append(f'optimizer-layer-{layer_idx}-full')
+        timers_to_log.append('optimizer-layer-other-step')
+        timers_to_log.append('optimizer-layer-other-full')
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()

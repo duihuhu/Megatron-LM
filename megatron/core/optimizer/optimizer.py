@@ -52,6 +52,21 @@ from .optimizer_config import OptimizerConfig
 logger = getLogger(__name__)
 
 
+def _optimizer_state_tensor_bytes_for_params(
+    optimizer: torch.optim.Optimizer, params: List[torch.nn.Parameter]
+) -> int:
+    """Sum bytes of tensor entries in optimizer.state for the given parameters."""
+    total = 0
+    state = optimizer.state
+    for p in params:
+        if p not in state:
+            continue
+        for _key, value in state[p].items():
+            if torch.is_tensor(value):
+                total += value.numel() * value.element_size()
+    return total
+
+
 def _zero_grad_group_helper(
     group: List[torch.nn.Parameter], set_to_none: bool, use_decoupled_grad: bool = False
 ):
@@ -599,9 +614,16 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         """
         timers = self.config.timers
 
+        if timers is not None:
+            timers('optimizer-layer-wise-before-layers', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
+            )
+
         # Prepare gradients globally (unscale, check for inf/nan)
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
+            if timers is not None:
+                timers('optimizer-layer-wise-before-layers').stop()
             return False, None, None
 
         # Clip gradients globally to ensure consistent scaling
@@ -624,9 +646,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if timers is not None:
             timers('optimizer-count-zeros').stop()
 
-        # Infer layer groups if not provided
+        # Infer layer groups if not provided (cache after first successful infer)
         if layer_params_groups is None:
-            layer_params_groups = self._infer_layer_param_groups()
+            cached_groups = getattr(self, '_cached_layer_params_groups', None)
+            if cached_groups is not None:
+                layer_params_groups = cached_groups
+            else:
+                layer_params_groups = self._infer_layer_param_groups()
+                self._cached_layer_params_groups = layer_params_groups
 
         # Log layer-wise update information for verification
         num_layers = len(layer_params_groups)
@@ -647,6 +674,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             logger.warning(
                 "[Layer-wise Update] No layer groups detected, falling back to single group update."
             )
+        if timers is not None:
+            timers('optimizer-layer-wise-before-layers').stop()
         # Step layer by layer
         success = self._step_with_ready_grads_layer_by_layer(layer_params_groups)
         if num_layers > 0:
@@ -658,8 +687,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         """
         Infer layer structure from parameters based on naming convention.
         
-        Uses model_chunks.named_parameters() to get actual parameter names,
-        then maps them to optimizer's main parameters.
+        Uses model_chunks.named_parameters() to get actual parameter names.
+        Layer groups returned by this function always contain model parameters
+        so downstream layer-wise step implementations can map them to internal
+        optimizer parameters (main/shard) consistently.
         
         Returns:
             List of parameter lists, each sublist contains parameters from one layer.
@@ -668,71 +699,49 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         layer_dict = {}
         other_params = []
         
-        # Build mapping from model param ID to (name, main_param)
+        # Build mappings for model parameter names and optimizer ownership.
         model_param_to_name = {}
-        model_param_to_main = {}
+        id_to_param_map = {}
+        optimizer_model_param_ids = set()
         
         # Get named parameters from model_chunks
         if hasattr(self, 'model_chunks') and self.model_chunks:
             for model_chunk in self.model_chunks:
                 for name, param in model_chunk.named_parameters():
                     model_param_to_name[id(param)] = name
+                    id_to_param_map[id(param)] = param
         
-        # For Float16Optimizer: build mapping from model params to main params
+        # For Float16Optimizer: record model params managed by optimizer.
         if hasattr(self, 'float16_groups') and hasattr(self, 'fp32_from_float16_groups'):
             for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
-                for model_param, main_param in zip(model_group, main_group):
+                for model_param, _main_param in zip(model_group, main_group):
                     param_id = id(model_param)
-                    model_param_to_main[param_id] = main_param
+                    optimizer_model_param_ids.add(param_id)
             # FP32 params are their own main params
             if hasattr(self, 'fp32_from_fp32_groups'):
                 for group in self.fp32_from_fp32_groups:
                     for param in group:
                         param_id = id(param)
-                        model_param_to_main[param_id] = param
+                        optimizer_model_param_ids.add(param_id)
         elif hasattr(self, 'model_chunks') and self.model_chunks:
             # For FP32Optimizer or DistributedOptimizer
-            # Map model params directly to optimizer params (they might be the same)
-            optimizer_params = self.get_parameters()
-            model_params_list = []
+            # Model params should be directly owned in these optimizer paths.
+            optimizer_params = set(self.get_parameters())
             for model_chunk in self.model_chunks:
-                for param in model_chunk.parameters():
-                    model_params_list.append(param)
-            
-            # Try to match by id first, then by shape
-            optimizer_param_by_shape = {}
-            for opt_param in optimizer_params:
-                key = (tuple(opt_param.shape), opt_param.dtype)
-                if key not in optimizer_param_by_shape:
-                    optimizer_param_by_shape[key] = []
-                optimizer_param_by_shape[key].append(opt_param)
-            
-            for model_param in model_params_list:
-                param_id = id(model_param)
-                # Try direct ID match first
-                if model_param in optimizer_params:
-                    model_param_to_main[param_id] = model_param
-                else:
-                    # Try shape match
-                    key = (tuple(model_param.shape), model_param.dtype)
-                    if key in optimizer_param_by_shape and optimizer_param_by_shape[key]:
-                        model_param_to_main[param_id] = optimizer_param_by_shape[key].pop(0)
-        
-        # Debug logging - basic info
-        logger.info(
-            f"[Layer-wise Update] Found {len(model_param_to_name)} named model parameters, "
-            f"{len(model_param_to_main)} model-to-main param mappings, "
-            f"{len(params)} total optimizer parameters"
-        )
+                for model_param in model_chunk.parameters():
+                    if model_param in optimizer_params:
+                        optimizer_model_param_ids.add(id(model_param))
         
         # Now iterate through model parameters and group them by layer
         for param_id, param_name in model_param_to_name.items():
-            # Get the main parameter for this model parameter
-            if param_id not in model_param_to_main:
+            # Include only parameters managed by this optimizer.
+            if param_id not in optimizer_model_param_ids:
                 # Skip parameters that are not in the optimizer
                 continue
-            
-            main_param = model_param_to_main[param_id]
+
+            param = id_to_param_map.get(param_id)
+            if param is None:
+                continue
             layer_detected = False
             
             if param_name:
@@ -746,7 +755,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                             layer_idx = int(parts[1].split('.')[0])
                             if layer_idx not in layer_dict:
                                 layer_dict[layer_idx] = []
-                            layer_dict[layer_idx].append(main_param)
+                            layer_dict[layer_idx].append(param)
                             layer_detected = True
                     except (ValueError, IndexError):
                         pass
@@ -760,170 +769,174 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                             layer_idx = int(match.group(1))
                             if layer_idx not in layer_dict:
                                 layer_dict[layer_idx] = []
-                            layer_dict[layer_idx].append(main_param)
+                            layer_dict[layer_idx].append(param)
                             layer_detected = True
                     except (ValueError, IndexError):
                         pass
             
             # If we can't determine layer, add to other_params
             if not layer_detected:
-                other_params.append(main_param)
+                other_params.append(param)
         
         # Convert dict to sorted list of layer parameter groups
         layer_params_groups = [layer_dict[idx] for idx in sorted(layer_dict.keys())]
         
-        # Add other parameters as a separate group at the end
+        # Add other parameters as a separate group at the end.
+        # Keep the index for per-group timing/logging.
+        self._layer_wise_other_group_index = None
         if other_params:
             layer_params_groups.append(other_params)
+            self._layer_wise_other_group_index = len(layer_params_groups) - 1
         
         # If no layers were detected, return all params as single group
         if not layer_params_groups:
             layer_params_groups = [params]
+            self._layer_wise_other_group_index = None
         
-        # Log layer detection results and size statistics
+        # Log layer detection results and size statistics (once per optimizer instance)
         if len(layer_dict) > 0:
-            logger.info(
-                f"[Layer-wise Update] Detected {len(layer_dict)} layers from parameter names. "
-                f"Layer indices: {sorted(layer_dict.keys())}"
-            )
-            
-            # Calculate and log size for each layer
-            logger.warning("=" * 80)
-            logger.warning("[Layer-wise Update] PARAMETER SIZE BY LAYER:")
-            logger.warning("=" * 80)
-            
-            total_all_layers_size = 0
-            total_all_layers_params = 0
-            
-            # Build reverse mapping from main_param to param_name for detailed output
-            main_to_name_map = {}
-            for param_id, param_name in model_param_to_name.items():
-                if param_id in model_param_to_main:
-                    main_param = model_param_to_main[param_id]
-                    main_to_name_map[id(main_param)] = param_name
-            
-            for layer_idx in sorted(layer_dict.keys()):
-                layer_params = layer_dict[layer_idx]
-                layer_size_bytes = 0
-                layer_num_params = 0
-                
-                logger.warning(f"\n  --- Layer {layer_idx:3d} ---")
-                
-                # Calculate size for each parameter in this layer
-                for param_idx, param in enumerate(layer_params):
-                    numel = param.numel()
-                    element_size = param.element_size()
-                    size_bytes = numel * element_size
-                    layer_size_bytes += size_bytes
-                    layer_num_params += numel
-                    
-                    # Get parameter name if available
-                    param_name = main_to_name_map.get(id(param), f"<param_{param_idx}>")
-                    shape_str = str(tuple(param.shape))
-                    
-                    # Format size display
-                    param_size_mb = size_bytes / (1024 * 1024)
-                    if param_size_mb >= 1024:
-                        param_size_str = f"{param_size_mb / 1024:.2f} GB"
-                    elif param_size_mb >= 1:
-                        param_size_str = f"{param_size_mb:.2f} MB"
-                    else:
-                        param_size_str = f"{size_bytes / 1024:.2f} KB"
-                    
-                    logger.warning(
-                        f"    Param #{param_idx+1:2d}: {param_name[:60]:<60} | "
-                        f"shape={shape_str:20s} | size={param_size_str:>10s} ({size_bytes:,} bytes)"
-                    )
-                
-                total_all_layers_size += layer_size_bytes
-                total_all_layers_params += layer_num_params
-                
-                # Format layer total size display
-                layer_size_mb = layer_size_bytes / (1024 * 1024)
-                if layer_size_mb >= 1024:
-                    layer_size_str = f"{layer_size_mb / 1024:.2f} GB ({layer_size_bytes:,} bytes)"
-                else:
-                    layer_size_str = f"{layer_size_mb:.2f} MB ({layer_size_bytes:,} bytes)"
-                
-                logger.warning(
-                    f"  Layer {layer_idx:3d} TOTAL: {len(layer_params)} parameters | "
-                    f"{layer_num_params:,} elements | size={layer_size_str}"
-                )
-            
-            # Log other parameters if any
-            if other_params:
-                logger.warning(f"\n  --- Other Parameters (not assigned to any layer) ---")
-                other_size_bytes = 0
-                other_num_params = 0
-                
-                for param_idx, param in enumerate(other_params):
-                    numel = param.numel()
-                    element_size = param.element_size()
-                    size_bytes = numel * element_size
-                    other_size_bytes += size_bytes
-                    other_num_params += numel
-                    
-                    # Get parameter name if available
-                    param_name = main_to_name_map.get(id(param), f"<param_{param_idx}>")
-                    shape_str = str(tuple(param.shape))
-                    
-                    # Format size display
-                    param_size_mb = size_bytes / (1024 * 1024)
-                    if param_size_mb >= 1024:
-                        param_size_str = f"{param_size_mb / 1024:.2f} GB"
-                    elif param_size_mb >= 1:
-                        param_size_str = f"{param_size_mb:.2f} MB"
-                    else:
-                        param_size_str = f"{size_bytes / 1024:.2f} KB"
-                    
-                    logger.warning(
-                        f"    Param #{param_idx+1:2d}: {param_name[:60]:<60} | "
-                        f"shape={shape_str:20s} | size={param_size_str:>10s} ({size_bytes:,} bytes)"
-                    )
-                
-                other_size_mb = other_size_bytes / (1024 * 1024)
-                if other_size_mb >= 1024:
-                    other_size_str = f"{other_size_mb / 1024:.2f} GB ({other_size_bytes:,} bytes)"
-                else:
-                    other_size_str = f"{other_size_mb:.2f} MB ({other_size_bytes:,} bytes)"
-                
-                logger.warning(
-                    f"  Other params TOTAL: {len(other_params)} parameters | "
-                    f"{other_num_params:,} elements | size={other_size_str}"
-                )
-                total_all_layers_size += other_size_bytes
-                total_all_layers_params += other_num_params
-            
-            # Log total
-            total_size_mb = total_all_layers_size / (1024 * 1024)
-            if total_size_mb >= 1024:
-                total_size_str = f"{total_size_mb / 1024:.2f} GB ({total_all_layers_size:,} bytes)"
-            else:
-                total_size_str = f"{total_size_mb:.2f} MB ({total_all_layers_size:,} bytes)"
-            
-            logger.warning("=" * 80)
-            logger.warning(
-                f"[Layer-wise Update] TOTAL: {total_all_layers_params:,} elements | "
-                f"size={total_size_str}"
-            )
-            logger.warning("=" * 80)
-            
-            if other_params:
+            if not getattr(self, '_layer_wise_infer_verbose_logged', False):
                 logger.info(
-                    f"[Layer-wise Update] Found {len(other_params)} parameters that could not be "
-                    "assigned to a specific layer (added as separate group)."
+                    f"[Layer-wise Update] Found {len(model_param_to_name)} named model parameters, "
+                    f"{len(optimizer_model_param_ids)} optimizer-managed model parameters, "
+                    f"{len(params)} total optimizer parameters"
                 )
+                logger.info(
+                    f"[Layer-wise Update] Detected {len(layer_dict)} layers from parameter names. "
+                    f"Layer indices: {sorted(layer_dict.keys())}"
+                )
+
+                logger.warning("=" * 80)
+                logger.warning("[Layer-wise Update] PARAMETER SIZE BY LAYER:")
+                logger.warning("=" * 80)
+
+                total_all_layers_size = 0
+                total_all_layers_params = 0
+
+                id_to_name_map = {}
+                for param_id, param_name in model_param_to_name.items():
+                    if param_id in optimizer_model_param_ids:
+                        id_to_name_map[param_id] = param_name
+
+                for layer_idx in sorted(layer_dict.keys()):
+                    layer_params = layer_dict[layer_idx]
+                    layer_size_bytes = 0
+                    layer_num_params = 0
+
+                    logger.warning(f"\n  --- Layer {layer_idx:3d} ---")
+
+                    for param_idx, param in enumerate(layer_params):
+                        numel = param.numel()
+                        element_size = param.element_size()
+                        size_bytes = numel * element_size
+                        layer_size_bytes += size_bytes
+                        layer_num_params += numel
+
+                        param_name = id_to_name_map.get(id(param), f"<param_{param_idx}>")
+                        shape_str = str(tuple(param.shape))
+
+                        param_size_mb = size_bytes / (1024 * 1024)
+                        if param_size_mb >= 1024:
+                            param_size_str = f"{param_size_mb / 1024:.2f} GB"
+                        elif param_size_mb >= 1:
+                            param_size_str = f"{param_size_mb:.2f} MB"
+                        else:
+                            param_size_str = f"{size_bytes / 1024:.2f} KB"
+
+                        logger.warning(
+                            f"    Param #{param_idx+1:2d}: {param_name[:60]:<60} | "
+                            f"shape={shape_str:20s} | size={param_size_str:>10s} ({size_bytes:,} bytes)"
+                        )
+
+                    total_all_layers_size += layer_size_bytes
+                    total_all_layers_params += layer_num_params
+
+                    layer_size_mb = layer_size_bytes / (1024 * 1024)
+                    if layer_size_mb >= 1024:
+                        layer_size_str = f"{layer_size_mb / 1024:.2f} GB ({layer_size_bytes:,} bytes)"
+                    else:
+                        layer_size_str = f"{layer_size_mb:.2f} MB ({layer_size_bytes:,} bytes)"
+
+                    logger.warning(
+                        f"  Layer {layer_idx:3d} TOTAL: {len(layer_params)} parameters | "
+                        f"{layer_num_params:,} elements | size={layer_size_str}"
+                    )
+
+                if other_params:
+                    logger.warning(
+                        "\n  --- Other Parameters (not assigned to any layer) ---"
+                    )
+                    other_size_bytes = 0
+                    other_num_params = 0
+
+                    for param_idx, param in enumerate(other_params):
+                        numel = param.numel()
+                        element_size = param.element_size()
+                        size_bytes = numel * element_size
+                        other_size_bytes += size_bytes
+                        other_num_params += numel
+
+                        param_name = id_to_name_map.get(id(param), f"<param_{param_idx}>")
+                        shape_str = str(tuple(param.shape))
+
+                        param_size_mb = size_bytes / (1024 * 1024)
+                        if param_size_mb >= 1024:
+                            param_size_str = f"{param_size_mb / 1024:.2f} GB"
+                        elif param_size_mb >= 1:
+                            param_size_str = f"{param_size_mb:.2f} MB"
+                        else:
+                            param_size_str = f"{size_bytes / 1024:.2f} KB"
+
+                        logger.warning(
+                            f"    Param #{param_idx+1:2d}: {param_name[:60]:<60} | "
+                            f"shape={shape_str:20s} | size={param_size_str:>10s} ({size_bytes:,} bytes)"
+                        )
+
+                    other_size_mb = other_size_bytes / (1024 * 1024)
+                    if other_size_mb >= 1024:
+                        other_size_str = f"{other_size_mb / 1024:.2f} GB ({other_size_bytes:,} bytes)"
+                    else:
+                        other_size_str = f"{other_size_mb:.2f} MB ({other_size_bytes:,} bytes)"
+
+                    logger.warning(
+                        f"  Other params TOTAL: {len(other_params)} parameters | "
+                        f"{other_num_params:,} elements | size={other_size_str}"
+                    )
+                    total_all_layers_size += other_size_bytes
+                    total_all_layers_params += other_num_params
+
+                total_size_mb = total_all_layers_size / (1024 * 1024)
+                if total_size_mb >= 1024:
+                    total_size_str = f"{total_size_mb / 1024:.2f} GB ({total_all_layers_size:,} bytes)"
+                else:
+                    total_size_str = f"{total_size_mb:.2f} MB ({total_all_layers_size:,} bytes)"
+
+                logger.warning("=" * 80)
+                logger.warning(
+                    f"[Layer-wise Update] TOTAL: {total_all_layers_params:,} elements | "
+                    f"size={total_size_str}"
+                )
+                logger.warning("=" * 80)
+
+                if other_params:
+                    logger.info(
+                        f"[Layer-wise Update] Found {len(other_params)} parameters that could not be "
+                        "assigned to a specific layer (added as separate group)."
+                    )
+                self._layer_wise_infer_verbose_logged = True
         else:
-            logger.warning(
-                f"[Layer-wise Update] Could not detect layer structure from parameter names. "
-                f"Treating all {len(params)} parameters as a single group."
-            )
-            logger.warning(
-                "[Layer-wise Update] HINT: You may need to:\n"
-                "  1. Use --layer-wise-fallback-grouping to enable automatic grouping\n"
-                "  2. Ensure model_chunks are passed to optimizer\n"
-                "  3. Provide explicit layer_params_groups to step_layer_by_layer()"
-            )
+            if not getattr(self, '_layer_wise_infer_verbose_logged', False):
+                logger.warning(
+                    f"[Layer-wise Update] Could not detect layer structure from parameter names. "
+                    f"Treating all {len(params)} parameters as a single group."
+                )
+                logger.warning(
+                    "[Layer-wise Update] HINT: You may need to:\n"
+                    "  1. Use --layer-wise-fallback-grouping to enable automatic grouping\n"
+                    "  2. Ensure model_chunks are passed to optimizer\n"
+                    "  3. Provide explicit layer_params_groups to step_layer_by_layer()"
+                )
+                self._layer_wise_infer_verbose_logged = True
         
         return layer_params_groups
 
@@ -1170,7 +1183,21 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 f"[Layer-wise Update] Updating layer {layer_idx}/{len(layer_params_groups)-1} "
                 f"with {len(layer_main_params)} parameters"
             )
-            
+
+            other_group_index = getattr(self, "_layer_wise_other_group_index", None)
+            if other_group_index is not None and layer_idx == other_group_index:
+                layer_timer_name = "optimizer-layer-other-step"
+                layer_full_timer_name = "optimizer-layer-other-full"
+            else:
+                layer_timer_name = f"optimizer-layer-{layer_idx}-step"
+                layer_full_timer_name = f"optimizer-layer-{layer_idx}-full"
+
+            # Full per-layer work: param group filter, step, logging, main-to-model copy, restore.
+            if timers is not None:
+                timers(layer_full_timer_name, log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
+
             # Create temporary param groups for this layer
             saved_param_groups = []
             for param_group in self.optimizer.param_groups:
@@ -1180,11 +1207,28 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 # Filter to only include this layer's params
                 layer_param_ids = set(id(p) for p in layer_main_params)
                 param_group['params'] = [p for p in original_params if id(p) in layer_param_ids]
-            
-            print("before optimizer step for layer ", layer_idx)
+
+            if timers is not None:
+                timers(layer_timer_name, log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
             # Step optimizer for this layer only
             self.optimizer.step()
-            print("end optimizer step for layer ", layer_idx)
+            if timers is not None:
+                timers(layer_timer_name).stop()
+
+            state_bytes = _optimizer_state_tensor_bytes_for_params(self.optimizer, layer_main_params)
+            param_numel = sum(p.numel() for p in layer_main_params)
+            group_label = (
+                "other"
+                if other_group_index is not None and layer_idx == other_group_index
+                else f"layer-{layer_idx}"
+            )
+            logger.info(
+                f"[Layer-wise Update] optimizer state tensor bytes | {group_label} | "
+                f"optimizer_params={len(layer_main_params)} | param_numel={param_numel} | "
+                f"state_bytes={state_bytes}"
+            )
 
             # Copy updated main params back to model params for this layer
             layer_model_data = []
@@ -1206,6 +1250,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             # Restore original param groups
             for param_group, original_params in zip(self.optimizer.param_groups, saved_param_groups):
                 param_group['params'] = original_params
+
+            if timers is not None:
+                timers(layer_full_timer_name).stop()
         
         if timers is not None:
             timers('optimizer-layer-by-layer-inner-step').stop()
@@ -1458,7 +1505,20 @@ class FP32Optimizer(MegatronOptimizer):
                 f"[Layer-wise Update] Updating layer {layer_idx}/{len(layer_params_groups)-1} "
                 f"with {len(layer_params)} parameters"
             )
-            
+
+            other_group_index = getattr(self, "_layer_wise_other_group_index", None)
+            if other_group_index is not None and layer_idx == other_group_index:
+                layer_timer_name = "optimizer-layer-other-step"
+                layer_full_timer_name = "optimizer-layer-other-full"
+            else:
+                layer_timer_name = f"optimizer-layer-{layer_idx}-step"
+                layer_full_timer_name = f"optimizer-layer-{layer_idx}-full"
+
+            if timers is not None:
+                timers(layer_full_timer_name, log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
+
             layer_param_ids = set(id(p) for p in layer_params)
             
             # Temporarily filter param groups to only include this layer
@@ -1469,13 +1529,35 @@ class FP32Optimizer(MegatronOptimizer):
                 
                 # Filter to only include this layer's params
                 param_group['params'] = [p for p in original_params if id(p) in layer_param_ids]
-            
+
+            if timers is not None:
+                timers(layer_timer_name, log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
             # Step optimizer for this layer
             self.optimizer.step()
-            
+            if timers is not None:
+                timers(layer_timer_name).stop()
+
+            state_bytes = _optimizer_state_tensor_bytes_for_params(self.optimizer, layer_params)
+            param_numel = sum(p.numel() for p in layer_params)
+            group_label = (
+                "other"
+                if other_group_index is not None and layer_idx == other_group_index
+                else f"layer-{layer_idx}"
+            )
+            logger.info(
+                f"[Layer-wise Update] optimizer state tensor bytes | {group_label} | "
+                f"optimizer_params={len(layer_params)} | param_numel={param_numel} | "
+                f"state_bytes={state_bytes}"
+            )
+
             # Restore original param groups
             for param_group, original_params in zip(self.optimizer.param_groups, saved_param_groups):
                 param_group['params'] = original_params
+
+            if timers is not None:
+                timers(layer_full_timer_name).stop()
         
         if timers is not None:
             timers('optimizer-layer-by-layer-inner-step').stop()
@@ -1832,8 +1914,16 @@ class ChainedOptimizer(MegatronOptimizer):
         Returns:
             Tuple of (success, grad_norm, num_zeros_in_grad)
         """
+        timers = self.config.timers
+        if timers is not None:
+            timers('optimizer-layer-wise-before-layers', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
+            )
+
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
+            if timers is not None:
+                timers('optimizer-layer-wise-before-layers').stop()
             return False, None, None
 
         grad_norm = self.get_grad_norm()
@@ -1858,9 +1948,17 @@ class ChainedOptimizer(MegatronOptimizer):
         # Count zeros
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
 
-        # Infer layer groups if not provided (from first optimizer)
+        # Infer layer groups if not provided (from first optimizer); cache after first infer
         if layer_params_groups is None and self.chained_optimizers:
-            layer_params_groups = self.chained_optimizers[0]._infer_layer_param_groups()
+            cached_groups = getattr(self, '_cached_layer_params_groups', None)
+            if cached_groups is not None:
+                layer_params_groups = cached_groups
+            else:
+                layer_params_groups = self.chained_optimizers[0]._infer_layer_param_groups()
+                self._cached_layer_params_groups = layer_params_groups
+
+        if timers is not None:
+            timers('optimizer-layer-wise-before-layers').stop()
 
         # Step each optimizer layer by layer
         update_successful = True

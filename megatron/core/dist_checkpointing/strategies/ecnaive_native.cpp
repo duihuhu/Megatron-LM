@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -7,6 +11,11 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <sched.h>
+
+#include <array>
+#include <cctype>
 
 // 64-bit network byte order conversion functions (for large data transfers > 4GB)
 inline uint64_t htonll(uint64_t value) {
@@ -27,7 +36,6 @@ inline uint64_t ntohll(uint64_t value) {
     return htonll(value);
 }
 
-#include <array>
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
@@ -434,41 +442,35 @@ private:
             size_t chunk_size = std::min(remaining, CHUNK_SIZE);
             size_t chunk_count = (chunk_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
             
-            std::vector<ibv_sge> sges;
-            std::vector<ibv_send_wr> wrs;
+            // Resize first so &sges[i] and &wrs[i+1] stay valid for the whole post_send call.
+            std::vector<ibv_sge> sges(chunk_count);
+            std::vector<ibv_send_wr> wrs(chunk_count);
             
             for (size_t i = 0; i < chunk_count; ++i) {
                 size_t current_size = std::min(CHUNK_SIZE, remaining);
                 
-                ibv_sge sge{};
-                sge.addr = reinterpret_cast<uint64_t>(data + offset);
-                sge.length = current_size;
-                sge.lkey = mr->lkey;
-                sges.push_back(sge);
+                sges[i].addr = reinterpret_cast<uint64_t>(data + offset);
+                sges[i].length = static_cast<uint32_t>(current_size);
+                sges[i].lkey = mr->lkey;
                 
-                ibv_send_wr wr{};
-                wr.wr_id = i;
-                wr.sg_list = &sges[i];
-                wr.num_sge = 1;
-                wr.opcode = IBV_WR_SEND;
-                wr.send_flags = IBV_SEND_SIGNALED;
-                if (i < chunk_count - 1) {
-                    wr.next = &wrs[i + 1];
-                }
-                wrs.push_back(wr);
+                std::memset(&wrs[i], 0, sizeof(wrs[i]));
+                wrs[i].wr_id = i;
+                wrs[i].sg_list = &sges[i];
+                wrs[i].num_sge = 1;
+                wrs[i].opcode = IBV_WR_SEND;
+                wrs[i].send_flags = IBV_SEND_SIGNALED;
+                wrs[i].next = (i + 1 < chunk_count) ? &wrs[i + 1] : nullptr;
                 
                 offset += current_size;
                 remaining -= current_size;
             }
             
-            // Post send work requests
             ibv_send_wr* bad_wr = nullptr;
             if (ibv_post_send(qp_, &wrs[0], &bad_wr)) {
                 throw std::runtime_error("Failed to post send work request");
             }
             
-            // Poll for completions
-            poll_completion(send_cq_, chunk_count);
+            poll_completion(send_cq_, static_cast<int>(chunk_count));
         }
     }
     
@@ -480,39 +482,32 @@ private:
             size_t chunk_count = std::min(remaining, CHUNK_SIZE * MAX_BATCH_WR) / CHUNK_SIZE;
             if (chunk_count == 0) chunk_count = 1;
             
-            std::vector<ibv_sge> sges;
-            std::vector<ibv_recv_wr> wrs;
+            std::vector<ibv_sge> sges(chunk_count);
+            std::vector<ibv_recv_wr> wrs(chunk_count);
             
             for (size_t i = 0; i < chunk_count; ++i) {
                 size_t current_size = std::min(CHUNK_SIZE, remaining);
                 
-                ibv_sge sge{};
-                sge.addr = reinterpret_cast<uint64_t>(buffer + offset);
-                sge.length = current_size;
-                sge.lkey = mr->lkey;
-                sges.push_back(sge);
+                sges[i].addr = reinterpret_cast<uint64_t>(buffer + offset);
+                sges[i].length = static_cast<uint32_t>(current_size);
+                sges[i].lkey = mr->lkey;
                 
-                ibv_recv_wr wr{};
-                wr.wr_id = i;
-                wr.sg_list = &sges[i];
-                wr.num_sge = 1;
-                if (i < chunk_count - 1) {
-                    wr.next = &wrs[i + 1];
-                }
-                wrs.push_back(wr);
+                std::memset(&wrs[i], 0, sizeof(wrs[i]));
+                wrs[i].wr_id = i;
+                wrs[i].sg_list = &sges[i];
+                wrs[i].num_sge = 1;
+                wrs[i].next = (i + 1 < chunk_count) ? &wrs[i + 1] : nullptr;
                 
                 offset += current_size;
                 remaining -= current_size;
             }
             
-            // Post receive work requests
             ibv_recv_wr* bad_wr = nullptr;
             if (ibv_post_recv(qp_, &wrs[0], &bad_wr)) {
                 throw std::runtime_error("Failed to post receive work request");
             }
             
-            // Poll for completions
-            poll_completion(recv_cq_, chunk_count);
+            poll_completion(recv_cq_, static_cast<int>(chunk_count));
         }
     }
     
@@ -1661,6 +1656,7 @@ void AsioConnectionManager::init_ecnaive_load_send_rank0_parity0(const std::stri
         std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank0_parity0 error: " << e.what() << std::endl;
         ecnaive_load_send_rank0_parity0_connected_ = false;
         connection_cv_.notify_all();
+        throw;
     }
 }
 
@@ -1676,6 +1672,7 @@ void AsioConnectionManager::init_ecnaive_load_send_rank3_data1(const std::string
         std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank3_data1 error: " << e.what() << std::endl;
         ecnaive_load_send_rank3_data1_connected_ = false;
         connection_cv_.notify_all();
+        throw;
     }
 }
 
@@ -1692,6 +1689,7 @@ void AsioConnectionManager::init_ecnaive_load_send_rank0_data0(const std::string
         std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank0_data0 error: " << e.what() << std::endl;
         ecnaive_load_send_rank0_data0_connected_ = false;
         connection_cv_.notify_all();
+        throw;
     }
 }
 
@@ -1707,6 +1705,7 @@ void AsioConnectionManager::init_ecnaive_load_send_rank0_data1(const std::string
         std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank0_data1 error: " << e.what() << std::endl;
         ecnaive_load_send_rank0_data1_connected_ = false;
         connection_cv_.notify_all();
+        throw;
     }
 }
 
@@ -1723,6 +1722,7 @@ void AsioConnectionManager::init_ecnaive_load_send_rank1_data1(const std::string
         std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank1_data1 error: " << e.what() << std::endl;
         ecnaive_load_send_rank1_data1_connected_ = false;
         connection_cv_.notify_all();
+        throw;
     }
 }
 
@@ -1738,6 +1738,7 @@ void AsioConnectionManager::init_ecnaive_load_send_rank1_data0(const std::string
         std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank1_data0 error: " << e.what() << std::endl;
         ecnaive_load_send_rank1_data0_connected_ = false;
         connection_cv_.notify_all();
+        throw;
     }
 }
 
@@ -1753,6 +1754,7 @@ void AsioConnectionManager::init_ecnaive_load_send_rank1_parity1(const std::stri
         std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank1_parity1 error: " << e.what() << std::endl;
         ecnaive_load_send_rank1_parity1_connected_ = false;
         connection_cv_.notify_all();
+        throw;
     }
 }
 
@@ -1769,6 +1771,7 @@ void AsioConnectionManager::init_ecnaive_load_send_rank3_data0(const std::string
         std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank3_data0 error: " << e.what() << std::endl;
         ecnaive_load_send_rank3_data0_connected_ = false;
         connection_cv_.notify_all();
+        throw;
     }
 }
 
@@ -1895,11 +1898,28 @@ struct LoadXORTask {
     size_t size;
 };
 
+// Four XORs over the same byte range: for each k, dst = src0 XOR src1 (memcpy src0 to dst, then xor_gen with src1).
+struct XorStripeFourOps {
+    size_t size{0};
+    struct {
+        uintptr_t dst{0};
+        uintptr_t src0{0};
+        uintptr_t src1{0};
+    } op[4]{};
+};
+
 struct LoadSendTask {
     uintptr_t send_addr;  // mmap地址或buffer地址
     size_t size;
     bool is_mmap;         // 标记是否为mmap（不需要释放）
     int socket_type;      // Socket类型标识: 0=parity0, 1=data0, 2=data1, 3=parity1 (用于区分不同socket)
+};
+
+class ECNaiveNative;
+
+struct XorPoolWorkerCtx {
+    ECNaiveNative* self{nullptr};
+    int wid{0};
 };
 
 class ECNaiveNative {
@@ -2698,6 +2718,8 @@ public:
             load_recv_queue_cv_.notify_all();
             load_xor_queue_cv_.notify_all();
             load_send_queue_cv_.notify_all();
+            // Unblock load XOR coordinator if it is waiting inside xor_pool_run_parallel_load_xor (predicate uses stop_)
+            xor_pool_coordinator_cv_.notify_all();
         }
         
         if (send_data1_thread_.joinable()) send_data1_thread_.join();
@@ -2715,6 +2737,7 @@ public:
             if (load_xor_worker_.joinable()) {
                 load_xor_worker_.join();
             }
+            xor_pool_shutdown();
         } else if (is_load_mode_ && (rank_ == 0 || rank_ == 1 || rank_ == 3)) {
             if (load_send_worker_.joinable()) {
                 load_send_worker_.join();
@@ -2751,7 +2774,8 @@ public:
             
             // Start workers based on rank_in_group (rank_ is set in init_ecnaive_load_connections)
             if (rank_ == 2) {
-                // rank2: start recv and xor workers
+                // rank2: start recv and xor workers (XOR uses a persistent pthread pool)
+                xor_pool_init();
                 if (!load_recv_worker_.joinable()) {
                     load_recv_worker_ = std::thread(&ECNaiveNative::load_recv_worker, this);
                 }
@@ -2862,128 +2886,156 @@ public:
             std::cout << "ECLATIN: [Rank " << rank << "] Load connections initialized" << std::endl;
     }
 
-    // EC-NAIVE load mode connection initialization (rank_in_group 2 is receiver per group)
+    // Phase 1: set rank_, create load RDMA CQs (all ranks), rank2 bind+listen on 8 ports.
+    // Python should call torch.distributed.barrier() after this on all ranks before phase 2.
+    void init_ecnaive_load_bind_listen_only(
+        int rank_in_group,
+        const std::string& rank2_ip,
+        uint16_t load_recv_rank3_data1_port,
+        uint16_t load_recv_rank0_parity0_port,
+        uint16_t load_recv_rank0_data0_port,
+        uint16_t load_recv_rank1_data1_port,
+        uint16_t load_recv_rank1_data0_port,
+        uint16_t load_recv_rank1_parity1_port,
+        uint16_t load_recv_rank3_data0_port,
+        uint16_t load_recv_rank0_data1_port
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "EC-NAIVE: init_ecnaive_load_bind_listen_only called but not in load mode" << std::endl;
+            return;
+        }
+        rank_ = rank_in_group;
+        if (use_rdma_) {
+            init_rdma_load_resources();
+        }
+        if (rank_in_group != 2) {
+            std::cout << "EC-NAIVE: [Rank_in_group " << rank_in_group << "] Load phase 1: RDMA resources ready (no TCP on this rank)"
+                      << std::endl;
+            return;
+        }
+        std::cout << "EC-NAIVE: [Rank_in_group 2] Load phase 1: binding and listening on 8 ports..." << std::endl;
+        conn_.bind_listen_ecnaive_load_recv_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
+        conn_.bind_listen_ecnaive_load_recv_rank0_parity0(rank2_ip, load_recv_rank0_parity0_port);
+        conn_.bind_listen_ecnaive_load_recv_rank0_data0(rank2_ip, load_recv_rank0_data0_port);
+        conn_.bind_listen_ecnaive_load_recv_rank1_data1(rank2_ip, load_recv_rank1_data1_port);
+        conn_.bind_listen_ecnaive_load_recv_rank1_data0(rank2_ip, load_recv_rank1_data0_port);
+        conn_.bind_listen_ecnaive_load_recv_rank1_parity1(rank2_ip, load_recv_rank1_parity1_port);
+        conn_.bind_listen_ecnaive_load_recv_rank3_data0(rank2_ip, load_recv_rank3_data0_port);
+        conn_.bind_listen_ecnaive_load_recv_rank0_data1(rank2_ip, load_recv_rank0_data1_port);
+        std::cout << "EC-NAIVE: [Rank_in_group 2] Load phase 1 complete: all 8 acceptors listening" << std::endl;
+    }
+
+    // Phase 2: rank2 accepts 8 TCP; rank0/1/3 connect; then init RDMA load channels.
+    void init_ecnaive_load_tcp_handshake_and_rdma(
+        int rank_in_group,
+        const std::string& rank2_ip,
+        uint16_t load_recv_rank3_data1_port,
+        uint16_t load_recv_rank0_parity0_port,
+        uint16_t load_recv_rank0_data0_port,
+        uint16_t load_recv_rank1_data1_port,
+        uint16_t load_recv_rank1_data0_port,
+        uint16_t load_recv_rank1_parity1_port,
+        uint16_t load_recv_rank3_data0_port,
+        uint16_t load_recv_rank0_data1_port
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "EC-NAIVE: init_ecnaive_load_tcp_handshake_and_rdma called but not in load mode" << std::endl;
+            return;
+        }
+        rank_ = rank_in_group;
+        std::cout << "EC-NAIVE: [Rank_in_group " << rank_in_group << "] Load phase 2: TCP handshake and RDMA channels..."
+                  << std::endl;
+
+        if (rank_in_group == 2) {
+            std::thread recv_init_thread([this]() {
+                std::thread accept_threads[8];
+                accept_threads[0] = std::thread([this]() { conn_.accept_ecnaive_load_recv_rank3_data1(); });
+                accept_threads[1] = std::thread([this]() { conn_.accept_ecnaive_load_recv_rank0_parity0(); });
+                accept_threads[2] = std::thread([this]() { conn_.accept_ecnaive_load_recv_rank0_data0(); });
+                accept_threads[3] = std::thread([this]() { conn_.accept_ecnaive_load_recv_rank1_data1(); });
+                accept_threads[4] = std::thread([this]() { conn_.accept_ecnaive_load_recv_rank1_data0(); });
+                accept_threads[5] = std::thread([this]() { conn_.accept_ecnaive_load_recv_rank1_parity1(); });
+                accept_threads[6] = std::thread([this]() { conn_.accept_ecnaive_load_recv_rank3_data0(); });
+                accept_threads[7] = std::thread([this]() { conn_.accept_ecnaive_load_recv_rank0_data1(); });
+                for (auto& t : accept_threads) {
+                    t.join();
+                }
+            });
+            recv_init_thread.join();
+            auto& c = conn_;
+            if (!c.is_ecnaive_load_recv_rank3_data1_connected() || !c.is_ecnaive_load_recv_rank0_parity0_connected() ||
+                !c.is_ecnaive_load_recv_rank0_data0_connected() || !c.is_ecnaive_load_recv_rank1_data1_connected() ||
+                !c.is_ecnaive_load_recv_rank1_data0_connected() || !c.is_ecnaive_load_recv_rank1_parity1_connected() ||
+                !c.is_ecnaive_load_recv_rank3_data0_connected() || !c.is_ecnaive_load_recv_rank0_data1_connected()) {
+                throw std::runtime_error(
+                    "EC-NAIVE: rank2 did not accept all 8 load TCP connections (check earlier accept errors)");
+            }
+            std::cout << "EC-NAIVE: [Rank_in_group 2] All 8 load TCP connections accepted" << std::endl;
+        } else if (rank_in_group == 0) {
+            std::cout << "EC-NAIVE: [Rank_in_group 0] Connecting to receiver on 3 ports..." << std::endl;
+            conn_.init_ecnaive_load_send_rank0_parity0(rank2_ip, load_recv_rank0_parity0_port);
+            conn_.init_ecnaive_load_send_rank0_data0(rank2_ip, load_recv_rank0_data0_port);
+            conn_.init_ecnaive_load_send_rank0_data1(rank2_ip, load_recv_rank0_data1_port);
+            auto& c = conn_;
+            if (!c.is_ecnaive_load_send_rank0_parity0_connected() || !c.is_ecnaive_load_send_rank0_data0_connected() ||
+                !c.is_ecnaive_load_send_rank0_data1_connected()) {
+                throw std::runtime_error("EC-NAIVE: rank0 load TCP connect verification failed");
+            }
+            std::cout << "EC-NAIVE: [Rank_in_group 0] All 3 load TCP connections verified" << std::endl;
+        } else if (rank_in_group == 1) {
+            std::cout << "EC-NAIVE: [Rank_in_group 1] Connecting to receiver on 3 ports..." << std::endl;
+            conn_.init_ecnaive_load_send_rank1_data1(rank2_ip, load_recv_rank1_data1_port);
+            conn_.init_ecnaive_load_send_rank1_data0(rank2_ip, load_recv_rank1_data0_port);
+            conn_.init_ecnaive_load_send_rank1_parity1(rank2_ip, load_recv_rank1_parity1_port);
+            auto& c = conn_;
+            if (!c.is_ecnaive_load_send_rank1_data1_connected() || !c.is_ecnaive_load_send_rank1_data0_connected() ||
+                !c.is_ecnaive_load_send_rank1_parity1_connected()) {
+                throw std::runtime_error("EC-NAIVE: rank1 load TCP connect verification failed");
+            }
+            std::cout << "EC-NAIVE: [Rank_in_group 1] All 3 load TCP connections verified" << std::endl;
+        } else if (rank_in_group == 3) {
+            std::cout << "EC-NAIVE: [Rank_in_group 3] Connecting to receiver on 2 ports..." << std::endl;
+            conn_.init_ecnaive_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
+            conn_.init_ecnaive_load_send_rank3_data0(rank2_ip, load_recv_rank3_data0_port);
+            auto& c = conn_;
+            if (!c.is_ecnaive_load_send_rank3_data1_connected() || !c.is_ecnaive_load_send_rank3_data0_connected()) {
+                throw std::runtime_error("EC-NAIVE: rank3 load TCP connect verification failed");
+            }
+            std::cout << "EC-NAIVE: [Rank_in_group 3] All 2 load TCP connections verified" << std::endl;
+        }
+
+        if (use_rdma_ && rdma_pd_) {
+            init_rdma_load_channels();
+        }
+    }
+
+    // EC-NAIVE load mode connection initialization (rank_in_group 2 is receiver per group).
+    // Prefer Python: init_ecnaive_load_bind_listen_only -> barrier -> init_ecnaive_load_tcp_handshake_and_rdma.
+    // This single call runs both phases back-to-back without a cross-rank barrier (may race if clients start early).
     void init_ecnaive_load_connections(
         int rank_in_group,
         const std::string& rank2_ip,
-        uint16_t load_recv_rank3_data1_port,      // port 0: d_{2,1} from rank3
-        uint16_t load_recv_rank0_parity0_port,    // port 1: p_{2,0} from rank0
-        uint16_t load_recv_rank0_data0_port,      // port 2: d_{0,0} from rank0
-        uint16_t load_recv_rank1_data1_port,      // port 3: d_{0,1} from rank1
-        uint16_t load_recv_rank1_data0_port,      // port 4: d_{1,0} from rank1
-        uint16_t load_recv_rank1_parity1_port,    // port 5: p_{1,1} from rank1
-        uint16_t load_recv_rank3_data0_port,      // port 6: d_{3,0} from rank3
-        uint16_t load_recv_rank0_data1_port       // port 7: d_{3,1} from rank0
+        uint16_t load_recv_rank3_data1_port,
+        uint16_t load_recv_rank0_parity0_port,
+        uint16_t load_recv_rank0_data0_port,
+        uint16_t load_recv_rank1_data1_port,
+        uint16_t load_recv_rank1_data0_port,
+        uint16_t load_recv_rank1_parity1_port,
+        uint16_t load_recv_rank3_data0_port,
+        uint16_t load_recv_rank0_data1_port
     ) {
         if (!is_load_mode_) {
             std::cerr << "EC-NAIVE: init_ecnaive_load_connections called but not in load mode" << std::endl;
             return;
         }
-        
-        rank_ = rank_in_group;  // For worker threads (receiver/sender role)
-
-        if (use_rdma_) {
-            try {
-                init_rdma_load_resources();
-            } catch (const std::exception& e) {
-                std::cerr << "EC-NAIVE: Load RDMA resources init failed: " << e.what() << std::endl;
-            }
-        }
-        
-        std::cout << "EC-NAIVE: [Rank_in_group " << rank_in_group << "] Initializing load connections (full recovery: 8 ports)..." << std::endl;
-        
-        if (rank_in_group == 2) {
-            // rank2: bind, listen, and accept on 8 ports
-            try {
-                // Bind and listen all 8 acceptors
-                conn_.bind_listen_ecnaive_load_recv_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
-                conn_.bind_listen_ecnaive_load_recv_rank0_parity0(rank2_ip, load_recv_rank0_parity0_port);
-                conn_.bind_listen_ecnaive_load_recv_rank0_data0(rank2_ip, load_recv_rank0_data0_port);
-                conn_.bind_listen_ecnaive_load_recv_rank1_data1(rank2_ip, load_recv_rank1_data1_port);
-                conn_.bind_listen_ecnaive_load_recv_rank1_data0(rank2_ip, load_recv_rank1_data0_port);
-                conn_.bind_listen_ecnaive_load_recv_rank1_parity1(rank2_ip, load_recv_rank1_parity1_port);
-                conn_.bind_listen_ecnaive_load_recv_rank3_data0(rank2_ip, load_recv_rank3_data0_port);
-                conn_.bind_listen_ecnaive_load_recv_rank0_data1(rank2_ip, load_recv_rank0_data1_port);
-                
-                std::cout << "EC-NAIVE: [Rank_in_group 2] All 8 acceptors bound and listening, starting accept threads..." << std::endl;
-                
-                // Start accept operations in separate threads
-                // These threads will block on accept() until connections arrive
-                std::thread recv_init_thread([this]() {
-                    std::thread accept_threads[8];
-                    
-                    accept_threads[0] = std::thread([this]() {
-                        conn_.accept_ecnaive_load_recv_rank3_data1();
-                    });
-                    accept_threads[1] = std::thread([this]() {
-                        conn_.accept_ecnaive_load_recv_rank0_parity0();
-                    });
-                    accept_threads[2] = std::thread([this]() {
-                        conn_.accept_ecnaive_load_recv_rank0_data0();
-                    });
-                    accept_threads[3] = std::thread([this]() {
-                        conn_.accept_ecnaive_load_recv_rank1_data1();
-                    });
-                    accept_threads[4] = std::thread([this]() {
-                        conn_.accept_ecnaive_load_recv_rank1_data0();
-                    });
-                    accept_threads[5] = std::thread([this]() {
-                        conn_.accept_ecnaive_load_recv_rank1_parity1();
-                    });
-                    accept_threads[6] = std::thread([this]() {
-                        conn_.accept_ecnaive_load_recv_rank3_data0();
-                    });
-                    accept_threads[7] = std::thread([this]() {
-                        conn_.accept_ecnaive_load_recv_rank0_data1();
-                    });
-                    
-                    // Join all accept threads
-                    for (auto& t : accept_threads) {
-                        t.join();
-                    }
-                });
-                
-                // Small delay to ensure accept sockets are bound and listening
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                
-                // Join so all 8 TCP connections are established before we create RDMA channels
-                recv_init_thread.join();
-                
-                std::cout << "EC-NAIVE: [Rank_in_group 2] All 8 load connections accepted" << std::endl;
-            } catch (const std::exception& e) {
-                std::cerr << "EC-NAIVE: [Rank_in_group 2] Failed to initialize load connections: " << e.what() << std::endl;
-                throw;
-            }
-        } else if (rank_in_group == 0) {
-            // rank_in_group 0: connect to receiver on 3 ports (p_{2,0}, d_{0,0}, d_{3,1})
-            std::cout << "EC-NAIVE: [Rank_in_group 0] Connecting to receiver on 3 ports..." << std::endl;
-            conn_.init_ecnaive_load_send_rank0_parity0(rank2_ip, load_recv_rank0_parity0_port);  // p_{2,0}
-            conn_.init_ecnaive_load_send_rank0_data0(rank2_ip, load_recv_rank0_data0_port);      // d_{0,0}
-            conn_.init_ecnaive_load_send_rank0_data1(rank2_ip, load_recv_rank0_data1_port);      // d_{3,1}
-            std::cout << "EC-NAIVE: [Rank_in_group 0] All 3 load connections established" << std::endl;
-        } else if (rank_in_group == 1) {
-            // rank_in_group 1: connect to receiver on 3 ports (d_{0,1}, d_{1,0}, p_{1,1})
-            std::cout << "EC-NAIVE: [Rank_in_group 1] Connecting to receiver on 3 ports..." << std::endl;
-            conn_.init_ecnaive_load_send_rank1_data1(rank2_ip, load_recv_rank1_data1_port);      // d_{0,1}
-            conn_.init_ecnaive_load_send_rank1_data0(rank2_ip, load_recv_rank1_data0_port);      // d_{1,0}
-            conn_.init_ecnaive_load_send_rank1_parity1(rank2_ip, load_recv_rank1_parity1_port);  // p_{1,1}
-            std::cout << "EC-NAIVE: [Rank_in_group 1] All 3 load connections established" << std::endl;
-        } else if (rank_in_group == 3) {
-            // rank_in_group 3: connect to receiver on 2 ports (d_{2,1}, d_{3,0})
-            std::cout << "EC-NAIVE: [Rank_in_group 3] Connecting to receiver on 2 ports..." << std::endl;
-            conn_.init_ecnaive_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);     // d_{2,1}
-            conn_.init_ecnaive_load_send_rank3_data0(rank2_ip, load_recv_rank3_data0_port);     // d_{3,0}
-            std::cout << "EC-NAIVE: [Rank_in_group 3] All 2 load connections established" << std::endl;
-        }
-
-        if (use_rdma_ && rdma_pd_) {
-            try {
-                init_rdma_load_channels();
-            } catch (const std::exception& e) {
-                std::cerr << "EC-NAIVE: Load RDMA channels init failed: " << e.what() << std::endl;
-                throw;
-            }
-        }
+        init_ecnaive_load_bind_listen_only(
+            rank_in_group, rank2_ip, load_recv_rank3_data1_port, load_recv_rank0_parity0_port,
+            load_recv_rank0_data0_port, load_recv_rank1_data1_port, load_recv_rank1_data0_port,
+            load_recv_rank1_parity1_port, load_recv_rank3_data0_port, load_recv_rank0_data1_port);
+        init_ecnaive_load_tcp_handshake_and_rdma(
+            rank_in_group, rank2_ip, load_recv_rank3_data1_port, load_recv_rank0_parity0_port,
+            load_recv_rank0_data0_port, load_recv_rank1_data1_port, load_recv_rank1_data0_port,
+            load_recv_rank1_parity1_port, load_recv_rank3_data0_port, load_recv_rank0_data1_port);
     }
 
     // Software failure only: 1 port (rank3_data1), no workers; rank_ = rank_in_group
@@ -3138,7 +3190,21 @@ public:
         
         std::cout << "ECLATIN: [Rank 2] All 6 blocks received" << std::endl;
         
-        // Step 2: Parallel XOR recoveries using threads
+        // Step 2: XOR recoveries — reuse EC-NAIVE 16-pthread XOR pool when it is already initialized
+        // (same session as full EC-NAIVE load). Do not call load_recover concurrently with load_xor_worker.
+        if (xor_pool_inited_.load(std::memory_order_acquire)) {
+            XorStripeFourOps job{};
+            job.size = size;
+            job.op[0] = {recovered_data1_addr, rank0_data2_addr, rank1_parity1_addr};
+            job.op[1] = {recovered_data2_addr, rank0_parity2_addr, rank1_data1_addr};
+            job.op[2] = {recovered_parity1_addr, rank1_data1_addr, rank3_data2_addr};
+            job.op[3] = {recovered_parity2_addr, rank0_data2_addr, rank3_data1_addr};
+            xor_pool_run_parallel_four_xor(job);
+            std::cout << "ECLATIN: [Rank 2] Recovery completed successfully (XOR pthread pool)" << std::endl;
+            return;
+        }
+
+        // Fallback: four std::threads (legacy path when XOR pool was not started)
         std::vector<std::exception_ptr> xor_exceptions(4);
         std::vector<std::thread> xor_threads;
         
@@ -3440,8 +3506,23 @@ private:
 
     // EC-NAIVE load mode worker threads
     std::thread load_recv_worker_;      // rank2 only
-    std::thread load_xor_worker_;       // rank2 only
+    std::thread load_xor_worker_;       // rank2 only: coordinates XOR pthread pool
     std::thread load_send_worker_;      // rank0/3 only
+
+    // Load XOR: 16 pthread workers (CPU affinity via ECNAIVE_XOR_CPU_LIST)
+    static constexpr int kXorPoolSize = 16;
+    std::array<pthread_t, kXorPoolSize> xor_pool_threads_{};
+    std::array<XorPoolWorkerCtx, kXorPoolSize> xor_pool_ctx_{};
+    std::array<int, kXorPoolSize> xor_pool_cpus_{};
+    std::atomic<bool> xor_pool_inited_{false};
+    std::atomic<bool> xor_pool_stop_{false};
+    std::mutex xor_pool_mutex_;
+    std::condition_variable xor_pool_worker_cv_;
+    std::condition_variable xor_pool_coordinator_cv_;
+    std::atomic<uint64_t> xor_pool_epoch_{0};
+    std::array<uint64_t, kXorPoolSize> xor_pool_last_epoch_{};
+    std::atomic<int> xor_pool_remaining_{0};
+    XorStripeFourOps xor_pool_shared_job_{};
 
     // EC-NAIVE load mode completion flags
     std::atomic<bool> load_recv_worker_completed_{false};
@@ -3890,7 +3971,7 @@ private:
             return;
         }
         std::cout << "[ECNAIVE RDMA] Establishing dedicated TCP sockets for RdmaConnInfo exchange..." << std::endl;
-        // Start 3 accept threads (same order as ASIO: recv_parity1, recv_parity0, recv_data1)
+        // Accept side: same order as ASIO recv roles (recv_parity1, recv_parity0, recv_data1).
         std::thread accept_thread([this]() {
             auto do_listen_accept = [this](const std::string& ip, uint16_t port, int& out_fd, const char* name) {
                 int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -3927,8 +4008,6 @@ private:
             do_listen_accept(recv_parity0_ip_, rdma_recv_parity0_port_, rdma_recv_parity0_fd_, "rdma_recv_parity0");
             do_listen_accept(recv_data1_ip_, rdma_recv_data1_port_, rdma_recv_data1_fd_, "rdma_recv_data1");
         });
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        // Connect 3 send sockets
         auto do_connect = [this](const std::string& ip, uint16_t port, int& out_fd, const char* name) {
             out_fd = socket(AF_INET, SOCK_STREAM, 0);
             if (out_fd < 0) {
@@ -3956,10 +4035,21 @@ private:
             }
             std::cout << "[ECNAIVE RDMA] " << name << " connected" << std::endl;
         };
-        do_connect(send_data1_ip_, rdma_send_data1_port_, rdma_send_data1_fd_, "rdma_send_data1");
-        do_connect(send_parity0_ip_, rdma_send_parity0_port_, rdma_send_parity0_fd_, "rdma_send_parity0");
-        do_connect(send_parity1_ip_, rdma_send_parity1_port_, rdma_send_parity1_fd_, "rdma_send_parity1");
-        accept_thread.join();
+        try {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            do_connect(send_data1_ip_, rdma_send_data1_port_, rdma_send_data1_fd_, "rdma_send_data1");
+            do_connect(send_parity0_ip_, rdma_send_parity0_port_, rdma_send_parity0_fd_, "rdma_send_parity0");
+            do_connect(send_parity1_ip_, rdma_send_parity1_port_, rdma_send_parity1_fd_, "rdma_send_parity1");
+        } catch (...) {
+            // Avoid std::terminate: a joinable std::thread must be joined before destruction.
+            if (accept_thread.joinable()) {
+                accept_thread.join();
+            }
+            throw;
+        }
+        if (accept_thread.joinable()) {
+            accept_thread.join();
+        }
         std::cout << "[ECNAIVE RDMA] All 6 dedicated TCP sockets for RdmaConnInfo exchange established" << std::endl;
     }
 
@@ -4031,9 +4121,8 @@ private:
                       << " recv_parity0=" << rdma_recv_parity0_fd_
                       << " recv_data1=" << rdma_recv_data1_fd_ << std::endl;
 
-            // Step 2: Connect channels based on rank relationship to avoid deadlock
-            // For each connection, the rank with smaller rank_in_group sends first
-            // This ensures no circular wait deadlock
+            // Step 2: RdmaConnInfo exchange on each TCP edge (both peers in same round).
+            // When rank_in_group is set, rounds follow ecnaive_manager port layout (see block below).
             if (rank_in_group_ < 0) {
                 std::cerr << "[ECNAIVE RDMA] WARNING: rank_in_group not set, using default connection order (may cause deadlock)" << std::endl;
                 // Fallback: recv channels first (so receivers are in recv()), then send channels to avoid deadlock
@@ -4052,54 +4141,55 @@ private:
                 std::cout << "[ECNAIVE RDMA] exchange channel 6/6 send_parity1" << std::endl;
                 send_parity1_channel_->exchange_and_connect(true);
             } else {
-                // Run exchanges by connection pair to avoid circular deadlock.
-                // Each TCP connection has exactly two endpoints; both must run exchange on the same connection
-                // in the same "round". Order: 6 rounds, each round runs one channel per rank (paired correctly).
-                const int RANKS_PER_GROUP = 4;
-                std::cout << "[ECNAIVE RDMA] Connecting channels by connection-pair (rank_in_group="
+                // Exchange order must match physical TCP pairs (ecnaive_manager.py):
+                // send_data1 -> peer rdma_recv_parity1 (+6); send_parity0 -> +7; send_parity1 -> +8 (recv_data1).
+                // The prior Python fix corrected +8 so each of the 6 meta sockets has exactly one peer.
+                // Here we run exchange_and_connect on both ends of the SAME edge in each round; the old
+                // "(0,1) recv_parity1 vs send_parity1" rounds were wrong (recv_parity1 pairs with send_data1, not send_parity1).
+                std::cout << "[ECNAIVE RDMA] Connecting channels by TCP edge (rank_in_group="
                           << rank_in_group_ << ")..." << std::endl;
 
-                // Round 1: parity1 connections (0,1) and (2,3): even recv_parity1, odd send_parity1
-                std::cout << "[ECNAIVE RDMA] round 1/6 parity1 (0,1),(2,3)" << std::endl;
-                if (rank_in_group_ % 2 == 0) {
-                    recv_parity1_channel_->exchange_and_connect(false);
+                // Round 1/6: send_data1 (r -> r+1) <-> recv_parity1 on r+1: edges (0,1) and (2,3)
+                std::cout << "[ECNAIVE RDMA] round 1/6 send_data1<->recv_parity1 (0,1),(2,3)" << std::endl;
+                if (rank_in_group_ == 0 || rank_in_group_ == 2) {
+                    send_data1_channel_->exchange_and_connect(false);
                 } else {
-                    send_parity1_channel_->exchange_and_connect(true);
+                    recv_parity1_channel_->exchange_and_connect(true);
                 }
-                // Round 2: parity1 (1,2) and (3,0): odd recv_parity1, even send_parity1
-                std::cout << "[ECNAIVE RDMA] round 2/6 parity1 (1,2),(3,0)" << std::endl;
-                if (rank_in_group_ % 2 == 1) {
-                    recv_parity1_channel_->exchange_and_connect(false);
+                // Round 2/6: edges (1,2) and (3,0)
+                std::cout << "[ECNAIVE RDMA] round 2/6 send_data1<->recv_parity1 (1,2),(3,0)" << std::endl;
+                if (rank_in_group_ == 1 || rank_in_group_ == 3) {
+                    send_data1_channel_->exchange_and_connect(false);
                 } else {
-                    send_parity1_channel_->exchange_and_connect(true);
+                    recv_parity1_channel_->exchange_and_connect(true);
                 }
-                // Round 3: parity0 (0,2) and (1,3): rank 0,1 recv_parity0, rank 2,3 send_parity0
-                std::cout << "[ECNAIVE RDMA] round 3/6 parity0 (0,2),(1,3)" << std::endl;
-                if (rank_in_group_ < 2) {
-                    recv_parity0_channel_->exchange_and_connect(false);
+                // Round 3/6: send_parity0 (r -> r+2) <-> recv_parity0: (0,2) and (1,3)
+                std::cout << "[ECNAIVE RDMA] round 3/6 send_parity0<->recv_parity0 (0,2),(1,3)" << std::endl;
+                if (rank_in_group_ == 0 || rank_in_group_ == 1) {
+                    send_parity0_channel_->exchange_and_connect(false);
                 } else {
-                    send_parity0_channel_->exchange_and_connect(true);
+                    recv_parity0_channel_->exchange_and_connect(true);
                 }
-                // Round 4: parity0 (2,0) and (3,1): rank 2,3 recv_parity0, rank 0,1 send_parity0
-                std::cout << "[ECNAIVE RDMA] round 4/6 parity0 (2,0),(3,1)" << std::endl;
-                if (rank_in_group_ >= 2) {
-                    recv_parity0_channel_->exchange_and_connect(false);
+                // Round 4/6: (2,0) and (3,1)
+                std::cout << "[ECNAIVE RDMA] round 4/6 send_parity0<->recv_parity0 (2,0),(3,1)" << std::endl;
+                if (rank_in_group_ == 2 || rank_in_group_ == 3) {
+                    send_parity0_channel_->exchange_and_connect(false);
                 } else {
-                    send_parity0_channel_->exchange_and_connect(true);
+                    recv_parity0_channel_->exchange_and_connect(true);
                 }
-                // Round 5: data1 (0,3) and (1,2): rank 0,1 recv_data1, rank 2,3 send_data1
-                std::cout << "[ECNAIVE RDMA] round 5/6 data1 (0,3),(1,2)" << std::endl;
-                if (rank_in_group_ < 2) {
-                    recv_data1_channel_->exchange_and_connect(false);
+                // Round 5/6: send_parity1 (r -> r+3) <-> recv_data1: (0,3) and (1,2)
+                std::cout << "[ECNAIVE RDMA] round 5/6 send_parity1<->recv_data1 (0,3),(1,2)" << std::endl;
+                if (rank_in_group_ == 0 || rank_in_group_ == 1) {
+                    send_parity1_channel_->exchange_and_connect(false);
                 } else {
-                    send_data1_channel_->exchange_and_connect(true);
+                    recv_data1_channel_->exchange_and_connect(true);
                 }
-                // Round 6: data1 (1,0) and (3,2): rank 1,3 recv_data1, rank 0,2 send_data1
-                std::cout << "[ECNAIVE RDMA] round 6/6 data1 (1,0),(3,2)" << std::endl;
-                if (rank_in_group_ % 2 == 1) {
-                    recv_data1_channel_->exchange_and_connect(false);
+                // Round 6/6: (2,1) and (3,0)
+                std::cout << "[ECNAIVE RDMA] round 6/6 send_parity1<->recv_data1 (2,1),(3,0)" << std::endl;
+                if (rank_in_group_ == 2 || rank_in_group_ == 3) {
+                    send_parity1_channel_->exchange_and_connect(false);
                 } else {
-                    send_data1_channel_->exchange_and_connect(true);
+                    recv_data1_channel_->exchange_and_connect(true);
                 }
             }
 
@@ -4454,6 +4544,207 @@ private:
         }
     }
 
+    // ========== EC-NAIVE Load XOR pthread pool (rank2, full recovery) ==========
+
+    static std::array<int, kXorPoolSize> parse_xor_pool_cpus_or_throw() {
+        std::array<int, kXorPoolSize> cpus{};
+        const char* env = std::getenv("ECNAIVE_XOR_CPU_LIST");
+        if (!env || !*env) {
+            for (int i = 0; i < kXorPoolSize; ++i) {
+                cpus[static_cast<size_t>(i)] = i;
+            }
+            std::cout << "ECNAIVE: ECNAIVE_XOR_CPU_LIST not set; XOR pool binds workers to CPUs 0.."
+                      << (kXorPoolSize - 1) << std::endl;
+            return cpus;
+        }
+        std::vector<int> parsed;
+        const char* p = env;
+        while (*p) {
+            while (*p && (std::isspace(static_cast<unsigned char>(*p)) || *p == ',')) {
+                ++p;
+            }
+            if (!*p) {
+                break;
+            }
+            char* end = nullptr;
+            long v = std::strtol(p, &end, 10);
+            if (end == p || v < 0 || v > 65535) {
+                throw std::runtime_error("ECNAIVE_XOR_CPU_LIST: invalid CPU id token");
+            }
+            parsed.push_back(static_cast<int>(v));
+            p = end;
+        }
+        if (parsed.size() != static_cast<size_t>(kXorPoolSize)) {
+            throw std::runtime_error(
+                "ECNAIVE_XOR_CPU_LIST must contain exactly 16 comma-separated CPU ids "
+                "(or unset to use 0..15)");
+        }
+        for (size_t i = 0; i < cpus.size(); ++i) {
+            cpus[i] = parsed[i];
+        }
+        return cpus;
+    }
+
+    void xor_pool_init() {
+        if (xor_pool_inited_.load(std::memory_order_acquire)) {
+            return;
+        }
+        xor_pool_cpus_ = parse_xor_pool_cpus_or_throw();
+        xor_pool_stop_.store(false, std::memory_order_release);
+        xor_pool_epoch_.store(0, std::memory_order_release);
+        xor_pool_remaining_.store(0, std::memory_order_release);
+        for (auto& e : xor_pool_last_epoch_) {
+            e = 0;
+        }
+        for (int i = 0; i < kXorPoolSize; ++i) {
+            xor_pool_ctx_[static_cast<size_t>(i)].self = this;
+            xor_pool_ctx_[static_cast<size_t>(i)].wid = i;
+            int rc = pthread_create(
+                &xor_pool_threads_[static_cast<size_t>(i)],
+                nullptr,
+                &ECNaiveNative::xor_pool_pthread_entry,
+                &xor_pool_ctx_[static_cast<size_t>(i)]);
+            if (rc != 0) {
+                xor_pool_stop_.store(true, std::memory_order_release);
+                xor_pool_worker_cv_.notify_all();
+                for (int j = 0; j < i; ++j) {
+                    pthread_join(xor_pool_threads_[static_cast<size_t>(j)], nullptr);
+                }
+                throw std::runtime_error(
+                    std::string("ECNAIVE: pthread_create for XOR pool failed: ") + std::strerror(rc));
+            }
+        }
+        xor_pool_inited_.store(true, std::memory_order_release);
+        std::cout << "ECNAIVE: XOR pthread pool (" << kXorPoolSize << " workers) initialized" << std::endl;
+    }
+
+    void xor_pool_shutdown() {
+        if (!xor_pool_inited_.load(std::memory_order_acquire)) {
+            return;
+        }
+        xor_pool_stop_.store(true, std::memory_order_release);
+        xor_pool_worker_cv_.notify_all();
+        for (int i = 0; i < kXorPoolSize; ++i) {
+            pthread_join(xor_pool_threads_[static_cast<size_t>(i)], nullptr);
+        }
+        xor_pool_stop_.store(false, std::memory_order_release);
+        xor_pool_inited_.store(false, std::memory_order_release);
+        std::cout << "ECNAIVE: XOR pthread pool shut down" << std::endl;
+    }
+
+    static void* xor_pool_pthread_entry(void* arg) {
+        auto* ctx = static_cast<XorPoolWorkerCtx*>(arg);
+        ctx->self->xor_pool_worker_loop(ctx->wid);
+        return nullptr;
+    }
+
+    void xor_pool_execute_stripe_from_job(const XorStripeFourOps& job, int wid) {
+        const size_t total = job.size;
+        const size_t base = total / static_cast<size_t>(kXorPoolSize);
+        const size_t rem = total % static_cast<size_t>(kXorPoolSize);
+        size_t off;
+        size_t len;
+        if (wid < kXorPoolSize - 1) {
+            off = static_cast<size_t>(wid) * base;
+            len = base;
+        } else {
+            off = static_cast<size_t>(kXorPoolSize - 1) * base;
+            len = base + rem;
+        }
+        if (len == 0) {
+            return;
+        }
+
+        auto at = [](uintptr_t base_ptr, size_t o) -> void* {
+            return reinterpret_cast<void*>(base_ptr + o);
+        };
+
+        for (int k = 0; k < 4; ++k) {
+            std::memcpy(at(job.op[static_cast<size_t>(k)].dst, off), at(job.op[static_cast<size_t>(k)].src0, off), len);
+            void* xa[2] = {
+                at(job.op[static_cast<size_t>(k)].dst, off),
+                at(job.op[static_cast<size_t>(k)].src1, off)};
+            xor_gen(2, static_cast<int>(len), xa);
+        }
+    }
+
+    void xor_pool_worker_loop(int wid) {
+        const int cpu = xor_pool_cpus_[static_cast<size_t>(wid)];
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (cpu >= 0 && static_cast<unsigned>(cpu) < CPU_SETSIZE) {
+            CPU_SET(static_cast<unsigned>(cpu), &cpuset);
+            int af = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+            if (af != 0) {
+                std::cerr << "ECNAIVE: xor_pool worker " << wid << " pthread_setaffinity_np failed: " << af
+                          << std::endl;
+            }
+        } else {
+            std::cerr << "ECNAIVE: xor_pool worker " << wid << " CPU id " << cpu
+                      << " invalid or >= CPU_SETSIZE, skipping affinity" << std::endl;
+        }
+
+        while (true) {
+            std::unique_lock<std::mutex> lk(xor_pool_mutex_);
+            xor_pool_worker_cv_.wait(lk, [&] {
+                return xor_pool_stop_.load(std::memory_order_acquire) ||
+                       (xor_pool_last_epoch_[static_cast<size_t>(wid)] <
+                        xor_pool_epoch_.load(std::memory_order_acquire));
+            });
+            if (xor_pool_stop_.load(std::memory_order_acquire)) {
+                break;
+            }
+            uint64_t e = xor_pool_epoch_.load(std::memory_order_acquire);
+            XorStripeFourOps local_copy = xor_pool_shared_job_;
+            lk.unlock();
+
+            xor_pool_execute_stripe_from_job(local_copy, wid);
+
+            {
+                std::lock_guard<std::mutex> guard(xor_pool_mutex_);
+                xor_pool_last_epoch_[static_cast<size_t>(wid)] = e;
+            }
+
+            const int left =
+                xor_pool_remaining_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (left == 0) {
+                xor_pool_coordinator_cv_.notify_one();
+            }
+        }
+    }
+
+    void xor_pool_run_parallel_four_xor(const XorStripeFourOps& job) {
+        {
+            std::lock_guard<std::mutex> publish(xor_pool_mutex_);
+            if (stop_.load(std::memory_order_acquire)) {
+                return;
+            }
+            xor_pool_shared_job_ = job;
+            xor_pool_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            xor_pool_remaining_.store(kXorPoolSize, std::memory_order_release);
+        }
+        xor_pool_worker_cv_.notify_all();
+        std::unique_lock<std::mutex> lk(xor_pool_mutex_);
+        xor_pool_coordinator_cv_.wait(lk, [&] {
+            return xor_pool_remaining_.load(std::memory_order_acquire) == 0 ||
+                   stop_.load(std::memory_order_acquire);
+        });
+    }
+
+    static XorStripeFourOps xor_job_from_load_xor_task(const LoadXORTask& t) {
+        XorStripeFourOps j{};
+        j.size = t.size;
+        j.op[0] = {t.output_data0_addr, t.recv_p20_addr, t.recv_d21_addr};
+        j.op[1] = {t.output_recv_parity0_addr, t.recv_d00_addr, t.recv_d01_addr};
+        j.op[2] = {t.output_recv_data1_addr, t.recv_d10_addr, t.recv_p11_addr};
+        j.op[3] = {t.output_recv_parity1_addr, t.recv_d30_addr, t.recv_d31_addr};
+        return j;
+    }
+
+    void xor_pool_run_parallel_load_xor(const LoadXORTask& task) {
+        xor_pool_run_parallel_four_xor(xor_job_from_load_xor_task(task));
+    }
+
     // ========== EC-NAIVE Load Mode Workers ==========
 
     // Load recv worker (rank2 only): parallel receive 8 blocks for full recovery
@@ -4734,13 +5025,14 @@ private:
         std::cout << "EC-NAIVE: [Rank 2] Load recv worker completed" << std::endl;
     }
 
-    // Load XOR worker (rank2 only): Perform 4 XOR operations for full recovery
+    // Load XOR coordinator (rank2 only): dispatches each chunk to 16 pthread workers (striped XOR).
     // XOR 1: d_{2,0} = p_{2,0} ⊕ d_{2,1} -> output_data0_addr
     // XOR 2: p_{0,0} = d_{0,0} ⊕ d_{0,1} -> output_recv_parity0_addr
     // XOR 3: d_{1,1} = d_{1,0} ⊕ p_{1,1} -> output_recv_data1_addr
     // XOR 4: p_{3,1} = d_{3,0} ⊕ d_{3,1} -> output_recv_parity1_addr
     void load_xor_worker() {
-        std::cout << "EC-NAIVE: [Rank 2] Load XOR worker started (full recovery: 4 XOR operations)" << std::endl;
+        std::cout << "EC-NAIVE: [Rank 2] Load XOR coordinator started (16 pthread workers, striped XOR)"
+                  << std::endl;
         
         while (!stop_) {
             LoadXORTask task;
@@ -4784,52 +5076,10 @@ private:
                 continue;
             }
             
-            // Perform 4 XOR operations (zero-copy: results written directly to output addresses)
-            // Note: xor_gen modifies the first parameter in-place, so we copy first operand to output first
-            
-            // XOR 1: d_{2,0} = p_{2,0} ⊕ d_{2,1} -> output_data0_addr
-            // Copy p_{2,0} to output first, then XOR with d_{2,1}
-            memcpy(reinterpret_cast<void*>(task.output_data0_addr), 
-                   reinterpret_cast<void*>(task.recv_p20_addr), task.size);
-            void* xor1_srcs[2] = {
-                reinterpret_cast<void*>(task.output_data0_addr),  // destination (contains p_{2,0})
-                reinterpret_cast<void*>(task.recv_d21_addr)       // d_{2,1}
-            };
-            xor_gen(2, static_cast<int>(task.size), xor1_srcs);
-            // Result is now in output_data0_addr (zero-copy)
-            
-            // XOR 2: p_{0,0} = d_{0,0} ⊕ d_{0,1} -> output_recv_parity0_addr
-            memcpy(reinterpret_cast<void*>(task.output_recv_parity0_addr), 
-                   reinterpret_cast<void*>(task.recv_d00_addr), task.size);
-            void* xor2_srcs[2] = {
-                reinterpret_cast<void*>(task.output_recv_parity0_addr),  // destination (contains d_{0,0})
-                reinterpret_cast<void*>(task.recv_d01_addr)              // d_{0,1}
-            };
-            xor_gen(2, static_cast<int>(task.size), xor2_srcs);
-            // Result is now in output_recv_parity0_addr (zero-copy)
-            
-            // XOR 3: d_{1,1} = d_{1,0} ⊕ p_{1,1} -> output_recv_data1_addr
-            memcpy(reinterpret_cast<void*>(task.output_recv_data1_addr), 
-                   reinterpret_cast<void*>(task.recv_d10_addr), task.size);
-            void* xor3_srcs[2] = {
-                reinterpret_cast<void*>(task.output_recv_data1_addr),  // destination (contains d_{1,0})
-                reinterpret_cast<void*>(task.recv_p11_addr)            // p_{1,1}
-            };
-            xor_gen(2, static_cast<int>(task.size), xor3_srcs);
-            // Result is now in output_recv_data1_addr (zero-copy)
-            
-            // XOR 4: p_{3,1} = d_{3,0} ⊕ d_{3,1} -> output_recv_parity1_addr
-            memcpy(reinterpret_cast<void*>(task.output_recv_parity1_addr), 
-                   reinterpret_cast<void*>(task.recv_d30_addr), task.size);
-            void* xor4_srcs[2] = {
-                reinterpret_cast<void*>(task.output_recv_parity1_addr),  // destination (contains d_{3,0})
-                reinterpret_cast<void*>(task.recv_d31_addr)               // d_{3,1}
-            };
-            xor_gen(2, static_cast<int>(task.size), xor4_srcs);
-            // Result is now in output_recv_parity1_addr (zero-copy)
-            
-            std::cout << "EC-NAIVE: [Rank 2] All 4 XOR operations completed for chunk (size=" 
-                      << task.size << ")" << std::endl;
+            // Parallel XOR: 16 pthread workers each process one byte stripe (base = size/16; remainder on last).
+            xor_pool_run_parallel_load_xor(task);
+
+            std::cout << "EC-NAIVE: [Rank 2] XOR chunk completed (size=" << task.size << ")" << std::endl;
             
             // After processing task, check if sentinel was received and queue is empty
             if (load_xor_sentinel_received_.load()) {
@@ -5062,8 +5312,32 @@ PYBIND11_MODULE(ecnaive_native, m) {
              pybind11::arg("rank") = -1,
              pybind11::arg("is_software_only") = false)
         // EC-NAIVE load mode functions (rank2 recovery)
+        .def("init_ecnaive_load_bind_listen_only", &ECNaiveNative::init_ecnaive_load_bind_listen_only,
+             "Load phase 1: RDMA load CQs + rank2 bind/listen on 8 ports; barrier all ranks before tcp_handshake",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("rank2_ip"),
+             pybind11::arg("load_recv_rank3_data1_port"),
+             pybind11::arg("load_recv_rank0_parity0_port"),
+             pybind11::arg("load_recv_rank0_data0_port"),
+             pybind11::arg("load_recv_rank1_data1_port"),
+             pybind11::arg("load_recv_rank1_data0_port"),
+             pybind11::arg("load_recv_rank1_parity1_port"),
+             pybind11::arg("load_recv_rank3_data0_port"),
+             pybind11::arg("load_recv_rank0_data1_port"))
+        .def("init_ecnaive_load_tcp_handshake_and_rdma", &ECNaiveNative::init_ecnaive_load_tcp_handshake_and_rdma,
+             "Load phase 2: TCP accept/connect then RDMA load channels (no barrier inside)",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("rank2_ip"),
+             pybind11::arg("load_recv_rank3_data1_port"),
+             pybind11::arg("load_recv_rank0_parity0_port"),
+             pybind11::arg("load_recv_rank0_data0_port"),
+             pybind11::arg("load_recv_rank1_data1_port"),
+             pybind11::arg("load_recv_rank1_data0_port"),
+             pybind11::arg("load_recv_rank1_parity1_port"),
+             pybind11::arg("load_recv_rank3_data0_port"),
+             pybind11::arg("load_recv_rank0_data1_port"))
         .def("init_ecnaive_load_connections", &ECNaiveNative::init_ecnaive_load_connections,
-             "Initialize EC-NAIVE load mode connections (rank_in_group 2 acceptor: 8 ports, 0/1/3 connectors)",
+             "One-shot load init (phase1+phase2 without cross-rank barrier); prefer bind_listen + barrier + tcp_handshake",
              pybind11::arg("rank_in_group"),
              pybind11::arg("rank2_ip"),
              pybind11::arg("load_recv_rank3_data1_port"),

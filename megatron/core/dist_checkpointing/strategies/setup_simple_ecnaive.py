@@ -195,9 +195,11 @@ ext_modules = [
             "-O3",
             "-std=c++17",
             "-fPIC",
+            "-pthread",
         ],
         extra_link_args=[
             "-fPIC",
+            "-pthread",
         ],
     ),
 ]

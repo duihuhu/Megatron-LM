@@ -19,7 +19,7 @@ export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
-NNODES=4
+NNODES=1
 GPUS_PER_NODE=1
 
 export ECCHECK_INTERFACE=$NETIFACES_INTERFACE
@@ -110,7 +110,7 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 4
+    --pipeline-model-parallel-size 1
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -129,12 +129,12 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-gemini-hardware-failure
 
     # --use-eclatin
-    --ckpt-format torch_dist
+    --ckpt-format torch
     # --no-save-optim
     # --no-load-optim
     --save-embeddings-separately
-    --timing-log-level 1
-    #--layer-wise-optimizer-update
+    --timing-log-level 2
+    --layer-wise-optimizer-update
     --no-barrier-with-level-1-timing
 )
 

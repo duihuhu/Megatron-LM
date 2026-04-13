@@ -5398,6 +5398,31 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # rank0/1/3: Load block data from files into allocated blocks
             self._load_ecnaive_blocks_from_files(checkpoint_dir, rank, rank_in_group)
         
+        # ===== Step 4b: Register sender tensors for RDMA (rank_in_group 0/1/3 only) =====
+        # Native RdmaConnectionChannel falls back to a 128MB temp MR only when unregistered;
+        # checkpoint blocks are typically much larger, so MR registration is required for RDMA load send.
+        if (
+            self.ecnaive_manager.use_rdma
+            and self.ecnaive_manager._ecnaive_native is not None
+            and rank_in_group != 2
+        ):
+            b = self.ecnaive_blocks
+            if rank_in_group == 0:
+                self.ecnaive_manager.register_buffer(b['recv_parity0'])
+                self.ecnaive_manager.register_buffer(b['data0'])
+                self.ecnaive_manager.register_buffer(b['recv_data1'])
+            elif rank_in_group == 1:
+                self.ecnaive_manager.register_buffer(b['recv_data1'])
+                self.ecnaive_manager.register_buffer(b['data0'])
+                self.ecnaive_manager.register_buffer(b['recv_parity1'])
+            elif rank_in_group == 3:
+                self.ecnaive_manager.register_buffer(b['recv_data1'])
+                self.ecnaive_manager.register_buffer(b['data0'])
+            logger.info(
+                f"EC-NAIVE: [Rank {rank}] Registered ecnaive_blocks for RDMA load send "
+                f"(rank_in_group={rank_in_group})"
+            )
+        
         # ===== Step 5: rank_in_group 2 allocate recv buffers =====
         if rank_in_group == 2:
             if self.ecnaive_recv_buffers is None:

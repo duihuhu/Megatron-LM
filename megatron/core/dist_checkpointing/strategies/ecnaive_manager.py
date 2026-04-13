@@ -448,12 +448,10 @@ class ECNAIVEManager:
         This method:
         1. Sets load mode in C++ native module
         2. Gets network configuration for load mode (8 ports for full recovery)
-        3. Initializes load connections in C++
-           - rank2: bind+listen on 8 ports, accept connections
-           - rank0: connect to 3 ports (parity0, data0, data1)
-           - rank1: connect to 3 ports (data1, data0, parity1)
-           - rank3: connect to 2 ports (data1, data0)
-        4. Waits for connections to be established
+        3. Phase 1 (all ranks): RDMA load CQs + rank2 bind/listen on 8 ports
+        4. torch.distributed.barrier() so clients never connect before listen
+        5. Phase 2 (all ranks): rank2 accepts 8 TCP; rank0/1/3 connect; RDMA load channels
+        6. Final barrier after TCP+RDMA setup
         
         Args:
             rank: Current rank (0, 1, 2, or 3)
@@ -490,45 +488,36 @@ class ECNAIVEManager:
             'recv_rank0_data1': ports.get('load_recv_rank0_data1', 0),
         }
         
-        # Step 3: rank_in_group 2 (receiver) starts accept first, then 0/1/3 connect
-        if rank_in_group == 2:
-            logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group 2) Initializing load accept connections for 8 ports...")
-            self._ecnaive_native.init_ecnaive_load_connections(
-                rank_in_group,
-                rank2_ip,
-                load_ports['recv_rank3_data1'],
-                load_ports['recv_rank0_parity0'],
-                load_ports['recv_rank0_data0'],
-                load_ports['recv_rank1_data1'],
-                load_ports['recv_rank1_data0'],
-                load_ports['recv_rank1_parity1'],
-                load_ports['recv_rank3_data0'],
-                load_ports['recv_rank0_data1']
-            )
-            logger.info(f"EC-NAIVE: [Rank {rank}] Accept operations started for 8 ports, waiting for other ranks in group...")
-        
+        # Step 3–4: Phase 1 on all ranks, then barrier (rank2 must listen before any connect).
+        logger.info(f"EC-NAIVE: [Rank {rank}] Load phase 1 (bind/listen on receiver, RDMA CQs on all ranks)...")
+        self._ecnaive_native.init_ecnaive_load_bind_listen_only(
+            rank_in_group,
+            rank2_ip,
+            load_ports['recv_rank3_data1'],
+            load_ports['recv_rank0_parity0'],
+            load_ports['recv_rank0_data0'],
+            load_ports['recv_rank1_data1'],
+            load_ports['recv_rank1_data0'],
+            load_ports['recv_rank1_parity1'],
+            load_ports['recv_rank3_data0'],
+            load_ports['recv_rank0_data1'],
+        )
         torch.distributed.barrier()
-        
-        if rank_in_group != 2:
-            logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group {rank_in_group}) Connecting load send sockets to receiver...")
-            self._ecnaive_native.init_ecnaive_load_connections(
-                rank_in_group,
-                rank2_ip,
-                load_ports['recv_rank3_data1'],
-                load_ports['recv_rank0_parity0'],
-                load_ports['recv_rank0_data0'],
-                load_ports['recv_rank1_data1'],
-                load_ports['recv_rank1_data0'],
-                load_ports['recv_rank1_parity1'],
-                load_ports['recv_rank3_data0'],
-                load_ports['recv_rank0_data1']
-            )
-            logger.info(f"EC-NAIVE: [Rank {rank}] Load send sockets connected")
-        
-        # Note: EC-NAIVE doesn't have wait_for_load_connections() like ECLATIN
-        # Connections are established synchronously in init_ecnaive_load_connections()
-        
-        # Synchronize to ensure all connections are established
+
+        # Step 5: Phase 2 — rank2 blocks on accept; clients connect concurrently (no barrier between them).
+        logger.info(f"EC-NAIVE: [Rank {rank}] Load phase 2 (TCP handshake + RDMA load channels)...")
+        self._ecnaive_native.init_ecnaive_load_tcp_handshake_and_rdma(
+            rank_in_group,
+            rank2_ip,
+            load_ports['recv_rank3_data1'],
+            load_ports['recv_rank0_parity0'],
+            load_ports['recv_rank0_data0'],
+            load_ports['recv_rank1_data1'],
+            load_ports['recv_rank1_data0'],
+            load_ports['recv_rank1_parity1'],
+            load_ports['recv_rank3_data0'],
+            load_ports['recv_rank0_data1'],
+        )
         torch.distributed.barrier()
         logger.info(f"EC-NAIVE: [Rank {rank}] Load connections initialized")
 
@@ -748,11 +737,13 @@ class ECNAIVEManager:
                 send_data1_partner_port = _port_base_for_rank(partner_ranks['send_data1_to']) + 3
                 send_parity0_partner_port = _port_base_for_rank(partner_ranks['send_parity0_to']) + 4
                 send_parity1_partner_port = _port_base_for_rank(partner_ranks['send_parity1_to']) + 5
-                # RDMA exchange: dedicated TCP ports (offset 6,7,8) - connect to partner's RDMA listen ports
-                # send_data1/send_parity1 both connect to partner's rdma_recv_parity1 (offset 6)
+                # RDMA exchange: dedicated TCP ports (offset 6,7,8) - must mirror ASIO edges:
+                # send_data1 -> partner recv_parity1 (+3) -> partner rdma_recv_parity1 (+6)
+                # send_parity0 -> partner recv_parity0 (+4) -> partner rdma_recv_parity0 (+7)
+                # send_parity1 -> partner recv_data1 (+5) -> partner rdma_recv_data1 (+8)
                 rdma_send_data1_port = _port_base_for_rank(partner_ranks['send_data1_to']) + 6
                 rdma_send_parity0_port = _port_base_for_rank(partner_ranks['send_parity0_to']) + 7
-                rdma_send_parity1_port = _port_base_for_rank(partner_ranks['send_parity1_to']) + 6
+                rdma_send_parity1_port = _port_base_for_rank(partner_ranks['send_parity1_to']) + 8
                 
                 # Get rank_in_group for RDMA connection ordering
                 rank_in_group = self._get_rank_in_group(rank, world_size)

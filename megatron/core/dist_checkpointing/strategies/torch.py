@@ -8745,6 +8745,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         logger.info(f"ECLATIN: [Rank {rank}] Load connections initialized")
         
         start_time = time()
+        wait_start_time = None
+        wait_end_time = None
         # === Step 2: rank_in_group 2 (receiver): Receive blocks and recover ===
         if rank_in_group == 2:
             if recv_buffers is None or recovered_buffer is None:
@@ -9021,7 +9023,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             # Wait for recovery to complete
             logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group 2) Waiting for full recovery pipeline to complete...")
+            wait_start_time = time()
             self.ecnaive_manager._ecnaive_native.wait_for_load_completion()
+            wait_end_time = time()
             
             # logger.info("EC-NAIVE: [Rank 2] Full recovery pipeline completed")
             # logger.info(
@@ -9032,7 +9036,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             #     f"  - recv_parity1 (p_{3,1})"
             # )
             end_time = time()
-            logger.info(f"EC-NAIVE: [Rank {rank}] Full recovery pipeline completed in {end_time - start_time:.4f} seconds")
+            if wait_start_time is not None and wait_end_time is not None:
+                logger.info(
+                    f"EC-NAIVE: [Rank {rank}] Recovery wait phase completed in "
+                    f"{wait_end_time - wait_start_time:.4f} seconds"
+                )
+            logger.info(
+                f"EC-NAIVE: [Rank {rank}] Full recovery pipeline completed in "
+                f"{end_time - start_time:.4f} seconds"
+            )
             
             # Note: All 4 blocks are now recovered and stored in ecnaive_blocks (zero-copy)
             # No need to copy - C++ pipeline wrote directly to ecnaive_blocks
@@ -9074,7 +9086,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
                 
                 end_time = time()
-                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 3 blocks to receiver in {end_time - start_time:.2f} seconds")
+                logger.info(
+                    f"EC-NAIVE: [Rank {rank}] Submitted 3 load-send blocks in "
+                    f"{end_time - start_time:.2f} seconds"
+                )
             
             elif rank_in_group == 1:
                 # rank_in_group 1: Sends d_{0,1}, d_{1,0}, p_{1,1} to receiver
@@ -9109,7 +9124,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
                 
                 end_time = time()
-                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 3 blocks to receiver in {end_time - start_time:.2f} seconds")
+                logger.info(
+                    f"EC-NAIVE: [Rank {rank}] Submitted 3 load-send blocks in "
+                    f"{end_time - start_time:.2f} seconds"
+                )
             
             elif rank_in_group == 3:
                 # rank_in_group 3: Sends d_{2,1}, d_{3,0} to receiver
@@ -9137,13 +9155,20 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
                 
                 end_time = time()
-                logger.info(f"EC-NAIVE: [Rank {rank}] Sent 2 blocks to receiver in {end_time - start_time:.2f} seconds")
+                logger.info(
+                    f"EC-NAIVE: [Rank {rank}] Submitted 2 load-send blocks in "
+                    f"{end_time - start_time:.2f} seconds"
+                )
             
             logger.info(f"EC-NAIVE: [Rank {rank}] Sent blocks to receiver")
         
         # Synchronize all ranks
         torch.distributed.barrier()
-        logger.info(f"EC-NAIVE: [Rank {rank}] Recovery pipeline completed")
+        end_time = time()
+        logger.info(
+            f"EC-NAIVE: [Rank {rank}] Recovery pipeline completed "
+            f"(total={end_time - start_time:.4f}s)"
+        )
     
     def _run_eclatin_layerwise_recovery_pipeline(
         self,

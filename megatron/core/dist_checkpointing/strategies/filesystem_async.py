@@ -8,6 +8,7 @@ import logging
 import os
 import pickle
 import queue
+import struct
 from functools import partial
 from heapq import heappop, heappush
 from itertools import chain
@@ -43,6 +44,8 @@ from .state_dict_decomposer import TensorMetadata
 logger = logging.getLogger(__name__)
 
 WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
+COMPONENT_FILE_HEADER_FORMAT = "@4sQQQ"
+COMPONENT_FILE_HEADER_SIZE = struct.calcsize(COMPONENT_FILE_HEADER_FORMAT)
 
 
 @dataclasses.dataclass
@@ -2043,7 +2046,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     # Header format: magic(4) + padding(4) + 3 sizes(8 each) = 32 bytes
                     # Magic number: 'ECLT' (ECLATIN)
                     header = struct.pack(
-                        '4sQQQ',
+                        COMPONENT_FILE_HEADER_FORMAT,
                         b'ECLT',              # Magic number
                         non_tensor_size,      # Component 1 size
                         tensor_keys_size,     # Component 2 size
@@ -2166,7 +2169,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     # Header format: magic(4) + padding(4) + 3 sizes(8 each) = 32 bytes
                     # Magic number: 'ECNV' (EC-NAIVE)
                     header = struct.pack(
-                        '4sQQQ',
+                        COMPONENT_FILE_HEADER_FORMAT,
                         b'ECNV',              # Magic number
                         non_tensor_size,      # Component 1 size
                         tensor_keys_size,     # Component 2 size
@@ -2259,6 +2262,10 @@ class FileSystemWriterAsync(FileSystemWriter):
                 
                 # Get file path (file_name is the eccheck_file_path)
                 eccheck_file_path = eccheck_metadata['eccheck_file_path']
+                logger.info(
+                    "EC-CHECK: Writer context "
+                    f"(proc={local_proc_idx}, storage_key={storage_key}, file={eccheck_file_path})"
+                )
                 
                 # Prepare header with component sizes
                 import struct
@@ -2270,7 +2277,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 # Magic number: 'ECCK' (EC-CHECK)
                 # Default format includes padding for alignment
                 header = struct.pack(
-                    '4sQQQ',
+                    COMPONENT_FILE_HEADER_FORMAT,
                     b'ECCK',              # Magic number
                     non_tensor_size,      # Component 1 size
                     tensor_keys_size,     # Component 2 size
@@ -2307,6 +2314,15 @@ class FileSystemWriterAsync(FileSystemWriter):
                         # tensor_buffer_size from metadata is the actual data size
                         actual_size = tensor_buffer_size
                         buffer_size = eccheck_continuous_buffer.numel()
+                        logger.info(
+                            "EC-CHECK: Buffer info before write "
+                            f"(proc={local_proc_idx}, storage_key={storage_key}, "
+                            f"data_ptr={int(eccheck_continuous_buffer.data_ptr())}, "
+                            f"numel={buffer_size}, actual_size={actual_size}, "
+                            f"dtype={eccheck_continuous_buffer.dtype}, "
+                            f"device={eccheck_continuous_buffer.device}, "
+                            f"contiguous={eccheck_continuous_buffer.is_contiguous()})"
+                        )
                         
                         if actual_size > buffer_size:
                             logger.warning(
@@ -2318,10 +2334,18 @@ class FileSystemWriterAsync(FileSystemWriter):
                         # Only write the actual data portion (exclude padding)
                         np_array = eccheck_continuous_buffer[:actual_size].numpy()  # Zero-copy view
                         mv = memoryview(np_array)
-                        
                         # Write actual data at once
-                        f.write(mv)
-                        component3_size = mv.nbytes
+                        try:
+                            written = f.write(mv)
+                            component3_size = mv.nbytes if written is None else written
+                        except Exception as write_err:
+                            logger.error(
+                                "EC-CHECK: Component 3 write failed "
+                                f"(proc={local_proc_idx}, storage_key={storage_key}, "
+                                f"file={eccheck_file_path}, data_ptr={int(eccheck_continuous_buffer.data_ptr())}, "
+                                f"actual_size={actual_size}, mv_nbytes={mv.nbytes}, error={write_err})"
+                            )
+                            raise
                         
                         # Verify size matches
                         if component3_size != tensor_buffer_size:
@@ -2357,7 +2381,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     f"  Total size: {total_size / (1024**3):.2f} GB\n"
                     f"  Overall bandwidth: {overall_bandwidth:.2f} GB/s\n"
                     f"  Breakdown:\n"
-                    f"    Header: 28 bytes\n"
+                    f"    Header: {len(header)} bytes\n"
                     f"    Component 1: {non_tensor_size / 1024:.2f} KB ({comp1_time:.4f}s)\n"
                     f"    Component 2: {tensor_keys_size / 1024:.2f} KB ({comp2_time:.4f}s)\n"
                     f"    Component 3: {component3_size / (1024**3):.2f} GB ({component3_time:.2f}s)"
@@ -2838,12 +2862,16 @@ class FileSystemWriterAsync(FileSystemWriter):
             partner_buffer = self.eccheck_p2p_buffers['partner_buffer']
             p2p_own_buffer_base_addr = int(own_buffer.data_ptr())
             p2p_partner_buffer_base_addr = int(partner_buffer.data_ptr())
+            p2p_own_buffer_size = own_buffer.numel()
+            p2p_partner_buffer_size = partner_buffer.numel()
             p2p_own_buffer_offset = 0  # Current offset in own_buffer
             p2p_partner_buffer_offset = 0  # Current offset in partner_buffer
         else:
             logger.warning("EC-CHECK: P2P buffers not set, using 0 addresses")
             p2p_own_buffer_base_addr = 0
             p2p_partner_buffer_base_addr = 0
+            p2p_own_buffer_size = 0
+            p2p_partner_buffer_size = 0
             p2p_own_buffer_offset = 0
             p2p_partner_buffer_offset = 0
 
@@ -2887,6 +2915,29 @@ class FileSystemWriterAsync(FileSystemWriter):
                     f"EC-CHECK: Adjusted 'take' from {min(self.eccheck_buffer_size, remaining_in_source)} "
                     f"to {take} to fit recv buffer bounds"
                 )
+
+            # Check p2p buffer bounds and reduce take if needed.
+            # This prevents out-of-bounds writes in downstream C++ memcpy.
+            if p2p_own_buffer_base_addr != 0:
+                p2p_own_buffer_offset_aligned = ((p2p_own_buffer_offset + 63) // 64) * 64
+                p2p_partner_buffer_offset_aligned = ((p2p_partner_buffer_offset + 63) // 64) * 64
+                remaining_p2p_own = p2p_own_buffer_size - p2p_own_buffer_offset_aligned
+                remaining_p2p_partner = p2p_partner_buffer_size - p2p_partner_buffer_offset_aligned
+                max_available_p2p_space = min(remaining_p2p_own, remaining_p2p_partner)
+                if take > max_available_p2p_space:
+                    if max_available_p2p_space < 64:
+                        logger.warning(
+                            "EC-CHECK: P2P buffers exhausted. "
+                            f"own remaining={remaining_p2p_own} bytes, "
+                            f"partner remaining={remaining_p2p_partner} bytes, "
+                            f"processed={src_pos / (1024**3):.2f} GB / {total_bytes / (1024**3):.2f} GB"
+                        )
+                        break
+                    take = max_available_p2p_space
+                    logger.debug(
+                        f"EC-CHECK: Adjusted 'take' to {take} for P2P buffer bounds "
+                        f"(own_remain={remaining_p2p_own}, partner_remain={remaining_p2p_partner})"
+                    )
             
             # Python memcpy: copy from continuous tensor buffer to data buffer
             t_start = time()
@@ -2990,6 +3041,14 @@ class FileSystemWriterAsync(FileSystemWriter):
                 assert p2p_partner_write_addr % 64 == 0, (
                     f"p2p_partner_write_addr not 64-byte aligned: {hex(p2p_partner_write_addr)}, "
                     f"base={hex(p2p_partner_buffer_base_addr)}, offset={p2p_partner_buffer_offset_aligned}"
+                )
+                assert p2p_own_buffer_offset_aligned + take <= p2p_own_buffer_size, (
+                    f"p2p_own_write_addr out of bounds: offset={p2p_own_buffer_offset_aligned}, "
+                    f"size={take}, buffer_size={p2p_own_buffer_size}"
+                )
+                assert p2p_partner_buffer_offset_aligned + take <= p2p_partner_buffer_size, (
+                    f"p2p_partner_write_addr out of bounds: offset={p2p_partner_buffer_offset_aligned}, "
+                    f"size={take}, buffer_size={p2p_partner_buffer_size}"
                 )
             else:
                 p2p_own_write_addr = 0
@@ -4910,19 +4969,24 @@ class FileSystemWriterAsync(FileSystemWriter):
             f = None
             
             # Parse header to extract Component 1 (non_tensor_data) and Component 2 (tensor_infos)
-            header_bytes = mm[:32]
-            if len(header_bytes) != 32:
-                raise RuntimeError(f"EC-CHECK: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+            header_bytes = mm[:COMPONENT_FILE_HEADER_SIZE]
+            if len(header_bytes) != COMPONENT_FILE_HEADER_SIZE:
+                raise RuntimeError(
+                    f"EC-CHECK: Invalid file header "
+                    f"(expected {COMPONENT_FILE_HEADER_SIZE} bytes, got {len(header_bytes)})"
+                )
             
             # Parse header (default format includes padding for alignment)
-            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
+                COMPONENT_FILE_HEADER_FORMAT, header_bytes
+            )
             
             # Validate magic number
             if magic != b'ECCK':
                 raise RuntimeError(f"EC-CHECK: Invalid magic number (expected b'ECCK', got {magic})")
             
             # Extract Component 1: non_tensor_data
-            offset = 32  # After header
+            offset = COMPONENT_FILE_HEADER_SIZE  # After header
             
             non_tensor_bytes = mm[offset:offset + non_tensor_size]
             if len(non_tensor_bytes) != non_tensor_size:
@@ -5051,19 +5115,24 @@ class FileSystemWriterAsync(FileSystemWriter):
             f = None
             
             # Parse header to extract Component 1 (non_tensor_data) and Component 2 (tensor_infos)
-            header_bytes = mm[:32]
-            if len(header_bytes) != 32:
-                raise RuntimeError(f"ECLATIN: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+            header_bytes = mm[:COMPONENT_FILE_HEADER_SIZE]
+            if len(header_bytes) != COMPONENT_FILE_HEADER_SIZE:
+                raise RuntimeError(
+                    f"ECLATIN: Invalid file header "
+                    f"(expected {COMPONENT_FILE_HEADER_SIZE} bytes, got {len(header_bytes)})"
+                )
             
             # Parse header
-            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
+                COMPONENT_FILE_HEADER_FORMAT, header_bytes
+            )
             
             # Validate magic number
             if magic != b'ECLT':
                 raise RuntimeError(f"ECLATIN: Invalid magic number (expected b'ECLT', got {magic})")
             
             # Extract Component 1: non_tensor_data
-            offset = 32  # After header
+            offset = COMPONENT_FILE_HEADER_SIZE  # After header
             
             non_tensor_bytes = mm[offset:offset + non_tensor_size]
             if len(non_tensor_bytes) != non_tensor_size:
@@ -5186,19 +5255,24 @@ class FileSystemWriterAsync(FileSystemWriter):
             f = None
             
             # Parse header to extract Component 1 (non_tensor_data) and Component 2 (tensor_infos)
-            header_bytes = mm[:32]
-            if len(header_bytes) != 32:
-                raise RuntimeError(f"EC-NAIVE: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+            header_bytes = mm[:COMPONENT_FILE_HEADER_SIZE]
+            if len(header_bytes) != COMPONENT_FILE_HEADER_SIZE:
+                raise RuntimeError(
+                    f"EC-NAIVE: Invalid file header "
+                    f"(expected {COMPONENT_FILE_HEADER_SIZE} bytes, got {len(header_bytes)})"
+                )
             
             # Parse header
-            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+            magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
+                COMPONENT_FILE_HEADER_FORMAT, header_bytes
+            )
             
             # Validate magic number
             if magic != b'ECNV':
                 raise RuntimeError(f"EC-NAIVE: Invalid magic number (expected b'ECNV', got {magic})")
             
             # Extract Component 1: non_tensor_data
-            offset = 32  # After header
+            offset = COMPONENT_FILE_HEADER_SIZE  # After header
             
             non_tensor_bytes = mm[offset:offset + non_tensor_size]
             if len(non_tensor_bytes) != non_tensor_size:
@@ -5319,12 +5393,17 @@ class FileSystemWriterAsync(FileSystemWriter):
             
             try:
                 # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
-                header_bytes = mm[:32]
-                if len(header_bytes) != 32:
-                    raise RuntimeError(f"EC-CHECK: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+                header_bytes = mm[:COMPONENT_FILE_HEADER_SIZE]
+                if len(header_bytes) != COMPONENT_FILE_HEADER_SIZE:
+                    raise RuntimeError(
+                        f"EC-CHECK: Invalid file header "
+                        f"(expected {COMPONENT_FILE_HEADER_SIZE} bytes, got {len(header_bytes)})"
+                    )
                 
                 # Parse header (default format includes padding for alignment)
-                magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+                magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
+                    COMPONENT_FILE_HEADER_FORMAT, header_bytes
+                )
                 
                 # Validate magic number
                 if magic != b'ECCK':
@@ -5338,7 +5417,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 )
                 
                 # Calculate offsets for each component
-                offset = 32  # After header
+                offset = COMPONENT_FILE_HEADER_SIZE  # After header
                 
                 t1 = time()
                 # Component 1: Non-tensor key-value pairs (direct slice from mmap)
@@ -5461,12 +5540,17 @@ class FileSystemWriterAsync(FileSystemWriter):
             
             try:
                 # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
-                header_bytes = mm[:32]
-                if len(header_bytes) != 32:
-                    raise RuntimeError(f"ECLATIN: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+                header_bytes = mm[:COMPONENT_FILE_HEADER_SIZE]
+                if len(header_bytes) != COMPONENT_FILE_HEADER_SIZE:
+                    raise RuntimeError(
+                        f"ECLATIN: Invalid file header "
+                        f"(expected {COMPONENT_FILE_HEADER_SIZE} bytes, got {len(header_bytes)})"
+                    )
                 
                 # Parse header
-                magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+                magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
+                    COMPONENT_FILE_HEADER_FORMAT, header_bytes
+                )
                 
                 # Validate magic number
                 if magic != b'ECLT':
@@ -5480,7 +5564,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 )
                 
                 # Calculate offsets for each component
-                offset = 32  # After header
+                offset = COMPONENT_FILE_HEADER_SIZE  # After header
                 
                 # Component 1: Non-tensor key-value pairs
                 non_tensor_bytes = mm[offset:offset + non_tensor_size]
@@ -5593,12 +5677,17 @@ class FileSystemWriterAsync(FileSystemWriter):
             
             try:
                 # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
-                header_bytes = mm[:32]
-                if len(header_bytes) != 32:
-                    raise RuntimeError(f"EC-NAIVE: Invalid file header (expected 32 bytes, got {len(header_bytes)})")
+                header_bytes = mm[:COMPONENT_FILE_HEADER_SIZE]
+                if len(header_bytes) != COMPONENT_FILE_HEADER_SIZE:
+                    raise RuntimeError(
+                        f"EC-NAIVE: Invalid file header "
+                        f"(expected {COMPONENT_FILE_HEADER_SIZE} bytes, got {len(header_bytes)})"
+                    )
                 
                 # Parse header
-                magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
+                magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
+                    COMPONENT_FILE_HEADER_FORMAT, header_bytes
+                )
                 
                 # Validate magic number
                 if magic != b'ECNV':
@@ -5612,7 +5701,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 )
                 
                 # Calculate offsets for each component
-                offset = 32  # After header
+                offset = COMPONENT_FILE_HEADER_SIZE  # After header
                 
                 # Component 1: Non-tensor key-value pairs
                 non_tensor_bytes = mm[offset:offset + non_tensor_size]

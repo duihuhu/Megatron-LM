@@ -2611,6 +2611,17 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             wait_count++;
         }
+        const double recv_ms =
+            static_cast<double>(load_recv_total_ns_.load(std::memory_order_relaxed)) / 1e6;
+        const double xor_ms =
+            static_cast<double>(load_xor_total_ns_.load(std::memory_order_relaxed)) / 1e6;
+        const size_t recv_tasks = load_recv_task_count_.load(std::memory_order_relaxed);
+        const size_t xor_tasks = load_xor_task_count_.load(std::memory_order_relaxed);
+        std::cout << "EC-NAIVE: [Rank 2] Load timing summary: "
+                  << "network_recv_ms=" << recv_ms
+                  << ", network_recv_tasks=" << recv_tasks
+                  << ", xor_decode_ms=" << xor_ms
+                  << ", xor_decode_tasks=" << xor_tasks << std::endl;
         std::cout << "EC-NAIVE: [Rank 2] All load workers completed" << std::endl;
     }
 
@@ -2771,6 +2782,10 @@ public:
             load_recv_sentinel_received_ = false;
             load_xor_sentinel_received_ = false;
             load_send_sentinel_received_ = false;
+            load_recv_total_ns_.store(0, std::memory_order_relaxed);
+            load_xor_total_ns_.store(0, std::memory_order_relaxed);
+            load_recv_task_count_.store(0, std::memory_order_relaxed);
+            load_xor_task_count_.store(0, std::memory_order_relaxed);
             
             // Start workers based on rank_in_group (rank_ is set in init_ecnaive_load_connections)
             if (rank_ == 2) {
@@ -3528,6 +3543,10 @@ private:
     std::atomic<bool> load_recv_worker_completed_{false};
     std::atomic<bool> load_xor_worker_completed_{false};
     std::atomic<bool> load_send_worker_completed_{false};
+    std::atomic<uint64_t> load_recv_total_ns_{0};
+    std::atomic<uint64_t> load_xor_total_ns_{0};
+    std::atomic<size_t> load_recv_task_count_{0};
+    std::atomic<size_t> load_xor_task_count_{0};
 
     // EC-NAIVE load mode sentinel flags
     std::atomic<bool> load_recv_sentinel_received_{false};
@@ -4819,6 +4838,7 @@ private:
             }
             
             // Parallel receive 8 blocks using 8 threads
+            auto recv_start = std::chrono::steady_clock::now();
             std::vector<std::thread> recv_threads(8);
             std::vector<std::exception_ptr> recv_exceptions(8);
             
@@ -4995,6 +5015,11 @@ private:
                     std::rethrow_exception(recv_exceptions[i]);
                 }
             }
+            auto recv_end = std::chrono::steady_clock::now();
+            const uint64_t recv_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(recv_end - recv_start).count());
+            load_recv_total_ns_.fetch_add(recv_ns, std::memory_order_relaxed);
+            load_recv_task_count_.fetch_add(1, std::memory_order_relaxed);
             
             // After all 8 blocks are received, submit XOR task
             LoadXORTask xor_task;
@@ -5077,7 +5102,13 @@ private:
             }
             
             // Parallel XOR: 16 pthread workers each process one byte stripe (base = size/16; remainder on last).
+            auto xor_start = std::chrono::steady_clock::now();
             xor_pool_run_parallel_load_xor(task);
+            auto xor_end = std::chrono::steady_clock::now();
+            const uint64_t xor_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(xor_end - xor_start).count());
+            load_xor_total_ns_.fetch_add(xor_ns, std::memory_order_relaxed);
+            load_xor_task_count_.fetch_add(1, std::memory_order_relaxed);
 
             std::cout << "EC-NAIVE: [Rank 2] XOR chunk completed (size=" << task.size << ")" << std::endl;
             

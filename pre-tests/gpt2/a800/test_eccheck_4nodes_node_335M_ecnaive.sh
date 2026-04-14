@@ -141,6 +141,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --no-load-optim
     --save-embeddings-separately
     --use-rdma
+    --timing-log-level 2
 )
 
 mkdir -p logs

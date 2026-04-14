@@ -8,8 +8,14 @@
 #include <condition_variable>
 #include <atomic>
 #include <vector>
+#include <array>
+#include <cctype>
+#include <cerrno>
+#include <stdexcept>
 #include <cstring>
 #include <iostream>
+#include <pthread.h>
+#include <sched.h>
 #include <unordered_map>
 #include <chrono>
 #include <isa-l/erasure_code.h>
@@ -337,6 +343,18 @@ void AsioConnectionManager::cleanup() {
     if (step6_p2p_recv_acceptor_.is_open()) step6_p2p_recv_acceptor_.close();
 }
 
+class ECCHECKNative;
+
+struct EccheckXorPoolWorkerCtx {
+    ECCHECKNative* self{nullptr};
+    int wid{0};
+};
+
+struct EccheckEncodePoolWorkerCtx {
+    ECCHECKNative* self{nullptr};
+    int wid{0};
+};
+
 class ECCHECKNative {
 private:
     int rank_;
@@ -592,6 +610,50 @@ private:
     std::thread load_xor_worker_;
     std::atomic<bool> load_xor_worker_completed_;
     std::atomic<bool> load_xor_worker_sentinel_received_;
+
+    // Load XOR: 16 pthread workers (CPU affinity via ECCHECK_XOR_CPU_LIST), rank 2/3 only
+    static constexpr int kLoadXorPoolSize = 16;
+    struct LoadXorPoolJob {
+        uintptr_t local_encoding_addr{0};
+        uintptr_t remote_encoding_addr{0};
+        uintptr_t parity_addr{0};
+        size_t size{0};
+    };
+    std::array<pthread_t, kLoadXorPoolSize> load_xor_pool_threads_{};
+    std::array<EccheckXorPoolWorkerCtx, kLoadXorPoolSize> load_xor_pool_ctx_{};
+    std::array<int, kLoadXorPoolSize> load_xor_pool_cpus_{};
+    std::atomic<bool> load_xor_pool_inited_{false};
+    std::atomic<bool> load_xor_pool_stop_{false};
+    std::mutex load_xor_pool_mutex_;
+    std::condition_variable load_xor_pool_worker_cv_;
+    std::condition_variable load_xor_pool_coordinator_cv_;
+    std::atomic<uint64_t> load_xor_pool_epoch_{0};
+    std::array<uint64_t, kLoadXorPoolSize> load_xor_pool_last_epoch_{};
+    std::atomic<int> load_xor_pool_remaining_{0};
+    LoadXorPoolJob load_xor_pool_shared_job_{};
+
+    // Load encode: 16 pthread workers (CPU affinity via ECCHECK_ENCODE_CPU_LIST), all ranks in load mode
+    static constexpr int kLoadEncodePoolSize = 16;
+    struct LoadEncodePoolJob {
+        uintptr_t data_addr{0};
+        uintptr_t encoding_addr{0};
+        size_t size{0};
+        bool use_isal_ec{false};
+        unsigned char* gftbls_ptr{nullptr};
+        uint8_t fallback_coeff{0};
+    };
+    std::array<pthread_t, kLoadEncodePoolSize> load_encode_pool_threads_{};
+    std::array<EccheckEncodePoolWorkerCtx, kLoadEncodePoolSize> load_encode_pool_ctx_{};
+    std::array<int, kLoadEncodePoolSize> load_encode_pool_cpus_{};
+    std::atomic<bool> load_encode_pool_inited_{false};
+    std::atomic<bool> load_encode_pool_stop_{false};
+    std::mutex load_encode_pool_mutex_;
+    std::condition_variable load_encode_pool_worker_cv_;
+    std::condition_variable load_encode_pool_coordinator_cv_;
+    std::atomic<uint64_t> load_encode_pool_epoch_{0};
+    std::array<uint64_t, kLoadEncodePoolSize> load_encode_pool_last_epoch_{};
+    std::atomic<int> load_encode_pool_remaining_{0};
+    LoadEncodePoolJob load_encode_pool_shared_job_{};
     
     // Load mode pending XOR encoding (matching encoding and recv)
     std::unordered_map<uintptr_t, uintptr_t> load_pending_xor_encoding_;
@@ -708,14 +770,17 @@ private:
     std::vector<uint8_t> rdma_temp_recv_buffer_;
     ibv_mr* rdma_temp_send_mr_;
     ibv_mr* rdma_temp_recv_mr_;
-    std::mutex rdma_xor_control_mutex_;
-    std::mutex rdma_p2p_control_mutex_;
+    std::mutex rdma_xor_send_control_mutex_;
+    std::mutex rdma_xor_recv_control_mutex_;
+    std::mutex rdma_p2p_send_control_mutex_;
+    std::mutex rdma_p2p_recv_control_mutex_;
     
     // Step6 P2P (Load: rank2<->rank3 only)
     ibv_cq* rdma_step6_p2p_send_cq_;
     ibv_cq* rdma_step6_p2p_recv_cq_;
     ibv_qp* rdma_step6_p2p_qp_;
-    std::mutex rdma_step6_p2p_control_mutex_;
+    std::mutex rdma_step6_p2p_send_control_mutex_;
+    std::mutex rdma_step6_p2p_recv_control_mutex_;
     
     // TCP sockets for RDMA connection setup (control plane)
     int rdma_listen_sock_;
@@ -1119,11 +1184,262 @@ private:
     }
 
     // ========== Worker线程函数 ==========
+
+    static std::array<int, kLoadEncodePoolSize> parse_load_encode_pool_cpus_or_throw() {
+        std::array<int, kLoadEncodePoolSize> cpus{};
+        const char* env = std::getenv("ECCHECK_ENCODE_CPU_LIST");
+        if (!env || !*env) {
+            for (int i = 0; i < kLoadEncodePoolSize; ++i) {
+                cpus[static_cast<size_t>(i)] = i;
+            }
+            std::cout << "EC-CHECK: ECCHECK_ENCODE_CPU_LIST not set; load encode pool binds workers to CPUs 0.."
+                      << (kLoadEncodePoolSize - 1) << std::endl;
+            return cpus;
+        }
+        std::vector<int> parsed;
+        const char* p = env;
+        while (*p) {
+            while (*p && (std::isspace(static_cast<unsigned char>(*p)) || *p == ',')) {
+                ++p;
+            }
+            if (!*p) {
+                break;
+            }
+            char* end = nullptr;
+            long v = std::strtol(p, &end, 10);
+            if (end == p || v < 0 || v > 65535) {
+                throw std::runtime_error("ECCHECK_ENCODE_CPU_LIST: invalid CPU id token");
+            }
+            parsed.push_back(static_cast<int>(v));
+            p = end;
+        }
+        if (parsed.size() != static_cast<size_t>(kLoadEncodePoolSize)) {
+            throw std::runtime_error(
+                "ECCHECK_ENCODE_CPU_LIST must contain exactly 16 comma-separated CPU ids "
+                "(or unset to use 0..15)");
+        }
+        for (size_t i = 0; i < cpus.size(); ++i) {
+            cpus[i] = parsed[i];
+        }
+        return cpus;
+    }
+
+    void load_encode_pool_init() {
+        if (load_encode_pool_inited_.load(std::memory_order_acquire)) {
+            return;
+        }
+        load_encode_pool_cpus_ = parse_load_encode_pool_cpus_or_throw();
+        load_encode_pool_stop_.store(false, std::memory_order_release);
+        load_encode_pool_epoch_.store(0, std::memory_order_release);
+        load_encode_pool_remaining_.store(0, std::memory_order_release);
+        for (auto& e : load_encode_pool_last_epoch_) {
+            e = 0;
+        }
+        for (int i = 0; i < kLoadEncodePoolSize; ++i) {
+            load_encode_pool_ctx_[static_cast<size_t>(i)].self = this;
+            load_encode_pool_ctx_[static_cast<size_t>(i)].wid = i;
+            int rc = pthread_create(
+                &load_encode_pool_threads_[static_cast<size_t>(i)],
+                nullptr,
+                &ECCHECKNative::load_encode_pool_pthread_entry,
+                &load_encode_pool_ctx_[static_cast<size_t>(i)]);
+            if (rc != 0) {
+                load_encode_pool_stop_.store(true, std::memory_order_release);
+                load_encode_pool_worker_cv_.notify_all();
+                for (int j = 0; j < i; ++j) {
+                    pthread_join(load_encode_pool_threads_[static_cast<size_t>(j)], nullptr);
+                }
+                throw std::runtime_error(
+                    std::string("EC-CHECK: pthread_create for load encode pool failed: ") + std::strerror(rc));
+            }
+        }
+        load_encode_pool_inited_.store(true, std::memory_order_release);
+        std::cout << "EC-CHECK: Load encode pthread pool (" << kLoadEncodePoolSize << " workers) initialized"
+                  << std::endl;
+    }
+
+    void load_encode_pool_shutdown() {
+        if (!load_encode_pool_inited_.load(std::memory_order_acquire)) {
+            return;
+        }
+        load_encode_pool_stop_.store(true, std::memory_order_release);
+        load_encode_pool_worker_cv_.notify_all();
+        for (int i = 0; i < kLoadEncodePoolSize; ++i) {
+            pthread_join(load_encode_pool_threads_[static_cast<size_t>(i)], nullptr);
+        }
+        load_encode_pool_stop_.store(false, std::memory_order_release);
+        load_encode_pool_inited_.store(false, std::memory_order_release);
+        std::cout << "EC-CHECK: Load encode pthread pool shut down" << std::endl;
+    }
+
+    static void* load_encode_pool_pthread_entry(void* arg) {
+        auto* ctx = static_cast<EccheckEncodePoolWorkerCtx*>(arg);
+        ctx->self->load_encode_pool_worker_loop(ctx->wid);
+        return nullptr;
+    }
+
+    void load_encode_pool_execute_stripe_from_job(const LoadEncodePoolJob& job, int wid) {
+        const size_t total = job.size;
+        const size_t base = total / static_cast<size_t>(kLoadEncodePoolSize);
+        const size_t rem = total % static_cast<size_t>(kLoadEncodePoolSize);
+        size_t off;
+        size_t len;
+        if (wid < kLoadEncodePoolSize - 1) {
+            off = static_cast<size_t>(wid) * base;
+            len = base;
+        } else {
+            off = static_cast<size_t>(kLoadEncodePoolSize - 1) * base;
+            len = base + rem;
+        }
+        if (len == 0) {
+            return;
+        }
+        auto at = [](uintptr_t base_ptr, size_t o) -> unsigned char* {
+            return reinterpret_cast<unsigned char*>(base_ptr + o);
+        };
+        unsigned char* d = at(job.data_addr, off);
+        unsigned char* e = at(job.encoding_addr, off);
+        if (job.use_isal_ec) {
+            unsigned char* srcs[1] = {d};
+            unsigned char* dests[1] = {e};
+            ec_encode_data(static_cast<int>(len), 1, 1, job.gftbls_ptr, srcs, dests);
+        } else {
+            const uint32_t fc = static_cast<uint32_t>(job.fallback_coeff);
+            for (size_t i = 0; i < len; ++i) {
+                e[i] = static_cast<unsigned char>((static_cast<uint32_t>(d[i]) * fc) & 0xFFu);
+            }
+        }
+    }
+
+    void load_encode_pool_worker_loop(int wid) {
+        const int cpu = load_encode_pool_cpus_[static_cast<size_t>(wid)];
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (cpu >= 0 && static_cast<unsigned>(cpu) < CPU_SETSIZE) {
+            CPU_SET(static_cast<unsigned>(cpu), &cpuset);
+            int af = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+            if (af != 0) {
+                std::cerr << "EC-CHECK: load_encode_pool worker " << wid
+                          << " pthread_setaffinity_np failed: " << af << std::endl;
+            }
+        } else {
+            std::cerr << "EC-CHECK: load_encode_pool worker " << wid << " CPU id " << cpu
+                      << " invalid or >= CPU_SETSIZE, skipping affinity" << std::endl;
+        }
+
+        while (true) {
+            std::unique_lock<std::mutex> lk(load_encode_pool_mutex_);
+            load_encode_pool_worker_cv_.wait(lk, [&] {
+                return load_encode_pool_stop_.load(std::memory_order_acquire) ||
+                       (load_encode_pool_last_epoch_[static_cast<size_t>(wid)] <
+                        load_encode_pool_epoch_.load(std::memory_order_acquire));
+            });
+            if (load_encode_pool_stop_.load(std::memory_order_acquire)) {
+                break;
+            }
+            uint64_t ep = load_encode_pool_epoch_.load(std::memory_order_acquire);
+            LoadEncodePoolJob local_copy = load_encode_pool_shared_job_;
+            lk.unlock();
+
+            load_encode_pool_execute_stripe_from_job(local_copy, wid);
+
+            {
+                std::lock_guard<std::mutex> guard(load_encode_pool_mutex_);
+                load_encode_pool_last_epoch_[static_cast<size_t>(wid)] = ep;
+            }
+
+            const int left =
+                load_encode_pool_remaining_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (left == 0) {
+                load_encode_pool_coordinator_cv_.notify_one();
+            }
+        }
+    }
+
+    void load_encode_pool_run_parallel(const LoadEncodePoolJob& task) {
+        {
+            std::lock_guard<std::mutex> publish(load_encode_pool_mutex_);
+            if (should_stop_threads_.load(std::memory_order_acquire)) {
+                return;
+            }
+            load_encode_pool_shared_job_ = task;
+            load_encode_pool_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            load_encode_pool_remaining_.store(kLoadEncodePoolSize, std::memory_order_release);
+        }
+        load_encode_pool_worker_cv_.notify_all();
+        std::unique_lock<std::mutex> lk(load_encode_pool_mutex_);
+        load_encode_pool_coordinator_cv_.wait(lk, [&] {
+            return load_encode_pool_remaining_.load(std::memory_order_acquire) == 0 ||
+                   should_stop_threads_.load(std::memory_order_acquire);
+        });
+    }
+
+    // Build one encode job for striped load-encode pool (ec_encode_data k=1,rows=1 is byte-independent).
+    bool try_build_load_encode_pool_job(
+        uintptr_t data_addr,
+        size_t size,
+        uintptr_t encoding_addr,
+        int coefficient,
+        LoadEncodePoolJob* out) {
+        if (k_ <= 0 || rows_ != 2 || g_tbls_ == nullptr) {
+            out->data_addr = data_addr;
+            out->encoding_addr = encoding_addr;
+            out->size = size;
+            out->use_isal_ec = false;
+            out->gftbls_ptr = nullptr;
+            out->fallback_coeff = static_cast<uint8_t>(coefficient & 0xFF);
+            return true;
+        }
+
+        int parity_idx = coefficient;
+        if (parity_idx < 0 || parity_idx >= rows_) {
+            parity_idx = 0;
+        }
+
+        if (is_load_mode_ && failed_rank_in_group_ == 2) {
+            if (rank_in_group_ < 2) {
+                parity_idx = decode_coefficient_0_;
+            } else if (rank_in_group_ < 4) {
+                parity_idx = decode_coefficient_1_;
+            } else {
+                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid rank_in_group " << rank_in_group_
+                          << " for load mode (expected 0-3)" << std::endl;
+                parity_idx = 1;
+            }
+            if (decode_coefficient_0_ == 0 || decode_coefficient_1_ == 0) {
+                std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: Decode coefficient is 0, this may cause issues"
+                          << std::endl;
+            }
+        }
+
+        if (data_block_index_ < 0 || data_block_index_ >= k_) {
+            std::cerr << "EC-CHECK: invalid data_block_index_=" << data_block_index_ << " for k=" << k_ << std::endl;
+            return false;
+        }
+
+        const size_t tbl_offset = (static_cast<size_t>(parity_idx * k_ + data_block_index_)) * 32u;
+        out->data_addr = data_addr;
+        out->encoding_addr = encoding_addr;
+        out->size = size;
+        out->use_isal_ec = true;
+        out->gftbls_ptr = g_tbls_ + tbl_offset;
+        out->fallback_coeff = 0;
+        return true;
+    }
     
     void encode_with_coefficient(uintptr_t data_addr, size_t size, uintptr_t encoding_addr, int coefficient) {
         // 使用 isa-l 的 EC 编码对整块 buffer 进行编码。
         // 我们在初始化时已经生成了 RS 矩阵并通过 ec_init_tables 产生了 g_tbls_。
-        // 每个 encoder 线程只保留自己负责的 parity（encoding_addr 指向本地 parity buffer），
+        // 每个 encoder 线程只保留自己负责的 parity（encoding_addr 指向本地 parity buffer）。
+        // Load mode: optional 16-thread striped pool (ECCHECK_ENCODE_CPU_LIST).
+
+        if (load_encode_pool_inited_.load(std::memory_order_acquire)) {
+            LoadEncodePoolJob job{};
+            if (try_build_load_encode_pool_job(data_addr, size, encoding_addr, coefficient, &job)) {
+                load_encode_pool_run_parallel(job);
+            }
+            return;
+        }
 
         // 如果没有正确初始化 EC 表，回退到简单乘法
         if (k_ <= 0 || rows_ != 2 || g_tbls_ == nullptr) {
@@ -1582,8 +1898,8 @@ private:
             if (use_rdma_ && rdma_xor_qp_) {
                 std::cout << "[EC-CHECK RDMA] Save_XOR_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                 try {
-                    rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_control_sock(),
-                        rdma_xor_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
+                    rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_send_control_sock(),
+                        rdma_xor_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 } catch (const std::exception& e) {
@@ -1741,7 +2057,7 @@ private:
                 std::cout << "[EC-CHECK RDMA] Save_XOR_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                 try {
                     size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
-                        get_rdma_xor_control_sock(), rdma_xor_control_mutex_,
+                        get_rdma_xor_recv_control_sock(), rdma_xor_recv_control_mutex_,
                         reinterpret_cast<uint8_t*>(task.recv_addr), task.size);
                     if (recv_size != task.size) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA XOR recv size mismatch: expected "
@@ -2094,6 +2410,16 @@ private:
             
             // Step 1: Copy own data/parity to own_buffer (save path only)
             if (task.p2p_own_write_addr != 0 && task.send_buffer_addr != 0 && task.size > 0) {
+#ifdef __linux__
+                if (use_rdma_ && (!rdma_range_registered(task.p2p_own_write_addr, task.size) ||
+                                  !rdma_range_registered(task.send_buffer_addr, task.size))) {
+                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid P2P send memcpy range "
+                              << "(dst=0x" << std::hex << task.p2p_own_write_addr
+                              << ", src=0x" << task.send_buffer_addr << std::dec
+                              << ", size=" << task.size << ")" << std::endl;
+                    throw std::runtime_error("EC-CHECK: Invalid P2P send memcpy range");
+                }
+#endif
                 std::memcpy(reinterpret_cast<void*>(task.p2p_own_write_addr),
                            reinterpret_cast<void*>(task.send_buffer_addr),
                            task.size);
@@ -2117,8 +2443,8 @@ private:
                 if (use_rdma_ && rdma_p2p_qp_) {
                     std::cout << "[EC-CHECK RDMA] Save_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                     try {
-                        rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_control_sock(),
-                            rdma_p2p_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
+                        rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
+                            rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA P2P send failed: " << e.what() << std::endl;
                     }
@@ -2366,7 +2692,7 @@ private:
                     std::cout << "[EC-CHECK RDMA] Save_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
-                            get_rdma_p2p_control_sock(), rdma_p2p_control_mutex_,
+                            get_rdma_p2p_recv_control_sock(), rdma_p2p_recv_control_mutex_,
                             reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size);
                         if (recv_size == task.size) task_processed = true;
                         else {
@@ -2490,6 +2816,16 @@ private:
             if (task_processed && task.is_load_mode_transfer && task.data_buffer_addr != 0) {
                 // If recv_buffer_addr != data_buffer_addr, need to copy data
                 if (task.recv_buffer_addr != task.data_buffer_addr) {
+#ifdef __linux__
+                    if (use_rdma_ && (!rdma_range_registered(task.data_buffer_addr, task.size) ||
+                                      !rdma_range_registered(task.recv_buffer_addr, task.size))) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid load P2P recv memcpy range "
+                                  << "(dst=0x" << std::hex << task.data_buffer_addr
+                                  << ", src=0x" << task.recv_buffer_addr << std::dec
+                                  << ", size=" << task.size << ")" << std::endl;
+                        throw std::runtime_error("EC-CHECK: Invalid load P2P recv memcpy range");
+                    }
+#endif
                     std::memcpy(
                         reinterpret_cast<void*>(task.data_buffer_addr),
                         reinterpret_cast<void*>(task.recv_buffer_addr),
@@ -3272,6 +3608,10 @@ public:
         load_p2p_recv_queue_cv_.notify_all();
         load_step6_p2p_send_queue_cv_.notify_all();
         load_step6_p2p_recv_queue_cv_.notify_all();
+        load_xor_pool_worker_cv_.notify_all();
+        load_xor_pool_coordinator_cv_.notify_all();
+        load_encode_pool_worker_cv_.notify_all();
+        load_encode_pool_coordinator_cv_.notify_all();
         
         // Join all threads
         if (encoder_thread_1_.joinable()) encoder_thread_1_.join();
@@ -3282,6 +3622,7 @@ public:
         if (p2p_send_worker_.joinable()) p2p_send_worker_.join();
         if (p2p_recv_worker_.joinable()) p2p_recv_worker_.join();
         if (load_encoder_worker_.joinable()) load_encoder_worker_.join();
+        load_encode_pool_shutdown();
         if (rank_in_group_ == 0 || rank_in_group_ == 1) {
             if (load_send_worker_.joinable()) load_send_worker_.join();
         }
@@ -3289,6 +3630,7 @@ public:
             if (load_recv_worker_.joinable()) load_recv_worker_.join();
         }
         if (load_xor_worker_.joinable()) load_xor_worker_.join();
+        load_xor_pool_shutdown();
         if (rank_in_group_ == 0 || rank_in_group_ == 3) {
             if (load_p2p_send_worker_.joinable()) load_p2p_send_worker_.join();
         }
@@ -3489,6 +3831,7 @@ public:
             load_step6_p2p_recv_worker_completed_ = false;
             load_step6_p2p_recv_worker_sentinel_received_ = false;
             
+            load_encode_pool_init();
             // Start load encoder worker (all ranks use it)
             load_encoder_worker_ = std::thread(&ECCHECKNative::load_encoder_worker, this);
             
@@ -3508,6 +3851,9 @@ public:
             }
             
             // Start load XOR worker (all ranks use it, though only rank2/3 actually do XOR)
+            if (rank_in_group_ == 2 || rank_in_group_ == 3) {
+                load_xor_pool_init();
+            }
             load_xor_worker_ = std::thread(&ECCHECKNative::load_xor_worker, this);
             
             // Start load P2P send worker (only rank0/3 use it)
@@ -3896,8 +4242,8 @@ public:
             if (use_rdma_ && rdma_xor_qp_) {
                 std::cout << "[EC-CHECK RDMA] Load_XOR_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                 try {
-                    rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_control_sock(),
-                        rdma_xor_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
+                    rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_send_control_sock(),
+                        rdma_xor_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 } catch (const std::exception& e) {
@@ -4014,7 +4360,7 @@ public:
                 std::cout << "[EC-CHECK RDMA] Load_XOR_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                 try {
                     size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
-                        get_rdma_xor_control_sock(), rdma_xor_control_mutex_,
+                        get_rdma_xor_recv_control_sock(), rdma_xor_recv_control_mutex_,
                         reinterpret_cast<uint8_t*>(task.recv_addr), task.size);
                     if (recv_size != task.size) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA XOR recv size mismatch: expected "
@@ -4120,6 +4466,191 @@ public:
         }
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv worker exited" << std::endl;
     }
+
+    static std::array<int, kLoadXorPoolSize> parse_load_xor_pool_cpus_or_throw() {
+        std::array<int, kLoadXorPoolSize> cpus{};
+        const char* env = std::getenv("ECCHECK_XOR_CPU_LIST");
+        if (!env || !*env) {
+            for (int i = 0; i < kLoadXorPoolSize; ++i) {
+                cpus[static_cast<size_t>(i)] = i;
+            }
+            std::cout << "EC-CHECK: ECCHECK_XOR_CPU_LIST not set; load XOR pool binds workers to CPUs 0.."
+                      << (kLoadXorPoolSize - 1) << std::endl;
+            return cpus;
+        }
+        std::vector<int> parsed;
+        const char* p = env;
+        while (*p) {
+            while (*p && (std::isspace(static_cast<unsigned char>(*p)) || *p == ',')) {
+                ++p;
+            }
+            if (!*p) {
+                break;
+            }
+            char* end = nullptr;
+            long v = std::strtol(p, &end, 10);
+            if (end == p || v < 0 || v > 65535) {
+                throw std::runtime_error("ECCHECK_XOR_CPU_LIST: invalid CPU id token");
+            }
+            parsed.push_back(static_cast<int>(v));
+            p = end;
+        }
+        if (parsed.size() != static_cast<size_t>(kLoadXorPoolSize)) {
+            throw std::runtime_error(
+                "ECCHECK_XOR_CPU_LIST must contain exactly 16 comma-separated CPU ids "
+                "(or unset to use 0..15)");
+        }
+        for (size_t i = 0; i < cpus.size(); ++i) {
+            cpus[i] = parsed[i];
+        }
+        return cpus;
+    }
+
+    void load_xor_pool_init() {
+        if (load_xor_pool_inited_.load(std::memory_order_acquire)) {
+            return;
+        }
+        load_xor_pool_cpus_ = parse_load_xor_pool_cpus_or_throw();
+        load_xor_pool_stop_.store(false, std::memory_order_release);
+        load_xor_pool_epoch_.store(0, std::memory_order_release);
+        load_xor_pool_remaining_.store(0, std::memory_order_release);
+        for (auto& e : load_xor_pool_last_epoch_) {
+            e = 0;
+        }
+        for (int i = 0; i < kLoadXorPoolSize; ++i) {
+            load_xor_pool_ctx_[static_cast<size_t>(i)].self = this;
+            load_xor_pool_ctx_[static_cast<size_t>(i)].wid = i;
+            int rc = pthread_create(
+                &load_xor_pool_threads_[static_cast<size_t>(i)],
+                nullptr,
+                &ECCHECKNative::load_xor_pool_pthread_entry,
+                &load_xor_pool_ctx_[static_cast<size_t>(i)]);
+            if (rc != 0) {
+                load_xor_pool_stop_.store(true, std::memory_order_release);
+                load_xor_pool_worker_cv_.notify_all();
+                for (int j = 0; j < i; ++j) {
+                    pthread_join(load_xor_pool_threads_[static_cast<size_t>(j)], nullptr);
+                }
+                throw std::runtime_error(
+                    std::string("EC-CHECK: pthread_create for load XOR pool failed: ") + std::strerror(rc));
+            }
+        }
+        load_xor_pool_inited_.store(true, std::memory_order_release);
+        std::cout << "EC-CHECK: Load XOR pthread pool (" << kLoadXorPoolSize << " workers) initialized"
+                  << std::endl;
+    }
+
+    void load_xor_pool_shutdown() {
+        if (!load_xor_pool_inited_.load(std::memory_order_acquire)) {
+            return;
+        }
+        load_xor_pool_stop_.store(true, std::memory_order_release);
+        load_xor_pool_worker_cv_.notify_all();
+        for (int i = 0; i < kLoadXorPoolSize; ++i) {
+            pthread_join(load_xor_pool_threads_[static_cast<size_t>(i)], nullptr);
+        }
+        load_xor_pool_stop_.store(false, std::memory_order_release);
+        load_xor_pool_inited_.store(false, std::memory_order_release);
+        std::cout << "EC-CHECK: Load XOR pthread pool shut down" << std::endl;
+    }
+
+    static void* load_xor_pool_pthread_entry(void* arg) {
+        auto* ctx = static_cast<EccheckXorPoolWorkerCtx*>(arg);
+        ctx->self->load_xor_pool_worker_loop(ctx->wid);
+        return nullptr;
+    }
+
+    void load_xor_pool_worker_loop(int wid) {
+        const int cpu = load_xor_pool_cpus_[static_cast<size_t>(wid)];
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (cpu >= 0 && static_cast<unsigned>(cpu) < CPU_SETSIZE) {
+            CPU_SET(static_cast<unsigned>(cpu), &cpuset);
+            int af = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+            if (af != 0) {
+                std::cerr << "EC-CHECK: load_xor_pool worker " << wid
+                          << " pthread_setaffinity_np failed: " << af << std::endl;
+            }
+        } else {
+            std::cerr << "EC-CHECK: load_xor_pool worker " << wid << " CPU id " << cpu
+                      << " invalid or >= CPU_SETSIZE, skipping affinity" << std::endl;
+        }
+
+        while (true) {
+            std::unique_lock<std::mutex> lk(load_xor_pool_mutex_);
+            load_xor_pool_worker_cv_.wait(lk, [&] {
+                return load_xor_pool_stop_.load(std::memory_order_acquire) ||
+                       (load_xor_pool_last_epoch_[static_cast<size_t>(wid)] <
+                        load_xor_pool_epoch_.load(std::memory_order_acquire));
+            });
+            if (load_xor_pool_stop_.load(std::memory_order_acquire)) {
+                break;
+            }
+            uint64_t e = load_xor_pool_epoch_.load(std::memory_order_acquire);
+            LoadXorPoolJob local_copy = load_xor_pool_shared_job_;
+            lk.unlock();
+
+            load_xor_pool_execute_stripe_from_job(local_copy, wid);
+
+            {
+                std::lock_guard<std::mutex> guard(load_xor_pool_mutex_);
+                load_xor_pool_last_epoch_[static_cast<size_t>(wid)] = e;
+            }
+
+            const int left =
+                load_xor_pool_remaining_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (left == 0) {
+                load_xor_pool_coordinator_cv_.notify_one();
+            }
+        }
+    }
+
+    void load_xor_pool_execute_stripe_from_job(const LoadXorPoolJob& job, int wid) {
+        const size_t total = job.size;
+        const size_t base = total / static_cast<size_t>(kLoadXorPoolSize);
+        const size_t rem = total % static_cast<size_t>(kLoadXorPoolSize);
+        size_t off;
+        size_t len;
+        if (wid < kLoadXorPoolSize - 1) {
+            off = static_cast<size_t>(wid) * base;
+            len = base;
+        } else {
+            off = static_cast<size_t>(kLoadXorPoolSize - 1) * base;
+            len = base + rem;
+        }
+        if (len == 0) {
+            return;
+        }
+        auto at = [](uintptr_t base_ptr, size_t o) -> unsigned char* {
+            return reinterpret_cast<unsigned char*>(base_ptr + o);
+        };
+        unsigned char* p0 = at(job.local_encoding_addr, off);
+        unsigned char* p1 = at(job.remote_encoding_addr, off);
+        unsigned char* pd = at(job.parity_addr, off);
+        void* xor_array[3] = {p0, p1, pd};
+        xor_gen(3, static_cast<int>(len), xor_array);
+    }
+
+    void load_xor_pool_run_parallel_xor(const LoadXORTask& task) {
+        {
+            std::lock_guard<std::mutex> publish(load_xor_pool_mutex_);
+            if (should_stop_threads_.load(std::memory_order_acquire)) {
+                return;
+            }
+            load_xor_pool_shared_job_.local_encoding_addr = task.local_encoding_addr;
+            load_xor_pool_shared_job_.remote_encoding_addr = task.remote_encoding_addr;
+            load_xor_pool_shared_job_.parity_addr = task.parity_addr;
+            load_xor_pool_shared_job_.size = task.size;
+            load_xor_pool_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            load_xor_pool_remaining_.store(kLoadXorPoolSize, std::memory_order_release);
+        }
+        load_xor_pool_worker_cv_.notify_all();
+        std::unique_lock<std::mutex> lk(load_xor_pool_mutex_);
+        load_xor_pool_coordinator_cv_.wait(lk, [&] {
+            return load_xor_pool_remaining_.load(std::memory_order_acquire) == 0 ||
+                   should_stop_threads_.load(std::memory_order_acquire);
+        });
+    }
     
     // Load XOR Worker - 执行 XOR 操作并处理 Step6 P2P
     void load_xor_worker() {
@@ -4163,18 +4694,20 @@ public:
                 continue;
             }
             
-            // Perform XOR
-            unsigned char* srcs[2];
-            srcs[0] = reinterpret_cast<unsigned char*>(task.local_encoding_addr);
-            srcs[1] = reinterpret_cast<unsigned char*>(task.remote_encoding_addr);
-            unsigned char* dest = reinterpret_cast<unsigned char*>(task.parity_addr);
-            
-            void* xor_array[3];
-            xor_array[0] = srcs[0];
-            xor_array[1] = srcs[1];
-            xor_array[2] = dest;
-            
-            xor_gen(3, static_cast<int>(task.size), xor_array);
+            // Perform XOR (rank 2/3: striped parallel via pthread pool when initialized)
+            if (load_xor_pool_inited_.load(std::memory_order_acquire)) {
+                load_xor_pool_run_parallel_xor(task);
+            } else {
+                unsigned char* srcs[2];
+                srcs[0] = reinterpret_cast<unsigned char*>(task.local_encoding_addr);
+                srcs[1] = reinterpret_cast<unsigned char*>(task.remote_encoding_addr);
+                unsigned char* dest = reinterpret_cast<unsigned char*>(task.parity_addr);
+                void* xor_array[3];
+                xor_array[0] = srcs[0];
+                xor_array[1] = srcs[1];
+                xor_array[2] = dest;
+                xor_gen(3, static_cast<int>(task.size), xor_array);
+            }
             
             // FIX: Release encoding buffers after XOR completes (matches save mode behavior)
             {
@@ -4269,8 +4802,8 @@ public:
                 if (use_rdma_ && rdma_p2p_qp_) {
                     std::cout << "[EC-CHECK RDMA] Load_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                     try {
-                        rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_control_sock(),
-                            rdma_p2p_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
+                        rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
+                            rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA P2P send failed: " << e.what() << std::endl;
                     }
@@ -4388,7 +4921,7 @@ public:
                     std::cout << "[EC-CHECK RDMA] Load_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
-                            get_rdma_p2p_control_sock(), rdma_p2p_control_mutex_,
+                            get_rdma_p2p_recv_control_sock(), rdma_p2p_recv_control_mutex_,
                             reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size);
                         if (recv_size == task.size) task_processed = true;
                         else {
@@ -4447,6 +4980,16 @@ public:
             if (task_processed && !task.is_step6_transfer && task.data_buffer_addr != 0) {
                 // If recv_buffer_addr != data_buffer_addr, need to copy data
                 if (task.recv_buffer_addr != task.data_buffer_addr) {
+#ifdef __linux__
+                    if (use_rdma_ && (!rdma_range_registered(task.data_buffer_addr, task.size) ||
+                                      !rdma_range_registered(task.recv_buffer_addr, task.size))) {
+                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid load mode memcpy range "
+                                  << "(dst=0x" << std::hex << task.data_buffer_addr
+                                  << ", src=0x" << task.recv_buffer_addr << std::dec
+                                  << ", size=" << task.size << ")" << std::endl;
+                        throw std::runtime_error("EC-CHECK: Invalid load mode memcpy range");
+                    }
+#endif
                     std::memcpy(
                         reinterpret_cast<void*>(task.data_buffer_addr),
                         reinterpret_cast<void*>(task.recv_buffer_addr),
@@ -4535,7 +5078,7 @@ public:
                     std::cout << "[EC-CHECK RDMA] Load_Step6_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         rdma_send_data_via_qp(rdma_step6_p2p_qp_, rdma_step6_p2p_send_cq_,
-                            get_rdma_step6_p2p_control_sock(), rdma_step6_p2p_control_mutex_,
+                            get_rdma_step6_p2p_send_control_sock(), rdma_step6_p2p_send_control_mutex_,
                             reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
                         send_success = true;
                     } catch (const std::exception& e) {
@@ -4636,7 +5179,7 @@ public:
                     std::cout << "[EC-CHECK RDMA] Load_Step6_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_step6_p2p_qp_, rdma_step6_p2p_recv_cq_,
-                            get_rdma_step6_p2p_control_sock(), rdma_step6_p2p_control_mutex_,
+                            get_rdma_step6_p2p_recv_control_sock(), rdma_step6_p2p_recv_control_mutex_,
                             reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size);
                         if (recv_size == task.size) task_processed = true;
                         else {
@@ -4759,8 +5302,8 @@ public:
             }
             std::cout << "[EC-CHECK RDMA] Simple_P2P_Send: Sending " << size << " bytes via RDMA" << std::endl;
             try {
-                rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_control_sock(),
-                    rdma_p2p_control_mutex_, reinterpret_cast<const uint8_t*>(buffer_addr), size);
+                rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
+                    rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(buffer_addr), size);
             } catch (...) {
                 if (temp_reg) unregister_buffer(buffer_addr);
                 throw;
@@ -4809,8 +5352,8 @@ public:
             }
             std::cout << "[EC-CHECK RDMA] Simple_P2P_Recv: Receiving " << size << " bytes via RDMA" << std::endl;
             try {
-                rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_, get_rdma_p2p_control_sock(),
-                    rdma_p2p_control_mutex_, reinterpret_cast<uint8_t*>(buffer_addr), size);
+                rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_, get_rdma_p2p_recv_control_sock(),
+                    rdma_p2p_recv_control_mutex_, reinterpret_cast<uint8_t*>(buffer_addr), size);
             } catch (...) {
                 if (temp_reg) unregister_buffer(buffer_addr);
                 throw;
@@ -5079,20 +5622,38 @@ public:
         return nullptr;
     }
 
-    int get_rdma_xor_control_sock() {
-        return (rank_in_group_ == 0 || rank_in_group_ == 1)
-            ? asio_conn_mgr_.get_xor_send_socket().native_handle()
-            : asio_conn_mgr_.get_xor_recv_socket().native_handle();
+    bool rdma_range_registered(uintptr_t addr, size_t size) {
+        if (size == 0) return true;
+        std::lock_guard<std::mutex> lock(rdma_buffer_mutex_);
+        for (const auto& kv : rdma_registered_buffers_) {
+            uintptr_t base = kv.first;
+            size_t buf_size = kv.second.size;
+            if (addr < base) continue;
+            uintptr_t offset = addr - base;
+            if (offset <= buf_size && size <= (buf_size - offset)) {
+                return true;
+            }
+        }
+        return false;
     }
-    int get_rdma_p2p_control_sock() {
-        return (rank_ % 2 == 0)
-            ? asio_conn_mgr_.get_p2p_send_socket().native_handle()
-            : asio_conn_mgr_.get_p2p_recv_socket().native_handle();
+
+    int get_rdma_xor_send_control_sock() {
+        return asio_conn_mgr_.get_xor_send_socket().native_handle();
     }
-    int get_rdma_step6_p2p_control_sock() {
-        return (rank_in_group_ == 3)
-            ? asio_conn_mgr_.get_step6_p2p_send_socket().native_handle()
-            : asio_conn_mgr_.get_step6_p2p_recv_socket().native_handle();
+    int get_rdma_xor_recv_control_sock() {
+        return asio_conn_mgr_.get_xor_recv_socket().native_handle();
+    }
+    int get_rdma_p2p_send_control_sock() {
+        return asio_conn_mgr_.get_p2p_send_socket().native_handle();
+    }
+    int get_rdma_p2p_recv_control_sock() {
+        return asio_conn_mgr_.get_p2p_recv_socket().native_handle();
+    }
+    int get_rdma_step6_p2p_send_control_sock() {
+        return asio_conn_mgr_.get_step6_p2p_send_socket().native_handle();
+    }
+    int get_rdma_step6_p2p_recv_control_sock() {
+        return asio_conn_mgr_.get_step6_p2p_recv_socket().native_handle();
     }
 
     void rdma_poll_completion(ibv_cq* cq, int num_completions) {

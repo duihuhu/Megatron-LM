@@ -2613,15 +2613,22 @@ public:
         }
         const double recv_ms =
             static_cast<double>(load_recv_total_ns_.load(std::memory_order_relaxed)) / 1e6;
-        const double xor_ms =
+        const double xor_sum_ms =
             static_cast<double>(load_xor_total_ns_.load(std::memory_order_relaxed)) / 1e6;
         const size_t recv_tasks = load_recv_task_count_.load(std::memory_order_relaxed);
         const size_t xor_tasks = load_xor_task_count_.load(std::memory_order_relaxed);
+        const bool xor_e2e_ok = load_xor_e2e_wall_valid_.load(std::memory_order_relaxed);
+        const double xor_e2e_ms =
+            static_cast<double>(load_xor_e2e_wall_ns_.load(std::memory_order_relaxed)) / 1e6;
         std::cout << "EC-NAIVE: [Rank 2] Load timing summary: "
                   << "network_recv_ms=" << recv_ms
                   << ", network_recv_tasks=" << recv_tasks
-                  << ", xor_decode_ms=" << xor_ms
-                  << ", xor_decode_tasks=" << xor_tasks << std::endl;
+                  << ", xor_decode_sum_ms=" << xor_sum_ms
+                  << " (per-chunk wall time summed)"
+                  << ", xor_decode_tasks=" << xor_tasks
+                  << ", xor_decode_e2e_wall_ms=" << (xor_e2e_ok ? xor_e2e_ms : 0.0)
+                  << " (wall: first XOR start to last XOR end; 0 if no XOR)"
+                  << std::endl;
         std::cout << "EC-NAIVE: [Rank 2] All load workers completed" << std::endl;
     }
 
@@ -2786,6 +2793,8 @@ public:
             load_xor_total_ns_.store(0, std::memory_order_relaxed);
             load_recv_task_count_.store(0, std::memory_order_relaxed);
             load_xor_task_count_.store(0, std::memory_order_relaxed);
+            load_xor_e2e_wall_ns_.store(0, std::memory_order_relaxed);
+            load_xor_e2e_wall_valid_.store(false, std::memory_order_relaxed);
             
             // Start workers based on rank_in_group (rank_ is set in init_ecnaive_load_connections)
             if (rank_ == 2) {
@@ -3547,6 +3556,9 @@ private:
     std::atomic<uint64_t> load_xor_total_ns_{0};
     std::atomic<size_t> load_recv_task_count_{0};
     std::atomic<size_t> load_xor_task_count_{0};
+    // Load XOR: wall clock from first XOR chunk start to last XOR chunk end (excludes idle between chunks)
+    std::atomic<uint64_t> load_xor_e2e_wall_ns_{0};
+    std::atomic<bool> load_xor_e2e_wall_valid_{false};
 
     // EC-NAIVE load mode sentinel flags
     std::atomic<bool> load_recv_sentinel_received_{false};
@@ -5058,6 +5070,10 @@ private:
     void load_xor_worker() {
         std::cout << "EC-NAIVE: [Rank 2] Load XOR coordinator started (16 pthread workers, striped XOR)"
                   << std::endl;
+
+        bool xor_have_chunk = false;
+        std::chrono::steady_clock::time_point xor_first_start{};
+        std::chrono::steady_clock::time_point xor_last_end{};
         
         while (!stop_) {
             LoadXORTask task;
@@ -5102,9 +5118,14 @@ private:
             }
             
             // Parallel XOR: 16 pthread workers each process one byte stripe (base = size/16; remainder on last).
+            if (!xor_have_chunk) {
+                xor_first_start = std::chrono::steady_clock::now();
+                xor_have_chunk = true;
+            }
             auto xor_start = std::chrono::steady_clock::now();
             xor_pool_run_parallel_load_xor(task);
             auto xor_end = std::chrono::steady_clock::now();
+            xor_last_end = xor_end;
             const uint64_t xor_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(xor_end - xor_start).count());
             load_xor_total_ns_.fetch_add(xor_ns, std::memory_order_relaxed);
@@ -5121,6 +5142,16 @@ private:
                     break;
                 }
             }
+        }
+
+        if (xor_have_chunk) {
+            const uint64_t e2e_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(xor_last_end - xor_first_start).count());
+            load_xor_e2e_wall_ns_.store(e2e_ns, std::memory_order_relaxed);
+            load_xor_e2e_wall_valid_.store(true, std::memory_order_relaxed);
+        } else {
+            load_xor_e2e_wall_ns_.store(0, std::memory_order_relaxed);
+            load_xor_e2e_wall_valid_.store(false, std::memory_order_relaxed);
         }
         
         std::cout << "EC-NAIVE: [Rank 2] Load XOR worker completed" << std::endl;

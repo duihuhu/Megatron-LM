@@ -610,6 +610,28 @@ private:
     std::thread load_xor_worker_;
     std::atomic<bool> load_xor_worker_completed_;
     std::atomic<bool> load_xor_worker_sentinel_received_;
+    std::atomic<uint64_t> load_xor_total_ns_{0};
+    std::atomic<size_t> load_xor_task_count_{0};
+    std::atomic<uint64_t> load_xor_e2e_wall_ns_{0};
+    std::atomic<bool> load_xor_e2e_wall_valid_{false};
+    std::atomic<uint64_t> load_encode_total_ns_{0};
+    std::atomic<size_t> load_encode_task_count_{0};
+    std::atomic<uint64_t> load_encode_e2e_wall_ns_{0};
+    std::atomic<bool> load_encode_e2e_wall_valid_{false};
+
+    // Load path network I/O: per-task wall time summed (similar semantics to EC-NAIVE network_recv_ms)
+    std::atomic<uint64_t> load_enc_xor_send_total_ns_{0};
+    std::atomic<size_t> load_enc_xor_send_task_count_{0};
+    std::atomic<uint64_t> load_enc_xor_recv_total_ns_{0};
+    std::atomic<size_t> load_enc_xor_recv_task_count_{0};
+    std::atomic<uint64_t> load_step2_p2p_send_total_ns_{0};
+    std::atomic<size_t> load_step2_p2p_send_task_count_{0};
+    std::atomic<uint64_t> load_step2_p2p_recv_total_ns_{0};
+    std::atomic<size_t> load_step2_p2p_recv_task_count_{0};
+    std::atomic<uint64_t> load_step6_p2p_send_total_ns_{0};
+    std::atomic<size_t> load_step6_p2p_send_task_count_{0};
+    std::atomic<uint64_t> load_step6_p2p_recv_total_ns_{0};
+    std::atomic<size_t> load_step6_p2p_recv_task_count_{0};
 
     // Load XOR: 16 pthread workers (CPU affinity via ECCHECK_XOR_CPU_LIST), rank 2/3 only
     static constexpr int kLoadXorPoolSize = 16;
@@ -3354,6 +3376,26 @@ public:
         load_recv_worker_sentinel_received_ = false;
         load_xor_worker_completed_ = false;
         load_xor_worker_sentinel_received_ = false;
+        load_xor_total_ns_.store(0, std::memory_order_relaxed);
+        load_xor_task_count_.store(0, std::memory_order_relaxed);
+        load_xor_e2e_wall_ns_.store(0, std::memory_order_relaxed);
+        load_xor_e2e_wall_valid_.store(false, std::memory_order_relaxed);
+        load_encode_total_ns_.store(0, std::memory_order_relaxed);
+        load_encode_task_count_.store(0, std::memory_order_relaxed);
+        load_encode_e2e_wall_ns_.store(0, std::memory_order_relaxed);
+        load_encode_e2e_wall_valid_.store(false, std::memory_order_relaxed);
+        load_enc_xor_send_total_ns_.store(0, std::memory_order_relaxed);
+        load_enc_xor_send_task_count_.store(0, std::memory_order_relaxed);
+        load_enc_xor_recv_total_ns_.store(0, std::memory_order_relaxed);
+        load_enc_xor_recv_task_count_.store(0, std::memory_order_relaxed);
+        load_step2_p2p_send_total_ns_.store(0, std::memory_order_relaxed);
+        load_step2_p2p_send_task_count_.store(0, std::memory_order_relaxed);
+        load_step2_p2p_recv_total_ns_.store(0, std::memory_order_relaxed);
+        load_step2_p2p_recv_task_count_.store(0, std::memory_order_relaxed);
+        load_step6_p2p_send_total_ns_.store(0, std::memory_order_relaxed);
+        load_step6_p2p_send_task_count_.store(0, std::memory_order_relaxed);
+        load_step6_p2p_recv_total_ns_.store(0, std::memory_order_relaxed);
+        load_step6_p2p_recv_task_count_.store(0, std::memory_order_relaxed);
         load_p2p_send_worker_completed_ = false;
         load_p2p_send_worker_sentinel_received_ = false;
         load_p2p_recv_worker_completed_ = false;
@@ -3497,6 +3539,47 @@ public:
                 wait_count++;
             }
             std::cout << "EC-CHECK: [Rank " << rank_ << "] All load workers completed" << std::endl;
+            {
+                const double xor_sum_ms =
+                    static_cast<double>(load_xor_total_ns_.load(std::memory_order_relaxed)) / 1e6;
+                const size_t xor_tasks = load_xor_task_count_.load(std::memory_order_relaxed);
+                const bool xor_e2e_ok = load_xor_e2e_wall_valid_.load(std::memory_order_relaxed);
+                const double xor_e2e_ms =
+                    static_cast<double>(load_xor_e2e_wall_ns_.load(std::memory_order_relaxed)) / 1e6;
+                const double encode_sum_ms =
+                    static_cast<double>(load_encode_total_ns_.load(std::memory_order_relaxed)) / 1e6;
+                const size_t encode_tasks = load_encode_task_count_.load(std::memory_order_relaxed);
+                const bool encode_e2e_ok = load_encode_e2e_wall_valid_.load(std::memory_order_relaxed);
+                const double encode_e2e_ms =
+                    static_cast<double>(load_encode_e2e_wall_ns_.load(std::memory_order_relaxed)) / 1e6;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Encode timing: encode_sum_ms=" << encode_sum_ms
+                          << " (per-chunk wall time summed), encode_tasks=" << encode_tasks
+                          << ", encode_e2e_wall_ms=" << (encode_e2e_ok ? encode_e2e_ms : 0.0)
+                          << " (wall: first encode start to last encode end; 0 if no encode)" << std::endl;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Load XOR timing: xor_decode_sum_ms=" << xor_sum_ms
+                          << " (per-chunk wall time summed), xor_decode_tasks=" << xor_tasks
+                          << ", xor_decode_e2e_wall_ms=" << (xor_e2e_ok ? xor_e2e_ms : 0.0)
+                          << " (wall: first XOR start to last XOR end; 0 if no XOR)" << std::endl;
+
+                const double enc_recv_ms =
+                    static_cast<double>(load_enc_xor_recv_total_ns_.load(std::memory_order_relaxed)) / 1e6;
+                const size_t enc_recv_tasks = load_enc_xor_recv_task_count_.load(std::memory_order_relaxed);
+                const double s2_recv_ms =
+                    static_cast<double>(load_step2_p2p_recv_total_ns_.load(std::memory_order_relaxed)) / 1e6;
+                const size_t s2_recv_tasks = load_step2_p2p_recv_task_count_.load(std::memory_order_relaxed);
+                const double s6_recv_ms =
+                    static_cast<double>(load_step6_p2p_recv_total_ns_.load(std::memory_order_relaxed)) / 1e6;
+                const size_t s6_recv_tasks = load_step6_p2p_recv_task_count_.load(std::memory_order_relaxed);
+                const double network_recv_ms = enc_recv_ms + s2_recv_ms + s6_recv_ms;
+                const size_t network_recv_tasks = enc_recv_tasks + s2_recv_tasks + s6_recv_tasks;
+                std::cout << "EC-CHECK: [Rank " << rank_ << "] Load network timing (recv-only): "
+                          << "network_recv_ms=" << network_recv_ms
+                          << ", network_recv_tasks=" << network_recv_tasks
+                          << ", enc_xor_recv_ms=" << enc_recv_ms << ", enc_xor_recv_tasks=" << enc_recv_tasks
+                          << ", step2_p2p_recv_ms=" << s2_recv_ms << ", step2_p2p_recv_tasks=" << s2_recv_tasks
+                          << ", step6_p2p_recv_ms=" << s6_recv_ms << ", step6_p2p_recv_tasks=" << s6_recv_tasks
+                          << std::endl;
+            }
             return;  // Load mode 下直接返回，不等待 save mode 的 workers
         } else {
             // Save mode: 现有逻辑保持不变
@@ -3822,6 +3905,26 @@ public:
             load_recv_worker_sentinel_received_ = false;
             load_xor_worker_completed_ = false;
             load_xor_worker_sentinel_received_ = false;
+            load_xor_total_ns_.store(0, std::memory_order_relaxed);
+            load_xor_task_count_.store(0, std::memory_order_relaxed);
+            load_xor_e2e_wall_ns_.store(0, std::memory_order_relaxed);
+            load_xor_e2e_wall_valid_.store(false, std::memory_order_relaxed);
+            load_encode_total_ns_.store(0, std::memory_order_relaxed);
+            load_encode_task_count_.store(0, std::memory_order_relaxed);
+            load_encode_e2e_wall_ns_.store(0, std::memory_order_relaxed);
+            load_encode_e2e_wall_valid_.store(false, std::memory_order_relaxed);
+            load_enc_xor_send_total_ns_.store(0, std::memory_order_relaxed);
+            load_enc_xor_send_task_count_.store(0, std::memory_order_relaxed);
+            load_enc_xor_recv_total_ns_.store(0, std::memory_order_relaxed);
+            load_enc_xor_recv_task_count_.store(0, std::memory_order_relaxed);
+            load_step2_p2p_send_total_ns_.store(0, std::memory_order_relaxed);
+            load_step2_p2p_send_task_count_.store(0, std::memory_order_relaxed);
+            load_step2_p2p_recv_total_ns_.store(0, std::memory_order_relaxed);
+            load_step2_p2p_recv_task_count_.store(0, std::memory_order_relaxed);
+            load_step6_p2p_send_total_ns_.store(0, std::memory_order_relaxed);
+            load_step6_p2p_send_task_count_.store(0, std::memory_order_relaxed);
+            load_step6_p2p_recv_total_ns_.store(0, std::memory_order_relaxed);
+            load_step6_p2p_recv_task_count_.store(0, std::memory_order_relaxed);
             load_p2p_send_worker_completed_ = false;
             load_p2p_send_worker_sentinel_received_ = false;
             load_p2p_recv_worker_completed_ = false;
@@ -3956,6 +4059,9 @@ public:
     // Load Encoder Worker - 独立的 load mode encoding worker
     void load_encoder_worker() {
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Load encoder worker started" << std::endl;
+        bool encode_have_chunk = false;
+        std::chrono::steady_clock::time_point encode_first_start{};
+        std::chrono::steady_clock::time_point encode_last_end{};
         
         while (!should_stop_threads_) {
             LoadEncodingTask task;
@@ -3967,6 +4073,13 @@ public:
                 });
                 
                 if (should_stop_threads_ && load_encoding_tasks_.empty()) {
+                    if (encode_have_chunk) {
+                        const uint64_t e2e_ns = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(encode_last_end - encode_first_start).count());
+                        load_encode_e2e_wall_ns_.store(e2e_ns, std::memory_order_relaxed);
+                        load_encode_e2e_wall_valid_.store(true, std::memory_order_relaxed);
+                        encode_have_chunk = false;
+                    }
                     break;
                 }
                 
@@ -4017,7 +4130,18 @@ public:
             
             // Perform encoding (only parity index 1)
             if (task.data_addr != 0 && task.encoding_addr != 0) {
+                if (!encode_have_chunk) {
+                    encode_first_start = std::chrono::steady_clock::now();
+                    encode_have_chunk = true;
+                }
+                const auto encode_chunk_t0 = std::chrono::steady_clock::now();
                 encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 1);
+                const auto encode_chunk_t1 = std::chrono::steady_clock::now();
+                encode_last_end = encode_chunk_t1;
+                const uint64_t encode_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(encode_chunk_t1 - encode_chunk_t0).count());
+                load_encode_total_ns_.fetch_add(encode_ns, std::memory_order_relaxed);
+                load_encode_task_count_.fetch_add(1, std::memory_order_relaxed);
                 
                 // Release data buffer immediately (load mode doesn't need to wait for P2P)
                 {
@@ -4084,6 +4208,13 @@ public:
                 }
                 
                 if (can_send_sentinel) {
+                    if (encode_have_chunk) {
+                        const uint64_t e2e_ns = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(encode_last_end - encode_first_start).count());
+                        load_encode_e2e_wall_ns_.store(e2e_ns, std::memory_order_relaxed);
+                        load_encode_e2e_wall_valid_.store(true, std::memory_order_relaxed);
+                        encode_have_chunk = false;
+                    }
                     load_encoding_completed_ = true;
                     // Submit sentinel to downstream load workers (only to queues used by this rank)
                     // rank_in_group 0/1: use load_send_queue_ (send encoding to rank_in_group 2/3)
@@ -4134,6 +4265,13 @@ public:
                     //           << "] Load encoder: All tasks completed, sentinel sent to downstream workers" << std::endl;
                 }
             }
+        }
+        if (encode_have_chunk) {
+            const uint64_t e2e_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(encode_last_end - encode_first_start).count());
+            load_encode_e2e_wall_ns_.store(e2e_ns, std::memory_order_relaxed);
+            load_encode_e2e_wall_valid_.store(true, std::memory_order_relaxed);
+            encode_have_chunk = false;
         }
     }
     
@@ -4193,6 +4331,17 @@ public:
     
     // ========== Load Mode 独立的 Worker 实现 ==========
     
+    void record_load_net_ns_(
+        std::atomic<uint64_t>& total_ns,
+        std::atomic<size_t>& task_count,
+        std::chrono::steady_clock::time_point t0) {
+        const auto t1 = std::chrono::steady_clock::now();
+        const uint64_t ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+        total_ns.fetch_add(ns, std::memory_order_relaxed);
+        task_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // Load Send Worker - rank0/1 发送 encoding 给 rank2/3
     void load_send_worker() {
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send worker started" << std::endl;
@@ -4241,9 +4390,11 @@ public:
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_qp_) {
                 std::cout << "[EC-CHECK RDMA] Load_XOR_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
+                const auto t_net = std::chrono::steady_clock::now();
                 try {
                     rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_send_control_sock(),
                         rdma_xor_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
+                    record_load_net_ns_(load_enc_xor_send_total_ns_, load_enc_xor_send_task_count_, t_net);
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 } catch (const std::exception& e) {
@@ -4259,6 +4410,7 @@ public:
                 uint32_t size_net = htonl(static_cast<uint32_t>(task.size));
                 
                 try {
+                    const auto t_net = std::chrono::steady_clock::now();
                     // Send message header (size) first
                     // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send: About to send header (size=" << task.size << ")" << std::endl;
                     boost::asio::write(
@@ -4274,7 +4426,7 @@ public:
                         boost::asio::buffer(buffer_ptr, task.size)
                     );
                     // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send: Data sent successfully" << std::endl;
-                    
+                    record_load_net_ns_(load_enc_xor_send_total_ns_, load_enc_xor_send_task_count_, t_net);
                     // Send completed successfully, release buffer
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
@@ -4358,6 +4510,7 @@ public:
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_qp_) {
                 std::cout << "[EC-CHECK RDMA] Load_XOR_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                const auto t_net = std::chrono::steady_clock::now();
                 try {
                     size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
                         get_rdma_xor_recv_control_sock(), rdma_xor_recv_control_mutex_,
@@ -4367,6 +4520,7 @@ public:
                                   << task.size << ", got " << recv_size << std::endl;
                         continue;
                     }
+                    record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net);
                 } catch (const std::exception& e) {
                     std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA XOR recv failed: " << e.what() << std::endl;
                     continue;
@@ -4378,6 +4532,7 @@ public:
                 uint32_t size_net;
                 
                 try {
+                    const auto t_net = std::chrono::steady_clock::now();
                     // Receive message header (size) first
                     // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv: About to receive header (expected_size=" << task.size << ")" << std::endl;
                     boost::asio::read(
@@ -4401,7 +4556,7 @@ public:
                         boost::asio::buffer(buffer_ptr, size)
                     );
                     // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv: Data received successfully" << std::endl;
-                    
+                    record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net);
                     // Receive completed successfully, continue with XOR processing below
                 } catch (const boost::system::system_error& e) {
                     std::cerr << "EC-CHECK: [Rank " << rank_ 
@@ -4655,6 +4810,25 @@ public:
     // Load XOR Worker - 执行 XOR 操作并处理 Step6 P2P
     void load_xor_worker() {
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Load XOR worker started" << std::endl;
+
+        bool xor_have_chunk = false;
+        std::chrono::steady_clock::time_point xor_first_start{};
+        std::chrono::steady_clock::time_point xor_last_end{};
+
+        // Publish per-load-batch e2e wall (first XOR chunk start -> last XOR chunk end).
+        // Unlike storing only at thread exit, this matches EC-NAIVE and wait_for_encoding_completion timing.
+        auto publish_load_xor_e2e_for_batch = [this](bool& have_chunk,
+                                                     const std::chrono::steady_clock::time_point& first_start,
+                                                     const std::chrono::steady_clock::time_point& last_end) {
+            if (!have_chunk) {
+                return;  // No XOR in this batch; counters stay 0; valid stays false from reset_encoding/set_load_mode.
+            }
+            const uint64_t e2e_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(last_end - first_start).count());
+            load_xor_e2e_wall_ns_.store(e2e_ns, std::memory_order_relaxed);
+            load_xor_e2e_wall_valid_.store(true, std::memory_order_relaxed);
+            have_chunk = false;
+        };
         
         while (!should_stop_threads_) {
             LoadXORTask task;
@@ -4666,12 +4840,21 @@ public:
                 });
                 
                 if (should_stop_threads_ && load_xor_queue_.empty()) {
+                    if (xor_have_chunk) {
+                        const uint64_t e2e_ns = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(xor_last_end - xor_first_start)
+                                .count());
+                        load_xor_e2e_wall_ns_.store(e2e_ns, std::memory_order_relaxed);
+                        load_xor_e2e_wall_valid_.store(true, std::memory_order_relaxed);
+                        xor_have_chunk = false;
+                    }
                     break;
                 }
                 
                 if (load_xor_worker_sentinel_received_.load() && load_xor_queue_.empty()) {
                     load_xor_worker_completed_ = true;
                     load_xor_worker_sentinel_received_ = false;
+                    publish_load_xor_e2e_for_batch(xor_have_chunk, xor_first_start, xor_last_end);
                     continue;
                 }
                 
@@ -4684,17 +4867,27 @@ public:
                                 task.p2p_partner_write_addr == 0 && task.data_addr == 0);
             if (is_sentinel) {
                 load_xor_worker_sentinel_received_ = true;
+                bool batch_xor_done = false;
                 {
                     std::lock_guard<std::mutex> lock(load_xor_queue_mutex_);
                     if (load_xor_queue_.empty()) {
                         load_xor_worker_completed_ = true;
                         load_xor_worker_sentinel_received_ = false;
+                        batch_xor_done = true;
                     }
+                }
+                if (batch_xor_done) {
+                    publish_load_xor_e2e_for_batch(xor_have_chunk, xor_first_start, xor_last_end);
                 }
                 continue;
             }
             
             // Perform XOR (rank 2/3: striped parallel via pthread pool when initialized)
+            if (!xor_have_chunk) {
+                xor_first_start = std::chrono::steady_clock::now();
+                xor_have_chunk = true;
+            }
+            const auto xor_chunk_t0 = std::chrono::steady_clock::now();
             if (load_xor_pool_inited_.load(std::memory_order_acquire)) {
                 load_xor_pool_run_parallel_xor(task);
             } else {
@@ -4708,6 +4901,12 @@ public:
                 xor_array[2] = dest;
                 xor_gen(3, static_cast<int>(task.size), xor_array);
             }
+            const auto xor_chunk_t1 = std::chrono::steady_clock::now();
+            xor_last_end = xor_chunk_t1;
+            const uint64_t xor_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(xor_chunk_t1 - xor_chunk_t0).count());
+            load_xor_total_ns_.fetch_add(xor_ns, std::memory_order_relaxed);
+            load_xor_task_count_.fetch_add(1, std::memory_order_relaxed);
             
             // FIX: Release encoding buffers after XOR completes (matches save mode behavior)
             {
@@ -4745,13 +4944,29 @@ public:
             }
             
             if (load_xor_worker_sentinel_received_.load()) {
-                std::lock_guard<std::mutex> lock(load_xor_queue_mutex_);
-                if (load_xor_queue_.empty()) {
-                    load_xor_worker_completed_ = true;
-                    load_xor_worker_sentinel_received_ = false;
-                    // Note: Step6 P2P sentinels are sent from Python after all Step6 tasks are submitted
+                bool batch_xor_done = false;
+                {
+                    std::lock_guard<std::mutex> lock(load_xor_queue_mutex_);
+                    if (load_xor_queue_.empty()) {
+                        load_xor_worker_completed_ = true;
+                        load_xor_worker_sentinel_received_ = false;
+                        batch_xor_done = true;
+                        // Note: Step6 P2P sentinels are sent from Python after all Step6 tasks are submitted
+                    }
+                }
+                if (batch_xor_done) {
+                    publish_load_xor_e2e_for_batch(xor_have_chunk, xor_first_start, xor_last_end);
                 }
             }
+        }
+
+        // Thread shutdown: only publish if a batch was in progress (avoid clearing last batch e2e).
+        if (xor_have_chunk) {
+            const uint64_t e2e_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(xor_last_end - xor_first_start).count());
+            load_xor_e2e_wall_ns_.store(e2e_ns, std::memory_order_relaxed);
+            load_xor_e2e_wall_valid_.store(true, std::memory_order_relaxed);
+            xor_have_chunk = false;
         }
     }
     
@@ -4801,9 +5016,11 @@ public:
 #ifdef __linux__
                 if (use_rdma_ && rdma_p2p_qp_) {
                     std::cout << "[EC-CHECK RDMA] Load_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
+                    const auto t_net = std::chrono::steady_clock::now();
                     try {
                         rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
                             rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
+                        record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net);
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA P2P send failed: " << e.what() << std::endl;
                     }
@@ -4815,6 +5032,7 @@ public:
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));
                     
                     try {
+                        const auto t_net = std::chrono::steady_clock::now();
                         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: About to send header (size=" << task.size << ")" << std::endl;
                         boost::asio::write(
                             asio_conn_mgr_.get_p2p_send_socket(),
@@ -4828,6 +5046,7 @@ public:
                             boost::asio::buffer(buffer_ptr, task.size)
                         );
                         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Data sent successfully" << std::endl;
+                        record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net);
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
                                   << "] Load P2P ASIO send failed: " << e.what() << std::endl;
@@ -4919,12 +5138,15 @@ public:
 #ifdef __linux__
                 if (use_rdma_ && rdma_p2p_qp_) {
                     std::cout << "[EC-CHECK RDMA] Load_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                    const auto t_net = std::chrono::steady_clock::now();
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
                             get_rdma_p2p_recv_control_sock(), rdma_p2p_recv_control_mutex_,
                             reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size);
-                        if (recv_size == task.size) task_processed = true;
-                        else {
+                        if (recv_size == task.size) {
+                            task_processed = true;
+                            record_load_net_ns_(load_step2_p2p_recv_total_ns_, load_step2_p2p_recv_task_count_, t_net);
+                        } else {
                             std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load P2P RDMA recv size mismatch: expected "
                                       << task.size << ", got " << recv_size << std::endl;
                         }
@@ -4940,6 +5162,7 @@ public:
                     uint32_t size_net;
                     
                     try {
+                        const auto t_net = std::chrono::steady_clock::now();
                         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: About to receive header (expected_size=" << task.size << ")" << std::endl;
                         boost::asio::read(
                             asio_conn_mgr_.get_p2p_recv_socket(),
@@ -4961,6 +5184,7 @@ public:
                             boost::asio::buffer(buffer_ptr, size)
                         );
                         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: Data received successfully" << std::endl;
+                        record_load_net_ns_(load_step2_p2p_recv_total_ns_, load_step2_p2p_recv_task_count_, t_net);
                         task_processed = true;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
@@ -5076,10 +5300,12 @@ public:
 #ifdef __linux__
                 if (use_rdma_ && rdma_step6_p2p_qp_) {
                     std::cout << "[EC-CHECK RDMA] Load_Step6_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
+                    const auto t_net = std::chrono::steady_clock::now();
                     try {
                         rdma_send_data_via_qp(rdma_step6_p2p_qp_, rdma_step6_p2p_send_cq_,
                             get_rdma_step6_p2p_send_control_sock(), rdma_step6_p2p_send_control_mutex_,
                             reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
+                        record_load_net_ns_(load_step6_p2p_send_total_ns_, load_step6_p2p_send_task_count_, t_net);
                         send_success = true;
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA send failed: " << e.what() << std::endl;
@@ -5092,6 +5318,7 @@ public:
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));
                     
                     try {
+                        const auto t_net = std::chrono::steady_clock::now();
                         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P send: About to send header (size=" << task.size << ")" << std::endl;
                         boost::asio::write(
                             asio_conn_mgr_.get_step6_p2p_send_socket(),
@@ -5105,6 +5332,7 @@ public:
                             boost::asio::buffer(buffer_ptr, task.size)
                         );
                         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P send: Data sent successfully" << std::endl;
+                        record_load_net_ns_(load_step6_p2p_send_total_ns_, load_step6_p2p_send_task_count_, t_net);
                         send_success = true;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
@@ -5177,12 +5405,15 @@ public:
 #ifdef __linux__
                 if (use_rdma_ && rdma_step6_p2p_qp_) {
                     std::cout << "[EC-CHECK RDMA] Load_Step6_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                    const auto t_net = std::chrono::steady_clock::now();
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_step6_p2p_qp_, rdma_step6_p2p_recv_cq_,
                             get_rdma_step6_p2p_recv_control_sock(), rdma_step6_p2p_recv_control_mutex_,
                             reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size);
-                        if (recv_size == task.size) task_processed = true;
-                        else {
+                        if (recv_size == task.size) {
+                            task_processed = true;
+                            record_load_net_ns_(load_step6_p2p_recv_total_ns_, load_step6_p2p_recv_task_count_, t_net);
+                        } else {
                             std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA recv size mismatch: expected "
                                       << task.size << ", got " << recv_size << std::endl;
                         }
@@ -5198,6 +5429,7 @@ public:
                     uint32_t size_net;
                     
                     try {
+                        const auto t_net = std::chrono::steady_clock::now();
                         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P recv: About to receive header (expected_size=" << task.size << ")" << std::endl;
                         boost::asio::read(
                             asio_conn_mgr_.get_step6_p2p_recv_socket(),
@@ -5219,6 +5451,7 @@ public:
                             boost::asio::buffer(buffer_ptr, size)
                         );
                         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P recv: Data received successfully" << std::endl;
+                        record_load_net_ns_(load_step6_p2p_recv_total_ns_, load_step6_p2p_recv_task_count_, t_net);
                         task_processed = true;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 

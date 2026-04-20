@@ -958,10 +958,28 @@ class ECCHECKManager:
         buffer_addr = buffer.data_ptr()
         buffer_size = buffer.numel() * buffer.element_size()
         
-        # Check if already registered
+        # Check if already registered. Re-register when the same address needs a larger coverage.
         if buffer_addr in self.registered_buffers:
-            logger.debug(f"EC-CHECK: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} (size: {buffer_size / (1024**2):.2f} MB)")
-            return
+            registered_size, _ = self.registered_buffers[buffer_addr]
+            if registered_size >= buffer_size:
+                logger.debug(
+                    f"EC-CHECK: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} "
+                    f"(registered={registered_size / (1024**2):.2f} MB, requested={buffer_size / (1024**2):.2f} MB)"
+                )
+                return
+            logger.info(
+                f"EC-CHECK: [Rank {rank}] Re-registering buffer at 0x{buffer_addr:x} "
+                f"to expand coverage from {registered_size / (1024**2):.2f} MB "
+                f"to {buffer_size / (1024**2):.2f} MB"
+            )
+            try:
+                self._eccheck_native.unregister_buffer(buffer_addr)
+            except Exception as e:
+                logger.warning(
+                    f"EC-CHECK: [Rank {rank}] Failed to unregister old MR at 0x{buffer_addr:x} "
+                    f"before re-register: {e}"
+                )
+            self.registered_buffers.pop(buffer_addr, None)
         
         try:
             logger.info(f"EC-CHECK: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")

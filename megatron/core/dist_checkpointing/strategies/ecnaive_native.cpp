@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cctype>
+#include <chrono>
 
 // 64-bit network byte order conversion functions (for large data transfers > 4GB)
 inline uint64_t htonll(uint64_t value) {
@@ -35,6 +36,20 @@ inline uint64_t ntohll(uint64_t value) {
     // ntohll is the same as htonll (symmetric operation)
     return htonll(value);
 }
+
+#include <cstdlib>
+
+namespace {
+// When MEGATRON_ECNAIVE_LOAD_NET_TRACE is non-empty and not starting with '0', log each parallel recv channel.
+bool ecnaive_load_net_trace_enabled() {
+    static int s_cached = -1;
+    if (s_cached < 0) {
+        const char* e = std::getenv("MEGATRON_ECNAIVE_LOAD_NET_TRACE");
+        s_cached = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return s_cached == 1;
+}
+}  // namespace
 
 #include <atomic>
 #include <cerrno>
@@ -4859,6 +4874,7 @@ private:
             // Thread 1: Receive p_{2,0} from rank0 (channel 1)
             recv_threads[0] = std::thread([&]() {
                 try {
+                    const auto thr_t0 = std::chrono::steady_clock::now();
                     if (use_rdma_ && rdma_load_channels_[recv_ch[0]]) {
                         std::cout << "[ECNAIVE RDMA] Load_Recv_P20: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_load_channels_[recv_ch[0]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_p20_addr), task.size);
@@ -4871,6 +4887,13 @@ private:
                             throw std::runtime_error("Failed to receive p_{2,0} from rank0");
                         }
                     }
+                    const auto thr_t1 = std::chrono::steady_clock::now();
+                    if (ecnaive_load_net_trace_enabled()) {
+                        const double wall_ms =
+                            std::chrono::duration<double, std::milli>(thr_t1 - thr_t0).count();
+                        std::cout << "EC-NAIVE: [Rank 2] Load net trace: channel=p20 wall_ms=" << wall_ms
+                                  << " bytes=" << task.size << std::endl;
+                    }
                 } catch (...) {
                     recv_exceptions[0] = std::current_exception();
                 }
@@ -4879,6 +4902,7 @@ private:
             // Thread 2: Receive d_{2,1} from rank3 (channel 0)
             recv_threads[1] = std::thread([&]() {
                 try {
+                    const auto thr_t0 = std::chrono::steady_clock::now();
                     if (use_rdma_ && rdma_load_channels_[recv_ch[1]]) {
                         std::cout << "[ECNAIVE RDMA] Load_Recv_D21: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_load_channels_[recv_ch[1]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d21_addr), task.size);
@@ -4891,6 +4915,13 @@ private:
                             throw std::runtime_error("Failed to receive d_{2,1} from rank3");
                         }
                     }
+                    const auto thr_t1 = std::chrono::steady_clock::now();
+                    if (ecnaive_load_net_trace_enabled()) {
+                        const double wall_ms =
+                            std::chrono::duration<double, std::milli>(thr_t1 - thr_t0).count();
+                        std::cout << "EC-NAIVE: [Rank 2] Load net trace: channel=d21 wall_ms=" << wall_ms
+                                  << " bytes=" << task.size << std::endl;
+                    }
                 } catch (...) {
                     recv_exceptions[1] = std::current_exception();
                 }
@@ -4899,6 +4930,7 @@ private:
             // Thread 3: Receive d_{0,0} from rank0 (channel 2)
             recv_threads[2] = std::thread([&]() {
                 try {
+                    const auto thr_t0 = std::chrono::steady_clock::now();
                     if (use_rdma_ && rdma_load_channels_[recv_ch[2]]) {
                         std::cout << "[ECNAIVE RDMA] Load_Recv_D00: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_load_channels_[recv_ch[2]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d00_addr), task.size);
@@ -4911,6 +4943,13 @@ private:
                             throw std::runtime_error("Failed to receive d_{0,0} from rank0");
                         }
                     }
+                    const auto thr_t1 = std::chrono::steady_clock::now();
+                    if (ecnaive_load_net_trace_enabled()) {
+                        const double wall_ms =
+                            std::chrono::duration<double, std::milli>(thr_t1 - thr_t0).count();
+                        std::cout << "EC-NAIVE: [Rank 2] Load net trace: channel=d00 wall_ms=" << wall_ms
+                                  << " bytes=" << task.size << std::endl;
+                    }
                 } catch (...) {
                     recv_exceptions[2] = std::current_exception();
                 }
@@ -4919,6 +4958,7 @@ private:
             // Thread 4: Receive d_{0,1} from rank1 (channel 3)
             recv_threads[3] = std::thread([&]() {
                 try {
+                    const auto thr_t0 = std::chrono::steady_clock::now();
                     if (use_rdma_ && rdma_load_channels_[recv_ch[3]]) {
                         std::cout << "[ECNAIVE RDMA] Load_Recv_D01: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_load_channels_[recv_ch[3]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d01_addr), task.size);
@@ -4931,6 +4971,13 @@ private:
                             throw std::runtime_error("Failed to receive d_{0,1} from rank1");
                         }
                     }
+                    const auto thr_t1 = std::chrono::steady_clock::now();
+                    if (ecnaive_load_net_trace_enabled()) {
+                        const double wall_ms =
+                            std::chrono::duration<double, std::milli>(thr_t1 - thr_t0).count();
+                        std::cout << "EC-NAIVE: [Rank 2] Load net trace: channel=d01 wall_ms=" << wall_ms
+                                  << " bytes=" << task.size << std::endl;
+                    }
                 } catch (...) {
                     recv_exceptions[3] = std::current_exception();
                 }
@@ -4939,6 +4986,7 @@ private:
             // Thread 5: Receive d_{1,0} from rank1 (channel 4)
             recv_threads[4] = std::thread([&]() {
                 try {
+                    const auto thr_t0 = std::chrono::steady_clock::now();
                     if (use_rdma_ && rdma_load_channels_[recv_ch[4]]) {
                         std::cout << "[ECNAIVE RDMA] Load_Recv_D10: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_load_channels_[recv_ch[4]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d10_addr), task.size);
@@ -4951,6 +4999,13 @@ private:
                             throw std::runtime_error("Failed to receive d_{1,0} from rank1");
                         }
                     }
+                    const auto thr_t1 = std::chrono::steady_clock::now();
+                    if (ecnaive_load_net_trace_enabled()) {
+                        const double wall_ms =
+                            std::chrono::duration<double, std::milli>(thr_t1 - thr_t0).count();
+                        std::cout << "EC-NAIVE: [Rank 2] Load net trace: channel=d10 wall_ms=" << wall_ms
+                                  << " bytes=" << task.size << std::endl;
+                    }
                 } catch (...) {
                     recv_exceptions[4] = std::current_exception();
                 }
@@ -4959,6 +5014,7 @@ private:
             // Thread 6: Receive p_{1,1} from rank1 (channel 5)
             recv_threads[5] = std::thread([&]() {
                 try {
+                    const auto thr_t0 = std::chrono::steady_clock::now();
                     if (use_rdma_ && rdma_load_channels_[recv_ch[5]]) {
                         std::cout << "[ECNAIVE RDMA] Load_Recv_P11: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_load_channels_[recv_ch[5]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_p11_addr), task.size);
@@ -4971,6 +5027,13 @@ private:
                             throw std::runtime_error("Failed to receive p_{1,1} from rank1");
                         }
                     }
+                    const auto thr_t1 = std::chrono::steady_clock::now();
+                    if (ecnaive_load_net_trace_enabled()) {
+                        const double wall_ms =
+                            std::chrono::duration<double, std::milli>(thr_t1 - thr_t0).count();
+                        std::cout << "EC-NAIVE: [Rank 2] Load net trace: channel=p11 wall_ms=" << wall_ms
+                                  << " bytes=" << task.size << std::endl;
+                    }
                 } catch (...) {
                     recv_exceptions[5] = std::current_exception();
                 }
@@ -4979,6 +5042,7 @@ private:
             // Thread 7: Receive d_{3,0} from rank3 (channel 6)
             recv_threads[6] = std::thread([&]() {
                 try {
+                    const auto thr_t0 = std::chrono::steady_clock::now();
                     if (use_rdma_ && rdma_load_channels_[recv_ch[6]]) {
                         std::cout << "[ECNAIVE RDMA] Load_Recv_D30: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_load_channels_[recv_ch[6]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d30_addr), task.size);
@@ -4991,6 +5055,13 @@ private:
                             throw std::runtime_error("Failed to receive d_{3,0} from rank3");
                         }
                     }
+                    const auto thr_t1 = std::chrono::steady_clock::now();
+                    if (ecnaive_load_net_trace_enabled()) {
+                        const double wall_ms =
+                            std::chrono::duration<double, std::milli>(thr_t1 - thr_t0).count();
+                        std::cout << "EC-NAIVE: [Rank 2] Load net trace: channel=d30 wall_ms=" << wall_ms
+                                  << " bytes=" << task.size << std::endl;
+                    }
                 } catch (...) {
                     recv_exceptions[6] = std::current_exception();
                 }
@@ -4999,6 +5070,7 @@ private:
             // Thread 8: Receive d_{3,1} from rank0 (channel 7)
             recv_threads[7] = std::thread([&]() {
                 try {
+                    const auto thr_t0 = std::chrono::steady_clock::now();
                     if (use_rdma_ && rdma_load_channels_[recv_ch[7]]) {
                         std::cout << "[ECNAIVE RDMA] Load_Recv_D31: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_load_channels_[recv_ch[7]]->receive_data(reinterpret_cast<uint8_t*>(task.recv_d31_addr), task.size);
@@ -5010,6 +5082,13 @@ private:
                             task.size)) {
                             throw std::runtime_error("Failed to receive d_{3,1} from rank0");
                         }
+                    }
+                    const auto thr_t1 = std::chrono::steady_clock::now();
+                    if (ecnaive_load_net_trace_enabled()) {
+                        const double wall_ms =
+                            std::chrono::duration<double, std::milli>(thr_t1 - thr_t0).count();
+                        std::cout << "EC-NAIVE: [Rank 2] Load net trace: channel=d31 wall_ms=" << wall_ms
+                                  << " bytes=" << task.size << std::endl;
                     }
                 } catch (...) {
                     recv_exceptions[7] = std::current_exception();

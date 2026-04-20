@@ -22,7 +22,7 @@ NNODES=4
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
-
+export MEGATRON_ECNAIVE_LOAD_NET_TRACE=1
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then

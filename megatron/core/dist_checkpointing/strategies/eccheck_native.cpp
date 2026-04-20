@@ -43,6 +43,10 @@ inline uint64_t ntohll(uint64_t value) {
     return htonll(value);
 }
 
+#ifndef ECCHECK_RANKS_PER_GROUP
+#define ECCHECK_RANKS_PER_GROUP 4  // Failed rank maps to EC group slot 0..3 (same convention as EC-NAIVE).
+#endif
+
 // RDMA includes (ibverbs)
 #ifdef __linux__
 #include <infiniband/verbs.h>
@@ -355,6 +359,21 @@ struct EccheckEncodePoolWorkerCtx {
     int wid{0};
 };
 
+// RDMA recv: attribute CQ poll-phase time to rank2 load recv workers (sum over chunks).
+enum class RdmaLoadRecvPollLane : int { None = 0, EncXor = 1, Step2P2p = 2, Step6P2p = 3 };
+
+namespace {
+// When MEGATRON_ECCHECK_LOAD_NET_TRACE is non-empty and not starting with '0', log each load-network op (wall_ms, bytes).
+bool eccheck_load_net_trace_enabled() {
+    static int s_cached = -1;
+    if (s_cached < 0) {
+        const char* e = std::getenv("MEGATRON_ECCHECK_LOAD_NET_TRACE");
+        s_cached = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return s_cached == 1;
+}
+}  // namespace
+
 class ECCHECKNative {
 private:
     int rank_;
@@ -632,6 +651,17 @@ private:
     std::atomic<size_t> load_step6_p2p_send_task_count_{0};
     std::atomic<uint64_t> load_step6_p2p_recv_total_ns_{0};
     std::atomic<size_t> load_step6_p2p_recv_task_count_{0};
+
+    // Rank 2 load RDMA: sum of ibv_poll_cq wait only (after post_recv + ACK), per worker path.
+    std::atomic<uint64_t> load_rank2_rdma_poll_enc_xor_recv_ns_{0};
+    std::atomic<uint64_t> load_rank2_rdma_poll_step2_p2p_recv_ns_{0};
+    std::atomic<uint64_t> load_rank2_rdma_poll_step6_p2p_recv_ns_{0};
+
+    // Load recv pipeline: wall clock from earliest recv start to latest recv end (overlapping workers/chunks).
+    std::mutex load_recv_pipeline_e2e_mu_;
+    bool load_recv_pipeline_e2e_have_any_{false};
+    std::chrono::steady_clock::time_point load_recv_pipeline_e2e_first_{};
+    std::chrono::steady_clock::time_point load_recv_pipeline_e2e_last_{};
 
     // Load XOR: 16 pthread workers (CPU affinity via ECCHECK_XOR_CPU_LIST), rank 2/3 only
     static constexpr int kLoadXorPoolSize = 16;
@@ -2080,7 +2110,8 @@ private:
                 try {
                     size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
                         get_rdma_xor_recv_control_sock(), rdma_xor_recv_control_mutex_,
-                        reinterpret_cast<uint8_t*>(task.recv_addr), task.size);
+                        reinterpret_cast<uint8_t*>(task.recv_addr), task.size,
+                        RdmaLoadRecvPollLane::None);
                     if (recv_size != task.size) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA XOR recv size mismatch: expected "
                                   << task.size << ", got " << recv_size << std::endl;
@@ -2715,7 +2746,8 @@ private:
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
                             get_rdma_p2p_recv_control_sock(), rdma_p2p_recv_control_mutex_,
-                            reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size);
+                            reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size,
+                            RdmaLoadRecvPollLane::None);
                         if (recv_size == task.size) task_processed = true;
                         else {
                             std::cerr << "EC-CHECK: [Rank " << rank_ << "] P2P RDMA recv size mismatch: expected "
@@ -3396,6 +3428,13 @@ public:
         load_step6_p2p_send_task_count_.store(0, std::memory_order_relaxed);
         load_step6_p2p_recv_total_ns_.store(0, std::memory_order_relaxed);
         load_step6_p2p_recv_task_count_.store(0, std::memory_order_relaxed);
+        load_rank2_rdma_poll_enc_xor_recv_ns_.store(0, std::memory_order_relaxed);
+        load_rank2_rdma_poll_step2_p2p_recv_ns_.store(0, std::memory_order_relaxed);
+        load_rank2_rdma_poll_step6_p2p_recv_ns_.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(load_recv_pipeline_e2e_mu_);
+            load_recv_pipeline_e2e_have_any_ = false;
+        }
         load_p2p_send_worker_completed_ = false;
         load_p2p_send_worker_sentinel_received_ = false;
         load_p2p_recv_worker_completed_ = false;
@@ -3572,13 +3611,47 @@ public:
                 const size_t s6_recv_tasks = load_step6_p2p_recv_task_count_.load(std::memory_order_relaxed);
                 const double network_recv_ms = enc_recv_ms + s2_recv_ms + s6_recv_ms;
                 const size_t network_recv_tasks = enc_recv_tasks + s2_recv_tasks + s6_recv_tasks;
+                double network_recv_pipeline_e2e_ms = 0.0;
+                bool pipeline_e2e_ok = false;
+                {
+                    std::lock_guard<std::mutex> lk(load_recv_pipeline_e2e_mu_);
+                    if (load_recv_pipeline_e2e_have_any_) {
+                        network_recv_pipeline_e2e_ms = static_cast<double>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                load_recv_pipeline_e2e_last_ - load_recv_pipeline_e2e_first_)
+                                .count()) /
+                            1e6;
+                        pipeline_e2e_ok = true;
+                    }
+                }
                 std::cout << "EC-CHECK: [Rank " << rank_ << "] Load network timing (recv-only): "
                           << "network_recv_ms=" << network_recv_ms
-                          << ", network_recv_tasks=" << network_recv_tasks
+                          << " (sum of per-recv wall), network_recv_tasks=" << network_recv_tasks
+                          << ", network_recv_pipeline_e2e_wall_ms="
+                          << (pipeline_e2e_ok ? network_recv_pipeline_e2e_ms : 0.0)
+                          << " (wall: earliest recv start to latest recv end across enc_xor/step2/step6; 0 if no recv)"
                           << ", enc_xor_recv_ms=" << enc_recv_ms << ", enc_xor_recv_tasks=" << enc_recv_tasks
                           << ", step2_p2p_recv_ms=" << s2_recv_ms << ", step2_p2p_recv_tasks=" << s2_recv_tasks
                           << ", step6_p2p_recv_ms=" << s6_recv_ms << ", step6_p2p_recv_tasks=" << s6_recv_tasks
                           << std::endl;
+                if (rank_ == 2) {
+                    const double poll_enc_ms =
+                        static_cast<double>(load_rank2_rdma_poll_enc_xor_recv_ns_.load(std::memory_order_relaxed)) /
+                        1e6;
+                    const double poll_s2_ms =
+                        static_cast<double>(load_rank2_rdma_poll_step2_p2p_recv_ns_.load(std::memory_order_relaxed)) /
+                        1e6;
+                    const double poll_s6_ms =
+                        static_cast<double>(load_rank2_rdma_poll_step6_p2p_recv_ns_.load(std::memory_order_relaxed)) /
+                        1e6;
+                    const double poll_total_ms = poll_enc_ms + poll_s2_ms + poll_s6_ms;
+                    std::cout << "EC-CHECK: [Rank " << rank_
+                              << "] Load RDMA recv CQ poll sum ms (rank2 only; ibv_poll_cq after post_recv+ACK; "
+                              << "ASIO unchanged 0): enc_xor_poll_sum_ms=" << poll_enc_ms
+                              << ", step2_p2p_poll_sum_ms=" << poll_s2_ms
+                              << ", step6_p2p_poll_sum_ms=" << poll_s6_ms
+                              << ", rdma_recv_poll_total_ms=" << poll_total_ms << std::endl;
+                }
             }
             return;  // Load mode 下直接返回，不等待 save mode 的 workers
         } else {
@@ -3889,10 +3962,13 @@ public:
     void set_load_mode(bool is_load, int failed_rank) {
         is_load_mode_ = is_load;
         failed_rank_ = failed_rank;
-        // Rebuild XOR configuration (pairing is same as save, but need to update flags)
+        failed_rank_in_group_ =
+            (failed_rank >= 0) ? (failed_rank % ECCHECK_RANKS_PER_GROUP) : -1;
+        // Rebuild XOR configuration (needs failed_rank_in_group_ for hardware recovery branches)
         build_xor_config();
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Set load mode: " 
-                  << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank << std::endl;
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Set load mode: "
+                  << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank
+                  << ", failed_rank_in_group=" << failed_rank_in_group_ << std::endl;
         
         // 新增：如果是 load mode，启动该 rank 实际使用的 load worker
         if (is_load && !load_encoder_worker_.joinable()) {
@@ -3925,6 +4001,13 @@ public:
             load_step6_p2p_send_task_count_.store(0, std::memory_order_relaxed);
             load_step6_p2p_recv_total_ns_.store(0, std::memory_order_relaxed);
             load_step6_p2p_recv_task_count_.store(0, std::memory_order_relaxed);
+            load_rank2_rdma_poll_enc_xor_recv_ns_.store(0, std::memory_order_relaxed);
+            load_rank2_rdma_poll_step2_p2p_recv_ns_.store(0, std::memory_order_relaxed);
+            load_rank2_rdma_poll_step6_p2p_recv_ns_.store(0, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(load_recv_pipeline_e2e_mu_);
+                load_recv_pipeline_e2e_have_any_ = false;
+            }
             load_p2p_send_worker_completed_ = false;
             load_p2p_send_worker_sentinel_received_ = false;
             load_p2p_recv_worker_completed_ = false;
@@ -4331,15 +4414,44 @@ public:
     
     // ========== Load Mode 独立的 Worker 实现 ==========
     
+    void touch_load_recv_pipeline_e2e_wall_(
+        std::chrono::steady_clock::time_point t0,
+        std::chrono::steady_clock::time_point t1) {
+        std::lock_guard<std::mutex> lk(load_recv_pipeline_e2e_mu_);
+        if (!load_recv_pipeline_e2e_have_any_) {
+            load_recv_pipeline_e2e_first_ = t0;
+            load_recv_pipeline_e2e_last_ = t1;
+            load_recv_pipeline_e2e_have_any_ = true;
+        } else {
+            if (t0 < load_recv_pipeline_e2e_first_) {
+                load_recv_pipeline_e2e_first_ = t0;
+            }
+            if (t1 > load_recv_pipeline_e2e_last_) {
+                load_recv_pipeline_e2e_last_ = t1;
+            }
+        }
+    }
+
     void record_load_net_ns_(
         std::atomic<uint64_t>& total_ns,
         std::atomic<size_t>& task_count,
-        std::chrono::steady_clock::time_point t0) {
+        std::chrono::steady_clock::time_point t0,
+        bool update_recv_pipeline_e2e_wall = false,
+        const char* trace_label = nullptr,
+        size_t trace_bytes = 0) {
         const auto t1 = std::chrono::steady_clock::now();
+        if (update_recv_pipeline_e2e_wall) {
+            touch_load_recv_pipeline_e2e_wall_(t0, t1);
+        }
         const uint64_t ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
         total_ns.fetch_add(ns, std::memory_order_relaxed);
-        task_count.fetch_add(1, std::memory_order_relaxed);
+        const size_t seq = task_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (eccheck_load_net_trace_enabled() && trace_label != nullptr) {
+            const double wall_ms = static_cast<double>(ns) / 1e6;
+            std::cout << "EC-CHECK: [Rank " << rank_ << "] Load net trace: op=" << trace_label
+                      << " seq=" << seq << " wall_ms=" << wall_ms << " bytes=" << trace_bytes << std::endl;
+        }
     }
 
     // Load Send Worker - rank0/1 发送 encoding 给 rank2/3
@@ -4394,7 +4506,8 @@ public:
                 try {
                     rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_send_control_sock(),
                         rdma_xor_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
-                    record_load_net_ns_(load_enc_xor_send_total_ns_, load_enc_xor_send_task_count_, t_net);
+                    record_load_net_ns_(load_enc_xor_send_total_ns_, load_enc_xor_send_task_count_, t_net, false,
+                                        "enc_xor_send", task.size);
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 } catch (const std::exception& e) {
@@ -4426,7 +4539,8 @@ public:
                         boost::asio::buffer(buffer_ptr, task.size)
                     );
                     // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load send: Data sent successfully" << std::endl;
-                    record_load_net_ns_(load_enc_xor_send_total_ns_, load_enc_xor_send_task_count_, t_net);
+                    record_load_net_ns_(load_enc_xor_send_total_ns_, load_enc_xor_send_task_count_, t_net, false,
+                                        "enc_xor_send", task.size);
                     // Send completed successfully, release buffer
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
@@ -4514,13 +4628,15 @@ public:
                 try {
                     size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
                         get_rdma_xor_recv_control_sock(), rdma_xor_recv_control_mutex_,
-                        reinterpret_cast<uint8_t*>(task.recv_addr), task.size);
+                        reinterpret_cast<uint8_t*>(task.recv_addr), task.size,
+                        RdmaLoadRecvPollLane::EncXor);
                     if (recv_size != task.size) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA XOR recv size mismatch: expected "
                                   << task.size << ", got " << recv_size << std::endl;
                         continue;
                     }
-                    record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net);
+                    record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net, true,
+                                        "enc_xor_recv", task.size);
                 } catch (const std::exception& e) {
                     std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA XOR recv failed: " << e.what() << std::endl;
                     continue;
@@ -4556,7 +4672,8 @@ public:
                         boost::asio::buffer(buffer_ptr, size)
                     );
                     // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load recv: Data received successfully" << std::endl;
-                    record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net);
+                    record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net, true,
+                                        "enc_xor_recv", task.size);
                     // Receive completed successfully, continue with XOR processing below
                 } catch (const boost::system::system_error& e) {
                     std::cerr << "EC-CHECK: [Rank " << rank_ 
@@ -5020,7 +5137,8 @@ public:
                     try {
                         rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
                             rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
-                        record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net);
+                        record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net, false,
+                                            "step2_p2p_send", task.size);
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA P2P send failed: " << e.what() << std::endl;
                     }
@@ -5046,7 +5164,8 @@ public:
                             boost::asio::buffer(buffer_ptr, task.size)
                         );
                         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P send: Data sent successfully" << std::endl;
-                        record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net);
+                        record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net, false,
+                                            "step2_p2p_send", task.size);
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
                                   << "] Load P2P ASIO send failed: " << e.what() << std::endl;
@@ -5142,10 +5261,12 @@ public:
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
                             get_rdma_p2p_recv_control_sock(), rdma_p2p_recv_control_mutex_,
-                            reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size);
+                            reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size,
+                            RdmaLoadRecvPollLane::Step2P2p);
                         if (recv_size == task.size) {
                             task_processed = true;
-                            record_load_net_ns_(load_step2_p2p_recv_total_ns_, load_step2_p2p_recv_task_count_, t_net);
+                            record_load_net_ns_(load_step2_p2p_recv_total_ns_, load_step2_p2p_recv_task_count_, t_net, true,
+                                                "step2_p2p_recv", task.size);
                         } else {
                             std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load P2P RDMA recv size mismatch: expected "
                                       << task.size << ", got " << recv_size << std::endl;
@@ -5184,7 +5305,7 @@ public:
                             boost::asio::buffer(buffer_ptr, size)
                         );
                         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load P2P recv: Data received successfully" << std::endl;
-                        record_load_net_ns_(load_step2_p2p_recv_total_ns_, load_step2_p2p_recv_task_count_, t_net);
+                        record_load_net_ns_(load_step2_p2p_recv_total_ns_, load_step2_p2p_recv_task_count_, t_net, true);
                         task_processed = true;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
@@ -5409,10 +5530,12 @@ public:
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_step6_p2p_qp_, rdma_step6_p2p_recv_cq_,
                             get_rdma_step6_p2p_recv_control_sock(), rdma_step6_p2p_recv_control_mutex_,
-                            reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size);
+                            reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size,
+                            RdmaLoadRecvPollLane::Step6P2p);
                         if (recv_size == task.size) {
                             task_processed = true;
-                            record_load_net_ns_(load_step6_p2p_recv_total_ns_, load_step6_p2p_recv_task_count_, t_net);
+                            record_load_net_ns_(load_step6_p2p_recv_total_ns_, load_step6_p2p_recv_task_count_, t_net, true,
+                                                "step6_p2p_recv", task.size);
                         } else {
                             std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA recv size mismatch: expected "
                                       << task.size << ", got " << recv_size << std::endl;
@@ -5451,7 +5574,7 @@ public:
                             boost::asio::buffer(buffer_ptr, size)
                         );
                         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P recv: Data received successfully" << std::endl;
-                        record_load_net_ns_(load_step6_p2p_recv_total_ns_, load_step6_p2p_recv_task_count_, t_net);
+                        record_load_net_ns_(load_step6_p2p_recv_total_ns_, load_step6_p2p_recv_task_count_, t_net, true);
                         task_processed = true;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
@@ -5586,7 +5709,8 @@ public:
             std::cout << "[EC-CHECK RDMA] Simple_P2P_Recv: Receiving " << size << " bytes via RDMA" << std::endl;
             try {
                 rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_, get_rdma_p2p_recv_control_sock(),
-                    rdma_p2p_recv_control_mutex_, reinterpret_cast<uint8_t*>(buffer_addr), size);
+                    rdma_p2p_recv_control_mutex_, reinterpret_cast<uint8_t*>(buffer_addr), size,
+                    RdmaLoadRecvPollLane::None);
             } catch (...) {
                 if (temp_reg) unregister_buffer(buffer_addr);
                 throw;
@@ -5948,7 +6072,8 @@ public:
     }
 
     size_t rdma_receive_data_via_qp(ibv_qp* qp, ibv_cq* recv_cq, int control_sock, std::mutex& control_mutex,
-                                    uint8_t* buffer, size_t buffer_size) {
+                                    uint8_t* buffer, size_t buffer_size,
+                                    RdmaLoadRecvPollLane poll_lane = RdmaLoadRecvPollLane::None) {
         static const size_t CHUNK_SIZE = 64ULL * 1024 * 1024;
         static const int MAX_BATCH_WR = 32;
         uint64_t size_net;
@@ -6029,11 +6154,30 @@ public:
                 throw std::runtime_error("EC-CHECK RDMA: failed to send ACK");
         }
         
-        // Step 6: Poll for completions
+        // Step 6: Poll for completions (RDMA data path wait; excludes control-channel recv/post_recv setup)
+        const auto poll_t0 = std::chrono::steady_clock::now();
         for (size_t i = 0; i < all_num_wrs.size(); ++i) {
             rdma_poll_completion(recv_cq, all_num_wrs[i]);
         }
-        
+        const auto poll_t1 = std::chrono::steady_clock::now();
+        if (rank_ == 2 && poll_lane != RdmaLoadRecvPollLane::None) {
+            const uint64_t poll_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(poll_t1 - poll_t0).count());
+            switch (poll_lane) {
+                case RdmaLoadRecvPollLane::EncXor:
+                    load_rank2_rdma_poll_enc_xor_recv_ns_.fetch_add(poll_ns, std::memory_order_relaxed);
+                    break;
+                case RdmaLoadRecvPollLane::Step2P2p:
+                    load_rank2_rdma_poll_step2_p2p_recv_ns_.fetch_add(poll_ns, std::memory_order_relaxed);
+                    break;
+                case RdmaLoadRecvPollLane::Step6P2p:
+                    load_rank2_rdma_poll_step6_p2p_recv_ns_.fetch_add(poll_ns, std::memory_order_relaxed);
+                    break;
+                default:
+                    break;
+            }
+        }
+
         if (use_temp) std::memcpy(buffer, rdma_temp_recv_buffer_.data(), size);
         return size;
     }

@@ -4817,6 +4817,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # logger.info("EC-CHECK: Allocating P2P buffers from checkpoint metadata")
             self.eccheck_p2p_buffers = self._allocate_p2p_buffers(registry)
             self.eccheck_manager.eccheck_p2p_buffers = self.eccheck_p2p_buffers
+
+        # Ensure load-stage P2P buffers are registered for RDMA even when coming from
+        # reuse/reallocation path in load recovery.
+        if self.eccheck_manager.use_rdma and self.eccheck_p2p_buffers is not None:
+            self.eccheck_manager.register_buffer(self.eccheck_p2p_buffers['own_buffer'])
+            self.eccheck_manager.register_buffer(self.eccheck_p2p_buffers['partner_buffer'])
         
         # For rank_in_group=1 software failure, receiver gets data from recovery sender (partner_rank_for_p2p), so recv size = sender's size; otherwise use P2P partner
         if input_args.use_eccheck_software_failure and rank_in_group == 1 and partner_rank_for_p2p >= 0:

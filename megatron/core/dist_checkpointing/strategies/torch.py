@@ -64,6 +64,7 @@ from .eclatin_manager import ECLATINManager
 from .ecnaive_manager import ECNAIVEManager
 from .gemini_manager import GeminiManager
 from .gemini_replicas_manager import GeminiReplicasManager
+from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
 from .filesystem_async import FileSystemWriterAsync
 from .resharding import (
     TensorReformulationMetadata,
@@ -921,10 +922,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         # ===== Allocate two large continuous buffers =====
         # Buffer 1: Own data/parity
-        own_buffer = torch.empty(own_aligned_size, dtype=torch.uint8)
+        own_buffer = allocate_hugepage_tensor(own_aligned_size)
         
         # Buffer 2: Partner's data/parity
-        partner_buffer = torch.empty(partner_aligned_size, dtype=torch.uint8)
+        partner_buffer = allocate_hugepage_tensor(partner_aligned_size)
         
         logger.info(
             f"EC-CHECK: Allocated P2P buffers:\n"
@@ -1899,12 +1900,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             
             if self.preallocated_cpu_buffer == None:
                 if self.eccheck_manager.eccheck_pin_memory and torch.cuda.is_available():
-                    self.preallocated_cpu_buffer = torch.empty(
-                        total_size_with_margin, dtype=torch.uint8).pin_memory()
+                    self.preallocated_cpu_buffer = allocate_hugepage_tensor(
+                        total_size_with_margin,
+                        fallback_pin_memory=True,
+                    )
                     logger.debug("EC-CHECK: Using pinned memory for CPU buffer")
                 else:
-                    self.preallocated_cpu_buffer = torch.empty(
-                        total_size_with_margin, dtype=torch.uint8
+                    self.preallocated_cpu_buffer = allocate_hugepage_tensor(
+                        total_size_with_margin,
+                        fallback_pin_memory=False,
                     )
                 
             prealloc_time = time() - start
@@ -2367,12 +2371,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             
             if self.preallocated_cpu_buffer is None:
                 if self.ecnaive_manager.ecnaive_pin_memory and torch.cuda.is_available():
-                    self.preallocated_cpu_buffer = torch.empty(
-                        total_size_with_margin, dtype=torch.uint8).pin_memory()
+                    self.preallocated_cpu_buffer = allocate_hugepage_tensor(
+                        total_size_with_margin,
+                        fallback_pin_memory=True,
+                    )
                     logger.info("EC-NAIVE: Using pinned memory for CPU buffer")
                 else:
-                    self.preallocated_cpu_buffer = torch.empty(
-                        total_size_with_margin, dtype=torch.uint8
+                    self.preallocated_cpu_buffer = allocate_hugepage_tensor(
+                        total_size_with_margin,
+                        fallback_pin_memory=False,
                     )
                     logger.info("EC-NAIVE: Using non-pinned memory for CPU buffer")
             
@@ -2543,10 +2550,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         # ===== Allocate 4 large continuous buffers =====
         # All blocks use the same aligned half size (each block stores half of the data)
-        data_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        data_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        parity_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        parity_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        data_block_1, data_block_2, parity_block_1, parity_block_2 = allocate_hugepage_slices(
+            aligned_half_block_size,
+            4,
+            touch_pages=True,
+        )
         
         logger.info(
             f"ECLATIN: Allocated 4 persistent blocks:\n"
@@ -2711,10 +2719,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         # ===== Allocate 4 large continuous buffers =====
         # All blocks use the same aligned half size (each block stores half of the data)
-        data0 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        recv_parity1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        recv_parity0 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        recv_data1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        data0, recv_parity1, recv_parity0, recv_data1 = allocate_hugepage_slices(
+            aligned_half_block_size,
+            4,
+            touch_pages=True,
+        )
         
         logger.info(
             f"EC-NAIVE: Allocated 4 persistent blocks:\n"
@@ -2876,10 +2885,11 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         # ===== Allocate 4 large continuous buffers =====
         # All blocks use the same aligned half size (each block stores half of the data)
-        data_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        data_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        parity_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
-        parity_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8)
+        data_block_1, data_block_2, parity_block_1, parity_block_2 = allocate_hugepage_slices(
+            aligned_half_block_size,
+            4,
+            touch_pages=True,
+        )
         
         logger.info(
             f"ECLATIN: Allocated 4 persistent blocks:\n"
@@ -5935,10 +5945,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # Allocate new buffers
             pin_memory = torch.cuda.is_available() and getattr(self.eclatin_manager, 'eclatin_pin_memory', False)
             
-            data_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
-            data_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
-            parity_block_1 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
-            parity_block_2 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
+            data_block_1, data_block_2, parity_block_1, parity_block_2 = allocate_hugepage_slices(
+                aligned_half_block_size,
+                4,
+                fallback_pin_memory=pin_memory,
+                touch_pages=True,
+            )
             
             # Store for future reuse
             self.eclatin_preallocated_blocks = {
@@ -6034,10 +6046,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             # Allocate new buffers
             pin_memory = torch.cuda.is_available() and getattr(self.ecnaive_manager, 'ecnaive_pin_memory', False)
             
-            data0 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
-            recv_parity1 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
-            recv_parity0 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
-            recv_data1 = torch.empty(aligned_half_block_size, dtype=torch.uint8, pin_memory=pin_memory)
+            data0, recv_parity1, recv_parity0, recv_data1 = allocate_hugepage_slices(
+                aligned_half_block_size,
+                4,
+                fallback_pin_memory=pin_memory,
+                touch_pages=True,
+            )
             
             # Store for future reuse
             self.ecnaive_preallocated_blocks = {

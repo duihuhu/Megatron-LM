@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from dataclasses import replace
 
+from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
 from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
 
 logger = getLogger(__name__)
@@ -730,7 +731,11 @@ class ECCHECKManager:
         
         data_buffers = []
         for i in range(self.eccheck_data_buffers_count):
-            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            buffer = allocate_hugepage_tensor(
+                self.eccheck_buffer_size,
+                fallback_pin_memory=self.eccheck_pin_memory,
+                touch_pages=True,
+            )
             data_buffers.append(buffer)
             logger.debug(f"EC-CHECK: Allocated data buffer {i}: {self.eccheck_buffer_size} bytes")
         
@@ -743,7 +748,11 @@ class ECCHECKManager:
         
         encoding_buffers = []
         for i in range(self.eccheck_encoding_buffers_count):
-            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            buffer = allocate_hugepage_tensor(
+                self.eccheck_buffer_size,
+                fallback_pin_memory=self.eccheck_pin_memory,
+                touch_pages=True,
+            )
             encoding_buffers.append(buffer)
             logger.debug(f"EC-CHECK: Allocated encoding buffer {i}: {self.eccheck_buffer_size} bytes")
         
@@ -763,7 +772,11 @@ class ECCHECKManager:
         
         parity_buffers = []
         for i in range(parity_buffer_count):
-            buffer = torch.empty(self.eccheck_buffer_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+            buffer = allocate_hugepage_tensor(
+                self.eccheck_buffer_size,
+                fallback_pin_memory=self.eccheck_pin_memory,
+                touch_pages=True,
+            )
             parity_buffers.append(buffer)
             logger.debug(f"EC-CHECK: Allocated parity buffer {i}: {self.eccheck_buffer_size} bytes")
         
@@ -927,8 +940,12 @@ class ECCHECKManager:
         )
         
         # Allocate two large continuous buffers (one for each encoding thread)
-        recv_buffer_thread1 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
-        recv_buffer_thread2 = torch.empty(aligned_size, dtype=torch.uint8, pin_memory=self.eccheck_pin_memory)
+        recv_buffer_thread1, recv_buffer_thread2 = allocate_hugepage_slices(
+            aligned_size,
+            2,
+            fallback_pin_memory=self.eccheck_pin_memory,
+            touch_pages=True,
+        )
         
         logger.info(
             f"EC-CHECK: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "

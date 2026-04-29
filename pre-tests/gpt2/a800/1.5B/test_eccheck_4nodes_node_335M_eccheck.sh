@@ -8,16 +8,16 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=bond0
+export NETIFACES_INTERFACE=eth0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-MASTER_ADDR=10.0.0.62
+MASTER_ADDR=172.16.0.216
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
-NNODES=4
+NNODES=1
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
@@ -59,7 +59,7 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs"
-CHECKPOINT_PATH="/workspace/Megatron-LM/data/checkpoint/models/gpt2-345m-0-eccheck"
+CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-eccheck"
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -68,8 +68,8 @@ SHM_PKT="/dev/shm/shm_pkt"
 ARGS_TO_PASS=("$@")
 
 # fixed Model related configuration here, pls not overlap with json config
-HIDDEN_SIZE=1600
-NUM_ATTENTION_HEADS=25
+HIDDEN_SIZE=1632
+NUM_ATTENTION_HEADS=24
 NUM_LAYERS=48 
 
 SEQ_LENGTH=1024
@@ -121,8 +121,8 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 4
+    --tensor-model-parallel-size 8
+    --pipeline-model-parallel-size 1
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -133,7 +133,7 @@ EVAL_AND_LOGGING_ARGS=(
     --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
-    --use-eccheck
+    #--use-eccheck
     #--use-eccheck-software-failure
     --ckpt-format torch_dist
     --save-embeddings-separately

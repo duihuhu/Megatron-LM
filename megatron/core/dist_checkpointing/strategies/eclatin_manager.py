@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from dataclasses import replace
 
+from .hugepage_alloc import allocate_hugepage_tensor
 from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
 
 logger = getLogger(__name__)
@@ -621,7 +622,11 @@ class ECLATINManager:
         
         data_buffers = []
         for i in range(self.eclatin_data_buffers_count):
-            buffer = torch.empty(self.eclatin_buffer_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory)
+            buffer = allocate_hugepage_tensor(
+                self.eclatin_buffer_size,
+                fallback_pin_memory=self.eclatin_pin_memory,
+                touch_pages=True,
+            )
             data_buffers.append(buffer)
             logger.debug(f"ECLATIN: Allocated data buffer {i}: {self.eclatin_buffer_size} bytes")
         
@@ -634,7 +639,11 @@ class ECLATINManager:
         
         recv_buffers = []
         for i in range(self.eclatin_recv_buffers_count):
-            buffer = torch.empty(self.eclatin_buffer_size, dtype=torch.uint8, pin_memory=self.eclatin_pin_memory)
+            buffer = allocate_hugepage_tensor(
+                self.eclatin_buffer_size,
+                fallback_pin_memory=self.eclatin_pin_memory,
+                touch_pages=True,
+            )
             recv_buffers.append(buffer)
             logger.debug(f"ECLATIN: Allocated recv buffer {i}: {self.eclatin_buffer_size} bytes")
         

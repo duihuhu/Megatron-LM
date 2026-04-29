@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from dataclasses import replace
 
+from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
 from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
 
 logger = getLogger(__name__)
@@ -602,22 +603,28 @@ class ECNAIVEManager:
         )
         
         # Allocate 8 recv buffers for full recovery
+        recv_chunks = allocate_hugepage_slices(
+            aligned_block_size,
+            8,
+            fallback_pin_memory=self.ecnaive_pin_memory,
+            touch_pages=True,
+        )
         recv_buffers = {
             # For recovering data0: d_{2,0} = p_{2,0} ⊕ d_{2,1}
-            'p20_from_rank0': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # p_{2,0}
-            'd21_from_rank3': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{2,1}
+            'p20_from_rank0': recv_chunks[0],  # p_{2,0}
+            'd21_from_rank3': recv_chunks[1],  # d_{2,1}
             
             # For recovering recv_parity0: p_{0,0} = d_{0,0} ⊕ d_{0,1}
-            'd00_from_rank0': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{0,0}
-            'd01_from_rank1': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{0,1}
+            'd00_from_rank0': recv_chunks[2],  # d_{0,0}
+            'd01_from_rank1': recv_chunks[3],  # d_{0,1}
             
             # For recovering recv_data1: d_{1,1} = d_{1,0} ⊕ p_{1,1}
-            'd10_from_rank1': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{1,0}
-            'p11_from_rank1': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # p_{1,1}
+            'd10_from_rank1': recv_chunks[4],  # d_{1,0}
+            'p11_from_rank1': recv_chunks[5],  # p_{1,1}
             
             # For recovering recv_parity1: p_{3,1} = d_{3,0} ⊕ d_{3,1}
-            'd30_from_rank3': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{3,0}
-            'd31_from_rank0': torch.empty(aligned_block_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory),  # d_{3,1}
+            'd30_from_rank3': recv_chunks[6],  # d_{3,0}
+            'd31_from_rank0': recv_chunks[7],  # d_{3,1}
         }
         
         # Register buffers for RDMA if enabled
@@ -847,7 +854,11 @@ class ECNAIVEManager:
         
         data_buffers = []
         for i in range(self.ecnaive_data_buffers_count):
-            buffer = torch.empty(self.ecnaive_buffer_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory)
+            buffer = allocate_hugepage_tensor(
+                self.ecnaive_buffer_size,
+                fallback_pin_memory=self.ecnaive_pin_memory,
+                touch_pages=True,
+            )
             data_buffers.append(buffer)
             logger.debug(f"EC-NAIVE: Allocated data buffer {i}: {self.ecnaive_buffer_size} bytes")
         
@@ -860,7 +871,11 @@ class ECNAIVEManager:
         
         parity_buffers = []
         for i in range(self.ecnaive_parity_buffers_count):
-            buffer = torch.empty(self.ecnaive_buffer_size, dtype=torch.uint8, pin_memory=self.ecnaive_pin_memory)
+            buffer = allocate_hugepage_tensor(
+                self.ecnaive_buffer_size,
+                fallback_pin_memory=self.ecnaive_pin_memory,
+                touch_pages=True,
+            )
             parity_buffers.append(buffer)
             logger.debug(f"EC-NAIVE: Allocated parity buffer {i}: {self.ecnaive_buffer_size} bytes")
         

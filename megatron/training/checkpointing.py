@@ -1165,7 +1165,27 @@ def _load_base_checkpoint(
         else:
             checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False)
         try:
-            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+            ckpt_parent = (
+                os.path.dirname(checkpoint_name)
+                if not os.path.isdir(checkpoint_name)
+                else checkpoint_name
+            )
+            ecnaive_marker = os.path.join(ckpt_parent, "ecnaive_main_rank0.pt")
+            if os.path.isfile(ecnaive_marker):
+                from .ecnaive_legacy import (
+                    load_ecnaive_legacy_checkpoint,
+                    state_dict_from_ecnaive_main_metadata_only,
+                )
+
+                if torch.distributed.is_initialized():
+                    state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
+                else:
+                    payload = torch.load(
+                        ecnaive_marker, map_location="cpu", weights_only=False
+                    )
+                    state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
+            else:
+                state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler
 

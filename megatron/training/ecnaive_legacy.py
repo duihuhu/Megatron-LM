@@ -2,7 +2,7 @@ import ctypes
 import queue
 from logging import getLogger
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -12,8 +12,12 @@ from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
     allocate_hugepage_tensor,
 )
 from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
+    DecomposedStateDict,
+    GlobalMetadataRegistry,
     TensorMetadata,
     decompose_state_dict,
+    extract_tensors_from_continuous_buffer,
+    reconstruct_state_dict,
 )
 
 logger = getLogger(__name__)
@@ -306,6 +310,371 @@ def _save_ecnaive_pt_files(
             },
             block_file,
         )
+
+
+def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
+    checkpoint_path = Path(checkpoint_name)
+    return checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
+
+
+def _tensor_infos_to_local_metadata(
+    rank: int, tensor_infos: List[Any]
+) -> List[TensorMetadata]:
+    out: List[TensorMetadata] = []
+    for info in tensor_infos:
+        chunk_type = getattr(info, "chunk_type", "data")
+        target_rank = getattr(info, "target_rank", rank)
+        source_rank = getattr(info, "source_rank", rank)
+        out.append(
+            TensorMetadata(
+                key=info.key,
+                shape=tuple(info.shape),
+                dtype=str(info.dtype),
+                size_bytes=info.size_bytes,
+                global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
+                shard_index=info.shard_index if info.shard_index is not None else 0,
+                chunk_type=chunk_type,
+                target_rank=target_rank,
+                source_rank=source_rank,
+            )
+        )
+    return out
+
+
+def _load_ecnaive_main_payload(
+    checkpoint_dir: Path, rank: int, world_size: int
+) -> Dict[str, Any]:
+    """
+    Load ecnaive_main_rank{rank}.pt. If missing on this rank, recover payload via all_gather_object
+    using other ranks' copies (rank r uses gathered[r] when present).
+    """
+    main_path = checkpoint_dir / f"ecnaive_main_rank{rank}.pt"
+    local_payload: Optional[Dict[str, Any]] = None
+    if main_path.is_file():
+        local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+
+    if world_size <= 1 or not torch.distributed.is_initialized():
+        if local_payload is None:
+            raise FileNotFoundError(f"EC-NAIVE legacy: missing main file {main_path}")
+        return local_payload
+
+    gathered: List[Optional[Dict[str, Any]]] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, local_payload)
+
+    chosen = gathered[rank]
+    if chosen is None:
+        raise FileNotFoundError(
+            f"EC-NAIVE legacy: ecnaive_main_rank{rank}.pt missing on all ranks under {checkpoint_dir}"
+        )
+    return chosen
+
+
+def _load_blocks_from_disk(checkpoint_dir: Path, rank: int) -> Dict[str, torch.Tensor]:
+    blocks: Dict[str, torch.Tensor] = {}
+    for block_name in ("data0", "recv_parity1", "recv_parity0", "recv_data1"):
+        block_path = checkpoint_dir / f"ecnaive_block_rank{rank}_{block_name}.pt"
+        if not block_path.is_file():
+            raise FileNotFoundError(f"EC-NAIVE legacy: missing block file {block_path}")
+        payload = torch.load(block_path, map_location="cpu", weights_only=False)
+        blocks[block_name] = payload["tensor"].contiguous().view(torch.uint8)
+    return blocks
+
+
+def _decode_data0_to_linear_first_half(
+    data0: torch.Tensor,
+    pipeline_total_bytes: int,
+    ecnaive_buffer_size: int,
+) -> torch.Tensor:
+    """Invert legacy encode layout: recover tensor_buffer[0:half_total) from data0."""
+    half_total = pipeline_total_bytes // 2
+    out = torch.zeros(half_total, dtype=torch.uint8, device=data0.device)
+    src_pos = 0
+    data0_offset = 0
+    block_elems = data0.numel()
+    while src_pos < half_total:
+        remaining_in_pipe = pipeline_total_bytes - src_pos
+        take = min(ecnaive_buffer_size, remaining_in_pipe)
+        aligned = ((data0_offset + 63) // 64) * 64
+        if aligned + take > block_elems:
+            logger.warning("EC-NAIVE legacy load: data0 exhausted during decode")
+            break
+        out[src_pos : src_pos + take].copy_(data0[aligned : aligned + take])
+        data0_offset = aligned + take
+        src_pos += take
+    return out
+
+
+def _reconstruct_state_dict_from_main_and_data0(
+    main_payload: Dict[str, Any],
+    data0_uint8: torch.Tensor,
+    manager: ECNAIVEManager,
+) -> Dict[str, Any]:
+    tensor_infos = main_payload["tensor_infos"]
+    non_tensor_data = main_payload["non_tensor_data"]
+    pipeline_total_bytes = int(main_payload["pipeline_total_bytes"])
+    actual_tensor_size = int(main_payload["actual_tensor_size"])
+
+    half_linear = _decode_data0_to_linear_first_half(
+        data0_uint8,
+        pipeline_total_bytes=pipeline_total_bytes,
+        ecnaive_buffer_size=manager.ecnaive_buffer_size,
+    )
+    buf_len = max(pipeline_total_bytes, actual_tensor_size)
+    full_buf = torch.zeros(buf_len, dtype=torch.uint8, device=half_linear.device)
+    n = min(half_linear.numel(), buf_len)
+    full_buf[:n].copy_(half_linear[:n])
+
+    tensor_data = extract_tensors_from_continuous_buffer(full_buf, tensor_infos)
+    decomposed = DecomposedStateDict(
+        non_tensor_data=non_tensor_data,
+        tensor_infos=tensor_infos,
+        tensor_data=tensor_data,
+    )
+    return reconstruct_state_dict(decomposed)
+
+
+def _run_ecnaive_full_recovery(
+    manager: ECNAIVEManager,
+    rank: int,
+    world_size: int,
+    ecnaive_blocks: Dict[str, torch.Tensor],
+    recv_buffers: Optional[Dict[str, torch.Tensor]],
+) -> None:
+    """Mirror megatron.core.dist_checkpointing.strategies.torch recovery send/recv layout."""
+    native = manager._ecnaive_native
+    if native is None:
+        raise RuntimeError("EC-NAIVE native module is not initialized")
+
+    net_config = manager._get_ecnaive_load_network_config(rank, world_size)
+    rank_in_group = net_config["rank_in_group"]
+
+    from time import time
+
+    start_time = time()
+
+    if rank_in_group == 2:
+        if recv_buffers is None:
+            raise RuntimeError("EC-NAIVE legacy load: recv_buffers required on rank_in_group 2")
+        required_keys = [
+            "p20_from_rank0",
+            "d21_from_rank3",
+            "d00_from_rank0",
+            "d01_from_rank1",
+            "d10_from_rank1",
+            "p11_from_rank1",
+            "d30_from_rank3",
+            "d31_from_rank0",
+        ]
+        missing = [k for k in required_keys if k not in recv_buffers]
+        if missing:
+            raise RuntimeError(f"EC-NAIVE legacy load: missing recv buffers {missing}")
+
+        required_blocks = ["data0", "recv_parity0", "recv_data1", "recv_parity1"]
+        missing_b = [k for k in required_blocks if k not in ecnaive_blocks]
+        if missing_b:
+            raise RuntimeError(f"EC-NAIVE legacy load: missing output blocks {missing_b}")
+
+        recv_addrs = {
+            "p20": int(recv_buffers["p20_from_rank0"].data_ptr()),
+            "d21": int(recv_buffers["d21_from_rank3"].data_ptr()),
+            "d00": int(recv_buffers["d00_from_rank0"].data_ptr()),
+            "d01": int(recv_buffers["d01_from_rank1"].data_ptr()),
+            "d10": int(recv_buffers["d10_from_rank1"].data_ptr()),
+            "p11": int(recv_buffers["p11_from_rank1"].data_ptr()),
+            "d30": int(recv_buffers["d30_from_rank3"].data_ptr()),
+            "d31": int(recv_buffers["d31_from_rank0"].data_ptr()),
+        }
+        output_addrs = {
+            "data0": int(ecnaive_blocks["data0"].data_ptr()),
+            "recv_parity0": int(ecnaive_blocks["recv_parity0"].data_ptr()),
+            "recv_data1": int(ecnaive_blocks["recv_data1"].data_ptr()),
+            "recv_parity1": int(ecnaive_blocks["recv_parity1"].data_ptr()),
+        }
+        aligned_block_size = ecnaive_blocks["data0"].numel()
+
+        native.submit_ecnaive_load_recovery_full(
+            recv_p20_addr=recv_addrs["p20"],
+            recv_d21_addr=recv_addrs["d21"],
+            recv_d00_addr=recv_addrs["d00"],
+            recv_d01_addr=recv_addrs["d01"],
+            recv_d10_addr=recv_addrs["d10"],
+            recv_p11_addr=recv_addrs["p11"],
+            recv_d30_addr=recv_addrs["d30"],
+            recv_d31_addr=recv_addrs["d31"],
+            output_data0_addr=output_addrs["data0"],
+            output_recv_parity0_addr=output_addrs["recv_parity0"],
+            output_recv_data1_addr=output_addrs["recv_data1"],
+            output_recv_parity1_addr=output_addrs["recv_parity1"],
+            size=aligned_block_size,
+        )
+        native.submit_load_recv_sentinel()
+        logger.info(
+            "EC-NAIVE legacy load: rank_in_group 2 waiting for load completion "
+            f"(aligned_block_size={aligned_block_size})"
+        )
+        native.wait_for_load_completion()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        logger.info(
+            f"EC-NAIVE legacy load: rank_in_group 2 recovery done in {time() - start_time:.4f}s"
+        )
+    else:
+        aligned_block_size = ecnaive_blocks["data0"].numel()
+        if rank_in_group == 0:
+            send_addrs = {
+                "p20": int(ecnaive_blocks["recv_parity0"].data_ptr()),
+                "d00": int(ecnaive_blocks["data0"].data_ptr()),
+                "d31": int(ecnaive_blocks["recv_data1"].data_ptr()),
+            }
+            native.submit_load_send_rank0_parity0(
+                send_addr=send_addrs["p20"], size=aligned_block_size
+            )
+            native.submit_load_send_rank0_data0(
+                send_addr=send_addrs["d00"], size=aligned_block_size
+            )
+            native.submit_load_send_rank0_data1(
+                send_addr=send_addrs["d31"], size=aligned_block_size
+            )
+            native.submit_load_send_sentinel()
+        elif rank_in_group == 1:
+            send_addrs = {
+                "d01": int(ecnaive_blocks["recv_data1"].data_ptr()),
+                "d10": int(ecnaive_blocks["data0"].data_ptr()),
+                "p11": int(ecnaive_blocks["recv_parity1"].data_ptr()),
+            }
+            native.submit_load_send_rank1_data1(
+                send_addr=send_addrs["d01"], size=aligned_block_size
+            )
+            native.submit_load_send_rank1_data0(
+                send_addr=send_addrs["d10"], size=aligned_block_size
+            )
+            native.submit_load_send_rank1_parity1(
+                send_addr=send_addrs["p11"], size=aligned_block_size
+            )
+            native.submit_load_send_sentinel()
+        elif rank_in_group == 3:
+            send_addrs = {
+                "d21": int(ecnaive_blocks["recv_data1"].data_ptr()),
+                "d30": int(ecnaive_blocks["data0"].data_ptr()),
+            }
+            native.submit_load_send_rank3_data1(
+                send_addr=send_addrs["d21"], size=aligned_block_size
+            )
+            native.submit_load_send_rank3_data0(
+                send_addr=send_addrs["d30"], size=aligned_block_size
+            )
+            native.submit_load_send_sentinel()
+        else:
+            raise RuntimeError(
+                f"EC-NAIVE legacy load: unexpected rank_in_group={rank_in_group}"
+            )
+        logger.info(
+            f"EC-NAIVE legacy load: rank_in_group {rank_in_group} submitted load sends "
+            f"in {time() - start_time:.4f}s"
+        )
+
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def state_dict_from_ecnaive_main_metadata_only(main_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a state_dict containing only non-tensor keys from an ecnaive main file payload.
+    Used when torch.distributed is not initialized yet (e.g. load_args_from_checkpoint).
+    """
+    decomposed = DecomposedStateDict(
+        non_tensor_data=main_payload["non_tensor_data"],
+        tensor_infos=[],
+        tensor_data=[],
+    )
+    return reconstruct_state_dict(decomposed)
+
+
+def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
+    """
+    Load EC-NAIVE torch legacy checkpoint: rank_in_group 2 recovers four blocks over the network;
+    other ranks load blocks from disk. Reconstruct state_dict from main payload + decoded data0.
+    """
+    from megatron.training import get_args
+
+    args = get_args()
+    if not getattr(args, "use_ecnaive", False):
+        logger.warning(
+            "EC-NAIVE legacy load: args.use_ecnaive is False; enabling for native module init"
+        )
+        args.use_ecnaive = True
+
+    checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+    manager = ECNAIVEManager()
+    manager.init_ecnaive_if_enabled()
+    if manager._ecnaive_native is None:
+        raise RuntimeError("EC-NAIVE native module is not available in legacy load path")
+
+    main_payload = _load_ecnaive_main_payload(checkpoint_dir, rank, world_size)
+    tensor_infos = main_payload["tensor_infos"]
+
+    local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
+    gathered_meta: List[Any]
+    if world_size > 1 and torch.distributed.is_initialized():
+        gathered_meta = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_meta, local_metadata)
+        rank_metadata = {i: gathered_meta[i] for i in range(world_size)}
+    else:
+        rank_metadata = {0: local_metadata}
+
+    global_registry = GlobalMetadataRegistry(rank_metadata=rank_metadata, rank_non_tensor_data={})
+
+    manager.init_ecnaive_load(rank, world_size)
+
+    rank_in_group = manager._get_rank_in_group(rank, world_size)
+    recv_buffers: Optional[Dict[str, torch.Tensor]] = None
+    ecnaive_blocks: Dict[str, torch.Tensor]
+
+    aligned_block_size = int(main_payload["aligned_block_size"])
+
+    if rank_in_group == 2:
+        recv_buffers = manager.allocate_ecnaive_load_recv_buffers(global_registry)
+        data0, recv_parity1, recv_parity0, recv_data1 = allocate_hugepage_slices(
+            aligned_block_size,
+            4,
+            touch_pages=True,
+        )
+        ecnaive_blocks = {
+            "data0": data0,
+            "recv_parity1": recv_parity1,
+            "recv_parity0": recv_parity0,
+            "recv_data1": recv_data1,
+        }
+        if manager.use_rdma:
+            for _n, t in ecnaive_blocks.items():
+                manager.register_buffer(t)
+    else:
+        ecnaive_blocks = _load_blocks_from_disk(checkpoint_dir, rank)
+        if manager.use_rdma:
+            for _n, t in ecnaive_blocks.items():
+                manager.register_buffer(t)
+
+    _run_ecnaive_full_recovery(
+        manager=manager,
+        rank=rank,
+        world_size=world_size,
+        ecnaive_blocks=ecnaive_blocks,
+        recv_buffers=recv_buffers,
+    )
+
+    state_dict = _reconstruct_state_dict_from_main_and_data0(
+        main_payload=main_payload,
+        data0_uint8=ecnaive_blocks["data0"],
+        manager=manager,
+    )
+
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    return state_dict
 
 
 def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:

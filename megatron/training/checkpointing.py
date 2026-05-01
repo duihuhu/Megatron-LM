@@ -425,6 +425,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             raise NotImplementedError(f"Please use local or global non-persistent checkpoints (got: {args.non_persistent_ckpt_type})")
 
     ckpt_format = args.ckpt_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
+    if args.use_ecnaive and (args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY):
+        raise RuntimeError(
+            "EC-NAIVE stage-1 only supports torch checkpoint format. "
+            "Please use --ckpt-format torch without distributed checkpoint save."
+        )
     print_rank_0('saving checkpoint at iteration {:7d} to {} in {} format'.format(
         iteration, save_dir, ckpt_format))
 
@@ -569,9 +574,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 checkpointing_context['local_checkpoint_cache'] = cacheable_metadata
             else:
                 assert ckpt_type == CheckpointType.LEGACY
-                # Save.
-                ensure_directory_exists(checkpoint_name)
-                torch.save(state_dict, checkpoint_name)
+                if args.use_ecnaive:
+                    from .ecnaive_legacy import save_ecnaive_legacy_checkpoint
+                    save_ecnaive_legacy_checkpoint(state_dict, checkpoint_name)
+                    checkpoint_name = str(Path(checkpoint_name).parent)
+                else:
+                    # Save.
+                    ensure_directory_exists(checkpoint_name)
+                    torch.save(state_dict, checkpoint_name)
     start_misc = time()
     if ckpt_type != CheckpointType.LOCAL:
         if not args.async_save:

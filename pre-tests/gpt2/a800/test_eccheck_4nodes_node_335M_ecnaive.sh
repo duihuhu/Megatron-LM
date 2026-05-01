@@ -136,7 +136,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-distributed-optimizer
     # --use-ecnaive-software-failure
     --use-ecnaive
-    --ckpt-format torch_dist
+    --ckpt-format torch
     # --no-save-optim
     # --no-load-optim
     --save-embeddings-separately

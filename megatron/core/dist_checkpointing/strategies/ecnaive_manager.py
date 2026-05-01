@@ -86,16 +86,125 @@ class ECNAIVEManager:
         self._initialized = True
 
     @staticmethod
-    def _get_group_id(rank: int, world_size: int) -> int:
-        """Get group id for multi-rank. Same logic as ECLATIN: group 0 has ranks 0,2,4,6 (8 ranks)."""
+    def _get_ranks_per_node() -> int:
+        """Best-effort infer per-node rank count from environment."""
+        env_keys = (
+            "LOCAL_WORLD_SIZE",
+            "OMPI_COMM_WORLD_LOCAL_SIZE",
+            "MPI_LOCALNRANKS",
+            "MV2_COMM_WORLD_LOCAL_SIZE",
+        )
+        for key in env_keys:
+            val = os.environ.get(key)
+            if not val:
+                continue
+            try:
+                parsed = int(val.strip())
+                if parsed > 0:
+                    return parsed
+            except Exception:
+                continue
+        slurm_val = os.environ.get("SLURM_NTASKS_PER_NODE")
+        if slurm_val:
+            # Common formats: "8" or "8(x2)"
+            token = slurm_val.split(",")[0].strip()
+            token = token.split("(")[0].strip()
+            if token:
+                try:
+                    parsed = int(token)
+                    if parsed > 0:
+                        return parsed
+                except Exception:
+                    pass
+        cuda_count = torch.cuda.device_count()
+        return max(1, cuda_count)
+
+    @classmethod
+    def _get_group_layout(cls, world_size: int) -> Dict[str, int]:
+        """Return EC grouping layout and mapping mode.
+
+        node-aware mode is used when:
+        - world_size is divisible by 4
+        - inferred num_nodes is divisible by 4
+        - ranks_per_node divides world_size
+        """
+        if world_size <= 0:
+            return {
+                "mode": 0,
+                "num_groups": 1,
+                "ranks_per_node": 1,
+                "num_nodes": 1,
+                "clusters": 1,
+            }
         num_groups = max(1, world_size // RANKS_PER_GROUP)
+        ranks_per_node = cls._get_ranks_per_node()
+        if (
+            world_size >= RANKS_PER_GROUP
+            and world_size % RANKS_PER_GROUP == 0
+            and ranks_per_node > 0
+            and world_size % ranks_per_node == 0
+        ):
+            num_nodes = world_size // ranks_per_node
+            if num_nodes >= RANKS_PER_GROUP and num_nodes % RANKS_PER_GROUP == 0:
+                clusters = num_nodes // RANKS_PER_GROUP
+                node_aware_groups = ranks_per_node * clusters
+                if node_aware_groups == num_groups:
+                    return {
+                        "mode": 1,
+                        "num_groups": num_groups,
+                        "ranks_per_node": ranks_per_node,
+                        "num_nodes": num_nodes,
+                        "clusters": clusters,
+                    }
+        return {
+            "mode": 0,
+            "num_groups": num_groups,
+            "ranks_per_node": max(1, ranks_per_node),
+            "num_nodes": max(1, world_size // max(1, ranks_per_node)),
+            "clusters": 1,
+        }
+
+    @classmethod
+    def _get_group_id(cls, rank: int, world_size: int) -> int:
+        """Get group id for EC-NAIVE multi-rank setup."""
+        layout = cls._get_group_layout(world_size)
+        num_groups = layout["num_groups"]
+        if layout["mode"] == 1:
+            ranks_per_node = layout["ranks_per_node"]
+            clusters = layout["clusters"]
+            node_id = rank // ranks_per_node
+            local_rank = rank % ranks_per_node
+            cluster_id = node_id % clusters
+            return local_rank * clusters + cluster_id
         return rank % num_groups
 
-    @staticmethod
-    def _get_rank_in_group(rank: int, world_size: int) -> int:
-        """Get rank index within group (0..3). Same group logic as _get_group_id."""
-        num_groups = max(1, world_size // RANKS_PER_GROUP)
+    @classmethod
+    def _get_rank_in_group(cls, rank: int, world_size: int) -> int:
+        """Get rank index within group (0..3)."""
+        layout = cls._get_group_layout(world_size)
+        num_groups = layout["num_groups"]
+        if layout["mode"] == 1:
+            ranks_per_node = layout["ranks_per_node"]
+            clusters = layout["clusters"]
+            node_id = rank // ranks_per_node
+            return node_id // clusters
         return rank // num_groups
+
+    @classmethod
+    def _get_rank_by_group_position(
+        cls, group_id: int, rank_in_group: int, world_size: int
+    ) -> int:
+        """Map (group_id, rank_in_group) -> global rank."""
+        layout = cls._get_group_layout(world_size)
+        num_groups = layout["num_groups"]
+        if layout["mode"] == 1:
+            ranks_per_node = layout["ranks_per_node"]
+            clusters = layout["clusters"]
+            local_rank = group_id // clusters
+            cluster_id = group_id % clusters
+            node_id = rank_in_group * clusters + cluster_id
+            return node_id * ranks_per_node + local_rank
+        return group_id + num_groups * rank_in_group
 
     def _get_round_robin_ranks(self, rank: int, world_size: int) -> dict:
         """Calculate round-robin partner ranks for EC-NAIVE.
@@ -111,21 +220,31 @@ class ECNAIVEManager:
             dict: Partner ranks for each connection (global rank).
         """
         if world_size >= RANKS_PER_GROUP and world_size % RANKS_PER_GROUP == 0:
-            num_groups = world_size // RANKS_PER_GROUP
             group_id = self._get_group_id(rank, world_size)
             rank_in_group = self._get_rank_in_group(rank, world_size)
             # In-group round-robin: +1, +2, +3 (mod 4)
             send_data1_to_in_group = (rank_in_group + 1) % RANKS_PER_GROUP
             send_parity0_to_in_group = (rank_in_group + 2) % RANKS_PER_GROUP
             send_parity1_to_in_group = (rank_in_group + 3) % RANKS_PER_GROUP
-            # Global rank = group_id + num_groups * rank_in_group
             return {
-                'send_data1_to': group_id + num_groups * send_data1_to_in_group,
-                'send_parity0_to': group_id + num_groups * send_parity0_to_in_group,
-                'send_parity1_to': group_id + num_groups * send_parity1_to_in_group,
-                'recv_parity1_from': group_id + num_groups * send_data1_to_in_group,
-                'recv_parity0_from': group_id + num_groups * send_parity0_to_in_group,
-                'recv_data1_from': group_id + num_groups * send_parity1_to_in_group,
+                'send_data1_to': self._get_rank_by_group_position(
+                    group_id, send_data1_to_in_group, world_size
+                ),
+                'send_parity0_to': self._get_rank_by_group_position(
+                    group_id, send_parity0_to_in_group, world_size
+                ),
+                'send_parity1_to': self._get_rank_by_group_position(
+                    group_id, send_parity1_to_in_group, world_size
+                ),
+                'recv_parity1_from': self._get_rank_by_group_position(
+                    group_id, send_data1_to_in_group, world_size
+                ),
+                'recv_parity0_from': self._get_rank_by_group_position(
+                    group_id, send_parity0_to_in_group, world_size
+                ),
+                'recv_data1_from': self._get_rank_by_group_position(
+                    group_id, send_parity1_to_in_group, world_size
+                ),
             }
         return {
             'send_data1_to': (rank + 1) % world_size,
@@ -370,7 +489,7 @@ class ECNAIVEManager:
         rank_in_group = self._get_rank_in_group(rank, world_size)
         # load_receiver_rank: global rank of rank_in_group 2 in this group (for init_ecnaive_load)
         load_receiver_rank = (
-            group_id + num_groups * 2
+            self._get_rank_by_group_position(group_id, 2, world_size)
             if world_size >= RANKS_PER_GROUP
             else 2
         )

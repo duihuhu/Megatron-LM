@@ -27,7 +27,7 @@ def _cpu_uint8_view(tensor: torch.Tensor) -> torch.Tensor:
     t = tensor.detach()
     if t.device.type != "cpu":
         t = t.to("cpu")
-    return t.contiguous().view(torch.uint8)
+    return t.contiguous().view(torch.uint8).reshape(-1)
 
 
 def _build_global_registry(local_metadata: List[TensorMetadata], local_non_tensor: Dict[str, Any]) -> Tuple[Dict[int, List[TensorMetadata]], Dict[int, Dict[str, Any]]]:
@@ -272,6 +272,7 @@ def _save_ecnaive_pt_files(
     non_tensor_data: Dict[str, Any],
     tensor_infos: List[Any],
     blocks: Dict[str, torch.Tensor],
+    full_tensor_buffer: torch.Tensor,
 ) -> None:
     checkpoint_path = Path(checkpoint_name)
     checkpoint_dir = checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
@@ -285,6 +286,7 @@ def _save_ecnaive_pt_files(
             "rank": rank,
             "non_tensor_data": non_tensor_data,
             "tensor_infos": tensor_infos,
+            "tensor_buffer": full_tensor_buffer.contiguous().view(torch.uint8),
             "actual_tensor_size": blocks["actual_size"],
             "pipeline_total_bytes": blocks["pipeline_size"],
             "aligned_block_size": blocks["aligned_size"],
@@ -427,6 +429,20 @@ def _reconstruct_state_dict_from_main_and_data0(
     tensor_data = extract_tensors_from_continuous_buffer(full_buf, tensor_infos)
     decomposed = DecomposedStateDict(
         non_tensor_data=non_tensor_data,
+        tensor_infos=tensor_infos,
+        tensor_data=tensor_data,
+    )
+    return reconstruct_state_dict(decomposed)
+
+
+def _reconstruct_full_state_dict_from_main_tensor_buffer(main_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Rebuild full state_dict from main payload when tensor_buffer is present (aligned with torch_dist)."""
+    tb = main_payload["tensor_buffer"]
+    buf = tb.detach().contiguous().reshape(-1).view(torch.uint8)
+    tensor_infos = main_payload["tensor_infos"]
+    tensor_data = extract_tensors_from_continuous_buffer(buf, tensor_infos)
+    decomposed = DecomposedStateDict(
+        non_tensor_data=main_payload["non_tensor_data"],
         tensor_infos=tensor_infos,
         tensor_data=tensor_data,
     )
@@ -579,9 +595,12 @@ def _run_ecnaive_full_recovery(
 
 def state_dict_from_ecnaive_main_metadata_only(main_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Build a state_dict containing only non-tensor keys from an ecnaive main file payload.
+    Build state_dict from ecnaive main file payload.
+    When tensor_buffer is present, reconstruct full tensors; otherwise only non-tensor keys.
     Used when torch.distributed is not initialized yet (e.g. load_args_from_checkpoint).
     """
+    if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
+        return _reconstruct_full_state_dict_from_main_tensor_buffer(main_payload)
     decomposed = DecomposedStateDict(
         non_tensor_data=main_payload["non_tensor_data"],
         tensor_infos=[],
@@ -595,6 +614,18 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     Load EC-NAIVE torch legacy checkpoint: rank_in_group 2 recovers four blocks over the network;
     other ranks load blocks from disk. Reconstruct state_dict from main payload + decoded data0.
     """
+    checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+    main_payload = _load_ecnaive_main_payload(checkpoint_dir, rank, world_size)
+
+    if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
+        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(main_payload)
+        if world_size > 1 and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        return state_dict
+
     from megatron.training import get_args
 
     args = get_args()
@@ -604,16 +635,11 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         )
         args.use_ecnaive = True
 
-    checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-
     manager = ECNAIVEManager()
     manager.init_ecnaive_if_enabled()
     if manager._ecnaive_native is None:
         raise RuntimeError("EC-NAIVE native module is not available in legacy load path")
 
-    main_payload = _load_ecnaive_main_payload(checkpoint_dir, rank, world_size)
     tensor_infos = main_payload["tensor_infos"]
 
     local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
@@ -700,7 +726,13 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     local_tensor_metadata: List[TensorMetadata] = []
     for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
         tensor_bytes = info.size_bytes
-        tensor_buffer[offset : offset + tensor_bytes].copy_(_cpu_uint8_view(tensor))
+        tensor_bytes_view = _cpu_uint8_view(tensor)
+        if tensor_bytes_view.numel() != tensor_bytes:
+            raise RuntimeError(
+                f"EC-NAIVE legacy save: tensor bytes mismatch for {info.key}, "
+                f"expected={tensor_bytes}, got={tensor_bytes_view.numel()}"
+            )
+        tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_bytes_view)
         info.offset = offset
         local_tensor_metadata.append(
             TensorMetadata(
@@ -733,12 +765,15 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         ecnaive_blocks=blocks,
     )
 
+    full_tensor_buffer = tensor_buffer[:total_tensor_size].detach().clone()
+
     _save_ecnaive_pt_files(
         checkpoint_name=checkpoint_name,
         rank=rank,
         non_tensor_data=decomposed.non_tensor_data,
         tensor_infos=decomposed.tensor_infos,
         blocks=blocks,
+        full_tensor_buffer=full_tensor_buffer,
     )
 
     if world_size > 1:

@@ -1170,8 +1170,22 @@ def _load_base_checkpoint(
                 if not os.path.isdir(checkpoint_name)
                 else checkpoint_name
             )
-            ecnaive_marker = os.path.join(ckpt_parent, "ecnaive_main_rank0.pt")
-            if os.path.isfile(ecnaive_marker):
+            ckpt_parent_path = Path(ckpt_parent)
+            ecnaive_marker = None
+            if torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+                rank_marker = ckpt_parent_path / f"ecnaive_main_rank{rank}.pt"
+                if rank_marker.is_file():
+                    ecnaive_marker = str(rank_marker)
+            if ecnaive_marker is None:
+                rank0_marker = ckpt_parent_path / "ecnaive_main_rank0.pt"
+                if rank0_marker.is_file():
+                    ecnaive_marker = str(rank0_marker)
+            if ecnaive_marker is None:
+                any_markers = sorted(ckpt_parent_path.glob("ecnaive_main_rank*.pt"))
+                if any_markers:
+                    ecnaive_marker = str(any_markers[0])
+            if ecnaive_marker is not None:
                 from .ecnaive_legacy import (
                     load_ecnaive_legacy_checkpoint,
                     state_dict_from_ecnaive_main_metadata_only,

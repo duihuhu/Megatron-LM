@@ -302,13 +302,15 @@ def _save_ecnaive_pt_files(
 
     for block_name in ("data0", "recv_parity1", "recv_parity0", "recv_data1"):
         block_file = checkpoint_dir / f"ecnaive_block_rank{rank}_{block_name}.pt"
+        # blocks are views from one shared base buffer; clone to avoid serializing the full base storage.
+        block_tensor = blocks[block_name].contiguous().clone()
         torch.save(
             {
                 "version": 1,
                 "format": "ecnaive_torch_legacy",
                 "rank": rank,
                 "block_name": block_name,
-                "tensor": blocks[block_name],
+                "tensor": block_tensor,
             },
             block_file,
         )
@@ -611,20 +613,14 @@ def state_dict_from_ecnaive_main_metadata_only(main_payload: Dict[str, Any]) -> 
 
 def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     """
-    Load EC-NAIVE torch legacy checkpoint: rank_in_group 2 recovers four blocks over the network;
-    other ranks load blocks from disk. Reconstruct state_dict from main payload + decoded data0.
+    Load EC-NAIVE torch legacy checkpoint: always run 8-port recovery (aligned with torch_dist),
+    then reconstruct state_dict from main tensor_buffer when present, else from decoded data0.
     """
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     main_payload = _load_ecnaive_main_payload(checkpoint_dir, rank, world_size)
-
-    if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
-        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(main_payload)
-        if world_size > 1 and torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        return state_dict
 
     from megatron.training import get_args
 
@@ -691,11 +687,14 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         recv_buffers=recv_buffers,
     )
 
-    state_dict = _reconstruct_state_dict_from_main_and_data0(
-        main_payload=main_payload,
-        data0_uint8=ecnaive_blocks["data0"],
-        manager=manager,
-    )
+    if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
+        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(main_payload)
+    else:
+        state_dict = _reconstruct_state_dict_from_main_and_data0(
+            main_payload=main_payload,
+            data0_uint8=ecnaive_blocks["data0"],
+            manager=manager,
+        )
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()

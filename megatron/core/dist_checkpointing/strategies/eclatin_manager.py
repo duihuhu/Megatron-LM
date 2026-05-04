@@ -271,18 +271,18 @@ class ECLATINManager:
         rank_in_group = self._get_rank_in_group(rank, world_size)
         # Load mode ports (for rank_in_group 2 recovery): per-group base to avoid port conflict
         load_base_port = base_port + 1000 + group_id * 100
-        if rank_in_group == 2:
-            # rank_in_group 2: 6 recv ports (receiver in load recovery)
-            ports.update({
-                'load_recv_rank0_data2': load_base_port + 0,
-                'load_recv_rank0_parity2': load_base_port + 1,
-                'load_recv_rank1_data1': load_base_port + 2,
-                'load_recv_rank1_parity1': load_base_port + 3,
-                'load_recv_rank3_data1': load_base_port + 4,
-                'load_recv_rank3_data2': load_base_port + 5,
-            })
-        else:
-            # rank_in_group 0/1/3: 2 send ports each (connect to group's rank_in_group 2)
+        # Always add all 6 load_recv_* port keys (for rank_in_group 2 receiver)
+        # so all ranks can look them up unconditionally.
+        ports.update({
+            'load_recv_rank0_data2': load_base_port + 0,
+            'load_recv_rank0_parity2': load_base_port + 1,
+            'load_recv_rank1_data1': load_base_port + 2,
+            'load_recv_rank1_parity1': load_base_port + 3,
+            'load_recv_rank3_data1': load_base_port + 4,
+            'load_recv_rank3_data2': load_base_port + 5,
+        })
+        # Add per-rank send port keys for non-receiver ranks
+        if rank_in_group != 2:
             if rank_in_group == 0:
                 ports.update({
                     'load_send_rank0_data2': load_base_port + 0,

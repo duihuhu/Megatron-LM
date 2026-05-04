@@ -2606,6 +2606,31 @@ private:
             // Round 8: parity2 (1 send2, 3 recv1)
             if (r == 1) rdma_save_channels_[5]->exchange_and_connect(true);
             if (r == 3) rdma_save_channels_[6]->exchange_and_connect(false);
+            // === Reverse direction exchanges (8 missing rounds) ===
+            // Round 9: parity1 (2 send1, 0 recv2)
+            if (r == 2) rdma_save_channels_[0]->exchange_and_connect(true);
+            if (r == 0) rdma_save_channels_[3]->exchange_and_connect(false);
+            // Round 10: parity1 (3 send1, 1 recv2)
+            if (r == 3) rdma_save_channels_[0]->exchange_and_connect(true);
+            if (r == 1) rdma_save_channels_[3]->exchange_and_connect(false);
+            // Round 11: parity1 (1 send2, 0 recv1)
+            if (r == 1) rdma_save_channels_[1]->exchange_and_connect(true);
+            if (r == 0) rdma_save_channels_[2]->exchange_and_connect(false);
+            // Round 12: parity1 (3 send2, 2 recv1)
+            if (r == 3) rdma_save_channels_[1]->exchange_and_connect(true);
+            if (r == 2) rdma_save_channels_[2]->exchange_and_connect(false);
+            // Round 13: parity2 (3 send1, 0 recv2)
+            if (r == 3) rdma_save_channels_[4]->exchange_and_connect(true);
+            if (r == 0) rdma_save_channels_[7]->exchange_and_connect(false);
+            // Round 14: parity2 (2 send1, 1 recv2)
+            if (r == 2) rdma_save_channels_[4]->exchange_and_connect(true);
+            if (r == 1) rdma_save_channels_[7]->exchange_and_connect(false);
+            // Round 15: parity2 (2 send2, 0 recv1)
+            if (r == 2) rdma_save_channels_[5]->exchange_and_connect(true);
+            if (r == 0) rdma_save_channels_[6]->exchange_and_connect(false);
+            // Round 16: parity2 (3 send2, 1 recv1)
+            if (r == 3) rdma_save_channels_[5]->exchange_and_connect(true);
+            if (r == 1) rdma_save_channels_[6]->exchange_and_connect(false);
         }
         std::cout << "[ECLATIN RDMA] All 8 save channels connected" << std::endl;
     }

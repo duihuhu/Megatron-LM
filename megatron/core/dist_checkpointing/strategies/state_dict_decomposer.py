@@ -327,28 +327,35 @@ def reconstruct_state_dict(decomposed: DecomposedStateDict) -> Dict[str, Any]:
         Dict[str, Any]: reconstructed state_dict
     """
     state_dict = {}
-    
-    # First, add non-tensor data
-    for key, value in decomposed.non_tensor_data.items():
-        if isinstance(value, dict):
-            # Nested dictionary
-            if key not in state_dict:
-                state_dict[key] = {}
-            state_dict[key].update(value)
-        else:
-            state_dict[key] = value
-    
-    # Then, add tensor data
-    for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
-        # Navigate to the correct position in nested dict
-        keys = info.key.split('.')
-        current = state_dict
-        for k in keys[:-1]:
+
+    def _ensure_nested(current, keys):
+        for k in keys:
             if k not in current:
                 current[k] = {}
             current = current[k]
-        current[keys[-1]] = tensor
-    
+        return current
+
+    # First, add non-tensor data
+    for key, value in decomposed.non_tensor_data.items():
+        if isinstance(value, dict):
+            # key is a dot-separated prefix; navigate into the nested structure
+            target = _ensure_nested(state_dict, key.split('.'))
+            target.update(value)
+        else:
+            # Scalar value: if key contains dots, nest it; otherwise top-level
+            keys = key.split('.')
+            if len(keys) == 1:
+                state_dict[key] = value
+            else:
+                target = _ensure_nested(state_dict, keys[:-1])
+                target[keys[-1]] = value
+
+    # Then, add tensor data
+    for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
+        keys = info.key.split('.')
+        target = _ensure_nested(state_dict, keys[:-1])
+        target[keys[-1]] = tensor
+
     return state_dict
 
 

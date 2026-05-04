@@ -18,3 +18,5 @@ runs/
 nccl.log.*
 *.log
 data/
+package-lock.json
+package.json

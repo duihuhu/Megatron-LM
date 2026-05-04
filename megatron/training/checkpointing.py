@@ -574,7 +574,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 checkpointing_context['local_checkpoint_cache'] = cacheable_metadata
             else:
                 assert ckpt_type == CheckpointType.LEGACY
-                if args.use_ecnaive:
+                if getattr(args, "use_eclatin", False):
+                    from .eclatin_legacy import save_eclatin_legacy_checkpoint
+                    save_eclatin_legacy_checkpoint(state_dict, checkpoint_name)
+                    checkpoint_name = str(Path(checkpoint_name).parent)
+                elif args.use_ecnaive:
                     from .ecnaive_legacy import save_ecnaive_legacy_checkpoint
                     save_ecnaive_legacy_checkpoint(state_dict, checkpoint_name)
                     checkpoint_name = str(Path(checkpoint_name).parent)
@@ -1171,35 +1175,63 @@ def _load_base_checkpoint(
                 else checkpoint_name
             )
             ckpt_parent_path = Path(ckpt_parent)
-            ecnaive_marker = None
+            eclatin_marker = None
             if torch.distributed.is_initialized():
                 rank = torch.distributed.get_rank()
-                rank_marker = ckpt_parent_path / f"ecnaive_main_rank{rank}.pt"
-                if rank_marker.is_file():
-                    ecnaive_marker = str(rank_marker)
-            if ecnaive_marker is None:
-                rank0_marker = ckpt_parent_path / "ecnaive_main_rank0.pt"
-                if rank0_marker.is_file():
-                    ecnaive_marker = str(rank0_marker)
-            if ecnaive_marker is None:
-                any_markers = sorted(ckpt_parent_path.glob("ecnaive_main_rank*.pt"))
-                if any_markers:
-                    ecnaive_marker = str(any_markers[0])
-            if ecnaive_marker is not None:
-                from .ecnaive_legacy import (
-                    load_ecnaive_legacy_checkpoint,
-                    state_dict_from_ecnaive_main_metadata_only,
+                eclatin_rank_marker = ckpt_parent_path / f"eclatin_main_rank{rank}.pt"
+                if eclatin_rank_marker.is_file():
+                    eclatin_marker = str(eclatin_rank_marker)
+            if eclatin_marker is None:
+                eclatin_rank0 = ckpt_parent_path / "eclatin_main_rank0.pt"
+                if eclatin_rank0.is_file():
+                    eclatin_marker = str(eclatin_rank0)
+            if eclatin_marker is None:
+                any_eclatin = sorted(ckpt_parent_path.glob("eclatin_main_rank*.pt"))
+                if any_eclatin:
+                    eclatin_marker = str(any_eclatin[0])
+            if eclatin_marker is not None:
+                from .eclatin_legacy import (
+                    load_eclatin_legacy_checkpoint,
+                    state_dict_from_eclatin_main_metadata_only,
                 )
 
                 if torch.distributed.is_initialized():
-                    state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
+                    state_dict = load_eclatin_legacy_checkpoint(checkpoint_name)
                 else:
                     payload = torch.load(
-                        ecnaive_marker, map_location="cpu", weights_only=False
+                        eclatin_marker, map_location="cpu", weights_only=False
                     )
-                    state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
+                    state_dict = state_dict_from_eclatin_main_metadata_only(payload)
             else:
-                state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+                ecnaive_marker = None
+                if torch.distributed.is_initialized():
+                    rank = torch.distributed.get_rank()
+                    rank_marker = ckpt_parent_path / f"ecnaive_main_rank{rank}.pt"
+                    if rank_marker.is_file():
+                        ecnaive_marker = str(rank_marker)
+                if ecnaive_marker is None:
+                    rank0_marker = ckpt_parent_path / "ecnaive_main_rank0.pt"
+                    if rank0_marker.is_file():
+                        ecnaive_marker = str(rank0_marker)
+                if ecnaive_marker is None:
+                    any_markers = sorted(ckpt_parent_path.glob("ecnaive_main_rank*.pt"))
+                    if any_markers:
+                        ecnaive_marker = str(any_markers[0])
+                if ecnaive_marker is not None:
+                    from .ecnaive_legacy import (
+                        load_ecnaive_legacy_checkpoint,
+                        state_dict_from_ecnaive_main_metadata_only,
+                    )
+
+                    if torch.distributed.is_initialized():
+                        state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
+                    else:
+                        payload = torch.load(
+                            ecnaive_marker, map_location="cpu", weights_only=False
+                        )
+                        state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
+                else:
+                    state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler
 

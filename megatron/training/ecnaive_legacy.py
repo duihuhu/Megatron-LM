@@ -2,7 +2,7 @@ import ctypes
 import queue
 from logging import getLogger
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -273,6 +273,7 @@ def _save_ecnaive_pt_files(
     tensor_infos: List[Any],
     blocks: Dict[str, torch.Tensor],
     full_tensor_buffer: torch.Tensor,
+    flat_key_roots: Optional[Set[str]] = None,
 ) -> None:
     checkpoint_path = Path(checkpoint_name)
     checkpoint_dir = checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
@@ -290,6 +291,7 @@ def _save_ecnaive_pt_files(
             "actual_tensor_size": blocks["actual_size"],
             "pipeline_total_bytes": blocks["pipeline_size"],
             "aligned_block_size": blocks["aligned_size"],
+            "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
             "block_files": {
                 "data0": f"ecnaive_block_rank{rank}_data0.pt",
                 "recv_parity1": f"ecnaive_block_rank{rank}_recv_parity1.pt",
@@ -412,6 +414,7 @@ def _reconstruct_state_dict_from_main_and_data0(
     main_payload: Dict[str, Any],
     data0_uint8: torch.Tensor,
     manager: ECNAIVEManager,
+    flat_key_roots: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     tensor_infos = main_payload["tensor_infos"]
     non_tensor_data = main_payload["non_tensor_data"]
@@ -433,11 +436,15 @@ def _reconstruct_state_dict_from_main_and_data0(
         non_tensor_data=non_tensor_data,
         tensor_infos=tensor_infos,
         tensor_data=tensor_data,
+        flat_key_roots=flat_key_roots or set(),
     )
     return reconstruct_state_dict(decomposed)
 
 
-def _reconstruct_full_state_dict_from_main_tensor_buffer(main_payload: Dict[str, Any]) -> Dict[str, Any]:
+def _reconstruct_full_state_dict_from_main_tensor_buffer(
+    main_payload: Dict[str, Any],
+    flat_key_roots: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
     """Rebuild full state_dict from main payload when tensor_buffer is present (aligned with torch_dist)."""
     tb = main_payload["tensor_buffer"]
     buf = tb.detach().contiguous().reshape(-1).view(torch.uint8)
@@ -447,6 +454,7 @@ def _reconstruct_full_state_dict_from_main_tensor_buffer(main_payload: Dict[str,
         non_tensor_data=main_payload["non_tensor_data"],
         tensor_infos=tensor_infos,
         tensor_data=tensor_data,
+        flat_key_roots=flat_key_roots or set(),
     )
     return reconstruct_state_dict(decomposed)
 
@@ -595,18 +603,38 @@ def _run_ecnaive_full_recovery(
         torch.distributed.barrier()
 
 
+def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
+    """Infer flat key roots from checkpoint payload (for backward compatibility)."""
+    if "flat_key_roots" in main_payload:
+        return set(main_payload["flat_key_roots"])
+    flat_key_roots: Set[str] = set()
+    for info in main_payload.get("tensor_infos", []):
+        first_seg = info.key.split('.')[0]
+        if first_seg == "model" or (
+            first_seg.startswith("model")
+            and len(first_seg) > 5
+            and first_seg[5:].isdigit()
+        ):
+            flat_key_roots.add(first_seg)
+    return flat_key_roots
+
+
 def state_dict_from_ecnaive_main_metadata_only(main_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Build state_dict from ecnaive main file payload.
     When tensor_buffer is present, reconstruct full tensors; otherwise only non-tensor keys.
     Used when torch.distributed is not initialized yet (e.g. load_args_from_checkpoint).
     """
+    flat_key_roots = _infer_flat_key_roots(main_payload)
     if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
-        return _reconstruct_full_state_dict_from_main_tensor_buffer(main_payload)
+        return _reconstruct_full_state_dict_from_main_tensor_buffer(
+            main_payload, flat_key_roots=flat_key_roots,
+        )
     decomposed = DecomposedStateDict(
         non_tensor_data=main_payload["non_tensor_data"],
         tensor_infos=[],
         tensor_data=[],
+        flat_key_roots=flat_key_roots,
     )
     return reconstruct_state_dict(decomposed)
 
@@ -687,14 +715,28 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         recv_buffers=recv_buffers,
     )
 
+    # Backward compatibility: checkpoints saved before flat_key_roots existed.
+    # See _infer_flat_key_roots for the inference heuristic.
+    flat_key_roots = _infer_flat_key_roots(main_payload)
+
     if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
-        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(main_payload)
+        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+            main_payload, flat_key_roots=flat_key_roots,
+        )
     else:
         state_dict = _reconstruct_state_dict_from_main_and_data0(
             main_payload=main_payload,
             data0_uint8=ecnaive_blocks["data0"],
             manager=manager,
+            flat_key_roots=flat_key_roots,
         )
+
+    # Clean up EC-NAIVE native module after load to prevent segfaults:
+    # C++ worker threads and RDMA connections remain alive after recovery and
+    # could access freed memory once local tensors (ecnaive_blocks, recv_buffers)
+    # go out of scope.
+    logger.info(f"EC-NAIVE legacy load: cleaning up native module (rank {rank})")
+    manager.cleanup()
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -773,6 +815,7 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         tensor_infos=decomposed.tensor_infos,
         blocks=blocks,
         full_tensor_buffer=full_tensor_buffer,
+        flat_key_roots=decomposed.flat_key_roots,
     )
 
     if world_size > 1:

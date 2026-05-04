@@ -14,7 +14,7 @@ checkpointing.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple, Union, Optional
+from typing import Any, Dict, List, Set, Tuple, Union, Optional
 
 import torch
 
@@ -182,6 +182,7 @@ class DecomposedStateDict:
     tensor_infos: List[TensorInfo]
     tensor_data: List[torch.Tensor]
     total_tensor_size_bytes: int = 0
+    flat_key_roots: Set[str] = field(default_factory=set)
     
     def __post_init__(self):
         """Calculate total tensor size after initialization."""
@@ -245,13 +246,21 @@ def decompose_state_dict(
     non_tensor_data = {}
     tensor_infos = []
     tensor_data = []
-    
+    flat_key_roots: Set[str] = set()
+
     # Recursively traverse state_dict
     def _traverse_dict(d: Dict, prefix: str = ""):
         """Recursively traverse dictionary to find tensors."""
         for key, value in d.items():
             full_key = f"{prefix}.{key}" if prefix else key
-            
+
+            # Detect flat key roots: if prefix is non-empty and key contains a dot,
+            # the top-level key has a flat dict with dot-containing keys (like
+            # model state_dict from state_dict_for_save_checkpoint()).
+            if prefix and isinstance(key, str) and '.' in key:
+                top_level = prefix.split('.')[0]
+                flat_key_roots.add(top_level)
+
             if isinstance(value, torch.Tensor):
                 # This is a tensor - extract metadata
                 tensor_info = TensorInfo(
@@ -275,7 +284,7 @@ def decompose_state_dict(
                     non_tensor_data[prefix][key] = value
                 else:
                     non_tensor_data[full_key] = value
-    
+
     _traverse_dict(state_dict)
     
     # Sort tensors by size if requested (largest first for better packing)
@@ -296,6 +305,7 @@ def decompose_state_dict(
         non_tensor_data=non_tensor_data,
         tensor_infos=tensor_infos,
         tensor_data=tensor_data,
+        flat_key_roots=flat_key_roots,
     )
     
     # Log statistics
@@ -350,11 +360,24 @@ def reconstruct_state_dict(decomposed: DecomposedStateDict) -> Dict[str, Any]:
                 target = _ensure_nested(state_dict, keys[:-1])
                 target[keys[-1]] = value
 
-    # Then, add tensor data
+    # Then, add tensor data with flat_key_roots awareness
     for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
-        keys = info.key.split('.')
-        target = _ensure_nested(state_dict, keys[:-1])
-        target[keys[-1]] = tensor
+        # Check if this tensor's top-level key is a flat key root.
+        # For flat key roots, the key after the first dot is a single flat key
+        # (not multi-level nesting). This handles model state_dicts where
+        # keys like "model.module.decoder.weight" must be stored as
+        # state_dict["model"]["module.decoder.weight"], NOT nested.
+        first_dot = info.key.find('.')
+        if first_dot >= 0 and info.key[:first_dot] in decomposed.flat_key_roots:
+            top_key = info.key[:first_dot]
+            flat_sub_key = info.key[first_dot + 1:]
+            if top_key not in state_dict:
+                state_dict[top_key] = {}
+            state_dict[top_key][flat_sub_key] = tensor
+        else:
+            keys = info.key.split('.')
+            target = _ensure_nested(state_dict, keys[:-1])
+            target[keys[-1]] = tensor
 
     return state_dict
 

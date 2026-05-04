@@ -1168,12 +1168,20 @@ class ECNAIVEManager:
         try:
             # Stop buffer poller thread
             self._stop_buffer_poller_thread()
-            
-            # Stop the C++ pipeline
+
+            # Stop the C++ pipeline and null it out so re-init works
             if hasattr(self, '_ecnaive_native') and self._ecnaive_native is not None:
                 self._ecnaive_native.stop()
+                self._ecnaive_native = None
                 logger.info("EC-NAIVE: C++ native module stopped in manager cleanup")
-                
+
+            # Clear registered buffers
+            self.registered_buffers.clear()
+            self.ecnaive_data_buffers = None
+            self.ecnaive_parity_buffers = None
+            self._free_data_buffer_queue = None
+            self._free_parity_buffer_queue = None
+
         except Exception as e:
             logger.warning(f"EC-NAIVE: Error during manager cleanup: {e}")
     

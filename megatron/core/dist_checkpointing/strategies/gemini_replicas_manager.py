@@ -53,6 +53,7 @@ class GeminiReplicasManager:
         
         # Replica configuration
         self.num_replicas = 3  # Default: 3 replicas (including local)
+        self.group_size: Optional[int] = None  # None = global, int = independent groups of this size
         
         # Buffer configuration
         self.gemini_replicas_pin_memory = True
@@ -74,19 +75,60 @@ class GeminiReplicasManager:
         
         self._initialized = True
     
+    @staticmethod
+    def _get_ranks_per_node() -> int:
+        """Detect how many ranks run per node from environment variables.
+
+        Priority: LOCAL_WORLD_SIZE > OMPI_COMM_WORLD_LOCAL_SIZE >
+        MPI_LOCALNRANKS > MV2_COMM_WORLD_LOCAL_SIZE > SLURM_NTASKS_PER_NODE >
+        torch.cuda.device_count().
+        """
+        env_keys = (
+            "LOCAL_WORLD_SIZE",
+            "OMPI_COMM_WORLD_LOCAL_SIZE",
+            "MPI_LOCALNRANKS",
+            "MV2_COMM_WORLD_LOCAL_SIZE",
+        )
+        for key in env_keys:
+            val = os.environ.get(key)
+            if not val:
+                continue
+            try:
+                parsed = int(val.strip())
+                if parsed > 0:
+                    return parsed
+            except Exception:
+                continue
+        slurm_val = os.environ.get("SLURM_NTASKS_PER_NODE")
+        if slurm_val:
+            token = slurm_val.split(",")[0].strip()
+            token = token.split("(")[0].strip()
+            if token:
+                try:
+                    parsed = int(token)
+                    if parsed > 0:
+                        return parsed
+                except Exception:
+                    pass
+        cuda_count = torch.cuda.device_count()
+        return max(1, cuda_count)
+
     def _calculate_target_ranks(self, my_rank: int, world_size: int) -> List[int]:
         """Calculate target ranks for replicas using round-robin strategy.
-        
-        Round-robin placement:
+
+        When group_size is set, ranks are partitioned into node-interleaved groups
+        (one rank per node per group, following FRCheck's layout), and round-robin
+        placement is confined within each group.  This ensures replicas of the same
+        data land on different physical nodes.
+
+        Round-robin placement (global, no grouping):
         - rank0 (3 replicas): [0, 1, 2]
         - rank1 (3 replicas): [1, 2, 3]
-        - rank2 (3 replicas): [2, 3, 0]
-        - rank3 (3 replicas): [3, 0, 1]
-        
+
         Args:
             my_rank (int): Current rank
             world_size (int): Total number of ranks
-            
+
         Returns:
             List[int]: List of target ranks (including self)
         """
@@ -95,21 +137,129 @@ class GeminiReplicasManager:
                 f"Gemini Replicas: num_replicas ({self.num_replicas}) cannot exceed "
                 f"world_size ({world_size})"
             )
-        
-        # Generate target ranks using round-robin
-        # First replica is always self, then (num_replicas - 1) subsequent ranks
+
+        # --- global round-robin (no grouping) ---
+        if self.group_size is None or self.group_size >= world_size:
+            targets = []
+            for i in range(self.num_replicas):
+                targets.append((my_rank + i) % world_size)
+            logger.info(
+                f"Gemini Replicas: [Rank {my_rank}] Calculated target ranks: {targets} "
+                f"({self.num_replicas} replicas, global)"
+            )
+            return targets
+
+        # --- node-interleaved grouping (FRCheck layout) ---
+        gs = self.group_size
+        ranks_per_node = self._get_ranks_per_node()
+
+        use_node_aware = (
+            world_size >= gs
+            and world_size % gs == 0
+            and ranks_per_node > 0
+            and world_size % ranks_per_node == 0
+        )
+        if use_node_aware:
+            num_nodes = world_size // ranks_per_node
+            if num_nodes >= gs and num_nodes % gs == 0:
+                clusters = num_nodes // gs
+                node_id = my_rank // ranks_per_node
+                local_rank = my_rank % ranks_per_node
+                cluster_id = node_id % clusters
+
+                # group_id follows FRCheck: local_rank * clusters + cluster_id
+                group_id = local_rank * clusters + cluster_id
+
+                # Build ordered list of members in this group (rank_in_group 0..gs-1)
+                group_members = []
+                for pos in range(gs):
+                    member_node = pos * clusters + cluster_id
+                    group_members.append(member_node * ranks_per_node + local_rank)
+
+                if self.num_replicas > len(group_members):
+                    raise ValueError(
+                        f"Gemini Replicas: num_replicas ({self.num_replicas}) exceeds "
+                        f"group member count ({len(group_members)}) for rank {my_rank}"
+                    )
+
+                my_pos = group_members.index(my_rank)
+                targets = []
+                for i in range(self.num_replicas):
+                    targets.append(group_members[(my_pos + i) % len(group_members)])
+
+                logger.info(
+                    f"Gemini Replicas: [Rank {my_rank}] node-aware targets: {targets} "
+                    f"({self.num_replicas} replicas, group_id={group_id}, "
+                    f"members={group_members}, nodes/group={gs})"
+                )
+                return targets
+            else:
+                logger.warning(
+                    f"Gemini Replicas: num_nodes ({num_nodes}) not divisible by "
+                    f"group_size ({gs}), falling back to consecutive grouping for rank {my_rank}"
+                )
+
+        # --- fallback: simple consecutive grouping ---
+        group_id = my_rank // gs
+        group_start = group_id * gs
+        group_end = min(group_start + gs, world_size)
+        group_world = group_end - group_start
+        local_rank = my_rank - group_start
+
+        if self.num_replicas > group_world:
+            raise ValueError(
+                f"Gemini Replicas: num_replicas ({self.num_replicas}) cannot exceed "
+                f"group size ({group_world}) for rank {my_rank}"
+            )
+
         targets = []
         for i in range(self.num_replicas):
-            target_rank = (my_rank + i) % world_size
-            targets.append(target_rank)
-        
+            target_local = (local_rank + i) % group_world
+            targets.append(group_start + target_local)
+
         logger.info(
-            f"Gemini Replicas: [Rank {my_rank}] Calculated target ranks: {targets} "
-            f"({self.num_replicas} replicas)"
+            f"Gemini Replicas: [Rank {my_rank}] consecutive-group targets: {targets} "
+            f"({self.num_replicas} replicas, group=[{group_start}, {group_end}))"
         )
-        
+
         return targets
-    
+
+    def get_group_members(self, my_rank: int, world_size: int) -> List[int]:
+        """Return all ranks that belong to the same group as my_rank.
+
+        Uses the same node-interleaved (or consecutive) grouping as
+        _calculate_target_ranks so recovery can determine group boundaries.
+        """
+        gs = self.group_size
+        if gs is None or gs >= world_size:
+            return list(range(world_size))
+
+        ranks_per_node = self._get_ranks_per_node()
+        use_node_aware = (
+            world_size >= gs
+            and world_size % gs == 0
+            and ranks_per_node > 0
+            and world_size % ranks_per_node == 0
+        )
+        if use_node_aware:
+            num_nodes = world_size // ranks_per_node
+            if num_nodes >= gs and num_nodes % gs == 0:
+                clusters = num_nodes // gs
+                node_id = my_rank // ranks_per_node
+                local_rank = my_rank % ranks_per_node
+                cluster_id = node_id % clusters
+                members = []
+                for pos in range(gs):
+                    member_node = pos * clusters + cluster_id
+                    members.append(member_node * ranks_per_node + local_rank)
+                return members
+
+        # Fallback: consecutive grouping
+        group_id = my_rank // gs
+        group_start = group_id * gs
+        group_end = min(group_start + gs, world_size)
+        return list(range(group_start, group_end))
+
     def _get_gemini_replicas_network_config(self, rank: int, world_size: int) -> dict:
         """
         Get network configuration for Gemini Replicas ASIO connections.
@@ -290,6 +440,7 @@ class GeminiReplicasManager:
             self.use_gemini_replicas = getattr(args, 'use_gemini_replicas', False)
             self.use_gemini_replicas_optimized = getattr(args, 'use_gemini_replicas_optimized', False)
             self.num_replicas = getattr(args, 'gemini_replicas_num', 3)
+            self.group_size = getattr(args, 'gemini_replicas_group_size', None)
             self.use_rdma = getattr(args, 'use_rdma', False)
             
             if not self.use_gemini_replicas or not self.use_gemini_replicas_optimized:

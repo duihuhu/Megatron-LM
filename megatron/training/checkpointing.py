@@ -437,6 +437,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             "FRCheck skeleton only supports torch checkpoint format and LEGACY checkpoints. "
             "Please use --ckpt-format torch without distributed checkpoint save."
         )
+    if getattr(args, "use_gemini_replicas", False) and (
+        args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
+    ):
+        raise RuntimeError(
+            "Gemini Replicas legacy only supports torch checkpoint format. "
+            "Please use --ckpt-format torch without distributed checkpoint save."
+        )
     print_rank_0('saving checkpoint at iteration {:7d} to {} in {} format'.format(
         iteration, save_dir, ckpt_format))
 
@@ -592,6 +599,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 elif getattr(args, "use_frcheck", False):
                     from .frcheck_legacy import save_frcheck_legacy_checkpoint
                     save_frcheck_legacy_checkpoint(state_dict, checkpoint_name)
+                    checkpoint_name = str(Path(checkpoint_name).parent)
+                elif getattr(args, "use_gemini_replicas", False):
+                    from .gemini_replicas_legacy import save_gemini_replicas_legacy_checkpoint
+                    save_gemini_replicas_legacy_checkpoint(state_dict, checkpoint_name)
                     checkpoint_name = str(Path(checkpoint_name).parent)
                 else:
                     # Save.
@@ -1260,7 +1271,35 @@ def _load_base_checkpoint(
                         raise NotImplementedError(
                             "Loading FRCheck legacy checkpoints is not implemented in the skeleton."
                         )
-                    state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+                    gemini_replicas_marker = None
+                    if torch.distributed.is_initialized():
+                        rank = torch.distributed.get_rank()
+                        gr_rank_marker = ckpt_parent_path / f"gemini_replicas_main_rank{rank}.pt"
+                        if gr_rank_marker.is_file():
+                            gemini_replicas_marker = str(gr_rank_marker)
+                    if gemini_replicas_marker is None:
+                        gr_rank0 = ckpt_parent_path / "gemini_replicas_main_rank0.pt"
+                        if gr_rank0.is_file():
+                            gemini_replicas_marker = str(gr_rank0)
+                    if gemini_replicas_marker is None:
+                        any_gr = sorted(ckpt_parent_path.glob("gemini_replicas_main_rank*.pt"))
+                        if any_gr:
+                            gemini_replicas_marker = str(any_gr[0])
+                    if gemini_replicas_marker is not None:
+                        from .gemini_replicas_legacy import (
+                            load_gemini_replicas_legacy_checkpoint,
+                            state_dict_from_gemini_replicas_main_metadata_only,
+                        )
+
+                        if torch.distributed.is_initialized():
+                            state_dict = load_gemini_replicas_legacy_checkpoint(checkpoint_name)
+                        else:
+                            payload = torch.load(
+                                gemini_replicas_marker, map_location="cpu", weights_only=False
+                            )
+                            state_dict = state_dict_from_gemini_replicas_main_metadata_only(payload)
+                    else:
+                        state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler
 

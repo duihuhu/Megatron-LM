@@ -354,10 +354,12 @@ def validate_args(args, defaults={}):
         bool(getattr(args, "use_ecnaive", False)),
         bool(getattr(args, "use_eclatin", False)),
         bool(getattr(args, "use_frcheck", False)),
+        bool(getattr(args, "use_gemini_replicas", False)),
     )
     if sum(_ec_legacy_flags) > 1:
         raise RuntimeError(
-            "At most one of --use-ecnaive, --use-eclatin, and --use-frcheck may be enabled."
+            "At most one of --use-ecnaive, --use-eclatin, --use-frcheck, "
+            "and --use-gemini-replicas may be enabled."
         )
     if getattr(args, "use_frcheck", False):
         frcheck_path = getattr(args, "frcheck_table_path", None)
@@ -2353,6 +2355,13 @@ def _add_checkpointing_args(parser):
                             'Default: 3. Must be <= world_size. Higher values provide better fault tolerance '
                             'but require more storage space. For example, with num_replicas=3 and 4 ranks, '
                             'each rank stores 3 copies of its data (local + 2 remote).')
+    group.add_argument('--gemini-replicas-group-size', type=int, default=None,
+                       help='Group size for Gemini Replicas replica placement. '
+                            'Ranks are divided into independent groups of this size, '
+                            'and round-robin replica placement happens within each group. '
+                            'Default: None (global round-robin across all ranks). '
+                            'Must evenly divide world_size when set. '
+                            'Similar to --frcheck-n for FRCheck.')
     group.add_argument('--use-gemini-replicas-hardware-failure', action='store_true',
                        help='Enable Gemini Replicas checkpointing for hardware failure recovery. '
                             'When a rank fails (e.g., rank2), the failed rank recovers its data from other ranks '

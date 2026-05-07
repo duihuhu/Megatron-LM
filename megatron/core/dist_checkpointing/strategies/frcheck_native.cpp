@@ -1024,7 +1024,7 @@ private:
         if (len <= 0) return;
 
         // Build per-worker source and parity pointers offset by 'off'
-        std::vector<unsigned char*> src(kRsPoolWorkers + 2); // max possible k + m
+        std::vector<unsigned char*> src((size_t)job.k);
         for (int i = 0; i < job.k; ++i)
             src[i] = job.data_ptrs[i] + off;
         unsigned char* dest[2] = { job.parity_ptrs[0] + off, job.parity_ptrs[1] + off };

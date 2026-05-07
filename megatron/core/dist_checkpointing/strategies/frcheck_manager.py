@@ -329,15 +329,23 @@ class FRCheckManager:
         # Determine my IP
         my_ip = self._resolve_my_ip()
 
-        # Build peer IPs (same group)
+        # Exchange IPs across all ranks via all_gather
+        rank_ip_list = [""] * world_size
+        my_ip_tensor = torch.tensor(
+            [int(b) for b in my_ip.encode("utf-8").ljust(64, b"\x00")[:64]],
+            dtype=torch.uint8,
+        )
+        all_ips_tensor = [torch.zeros(64, dtype=torch.uint8) for _ in range(world_size)]
+        torch.distributed.all_gather(all_ips_tensor, my_ip_tensor)
+        for i in range(world_size):
+            raw = bytes(all_ips_tensor[i].tolist()).rstrip(b"\x00")
+            rank_ip_list[i] = raw.decode("utf-8") if raw else "127.0.0.1"
+
+        # Build peer IPs for my group
         peer_ips = []
         for i in range(n):
-            peer_rank = self._get_rank_by_group_position(self.group_id, i, world_size, n)
-            # For now, all peers in group use the same IP (we're on same machine);
-            # in cross-node setup, each node's rank 0 would have its own IP.
-            # We exchange IPs via all_gather.
-            peer_ip = my_ip
-            peer_ips.append(peer_ip)
+            peer_global_rank = self._get_rank_by_group_position(self.group_id, i, world_size, n)
+            peer_ips.append(rank_ip_list[peer_global_rank])
 
         # Compute base port: same scheme as ecnaive
         # Use MASTER_PORT + 20000 as base, offset by group_id * (n * 100)

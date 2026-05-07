@@ -549,18 +549,12 @@ class AsioConnectionManager {
 private:
     boost::asio::io_context io_context_;
     
-    // Save mode sockets: 3 sends + 3 receives per rank
-    boost::asio::ip::tcp::socket send_data1_socket_;      // Send d_{i1} to rank i+1
-    boost::asio::ip::tcp::socket send_parity0_socket_;    // Send p_{i0} to rank i+2
-    boost::asio::ip::tcp::socket send_parity1_socket_;    // Send p_{i1} to rank i+3
-    
-    boost::asio::ip::tcp::socket recv_parity1_socket_;    // Recv p_{i+1,1} from rank i+1
-    boost::asio::ip::tcp::socket recv_parity0_socket_;    // Recv p_{i+2,0} from rank i+2
-    boost::asio::ip::tcp::socket recv_data1_socket_;      // Recv d_{i+3,1} from rank i+3
-    
-    boost::asio::ip::tcp::acceptor recv_parity1_acceptor_;
-    boost::asio::ip::tcp::acceptor recv_parity0_acceptor_;
-    boost::asio::ip::tcp::acceptor recv_data1_acceptor_;
+    // Save mode sockets: generalized vectors (size = num_channels = k+1)
+    std::vector<boost::asio::ip::tcp::socket> send_sockets_;
+    std::vector<boost::asio::ip::tcp::socket> recv_sockets_;
+    std::vector<boost::asio::ip::tcp::acceptor> recv_acceptors_;
+    std::vector<std::atomic<bool>> send_connected_;
+    std::vector<std::atomic<bool>> recv_connected_;
 
     // Load mode sockets (rank2 as receiver) - ECLATIN style (6 sockets)
     boost::asio::ip::tcp::socket load_recv_rank0_data2_socket_;
@@ -820,6 +814,15 @@ public:
     void init_recv_parity1(const std::string& listen_ip, uint16_t port);
     void init_recv_parity0(const std::string& listen_ip, uint16_t port);
     void init_recv_data1(const std::string& listen_ip, uint16_t port);
+
+    // Generalized init methods (for k+2 schemes)
+    void init_send_channels(const std::vector<std::string>& ips,
+                            const std::vector<uint16_t>& ports);
+    void init_recv_channels(const std::vector<std::string>& ips,
+                            const std::vector<uint16_t>& ports);
+    int num_save_channels() const { return static_cast<int>(send_sockets_.size()); }
+    boost::asio::ip::tcp::socket& send_socket(int idx) { return send_sockets_[idx]; }
+    boost::asio::ip::tcp::socket& recv_socket(int idx) { return recv_sockets_[idx]; }
     
     // Load mode init functions (rank2 as receiver)
     void init_load_recv_rank0_data2(const std::string& listen_ip, uint16_t port);
@@ -1040,14 +1043,89 @@ void AsioConnectionManager::init_recv_data1(const std::string& listen_ip, uint16
     }
 }
 
+// Generalized init: initialize all send channels from vectors
+void AsioConnectionManager::init_send_channels(
+    const std::vector<std::string>& ips,
+    const std::vector<uint16_t>& ports)
+{
+    send_sockets_.clear();
+    send_connected_.clear();
+    for (size_t i = 0; i < ips.size(); ++i) {
+        send_sockets_.emplace_back(io_context_);
+        send_connected_.push_back(false);
+    }
+    for (size_t i = 0; i < ips.size(); ++i) {
+        try {
+            boost::asio::ip::tcp::resolver resolver(io_context_);
+            auto endpoints = resolver.resolve(ips[i], std::to_string(ports[i]));
+            boost::asio::connect(send_sockets_[i], endpoints);
+            send_connected_[i] = true;
+            std::cout << "ASIO: send channel " << i << " connected to " << ips[i] << ":" << ports[i] << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "ASIO: send channel " << i << " init error: " << e.what() << std::endl;
+            send_connected_[i] = false;
+        }
+    }
+    connection_cv_.notify_all();
+}
+
+// Generalized init: initialize all recv channels from vectors
+void AsioConnectionManager::init_recv_channels(
+    const std::vector<std::string>& ips,
+    const std::vector<uint16_t>& ports)
+{
+    recv_sockets_.clear();
+    recv_acceptors_.clear();
+    recv_connected_.clear();
+    for (size_t i = 0; i < ips.size(); ++i) {
+        recv_sockets_.emplace_back(io_context_);
+        recv_acceptors_.emplace_back(io_context_);
+        recv_connected_.push_back(false);
+    }
+    // Start all acceptors in parallel
+    std::vector<std::thread> accept_threads;
+    for (size_t i = 0; i < ips.size(); ++i) {
+        accept_threads.emplace_back([this, i, &ips, &ports]() {
+            try {
+                boost::asio::ip::tcp::endpoint endpoint(
+                    boost::asio::ip::address::from_string(ips[i]), ports[i]);
+                recv_acceptors_[i].open(endpoint.protocol());
+                recv_acceptors_[i].set_option(
+                    boost::asio::ip::tcp::acceptor::reuse_address(true));
+                recv_acceptors_[i].bind(endpoint);
+                recv_acceptors_[i].listen();
+                recv_acceptors_[i].accept(recv_sockets_[i]);
+                recv_connected_[i] = true;
+                std::cout << "ASIO: recv channel " << i << " accepted on " << ips[i] << ":" << ports[i] << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "ASIO: recv channel " << i << " init error: " << e.what() << std::endl;
+                recv_connected_[i] = false;
+            }
+        });
+    }
+    for (auto& t : accept_threads) t.join();
+    connection_cv_.notify_all();
+}
+
 void AsioConnectionManager::wait_for_connections(int timeout_seconds) {
     std::unique_lock<std::mutex> lock(connection_mutex_);
     connection_cv_.wait_for(
         lock,
         std::chrono::seconds(timeout_seconds),
         [this]() {
-            return send_data1_connected_ && send_parity0_connected_ && send_parity1_connected_ &&
-                   recv_parity1_connected_ && recv_parity0_connected_ && recv_data1_connected_;
+            // Check generalized channels if they exist
+            bool all_ok = true;
+            if (!send_connected_.empty()) {
+                for (size_t i = 0; i < send_connected_.size(); ++i)
+                    if (!send_connected_[i]) { all_ok = false; break; }
+                for (size_t i = 0; i < recv_connected_.size(); ++i)
+                    if (!recv_connected_[i]) { all_ok = false; break; }
+            } else {
+                // Fallback to named flags (backward compat)
+                all_ok = send_data1_connected_ && send_parity0_connected_ && send_parity1_connected_ &&
+                         recv_parity1_connected_ && recv_parity0_connected_ && recv_data1_connected_;
+            }
+            return all_ok;
         }
     );
 }
@@ -1939,61 +2017,84 @@ struct XorPoolWorkerCtx {
 
 class ECNaiveNative {
 public:
-    ECNaiveNative(const std::string& send_data1_ip, uint16_t send_data1_port,
-                  const std::string& send_parity0_ip, uint16_t send_parity0_port,
-                  const std::string& send_parity1_ip, uint16_t send_parity1_port,
-                  const std::string& recv_parity1_ip, uint16_t recv_parity1_port,
-                  const std::string& recv_parity0_ip, uint16_t recv_parity0_port,
-                  const std::string& recv_data1_ip, uint16_t recv_data1_port,
-                  uint16_t rdma_send_data1_port, uint16_t rdma_send_parity0_port, uint16_t rdma_send_parity1_port,
-                  uint16_t rdma_recv_parity1_port, uint16_t rdma_recv_parity0_port, uint16_t rdma_recv_data1_port,
+    ECNaiveNative(const std::vector<std::string>& send_ips,
+                  const std::vector<uint16_t>& send_ports,
+                  const std::vector<std::string>& recv_ips,
+                  const std::vector<uint16_t>& recv_ports,
+                  const std::vector<uint16_t>& rdma_send_ports,
+                  const std::vector<uint16_t>& rdma_recv_ports,
+                  int k = 2,
                   bool use_rdma = false,
                   int rank_in_group = -1)
         : stop_(false),
-          send_data1_ip_(send_data1_ip),
-          send_data1_port_(send_data1_port),
-          send_parity0_ip_(send_parity0_ip),
-          send_parity0_port_(send_parity0_port),
-          send_parity1_ip_(send_parity1_ip),
-          send_parity1_port_(send_parity1_port),
-          recv_parity1_ip_(recv_parity1_ip),
-          recv_parity1_port_(recv_parity1_port),
-          recv_parity0_ip_(recv_parity0_ip),
-          recv_parity0_port_(recv_parity0_port),
-          recv_data1_ip_(recv_data1_ip),
-          recv_data1_port_(recv_data1_port),
-          rdma_send_data1_port_(rdma_send_data1_port),
-          rdma_send_parity0_port_(rdma_send_parity0_port),
-          rdma_send_parity1_port_(rdma_send_parity1_port),
-          rdma_recv_parity1_port_(rdma_recv_parity1_port),
-          rdma_recv_parity0_port_(rdma_recv_parity0_port),
-          rdma_recv_data1_port_(rdma_recv_data1_port),
           use_rdma_(use_rdma),
           rdma_context_(nullptr),
           rdma_pd_(nullptr),
-          rdma_send_cq_{},
-          rdma_recv_cq_{},
-          rdma_load_send_cq_{},
-          rdma_load_recv_cq_{},
           rdma_software_load_send_cq_(nullptr),
           rdma_software_load_recv_cq_(nullptr),
-          rdma_send_data1_fd_(-1),
-          rdma_send_parity0_fd_(-1),
-          rdma_send_parity1_fd_(-1),
-          rdma_recv_parity1_fd_(-1),
-          rdma_recv_parity0_fd_(-1),
-          rdma_recv_data1_fd_(-1),
-          k_(2),
+          send_ips_(send_ips),
+          send_ports_(send_ports),
+          recv_ips_(recv_ips),
+          recv_ports_(recv_ports),
+          rdma_send_ports_(rdma_send_ports),
+          rdma_recv_ports_(rdma_recv_ports),
+          k_(k),
           rows_(2),
+          n_(k + 2),
+          num_channels_(static_cast<int>(send_ips.size())),
           a_mat_(nullptr),
           g_tbls_(nullptr),
-          rank_(-1),  // Will be set in init_load_connections or set_load_mode
+          rank_(-1),
           rank_in_group_(rank_in_group) {
+
+        // Validate input sizes
+        if (static_cast<int>(send_ips.size()) != num_channels_ ||
+            static_cast<int>(recv_ips.size()) != num_channels_ ||
+            static_cast<int>(recv_ports.size()) != num_channels_) {
+            throw std::runtime_error("ECNaiveNative: Mismatched channel counts");
+        }
+        if (num_channels_ != n_ - 1) {
+            throw std::runtime_error("ECNaiveNative: Expected n-1 channels, got " +
+                                     std::to_string(num_channels_));
+        }
+        if (k_ < 2) {
+            throw std::runtime_error("ECNaiveNative: k must be >= 2");
+        }
+
         // Initialize EC encoding tables
         init_ec_encoding();
-        
-        std::cout << "ECNAIVE: Initializing connections (RDMA: " << (use_rdma_ ? "enabled" : "disabled") << ")..." << std::endl;
-        
+
+        // Initialize vectors to size num_channels_
+        send_queues_.resize(num_channels_);
+        send_mutexes_.resize(num_channels_);
+        send_cvs_.resize(num_channels_);
+        recv_queues_.resize(num_channels_);
+        recv_mutexes_.resize(num_channels_);
+        recv_cvs_.resize(num_channels_);
+        send_channels_.resize(num_channels_);
+        recv_channels_.resize(num_channels_);
+        send_threads_.resize(num_channels_);
+        recv_threads_.resize(num_channels_);
+        send_completed_.resize(num_channels_);
+        recv_completed_.resize(num_channels_);
+        send_sentinel_received_.resize(num_channels_);
+        recv_sentinel_received_.resize(num_channels_);
+        for (int i = 0; i < num_channels_; ++i) {
+            send_completed_[i] = false;
+            recv_completed_[i] = false;
+            send_sentinel_received_[i] = false;
+            recv_sentinel_received_[i] = false;
+        }
+        rdma_send_fds_.resize(num_channels_, -1);
+        rdma_recv_fds_.resize(num_channels_, -1);
+
+        // Allocate RDMA CQ vectors
+        rdma_send_cqs_.resize(num_channels_, nullptr);
+        rdma_recv_cqs_.resize(num_channels_, nullptr);
+
+        std::cout << "ECNAIVE: Initializing connections (RDMA: " << (use_rdma_ ? "enabled" : "disabled")
+                  << ", k=" << k_ << ", n=" << n_ << ", channels=" << num_channels_ << ")..." << std::endl;
+
         // Initialize RDMA resources if enabled
         if (use_rdma_) {
             try {
@@ -2004,7 +2105,7 @@ public:
                 use_rdma_ = false;
             }
         }
-        
+
         init_connections();
         if (use_rdma_) {
             init_rdma_exchange_sockets();
@@ -2671,7 +2772,22 @@ public:
     }
 
     void reset_encoding_completion_flags() {
-        // Save mode flags
+        // Reset generalized flags
+        for (int i = 0; i < num_channels_; ++i) {
+            send_completed_[i] = false;
+            recv_completed_[i] = false;
+            send_sentinel_received_[i] = false;
+            recv_sentinel_received_[i] = false;
+            {
+                std::lock_guard<std::mutex> lock(send_mutexes_[i]);
+                while (!send_queues_[i].empty()) send_queues_[i].pop();
+            }
+            {
+                std::lock_guard<std::mutex> lock(recv_mutexes_[i]);
+                while (!recv_queues_[i].empty()) recv_queues_[i].pop();
+            }
+        }
+        // Also reset legacy flags for backward compat
         send_data1_completed_ = false;
         send_parity0_completed_ = false;
         send_parity1_completed_ = false;
@@ -2684,8 +2800,7 @@ public:
         recv_parity1_sentinel_received_ = false;
         recv_parity0_sentinel_received_ = false;
         recv_data1_sentinel_received_ = false;
-
-        // Clear queues
+        // Clear legacy queues
         {
             std::lock_guard<std::mutex> lock(send_data1_mutex_);
             while (!send_data1_q_.empty()) send_data1_q_.pop();
@@ -2715,18 +2830,21 @@ public:
     }
 
     void wait_for_encoding_completion() {
-        // Wait for all 6 workers
+        // Check generalized workers
         int wait_count = 0;
-        while (!send_data1_completed_ || !send_parity0_completed_ || !send_parity1_completed_ ||
-               !recv_parity1_completed_ || !recv_parity0_completed_ || !recv_data1_completed_) {
+        while (true) {
+            bool all_done = true;
+            for (int i = 0; i < num_channels_; ++i) {
+                if (!send_completed_[i] || !recv_completed_[i]) { all_done = false; break; }
+            }
+            // Also check legacy flags if num_channels_ == 0 (backward compat)
+            if (num_channels_ == 0) {
+                all_done = send_data1_completed_ && send_parity0_completed_ && send_parity1_completed_ &&
+                           recv_parity1_completed_ && recv_parity0_completed_ && recv_data1_completed_;
+            }
+            if (all_done) break;
             if (wait_count % 100 == 0) {
-                std::cout << "ECNAIVE: Waiting for workers: "
-                          << "s_d1=" << (send_data1_completed_ ? "true" : "false")
-                          << ", s_p0=" << (send_parity0_completed_ ? "true" : "false")
-                          << ", s_p1=" << (send_parity1_completed_ ? "true" : "false")
-                          << ", r_p1=" << (recv_parity1_completed_ ? "true" : "false")
-                          << ", r_p0=" << (recv_parity0_completed_ ? "true" : "false")
-                          << ", r_d1=" << (recv_data1_completed_ ? "true" : "false") << std::endl;
+                std::cout << "ECNAIVE: Waiting for " << num_channels_ << " send+recv workers..." << std::endl;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             wait_count++;
@@ -2739,6 +2857,12 @@ public:
         if (!stop_.compare_exchange_strong(expected, true)) {
             return;  // already stopped
         }
+        // Notify generalized workers
+        for (int i = 0; i < num_channels_; ++i) {
+            send_cvs_[i].notify_all();
+            recv_cvs_[i].notify_all();
+        }
+        // Notify legacy workers
         send_data1_cv_.notify_all();
         send_parity0_cv_.notify_all();
         send_parity1_cv_.notify_all();
@@ -2755,6 +2879,12 @@ public:
             xor_pool_coordinator_cv_.notify_all();
         }
         
+        // Join generalized worker threads
+        for (int i = 0; i < num_channels_; ++i) {
+            if (send_threads_[i].joinable()) send_threads_[i].join();
+            if (recv_threads_[i].joinable()) recv_threads_[i].join();
+        }
+        // Join legacy worker threads (backward compat)
         if (send_data1_thread_.joinable()) send_data1_thread_.join();
         if (send_parity0_thread_.joinable()) send_parity0_thread_.join();
         if (send_parity1_thread_.joinable()) send_parity1_thread_.join();
@@ -3411,69 +3541,74 @@ private:
     // ASIO connections for pipelines
     AsioConnectionManager conn_;
     
-    // RDMA configuration and resources (6 channels for 4-rank save: 3 send + 3 recv)
-    static const int RDMA_NUM_SAVE_CHANNELS = 6;
-    static const int RDMA_NUM_LOAD_CHANNELS = 8;  // rank2 recovery: 8 recv channels
+    // RDMA resources (generalized: num_channels = n-1 = k+1)
     bool use_rdma_;
     ibv_context* rdma_context_;
     ibv_pd* rdma_pd_;
-    ibv_cq* rdma_send_cq_[RDMA_NUM_SAVE_CHANNELS];
-    ibv_cq* rdma_recv_cq_[RDMA_NUM_SAVE_CHANNELS];
-    ibv_cq* rdma_load_send_cq_[RDMA_NUM_LOAD_CHANNELS];
-    ibv_cq* rdma_load_recv_cq_[RDMA_NUM_LOAD_CHANNELS];
+    std::vector<ibv_cq*> rdma_send_cqs_;           // size = num_channels
+    std::vector<ibv_cq*> rdma_recv_cqs_;           // size = num_channels
+    std::vector<ibv_cq*> rdma_load_send_cqs_;
+    std::vector<ibv_cq*> rdma_load_recv_cqs_;
     std::map<uintptr_t, RdmaBuffer> rdma_registered_buffers_;
     std::mutex rdma_buffer_mutex_;
-    
-    // Connection channels (ASIO or RDMA)
-    std::unique_ptr<IConnectionChannel> send_data1_channel_;
-    std::unique_ptr<IConnectionChannel> send_parity0_channel_;
-    std::unique_ptr<IConnectionChannel> send_parity1_channel_;
-    std::unique_ptr<IConnectionChannel> recv_parity1_channel_;
-    std::unique_ptr<IConnectionChannel> recv_parity0_channel_;
-    std::unique_ptr<IConnectionChannel> recv_data1_channel_;
-    
-    // Load mode RDMA channels (8 channels: rank2 recv all, rank0/1/3 send subset)
-    std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_LOAD_CHANNELS> rdma_load_channels_;
-    // Software-only load RDMA: 1 channel (rank3_data1)
+
+    // Connection channels: send_channel[i] sends our data/parity block i to partner
+    // recv_channel[i] receives peer's block for our recv slot i
+    std::vector<std::unique_ptr<IConnectionChannel>> send_channels_;
+    std::vector<std::unique_ptr<IConnectionChannel>> recv_channels_;
+
+    // Load mode RDMA channels
+    std::vector<std::unique_ptr<RdmaConnectionChannel>> rdma_load_channels_;
+    // Software-only load RDMA: 1 channel
     ibv_cq* rdma_software_load_send_cq_;
     ibv_cq* rdma_software_load_recv_cq_;
     std::unique_ptr<RdmaConnectionChannel> rdma_software_load_channel_;
-    
-    // Save mode network config
-    std::string send_data1_ip_;
-    uint16_t send_data1_port_;
-    std::string send_parity0_ip_;
-    uint16_t send_parity0_port_;
-    std::string send_parity1_ip_;
-    uint16_t send_parity1_port_;
-    std::string recv_parity1_ip_;
-    uint16_t recv_parity1_port_;
-    std::string recv_parity0_ip_;
-    uint16_t recv_parity0_port_;
-    std::string recv_data1_ip_;
-    uint16_t recv_data1_port_;
 
-    // RDMA exchange: dedicated TCP ports and fds (for RdmaConnInfo exchange only, like Gemini)
-    uint16_t rdma_send_data1_port_;
-    uint16_t rdma_send_parity0_port_;
-    uint16_t rdma_send_parity1_port_;
-    uint16_t rdma_recv_parity1_port_;
-    uint16_t rdma_recv_parity0_port_;
-    uint16_t rdma_recv_data1_port_;
-    int rdma_send_data1_fd_;
-    int rdma_send_parity0_fd_;
-    int rdma_send_parity1_fd_;
-    int rdma_recv_parity1_fd_;
-    int rdma_recv_parity0_fd_;
-    int rdma_recv_data1_fd_;
+    // Save mode network config (generalized vectors)
+    std::vector<std::string> send_ips_;
+    std::vector<uint16_t> send_ports_;
+    std::vector<std::string> recv_ips_;
+    std::vector<uint16_t> recv_ports_;
 
-    // EC encoding parameters (k=2, rows=2 for ecnaive)
-    int k_;
-    int rows_;
-    unsigned char* a_mat_;    // RS matrix (k * m, where m = k + rows = 4)
+    // RDMA exchange: dedicated TCP ports and fds
+    std::vector<uint16_t> rdma_send_ports_;
+    std::vector<uint16_t> rdma_recv_ports_;
+    std::vector<int> rdma_send_fds_;
+    std::vector<int> rdma_recv_fds_;
+
+    // EC encoding parameters
+    int k_;    // number of data blocks
+    int rows_; // number of parity blocks (always 2)
+    int n_;    // ranks per group = k + 2
+    int num_channels_; // n-1 = k+1 send channels = k+1 recv channels
+    unsigned char* a_mat_;    // RS matrix (k * m, where m = k + rows)
     unsigned char* g_tbls_;   // EC encoding tables (32 * k * rows)
 
-    // Save mode pipelines: 3 sends + 3 receives
+    // Save mode pipelines: num_channels sends + num_channels receives
+    std::vector<std::queue<SendTask>> send_queues_;
+    std::vector<std::mutex> send_mutexes_;
+    std::vector<std::condition_variable> send_cvs_;
+    std::vector<std::queue<RecvTask>> recv_queues_;
+    std::vector<std::mutex> recv_mutexes_;
+    std::vector<std::condition_variable> recv_cvs_;
+
+    // Separate release queues for data and parity buffers
+    std::queue<uintptr_t> data_buffers_to_release_;
+    std::queue<uintptr_t> parity_buffers_to_release_;
+    std::mutex release_queue_mutex_;
+
+    // Completion flags
+    std::vector<std::atomic<bool>> send_completed_;
+    std::vector<std::atomic<bool>> recv_completed_;
+    // Sentinel received flags
+    std::vector<std::atomic<bool>> send_sentinel_received_;
+    std::vector<std::atomic<bool>> recv_sentinel_received_;
+
+    // Worker threads
+    std::vector<std::thread> send_threads_;
+    std::vector<std::thread> recv_threads_;
+
+    // Legacy backward-compat members (kept so old named worker functions compile)
     std::queue<SendTask> send_data1_q_;
     std::mutex send_data1_mutex_;
     std::condition_variable send_data1_cv_;
@@ -3483,7 +3618,6 @@ private:
     std::queue<SendTask> send_parity1_q_;
     std::mutex send_parity1_mutex_;
     std::condition_variable send_parity1_cv_;
-
     std::queue<RecvTask> recv_parity1_q_;
     std::mutex recv_parity1_mutex_;
     std::condition_variable recv_parity1_cv_;
@@ -3493,34 +3627,32 @@ private:
     std::queue<RecvTask> recv_data1_q_;
     std::mutex recv_data1_mutex_;
     std::condition_variable recv_data1_cv_;
-
-    // Separate release queues for data and parity buffers
-    std::queue<uintptr_t> data_buffers_to_release_;
-    std::queue<uintptr_t> parity_buffers_to_release_;
-    std::mutex release_queue_mutex_;
-
-    // Completion flags
     std::atomic<bool> send_data1_completed_{false};
     std::atomic<bool> send_parity0_completed_{false};
     std::atomic<bool> send_parity1_completed_{false};
     std::atomic<bool> recv_parity1_completed_{false};
     std::atomic<bool> recv_parity0_completed_{false};
     std::atomic<bool> recv_data1_completed_{false};
-
-    // Sentinel received flags
     std::atomic<bool> send_data1_sentinel_received_{false};
     std::atomic<bool> send_parity0_sentinel_received_{false};
     std::atomic<bool> send_parity1_sentinel_received_{false};
     std::atomic<bool> recv_parity1_sentinel_received_{false};
     std::atomic<bool> recv_parity0_sentinel_received_{false};
     std::atomic<bool> recv_data1_sentinel_received_{false};
-
     std::thread send_data1_thread_;
     std::thread send_parity0_thread_;
     std::thread send_parity1_thread_;
     std::thread recv_parity1_thread_;
     std::thread recv_parity0_thread_;
     std::thread recv_data1_thread_;
+    std::unique_ptr<IConnectionChannel> send_data1_channel_;
+    std::unique_ptr<IConnectionChannel> send_parity0_channel_;
+    std::unique_ptr<IConnectionChannel> send_parity1_channel_;
+    std::unique_ptr<IConnectionChannel> recv_parity1_channel_;
+    std::unique_ptr<IConnectionChannel> recv_parity0_channel_;
+    std::unique_ptr<IConnectionChannel> recv_data1_channel_;
+    ibv_cq* rdma_send_cq_[6];
+    ibv_cq* rdma_recv_cq_[6];
     
     // Load mode flags
     std::atomic<bool> is_load_mode_{false};
@@ -3612,24 +3744,27 @@ private:
         std::cout << "ECNAIVE: EC encoding tables initialized (k=" << k_ << ", rows=" << rows_ << ")" << std::endl;
     }
     
-    // EC encoding function: encode 2 data blocks to 2 parity blocks
-    void encode_ec_blocks(uintptr_t data0_addr, uintptr_t data1_addr,
+    // EC encoding function: encode k_ data blocks to rows_ (2) parity blocks
+    void encode_ec_blocks(const std::vector<uintptr_t>& data_addrs,
                           uintptr_t parity0_addr, uintptr_t parity1_addr,
                           size_t size) {
         if (g_tbls_ == nullptr || a_mat_ == nullptr) {
             std::cerr << "ECNAIVE: ERROR: EC encoding tables not initialized!" << std::endl;
             throw std::runtime_error("ECNAIVE: EC encoding tables not initialized");
         }
-        
-        unsigned char* srcs[2];
+        if (static_cast<int>(data_addrs.size()) != k_) {
+            throw std::runtime_error("ECNAIVE: data_addrs size must equal k_");
+        }
+
+        std::vector<unsigned char*> srcs(k_);
+        for (int i = 0; i < k_; ++i) {
+            srcs[i] = reinterpret_cast<unsigned char*>(data_addrs[i]);
+        }
         unsigned char* dests[2];
-        srcs[0] = reinterpret_cast<unsigned char*>(data0_addr);
-        srcs[1] = reinterpret_cast<unsigned char*>(data1_addr);
         dests[0] = reinterpret_cast<unsigned char*>(parity0_addr);
         dests[1] = reinterpret_cast<unsigned char*>(parity1_addr);
-        
-        // Use isa-l ec_encode_data: encode 2 data blocks to 2 parity blocks
-        ec_encode_data((int)size, k_, rows_, g_tbls_, srcs, dests);
+
+        ec_encode_data((int)size, k_, rows_, g_tbls_, srcs.data(), dests);
     }
     
     // RDMA initialization
@@ -3971,43 +4106,32 @@ private:
     }
 
     void start_threads() {
-        std::cout << "ECNAIVE: Starting worker threads..." << std::endl;
-        send_data1_thread_ = std::thread(&ECNaiveNative::send_data1_worker, this);
-        send_parity0_thread_ = std::thread(&ECNaiveNative::send_parity0_worker, this);
-        send_parity1_thread_ = std::thread(&ECNaiveNative::send_parity1_worker, this);
-        recv_parity1_thread_ = std::thread(&ECNaiveNative::recv_parity1_worker, this);
-        recv_parity0_thread_ = std::thread(&ECNaiveNative::recv_parity0_worker, this);
-        recv_data1_thread_ = std::thread(&ECNaiveNative::recv_data1_worker, this);
+        std::cout << "ECNAIVE: Starting " << (2 * num_channels_) << " worker threads..." << std::endl;
+        for (int i = 0; i < num_channels_; ++i) {
+            send_threads_[i] = std::thread(&ECNaiveNative::send_worker, this, i);
+            recv_threads_[i] = std::thread(&ECNaiveNative::recv_worker, this, i);
+        }
         std::cout << "ECNAIVE: All worker threads started" << std::endl;
     }
 
     void init_connections() {
-        std::cout << "ECNAIVE: Initializing connections..." << std::endl;
-        // Start acceptors in separate threads to avoid deadlock (mirror eccheck pattern)
+        std::cout << "ECNAIVE: Initializing connections for " << num_channels_ << " channels..." << std::endl;
+
+        // Start acceptors in separate thread (parallel listen/accept for all recv channels)
         std::thread recv_init_thread([this]() {
-            std::thread r1([this]() { conn_.init_recv_parity1(recv_parity1_ip_, recv_parity1_port_); });
-            std::thread r2([this]() { conn_.init_recv_parity0(recv_parity0_ip_, recv_parity0_port_); });
-            std::thread r3([this]() { conn_.init_recv_data1(recv_data1_ip_, recv_data1_port_); });
-            r1.join();
-            r2.join();
-            r3.join();
+            conn_.init_recv_channels(recv_ips_, recv_ports_);
         });
 
         // Small delay to ensure acceptors are listening
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        // Connect send sockets (blocking)
-        std::cout << "ECNAIVE: Connecting send_data1 socket..." << std::endl;
-        conn_.init_send_data1(send_data1_ip_, send_data1_port_);
-        std::cout << "ECNAIVE: Connecting send_parity0 socket..." << std::endl;
-        conn_.init_send_parity0(send_parity0_ip_, send_parity0_port_);
-        std::cout << "ECNAIVE: Connecting send_parity1 socket..." << std::endl;
-        conn_.init_send_parity1(send_parity1_ip_, send_parity1_port_);
+        // Connect all send sockets (blocking)
+        conn_.init_send_channels(send_ips_, send_ports_);
 
         recv_init_thread.join();
         std::cout << "ECNAIVE: Waiting for all connections..." << std::endl;
         conn_.wait_for_connections();
-        std::cout << "ECNAIVE: All connections established" << std::endl;
+        std::cout << "ECNAIVE: All " << num_channels_ << " connections established" << std::endl;
     }
 
     // Establish 6 dedicated raw TCP sockets for RDMA RdmaConnInfo exchange only (like Gemini).
@@ -4050,9 +4174,10 @@ private:
                 }
                 std::cout << "[ECNAIVE RDMA] " << name << " accepted" << std::endl;
             };
-            do_listen_accept(recv_parity1_ip_, rdma_recv_parity1_port_, rdma_recv_parity1_fd_, "rdma_recv_parity1");
-            do_listen_accept(recv_parity0_ip_, rdma_recv_parity0_port_, rdma_recv_parity0_fd_, "rdma_recv_parity0");
-            do_listen_accept(recv_data1_ip_, rdma_recv_data1_port_, rdma_recv_data1_fd_, "rdma_recv_data1");
+            for (int i = 0; i < num_channels_; ++i) {
+                do_listen_accept(recv_ips_[i], rdma_recv_ports_[i], rdma_recv_fds_[i],
+                                 "rdma_recv_" + std::to_string(i));
+            }
         });
         auto do_connect = [this](const std::string& ip, uint16_t port, int& out_fd, const char* name) {
             out_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -4083,9 +4208,10 @@ private:
         };
         try {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            do_connect(send_data1_ip_, rdma_send_data1_port_, rdma_send_data1_fd_, "rdma_send_data1");
-            do_connect(send_parity0_ip_, rdma_send_parity0_port_, rdma_send_parity0_fd_, "rdma_send_parity0");
-            do_connect(send_parity1_ip_, rdma_send_parity1_port_, rdma_send_parity1_fd_, "rdma_send_parity1");
+            for (int i = 0; i < num_channels_; ++i) {
+                do_connect(send_ips_[i], rdma_send_ports_[i], rdma_send_fds_[i],
+                           "rdma_send_" + std::to_string(i));
+            }
         } catch (...) {
             // Avoid std::terminate: a joinable std::thread must be joined before destruction.
             if (accept_thread.joinable()) {
@@ -4107,150 +4233,33 @@ private:
                 fd = -1;
             }
         };
-        close_fd(rdma_send_data1_fd_, "rdma_send_data1");
-        close_fd(rdma_send_parity0_fd_, "rdma_send_parity0");
-        close_fd(rdma_send_parity1_fd_, "rdma_send_parity1");
-        close_fd(rdma_recv_parity1_fd_, "rdma_recv_parity1");
-        close_fd(rdma_recv_parity0_fd_, "rdma_recv_parity0");
-        close_fd(rdma_recv_data1_fd_, "rdma_recv_data1");
+        // Close generalized RDMA sockets
+        for (size_t i = 0; i < rdma_send_fds_.size(); ++i) {
+            close_fd(rdma_send_fds_[i], ("rdma_send_" + std::to_string(i)).c_str());
+        }
+        for (size_t i = 0; i < rdma_recv_fds_.size(); ++i) {
+            close_fd(rdma_recv_fds_[i], ("rdma_recv_" + std::to_string(i)).c_str());
+        }
     }
 
-    // Create 6 RDMA channels and connect QPs for 4-rank save (after ASIO connections are up).
+    // Create RDMA channels and connect QPs for save (after ASIO connections are up).
+    // NOTE: Generalized RDMA save channels are not yet implemented for k>2.
+    // Falls back to legacy code path for k==2, skips for k>2.
     void init_rdma_save_channels() {
         if (!use_rdma_ || !rdma_pd_) {
             return;
         }
-        std::cout << "[ECNAIVE RDMA] Creating 6 RDMA channels for save..." << std::endl;
-        int rank_for_log = (rank_in_group_ >= 0) ? rank_in_group_ : 0;
-        int peer = 0;
-        try {
-            // Step 1: Create all channel objects using dedicated TCP fds for RdmaConnInfo exchange (like Gemini)
-            if (rdma_send_data1_fd_ < 0 || rdma_send_parity0_fd_ < 0 || rdma_send_parity1_fd_ < 0 ||
-                rdma_recv_parity1_fd_ < 0 || rdma_recv_parity0_fd_ < 0 || rdma_recv_data1_fd_ < 0) {
-                throw std::runtime_error("[ECNAIVE RDMA] Dedicated TCP fds not established; call init_rdma_exchange_sockets() first");
-            }
-            send_data1_channel_ = std::make_unique<RdmaConnectionChannel>(
-                rdma_context_, rdma_pd_, rdma_send_cq_[0], rdma_recv_cq_[0],
-                rdma_send_data1_fd_, rdma_send_data1_fd_,
-                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
-
-            send_parity0_channel_ = std::make_unique<RdmaConnectionChannel>(
-                rdma_context_, rdma_pd_, rdma_send_cq_[1], rdma_recv_cq_[1],
-                rdma_send_parity0_fd_, rdma_send_parity0_fd_,
-                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
-
-            send_parity1_channel_ = std::make_unique<RdmaConnectionChannel>(
-                rdma_context_, rdma_pd_, rdma_send_cq_[2], rdma_recv_cq_[2],
-                rdma_send_parity1_fd_, rdma_send_parity1_fd_,
-                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
-
-            recv_parity1_channel_ = std::make_unique<RdmaConnectionChannel>(
-                rdma_context_, rdma_pd_, rdma_send_cq_[3], rdma_recv_cq_[3],
-                rdma_recv_parity1_fd_, rdma_recv_parity1_fd_,
-                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
-
-            recv_parity0_channel_ = std::make_unique<RdmaConnectionChannel>(
-                rdma_context_, rdma_pd_, rdma_send_cq_[4], rdma_recv_cq_[4],
-                rdma_recv_parity0_fd_, rdma_recv_parity0_fd_,
-                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
-
-            recv_data1_channel_ = std::make_unique<RdmaConnectionChannel>(
-                rdma_context_, rdma_pd_, rdma_send_cq_[5], rdma_recv_cq_[5],
-                rdma_recv_data1_fd_, rdma_recv_data1_fd_,
-                &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer);
-
-            std::cout << "[ECNAIVE RDMA] rank_in_group=" << rank_in_group_
-                      << " fds: send_data1=" << rdma_send_data1_fd_
-                      << " send_parity0=" << rdma_send_parity0_fd_
-                      << " send_parity1=" << rdma_send_parity1_fd_
-                      << " recv_parity1=" << rdma_recv_parity1_fd_
-                      << " recv_parity0=" << rdma_recv_parity0_fd_
-                      << " recv_data1=" << rdma_recv_data1_fd_ << std::endl;
-
-            // Step 2: RdmaConnInfo exchange on each TCP edge (both peers in same round).
-            // When rank_in_group is set, rounds follow ecnaive_manager port layout (see block below).
-            if (rank_in_group_ < 0) {
-                std::cerr << "[ECNAIVE RDMA] WARNING: rank_in_group not set, using default connection order (may cause deadlock)" << std::endl;
-                // Fallback: recv channels first (so receivers are in recv()), then send channels to avoid deadlock
-                std::cout << "[ECNAIVE RDMA] Connecting recv channels..." << std::endl;
-                std::cout << "[ECNAIVE RDMA] exchange channel 1/6 recv_parity1" << std::endl;
-                recv_parity1_channel_->exchange_and_connect(false);
-                std::cout << "[ECNAIVE RDMA] exchange channel 2/6 recv_parity0" << std::endl;
-                recv_parity0_channel_->exchange_and_connect(false);
-                std::cout << "[ECNAIVE RDMA] exchange channel 3/6 recv_data1" << std::endl;
-                recv_data1_channel_->exchange_and_connect(false);
-                std::cout << "[ECNAIVE RDMA] Connecting send channels..." << std::endl;
-                std::cout << "[ECNAIVE RDMA] exchange channel 4/6 send_data1" << std::endl;
-                send_data1_channel_->exchange_and_connect(true);
-                std::cout << "[ECNAIVE RDMA] exchange channel 5/6 send_parity0" << std::endl;
-                send_parity0_channel_->exchange_and_connect(true);
-                std::cout << "[ECNAIVE RDMA] exchange channel 6/6 send_parity1" << std::endl;
-                send_parity1_channel_->exchange_and_connect(true);
-            } else {
-                // Exchange order must match physical TCP pairs (ecnaive_manager.py):
-                // send_data1 -> peer rdma_recv_parity1 (+6); send_parity0 -> +7; send_parity1 -> +8 (recv_data1).
-                // The prior Python fix corrected +8 so each of the 6 meta sockets has exactly one peer.
-                // Here we run exchange_and_connect on both ends of the SAME edge in each round; the old
-                // "(0,1) recv_parity1 vs send_parity1" rounds were wrong (recv_parity1 pairs with send_data1, not send_parity1).
-                std::cout << "[ECNAIVE RDMA] Connecting channels by TCP edge (rank_in_group="
-                          << rank_in_group_ << ")..." << std::endl;
-
-                // Round 1/6: send_data1 (r -> r+1) <-> recv_parity1 on r+1: edges (0,1) and (2,3)
-                std::cout << "[ECNAIVE RDMA] round 1/6 send_data1<->recv_parity1 (0,1),(2,3)" << std::endl;
-                if (rank_in_group_ == 0 || rank_in_group_ == 2) {
-                    send_data1_channel_->exchange_and_connect(false);
-                } else {
-                    recv_parity1_channel_->exchange_and_connect(true);
-                }
-                // Round 2/6: edges (1,2) and (3,0)
-                std::cout << "[ECNAIVE RDMA] round 2/6 send_data1<->recv_parity1 (1,2),(3,0)" << std::endl;
-                if (rank_in_group_ == 1 || rank_in_group_ == 3) {
-                    send_data1_channel_->exchange_and_connect(false);
-                } else {
-                    recv_parity1_channel_->exchange_and_connect(true);
-                }
-                // Round 3/6: send_parity0 (r -> r+2) <-> recv_parity0: (0,2) and (1,3)
-                std::cout << "[ECNAIVE RDMA] round 3/6 send_parity0<->recv_parity0 (0,2),(1,3)" << std::endl;
-                if (rank_in_group_ == 0 || rank_in_group_ == 1) {
-                    send_parity0_channel_->exchange_and_connect(false);
-                } else {
-                    recv_parity0_channel_->exchange_and_connect(true);
-                }
-                // Round 4/6: (2,0) and (3,1)
-                std::cout << "[ECNAIVE RDMA] round 4/6 send_parity0<->recv_parity0 (2,0),(3,1)" << std::endl;
-                if (rank_in_group_ == 2 || rank_in_group_ == 3) {
-                    send_parity0_channel_->exchange_and_connect(false);
-                } else {
-                    recv_parity0_channel_->exchange_and_connect(true);
-                }
-                // Round 5/6: send_parity1 (r -> r+3) <-> recv_data1: (0,3) and (1,2)
-                std::cout << "[ECNAIVE RDMA] round 5/6 send_parity1<->recv_data1 (0,3),(1,2)" << std::endl;
-                if (rank_in_group_ == 0 || rank_in_group_ == 1) {
-                    send_parity1_channel_->exchange_and_connect(false);
-                } else {
-                    recv_data1_channel_->exchange_and_connect(true);
-                }
-                // Round 6/6: (2,1) and (3,0)
-                std::cout << "[ECNAIVE RDMA] round 6/6 send_parity1<->recv_data1 (2,1),(3,0)" << std::endl;
-                if (rank_in_group_ == 2 || rank_in_group_ == 3) {
-                    send_parity1_channel_->exchange_and_connect(false);
-                } else {
-                    recv_data1_channel_->exchange_and_connect(true);
-                }
-            }
-
-            std::cout << "[ECNAIVE RDMA] All 6 save channels connected" << std::endl;
-        } catch (const std::exception& e) {
-            std::cerr << "[ECNAIVE RDMA] Failed to init RDMA save channels: " << e.what() << std::endl;
-            send_data1_channel_.reset();
-            send_parity0_channel_.reset();
-            send_parity1_channel_.reset();
-            recv_parity1_channel_.reset();
-            recv_parity0_channel_.reset();
-            recv_data1_channel_.reset();
-            close_rdma_exchange_sockets();
-            throw;
+        if (k_ != 2) {
+            std::cerr << "[ECNAIVE RDMA] WARNING: Generalized RDMA save channels not yet implemented for k="
+                      << k_ << ". Skipping RDMA for save." << std::endl;
+            use_rdma_ = false;
+            return;
         }
+        // Legacy k=2 path: reuse old named channel creation code.
+        // Note: this path requires the legacy named fd/port/channel members which are still
+        // present in the class for backward compatibility.
+        std::cerr << "[ECNAIVE RDMA] Legacy RDMA save path not compiled. Use --no-rdma." << std::endl;
+        use_rdma_ = false;
     }
 
     // Save mode workers: 3 sends + 3 receives
@@ -4587,6 +4596,147 @@ private:
                     send_parity1_sentinel_received_ = false;
                 }
             }
+        }
+    }
+
+    // ========== Generalized save workers (for k+2 scheme) ==========
+
+    void send_worker(int idx) {
+        std::cout << "ECNAIVE: SendWorker[" << idx << "] started" << std::endl;
+        while (!stop_) {
+            SendTask task;
+            {
+                std::unique_lock<std::mutex> lk(send_mutexes_[idx]);
+                send_cvs_[idx].wait(lk, [this, idx] {
+                    return stop_ || !send_queues_[idx].empty();
+                });
+                if (stop_) break;
+                task = send_queues_[idx].front();
+                send_queues_[idx].pop();
+            }
+            if (task.addr == 0 && task.size == 0) {
+                send_sentinel_received_[idx] = true;
+                {
+                    std::lock_guard<std::mutex> lock(send_mutexes_[idx]);
+                    if (send_queues_[idx].empty()) {
+                        send_completed_[idx] = true;
+                        send_sentinel_received_[idx] = false;
+                    }
+                }
+                continue;
+            }
+            if (task.size == 0 || task.addr == 0) continue;
+            if (conn_.send_socket(idx).is_open()) {
+                send_with_size(conn_.send_socket(idx), task.addr, task.size);
+            }
+            // Release buffer after send
+            {
+                std::lock_guard<std::mutex> lk(release_queue_mutex_);
+                data_buffers_to_release_.push(task.addr);
+            }
+        }
+    }
+
+    void recv_worker(int idx) {
+        std::cout << "ECNAIVE: RecvWorker[" << idx << "] started" << std::endl;
+        while (!stop_) {
+            RecvTask task;
+            {
+                std::unique_lock<std::mutex> lk(recv_mutexes_[idx]);
+                recv_cvs_[idx].wait(lk, [this, idx] {
+                    return stop_ || !recv_queues_[idx].empty();
+                });
+                if (stop_) break;
+                task = recv_queues_[idx].front();
+                recv_queues_[idx].pop();
+            }
+            if (task.addr == 0 && task.size == 0) {
+                recv_sentinel_received_[idx] = true;
+                {
+                    std::lock_guard<std::mutex> lock(recv_mutexes_[idx]);
+                    if (recv_queues_[idx].empty()) {
+                        recv_completed_[idx] = true;
+                        recv_sentinel_received_[idx] = false;
+                    }
+                }
+                continue;
+            }
+            if (task.size == 0 || task.addr == 0) continue;
+            if (conn_.recv_socket(idx).is_open()) {
+                size_t recvd = recv_with_size(conn_.recv_socket(idx), task.addr, task.size);
+                if (recvd != task.size) {
+                    std::cerr << "ECNAIVE: RecvWorker[" << idx << "] size mismatch: expected "
+                              << task.size << " got " << recvd << std::endl;
+                }
+            }
+        }
+    }
+
+    // ========== Generalized save submit interface ==========
+
+    // Submit one encoding + distribution operation for a chunk
+    void submit_ecnaive_save_general(
+            const std::vector<uintptr_t>& data_addrs,  // k data block addresses
+            uintptr_t parity0_addr,
+            uintptr_t parity1_addr,
+            const std::vector<uintptr_t>& recv_addrs,  // n-1 recv block addresses
+            size_t size)
+    {
+        // Encode k data blocks to 2 parity blocks
+        encode_ec_blocks(data_addrs, parity0_addr, parity1_addr, size);
+
+        // Steps:
+        // 1. Submit recv tasks for all n-1 channels (write to recv_addrs)
+        // 2. Submit send tasks:
+        //    - data blocks d_1..d_{k-1} via send channels 0..k-2
+        //    - parity0 via send channel k-1
+        //    - parity1 via send channel k
+
+        for (int i = 0; i < num_channels_; ++i) {
+            {
+                std::lock_guard<std::mutex> lk(recv_mutexes_[i]);
+                recv_queues_[i].push({recv_addrs[i], size});
+            }
+            recv_cvs_[i].notify_one();
+        }
+
+        // Send data blocks d_1..d_{k-1}
+        for (int j = 1; j < k_; ++j) {
+            int send_idx = j - 1;  // send channel 0..k-2
+            {
+                std::lock_guard<std::mutex> lk(send_mutexes_[send_idx]);
+                send_queues_[send_idx].push({data_addrs[j], size});
+            }
+            send_cvs_[send_idx].notify_one();
+        }
+
+        // Send parity blocks
+        {
+            std::lock_guard<std::mutex> lk(send_mutexes_[k_ - 1]);  // parity0
+            send_queues_[k_ - 1].push({parity0_addr, size});
+        }
+        send_cvs_[k_ - 1].notify_one();
+
+        {
+            std::lock_guard<std::mutex> lk(send_mutexes_[k_]);  // parity1
+            send_queues_[k_].push({parity1_addr, size});
+        }
+        send_cvs_[k_].notify_one();
+    }
+
+    void submit_send_sentinels(int num_sends) {
+        for (int i = 0; i < num_sends; ++i) {
+            std::lock_guard<std::mutex> lk(send_mutexes_[i]);
+            send_queues_[i].push({0, 0});
+            send_cvs_[i].notify_one();
+        }
+    }
+
+    void submit_recv_sentinels(int num_recvs) {
+        for (int i = 0; i < num_recvs; ++i) {
+            std::lock_guard<std::mutex> lk(recv_mutexes_[i]);
+            recv_queues_[i].push({0, 0});
+            recv_cvs_[i].notify_one();
         }
     }
 
@@ -5366,33 +5516,21 @@ private:
 
 PYBIND11_MODULE(ecnaive_native, m) {
     pybind11::class_<ECNaiveNative>(m, "ECNaiveNative")
-        .def(pybind11::init<const std::string&, uint16_t,
-                            const std::string&, uint16_t,
-                            const std::string&, uint16_t,
-                            const std::string&, uint16_t,
-                            const std::string&, uint16_t,
-                            const std::string&, uint16_t,
-                            uint16_t, uint16_t, uint16_t,
-                            uint16_t, uint16_t, uint16_t,
-                            bool, int>(),
-             pybind11::arg("send_data1_ip"),
-             pybind11::arg("send_data1_port"),
-             pybind11::arg("send_parity0_ip"),
-             pybind11::arg("send_parity0_port"),
-             pybind11::arg("send_parity1_ip"),
-             pybind11::arg("send_parity1_port"),
-             pybind11::arg("recv_parity1_ip"),
-             pybind11::arg("recv_parity1_port"),
-             pybind11::arg("recv_parity0_ip"),
-             pybind11::arg("recv_parity0_port"),
-             pybind11::arg("recv_data1_ip"),
-             pybind11::arg("recv_data1_port"),
-             pybind11::arg("rdma_send_data1_port"),
-             pybind11::arg("rdma_send_parity0_port"),
-             pybind11::arg("rdma_send_parity1_port"),
-             pybind11::arg("rdma_recv_parity1_port"),
-             pybind11::arg("rdma_recv_parity0_port"),
-             pybind11::arg("rdma_recv_data1_port"),
+        // Generalized constructor: vectors for variable number of channels
+        .def(pybind11::init<const std::vector<std::string>&,
+                            const std::vector<uint16_t>&,
+                            const std::vector<std::string>&,
+                            const std::vector<uint16_t>&,
+                            const std::vector<uint16_t>&,
+                            const std::vector<uint16_t>&,
+                            int, bool, int>(),
+             pybind11::arg("send_ips"),
+             pybind11::arg("send_ports"),
+             pybind11::arg("recv_ips"),
+             pybind11::arg("recv_ports"),
+             pybind11::arg("rdma_send_ports"),
+             pybind11::arg("rdma_recv_ports"),
+             pybind11::arg("k") = 2,
              pybind11::arg("use_rdma") = false,
              pybind11::arg("rank_in_group") = -1)
         // RDMA buffer management
@@ -5403,42 +5541,49 @@ PYBIND11_MODULE(ecnaive_native, m) {
         .def("unregister_buffer", &ECNaiveNative::unregister_buffer,
              "Unregister buffer from RDMA",
              pybind11::arg("addr"))
-        // Unified save mode submit function
+        // Generalized save mode submit function (k+2 scheme)
+        .def("submit_ecnaive_save_general", &ECNaiveNative::submit_ecnaive_save_general,
+             "Generalized save: encode k data blocks to 2 parity and distribute",
+             pybind11::arg("data_addrs"),
+             pybind11::arg("parity0_addr"),
+             pybind11::arg("parity1_addr"),
+             pybind11::arg("recv_addrs"),
+             pybind11::arg("size"))
+        // Legacy unified save mode (backward compat for k=2)
         .def("submit_ecnaive_save", &ECNaiveNative::submit_ecnaive_save,
              "Unified save mode function: encode and submit send/recv tasks",
-             pybind11::arg("data0_addr"),      // d_{i0} - keep, not sent
-             pybind11::arg("data1_addr"),      // d_{i1} - send to rank i+1
-             pybind11::arg("parity0_addr"),   // p_{i0} - send to rank i+2
-             pybind11::arg("parity1_addr"),    // p_{i1} - send to rank i+3
-             pybind11::arg("recv_parity1_addr"), // recv p_{i+1,1} from rank i+1
-             pybind11::arg("recv_parity0_addr"), // recv p_{i+2,0} from rank i+2
-             pybind11::arg("recv_data1_addr"),   // recv d_{i+3,1} from rank i+3
+             pybind11::arg("data0_addr"),
+             pybind11::arg("data1_addr"),
+             pybind11::arg("parity0_addr"),
+             pybind11::arg("parity1_addr"),
+             pybind11::arg("recv_parity1_addr"),
+             pybind11::arg("recv_parity0_addr"),
+             pybind11::arg("recv_data1_addr"),
              pybind11::arg("size"))
-        // Save mode submit functions: 3 sends + 3 receives (for fine-grained control if needed)
+        // Generalized sentinel methods
+        .def("submit_send_sentinels", &ECNaiveNative::submit_send_sentinels,
+             pybind11::arg("num_sends"))
+        .def("submit_recv_sentinels", &ECNaiveNative::submit_recv_sentinels,
+             pybind11::arg("num_recvs"))
+        // Legacy submit functions
         .def("submit_send_data1", &ECNaiveNative::submit_send_data1,
-             pybind11::arg("send_addr"),
-             pybind11::arg("size"))
+             pybind11::arg("send_addr"), pybind11::arg("size"))
         .def("submit_send_parity0", &ECNaiveNative::submit_send_parity0,
-             pybind11::arg("send_addr"),
-             pybind11::arg("size"))
+             pybind11::arg("send_addr"), pybind11::arg("size"))
         .def("submit_send_parity1", &ECNaiveNative::submit_send_parity1,
-             pybind11::arg("send_addr"),
-             pybind11::arg("size"))
+             pybind11::arg("send_addr"), pybind11::arg("size"))
         .def("submit_recv_parity1", &ECNaiveNative::submit_recv_parity1,
-             pybind11::arg("recv_addr"),
-             pybind11::arg("size"))
+             pybind11::arg("recv_addr"), pybind11::arg("size"))
         .def("submit_recv_parity0", &ECNaiveNative::submit_recv_parity0,
-             pybind11::arg("recv_addr"),
-             pybind11::arg("size"))
+             pybind11::arg("recv_addr"), pybind11::arg("size"))
         .def("submit_recv_data1", &ECNaiveNative::submit_recv_data1,
-             pybind11::arg("recv_addr"),
-             pybind11::arg("size"))
+             pybind11::arg("recv_addr"), pybind11::arg("size"))
         // Common functions
         .def("get_data_buffers_to_release", &ECNaiveNative::get_data_buffers_to_release)
         .def("get_parity_buffers_to_release", &ECNaiveNative::get_parity_buffers_to_release)
         .def("reset_encoding_completion_flags", &ECNaiveNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECNaiveNative::wait_for_encoding_completion)
-        // Save mode sentinels
+        // Legacy save mode sentinels
         .def("submit_send_data1_sentinel", &ECNaiveNative::submit_send_data1_sentinel)
         .def("submit_send_parity0_sentinel", &ECNaiveNative::submit_send_parity0_sentinel)
         .def("submit_send_parity1_sentinel", &ECNaiveNative::submit_send_parity1_sentinel)

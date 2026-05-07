@@ -425,11 +425,36 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             raise NotImplementedError(f"Please use local or global non-persistent checkpoints (got: {args.non_persistent_ckpt_type})")
 
     ckpt_format = args.ckpt_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
-    if args.use_ecnaive and (args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY):
-        raise RuntimeError(
-            "EC-NAIVE stage-1 only supports torch checkpoint format. "
-            "Please use --ckpt-format torch without distributed checkpoint save."
-        )
+    if args.use_ecnaive:
+        if args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY:
+            raise RuntimeError(
+                "EC-NAIVE stage-1 only supports torch checkpoint format. "
+                "Please use --ckpt-format torch without distributed checkpoint save."
+            )
+        ecnaive_k = getattr(args, "ecnaive_rs_k", 2)
+        if ecnaive_k < 2:
+            raise RuntimeError(
+                f"EC-NAIVE --ecnaive-rs-k must be >= 2, got {ecnaive_k}"
+            )
+        ecnaive_n = ecnaive_k + 2
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            if world_size % ecnaive_n != 0:
+                raise RuntimeError(
+                    f"EC-NAIVE --ecnaive-rs-k={ecnaive_k} → group size n={ecnaive_n} must divide "
+                    f"world_size={world_size}"
+                )
+        ecnaive_failed_rank = getattr(args, "ecnaive_failed_rank", None)
+        if ecnaive_failed_rank is not None:
+            if not torch.distributed.is_initialized():
+                raise RuntimeError(
+                    "EC-NAIVE --ecnaive-failed-rank requires torch.distributed to be initialized"
+                )
+            if ecnaive_failed_rank < 0 or ecnaive_failed_rank >= world_size:
+                raise RuntimeError(
+                    f"EC-NAIVE --ecnaive-failed-rank={ecnaive_failed_rank} out of range "
+                    f"[0, {world_size - 1}]"
+                )
     if getattr(args, "use_frcheck", False) and (
         args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
     ):
@@ -1218,9 +1243,19 @@ def _load_base_checkpoint(
             elif args.use_ecnaive:
                 from .ecnaive_legacy import (
                     load_ecnaive_legacy_checkpoint,
+                    load_ecnaive_legacy_checkpoint_software_recovery,
                     state_dict_from_ecnaive_main_metadata_only,
                 )
-                if torch.distributed.is_initialized():
+                failed_rank = getattr(args, "ecnaive_failed_rank", None)
+                if failed_rank is not None and torch.distributed.is_initialized():
+                    logger.info(
+                        f"EC-NAIVE: software recovery mode — "
+                        f"simulating failed rank {failed_rank}"
+                    )
+                    state_dict = load_ecnaive_legacy_checkpoint_software_recovery(
+                        checkpoint_name, failed_rank,
+                    )
+                elif torch.distributed.is_initialized():
                     state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
                 else:
                     ckpt_parent_path = Path(

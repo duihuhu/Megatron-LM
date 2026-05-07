@@ -16,11 +16,12 @@ from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
 
 logger = getLogger(__name__)
 
-# Number of ranks per EC-NAIVE group (each group behaves like the original 4-rank setup)
-RANKS_PER_GROUP = 4
-# Ports per rank: 6 for ASIO (send_data1, send_parity0, send_parity1, recv_parity1, recv_parity0, recv_data1)
-# + 3 for RDMA exchange only (rdma_recv_parity1, rdma_recv_parity0, rdma_recv_data1)
-PORTS_PER_RANK = 9
+# Default number of ranks per EC-NAIVE group (backward compatible 2+2 scheme)
+DEFAULT_RANKS_PER_GROUP = 4
+# Ports per rank for default 2+2 scheme:
+# 6 ASIO (send_data1, send_parity0, send_parity1, recv_parity1, recv_parity0, recv_data1)
+# + 3 RDMA exchange (rdma_recv_parity1, rdma_recv_parity0, rdma_recv_data1)
+DEFAULT_PORTS_PER_RANK = 9
 
 
 class ECNAIVEManager:
@@ -54,11 +55,16 @@ class ECNAIVEManager:
         """Initialize the manager (only once due to singleton)."""
         if hasattr(self, '_initialized') and self._initialized:
             return
-        
+
         self._ecnaive_native = None
         self.use_ecnaive = False
         self.use_rdma = False  # New: RDMA support flag
-        
+
+        # EC-NAIVE configuration
+        self.ecnaive_k = 2        # number of data blocks (default 2 → 2+2 scheme)
+        self.ecnaive_n = 4        # ranks per group = k + 2
+        self.ecnaive_ports_per_rank = DEFAULT_PORTS_PER_RANK  # computed from n
+
         # Buffer configuration
         self.ecnaive_data_buffers_count = 12
         self.ecnaive_parity_buffers_count = 12  # Pooled parity buffers
@@ -119,15 +125,15 @@ class ECNAIVEManager:
         cuda_count = torch.cuda.device_count()
         return max(1, cuda_count)
 
-    @classmethod
-    def _get_group_layout(cls, world_size: int) -> Dict[str, int]:
+    def _get_group_layout(self, world_size: int) -> Dict[str, int]:
         """Return EC grouping layout and mapping mode.
 
         node-aware mode is used when:
-        - world_size is divisible by 4
-        - inferred num_nodes is divisible by 4
+        - world_size is divisible by n (k+2)
+        - inferred num_nodes is divisible by n
         - ranks_per_node divides world_size
         """
+        n = self.ecnaive_n
         if world_size <= 0:
             return {
                 "mode": 0,
@@ -136,17 +142,17 @@ class ECNAIVEManager:
                 "num_nodes": 1,
                 "clusters": 1,
             }
-        num_groups = max(1, world_size // RANKS_PER_GROUP)
-        ranks_per_node = cls._get_ranks_per_node()
+        num_groups = max(1, world_size // n)
+        ranks_per_node = self._get_ranks_per_node()
         if (
-            world_size >= RANKS_PER_GROUP
-            and world_size % RANKS_PER_GROUP == 0
+            world_size >= n
+            and world_size % n == 0
             and ranks_per_node > 0
             and world_size % ranks_per_node == 0
         ):
             num_nodes = world_size // ranks_per_node
-            if num_nodes >= RANKS_PER_GROUP and num_nodes % RANKS_PER_GROUP == 0:
-                clusters = num_nodes // RANKS_PER_GROUP
+            if num_nodes >= n and num_nodes % n == 0:
+                clusters = num_nodes // n
                 node_aware_groups = ranks_per_node * clusters
                 if node_aware_groups == num_groups:
                     return {
@@ -164,10 +170,9 @@ class ECNAIVEManager:
             "clusters": 1,
         }
 
-    @classmethod
-    def _get_group_id(cls, rank: int, world_size: int) -> int:
+    def _get_group_id(self, rank: int, world_size: int) -> int:
         """Get group id for EC-NAIVE multi-rank setup."""
-        layout = cls._get_group_layout(world_size)
+        layout = self._get_group_layout(world_size)
         num_groups = layout["num_groups"]
         if layout["mode"] == 1:
             ranks_per_node = layout["ranks_per_node"]
@@ -178,10 +183,9 @@ class ECNAIVEManager:
             return local_rank * clusters + cluster_id
         return rank % num_groups
 
-    @classmethod
-    def _get_rank_in_group(cls, rank: int, world_size: int) -> int:
-        """Get rank index within group (0..3)."""
-        layout = cls._get_group_layout(world_size)
+    def _get_rank_in_group(self, rank: int, world_size: int) -> int:
+        """Get rank index within group (0..n-1)."""
+        layout = self._get_group_layout(world_size)
         num_groups = layout["num_groups"]
         if layout["mode"] == 1:
             ranks_per_node = layout["ranks_per_node"]
@@ -190,12 +194,11 @@ class ECNAIVEManager:
             return node_id // clusters
         return rank // num_groups
 
-    @classmethod
     def _get_rank_by_group_position(
-        cls, group_id: int, rank_in_group: int, world_size: int
+        self, group_id: int, rank_in_group: int, world_size: int
     ) -> int:
         """Map (group_id, rank_in_group) -> global rank."""
-        layout = cls._get_group_layout(world_size)
+        layout = self._get_group_layout(world_size)
         num_groups = layout["num_groups"]
         if layout["mode"] == 1:
             ranks_per_node = layout["ranks_per_node"]
@@ -208,52 +211,115 @@ class ECNAIVEManager:
 
     def _get_round_robin_ranks(self, rank: int, world_size: int) -> dict:
         """Calculate round-robin partner ranks for EC-NAIVE.
-        
-        Multi-rank: when world_size is divisible by 4, each group of 4 ranks uses
-        in-group round-robin (same as original 4-rank). Otherwise single ring over world_size.
-        - Rank i sends d_{i1} to (i+1) within group
-        - Rank i sends p_{i0} to (i+2) within group
-        - Rank i sends p_{i1} to (i+3) within group
-        - Same for recv partners.
-        
-        Returns:
-            dict: Partner ranks for each connection (global rank).
+
+        Generalized for k+2 scheme:
+        - Rank i splits data into k blocks: d_{i,0}, ..., d_{i,k-1}
+        - Rank i encodes: (d_{i,0}, ..., d_{i,k-1}) -> p_{i,0}, p_{i,1}
+        - Rank i keeps d_{i,0}
+        - Sends: d_{i,j} to rank i+j for j in [1, k-1]
+                 p_{i,0} to rank i+k
+                 p_{i,1} to rank i+k+1
+        - Recvs: mirror of sends (n-1 blocks from other ranks in group)
+
+        Returns dict with:
+            'send_partners': list of (global_rank, label) for each send channel
+            'recv_partners': list of (global_rank, label) for each recv channel
+            'send_block_types': list of block type names for each send
+            'recv_block_types': list of block type names for each recv
+        For backward compat with 2+2, also includes legacy keys.
         """
-        if world_size >= RANKS_PER_GROUP and world_size % RANKS_PER_GROUP == 0:
+        k = self.ecnaive_k
+        n = self.ecnaive_n
+
+        if world_size >= n and world_size % n == 0:
             group_id = self._get_group_id(rank, world_size)
             rank_in_group = self._get_rank_in_group(rank, world_size)
-            # In-group round-robin: +1, +2, +3 (mod 4)
-            send_data1_to_in_group = (rank_in_group + 1) % RANKS_PER_GROUP
-            send_parity0_to_in_group = (rank_in_group + 2) % RANKS_PER_GROUP
-            send_parity1_to_in_group = (rank_in_group + 3) % RANKS_PER_GROUP
-            return {
-                'send_data1_to': self._get_rank_by_group_position(
-                    group_id, send_data1_to_in_group, world_size
-                ),
-                'send_parity0_to': self._get_rank_by_group_position(
-                    group_id, send_parity0_to_in_group, world_size
-                ),
-                'send_parity1_to': self._get_rank_by_group_position(
-                    group_id, send_parity1_to_in_group, world_size
-                ),
-                'recv_parity1_from': self._get_rank_by_group_position(
-                    group_id, send_data1_to_in_group, world_size
-                ),
-                'recv_parity0_from': self._get_rank_by_group_position(
-                    group_id, send_parity0_to_in_group, world_size
-                ),
-                'recv_data1_from': self._get_rank_by_group_position(
-                    group_id, send_parity1_to_in_group, world_size
-                ),
+
+            send_partners = []
+            recv_partners = []
+            send_block_types = []
+            recv_block_types = []
+
+            # Data blocks d_{i,1} ... d_{i,k-1}: send to rank_in_group + j
+            for j in range(1, k):
+                target_ig = (rank_in_group + j) % n
+                src_ig = (rank_in_group - j) % n
+                send_partners.append(self._get_rank_by_group_position(group_id, target_ig, world_size))
+                recv_partners.append(self._get_rank_by_group_position(group_id, src_ig, world_size))
+                send_block_types.append(f"data_{j}")
+                recv_block_types.append(f"data")  # received block is a data block from another rank
+
+            # Parity 0: send to rank_in_group + k
+            p0_target_ig = (rank_in_group + k) % n
+            p0_src_ig = (rank_in_group - k) % n
+            send_partners.append(self._get_rank_by_group_position(group_id, p0_target_ig, world_size))
+            recv_partners.append(self._get_rank_by_group_position(group_id, p0_src_ig, world_size))
+            send_block_types.append("parity0")
+            recv_block_types.append("parity0")
+
+            # Parity 1: send to rank_in_group + k + 1
+            p1_target_ig = (rank_in_group + k + 1) % n
+            p1_src_ig = (rank_in_group - k - 1) % n
+            send_partners.append(self._get_rank_by_group_position(group_id, p1_target_ig, world_size))
+            recv_partners.append(self._get_rank_by_group_position(group_id, p1_src_ig, world_size))
+            send_block_types.append("parity1")
+            recv_block_types.append("parity1")
+
+            result = {
+                'send_partners': send_partners,
+                'recv_partners': recv_partners,
+                'send_block_types': send_block_types,
+                'recv_block_types': recv_block_types,
             }
-        return {
-            'send_data1_to': (rank + 1) % world_size,
-            'send_parity0_to': (rank + 2) % world_size,
-            'send_parity1_to': (rank + 3) % world_size,
-            'recv_parity1_from': (rank + 1) % world_size,
-            'recv_parity0_from': (rank + 2) % world_size,
-            'recv_data1_from': (rank + 3) % world_size,
+
+            # Backward compatibility aliases for k=2
+            if k == 2:
+                result.update({
+                    'send_data1_to': send_partners[0],
+                    'send_parity0_to': send_partners[1],
+                    'send_parity1_to': send_partners[2],
+                    'recv_parity1_from': recv_partners[0],
+                    'recv_parity0_from': recv_partners[1],
+                    'recv_data1_from': recv_partners[2],
+                })
+
+            return result
+
+        # Single-ring fallback (world_size not divisible by n)
+        send_partners = []
+        recv_partners = []
+        send_block_types = []
+        recv_block_types = []
+        for j in range(1, k):
+            send_partners.append((rank + j) % world_size)
+            recv_partners.append((rank - j) % world_size)
+            send_block_types.append(f"data_{j}")
+            recv_block_types.append("data")
+        send_partners.append((rank + k) % world_size)
+        recv_partners.append((rank - k) % world_size)
+        send_block_types.append("parity0")
+        recv_block_types.append("parity0")
+        send_partners.append((rank + k + 1) % world_size)
+        recv_partners.append((rank - k - 1) % world_size)
+        send_block_types.append("parity1")
+        recv_block_types.append("parity1")
+
+        result = {
+            'send_partners': send_partners,
+            'recv_partners': recv_partners,
+            'send_block_types': send_block_types,
+            'recv_block_types': recv_block_types,
         }
+        if k == 2:
+            result.update({
+                'send_data1_to': send_partners[0],
+                'send_parity0_to': send_partners[1],
+                'send_parity1_to': send_partners[2],
+                'recv_parity1_from': recv_partners[0],
+                'recv_parity0_from': recv_partners[1],
+                'recv_data1_from': recv_partners[2],
+            })
+        return result
     
     def _get_ecnaive_network_config(self, rank: int, world_size: int) -> dict:
         """
@@ -334,26 +400,42 @@ class ECNAIVEManager:
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
         base_port = int(os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000))
         
-        # Step 3: Calculate ports for this rank (per-group to avoid conflict in multi-rank)
-        # When world_size divisible by 4: base_port + group_id * (4*PORTS_PER_RANK) + rank_in_group * PORTS_PER_RANK
-        # PORTS_PER_RANK = 9: 6 ASIO + 3 RDMA exchange
-        if world_size >= RANKS_PER_GROUP and world_size % RANKS_PER_GROUP == 0:
+        # Step 3: Calculate ports for this rank
+        # Each rank gets 3*(n-1) ports: (n-1) ASIO send + (n-1) ASIO recv + (n-1) RDMA recv
+        # Per-group allocation to avoid port conflicts across groups
+        n = self.ecnaive_n
+        ports_per_rank = self.ecnaive_ports_per_rank
+        if world_size >= n and world_size % n == 0:
             group_id = self._get_group_id(rank, world_size)
             rank_in_group = self._get_rank_in_group(rank, world_size)
-            port_base = base_port + group_id * (RANKS_PER_GROUP * PORTS_PER_RANK) + rank_in_group * PORTS_PER_RANK
+            port_base = base_port + group_id * (n * ports_per_rank) + rank_in_group * ports_per_rank
         else:
-            port_base = base_port + rank * PORTS_PER_RANK
+            port_base = base_port + rank * ports_per_rank
+
+        # Build port dicts: generalized lists + backward-compat named keys for k=2
+        send_ports = [port_base + i for i in range(n - 1)]
+        recv_ports = [port_base + (n - 1) + i for i in range(n - 1)]
+        rdma_recv_ports = [port_base + 2 * (n - 1) + i for i in range(n - 1)]
+
+        k = self.ecnaive_k
         ports = {
-            'send_data1': port_base + 0,
-            'send_parity0': port_base + 1,
-            'send_parity1': port_base + 2,
-            'recv_parity1': port_base + 3,
-            'recv_parity0': port_base + 4,
-            'recv_data1': port_base + 5,
-            'rdma_recv_parity1': port_base + 6,
-            'rdma_recv_parity0': port_base + 7,
-            'rdma_recv_data1': port_base + 8,
+            'send_ports': send_ports,
+            'recv_ports': recv_ports,
+            'rdma_recv_ports': rdma_recv_ports,
         }
+        # Backward compatibility: named keys for k=2 (original 2+2 scheme)
+        if k == 2:
+            ports.update({
+                'send_data1': send_ports[0],
+                'send_parity0': send_ports[1],
+                'send_parity1': send_ports[2] if len(send_ports) > 2 else None,
+                'recv_parity1': recv_ports[0],
+                'recv_parity0': recv_ports[1],
+                'recv_data1': recv_ports[2] if len(recv_ports) > 2 else None,
+                'rdma_recv_parity1': rdma_recv_ports[0],
+                'rdma_recv_parity0': rdma_recv_ports[1],
+                'rdma_recv_data1': rdma_recv_ports[2] if len(rdma_recv_ports) > 2 else None,
+            })
         
         # Step 4: Exchange IP addresses via torch.distributed.all_gather
         rank_ips = {}
@@ -484,13 +566,14 @@ class ECNAIVEManager:
         base_port = int(os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000))
         
         # Multi-rank: per-group load ports to avoid conflict
-        num_groups = max(1, world_size // RANKS_PER_GROUP) if world_size >= RANKS_PER_GROUP else 1
+        n = self.ecnaive_n
+        num_groups = max(1, world_size // n) if world_size >= n else 1
         group_id = self._get_group_id(rank, world_size)
         rank_in_group = self._get_rank_in_group(rank, world_size)
         # load_receiver_rank: global rank of rank_in_group 2 in this group (for init_ecnaive_load)
         load_receiver_rank = (
             self._get_rank_by_group_position(group_id, 2, world_size)
-            if world_size >= RANKS_PER_GROUP
+            if world_size >= n
             else 2
         )
         load_base_port = base_port + 1000 + group_id * 100
@@ -759,20 +842,70 @@ class ECNAIVEManager:
         )
         
         return recv_buffers
-    
+
+    def get_software_recovery_source_ranks(
+        self, failed_global_rank: int, world_size: int
+    ) -> List[Tuple[int, int, int]]:
+        """Compute block source mapping for software recovery.
+
+        For a failed rank f with rank_in_group = r_f:
+        - d_{f,0} is on rank f itself (own_data0, readable from local disk)
+        - d_{f,j} for j in [1, k-1] is stored on rank (f + j) mod n
+
+        Returns list of (source_global_rank, data_chunk_index_j, recv_slot_index)
+        for each data block that needs to be fetched from a peer rank.
+        recv_slot_index is the index into the recv_blocks list on the source rank.
+
+        Example for k=6, n=8, failed rank f with r_f=3:
+          d_{f,1}: source = rank (f+1), recv_slot = 0 (data from r_f-1 = r_f-1)
+          Wait: recv slot 0 on rank r has data from rank (r-1) mod n.
+          For source rank s = (f+j) mod n: which recv slot has data from rank f?
+          On rank s, recv slot (s-f-1) mod (n-1) has data from rank f.
+          Since s-f = j, recv_slot = j-1.
+          So: d_{f,j} is in recv slot j-1 on rank s = (f+j) mod n.
+        """
+        k = self.ecnaive_k
+        n = self.ecnaive_n
+        group_id = self._get_group_id(failed_global_rank, world_size)
+        failed_rig = self._get_rank_in_group(failed_global_rank, world_size)
+
+        sources: List[Tuple[int, int, int]] = []
+        for j in range(1, k):
+            source_rig = (failed_rig + j) % n
+            source_global = self._get_rank_by_group_position(
+                group_id, source_rig, world_size
+            )
+            recv_slot = j - 1  # recv slot j-1 on source rank contains d_{f,j}
+            sources.append((source_global, j, recv_slot))
+
+        return sources
+
     def init_ecnaive_if_enabled(self):
         """Initialize EC-NAIVE C++ module if enabled and distributed environment is ready."""
         if self._ecnaive_native is not None:
             logger.debug("EC-NAIVE: Already initialized, skipping")
             return
-        
+
         try:
             from megatron.training import get_args as input_args
             args = input_args()
             self.use_ecnaive = args.use_ecnaive
             if not getattr(args, 'use_ecnaive', False):
                 return
-            
+
+            # Read RS k parameter (number of data blocks)
+            self.ecnaive_k = getattr(args, 'ecnaive_rs_k', 2)
+            if self.ecnaive_k < 2:
+                raise RuntimeError(f"EC-NAIVE: ecnaive_rs_k must be >= 2, got {self.ecnaive_k}")
+            self.ecnaive_n = self.ecnaive_k + 2
+            # Ports per rank: (n-1) ASIO send + (n-1) ASIO recv + (n-1) RDMA recv
+            self.ecnaive_ports_per_rank = 3 * (self.ecnaive_n - 1)
+
+            logger.info(
+                f"EC-NAIVE: RS scheme {self.ecnaive_k}+2 → {self.ecnaive_n} ranks/group, "
+                f"{self.ecnaive_ports_per_rank} ports/rank"
+            )
+
             # Check RDMA flag
             self.use_rdma = getattr(args, 'use_rdma', False)
             logger.info(f"EC-NAIVE: RDMA support {'enabled' if self.use_rdma else 'disabled'}")
@@ -843,53 +976,60 @@ class ECNAIVEManager:
                 
                 # Calculate round-robin partner ranks
                 partner_ranks = self._get_round_robin_ranks(rank, world_size)
-                
+
                 base_port = net_config['base_port']
                 rank_ips = net_config['rank_ips']
-                
-                # Calculate partner ports (send connects to partner's recv port).
-                # Must use the same per-group port formula as _get_ecnaive_network_config,
-                # otherwise multi-group (e.g. 8 ranks) would connect to wrong ports.
+                n = self.ecnaive_n
+                ports_per_rank = self.ecnaive_ports_per_rank
+
+                # Per-rank port base helper (generalized)
                 def _port_base_for_rank(r: int) -> int:
-                    if world_size >= RANKS_PER_GROUP and world_size % RANKS_PER_GROUP == 0:
+                    if world_size >= n and world_size % n == 0:
                         gid = self._get_group_id(r, world_size)
                         rig = self._get_rank_in_group(r, world_size)
-                        return base_port + gid * (RANKS_PER_GROUP * PORTS_PER_RANK) + rig * PORTS_PER_RANK
-                    return base_port + r * PORTS_PER_RANK
-                # For send connections, we connect to the partner's recv port:
-                # - send_data1 connects to partner's recv_parity1 (offset 3)
-                # - send_parity0 connects to partner's recv_parity0 (offset 4)
-                # - send_parity1 connects to partner's recv_data1 (offset 5)
-                send_data1_partner_port = _port_base_for_rank(partner_ranks['send_data1_to']) + 3
-                send_parity0_partner_port = _port_base_for_rank(partner_ranks['send_parity0_to']) + 4
-                send_parity1_partner_port = _port_base_for_rank(partner_ranks['send_parity1_to']) + 5
-                # RDMA exchange: dedicated TCP ports (offset 6,7,8) - must mirror ASIO edges:
-                # send_data1 -> partner recv_parity1 (+3) -> partner rdma_recv_parity1 (+6)
-                # send_parity0 -> partner recv_parity0 (+4) -> partner rdma_recv_parity0 (+7)
-                # send_parity1 -> partner recv_data1 (+5) -> partner rdma_recv_data1 (+8)
-                rdma_send_data1_port = _port_base_for_rank(partner_ranks['send_data1_to']) + 6
-                rdma_send_parity0_port = _port_base_for_rank(partner_ranks['send_parity0_to']) + 7
-                rdma_send_parity1_port = _port_base_for_rank(partner_ranks['send_parity1_to']) + 8
-                
+                        return base_port + gid * (n * ports_per_rank) + rig * ports_per_rank
+                    return base_port + r * ports_per_rank
+
+                # Generalized connection setup:
+                # For each send channel j in [0, n-2]:
+                #   - Connect to send_partners[j]'s recv port: offset (n-1) + j
+                #   - RDMA: connect to send_partners[j]'s RDMA recv port: offset 2*(n-1) + j
+                # For each recv channel j:
+                #   - Listen on local recv port: offset (n-1) + j
+                #   - RDMA listen on local RDMA recv port: offset 2*(n-1) + j
+
+                send_partners = partner_ranks['send_partners']
+                recv_partners = partner_ranks['recv_partners']
+                num_channels = n - 1  # = k + 1 send channels = k + 1 recv channels
+
+                # Build send connection params: (partner_ip, partner_recv_port) for each channel
+                send_ips = []
+                send_ports_to = []
+                for j, target_r in enumerate(send_partners):
+                    partner_port_base = _port_base_for_rank(target_r)
+                    send_ips.append(rank_ips.get(target_r, net_config['my_ip']))
+                    send_ports_to.append(partner_port_base + (n - 1) + j)  # partner's recv_ports[j]
+
+                # Build recv connection params: (local_ip, local_recv_port) for each channel
+                recv_ips = [net_config['my_ip']] * num_channels
+                recv_ports_local = net_config['ports']['recv_ports']  # list of local recv listen ports
+
+                # Build RDMA exchange params: (partner_rdma_recv_port, local_rdma_recv_port) for each channel
+                rdma_send_ports_to = []
+                rdma_recv_ports_local = net_config['ports']['rdma_recv_ports']
+                for j, target_r in enumerate(send_partners):
+                    partner_port_base = _port_base_for_rank(target_r)
+                    rdma_send_ports_to.append(partner_port_base + 2 * (n - 1) + j)  # partner's rdma_recv_ports[j]
+
                 # Get rank_in_group for RDMA connection ordering
                 rank_in_group = self._get_rank_in_group(rank, world_size)
-                
-                # Create C++ instance: 6 ASIO ip:port + 6 RDMA exchange ports + use_rdma + rank_in_group
+
+                # Create C++ instance with generalized connection lists
                 self._ecnaive_native = ecnaive_native.ECNaiveNative(
-                    # ASIO send connections
-                    rank_ips.get(partner_ranks['send_data1_to'], net_config['my_ip']), send_data1_partner_port,
-                    rank_ips.get(partner_ranks['send_parity0_to'], net_config['my_ip']), send_parity0_partner_port,
-                    rank_ips.get(partner_ranks['send_parity1_to'], net_config['my_ip']), send_parity1_partner_port,
-                    # ASIO recv connections (listen on local IP)
-                    net_config['my_ip'], net_config['ports']['recv_parity1'],
-                    net_config['my_ip'], net_config['ports']['recv_parity0'],
-                    net_config['my_ip'], net_config['ports']['recv_data1'],
-                    # RDMA exchange ports (dedicated TCP for RdmaConnInfo): 3 partner + 3 local
-                    rdma_send_data1_port, rdma_send_parity0_port, rdma_send_parity1_port,
-                    net_config['ports']['rdma_recv_parity1'],
-                    net_config['ports']['rdma_recv_parity0'],
-                    net_config['ports']['rdma_recv_data1'],
-                    # RDMA flag and rank_in_group
+                    send_ips, send_ports_to,
+                    recv_ips, recv_ports_local,
+                    rdma_send_ports_to, rdma_recv_ports_local,
+                    self.ecnaive_k,
                     self.use_rdma,
                     rank_in_group
                 )

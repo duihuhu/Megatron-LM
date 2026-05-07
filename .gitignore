@@ -20,3 +20,4 @@ nccl.log.*
 data/
 package-lock.json
 package.json
+.claude

@@ -430,6 +430,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             "EC-NAIVE stage-1 only supports torch checkpoint format. "
             "Please use --ckpt-format torch without distributed checkpoint save."
         )
+    if getattr(args, "use_frcheck", False) and (
+        args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
+    ):
+        raise RuntimeError(
+            "FRCheck skeleton only supports torch checkpoint format and LEGACY checkpoints. "
+            "Please use --ckpt-format torch without distributed checkpoint save."
+        )
     print_rank_0('saving checkpoint at iteration {:7d} to {} in {} format'.format(
         iteration, save_dir, ckpt_format))
 
@@ -581,6 +588,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 elif args.use_ecnaive:
                     from .ecnaive_legacy import save_ecnaive_legacy_checkpoint
                     save_ecnaive_legacy_checkpoint(state_dict, checkpoint_name)
+                    checkpoint_name = str(Path(checkpoint_name).parent)
+                elif getattr(args, "use_frcheck", False):
+                    from .frcheck_legacy import save_frcheck_legacy_checkpoint
+                    save_frcheck_legacy_checkpoint(state_dict, checkpoint_name)
                     checkpoint_name = str(Path(checkpoint_name).parent)
                 else:
                     # Save.
@@ -1231,6 +1242,24 @@ def _load_base_checkpoint(
                         )
                         state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
                 else:
+                    frcheck_marker = None
+                    if torch.distributed.is_initialized():
+                        rank = torch.distributed.get_rank()
+                        frcheck_rank_marker = ckpt_parent_path / f"frcheck_main_rank{rank}.pt"
+                        if frcheck_rank_marker.is_file():
+                            frcheck_marker = str(frcheck_rank_marker)
+                    if frcheck_marker is None:
+                        frcheck_rank0 = ckpt_parent_path / "frcheck_main_rank0.pt"
+                        if frcheck_rank0.is_file():
+                            frcheck_marker = str(frcheck_rank0)
+                    if frcheck_marker is None:
+                        any_frcheck = sorted(ckpt_parent_path.glob("frcheck_main_rank*.pt"))
+                        if any_frcheck:
+                            frcheck_marker = str(any_frcheck[0])
+                    if frcheck_marker is not None:
+                        raise NotImplementedError(
+                            "Loading FRCheck legacy checkpoints is not implemented in the skeleton."
+                        )
                     state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler

@@ -350,6 +350,32 @@ def validate_args(args, defaults={}):
             "legacy model format only supports the 'torch' checkpoint format."
     update_use_dist_ckpt(args)
 
+    _ec_legacy_flags = (
+        bool(getattr(args, "use_ecnaive", False)),
+        bool(getattr(args, "use_eclatin", False)),
+        bool(getattr(args, "use_frcheck", False)),
+    )
+    if sum(_ec_legacy_flags) > 1:
+        raise RuntimeError(
+            "At most one of --use-ecnaive, --use-eclatin, and --use-frcheck may be enabled."
+        )
+    if getattr(args, "use_frcheck", False):
+        frcheck_path = getattr(args, "frcheck_table_path", None)
+        frcheck_n = getattr(args, "frcheck_n", None)
+        frcheck_dir = getattr(args, "frcheck_table_dir", None)
+        if frcheck_path:
+            if not os.path.isfile(frcheck_path):
+                raise RuntimeError(f"FRCheck: --frcheck-table-path not found: {frcheck_path}")
+        else:
+            if frcheck_n is None or frcheck_n <= 0:
+                raise RuntimeError(
+                    "FRCheck: --frcheck-n must be provided and > 0 when --frcheck-table-path is not set."
+                )
+            if not frcheck_dir:
+                raise RuntimeError(
+                    "FRCheck: --frcheck-table-dir is required when --frcheck-table-path is not set."
+                )
+
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
 
     # Total model size.
@@ -2277,6 +2303,16 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-ecnaive-software-failure', action='store_true',
                        help='Enable EC-NAIVE checkpointing for software failure recovery. '
                             'When enabled, rank2 reads d21 from rank3 via network and merges with local d20.')
+
+    group.add_argument('--use-frcheck', action='store_true',
+                       help='Enable FRCheck legacy checkpoint skeleton: validates POA file via native module '
+                            'and writes layer/stripe directory layout with frcheck_torch_legacy metadata.')
+    group.add_argument('--frcheck-n', type=int, default=None,
+                       help='FRCheck group size n (POA columns). Used for node-aware grouping and automatic POA file selection.')
+    group.add_argument('--frcheck-table-dir', type=str, default=None,
+                       help='Directory containing FRCheck POA tables. Used with --frcheck-n when --frcheck-table-path is not set.')
+    group.add_argument('--frcheck-table-path', type=str, default=None,
+                       help='Path to POA table file (highest priority). If unset, manager resolves from --frcheck-table-dir and --frcheck-n.')
 
     # use gemini checkpointing arguments
     group.add_argument('--use-gemini', action='store_true',

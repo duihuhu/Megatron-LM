@@ -35,6 +35,24 @@
 // ISA-L erasure coding
 #include <isa-l/erasure_code.h>
 
+// RS encode thread pool
+static constexpr int kRsPoolSize = 16;
+static constexpr const char* kRsCpuListEnv = "FRCHECK_RS_CPU_LIST";
+
+struct RsEncodeJob {
+    int len = 0;
+    int k = 0;
+    int m = 0;
+    unsigned char* g_tbls = nullptr;
+    unsigned char** data_ptrs = nullptr;
+    unsigned char** parity_ptrs = nullptr;
+};
+
+struct RsPoolWorkerCtx {
+    class FRCheckNative* self = nullptr;
+    int wid = 0;
+};
+
 namespace py = pybind11;
 
 // ---------------------------------------------------------------------------
@@ -543,6 +561,9 @@ public:
         std::cout << "[FRCheck RDMA] rank=" << rank_in_group
                   << " all " << group_size_ << " nodes connected" << std::endl;
 
+        // Init RS encode thread pool
+        rs_pool_init();
+
         // Pre-compile stripe plans
         compile_stripe_plans_();
     }
@@ -631,21 +652,31 @@ public:
                 ch->recv_data((uint8_t*)this_recv, recv_buf_size);
             }
 
-            // RS encode via ISA-L: k=n_src data blocks → m=2 parity blocks
+            // RS encode via ISA-L (16-worker pool matching ecnaive xor_pool)
             {
                 int k = (int)n_src;
                 int m = 2;
-                // Build source pointers: recv_buf has k sequential blocks
                 std::vector<unsigned char*> data_ptrs(k);
                 for (int i = 0; i < k; ++i)
                     data_ptrs[i] = (unsigned char*)recv_buf_addr + i * block_size;
-                // Build parity output pointers
                 unsigned char* parity_ptrs[2] = {
                     (unsigned char*)parity1_out_addr,
                     (unsigned char*)parity2_out_addr,
                 };
-                ec_encode_data((int)block_size, k, m,
-                               g_tbls_, data_ptrs.data(), parity_ptrs);
+
+                if (rs_pool_inited_.load(std::memory_order_acquire)) {
+                    RsEncodeJob job;
+                    job.len = (int)block_size;
+                    job.k = k;
+                    job.m = m;
+                    job.g_tbls = g_tbls_;
+                    job.data_ptrs = data_ptrs.data();
+                    job.parity_ptrs = parity_ptrs;
+                    rs_pool_run_parallel_encode(job);
+                } else {
+                    ec_encode_data((int)block_size, k, m,
+                                   g_tbls_, data_ptrs.data(), parity_ptrs);
+                }
             }
 
             // Send parity2 to target
@@ -882,6 +913,141 @@ private:
         ec_init_tables(k, rows, a_mat_, g_tbls_);
     }
 
+    // ---- RS encode thread pool (matches ecnaive xor_pool) ----
+    static std::array<int, kRsPoolSize> rs_parse_cpus_or_default() {
+        std::array<int, kRsPoolSize> cpus{};
+        const char* env = std::getenv(kRsCpuListEnv);
+        if (!env || !*env) {
+            for (int i = 0; i < kRsPoolSize; ++i) cpus[i] = i;
+            return cpus;
+        }
+        std::vector<int> parsed;
+        const char* p = env;
+        while (*p) {
+            while (*p && (std::isspace((unsigned char)*p) || *p == ',')) ++p;
+            if (!*p) break;
+            char* end = nullptr;
+            long v = std::strtol(p, &end, 10);
+            if (end == p || v < 0 || v > 65535)
+                throw std::runtime_error(std::string(kRsCpuListEnv) + ": invalid CPU id");
+            parsed.push_back((int)v);
+            p = end;
+        }
+        if (parsed.size() != (size_t)kRsPoolSize)
+            throw std::runtime_error(std::string(kRsCpuListEnv) +
+                                     " must have exactly " + std::to_string(kRsPoolSize) + " CPU ids");
+        for (int i = 0; i < kRsPoolSize; ++i) cpus[i] = parsed[i];
+        return cpus;
+    }
+
+    void rs_pool_init() {
+        if (rs_pool_inited_.load(std::memory_order_acquire)) return;
+        rs_pool_cpus_ = rs_parse_cpus_or_default();
+        rs_pool_stop_.store(false, std::memory_order_release);
+        rs_pool_epoch_.store(0, std::memory_order_release);
+        rs_pool_remaining_.store(0, std::memory_order_release);
+        for (auto& e : rs_pool_last_epoch_) e = 0;
+        for (int i = 0; i < kRsPoolSize; ++i) {
+            rs_pool_ctx_[i].self = this;
+            rs_pool_ctx_[i].wid = i;
+            int rc = pthread_create(&rs_pool_threads_[i], nullptr,
+                                    &FRCheckNative::rs_pool_entry, &rs_pool_ctx_[i]);
+            if (rc != 0) {
+                rs_pool_stop_.store(true, std::memory_order_release);
+                rs_pool_worker_cv_.notify_all();
+                for (int j = 0; j < i; ++j) pthread_join(rs_pool_threads_[j], nullptr);
+                throw std::runtime_error("FRCheck: pthread_create for RS pool failed: " +
+                                         std::string(std::strerror(rc)));
+            }
+        }
+        rs_pool_inited_.store(true, std::memory_order_release);
+        std::cout << "FRCheck: RS encode pool (" << kRsPoolSize << " workers) initialized" << std::endl;
+    }
+
+    void rs_pool_shutdown() {
+        if (!rs_pool_inited_.load(std::memory_order_acquire)) return;
+        rs_pool_stop_.store(true, std::memory_order_release);
+        rs_pool_worker_cv_.notify_all();
+        for (int i = 0; i < kRsPoolSize; ++i) pthread_join(rs_pool_threads_[i], nullptr);
+        rs_pool_inited_.store(false, std::memory_order_release);
+        std::cout << "FRCheck: RS encode pool shut down" << std::endl;
+    }
+
+    static void* rs_pool_entry(void* arg) {
+        auto* ctx = (RsPoolWorkerCtx*)arg;
+        ctx->self->rs_pool_worker(ctx->wid);
+        return nullptr;
+    }
+
+    void rs_pool_worker(int wid) {
+        int cpu = rs_pool_cpus_[wid];
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (cpu >= 0 && (unsigned)cpu < CPU_SETSIZE) {
+            CPU_SET((unsigned)cpu, &cpuset);
+            pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+        }
+        while (true) {
+            std::unique_lock<std::mutex> lk(rs_pool_mutex_);
+            rs_pool_worker_cv_.wait(lk, [&] {
+                return rs_pool_stop_.load(std::memory_order_acquire) ||
+                       (rs_pool_last_epoch_[wid] < rs_pool_epoch_.load(std::memory_order_acquire));
+            });
+            if (rs_pool_stop_.load(std::memory_order_acquire)) break;
+            uint64_t e = rs_pool_epoch_.load(std::memory_order_acquire);
+            RsEncodeJob job = rs_pool_shared_job_;
+            lk.unlock();
+
+            rs_pool_execute_slice(job, wid);
+
+            {
+                std::lock_guard<std::mutex> guard(rs_pool_mutex_);
+                rs_pool_last_epoch_[wid] = e;
+            }
+            int left = rs_pool_remaining_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (left == 0) rs_pool_coordinator_cv_.notify_one();
+        }
+    }
+
+    void rs_pool_execute_slice(const RsEncodeJob& job, int wid) {
+        int total = job.len;
+        int base = total / kRsPoolSize;
+        int rem = total % kRsPoolSize;
+        int off, len;
+        if (wid < kRsPoolSize - 1) {
+            off = wid * base;
+            len = base;
+        } else {
+            off = (kRsPoolSize - 1) * base;
+            len = base + rem;
+        }
+        if (len <= 0) return;
+
+        // Build per-worker source and parity pointers offset by 'off'
+        std::vector<unsigned char*> src(kRsPoolWorkers + 2); // max possible k + m
+        for (int i = 0; i < job.k; ++i)
+            src[i] = job.data_ptrs[i] + off;
+        unsigned char* dest[2] = { job.parity_ptrs[0] + off, job.parity_ptrs[1] + off };
+
+        ec_encode_data(len, job.k, job.m, job.g_tbls, src.data(), dest);
+    }
+
+    void rs_pool_run_parallel_encode(const RsEncodeJob& job) {
+        {
+            std::lock_guard<std::mutex> publish(rs_pool_mutex_);
+            if (stopped_) return;
+            rs_pool_shared_job_ = job;
+            rs_pool_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            rs_pool_remaining_.store(kRsPoolSize, std::memory_order_release);
+        }
+        rs_pool_worker_cv_.notify_all();
+        std::unique_lock<std::mutex> lk(rs_pool_mutex_);
+        rs_pool_coordinator_cv_.wait(lk, [&] {
+            return rs_pool_remaining_.load(std::memory_order_acquire) == 0 ||
+                   stopped_.load();
+        });
+    }
+
     // ---- RDMA device init ----
     void init_ibv_() {
         if (ibv_fork_init() != 0)
@@ -907,6 +1073,7 @@ private:
     }
 
     void cleanup_rdma_() {
+        rs_pool_shutdown();
         channel_owners_.clear();
         channels_.clear();
 
@@ -1084,6 +1251,21 @@ private:
 
     // Stripe plans (pre-compiled)
     std::vector<StripePlan> stripe_plans_;
+
+    // ---- RS encode thread pool (matches ecnaive xor_pool pattern) ----
+    static constexpr int kRsPoolWorkers = 16;
+    std::array<pthread_t, kRsPoolWorkers> rs_pool_threads_{};
+    std::array<RsPoolWorkerCtx, kRsPoolWorkers> rs_pool_ctx_{};
+    std::array<int, kRsPoolWorkers> rs_pool_cpus_{};
+    std::atomic<bool> rs_pool_inited_{false};
+    std::atomic<bool> rs_pool_stop_{false};
+    std::mutex rs_pool_mutex_;
+    std::condition_variable rs_pool_worker_cv_;
+    std::condition_variable rs_pool_coordinator_cv_;
+    std::atomic<uint64_t> rs_pool_epoch_{0};
+    std::array<uint64_t, kRsPoolWorkers> rs_pool_last_epoch_{};
+    std::atomic<int> rs_pool_remaining_{0};
+    RsEncodeJob rs_pool_shared_job_{};
 };
 
 // ---------------------------------------------------------------------------

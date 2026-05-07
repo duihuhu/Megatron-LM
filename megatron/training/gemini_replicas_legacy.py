@@ -333,50 +333,86 @@ def save_gemini_replicas_legacy_checkpoint(
 # ---------------------------------------------------------------------------
 
 
-def _load_gemini_replicas_main_payload(
-    checkpoint_dir: Path, rank: int, world_size: int
+def _dict_to_tensor_info(info: Dict) -> Any:
+    """Convert a serialized tensor info dict back to an object with the
+    attributes expected by extract_tensors_from_continuous_buffer and
+    reconstruct_state_dict (.offset, .size_bytes, .dtype, .shape, .key)."""
+    from types import SimpleNamespace
+
+    dtype_str = info.get("dtype", "torch.float32")
+    dtype = getattr(torch, dtype_str.split(".")[-1]) if "." in dtype_str else torch.float32
+    return SimpleNamespace(
+        key=info.get("key", ""),
+        offset=info["offset"],
+        size_bytes=info["size_bytes"],
+        dtype=dtype,
+        shape=tuple(info["shape"]),
+    )
+
+
+def _reconstruct_from_payload(
+    tensor_infos: List[Dict],
+    non_tensor_data: Dict[str, Any],
+    tensor_buffer: torch.Tensor,
+    flat_key_roots: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
-    """Load gemini_replicas_main_rank{rank}.pt with all_gather fallback."""
-    main_path = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
-    local_payload: Optional[Dict[str, Any]] = None
-    if main_path.is_file():
-        local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
-
-    if world_size <= 1 or not torch.distributed.is_initialized():
-        if local_payload is None:
-            raise FileNotFoundError(
-                f"Gemini Replicas legacy: missing main file {main_path}"
-            )
-        return local_payload
-
-    gathered: List[Optional[Dict[str, Any]]] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(gathered, local_payload)
-
-    chosen = gathered[rank]
-    if chosen is None:
-        raise FileNotFoundError(
-            f"Gemini Replicas legacy: gemini_replicas_main_rank{rank}.pt "
-            f"missing on all ranks under {checkpoint_dir}"
-        )
-    return chosen
-
-
-def _reconstruct_from_main_payload(
-    main_payload: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Reconstruct state_dict from a main payload that has tensor_buffer."""
-    tb = main_payload["tensor_buffer"]
-    buf = tb.detach().contiguous().reshape(-1).view(torch.uint8)
-    tensor_infos = main_payload["tensor_infos"]
-    tensor_data = extract_tensors_from_continuous_buffer(buf, tensor_infos)
-    flat_key_roots = _infer_flat_key_roots(main_payload)
+    """Reconstruct state_dict from metadata + tensor buffer."""
+    tb = tensor_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
+    ti_objs = [_dict_to_tensor_info(info) for info in tensor_infos]
+    tensor_data = extract_tensors_from_continuous_buffer(tb, ti_objs)
     decomposed = DecomposedStateDict(
-        non_tensor_data=main_payload["non_tensor_data"],
-        tensor_infos=tensor_infos,
+        non_tensor_data=non_tensor_data,
+        tensor_infos=ti_objs,
         tensor_data=tensor_data,
-        flat_key_roots=flat_key_roots,
+        flat_key_roots=flat_key_roots or set(),
     )
     return reconstruct_state_dict(decomposed)
+
+
+def _collect_metadata_for_failed_rank(
+    checkpoint_dir: Path,
+    rank: int,
+    world_size: int,
+) -> Dict[str, Any]:
+    """Gather metadata (tensor_infos, non_tensor_data) for a failed rank.
+
+    Every healthy rank loads its own main file which contains all-to-all
+    metadata tables.  Failed ranks contribute None.  After all_gather,
+    each failed rank picks its own metadata from any healthy source.
+    """
+    main_path = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
+
+    my_all_meta: Optional[Dict[str, Any]] = None
+    if main_path.is_file():
+        own = torch.load(main_path, map_location="cpu", weights_only=False)
+        my_all_meta = {
+            "all_tensor_infos": own.get("all_tensor_infos", {}),
+            "all_non_tensor_data": own.get("all_non_tensor_data", {}),
+            "all_flat_key_roots": own.get("all_flat_key_roots", {}),
+            "all_tensor_buffer_sizes": own.get("all_tensor_buffer_sizes", {}),
+        }
+
+    gathered: List[Any] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, my_all_meta)
+
+    # Find metadata for THIS specific rank from any healthy source
+    for meta in gathered:
+        if meta is None:
+            continue
+        ti = meta["all_tensor_infos"].get(rank)
+        if ti is not None:
+            return {
+                "tensor_infos": ti,
+                "non_tensor_data": meta["all_non_tensor_data"].get(rank, {}),
+                "flat_key_roots": meta["all_flat_key_roots"].get(rank, []),
+                "tensor_buffer_size": meta["all_tensor_buffer_sizes"].get(rank, 0),
+            }
+
+    raise RuntimeError(
+        f"Gemini Replicas legacy load rank {rank}: "
+        f"no metadata available for recovery. "
+        f"At least one healthy rank must have a main file."
+    )
 
 
 def _run_hardware_recovery(
@@ -384,22 +420,24 @@ def _run_hardware_recovery(
     checkpoint_dir: Path,
     rank: int,
     world_size: int,
-    main_payload: Dict[str, Any],
+    failed_override: Optional[Set[int]] = None,
 ) -> torch.Tensor:
     """Hardware failure recovery for Gemini Replicas legacy.
 
     Protocol:
       Phase 1 — Health check: exchange who still has their main file.
+          If failed_override is set, those ranks are treated as failed
+          regardless of file existence (for software recovery testing).
       Phase 2 — Role assignment (per group):
           For each failed rank f, pick the first healthy rank in the group
           that holds a replica of f's data.  That rank becomes the sender for f.
-      Phase 3 — Data transfer: senders load replica .pt files and use
-          torch.distributed.send to push data to the failed ranks (gloo backend).
-      Phase 4 — Reconstruct: the recovering rank returns the recovered buffer.
+      Phase 3 — Data transfer: senders load replica .pt files (which now
+          include source metadata) and use torch.distributed.send to push
+          both metadata and tensor data to the failed ranks (gloo backend).
     """
     gloo_group = get_or_create_global_gloo_group()
 
-    # Build per-rank group membership (must match _calculate_target_ranks layout)
+    # Build per-rank group membership
     rank_to_group: Dict[int, List[int]] = {}
     for r in range(world_size):
         if r not in rank_to_group:
@@ -413,8 +451,14 @@ def _run_hardware_recovery(
     main_file_exists = (checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt").is_file()
     health_list = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(health_list, main_file_exists)
-    healthy = {r for r, ok in enumerate(health_list) if ok}
-    failed = {r for r in range(world_size) if r not in healthy}
+
+    if failed_override:
+        # Override: specified ranks are "failed", all others "healthy"
+        healthy = {r for r in range(world_size) if r not in failed_override}
+        failed = failed_override
+    else:
+        healthy = {r for r, ok in enumerate(health_list) if ok}
+        failed = {r for r in range(world_size) if r not in healthy}
 
     logger.info(
         f"Gemini Replicas recovery rank {rank}: group={my_group}, "
@@ -423,11 +467,10 @@ def _run_hardware_recovery(
 
     if rank in healthy:
         # ---- Phase 2: role assignment (sender side) ----
-        assignments: Dict[int, int] = {}  # failed_rank -> sender_rank
+        assignments: Dict[int, int] = {}
 
         for f in sorted(failed):
             f_group = set(rank_to_group.get(f, []))
-            # Find a healthy rank in the same group that holds f's replica
             sender = None
             for candidate in sorted(healthy):
                 if candidate not in f_group:
@@ -461,7 +504,7 @@ def _run_hardware_recovery(
                 for f, s in r_assign:
                     global_assignments[f] = s
 
-        # ---- Phase 3: send replica data ----
+        # ---- Phase 3: send metadata + tensor data ----
         for f, s in global_assignments.items():
             if s != rank:
                 continue
@@ -472,19 +515,31 @@ def _run_hardware_recovery(
                 f"Gemini Replicas recovery rank {rank}: loading replica for rank {f} "
                 f"from {replica_path}"
             )
-            replica_payload = torch.load(
-                replica_path, map_location="cpu", weights_only=False
-            )
-            replica_buffer = replica_payload["tensor_buffer"]
-            buf = (
-                replica_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
-            )
-            buf_size = torch.tensor([buf.numel()], dtype=torch.long)
+            rp = torch.load(replica_path, map_location="cpu", weights_only=False)
 
-            torch.distributed.send(buf_size, dst=f, group=gloo_group)
+            # Build metadata dict with everything the receiver needs
+            meta = {
+                "tensor_infos": rp["source_tensor_infos"],
+                "non_tensor_data": rp["source_non_tensor_data"],
+                "flat_key_roots": rp["source_flat_key_roots"],
+                "tensor_buffer_size": rp["source_tensor_buffer_size"],
+            }
+            import io as _io
+            meta_buf = _io.BytesIO()
+            torch.save(meta, meta_buf)
+            meta_bytes = meta_buf.getvalue()
+
+            # Send: [metadata_size:8B][metadata_bytes][tensor_data]
+            meta_size_tensor = torch.tensor([len(meta_bytes)], dtype=torch.long)
+            torch.distributed.send(meta_size_tensor, dst=f, group=gloo_group)
+            meta_tensor = torch.frombuffer(bytearray(meta_bytes), dtype=torch.uint8)
+            torch.distributed.send(meta_tensor, dst=f, group=gloo_group)
+
+            replica_buffer = rp["tensor_buffer"]
+            buf = replica_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
             torch.distributed.send(buf, dst=f, group=gloo_group)
             logger.info(
-                f"Gemini Replicas recovery rank {rank}: sent "
+                f"Gemini Replicas recovery rank {rank}: sent metadata + "
                 f"{buf.numel() / (1024**2):.2f} MB to rank {f}"
             )
 
@@ -503,25 +558,43 @@ def _run_hardware_recovery(
         sender = global_assignments.get(rank)
         if sender is None:
             raise RuntimeError(
-                f"Gemini Replicas recovery rank {rank}: no sender assigned — "
-                f"not enough replicas to recover. global_assignments={global_assignments}"
+                f"Gemini Replicas recovery rank {rank}: no sender assigned. "
+                f"global_assignments={global_assignments}"
             )
 
-        # ---- Phase 3: receive replica data ----
-        buf_size_tensor = torch.empty(1, dtype=torch.long)
-        torch.distributed.recv(buf_size_tensor, src=sender, group=gloo_group)
-        actual_size = int(buf_size_tensor[0].item())
+        # ---- Phase 3: receive metadata + tensor data ----
+        meta_size_tensor = torch.empty(1, dtype=torch.long)
+        torch.distributed.recv(meta_size_tensor, src=sender, group=gloo_group)
+        meta_size = int(meta_size_tensor[0].item())
 
-        recovered_buffer = torch.empty(actual_size, dtype=torch.uint8)
+        meta_tensor = torch.empty(meta_size, dtype=torch.uint8)
+        torch.distributed.recv(meta_tensor, src=sender, group=gloo_group)
+        import io as _io
+        meta = torch.load(
+            _io.BytesIO(meta_tensor.numpy().tobytes()),
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        # Store metadata for reconstruction
+        _recovery_meta[rank] = meta
+
+        buf_size = meta["tensor_buffer_size"]
+        recovered_buffer = torch.empty(buf_size, dtype=torch.uint8)
         torch.distributed.recv(recovered_buffer, src=sender, group=gloo_group)
 
         logger.info(
-            f"Gemini Replicas recovery rank {rank}: received "
-            f"{actual_size / (1024**2):.2f} MB from sender rank {sender}"
+            f"Gemini Replicas recovery rank {rank}: received metadata + "
+            f"{buf_size / (1024**2):.2f} MB from sender rank {sender}"
         )
         return recovered_buffer
 
     return torch.zeros(0, dtype=torch.uint8)
+
+
+# Module-level dict so the receiver side of _run_hardware_recovery can
+# hand metadata back to load_gemini_replicas_legacy_checkpoint.
+_recovery_meta: Dict[int, Dict[str, Any]] = {}
 
 
 def load_gemini_replicas_legacy_checkpoint(
@@ -529,21 +602,18 @@ def load_gemini_replicas_legacy_checkpoint(
 ) -> Dict[str, Any]:
     """Load Gemini Replicas torch legacy checkpoint.
 
-    Software failure (all ranks alive, main file present on every rank):
-      Each rank loads its main .pt file and reconstructs the state_dict directly.
+    Normal load (main file present):
+      Each rank loads its own main .pt directly.  Replicas are not touched.
 
-    Hardware failure (one or more ranks' main files missing):
-      Uses the replica files saved by other ranks during save.  For each failed
-      rank, a healthy sender in the same group that holds a replica loads it from
-      disk and pushes it to the failed rank via torch.distributed.send/recv.
+    Hardware recovery (main file missing, or --gemini-replicas-recovery-rank):
+      Failed ranks recover from other ranks' replica files.  After recovery,
+      the main .pt file is regenerated.
     """
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = (
         torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
     )
-
-    main_payload = _load_gemini_replicas_main_payload(checkpoint_dir, rank, world_size)
 
     from megatron.training import get_args
 
@@ -556,27 +626,99 @@ def load_gemini_replicas_legacy_checkpoint(
         args.use_gemini_replicas = True
 
     manager = GeminiReplicasManager()
-    # Init C++ native only when we need it (save-time data exchange).
-    # During load, init is needed only to get group_size/num_replicas for
-    # the recovery topology calculation — the actual recovery transfer uses
-    # torch.distributed, not C++ native.
     manager.init_gemini_replicas_if_enabled()
 
-    needs_recovery = not isinstance(main_payload.get("tensor_buffer"), torch.Tensor)
+    # ---- Determine which ranks need recovery ----
+    recovery_rank_str = getattr(args, "gemini_replicas_recovery_rank", None)
+    main_path = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
+    main_file_exists = main_path.is_file()
+    health_list = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(health_list, main_file_exists)
 
-    if needs_recovery:
+    if recovery_rank_str:
+        # Explicit ranks treated as failed (for testing)
+        recovery_ranks = {int(x.strip()) for x in recovery_rank_str.split(",")}
+        is_failed = rank in recovery_ranks
         logger.info(
-            f"Gemini Replicas legacy load rank {rank}: main payload missing "
-            f"tensor_buffer, entering hardware recovery"
+            f"Gemini Replicas load rank {rank}: "
+            f"recovery_ranks={recovery_ranks}, is_failed={is_failed}"
         )
-        recovered_buffer = _run_hardware_recovery(
-            manager, checkpoint_dir, rank, world_size, main_payload
+    else:
+        # Auto-detect from file existence
+        is_failed = not main_file_exists
+
+    main_payload: Optional[Dict[str, Any]] = None
+    if main_file_exists:
+        main_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+
+    if not is_failed and all(health_list):
+        # ---- Normal load ----
+        state_dict = _reconstruct_from_payload(
+            tensor_infos=main_payload["tensor_infos"],
+            non_tensor_data=main_payload["non_tensor_data"],
+            tensor_buffer=main_payload["tensor_buffer"],
+            flat_key_roots=_infer_flat_key_roots(main_payload),
         )
-        main_payload["tensor_buffer"] = recovered_buffer.contiguous().view(
-            torch.uint8
+    else:
+        # ---- Hardware recovery ----
+        logger.info(
+            f"Gemini Replicas legacy load rank {rank}: "
+            f"{sum(health_list)}/{world_size} healthy, entering recovery"
         )
 
-    state_dict = _reconstruct_from_main_payload(main_payload)
+        # Build failed_override for _run_hardware_recovery
+        # (all ranks must agree on who is failed)
+        if recovery_rank_str:
+            failed_override = recovery_ranks
+        else:
+            failed_override = None  # auto-detect inside _run_hardware_recovery
+
+        # Step 1: Exchange all-to-all metadata
+        meta = _collect_metadata_for_failed_rank(checkpoint_dir, rank, world_size)
+
+        # Step 2: Recovery data transfer
+        recovered_buffer = _run_hardware_recovery(
+            manager, checkpoint_dir, rank, world_size,
+            failed_override=failed_override,
+        )
+
+        # Step 3: Reconstruct
+        if is_failed:
+            if rank in _recovery_meta:
+                meta.update(_recovery_meta.pop(rank))
+            state_dict = _reconstruct_from_payload(
+                tensor_infos=meta["tensor_infos"],
+                non_tensor_data=meta["non_tensor_data"],
+                tensor_buffer=recovered_buffer,
+                flat_key_roots=set(meta.get("flat_key_roots", [])),
+            )
+            # Regenerate main file
+            regenerated = {
+                "version": 1,
+                "format": "gemini_replicas_torch_legacy",
+                "rank": rank,
+                "world_size": world_size,
+                "num_replicas": manager.num_replicas,
+                "group_size": manager.group_size,
+                "non_tensor_data": meta["non_tensor_data"],
+                "tensor_infos": meta["tensor_infos"],
+                "tensor_buffer": recovered_buffer.contiguous().view(torch.uint8),
+                "tensor_buffer_size": meta["tensor_buffer_size"],
+                "flat_key_roots": meta.get("flat_key_roots", []),
+            }
+            torch.save(regenerated, main_path)
+            logger.info(
+                f"Gemini Replicas hardware recovery rank {rank}: "
+                f"regenerated main file {main_path}"
+            )
+        else:
+            # Healthy rank — load normally
+            state_dict = _reconstruct_from_payload(
+                tensor_infos=main_payload["tensor_infos"],
+                non_tensor_data=main_payload["non_tensor_data"],
+                tensor_buffer=main_payload["tensor_buffer"],
+                flat_key_roots=_infer_flat_key_roots(main_payload),
+            )
 
     if manager._gemini_replicas_native is not None:
         logger.info(

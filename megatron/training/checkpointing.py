@@ -1191,114 +1191,156 @@ def _load_base_checkpoint(
         else:
             checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=False)
         try:
-            ckpt_parent = (
-                os.path.dirname(checkpoint_name)
-                if not os.path.isdir(checkpoint_name)
-                else checkpoint_name
-            )
-            ckpt_parent_path = Path(ckpt_parent)
-            eclatin_marker = None
-            if torch.distributed.is_initialized():
-                rank = torch.distributed.get_rank()
-                eclatin_rank_marker = ckpt_parent_path / f"eclatin_main_rank{rank}.pt"
-                if eclatin_rank_marker.is_file():
-                    eclatin_marker = str(eclatin_rank_marker)
-            if eclatin_marker is None:
-                eclatin_rank0 = ckpt_parent_path / "eclatin_main_rank0.pt"
-                if eclatin_rank0.is_file():
-                    eclatin_marker = str(eclatin_rank0)
-            if eclatin_marker is None:
-                any_eclatin = sorted(ckpt_parent_path.glob("eclatin_main_rank*.pt"))
-                if any_eclatin:
-                    eclatin_marker = str(any_eclatin[0])
-            if eclatin_marker is not None:
+            # ---- Direct args-driven routing (no marker detection) ----
+            # When the user explicitly specified a strategy via --use-xxx,
+            # trust the args instead of probing the filesystem.  This is
+            # essential for hardware recovery where main files may be missing.
+            if getattr(args, "use_gemini_replicas", False):
+                from .gemini_replicas_legacy import (
+                    load_gemini_replicas_legacy_checkpoint,
+                    state_dict_from_gemini_replicas_main_metadata_only,
+                )
+                if torch.distributed.is_initialized():
+                    state_dict = load_gemini_replicas_legacy_checkpoint(checkpoint_name)
+                else:
+                    ckpt_parent_path = Path(
+                        os.path.dirname(checkpoint_name)
+                        if not os.path.isdir(checkpoint_name)
+                        else checkpoint_name
+                    )
+                    marker = next(ckpt_parent_path.glob("gemini_replicas_main_rank*.pt"), None)
+                    if marker is None:
+                        raise FileNotFoundError(
+                            f"No gemini_replicas_main_rank*.pt found in {ckpt_parent_path}"
+                        )
+                    payload = torch.load(str(marker), map_location="cpu", weights_only=False)
+                    state_dict = state_dict_from_gemini_replicas_main_metadata_only(payload)
+            elif args.use_ecnaive:
+                from .ecnaive_legacy import (
+                    load_ecnaive_legacy_checkpoint,
+                    state_dict_from_ecnaive_main_metadata_only,
+                )
+                if torch.distributed.is_initialized():
+                    state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
+                else:
+                    ckpt_parent_path = Path(
+                        os.path.dirname(checkpoint_name)
+                        if not os.path.isdir(checkpoint_name)
+                        else checkpoint_name
+                    )
+                    marker = next(ckpt_parent_path.glob("ecnaive_main_rank*.pt"), None)
+                    if marker is None:
+                        raise FileNotFoundError(
+                            f"No ecnaive_main_rank*.pt found in {ckpt_parent_path}"
+                        )
+                    payload = torch.load(str(marker), map_location="cpu", weights_only=False)
+                    state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
+            elif getattr(args, "use_eclatin", False):
                 from .eclatin_legacy import (
                     load_eclatin_legacy_checkpoint,
                     state_dict_from_eclatin_main_metadata_only,
                 )
-
                 if torch.distributed.is_initialized():
                     state_dict = load_eclatin_legacy_checkpoint(checkpoint_name)
                 else:
-                    payload = torch.load(
-                        eclatin_marker, map_location="cpu", weights_only=False
+                    ckpt_parent_path = Path(
+                        os.path.dirname(checkpoint_name)
+                        if not os.path.isdir(checkpoint_name)
+                        else checkpoint_name
                     )
+                    marker = next(ckpt_parent_path.glob("eclatin_main_rank*.pt"), None)
+                    if marker is None:
+                        raise FileNotFoundError(
+                            f"No eclatin_main_rank*.pt found in {ckpt_parent_path}"
+                        )
+                    payload = torch.load(str(marker), map_location="cpu", weights_only=False)
                     state_dict = state_dict_from_eclatin_main_metadata_only(payload)
+            elif getattr(args, "use_frcheck", False):
+                raise NotImplementedError(
+                    "Loading FRCheck legacy checkpoints is not implemented in the skeleton."
+                )
             else:
-                ecnaive_marker = None
+                # ---- Marker-based auto-detection (backward compat) ----
+                ckpt_parent = (
+                    os.path.dirname(checkpoint_name)
+                    if not os.path.isdir(checkpoint_name)
+                    else checkpoint_name
+                )
+                ckpt_parent_path = Path(ckpt_parent)
+                eclatin_marker = None
                 if torch.distributed.is_initialized():
                     rank = torch.distributed.get_rank()
-                    rank_marker = ckpt_parent_path / f"ecnaive_main_rank{rank}.pt"
-                    if rank_marker.is_file():
-                        ecnaive_marker = str(rank_marker)
-                if ecnaive_marker is None:
-                    rank0_marker = ckpt_parent_path / "ecnaive_main_rank0.pt"
-                    if rank0_marker.is_file():
-                        ecnaive_marker = str(rank0_marker)
-                if ecnaive_marker is None:
-                    any_markers = sorted(ckpt_parent_path.glob("ecnaive_main_rank*.pt"))
-                    if any_markers:
-                        ecnaive_marker = str(any_markers[0])
-                if ecnaive_marker is not None:
-                    from .ecnaive_legacy import (
-                        load_ecnaive_legacy_checkpoint,
-                        state_dict_from_ecnaive_main_metadata_only,
+                    eclatin_rank_marker = ckpt_parent_path / f"eclatin_main_rank{rank}.pt"
+                    if eclatin_rank_marker.is_file():
+                        eclatin_marker = str(eclatin_rank_marker)
+                if eclatin_marker is None:
+                    eclatin_rank0 = ckpt_parent_path / "eclatin_main_rank0.pt"
+                    if eclatin_rank0.is_file():
+                        eclatin_marker = str(eclatin_rank0)
+                if eclatin_marker is None:
+                    any_eclatin = sorted(ckpt_parent_path.glob("eclatin_main_rank*.pt"))
+                    if any_eclatin:
+                        eclatin_marker = str(any_eclatin[0])
+                if eclatin_marker is not None:
+                    from .eclatin_legacy import (
+                        load_eclatin_legacy_checkpoint,
+                        state_dict_from_eclatin_main_metadata_only,
                     )
 
                     if torch.distributed.is_initialized():
-                        state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
+                        state_dict = load_eclatin_legacy_checkpoint(checkpoint_name)
                     else:
                         payload = torch.load(
-                            ecnaive_marker, map_location="cpu", weights_only=False
+                            eclatin_marker, map_location="cpu", weights_only=False
                         )
-                        state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
+                        state_dict = state_dict_from_eclatin_main_metadata_only(payload)
                 else:
-                    frcheck_marker = None
+                    ecnaive_marker = None
                     if torch.distributed.is_initialized():
                         rank = torch.distributed.get_rank()
-                        frcheck_rank_marker = ckpt_parent_path / f"frcheck_main_rank{rank}.pt"
-                        if frcheck_rank_marker.is_file():
-                            frcheck_marker = str(frcheck_rank_marker)
-                    if frcheck_marker is None:
-                        frcheck_rank0 = ckpt_parent_path / "frcheck_main_rank0.pt"
-                        if frcheck_rank0.is_file():
-                            frcheck_marker = str(frcheck_rank0)
-                    if frcheck_marker is None:
-                        any_frcheck = sorted(ckpt_parent_path.glob("frcheck_main_rank*.pt"))
-                        if any_frcheck:
-                            frcheck_marker = str(any_frcheck[0])
-                    if frcheck_marker is not None:
-                        raise NotImplementedError(
-                            "Loading FRCheck legacy checkpoints is not implemented in the skeleton."
-                        )
-                    gemini_replicas_marker = None
-                    if torch.distributed.is_initialized():
-                        rank = torch.distributed.get_rank()
-                        gr_rank_marker = ckpt_parent_path / f"gemini_replicas_main_rank{rank}.pt"
-                        if gr_rank_marker.is_file():
-                            gemini_replicas_marker = str(gr_rank_marker)
-                    if gemini_replicas_marker is None:
-                        gr_rank0 = ckpt_parent_path / "gemini_replicas_main_rank0.pt"
-                        if gr_rank0.is_file():
-                            gemini_replicas_marker = str(gr_rank0)
-                    if gemini_replicas_marker is None:
-                        any_gr = sorted(ckpt_parent_path.glob("gemini_replicas_main_rank*.pt"))
-                        if any_gr:
-                            gemini_replicas_marker = str(any_gr[0])
-                    if gemini_replicas_marker is not None:
-                        from .gemini_replicas_legacy import (
-                            load_gemini_replicas_legacy_checkpoint,
-                            state_dict_from_gemini_replicas_main_metadata_only,
+                        rank_marker = ckpt_parent_path / f"ecnaive_main_rank{rank}.pt"
+                        if rank_marker.is_file():
+                            ecnaive_marker = str(rank_marker)
+                    if ecnaive_marker is None:
+                        rank0_marker = ckpt_parent_path / "ecnaive_main_rank0.pt"
+                        if rank0_marker.is_file():
+                            ecnaive_marker = str(rank0_marker)
+                    if ecnaive_marker is None:
+                        any_markers = sorted(ckpt_parent_path.glob("ecnaive_main_rank*.pt"))
+                        if any_markers:
+                            ecnaive_marker = str(any_markers[0])
+                    if ecnaive_marker is not None:
+                        from .ecnaive_legacy import (
+                            load_ecnaive_legacy_checkpoint,
+                            state_dict_from_ecnaive_main_metadata_only,
                         )
 
                         if torch.distributed.is_initialized():
-                            state_dict = load_gemini_replicas_legacy_checkpoint(checkpoint_name)
+                            state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
                         else:
                             payload = torch.load(
-                                gemini_replicas_marker, map_location="cpu", weights_only=False
+                                ecnaive_marker, map_location="cpu", weights_only=False
                             )
-                            state_dict = state_dict_from_gemini_replicas_main_metadata_only(payload)
+                            state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
                     else:
+                        frcheck_marker = None
+                        if torch.distributed.is_initialized():
+                            rank = torch.distributed.get_rank()
+                            frcheck_rank_marker = ckpt_parent_path / f"frcheck_main_rank{rank}.pt"
+                            if frcheck_rank_marker.is_file():
+                                frcheck_marker = str(frcheck_rank_marker)
+                        if frcheck_marker is None:
+                            frcheck_rank0 = ckpt_parent_path / "frcheck_main_rank0.pt"
+                            if frcheck_rank0.is_file():
+                                frcheck_marker = str(frcheck_rank0)
+                        if frcheck_marker is None:
+                            any_frcheck = sorted(ckpt_parent_path.glob("frcheck_main_rank*.pt"))
+                            if any_frcheck:
+                                frcheck_marker = str(any_frcheck[0])
+                        if frcheck_marker is not None:
+                            raise NotImplementedError(
+                                "Loading FRCheck legacy checkpoints is not implemented in the skeleton."
+                            )
                         state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler

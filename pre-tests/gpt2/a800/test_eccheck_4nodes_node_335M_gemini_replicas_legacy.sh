@@ -190,12 +190,23 @@ EVAL_AND_LOGGING_ARGS=(
                                         # 需要硬件支持 + 提前注册内存
 
     # ---------------------------------------------------------------------------
-    # 硬件故障恢复：load 时从其他 rank 的副本文件恢复
+    # 恢复模式（load 时使用，save 不需要）
     # ---------------------------------------------------------------------------
-    # --use-gemini-replicas-hardware-failure  # 启用硬件故障恢复模式
-                                               # load 时检测 main_rank{r}.pt 缺失
-                                               # 组内选健康 rank 通过 torch.distributed 发送副本数据
-                                               # 支持多 rank 同时故障恢复
+    # 方式 1 — 自动检测（文件缺失 = 故障）:
+    #   删掉要模拟故障的 rank 的 main 文件，然后 load。
+    #   系统自动检测缺失 → 组内选 sender 通过 torch.distributed 发送副本数据。
+    #   恢复完成后自动重新生成 main 文件。
+    #   测试方法：save 完成后删故障 rank 的 gemini_replicas_main_rank*.pt，
+    #            然后带相同参数 load。
+    #
+    #   --use-gemini-replicas-hardware-failure
+
+    # 方式 2 — 指定故障 rank（不删文件，精确控制）:
+    #   指定哪些 rank 模拟故障。这些 rank 即使 main 文件存在也会走恢复路径。
+    #   测试方法：save 完成后直接 load，加下面参数。
+    #   示例："2,3" 表示 rank2 和 rank3 当作故障处理。
+    #
+    #   --gemini-replicas-recovery-rank 2,3
 
     # ---------------------------------------------------------------------------
     # ckpt 格式：必须用 torch（legacy 路径）
@@ -214,21 +225,24 @@ EVAL_AND_LOGGING_ARGS=(
 # 参数组合速查
 # =============================================================================
 #
-# 场景 1 — 全局 3 副本（默认，适用于小规模测试）:
+# 场景 1 — 全局 3 副本（默认，小规模测试）:
 #   --use-gemini-replicas --use-gemini-replicas-optimized --ckpt-format torch
 #
-# 场景 2 — 全局 2 副本（等同于原 Gemini 两副本，但用 round-robin 配对）:
+# 场景 2 — 全局 2 副本（等同于原 Gemini 两副本，round-robin 配对）:
 #   --use-gemini-replicas --use-gemini-replicas-optimized
 #   --gemini-replicas-num 2 --ckpt-format torch
 #
-# 场景 3 — 8 节点各 8 GPU，按 8 分组（每组 8 个不同节点各一个 rank），组内 4 副本:
+# 场景 3 — 8 节点各 8 GPU，组大小 8，组内 4 副本:
 #   --use-gemini-replicas --use-gemini-replicas-optimized
 #   --gemini-replicas-num 4 --gemini-replicas-group-size 8 --ckpt-format torch
 #
-# 场景 4 — RDMA + 硬件故障恢复:
+# 场景 4 — 硬件故障恢复（删文件后自动检测）:
 #   --use-gemini-replicas --use-gemini-replicas-optimized
-#   --use-rdma --use-gemini-replicas-hardware-failure
-#   --gemini-replicas-num 3 --gemini-replicas-group-size 4 --ckpt-format torch
+#   --use-gemini-replicas-hardware-failure --use-rdma --ckpt-format torch
+#
+# 场景 5 — 指定 rank2,3 故障（不删文件，精确控制）:
+#   --use-gemini-replicas --use-gemini-replicas-optimized
+#   --gemini-replicas-recovery-rank 2,3 --ckpt-format torch
 #
 # =============================================================================
 

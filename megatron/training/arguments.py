@@ -2370,6 +2370,12 @@ def _add_checkpointing_args(parser):
                             'backup of rank2 original data. Uses mmap for zero-copy file access and C++ ASIO '
                             'for efficient network transfer. Data sizes are broadcasted first, then C++ handles '
                             'the actual data transfer for optimal performance.')
+    group.add_argument('--gemini-replicas-recovery-rank', type=str, default=None,
+                       help='Comma-separated list of ranks to treat as failed during load, '
+                            'e.g. "2,3". When set, these ranks force recovery from replicas '
+                            'even if their main files exist. When not set, failure is detected '
+                            'automatically by checking file existence. '
+                            'Used with --use-gemini-replicas-hardware-failure for testing.')
     return parser
 
 

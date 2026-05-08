@@ -17,6 +17,7 @@ import torch
 from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
     allocate_hugepage_tensor,
 )
+from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 
 logger = getLogger(__name__)
 
@@ -376,32 +377,8 @@ class FRCheckManager:
         logger.info("FRCheck RDMA: group initialized (rank_in_group=%d/%d)", rg, n)
 
     def _resolve_my_ip(self) -> str:
-        """Determine my IP for listen socket."""
-        # Priority: env var, MASTER_ADDR, or auto-detect
-        import socket
-
-        base_ip = os.environ.get("FRCHECK_BASE_IP") or os.environ.get("ECLATIN_BASE_IP")
-        if base_ip:
-            return base_ip
-
-        interface_name = os.environ.get("FRCHECK_INTERFACE") or os.environ.get("ECLATIN_INTERFACE")
-        if interface_name:
-            try:
-                import netifaces
-                addrs = netifaces.ifaddresses(interface_name)
-                if netifaces.AF_INET in addrs:
-                    return addrs[netifaces.AF_INET][0]["addr"]
-            except ImportError:
-                pass
-
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return os.environ.get("MASTER_ADDR", "127.0.0.1")
+        """Determine my IP for listen socket, with multi-NIC per-rank support."""
+        return resolve_ip("FRCHECK", fallback_prefixes=["ECLATIN"])
 
     def _allocate_default_buffers(self, native, n: int) -> None:
         """Allocate data/recv/parity buffers and register for RDMA."""

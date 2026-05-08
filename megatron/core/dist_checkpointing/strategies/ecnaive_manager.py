@@ -4,6 +4,7 @@
 
 import os
 import queue
+import socket
 import threading
 from logging import getLogger
 from typing import Dict, List, Optional, Tuple
@@ -13,6 +14,7 @@ from dataclasses import replace
 
 from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
 from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
+from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 
 logger = getLogger(__name__)
 
@@ -347,54 +349,9 @@ class ECNAIVEManager:
                     - 'recv_parity0': int
                     - 'recv_data1': int
         """
-        import socket
-        
-        # Step 1: Get base IP address
-        # Priority: ECNAIVE_BASE_IP > ECNAIVE_INTERFACE > auto-detect > MASTER_ADDR (fallback)
-        base_ip = os.environ.get('ECNAIVE_BASE_IP')
-        
-        # If ECNAIVE_BASE_IP is not set, try to auto-detect actual IP
-        if not base_ip:
-            # Check if specific network interface is requested
-            interface_name = os.environ.get('ECNAIVE_INTERFACE')
-            
-            if interface_name:
-                try:
-                    import netifaces
-                    addrs = netifaces.ifaddresses(interface_name)
-                    if netifaces.AF_INET in addrs:
-                        base_ip = addrs[netifaces.AF_INET][0]['addr']
-                        logger.info(f"EC-NAIVE: Using IP from interface {interface_name}: {base_ip}")
-                    else:
-                        logger.warning(f"EC-NAIVE: Interface {interface_name} has no IPv4 address")
-                        base_ip = None
-                except ImportError:
-                    logger.warning(
-                        "EC-NAIVE: netifaces module not installed. "
-                        "Install via 'pip install netifaces' to use ECNAIVE_INTERFACE. "
-                        "Falling back to auto-detection."
-                    )
-                    base_ip = None
-                except Exception as e:
-                    logger.warning(f"EC-NAIVE: Failed to get IP from interface {interface_name}: {e}")
-                    base_ip = None
-            
-            if not base_ip:
-                try:
-                    # Get IP of the interface used for distributed training
-                    # Connect to a remote address (doesn't actually send data)
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    # Use a public DNS server IP to determine the default route interface
-                    s.connect(('8.8.8.8', 80))
-                    base_ip = s.getsockname()[0]
-                    s.close()
-                    logger.info(f"EC-NAIVE: Auto-detected IP address: {base_ip}")
-                except Exception as e:
-                    logger.warning(f"EC-NAIVE: Failed to auto-detect IP: {e}")
-                    # Fallback to MASTER_ADDR or localhost
-                    base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
-                    logger.warning(f"EC-NAIVE: Using fallback IP: {base_ip}")
-        
+        # Step 1: Get base IP address (with multi-NIC per-rank support)
+        base_ip = resolve_ip("ECNAIVE", rank=rank)
+
         # Step 2: Get base port
         # Priority: ECNAIVE_BASE_PORT > MASTER_PORT + 10000 > default 16000
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
@@ -520,47 +477,9 @@ class ECNAIVEManager:
                 - 'rank_ips': dict - IP addresses for all ranks
                 - 'ports': dict - Port numbers for load mode connections (8 ports for rank2)
         """
-        import socket
-        
-        # Reuse the same IP detection logic as save mode
-        base_ip = os.environ.get('ECNAIVE_BASE_IP')
-        
-        if not base_ip:
-            interface_name = os.environ.get('ECNAIVE_INTERFACE')
-            
-            if interface_name:
-                try:
-                    import netifaces
-                    addrs = netifaces.ifaddresses(interface_name)
-                    if netifaces.AF_INET in addrs:
-                        base_ip = addrs[netifaces.AF_INET][0]['addr']
-                        logger.info(f"EC-NAIVE: Using IP from interface {interface_name}: {base_ip}")
-                    else:
-                        logger.warning(f"EC-NAIVE: Interface {interface_name} has no IPv4 address")
-                        base_ip = None
-                except ImportError:
-                    logger.warning(
-                        "EC-NAIVE: netifaces module not installed. "
-                        "Install via 'pip install netifaces' to use ECNAIVE_INTERFACE. "
-                        "Falling back to auto-detection."
-                    )
-                    base_ip = None
-                except Exception as e:
-                    logger.warning(f"EC-NAIVE: Failed to get IP from interface {interface_name}: {e}")
-                    base_ip = None
-            
-            if not base_ip:
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    s.connect(('8.8.8.8', 80))
-                    base_ip = s.getsockname()[0]
-                    s.close()
-                    logger.info(f"EC-NAIVE: Auto-detected IP address: {base_ip}")
-                except Exception as e:
-                    logger.warning(f"EC-NAIVE: Failed to auto-detect IP: {e}")
-                    base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
-                    logger.warning(f"EC-NAIVE: Using fallback IP: {base_ip}")
-        
+        # Step 1: Get base IP address (with multi-NIC per-rank support)
+        base_ip = resolve_ip("ECNAIVE", rank=rank)
+
         # Get base port (same as save mode)
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
         base_port = int(os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000))

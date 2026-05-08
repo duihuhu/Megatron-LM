@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from .state_dict_decomposer import DecomposedStateDict, TensorInfo
+from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 
 logger = getLogger(__name__)
 
@@ -120,53 +121,8 @@ class GeminiManager:
                     - 'send': int - Port for sending data
                     - 'recv': int - Port for receiving data
         """
-        import socket
-        
-        # Step 1: Get base IP address
-        # Priority: GEMINI_BASE_IP > GEMINI_INTERFACE > auto-detect > MASTER_ADDR (fallback)
-        base_ip = os.environ.get('GEMINI_BASE_IP')
-        
-        # If GEMINI_BASE_IP is not set, try to auto-detect actual IP
-        if not base_ip:
-            # Check if specific network interface is requested
-            interface_name = os.environ.get('GEMINI_INTERFACE')
-            
-            if interface_name:
-                try:
-                    import netifaces
-                    addrs = netifaces.ifaddresses(interface_name)
-                    if netifaces.AF_INET in addrs:
-                        base_ip = addrs[netifaces.AF_INET][0]['addr']
-                        logger.info(f"Gemini: Using IP from interface {interface_name}: {base_ip}")
-                    else:
-                        logger.warning(f"Gemini: Interface {interface_name} has no IPv4 address")
-                        base_ip = None
-                except ImportError:
-                    logger.warning(
-                        "Gemini: netifaces module not installed. "
-                        "Install via 'pip install netifaces' to use GEMINI_INTERFACE. "
-                        "Falling back to auto-detection."
-                    )
-                    base_ip = None
-                except Exception as e:
-                    logger.warning(f"Gemini: Failed to get IP from interface {interface_name}: {e}")
-                    base_ip = None
-            
-            if not base_ip:
-                try:
-                    # Get IP of the interface used for distributed training
-                    # Connect to a remote address (doesn't actually send data)
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    # Use a public DNS server IP to determine the default route interface
-                    s.connect(('8.8.8.8', 80))
-                    base_ip = s.getsockname()[0]
-                    s.close()
-                    logger.info(f"Gemini: Auto-detected IP address: {base_ip}")
-                except Exception as e:
-                    logger.warning(f"Gemini: Failed to auto-detect IP: {e}")
-                    # Fallback to MASTER_ADDR or localhost
-                    base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
-                    logger.warning(f"Gemini: Using fallback IP: {base_ip}")
+        # Step 1: Get base IP address (with multi-NIC per-rank support)
+        base_ip = resolve_ip("GEMINI", rank=rank)
         
         # Step 2: Get base port
         master_port = int(os.environ.get('MASTER_PORT', '6000'))

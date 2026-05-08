@@ -4,6 +4,7 @@
 
 import os
 import queue
+import socket
 import threading
 from logging import getLogger
 from typing import Dict, List, Optional, Tuple
@@ -13,6 +14,7 @@ from dataclasses import replace
 
 from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
 from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
+from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 
 logger = getLogger(__name__)
 
@@ -207,54 +209,9 @@ class ECCHECKManager:
                     - 'p2p_send': int
                     - 'p2p_recv': int
         """
-        import socket
-        
-        # Step 1: Get base IP address
-        # Priority: ECCHECK_BASE_IP > MASTER_ADDR > auto-detect
-        base_ip = os.environ.get('ECCHECK_BASE_IP')
-        if not base_ip:
-            base_ip = os.environ.get('MASTER_ADDR', '127.0.0.1')
-        
-        # If using localhost, try to get actual IP
-        if base_ip == '127.0.0.1' or base_ip == 'localhost':
-            # Check if specific network interface is requested
-            interface_name = os.environ.get('ECCHECK_INTERFACE')
-            
-            if interface_name:
-                try:
-                    import netifaces
-                    addrs = netifaces.ifaddresses(interface_name)
-                    if netifaces.AF_INET in addrs:
-                        base_ip = addrs[netifaces.AF_INET][0]['addr']
-                        logger.info(f"EC-CHECK: Using IP from interface {interface_name}: {base_ip}")
-                    else:
-                        logger.warning(f"EC-CHECK: Interface {interface_name} has no IPv4 address")
-                        base_ip = '127.0.0.1'
-                except ImportError:
-                    logger.warning(
-                        "EC-CHECK: netifaces module not installed. "
-                        "Install via 'pip install netifaces' to use ECCHECK_INTERFACE. "
-                        "Falling back to auto-detection."
-                    )
-                    base_ip = '127.0.0.1'
-                except Exception as e:
-                    logger.warning(f"EC-CHECK: Failed to get IP from interface {interface_name}: {e}")
-                    base_ip = '127.0.0.1'
-            
-            if base_ip == '127.0.0.1':
-                try:
-                    # Get IP of the interface used for distributed training
-                    # Connect to a remote address (doesn't actually send data)
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    s.connect(('8.8.8.8', 80))
-                    base_ip = s.getsockname()[0]
-                    s.close()
-                    logger.info(f"EC-CHECK: Auto-detected IP address: {base_ip}")
-                except Exception as e:
-                    # Fallback to localhost
-                    logger.warning(f"EC-CHECK: Failed to auto-detect IP, using localhost: {e}")
-                    base_ip = '127.0.0.1'
-        
+        # Step 1: Get base IP address (with multi-NIC per-rank support)
+        base_ip = resolve_ip("ECCHECK", rank=rank)
+
         # Step 2: Get base port
         # Priority: ECCHECK_BASE_PORT > MASTER_PORT + 10000 > default 16000
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
@@ -283,50 +240,10 @@ class ECCHECKManager:
         
         if torch.distributed.is_initialized():
             try:
-                # Get actual IP address for each rank
-                # Priority: ECCHECK_RANK_IP_<rank> > ECCHECK_INTERFACE > auto-detect from network interface
-                my_actual_ip = os.environ.get(f'ECCHECK_RANK_IP_{rank}')
-                if not my_actual_ip:
-                    # Check if specific network interface is requested
-                    interface_name = os.environ.get('ECCHECK_INTERFACE')
-                    
-                    if interface_name:
-                        try:
-                            import netifaces
-                            addrs = netifaces.ifaddresses(interface_name)
-                            if netifaces.AF_INET in addrs:
-                                my_actual_ip = addrs[netifaces.AF_INET][0]['addr']
-                                logger.info(f"EC-CHECK: [Rank {rank}] Using IP from interface {interface_name}: {my_actual_ip}")
-                            else:
-                                logger.warning(f"EC-CHECK: [Rank {rank}] Interface {interface_name} has no IPv4 address")
-                                my_actual_ip = None
-                        except ImportError:
-                            logger.warning(
-                                f"EC-CHECK: [Rank {rank}] netifaces module not installed. "
-                                "Install via 'pip install netifaces' to use ECCHECK_INTERFACE. "
-                                "Falling back to auto-detection."
-                            )
-                            my_actual_ip = None
-                        except Exception as e:
-                            logger.warning(f"EC-CHECK: [Rank {rank}] Failed to get IP from interface {interface_name}: {e}")
-                            my_actual_ip = None
-                    
-                    if not my_actual_ip:
-                        # Try to get actual IP from network interface
-                        try:
-                            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                            s.connect(('8.8.8.8', 80))
-                            my_actual_ip = s.getsockname()[0]
-                            s.close()
-                            logger.info(f"EC-CHECK: [Rank {rank}] Auto-detected my IP: {my_actual_ip}")
-                        except Exception as e:
-                            logger.warning(f"EC-CHECK: [Rank {rank}] Failed to auto-detect IP, using base_ip: {e}")
-                            my_actual_ip = base_ip
-                else:
-                    logger.info(f"EC-CHECK: [Rank {rank}] Using IP from ECCHECK_RANK_IP_{rank}: {my_actual_ip}")
-                
+                # base_ip already resolved via resolve_ip() which handles
+                # ECCHECK_RANK_IP_{rank}, ECCHECK_BASE_IP, ECCHECK_INTERFACE, etc.
                 # Convert IP to bytes, then to int list for tensor
-                my_ip_bytes = socket.inet_aton(my_actual_ip)
+                my_ip_bytes = socket.inet_aton(base_ip)
                 my_ip_tensor = torch.tensor(
                     [int(b) for b in my_ip_bytes], 
                     dtype=torch.uint8
@@ -347,14 +264,11 @@ class ECCHECKManager:
                     rank_ips[r] = socket.inet_ntoa(ip_bytes)
                 
                 logger.info(f"EC-CHECK: [Rank {rank}] All ranks IPs: {rank_ips}")
-                
+
                 # Get partner IPs from gathered results
                 xor_partner_ip = rank_ips.get(xor_partner, base_ip)
                 p2p_partner_ip = rank_ips.get(p2p_partner, base_ip)
-                
-                # Update my_ip to use the actual detected IP
-                base_ip = my_actual_ip
-                
+
                 logger.info(
                     f"EC-CHECK: [Rank {rank}] IP exchange completed - "
                     f"XOR partner ({xor_partner}): {xor_partner_ip}, "

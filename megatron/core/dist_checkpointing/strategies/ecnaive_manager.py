@@ -799,6 +799,67 @@ class ECNAIVEManager:
 
         return sources
 
+    def get_multi_failure_recovery_plan(
+        self, failed_global_ranks: List[int], world_size: int
+    ) -> Dict[int, Dict]:
+        """Compute recovery plan for 1-2 failed ranks with RS decoding.
+
+        For each failed rank f:
+          lost_positions: data block indices j where d_{f,j} is on a failed rank
+          surviving: list of (source_rank, block_label, recv_slot, data_chunk_or_parity)
+
+        Returns dict keyed by failed_global_rank.
+        """
+        k = self.ecnaive_k
+        n = self.ecnaive_n
+        failed_set = set(failed_global_ranks)
+
+        # Map each failed rank to group/rig
+        failed_info = {}
+        for fr in failed_global_ranks:
+            failed_info[fr] = {
+                'group_id': self._get_group_id(fr, world_size),
+                'rank_in_group': self._get_rank_in_group(fr, world_size),
+            }
+
+        result: Dict[int, Dict] = {}
+        for fr in failed_global_ranks:
+            gid = failed_info[fr]['group_id']
+            rig = failed_info[fr]['rank_in_group']
+
+            # Which data blocks are lost?
+            lost_positions = []
+            for j in range(k):
+                source_rig = (rig + j) % n
+                source_global = self._get_rank_by_group_position(gid, source_rig, world_size)
+                if source_global in failed_set:
+                    lost_positions.append(j)
+
+            # Which blocks survive and where are they?
+            surviving: List[Tuple[int, str, int, Any]] = []
+            for j in range(k):
+                if j in lost_positions:
+                    continue
+                source_rig = (rig + j) % n
+                source_global = self._get_rank_by_group_position(gid, source_rig, world_size)
+                recv_slot = j - 1 if j > 0 else -1  # own_data0 has no recv slot
+                surviving.append((source_global, f'data_{j}', recv_slot, j))
+
+            # Parity blocks (always survive)
+            for pi, pname in enumerate(['parity0', 'parity1']):
+                source_rig = (rig + k + pi) % n
+                source_global = self._get_rank_by_group_position(gid, source_rig, world_size)
+                surviving.append((source_global, pname, -1, pname))
+
+            result[fr] = {
+                'lost_positions': lost_positions,
+                'surviving': surviving,
+                'rank_in_group': rig,
+                'group_id': gid,
+            }
+
+        return result
+
     def init_ecnaive_if_enabled(self):
         """Initialize EC-NAIVE C++ module if enabled and distributed environment is ready."""
         if self._ecnaive_native is not None:

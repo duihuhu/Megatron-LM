@@ -142,6 +142,12 @@ EVAL_AND_LOGGING_ARGS=(
     --save-embeddings-separately
     --use-rdma
     --timing-log-level 2
+
+    # --- EC-NAIVE generalized parameters ---
+    # --ecnaive-rs-k 2             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
+    #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
+    # --ecnaive-failed-ranks 2,5   # Comma-separated failed global ranks for software recovery
+    #                                Uses ISA-L RS decoding (GF(2^8)) to recover 1-2 lost blocks
 )
 
 mkdir -p logs

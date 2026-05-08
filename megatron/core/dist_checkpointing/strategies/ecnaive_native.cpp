@@ -2326,6 +2326,114 @@ public:
         recv_data1_cv_.notify_one();
     }
 
+    // ========== RS Decode Recovery (software recovery, synchronous) ==========
+
+    // Recover m lost data blocks from k surviving blocks using RS decode.
+    // surviving_addrs must be in original data position order for the data blocks,
+    // followed by parity0 and parity1 at the end.
+    void submit_ecnaive_decode_recovery(
+            int k, int m,
+            const std::vector<int>& lost_positions,
+            const std::vector<uintptr_t>& surviving_addrs,
+            const std::vector<uintptr_t>& recovered_addrs,
+            size_t size)
+    {
+        if (k < 2 || m < 1 || m > 2) {
+            std::cerr << "ECNAIVE: decode_recovery invalid params k=" << k << " m=" << m << std::endl;
+            return;
+        }
+        if (static_cast<int>(surviving_addrs.size()) != k) {
+            std::cerr << "ECNAIVE: decode_recovery need exactly k surviving blocks" << std::endl;
+            return;
+        }
+        if (static_cast<int>(recovered_addrs.size()) != m) {
+            std::cerr << "ECNAIVE: decode_recovery need exactly m recovered buffers" << std::endl;
+            return;
+        }
+
+        // Step 1: Build full (k+2) x k Vandermonde encoding matrix
+        int full_rows = k + 2;
+        std::vector<unsigned char> encode_mat(k * full_rows);
+        gf_gen_rs_matrix(encode_mat.data(), full_rows, k);
+
+        // Step 2: Build k x k survivor matrix A
+        // A is stored row-major, size = k * k bytes
+        std::vector<unsigned char> A(k * k, 0);
+
+        // Fill in identity rows for surviving data positions
+        int data_row = 0;
+        for (int pos = 0; pos < k; ++pos) {
+            bool is_lost = false;
+            for (int lp : lost_positions) {
+                if (lp == pos) { is_lost = true; break; }
+            }
+            if (!is_lost) {
+                // Identity row at position pos
+                A[data_row * k + pos] = 1;
+                ++data_row;
+            }
+        }
+        // Fill in 2 parity rows (rows k and k+1 of the full matrix)
+        for (int parity_idx = 0; parity_idx < 2; ++parity_idx) {
+            int src_row = k + parity_idx;  // row index in full encode_mat
+            for (int col = 0; col < k; ++col) {
+                A[data_row * k + col] = encode_mat[src_row * k + col];
+            }
+            ++data_row;
+        }
+
+        // Step 3: Invert A in GF(2^8)
+        // gf_invert_matrix needs workspace of size k * 2k
+        std::vector<unsigned char> inv_workspace(k * 2 * k);
+        std::vector<unsigned char> A_inv(k * k);
+        // Copy A to workspace (gf_invert_matrix works in-place within the workspace)
+        for (int i = 0; i < k * k; ++i) {
+            inv_workspace[i] = A[i];
+        }
+        int ret = gf_invert_matrix(inv_workspace.data(), A_inv.data(), k);
+        if (ret != 0) {
+            std::cerr << "ECNAIVE: gf_invert_matrix failed (singular matrix), ret=" << ret << std::endl;
+            // Fallback: zero out recovered blocks
+            for (int i = 0; i < m; ++i) {
+                std::memset(reinterpret_cast<void*>(recovered_addrs[i]), 0, size);
+            }
+            return;
+        }
+
+        // Step 4: Extract decode coefficients (m rows from A_inv at lost positions)
+        std::vector<unsigned char> decode_mat(m * k);
+        for (int i = 0; i < m; ++i) {
+            int lost_pos = lost_positions[i];
+            for (int col = 0; col < k; ++col) {
+                decode_mat[i * k + col] = A_inv[lost_pos * k + col];
+            }
+        }
+
+        // Step 5: Generate decode tables
+        size_t decode_tbls_size = 32 * (size_t)k * (size_t)m;
+        std::vector<unsigned char> decode_tbls(decode_tbls_size);
+        ec_init_tables(k, m, decode_mat.data(), decode_tbls.data());
+
+        // Step 6: Set up srcs and dests for ec_encode_data
+        std::vector<unsigned char*> srcs(k);
+        for (int i = 0; i < k; ++i) {
+            srcs[i] = reinterpret_cast<unsigned char*>(surviving_addrs[i]);
+        }
+        std::vector<unsigned char*> dests(m);
+        for (int i = 0; i < m; ++i) {
+            dests[i] = reinterpret_cast<unsigned char*>(recovered_addrs[i]);
+        }
+
+        // Decode: ec_encode_data uses the decode tables to recover lost data
+        ec_encode_data(static_cast<int>(size), k, m,
+                       decode_tbls.data(), srcs.data(), dests.data());
+
+        std::cout << "ECNAIVE: RS decode recovery done: k=" << k << " m=" << m
+                  << " lost_pos=[" << lost_positions[0];
+        if (m > 1) std::cout << "," << lost_positions[1];
+        std::cout << "] size=" << size << std::endl;
+    }
+
     // ========== EC-NAIVE Load Mode Submit Interfaces ==========
 
     // Unified load recovery interface (rank2 only)
@@ -5742,6 +5850,15 @@ PYBIND11_MODULE(ecnaive_native, m) {
              pybind11::arg("block1_addr"),
              pybind11::arg("block2_name"),
              pybind11::arg("block2_addr"),
+             pybind11::arg("size"))
+        // RS decode recovery (software recovery, synchronous)
+        .def("submit_ecnaive_decode_recovery", &ECNaiveNative::submit_ecnaive_decode_recovery,
+             "Recover m lost data blocks from k surviving blocks via RS decode (ISA-L)",
+             pybind11::arg("k"),
+             pybind11::arg("m"),
+             pybind11::arg("lost_positions"),
+             pybind11::arg("surviving_addrs"),
+             pybind11::arg("recovered_addrs"),
              pybind11::arg("size"))
         .def("stop", &ECNaiveNative::stop);
 }

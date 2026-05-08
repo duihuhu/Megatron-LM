@@ -444,17 +444,38 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     f"EC-NAIVE --ecnaive-rs-k={ecnaive_k} → group size n={ecnaive_n} must divide "
                     f"world_size={world_size}"
                 )
-        ecnaive_failed_rank = getattr(args, "ecnaive_failed_rank", None)
-        if ecnaive_failed_rank is not None:
+        ecnaive_failed_ranks_str = getattr(args, "ecnaive_failed_ranks", None)
+        if ecnaive_failed_ranks_str is not None:
             if not torch.distributed.is_initialized():
                 raise RuntimeError(
-                    "EC-NAIVE --ecnaive-failed-rank requires torch.distributed to be initialized"
+                    "EC-NAIVE --ecnaive-failed-ranks requires torch.distributed to be initialized"
                 )
-            if ecnaive_failed_rank < 0 or ecnaive_failed_rank >= world_size:
+            # Parse comma-separated list
+            failed_ranks = [int(x.strip()) for x in ecnaive_failed_ranks_str.split(",")]
+            if len(failed_ranks) < 1 or len(failed_ranks) > 2:
                 raise RuntimeError(
-                    f"EC-NAIVE --ecnaive-failed-rank={ecnaive_failed_rank} out of range "
-                    f"[0, {world_size - 1}]"
+                    f"EC-NAIVE --ecnaive-failed-ranks supports 1-2 ranks, got {len(failed_ranks)}"
                 )
+            for fr in failed_ranks:
+                if fr < 0 or fr >= world_size:
+                    raise RuntimeError(
+                        f"EC-NAIVE --ecnaive-failed-ranks rank {fr} out of range [0, {world_size - 1}]"
+                    )
+            if len(failed_ranks) == 2:
+                # Verify both in same group
+                from megatron.core.dist_checkpointing.strategies.ecnaive_manager import ECNAIVEManager
+                mgr = ECNAIVEManager()
+                mgr.ecnaive_n = ecnaive_n
+                mgr.ecnaive_k = ecnaive_k
+                g0 = mgr._get_group_id(failed_ranks[0], world_size)
+                g1 = mgr._get_group_id(failed_ranks[1], world_size)
+                if g0 != g1:
+                    raise RuntimeError(
+                        f"EC-NAIVE --ecnaive-failed-ranks: ranks {failed_ranks[0]} and "
+                        f"{failed_ranks[1]} are in different groups ({g0} vs {g1})"
+                    )
+            # Store parsed list back on args for downstream use
+            args.ecnaive_failed_ranks_parsed = failed_ranks
     if getattr(args, "use_frcheck", False) and (
         args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
     ):
@@ -1246,14 +1267,14 @@ def _load_base_checkpoint(
                     load_ecnaive_legacy_checkpoint_software_recovery,
                     state_dict_from_ecnaive_main_metadata_only,
                 )
-                failed_rank = getattr(args, "ecnaive_failed_rank", None)
-                if failed_rank is not None and torch.distributed.is_initialized():
+                failed_ranks = getattr(args, "ecnaive_failed_ranks_parsed", None)
+                if failed_ranks is not None and torch.distributed.is_initialized():
                     logger.info(
                         f"EC-NAIVE: software recovery mode — "
-                        f"simulating failed rank {failed_rank}"
+                        f"simulating failed ranks {failed_ranks}"
                     )
                     state_dict = load_ecnaive_legacy_checkpoint_software_recovery(
-                        checkpoint_name, failed_rank,
+                        checkpoint_name, failed_ranks,
                     )
                 elif torch.distributed.is_initialized():
                     state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)

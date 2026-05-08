@@ -2306,10 +2306,11 @@ def _add_checkpointing_args(parser):
                        help='Number of data blocks (k) for EC-NAIVE Reed-Solomon encoding. '
                             'Group size n = k + 2 (e.g., k=2 → 2+2=4 ranks, k=6 → 6+2=8 ranks). '
                             'Default 2 preserves the original 2+2 scheme.')
-    group.add_argument('--ecnaive-failed-rank', type=int, default=None,
-                       help='Global rank to simulate as failed for EC-NAIVE software recovery. '
-                            'When set, the specified rank recovers its data blocks from '
-                            'peer ranks in the same encoding group using torch.distributed transfer.')
+    group.add_argument('--ecnaive-failed-ranks', type=str, default=None,
+                       help='Comma-separated global ranks to simulate as failed for EC-NAIVE '
+                            'software recovery. Uses RS decoding (ISA-L) to recover lost data blocks. '
+                            'Supports 1-2 failed ranks per group. '
+                            'E.g. --ecnaive-failed-ranks 2,5')
     group.add_argument('--use-ecnaive-software-failure', action='store_true',
                        help='Enable EC-NAIVE checkpointing for software failure recovery. '
                             'When enabled, rank2 reads d21 from rank3 via network and merges with local d20.')

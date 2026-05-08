@@ -130,7 +130,7 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
     --use-eccheck
     #--use-eccheck-software-failure
-    --ckpt-format torch_dist
+    --ckpt-format torch
     --save-embeddings-separately
     --timing-log-level 2
     --timing-log-option all

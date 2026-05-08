@@ -650,6 +650,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     from .gemini_replicas_legacy import save_gemini_replicas_legacy_checkpoint
                     save_gemini_replicas_legacy_checkpoint(state_dict, checkpoint_name)
                     checkpoint_name = str(Path(checkpoint_name).parent)
+                elif getattr(args, "use_eccheck", False):
+                    from .eccheck_legacy import save_eccheck_legacy_checkpoint
+                    save_eccheck_legacy_checkpoint(state_dict, checkpoint_name)
+                    checkpoint_name = str(Path(checkpoint_name).parent)
                 else:
                     # Save.
                     ensure_directory_exists(checkpoint_name)
@@ -1315,6 +1319,26 @@ def _load_base_checkpoint(
                 raise NotImplementedError(
                     "Loading FRCheck legacy checkpoints is not implemented in the skeleton."
                 )
+            elif getattr(args, "use_eccheck", False):
+                from .eccheck_legacy import (
+                    load_eccheck_legacy_checkpoint,
+                    state_dict_from_eccheck_main_metadata_only,
+                )
+                if torch.distributed.is_initialized():
+                    state_dict = load_eccheck_legacy_checkpoint(checkpoint_name)
+                else:
+                    ckpt_parent_path = Path(
+                        os.path.dirname(checkpoint_name)
+                        if not os.path.isdir(checkpoint_name)
+                        else checkpoint_name
+                    )
+                    marker = next(ckpt_parent_path.glob("eccheck_main_rank*.pt"), None)
+                    if marker is None:
+                        raise FileNotFoundError(
+                            f"No eccheck_main_rank*.pt found in {ckpt_parent_path}"
+                        )
+                    payload = torch.load(str(marker), map_location="cpu", weights_only=False)
+                    state_dict = state_dict_from_eccheck_main_metadata_only(payload)
             else:
                 # ---- Marker-based auto-detection (backward compat) ----
                 ckpt_parent = (
@@ -1397,7 +1421,34 @@ def _load_base_checkpoint(
                             raise NotImplementedError(
                                 "Loading FRCheck legacy checkpoints is not implemented in the skeleton."
                             )
-                        state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
+                        eccheck_marker = None
+                        if torch.distributed.is_initialized():
+                            rank = torch.distributed.get_rank()
+                            eccheck_rank_marker = ckpt_parent_path / f"eccheck_main_rank{rank}.pt"
+                            if eccheck_rank_marker.is_file():
+                                eccheck_marker = str(eccheck_rank_marker)
+                        if eccheck_marker is None:
+                            eccheck_rank0 = ckpt_parent_path / "eccheck_main_rank0.pt"
+                            if eccheck_rank0.is_file():
+                                eccheck_marker = str(eccheck_rank0)
+                        if eccheck_marker is None:
+                            any_eccheck = sorted(ckpt_parent_path.glob("eccheck_main_rank*.pt"))
+                            if any_eccheck:
+                                eccheck_marker = str(any_eccheck[0])
+                        if eccheck_marker is not None:
+                            from .eccheck_legacy import (
+                                load_eccheck_legacy_checkpoint,
+                                state_dict_from_eccheck_main_metadata_only,
+                            )
+                            if torch.distributed.is_initialized():
+                                state_dict = load_eccheck_legacy_checkpoint(checkpoint_name)
+                            else:
+                                payload = torch.load(
+                                    eccheck_marker, map_location="cpu", weights_only=False
+                                )
+                                state_dict = state_dict_from_eccheck_main_metadata_only(payload)
+                        else:
+                            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler
 

@@ -2015,6 +2015,21 @@ struct XorPoolWorkerCtx {
     int wid{0};
 };
 
+// RS decode pthread pool: shared job + per-worker stripe execution
+struct EcDecodeJob {
+    size_t size;
+    int k;       // number of surviving blocks (input to ec_encode_data)
+    int m;       // number of recovered blocks (output from ec_encode_data)
+    const uintptr_t* surviving_addrs;  // [k] input block addresses
+    const uintptr_t* recovered_addrs;  // [m] output block addresses
+    const unsigned char* decode_tbls;  // decode tables (32 * k * m bytes)
+};
+
+struct EcDecodeWorkerCtx {
+    ECNaiveNative* self{nullptr};
+    int wid{0};
+};
+
 class ECNaiveNative {
 public:
     ECNaiveNative(const std::vector<std::string>& send_ips,
@@ -2409,26 +2424,34 @@ public:
             }
         }
 
-        // Step 5: Generate decode tables
+        // Step 5: Generate decode tables (stable, not local temp)
+        // Store as member so pool workers can access it
         size_t decode_tbls_size = 32 * (size_t)k * (size_t)m;
-        std::vector<unsigned char> decode_tbls(decode_tbls_size);
-        ec_init_tables(k, m, decode_mat.data(), decode_tbls.data());
+        ec_decode_tbls_.resize(decode_tbls_size);
+        ec_init_tables(k, m, decode_mat.data(), ec_decode_tbls_.data());
+        ec_decode_have_tbls_ = true;
+        ec_decode_tbls_k_ = k;
+        ec_decode_tbls_m_ = m;
 
-        // Step 6: Set up srcs and dests for ec_encode_data
-        std::vector<unsigned char*> srcs(k);
-        for (int i = 0; i < k; ++i) {
-            srcs[i] = reinterpret_cast<unsigned char*>(surviving_addrs[i]);
+        // Step 6: Lazy-init decode pool on first use
+        if (!ec_decode_inited_.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lk(ec_decode_mutex_);
+            if (!ec_decode_inited_.load(std::memory_order_acquire)) {
+                ec_decode_pool_init();
+            }
         }
-        std::vector<unsigned char*> dests(m);
-        for (int i = 0; i < m; ++i) {
-            dests[i] = reinterpret_cast<unsigned char*>(recovered_addrs[i]);
-        }
 
-        // Decode: ec_encode_data uses the decode tables to recover lost data
-        ec_encode_data(static_cast<int>(size), k, m,
-                       decode_tbls.data(), srcs.data(), dests.data());
+        // Step 7: Dispatch to 16-worker pthread pool
+        EcDecodeJob job;
+        job.size = size;
+        job.k = k;
+        job.m = m;
+        job.surviving_addrs = surviving_addrs.data();
+        job.recovered_addrs = recovered_addrs.data();
+        job.decode_tbls = ec_decode_tbls_.data();
+        ec_decode_pool_run_parallel(job);
 
-        std::cout << "ECNAIVE: RS decode recovery done: k=" << k << " m=" << m
+        std::cout << "ECNAIVE: RS decode recovery done (pool): k=" << k << " m=" << m
                   << " lost_pos=[" << lost_positions[0];
         if (m > 1) std::cout << "," << lost_positions[1];
         std::cout << "] size=" << size << std::endl;
@@ -3014,7 +3037,10 @@ public:
                 load_send_worker_.join();
             }
         }
-        
+
+        // Shut down EC decode pool if initialized (used by software recovery)
+        ec_decode_pool_shutdown();
+
         conn_.cleanup();
     }
 
@@ -3802,6 +3828,27 @@ private:
     std::array<uint64_t, kXorPoolSize> xor_pool_last_epoch_{};
     std::atomic<int> xor_pool_remaining_{0};
     XorStripeFourOps xor_pool_shared_job_{};
+
+    // EC decode pthread pool (same pattern as XOR pool, for RS decode)
+    static constexpr int kEcDecodePoolSize = 16;
+    std::array<pthread_t, kEcDecodePoolSize> ec_decode_threads_{};
+    std::array<EcDecodeWorkerCtx, kEcDecodePoolSize> ec_decode_ctx_{};
+    std::array<int, kEcDecodePoolSize> ec_decode_cpus_{};
+    std::atomic<bool> ec_decode_inited_{false};
+    std::atomic<bool> ec_decode_stop_{false};
+    std::mutex ec_decode_mutex_;
+    std::condition_variable ec_decode_worker_cv_;
+    std::condition_variable ec_decode_coordinator_cv_;
+    std::atomic<uint64_t> ec_decode_epoch_{0};
+    std::array<uint64_t, kEcDecodePoolSize> ec_decode_last_epoch_{};
+    std::atomic<int> ec_decode_remaining_{0};
+    EcDecodeJob ec_decode_shared_job_{};
+    // Per-worker decode table storage: each worker has its own tables
+    // to avoid concurrent access. Tables are initialized before dispatch.
+    bool ec_decode_have_tbls_{false};
+    int ec_decode_tbls_k_{0};
+    int ec_decode_tbls_m_{0};
+    std::vector<unsigned char> ec_decode_tbls_;  // stable storage for decode tables
 
     // EC-NAIVE load mode completion flags
     std::atomic<bool> load_recv_worker_completed_{false};
@@ -5047,6 +5094,136 @@ private:
 
     void xor_pool_run_parallel_load_xor(const LoadXORTask& task) {
         xor_pool_run_parallel_four_xor(xor_job_from_load_xor_task(task));
+    }
+
+    // ========== EC Decode pthread pool (RS decode, 16 workers) ==========
+
+    void ec_decode_pool_init() {
+        if (ec_decode_inited_.load(std::memory_order_acquire)) {
+            return;
+        }
+        ec_decode_cpus_ = parse_xor_pool_cpus_or_throw();  // reuse same CPU list
+        ec_decode_stop_.store(false, std::memory_order_release);
+        ec_decode_epoch_.store(0, std::memory_order_release);
+        ec_decode_remaining_.store(0, std::memory_order_release);
+        ec_decode_have_tbls_ = false;
+        for (auto& e : ec_decode_last_epoch_) e = 0;
+
+        for (int i = 0; i < kEcDecodePoolSize; ++i) {
+            ec_decode_ctx_[static_cast<size_t>(i)].self = this;
+            ec_decode_ctx_[static_cast<size_t>(i)].wid = i;
+            int rc = pthread_create(
+                &ec_decode_threads_[static_cast<size_t>(i)],
+                nullptr,
+                &ECNaiveNative::ec_decode_pthread_entry,
+                &ec_decode_ctx_[static_cast<size_t>(i)]);
+            if (rc != 0) {
+                ec_decode_stop_.store(true, std::memory_order_release);
+                ec_decode_worker_cv_.notify_all();
+                for (int j = 0; j < i; ++j) {
+                    pthread_join(ec_decode_threads_[static_cast<size_t>(j)], nullptr);
+                }
+                throw std::runtime_error("ECNAIVE: pthread_create for EC decode pool failed: " +
+                                         std::string(std::strerror(rc)));
+            }
+        }
+        ec_decode_inited_.store(true, std::memory_order_release);
+        std::cout << "ECNAIVE: EC decode pthread pool (" << kEcDecodePoolSize
+                  << " workers) initialized" << std::endl;
+    }
+
+    void ec_decode_pool_shutdown() {
+        if (!ec_decode_inited_.load(std::memory_order_acquire)) return;
+        ec_decode_stop_.store(true, std::memory_order_release);
+        ec_decode_worker_cv_.notify_all();
+        for (int i = 0; i < kEcDecodePoolSize; ++i) {
+            pthread_join(ec_decode_threads_[static_cast<size_t>(i)], nullptr);
+        }
+        ec_decode_stop_.store(false, std::memory_order_release);
+        ec_decode_inited_.store(false, std::memory_order_release);
+        std::cout << "ECNAIVE: EC decode pthread pool shut down" << std::endl;
+    }
+
+    static void* ec_decode_pthread_entry(void* arg) {
+        auto* ctx = static_cast<EcDecodeWorkerCtx*>(arg);
+        ctx->self->ec_decode_worker_loop(ctx->wid);
+        return nullptr;
+    }
+
+    void ec_decode_execute_stripe(const EcDecodeJob& job, int wid) {
+        const size_t total = job.size;
+        const size_t base = total / static_cast<size_t>(kEcDecodePoolSize);
+        const size_t rem  = total % static_cast<size_t>(kEcDecodePoolSize);
+        size_t off, len;
+        if (wid < kEcDecodePoolSize - 1) {
+            off = static_cast<size_t>(wid) * base;
+            len = base;
+        } else {
+            off = static_cast<size_t>(kEcDecodePoolSize - 1) * base;
+            len = base + rem;
+        }
+        if (len == 0) return;
+
+        // Build per-stripe address arrays
+        std::vector<unsigned char*> srcs(static_cast<size_t>(job.k));
+        std::vector<unsigned char*> dests(static_cast<size_t>(job.m));
+        for (int i = 0; i < job.k; ++i) {
+            srcs[static_cast<size_t>(i)] =
+                reinterpret_cast<unsigned char*>(job.surviving_addrs[i] + off);
+        }
+        for (int i = 0; i < job.m; ++i) {
+            dests[static_cast<size_t>(i)] =
+                reinterpret_cast<unsigned char*>(job.recovered_addrs[i] + off);
+        }
+        ec_encode_data(static_cast<int>(len), job.k, job.m,
+                       job.decode_tbls, srcs.data(), dests.data());
+    }
+
+    void ec_decode_worker_loop(int wid) {
+        const int cpu = ec_decode_cpus_[static_cast<size_t>(wid)];
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (cpu >= 0 && static_cast<unsigned>(cpu) < CPU_SETSIZE) {
+            CPU_SET(static_cast<unsigned>(cpu), &cpuset);
+            pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+        }
+        while (true) {
+            std::unique_lock<std::mutex> lk(ec_decode_mutex_);
+            ec_decode_worker_cv_.wait(lk, [&] {
+                return ec_decode_stop_.load(std::memory_order_acquire) ||
+                       ec_decode_last_epoch_[static_cast<size_t>(wid)] <
+                           ec_decode_epoch_.load(std::memory_order_acquire);
+            });
+            if (ec_decode_stop_.load(std::memory_order_acquire)) break;
+            uint64_t e = ec_decode_epoch_.load(std::memory_order_acquire);
+            EcDecodeJob local_copy = ec_decode_shared_job_;
+            lk.unlock();
+
+            ec_decode_execute_stripe(local_copy, wid);
+
+            {
+                std::lock_guard<std::mutex> guard(ec_decode_mutex_);
+                ec_decode_last_epoch_[static_cast<size_t>(wid)] = e;
+                int rem = ec_decode_remaining_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+                if (rem == 0) ec_decode_coordinator_cv_.notify_one();
+            }
+        }
+    }
+
+    void ec_decode_pool_run_parallel(const EcDecodeJob& job) {
+        {
+            std::lock_guard<std::mutex> publish(ec_decode_mutex_);
+            if (stop_.load(std::memory_order_acquire)) return;
+            ec_decode_shared_job_ = job;
+            ec_decode_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            ec_decode_remaining_.store(kEcDecodePoolSize, std::memory_order_release);
+        }
+        ec_decode_worker_cv_.notify_all();
+        std::unique_lock<std::mutex> lk(ec_decode_mutex_);
+        ec_decode_coordinator_cv_.wait(lk, [&] {
+            return ec_decode_remaining_.load(std::memory_order_acquire) == 0 ||
+                   stop_.load(std::memory_order_acquire);
+        });
     }
 
     // ========== EC-NAIVE Load Mode Workers ==========

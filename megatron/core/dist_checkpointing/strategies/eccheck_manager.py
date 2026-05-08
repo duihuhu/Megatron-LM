@@ -84,35 +84,100 @@ class ECCHECKManager:
         
         self._initialized = True
 
-    @staticmethod
-    def _get_group_id(rank: int, world_size: int) -> int:
-        """Get group id for multi-rank. Groups: 0,2,4,6 -> group 0; 1,3,5,7 -> group 1 (8 ranks)."""
-        num_groups = world_size // RANKS_PER_GROUP
+    @classmethod
+    def _get_ranks_per_node(cls) -> int:
+        """Detect ranks per node from CUDA_VISIBLE_DEVICES or torch.cuda."""
+        cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        if cuda_visible_devices:
+            return len(cuda_visible_devices.split(','))
+        if torch.cuda.is_available():
+            return torch.cuda.device_count()
+        return int(os.environ.get('LOCAL_WORLD_SIZE', '1'))
+
+    @classmethod
+    def _get_group_layout(cls, world_size: int) -> Dict[str, int]:
+        """Return EC grouping layout: mode 1 (node-aware) or mode 0 (simple)."""
+        n = RANKS_PER_GROUP
+        if world_size <= 0:
+            return {"mode": 0, "num_groups": 1, "ranks_per_node": 1,
+                    "num_nodes": 1, "clusters": 1}
+        num_groups = max(1, world_size // n)
+        ranks_per_node = cls._get_ranks_per_node()
+        if (world_size >= n and world_size % n == 0
+                and ranks_per_node > 0
+                and world_size % ranks_per_node == 0):
+            num_nodes = world_size // ranks_per_node
+            if num_nodes >= n and num_nodes % n == 0:
+                clusters = num_nodes // n
+                node_aware_groups = ranks_per_node * clusters
+                if node_aware_groups == num_groups:
+                    return {"mode": 1, "num_groups": num_groups,
+                            "ranks_per_node": ranks_per_node,
+                            "num_nodes": num_nodes, "clusters": clusters}
+        return {"mode": 0, "num_groups": num_groups,
+                "ranks_per_node": max(1, ranks_per_node),
+                "num_nodes": max(1, world_size // max(1, ranks_per_node)),
+                "clusters": 1}
+
+    @classmethod
+    def _get_group_id(cls, rank: int, world_size: int) -> int:
+        """Get group id for multi-rank (mode 0 or mode 1)."""
+        layout = cls._get_group_layout(world_size)
+        num_groups = layout["num_groups"]
+        if layout["mode"] == 1:
+            ranks_per_node = layout["ranks_per_node"]
+            clusters = layout["clusters"]
+            node_id = rank // ranks_per_node
+            local_rank = rank % ranks_per_node
+            cluster_id = node_id % clusters
+            return local_rank * clusters + cluster_id
         return rank % num_groups
 
-    @staticmethod
-    def _get_rank_in_group(rank: int, world_size: int) -> int:
-        """Get rank index within group (0..3). Same group logic as _get_group_id."""
-        num_groups = world_size // RANKS_PER_GROUP
+    @classmethod
+    def _get_rank_in_group(cls, rank: int, world_size: int) -> int:
+        """Get rank index within group (0..3), mode 0 or mode 1."""
+        layout = cls._get_group_layout(world_size)
+        num_groups = layout["num_groups"]
+        if layout["mode"] == 1:
+            ranks_per_node = layout["ranks_per_node"]
+            clusters = layout["clusters"]
+            node_id = rank // ranks_per_node
+            return node_id // clusters
         return rank // num_groups
+
+    @classmethod
+    def _get_rank_by_group_position(
+        cls, group_id: int, rank_in_group: int, world_size: int
+    ) -> int:
+        """Map (group_id, rank_in_group) -> global rank."""
+        layout = cls._get_group_layout(world_size)
+        num_groups = layout["num_groups"]
+        if layout["mode"] == 1:
+            ranks_per_node = layout["ranks_per_node"]
+            clusters = layout["clusters"]
+            local_rank = group_id // clusters
+            cluster_id = group_id % clusters
+            node_id = rank_in_group * clusters + cluster_id
+            return node_id * ranks_per_node + local_rank
+        return group_id + num_groups * rank_in_group
 
     def _get_xor_paired_rank(self, my_rank: int, world_size: int) -> int:
         """Get the paired rank for parity exchange (XOR pairing within group).
 
         Multi-rank: world_size must be divisible by 4. Each group of 4 ranks uses
         same pairing as original 4-rank: in-group 0<->2, 1<->3 (by position).
-        E.g. 8 ranks: group0={0,2,4,6} -> 0<->4, 2<->6; group1={1,3,5,7} -> 1<->5, 3<->7.
         """
         if world_size % RANKS_PER_GROUP != 0:
             raise ValueError(
                 f"EC-CHECK: World size must be divisible by {RANKS_PER_GROUP} for multi-rank, got {world_size}"
             )
-        num_groups = world_size // RANKS_PER_GROUP
         group_id = self._get_group_id(my_rank, world_size)
         rank_in_group = self._get_rank_in_group(my_rank, world_size)
         # In-group XOR pairing: position 0<->2, 1<->3
         paired_rank_in_group = (rank_in_group + 2) % RANKS_PER_GROUP
-        paired_rank = group_id + num_groups * paired_rank_in_group
+        paired_rank = self._get_rank_by_group_position(
+            group_id, paired_rank_in_group, world_size
+        )
         logger.debug(
             f"EC-CHECK: Rank {my_rank} (group_id={group_id}, rank_in_group={rank_in_group}) "
             f"XOR paired with Rank {paired_rank}"
@@ -121,66 +186,44 @@ class ECCHECKManager:
 
     def get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank for data/parity exchange.
-        
-        P2P pairing rules (different from XOR pairing):
-        - Rank 0 ↔ Rank 1 (P2P)
-        - Rank 2 ↔ Rank 3 (P2P)
-        
-        XOR pairing (for reference):
-        - Rank 0 ↔ Rank 2 (XOR)
-        - Rank 1 ↔ Rank 3 (XOR)
-        
-        Args:
-            my_rank (int): Current rank
-            world_size (int): Total number of ranks
-            
-        Returns:
-            int: P2P partner rank
+
+        P2P pairing within each EC group:
+        - rank_in_group 0 <-> 1 (P2P pair)
+        - rank_in_group 2 <-> 3 (P2P pair)
         """
         if world_size % 2 != 0:
             raise ValueError(f"EC-CHECK: World size must be even for P2P pairing, got {world_size}")
-        
-        # P2P pairing: adjacent ranks in pairs
-        # For 4-rank setup: (0,1) and (2,3)
-        if my_rank % 2 == 0:
-            # Even rank: pair with next rank
-            p2p_partner_rank = my_rank + 1
+        group_id = self._get_group_id(my_rank, world_size)
+        rank_in_group = self._get_rank_in_group(my_rank, world_size)
+        if rank_in_group % 2 == 0:
+            partner_rig = rank_in_group + 1
         else:
-            # Odd rank: pair with previous rank
-            p2p_partner_rank = my_rank - 1
-        
-        # Ensure partner rank is valid
-        if p2p_partner_rank < 0 or p2p_partner_rank >= world_size:
-            raise ValueError(f"EC-CHECK: Invalid P2P partner rank {p2p_partner_rank} for rank {my_rank}")
-        
-        logger.debug(f"EC-CHECK: Rank {my_rank} P2P partner is Rank {p2p_partner_rank}")
+            partner_rig = rank_in_group - 1
+        p2p_partner_rank = self._get_rank_by_group_position(
+            group_id, partner_rig, world_size
+        )
+        logger.debug(
+            f"EC-CHECK: Rank {my_rank} (group_id={group_id}, rank_in_group={rank_in_group}) "
+            f"P2P partner is Rank {p2p_partner_rank}"
+        )
         return p2p_partner_rank
 
     def get_recovery_partner_rank_for_rank1_software(self, my_rank: int, world_size: int) -> int:
-        """Get recovery partner for rank_in_group=1 software failure (node1 failure).
+        """Get recovery partner for rank_in_group=1 software failure.
 
-        Recovery pairing: same EC group, rank_in_group 0 sends to rank_in_group 1.
-        - rank_in_group 0: partner = rank + num_groups (receiver to send to).
-        - rank_in_group 1: partner = rank % num_groups (sender to recv from).
-        For 4-rank: same as P2P (0<->1). For 8-rank: (0->2), (1->3).
-
-        Args:
-            my_rank (int): Current rank
-            world_size (int): Total number of ranks
-
-        Returns:
-            int: Recovery partner rank, or -1 if not participating (rank_in_group 2/3).
+        Within the same EC group, rank_in_group 0 sends to rank_in_group 1.
+        Returns -1 for rank_in_group 2/3 (not participating).
         """
         if world_size < 4 or world_size % 4 != 0:
             raise ValueError(
                 f"EC-CHECK: world_size must be >=4 and divisible by 4 for recovery, got {world_size}"
             )
-        num_groups = world_size // 4
-        rank_in_group = my_rank // num_groups
+        group_id = self._get_group_id(my_rank, world_size)
+        rank_in_group = self._get_rank_in_group(my_rank, world_size)
         if rank_in_group == 0:
-            return my_rank + num_groups
+            return self._get_rank_by_group_position(group_id, 1, world_size)
         if rank_in_group == 1:
-            return my_rank % num_groups
+            return self._get_rank_by_group_position(group_id, 0, world_size)
         return -1
 
     def _get_eccheck_network_config(self, rank: int, world_size: int) -> dict:
@@ -287,6 +330,9 @@ class ECCHECKManager:
             logger.info("EC-CHECK: Distributed not initialized, using local IP for all partners")
             rank_ips = {r: base_ip for r in range(world_size)}
 
+        group_id = self._get_group_id(rank, world_size)
+        rank_in_group = self._get_rank_in_group(rank, world_size)
+
         config = {
             'my_ip': base_ip,
             'base_port': base_port,
@@ -294,17 +340,20 @@ class ECCHECKManager:
             'p2p_partner_ip': p2p_partner_ip,
             'ports': ports,
             'rank_ips': rank_ips,
+            'rank_in_group': rank_in_group,
+            'group_id': group_id,
         }
-        
+
         logger.info(
             f"EC-CHECK: [Rank {rank}] Network config:\n"
             f"  My IP: {config['my_ip']}\n"
             f"  Base port: {config['base_port']}\n"
             f"  XOR partner IP: {config['xor_partner_ip']}\n"
             f"  P2P partner IP: {config['p2p_partner_ip']}\n"
+            f"  Group: {group_id}, Rank in group: {rank_in_group}\n"
             f"  Ports: {config['ports']}"
         )
-        
+
         return config
     
     def init_eccheck_if_enabled(self):
@@ -435,12 +484,13 @@ class ECCHECKManager:
                     
                     # Step6 P2P: rank_in_group 3 sends to rank_in_group 2 in same group
                     # rank_in_group 2 listens on step6_p2p_recv port (multi-rank: per-group)
-                    num_groups = world_size // RANKS_PER_GROUP
                     group_id = self._get_group_id(rank, world_size)
                     rank_in_group = self._get_rank_in_group(rank, world_size)
                     rank_ips = net_config.get('rank_ips', {})
                     if rank_in_group == 3:
-                        step6_p2p_partner_rank = group_id + num_groups * 2
+                        step6_p2p_partner_rank = self._get_rank_by_group_position(
+                            group_id, 2, world_size
+                        )
                         step6_p2p_partner_ip = rank_ips.get(step6_p2p_partner_rank, net_config['my_ip'])
                         step6_p2p_send_port = base_port + step6_p2p_partner_rank * 6 + 5
                         step6_p2p_listen_ip = ""

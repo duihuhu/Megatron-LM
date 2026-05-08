@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <pthread.h>
 
 // 64-bit network byte order conversion functions (for large data transfers > 4GB)
 inline uint64_t htonll(uint64_t value) {
@@ -1229,6 +1230,22 @@ struct LayerWiseLoadTask {
     std::vector<TensorTransferInfo> gpu_tensors;
 };
 
+// ── XOR thread pool (16 workers + CPU affinity, matches ecnaive xor_pool) ────
+static constexpr int kEclatinXorPoolSize = 16;
+static constexpr const char* kEclatinXorCpuListEnv = "ECLATIN_XOR_CPU_LIST";
+
+struct EclatinXorJob {
+    int len = 0;
+    uintptr_t dst = 0;
+    uintptr_t src1 = 0;
+    uintptr_t src2 = 0;
+};
+
+struct EclatinXorPoolCtx {
+    class ECLATINNative* self = nullptr;
+    int wid = 0;
+};
+
 class ECLATINNative {
 public:
     ECLATINNative(const std::string& parity1_send1_ip, uint16_t parity1_send1_port,
@@ -1614,6 +1631,7 @@ public:
         if (parity2_send2_thread_.joinable()) parity2_send2_thread_.join();
         if (layerwise_worker_thread_.joinable()) layerwise_worker_thread_.join();
         if (layerwise_load_worker_thread_.joinable()) layerwise_load_worker_thread_.join();
+        xor_pool_shutdown();
 #if RDMA_AVAILABLE
         cleanup_rdma_resources();
 #endif
@@ -2481,7 +2499,23 @@ private:
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_LOAD_CHANNELS> rdma_load_channels_;
 #endif
 
+    // ── XOR thread pool (matches ecnaive xor_pool) ──────
+    std::array<pthread_t, kEclatinXorPoolSize> xor_pool_threads_{};
+    std::array<EclatinXorPoolCtx, kEclatinXorPoolSize> xor_pool_ctx_{};
+    std::array<int, kEclatinXorPoolSize> xor_pool_cpus_{};
+    std::atomic<bool> xor_pool_inited_{false};
+    std::atomic<bool> xor_pool_stop_{false};
+    std::mutex xor_pool_mutex_;
+    std::condition_variable xor_pool_worker_cv_;
+    std::condition_variable xor_pool_coordinator_cv_;
+    std::atomic<uint64_t> xor_pool_epoch_{0};
+    std::array<uint64_t, kEclatinXorPoolSize> xor_pool_last_epoch_{};
+    std::atomic<int> xor_pool_remaining_{0};
+    EclatinXorJob xor_pool_shared_job_{};
+    std::mutex xor_pool_work_mutex_;  // serialize parity1/parity2 pool dispatch
+
     void start_threads() {
+        xor_pool_init();
         std::cout << "ECLATIN: Starting worker threads..." << std::endl;
         parity1_send1_thread_ = std::thread(&ECLATINNative::parity1_send1_worker, this);
         parity1_send2_thread_ = std::thread(&ECLATINNative::parity1_send2_worker, this);
@@ -2493,6 +2527,161 @@ private:
         layerwise_load_worker_thread_ = std::thread(&ECLATINNative::layerwise_load_worker, this);
         std::cout << "ECLATIN: All worker threads started (including layerwise load)" << std::endl;
     }
+
+    // ── XOR pool methods ──────────────────────────────────────────────
+
+    static std::array<int, kEclatinXorPoolSize> xor_parse_cpus() {
+        std::array<int, kEclatinXorPoolSize> cpus{};
+        const char* env = std::getenv(kEclatinXorCpuListEnv);
+        if (!env || !*env) {
+            for (int i = 0; i < kEclatinXorPoolSize; ++i)
+                cpus[static_cast<size_t>(i)] = i;
+            std::cout << "ECLATIN: " << kEclatinXorCpuListEnv
+                      << " not set; XOR pool binds workers to CPUs 0.."
+                      << (kEclatinXorPoolSize - 1) << std::endl;
+            return cpus;
+        }
+        std::vector<int> parsed;
+        const char* p = env;
+        while (*p) {
+            while (*p && (std::isspace(static_cast<unsigned char>(*p)) || *p == ','))
+                ++p;
+            if (!*p) break;
+            char* end = nullptr;
+            long v = std::strtol(p, &end, 10);
+            if (end == p || v < 0 || v > 65535)
+                throw std::runtime_error(std::string(kEclatinXorCpuListEnv) + ": invalid CPU id token");
+            parsed.push_back(static_cast<int>(v));
+            p = end;
+        }
+        if (parsed.size() != static_cast<size_t>(kEclatinXorPoolSize))
+            throw std::runtime_error(
+                std::string(kEclatinXorCpuListEnv) +
+                " must contain exactly 16 comma-separated CPU ids (or unset to use 0..15)");
+        for (size_t i = 0; i < cpus.size(); ++i)
+            cpus[i] = parsed[i];
+        return cpus;
+    }
+
+    void xor_pool_init() {
+        if (xor_pool_inited_.load(std::memory_order_acquire)) return;
+        xor_pool_cpus_ = xor_parse_cpus();
+        xor_pool_stop_.store(false, std::memory_order_release);
+        xor_pool_epoch_.store(0, std::memory_order_release);
+        xor_pool_remaining_.store(0, std::memory_order_release);
+        for (auto& e : xor_pool_last_epoch_) e = 0;
+        for (int i = 0; i < kEclatinXorPoolSize; ++i) {
+            xor_pool_ctx_[static_cast<size_t>(i)].self = this;
+            xor_pool_ctx_[static_cast<size_t>(i)].wid = i;
+            int rc = pthread_create(&xor_pool_threads_[static_cast<size_t>(i)], nullptr,
+                                    &ECLATINNative::xor_pool_pthread_entry,
+                                    &xor_pool_ctx_[static_cast<size_t>(i)]);
+            if (rc != 0) {
+                xor_pool_stop_.store(true, std::memory_order_release);
+                xor_pool_worker_cv_.notify_all();
+                for (int j = 0; j < i; ++j)
+                    pthread_join(xor_pool_threads_[static_cast<size_t>(j)], nullptr);
+                throw std::runtime_error("ECLATIN: pthread_create for XOR pool failed: " +
+                                         std::string(std::strerror(rc)));
+            }
+        }
+        xor_pool_inited_.store(true, std::memory_order_release);
+        std::cout << "ECLATIN: XOR pthread pool (" << kEclatinXorPoolSize
+                  << " workers) initialized" << std::endl;
+    }
+
+    void xor_pool_shutdown() {
+        if (!xor_pool_inited_.load(std::memory_order_acquire)) return;
+        xor_pool_stop_.store(true, std::memory_order_release);
+        xor_pool_worker_cv_.notify_all();
+        for (int i = 0; i < kEclatinXorPoolSize; ++i)
+            pthread_join(xor_pool_threads_[static_cast<size_t>(i)], nullptr);
+        xor_pool_stop_.store(false, std::memory_order_release);
+        xor_pool_inited_.store(false, std::memory_order_release);
+        std::cout << "ECLATIN: XOR pthread pool shut down" << std::endl;
+    }
+
+    static void* xor_pool_pthread_entry(void* arg) {
+        auto* ctx = static_cast<EclatinXorPoolCtx*>(arg);
+        ctx->self->xor_pool_worker_loop(ctx->wid);
+        return nullptr;
+    }
+
+    void xor_pool_execute_chunk(const EclatinXorJob& job, int wid) {
+        const size_t total = static_cast<size_t>(job.len);
+        const size_t base = total / static_cast<size_t>(kEclatinXorPoolSize);
+        const size_t rem = total % static_cast<size_t>(kEclatinXorPoolSize);
+        size_t off, len;
+        if (wid < kEclatinXorPoolSize - 1) {
+            off = static_cast<size_t>(wid) * base;
+            len = base;
+        } else {
+            off = static_cast<size_t>(kEclatinXorPoolSize - 1) * base;
+            len = base + rem;
+        }
+        if (len == 0) return;
+
+        uint8_t* dst = reinterpret_cast<uint8_t*>(job.dst) + off;
+        uint8_t* s1  = reinterpret_cast<uint8_t*>(job.src1) + off;
+        uint8_t* s2  = reinterpret_cast<uint8_t*>(job.src2) + off;
+
+        void* xa[3] = {dst, s1, s2};
+        xor_gen(3, static_cast<int>(len), xa);
+    }
+
+    void xor_pool_worker_loop(int wid) {
+        const int cpu = xor_pool_cpus_[static_cast<size_t>(wid)];
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (cpu >= 0 && static_cast<unsigned>(cpu) < CPU_SETSIZE) {
+            CPU_SET(static_cast<unsigned>(cpu), &cpuset);
+            int af = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+            if (af != 0)
+                std::cerr << "ECLATIN: xor_pool worker " << wid
+                          << " pthread_setaffinity_np failed: " << af << std::endl;
+        }
+
+        while (true) {
+            std::unique_lock<std::mutex> lk(xor_pool_mutex_);
+            xor_pool_worker_cv_.wait(lk, [&] {
+                return xor_pool_stop_.load(std::memory_order_acquire) ||
+                       (xor_pool_last_epoch_[static_cast<size_t>(wid)] <
+                        xor_pool_epoch_.load(std::memory_order_acquire));
+            });
+            if (xor_pool_stop_.load(std::memory_order_acquire)) break;
+            uint64_t e = xor_pool_epoch_.load(std::memory_order_acquire);
+            EclatinXorJob local_copy = xor_pool_shared_job_;
+            lk.unlock();
+
+            xor_pool_execute_chunk(local_copy, wid);
+
+            {
+                std::lock_guard<std::mutex> guard(xor_pool_mutex_);
+                xor_pool_last_epoch_[static_cast<size_t>(wid)] = e;
+            }
+            int left = xor_pool_remaining_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (left == 0)
+                xor_pool_coordinator_cv_.notify_one();
+        }
+    }
+
+    void xor_pool_run_parallel(uintptr_t dst, uintptr_t src1, uintptr_t src2, int len) {
+        {
+            std::lock_guard<std::mutex> publish(xor_pool_mutex_);
+            if (stop_.load(std::memory_order_acquire)) return;
+            xor_pool_shared_job_ = EclatinXorJob{len, dst, src1, src2};
+            xor_pool_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            xor_pool_remaining_.store(kEclatinXorPoolSize, std::memory_order_release);
+        }
+        xor_pool_worker_cv_.notify_all();
+        std::unique_lock<std::mutex> lk(xor_pool_mutex_);
+        xor_pool_coordinator_cv_.wait(lk, [&] {
+            return xor_pool_remaining_.load(std::memory_order_acquire) == 0 ||
+                   stop_.load(std::memory_order_acquire);
+        });
+    }
+
+    // ── Connection initialization ─────────────────────────────────────
 
     void init_connections() {
         std::cout << "ECLATIN: Initializing connections..." << std::endl;
@@ -2972,18 +3161,14 @@ private:
                 throw std::runtime_error(recv2_error_msg);
             }
 
-            // XOR after both recvs succeed
+            // XOR after both recvs succeed → dispatch to 16-worker pool
             auto xor_start = std::chrono::high_resolution_clock::now();
-            unsigned char* recv1_ptr = reinterpret_cast<unsigned char*>(task.recv1_addr);
-            unsigned char* recv2_ptr = reinterpret_cast<unsigned char*>(task.recv2_addr);
-            unsigned char* parity_ptr = reinterpret_cast<unsigned char*>(task.parity_addr);
-
-            void* xor_array[3];
-            xor_array[0] = recv1_ptr;
-            xor_array[1] = recv2_ptr;
-            xor_array[2] = parity_ptr;
-            xor_gen(3, static_cast<int>(task.size), xor_array);
-            
+            // XOR: parity = parity ⊕ recv1 ⊕ recv2  (parity pre-zeroed, result → parity)
+            {
+                std::lock_guard<std::mutex> pool_lk(xor_pool_work_mutex_);
+                xor_pool_run_parallel(task.parity_addr, task.recv1_addr, task.recv2_addr,
+                                       static_cast<int>(task.size));
+            }
             auto xor_end = std::chrono::high_resolution_clock::now();
             double xor_time_ms = std::chrono::duration<double, std::milli>(xor_end - xor_start).count();
             total_xor_time_ms_.store(total_xor_time_ms_.load() + xor_time_ms);
@@ -2991,7 +3176,6 @@ private:
             xor_count_++;
 
             // Release recv buffers after XOR operation completes
-            // Note: parity_addr is managed by Python, not released here
             {
                 std::lock_guard<std::mutex> lk(release_queue_mutex_);
                 recv_buffers_to_release_.push(task.recv1_addr);
@@ -3319,18 +3503,13 @@ private:
                 throw std::runtime_error(recv2_error_msg);
             }
 
-            // XOR after both recvs succeed
+            // XOR after both recvs succeed → dispatch to 16-worker pool
             auto xor_start = std::chrono::high_resolution_clock::now();
-            unsigned char* recv1_ptr = reinterpret_cast<unsigned char*>(task.recv1_addr);
-            unsigned char* recv2_ptr = reinterpret_cast<unsigned char*>(task.recv2_addr);
-            unsigned char* parity_ptr = reinterpret_cast<unsigned char*>(task.parity_addr);
-
-            void* xor_array[3];
-            xor_array[0] = recv1_ptr;
-            xor_array[1] = recv2_ptr;
-            xor_array[2] = parity_ptr;
-            xor_gen(3, static_cast<int>(task.size), xor_array);
-            
+            {
+                std::lock_guard<std::mutex> pool_lk(xor_pool_work_mutex_);
+                xor_pool_run_parallel(task.parity_addr, task.recv1_addr, task.recv2_addr,
+                                       static_cast<int>(task.size));
+            }
             auto xor_end = std::chrono::high_resolution_clock::now();
             double xor_time_ms = std::chrono::duration<double, std::milli>(xor_end - xor_start).count();
             total_xor_time_ms_.store(total_xor_time_ms_.load() + xor_time_ms);
@@ -3338,7 +3517,6 @@ private:
             xor_count_++;
 
             // Release recv buffers after XOR operation completes
-            // Note: parity_addr is managed by Python, not released here
             {
                 std::lock_guard<std::mutex> lk(release_queue_mutex_);
                 recv_buffers_to_release_.push(task.recv1_addr);

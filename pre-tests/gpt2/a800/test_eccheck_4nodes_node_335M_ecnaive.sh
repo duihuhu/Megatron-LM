@@ -24,6 +24,8 @@ export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECNAIVE_INTERFACE=$NETIFACES_INTERFACE
 export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
 export MEGATRON_ECNAIVE_LOAD_NET_TRACE=1
+export ECNAIVE_LOCAL_RANK_NIC_0=bond0
+export ECNAIVE_LOCAL_RANK_NIC_1=bond0
 #  priority from
 #  ┌──────────────────────────────────────────┬──────────────────────────┐
 #  │                 环境变量                 │           用途           │
@@ -132,7 +134,7 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 1
+    --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 4
 )
 
@@ -141,7 +143,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH
+    #--load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
@@ -163,7 +165,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --- EC-NAIVE generalized parameters ---
      --ecnaive-rs-k 2             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
     #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
-     --ecnaive-failed-ranks 1,2   # Comma-separated failed global ranks for software recovery
+    #--ecnaive-failed-ranks 1,2   # Comma-separated failed global ranks for software recovery
     #                                Uses ISA-L RS decoding (GF(2^8)) to recover 1-2 lost blocks
 )
 

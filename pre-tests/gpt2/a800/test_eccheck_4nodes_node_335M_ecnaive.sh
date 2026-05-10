@@ -21,8 +21,25 @@ NNODES=4
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
+export ECNAIVE_INTERFACE=$NETIFACES_INTERFACE
 export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
 export MEGATRON_ECNAIVE_LOAD_NET_TRACE=1
+#  priority from
+#  ┌──────────────────────────────────────────┬──────────────────────────┐
+#  │                 环境变量                 │           用途           │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ ECNAIVE_RANK_IP_0=10.0.0.1               │ 每个 rank 显式指定 IP    │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ ECNAIVE_LOCAL_RANK_NIC_0=mlx5_0          │ 每个 local_rank 绑定 NIC │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ ECNAIVE_NIC_LIST + ECNAIVE_RANKS_PER_NIC │ 批量 NIC 分配            │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ ECNAIVE_BASE_IP=10.0.0.1                 │ 所有 rank 同一 IP        │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ ECNAIVE_INTERFACE=bond0                  │ 从指定接口自动检测 IP    │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ MASTER_ADDR                              │ 最终 fallback            │
+#  └──────────────────────────────────────────┴──────────────────────────┘
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -144,9 +161,9 @@ EVAL_AND_LOGGING_ARGS=(
     --timing-log-level 2
 
     # --- EC-NAIVE generalized parameters ---
-    # --ecnaive-rs-k 2             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
+     --ecnaive-rs-k 2             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
     #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
-    # --ecnaive-failed-ranks 2,5   # Comma-separated failed global ranks for software recovery
+     --ecnaive-failed-ranks 1,2   # Comma-separated failed global ranks for software recovery
     #                                Uses ISA-L RS decoding (GF(2^8)) to recover 1-2 lost blocks
 )
 

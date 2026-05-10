@@ -905,9 +905,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # Use maximum size for pipeline synchronization (all ranks use same size)
         own_pipeline_size = max_total_bytes
         partner_pipeline_size = max_total_bytes
-        own_aligned_size = ((own_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
-        partner_aligned_size = ((partner_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
-        
+        own_aligned_size = ((own_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size + 1) * eccheck_buffer_size
+        partner_aligned_size = ((partner_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size + 1) * eccheck_buffer_size
+
         logger.info(
             f"EC-CHECK: Allocating P2P buffers based on metadata\n"
             f"  P2P partner rank: {p2p_partner_rank}\n"
@@ -4801,7 +4801,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             # Calculate aligned sizes
             eccheck_buffer_size = self.eccheck_manager.eccheck_buffer_size
-            needed_own_size = ((max_total_bytes + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
+            needed_own_size = ((max_total_bytes + eccheck_buffer_size - 1) // eccheck_buffer_size + 1) * eccheck_buffer_size
             needed_partner_size = needed_own_size  # Same size for pipeline sync
             
             if (existing_own_size >= needed_own_size and 
@@ -9405,9 +9405,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         eccheck_buffer_size = self.eccheck_manager.eccheck_buffer_size
         own_pipeline_size = max_total_bytes
         partner_pipeline_size = max_total_bytes
-        own_aligned_size = ((own_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
-        partner_aligned_size = ((partner_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size) * eccheck_buffer_size
-        
+        own_aligned_size = ((own_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size + 1) * eccheck_buffer_size
+        partner_aligned_size = ((partner_pipeline_size + eccheck_buffer_size - 1) // eccheck_buffer_size + 1) * eccheck_buffer_size
+
         logger.info(
             f"EC-CHECK: Allocating P2P buffers for load phase based on metadata\n"
             f"  P2P partner rank: {p2p_partner_rank}\n"

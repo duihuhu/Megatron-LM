@@ -140,7 +140,7 @@ def _allocate_eccheck_blocks_legacy(
 
     aligned_size = (
         (max_total_bytes + manager.eccheck_buffer_size - 1)
-        // manager.eccheck_buffer_size
+        // manager.eccheck_buffer_size + 1
     ) * manager.eccheck_buffer_size
 
     own_buffer, partner_buffer = allocate_hugepage_slices(
@@ -270,15 +270,45 @@ def _encode_eccheck_with_native(
 
             recv_chunk_size = take
 
+            # Bounds check: recv buffers (prevent alignment-padding overflow)
             recv_offset_1_aligned = ((recv_offset_1 + 63) // 64) * 64
             recv_offset_2_aligned = ((recv_offset_2 + 63) // 64) * 64
+            recv_rem_1 = recv_buffer_thread1.numel() - recv_offset_1_aligned
+            recv_rem_2 = recv_buffer_thread2.numel() - recv_offset_2_aligned
+            max_recv_space = min(recv_rem_1, recv_rem_2)
+            if take > max_recv_space:
+                if max_recv_space < 64:
+                    logger.warning(
+                        f"ECCHECK legacy: recv buffers exhausted "
+                        f"(rem1={recv_rem_1}, rem2={recv_rem_2}), stopping at "
+                        f"{src_pos / (1024**3):.2f} GB / {pipeline_total_bytes / (1024**3):.2f} GB"
+                    )
+                    break
+                take = max_recv_space
+                recv_chunk_size = take
+
+            # Bounds check: P2P buffers
+            own_offset_aligned = ((own_offset + 63) // 64) * 64
+            partner_offset_aligned = ((partner_offset + 63) // 64) * 64
+            p2p_rem_own = own_buffer.numel() - own_offset_aligned
+            p2p_rem_partner = partner_buffer.numel() - partner_offset_aligned
+            max_p2p_space = min(p2p_rem_own, p2p_rem_partner)
+            if take > max_p2p_space:
+                if max_p2p_space < 64:
+                    logger.warning(
+                        f"ECCHECK legacy: P2P buffers exhausted "
+                        f"(rem_own={p2p_rem_own}, rem_partner={p2p_rem_partner}), stopping at "
+                        f"{src_pos / (1024**3):.2f} GB / {pipeline_total_bytes / (1024**3):.2f} GB"
+                    )
+                    break
+                take = max_p2p_space
+                recv_chunk_size = take
+
             recv_addr_1 = recv_base_1 + recv_offset_1_aligned
             recv_addr_2 = recv_base_2 + recv_offset_2_aligned
             recv_offset_1 = recv_offset_1_aligned + recv_chunk_size
             recv_offset_2 = recv_offset_2_aligned + recv_chunk_size
 
-            own_offset_aligned = ((own_offset + 63) // 64) * 64
-            partner_offset_aligned = ((partner_offset + 63) // 64) * 64
             own_write_addr = own_base + own_offset_aligned
             partner_write_addr = partner_base + partner_offset_aligned
             own_offset = own_offset_aligned + take
@@ -550,47 +580,47 @@ def _load_eccheck_blocks_from_disk_into(
 
 
 # ---------------------------------------------------------------------------
-# Recovery pipeline (load)
+# Recovery helpers
 # ---------------------------------------------------------------------------
 
-def _allocate_eccheck_load_recv_buffers(
-    manager: ECCHECKManager,
-    registry: GlobalMetadataRegistry,
-) -> Dict[str, torch.Tensor]:
-    """Allocate 6 recv buffers for rank_in_group=2 hardware failure recovery.
+def _extract_dense_from_gapped_buffer(
+    gapped_buf: torch.Tensor,
+    chunk_size: int,
+    total_bytes: int,
+) -> torch.Tensor:
+    """Reconstruct a dense byte buffer from a gapped buffer written by C++.
 
-    Buffer names match the C++ load_recover layout:
-    - rank0_data2, rank0_parity2  (from rank_in_group 0)
-    - rank1_data1, rank1_parity1  (from rank_in_group 1)
-    - rank3_data1, rank3_data2    (from rank_in_group 3)
+    The C++ encoding writes chunks at 64-byte-aligned offsets.  Between
+    chunks there may be 0--63 bytes of alignment padding.  This function
+    extracts only the data bytes, producing a contiguous dense buffer.
+
+    Mirrors ``_decode_data0_to_linear_first_half`` in ecnaive_legacy.py.
     """
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    out = torch.zeros(total_bytes, dtype=torch.uint8, device=gapped_buf.device)
+    src_pos = 0       # position in output (dense)
+    buf_offset = 0    # position in gapped_buf
+    buf_size = gapped_buf.numel()
+    while src_pos < total_bytes:
+        remaining = total_bytes - src_pos
+        take = min(chunk_size, remaining)
+        aligned_offset = ((buf_offset + 63) // 64) * 64
+        if aligned_offset + take > buf_size:
+            logger.warning(
+                f"ECCHECK legacy: gapped buffer exhausted at src_pos={src_pos} "
+                f"(buf_size={buf_size}, aligned={aligned_offset}, take={take})"
+            )
+            break
+        out[src_pos : src_pos + take].copy_(
+            gapped_buf[aligned_offset : aligned_offset + take]
+        )
+        buf_offset = aligned_offset + take
+        src_pos += take
+    return out
 
-    max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
-    aligned_size = (
-        (max_total_bytes + manager.eccheck_buffer_size - 1)
-        // manager.eccheck_buffer_size
-    ) * manager.eccheck_buffer_size
 
-    recv_names = [
-        "rank0_data2", "rank0_parity2",
-        "rank1_data1", "rank1_parity1",
-        "rank3_data1", "rank3_data2",
-    ]
-    slices = allocate_hugepage_slices(aligned_size, len(recv_names), touch_pages=True)
-    recv_buffers = {name: slices[i] for i, name in enumerate(recv_names)}
-
-    if manager.use_rdma:
-        for t in slices:
-            manager.register_buffer(t)
-
-    logger.info(
-        f"ECCHECK legacy load: [Rank {rank}] Allocated {len(recv_names)} recv buffers "
-        f"({aligned_size / (1024**3):.2f} GB each, total={len(recv_names) * aligned_size / (1024**3):.2f} GB)"
-    )
-    return recv_buffers
-
+# ---------------------------------------------------------------------------
+# Recovery pipeline (load)
+# ---------------------------------------------------------------------------
 
 def _run_eccheck_legacy_recovery(
     manager: ECCHECKManager,
@@ -602,10 +632,10 @@ def _run_eccheck_legacy_recovery(
     total_size: int,
     registry: GlobalMetadataRegistry,
 ) -> None:
-    """Drive C++ recovery for ECCHECK legacy load.
+    """Drive C++ recovery for ECCHECK legacy load using submit_load_pipeline_chunk.
 
-    Mirrors the send/recv layout from the modern path but uses pre-loaded
-    .pt block files instead of mmap'd .distcp files.
+    Uses the same chunked pipeline API as the modern path but sources data
+    from pre-loaded .pt block buffers instead of mmap files.
     """
     from time import time
 
@@ -619,27 +649,19 @@ def _run_eccheck_legacy_recovery(
 
     rank_in_group = manager._get_rank_in_group(rank, world_size)
 
-    # ---- software failure path (rank_in_group 1 / 2) ----
+    # ---- software failure path ----
     if software_failure:
         if rank_in_group == 2:
             if recovered_buffer is None:
-                raise RuntimeError(
-                    "ECCHECK legacy load: software failure path needs recovered_buffer"
-                )
-            start_t = time()
+                raise RuntimeError("ECCHECK legacy: software failure needs recovered_buffer")
             actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
             own_buf = blocks["own_buffer"].contiguous().view(torch.uint8).reshape(-1)
             if recovered_buffer.numel() >= total_size:
                 n_copy = min(actual_tensor_bytes, total_size)
                 recovered_buffer[:n_copy].copy_(own_buf[:n_copy])
-            logger.info(
-                f"ECCHECK legacy load: rank_in_group 2 software recovery done "
-                f"in {time() - start_t:.2f}s"
-            )
+            logger.info(f"ECCHECK legacy: rank_in_group 2 sw recovery done in {time():.2f}s")
         else:
-            logger.info(
-                f"ECCHECK legacy load: rank_in_group {rank_in_group} no-op for software failure"
-            )
+            logger.info(f"ECCHECK legacy: rank_in_group {rank_in_group} no-op for sw failure")
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return
@@ -647,134 +669,196 @@ def _run_eccheck_legacy_recovery(
     # ---- hardware failure path (rank_in_group 2) ----
     failed_rank = 2
     native.set_load_mode(True, failed_rank)
-    logger.info(f"ECCHECK legacy load: set load mode (failed_rank={failed_rank})")
+    logger.info(f"ECCHECK legacy: set load mode (failed_rank={failed_rank})")
 
-    # Get network config and rank2 IP
-    net_config = manager._get_eccheck_network_config(rank, world_size)
-    rank_ips = net_config.get("rank_ips", {})
+    # Compute pipeline size
+    max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
+    if max_total_bytes == 0:
+        return
+    buffer_size = manager.eccheck_buffer_size
 
-    # Find rank_in_group=2 in our EC group
-    group_id = manager._get_group_id(rank, world_size)
-    rank2_global_rank = None
-    for r in range(world_size):
-        if (manager._get_rank_in_group(r, world_size) == 2
-                and manager._get_group_id(r, world_size) == group_id):
-            rank2_global_rank = r
-            break
-    if rank2_global_rank is None:
-        raise RuntimeError("ECCHECK legacy load: cannot locate rank_in_group=2 in our group")
-    rank2_ip = rank_ips.get(rank2_global_rank, net_config["my_ip"])
+    # Get buffer pools (reuse save-time pools via manager)
+    buffers = manager.get_eccheck_buffers()
+    if buffers is None:
+        raise RuntimeError("ECCHECK legacy: buffer pools not initialized")
+    free_data_queue = buffers["free_data_buffer_queue"]
+    free_encoding_queue = buffers["free_encoding_buffer_queue"]
+    free_parity_queue = buffers["free_parity_buffer_queue"]
+    poll_and_release = buffers.get("poll_and_release_buffers")
+    active_event = buffers.get("buffer_poller_active_event")
 
-    # Build load connection ports following ECLATIN's pattern
-    base_port = net_config["base_port"]
-    load_recv_rank0_data2_port = base_port + rank2_global_rank * 6 + 2
-    load_recv_rank0_parity2_port = base_port + rank2_global_rank * 6 + 3
-    load_recv_rank1_data1_port = base_port + rank2_global_rank * 6 + 0
-    load_recv_rank1_parity1_port = base_port + rank2_global_rank * 6 + 1
-    load_recv_rank3_data1_port = base_port + rank2_global_rank * 6 + 4
-    load_recv_rank3_data2_port = base_port + rank2_global_rank * 6 + 5
+    def _get_free_data():
+        if poll_and_release is not None:
+            poll_and_release()
+        try:
+            return free_data_queue.get(timeout=5.0)
+        except queue.Empty:
+            logger.error("ECCHECK legacy: timeout waiting for free data buffer")
+            return free_data_queue.get()
 
-    if rank_in_group == 2:
-        logger.info("ECCHECK legacy load: rank_in_group 2 init load accept connections")
-        native.init_load_connections(
-            rank_in_group,
-            rank2_ip,
-            load_recv_rank0_data2_port,
-            load_recv_rank0_parity2_port,
-            load_recv_rank1_data1_port,
-            load_recv_rank1_parity1_port,
-            load_recv_rank3_data1_port,
-            load_recv_rank3_data2_port,
+    def _get_free_encoding():
+        if poll_and_release is not None:
+            poll_and_release()
+        try:
+            return free_encoding_queue.get(timeout=5.0)
+        except queue.Empty:
+            logger.error("ECCHECK legacy: timeout waiting for free encoding buffer")
+            return free_encoding_queue.get()
+
+    def _get_free_parity():
+        if poll_and_release is not None:
+            poll_and_release()
+        try:
+            return free_parity_queue.get(timeout=5.0)
+        except queue.Empty:
+            logger.error("ECCHECK legacy: timeout waiting for free parity buffer")
+            return free_parity_queue.get()
+
+    # Ensure recv encoding buffers are allocated
+    if manager.eccheck_recv_encoding_buffers is None:
+        manager.eccheck_recv_encoding_buffers = (
+            manager.allocate_recv_encoding_buffers_phase2(registry)
         )
+    __, recv_buf2 = manager.eccheck_recv_encoding_buffers
+    recv_base2 = int(recv_buf2.data_ptr())
 
-    torch.distributed.barrier()
+    own_base = int(blocks["own_buffer"].data_ptr())
+    partner_base = int(blocks["partner_buffer"].data_ptr())
+    own_buf = blocks["own_buffer"]
+    partner_buf = blocks["partner_buffer"]
 
-    if rank_in_group != 2:
-        logger.info(
-            f"ECCHECK legacy load: rank_in_group {rank_in_group} connecting load send sockets"
-        )
-        native.init_load_connections(
-            rank_in_group,
-            rank2_ip,
-            load_recv_rank0_data2_port,
-            load_recv_rank0_parity2_port,
-            load_recv_rank1_data1_port,
-            load_recv_rank1_parity1_port,
-            load_recv_rank3_data1_port,
-            load_recv_rank3_data2_port,
-        )
+    native.reset_encoding_completion_flags()
+    if active_event is not None:
+        active_event.set()
 
-    native.wait_for_load_connections(timeout_seconds=30)
-    torch.distributed.barrier()
+    processed = 0
+    p2p_partner_offset = 0
+    recv_offset2 = 0
 
     start_t = time()
-    aligned_block_size = blocks["own_buffer"].numel()
+    try:
+        while processed < max_total_bytes:
+            remaining = max_total_bytes - processed
+            take = min(buffer_size, remaining)
 
-    if rank_in_group == 2:
-        if recv_buffers is None or recovered_buffer is None:
-            raise RuntimeError(
-                "ECCHECK legacy load: rank_in_group 2 needs recv_buffers and recovered_buffer"
+            cur_buffer_addr = _get_free_data()
+
+            # Copy source data from pre-loaded P2P block buffers
+            buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
+            buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
+
+            if rank_in_group == 0:
+                src_off = processed
+                bytes_to_copy = min(take, own_buf.numel() - src_off)
+                if bytes_to_copy > 0:
+                    ctypes.memmove(buffer_array.contents,
+                                   own_base + src_off, bytes_to_copy)
+                if take > bytes_to_copy:
+                    ctypes.memset(buffer_array.contents + bytes_to_copy, 0,
+                                  take - bytes_to_copy)
+            elif rank_in_group == 1:
+                src_off = processed
+                bytes_to_copy = min(take, partner_buf.numel() - src_off)
+                if bytes_to_copy > 0:
+                    ctypes.memmove(buffer_array.contents,
+                                   partner_base + src_off, bytes_to_copy)
+                if take > bytes_to_copy:
+                    ctypes.memset(buffer_array.contents + bytes_to_copy, 0,
+                                  take - bytes_to_copy)
+            elif rank_in_group == 3:
+                src_off = processed
+                bytes_to_copy = min(take, own_buf.numel() - src_off)
+                if bytes_to_copy > 0:
+                    ctypes.memmove(buffer_array.contents,
+                                   own_base + src_off, bytes_to_copy)
+                if take > bytes_to_copy:
+                    ctypes.memset(buffer_array.contents + bytes_to_copy, 0,
+                                  take - bytes_to_copy)
+            else:
+                # rank2: fill with zeros, will receive data via network
+                ctypes.memset(buffer_array.contents, 0, take)
+
+            enc_addr2 = _get_free_encoding()
+
+            # Parity and recv: only rank2/3 need these
+            if rank_in_group in (2, 3):
+                parity_addr2 = _get_free_parity()
+                recv_offset2_aligned = ((recv_offset2 + 63) // 64) * 64
+                recv_addr2 = recv_base2 + recv_offset2_aligned
+                recv_chunk_size = take
+                recv_offset2 = recv_offset2_aligned + recv_chunk_size
+            else:
+                parity_addr2 = 0
+                recv_addr2 = 0
+                recv_chunk_size = 0
+
+            # Step2 P2P: rank0/3 send partner data; rank1/2 recv
+            if rank_in_group in (0, 3):
+                step2_send_addr = partner_base + processed
+                step2_recv_data_addr = 0
+                step2_size = take
+            elif rank_in_group in (1, 2):
+                step2_send_addr = 0
+                step2_recv_data_addr = cur_buffer_addr
+                step2_size = take
+            else:
+                step2_send_addr = 0
+                step2_recv_data_addr = 0
+                step2_size = 0
+
+            # Step6 P2P: rank2 receives d3 from rank3
+            if rank_in_group == 2:
+                p2p_partner_offset_aligned = ((p2p_partner_offset + 63) // 64) * 64
+                p2p_partner_write = partner_base + p2p_partner_offset_aligned
+                p2p_partner_offset = p2p_partner_offset_aligned + take
+            else:
+                p2p_partner_write = 0
+
+            native.submit_load_pipeline_chunk(
+                step2_send_addr=step2_send_addr,
+                step2_recv_data_addr=step2_recv_data_addr,
+                step2_size=step2_size,
+                data_addr=cur_buffer_addr,
+                size=take,
+                encoding_addr=enc_addr2,
+                recv_addr=recv_addr2,
+                recv_chunk_size=recv_chunk_size,
+                parity_addr=parity_addr2,
+                p2p_partner_write_addr=p2p_partner_write,
             )
-        required_keys = [
-            "rank0_data2", "rank0_parity2",
-            "rank1_data1", "rank1_parity1",
-            "rank3_data1", "rank3_data2",
-        ]
-        missing = [k for k in required_keys if k not in recv_buffers]
-        if missing:
-            raise RuntimeError(f"ECCHECK legacy load: missing recv buffers {missing}")
 
-        recv_addrs = {k: int(recv_buffers[k].data_ptr()) for k in required_keys}
-        out_own = int(blocks["own_buffer"].data_ptr())
-        out_partner = int(blocks["partner_buffer"].data_ptr())
+            processed += take
 
-        native.load_recover(
-            recv_addrs["rank0_data2"],
-            recv_addrs["rank0_parity2"],
-            recv_addrs["rank1_data1"],
-            recv_addrs["rank1_parity1"],
-            recv_addrs["rank3_data1"],
-            recv_addrs["rank3_data2"],
-            out_own,
-            out_partner,
-            aligned_block_size,
-        )
+        # Sentinels and completion
+        native.submit_load_encoding_sentinel()
+        native.wait_for_xor_worker_completion()
 
-        actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
-        own_flat = blocks["own_buffer"].contiguous().view(torch.uint8).reshape(-1)
-        if recovered_buffer.numel() >= total_size:
-            n_copy = min(actual_tensor_bytes, total_size)
-            recovered_buffer[:n_copy].copy_(own_flat[:n_copy])
-        logger.info(
-            f"ECCHECK legacy load: rank_in_group 2 recovery done in {time() - start_t:.4f}s"
-        )
+        if rank_in_group in (2, 3):
+            native.submit_load_step6_p2p_sentinel()
 
-    elif rank_in_group == 0:
-        partner_base = int(blocks["partner_buffer"].data_ptr())
-        native.load_send_blocks(
-            "rank0_data2", partner_base,
-            "rank0_parity2", partner_base,
-            aligned_block_size,
-        )
-    elif rank_in_group == 1:
-        own_base = int(blocks["own_buffer"].data_ptr())
-        native.load_send_blocks(
-            "rank1_data1", own_base,
-            "rank1_parity1", own_base,
-            aligned_block_size,
-        )
-    elif rank_in_group == 3:
-        own_base = int(blocks["own_buffer"].data_ptr())
-        partner_base = int(blocks["partner_buffer"].data_ptr())
-        native.load_send_blocks(
-            "rank3_data1", own_base,
-            "rank3_data2", partner_base,
-            aligned_block_size,
-        )
-    else:
-        raise RuntimeError(
-            f"ECCHECK legacy load: unexpected rank_in_group={rank_in_group}"
-        )
+        native.wait_for_encoding_completion()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        # Extract recovered data from own_buffer for rank2.
+        # own_buf was written by C++ at 64B-aligned offsets with gaps between
+        # chunks.  We iterate over the same chunk layout used during encoding
+        # to reconstruct a dense buffer.
+        if rank_in_group == 2 and recovered_buffer is not None:
+            recovered_dense = _extract_dense_from_gapped_buffer(
+                own_buf, buffer_size, max_total_bytes,
+            )
+            actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
+            if recovered_buffer.numel() >= total_size:
+                n_copy = min(actual_tensor_bytes, total_size,
+                             recovered_dense.numel())
+                recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
+
+        logger.info(f"ECCHECK legacy: recovery pipeline done in {time() - start_t:.2f}s")
+
+    finally:
+        if active_event is not None:
+            active_event.clear()
 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -885,22 +969,19 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     if world_size <= 1:
         return _reconstruct_state_dict_from_eccheck_buffer(main_payload, None)
 
-    blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
-
     rank_in_group = manager._get_rank_in_group(rank, world_size)
     sw_failure = bool(getattr(args, "use_eccheck_software_failure", False))
-
-    recv_buffers: Optional[Dict[str, torch.Tensor]] = None
-    recovered_buffer: Optional[torch.Tensor] = None
     total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
+
+    blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
+
+    recovered_buffer: Optional[torch.Tensor] = None
 
     if rank_in_group == 2:
         if sw_failure:
             _load_eccheck_blocks_from_disk_into(
                 blocks, checkpoint_dir, rank, rank_in_group, software_failure=True,
             )
-        else:
-            recv_buffers = _allocate_eccheck_load_recv_buffers(manager, registry)
         pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
         recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
     else:
@@ -911,9 +992,6 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     if manager.use_rdma:
         for t in [blocks["own_buffer"], blocks["partner_buffer"]]:
             manager.register_buffer(t)
-        if recv_buffers is not None:
-            for t in recv_buffers.values():
-                manager.register_buffer(t)
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 
@@ -922,7 +1000,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         rank=rank,
         world_size=world_size,
         blocks=blocks,
-        recv_buffers=recv_buffers,
+        recv_buffers=None,
         recovered_buffer=recovered_buffer,
         total_size=total_size,
         registry=registry,
@@ -935,5 +1013,11 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()
+
+    # Stop C++ load workers so they don't interfere with subsequent training.
+    # The singleton manager will be reinitialized on the next save.
+    logger.info(f"ECCHECK legacy: cleaning up C++ module after recovery (rank {rank})")
+    manager.cleanup()
+    manager._eccheck_native = None
 
     return state_dict

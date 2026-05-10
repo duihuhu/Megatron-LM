@@ -226,7 +226,7 @@ def _encode_with_native(
 
             # Submit to C++ native: encode k data → 2 parity, send/recv over network
             native.submit_ecnaive_save_general(
-                k, data_block_addrs, parity0_addr, parity1_addr,
+                data_block_addrs, parity0_addr, parity1_addr,
                 recv_write_addrs, take,
             )
 
@@ -732,9 +732,11 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     # Clean up EC-NAIVE native module after load to prevent segfaults:
     # C++ worker threads and RDMA connections remain alive after recovery and
     # could access freed memory once local tensors (ecnaive_blocks, recv_buffers)
-    # go out of scope.
+    # go out of scope. Also reset _ecnaive_native so the next save will
+    # reinitialize the C++ module from scratch.
     logger.info(f"EC-NAIVE legacy load: cleaning up native module (rank {rank})")
     manager.cleanup()
+    manager._ecnaive_native = None
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -742,23 +744,23 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     return state_dict
 
 
-def load_ecnaive_legacy_checkpoint_software_recovery(
+def load_ecnaive_legacy_checkpoint_hardware_recovery(
     checkpoint_name: str, failed_global_ranks: List[int]
 ) -> Dict[str, Any]:
-    """Software recovery for 1-2 failed ranks using RS decoding (ISA-L).
+    """Hardware recovery for 1-2 failed ranks using C++ ASIO send/recv + RS decode.
 
-    Failed ranks receive surviving data/parity blocks from peer ranks,
-    then use C++ submit_ecnaive_decode_recovery for GF(2^8) RS decode.
+    Source ranks read surviving blocks from disk and send via existing C++ ASIO
+    send channels. Failed ranks receive via C++ ASIO recv channels, then use the
+    16-worker RS decode pool to recover lost data blocks.
     """
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     if not torch.distributed.is_initialized():
-        raise RuntimeError("EC-NAIVE software recovery requires torch.distributed")
+        raise RuntimeError("EC-NAIVE hardware recovery requires torch.distributed")
 
     from megatron.training import get_args
-
     args = get_args()
     ecnaive_k = getattr(args, "ecnaive_rs_k", 2)
     ecnaive_n = ecnaive_k + 2
@@ -769,6 +771,12 @@ def load_ecnaive_legacy_checkpoint_software_recovery(
     manager.ecnaive_n = ecnaive_n
     if not getattr(args, "use_ecnaive", False):
         args.use_ecnaive = True
+
+    # Init C++ native module for ALL ranks (ASIO connections needed for send/recv)
+    manager.init_ecnaive_if_enabled()
+    native = manager._ecnaive_native
+    if native is None:
+        raise RuntimeError("EC-NAIVE native module unavailable for hardware recovery")
 
     # Step 1: Load main payload + exchange metadata
     main_payload = _load_ecnaive_main_payload(checkpoint_dir, rank, world_size)
@@ -791,8 +799,8 @@ def load_ecnaive_legacy_checkpoint_software_recovery(
 
     is_failed = (rank in failed_set)
 
-    # Determine if we're a source for any failed rank
-    my_contributions: List[Tuple[int, str, int, Any]] = []  # (dest_failed_rank, block_label, recv_slot, j_or_parity)
+    # Determine contributions: list of (failed_rank, label, recv_slot, j_or_parity)
+    my_contributions: List[Tuple[int, str, int, Any]] = []
     for fr, plan in recovery_plan.items():
         for src_rank, label, recv_slot, j_or_parity in plan['surviving']:
             if src_rank == rank:
@@ -800,68 +808,80 @@ def load_ecnaive_legacy_checkpoint_software_recovery(
 
     torch.distributed.barrier()
 
-    if is_failed:
-        # Init C++ native module for RS decode
-        manager.init_ecnaive_if_enabled()
-        native = manager._ecnaive_native
-        if native is None:
-            raise RuntimeError("EC-NAIVE native module unavailable for RS decode")
+    # Helper: resolve block file name from label and recv_slot
+    legacy_recv_names = {0: "recv_parity1", 1: "recv_parity0", 2: "recv_data1"}
 
+    def _resolve_block_filename(label: str, recv_slot: int) -> str:
+        if label.startswith('data_'):
+            if recv_slot >= 0:
+                key = f"recv_{recv_slot}"
+                return block_files.get(key) or block_files.get(legacy_recv_names.get(recv_slot, "")) or f"ecnaive_block_rank{rank}_{key}.pt"
+            else:
+                return block_files.get("own_data0") or f"ecnaive_block_rank{rank}_own_data0.pt"
+        elif label == 'parity0':
+            key = f"recv_{ecnaive_k - 1}"
+            return block_files.get(key) or f"ecnaive_block_rank{rank}_{key}.pt"
+        elif label == 'parity1':
+            key = f"recv_{ecnaive_k}"
+            return block_files.get(key) or f"ecnaive_block_rank{rank}_{key}.pt"
+        return ""
+
+    num_channels = ecnaive_n - 1  # = k + 1
+
+    if is_failed:
         plan = recovery_plan[rank]
         lost_positions = plan['lost_positions']
         m = len(lost_positions)
         if m == 0:
-            # No blocks lost (special case: own_data0 survived on another rank)
-            logger.warning(f"EC-NAIVE sw recovery: rank {rank} has no lost blocks, loading normally")
+            logger.warning(f"EC-NAIVE hw recovery: rank {rank} has no lost blocks")
             return _reconstruct_full_state_dict_from_main_tensor_buffer(
                 main_payload, flat_key_roots=flat_key_roots,
             )
 
-        # Receive all surviving blocks from source ranks
-        surviving_blocks: Dict[str, torch.Tensor] = {}
-        surviving_order: List[str] = []  # order: surviving data (by position) + parity0 + parity1
+        # Allocate recv buffers for all surviving blocks
+        surviving_tensors: Dict[str, torch.Tensor] = {}
+        surviving_addrs_ordered: List[str] = []  # ordered: data by pos, then parity
 
-        # First, receive surviving data blocks
-        data_blocks_received = []
-        parity_blocks_received = []
-        for src_rank, label, recv_slot, j_or_parity in plan['surviving']:
-            recv_tensor = torch.zeros(block_data_size, dtype=torch.uint8)
-            logger.info(
-                f"EC-NAIVE sw recovery: failed rank {rank} recv {label} "
-                f"from rank {src_rank}"
-            )
-            torch.distributed.recv(recv_tensor, src=src_rank)
-            surviving_blocks[label] = recv_tensor
+        data_labels = []
+        parity_labels = []
+        for _, label, _, _ in plan['surviving']:
+            surviving_tensors[label] = torch.zeros(block_data_size, dtype=torch.uint8)
             if label.startswith('data_'):
-                data_blocks_received.append((int(label.split('_')[1]), label))
+                data_labels.append(label)
             else:
-                parity_blocks_received.append(label)
-
-        # Build surviving_addrs in order: data blocks at original positions, then parity
-        data_blocks_received.sort()  # sort by data chunk index
-        surviving_order = [label for _, label in data_blocks_received] + sorted(parity_blocks_received)
-
-        surviving_block_data = [surviving_blocks[label] for label in surviving_order]
+                parity_labels.append(label)
+        data_labels.sort(key=lambda x: int(x.split('_')[1]))
+        surviving_addrs_ordered = data_labels + sorted(parity_labels)
 
         # Allocate recovery buffers for lost blocks
-        recovered_blocks = [
-            torch.zeros(block_data_size, dtype=torch.uint8)
-            for _ in range(m)
-        ]
+        recovered_blocks = [torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(m)]
 
-        # Run C++ RS decode per 64MB chunk
+        # Submit recv tasks to C++ recv workers
+        native.reset_encoding_completion_flags()
+        for src_rank, label, recv_slot, _ in plan['surviving']:
+            recv_ch = manager.get_recv_channel_from_source(rank, src_rank, world_size)
+            buf_addr = int(surviving_tensors[label].data_ptr())
+            logger.info(
+                f"EC-NAIVE hw recovery: failed rank {rank} recv {label} "
+                f"from rank {src_rank} via recv channel {recv_ch} ({block_data_size} bytes)"
+            )
+            native.submit_recv_task(recv_ch, buf_addr, block_data_size)
+
+        # Send sentinels for all channels (unused channels complete immediately)
+        native.submit_send_sentinels(num_channels)
+        native.submit_recv_sentinels(num_channels)
+
+        # Wait for all recv workers to finish
+        native.wait_for_encoding_completion()
+
+        # RS decode per 64MB chunk using the decode pool
+        surviving_block_data = [surviving_tensors[label] for label in surviving_addrs_ordered]
         ecnaive_buffer_size = manager.ecnaive_buffer_size
         src_pos = 0
         while src_pos < block_data_size:
             take = min(ecnaive_buffer_size, block_data_size - src_pos)
-
-            surviving_chunk_addrs = [
-                int(sb.data_ptr()) + src_pos for sb in surviving_block_data
-            ]
-            recovered_chunk_addrs = [
-                int(rb.data_ptr()) + src_pos for rb in recovered_blocks
-            ]
-
+            surviving_chunk_addrs = [int(sb.data_ptr()) + src_pos for sb in surviving_block_data]
+            recovered_chunk_addrs = [int(rb.data_ptr()) + src_pos for rb in recovered_blocks]
             native.submit_ecnaive_decode_recovery(
                 ecnaive_k, m, lost_positions,
                 surviving_chunk_addrs, recovered_chunk_addrs, take,
@@ -869,17 +889,14 @@ def load_ecnaive_legacy_checkpoint_software_recovery(
             src_pos += take
 
         # Reassemble tensor_buffer
-        # Build mapping: data chunk index -> block tensor
         all_data_blocks: Dict[int, torch.Tensor] = {}
-        for label, tensor in surviving_blocks.items():
+        for label, tensor in surviving_tensors.items():
             if label.startswith('data_'):
                 j = int(label.split('_')[1])
                 all_data_blocks[j] = tensor
-        # Add recovered blocks
         for i, pos in enumerate(lost_positions):
             all_data_blocks[pos] = recovered_blocks[i]
 
-        # Concatenate in order
         ordered_blocks = [all_data_blocks[j] for j in range(ecnaive_k)]
         tensor_buffer = torch.cat(ordered_blocks, dim=0)
         if actual_tensor_size > 0:
@@ -892,57 +909,43 @@ def load_ecnaive_legacy_checkpoint_software_recovery(
             flat_key_roots=flat_key_roots,
         )
         logger.info(
-            f"EC-NAIVE sw recovery: rank {rank} recovered via RS decode "
+            f"EC-NAIVE hw recovery: rank {rank} recovered via RS decode "
             f"(k={ecnaive_k}, m={m}, lost_pos={lost_positions})"
         )
         manager.cleanup()
+        manager._ecnaive_native = None
 
     elif my_contributions:
-        # Source rank: read blocks from disk and send to failed ranks
-        legacy_recv_names = {0: "recv_parity1", 1: "recv_parity0", 2: "recv_data1"}
+        # Source rank: read blocks from disk and send via C++ ASIO send channels
+        native.reset_encoding_completion_flags()
 
-        for dest_fr, label, recv_slot, j_or_parity in my_contributions:
-            # Resolve block file name
-            if label.startswith('data_'):
-                if recv_slot >= 0:
-                    recv_key = f"recv_{recv_slot}"
-                    legacy_key = legacy_recv_names.get(recv_slot)
-                    filename = block_files.get(recv_key) or (
-                        block_files.get(legacy_key) if legacy_key else None
-                    )
-                else:
-                    # own_data0 of a failed rank — we're the failed rank itself
-                    # Actually this shouldn't happen: own_data0 is on the failed rank
-                    filename = block_files.get("own_data0") or f"ecnaive_block_rank{rank}_own_data0.pt"
-            elif label == 'parity0':
-                # Parity0: stored as recv_{k-1} on this rank
-                recv_key = f"recv_{ecnaive_k - 1}"
-                filename = block_files.get(recv_key)
-                if not filename:
-                    filename = f"ecnaive_block_rank{rank}_{recv_key}.pt"
-            elif label == 'parity1':
-                recv_key = f"recv_{ecnaive_k}"
-                filename = block_files.get(recv_key)
-                if not filename:
-                    filename = f"ecnaive_block_rank{rank}_{recv_key}.pt"
-            else:
-                continue
-
+        # Keep references to block tensors until send workers finish (GC safety)
+        block_tensors: List[torch.Tensor] = []
+        for dest_fr, label, recv_slot, _ in my_contributions:
+            filename = _resolve_block_filename(label, recv_slot)
             if not filename:
-                filename = f"ecnaive_block_rank{rank}_{label}.pt"
+                continue
             block_path = checkpoint_dir / filename
             if not block_path.is_file():
                 raise FileNotFoundError(
-                    f"EC-NAIVE sw recovery: source rank {rank} missing block "
+                    f"EC-NAIVE hw recovery: source rank {rank} missing block "
                     f"{label} for failed rank {dest_fr} at {block_path}"
                 )
-            logger.info(
-                f"EC-NAIVE sw recovery: rank {rank} sending {label} "
-                f"({block_path}) to failed rank {dest_fr}"
-            )
             payload = torch.load(block_path, map_location="cpu", weights_only=False)
             block_tensor = payload["tensor"].contiguous().view(torch.uint8)[:block_data_size]
-            torch.distributed.send(block_tensor.contiguous(), dst=dest_fr)
+            block_tensors.append(block_tensor)  # keep alive
+            send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
+            logger.info(
+                f"EC-NAIVE hw recovery: rank {rank} sending {label} "
+                f"to failed rank {dest_fr} via send channel {send_ch} "
+                f"({block_tensor.numel()} bytes)"
+            )
+            native.submit_send_task(send_ch, int(block_tensor.data_ptr()), block_tensor.numel())
+
+        # Sentinels for all channels
+        native.submit_send_sentinels(num_channels)
+        native.submit_recv_sentinels(num_channels)
+        native.wait_for_encoding_completion()
 
         # Load own state
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(

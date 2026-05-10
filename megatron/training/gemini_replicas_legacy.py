@@ -725,6 +725,7 @@ def load_gemini_replicas_legacy_checkpoint(
             f"Gemini Replicas legacy load: cleaning up native module (rank {rank})"
         )
         manager.cleanup()
+        manager._gemini_replicas_native = None
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()

@@ -1268,16 +1268,19 @@ def _load_base_checkpoint(
             elif args.use_ecnaive:
                 from .ecnaive_legacy import (
                     load_ecnaive_legacy_checkpoint,
-                    load_ecnaive_legacy_checkpoint_software_recovery,
+                    load_ecnaive_legacy_checkpoint_hardware_recovery,
                     state_dict_from_ecnaive_main_metadata_only,
                 )
-                failed_ranks = getattr(args, "ecnaive_failed_ranks_parsed", None)
+                failed_ranks_str = getattr(args, "ecnaive_failed_ranks", None)
+                failed_ranks = (getattr(args, "ecnaive_failed_ranks_parsed", None) or
+                                ([int(x.strip()) for x in failed_ranks_str.split(",")]
+                                 if failed_ranks_str else None))
                 if failed_ranks is not None and torch.distributed.is_initialized():
                     logger.info(
-                        f"EC-NAIVE: software recovery mode — "
-                        f"simulating failed ranks {failed_ranks}"
+                        f"EC-NAIVE: hardware recovery mode — "
+                        f"failed ranks {failed_ranks}"
                     )
-                    state_dict = load_ecnaive_legacy_checkpoint_software_recovery(
+                    state_dict = load_ecnaive_legacy_checkpoint_hardware_recovery(
                         checkpoint_name, failed_ranks,
                     )
                 elif torch.distributed.is_initialized():

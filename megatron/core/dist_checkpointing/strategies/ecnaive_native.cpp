@@ -553,8 +553,19 @@ private:
     std::vector<boost::asio::ip::tcp::socket> send_sockets_;
     std::vector<boost::asio::ip::tcp::socket> recv_sockets_;
     std::vector<boost::asio::ip::tcp::acceptor> recv_acceptors_;
-    std::vector<std::atomic<bool>> send_connected_;
-    std::vector<std::atomic<bool>> recv_connected_;
+    std::deque<std::atomic<bool>> send_connected_;
+    std::deque<std::atomic<bool>> recv_connected_;
+
+    // Legacy named save-mode sockets (referenced by init_/get_/cleanup methods)
+    boost::asio::ip::tcp::socket send_data1_socket_;
+    boost::asio::ip::tcp::socket send_parity0_socket_;
+    boost::asio::ip::tcp::socket send_parity1_socket_;
+    boost::asio::ip::tcp::socket recv_parity1_socket_;
+    boost::asio::ip::tcp::socket recv_parity0_socket_;
+    boost::asio::ip::tcp::socket recv_data1_socket_;
+    boost::asio::ip::tcp::acceptor recv_parity1_acceptor_;
+    boost::asio::ip::tcp::acceptor recv_parity0_acceptor_;
+    boost::asio::ip::tcp::acceptor recv_data1_acceptor_;
 
     // Load mode sockets (rank2 as receiver) - ECLATIN style (6 sockets)
     boost::asio::ip::tcp::socket load_recv_rank0_data2_socket_;
@@ -1050,9 +1061,10 @@ void AsioConnectionManager::init_send_channels(
 {
     send_sockets_.clear();
     send_connected_.clear();
+    send_sockets_.reserve(ips.size());
     for (size_t i = 0; i < ips.size(); ++i) {
         send_sockets_.emplace_back(io_context_);
-        send_connected_.push_back(false);
+        send_connected_.emplace_back(false);
     }
     for (size_t i = 0; i < ips.size(); ++i) {
         try {
@@ -1077,10 +1089,12 @@ void AsioConnectionManager::init_recv_channels(
     recv_sockets_.clear();
     recv_acceptors_.clear();
     recv_connected_.clear();
+    recv_sockets_.reserve(ips.size());
+    recv_acceptors_.reserve(ips.size());
     for (size_t i = 0; i < ips.size(); ++i) {
         recv_sockets_.emplace_back(io_context_);
         recv_acceptors_.emplace_back(io_context_);
-        recv_connected_.push_back(false);
+        recv_connected_.emplace_back(false);
     }
     // Start all acceptors in parallel
     std::vector<std::thread> accept_threads;
@@ -2079,33 +2093,39 @@ public:
         // Initialize EC encoding tables
         init_ec_encoding();
 
-        // Initialize vectors to size num_channels_
-        send_queues_.resize(num_channels_);
-        send_mutexes_.resize(num_channels_);
-        send_cvs_.resize(num_channels_);
-        recv_queues_.resize(num_channels_);
-        recv_mutexes_.resize(num_channels_);
-        recv_cvs_.resize(num_channels_);
-        send_channels_.resize(num_channels_);
-        recv_channels_.resize(num_channels_);
-        send_threads_.resize(num_channels_);
-        recv_threads_.resize(num_channels_);
-        send_completed_.resize(num_channels_);
-        recv_completed_.resize(num_channels_);
-        send_sentinel_received_.resize(num_channels_);
-        recv_sentinel_received_.resize(num_channels_);
-        for (int i = 0; i < num_channels_; ++i) {
-            send_completed_[i] = false;
-            recv_completed_[i] = false;
-            send_sentinel_received_[i] = false;
-            recv_sentinel_received_[i] = false;
-        }
-        rdma_send_fds_.resize(num_channels_, -1);
-        rdma_recv_fds_.resize(num_channels_, -1);
+        // Fill vectors via emplace_back (avoids resize on non-copyable types)
+        auto reserve_all = [&](int n) {
+            send_queues_.reserve(n);
+            recv_queues_.reserve(n);
+            send_channels_.reserve(n);
+            recv_channels_.reserve(n);
+            rdma_send_fds_.reserve(n);
+            rdma_recv_fds_.reserve(n);
+            rdma_send_cqs_.reserve(n);
+            rdma_recv_cqs_.reserve(n);
+        };
+        reserve_all(num_channels_);
 
-        // Allocate RDMA CQ vectors
-        rdma_send_cqs_.resize(num_channels_, nullptr);
-        rdma_recv_cqs_.resize(num_channels_, nullptr);
+        for (int i = 0; i < num_channels_; ++i) {
+            send_queues_.emplace_back();
+            send_mutexes_.emplace_back();
+            send_cvs_.emplace_back();
+            recv_queues_.emplace_back();
+            recv_mutexes_.emplace_back();
+            recv_cvs_.emplace_back();
+            send_channels_.emplace_back();
+            recv_channels_.emplace_back();
+            send_threads_.emplace_back();
+            recv_threads_.emplace_back();
+            send_completed_.emplace_back(false);
+            recv_completed_.emplace_back(false);
+            send_sentinel_received_.emplace_back(false);
+            recv_sentinel_received_.emplace_back(false);
+            rdma_send_fds_.emplace_back(-1);
+            rdma_recv_fds_.emplace_back(-1);
+            rdma_send_cqs_.emplace_back(nullptr);
+            rdma_recv_cqs_.emplace_back(nullptr);
+        }
 
         std::cout << "ECNAIVE: Initializing connections (RDMA: " << (use_rdma_ ? "enabled" : "disabled")
                   << ", k=" << k_ << ", n=" << n_ << ", channels=" << num_channels_ << ")..." << std::endl;
@@ -2272,8 +2292,11 @@ public:
         //           << ", recv_d1=" << recv_data1_addr
         //           << ", size=" << size << std::endl;
         
-        // Step 1: Encode data blocks to get parity blocks
-        encode_ec_blocks(data0_addr, data1_addr, parity0_addr, parity1_addr, size);
+        // Step 1: Encode data blocks to get parity blocks (legacy 2-data-block call)
+        {
+            std::vector<uintptr_t> addrs = {data0_addr, data1_addr};
+            encode_ec_blocks(addrs, parity0_addr, parity1_addr, size);
+        }
         
         // Step 2: Submit send tasks (data1, parity0, parity1)
         submit_send_data1(data1_addr, size);
@@ -2341,24 +2364,31 @@ public:
         recv_data1_cv_.notify_one();
     }
 
-    // ========== RS Decode Recovery (software recovery, synchronous) ==========
+    // ========== RS Decode Recovery (synchronous, with 16-worker pool) ==========
 
-    // Recover m lost data blocks from k surviving blocks using RS decode.
-    // surviving_addrs must be in original data position order for the data blocks,
-    // followed by parity0 and parity1 at the end.
+    // Recover m lost data blocks from k_orig data blocks using surviving blocks.
+    // k_orig: number of original data blocks (e.g. 2 or 6)
+    // m: number of lost data blocks (1-2)
+    // lost_positions: indices of lost data blocks (0..k_orig-1)
+    // surviving_addrs: addresses of surviving blocks
+    //   - surviving data blocks in original position order
+    //   - surviving parity blocks at the end (1 or 2)
+    //   Size = (k_orig - m) + num_surviving_parity, which may be != k_orig
     void submit_ecnaive_decode_recovery(
-            int k, int m,
+            int k_orig, int m,
             const std::vector<int>& lost_positions,
             const std::vector<uintptr_t>& surviving_addrs,
             const std::vector<uintptr_t>& recovered_addrs,
             size_t size)
     {
-        if (k < 2 || m < 1 || m > 2) {
-            std::cerr << "ECNAIVE: decode_recovery invalid params k=" << k << " m=" << m << std::endl;
+        if (k_orig < 2 || m < 1 || m > 2) {
+            std::cerr << "ECNAIVE: decode_recovery invalid params k_orig=" << k_orig << " m=" << m << std::endl;
             return;
         }
-        if (static_cast<int>(surviving_addrs.size()) != k) {
-            std::cerr << "ECNAIVE: decode_recovery need exactly k surviving blocks" << std::endl;
+        int surviving_count = static_cast<int>(surviving_addrs.size());
+        int num_surviving_parity = surviving_count - (k_orig - m);
+        if (num_surviving_parity < 1 || num_surviving_parity > 2) {
+            std::cerr << "ECNAIVE: decode_recovery invalid parity count " << num_surviving_parity << std::endl;
             return;
         }
         if (static_cast<int>(recovered_addrs.size()) != m) {
@@ -2366,71 +2396,72 @@ public:
             return;
         }
 
-        // Step 1: Build full (k+2) x k Vandermonde encoding matrix
-        int full_rows = k + 2;
-        std::vector<unsigned char> encode_mat(k * full_rows);
-        gf_gen_rs_matrix(encode_mat.data(), full_rows, k);
+        // Step 1: Build full (k_orig+2) x k_orig Vandermonde encoding matrix
+        int full_rows = k_orig + 2;
+        std::vector<unsigned char> encode_mat(k_orig * full_rows);
+        gf_gen_rs_matrix(encode_mat.data(), full_rows, k_orig);
 
-        // Step 2: Build k x k survivor matrix A
-        // A is stored row-major, size = k * k bytes
-        std::vector<unsigned char> A(k * k, 0);
-
-        // Fill in identity rows for surviving data positions
+        // Step 2: Build k_orig x k_orig survivor matrix A
+        std::vector<unsigned char> A(k_orig * k_orig, 0);
         int data_row = 0;
-        for (int pos = 0; pos < k; ++pos) {
+        for (int pos = 0; pos < k_orig; ++pos) {
             bool is_lost = false;
             for (int lp : lost_positions) {
                 if (lp == pos) { is_lost = true; break; }
             }
             if (!is_lost) {
-                // Identity row at position pos
-                A[data_row * k + pos] = 1;
+                A[data_row * k_orig + pos] = 1;
                 ++data_row;
             }
         }
-        // Fill in 2 parity rows (rows k and k+1 of the full matrix)
-        for (int parity_idx = 0; parity_idx < 2; ++parity_idx) {
-            int src_row = k + parity_idx;  // row index in full encode_mat
-            for (int col = 0; col < k; ++col) {
-                A[data_row * k + col] = encode_mat[src_row * k + col];
+        // Fill in surviving parity rows
+        for (int parity_idx = 0; parity_idx < num_surviving_parity; ++parity_idx) {
+            int src_row = k_orig + parity_idx;
+            for (int col = 0; col < k_orig; ++col) {
+                A[data_row * k_orig + col] = encode_mat[src_row * k_orig + col];
             }
             ++data_row;
         }
 
         // Step 3: Invert A in GF(2^8)
-        // gf_invert_matrix needs workspace of size k * 2k
-        std::vector<unsigned char> inv_workspace(k * 2 * k);
-        std::vector<unsigned char> A_inv(k * k);
-        // Copy A to workspace (gf_invert_matrix works in-place within the workspace)
-        for (int i = 0; i < k * k; ++i) {
-            inv_workspace[i] = A[i];
-        }
-        int ret = gf_invert_matrix(inv_workspace.data(), A_inv.data(), k);
+        std::vector<unsigned char> inv_workspace(k_orig * 2 * k_orig);
+        std::vector<unsigned char> A_inv(k_orig * k_orig);
+        for (int i = 0; i < k_orig * k_orig; ++i) inv_workspace[i] = A[i];
+        int ret = gf_invert_matrix(inv_workspace.data(), A_inv.data(), k_orig);
         if (ret != 0) {
             std::cerr << "ECNAIVE: gf_invert_matrix failed (singular matrix), ret=" << ret << std::endl;
-            // Fallback: zero out recovered blocks
-            for (int i = 0; i < m; ++i) {
+            for (int i = 0; i < m; ++i)
                 std::memset(reinterpret_cast<void*>(recovered_addrs[i]), 0, size);
-            }
             return;
         }
 
-        // Step 4: Extract decode coefficients (m rows from A_inv at lost positions)
-        std::vector<unsigned char> decode_mat(m * k);
+        // Step 4: Extract decode coefficients (surviving_count columns per lost position)
+        std::vector<unsigned char> decode_mat(m * surviving_count);
         for (int i = 0; i < m; ++i) {
             int lost_pos = lost_positions[i];
-            for (int col = 0; col < k; ++col) {
-                decode_mat[i * k + col] = A_inv[lost_pos * k + col];
+            int col = 0;
+            // Coefficients for surviving data blocks (at their original positions)
+            for (int pos = 0; pos < k_orig; ++pos) {
+                bool is_lost = false;
+                for (int lp : lost_positions) { if (lp == pos) { is_lost = true; break; } }
+                if (!is_lost) {
+                    decode_mat[i * surviving_count + col] = A_inv[lost_pos * k_orig + pos];
+                    ++col;
+                }
+            }
+            // Coefficients for surviving parity blocks
+            for (int pi = 0; pi < num_surviving_parity; ++pi) {
+                decode_mat[i * surviving_count + col] = A_inv[lost_pos * k_orig + k_orig + pi];
+                ++col;
             }
         }
 
-        // Step 5: Generate decode tables (stable, not local temp)
-        // Store as member so pool workers can access it
-        size_t decode_tbls_size = 32 * (size_t)k * (size_t)m;
+        // Step 5: Generate decode tables
+        size_t decode_tbls_size = 32 * (size_t)surviving_count * (size_t)m;
         ec_decode_tbls_.resize(decode_tbls_size);
-        ec_init_tables(k, m, decode_mat.data(), ec_decode_tbls_.data());
+        ec_init_tables(surviving_count, m, decode_mat.data(), ec_decode_tbls_.data());
         ec_decode_have_tbls_ = true;
-        ec_decode_tbls_k_ = k;
+        ec_decode_tbls_k_ = surviving_count;
         ec_decode_tbls_m_ = m;
 
         // Step 6: Lazy-init decode pool on first use
@@ -2444,14 +2475,15 @@ public:
         // Step 7: Dispatch to 16-worker pthread pool
         EcDecodeJob job;
         job.size = size;
-        job.k = k;
+        job.k = surviving_count;
         job.m = m;
         job.surviving_addrs = surviving_addrs.data();
         job.recovered_addrs = recovered_addrs.data();
         job.decode_tbls = ec_decode_tbls_.data();
         ec_decode_pool_run_parallel(job);
 
-        std::cout << "ECNAIVE: RS decode recovery done (pool): k=" << k << " m=" << m
+        std::cout << "ECNAIVE: RS decode recovery done (pool): k_orig=" << k_orig
+                  << " surviving=" << surviving_count << " m=" << m
                   << " lost_pos=[" << lost_positions[0];
         if (m > 1) std::cout << "," << lost_positions[1];
         std::cout << "] size=" << size << std::endl;
@@ -3675,10 +3707,15 @@ private:
     // ASIO connections for pipelines
     AsioConnectionManager conn_;
     
-    // RDMA resources (generalized: num_channels = n-1 = k+1)
+    // RDMA resources
+    static constexpr int RDMA_NUM_SAVE_CHANNELS = 6;   // legacy, for k=2
+    static constexpr int RDMA_NUM_LOAD_CHANNELS = 8;   // legacy, for k=2 load
     bool use_rdma_;
     ibv_context* rdma_context_;
     ibv_pd* rdma_pd_;
+    // Legacy fixed-size RDMA arrays (referenced by named constants)
+    ibv_cq* rdma_load_send_cq_[RDMA_NUM_LOAD_CHANNELS]{};
+    ibv_cq* rdma_load_recv_cq_[RDMA_NUM_LOAD_CHANNELS]{};
     std::vector<ibv_cq*> rdma_send_cqs_;           // size = num_channels
     std::vector<ibv_cq*> rdma_recv_cqs_;           // size = num_channels
     std::vector<ibv_cq*> rdma_load_send_cqs_;
@@ -3720,11 +3757,11 @@ private:
 
     // Save mode pipelines: num_channels sends + num_channels receives
     std::vector<std::queue<SendTask>> send_queues_;
-    std::vector<std::mutex> send_mutexes_;
-    std::vector<std::condition_variable> send_cvs_;
+    std::deque<std::mutex> send_mutexes_;
+    std::deque<std::condition_variable> send_cvs_;
     std::vector<std::queue<RecvTask>> recv_queues_;
-    std::vector<std::mutex> recv_mutexes_;
-    std::vector<std::condition_variable> recv_cvs_;
+    std::deque<std::mutex> recv_mutexes_;
+    std::deque<std::condition_variable> recv_cvs_;
 
     // Separate release queues for data and parity buffers
     std::queue<uintptr_t> data_buffers_to_release_;
@@ -3732,15 +3769,15 @@ private:
     std::mutex release_queue_mutex_;
 
     // Completion flags
-    std::vector<std::atomic<bool>> send_completed_;
-    std::vector<std::atomic<bool>> recv_completed_;
+    std::deque<std::atomic<bool>> send_completed_;
+    std::deque<std::atomic<bool>> recv_completed_;
     // Sentinel received flags
-    std::vector<std::atomic<bool>> send_sentinel_received_;
-    std::vector<std::atomic<bool>> recv_sentinel_received_;
+    std::deque<std::atomic<bool>> send_sentinel_received_;
+    std::deque<std::atomic<bool>> recv_sentinel_received_;
 
     // Worker threads
-    std::vector<std::thread> send_threads_;
-    std::vector<std::thread> recv_threads_;
+    std::deque<std::thread> send_threads_;
+    std::deque<std::thread> recv_threads_;
 
     // Legacy backward-compat members (kept so old named worker functions compile)
     std::queue<SendTask> send_data1_q_;
@@ -3785,8 +3822,8 @@ private:
     std::unique_ptr<IConnectionChannel> recv_parity1_channel_;
     std::unique_ptr<IConnectionChannel> recv_parity0_channel_;
     std::unique_ptr<IConnectionChannel> recv_data1_channel_;
-    ibv_cq* rdma_send_cq_[6];
-    ibv_cq* rdma_recv_cq_[6];
+    ibv_cq* rdma_send_cq_[6]{};
+    ibv_cq* rdma_recv_cq_[6]{};
     
     // Load mode flags
     std::atomic<bool> is_load_mode_{false};
@@ -4298,7 +4335,7 @@ private:
         std::cout << "[ECNAIVE RDMA] Establishing dedicated TCP sockets for RdmaConnInfo exchange..." << std::endl;
         // Accept side: same order as ASIO recv roles (recv_parity1, recv_parity0, recv_data1).
         std::thread accept_thread([this]() {
-            auto do_listen_accept = [this](const std::string& ip, uint16_t port, int& out_fd, const char* name) {
+            auto do_listen_accept = [this](const std::string& ip, uint16_t port, int& out_fd, const std::string& name) {
                 int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
                 if (listen_fd < 0) {
                     throw std::runtime_error(std::string("[ECNAIVE RDMA] socket() failed for ") + name + ": " + std::strerror(errno));
@@ -4334,7 +4371,7 @@ private:
                                  "rdma_recv_" + std::to_string(i));
             }
         });
-        auto do_connect = [this](const std::string& ip, uint16_t port, int& out_fd, const char* name) {
+        auto do_connect = [this](const std::string& ip, uint16_t port, int& out_fd, const std::string& name) {
             out_fd = socket(AF_INET, SOCK_STREAM, 0);
             if (out_fd < 0) {
                 throw std::runtime_error(std::string("[ECNAIVE RDMA] socket() failed for ") + name + ": " + std::strerror(errno));
@@ -4381,7 +4418,7 @@ private:
     }
 
     void close_rdma_exchange_sockets() {
-        auto close_fd = [](int& fd, const char* name) {
+        auto close_fd = [](int& fd, const std::string& name) {
             if (fd >= 0) {
                 close(fd);
                 std::cout << "[ECNAIVE RDMA] Closed " << name << " fd=" << fd << std::endl;
@@ -4784,10 +4821,14 @@ private:
             if (conn_.send_socket(idx).is_open()) {
                 send_with_size(conn_.send_socket(idx), task.addr, task.size);
             }
-            // Release buffer after send
+            // Release buffer after send: data channels 0..k-2, parity channels k-1..k
             {
                 std::lock_guard<std::mutex> lk(release_queue_mutex_);
-                data_buffers_to_release_.push(task.addr);
+                if (idx >= k_ - 1) {
+                    parity_buffers_to_release_.push(task.addr);
+                } else {
+                    data_buffers_to_release_.push(task.addr);
+                }
             }
         }
     }
@@ -4818,15 +4859,15 @@ private:
             }
             if (task.size == 0 || task.addr == 0) continue;
             if (conn_.recv_socket(idx).is_open()) {
-                size_t recvd = recv_with_size(conn_.recv_socket(idx), task.addr, task.size);
-                if (recvd != task.size) {
-                    std::cerr << "ECNAIVE: RecvWorker[" << idx << "] size mismatch: expected "
-                              << task.size << " got " << recvd << std::endl;
+                if (!recv_with_size_bool(conn_.recv_socket(idx),
+                                         reinterpret_cast<void*>(task.addr), task.size)) {
+                    std::cerr << "ECNAIVE: RecvWorker[" << idx << "] recv failed" << std::endl;
                 }
             }
         }
     }
 
+public:
     // ========== Generalized save submit interface ==========
 
     // Submit one encoding + distribution operation for a chunk
@@ -4895,6 +4936,26 @@ private:
         }
     }
 
+    // Generalized single-task submit: push one send/recv task to a channel (for recovery)
+    void submit_send_task(int channel_idx, uintptr_t addr, size_t size) {
+        if (channel_idx < 0 || channel_idx >= num_channels_) return;
+        {
+            std::lock_guard<std::mutex> lk(send_mutexes_[channel_idx]);
+            send_queues_[channel_idx].push({addr, size});
+        }
+        send_cvs_[channel_idx].notify_one();
+    }
+
+    void submit_recv_task(int channel_idx, uintptr_t addr, size_t size) {
+        if (channel_idx < 0 || channel_idx >= num_channels_) return;
+        {
+            std::lock_guard<std::mutex> lk(recv_mutexes_[channel_idx]);
+            recv_queues_[channel_idx].push({addr, size});
+        }
+        recv_cvs_[channel_idx].notify_one();
+    }
+
+private:
     // ========== EC-NAIVE Load XOR pthread pool (rank2, full recovery) ==========
 
     static std::array<int, kXorPoolSize> parse_xor_pool_cpus_or_throw() {
@@ -5176,7 +5237,8 @@ private:
                 reinterpret_cast<unsigned char*>(job.recovered_addrs[i] + off);
         }
         ec_encode_data(static_cast<int>(len), job.k, job.m,
-                       job.decode_tbls, srcs.data(), dests.data());
+                       const_cast<unsigned char*>(job.decode_tbls),
+                       srcs.data(), dests.data());
     }
 
     void ec_decode_worker_loop(int wid) {
@@ -5850,6 +5912,15 @@ PYBIND11_MODULE(ecnaive_native, m) {
              pybind11::arg("num_sends"))
         .def("submit_recv_sentinels", &ECNaiveNative::submit_recv_sentinels,
              pybind11::arg("num_recvs"))
+        // Generalized single-task submit for recovery
+        .def("submit_send_task", &ECNaiveNative::submit_send_task,
+             pybind11::arg("channel_idx"),
+             pybind11::arg("addr"),
+             pybind11::arg("size"))
+        .def("submit_recv_task", &ECNaiveNative::submit_recv_task,
+             pybind11::arg("channel_idx"),
+             pybind11::arg("addr"),
+             pybind11::arg("size"))
         // Legacy submit functions
         .def("submit_send_data1", &ECNaiveNative::submit_send_data1,
              pybind11::arg("send_addr"), pybind11::arg("size"))

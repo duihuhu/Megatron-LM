@@ -845,11 +845,12 @@ class ECNAIVEManager:
                 recv_slot = j - 1 if j > 0 else -1  # own_data0 has no recv slot
                 surviving.append((source_global, f'data_{j}', recv_slot, j))
 
-            # Parity blocks (always survive)
+            # Parity blocks (may also be on failed ranks!)
             for pi, pname in enumerate(['parity0', 'parity1']):
                 source_rig = (rig + k + pi) % n
                 source_global = self._get_rank_by_group_position(gid, source_rig, world_size)
-                surviving.append((source_global, pname, -1, pname))
+                if source_global not in failed_set:
+                    surviving.append((source_global, pname, -1, pname))
 
             result[fr] = {
                 'lost_positions': lost_positions,
@@ -859,6 +860,44 @@ class ECNAIVEManager:
             }
 
         return result
+
+    def get_send_channel_for_target(
+        self, source_global_rank: int, target_global_rank: int, world_size: int
+    ) -> int:
+        """Return the send channel index on source_rank that connects to target_rank.
+
+        During save, rank i's send channel j connects to rank (i + j + 1) mod n.
+        So to send from source to target: channel = (target_rig - source_rig - 1 + n) % n.
+        """
+        n = self.ecnaive_n
+        src_rig = self._get_rank_in_group(source_global_rank, world_size)
+        tgt_rig = self._get_rank_in_group(target_global_rank, world_size)
+        ch = (tgt_rig - src_rig - 1 + n) % n
+        if ch >= n - 1:
+            raise ValueError(
+                f"No send channel from rank {source_global_rank} (rig={src_rig}) "
+                f"to rank {target_global_rank} (rig={tgt_rig})"
+            )
+        return ch
+
+    def get_recv_channel_from_source(
+        self, my_global_rank: int, source_global_rank: int, world_size: int
+    ) -> int:
+        """Return the recv channel index on my_rank that receives from source_rank.
+
+        During save, recv channel j on rank r receives from rank (r - j - 1) mod n.
+        So to receive from source on my rank: channel = (my_rig - src_rig - 1 + n) % n.
+        """
+        n = self.ecnaive_n
+        my_rig = self._get_rank_in_group(my_global_rank, world_size)
+        src_rig = self._get_rank_in_group(source_global_rank, world_size)
+        ch = (my_rig - src_rig - 1 + n) % n
+        if ch >= n - 1:
+            raise ValueError(
+                f"No recv channel on rank {my_global_rank} (rig={my_rig}) "
+                f"from rank {source_global_rank} (rig={src_rig})"
+            )
+        return ch
 
     def init_ecnaive_if_enabled(self):
         """Initialize EC-NAIVE C++ module if enabled and distributed environment is ready."""

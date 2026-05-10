@@ -892,7 +892,7 @@ class ECCHECKManager:
                 max_total_size = rank_total_size
         
         # Align maximum size to buffer_size (64MB) so recv buffers match pipeline iterations
-        aligned_size = ((max_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size) * self.eccheck_buffer_size
+        aligned_size = ((max_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size + 1) * self.eccheck_buffer_size
         
         logger.info(
             f"EC-CHECK: Allocating TWO receive buffers using global maximum size\n"

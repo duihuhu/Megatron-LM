@@ -187,7 +187,7 @@ class ECCHECKManager:
     def get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank for data/parity exchange.
 
-        P2P pairing within each EC group:
+        Group-based pairing, same grouping as XOR:
         - rank_in_group 0 <-> 1 (P2P pair)
         - rank_in_group 2 <-> 3 (P2P pair)
         """
@@ -508,6 +508,7 @@ class ECCHECKManager:
                         step6_p2p_listen_ip = ""
                         step6_p2p_recv_port = 0
                     
+                    p2p_partner_rank = self.get_p2p_partner_rank(rank, world_size)
                     self._eccheck_native = eccheck_native.ECCHECKNative(
                         rank, world_size, paired_rank,
                         # XOR connections: (partner_ip, partner_recv_port, my_ip, my_recv_port, use_rdma)
@@ -522,6 +523,7 @@ class ECCHECKManager:
                         step6_p2p_listen_ip, step6_p2p_recv_port,
                         self.use_rdma,
                         rank_in_group,
+                        p2p_partner_rank,
                     )
                     
                     # If we reach here, ASIO/RDMA connections are ready and threads are running
@@ -603,6 +605,7 @@ class ECCHECKManager:
                     print(f"EC-CHECK: [Rank {rank}] Creating C++ native module (blocking until NCCL initialization completes)...")
                     
                     rank_in_group = self._get_rank_in_group(rank, world_size)
+                    p2p_partner_rank = self.get_p2p_partner_rank(rank, world_size)
                     self._eccheck_native = eccheck_native.ECCHECKNative(
                         rank, world_size, paired_rank,
                         nccl_id_thread1,    # rank0↔rank2 XOR
@@ -610,6 +613,7 @@ class ECCHECKManager:
                         nccl_id_p2p_0_1,   # rank0↔rank1 P2P
                         nccl_id_p2p_2_3,   # rank2↔rank3 P2P
                         rank_in_group,
+                        p2p_partner_rank,
                     )
                     
                     # If we reach here, NCCL communicators are ready and threads are running

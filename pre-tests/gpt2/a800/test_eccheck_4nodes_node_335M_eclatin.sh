@@ -22,6 +22,8 @@ NNODES=4
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
+export ECLATIN_LOCAL_RANK_NIC_0=bond0
+export ECLATIN_LOCAL_RANK_NIC_1=bond0
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -114,7 +116,7 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 1
+    --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 4
 )
 
@@ -123,7 +125,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --load $CHECKPOINT_PATH
+    #--load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck

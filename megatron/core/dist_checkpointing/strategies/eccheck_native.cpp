@@ -911,24 +911,29 @@ private:
     // ========== P2P配置构建函数 ==========
     
     void build_p2p_config() {
-        // P2P pairing: adjacent ranks (0<->1, 2<->3)
-        if (rank_ % 2 == 0) {
-            // Even rank: pair with next rank
-            p2p_partner_rank_ = rank_ + 1;
-        } else {
-            // Odd rank: pair with previous rank
-            p2p_partner_rank_ = rank_ - 1;
+        // Use Python-provided partner when available; fall back to adjacent pairing.
+        if (p2p_partner_rank_ < 0) {
+            if (rank_ % 2 == 0) {
+                p2p_partner_rank_ = rank_ + 1;
+            } else {
+                p2p_partner_rank_ = rank_ - 1;
+            }
         }
-        
-        // Validate partner rank
+
         if (p2p_partner_rank_ < 0 || p2p_partner_rank_ >= world_size_) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid P2P partner rank: " 
+            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid P2P partner rank: "
                       << p2p_partner_rank_ << std::endl;
             p2p_partner_rank_ = -1;
                 }
-        
+
         std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P config - "
                   << "partner_rank=" << p2p_partner_rank_ << std::endl;
+    }
+
+    // Helper: lower-ranked partner in a P2P pair sends parity, higher sends data.
+    // This works for both adjacent pairing (0↔1) and group-based pairing (0↔2).
+    bool is_p2p_parity_sender() const {
+        return rank_ < p2p_partner_rank_;
     }
 
     // ========== NCCL初始化函数 ==========
@@ -1630,11 +1635,12 @@ private:
                         if (is_load_mode_ && failed_rank_in_group_ == 2 && (rank_in_group_ == 1 || rank_in_group_ == 2)) {
                             // Load mode: rank 1 and rank 2 release data buffer immediately
                             should_release = true;
-                        } else if (rank_ % 2 == 0) {
-                            // Save mode: even ranks release immediately
+                        } else if (is_p2p_parity_sender()) {
+                            // Save mode: parity senders release data buffer immediately
+                            // (P2P worker uses parity buffer instead)
                             should_release = true;
                         }
-                        // For odd ranks in save mode, data buffer will be released by P2P worker
+                        // For data senders, data buffer will be released by P2P worker
                         
                         if (should_release) {
                         std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
@@ -1811,11 +1817,12 @@ private:
                         if (is_load_mode_ && failed_rank_in_group_ == 2 && (rank_in_group_ == 1 || rank_in_group_ == 2)) {
                             // Load mode: rank 1 and rank 2 release data buffer immediately
                             should_release = true;
-                        } else if (rank_ % 2 == 0) {
-                            // Save mode: even ranks release immediately
+                        } else if (is_p2p_parity_sender()) {
+                            // Save mode: parity senders release data buffer immediately
+                            // (P2P worker uses parity buffer instead)
                             should_release = true;
                         }
-                        // For odd ranks in save mode, data buffer will be released by P2P worker
+                        // For data senders, data buffer will be released by P2P worker
                         
                         if (should_release) {
                         std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
@@ -2352,7 +2359,7 @@ private:
                     }
                 } else {
                     // Save mode: original logic
-                    uintptr_t send_buffer = (rank_ % 2 == 0) ? task.parity_addr : task.data_addr;
+                    uintptr_t send_buffer = is_p2p_parity_sender() ? task.parity_addr : task.data_addr;
                     
                     {
                         std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
@@ -2398,7 +2405,7 @@ private:
                 // Only handle save mode here to avoid duplicate release
                 if (!(is_load_mode_ && failed_rank_in_group_ == 2)) {
                     // Save mode: original logic
-                if (rank_ % 2 == 1 && task.parity_addr != 0) {
+                if (!is_p2p_parity_sender() && task.parity_addr != 0) {
                     parity_buffers_to_release_.push(task.parity_addr);
                     }
                 }
@@ -2505,7 +2512,7 @@ private:
 #endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_send_connected()) {
                     // ASIO send path (synchronous)
-                    const char* send_label = (rank_ % 2 == 0) ? "parity" : "data";
+                    const char* send_label = is_p2p_parity_sender() ? "parity" : "data";
                     std::cout << "[EC-CHECK ASIO] P2P_Send: Sending " << task.size << " bytes (" << send_label << ") via ASIO" << std::endl;
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.send_buffer_addr);
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));  // Network byte order
@@ -2563,7 +2570,7 @@ private:
                                 // std::cerr << "EC-CHECK: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
                                 std::cerr.flush();
                             } else {
-                                const char* send_label = (rank_ % 2 == 0) ? "parity" : "data";
+                                const char* send_label = is_p2p_parity_sender() ? "parity" : "data";
                                 // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Starting NCCL send ("
                                 //           << send_label << "), size=" << task.size
                                 //           << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
@@ -2662,11 +2669,11 @@ private:
                     // Save mode or Step6: original logic
                     // For even ranks, release parity buffer after send completes (parity was sent)
                     // For odd ranks, parity buffer is not sent, so it will be released in XOR worker
-                    if (rank_ % 2 == 0 && task.parity_addr != 0) {
+                    if (is_p2p_parity_sender() && task.parity_addr != 0) {
                         parity_buffers_to_release_.push(task.parity_addr);
                     }
-                    // For odd ranks, release data buffer after send completes (it was delayed in encoder worker)
-                    if (rank_ % 2 == 1 && task.data_addr != 0) {
+                    // For data senders (higher rank in P2P pair), release data buffer
+                    if (!is_p2p_parity_sender() && task.data_addr != 0) {
                         data_buffers_to_release_.push(task.data_addr);
                         // Also remove from data_buffer_states_ if it exists
                         {
@@ -2761,7 +2768,7 @@ private:
 #endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_recv_connected()) {
                     // ASIO recv path (synchronous)
-                    const char* recv_label = (rank_ % 2 == 0) ? "data" : "parity";
+                    const char* recv_label = is_p2p_parity_sender() ? "data" : "parity";
                     std::cout << "[EC-CHECK ASIO] P2P_Recv: Receiving " << task.size << " bytes (" << recv_label << ") via ASIO" << std::endl;
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_buffer_addr);
                     uint32_t size_net;
@@ -2822,7 +2829,7 @@ private:
                                 std::cerr << "EC-CHECK: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
                                 std::cerr.flush();
                             } else {
-                                const char* recv_label = (rank_ % 2 == 0) ? "data" : "parity";
+                                const char* recv_label = is_p2p_parity_sender() ? "data" : "parity";
                                 std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Starting NCCL recv ("
                                           << recv_label << "), size=" << task.size
                                           << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
@@ -2973,9 +2980,11 @@ public:
                   const std::vector<uint8_t>& nccl_id_xor_recv,
                   const std::vector<uint8_t>& nccl_id_p2p_send,
                   const std::vector<uint8_t>& nccl_id_p2p_recv,
-                  int rank_in_group = -1)
+                  int rank_in_group = -1,
+                  int p2p_partner_rank = -1)
         : rank_(rank), world_size_(world_size), paired_rank_(paired_rank),
           rank_in_group_(rank_in_group >= 0 ? rank_in_group : rank),
+          p2p_partner_rank_(p2p_partner_rank),
           failed_rank_in_group_(-1),
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_completed_(false), recv_worker_completed_(false),
@@ -2998,7 +3007,6 @@ public:
           nccl_p2p_send_init_completed_(false), nccl_p2p_recv_init_completed_(false),
           k_(0), rows_(0), data_block_index_(0), a_mat_(nullptr), g_tbls_(nullptr),
           decode_coefficient_0_(1), decode_coefficient_1_(1),  // Initialize to 1 for simplified version
-          p2p_partner_rank_(-1),
           is_load_mode_(false), failed_rank_(-1),
           asio_initialized_(false), use_asio_(false) {
 
@@ -3087,9 +3095,11 @@ public:
                   const std::string& p2p_listen_ip, uint16_t p2p_recv_port,
                   const std::string& step6_p2p_partner_ip, uint16_t step6_p2p_send_port,
                   const std::string& step6_p2p_listen_ip, uint16_t step6_p2p_recv_port,
-                  bool use_rdma = false, int rank_in_group = -1)
+                  bool use_rdma = false, int rank_in_group = -1,
+                  int p2p_partner_rank = -1)
         : rank_(rank), world_size_(world_size), paired_rank_(paired_rank),
           rank_in_group_(rank_in_group >= 0 ? rank_in_group : rank),
+          p2p_partner_rank_(p2p_partner_rank),
           failed_rank_in_group_(-1),
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_completed_(false), recv_worker_completed_(false),
@@ -3112,7 +3122,6 @@ public:
           nccl_p2p_send_init_completed_(false), nccl_p2p_recv_init_completed_(false),
           k_(0), rows_(0), data_block_index_(0), a_mat_(nullptr), g_tbls_(nullptr),
           decode_coefficient_0_(1), decode_coefficient_1_(1),  // Initialize to 1 for simplified version
-          p2p_partner_rank_(-1),
           is_load_mode_(false), failed_rank_(-1),
           asio_initialized_(false), use_asio_(true), use_rdma_(use_rdma)
 #ifdef __linux__
@@ -3236,10 +3245,10 @@ public:
                     : asio_conn_mgr_.get_xor_recv_socket().native_handle();
                 bool xor_first = (rank_in_group_ == 0 || rank_in_group_ == 1);
                 exchange_and_connect_qp(sock_xor, rdma_xor_qp_, xor_first);
-                int sock_p2p = (rank_ % 2 == 0)
+                int sock_p2p = (rank_ < p2p_partner_rank_)
                     ? asio_conn_mgr_.get_p2p_send_socket().native_handle()
                     : asio_conn_mgr_.get_p2p_recv_socket().native_handle();
-                bool p2p_first = (rank_ % 2 == 0);
+                bool p2p_first = (rank_ < p2p_partner_rank_);
                 exchange_and_connect_qp(sock_p2p, rdma_p2p_qp_, p2p_first);
                 if (rank_in_group_ == 2 || rank_in_group_ == 3) {
                     int sock_step6 = (rank_in_group_ == 3)
@@ -6295,11 +6304,12 @@ PYBIND11_MODULE(eccheck_native, m) {
     // Class definition
     pybind11::class_<ECCHECKNative>(m, "ECCHECKNative")
         // NCCL constructor (with optional rank_in_group for multi-rank)
-        .def(pybind11::init<int, int, int, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&, int>(),
+        .def(pybind11::init<int, int, int, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&, const std::vector<uint8_t>&, int, int>(),
              pybind11::arg("rank"), pybind11::arg("world_size"), pybind11::arg("paired_rank"),
              pybind11::arg("nccl_id_xor_send"), pybind11::arg("nccl_id_xor_recv"),
              pybind11::arg("nccl_id_p2p_send"), pybind11::arg("nccl_id_p2p_recv"),
-             pybind11::arg("rank_in_group") = -1)
+             pybind11::arg("rank_in_group") = -1,
+             pybind11::arg("p2p_partner_rank") = -1)
         // ASIO/RDMA constructor (with use_rdma flag)
         .def(pybind11::init<int, int, int,
              const std::string&, uint16_t,
@@ -6308,7 +6318,7 @@ PYBIND11_MODULE(eccheck_native, m) {
              const std::string&, uint16_t,
              const std::string&, uint16_t,
              const std::string&, uint16_t,
-             bool, int>(),
+             bool, int, int>(),
              pybind11::arg("rank"), pybind11::arg("world_size"), pybind11::arg("paired_rank"),
              pybind11::arg("xor_partner_ip"), pybind11::arg("xor_send_port"),
              pybind11::arg("xor_listen_ip"), pybind11::arg("xor_recv_port"),
@@ -6316,7 +6326,8 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("p2p_listen_ip"), pybind11::arg("p2p_recv_port"),
              pybind11::arg("step6_p2p_partner_ip"), pybind11::arg("step6_p2p_send_port"),
              pybind11::arg("step6_p2p_listen_ip"), pybind11::arg("step6_p2p_recv_port"),
-             pybind11::arg("use_rdma") = false, pybind11::arg("rank_in_group") = -1)
+             pybind11::arg("use_rdma") = false, pybind11::arg("rank_in_group") = -1,
+             pybind11::arg("p2p_partner_rank") = -1)
         .def("set_buffer_addresses", &ECCHECKNative::set_buffer_addresses)
         .def("reset_encoding_completion_flags", &ECCHECKNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECCHECKNative::wait_for_encoding_completion)

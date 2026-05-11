@@ -22,6 +22,8 @@ NNODES=4
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_INTERFACE=$NETIFACES_INTERFACE
+export ECCHECK_LOCAL_RANK_NIC_0=bond0
+export ECCHECK_LOCAL_RANK_NIC_1=bond0
 export MEGATRON_ECCHECK_LOAD_NET_TRACE=1
 
 # If first argument is a numeric node rank use it, otherwise default to 0
@@ -98,7 +100,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00015
-    --train-iters 10
+    --train-iters 2
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -116,7 +118,7 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 1
+    --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 4
 )
 
@@ -125,7 +127,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    --load $CHECKPOINT_PATH
+    #--load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
     --use-eccheck

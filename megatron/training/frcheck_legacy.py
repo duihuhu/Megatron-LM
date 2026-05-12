@@ -6,6 +6,7 @@ independently so per-layer data fits within SOURCE stripe capacity.
 """
 
 import re
+import time
 from logging import getLogger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -216,6 +217,7 @@ def _write_layer_shards(
 
 def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
     """Write frcheck_main_rank*.pt + layer-wise source/parity shards."""
+    start_time = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -369,6 +371,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         "FRCheck save: done rank=%d node=%d gdr=%s layers=%d file=%s",
         rank, my_node, gdr, num_layers, main_file,
     )
+    logger.info(f"FRCHECK legacy save: done in {time.time() - start_time:.2f}s")
 
     if world_size > 1:
         torch.distributed.barrier()

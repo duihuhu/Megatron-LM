@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Script to run a single node in 4-node simulation (default 1 GPU per node)
-# Usage: ./test_4nodes_node_335M.sh <node_rank> <global_gpu_rank> [additional_args...]
-# Example: ./test_4nodes_node_335M.sh 0 0
-# Example: ./test_4nodes_node_335M.sh 1 3
+# Usage: ./test_eccheck_4nodes_node.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]
+# Example: ./test_eccheck_4nodes_node.sh 0 0
+# Example (2 GPUs per container): ./test_eccheck_4nodes_node.sh 0 2 3
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
@@ -13,21 +13,25 @@ export NETIFACES_INTERFACE=bond0
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-
 MASTER_ADDR=10.0.0.62
-export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
-export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
+
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
-NNODES=1
-GPUS_PER_NODE=1
+NNODES=4
 
-export ECCHECK_INTERFACE=$NETIFACES_INTERFACE
-
-# Parse node_rank and global_gpu_rank
+export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
+export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
+export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
+export ECLATIN_LOCAL_RANK_NIC_0=eth0
+export ECLATIN_LOCAL_RANK_NIC_1=eth0
+export ECLATIN_LOCAL_RANK_NIC_2=eth0
+export ECLATIN_LOCAL_RANK_NIC_3=eth0
+export ECLATIN_LOCAL_RANK_NIC_4=eth1
+export ECLATIN_LOCAL_RANK_NIC_5=eth1
+export ECLATIN_LOCAL_RANK_NIC_6=eth1
+export ECLATIN_LOCAL_RANK_NIC_7=eth1
+# If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
-GLOBAL_GPU_RANK=0
-
 if [ -n "$1" ]; then
     if [[ "$1" =~ ^[0-9]+$ ]]; then
         NODE_RANK=$1
@@ -35,32 +39,41 @@ if [ -n "$1" ]; then
     fi
 fi
 
-if [ -n "$1" ]; then
-    if [[ "$1" =~ ^[0-9]+$ ]]; then
-        GLOBAL_GPU_RANK=$1
-        shift
-    fi
+# Next arguments are GPU IDs, collect them until we hit a non-numeric (additional args start with non-numeric or --)
+GPU_IDS=()
+while [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; do
+    GPU_IDS+=("$1")
+    shift
+done
+
+if [ "${#GPU_IDS[@]}" -eq 0 ]; then
+    echo "Error: At least one GPU id must be specified."
+    echo "Usage: ./test_eccheck_4nodes_node.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]"
+    exit 1
 fi
 
-export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
-WORLD_SIZE=$((GPUS_PER_NODE * NNODES))
+GPUS_PER_NODE=${#GPU_IDS[@]}
 
-# Set CUDA_VISIBLE_DEVICES using global_gpu_rank
-export CUDA_VISIBLE_DEVICES=$GLOBAL_GPU_RANK
+# Set CUDA_VISIBLE_DEVICES by explicitly listing all provided GPU IDs (as comma-separated values)
+export CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_IDS[*]}")
+
+# Set NCCL_DEBUG_FILE after NODE_RANK is determined
+export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
+WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs"
-CHECKPOINT_PATH="/workspace/Megatron-LM/data/checkpoint/models/gpt2-345m-0"
-DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
+TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
+CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-eclatin" #<Specify path>
+DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
 
-# Remaining arguments after node_rank and global_gpu_rank are passed to the training script
+# Remaining args after node-rank and GPU ids are passed to the training script
 ARGS_TO_PASS=("$@")
 
-# Fixed model configuration
+# Model related configuration here, please do not overlap with json config
 HIDDEN_SIZE=1024
 NUM_ATTENTION_HEADS=16
 SEQ_LENGTH=1024
@@ -109,8 +122,8 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 1
+    --tensor-model-parallel-size 8
+    --pipeline-model-parallel-size 4
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -121,21 +134,21 @@ EVAL_AND_LOGGING_ARGS=(
     #--load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    #--use-eccheck
-    #--use-eccheck-software-failure
+    # --use-eccheck
+
     # --use-gemini
     # --use-gemini-optimized
     # --use-gemini-software-failure
     # --use-gemini-hardware-failure
-
-    # --use-eclatin
+    # --use-distributed-optimizer
+    # --use-ecnaive-software-failure
+    --use-eclatin
     --ckpt-format torch
     # --no-save-optim
     # --no-load-optim
     --save-embeddings-separately
+    --use-rdma
     --timing-log-level 2
-    --layer-wise-optimizer-update
-    --no-barrier-with-level-1-timing
 )
 
 mkdir -p logs
@@ -145,18 +158,17 @@ mkdir -p logs/csv
 # Print command if PRINT_CMD is set
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK, Global GPU Rank $GLOBAL_GPU_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
 
-echo "Starting Node $NODE_RANK with visible global GPU rank $CUDA_VISIBLE_DEVICES"
+echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 
-export USE_FLASH_ATTN=1
-export NVTE_SYNC_P2P=1
+export USE_FLASH_ATTN=1 && \
+export NVTE_SYNC_P2P=1 && \
 
-export ECCHECK_USE_ASIO=true
 PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     pretrain_gpt.py \
     ${GPT_ARGS[@]} \
@@ -165,4 +177,3 @@ PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
     --distributed-backend nccl \
     ${ARGS_TO_PASS[@]}
-

@@ -1,5 +1,6 @@
 import ctypes
 import queue
+import time
 from logging import getLogger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -540,7 +541,7 @@ def _run_ecnaive_full_recovery(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         logger.info(
-            f"EC-NAIVE legacy load: rank_in_group 2 recovery done in {time() - start_time:.4f}s"
+            f"EC-NAIVE legacy load: hw recovery done in {time() - start_time:.2f}s (rank_in_group=2)"
         )
     else:
         aligned_block_size = ecnaive_blocks["data0"].numel()
@@ -593,8 +594,8 @@ def _run_ecnaive_full_recovery(
                 f"EC-NAIVE legacy load: unexpected rank_in_group={rank_in_group}"
             )
         logger.info(
-            f"EC-NAIVE legacy load: rank_in_group {rank_in_group} submitted load sends "
-            f"in {time() - start_time:.4f}s"
+            f"EC-NAIVE legacy load: submitted load sends in {time() - start_time:.2f}s "
+            f"(rank_in_group={rank_in_group})"
         )
 
     if torch.distributed.is_initialized():
@@ -642,6 +643,7 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     Load EC-NAIVE torch legacy checkpoint: always run 8-port recovery (aligned with torch_dist),
     then reconstruct state_dict from main tensor_buffer when present, else from decoded data0.
     """
+    start_time = time.time()
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -734,6 +736,7 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     # could access freed memory once local tensors (ecnaive_blocks, recv_buffers)
     # go out of scope. Also reset _ecnaive_native so the next save will
     # reinitialize the C++ module from scratch.
+    logger.info(f"EC-NAIVE legacy load: done in {time.time() - start_time:.2f}s")
     logger.info(f"EC-NAIVE legacy load: cleaning up native module (rank {rank})")
     manager.cleanup()
     manager._ecnaive_native = None
@@ -753,6 +756,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     send channels. Failed ranks receive via C++ ASIO recv channels, then use the
     16-worker RS decode pool to recover lost data blocks.
     """
+    start_time = time.time()
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -957,6 +961,8 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             main_payload, flat_key_roots=flat_key_roots,
         )
 
+    logger.info(f"EC-NAIVE legacy hw recovery load: done in {time.time() - start_time:.2f}s")
+
     if world_size > 1:
         torch.distributed.barrier()
 
@@ -964,6 +970,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
 
 def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
+    start_time = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -1036,6 +1043,8 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         flat_key_roots=decomposed.flat_key_roots,
         manager=manager,
     )
+
+    logger.info(f"EC-NAIVE legacy save: done in {time.time() - start_time:.2f}s")
 
     if world_size > 1:
         torch.distributed.barrier()

@@ -5,6 +5,7 @@ Mirrors ecnaive_legacy.py: decompose state dict, exchange via C++ native,
 save/load .pt files with torch.save / torch.load.
 """
 
+import time
 from logging import getLogger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -133,6 +134,7 @@ def state_dict_from_gemini_replicas_main_metadata_only(
 def save_gemini_replicas_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str
 ) -> None:
+    start_time = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = (
         torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -323,6 +325,8 @@ def save_gemini_replicas_legacy_checkpoint(
         logger.info(
             f"Gemini Replicas legacy save rank {rank}: saved replica file {replica_file}"
         )
+
+    logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
 
     if world_size > 1:
         torch.distributed.barrier()
@@ -609,6 +613,7 @@ def load_gemini_replicas_legacy_checkpoint(
       Failed ranks recover from other ranks' replica files.  After recovery,
       the main .pt file is regenerated.
     """
+    start_time = time.time()
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = (
@@ -726,6 +731,8 @@ def load_gemini_replicas_legacy_checkpoint(
         )
         manager.cleanup()
         manager._gemini_replicas_native = None
+
+    logger.info(f"GEMINI REPLICAS legacy load: done in {time.time() - start_time:.2f}s")
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()

@@ -46,6 +46,14 @@ export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
 # 基础端口号，每个 rank 占用 100 个端口范围以避免冲突
 # export GEMINI_REPLICAS_BASE_PORT=12345
 
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_0=eth0
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_1=eth0
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_2=eth0
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_3=eth0
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_4=eth1
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_5=eth1
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_6=eth1
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_7=eth1
 MASTER_PORT=6000
 NNODES=4
 
@@ -83,7 +91,7 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs"
-CHECKPOINT_PATH="/workspace/Megatron-LM/data/checkpoint/models/gpt2-345m-0-gemini-replicas-legacy"
+CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-gemini-replicas-legacy"
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -121,8 +129,8 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00015
-    --train-iters 2
-    --lr-decay-iters 320000
+    --train-iters 10
+    --lr-decay-iters 320000 
     --lr-decay-style cosine
     --min-lr 1.0e-5
     --weight-decay 1e-2
@@ -139,7 +147,7 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 2
+    --tensor-model-parallel-size 8
     --pipeline-model-parallel-size 4
 )
 
@@ -167,7 +175,7 @@ EVAL_AND_LOGGING_ARGS=(
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）
     # ---------------------------------------------------------------------------
-    --gemini-replicas-num 3         # 默认 3。设为 2 即两副本，设为 N 即 N 副本
+    --gemini-replicas-num 3          # 默认 3。设为 2 即两副本，设为 N 即 N 副本
                                         # 在组内 round-robin 轮询放置副本
                                         # 容错能力 = num_replicas - 1 个 rank 同时故障
 

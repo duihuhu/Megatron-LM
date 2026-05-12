@@ -1,5 +1,6 @@
 import ctypes
 import queue
+import time
 from logging import getLogger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -428,6 +429,7 @@ def _save_eclatin_pt_files(
 
 
 def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
+    start_time = time.time()
     from megatron.training import get_args
 
     args = get_args()
@@ -508,6 +510,8 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         blocks=blocks,
         full_tensor_buffer=full_tensor_buffer,
     )
+
+    logger.info(f"ECLATIN legacy save: done in {time.time() - start_time:.2f}s")
 
     if world_size > 1:
         torch.distributed.barrier()
@@ -810,7 +814,7 @@ def _run_eclatin_full_recovery(
                     eclatin_blocks["data_block_2"][:second_half_size]
                 )
         logger.info(
-            f"ECLATIN legacy load: rank_in_group 2 recovery done in {time() - start_time:.4f}s"
+            f"ECLATIN legacy load: hw recovery done in {time() - start_time:.2f}s (rank_in_group=2)"
         )
     elif rank_in_group == 0:
         data2_addr = int(eclatin_blocks["data_block_2"].data_ptr())
@@ -855,6 +859,7 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     Load ECLATIN torch legacy checkpoint: run recovery (aligned with torch_dist), then reconstruct
     state_dict from main tensor_buffer (rank_in_group 2 may use recovered_buffer).
     """
+    start_time = time.time()
     from megatron.training import get_args
 
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
@@ -943,6 +948,8 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         main_payload,
         recovered_buffer=recovered_buffer if rank_in_group == 2 else None,
     )
+
+    logger.info(f"ECLATIN legacy load: done in {time.time() - start_time:.2f}s")
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()

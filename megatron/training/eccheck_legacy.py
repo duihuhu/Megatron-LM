@@ -9,6 +9,7 @@ singleton and its C++ native module.
 
 import ctypes
 import queue
+import time
 from logging import getLogger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -399,6 +400,7 @@ def _save_eccheck_pt_files(
 def save_eccheck_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str
 ) -> None:
+    start_time = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -484,6 +486,8 @@ def save_eccheck_legacy_checkpoint(
         blocks=blocks,
         full_tensor_buffer=full_tensor_buffer,
     )
+
+    logger.info(f"ECCHECK legacy save: done in {time.time() - start_time:.2f}s")
 
     if world_size > 1:
         torch.distributed.barrier()
@@ -651,6 +655,7 @@ def _run_eccheck_legacy_recovery(
 
     # ---- software failure path ----
     if software_failure:
+        t_sw = time()
         if rank_in_group == 2:
             if recovered_buffer is None:
                 raise RuntimeError("ECCHECK legacy: software failure needs recovered_buffer")
@@ -659,7 +664,7 @@ def _run_eccheck_legacy_recovery(
             if recovered_buffer.numel() >= total_size:
                 n_copy = min(actual_tensor_bytes, total_size)
                 recovered_buffer[:n_copy].copy_(own_buf[:n_copy])
-            logger.info(f"ECCHECK legacy: rank_in_group 2 sw recovery done in {time():.2f}s")
+            logger.info(f"ECCHECK legacy: sw recovery done in {time() - t_sw:.2f}s (rank_in_group=2)")
         else:
             logger.info(f"ECCHECK legacy: rank_in_group {rank_in_group} no-op for sw failure")
         if torch.distributed.is_initialized():
@@ -854,7 +859,7 @@ def _run_eccheck_legacy_recovery(
                              recovered_dense.numel())
                 recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
 
-        logger.info(f"ECCHECK legacy: recovery pipeline done in {time() - start_t:.2f}s")
+        logger.info(f"ECCHECK legacy: hw recovery pipeline done in {time() - start_t:.2f}s")
 
     finally:
         if active_event is not None:
@@ -934,6 +939,7 @@ def state_dict_from_eccheck_main_metadata_only(
 # ---------------------------------------------------------------------------
 
 def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
+    start_time = time.time()
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -1016,6 +1022,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     # Stop C++ load workers so they don't interfere with subsequent training.
     # The singleton manager will be reinitialized on the next save.
+    logger.info(f"ECCHECK legacy load: done in {time.time() - start_time:.2f}s")
     logger.info(f"ECCHECK legacy: cleaning up C++ module after recovery (rank {rank})")
     manager.cleanup()
     manager._eccheck_native = None

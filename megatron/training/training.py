@@ -52,6 +52,7 @@ from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
+from megatron.training.checkpointing import maybe_preinitialize_legacy_ec_modules
 from megatron.training.checkpointing import maybe_preinitialize_torch_dist_save_strategy
 from megatron.training.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.module import Float16Module
@@ -785,6 +786,7 @@ def pretrain(
     else:
         print_rank_0("Initial training run")
 
+    maybe_preinitialize_legacy_ec_modules()
     maybe_preinitialize_torch_dist_save_strategy()
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.

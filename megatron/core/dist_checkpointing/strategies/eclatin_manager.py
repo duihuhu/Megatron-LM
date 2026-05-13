@@ -79,8 +79,46 @@ class ECLATINManager:
         # Track registered buffers (for RDMA)
         self.registered_buffers: Dict[int, Tuple[int, int]] = {}  # {buffer_addr: (size, iteration)}
         self.current_iteration: int = 0
+        self.preallocated_cpu_buffer: Optional[torch.Tensor] = None
 
         self._initialized = True
+
+    def allocate_preallocated_buffer(self, size_bytes: int):
+        """Allocate or reuse cached CPU buffer.  Grows only when needed."""
+        if self.preallocated_cpu_buffer is not None:
+            if self.preallocated_cpu_buffer.numel() >= size_bytes:
+                return
+        pin = self.eclatin_pin_memory and torch.cuda.is_available()
+        logger.info(
+            f"ECLATIN: Allocating preallocated buffer: {size_bytes / (1024**3):.2f} GB (pin={pin})"
+        )
+        self.preallocated_cpu_buffer = allocate_hugepage_tensor(
+            size_bytes, fallback_pin_memory=pin, touch_pages=False,
+        )
+
+    _cached_block_count: int = 0
+    _cached_block_size: int = 0
+    _cached_blocks: Optional[List[torch.Tensor]] = None
+
+    def allocate_preallocated_blocks(self, count: int, aligned_size: int):
+        """Allocate or reuse cached persistent blocks (4 blocks)."""
+        if (self._cached_blocks is not None and self._cached_block_count == count
+                and self._cached_block_size >= aligned_size):
+            return self._cached_blocks
+        pin = self.eclatin_pin_memory and torch.cuda.is_available()
+        logger.info(
+            f"ECLATIN: Allocating {count} blocks: {aligned_size / (1024**3):.2f} GB each "
+            f"({count * aligned_size / (1024**3):.2f} GB total, pin={pin})"
+        )
+        self._cached_blocks = list(allocate_hugepage_slices(
+            aligned_size, count, fallback_pin_memory=pin, touch_pages=True,
+        ))
+        self._cached_block_count = count
+        self._cached_block_size = aligned_size
+        if self.use_rdma:
+            for b in self._cached_blocks:
+                self.register_buffer(b)
+        return self._cached_blocks
 
     # ---- Group layout methods (identical pattern to ECNAIVE / FRCheck) ----
 
@@ -1009,6 +1047,16 @@ class ECLATINManager:
             if hasattr(self, '_eclatin_native') and self._eclatin_native is not None:
                 self._eclatin_native.stop()
                 logger.info("ECLATIN: C++ native module stopped in manager cleanup")
+
+            # Release cached allocations
+            self.preallocated_cpu_buffer = None
+            self._cached_blocks = None
+            self._cached_block_count = 0
+            self._cached_block_size = 0
+            self.eclatin_data_buffers = None
+            self.eclatin_recv_buffers = None
+            self._free_data_buffer_queue = None
+            self._free_recv_buffer_queue = None
 
         except Exception as e:
             logger.warning(f"ECLATIN: Error during manager cleanup: {e}")

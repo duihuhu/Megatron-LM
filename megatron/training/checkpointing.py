@@ -74,6 +74,47 @@ def get_checkpoint_version():
     global _CHECKPOINT_VERSION
     return _CHECKPOINT_VERSION
 
+_LEGACY_EC_PREINITIALIZED = False
+
+def maybe_preinitialize_legacy_ec_modules():
+    """Pre-initialize EC C++ native modules for legacy (torch) checkpoint format.
+
+    Called early in pretrain() so that the first save does not pay
+    the one-time cost of .so loading, TCP handshakes, and buffer-pool
+    allocation.
+    """
+    global _LEGACY_EC_PREINITIALIZED
+    if _LEGACY_EC_PREINITIALIZED:
+        return
+
+    args = get_args()
+    if args.ckpt_format != 'torch':
+        return
+    if not torch.distributed.is_initialized():
+        return
+
+    schemes = [
+        ('use_eccheck',          'megatron.core.dist_checkpointing.strategies.eccheck_manager',           'ECCHECKManager',         'init_eccheck_if_enabled'),
+        ('use_ecnaive',          'megatron.core.dist_checkpointing.strategies.ecnaive_manager',           'ECNAIVEManager',         'init_ecnaive_if_enabled'),
+        ('use_eclatin',          'megatron.core.dist_checkpointing.strategies.eclatin_manager',           'ECLATINManager',         'init_eclatin_if_enabled'),
+        ('use_gemini_replicas',  'megatron.core.dist_checkpointing.strategies.gemini_replicas_manager',   'GeminiReplicasManager',  'init_gemini_replicas_if_enabled'),
+    ]
+
+    for flag, mod_path, cls_name, init_method in schemes:
+        if not getattr(args, flag, False):
+            continue
+        try:
+            import importlib
+            mod = importlib.import_module(mod_path)
+            mgr = getattr(mod, cls_name)()
+            getattr(mgr, init_method)()
+            logger.info(f'EC legacy preinit: {cls_name} initialized')
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(f'EC legacy preinit: {cls_name} init failed: {exc}')
+
+    _LEGACY_EC_PREINITIALIZED = True
+
+
 def maybe_preinitialize_torch_dist_save_strategy():
     """pre init TorchDist Stragty"""
     global _TORCH_DIST_STRATEGY_PREINITIALIZED

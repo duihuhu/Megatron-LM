@@ -151,12 +151,8 @@ def save_gemini_replicas_legacy_checkpoint(
     total_tensor_size = decomposed.total_tensor_size_bytes
 
     safety_margin = max(int(total_tensor_size * 0.01), 1024 * 1024)
-    tensor_buffer = allocate_hugepage_tensor(
-        total_tensor_size + safety_margin,
-        fallback_pin_memory=manager.gemini_replicas_pin_memory
-        and torch.cuda.is_available(),
-    )
-    tensor_buffer.zero_()
+    manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
+    tensor_buffer = manager.preallocated_cpu_buffer
 
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
@@ -186,6 +182,8 @@ def save_gemini_replicas_legacy_checkpoint(
             )
         )
         offset += tensor_bytes
+
+    del decomposed.tensor_data  # GPU tensors no longer needed, data is in tensor_buffer
 
     # Build global metadata registry (for size exchange)
     rank_metadata, _ = _build_global_registry(
@@ -273,15 +271,13 @@ def save_gemini_replicas_legacy_checkpoint(
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    full_tensor_buffer = tensor_buffer[:total_tensor_size].detach().clone()
-
     main_payload = {
         "version": 1,
         "format": "gemini_replicas_torch_legacy",
         "rank": rank,
         "non_tensor_data": decomposed.non_tensor_data,
         "tensor_infos": rank_meta[rank]["tensor_infos"],
-        "tensor_buffer": full_tensor_buffer.contiguous().view(torch.uint8),
+        "tensor_buffer": tensor_buffer[:total_tensor_size].contiguous().view(torch.uint8),
         "tensor_buffer_size": total_tensor_size,
         "flat_key_roots": rank_meta[rank]["flat_key_roots"],
         "world_size": world_size,
@@ -325,6 +321,12 @@ def save_gemini_replicas_legacy_checkpoint(
         logger.info(
             f"Gemini Replicas legacy save rank {rank}: saved replica file {replica_file}"
         )
+
+    # Unregister receive buffers from RDMA before they go out of scope
+    if manager.use_rdma:
+        for recv_buf in receive_buffers.values():
+            manager.unregister_buffer(recv_buf)
+    del receive_buffers
 
     logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
 

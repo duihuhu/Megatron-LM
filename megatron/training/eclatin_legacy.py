@@ -70,17 +70,8 @@ def _allocate_eclatin_blocks_legacy(
         (half_max_total_bytes + eclatin_buffer_size - 1) // eclatin_buffer_size
     ) * eclatin_buffer_size
 
-    data_block_1, data_block_2, parity_block_1, parity_block_2 = allocate_hugepage_slices(
-        aligned_half_block_size,
-        4,
-        touch_pages=True,
-    )
-
-    if manager.use_rdma:
-        manager.register_buffer(data_block_1)
-        manager.register_buffer(data_block_2)
-        manager.register_buffer(parity_block_1)
-        manager.register_buffer(parity_block_2)
+    data_block_1, data_block_2, parity_block_1, parity_block_2 = \
+        manager.allocate_preallocated_blocks(4, aligned_half_block_size)
 
     return {
         "data_block_1": data_block_1,
@@ -451,11 +442,8 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     total_tensor_size = decomposed.total_tensor_size_bytes
 
     safety_margin = max(int(total_tensor_size * 0.01), manager.eclatin_buffer_size)
-    tensor_buffer = allocate_hugepage_tensor(
-        total_tensor_size + safety_margin,
-        fallback_pin_memory=manager.eclatin_pin_memory and torch.cuda.is_available(),
-    )
-    tensor_buffer.zero_()
+    manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
+    tensor_buffer = manager.preallocated_cpu_buffer
 
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
@@ -484,6 +472,8 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         )
         offset += tensor_bytes
 
+    del decomposed.tensor_data  # GPU tensors no longer needed, data is in tensor_buffer
+
     rank_metadata, _ = _build_global_registry(
         local_tensor_metadata, decomposed.non_tensor_data
     )
@@ -500,15 +490,13 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         eclatin_blocks=blocks,
     )
 
-    full_tensor_buffer = tensor_buffer[:total_tensor_size].detach().clone()
-
     _save_eclatin_pt_files(
         checkpoint_name=checkpoint_name,
         rank=rank,
         non_tensor_data=decomposed.non_tensor_data,
         tensor_infos=decomposed.tensor_infos,
         blocks=blocks,
-        full_tensor_buffer=full_tensor_buffer,
+        full_tensor_buffer=tensor_buffer[:total_tensor_size],
     )
 
     logger.info(f"ECLATIN legacy save: done in {time.time() - start_time:.2f}s")
@@ -953,5 +941,9 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()
+
+    logger.info(f"ECLATIN legacy load: cleaning up native module (rank {rank})")
+    manager.cleanup()
+    manager._eclatin_native = None
 
     return state_dict

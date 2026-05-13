@@ -81,8 +81,47 @@ class ECCHECKManager:
         # RDMA buffer tracking (similar to Gemini)
         self.registered_buffers: Dict[int, Tuple[int, int]] = {}  # {buffer_addr: (size, iteration)}
         self.current_iteration: int = 0
-        
+        self.preallocated_cpu_buffer: Optional[torch.Tensor] = None
+
         self._initialized = True
+
+    def allocate_preallocated_buffer(self, size_bytes: int):
+        """Allocate or reuse cached CPU buffer.  Grows only when needed."""
+        if self.preallocated_cpu_buffer is not None:
+            if self.preallocated_cpu_buffer.numel() >= size_bytes:
+                return
+        pin = self.eccheck_pin_memory and torch.cuda.is_available()
+        logger.info(
+            f"ECCHECK: Allocating preallocated buffer: {size_bytes / (1024**3):.2f} GB (pin={pin})"
+        )
+        self.preallocated_cpu_buffer = allocate_hugepage_tensor(
+            size_bytes, fallback_pin_memory=pin, touch_pages=False,
+        )
+
+    # cache for persistent P2P blocks (own_buffer, partner_buffer)
+    _cached_block_count: int = 0
+    _cached_block_size: int = 0
+    _cached_blocks: Optional[List[torch.Tensor]] = None
+
+    def allocate_preallocated_blocks(self, count: int, aligned_size: int):
+        """Allocate or reuse cached persistent blocks (e.g. own_buffer, partner_buffer)."""
+        if (self._cached_blocks is not None and self._cached_block_count == count
+                and self._cached_block_size >= aligned_size):
+            return self._cached_blocks
+        pin = self.eccheck_pin_memory and torch.cuda.is_available()
+        logger.info(
+            f"ECCHECK: Allocating {count} blocks: {aligned_size / (1024**3):.2f} GB each "
+            f"({count * aligned_size / (1024**3):.2f} GB total, pin={pin})"
+        )
+        self._cached_blocks = list(allocate_hugepage_slices(
+            aligned_size, count, fallback_pin_memory=pin, touch_pages=True,
+        ))
+        self._cached_block_count = count
+        self._cached_block_size = aligned_size
+        if self.use_rdma:
+            for b in self._cached_blocks:
+                self.register_buffer(b)
+        return self._cached_blocks
 
     @classmethod
     def _get_ranks_per_node(cls) -> int:
@@ -1061,7 +1100,20 @@ class ECCHECKManager:
             if hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
                 self._eccheck_native.stop_pipeline()
                 logger.info("EC-CHECK: C++ native module stopped in manager cleanup")
-                
+
+            # Release cached allocations
+            self.preallocated_cpu_buffer = None
+            self._cached_blocks = None
+            self._cached_block_count = 0
+            self._cached_block_size = 0
+            self.eccheck_data_buffers = None
+            self.eccheck_encoding_buffers = None
+            self.eccheck_parity_buffers = None
+            self.eccheck_recv_encoding_buffers = None
+            self._free_data_buffer_queue = None
+            self._free_encoding_buffer_queue = None
+            self._free_parity_buffer_queue = None
+
         except Exception as e:
             logger.warning(f"EC-CHECK: Error during manager cleanup: {e}")
     

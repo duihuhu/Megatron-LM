@@ -144,13 +144,7 @@ def _allocate_eccheck_blocks_legacy(
         // manager.eccheck_buffer_size + 1
     ) * manager.eccheck_buffer_size
 
-    own_buffer, partner_buffer = allocate_hugepage_slices(
-        aligned_size, 2, touch_pages=True,
-    )
-
-    if manager.use_rdma:
-        manager.register_buffer(own_buffer)
-        manager.register_buffer(partner_buffer)
+    own_buffer, partner_buffer = manager.allocate_preallocated_blocks(2, aligned_size)
 
     return {
         "own_buffer": own_buffer,
@@ -368,7 +362,7 @@ def _save_eccheck_pt_files(
             "rank": rank,
             "non_tensor_data": non_tensor_data,
             "tensor_infos": tensor_infos,
-            "tensor_buffer": full_tensor_buffer.contiguous().view(torch.uint8).clone(),
+            "tensor_buffer": full_tensor_buffer.contiguous().view(torch.uint8),
             "actual_tensor_size": blocks["actual_size"],
             "pipeline_total_bytes": blocks["pipeline_size"],
             "aligned_block_size": blocks["aligned_size"],
@@ -413,11 +407,8 @@ def save_eccheck_legacy_checkpoint(
     total_tensor_size = decomposed.total_tensor_size_bytes
 
     safety_margin = max(int(total_tensor_size * 0.01), manager.eccheck_buffer_size)
-    tensor_buffer = allocate_hugepage_tensor(
-        total_tensor_size + safety_margin,
-        fallback_pin_memory=manager.eccheck_pin_memory and torch.cuda.is_available(),
-    )
-    tensor_buffer.zero_()
+    manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
+    tensor_buffer = manager.preallocated_cpu_buffer
 
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
@@ -445,6 +436,8 @@ def save_eccheck_legacy_checkpoint(
             )
         )
         offset += tensor_bytes
+
+    del decomposed.tensor_data  # GPU tensors no longer needed, data is in tensor_buffer
 
     rank_metadata, _ = _build_global_registry(
         local_tensor_metadata, decomposed.non_tensor_data
@@ -476,15 +469,13 @@ def save_eccheck_legacy_checkpoint(
         blocks=blocks,
     )
 
-    full_tensor_buffer = tensor_buffer[:total_tensor_size].detach().clone()
-
     _save_eccheck_pt_files(
         checkpoint_name=checkpoint_name,
         rank=rank,
         non_tensor_data=decomposed.non_tensor_data,
         tensor_infos=decomposed.tensor_infos,
         blocks=blocks,
-        full_tensor_buffer=full_tensor_buffer,
+        full_tensor_buffer=tensor_buffer[:total_tensor_size],
     )
 
     logger.info(f"ECCHECK legacy save: done in {time.time() - start_time:.2f}s")

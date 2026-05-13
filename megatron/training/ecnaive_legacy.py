@@ -75,12 +75,7 @@ def _allocate_ecnaive_blocks(
         // manager.ecnaive_buffer_size
     ) * manager.ecnaive_buffer_size
 
-    # Allocate n blocks: own data0 + (n-1) recv blocks
-    slices = allocate_hugepage_slices(
-        aligned_block_size,
-        n,
-        touch_pages=True,
-    )
+    slices = manager.allocate_preallocated_blocks(n, aligned_block_size)
 
     # Name blocks: own_data0 + recv_0 ... recv_{n-2}
     blocks: Dict[str, torch.Tensor] = {"own_data0": slices[0]}
@@ -89,10 +84,6 @@ def _allocate_ecnaive_blocks(
         name = f"recv_{j - 1}"
         blocks[name] = slices[j]
         blocks["block_names"].append(name)
-
-    if manager.use_rdma:
-        for t in slices:
-            manager.register_buffer(t)
 
     # Backward-compat aliases for k=2 (n=4)
     if k == 2:
@@ -983,11 +974,8 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     total_tensor_size = decomposed.total_tensor_size_bytes
 
     safety_margin = max(int(total_tensor_size * 0.01), manager.ecnaive_buffer_size)
-    tensor_buffer = allocate_hugepage_tensor(
-        total_tensor_size + safety_margin,
-        fallback_pin_memory=manager.ecnaive_pin_memory and torch.cuda.is_available(),
-    )
-    tensor_buffer.zero_()
+    manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
+    tensor_buffer = manager.preallocated_cpu_buffer
 
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
@@ -1016,6 +1004,8 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         )
         offset += tensor_bytes
 
+    del decomposed.tensor_data  # GPU tensors no longer needed, data is in tensor_buffer
+
     rank_metadata, _ = _build_global_registry(
         local_tensor_metadata, decomposed.non_tensor_data
     )
@@ -1031,15 +1021,13 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         ecnaive_blocks=blocks,
     )
 
-    full_tensor_buffer = tensor_buffer[:total_tensor_size].detach().clone()
-
     _save_ecnaive_pt_files(
         checkpoint_name=checkpoint_name,
         rank=rank,
         non_tensor_data=decomposed.non_tensor_data,
         tensor_infos=decomposed.tensor_infos,
         blocks=blocks,
-        full_tensor_buffer=full_tensor_buffer,
+        full_tensor_buffer=tensor_buffer[:total_tensor_size],
         flat_key_roots=decomposed.flat_key_roots,
         manager=manager,
     )

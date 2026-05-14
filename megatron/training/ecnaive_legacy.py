@@ -271,41 +271,25 @@ def _save_ecnaive_pt_files(
         block_files_legacy = None
 
     main_file = checkpoint_dir / f"ecnaive_main_rank{rank}.pt"
-    torch.save(
-        {
-            "version": 2,
-            "format": "ecnaive_torch_legacy",
-            "rank": rank,
-            "ecnaive_k": k,
-            "ecnaive_n": n,
-            "non_tensor_data": non_tensor_data,
-            "tensor_infos": tensor_infos,
-            "tensor_buffer": full_tensor_buffer.contiguous().view(torch.uint8),
-            "actual_tensor_size": blocks["actual_size"],
-            "pipeline_total_bytes": blocks["pipeline_size"],
-            "aligned_block_size": blocks["aligned_size"],
-            "block_data_size": blocks.get("block_data_size", blocks["pipeline_size"] // k),
-            "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
-            "block_files": block_files,
-            # backward compat for k=2 loaders
-            "_block_files_legacy": block_files_legacy,
-        },
-        main_file,
+    from megatron.training.legacy_io_utils import write_raw_checkpoint, write_raw_block, MAGIC_ECNAIVE, MAGIC_BLOCK
+    write_raw_checkpoint(
+        str(main_file), MAGIC_ECNAIVE,
+        non_tensor_data, tensor_infos,
+        full_tensor_buffer, blocks["actual_size"],
+        version=2, format="ecnaive_torch_legacy", rank=rank,
+        ecnaive_k=k, ecnaive_n=n,
+        actual_tensor_size=blocks["actual_size"],
+        pipeline_total_bytes=blocks["pipeline_size"],
+        aligned_block_size=blocks["aligned_size"],
+        block_data_size=blocks.get("block_data_size", blocks["pipeline_size"] // k),
+        flat_key_roots=list(flat_key_roots) if flat_key_roots else [],
+        block_files=block_files,
+        _block_files_legacy=block_files_legacy,
     )
 
     for name in block_names:
         block_file = checkpoint_dir / f"ecnaive_block_rank{rank}_{name}.pt"
-        block_tensor = blocks[name].detach().contiguous().clone()
-        torch.save(
-            {
-                "version": 2,
-                "format": "ecnaive_torch_legacy",
-                "rank": rank,
-                "block_name": name,
-                "tensor": block_tensor,
-            },
-            block_file,
-        )
+        write_raw_block(str(block_file), MAGIC_BLOCK, blocks[name], blocks[name].numel())
 
 
 def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
@@ -347,7 +331,11 @@ def _load_ecnaive_main_payload(
     main_path = checkpoint_dir / f"ecnaive_main_rank{rank}.pt"
     local_payload: Optional[Dict[str, Any]] = None
     if main_path.is_file():
-        local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+        from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_ECNAIVE
+        if is_raw_format(str(main_path), MAGIC_ECNAIVE):
+            local_payload = read_raw_checkpoint(str(main_path), MAGIC_ECNAIVE)
+        else:
+            local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
 
     if world_size <= 1 or not torch.distributed.is_initialized():
         if local_payload is None:
@@ -366,13 +354,17 @@ def _load_ecnaive_main_payload(
 
 
 def _load_blocks_from_disk(checkpoint_dir: Path, rank: int) -> Dict[str, torch.Tensor]:
+    from megatron.training.legacy_io_utils import is_raw_format, read_raw_block, MAGIC_BLOCK
     blocks: Dict[str, torch.Tensor] = {}
     for block_name in ("data0", "recv_parity1", "recv_parity0", "recv_data1"):
         block_path = checkpoint_dir / f"ecnaive_block_rank{rank}_{block_name}.pt"
         if not block_path.is_file():
             raise FileNotFoundError(f"EC-NAIVE legacy: missing block file {block_path}")
-        payload = torch.load(block_path, map_location="cpu", weights_only=False)
-        blocks[block_name] = payload["tensor"].contiguous().view(torch.uint8)
+        if is_raw_format(str(block_path), MAGIC_BLOCK):
+            blocks[block_name] = read_raw_block(str(block_path), MAGIC_BLOCK)
+        else:
+            payload = torch.load(block_path, map_location="cpu", weights_only=False)
+            blocks[block_name] = payload["tensor"].contiguous().view(torch.uint8)
     return blocks
 
 
@@ -970,8 +962,10 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     if manager._ecnaive_native is None:
         raise RuntimeError("EC-NAIVE native module is not available in legacy save path")
 
+    t0 = time.time()
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
+    logger.info(f"ECNAIVE save timing: decompose {time.time()-t0:.3f}s")
 
     safety_margin = max(int(total_tensor_size * 0.01), manager.ecnaive_buffer_size)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
@@ -979,7 +973,7 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
-    for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
+    for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
         tensor_bytes = info.size_bytes
         tensor_bytes_view = _cpu_uint8_view(tensor)
         if tensor_bytes_view.numel() != tensor_bytes:
@@ -1003,24 +997,34 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             )
         )
         offset += tensor_bytes
+        decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
 
-    del decomposed.tensor_data  # GPU tensors no longer needed, data is in tensor_buffer
+    del decomposed.tensor_data  # drop remaining refs
+    logger.info(f"ECNAIVE save timing: D2H+copy {time.time()-t0:.3f}s")
 
-    rank_metadata, _ = _build_global_registry(
-        local_tensor_metadata, decomposed.non_tensor_data
-    )
+    t0 = time.time()
+    rank_metadata, _ = _build_global_registry(local_tensor_metadata, {})
+    logger.info(f"ECNAIVE save timing: metadata exchange {time.time()-t0:.3f}s")
+
+    t0 = time.time()
     blocks = _allocate_ecnaive_blocks(manager, rank_metadata)
+    logger.info(f"ECNAIVE save timing: block alloc {time.time()-t0:.3f}s")
 
+    t0 = time.time()
     if manager.use_rdma:
         manager.register_buffer(tensor_buffer)
+    logger.info(f"ECNAIVE save timing: RDMA reg {time.time()-t0:.3f}s")
 
+    t0 = time.time()
     _encode_with_native(
         manager=manager,
         tensor_buffer=tensor_buffer,
         actual_data_bytes=total_tensor_size,
         ecnaive_blocks=blocks,
     )
+    logger.info(f"ECNAIVE save timing: encode {time.time()-t0:.3f}s")
 
+    t0 = time.time()
     _save_ecnaive_pt_files(
         checkpoint_name=checkpoint_name,
         rank=rank,
@@ -1031,6 +1035,7 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         flat_key_roots=decomposed.flat_key_roots,
         manager=manager,
     )
+    logger.info(f"ECNAIVE save timing: file write {time.time()-t0:.3f}s")
 
     logger.info(f"EC-NAIVE legacy save: done in {time.time() - start_time:.2f}s")
 

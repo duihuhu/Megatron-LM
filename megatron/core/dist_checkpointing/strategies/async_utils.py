@@ -1463,3 +1463,44 @@ class AsyncCallsQueue:
         self.maybe_finalize_async_calls(blocking=True)
         if self.persistent and self.persistent_caller:
             self.persistent_caller.close()
+
+
+def fast_all_gather_dicts(
+    local_dict: dict,
+    gloo_group,
+    world_size: int = None,
+) -> list:
+    """Exchange dicts across all ranks via tensor all_gather (much faster than
+    ``all_gather_object`` which pickles at each hop).
+
+    1. Pickle *local_dict* to bytes (once).
+    2. Exchange sizes, pad to max, all_gather raw byte tensors.
+    3. Unpickle each rank's dict.
+
+    Returns a list of length *world_size* where index *r* is the dict from rank *r*.
+    """
+    import pickle as _pickle
+
+    if world_size is None:
+        world_size = torch.distributed.get_world_size()
+
+    payload = _pickle.dumps(local_dict)
+    payload_len = torch.tensor([len(payload)], dtype=torch.long, device="cpu")
+    all_lens = [torch.zeros_like(payload_len) for _ in range(world_size)]
+    torch.distributed.all_gather(all_lens, payload_len, group=gloo_group)
+    sizes = [int(t.item()) for t in all_lens]
+    max_size = max(sizes)
+
+    buf = torch.zeros(max_size, dtype=torch.uint8, device="cpu")
+    buf[:len(payload)].copy_(
+        torch.frombuffer(payload, dtype=torch.uint8)
+    )
+    all_bufs = [torch.zeros(max_size, dtype=torch.uint8, device="cpu")
+                for _ in range(world_size)]
+    torch.distributed.all_gather(all_bufs, buf, group=gloo_group)
+
+    results = []
+    for r in range(world_size):
+        raw = all_bufs[r][:sizes[r]].numpy().tobytes()
+        results.append(_pickle.loads(raw))
+    return results

@@ -5,11 +5,14 @@ Mirrors ecnaive_legacy.py: decompose state dict, exchange via C++ native,
 save/load .pt files with torch.save / torch.load.
 """
 
+import pickle
+import struct
 import time
 from logging import getLogger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import numpy as np
 import torch
 
 from megatron.core.dist_checkpointing.strategies.gemini_replicas_manager import (
@@ -135,6 +138,7 @@ def save_gemini_replicas_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str
 ) -> None:
     start_time = time.time()
+    t0 = start_time
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = (
         torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -147,16 +151,19 @@ def save_gemini_replicas_legacy_checkpoint(
             "Gemini Replicas native module is not available in legacy save path"
         )
 
+    t0 = time.time()
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
+    logger.info(f"GEMINI save timing: decompose {time.time()-t0:.3f}s")
 
+    t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), 1024 * 1024)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
 
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
-    for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
+    for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
         tensor_bytes = info.size_bytes
         tensor_bytes_view = _cpu_uint8_view(tensor)
         if tensor_bytes_view.numel() != tensor_bytes:
@@ -182,17 +189,17 @@ def save_gemini_replicas_legacy_checkpoint(
             )
         )
         offset += tensor_bytes
+        decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
 
-    del decomposed.tensor_data  # GPU tensors no longer needed, data is in tensor_buffer
+    del decomposed.tensor_data  # drop remaining refs
+    logger.info(f"GEMINI save timing: D2H+copy {time.time()-t0:.3f}s")
 
-    # Build global metadata registry (for size exchange)
-    rank_metadata, _ = _build_global_registry(
-        local_tensor_metadata, decomposed.non_tensor_data
-    )
-
+    t0 = time.time()
     if manager.use_rdma:
         manager.register_buffer(tensor_buffer)
+    logger.info(f"GEMINI save timing: RDMA reg tensor {time.time()-t0:.3f}s")
 
+    t0 = time.time()
     # Exchange buffer sizes via gloo all_gather
     send_buffer_size = total_tensor_size
     global_gloo_group = get_or_create_global_gloo_group()
@@ -200,6 +207,7 @@ def save_gemini_replicas_legacy_checkpoint(
     all_sizes = [torch.zeros_like(size_tensor) for _ in range(world_size)]
     torch.distributed.all_gather(all_sizes, size_tensor, group=global_gloo_group)
     rank_sizes = {r: int(all_sizes[r][0].item()) for r in range(world_size)}
+    logger.info(f"GEMINI save timing: size exchange {time.time()-t0:.3f}s")
 
     # Determine source ranks (ranks whose target list includes us)
     target_ranks = manager._calculate_target_ranks(rank, world_size)
@@ -217,17 +225,20 @@ def save_gemini_replicas_legacy_checkpoint(
         f"buffer={send_buffer_size / (1024**2):.2f} MB"
     )
 
-    # Allocate receive buffers
+    t0 = time.time()
+    # Allocate or reuse cached receive buffers
     receive_buffers: Dict[int, torch.Tensor] = {}
     for src_r in source_ranks:
         src_size = rank_sizes[src_r]
-        recv_buf = torch.empty(src_size, dtype=torch.uint8)
+        recv_buf = manager.allocate_recv_buffer(src_r, src_size)
         if manager.use_rdma:
             manager.register_buffer(recv_buf)
         receive_buffers[src_r] = recv_buf
 
     torch.distributed.barrier()
+    logger.info(f"GEMINI save timing: recv buf alloc + barrier {time.time()-t0:.3f}s")
 
+    t0 = time.time()
     # Submit to C++ native and execute exchange
     native = manager._gemini_replicas_native
     send_addr = tensor_buffer.data_ptr()
@@ -241,11 +252,16 @@ def save_gemini_replicas_legacy_checkpoint(
         f"(send to {len(target_ranks) - 1} targets, recv from {len(source_ranks)} sources)..."
     )
     native.execute_exchange()
-    logger.info(f"Gemini Replicas legacy save rank {rank}: C++ exchange done")
+    logger.info(f"Gemini Replicas legacy save rank {rank}: C++ exchange done ({time.time()-t0:.3f}s)")
 
+    t0 = time.time()
     # ===== Exchange metadata so replica files are self-contained =====
     # Each rank needs to know every source rank's tensor_infos + non_tensor_data
     # so that during hardware recovery the sender can provide full metadata.
+    # Exchange metadata needed for recovery — exclude optimizer.* keys which
+    # contain ~240MB of FP32 master weights stored as non-tensor data.
+    slim_ntd = {k: v for k, v in decomposed.non_tensor_data.items()
+                if not k.startswith("optimizer")}
     my_meta = {
         "tensor_infos": [
             {
@@ -257,7 +273,7 @@ def save_gemini_replicas_legacy_checkpoint(
             }
             for info in decomposed.tensor_infos
         ],
-        "non_tensor_data": decomposed.non_tensor_data,
+        "non_tensor_data": slim_ntd,
         "tensor_buffer_size": total_tensor_size,
         "flat_key_roots": list(decomposed.flat_key_roots)
         if decomposed.flat_key_roots
@@ -266,67 +282,59 @@ def save_gemini_replicas_legacy_checkpoint(
     all_meta: List[Any] = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(all_meta, my_meta)
     rank_meta = {r: all_meta[r] for r in range(world_size)}
+    logger.info(f"GEMINI save timing: meta exchange {time.time()-t0:.3f}s")
 
+    t0 = time.time()
     # Save .pt files
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    main_payload = {
-        "version": 1,
-        "format": "gemini_replicas_torch_legacy",
-        "rank": rank,
-        "non_tensor_data": decomposed.non_tensor_data,
-        "tensor_infos": rank_meta[rank]["tensor_infos"],
-        "tensor_buffer": tensor_buffer[:total_tensor_size].contiguous().view(torch.uint8),
+    main_payload_meta = {
+        "version": 1, "format": "gemini_replicas_torch_legacy", "rank": rank,
         "tensor_buffer_size": total_tensor_size,
         "flat_key_roots": rank_meta[rank]["flat_key_roots"],
-        "world_size": world_size,
-        "num_replicas": manager.num_replicas,
+        "world_size": world_size, "num_replicas": manager.num_replicas,
         "group_size": manager.group_size,
-        "target_ranks": target_ranks,
-        "source_ranks": source_ranks,
-        # Store all ranks' metadata so any healthy main file can serve
-        # as metadata source for any failed rank during recovery.
+        "target_ranks": target_ranks, "source_ranks": source_ranks,
         "all_tensor_infos": {r: rank_meta[r]["tensor_infos"] for r in range(world_size)},
-        "all_non_tensor_data": {r: rank_meta[r]["non_tensor_data"] for r in range(world_size)},
         "all_flat_key_roots": {r: rank_meta[r]["flat_key_roots"] for r in range(world_size)},
         "all_tensor_buffer_sizes": {r: rank_meta[r]["tensor_buffer_size"] for r in range(world_size)},
     }
 
     main_file = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
-    torch.save(main_payload, main_file)
+    from megatron.training.legacy_io_utils import write_raw_checkpoint, write_raw_simple, MAGIC_GEMINI, MAGIC_GEMINI_REPLICA
+    write_raw_checkpoint(
+        str(main_file), MAGIC_GEMINI,
+        decomposed.non_tensor_data, rank_meta[rank]["tensor_infos"],
+        tensor_buffer, total_tensor_size,
+        **main_payload_meta,
+    )
     logger.info(
-        f"Gemini Replicas legacy save rank {rank}: saved main file {main_file}"
+        f"Gemini Replicas legacy save rank {rank}: saved main file {main_file} ({time.time()-t0:.3f}s)"
     )
 
+    t0 = time.time()
     # Save replica files — include source rank's metadata so recovery is self-contained
     for src_r, recv_buf in receive_buffers.items():
         replica_file = (
             checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{src_r}.pt"
         )
-        replica_payload = {
-            "version": 1,
-            "format": "gemini_replicas_torch_legacy",
-            "rank": rank,
-            "source_rank": src_r,
-            "buffer_size": recv_buf.numel(),
-            "tensor_buffer": recv_buf.detach().clone().contiguous().view(torch.uint8),
-            # Include source rank's metadata for recovery
+        meta_bytes = pickle.dumps({
+            "version": 1, "format": "gemini_replicas_torch_legacy",
+            "rank": rank, "source_rank": src_r, "buffer_size": recv_buf.numel(),
             "source_tensor_infos": rank_meta[src_r]["tensor_infos"],
             "source_non_tensor_data": rank_meta[src_r]["non_tensor_data"],
             "source_flat_key_roots": rank_meta[src_r]["flat_key_roots"],
             "source_tensor_buffer_size": rank_meta[src_r]["tensor_buffer_size"],
-        }
-        torch.save(replica_payload, replica_file)
+        })
+        with open(str(replica_file), "wb") as f:
+            f.write(struct.pack("<4sQ", MAGIC_GEMINI_REPLICA, len(meta_bytes)))
+            f.write(meta_bytes)
+            f.write(memoryview(recv_buf.numpy()))
         logger.info(
             f"Gemini Replicas legacy save rank {rank}: saved replica file {replica_file}"
         )
-
-    # Unregister receive buffers from RDMA before they go out of scope
-    if manager.use_rdma:
-        for recv_buf in receive_buffers.values():
-            manager.unregister_buffer(recv_buf)
-    del receive_buffers
+    logger.info(f"GEMINI save timing: replica files write {time.time()-t0:.3f}s")
 
     logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
 
@@ -390,7 +398,10 @@ def _collect_metadata_for_failed_rank(
 
     my_all_meta: Optional[Dict[str, Any]] = None
     if main_path.is_file():
-        own = torch.load(main_path, map_location="cpu", weights_only=False)
+        from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
+        own = (read_raw_checkpoint(str(main_path), MAGIC_GEMINI)
+               if is_raw_format(str(main_path), MAGIC_GEMINI)
+               else torch.load(main_path, map_location="cpu", weights_only=False))
         my_all_meta = {
             "all_tensor_infos": own.get("all_tensor_infos", {}),
             "all_non_tensor_data": own.get("all_non_tensor_data", {}),
@@ -521,7 +532,16 @@ def _run_hardware_recovery(
                 f"Gemini Replicas recovery rank {rank}: loading replica for rank {f} "
                 f"from {replica_path}"
             )
-            rp = torch.load(replica_path, map_location="cpu", weights_only=False)
+            from megatron.training.legacy_io_utils import is_raw_format, MAGIC_GEMINI_REPLICA
+            if is_raw_format(str(replica_path), MAGIC_GEMINI_REPLICA):
+                with open(str(replica_path), "rb") as _f:
+                    _f.read(4)  # skip magic
+                    meta_len = struct.unpack("<Q", _f.read(8))[0]
+                    rp = pickle.loads(_f.read(meta_len))
+                    rp["tensor_buffer"] = torch.from_numpy(
+                        np.frombuffer(_f.read(), dtype=np.uint8))
+            else:
+                rp = torch.load(replica_path, map_location="cpu", weights_only=False)
 
             # Build metadata dict with everything the receiver needs
             meta = {
@@ -656,7 +676,10 @@ def load_gemini_replicas_legacy_checkpoint(
 
     main_payload: Optional[Dict[str, Any]] = None
     if main_file_exists:
-        main_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+        from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
+        main_payload = (read_raw_checkpoint(str(main_path), MAGIC_GEMINI)
+                        if is_raw_format(str(main_path), MAGIC_GEMINI)
+                        else torch.load(main_path, map_location="cpu", weights_only=False))
 
     if not is_failed and all(health_list):
         # ---- Normal load ----

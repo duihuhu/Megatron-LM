@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from dataclasses import replace
 
-from .hugepage_alloc import allocate_hugepage_tensor
+from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
 from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
 
 logger = getLogger(__name__)

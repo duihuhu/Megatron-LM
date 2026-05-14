@@ -5,7 +5,9 @@ Layerwise: groups tensors by transformer layer index, encodes each layer
 independently so per-layer data fits within SOURCE stripe capacity.
 """
 
+import pickle
 import re
+import struct
 import time
 from logging import getLogger
 from pathlib import Path
@@ -158,66 +160,56 @@ def _write_layer_shards(
     layer_dir = checkpoint_dir / layer_name
     layer_dir.mkdir(parents=True, exist_ok=True)
 
+    from megatron.training.legacy_io_utils import write_raw_block, MAGIC_FRCHECK, MAGIC_FRCHECK_BLOCK
+    import struct
+
     if n_source_my > 0 and tensor_buffer is not None:
         source_size = n_source_my * block_size
         source_data = tensor_buffer[:source_size]
         if gdr:
             source_data = source_data.cpu()
-        torch.save(
-            {
-                "version": 2,
-                "format": "frcheck_torch_legacy",
-                "rank": rank,
-                "layer_name": layer_name,
-                "rank_in_group": rg,
-                "role": "SOURCE",
-                "num_blocks": n_source_my,
-                "block_size": block_size,
-                "data": source_data.contiguous().view(torch.uint8),
-            },
-            layer_dir / f"frcheck_source_rank{rank}.pt",
-        )
+        meta = pickle.dumps({
+            "version": 2, "format": "frcheck_torch_legacy", "rank": rank,
+            "layer_name": layer_name, "rank_in_group": rg, "role": "SOURCE",
+            "num_blocks": n_source_my, "block_size": block_size,
+        })
+        sp = str(layer_dir / f"frcheck_source_rank{rank}.pt")
+        with open(sp, "wb") as _f:
+            _f.write(struct.pack("<4sQ", MAGIC_FRCHECK_BLOCK, len(meta)))
+            _f.write(meta)
+            _f.write(memoryview(source_data[:source_size].numpy()))
 
     if n_encoder_my > 0:
         encoder_size = n_encoder_my * block_size
-        p1 = manager.parity1_accum[:encoder_size].clone()
-        torch.save(
-            {
-                "version": 2,
-                "format": "frcheck_torch_legacy",
-                "rank": rank,
-                "layer_name": layer_name,
-                "rank_in_group": rg,
-                "role": "ENCODER",
-                "num_blocks": n_encoder_my,
-                "block_size": block_size,
-                "parity": p1.contiguous().view(torch.uint8),
-            },
-            layer_dir / f"frcheck_encoder_rank{rank}.pt",
-        )
+        meta = pickle.dumps({
+            "version": 2, "format": "frcheck_torch_legacy", "rank": rank,
+            "layer_name": layer_name, "rank_in_group": rg, "role": "ENCODER",
+            "num_blocks": n_encoder_my, "block_size": block_size,
+        })
+        ep = str(layer_dir / f"frcheck_encoder_rank{rank}.pt")
+        with open(ep, "wb") as _f:
+            _f.write(struct.pack("<4sQ", MAGIC_FRCHECK_BLOCK, len(meta)))
+            _f.write(meta)
+            _f.write(memoryview(manager.parity1_accum[:encoder_size].numpy()))
 
     if n_parity_my > 0:
         par_size = n_parity_my * block_size
-        p2 = manager.parity2_accum[:par_size].clone()
-        torch.save(
-            {
-                "version": 2,
-                "format": "frcheck_torch_legacy",
-                "rank": rank,
-                "layer_name": layer_name,
-                "rank_in_group": rg,
-                "role": "PARITY_TARGET",
-                "num_blocks": n_parity_my,
-                "block_size": block_size,
-                "parity": p2.contiguous().view(torch.uint8),
-            },
-            layer_dir / f"frcheck_parity2_rank{rank}.pt",
-        )
+        meta = pickle.dumps({
+            "version": 2, "format": "frcheck_torch_legacy", "rank": rank,
+            "layer_name": layer_name, "rank_in_group": rg, "role": "PARITY_TARGET",
+            "num_blocks": n_parity_my, "block_size": block_size,
+        })
+        pp = str(layer_dir / f"frcheck_parity2_rank{rank}.pt")
+        with open(pp, "wb") as _f:
+            _f.write(struct.pack("<4sQ", MAGIC_FRCHECK_BLOCK, len(meta)))
+            _f.write(meta)
+            _f.write(memoryview(manager.parity2_accum[:par_size].numpy()))
 
 
 def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
     """Write frcheck_main_rank*.pt + layer-wise source/parity shards."""
     start_time = time.time()
+    t0 = start_time
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -229,8 +221,12 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         rank, total_tensor_size, len(decomposed.tensor_data),
     )
 
+    logger.info(f"FRCHECK save timing: decompose+group {time.time()-t0:.3f}s")
+
     # 2. Group tensors by layer index
+    t0 = time.time()
     layer_groups = _group_by_layer(decomposed)
+    del decomposed.tensor_data  # GPU refs now held by per-layer groups
     num_layers = len(layer_groups)
     logger.info(
         "FRCheck save: grouped %d layers from %d tensors (layers: %s)",
@@ -272,18 +268,17 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     flat_key_roots = decomposed.flat_key_roots
     all_tensor_infos = decomposed.tensor_infos  # full list for metadata
 
+    logger.info(f"FRCHECK save timing: layer group+manager init {time.time()-t0:.3f}s")
+
     # 5. Encode each layer independently
+    t0 = time.time()
     for group in layer_groups:
         layer_name = f"layer_{group.layer_idx}" if group.layer_idx >= 0 else "layer_common"
 
-        # Allocate per-layer contiguous buffer
+        # Allocate or reuse cached per-layer contiguous buffer
         safety_margin = max(int(group.total_bytes * 0.01), 4096)
         layer_buf_size = group.total_bytes + safety_margin
-        if gdr:
-            tensor_buffer = torch.zeros(layer_buf_size, dtype=torch.uint8, device="cuda")
-        else:
-            tensor_buffer = allocate_hugepage_tensor(layer_buf_size, fallback_pin_memory=True)
-            tensor_buffer.zero_()
+        tensor_buffer = manager.allocate_layer_buffer(group.layer_idx, layer_buf_size, gdr)
 
         # Copy layer tensors into layer buffer
         offset = 0
@@ -294,7 +289,11 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             info.offset = offset
             offset += nbytes
 
-        native.register_buffer(tensor_buffer.data_ptr(), tensor_buffer.numel())
+        group.tensor_data = []  # free GPU refs for this layer
+        addr = tensor_buffer.data_ptr()
+        if addr not in manager._rdma_registered_addrs:
+            native.register_buffer(addr, tensor_buffer.numel())
+            manager._rdma_registered_addrs.add(addr)
         logger.info(
             "FRCheck save: %s tensor_buffer %s, size=%d",
             layer_name, "GPU" if gdr else "CPU", layer_buf_size,
@@ -335,11 +334,14 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             layer_main,
         )
 
-        # Release per-layer GPU buffer
-        native.unregister_buffer(tensor_buffer.data_ptr())
-        del tensor_buffer
+        # Release per-layer GPU buffer (skip if cached — kept registered for next save)
+        if addr not in manager._rdma_registered_addrs:
+            native.unregister_buffer(addr)
+
+    logger.info(f"FRCHECK save timing: all layers encode+write {time.time()-t0:.3f}s")
 
     # 6. Write top-level main file
+    t0 = time.time()
     main_file = checkpoint_dir / f"frcheck_main_rank{rank}.pt"
     torch.save(
         {
@@ -367,6 +369,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         main_file,
     )
 
+    logger.info(f"FRCHECK save timing: main file write {time.time()-t0:.3f}s")
     logger.info(
         "FRCheck save: done rank=%d node=%d gdr=%s layers=%d file=%s",
         rank, my_node, gdr, num_layers, main_file,

@@ -1304,7 +1304,8 @@ def _load_base_checkpoint(
                         raise FileNotFoundError(
                             f"No gemini_replicas_main_rank*.pt found in {ckpt_parent_path}"
                         )
-                    payload = torch.load(str(marker), map_location="cpu", weights_only=False)
+                    from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_GEMINI
+                    payload = smart_load_checkpoint(str(marker), MAGIC_GEMINI)
                     state_dict = state_dict_from_gemini_replicas_main_metadata_only(payload)
             elif args.use_ecnaive:
                 from .ecnaive_legacy import (
@@ -1337,7 +1338,8 @@ def _load_base_checkpoint(
                         raise FileNotFoundError(
                             f"No ecnaive_main_rank*.pt found in {ckpt_parent_path}"
                         )
-                    payload = torch.load(str(marker), map_location="cpu", weights_only=False)
+                    from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECNAIVE
+                    payload = smart_load_checkpoint(str(marker), MAGIC_ECNAIVE)
                     state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
             elif getattr(args, "use_eclatin", False):
                 from .eclatin_legacy import (
@@ -1357,7 +1359,8 @@ def _load_base_checkpoint(
                         raise FileNotFoundError(
                             f"No eclatin_main_rank*.pt found in {ckpt_parent_path}"
                         )
-                    payload = torch.load(str(marker), map_location="cpu", weights_only=False)
+                    from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECLATIN
+                    payload = smart_load_checkpoint(str(marker), MAGIC_ECLATIN)
                     state_dict = state_dict_from_eclatin_main_metadata_only(payload)
             elif getattr(args, "use_frcheck", False):
                 raise NotImplementedError(
@@ -1381,7 +1384,8 @@ def _load_base_checkpoint(
                         raise FileNotFoundError(
                             f"No eccheck_main_rank*.pt found in {ckpt_parent_path}"
                         )
-                    payload = torch.load(str(marker), map_location="cpu", weights_only=False)
+                    from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECCHECK
+                    payload = smart_load_checkpoint(str(marker), MAGIC_ECCHECK)
                     state_dict = state_dict_from_eccheck_main_metadata_only(payload)
             else:
                 # ---- Marker-based auto-detection (backward compat) ----
@@ -1414,9 +1418,8 @@ def _load_base_checkpoint(
                     if torch.distributed.is_initialized():
                         state_dict = load_eclatin_legacy_checkpoint(checkpoint_name)
                     else:
-                        payload = torch.load(
-                            eclatin_marker, map_location="cpu", weights_only=False
-                        )
+                        from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECLATIN
+                        payload = smart_load_checkpoint(str(eclatin_marker), MAGIC_ECLATIN)
                         state_dict = state_dict_from_eclatin_main_metadata_only(payload)
                 else:
                     ecnaive_marker = None
@@ -1442,9 +1445,8 @@ def _load_base_checkpoint(
                         if torch.distributed.is_initialized():
                             state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
                         else:
-                            payload = torch.load(
-                                ecnaive_marker, map_location="cpu", weights_only=False
-                            )
+                            from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECNAIVE
+                            payload = smart_load_checkpoint(str(ecnaive_marker), MAGIC_ECNAIVE)
                             state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
                     else:
                         frcheck_marker = None
@@ -1487,9 +1489,8 @@ def _load_base_checkpoint(
                             if torch.distributed.is_initialized():
                                 state_dict = load_eccheck_legacy_checkpoint(checkpoint_name)
                             else:
-                                payload = torch.load(
-                                    eccheck_marker, map_location="cpu", weights_only=False
-                                )
+                                from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECCHECK
+                                payload = smart_load_checkpoint(str(eccheck_marker), MAGIC_ECCHECK)
                                 state_dict = state_dict_from_eccheck_main_metadata_only(payload)
                         else:
                             state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)

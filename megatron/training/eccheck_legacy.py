@@ -355,36 +355,22 @@ def _save_eccheck_pt_files(
     }
 
     main_file = checkpoint_dir / f"eccheck_main_rank{rank}.pt"
-    torch.save(
-        {
-            "version": 1,
-            "format": _FORMAT,
-            "rank": rank,
-            "non_tensor_data": non_tensor_data,
-            "tensor_infos": tensor_infos,
-            "tensor_buffer": full_tensor_buffer.contiguous().view(torch.uint8),
-            "actual_tensor_size": blocks["actual_size"],
-            "pipeline_total_bytes": blocks["pipeline_size"],
-            "aligned_block_size": blocks["aligned_size"],
-            "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
-            "block_files": block_files,
-        },
-        main_file,
+    from megatron.training.legacy_io_utils import write_raw_checkpoint, write_raw_block, MAGIC_ECCHECK, MAGIC_BLOCK
+    write_raw_checkpoint(
+        str(main_file), MAGIC_ECCHECK,
+        non_tensor_data, tensor_infos,
+        full_tensor_buffer, blocks["actual_size"],
+        version=1, format=_FORMAT, rank=rank,
+        actual_tensor_size=blocks["actual_size"],
+        pipeline_total_bytes=blocks["pipeline_size"],
+        aligned_block_size=blocks["aligned_size"],
+        flat_key_roots=list(flat_key_roots) if flat_key_roots else [],
+        block_files=block_files,
     )
 
     for name in ("own_buffer", "partner_buffer"):
         block_file = checkpoint_dir / f"eccheck_block_rank{rank}_{name}.pt"
-        block_tensor = blocks[name].detach().contiguous().clone()
-        torch.save(
-            {
-                "version": 1,
-                "format": _FORMAT,
-                "rank": rank,
-                "block_name": name,
-                "tensor": block_tensor,
-            },
-            block_file,
-        )
+        write_raw_block(str(block_file), MAGIC_BLOCK, blocks[name], blocks[name].numel())
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +381,7 @@ def save_eccheck_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str
 ) -> None:
     start_time = time.time()
+    t0 = start_time
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -403,8 +390,10 @@ def save_eccheck_legacy_checkpoint(
     if manager._eccheck_native is None:
         raise RuntimeError("ECCHECK native module is not available in legacy save path")
 
+    t0 = time.time()
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
+    logger.info(f"ECCHECK save timing: decompose {time.time()-t0:.3f}s")
 
     safety_margin = max(int(total_tensor_size * 0.01), manager.eccheck_buffer_size)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
@@ -412,7 +401,7 @@ def save_eccheck_legacy_checkpoint(
 
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
-    for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
+    for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
         tensor_bytes = info.size_bytes
         tensor_bytes_view = _cpu_uint8_view(tensor)
         if tensor_bytes_view.numel() != tensor_bytes:
@@ -436,25 +425,37 @@ def save_eccheck_legacy_checkpoint(
             )
         )
         offset += tensor_bytes
+        decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
 
-    del decomposed.tensor_data  # GPU tensors no longer needed, data is in tensor_buffer
+    del decomposed.tensor_data  # drop remaining refs
+    logger.info(f"ECCHECK save timing: D2H+copy {time.time()-t0:.3f}s")
 
-    rank_metadata, _ = _build_global_registry(
-        local_tensor_metadata, decomposed.non_tensor_data
-    )
+    t0 = time.time()
+    # Only tensor metadata needed for block sizing; non_tensor_data (~250MB)
+    # is exchanged by all_gather_object but never consumed here.  Pass an empty
+    # dict to avoid wasting 5+ seconds on unnecessary exchange.
+    rank_metadata, _ = _build_global_registry(local_tensor_metadata, {})
+    logger.info(f"ECCHECK save timing: metadata exchange {time.time()-t0:.3f}s")
+
+    t0 = time.time()
     blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
+    logger.info(f"ECCHECK save timing: block alloc {time.time()-t0:.3f}s")
 
     # Allocate recv encoding buffers now that we know peer data sizes
     registry = GlobalMetadataRegistry(
         rank_metadata=rank_metadata, rank_non_tensor_data={}
     )
+    t0 = time.time()
     if manager.eccheck_recv_encoding_buffers is None:
         manager.eccheck_recv_encoding_buffers = (
             manager.allocate_recv_encoding_buffers_phase2(registry)
         )
+    logger.info(f"ECCHECK save timing: recv buf alloc {time.time()-t0:.3f}s")
 
+    t0 = time.time()
     if manager.use_rdma:
         manager.register_buffer(tensor_buffer)
+    logger.info(f"ECCHECK save timing: RDMA reg {time.time()-t0:.3f}s")
 
     logger.info(
         f"ECCHECK legacy save: rank {rank} encoding "
@@ -462,13 +463,16 @@ def save_eccheck_legacy_checkpoint(
         f"(actual: {total_tensor_size / (1024**3):.2f} GB)"
     )
 
+    t0 = time.time()
     _encode_eccheck_with_native(
         manager=manager,
         tensor_buffer=tensor_buffer,
         actual_data_bytes=total_tensor_size,
         blocks=blocks,
     )
+    logger.info(f"ECCHECK save timing: encode {time.time()-t0:.3f}s")
 
+    t0 = time.time()
     _save_eccheck_pt_files(
         checkpoint_name=checkpoint_name,
         rank=rank,
@@ -477,6 +481,7 @@ def save_eccheck_legacy_checkpoint(
         blocks=blocks,
         full_tensor_buffer=tensor_buffer[:total_tensor_size],
     )
+    logger.info(f"ECCHECK save timing: file write {time.time()-t0:.3f}s")
 
     logger.info(f"ECCHECK legacy save: done in {time.time() - start_time:.2f}s")
 
@@ -494,7 +499,11 @@ def _load_eccheck_main_payload(
     main_path = checkpoint_dir / f"eccheck_main_rank{rank}.pt"
     local_payload: Optional[Dict[str, Any]] = None
     if main_path.is_file():
-        local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+        from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_ECCHECK
+        if is_raw_format(str(main_path), MAGIC_ECCHECK):
+            local_payload = read_raw_checkpoint(str(main_path), MAGIC_ECCHECK)
+        else:
+            local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
 
     if world_size <= 1 or not torch.distributed.is_initialized():
         if local_payload is None:
@@ -518,8 +527,12 @@ def _copy_block_file_into_tensor(
     block_path = checkpoint_dir / f"eccheck_block_rank{rank}_{block_name}.pt"
     if not block_path.is_file():
         raise FileNotFoundError(f"ECCHECK legacy load: missing block file {block_path}")
-    payload = torch.load(block_path, map_location="cpu", weights_only=False)
-    src = payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
+    from megatron.training.legacy_io_utils import is_raw_format, read_raw_block, MAGIC_BLOCK
+    if is_raw_format(str(block_path), MAGIC_BLOCK):
+        src = read_raw_block(str(block_path), MAGIC_BLOCK)
+    else:
+        payload = torch.load(block_path, map_location="cpu", weights_only=False)
+        src = payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
     dst = dest.contiguous().view(-1)
     n = min(src.numel(), dst.numel())
     dst[:n].copy_(src[:n])

@@ -615,7 +615,18 @@ class GeminiReplicasManager:
         else:
             self.preallocated_cpu_buffer = torch.empty(size_bytes, dtype=torch.uint8)
             logger.info(f"Gemini Replicas: [Rank {rank}] Allocated regular CPU buffer")
-    
+
+    _cached_recv_buffers: Dict[int, torch.Tensor] = {}
+
+    def allocate_recv_buffer(self, src_rank: int, size_bytes: int):
+        """Allocate or reuse a cached receive buffer for *src_rank*."""
+        cached = self._cached_recv_buffers.get(src_rank)
+        if cached is not None and cached.numel() >= size_bytes:
+            return cached
+        buf = torch.empty(size_bytes, dtype=torch.uint8)
+        self._cached_recv_buffers[src_rank] = buf
+        return buf
+
     def register_buffer(self, buffer: torch.Tensor):
         """Register buffer for RDMA operations (called on first allocation in save phase).
         
@@ -702,4 +713,5 @@ class GeminiReplicasManager:
         self.decomposed_state_dict = None
         self.replica_buffers = []
         self.replica_metadata = []
+        self._cached_recv_buffers = {}
 

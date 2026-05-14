@@ -80,6 +80,21 @@ class FRCheckManager:
         self.parity2_accum: Optional[torch.Tensor] = None
         self._initialized = True
 
+    _cached_layer_buffers: Dict[int, torch.Tensor] = {}
+    _rdma_registered_addrs: set = set()
+
+    def allocate_layer_buffer(self, layer_idx: int, size_bytes: int, gdr: bool):
+        """Allocate or reuse a cached per-layer tensor_buffer."""
+        cached = self._cached_layer_buffers.get(layer_idx)
+        if cached is not None and cached.numel() >= size_bytes:
+            return cached
+        if gdr:
+            buf = torch.empty(size_bytes, dtype=torch.uint8, device="cuda")
+        else:
+            buf = allocate_hugepage_tensor(size_bytes, fallback_pin_memory=True)
+        self._cached_layer_buffers[layer_idx] = buf
+        return buf
+
     def init_frcheck_if_enabled(self) -> None:
         """Load native .so, init RDMA, compile stripe plans."""
         from megatron.training import get_args
@@ -483,11 +498,11 @@ class FRCheckManager:
         off = stripe_id * self.block_size
         if plan.role == StripeRole.ENCODER:
             self.parity1_accum[off : off + self.block_size].copy_(
-                self.parity1_buffer[:].clone().view(torch.uint8)
+                self.parity1_buffer[:].view(torch.uint8)
             )
         elif plan.role == StripeRole.PARITY_TARGET:
             self.parity2_accum[off : off + self.block_size].copy_(
-                self.parity2_buffer[:].clone().view(torch.uint8)
+                self.parity2_buffer[:].view(torch.uint8)
             )
 
     def get_native(self) -> Any:
@@ -519,3 +534,5 @@ class FRCheckManager:
         self.stop()
         self._frcheck_native = None
         self.stripe_plans.clear()
+        self._cached_layer_buffers = {}
+        self._rdma_registered_addrs = set()

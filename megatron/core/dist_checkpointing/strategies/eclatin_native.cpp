@@ -35,6 +35,7 @@ inline uint64_t ntohll(uint64_t value) {
 // RDMA headers (ibverbs) - only if RDMA libraries are available
 #if RDMA_AVAILABLE
 #include <infiniband/verbs.h>
+#include "rdma_device_utils.h"
 #include <endian.h>
 #endif
 
@@ -2839,7 +2840,8 @@ private:
             throw std::runtime_error("ECLATIN RDMA: No RDMA devices found");
         }
 
-        rdma_context_ = ibv_open_device(device_list[0]);
+        rdma_context_ = ibv_open_device(
+            find_rdma_device_by_ip(parity1_recv1_ip_, device_list, num_devices));
         if (!rdma_context_) {
             ibv_free_device_list(device_list);
             throw std::runtime_error("ECLATIN RDMA: Failed to open RDMA device");

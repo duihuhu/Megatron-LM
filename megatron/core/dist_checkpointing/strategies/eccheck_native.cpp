@@ -50,6 +50,7 @@ inline uint64_t ntohll(uint64_t value) {
 // RDMA includes (ibverbs)
 #ifdef __linux__
 #include <infiniband/verbs.h>
+#include "rdma_device_utils.h"
 #include <map>
 #include <sys/socket.h>
 #endif
@@ -804,6 +805,7 @@ private:
     
 #ifdef __linux__
     // RDMA resources (ibverbs)
+    std::string my_ip_;  // Local IP for RDMA device selection
     ibv_context* rdma_context_;
     ibv_pd* rdma_pd_;
     ibv_cq* rdma_xor_send_cq_;
@@ -3125,7 +3127,8 @@ public:
           is_load_mode_(false), failed_rank_(-1),
           asio_initialized_(false), use_asio_(true), use_rdma_(use_rdma)
 #ifdef __linux__
-          , rdma_context_(nullptr), rdma_pd_(nullptr),
+          , my_ip_(xor_listen_ip),
+          rdma_context_(nullptr), rdma_pd_(nullptr),
           rdma_xor_send_cq_(nullptr), rdma_xor_recv_cq_(nullptr),
           rdma_p2p_send_cq_(nullptr), rdma_p2p_recv_cq_(nullptr),
           rdma_xor_qp_(nullptr), rdma_p2p_qp_(nullptr),
@@ -5779,7 +5782,8 @@ public:
             throw std::runtime_error("No RDMA devices found");
         }
 
-        rdma_context_ = ibv_open_device(device_list[0]);
+        rdma_context_ = ibv_open_device(
+            find_rdma_device_by_ip(my_ip_, device_list, num_devices));
         if (!rdma_context_) {
             ibv_free_device_list(device_list);
             throw std::runtime_error("Failed to open RDMA device");

@@ -32,6 +32,8 @@
 // RDMA headers
 #include <infiniband/verbs.h>
 
+#include "rdma_device_utils.h"
+
 // ISA-L erasure coding
 #include <isa-l/erasure_code.h>
 
@@ -1057,7 +1059,7 @@ private:
         ibv_device** devs = ibv_get_device_list(&ndev);
         if (!devs || ndev == 0)
             throw std::runtime_error("FRCheck RDMA: no IB devices found");
-        rdma_ctx_ = ibv_open_device(devs[0]);
+        rdma_ctx_ = ibv_open_device(find_rdma_device_by_ip(my_ip_, devs, ndev));
         ibv_free_device_list(devs);
         if (!rdma_ctx_)
             throw std::runtime_error("FRCheck RDMA: failed to open device");

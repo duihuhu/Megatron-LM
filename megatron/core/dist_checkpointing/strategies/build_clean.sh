@@ -101,6 +101,7 @@ echo "Using isolated build directory: $TEMP_DIR"
 # Copy only the necessary files
 cp setup_simple.py "$TEMP_DIR/"
 cp eccheck_native.cpp "$TEMP_DIR/"
+cp rdma_device_utils.h "$TEMP_DIR/"
 
 # Build in completely isolated environment
 cd "$TEMP_DIR"

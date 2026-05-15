@@ -26,6 +26,8 @@
 // RDMA headers (ibverbs)
 #include <infiniband/verbs.h>
 
+#include "rdma_device_utils.h"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -870,7 +872,7 @@ private:
         }
         
         // Open first device
-        context_ = ibv_open_device(device_list[0]);
+        context_ = ibv_open_device(find_rdma_device_by_ip(my_ip_, device_list, num_devices));
         ibv_free_device_list(device_list);
         
         if (!context_) {

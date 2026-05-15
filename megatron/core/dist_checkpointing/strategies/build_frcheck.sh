@@ -76,6 +76,7 @@ echo "Using isolated build directory: $TEMP_DIR"
 
 cp setup_simple_frcheck.py "$TEMP_DIR/"
 cp frcheck_native.cpp "$TEMP_DIR/"
+cp rdma_device_utils.h "$TEMP_DIR/"
 
 cd "$TEMP_DIR"
 

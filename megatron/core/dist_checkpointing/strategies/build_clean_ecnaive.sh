@@ -88,6 +88,7 @@ echo "Using isolated build directory: $TEMP_DIR"
 # Copy only the necessary files
 cp setup_simple_ecnaive.py "$TEMP_DIR/"
 cp ecnaive_native.cpp "$TEMP_DIR/"
+cp rdma_device_utils.h "$TEMP_DIR/"
 
 # Build in completely isolated environment
 cd "$TEMP_DIR"

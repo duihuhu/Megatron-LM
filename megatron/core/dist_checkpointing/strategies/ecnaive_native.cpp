@@ -72,6 +72,8 @@ bool ecnaive_load_net_trace_enabled() {
 // RDMA headers
 #include <infiniband/verbs.h>
 
+#include "rdma_device_utils.h"
+
 
 namespace {
 
@@ -3978,8 +3980,9 @@ private:
             throw std::runtime_error("No RDMA devices found");
         }
         
-        // Use first device
-        rdma_context_ = ibv_open_device(device_list[0]);
+        // Select RDMA device by local IP (recv_ips_[0])
+        rdma_context_ = ibv_open_device(
+            find_rdma_device_by_ip(recv_ips_[0], device_list, num_devices));
         if (!rdma_context_) {
             ibv_free_device_list(device_list);
             throw std::runtime_error("Failed to open RDMA device");
@@ -4169,7 +4172,8 @@ private:
             if (!device_list || num_devices == 0) {
                 throw std::runtime_error("No RDMA devices found");
             }
-            rdma_context_ = ibv_open_device(device_list[0]);
+            rdma_context_ = ibv_open_device(
+                find_rdma_device_by_ip(recv_ips_[0], device_list, num_devices));
             if (!rdma_context_) {
                 ibv_free_device_list(device_list);
                 throw std::runtime_error("Failed to open RDMA device");

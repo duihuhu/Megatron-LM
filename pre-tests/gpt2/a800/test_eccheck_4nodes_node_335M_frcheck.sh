@@ -59,7 +59,7 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs"
-CHECKPOINT_PATH="/workspace/Megatron-LM/data/checkpoint/models/gpt2-345m-0-frcheck"
+CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-frcheck"
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -115,7 +115,7 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 1
+    --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 4
 )
 

@@ -28,6 +28,7 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     DecomposedStateDict,
     TensorInfo,
     TensorMetadata,
+    flatten_optimizer_fp32_params,
     reconstruct_state_dict,
     extract_tensors_from_continuous_buffer,
 )
@@ -272,6 +273,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     # 1. Decompose state_dict
+    flatten_optimizer_fp32_params(state_dict)
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
     logger.info(
@@ -379,7 +381,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
                 "layer_name": layer_name,
                 "n": n,
                 "num_stripes": num_stripes,
-                "block_size": block_size,
+                "block_size": layer_block_size,
                 "rank_in_group": rg,
                 "gdr": gdr,
                 "tensor_infos": group.tensor_infos,

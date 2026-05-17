@@ -382,6 +382,67 @@ def reconstruct_state_dict(decomposed: DecomposedStateDict) -> Dict[str, Any]:
     return state_dict
 
 
+# ---------------------------------------------------------------------------
+# Optimizer fp32_from_fp16_params flatten / unflatten
+# ---------------------------------------------------------------------------
+
+_OPT_FP32_FLAT_PREFIX = "_fp32_group"
+
+
+def flatten_optimizer_fp32_params(state_dict: Dict[str, Any]) -> bool:
+    """Flatten ``fp32_from_fp16_params`` (list-of-lists of tensors) into a dict
+    so that ``decompose_state_dict`` can extract the tensors into the
+    EC-protected tensor buffer instead of burying them in non_tensor_data.
+
+    Modifies *state_dict* in-place.  Returns True if flattening was performed.
+    """
+    optim_sd = state_dict.get("optimizer")
+    if optim_sd is None:
+        return False
+    fp32_params = optim_sd.get("fp32_from_fp16_params")
+    if fp32_params is None:
+        return False
+
+    structure = []       # [len(g0), len(g1), ...]
+    flat_dict = {}       # "_fp32_group{gi}_param{pi}" → tensor
+    for gi, group in enumerate(fp32_params):
+        structure.append(len(group))
+        for pi, tensor in enumerate(group):
+            flat_dict[f"{_OPT_FP32_FLAT_PREFIX}{gi}_param{pi}"] = tensor
+
+    optim_sd.pop("fp32_from_fp16_params")          # remove old list-of-lists
+    optim_sd["fp32_params_flat"] = flat_dict       # dict form → decompose extracts tensors
+    optim_sd["_fp32_structure"] = structure        # small metadata for unflatten
+    return True
+
+
+def unflatten_optimizer_fp32_params(reconstructed: Dict[str, Any]) -> bool:
+    """Reverse of ``flatten_optimizer_fp32_params``: rebuild the original
+    ``fp32_from_fp16_params`` list-of-lists from the flat dict produced
+    during save.
+
+    Modifies *reconstructed* in-place.  Returns True if unflattening was
+    performed (i.e. the flat representation was present).
+    """
+    optim_sd = reconstructed.get("optimizer")
+    if optim_sd is None:
+        return False
+    flat_dict = optim_sd.pop("fp32_params_flat", None)
+    structure = optim_sd.pop("_fp32_structure", None)
+    if flat_dict is None or structure is None:
+        return False  # old-format checkpoint — fp32_from_fp16_params already present
+
+    fp32_params: List[List[torch.Tensor]] = []
+    for gi, group_size in enumerate(structure):
+        group = []
+        for pi in range(group_size):
+            key = f"{_OPT_FP32_FLAT_PREFIX}{gi}_param{pi}"
+            group.append(flat_dict[key])
+        fp32_params.append(group)
+    optim_sd["fp32_from_fp16_params"] = fp32_params
+    return True
+
+
 def organize_tensor_data_in_cpu_memory(
     tensor_data_list: List[torch.Tensor],
     use_continuous_buffer: bool = True,

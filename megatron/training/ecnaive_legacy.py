@@ -18,7 +18,9 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     TensorMetadata,
     decompose_state_dict,
     extract_tensors_from_continuous_buffer,
+    flatten_optimizer_fp32_params,
     reconstruct_state_dict,
+    unflatten_optimizer_fp32_params,
 )
 
 logger = getLogger(__name__)
@@ -420,7 +422,9 @@ def _reconstruct_state_dict_from_main_and_data0(
         tensor_data=tensor_data,
         flat_key_roots=flat_key_roots or set(),
     )
-    return reconstruct_state_dict(decomposed)
+    result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
 
 
 def _reconstruct_full_state_dict_from_main_tensor_buffer(
@@ -438,7 +442,9 @@ def _reconstruct_full_state_dict_from_main_tensor_buffer(
         tensor_data=tensor_data,
         flat_key_roots=flat_key_roots or set(),
     )
-    return reconstruct_state_dict(decomposed)
+    result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
 
 
 def _run_ecnaive_full_recovery(
@@ -609,16 +615,19 @@ def state_dict_from_ecnaive_main_metadata_only(main_payload: Dict[str, Any]) -> 
     """
     flat_key_roots = _infer_flat_key_roots(main_payload)
     if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
-        return _reconstruct_full_state_dict_from_main_tensor_buffer(
+        result = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
-    decomposed = DecomposedStateDict(
-        non_tensor_data=main_payload["non_tensor_data"],
-        tensor_infos=[],
-        tensor_data=[],
-        flat_key_roots=flat_key_roots,
-    )
-    return reconstruct_state_dict(decomposed)
+    else:
+        decomposed = DecomposedStateDict(
+            non_tensor_data=main_payload["non_tensor_data"],
+            tensor_infos=[],
+            tensor_data=[],
+            flat_key_roots=flat_key_roots,
+        )
+        result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
 
 
 def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
@@ -962,6 +971,7 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     if manager._ecnaive_native is None:
         raise RuntimeError("EC-NAIVE native module is not available in legacy save path")
 
+    flatten_optimizer_fp32_params(state_dict)
     t0 = time.time()
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes

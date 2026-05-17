@@ -27,7 +27,9 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     TensorMetadata,
     decompose_state_dict,
     extract_tensors_from_continuous_buffer,
+    flatten_optimizer_fp32_params,
     reconstruct_state_dict,
+    unflatten_optimizer_fp32_params,
 )
 
 from megatron.core.dist_checkpointing.strategies.async_utils import (
@@ -118,15 +120,17 @@ def state_dict_from_gemini_replicas_main_metadata_only(
             tensor_data=tensor_data,
             flat_key_roots=flat_key_roots,
         )
-        return reconstruct_state_dict(decomposed)
-
-    decomposed = DecomposedStateDict(
-        non_tensor_data=main_payload["non_tensor_data"],
-        tensor_infos=[],
-        tensor_data=[],
-        flat_key_roots=flat_key_roots,
-    )
-    return reconstruct_state_dict(decomposed)
+        result = reconstruct_state_dict(decomposed)
+    else:
+        decomposed = DecomposedStateDict(
+            non_tensor_data=main_payload["non_tensor_data"],
+            tensor_infos=[],
+            tensor_data=[],
+            flat_key_roots=flat_key_roots,
+        )
+        result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +155,7 @@ def save_gemini_replicas_legacy_checkpoint(
             "Gemini Replicas native module is not available in legacy save path"
         )
 
+    flatten_optimizer_fp32_params(state_dict)
     t0 = time.time()
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
@@ -258,10 +263,16 @@ def save_gemini_replicas_legacy_checkpoint(
     # ===== Exchange metadata so replica files are self-contained =====
     # Each rank needs to know every source rank's tensor_infos + non_tensor_data
     # so that during hardware recovery the sender can provide full metadata.
-    # Exchange metadata needed for recovery — exclude optimizer.* keys which
-    # contain ~240MB of FP32 master weights stored as non-tensor data.
-    slim_ntd = {k: v for k, v in decomposed.non_tensor_data.items()
-                if not k.startswith("optimizer")}
+    # Exchange metadata needed for hardware recovery.
+    # Exclude large non-tensor keys that bloat pickle sizes — optimizer state,
+    # rng tensors embedded in lists, rerun state, and argparse namespace can
+    # be hundreds of MB or more after pickling and cause OOM when gathered
+    # across all ranks on the default (NCCL) pg.
+    _NTD_SKIP_PREFIXES = ("optimizer", "rng_state", "rerun_state_machine", "args")
+    slim_ntd = {
+        k: v for k, v in decomposed.non_tensor_data.items()
+        if not k.startswith(_NTD_SKIP_PREFIXES)
+    }
     my_meta = {
         "tensor_infos": [
             {
@@ -280,7 +291,9 @@ def save_gemini_replicas_legacy_checkpoint(
         else [],
     }
     all_meta: List[Any] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(all_meta, my_meta)
+    torch.distributed.all_gather_object(
+        all_meta, my_meta, group=global_gloo_group,
+    )
     rank_meta = {r: all_meta[r] for r in range(world_size)}
     logger.info(f"GEMINI save timing: meta exchange {time.time()-t0:.3f}s")
 
@@ -380,7 +393,9 @@ def _reconstruct_from_payload(
         tensor_data=tensor_data,
         flat_key_roots=flat_key_roots or set(),
     )
-    return reconstruct_state_dict(decomposed)
+    result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
 
 
 def _collect_metadata_for_failed_rank(

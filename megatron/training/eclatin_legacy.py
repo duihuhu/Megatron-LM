@@ -18,7 +18,9 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     TensorMetadata,
     decompose_state_dict,
     extract_tensors_from_continuous_buffer,
+    flatten_optimizer_fp32_params,
     reconstruct_state_dict,
+    unflatten_optimizer_fp32_params,
 )
 
 logger = getLogger(__name__)
@@ -424,6 +426,7 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     if manager._eclatin_native is None:
         raise RuntimeError("ECLATIN native module is not available in legacy save path")
 
+    flatten_optimizer_fp32_params(state_dict)
     t0 = time.time()
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
@@ -643,19 +646,24 @@ def _reconstruct_state_dict_from_eclatin_buffer(
         tensor_infos=tensor_infos,
         tensor_data=tensor_data,
     )
-    return reconstruct_state_dict(decomposed)
+    result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
 
 
 def state_dict_from_eclatin_main_metadata_only(main_payload: Dict[str, Any]) -> Dict[str, Any]:
     """Build state_dict from eclatin main file; used when torch.distributed is not initialized."""
     if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
-        return _reconstruct_state_dict_from_eclatin_buffer(main_payload, None)
-    decomposed = DecomposedStateDict(
-        non_tensor_data=main_payload["non_tensor_data"],
-        tensor_infos=[],
-        tensor_data=[],
-    )
-    return reconstruct_state_dict(decomposed)
+        result = _reconstruct_state_dict_from_eclatin_buffer(main_payload, None)
+    else:
+        decomposed = DecomposedStateDict(
+            non_tensor_data=main_payload["non_tensor_data"],
+            tensor_infos=[],
+            tensor_data=[],
+        )
+        result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
 
 
 def _max_tensor_bytes_from_registry(registry: GlobalMetadataRegistry, world_size: int) -> int:

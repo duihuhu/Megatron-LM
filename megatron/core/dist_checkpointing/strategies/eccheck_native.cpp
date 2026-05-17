@@ -707,6 +707,52 @@ private:
     std::array<uint64_t, kLoadEncodePoolSize> load_encode_pool_last_epoch_{};
     std::atomic<int> load_encode_pool_remaining_{0};
     LoadEncodePoolJob load_encode_pool_shared_job_{};
+
+    // ── Save-path encode pool (16 pthread, ec_encode_data) ────────
+    static constexpr int kEcRsEncodePoolSize = 16;
+    struct EcRsEncodeJob {
+        uintptr_t data_addr{0};
+        uintptr_t encoding_addr{0};
+        size_t size{0};
+        unsigned char* gftbls_ptr{nullptr};
+    };
+    struct EcRsEncodePoolWorkerCtx { class ECCHECKNative* self{nullptr}; int wid{0}; };
+    std::array<pthread_t, kEcRsEncodePoolSize> ec_rs_encode_pool_threads_{};
+    std::array<EcRsEncodePoolWorkerCtx, kEcRsEncodePoolSize> ec_rs_encode_pool_ctx_{};
+    std::array<int, kEcRsEncodePoolSize> ec_rs_encode_pool_cpus_{};
+    std::atomic<bool> ec_rs_encode_pool_inited_{false};
+    std::atomic<bool> ec_rs_encode_pool_stop_{false};
+    std::mutex ec_rs_encode_pool_mutex_;
+    std::condition_variable ec_rs_encode_pool_worker_cv_;
+    std::condition_variable ec_rs_encode_pool_coordinator_cv_;
+    std::atomic<uint64_t> ec_rs_encode_pool_epoch_{0};
+    std::array<uint64_t, kEcRsEncodePoolSize> ec_rs_encode_pool_last_epoch_{};
+    std::atomic<int> ec_rs_encode_pool_remaining_{0};
+    EcRsEncodeJob ec_rs_encode_pool_shared_job_{};
+    std::mutex ec_rs_encode_pool_work_mutex_;  // serialize encoder_1/encoder_2 dispatch
+
+    // ── Save-path XOR pool (16 pthread, xor_gen) ──────────────────
+    static constexpr int kEcXorPoolSize = 16;
+    struct EcXorJob {
+        uintptr_t dst{0};
+        uintptr_t src1{0};
+        uintptr_t src2{0};
+        size_t size{0};
+    };
+    struct EcXorPoolWorkerCtx { class ECCHECKNative* self{nullptr}; int wid{0}; };
+    std::array<pthread_t, kEcXorPoolSize> ec_xor_pool_threads_{};
+    std::array<EcXorPoolWorkerCtx, kEcXorPoolSize> ec_xor_pool_ctx_{};
+    std::array<int, kEcXorPoolSize> ec_xor_pool_cpus_{};
+    std::atomic<bool> ec_xor_pool_inited_{false};
+    std::atomic<bool> ec_xor_pool_stop_{false};
+    std::mutex ec_xor_pool_mutex_;
+    std::condition_variable ec_xor_pool_worker_cv_;
+    std::condition_variable ec_xor_pool_coordinator_cv_;
+    std::atomic<uint64_t> ec_xor_pool_epoch_{0};
+    std::array<uint64_t, kEcXorPoolSize> ec_xor_pool_last_epoch_{};
+    std::atomic<int> ec_xor_pool_remaining_{0};
+    EcXorJob ec_xor_pool_shared_job_{};
+    std::mutex ec_xor_pool_work_mutex_;
     
     // Load mode pending XOR encoding (matching encoding and recv)
     std::unordered_map<uintptr_t, uintptr_t> load_pending_xor_encoding_;
@@ -1492,6 +1538,17 @@ private:
         // 每个 encoder 线程只保留自己负责的 parity（encoding_addr 指向本地 parity buffer）。
         // Load mode: optional 16-thread striped pool (ECCHECK_ENCODE_CPU_LIST).
 
+        if (ec_rs_encode_pool_inited_.load(std::memory_order_acquire)) {
+            // Save path: 16-pthread encode pool (serialized dispatch)
+            std::lock_guard<std::mutex> work_lk(ec_rs_encode_pool_work_mutex_);
+            int parity_idx = coefficient;
+            if (parity_idx < 0 || parity_idx >= rows_) parity_idx = 0;
+            if (data_block_index_ >= 0 && data_block_index_ < k_) {
+                size_t tbl_off = (static_cast<size_t>(parity_idx * k_ + data_block_index_)) * 32u;
+                ec_rs_encode_pool_run_parallel(data_addr, encoding_addr, size, g_tbls_ + tbl_off);
+            }
+            return;
+        }
         if (load_encode_pool_inited_.load(std::memory_order_acquire)) {
             LoadEncodePoolJob job{};
             if (try_build_load_encode_pool_job(data_addr, size, encoding_addr, coefficient, &job)) {
@@ -2325,13 +2382,20 @@ private:
             srcs[1] = reinterpret_cast<unsigned char*>(task.remote_encoding_addr);
             unsigned char* dest = reinterpret_cast<unsigned char*>(task.parity_addr);
             
-            void* xor_array[3];
-            xor_array[0] = srcs[0];
-            xor_array[1] = srcs[1];
-            xor_array[2] = dest;
-            
-            xor_gen(3, static_cast<int>(task.size), xor_array);
-            // std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker: XOR completed, parity addr=" << task.parity_addr << std::endl;
+            // XOR via 16-pthread save pool when available (serialized dispatch)
+            if (ec_xor_pool_inited_.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> work_lk(ec_xor_pool_work_mutex_);
+                ec_xor_pool_run_parallel(task.parity_addr,
+                                         task.local_encoding_addr,
+                                         task.remote_encoding_addr,
+                                         task.size);
+            } else {
+                void* xor_array[3];
+                xor_array[0] = srcs[0];
+                xor_array[1] = srcs[1];
+                xor_array[2] = dest;
+                xor_gen(3, static_cast<int>(task.size), xor_array);
+            }
             
             if (task.p2p_own_write_addr != 0 && task.p2p_partner_write_addr != 0 && task.parity_addr != 0) {
                 if (is_load_mode_ && failed_rank_in_group_ == 2) {
@@ -2960,20 +3024,24 @@ private:
     }
 
     void start_pipeline() {
+        // Init 16-pthread pools for save-phase encode and XOR
+        ec_rs_encode_pool_init();
+        ec_xor_pool_init();
+
         // Start encoding threads
         encoder_thread_1_ = std::thread(&ECCHECKNative::encoder_worker_1, this);
         encoder_thread_2_ = std::thread(&ECCHECKNative::encoder_worker_2, this);
-        
+
         // Start unified send/recv/xor workers
         send_worker_ = std::thread(&ECCHECKNative::send_worker, this);
         recv_worker_ = std::thread(&ECCHECKNative::recv_worker, this);
         xor_worker_ = std::thread(&ECCHECKNative::xor_worker, this);
-        
+
         // Start P2P workers (split into send and recv)
         p2p_send_worker_ = std::thread(&ECCHECKNative::p2p_send_worker, this);
         p2p_recv_worker_ = std::thread(&ECCHECKNative::p2p_recv_worker, this);
-        
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] Started 7 threads (2 encoding + 1 send + 1 recv + 1 XOR + 2 P2P)" << std::endl;
+
+        std::cout << "EC-CHECK: [Rank " << rank_ << "] Started 7 threads + 2 save pools (encode + XOR, 16p each)" << std::endl;
     }
 
 public:
@@ -3790,6 +3858,8 @@ public:
         if (p2p_send_worker_.joinable()) p2p_send_worker_.join();
         if (p2p_recv_worker_.joinable()) p2p_recv_worker_.join();
         if (load_encoder_worker_.joinable()) load_encoder_worker_.join();
+        ec_rs_encode_pool_shutdown();
+        ec_xor_pool_shutdown();
         load_encode_pool_shutdown();
         if (rank_in_group_ == 0 || rank_in_group_ == 1) {
             if (load_send_worker_.joinable()) load_send_worker_.join();
@@ -4936,6 +5006,230 @@ public:
         });
     }
     
+
+    // ========== Save-path Encode Pool (ec_encode_data) ==========
+
+    void ec_rs_encode_pool_init() {
+        if (ec_rs_encode_pool_inited_.load(std::memory_order_acquire)) return;
+        ec_rs_encode_pool_cpus_ = parse_load_encode_pool_cpus_or_throw();
+        ec_rs_encode_pool_stop_.store(false, std::memory_order_release);
+        ec_rs_encode_pool_epoch_.store(0, std::memory_order_release);
+        ec_rs_encode_pool_remaining_.store(0, std::memory_order_release);
+        for (auto& e : ec_rs_encode_pool_last_epoch_) e = 0;
+        for (int i = 0; i < kEcRsEncodePoolSize; ++i) {
+            ec_rs_encode_pool_ctx_[static_cast<size_t>(i)].self = this;
+            ec_rs_encode_pool_ctx_[static_cast<size_t>(i)].wid = i;
+            int rc = pthread_create(&ec_rs_encode_pool_threads_[static_cast<size_t>(i)], nullptr,
+                                    &ECCHECKNative::ec_rs_encode_pool_pthread_entry,
+                                    &ec_rs_encode_pool_ctx_[static_cast<size_t>(i)]);
+            if (rc != 0) {
+                ec_rs_encode_pool_stop_.store(true, std::memory_order_release);
+                ec_rs_encode_pool_worker_cv_.notify_all();
+                for (int j = 0; j < i; ++j)
+                    pthread_join(ec_rs_encode_pool_threads_[static_cast<size_t>(j)], nullptr);
+                throw std::runtime_error("EC-CHECK: pthread_create for encode pool failed: " +
+                                         std::string(std::strerror(rc)));
+            }
+        }
+        ec_rs_encode_pool_inited_.store(true, std::memory_order_release);
+        std::cout << "EC-CHECK: Encode pthread pool (" << kEcRsEncodePoolSize
+                  << " workers) initialized" << std::endl;
+    }
+
+    void ec_rs_encode_pool_shutdown() {
+        if (!ec_rs_encode_pool_inited_.load(std::memory_order_acquire)) return;
+        ec_rs_encode_pool_stop_.store(true, std::memory_order_release);
+        ec_rs_encode_pool_worker_cv_.notify_all();
+        for (int i = 0; i < kEcRsEncodePoolSize; ++i)
+            pthread_join(ec_rs_encode_pool_threads_[static_cast<size_t>(i)], nullptr);
+        ec_rs_encode_pool_stop_.store(false, std::memory_order_release);
+        ec_rs_encode_pool_inited_.store(false, std::memory_order_release);
+        std::cout << "EC-CHECK: Encode pthread pool shut down" << std::endl;
+    }
+
+    static void* ec_rs_encode_pool_pthread_entry(void* arg) {
+        auto* ctx = static_cast<EcRsEncodePoolWorkerCtx*>(arg);
+        ctx->self->ec_rs_encode_pool_worker_loop(ctx->wid);
+        return nullptr;
+    }
+
+    void ec_rs_encode_pool_execute_chunk(const EcRsEncodeJob& job, int wid) {
+        const size_t total = job.size;
+        const size_t base = total / static_cast<size_t>(kEcRsEncodePoolSize);
+        const size_t rem = total % static_cast<size_t>(kEcRsEncodePoolSize);
+        size_t off, len;
+        if (wid < kEcRsEncodePoolSize - 1) {
+            off = static_cast<size_t>(wid) * base;
+            len = base;
+        } else {
+            off = static_cast<size_t>(kEcRsEncodePoolSize - 1) * base;
+            len = base + rem;
+        }
+        if (len == 0) return;
+        unsigned char* d = reinterpret_cast<unsigned char*>(job.data_addr + off);
+        unsigned char* e = reinterpret_cast<unsigned char*>(job.encoding_addr + off);
+        unsigned char* srcs[1] = {d};
+        unsigned char* dests[1] = {e};
+        ec_encode_data(static_cast<int>(len), 1, 1, job.gftbls_ptr, srcs, dests);
+    }
+
+    void ec_rs_encode_pool_worker_loop(int wid) {
+        const int cpu = ec_rs_encode_pool_cpus_[static_cast<size_t>(wid)];
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (cpu >= 0 && static_cast<unsigned>(cpu) < CPU_SETSIZE) {
+            CPU_SET(static_cast<unsigned>(cpu), &cpuset);
+            pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+        }
+        while (true) {
+            std::unique_lock<std::mutex> lk(ec_rs_encode_pool_mutex_);
+            ec_rs_encode_pool_worker_cv_.wait(lk, [&] {
+                return ec_rs_encode_pool_stop_.load(std::memory_order_acquire) ||
+                       (ec_rs_encode_pool_last_epoch_[static_cast<size_t>(wid)] <
+                        ec_rs_encode_pool_epoch_.load(std::memory_order_acquire));
+            });
+            if (ec_rs_encode_pool_stop_.load(std::memory_order_acquire)) break;
+            uint64_t e = ec_rs_encode_pool_epoch_.load(std::memory_order_acquire);
+            EcRsEncodeJob local_copy = ec_rs_encode_pool_shared_job_;
+            lk.unlock();
+            ec_rs_encode_pool_execute_chunk(local_copy, wid);
+            {
+                std::lock_guard<std::mutex> guard(ec_rs_encode_pool_mutex_);
+                ec_rs_encode_pool_last_epoch_[static_cast<size_t>(wid)] = e;
+            }
+            int left = ec_rs_encode_pool_remaining_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (left == 0) ec_rs_encode_pool_coordinator_cv_.notify_all();
+        }
+    }
+
+    void ec_rs_encode_pool_run_parallel(uintptr_t data_addr, uintptr_t encoding_addr,
+                                        size_t size, unsigned char* gftbls_ptr) {
+        {
+            std::lock_guard<std::mutex> publish(ec_rs_encode_pool_mutex_);
+            if (should_stop_threads_.load(std::memory_order_acquire)) return;
+            ec_rs_encode_pool_shared_job_ = EcRsEncodeJob{data_addr, encoding_addr, size, gftbls_ptr};
+            ec_rs_encode_pool_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            ec_rs_encode_pool_remaining_.store(kEcRsEncodePoolSize, std::memory_order_release);
+        }
+        ec_rs_encode_pool_worker_cv_.notify_all();
+        std::unique_lock<std::mutex> lk(ec_rs_encode_pool_mutex_);
+        ec_rs_encode_pool_coordinator_cv_.wait(lk, [&] {
+            return ec_rs_encode_pool_remaining_.load(std::memory_order_acquire) == 0 ||
+                   should_stop_threads_.load(std::memory_order_acquire);
+        });
+    }
+
+    // ========== Save-path XOR Pool (xor_gen) =======================
+
+    void ec_xor_pool_init() {
+        if (ec_xor_pool_inited_.load(std::memory_order_acquire)) return;
+        ec_xor_pool_cpus_ = parse_load_xor_pool_cpus_or_throw();
+        ec_xor_pool_stop_.store(false, std::memory_order_release);
+        ec_xor_pool_epoch_.store(0, std::memory_order_release);
+        ec_xor_pool_remaining_.store(0, std::memory_order_release);
+        for (auto& e : ec_xor_pool_last_epoch_) e = 0;
+        for (int i = 0; i < kEcXorPoolSize; ++i) {
+            ec_xor_pool_ctx_[static_cast<size_t>(i)].self = this;
+            ec_xor_pool_ctx_[static_cast<size_t>(i)].wid = i;
+            int rc = pthread_create(&ec_xor_pool_threads_[static_cast<size_t>(i)], nullptr,
+                                    &ECCHECKNative::ec_xor_pool_pthread_entry,
+                                    &ec_xor_pool_ctx_[static_cast<size_t>(i)]);
+            if (rc != 0) {
+                ec_xor_pool_stop_.store(true, std::memory_order_release);
+                ec_xor_pool_worker_cv_.notify_all();
+                for (int j = 0; j < i; ++j)
+                    pthread_join(ec_xor_pool_threads_[static_cast<size_t>(j)], nullptr);
+                throw std::runtime_error("EC-CHECK: pthread_create for XOR pool failed: " +
+                                         std::string(std::strerror(rc)));
+            }
+        }
+        ec_xor_pool_inited_.store(true, std::memory_order_release);
+        std::cout << "EC-CHECK: XOR pthread pool (" << kEcXorPoolSize
+                  << " workers) initialized" << std::endl;
+    }
+
+    void ec_xor_pool_shutdown() {
+        if (!ec_xor_pool_inited_.load(std::memory_order_acquire)) return;
+        ec_xor_pool_stop_.store(true, std::memory_order_release);
+        ec_xor_pool_worker_cv_.notify_all();
+        for (int i = 0; i < kEcXorPoolSize; ++i)
+            pthread_join(ec_xor_pool_threads_[static_cast<size_t>(i)], nullptr);
+        ec_xor_pool_stop_.store(false, std::memory_order_release);
+        ec_xor_pool_inited_.store(false, std::memory_order_release);
+        std::cout << "EC-CHECK: XOR pthread pool shut down" << std::endl;
+    }
+
+    static void* ec_xor_pool_pthread_entry(void* arg) {
+        auto* ctx = static_cast<EcXorPoolWorkerCtx*>(arg);
+        ctx->self->ec_xor_pool_worker_loop(ctx->wid);
+        return nullptr;
+    }
+
+    void ec_xor_pool_execute_chunk(const EcXorJob& job, int wid) {
+        const size_t total = job.size;
+        const size_t base = total / static_cast<size_t>(kEcXorPoolSize);
+        const size_t rem = total % static_cast<size_t>(kEcXorPoolSize);
+        size_t off, len;
+        if (wid < kEcXorPoolSize - 1) {
+            off = static_cast<size_t>(wid) * base;
+            len = base;
+        } else {
+            off = static_cast<size_t>(kEcXorPoolSize - 1) * base;
+            len = base + rem;
+        }
+        if (len == 0) return;
+        void* xor_array[3] = {
+            reinterpret_cast<void*>(job.dst + off),
+            reinterpret_cast<void*>(job.src1 + off),
+            reinterpret_cast<void*>(job.src2 + off),
+        };
+        xor_gen(3, static_cast<int>(len), xor_array);
+    }
+
+    void ec_xor_pool_worker_loop(int wid) {
+        const int cpu = ec_xor_pool_cpus_[static_cast<size_t>(wid)];
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        if (cpu >= 0 && static_cast<unsigned>(cpu) < CPU_SETSIZE) {
+            CPU_SET(static_cast<unsigned>(cpu), &cpuset);
+            pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+        }
+        while (true) {
+            std::unique_lock<std::mutex> lk(ec_xor_pool_mutex_);
+            ec_xor_pool_worker_cv_.wait(lk, [&] {
+                return ec_xor_pool_stop_.load(std::memory_order_acquire) ||
+                       (ec_xor_pool_last_epoch_[static_cast<size_t>(wid)] <
+                        ec_xor_pool_epoch_.load(std::memory_order_acquire));
+            });
+            if (ec_xor_pool_stop_.load(std::memory_order_acquire)) break;
+            uint64_t e = ec_xor_pool_epoch_.load(std::memory_order_acquire);
+            EcXorJob local_copy = ec_xor_pool_shared_job_;
+            lk.unlock();
+            ec_xor_pool_execute_chunk(local_copy, wid);
+            {
+                std::lock_guard<std::mutex> guard(ec_xor_pool_mutex_);
+                ec_xor_pool_last_epoch_[static_cast<size_t>(wid)] = e;
+            }
+            int left = ec_xor_pool_remaining_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if (left == 0) ec_xor_pool_coordinator_cv_.notify_all();
+        }
+    }
+
+    void ec_xor_pool_run_parallel(uintptr_t dst, uintptr_t src1, uintptr_t src2, size_t size) {
+        {
+            std::lock_guard<std::mutex> publish(ec_xor_pool_mutex_);
+            if (should_stop_threads_.load(std::memory_order_acquire)) return;
+            ec_xor_pool_shared_job_ = EcXorJob{dst, src1, src2, size};
+            ec_xor_pool_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            ec_xor_pool_remaining_.store(kEcXorPoolSize, std::memory_order_release);
+        }
+        ec_xor_pool_worker_cv_.notify_all();
+        std::unique_lock<std::mutex> lk(ec_xor_pool_mutex_);
+        ec_xor_pool_coordinator_cv_.wait(lk, [&] {
+            return ec_xor_pool_remaining_.load(std::memory_order_acquire) == 0 ||
+                   should_stop_threads_.load(std::memory_order_acquire);
+        });
+    }
     // Load XOR Worker - 执行 XOR 操作并处理 Step6 P2P
     void load_xor_worker() {
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Load XOR worker started" << std::endl;

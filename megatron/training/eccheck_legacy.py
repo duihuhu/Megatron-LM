@@ -27,7 +27,9 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     TensorMetadata,
     decompose_state_dict,
     extract_tensors_from_continuous_buffer,
+    flatten_optimizer_fp32_params,
     reconstruct_state_dict,
+    unflatten_optimizer_fp32_params,
 )
 
 logger = getLogger(__name__)
@@ -390,6 +392,7 @@ def save_eccheck_legacy_checkpoint(
     if manager._eccheck_native is None:
         raise RuntimeError("ECCHECK native module is not available in legacy save path")
 
+    flatten_optimizer_fp32_params(state_dict)
     t0 = time.time()
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
@@ -896,7 +899,9 @@ def _reconstruct_state_dict_from_eccheck_buffer(
         tensor_data=tensor_data,
         flat_key_roots=flat_key_roots,
     )
-    return reconstruct_state_dict(decomposed)
+    result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
 
 
 def _reconstruct_state_dict_from_main_tensor_buffer(
@@ -913,7 +918,9 @@ def _reconstruct_state_dict_from_main_tensor_buffer(
         tensor_data=tensor_data,
         flat_key_roots=flat_key_roots,
     )
-    return reconstruct_state_dict(decomposed)
+    result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -928,14 +935,17 @@ def state_dict_from_eccheck_main_metadata_only(
     Used when torch.distributed is not initialized (e.g. load_args_from_checkpoint).
     """
     if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
-        return _reconstruct_state_dict_from_main_tensor_buffer(main_payload)
-    decomposed = DecomposedStateDict(
-        non_tensor_data=main_payload["non_tensor_data"],
-        tensor_infos=[],
-        tensor_data=[],
-        flat_key_roots=_infer_flat_key_roots(main_payload),
-    )
-    return reconstruct_state_dict(decomposed)
+        result = _reconstruct_state_dict_from_main_tensor_buffer(main_payload)
+    else:
+        decomposed = DecomposedStateDict(
+            non_tensor_data=main_payload["non_tensor_data"],
+            tensor_infos=[],
+            tensor_data=[],
+            flat_key_roots=_infer_flat_key_roots(main_payload),
+        )
+        result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
 
 
 # ---------------------------------------------------------------------------

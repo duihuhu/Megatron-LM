@@ -514,9 +514,8 @@ public:
     std::string path() const { return poa_path_; }
     void stop() {
         if (stopped_.exchange(true)) return; // already stopped
-        // Notify RS pool threads (matches ecnaive pattern)
-        rs_pool_worker_cv_.notify_all();
-        rs_pool_coordinator_cv_.notify_one();
+        // Shut down RS pool inline (pthread_join), matching ECLATIN/ECNAIVE/ECCheck pattern
+        rs_pool_shutdown();
     }
     bool is_stopped() const { return stopped_; }
 
@@ -636,8 +635,9 @@ public:
         std::cout << "[FRCheck RDMA] rank=" << rank_in_group
                   << " all " << group_size_ << " nodes connected" << std::endl;
 
-        // Init RS encode thread pool
+        // Init RS encode thread pool + async poller
         rs_pool_init();
+        async_poller_init();
 
         // Pre-compile stripe plans
         compile_stripe_plans_();
@@ -1145,11 +1145,60 @@ private:
     static int wr_id_sub(uint64_t id) { return (int)(id & 0xFFFF); }
 
     std::vector<StripeAsyncState> async_stripes_;
+    // Persistent async poller (created once, reused across layers)
+    struct AsyncPollerWork {
+        std::string layer_dir;
+        int rank;
+        size_t block_size;
+        unsigned char* g_tbls;
+        std::vector<uintptr_t> recv_bufs;
+        std::vector<uintptr_t> parity1_addrs;
+        std::vector<uintptr_t> parity2_addrs;
+        std::vector<uintptr_t> data_addrs;
+    };
+
     std::thread async_poller_;
+    std::atomic<bool> async_poller_stop_{false};
+    std::mutex async_poller_mtx_;
+    std::condition_variable async_poller_cv_;
+    std::condition_variable async_done_cv_;
+    AsyncPollerWork async_poller_data_;
+    bool async_poller_work_ready_ = false;
+
+    // Per-call state (reset each submit)
     std::atomic<int> async_done_count_{0};
     int async_total_stripes_ = 0;
     bool async_active_ = false;
     std::vector<uintptr_t> async_data_sizes_;
+
+    void async_poller_init() {
+        async_poller_stop_ = false;
+        async_poller_ = std::thread([this]() {
+            while (!async_poller_stop_) {
+                AsyncPollerWork work;
+                {
+                    std::unique_lock<std::mutex> lk(async_poller_mtx_);
+                    async_poller_cv_.wait(lk, [this]() {
+                        return async_poller_work_ready_ || async_poller_stop_;
+                    });
+                    if (async_poller_stop_) break;
+                    if (!async_poller_work_ready_) continue;
+                    work = async_poller_data_;
+                    async_poller_work_ready_ = false;
+                }
+                async_poller_loop_(async_total_stripes_, work.g_tbls,
+                                   work.recv_bufs, work.parity1_addrs, work.parity2_addrs,
+                                   work.data_addrs, work.block_size, work.layer_dir, work.rank);
+                async_done_cv_.notify_one();
+            }
+        });
+    }
+
+    void async_poller_shutdown() {
+        async_poller_stop_ = true;
+        async_poller_cv_.notify_one();
+        if (async_poller_.joinable()) async_poller_.join();
+    }
 
 public:
     void submit_stripes_post_recvs(
@@ -1237,18 +1286,22 @@ public:
             }
         }
 
-        // Start poller thread
+        // Signal persistent poller thread with new work
         std::string layer_dir = output_dir + "/" + layer_name;
-        async_poller_ = std::thread([this,
-            rbufs=recv_bufs, p1a=parity1_addrs, p2a=parity2_addrs,
-            daddrs=data_addrs, block_size, tbls, layer_dir, rank]() {
-            async_poller_loop_(async_total_stripes_, tbls, rbufs, p1a, p2a, daddrs,
-                               block_size, layer_dir, rank);
-        });
+        {
+            std::lock_guard<std::mutex> lk(async_poller_mtx_);
+            async_poller_data_ = {layer_dir, rank, block_size, tbls,
+                                  recv_bufs, parity1_addrs, parity2_addrs, data_addrs};
+            async_poller_work_ready_ = true;
+        }
+        async_poller_cv_.notify_one();
     }
 
     void wait_stripes_async() {
-        if (async_poller_.joinable()) async_poller_.join();
+        std::unique_lock<std::mutex> lk(async_poller_mtx_);
+        async_done_cv_.wait(lk, [this]() {
+            return async_done_count_ >= async_total_stripes_ || stopped_;
+        });
         async_active_ = false;
     }
 
@@ -1378,6 +1431,7 @@ public:
     }
 
     void cleanup_rdma_() {
+        async_poller_shutdown();
         rs_pool_shutdown();
         channel_owners_.clear();
         channels_.clear();

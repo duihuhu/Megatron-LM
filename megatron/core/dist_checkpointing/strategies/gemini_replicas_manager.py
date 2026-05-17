@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from .state_dict_decomposer import DecomposedStateDict, TensorInfo
+from .hugepage_alloc import allocate_hugepage_tensor
 from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 
 logger = getLogger(__name__)
@@ -619,11 +620,19 @@ class GeminiReplicasManager:
     _cached_recv_buffers: Dict[int, torch.Tensor] = {}
 
     def allocate_recv_buffer(self, src_rank: int, size_bytes: int):
-        """Allocate or reuse a cached receive buffer for *src_rank*."""
+        """Allocate or reuse a cached receive buffer for *src_rank*.
+
+        Uses hugepage memory so that ``ibv_reg_mr`` (RDMA registration) can
+        pin the buffer — plain ``torch.empty`` pages routinely fail pinning
+        at the multi-GB scale required for large models.
+        """
         cached = self._cached_recv_buffers.get(src_rank)
         if cached is not None and cached.numel() >= size_bytes:
             return cached
-        buf = torch.empty(size_bytes, dtype=torch.uint8)
+        pin = self.gemini_replicas_pin_memory and torch.cuda.is_available()
+        buf = allocate_hugepage_tensor(
+            size_bytes, fallback_pin_memory=pin, touch_pages=False,
+        )
         self._cached_recv_buffers[src_rank] = buf
         return buf
 

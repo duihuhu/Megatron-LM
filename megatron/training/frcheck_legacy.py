@@ -283,6 +283,21 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     logger.info(f"FRCHECK save timing: decompose+group {time.time()-t0:.3f}s")
 
+    # 1.5 Build contiguous tensor_buffer for main file (same as other EC strategies).
+    #     Per-layer grouping overwrites info.offset → snapshot offsets first.
+    t0 = time.time()
+    safety_margin = max(int(total_tensor_size * 0.01), 4096)
+    full_buf = allocate_hugepage_tensor(
+        total_tensor_size + safety_margin, fallback_pin_memory=torch.cuda.is_available(),
+    )
+    full_buf.zero_()
+    for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
+        view = _to_device_view(tensor, torch.device("cpu"))
+        full_buf[info.offset : info.offset + info.size_bytes].copy_(view)
+    # save global offsets (decompose set them) before grouping clobbers them
+    _global_offsets = {id(info): info.offset for info in decomposed.tensor_infos}
+    logger.info(f"FRCHECK save timing: full tensor buf build {time.time()-t0:.3f}s")
+
     # 2. Group tensors by layer index
     t0 = time.time()
     layer_groups = _group_by_layer(decomposed)
@@ -327,7 +342,6 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     flat_key_roots = decomposed.flat_key_roots
-    all_tensor_infos = decomposed.tensor_infos  # full list for metadata
 
     logger.info(f"FRCHECK save timing: layer group+manager init {time.time()-t0:.3f}s")
 
@@ -396,17 +410,18 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     logger.info(f"FRCHECK save timing: all layers encode+write {time.time()-t0:.3f}s")
 
-    # 6. Write top-level main file (metadata-only, per-layer tensor data is in
-    #    per-layer shards — skip non_tensor_data (~250MB of optimizer state))
+    # 6. Write top-level main file with full tensor_buffer + non_tensor_data,
+    #    matching the pattern of eccheck / eclatin / ecnaive.
     t0 = time.time()
     main_file = checkpoint_dir / f"frcheck_main_rank{rank}.pt"
     from megatron.training.legacy_io_utils import write_raw_checkpoint, MAGIC_FRCHECK
-    slim_ntd = {k: v for k, v in decomposed.non_tensor_data.items()
-                if not k.startswith("optimizer")}
+    # restore global offsets (per-layer encode clobbered them with local offsets)
+    for info in decomposed.tensor_infos:
+        info.offset = _global_offsets[id(info)]
     write_raw_checkpoint(
         str(main_file), MAGIC_FRCHECK,
-        slim_ntd, all_tensor_infos,
-        torch.empty(0, dtype=torch.uint8), 0,  # no tensor data at this level
+        decomposed.non_tensor_data, decomposed.tensor_infos,
+        full_buf[:total_tensor_size], total_tensor_size,
         version=2, format="frcheck_torch_legacy", rank=rank,
         group_id=manager.group_id, rank_in_group=rg,
         poa_path=manager.get_resolved_table_path() or native.path(),
@@ -427,6 +442,8 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         rank, my_node, gdr, num_layers, main_file,
     )
     logger.info(f"FRCHECK legacy save: done in {time.time() - start_time:.2f}s")
+
+    del _global_offsets
 
     if world_size > 1:
         torch.distributed.barrier()

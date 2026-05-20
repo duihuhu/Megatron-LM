@@ -28,6 +28,10 @@ class StripeRole(IntEnum):
     SOURCE = 0
     ENCODER = 1
     PARITY_TARGET = 2
+    # Recovery roles (mirror save roles)
+    HELPER = 3        # Sends stripe block to decoder
+    DECODER = 4       # Receives, RS-decodes, sends to failed rank
+    FAILED_RANK = 5   # Receives decoded blocks, assembles per-layer
 
 
 @dataclass
@@ -85,6 +89,15 @@ class FRCheckManager:
         self.recv_buffer: Optional[torch.Tensor] = None
         self.parity1_buffer: Optional[torch.Tensor] = None
         self.parity2_buffer: Optional[torch.Tensor] = None
+        # Recovery state
+        self.is_recovery_mode: bool = False
+        self.failed_global_ranks: List[int] = []
+        self.recovery_stripe_plans: List[Dict] = []  # Per-stripe recovery plan
+        # Per-stripe recovery buffers
+        self.recovery_helper_bufs: List[Optional[torch.Tensor]] = []
+        self.recovery_decoder_bufs: List[Optional[torch.Tensor]] = []
+        self.recovery_failed_bufs: List[Optional[torch.Tensor]] = []
+
         self._initialized = True
 
     _cached_layer_buffers: Dict[int, torch.Tensor] = {}
@@ -605,6 +618,173 @@ class FRCheckManager:
             "node_slot_to_global_rank": self.node_slot_to_global_rank,
             "num_stripes": len(self.stripe_plans),
         }
+
+    # ---- Hardware recovery ----
+
+    def _compile_recovery_plans(self, failed_rank_node: int) -> List[Dict]:
+        """For each stripe, compute recovery roles (DECODER/HELPER/FAILED_RANK)
+        given the failed rank's node id (1-based in the POA table).
+
+        The n-2 ranks cyclically to the right of the failed rank in each POA row
+        collaborate: 1st right = DECODER, remaining n-3 = HELPERS.
+        """
+        n = self.frcheck_n
+        plans = []
+        for sp in self.stripe_plans:
+            row = sp.row  # list of 1-based node IDs
+            sid = sp.stripe_id
+            try:
+                failed_pos = row.index(failed_rank_node)
+            except ValueError:
+                continue  # Failed rank not in this stripe (should not happen)
+
+            # n-2 right-side positions (cyclic)
+            decoder_pos = (failed_pos + 1) % n
+            helper_positions = [(failed_pos + 2 + i) % n for i in range(n - 3)]
+
+            decoder_node = row[decoder_pos]
+            helper_nodes = [row[p] for p in helper_positions]
+
+            plans.append({
+                'stripe_id': sid,
+                'failed_node': failed_rank_node,
+                'failed_pos': failed_pos,
+                'decoder_node': decoder_node,
+                'decoder_pos': decoder_pos,
+                'helper_nodes': helper_nodes,
+                'helper_positions': helper_positions,
+                'original_role': int(sp.role),
+            })
+        return plans
+
+    def _allocate_recovery_bufs(self, native, block_sz: int) -> None:
+        """Allocate per-stripe buffers for hardware recovery.
+
+        HELPER: one block-sized buffer to read from disk → send to decoder.
+        DECODER: recv buffer for (n-3) helper blocks, + one decode output buffer.
+        FAILED_RANK: recv buffer for each stripe's recovered block.
+        """
+        n = self.frcheck_n
+        num_helper = n - 3
+        ns = self.num_stripes
+
+        self.recovery_helper_bufs = [None] * ns
+        self.recovery_decoder_bufs = [None] * ns
+        self.recovery_failed_bufs = [None] * ns
+
+        for plan in self.recovery_stripe_plans:
+            sid = plan['stripe_id']
+            my_node = self.rank_in_group + 1
+
+            if my_node == plan['decoder_node']:
+                # Allocate recv buffer for helpers' blocks + decode output
+                recv_sz = num_helper * block_sz
+                from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+                    allocate_hugepage_slices, allocate_hugepage_tensor,
+                )
+                if self.gdr_available:
+                    self.recovery_decoder_bufs[sid] = torch.cuda.ByteTensor(recv_sz + block_sz)
+                else:
+                    self.recovery_decoder_bufs[sid] = allocate_hugepage_tensor(
+                        recv_sz + block_sz, fallback_pin_memory=True)
+                native.register_buffer(
+                    self.recovery_decoder_bufs[sid].data_ptr(),
+                    self.recovery_decoder_bufs[sid].numel())
+
+            elif my_node in plan['helper_nodes']:
+                # Allocate block-sized buffer for reading from disk
+                if self.gdr_available:
+                    self.recovery_helper_bufs[sid] = torch.cuda.ByteTensor(block_sz)
+                else:
+                    from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+                        allocate_hugepage_tensor,
+                    )
+                    self.recovery_helper_bufs[sid] = allocate_hugepage_tensor(
+                        block_sz, fallback_pin_memory=True)
+                native.register_buffer(
+                    self.recovery_helper_bufs[sid].data_ptr(),
+                    self.recovery_helper_bufs[sid].numel())
+
+            elif my_node == plan['failed_node']:
+                # Allocate recv buffer for decoded block
+                from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+                    allocate_hugepage_tensor,
+                )
+                self.recovery_failed_bufs[sid] = allocate_hugepage_tensor(
+                    block_sz, fallback_pin_memory=True)
+                native.register_buffer(
+                    self.recovery_failed_bufs[sid].data_ptr(),
+                    self.recovery_failed_bufs[sid].numel())
+
+    def init_frcheck_hardware_recovery(self, failed_global_ranks: List[int]) -> Dict[int, Dict]:
+        """Initialize hardware recovery mode for a list of failed global ranks.
+
+        Each failed rank is in a different POA group (same-node failure pattern).
+        Returns a dict mapping failed_global_rank → recovery context with:
+          - 'group_id': group that contains this failed rank
+          - 'failed_rig': rank_in_group of the failed rank
+          - 'failed_node': 1-based node id in the POA table
+          - 'recovery_plans': per-stripe recovery plan
+        """
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("FRCheck hardware recovery requires torch.distributed")
+
+        world_size = torch.distributed.get_world_size()
+        my_rank = torch.distributed.get_rank()
+
+        self.is_recovery_mode = True
+        self.failed_global_ranks = list(failed_global_ranks)
+
+        recovery_contexts: Dict[int, Dict] = {}
+
+        for failed_rank in failed_global_ranks:
+            # Determine which group this failed rank belongs to
+            group_id = self._get_group_id(failed_rank, world_size, self.frcheck_n)
+            failed_rig = self._get_rank_in_group(failed_rank, world_size, self.frcheck_n)
+            failed_node = failed_rig + 1  # 1-based in POA
+
+            ctx = {
+                'group_id': group_id,
+                'failed_rig': failed_rig,
+                'failed_node': failed_node,
+                'recovery_plans': self._compile_recovery_plans(failed_node),
+            }
+            recovery_contexts[failed_rank] = ctx
+
+            if my_rank == failed_rank:
+                logger.info(
+                    "FRCheck hardware recovery: I am the failed rank %d (group %d, rig %d)",
+                    failed_rank, group_id, failed_rig)
+            elif group_id == self.group_id:
+                logger.info(
+                    "FRCheck hardware recovery: I am in group %d with failed rank %d (rig %d)",
+                    group_id, failed_rank, failed_rig)
+
+        # If I'm in a group with a failed rank, compile my per-stripe recovery role
+        my_recovery_ctx = None
+        for fr, ctx in recovery_contexts.items():
+            if ctx['group_id'] == self.group_id:
+                my_recovery_ctx = ctx
+                break
+
+        if my_recovery_ctx is not None:
+            self.recovery_stripe_plans = my_recovery_ctx['recovery_plans']
+            # Determine my role for each stripe and summary
+            my_node = self.rank_in_group + 1
+            n_decoder = n_helper = n_failed = 0
+            for plan in self.recovery_stripe_plans:
+                if my_node == plan['decoder_node']:
+                    n_decoder += 1
+                elif my_node in plan['helper_nodes']:
+                    n_helper += 1
+                elif my_node == plan['failed_node']:
+                    n_failed += 1
+            logger.info(
+                "FRCheck recovery: my roles — %d decoder, %d helper, %d failed "
+                "(total %d relevant stripes)",
+                n_decoder, n_helper, n_failed, len(self.recovery_stripe_plans))
+
+        return recovery_contexts
 
     def stop(self, timeout: float = 10.0) -> None:
         """Stop C++ encode workers with a timeout to prevent hangs on exit."""

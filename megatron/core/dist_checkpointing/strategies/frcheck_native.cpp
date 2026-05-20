@@ -39,7 +39,7 @@
 #include <isa-l/erasure_code.h>
 
 // Per-stripe file header (matches legacy_io_utils binary format)
-struct StripeFileHeader {
+struct __attribute__((packed)) StripeFileHeader {
     char magic[4];        // "FRBK"
     uint32_t stripe_id;
     uint32_t role;        // 0=SOURCE, 1=ENCODER, 2=PARITY_TARGET
@@ -504,6 +504,7 @@ public:
         cleanup_rdma_();
         if (a_mat_) { free(a_mat_); a_mat_ = nullptr; }
         if (g_tbls_) { free(g_tbls_); g_tbls_ = nullptr; }
+        if (decode_tbls_) { free(decode_tbls_); decode_tbls_ = nullptr; }
     }
 
     // ---- POA query (existing) ----
@@ -770,6 +771,68 @@ public:
         }
     }
 
+    // ---- Stripe decode (hardware recovery) ----
+    void submit_stripe_decode(
+        int k,
+        const std::vector<int>& survivor_positions,
+        int lost_position,
+        const std::vector<uintptr_t>& survivor_addrs,
+        uintptr_t recovered_addr,
+        size_t block_size)
+    {
+        if (stopped_) return;
+        int surviving_count = k;
+        if ((int)survivor_positions.size() != surviving_count ||
+            (int)survivor_addrs.size() != surviving_count) {
+            std::cerr << "FRCheck decode: survivor count mismatch" << std::endl;
+            return;
+        }
+
+        // Build decode tables for this stripe
+        init_decode_tables_(k, survivor_positions, lost_position);
+        if (!decode_tbls_) {
+            std::cerr << "FRCheck decode: failed to init decode tables" << std::endl;
+            return;
+        }
+
+        // Run parallel decode via RS pool (reuses encode pool)
+        if (rs_pool_inited_.load(std::memory_order_acquire)) {
+            RsEncodeJob job;
+            job.len = (int)block_size;
+            job.k = surviving_count;
+            job.m = 1;  // recover 1 block
+            job.g_tbls = decode_tbls_;
+            std::vector<unsigned char*> data_ptrs(surviving_count);
+            for (int i = 0; i < surviving_count; ++i)
+                data_ptrs[i] = (unsigned char*)survivor_addrs[i];
+            job.data_ptrs = data_ptrs.data();
+            unsigned char* out[1] = { (unsigned char*)recovered_addr };
+            job.parity_ptrs = out;
+            rs_pool_run_parallel_encode(job);
+        } else {
+            // Fallback: single-threaded decode
+            std::vector<unsigned char*> data_ptrs(surviving_count);
+            for (int i = 0; i < surviving_count; ++i)
+                data_ptrs[i] = (unsigned char*)survivor_addrs[i];
+            unsigned char* out[1] = { (unsigned char*)recovered_addr };
+            ec_encode_data((int)block_size, surviving_count, 1,
+                          decode_tbls_, data_ptrs.data(), out);
+        }
+    }
+
+    // ---- Point-to-point RDMA (for recovery) ----
+    void send_to_peer(int peer_rig, uintptr_t addr, size_t size) {
+        FRCheckRdmaChannel* ch = get_channel_(peer_rig);
+        if (!ch) throw std::runtime_error("FRCheck send_to_peer: no channel to rig " + std::to_string(peer_rig));
+        ch->send_data((const uint8_t*)addr, size);
+    }
+
+    void recv_from_peer(int peer_rig, uintptr_t addr, size_t size) {
+        FRCheckRdmaChannel* ch = get_channel_(peer_rig);
+        if (!ch) throw std::runtime_error("FRCheck recv_from_peer: no channel from rig " + std::to_string(peer_rig));
+        ch->recv_data((uint8_t*)addr, size);
+    }
+
     // ---- StripePlan queries for Python ----
     int get_role_for_stripe(int stripe_id) const {
         if (stripe_id < 0 || stripe_id >= (int)stripe_plans_.size())
@@ -988,6 +1051,84 @@ private:
         ec_init_tables(k, rows, a_mat_, g_tbls_);
     }
 
+    // ---- RS decode table init (hardware recovery) ----
+    // Builds decode tables for recovering one lost block from k=n-2 surviving blocks.
+    // survivor_positions: k positions in [0, n-1] of the surviving blocks
+    //   positions 0..k-1 are data blocks (identity); positions k, k+1 are parity
+    // lost_position: position in [0, n-1] of the failed rank's block
+    void init_decode_tables_(int k,
+                             const std::vector<int>& survivor_positions,
+                             int lost_position) {
+        int m_parity = 2;
+        int full_rows = k + m_parity;  // = n
+
+        // Free old decode tables
+        if (decode_tbls_) { free(decode_tbls_); decode_tbls_ = nullptr; }
+
+        // Step 1: Build full (k+2) x k Vandermonde encoding matrix
+        std::vector<unsigned char> encode_mat((size_t)k * (size_t)full_rows);
+        gf_gen_rs_matrix(encode_mat.data(), full_rows, k);
+
+        // Step 2: Build k x k survivor matrix A
+        // For each surviving position:
+        //   - pos < k: identity row (1 at column pos)
+        //   - pos >= k: Vandermonde row from encode_mat
+        std::vector<unsigned char> A((size_t)k * (size_t)k, 0);
+        int a_row = 0;
+        for (int pos : survivor_positions) {
+            if (pos < 0 || pos >= full_rows) continue;
+            if (pos < k) {
+                A[a_row * k + pos] = 1;
+            } else {
+                // Parity row from Vandermonde
+                for (int col = 0; col < k; ++col)
+                    A[a_row * k + col] = encode_mat[pos * k + col];
+            }
+            ++a_row;
+        }
+
+        // Step 3: Invert A in GF(2^8)
+        std::vector<unsigned char> inv_workspace((size_t)k * 2 * k);
+        std::vector<unsigned char> A_inv((size_t)k * k);
+        for (int i = 0; i < k * k; ++i) inv_workspace[i] = A[i];
+        int ret = gf_invert_matrix(inv_workspace.data(), A_inv.data(), k);
+        if (ret != 0) {
+            std::cerr << "FRCheck: gf_invert_matrix failed (singular), ret=" << ret << std::endl;
+            return;
+        }
+
+        // Step 4: Extract decode coefficients from A_inv
+        // A_inv is k x k, mapping survivor outputs → original data blocks
+        // Row j of A_inv recovers data block j from the k survivor inputs
+        std::vector<unsigned char> decode_mat((size_t)k);  // 1 row, k cols
+        if (lost_position < k) {
+            // Lost is a data block: use row lost_position of A_inv directly
+            for (int s = 0; s < k; ++s)
+                decode_mat[s] = A_inv[lost_position * k + s];
+        } else {
+            // Lost is a parity block at position P (k or k+1)
+            // Parity P = sum_{j=0}^{k-1} encode_mat[P*k + j] * data_j
+            // data_j = sum_{s=0}^{k-1} A_inv[j*k + s] * survivor_s
+            // => Parity P = sum_{s} (sum_{j} encode_mat[P*k + j] * A_inv[j*k + s]) * survivor_s
+            for (int s = 0; s < k; ++s) {
+                unsigned char coeff = 0;
+                for (int j = 0; j < k; ++j)
+                    coeff ^= gf_mul(encode_mat[lost_position * k + j],
+                                    A_inv[j * k + s]);
+                decode_mat[s] = coeff;
+            }
+        }
+
+        // Step 5: Generate decode tables (1 output row, k input columns)
+        size_t tbl_size = 32 * (size_t)k * 1;
+        void* tmp = nullptr;
+        if (posix_memalign(&tmp, 32, tbl_size) != 0) tmp = nullptr;
+        if (tmp == nullptr) tmp = malloc(tbl_size);
+        decode_tbls_ = (unsigned char*)tmp;
+        if (!decode_tbls_) return;
+        ec_init_tables(k, 1, decode_mat.data(), decode_tbls_);
+    }
+
     // ---- RS encode thread pool (matches ecnaive xor_pool) ----
     static std::array<int, kRsPoolSize> rs_parse_cpus_or_default() {
         std::array<int, kRsPoolSize> cpus{};
@@ -1122,6 +1263,86 @@ private:
             return rs_pool_remaining_.load(std::memory_order_acquire) == 0 ||
                    stopped_.load() || rs_pool_stop_.load(std::memory_order_acquire);
         });
+    }
+
+    // ---- Compute worker (async encode + file write) ----
+    struct ComputeJob {
+        int stripe_id;
+        size_t block_size;
+        int k;                  // n_src = n-2
+        uintptr_t recv_buf_addr;
+        uintptr_t parity1_out_addr;
+        uintptr_t parity2_out_addr;
+        unsigned char* g_tbls;
+        std::string layer_dir;
+        int rank;
+        int parity_target_rig;  // peer rig to send parity2 to
+    };
+
+    std::thread compute_worker_;
+    std::atomic<bool> compute_worker_stop_{false};
+    std::queue<ComputeJob> compute_queue_;
+    std::mutex compute_mtx_;
+    std::condition_variable compute_cv_;
+
+    void push_compute_job(const ComputeJob& job) {
+        {
+            std::lock_guard<std::mutex> lk(compute_mtx_);
+            compute_queue_.push(job);
+        }
+        compute_cv_.notify_one();
+    }
+
+    ComputeJob pop_compute_job() {
+        std::unique_lock<std::mutex> lk(compute_mtx_);
+        compute_cv_.wait(lk, [this]() {
+            return !compute_queue_.empty() || compute_worker_stop_;
+        });
+        if (compute_queue_.empty()) return ComputeJob{};
+        ComputeJob job = compute_queue_.front();
+        compute_queue_.pop();
+        return job;
+    }
+
+    void compute_worker_loop() {
+        while (!compute_worker_stop_) {
+            ComputeJob job = pop_compute_job();
+            if (compute_worker_stop_) break;
+
+            // 1. RS encode via 16-worker pool (blocks this thread, not poller)
+            RsEncodeJob rs;
+            rs.len = (int)job.block_size;
+            rs.k = job.k;
+            rs.m = 2;
+            rs.g_tbls = job.g_tbls;
+            std::vector<unsigned char*> dp((size_t)job.k);
+            for (int i = 0; i < job.k; ++i)
+                dp[i] = (unsigned char*)(job.recv_buf_addr + i * job.block_size);
+            rs.data_ptrs = dp.data();
+            unsigned char* pptr[2] = {
+                (unsigned char*)job.parity1_out_addr,
+                (unsigned char*)job.parity2_out_addr };
+            rs.parity_ptrs = pptr;
+            rs_pool_run_parallel_encode(rs);
+
+            // 2. Post parity2 send to target (non-blocking RDMA WR)
+            FRCheckRdmaChannel* ch = get_channel_(job.parity_target_rig);
+            ibv_mr* mr = ch->find_mr(job.parity2_out_addr, job.block_size);
+            ch->post_send((uint8_t*)job.parity2_out_addr, job.block_size, mr,
+                          wr_id_encode(job.stripe_id, job.k));
+
+            // 3. Write per-stripe parity files
+            write_stripe_file(job.layer_dir, job.stripe_id, 1, job.rank,
+                (const uint8_t*)job.parity1_out_addr, job.block_size, job.block_size, "_p1");
+            write_stripe_file(job.layer_dir, job.stripe_id, 2, job.rank,
+                (const uint8_t*)job.parity2_out_addr, job.block_size, job.block_size, "_p2");
+
+            // 4. Mark stripe done
+            auto& st = async_stripes_[job.stripe_id];
+            st.encode_done = true;
+            st.all_done = true;
+            async_done_count_++;
+        }
     }
 
     // ---- Stripe async pipeline ----
@@ -1578,6 +1799,7 @@ private:
     std::vector<std::vector<int>> table_;
     unsigned char* a_mat_ = nullptr;  // ISA-L RS generator matrix (rows_ × k_)
     unsigned char* g_tbls_ = nullptr; // ISA-L RS encode tables (32*k_*rows_)
+    unsigned char* decode_tbls_ = nullptr; // ISA-L RS decode tables (for recovery)
     std::atomic<bool> stopped_;
 
     // RDMA
@@ -1679,6 +1901,23 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("parity1_out_addr"),
              py::arg("parity2_out_addr"),
              py::arg("parity2_in_addr"))
+
+        // Stripe decode (hardware recovery)
+        .def("submit_stripe_decode", &FRCheckNative::submit_stripe_decode,
+             py::arg("k"),
+             py::arg("survivor_positions"),
+             py::arg("lost_position"),
+             py::arg("survivor_addrs"),
+             py::arg("recovered_addr"),
+             py::arg("block_size"))
+
+        // Point-to-point RDMA send/recv (for recovery, GIL released for threading)
+        .def("send_to_peer", &FRCheckNative::send_to_peer,
+             py::arg("peer_rig"), py::arg("addr"), py::arg("size"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("recv_from_peer", &FRCheckNative::recv_from_peer,
+             py::arg("peer_rig"), py::arg("addr"), py::arg("size"),
+             py::call_guard<py::gil_scoped_release>())
 
         // StripePlan queries
         .def("get_role_for_stripe", &FRCheckNative::get_role_for_stripe,

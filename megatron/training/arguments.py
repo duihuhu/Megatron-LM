@@ -2324,6 +2324,17 @@ def _add_checkpointing_args(parser):
                        help='Directory containing FRCheck POA tables. Used with --frcheck-n when --frcheck-table-path is not set.')
     group.add_argument('--frcheck-table-path', type=str, default=None,
                        help='Path to POA table file (highest priority). If unset, manager resolves from --frcheck-table-dir and --frcheck-n.')
+    group.add_argument('--use-frcheck-hardware-failure', action='store_true',
+                       help='Enable FRCheck checkpointing for hardware failure recovery. '
+                            'When enabled, the load path uses RS decode over RDMA to recover '
+                            'failed ranks\' data from surviving ranks in the POA-based stripe group. '
+                            'Use --frcheck-failed-ranks to specify which ranks to treat as failed.')
+    group.add_argument('--frcheck-failed-ranks', type=str, default=None,
+                       help='Comma-separated list of global ranks to treat as failed '
+                            'for FRCheck hardware recovery (e.g. "1" or "1,2"). '
+                            'When set, these ranks force recovery from surviving stripe blocks '
+                            'even if their main files exist. '
+                            'Used with --use-frcheck-hardware-failure for testing.')
 
     # use gemini checkpointing arguments
     group.add_argument('--use-gemini', action='store_true',

@@ -71,7 +71,14 @@ def _group_by_layer(decomposed) -> List[_LayerGroup]:
 
 def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
     checkpoint_path = Path(checkpoint_name)
-    return checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
+    # If checkpoint_name has a file extension, use its parent directory
+    base = checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
+    # FRCheck files may be in a "frcheck/" subdirectory (created during save).
+    # Try the subdirectory first, fall back to base.
+    frcheck_sub = base / "frcheck"
+    if frcheck_sub.is_dir():
+        return frcheck_sub
+    return base
 
 
 def _to_device_view(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -449,8 +456,486 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         torch.distributed.barrier()
 
 
+# ---------------------------------------------------------------------------
+# Hardware recovery helpers
+# ---------------------------------------------------------------------------
+
+def _read_frbk_block(filepath: str) -> Optional[torch.Tensor]:
+    """Read a FRBK-format per-stripe block file. Returns the data tensor (CPU uint8)."""
+    import struct as _struct
+    path = Path(filepath)
+    if not path.is_file():
+        return None
+    with open(path, "rb") as f:
+        hdr = f.read(28)  # <4sIIQQ: magic(4) + stripe_id(4) + role(4) + size(8) + block_size(8) = 28
+        if len(hdr) < 28:
+            return None
+        magic, stripe_id, role, data_size, block_sz = _struct.unpack("<4sIIQQ", hdr)
+        if magic != b"FRBK":
+            return None
+        data = torch.empty(data_size, dtype=torch.uint8)
+        if data_size > 0:
+            f.readinto(data.numpy())
+    return data
+
+
+def _read_my_stripe_block(
+    checkpoint_dir: Path,
+    layer_name: str,
+    stripe_id: int,
+    my_global_rank: int,
+    my_original_role: int,
+) -> Optional[torch.Tensor]:
+    """Read the stripe block for my rank from disk based on my original role in this stripe.
+
+    SOURCE(0):     stripe_{sid}/frcheck_shard_rank{R}.pt
+    ENCODER(1):    stripe_{sid}/frcheck_shard_rank{R}_p1.pt  (we need parity1)
+    PARITY(2):     stripe_{sid}/frcheck_shard_rank{R}.pt     (parity2 is saved as this)
+    """
+    stripe_dir = checkpoint_dir / layer_name / f"stripe_{stripe_id}"
+    if my_original_role == 1:  # ENCODER → read parity1
+        filepath = stripe_dir / f"frcheck_shard_rank{my_global_rank}_p1.pt"
+    else:
+        filepath = stripe_dir / f"frcheck_shard_rank{my_global_rank}.pt"
+    return _read_frbk_block(str(filepath))
+
+
+# ---------------------------------------------------------------------------
+# Per-layer recovery pipeline
+# ---------------------------------------------------------------------------
+
+def _recover_one_layer(
+    manager,
+    native,
+    checkpoint_dir: Path,
+    layer_name: str,
+    layer_block_size: int,
+    layer_total_bytes: int,
+    n: int,
+    gdr: bool,
+    world_size: int,
+    rank: int,
+) -> Optional[torch.Tensor]:
+    """Run stripe-level RS decode recovery for one layer.
+
+    Uses RDMA point-to-point for data transfer (send_to_peer / recv_from_peer).
+    Three task types per stripe: HELPER, DECODER, FAILED_RANK.
+
+    Processes stripes in a batched loop: per stripe, decoder posts recvs in threads
+    (GIL released during recv_from_peer), helpers send, decoder decodes and sends
+    to failed rank. No inter-stripe barriers — the TCP handshake in send_data/recv_data
+    provides per-channel synchronization. For n≤8 and typical block sizes, the RS pool
+    is the bottleneck, not stripe dispatch.
+    """
+    my_node = manager.rank_in_group + 1
+    group_members = manager.group_member_ranks
+
+    if not manager.recovery_stripe_plans:
+        return None
+
+    # Bin stripes by my role
+    decoder_stripes = [p for p in manager.recovery_stripe_plans if my_node == p['decoder_node']]
+    helper_stripes = [p for p in manager.recovery_stripe_plans if my_node in p['helper_nodes']]
+    failed_stripes = [p for p in manager.recovery_stripe_plans if my_node == p['failed_node']]
+    is_failed = len(failed_stripes) > 0
+
+    logger.info(
+        "FRCheck recovery layer %s: rank %d — %d decoder, %d helper, %d failed stripes",
+        layer_name, rank, len(decoder_stripes), len(helper_stripes), len(failed_stripes),
+    )
+
+    # Phase 1: Survivors read ALL their blocks from disk (single batch)
+    # Register every block for RDMA — send_to_peer requires registered buffers
+    # (the 128MB temp buffer fallback is insufficient for layer_common's 132MB blocks)
+    my_blocks: Dict[int, torch.Tensor] = {}
+    for plan in decoder_stripes + helper_stripes:
+        sid = plan['stripe_id']
+        blk = _read_my_stripe_block(checkpoint_dir, layer_name, sid, rank, plan['original_role'])
+        if blk is None or blk.numel() == 0:
+            blk = torch.zeros(layer_block_size, dtype=torch.uint8)
+        elif blk.numel() < layer_block_size:
+            padded = torch.zeros(layer_block_size, dtype=torch.uint8)
+            padded[:blk.numel()] = blk
+            blk = padded
+        blk = blk.contiguous()
+        native.register_buffer(blk.data_ptr(), blk.numel())
+        my_blocks[sid] = blk
+
+    # Allocate layer buffer for failed rank
+    layer_buf = None
+    if is_failed:
+        num_source_stripes = (n - 1) * (n - 2)
+        from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+            allocate_hugepage_tensor,
+        )
+        layer_buf = allocate_hugepage_tensor(
+            num_source_stripes * layer_block_size, fallback_pin_memory=True)
+        layer_buf.zero_()
+
+    # Node ID → rig mapping
+    node_to_rig = {i + 1: i for i in range(n)}
+
+    import threading
+    import time as _time
+
+    # Tracks SOURCE block indices (matches save order: increment only for SOURCE stripes)
+    src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
+
+    # Phase 2: Batch all stripes — post recvs (threaded), sends, decode, deliver
+    # For each stripe, the decoder starts one recv thread per helper.
+    # All recv threads block on TCP (GIL released), helpers send, threads unblock.
+    for stri_plan in manager.recovery_stripe_plans:
+        sid = stri_plan['stripe_id']
+        decoder_node = stri_plan['decoder_node']
+        helper_nodes = stri_plan['helper_nodes']
+        failed_node = stri_plan['failed_node']
+        failed_pos = stri_plan['failed_pos']
+        decoder_pos = stri_plan['decoder_pos']
+        helper_positions = stri_plan['helper_positions']
+        original_role = stri_plan['original_role']
+
+        decoder_rig = node_to_rig[decoder_node]
+        failed_rig = node_to_rig[failed_node]
+
+        # --- Decoder: start recv threads for each helper ---
+        recv_threads = []
+        recv_bufs = []
+        if my_node == decoder_node:
+            for helper_node in helper_nodes:
+                helper_rig = node_to_rig[helper_node]
+                from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+                    allocate_hugepage_tensor,
+                )
+                recv_buf = allocate_hugepage_tensor(layer_block_size, fallback_pin_memory=True)
+                recv_bufs.append(recv_buf)
+                native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
+
+                def _recv_thread(rb=recv_buf, hrig=helper_rig):
+                    native.recv_from_peer(hrig, rb.data_ptr(), rb.numel())
+
+                t = threading.Thread(target=_recv_thread, daemon=True)
+                t.start()
+                recv_threads.append(t)
+
+        # Brief yield so decoder recv threads post their RDMA WRs / TCP reads
+        _time.sleep(0.01)
+
+        # --- Helpers: send blocks to decoder ---
+        if my_node in helper_nodes:
+            my_block = my_blocks.get(sid)
+            if my_block is None:
+                my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
+                native.register_buffer(my_block.data_ptr(), my_block.numel())
+            native.send_to_peer(decoder_rig, my_block.data_ptr(), my_block.numel())
+
+        # --- Decoder: join, decode, send to failed ---
+        if my_node == decoder_node:
+            for t in recv_threads:
+                t.join()
+
+            k = n - 2
+            survivor_positions = [decoder_pos] + helper_positions
+            survivor_addrs = []
+
+            my_block = my_blocks.get(sid)
+            if my_block is None:
+                my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
+            survivor_addrs.append(my_block.data_ptr())
+            for recv_buf in recv_bufs:
+                survivor_addrs.append(recv_buf.data_ptr())
+
+            recovered = torch.zeros(layer_block_size, dtype=torch.uint8)
+            native.register_buffer(recovered.data_ptr(), recovered.numel())
+            native.submit_stripe_decode(
+                k=k,
+                survivor_positions=survivor_positions,
+                lost_position=failed_pos,
+                survivor_addrs=survivor_addrs,
+                recovered_addr=recovered.data_ptr(),
+                block_size=layer_block_size,
+            )
+
+            native.send_to_peer(failed_rig, recovered.data_ptr(), recovered.numel())
+
+        # --- Failed rank: recv decoded block ---
+        if my_node == failed_node:
+            from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+                allocate_hugepage_tensor,
+            )
+            recv_buf = allocate_hugepage_tensor(layer_block_size, fallback_pin_memory=True)
+            native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
+            native.recv_from_peer(decoder_rig, recv_buf.data_ptr(), recv_buf.numel())
+
+            # Only store SOURCE blocks; encoder/parity_target blocks are parity data
+            if layer_buf is not None and original_role == int(StripeRole.SOURCE):
+                blk_idx = src_block_per_node[failed_node]
+                src_block_per_node[failed_node] += 1
+                offset = blk_idx * layer_block_size
+                ncopy = min(layer_block_size, max(0, layer_total_bytes - offset))
+                if ncopy > 0:
+                    layer_buf[offset:offset + ncopy].copy_(recv_buf[:ncopy])
+
+            del recv_buf
+
+        # Cleanup decoder recv bufs
+        if my_node == decoder_node:
+            for buf in recv_bufs:
+                del buf
+
+    if is_failed:
+        n_stored = src_block_per_node.get(my_node, 0)
+        logger.info(
+            "FRCheck recovery: %s — stored %d SOURCE blocks (expected %d)",
+            layer_name, n_stored, (n - 1) * (n - 2),
+        )
+
+    return layer_buf
+
+
+# ---------------------------------------------------------------------------
+# Main recovery entry point
+# ---------------------------------------------------------------------------
+
+def recover_frcheck_legacy_hardware(
+    checkpoint_name: str,
+    failed_global_ranks: List[int],
+) -> Dict[str, Any]:
+    """Main entry point for FRCheck hardware recovery.
+
+    Steps:
+    1. Initialize manager with recovery mode
+    2. Read the main checkpoint payload (all_gather if local missing)
+    3. Layer-by-layer recovery via _recover_one_layer()
+    4. Reconstruct state_dict from recovered tensor buffer
+    """
+    start_time = time.time()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+    # 1. Init manager / RDMA
+    manager = FRCheckManager()
+    manager.init_frcheck_if_enabled()
+    native = manager.get_native()
+    if native is None:
+        raise RuntimeError("FRCheck hardware recovery: native module not available")
+
+    n = native.n()
+    num_stripes = native.num_stripes()
+    rg = manager.rank_in_group
+    gdr = manager.gdr_available
+
+    logger.info(
+        "FRCheck hardware recovery: rank=%d group=%d rig=%d n=%d gdr=%s failed=%s",
+        rank, manager.group_id, rg, n, gdr, failed_global_ranks,
+    )
+
+    # 2. Init recovery plans
+    recovery_contexts = manager.init_frcheck_hardware_recovery(failed_global_ranks)
+    is_failed = rank in failed_global_ranks
+    is_survivor = not is_failed
+
+    checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
+
+    # 3. Read main payload (metadata + tensor info)
+    main_path = checkpoint_dir / f"frcheck_main_rank{rank}.pt"
+    main_payload = None
+    if main_path.is_file():
+        from megatron.training.legacy_io_utils import (
+            is_raw_format, read_raw_checkpoint, MAGIC_FRCHECK,
+        )
+        try:
+            if is_raw_format(str(main_path), MAGIC_FRCHECK):
+                main_payload = read_raw_checkpoint(str(main_path), MAGIC_FRCHECK)
+            else:
+                main_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            logger.warning("FRCheck recovery: failed to read main file: %s", e)
+
+    # Exchange payloads via all_gather so failed ranks get metadata
+    if world_size > 1 and torch.distributed.is_initialized():
+        gathered = [None] * world_size
+        torch.distributed.all_gather_object(gathered, main_payload)
+        if main_payload is None:
+            # Find a valid payload from another rank
+            for g in gathered:
+                if g is not None:
+                    main_payload = g
+                    break
+
+    if main_payload is None:
+        raise FileNotFoundError(
+            f"FRCheck: no main payload available at {checkpoint_dir}"
+        )
+
+    logger.info("FRCheck recovery: main payload loaded, layers=%s",
+                main_payload.get("layer_names", []))
+
+    tensor_infos = main_payload.get("tensor_infos", [])
+    total_tensor_size = int(main_payload.get("actual_tensor_size", 0))
+    non_tensor_data = main_payload.get("non_tensor_data", {})
+    flat_key_roots = main_payload.get("flat_key_roots", [])
+    layer_names = main_payload.get("layer_names", [])
+    saved_block_size = int(main_payload.get("block_size", 64 * 1024 * 1024))
+
+    # 4. Recovery simulation: if survivor, load own layer data from files
+    #    If failed, recover via _recover_one_layer() for each layer
+
+    if is_survivor and not manager.recovery_stripe_plans:
+        # Not in a group with a failed rank — load normally
+        logger.info("FRCheck recovery: rank %d not involved in recovery, loading directly", rank)
+        from megatron.training.legacy_io_utils import read_raw_checkpoint, MAGIC_FRCHECK
+        main_payload_direct = read_raw_checkpoint(str(main_path), MAGIC_FRCHECK)
+        result = _reconstruct_from_main_payload(main_payload_direct, flat_key_roots)
+        return result
+
+    # For survivors in the recovery group: read own data normally from saved files
+    # But they still participate in recovery for the failed rank's stripes
+    if is_survivor:
+        # Load our own tensor data from the main file
+        from megatron.training.legacy_io_utils import read_raw_checkpoint, MAGIC_FRCHECK
+        if main_path.is_file():
+            own_payload = read_raw_checkpoint(str(main_path), MAGIC_FRCHECK)
+        else:
+            own_payload = main_payload
+
+        # Read layer data: for each layer, read per-layer source/encoder/parity files
+        for layer_name in layer_names:
+            layer_dir = checkpoint_dir / layer_name
+            layer_block_size = saved_block_size
+
+            # Read layer metadata for block size
+            layer_main_path = layer_dir / f"frcheck_layer_main_rank{rank}.pt"
+            if layer_main_path.is_file():
+                layer_meta = torch.load(layer_main_path, map_location="cpu", weights_only=False)
+                layer_block_size = layer_meta.get("block_size", saved_block_size)
+
+            # Recover failed rank's data for this layer
+            _recover_one_layer(
+                manager, native, checkpoint_dir, layer_name,
+                layer_block_size, 0,  # layer_total_bytes not needed for survivor
+                n, gdr, world_size, rank,
+            )
+
+        # Load own state dict normally
+        result = _reconstruct_from_main_payload(own_payload, flat_key_roots)
+        logger.info("FRCheck recovery: survivor rank %d done in %.2fs", rank, time.time() - start_time)
+        return result
+
+    # ---- Failed rank path ----
+    # Allocate full tensor buffer for recovered data
+    safety_margin = max(int(total_tensor_size * 0.01), 4096)
+    from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+        allocate_hugepage_tensor,
+    )
+    full_buf = allocate_hugepage_tensor(
+        total_tensor_size + safety_margin, fallback_pin_memory=True,
+    )
+    full_buf.zero_()
+
+    # Recover each layer and copy into the full buffer at correct offsets
+    # We need to reconstruct the layer-to-offset mapping
+    # The layer names are in order: layer_common, layer_0, layer_1, ...
+    t0 = time.time()
+    total_recovered = 0
+    for layer_name in layer_names:
+        layer_dir = checkpoint_dir / layer_name
+        layer_block_size = saved_block_size
+
+        # Read layer metadata
+        layer_main_path = layer_dir / f"frcheck_layer_main_rank{rank}.pt"
+        if layer_main_path.is_file():
+            layer_meta = torch.load(layer_main_path, map_location="cpu", weights_only=False)
+            layer_block_size = layer_meta.get("block_size", saved_block_size)
+            actual_size = layer_meta.get("actual_tensor_size", 0)
+            layer_infos = layer_meta.get("tensor_infos", [])
+        else:
+            logger.warning("FRCheck recovery: no layer metadata for %s", layer_name)
+            actual_size = 0
+            layer_infos = []
+
+        if actual_size == 0:
+            continue
+
+        layer_buf = _recover_one_layer(
+            manager, native, checkpoint_dir, layer_name,
+            layer_block_size, actual_size,
+            n, gdr, world_size, rank,
+        )
+
+        if layer_buf is not None:
+            # Copy recovered data into the full buffer at correct offsets
+            for info in layer_infos:
+                offset = info.offset
+                size = info.size_bytes
+                if offset + size <= full_buf.numel():
+                    full_buf[offset:offset + size].copy_(layer_buf[offset:offset + size])
+            total_recovered += actual_size
+
+    logger.info(
+        "FRCheck recovery: failed rank %d — recovered %d bytes in %.2fs",
+        rank, total_recovered, time.time() - t0,
+    )
+
+    # 5. Reconstruct state_dict from recovered full buffer.
+    #    Replace tensor_buffer with recovered data — main_payload's tensor_buffer
+    #    is either the failed rank's old file data (simulated) or a peer's (real).
+    main_payload['tensor_buffer'] = full_buf[:total_tensor_size].clone()
+    result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
+    logger.info("FRCheck hardware recovery: done rank=%d in %.2fs", rank, time.time() - start_time)
+    return result
+
+
+def _reconstruct_from_main_payload(main_payload: Dict, flat_key_roots: list = None) -> Dict[str, Any]:
+    """Reconstruct state_dict from a main payload that contains tensor_infos + tensor_buffer."""
+    tensor_infos = main_payload.get("tensor_infos", [])
+    non_tensor_data = main_payload.get("non_tensor_data", {})
+    flat_key_roots = flat_key_roots or main_payload.get("flat_key_roots", [])
+
+    # Check if tensor_buffer is in the payload
+    tensor_buffer = main_payload.get("tensor_buffer")
+    if tensor_buffer is not None:
+        buf = tensor_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
+        tensor_data = extract_tensors_from_continuous_buffer(buf, tensor_infos)
+    else:
+        tensor_data = []
+
+    decomposed = DecomposedStateDict(
+        non_tensor_data=non_tensor_data,
+        tensor_infos=tensor_infos,
+        tensor_data=tensor_data,
+        flat_key_roots=set(flat_key_roots) if flat_key_roots else set(),
+    )
+    result = reconstruct_state_dict(decomposed)
+    from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
+        unflatten_optimizer_fp32_params,
+    )
+    unflatten_optimizer_fp32_params(result)
+    return result
+
+
 def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
+    """Load FRCheck legacy checkpoint, with optional hardware recovery."""
+    from megatron.training import get_args
+    args = get_args()
+
+    hw_failure = getattr(args, "use_frcheck_hardware_failure", False)
+    failed_ranks_str = getattr(args, "frcheck_failed_ranks", None)
+    failed_ranks_parsed = getattr(args, "frcheck_failed_ranks_parsed", None)
+    logger.info(
+        "FRCheck load: hw_failure=%s failed_ranks_raw=%r failed_ranks_parsed=%r",
+        hw_failure, failed_ranks_str, failed_ranks_parsed,
+    )
+
+    # Check for hardware recovery mode
+    if hw_failure:
+        failed_ranks = failed_ranks_parsed
+        if failed_ranks is None and failed_ranks_str:
+            failed_ranks = [int(x.strip()) for x in failed_ranks_str.split(",")]
+        if failed_ranks:
+            logger.info("FRCheck: hardware recovery mode — failed ranks %s", failed_ranks)
+            return recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
+
     raise NotImplementedError(
-        "FRCheck legacy load is not implemented; use a checkpoint saved "
+        "FRCheck legacy load (non-recovery) is not implemented; use a checkpoint saved "
         "with another format or extend load_frcheck_legacy_checkpoint."
     )

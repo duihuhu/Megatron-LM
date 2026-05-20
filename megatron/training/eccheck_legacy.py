@@ -358,21 +358,52 @@ def _save_eccheck_pt_files(
 
     main_file = checkpoint_dir / f"eccheck_main_rank{rank}.pt"
     from megatron.training.legacy_io_utils import write_raw_checkpoint, write_raw_block, MAGIC_ECCHECK, MAGIC_BLOCK
-    write_raw_checkpoint(
-        str(main_file), MAGIC_ECCHECK,
-        non_tensor_data, tensor_infos,
-        full_tensor_buffer, blocks["actual_size"],
-        version=1, format=_FORMAT, rank=rank,
-        actual_tensor_size=blocks["actual_size"],
-        pipeline_total_bytes=blocks["pipeline_size"],
-        aligned_block_size=blocks["aligned_size"],
-        flat_key_roots=list(flat_key_roots) if flat_key_roots else [],
-        block_files=block_files,
-    )
 
-    for name in ("own_buffer", "partner_buffer"):
-        block_file = checkpoint_dir / f"eccheck_block_rank{rank}_{name}.pt"
-        write_raw_block(str(block_file), MAGIC_BLOCK, blocks[name], blocks[name].numel())
+    # Pre-serialize metadata + prepare memoryview for main file
+    import pickle as _pickle
+    meta1 = _pickle.dumps(non_tensor_data)
+    meta2 = _pickle.dumps(tensor_infos)
+    extra = _pickle.dumps({
+        "version": 1, "format": _FORMAT, "rank": rank,
+        "actual_tensor_size": blocks["actual_size"],
+        "pipeline_total_bytes": blocks["pipeline_size"],
+        "aligned_block_size": blocks["aligned_size"],
+        "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
+        "block_files": block_files,
+    })
+    buf = full_tensor_buffer[: blocks["actual_size"]]
+    if not buf.is_contiguous():
+        buf = buf.contiguous()
+    if buf.device.type != "cpu":
+        buf = buf.to("cpu")
+    main_mv = memoryview(buf.numpy())
+
+    # Pre-prepare block memoryviews
+    block_names = ("own_buffer", "partner_buffer")
+    block_mvs = {}
+    for name in block_names:
+        b = blocks[name][: blocks[name].numel()]
+        if not b.is_contiguous():
+            b = b.contiguous()
+        if b.device.type != "cpu":
+            b = b.to("cpu")
+        block_mvs[name] = memoryview(b.numpy())
+
+    # Parallel writes (f.write releases GIL — truly concurrent I/O)
+    import concurrent.futures
+    from megatron.training.legacy_io_utils import write_main_prepared, write_block_prepared
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1 + len(block_names)) as ex:
+        futs = [ex.submit(write_main_prepared, str(main_file), MAGIC_ECCHECK,
+                          meta1, meta2, extra, main_mv, blocks["actual_size"])]
+        for name in block_names:
+            block_file = checkpoint_dir / f"eccheck_block_rank{rank}_{name}.pt"
+            futs.append(ex.submit(write_block_prepared,
+                                  str(block_file), MAGIC_BLOCK,
+                                  block_mvs[name], blocks[name].numel()))
+        for f in futs:
+            f.result()
+
+
 
 
 # ---------------------------------------------------------------------------

@@ -99,6 +99,30 @@ def write_raw_simple(path: str, magic: bytes, tensor: torch.Tensor) -> None:
     write_raw_block(path, magic, tensor, tensor.numel())
 
 
+# ---- parallel write helpers (pre-serialized data, for ThreadPoolExecutor) ----
+
+def write_main_prepared(
+    path: str, magic: bytes,
+    meta1: bytes, meta2: bytes, extra: bytes,
+    mv: memoryview, data_len: int,
+) -> None:
+    """Write a main file from pre-serialized metadata + prepared memoryview."""
+    with open(path, "wb") as f:
+        f.write(struct.pack("<4sQQQ", magic, len(meta1), len(meta2), data_len))
+        f.write(struct.pack("<Q", len(extra)))
+        f.write(meta1)
+        f.write(meta2)
+        f.write(extra)
+        f.write(mv)
+
+
+def write_block_prepared(path: str, magic: bytes, mv: memoryview, size: int) -> None:
+    """Write a block file from a pre-prepared memoryview."""
+    with open(path, "wb") as f:
+        f.write(struct.pack("<4sQ", magic, size))
+        f.write(mv)
+
+
 # ---- read helpers -----------------------------------------------------------
 
 def _peek_magic(path: str) -> bytes:

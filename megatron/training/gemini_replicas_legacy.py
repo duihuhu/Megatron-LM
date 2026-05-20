@@ -297,12 +297,16 @@ def save_gemini_replicas_legacy_checkpoint(
     rank_meta = {r: all_meta[r] for r in range(world_size)}
     logger.info(f"GEMINI save timing: meta exchange {time.time()-t0:.3f}s")
 
-    t0 = time.time()
     # Save .pt files
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    main_payload_meta = {
+    from megatron.training.legacy_io_utils import write_main_prepared, write_block_prepared, MAGIC_GEMINI, MAGIC_GEMINI_REPLICA
+
+    # ---- Pre-serialize main file ----
+    main_meta1 = pickle.dumps(decomposed.non_tensor_data)
+    main_meta2 = pickle.dumps(rank_meta[rank]["tensor_infos"])
+    main_extra = pickle.dumps({
         "version": 1, "format": "gemini_replicas_torch_legacy", "rank": rank,
         "tensor_buffer_size": total_tensor_size,
         "flat_key_roots": rank_meta[rank]["flat_key_roots"],
@@ -312,26 +316,16 @@ def save_gemini_replicas_legacy_checkpoint(
         "all_tensor_infos": {r: rank_meta[r]["tensor_infos"] for r in range(world_size)},
         "all_flat_key_roots": {r: rank_meta[r]["flat_key_roots"] for r in range(world_size)},
         "all_tensor_buffer_sizes": {r: rank_meta[r]["tensor_buffer_size"] for r in range(world_size)},
-    }
+    })
+    buf = tensor_buffer[:total_tensor_size]
+    if not buf.is_contiguous():
+        buf = buf.contiguous()
+    main_mv = memoryview(buf.numpy())
 
-    main_file = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
-    from megatron.training.legacy_io_utils import write_raw_checkpoint, write_raw_simple, MAGIC_GEMINI, MAGIC_GEMINI_REPLICA
-    write_raw_checkpoint(
-        str(main_file), MAGIC_GEMINI,
-        decomposed.non_tensor_data, rank_meta[rank]["tensor_infos"],
-        tensor_buffer, total_tensor_size,
-        **main_payload_meta,
-    )
-    logger.info(
-        f"Gemini Replicas legacy save rank {rank}: saved main file {main_file} ({time.time()-t0:.3f}s)"
-    )
-
-    t0 = time.time()
-    # Save replica files — include source rank's metadata so recovery is self-contained
+    # ---- Pre-serialize replica files ----
+    replica_tasks = []
     for src_r, recv_buf in receive_buffers.items():
-        replica_file = (
-            checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{src_r}.pt"
-        )
+        replica_file = checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{src_r}.pt"
         meta_bytes = pickle.dumps({
             "version": 1, "format": "gemini_replicas_torch_legacy",
             "rank": rank, "source_rank": src_r, "buffer_size": recv_buf.numel(),
@@ -340,14 +334,32 @@ def save_gemini_replicas_legacy_checkpoint(
             "source_flat_key_roots": rank_meta[src_r]["flat_key_roots"],
             "source_tensor_buffer_size": rank_meta[src_r]["tensor_buffer_size"],
         })
-        with open(str(replica_file), "wb") as f:
-            f.write(struct.pack("<4sQ", MAGIC_GEMINI_REPLICA, len(meta_bytes)))
-            f.write(meta_bytes)
-            f.write(memoryview(recv_buf.numpy()))
-        logger.info(
-            f"Gemini Replicas legacy save rank {rank}: saved replica file {replica_file}"
-        )
-    logger.info(f"GEMINI save timing: replica files write {time.time()-t0:.3f}s")
+        b = recv_buf[: recv_buf.numel()]
+        if not b.is_contiguous():
+            b = b.contiguous()
+        replica_tasks.append((str(replica_file), meta_bytes, memoryview(b.numpy())))
+
+    # ---- Parallel writes ----
+    t0 = time.time()
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1 + len(replica_tasks)) as ex:
+        main_file = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
+        futs = [ex.submit(write_main_prepared, str(main_file), MAGIC_GEMINI,
+                          main_meta1, main_meta2, main_extra, main_mv, total_tensor_size)]
+        for rep_path, rep_meta, rep_mv in replica_tasks:
+            futs.append(ex.submit(_write_replica_file, rep_path, MAGIC_GEMINI_REPLICA,
+                                  rep_meta, rep_mv))
+        for f in futs:
+            f.result()
+    logger.info(f"GEMINI save timing: file write {time.time()-t0:.3f}s")
+
+
+def _write_replica_file(path, magic, meta_bytes, mv):
+    import struct as _struct
+    with open(path, "wb") as f:
+        f.write(_struct.pack("<4sQ", magic, len(meta_bytes)))
+        f.write(meta_bytes)
+        f.write(mv)
 
     logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
 
@@ -565,10 +577,8 @@ def _run_hardware_recovery(
                 "flat_key_roots": rp["source_flat_key_roots"],
                 "tensor_buffer_size": rp["source_tensor_buffer_size"],
             }
-            import io as _io
-            meta_buf = _io.BytesIO()
-            torch.save(meta, meta_buf)
-            meta_bytes = meta_buf.getvalue()
+            import pickle as _pickle
+            meta_bytes = _pickle.dumps(meta)
 
             # Send: [metadata_size:8B][metadata_bytes][tensor_data]
             meta_size_tensor = torch.tensor([len(meta_bytes)], dtype=torch.long)
@@ -610,12 +620,8 @@ def _run_hardware_recovery(
 
         meta_tensor = torch.empty(meta_size, dtype=torch.uint8)
         torch.distributed.recv(meta_tensor, src=sender, group=gloo_group)
-        import io as _io
-        meta = torch.load(
-            _io.BytesIO(meta_tensor.numpy().tobytes()),
-            map_location="cpu",
-            weights_only=False,
-        )
+        import pickle as _pickle
+        meta = _pickle.loads(meta_tensor.numpy().tobytes())
 
         # Store metadata for reconstruction
         _recovery_meta[rank] = meta
@@ -737,21 +743,20 @@ def load_gemini_replicas_legacy_checkpoint(
                 tensor_buffer=recovered_buffer,
                 flat_key_roots=set(meta.get("flat_key_roots", [])),
             )
-            # Regenerate main file
-            regenerated = {
-                "version": 1,
-                "format": "gemini_replicas_torch_legacy",
-                "rank": rank,
-                "world_size": world_size,
-                "num_replicas": manager.num_replicas,
-                "group_size": manager.group_size,
-                "non_tensor_data": meta["non_tensor_data"],
-                "tensor_infos": meta["tensor_infos"],
-                "tensor_buffer": recovered_buffer.contiguous().view(torch.uint8),
-                "tensor_buffer_size": meta["tensor_buffer_size"],
-                "flat_key_roots": meta.get("flat_key_roots", []),
-            }
-            torch.save(regenerated, main_path)
+            # Regenerate main file (raw write, no torch.save)
+            from megatron.training.legacy_io_utils import write_raw_checkpoint, MAGIC_GEMINI
+            regen_tensor = recovered_buffer.contiguous().view(torch.uint8)
+            write_raw_checkpoint(
+                str(main_path), MAGIC_GEMINI,
+                meta["non_tensor_data"], meta["tensor_infos"],
+                regen_tensor, meta["tensor_buffer_size"],
+                version=1, format="gemini_replicas_torch_legacy",
+                rank=rank, world_size=world_size,
+                num_replicas=manager.num_replicas,
+                group_size=manager.group_size,
+                tensor_buffer_size=meta["tensor_buffer_size"],
+                flat_key_roots=meta.get("flat_key_roots", []),
+            )
             logger.info(
                 f"Gemini Replicas hardware recovery rank {rank}: "
                 f"regenerated main file {main_path}"

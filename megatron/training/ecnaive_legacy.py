@@ -273,25 +273,53 @@ def _save_ecnaive_pt_files(
         block_files_legacy = None
 
     main_file = checkpoint_dir / f"ecnaive_main_rank{rank}.pt"
-    from megatron.training.legacy_io_utils import write_raw_checkpoint, write_raw_block, MAGIC_ECNAIVE, MAGIC_BLOCK
-    write_raw_checkpoint(
-        str(main_file), MAGIC_ECNAIVE,
-        non_tensor_data, tensor_infos,
-        full_tensor_buffer, blocks["actual_size"],
-        version=2, format="ecnaive_torch_legacy", rank=rank,
-        ecnaive_k=k, ecnaive_n=n,
-        actual_tensor_size=blocks["actual_size"],
-        pipeline_total_bytes=blocks["pipeline_size"],
-        aligned_block_size=blocks["aligned_size"],
-        block_data_size=blocks.get("block_data_size", blocks["pipeline_size"] // k),
-        flat_key_roots=list(flat_key_roots) if flat_key_roots else [],
-        block_files=block_files,
-        _block_files_legacy=block_files_legacy,
-    )
+    from megatron.training.legacy_io_utils import MAGIC_ECNAIVE, MAGIC_BLOCK
 
+    # Pre-serialize metadata + prepare memoryview for main file
+    import pickle as _pickle
+    meta1 = _pickle.dumps(non_tensor_data)
+    meta2 = _pickle.dumps(tensor_infos)
+    extra = _pickle.dumps({
+        "version": 2, "format": "ecnaive_torch_legacy", "rank": rank,
+        "ecnaive_k": k, "ecnaive_n": n,
+        "actual_tensor_size": blocks["actual_size"],
+        "pipeline_total_bytes": blocks["pipeline_size"],
+        "aligned_block_size": blocks["aligned_size"],
+        "block_data_size": blocks.get("block_data_size", blocks["pipeline_size"] // k),
+        "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
+        "block_files": block_files,
+        "_block_files_legacy": block_files_legacy,
+    })
+    buf = full_tensor_buffer[: blocks["actual_size"]]
+    if not buf.is_contiguous():
+        buf = buf.contiguous()
+    if buf.device.type != "cpu":
+        buf = buf.to("cpu")
+    main_mv = memoryview(buf.numpy())
+
+    # Pre-prepare block memoryviews
+    block_mvs = {}
     for name in block_names:
-        block_file = checkpoint_dir / f"ecnaive_block_rank{rank}_{name}.pt"
-        write_raw_block(str(block_file), MAGIC_BLOCK, blocks[name], blocks[name].numel())
+        b = blocks[name][: blocks[name].numel()]
+        if not b.is_contiguous():
+            b = b.contiguous()
+        if b.device.type != "cpu":
+            b = b.to("cpu")
+        block_mvs[name] = memoryview(b.numpy())
+
+    # Parallel writes
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1 + len(block_names)) as ex:
+        from megatron.training.legacy_io_utils import write_main_prepared, write_block_prepared
+        futs = [ex.submit(write_main_prepared, str(main_file), MAGIC_ECNAIVE,
+                          meta1, meta2, extra, main_mv, blocks["actual_size"])]
+        for name in block_names:
+            block_file = checkpoint_dir / f"ecnaive_block_rank{rank}_{name}.pt"
+            futs.append(ex.submit(write_block_prepared,
+                                  str(block_file), MAGIC_BLOCK,
+                                  block_mvs[name], blocks[name].numel()))
+        for f in futs:
+            f.result()
 
 
 def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:

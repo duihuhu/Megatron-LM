@@ -184,20 +184,17 @@ def _encode_one_layer(
     # Phase 3: Wait for all stripes to complete
     native.wait_stripes_async()
 
-    # Phase 4: Write SOURCE files (GPU buffers, not fwrite-safe in C++)
+    # Phase 4: Write SOURCE files (GPU buffers, threaded for GPU→CPU + disk I/O)
     import struct
+    import concurrent.futures
     _FRBK_MAGIC = b"FRBK"
-    for stripe_id in range(num_stripes):
-        plan = stripe_plans[stripe_id]
-        if plan.role != StripeRole.SOURCE:
-            continue
-        ncopy = actual_sizes[stripe_id]
-        buf = manager.stripe_data_bufs[stripe_id]
+
+    def _write_one_source(stripe_id, ncopy, buf):
         if buf is None:
-            continue
+            return
         data = buf[:ncopy]
         if gdr:
-            data = data.cpu()
+            data = data.cpu()  # GIL released during CUDA op
         stripe_dir = Path(output_dir) / layer_name / f"stripe_{stripe_id}"
         stripe_dir.mkdir(parents=True, exist_ok=True)
         path = stripe_dir / f"frcheck_shard_rank{rank}.pt"
@@ -206,7 +203,17 @@ def _encode_one_layer(
             f.write(hdr)
             if ncopy > 0:
                 f.write(memoryview(data.numpy()))
-    del data
+
+    source_jobs = [(sid, actual_sizes[sid], manager.stripe_data_bufs[sid])
+                   for sid in range(num_stripes)
+                   if stripe_plans[sid].role == StripeRole.SOURCE]
+    if source_jobs:
+        n_workers = min(len(source_jobs), 6)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = [ex.submit(_write_one_source, sid, ncopy, buf)
+                       for sid, ncopy, buf in source_jobs]
+            for f in futures:
+                f.result()  # propagate exceptions
 
 
 def _write_layer_shards(
@@ -384,6 +391,11 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             "FRCheck save: %s tensor_buffer %s, size=%d layer_blk=%d",
             layer_name, "GPU" if gdr else "CPU", layer_buf_size, layer_block_size,
         )
+
+        # Pre-create stripe directories so C++ poller's mkdir (single-level) succeeds
+        layer_dir = checkpoint_dir / layer_name
+        for sid in range(num_stripes):
+            (layer_dir / f"stripe_{sid}").mkdir(parents=True, exist_ok=True)
 
         # Stripe encode (RDMA + per-stripe file writes by C++ poller)
         _encode_one_layer(

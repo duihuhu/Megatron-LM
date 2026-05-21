@@ -475,6 +475,176 @@ def _reconstruct_full_state_dict_from_main_tensor_buffer(
     return result
 
 
+def _load_ecnaive_block_file(
+    checkpoint_dir: Path,
+    rank: int,
+    canonical_name: str,
+    legacy_name: str,
+    block_files_legacy: Optional[Dict[str, str]] = None,
+) -> torch.Tensor:
+    """Load a single EC-NAIVE block file with canonical/legacy name fallback.
+
+    Args:
+        checkpoint_dir: Checkpoint directory.
+        rank: Global rank.
+        canonical_name: Canonical block name (e.g. "own_data0", "recv_2").
+        legacy_name: Legacy block name (e.g. "data0", "recv_data1").
+        block_files_legacy: Optional legacy->canonical mapping from main_payload extra metadata.
+
+    Returns:
+        torch.Tensor of dtype uint8 with the block data.
+    """
+    from megatron.training.legacy_io_utils import is_raw_format, read_raw_block, MAGIC_BLOCK
+
+    candidates: List[Path] = []
+
+    if block_files_legacy and legacy_name in block_files_legacy:
+        candidates.append(checkpoint_dir / block_files_legacy[legacy_name])
+
+    candidates.append(checkpoint_dir / f"ecnaive_block_rank{rank}_{canonical_name}.pt")
+    candidates.append(checkpoint_dir / f"ecnaive_block_rank{rank}_{legacy_name}.pt")
+
+    block_path = None
+    for p in candidates:
+        if p.is_file():
+            block_path = p
+            break
+
+    if block_path is None:
+        raise FileNotFoundError(
+            f"EC-NAIVE legacy: missing block {canonical_name}/{legacy_name} "
+            f"for rank {rank} under {checkpoint_dir}"
+        )
+
+    if is_raw_format(str(block_path), MAGIC_BLOCK):
+        return read_raw_block(str(block_path), MAGIC_BLOCK)
+    payload = torch.load(str(block_path), map_location="cpu", weights_only=False)
+    return payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
+
+
+def _load_ecnaive_legacy_software_failure(
+    checkpoint_dir: Path,
+    rank: int,
+    world_size: int,
+    manager: ECNAIVEManager,
+    main_payload: Dict[str, Any],
+    global_registry: GlobalMetadataRegistry,
+) -> Dict[str, Any]:
+    """EC-NAIVE legacy load software failure path.
+
+    Called when use_ecnaive_software_failure is True.
+    - rank_in_group=2 (failed): reads own_data0 from local disk, receives d_{2,1}
+      from rank_in_group=3 via C++ (1 port, ASIO or RDMA), concatenates the two
+      halves, and reconstructs state_dict.
+    - rank_in_group=3 (sender): reads recv_2 block from local disk and sends it
+      to rank_in_group=2 via C++.
+    - rank_in_group 0,1: no-op, reconstruct state_dict from main_payload tensor_buffer.
+    """
+    from time import time as _time
+    t_start = _time()
+
+    native = manager._ecnaive_native
+    if native is None:
+        raise RuntimeError("EC-NAIVE native module not initialized for sw recovery")
+
+    net_config = manager._get_ecnaive_load_network_config(rank, world_size)
+    rank_in_group = net_config['rank_in_group']
+
+    # Phase 1: 1-port software-only connection (1 barrier inside)
+    manager.init_ecnaive_load_software_only(rank, world_size, net_config=net_config)
+
+    flat_key_roots = _infer_flat_key_roots(main_payload)
+    pipeline_total_bytes = int(main_payload["pipeline_total_bytes"])
+    actual_tensor_size = int(main_payload["actual_tensor_size"])
+    aligned_block_size = int(main_payload["aligned_block_size"])
+    tensor_infos = main_payload["tensor_infos"]
+    non_tensor_data = main_payload["non_tensor_data"]
+
+    block_files_legacy = main_payload.get("_block_files_legacy", None)
+
+    if rank_in_group == 2:
+        # ---- FAILED RANK: local d_{2,0} + network d_{2,1} ----
+        d20_block = _load_ecnaive_block_file(
+            checkpoint_dir, rank,
+            canonical_name="own_data0",
+            legacy_name="data0",
+            block_files_legacy=block_files_legacy,
+        )
+        d21_buffer = torch.zeros(aligned_block_size, dtype=torch.uint8)
+        native.software_recv_data1(int(d21_buffer.data_ptr()), d21_buffer.numel())
+        logger.info(
+            f"EC-NAIVE legacy sw: rank2 received d21 "
+            f"({d21_buffer.numel()} bytes)"
+        )
+
+        half = pipeline_total_bytes // 2
+        first = _decode_data0_to_linear_first_half(
+            d20_block, pipeline_total_bytes, manager.ecnaive_buffer_size,
+        )
+        second = _decode_data0_to_linear_first_half(
+            d21_buffer, pipeline_total_bytes, manager.ecnaive_buffer_size,
+        )
+
+        buf_len = max(pipeline_total_bytes, actual_tensor_size)
+        full_buf = torch.zeros(buf_len, dtype=torch.uint8)
+        full_buf[:half].copy_(first[:half])
+        remaining = buf_len - half
+        if remaining > 0:
+            m = min(second.numel(), remaining)
+            full_buf[half:half + m].copy_(second[:m])
+
+        tensor_data = extract_tensors_from_continuous_buffer(full_buf, tensor_infos)
+        decomposed = DecomposedStateDict(
+            non_tensor_data=non_tensor_data,
+            tensor_infos=tensor_infos,
+            tensor_data=tensor_data,
+            flat_key_roots=flat_key_roots,
+        )
+        state_dict = reconstruct_state_dict(decomposed)
+        unflatten_optimizer_fp32_params(state_dict)
+        logger.info(
+            f"EC-NAIVE legacy sw: rank_in_group=2 recovered state_dict "
+            f"in {_time() - t_start:.2f}s"
+        )
+
+    elif rank_in_group == 3:
+        # ---- SOURCE RANK: send d_{2,1} to rank2 ----
+        d21_block = _load_ecnaive_block_file(
+            checkpoint_dir, rank,
+            canonical_name="recv_2",
+            legacy_name="recv_data1",
+            block_files_legacy=block_files_legacy,
+        )
+        native.software_send_rank3_data1(int(d21_block.data_ptr()), d21_block.numel())
+        logger.info(
+            f"EC-NAIVE legacy sw: rank3 sent d21 "
+            f"({d21_block.numel()} bytes)"
+        )
+        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+            main_payload, flat_key_roots=flat_key_roots,
+        )
+
+    else:
+        # rank_in_group 0,1: no network participation
+        logger.info(
+            f"EC-NAIVE legacy sw: rank_in_group={rank_in_group} no-op"
+        )
+        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+            main_payload, flat_key_roots=flat_key_roots,
+        )
+
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    logger.info(
+        f"EC-NAIVE legacy sw: done in {_time() - t_start:.2f}s (rank {rank})"
+    )
+    manager.cleanup()
+    manager._ecnaive_native = None
+
+    return state_dict
+
+
 def _run_ecnaive_full_recovery(
     manager: ECNAIVEManager,
     rank: int,
@@ -660,8 +830,15 @@ def state_dict_from_ecnaive_main_metadata_only(main_payload: Dict[str, Any]) -> 
 
 def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     """
-    Load EC-NAIVE torch legacy checkpoint: always run 8-port recovery (aligned with torch_dist),
-    then reconstruct state_dict from main tensor_buffer when present, else from decoded data0.
+    Load EC-NAIVE torch legacy checkpoint.
+
+    Normal load: always run 8-port recovery (aligned with torch_dist), then
+    reconstruct state_dict from main tensor_buffer when present, else from
+    decoded data0.
+
+    Software failure (use_ecnaive_software_failure=True): rank_in_group=2
+    reads d_{2,0} locally + receives d_{2,1} from rank_in_group=3 via C++
+    (1 port), concatenates, and reconstructs.  No XOR decode or parity needed.
     """
     start_time = time.time()
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
@@ -696,6 +873,21 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         rank_metadata = {0: local_metadata}
 
     global_registry = GlobalMetadataRegistry(rank_metadata=rank_metadata, rank_non_tensor_data={})
+
+    # ---- Software failure fast path ----
+    # In software failure, the failed rank's block files are on local disk.
+    # d_{2,0} is read locally; d_{2,1} is received from rank_in_group=3 via C++
+    # (1 port, ASIO or RDMA). No parity blocks or XOR decode needed.
+    if bool(getattr(args, "use_ecnaive_software_failure", False)):
+        logger.info("EC-NAIVE legacy: software failure recovery path")
+        return _load_ecnaive_legacy_software_failure(
+            checkpoint_dir=checkpoint_dir,
+            rank=rank,
+            world_size=world_size,
+            manager=manager,
+            main_payload=main_payload,
+            global_registry=global_registry,
+        )
 
     manager.init_ecnaive_load(rank, world_size)
 

@@ -572,7 +572,7 @@ private:
     ibv_mr* temp_recv_mr_;
     
     static const size_t TEMP_BUFFER_SIZE = 2ULL * 1024 * 1024 * 1024; // 2 GB
-    static const int MAX_WR = 64;
+    static const int MAX_WR = 256;
     static const int MAX_SGE = 1;
     static const size_t CHUNK_SIZE = 64 * 1024 * 1024;  // 64 MB per RDMA operation
     static const int MAX_BATCH_WR = 32;
@@ -806,18 +806,26 @@ public:
             throw std::runtime_error("Not connected");
         }
         
-        // Send size to all targets via control channel
+        // Send size to all targets via control channel, then wait for ACK
+        // (receiver posts recv WRs and ACKs — matches ecnaive ordering).
         uint64_t size_net = htobe64(size);
         for (size_t i = 0; i < target_ranks_.size(); ++i) {
             if (send(control_socks_send_[i], &size_net, sizeof(size_net), 0) != sizeof(size_net)) {
                 throw std::runtime_error("Failed to send size to target " + std::to_string(target_ranks_[i]));
             }
         }
-        
+        // Wait for ACKs BEFORE RDMA send (receiver ACKs when recv WRs are posted)
+        for (size_t i = 0; i < target_ranks_.size(); ++i) {
+            char ack;
+            if (recv(control_socks_send_[i], &ack, 1, MSG_WAITALL) != 1 || ack != 'A') {
+                throw std::runtime_error("Failed to receive ACK from target " + std::to_string(target_ranks_[i]));
+            }
+        }
+
         // Find or use temp buffer for MR
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(data), size);
         bool use_temp = (mr == nullptr);
-        
+
         if (use_temp) {
             if (size > temp_send_buffer_.size()) {
                 throw std::runtime_error("Data size exceeds temporary buffer size");
@@ -825,20 +833,12 @@ public:
             std::memcpy(temp_send_buffer_.data(), data, size);
             mr = temp_send_mr_;
         }
-        
+
         const uint8_t* send_data = use_temp ? temp_send_buffer_.data() : data;
-        
+
         // Send data to all targets via RDMA
         for (size_t i = 0; i < target_ranks_.size(); ++i) {
             send_data_chunked(send_data, size, mr, send_qps_[i]);
-        }
-        
-        // Wait for ACKs from all targets
-        for (size_t i = 0; i < target_ranks_.size(); ++i) {
-            char ack;
-            if (recv(control_socks_send_[i], &ack, 1, MSG_WAITALL) != 1 || ack != 'A') {
-                throw std::runtime_error("Failed to receive ACK from target " + std::to_string(target_ranks_[i]));
-            }
         }
     }
     
@@ -932,20 +932,22 @@ private:
         }
         
         uint8_t* recv_buffer = use_temp ? temp_recv_buffer_.data() : buffer;
-        
-        // Receive data via RDMA
-        receive_data_chunked(recv_buffer, recv_size, mr, recv_qps_[qp_idx]);
-        
-        if (use_temp) {
-            std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
-        }
-        
-        // Send ACK
+
+        // Send ACK BEFORE posting recv WRs (matches ecnaive ordering).
+        // Sender waits for this ACK before starting RDMA send, so
+        // the recv QP is guaranteed ready.
         char ack = 'A';
         if (send(control_socks_recv_[qp_idx], &ack, 1, 0) != 1) {
             throw std::runtime_error("Failed to send ACK");
         }
-        
+
+        // Receive data via RDMA
+        receive_data_chunked(recv_buffer, recv_size, mr, recv_qps_[qp_idx]);
+
+        if (use_temp) {
+            std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
+        }
+
         return {recv_source_ranks_[qp_idx], recv_size};
     }
 

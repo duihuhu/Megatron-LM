@@ -4447,23 +4447,64 @@ private:
     }
 
     // Create RDMA channels and connect QPs for save (after ASIO connections are up).
-    // NOTE: Generalized RDMA save channels are not yet implemented for k>2.
-    // Falls back to legacy code path for k==2, skips for k>2.
+    // Create RDMA save channels using ASIO socket fds for control
+    // (same pattern as eclatin init_rdma_save_channels).
     void init_rdma_save_channels() {
-        if (!use_rdma_ || !rdma_pd_) {
-            return;
-        }
-        if (k_ != 2) {
-            std::cerr << "[ECNAIVE RDMA] WARNING: Generalized RDMA save channels not yet implemented for k="
-                      << k_ << ". Skipping RDMA for save." << std::endl;
+        if (!use_rdma_ || !rdma_pd_) return;
+
+        try {
+            std::cout << "[ECNAIVE RDMA] Creating " << (2 * num_channels_)
+                      << " RDMA save channels (k=" << k_ << ")..." << std::endl;
+
+            // Create all channels first (no exchange yet).
+            // Send channels: rdma_send_fds_[i] is the "connect" side.
+            for (int i = 0; i < num_channels_; ++i) {
+                send_channels_[i] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_,
+                    rdma_send_cq_[i], rdma_recv_cq_[i],
+                    rdma_send_fds_[i], rdma_send_fds_[i],
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_,
+                    rank_in_group_, 0);
+            }
+            // Recv channels: rdma_recv_fds_[i] is the "accept" side.
+            for (int i = 0; i < num_channels_; ++i) {
+                recv_channels_[i] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_,
+                    rdma_send_cq_[i + num_channels_], rdma_recv_cq_[i + num_channels_],
+                    rdma_recv_fds_[i], rdma_recv_fds_[i],
+                    &rdma_registered_buffers_, &rdma_buffer_mutex_,
+                    rank_in_group_, 0);
+            }
+
+            // Run all 2*num_channels_ exchanges concurrently in threads.
+            // Each send channel does exchange(true), each recv channel
+            // does exchange(false). Threads avoid ordering deadlocks.
+            {
+                std::vector<std::thread> ex_threads;
+                ex_threads.reserve(2 * num_channels_);
+                for (int i = 0; i < num_channels_; ++i) {
+                    ex_threads.emplace_back([this, i]() {
+                        send_channels_[i]->exchange_and_connect(true);
+                    });
+                    ex_threads.emplace_back([this, i]() {
+                        recv_channels_[i]->exchange_and_connect(false);
+                    });
+                }
+                for (auto& t : ex_threads) t.join();
+            }
+
+            std::cout << "[ECNAIVE RDMA] All " << (2 * num_channels_)
+                      << " RDMA save channels connected" << std::endl;
+
+        } catch (const std::exception& e) {
+            std::cerr << "[ECNAIVE RDMA] Save channel init failed: " << e.what()
+                      << " — falling back to ASIO" << std::endl;
             use_rdma_ = false;
-            return;
+            for (int i = 0; i < num_channels_; ++i) {
+                send_channels_[i].reset();
+                recv_channels_[i].reset();
+            }
         }
-        // Legacy k=2 path: reuse old named channel creation code.
-        // Note: this path requires the legacy named fd/port/channel members which are still
-        // present in the class for backward compatibility.
-        std::cerr << "[ECNAIVE RDMA] Legacy RDMA save path not compiled. Use --no-rdma." << std::endl;
-        use_rdma_ = false;
     }
 
     // Save mode workers: 3 sends + 3 receives
@@ -4830,7 +4871,12 @@ private:
                 continue;
             }
             if (task.size == 0 || task.addr == 0) continue;
-            if (conn_.send_socket(idx).is_open()) {
+            if (use_rdma_ && send_channels_[idx] && send_channels_[idx]->is_connected()) {
+                std::cout << "[ECNAIVE RDMA] SendWorker[" << idx << "] RDMA send "
+                          << (task.size / (1024.0*1024.0)) << " MB" << std::endl;
+                send_channels_[idx]->send_data(
+                    reinterpret_cast<const uint8_t*>(task.addr), task.size);
+            } else if (conn_.send_socket(idx).is_open()) {
                 send_with_size(conn_.send_socket(idx), task.addr, task.size);
             }
             // Release buffer after send: data channels 0..k-2, parity channels k-1..k
@@ -4870,7 +4916,12 @@ private:
                 continue;
             }
             if (task.size == 0 || task.addr == 0) continue;
-            if (conn_.recv_socket(idx).is_open()) {
+            if (use_rdma_ && recv_channels_[idx] && recv_channels_[idx]->is_connected()) {
+                std::cout << "[ECNAIVE RDMA] RecvWorker[" << idx << "] RDMA recv "
+                          << (task.size / (1024.0*1024.0)) << " MB" << std::endl;
+                recv_channels_[idx]->receive_data(
+                    reinterpret_cast<uint8_t*>(task.addr), task.size);
+            } else if (conn_.recv_socket(idx).is_open()) {
                 if (!recv_with_size_bool(conn_.recv_socket(idx),
                                          reinterpret_cast<void*>(task.addr), task.size)) {
                     std::cerr << "ECNAIVE: RecvWorker[" << idx << "] recv failed" << std::endl;

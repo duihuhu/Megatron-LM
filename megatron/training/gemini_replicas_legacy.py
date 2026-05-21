@@ -702,6 +702,39 @@ def load_gemini_replicas_legacy_checkpoint(
                         if is_raw_format(str(main_path), MAGIC_GEMINI)
                         else torch.load(main_path, map_location="cpu", weights_only=False))
 
+    # ---- Software failure path ----
+    # In software failure, all checkpoint files are intact on disk.
+    # Gemini Replicas is a replication scheme — each rank's main.pt contains its
+    # complete tensor data.  The "failed" rank simply loads from its own main.pt.
+    # No network transfer or C++ native module is needed.
+    # Parameters (num_replicas, group_size, world_size) have no effect here:
+    # each rank reads only its own local file.
+    sw_failure = bool(getattr(args, "use_gemini_replicas_software_failure", False))
+    if sw_failure:
+        if main_payload is None:
+            raise FileNotFoundError(
+                f"Gemini Replicas software failure: rank {rank} main file not found "
+                f"at {main_path}. In software failure mode, main.pt must exist on disk."
+            )
+        logger.info(
+            f"Gemini Replicas legacy SW failure: rank {rank} "
+            f"(recovery_ranks={recovery_ranks if recovery_rank_str else 'N/A'}, "
+            f"is_failed={is_failed}) loading directly from main.pt"
+        )
+        state_dict = _reconstruct_from_payload(
+            tensor_infos=main_payload["tensor_infos"],
+            non_tensor_data=main_payload["non_tensor_data"],
+            tensor_buffer=main_payload["tensor_buffer"],
+            flat_key_roots=_infer_flat_key_roots(main_payload),
+        )
+        logger.info(
+            f"GEMINI REPLICAS legacy SW recovery load: done in "
+            f"{time.time() - start_time:.2f}s"
+        )
+        if world_size > 1 and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        return state_dict
+
     if not is_failed and all(health_list):
         # ---- Normal load ----
         state_dict = _reconstruct_from_payload(

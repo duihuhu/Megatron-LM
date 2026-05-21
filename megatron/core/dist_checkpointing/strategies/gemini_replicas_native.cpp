@@ -520,18 +520,26 @@ private:
     ibv_pd* pd_;
     ibv_cq* send_cq_;
     ibv_cq* recv_cq_;
-    
+
     // Queue pairs for each target rank
     std::vector<ibv_qp*> send_qps_;
-    
+
     // Queue pairs for receiving (one per expected source)
     std::vector<ibv_qp*> recv_qps_;
     std::vector<int> recv_source_ranks_;  // Track which rank each recv QP is for
-    
-    // TCP sockets for control messages (size exchange, ACKs)
+
+    // ASIO resources (connection setup, matching eccheck pattern)
+    boost::asio::io_context io_context_;
+    std::unique_ptr<boost::asio::ip::tcp::acceptor> recv_acceptor_;
+    std::unique_ptr<std::thread> io_thread_;  // runs io_context
+
+    // TCP control sockets (raw fds from ASIO sockets' native_handle)
     std::vector<int> control_socks_send_;  // One per target rank
-    int listen_sock_;
     std::vector<int> control_socks_recv_;  // One per source rank
+
+    // ASIO socket objects kept alive so native_handle fds stay valid
+    std::vector<std::unique_ptr<boost::asio::ip::tcp::socket>> send_socks_;
+    std::vector<std::unique_ptr<boost::asio::ip::tcp::socket>> recv_socks_;
     
     // Connection status
     std::atomic<bool> connected_{false};
@@ -582,7 +590,6 @@ public:
           pd_(nullptr),
           send_cq_(nullptr),
           recv_cq_(nullptr),
-          listen_sock_(-1),
           rank_(rank),
           world_size_(world_size),
           target_ranks_(target_ranks),
@@ -610,13 +617,20 @@ public:
     
     void initialize_connections() override {
         std::cout << "[Rank " << rank_ << "] Initializing RDMA connections..." << std::endl;
-        
+
+        // Start ASIO io_context in background thread.
+        // The open acceptor keeps io_context busy; when all connections are
+        // accepted and acceptor is closed, io_context::run() exits naturally.
+        io_thread_ = std::make_unique<std::thread>([this]() {
+            io_context_.run();
+        });
+
         // Initialize RDMA resources
         init_rdma_resources();
-        
-        // Start TCP listener for control messages
+
+        // Start TCP listener via ASIO (matching eccheck pattern)
         start_tcp_listener();
-        
+
         std::cout << "[Rank " << rank_ << "] RDMA initialization complete (Phase 1)" << std::endl;
     }
     
@@ -1006,21 +1020,26 @@ private:
             }
         }
         
-        // Step 3: Wait for all sends to complete
+        // Step 3: Wait for all sends to complete (with timeout, matching
+        // eccheck which has no warmup — failures here are non-fatal)
         std::cout << "[Rank " << rank_ << "] Waiting for " << send_qps_.size() << " send completions..." << std::endl;
-        for (size_t i = 0; i < send_qps_.size(); ++i) {
-            poll_completion(send_cq_, 1);
-            std::cout << "[Rank " << rank_ << "] Warmup send " << (i+1) << "/" << send_qps_.size() << " completed" << std::endl;
+        try {
+            for (size_t i = 0; i < send_qps_.size(); ++i) {
+                poll_completion_timeout(send_cq_, 1, 5);  // 5 second timeout per completion
+                std::cout << "[Rank " << rank_ << "] Warmup send " << (i+1) << "/" << send_qps_.size() << " completed" << std::endl;
+            }
+
+            // Step 4: Wait for all receives to complete
+            std::cout << "[Rank " << rank_ << "] Waiting for " << recv_qps_.size() << " receive completions..." << std::endl;
+            for (size_t i = 0; i < recv_qps_.size(); ++i) {
+                poll_completion_timeout(recv_cq_, 1, 5);
+                std::cout << "[Rank " << rank_ << "] Warmup receive " << (i+1) << "/" << recv_qps_.size() << " completed" << std::endl;
+            }
+            std::cout << "[Rank " << rank_ << "] RDMA warmup complete" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[Rank " << rank_ << "] Warmup timed out: " << e.what()
+                      << " — skipping (non-fatal, matches eccheck)" << std::endl;
         }
-        
-        // Step 4: Wait for all receives to complete
-        std::cout << "[Rank " << rank_ << "] Waiting for " << recv_qps_.size() << " receive completions..." << std::endl;
-        for (size_t i = 0; i < recv_qps_.size(); ++i) {
-            poll_completion(recv_cq_, 1);
-            std::cout << "[Rank " << rank_ << "] Warmup receive " << (i+1) << "/" << recv_qps_.size() << " completed" << std::endl;
-        }
-        
-        std::cout << "[Rank " << rank_ << "] RDMA warmup complete" << std::endl;
     }
     
     void init_rdma_resources() {
@@ -1089,53 +1108,27 @@ private:
     }
     
     void start_tcp_listener() {
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(my_port_);
-        inet_pton(AF_INET, my_ip_.c_str(), &addr.sin_addr);
-
-        // Retry bind with backoff (handles TIME_WAIT from previous runs).
-        // Fresh socket each attempt since bind-on-failed-socket is undefined.
-        std::string last_err;
-        for (int retry = 0; retry < 30; ++retry) {
-            int fd = socket(AF_INET, SOCK_STREAM, 0);
-            if (fd < 0) {
-                throw std::runtime_error("Failed to create listen socket");
-            }
-            int opt = 1;
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#ifdef SO_REUSEPORT
-            setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-#endif
-            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
-                listen_sock_ = fd;
-                break;
-            }
-            last_err = std::string("bind attempt ") + std::to_string(retry + 1)
-                     + " failed: " + strerror(errno);
-            close(fd);
-            if (retry == 29) {
-                throw std::runtime_error(last_err);
-            }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-        
-        if (listen(listen_sock_, expected_recv_connections_) < 0) {
-            throw std::runtime_error("Failed to listen on socket");
-        }
-        
-        std::cout << "[Rank " << rank_ << "] TCP listener started on " << my_ip_ << ":" << my_port_ << std::endl;
+        // Use ASIO acceptor instead of raw socket/bind/listen (matching eccheck pattern).
+        // ASIO's reuse_address handles TIME_WAIT automatically — no retry loop needed.
+        boost::asio::ip::tcp::endpoint endpoint(
+            boost::asio::ip::address::from_string(my_ip_), my_port_);
+        recv_acceptor_ = std::make_unique<boost::asio::ip::tcp::acceptor>(io_context_);
+        recv_acceptor_->open(endpoint.protocol());
+        recv_acceptor_->set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        recv_acceptor_->bind(endpoint);
+        recv_acceptor_->listen(expected_recv_connections_);
+        std::cout << "[Rank " << rank_ << "] ASIO acceptor listening on " << my_ip_ << ":" << my_port_ << std::endl;
     }
     
     void accept_tcp_connection() {
         try {
             std::cout << "[Rank " << rank_ << "] Waiting to accept incoming connection..." << std::endl;
-            int client_sock = accept(listen_sock_, nullptr, nullptr);
-            if (client_sock < 0) {
-                throw std::runtime_error("Failed to accept connection: " + std::string(strerror(errno)));
-            }
-            std::cout << "[Rank " << rank_ << "] Accepted TCP connection" << std::endl;
-            
+            // ASIO synchronous accept (matching eccheck pattern)
+            auto sock = std::make_unique<boost::asio::ip::tcp::socket>(io_context_);
+            recv_acceptor_->accept(*sock);
+            int client_sock = sock->native_handle();
+            std::cout << "[Rank " << rank_ << "] Accepted TCP connection (ASIO)" << std::endl;
+
             // Exchange QP info
             // First, create a new QP for this incoming connection
             std::cout << "[Rank " << rank_ << "] Creating recv QP..." << std::endl;
@@ -1147,138 +1140,112 @@ private:
             qp_init_attr.cap.max_recv_wr = MAX_WR;
             qp_init_attr.cap.max_send_sge = MAX_SGE;
             qp_init_attr.cap.max_recv_sge = MAX_SGE;
-            
+
             ibv_qp* qp = ibv_create_qp(pd_, &qp_init_attr);
             if (!qp) {
-                close(client_sock);
                 throw std::runtime_error("Failed to create recv QP: " + std::string(strerror(errno)));
             }
-            
-            std::cout << "[Rank " << rank_ << "] Exchanging QP info..." << std::endl;
+
+            // Acceptor receives QP info first (same as eccheck's exchange(false))
+            std::cout << "[Rank " << rank_ << "] Exchanging QP info (recv-first)..." << std::endl;
             RdmaConnInfo local_info = get_local_conn_info(qp);
             RdmaConnInfo remote_info;
-            
-            // Exchange connection info with remote
-            if (!exchange_conn_info(client_sock, local_info, remote_info)) {
+            if (!exchange_conn_info(client_sock, local_info, remote_info, false)) {
                 ibv_destroy_qp(qp);
-                close(client_sock);
                 throw std::runtime_error("Failed to exchange connection info");
             }
-            
+
             // Connect QP
             std::cout << "[Rank " << rank_ << "] Connecting recv QP..." << std::endl;
             if (!connect_qp(qp, remote_info)) {
                 ibv_destroy_qp(qp);
-                close(client_sock);
                 throw std::runtime_error("Failed to connect recv QP");
             }
-            
+
             // Receive source rank from sender
             std::cout << "[Rank " << rank_ << "] Receiving source rank ID..." << std::endl;
             int32_t source_rank_net;
             if (recv(client_sock, &source_rank_net, sizeof(source_rank_net), MSG_WAITALL) != sizeof(source_rank_net)) {
                 ibv_destroy_qp(qp);
-                close(client_sock);
                 throw std::runtime_error("Failed to receive source rank: " + std::string(strerror(errno)));
             }
             int source_rank = ntohl(source_rank_net);
-            
-            // Store the QP and source rank
+
+            // Store the QP, source rank, raw fd, and keep ASIO socket alive
             recv_qps_.push_back(qp);
             recv_source_ranks_.push_back(source_rank);
             control_socks_recv_.push_back(client_sock);
-            
+            recv_socks_.push_back(std::move(sock));
+
             std::cout << "[Rank " << rank_ << "] Successfully accepted RDMA connection from rank " << source_rank << std::endl;
+
+            // If we're the last to finish (accept side), signal connected_
+            if (recv_qps_.size() == static_cast<size_t>(expected_recv_connections_) &&
+                send_qps_.size() == target_ranks_.size() &&
+                std::all_of(control_socks_send_.begin(), control_socks_send_.end(), [](int s) { return s >= 0; })) {
+                std::lock_guard<std::mutex> lock(connection_mutex_);
+                connected_ = true;
+                connection_cv_.notify_all();
+                std::cout << "[Rank " << rank_ << "] All connections complete (from accept side), notifying waiters" << std::endl;
+            }
         } catch (const std::exception& e) {
             std::cerr << "[Rank " << rank_ << "] ERROR in accept_tcp_connection: " << e.what() << std::endl;
             throw;
         }
-        
-        // Check if all connections established
-        std::cout << "[Rank " << rank_ << "] Connection status: recv_qps=" << recv_qps_.size() 
-                  << "/" << expected_recv_connections_ << ", send_qps=" << send_qps_.size() 
-                  << "/" << target_ranks_.size() << std::endl;
-        
-        if (recv_qps_.size() == static_cast<size_t>(expected_recv_connections_) &&
-            send_qps_.size() == target_ranks_.size() &&
-            std::all_of(control_socks_send_.begin(), control_socks_send_.end(), [](int s) { return s >= 0; })) {
-            std::lock_guard<std::mutex> lock(connection_mutex_);
-            connected_ = true;
-            connection_cv_.notify_all();
-            std::cout << "[Rank " << rank_ << "] All connections complete, notifying waiters" << std::endl;
-        }
     }
-    
+
     void connect_to_target(size_t target_idx) {
         try {
-            std::cout << "[Rank " << rank_ << "] Creating socket for target " << target_ranks_[target_idx] << std::endl;
-            int sock = socket(AF_INET, SOCK_STREAM, 0);
-            if (sock < 0) {
-                throw std::runtime_error("Failed to create socket: " + std::string(strerror(errno)));
-            }
-            
-            sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(target_ports_[target_idx]);
-            if (inet_pton(AF_INET, target_ips_[target_idx].c_str(), &addr.sin_addr) <= 0) {
-                close(sock);
-                throw std::runtime_error("Invalid IP address: " + target_ips_[target_idx]);
-            }
-            
-            // Retry connection
-            std::cout << "[Rank " << rank_ << "] Connecting to " << target_ips_[target_idx] 
-                      << ":" << target_ports_[target_idx] << std::endl;
-            int max_retries = 20;
-            for (int retry = 0; retry < max_retries; ++retry) {
-                if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
-                    std::cout << "[Rank " << rank_ << "] TCP connected to target " << target_ranks_[target_idx] << std::endl;
-                    break;
-                }
-                if (retry == max_retries - 1) {
-                    close(sock);
-                    throw std::runtime_error("Failed to connect to target " + std::to_string(target_ranks_[target_idx]) + 
-                                           " at " + target_ips_[target_idx] + ":" + std::to_string(target_ports_[target_idx]) +
-                                           " after " + std::to_string(max_retries) + " retries: " + std::string(strerror(errno)));
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-            
-            // Exchange QP info
-            std::cout << "[Rank " << rank_ << "] Exchanging QP info with target " << target_ranks_[target_idx] << std::endl;
+            std::cout << "[Rank " << rank_ << "] Connecting to target "
+                      << target_ranks_[target_idx] << " at "
+                      << target_ips_[target_idx] << ":" << target_ports_[target_idx] << std::endl;
+
+            // ASIO synchronous connect (matching eccheck pattern).
+            // ASIO handles DNS resolution and retry internally.
+            auto sock = std::make_unique<boost::asio::ip::tcp::socket>(io_context_);
+            boost::asio::ip::tcp::resolver resolver(io_context_);
+            auto endpoints = resolver.resolve(
+                target_ips_[target_idx], std::to_string(target_ports_[target_idx]));
+            boost::asio::connect(*sock, endpoints);
+            int fd = sock->native_handle();
+            std::cout << "[Rank " << rank_ << "] TCP connected to target "
+                      << target_ranks_[target_idx] << " (ASIO)" << std::endl;
+
+            // Connector sends QP info first (same as eccheck's exchange(true))
+            std::cout << "[Rank " << rank_ << "] Exchanging QP info (send-first) with target "
+                      << target_ranks_[target_idx] << std::endl;
             RdmaConnInfo local_info = get_local_conn_info(send_qps_[target_idx]);
             RdmaConnInfo remote_info;
-            
-            if (!exchange_conn_info(sock, local_info, remote_info)) {
-                close(sock);
-                throw std::runtime_error("Failed to exchange connection info with target " + std::to_string(target_ranks_[target_idx]));
+            if (!exchange_conn_info(fd, local_info, remote_info, true)) {
+                throw std::runtime_error("Failed to exchange connection info with target "
+                    + std::to_string(target_ranks_[target_idx]));
             }
-            
+
             // Connect QP
             std::cout << "[Rank " << rank_ << "] Connecting QP to target " << target_ranks_[target_idx] << std::endl;
             if (!connect_qp(send_qps_[target_idx], remote_info)) {
-                close(sock);
                 throw std::runtime_error("Failed to connect QP to target " + std::to_string(target_ranks_[target_idx]));
             }
-            
+
             // Send my rank to receiver
             std::cout << "[Rank " << rank_ << "] Sending rank ID to target " << target_ranks_[target_idx] << std::endl;
             int32_t my_rank_net = htonl(rank_);
-            if (send(sock, &my_rank_net, sizeof(my_rank_net), 0) != sizeof(my_rank_net)) {
-                close(sock);
+            if (send(fd, &my_rank_net, sizeof(my_rank_net), 0) != sizeof(my_rank_net)) {
                 throw std::runtime_error("Failed to send rank to target " + std::to_string(target_ranks_[target_idx]));
             }
-            
-            control_socks_send_[target_idx] = sock;
-            
+
+            control_socks_send_[target_idx] = fd;
+            send_socks_.push_back(std::move(sock));
+
             std::cout << "[Rank " << rank_ << "] Successfully connected to target " << target_ranks_[target_idx] << std::endl;
-            
+
             // Check if all connections established
-            std::cout << "[Rank " << rank_ << "] Connection status: recv_qps=" << recv_qps_.size() 
-                      << "/" << expected_recv_connections_ << ", send_qps=" << send_qps_.size() 
-                      << "/" << target_ranks_.size() << ", control_socks_send=" 
+            std::cout << "[Rank " << rank_ << "] Connection status: recv_qps=" << recv_qps_.size()
+                      << "/" << expected_recv_connections_ << ", send_qps=" << send_qps_.size()
+                      << "/" << target_ranks_.size() << ", control_socks_send="
                       << std::count_if(control_socks_send_.begin(), control_socks_send_.end(), [](int s) { return s >= 0; })
                       << "/" << target_ranks_.size() << std::endl;
-            
+
             if (recv_qps_.size() == static_cast<size_t>(expected_recv_connections_) &&
                 send_qps_.size() == target_ranks_.size() &&
                 std::all_of(control_socks_send_.begin(), control_socks_send_.end(), [](int s) { return s >= 0; })) {
@@ -1313,12 +1280,22 @@ private:
         return info;
     }
     
-    bool exchange_conn_info(int sock_fd, const RdmaConnInfo& local_info, RdmaConnInfo& remote_info) {
-        if (send(sock_fd, &local_info, sizeof(local_info), 0) != sizeof(local_info)) {
-            return false;
-        }
-        if (recv(sock_fd, &remote_info, sizeof(remote_info), MSG_WAITALL) != sizeof(remote_info)) {
-            return false;
+    // Exchange QP connection info over a TCP control socket.
+    // we_send_first=true: connector sends its info first, then receives remote's
+    // we_send_first=false: acceptor receives remote's info first, then sends its own
+    // (same deadlock-avoidance pattern as eccheck's exchange_and_connect_qp)
+    bool exchange_conn_info(int sock_fd, const RdmaConnInfo& local_info,
+                            RdmaConnInfo& remote_info, bool we_send_first) {
+        if (we_send_first) {
+            if (send(sock_fd, &local_info, sizeof(local_info), 0) != sizeof(local_info))
+                return false;
+            if (recv(sock_fd, &remote_info, sizeof(remote_info), MSG_WAITALL) != sizeof(remote_info))
+                return false;
+        } else {
+            if (recv(sock_fd, &remote_info, sizeof(remote_info), MSG_WAITALL) != sizeof(remote_info))
+                return false;
+            if (send(sock_fd, &local_info, sizeof(local_info), 0) != sizeof(local_info))
+                return false;
         }
         return true;
     }
@@ -1434,7 +1411,34 @@ private:
             }
         }
     }
-    
+
+    // Like poll_completion but with a timeout (seconds). Used by warmup
+    // to avoid hanging forever if a peer hasn't posted recv WRs yet.
+    void poll_completion_timeout(ibv_cq* cq, int num_completions, int timeout_secs) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_secs);
+        int polled = 0;
+        while (polled < num_completions) {
+            ibv_wc wc;
+            int n = ibv_poll_cq(cq, 1, &wc);
+            if (n < 0) {
+                throw std::runtime_error("Failed to poll completion queue");
+            }
+            if (n > 0) {
+                if (wc.status != IBV_WC_SUCCESS) {
+                    throw std::runtime_error("Work completion failed with status " + std::to_string(wc.status));
+                }
+                polled++;
+                continue;
+            }
+            if (std::chrono::steady_clock::now() > deadline) {
+                throw std::runtime_error("poll_completion_timeout expired after "
+                    + std::to_string(timeout_secs) + "s (got " + std::to_string(polled)
+                    + "/" + std::to_string(num_completions) + " completions)");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
     void wait_for_connections() {
         std::unique_lock<std::mutex> lock(connection_mutex_);
         connection_cv_.wait(lock, [this]() {
@@ -1497,18 +1501,16 @@ private:
                 context_ = nullptr;
             }
             
-            // Close control sockets
-            for (int sock : control_socks_send_) {
-                if (sock >= 0) close(sock);
+            // Stop ASIO io_context and background thread
+            io_context_.stop();
+            if (io_thread_ && io_thread_->joinable()) {
+                io_thread_->join();
             }
-            for (int sock : control_socks_recv_) {
-                if (sock >= 0) close(sock);
-            }
-            if (listen_sock_ >= 0) {
-                close(listen_sock_);
-                listen_sock_ = -1;
-            }
-            
+            // Destroy ASIO socket objects (closes fds automatically)
+            send_socks_.clear();
+            recv_socks_.clear();
+            recv_acceptor_.reset();
+
             control_socks_send_.clear();
             control_socks_recv_.clear();
         } catch (...) {

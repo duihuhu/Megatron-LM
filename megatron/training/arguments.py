@@ -2396,6 +2396,11 @@ def _add_checkpointing_args(parser):
                             'even if their main files exist. When not set, failure is detected '
                             'automatically by checking file existence. '
                             'Used with --use-gemini-replicas-hardware-failure for testing.')
+    group.add_argument('--use-gemini-replicas-software-failure', action='store_true',
+                       help='Enable Gemini Replicas software failure recovery. '
+                            'In software failure, the failed rank main.pt still exists on disk, '
+                            'so recovery loads directly from local file without network transfer. '
+                            'Use with --gemini-replicas-recovery-rank to specify the failed rank(s).')
     return parser
 
 

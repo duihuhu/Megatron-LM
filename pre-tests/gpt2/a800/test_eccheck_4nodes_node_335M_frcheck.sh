@@ -131,6 +131,8 @@ EVAL_AND_LOGGING_ARGS=(
 
     --use-frcheck
     --frcheck-n 4
+    --use-frcheck-software-failure 
+    --frcheck-failed-ranks "4,5"
     --frcheck-table-dir $FRCHECK_TABLE_DIR
     --frcheck-failed-ranks 0,1
     --use-frcheck-hardware-failure

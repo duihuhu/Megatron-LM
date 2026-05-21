@@ -1815,12 +1815,15 @@ public:
         if (!workers_started_)
             throw std::runtime_error("Workers not started — call start_workers first");
 
-        send_task_addr_ = buffer_addr;
-        send_task_size_ = buffer_size;
-        send_ready_ = true;
-        send_done_ = false;
-        send_error_ = false;
-        send_cv_.notify_one();
+        {
+            std::lock_guard<std::mutex> lk(send_mutex_);
+            send_task_addr_ = buffer_addr;
+            send_task_size_ = buffer_size;
+            send_ready_ = true;
+            send_done_ = false;
+            send_error_ = false;
+            send_cv_.notify_one();
+        }
 
         std::cout << "[Rank " << rank_ << "] Submitted send buffer: "
                   << buffer_size << " bytes" << std::endl;
@@ -1841,12 +1844,15 @@ public:
             throw std::runtime_error("Source rank " + std::to_string(source_rank) +
                                      " not in registered recv source_ranks");
 
-        recv_task_addrs_[idx] = buffer_addr;
-        recv_task_sizes_[idx] = buffer_size;
-        recv_ready_[idx] = true;
-        recv_done_[idx] = false;
-        recv_error_[idx] = false;
-        recv_cvs_[idx]->notify_one();
+        {
+            std::lock_guard<std::mutex> lk(*recv_mutexes_[idx]);
+            recv_task_addrs_[idx] = buffer_addr;
+            recv_task_sizes_[idx] = buffer_size;
+            recv_ready_[idx] = true;
+            recv_done_[idx] = false;
+            recv_error_[idx] = false;
+            recv_cvs_[idx]->notify_one();
+        }
 
         std::cout << "[Rank " << rank_ << "] Submitted recv buffer for source rank "
                   << source_rank << ": " << buffer_size << " bytes" << std::endl;

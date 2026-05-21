@@ -1391,6 +1391,7 @@ private:
     int async_total_stripes_ = 0;
     bool async_active_ = false;
     std::vector<uintptr_t> async_data_sizes_;
+    bool defer_file_writes_ = false;
 
     void async_poller_init() {
         async_poller_stop_ = false;
@@ -1526,6 +1527,27 @@ public:
         async_active_ = false;
     }
 
+    void set_defer_file_writes(bool v) { defer_file_writes_ = v; }
+
+    void flush_stripe_files(const std::string& layer_dir, int rank,
+                            const std::vector<uintptr_t>& parity1_addrs,
+                            const std::vector<uintptr_t>& parity2_addrs,
+                            size_t block_size) {
+        for (int sid = 0; sid < (int)async_stripes_.size(); ++sid) {
+            auto& st = async_stripes_[sid];
+            if (!st.all_done) continue;
+            if (st.role == (int)StripeRole::ENCODER) {
+                write_stripe_file(layer_dir, sid, 1, rank,
+                    (const uint8_t*)parity1_addrs[sid], block_size, block_size, "_p1");
+                write_stripe_file(layer_dir, sid, 2, rank,
+                    (const uint8_t*)parity2_addrs[sid], block_size, block_size, "_p2");
+            } else if (st.role == (int)StripeRole::PARITY_TARGET) {
+                write_stripe_file(layer_dir, sid, st.role, rank,
+                    (const uint8_t*)parity2_addrs[sid], block_size, block_size);
+            }
+        }
+    }
+
     uintptr_t _get_g_tbls_ptr() const { return (uintptr_t)g_tbls_; }
 
     void async_poller_loop_(
@@ -1601,16 +1623,18 @@ public:
         if (st.role == (int)StripeRole::ENCODER)
             need = st.n_src + 1;
         if (st.ops_done >= need && (!(st.role == (int)StripeRole::ENCODER) || st.encode_done)) {
-            if (st.role == (int)StripeRole::SOURCE) {
-                // SOURCE write handled in Python (GPU buffers not fwrite-safe)
-            } else if (st.role == (int)StripeRole::ENCODER) {
-                write_stripe_file(layer_dir, sid, 1, rank,
-                    (const uint8_t*)parity1_addrs[sid], blk, blk, "_p1");
-                write_stripe_file(layer_dir, sid, 2, rank,
-                    (const uint8_t*)parity2_addrs[sid], blk, blk, "_p2");
-            } else if (st.role == (int)StripeRole::PARITY_TARGET) {
-                write_stripe_file(layer_dir, sid, st.role, rank,
-                    (const uint8_t*)parity2_addrs[sid], blk, blk);
+            if (!defer_file_writes_) {
+                if (st.role == (int)StripeRole::SOURCE) {
+                    // SOURCE write handled in Python (GPU buffers not fwrite-safe)
+                } else if (st.role == (int)StripeRole::ENCODER) {
+                    write_stripe_file(layer_dir, sid, 1, rank,
+                        (const uint8_t*)parity1_addrs[sid], blk, blk, "_p1");
+                    write_stripe_file(layer_dir, sid, 2, rank,
+                        (const uint8_t*)parity2_addrs[sid], blk, blk, "_p2");
+                } else if (st.role == (int)StripeRole::PARITY_TARGET) {
+                    write_stripe_file(layer_dir, sid, st.role, rank,
+                        (const uint8_t*)parity2_addrs[sid], blk, blk);
+                }
             }
             st.all_done = true;
             async_done_count_++;
@@ -1939,5 +1963,11 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("g_tbls"),
              py::arg("output_dir"), py::arg("layer_name"), py::arg("rank"))
         .def("wait_stripes_async", &FRCheckNative::wait_stripes_async)
+        .def("set_defer_file_writes", &FRCheckNative::set_defer_file_writes,
+             py::arg("v"))
+        .def("flush_stripe_files", &FRCheckNative::flush_stripe_files,
+             py::arg("layer_dir"), py::arg("rank"),
+             py::arg("parity1_addrs"), py::arg("parity2_addrs"),
+             py::arg("block_size"))
         .def("_get_g_tbls_ptr", &FRCheckNative::_get_g_tbls_ptr);
 }

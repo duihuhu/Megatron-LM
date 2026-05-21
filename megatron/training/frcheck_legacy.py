@@ -168,6 +168,7 @@ def _encode_one_layer(
 
     # Phase 2b: Post all send WRs + start poller (after barrier, all recvs ready)
     p1_list = [(b.data_ptr() if b is not None else 0) for b in manager.parity1_bufs]
+    native.set_defer_file_writes(True)
     native.submit_stripes_post_sends(
         data_addrs=data_addrs,
         actual_sizes=actual_sizes,
@@ -181,10 +182,28 @@ def _encode_one_layer(
         rank=rank,
     )
 
-    # Phase 3: Wait for all stripes to complete
+    # Phase 3: Wait for all stripes to complete (encoding only, no file writes)
     native.wait_stripes_async()
+    native.set_defer_file_writes(False)
+    return actual_sizes
 
-    # Phase 4: Write SOURCE files (GPU buffers, threaded for GPU→CPU + disk I/O)
+
+def _flush_one_layer_stripe_files(
+    manager,
+    native,
+    layer_name: str,
+    output_dir: str,
+    rank: int,
+    num_stripes: int,
+    block_size: int,
+    gdr: bool,
+    actual_sizes: list,
+) -> None:
+    """Write per-layer stripe files (ENCODER/PARITY_TARGET via C++, SOURCE via Python)."""
+    stripe_plans = manager.stripe_plans
+    p1_list = [(b.data_ptr() if b is not None else 0) for b in manager.parity1_bufs]
+    p2_list = [(b.data_ptr() if b is not None else 0) for b in manager.parity2_bufs]
+    native.flush_stripe_files(output_dir + "/" + layer_name, rank, p1_list, p2_list, block_size)
     import struct
     import concurrent.futures
     _FRBK_MAGIC = b"FRBK"
@@ -281,8 +300,7 @@ def _write_layer_shards(
 
 def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
     """Write frcheck_main_rank*.pt + layer-wise source/parity shards."""
-    start_time = time.time()
-    t0 = start_time
+    t0 = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -297,34 +315,12 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     logger.info(f"FRCHECK save timing: decompose+group {time.time()-t0:.3f}s")
 
-    # 1.5 Build contiguous tensor_buffer for main file (same as other EC strategies).
-    #     Per-layer grouping overwrites info.offset → snapshot offsets first.
-    t0 = time.time()
-    safety_margin = max(int(total_tensor_size * 0.01), 4096)
-    full_buf = allocate_hugepage_tensor(
-        total_tensor_size + safety_margin, fallback_pin_memory=torch.cuda.is_available(),
-    )
-    full_buf.zero_()
-    for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
-        view = _to_device_view(tensor, torch.device("cpu"))
-        full_buf[info.offset : info.offset + info.size_bytes].copy_(view)
-    # save global offsets (decompose set them) before grouping clobbers them
+    # 1.5 Init manager early (cached after first call) and snapshot global offsets.
+    #     Per-layer grouping overwrites info.offset, so snapshot first.
+    start_time = t0 = time.time()
     _global_offsets = {id(info): info.offset for info in decomposed.tensor_infos}
-    logger.info(f"FRCHECK save timing: full tensor buf build {time.time()-t0:.3f}s")
 
-    # 2. Group tensors by layer index
-    t0 = time.time()
-    layer_groups = _group_by_layer(decomposed)
-    n_tensors = len(decomposed.tensor_data)
-    del decomposed.tensor_data  # GPU refs now held by per-layer groups
-    num_layers = len(layer_groups)
-    logger.info(
-        "FRCheck save: grouped %d layers from %d tensors (layers: %s)",
-        num_layers, n_tensors,
-        [(g.layer_idx, g.total_bytes) for g in layer_groups],
-    )
-
-    # 3. Init FRCheck manager + RDMA + stripe plans (once, shared across layers)
+    # 2. Init FRCheck manager + RDMA + stripe plans (once, shared across layers)
     manager = FRCheckManager()
     manager.init_frcheck_if_enabled()
     native = manager.get_native()
@@ -345,15 +341,27 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     buf_device = torch.device("cuda") if gdr else torch.device("cpu")
 
-    n_source_my = _stripes_per_role(stripe_plans, StripeRole.SOURCE)
-    n_encoder_my = _stripes_per_role(stripe_plans, StripeRole.ENCODER)
-    n_parity_my = _stripes_per_role(stripe_plans, StripeRole.PARITY_TARGET)
-
-    # 4. Setup output directory
+    # 3. Setup output directory
     checkpoint_dir = Path(checkpoint_name)
     if checkpoint_name.endswith(".pt") or checkpoint_name.endswith(".ckpt"):
         checkpoint_dir = checkpoint_dir.parent / "frcheck"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # 4. Allocate cached full_buf (grows-only, reused across saves; copy deferred to per-layer loop)
+    full_buf = manager.allocate_full_buf(total_tensor_size)
+    logger.info(f"FRCHECK save timing: full tensor buf build {time.time()-t0:.3f}s")
+
+    # 5. Group tensors by layer index
+    t0 = time.time()
+    layer_groups = _group_by_layer(decomposed)
+    n_tensors = len(decomposed.tensor_data)
+    del decomposed.tensor_data  # GPU refs now held by per-layer groups
+    num_layers = len(layer_groups)
+    logger.info(
+        "FRCheck save: grouped %d layers from %d tensors (layers: %s)",
+        num_layers, n_tensors,
+        [(g.layer_idx, g.total_bytes) for g in layer_groups],
+    )
 
     flat_key_roots = decomposed.flat_key_roots
 
@@ -362,8 +370,9 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     # 4.5 Compute per-layer adaptive block sizes (first save, cached thereafter)
     manager.compute_layer_block_sizes(layer_groups)
 
-    # 5. Encode each layer independently
+    # 5. Encode each layer (encoding only, no file writes)
     t0 = time.time()
+    _layer_write_data = []
     for group in layer_groups:
         layer_name = f"layer_{group.layer_idx}" if group.layer_idx >= 0 else "layer_common"
         layer_block_size = manager._layer_block_sizes[group.layer_idx]
@@ -373,12 +382,16 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         layer_buf_size = group.total_bytes + safety_margin
         tensor_buffer = manager.allocate_layer_buffer(group.layer_idx, layer_buf_size, gdr)
 
-        # Copy layer tensors into layer buffer
+        # Copy layer tensors into layer buffer and full_buf
         offset = 0
         for info, tensor in zip(group.tensor_infos, group.tensor_data):
             tb = _to_device_view(tensor, buf_device)
             nbytes = tb.numel()
             tensor_buffer[offset : offset + nbytes].copy_(tb)
+            # Also copy to full_buf at global offset for main file write
+            full_buf[_global_offsets[id(info)] : _global_offsets[id(info)] + nbytes].copy_(
+                _to_device_view(tensor, torch.device("cpu"))
+            )
             info.offset = offset
             offset += nbytes
 
@@ -397,14 +410,29 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         for sid in range(num_stripes):
             (layer_dir / f"stripe_{sid}").mkdir(parents=True, exist_ok=True)
 
-        # Stripe encode (RDMA + per-stripe file writes by C++ poller)
-        _encode_one_layer(
+        # Stripe encode (encoding only, file writes deferred)
+        actual_sizes = _encode_one_layer(
             manager, native, tensor_buffer, group.total_bytes,
             n, num_stripes, layer_block_size, my_node, gdr, world_size,
             str(checkpoint_dir), layer_name, rank,
         )
 
-        # Write layer metadata
+        _layer_write_data.append((
+            layer_name, actual_sizes, addr, layer_block_size,
+            group.tensor_infos, group.total_bytes,
+        ))
+
+    logger.info(f"FRCHECK save timing: all layers encode {time.time()-t0:.3f}s")
+
+    logger.info(f"FRCHECK legacy save: done in {time.time() - start_time:.2f}s")
+
+    # Write per-layer stripe files + layer metadata (outside timing)
+    for (layer_name, actual_sizes, addr, layer_block_size,
+         tensor_infos, total_bytes) in _layer_write_data:
+        _flush_one_layer_stripe_files(
+            manager, native, layer_name, str(checkpoint_dir), rank,
+            num_stripes, layer_block_size, gdr, actual_sizes,
+        )
         layer_main = checkpoint_dir / layer_name / f"frcheck_layer_main_rank{rank}.pt"
         torch.save(
             {
@@ -417,21 +445,16 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
                 "block_size": layer_block_size,
                 "rank_in_group": rg,
                 "gdr": gdr,
-                "tensor_infos": group.tensor_infos,
-                "actual_tensor_size": group.total_bytes,
+                "tensor_infos": tensor_infos,
+                "actual_tensor_size": total_bytes,
             },
             layer_main,
         )
-
-        # Release per-layer GPU buffer (skip if cached — kept registered for next save)
         if addr not in manager._rdma_registered_addrs:
             native.unregister_buffer(addr)
 
-    logger.info(f"FRCHECK save timing: all layers encode+write {time.time()-t0:.3f}s")
-
     # 6. Write top-level main file with full tensor_buffer + non_tensor_data,
     #    matching the pattern of eccheck / eclatin / ecnaive.
-    t0 = time.time()
     main_file = checkpoint_dir / f"frcheck_main_rank{rank}.pt"
     from megatron.training.legacy_io_utils import write_raw_checkpoint, MAGIC_FRCHECK
     # restore global offsets (per-layer encode clobbered them with local offsets)
@@ -455,12 +478,10 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
                      for g in layer_groups],
     )
 
-    logger.info(f"FRCHECK save timing: main file write {time.time()-t0:.3f}s")
     logger.info(
         "FRCheck save: done rank=%d node=%d gdr=%s layers=%d file=%s",
         rank, my_node, gdr, num_layers, main_file,
     )
-    logger.info(f"FRCHECK legacy save: done in {time.time() - start_time:.2f}s")
 
     del _global_offsets
 
@@ -925,24 +946,241 @@ def _reconstruct_from_main_payload(main_payload: Dict, flat_key_roots: list = No
     return result
 
 
+# ---------------------------------------------------------------------------
+# Software failure recovery helpers
+# ---------------------------------------------------------------------------
+
+def _parse_poa_table(poa_path: str, n: int) -> List[List[int]]:
+    """Parse POA table text file.
+
+    Format: lines starting with # are comments. Data lines have n
+    space-separated integers (1-based node IDs).
+
+    Returns list of rows, each a list of n ints.
+    """
+    rows: List[List[int]] = []
+    with open(poa_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) != n:
+                continue
+            rows.append([int(p) for p in parts])
+    if len(rows) != n * (n - 1):
+        logger.warning(
+            f"FRCheck: POA table at {poa_path} has {len(rows)} rows, "
+            f"expected {n * (n - 1)} for n={n}"
+        )
+    return rows
+
+
+def _find_source_stripes(
+    poa_rows: List[List[int]], my_node: int, n: int
+) -> List[Tuple[int, int]]:
+    """Find stripes where *my_node* (1-based) is a SOURCE.
+
+    Returns list of (stripe_id, blk_idx) sorted by stripe_id.
+    blk_idx is the 0-based accumulation index for SOURCE blocks of this node.
+    """
+    k = n - 2  # SOURCE columns are 0 .. k-1
+    result: List[Tuple[int, int]] = []
+    blk_idx = 0
+    for stripe_id, row in enumerate(poa_rows):
+        for col in range(k):
+            if row[col] == my_node:
+                result.append((stripe_id, blk_idx))
+                blk_idx += 1
+                break
+    return result
+
+
+def _recover_frcheck_legacy_software(
+    checkpoint_name: str, failed_ranks: List[int]
+) -> Dict[str, Any]:
+    """FRCheck legacy software failure recovery.
+
+    Failed ranks read their SOURCE stripe blocks from local disk and reassemble
+    the tensor buffer. Non-failed ranks load from main.pt directly.
+    No network transfer — source data is always stored locally.
+    """
+    start_time = time.time()
+    checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+    # --- Load main payload for metadata ---
+    main_path = checkpoint_dir / f"frcheck_main_rank{rank}.pt"
+    if not main_path.is_file():
+        raise FileNotFoundError(
+            f"FRCheck SW recovery: missing main file {main_path}. "
+            f"In software failure, main.pt must exist on disk."
+        )
+
+    from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_FRCHECK
+    if is_raw_format(str(main_path), MAGIC_FRCHECK):
+        main_payload = read_raw_checkpoint(str(main_path), MAGIC_FRCHECK)
+    else:
+        main_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+
+    is_failed = rank in failed_ranks
+
+    if not is_failed:
+        # --- Non-failed rank: normal load from main.pt ---
+        flat_key_roots = main_payload.get("flat_key_roots", [])
+        result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
+        logger.info(
+            f"FRCheck SW recovery: rank {rank} (non-failed) loaded normally "
+            f"in {time.time() - start_time:.2f}s"
+        )
+        if world_size > 1 and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        return result
+
+    # --- Failed rank: recover from local SOURCE stripe blocks ---
+    n = int(main_payload.get("n", 0))
+    if n < 3:
+        raise RuntimeError(f"FRCheck SW recovery: invalid n={n} in main payload")
+
+    poa_path = main_payload.get("poa_path", "")
+    if not poa_path:
+        raise RuntimeError("FRCheck SW recovery: poa_path not found in main payload")
+
+    layer_names = main_payload.get("layer_names", [])
+    if not layer_names:
+        raise RuntimeError("FRCheck SW recovery: layer_names empty in main payload")
+
+    total_tensor_size = int(main_payload.get("actual_tensor_size", 0))
+    global_tensor_infos = main_payload.get("tensor_infos", [])
+    non_tensor_data = main_payload.get("non_tensor_data", {})
+    flat_key_roots = main_payload.get("flat_key_roots", [])
+
+    my_node = main_payload.get("rank_in_group", 0) + 1  # 1-based node id
+
+    logger.info(
+        f"FRCheck SW recovery: rank {rank} (failed) — n={n}, my_node={my_node}, "
+        f"layers={len(layer_names)}, total_tensor={total_tensor_size / (1024**2):.1f} MB"
+    )
+
+    # Parse POA table once
+    poa_rows = _parse_poa_table(poa_path, n)
+    source_stripes_global = _find_source_stripes(poa_rows, my_node, n)
+    num_source = len(source_stripes_global)
+    logger.info(
+        f"FRCheck SW recovery: rank {rank} has {num_source} SOURCE stripes"
+    )
+
+    # Allocate full recovered buffer
+    safety_margin = max(int(total_tensor_size * 0.01), 4096)
+    full_buf = torch.zeros(total_tensor_size + safety_margin, dtype=torch.uint8)
+
+    # Recover each layer: build per-layer buffer from source blocks,
+    # then map to full_buf using global tensor_infos offsets.
+    # Build a key→(layer_buf, local_offset) lookup from layer_infos.
+    key_to_local: Dict[str, Tuple[torch.Tensor, int]] = {}
+
+    for layer_name in layer_names:
+        layer_dir = checkpoint_dir / layer_name
+        layer_main_path = layer_dir / f"frcheck_layer_main_rank{rank}.pt"
+        if not layer_main_path.is_file():
+            logger.warning(
+                f"FRCheck SW recovery: missing layer_main for {layer_name}, skipping"
+            )
+            continue
+
+        layer_meta = torch.load(layer_main_path, map_location="cpu", weights_only=False)
+        layer_block_size = layer_meta.get("block_size", 64 * 1024 * 1024)
+        layer_infos = layer_meta.get("tensor_infos", [])
+        layer_tensor_size = layer_meta.get("actual_tensor_size", 0)
+
+        source_stripes = _find_source_stripes(poa_rows, my_node, n)
+        layer_buf = torch.zeros(num_source * layer_block_size, dtype=torch.uint8)
+
+        for stripe_id, blk_idx in source_stripes:
+            block_path = (
+                layer_dir / f"stripe_{stripe_id}" / f"frcheck_shard_rank{rank}.pt"
+            )
+            blk = _read_frbk_block(str(block_path))
+            if blk is None:
+                logger.warning(
+                    f"FRCheck SW recovery: missing block {block_path}, skipping"
+                )
+                continue
+            src_offset = blk_idx * layer_block_size
+            ncopy = min(blk.numel(), max(0, layer_tensor_size - src_offset))
+            if ncopy > 0:
+                layer_buf[src_offset:src_offset + ncopy].copy_(blk[:ncopy])
+
+        # Build lookup: tensor key -> (layer_buf, local_offset)
+        for info in layer_infos:
+            key = getattr(info, "key", "")
+            local_offset = getattr(info, "offset", 0)
+            key_to_local[key] = (layer_buf, local_offset)
+
+    # Map global tensor_infos → full_buf using key→local lookup
+    for global_info in global_tensor_infos:
+        key = getattr(global_info, "key", "")
+        if key in key_to_local:
+            layer_buf, local_offset = key_to_local[key]
+            global_offset = getattr(global_info, "offset", 0)
+            size = getattr(global_info, "size_bytes", 0)
+            if size > 0 and global_offset + size <= full_buf.numel():
+                full_buf[global_offset:global_offset + size].copy_(
+                    layer_buf[local_offset:local_offset + size]
+                )
+
+    # Reconstruct state dict from recovered full buffer
+    main_payload["tensor_buffer"] = full_buf[:total_tensor_size].clone()
+    result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
+
+    logger.info(
+        f"FRCheck SW recovery: rank {rank} done in {time.time() - start_time:.2f}s"
+    )
+    if world_size > 1 and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    return result
+
+
 def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
-    """Load FRCheck legacy checkpoint, with optional hardware recovery."""
+    """Load FRCheck legacy checkpoint.
+
+    Supports three modes:
+    - Software failure (--use-frcheck-software-failure): failed ranks read
+      SOURCE stripe blocks from local disk and reassemble.
+    - Hardware failure (--use-frcheck-hardware-failure): failed ranks recover
+      via RDMA RS decode from surviving ranks.
+    """
     from megatron.training import get_args
     args = get_args()
 
+    sw_failure = getattr(args, "use_frcheck_software_failure", False)
     hw_failure = getattr(args, "use_frcheck_hardware_failure", False)
     failed_ranks_str = getattr(args, "frcheck_failed_ranks", None)
     failed_ranks_parsed = getattr(args, "frcheck_failed_ranks_parsed", None)
     logger.info(
-        "FRCheck load: hw_failure=%s failed_ranks_raw=%r failed_ranks_parsed=%r",
-        hw_failure, failed_ranks_str, failed_ranks_parsed,
+        "FRCheck load: sw_failure=%s hw_failure=%s failed_ranks_raw=%r failed_ranks_parsed=%r",
+        sw_failure, hw_failure, failed_ranks_str, failed_ranks_parsed,
     )
+
+    # Resolve failed ranks list
+    failed_ranks = failed_ranks_parsed
+    if failed_ranks is None and failed_ranks_str:
+        failed_ranks = [int(x.strip()) for x in failed_ranks_str.split(",")]
+
+    # Check for software failure mode
+    if sw_failure:
+        if not failed_ranks:
+            logger.warning(
+                "FRCheck: --use-frcheck-software-failure set but no "
+                "--frcheck-failed-ranks provided"
+            )
+            failed_ranks = []
+        logger.info("FRCheck: software failure mode — failed ranks %s", failed_ranks)
+        return _recover_frcheck_legacy_software(checkpoint_name, failed_ranks)
 
     # Check for hardware recovery mode
     if hw_failure:
-        failed_ranks = failed_ranks_parsed
-        if failed_ranks is None and failed_ranks_str:
-            failed_ranks = [int(x.strip()) for x in failed_ranks_str.split(",")]
         if failed_ranks:
             logger.info("FRCheck: hardware recovery mode — failed ranks %s", failed_ranks)
             return recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)

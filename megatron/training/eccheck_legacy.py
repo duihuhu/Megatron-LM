@@ -413,8 +413,7 @@ def _save_eccheck_pt_files(
 def save_eccheck_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str
 ) -> None:
-    start_time = time.time()
-    t0 = start_time
+    t0 = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -429,6 +428,7 @@ def save_eccheck_legacy_checkpoint(
     total_tensor_size = decomposed.total_tensor_size_bytes
     logger.info(f"ECCHECK save timing: decompose {time.time()-t0:.3f}s")
 
+    start_time = t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), manager.eccheck_buffer_size)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
@@ -506,7 +506,8 @@ def save_eccheck_legacy_checkpoint(
     )
     logger.info(f"ECCHECK save timing: encode {time.time()-t0:.3f}s")
 
-    t0 = time.time()
+    logger.info(f"ECCHECK legacy save: done in {time.time() - start_time:.2f}s")
+
     _save_eccheck_pt_files(
         checkpoint_name=checkpoint_name,
         rank=rank,
@@ -515,10 +516,6 @@ def save_eccheck_legacy_checkpoint(
         blocks=blocks,
         full_tensor_buffer=tensor_buffer[:total_tensor_size],
     )
-    logger.info(f"ECCHECK save timing: file write {time.time()-t0:.3f}s")
-
-    logger.info(f"ECCHECK legacy save: done in {time.time() - start_time:.2f}s")
-
     if world_size > 1:
         torch.distributed.barrier()
 
@@ -581,19 +578,24 @@ def _load_eccheck_blocks_from_disk_into(
 ) -> None:
     """Load block .pt files into pre-allocated P2P buffers.
 
-    Recovery layout:
-    - rank_in_group 2 (failed): normal recovery path loads nothing here
-      (blocks allocated empty, data comes via network). Software failure
-      path: rank_in_group 2 loads own_buffer from disk (its own saved data).
+    Normal recovery layout:
+    - rank_in_group 2: loads nothing (data comes via network XOR recovery)
     - rank_in_group 0: loads partner_buffer (received from rank1 during save)
     - rank_in_group 1: loads own_buffer (its own data)
     - rank_in_group 3: loads own_buffer + partner_buffer (its own data + received)
+
+    Software failure layout (use_eccheck_software_failure=True):
+    - rank_in_group 0: loads own_buffer (to send to rig=1 via C++ P2P)
+    - rank_in_group 1: loads nothing (receives from rig=0 via C++ P2P)
+    - rank_in_group 2/3: not participating in software failure
     """
-    if software_failure and rank_in_group == 2:
-        # Software failure: rank2 reads own data from disk (no network recovery needed)
-        _copy_block_file_into_tensor(
-            checkpoint_dir, rank, "own_buffer", blocks["own_buffer"]
-        )
+    if software_failure:
+        if rank_in_group == 0:
+            _copy_block_file_into_tensor(
+                checkpoint_dir, rank, "own_buffer", blocks["own_buffer"]
+            )
+        # rig=1: will receive via C++ P2P, no local disk load
+        # rig=2/3: not participating
         return
 
     if rank_in_group == 2:
@@ -692,19 +694,43 @@ def _run_eccheck_legacy_recovery(
     rank_in_group = manager._get_rank_in_group(rank, world_size)
 
     # ---- software failure path ----
+    # rank_in_group 0 sends own_buffer to rank_in_group 1 via C++ P2P.
+    # rank_in_group 1 receives into recovered_buffer.
+    # This exercises the network path for worst-case recovery time measurement.
     if software_failure:
+        # Barrier before P2P: RDMA requires receiver to post recv WR before sender sends,
+        # otherwise RNR (Receiver Not Ready) causes "failed to receive ACK".
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         t_sw = time()
-        if rank_in_group == 2:
+        if rank_in_group == 0:
+            own_buf = blocks["own_buffer"].contiguous().view(torch.uint8).reshape(-1)
+            actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
+            send_size = min(actual_tensor_bytes, own_buf.numel())
+            native.simple_p2p_send(int(own_buf.data_ptr()), send_size)
+            logger.info(
+                f"ECCHECK legacy sw: rig=0 sent {send_size} bytes to rig=1 "
+                f"in {time() - t_sw:.2f}s"
+            )
+        elif rank_in_group == 1:
             if recovered_buffer is None:
                 raise RuntimeError("ECCHECK legacy: software failure needs recovered_buffer")
-            actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
-            own_buf = blocks["own_buffer"].contiguous().view(torch.uint8).reshape(-1)
-            if recovered_buffer.numel() >= total_size:
-                n_copy = min(actual_tensor_bytes, total_size)
-                recovered_buffer[:n_copy].copy_(own_buf[:n_copy])
-            logger.info(f"ECCHECK legacy: sw recovery done in {time() - t_sw:.2f}s (rank_in_group=2)")
+            native.simple_p2p_recv(
+                int(recovered_buffer.data_ptr()), recovered_buffer.numel()
+            )
+            logger.info(
+                f"ECCHECK legacy sw: rig=1 recvd {recovered_buffer.numel()} bytes "
+                f"from rig=0 in {time() - t_sw:.2f}s"
+            )
+        elif rank_in_group == 2:
+            logger.info(
+                f"ECCHECK legacy sw: rig=2 no-op (not participating) "
+                f"in {time() - t_sw:.2f}s"
+            )
         else:
-            logger.info(f"ECCHECK legacy: rank_in_group {rank_in_group} no-op for sw failure")
+            logger.info(
+                f"ECCHECK legacy sw: rank_in_group {rank_in_group} no-op"
+            )
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return
@@ -1028,11 +1054,18 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     recovered_buffer: Optional[torch.Tensor] = None
 
-    if rank_in_group == 2:
-        if sw_failure:
+    if sw_failure:
+        # Software failure: rig=0 sends own_buffer to rig=1 via C++ P2P
+        if rank_in_group == 0:
             _load_eccheck_blocks_from_disk_into(
                 blocks, checkpoint_dir, rank, rank_in_group, software_failure=True,
             )
+        elif rank_in_group == 1:
+            pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
+            recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
+        # rig=2/3: not participating in software failure
+    elif rank_in_group == 2:
+        # Hardware failure: rank_in_group 2 is the failed rank, data comes via network
         pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
         recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
     else:

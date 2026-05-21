@@ -103,6 +103,18 @@ class FRCheckManager:
     _cached_layer_buffers: Dict[int, torch.Tensor] = {}
     _rdma_registered_addrs: set = set()
     _layer_block_sizes: Optional[Dict[int, int]] = None  # layer_idx → block_size
+    _full_buf: Optional[torch.Tensor] = None
+
+    def allocate_full_buf(self, size_bytes: int):
+        """Allocate or reuse cached full tensor buffer (grows-only)."""
+        if self._full_buf is not None:
+            if self._full_buf.numel() >= size_bytes:
+                self._full_buf.zero_()
+                return self._full_buf
+        self._full_buf = allocate_hugepage_tensor(
+            size_bytes, fallback_pin_memory=torch.cuda.is_available(),
+        )
+        return self._full_buf
 
     def allocate_layer_buffer(self, layer_idx: int, size_bytes: int, gdr: bool):
         """Allocate or reuse a cached per-layer tensor_buffer."""

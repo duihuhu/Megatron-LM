@@ -167,7 +167,7 @@ EVAL_AND_LOGGING_ARGS=(
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）
     # ---------------------------------------------------------------------------
-    --gemini-replicas-num 2         # 默认 3。设为 2 即两副本，设为 N 即 N 副本
+    --gemini-replicas-num 3         # 默认 3。设为 2 即两副本，设为 N 即 N 副本
                                         # 在组内 round-robin 轮询放置副本
                                         # 容错能力 = num_replicas - 1 个 rank 同时故障
 
@@ -206,7 +206,8 @@ EVAL_AND_LOGGING_ARGS=(
     #   测试方法：save 完成后直接 load，加下面参数。
     #   示例："2,3" 表示 rank2 和 rank3 当作故障处理。
     #
-    #   --gemini-replicas-recovery-rank 2,3
+    --use-gemini-replicas-software-failure
+    --gemini-replicas-recovery-rank "2,3"
 
     # ---------------------------------------------------------------------------
     # ckpt 格式：必须用 torch（legacy 路径）

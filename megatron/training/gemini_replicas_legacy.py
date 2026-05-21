@@ -141,8 +141,6 @@ def state_dict_from_gemini_replicas_main_metadata_only(
 def save_gemini_replicas_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str
 ) -> None:
-    start_time = time.time()
-    t0 = start_time
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = (
         torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -161,7 +159,7 @@ def save_gemini_replicas_legacy_checkpoint(
     total_tensor_size = decomposed.total_tensor_size_bytes
     logger.info(f"GEMINI save timing: decompose {time.time()-t0:.3f}s")
 
-    t0 = time.time()
+    start_time = t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), 1024 * 1024)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
@@ -343,8 +341,9 @@ def save_gemini_replicas_legacy_checkpoint(
             b = b.contiguous()
         replica_tasks.append((str(replica_file), meta_bytes, memoryview(b.numpy())))
 
+    logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
+
     # ---- Parallel writes ----
-    t0 = time.time()
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=1 + len(replica_tasks)) as ex:
         main_file = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
@@ -355,8 +354,6 @@ def save_gemini_replicas_legacy_checkpoint(
                                   rep_meta, rep_mv))
         for f in futs:
             f.result()
-    logger.info(f"GEMINI save timing: file write {time.time()-t0:.3f}s")
-    logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
 
 
 def _write_replica_file(path, magic, meta_bytes, mv):

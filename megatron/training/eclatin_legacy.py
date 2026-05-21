@@ -439,7 +439,7 @@ def _save_eclatin_pt_files(
 
 
 def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
-    start_time = time.time()
+    t0 = time.time()
     from megatron.training import get_args
 
     args = get_args()
@@ -463,6 +463,7 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     total_tensor_size = decomposed.total_tensor_size_bytes
     logger.info(f"ECLATIN save timing: decompose {time.time()-t0:.3f}s")
 
+    start_time = t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), manager.eclatin_buffer_size)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
@@ -521,7 +522,8 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     )
     logger.info(f"ECLATIN save timing: encode {time.time()-t0:.3f}s")
 
-    t0 = time.time()
+    logger.info(f"ECLATIN legacy save: done in {time.time() - start_time:.2f}s")
+
     _save_eclatin_pt_files(
         checkpoint_name=checkpoint_name,
         rank=rank,
@@ -530,9 +532,6 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         blocks=blocks,
         full_tensor_buffer=tensor_buffer[:total_tensor_size],
     )
-    logger.info(f"ECLATIN save timing: file write {time.time()-t0:.3f}s")
-
-    logger.info(f"ECLATIN legacy save: done in {time.time() - start_time:.2f}s")
 
     if world_size > 1:
         torch.distributed.barrier()

@@ -1182,7 +1182,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
 
 def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
-    start_time = time.time()
+    t0 = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -1197,6 +1197,7 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     total_tensor_size = decomposed.total_tensor_size_bytes
     logger.info(f"ECNAIVE save timing: decompose {time.time()-t0:.3f}s")
 
+    start_time = t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), manager.ecnaive_buffer_size)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
@@ -1254,7 +1255,8 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     )
     logger.info(f"ECNAIVE save timing: encode {time.time()-t0:.3f}s")
 
-    t0 = time.time()
+    logger.info(f"EC-NAIVE legacy save: done in {time.time() - start_time:.2f}s")
+
     _save_ecnaive_pt_files(
         checkpoint_name=checkpoint_name,
         rank=rank,
@@ -1265,9 +1267,6 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         flat_key_roots=decomposed.flat_key_roots,
         manager=manager,
     )
-    logger.info(f"ECNAIVE save timing: file write {time.time()-t0:.3f}s")
-
-    logger.info(f"EC-NAIVE legacy save: done in {time.time() - start_time:.2f}s")
 
     if world_size > 1:
         torch.distributed.barrier()

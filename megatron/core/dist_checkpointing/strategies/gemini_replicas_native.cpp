@@ -690,11 +690,9 @@ public:
         std::cout << "[Rank " << rank_ << "] Waiting for all connections to be ready..." << std::endl;
         wait_for_connections();
 
-        // Warmup RDMA connections
-        std::cout << "[Rank " << rank_ << "] Warming up RDMA connections..." << std::endl;
-        warmup_rdma_connections();
-
-        std::cout << "[Rank " << rank_ << "] All RDMA connections established and warmed up" << std::endl;
+        // No warmup — matching eccheck. QPs are connected during
+        // exchange_and_connect and the first real data transfer validates them.
+        std::cout << "[Rank " << rank_ << "] All RDMA connections established (no warmup)" << std::endl;
     }
     
     void register_buffer(uintptr_t addr, size_t size) override {

@@ -622,55 +622,65 @@ public:
     
     void connect_and_wait() override {
         std::cout << "[Rank " << rank_ << "] Connecting to targets and waiting for connections..." << std::endl;
-        
-        try {
-            // Accept control connections from source ranks
-            std::exception_ptr accept_exception = nullptr;
-            std::thread accept_thread([this, &accept_exception]() {
-                try {
-                    for (int i = 0; i < expected_recv_connections_; ++i) {
-                        std::cout << "[Rank " << rank_ << "] Accepting connection " << (i+1) 
-                                  << "/" << expected_recv_connections_ << "..." << std::endl;
-                        accept_tcp_connection();
-                    }
-                } catch (...) {
-                    accept_exception = std::current_exception();
+
+        // Accept control connections from source ranks
+        std::exception_ptr accept_exception = nullptr;
+        std::thread accept_thread([this, &accept_exception]() {
+            try {
+                for (int i = 0; i < expected_recv_connections_; ++i) {
+                    std::cout << "[Rank " << rank_ << "] Accepting connection " << (i+1)
+                              << "/" << expected_recv_connections_ << "..." << std::endl;
+                    accept_tcp_connection();
                 }
-            });
-            
-            // Small delay to let receivers start accepting
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            
-            // Connect to target ranks (control channel + RDMA QP)
+            } catch (...) {
+                accept_exception = std::current_exception();
+            }
+        });
+
+        // Small delay to let receivers start accepting
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        // Connect to target ranks (control channel + RDMA QP).
+        // IMPORTANT: wrap in try-catch so that accept_thread is joined
+        // even on failure — otherwise std::thread destructor calls
+        // std::terminate (same pattern as the old execute_exchange bug).
+        std::exception_ptr connect_exception = nullptr;
+        try {
             for (size_t i = 0; i < target_ranks_.size(); ++i) {
-                std::cout << "[Rank " << rank_ << "] Connecting to target " << (i+1) 
+                std::cout << "[Rank " << rank_ << "] Connecting to target " << (i+1)
                           << "/" << target_ranks_.size() << " (rank " << target_ranks_[i] << ")..." << std::endl;
                 connect_to_target(i);
             }
-            
-            accept_thread.join();
-            
-            // Check if accept thread had an exception
-            if (accept_exception) {
-                std::rethrow_exception(accept_exception);
-            }
-            
-            // Wait for all connections
-            std::cout << "[Rank " << rank_ << "] Waiting for all connections to be ready..." << std::endl;
-            wait_for_connections();
-            
-            // Warmup RDMA connections
-            std::cout << "[Rank " << rank_ << "] Warming up RDMA connections..." << std::endl;
-            warmup_rdma_connections();
-            
-            std::cout << "[Rank " << rank_ << "] All RDMA connections established and warmed up" << std::endl;
-        } catch (const std::exception& e) {
-            std::cerr << "[Rank " << rank_ << "] ERROR in connect_and_wait: " << e.what() << std::endl;
-            throw;
         } catch (...) {
-            std::cerr << "[Rank " << rank_ << "] ERROR in connect_and_wait: Unknown exception" << std::endl;
-            throw;
+            connect_exception = std::current_exception();
         }
+
+        accept_thread.join();
+
+        if (accept_exception) {
+            try { std::rethrow_exception(accept_exception); }
+            catch (const std::exception& e) {
+                std::cerr << "[Rank " << rank_ << "] ERROR in accept thread: " << e.what() << std::endl;
+                throw;
+            }
+        }
+        if (connect_exception) {
+            try { std::rethrow_exception(connect_exception); }
+            catch (const std::exception& e) {
+                std::cerr << "[Rank " << rank_ << "] ERROR in connect_and_wait: " << e.what() << std::endl;
+                throw;
+            }
+        }
+
+        // Wait for all connections
+        std::cout << "[Rank " << rank_ << "] Waiting for all connections to be ready..." << std::endl;
+        wait_for_connections();
+
+        // Warmup RDMA connections
+        std::cout << "[Rank " << rank_ << "] Warming up RDMA connections..." << std::endl;
+        warmup_rdma_connections();
+
+        std::cout << "[Rank " << rank_ << "] All RDMA connections established and warmed up" << std::endl;
     }
     
     void register_buffer(uintptr_t addr, size_t size) override {
@@ -1079,21 +1089,35 @@ private:
     }
     
     void start_tcp_listener() {
-        listen_sock_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_sock_ < 0) {
-            throw std::runtime_error("Failed to create listen socket");
-        }
-        
-        int opt = 1;
-        setsockopt(listen_sock_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(my_port_);
         inet_pton(AF_INET, my_ip_.c_str(), &addr.sin_addr);
-        
-        if (bind(listen_sock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-            throw std::runtime_error("Failed to bind listen socket");
+
+        // Retry bind with backoff (handles TIME_WAIT from previous runs).
+        // Fresh socket each attempt since bind-on-failed-socket is undefined.
+        std::string last_err;
+        for (int retry = 0; retry < 30; ++retry) {
+            int fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0) {
+                throw std::runtime_error("Failed to create listen socket");
+            }
+            int opt = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+            setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+                listen_sock_ = fd;
+                break;
+            }
+            last_err = std::string("bind attempt ") + std::to_string(retry + 1)
+                     + " failed: " + strerror(errno);
+            close(fd);
+            if (retry == 29) {
+                throw std::runtime_error(last_err);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         
         if (listen(listen_sock_, expected_recv_connections_) < 0) {

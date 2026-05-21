@@ -244,8 +244,12 @@ def save_gemini_replicas_legacy_checkpoint(
     logger.info(f"GEMINI save timing: recv buf alloc + barrier {time.time()-t0:.3f}s")
 
     t0 = time.time()
-    # Submit to C++ native and execute exchange
+    # Submit to C++ native workers (non-blocking, like ecnaive).
+    # Workers were started by manager._init_gemini_replicas_native() right
+    # after finalize_connections, so they are already waiting on CVs.
     native = manager._gemini_replicas_native
+    native.reset_exchange_state()
+
     send_addr = tensor_buffer.data_ptr()
     native.submit_send_buffer(send_addr, send_buffer_size)
 
@@ -256,7 +260,7 @@ def save_gemini_replicas_legacy_checkpoint(
         f"Gemini Replicas legacy save rank {rank}: executing C++ exchange "
         f"(send to {len(target_ranks) - 1} targets, recv from {len(source_ranks)} sources)..."
     )
-    native.execute_exchange()
+    native.wait_for_exchange_completion()
     logger.info(f"Gemini Replicas legacy save rank {rank}: C++ exchange done ({time.time()-t0:.3f}s)")
 
     t0 = time.time()
@@ -352,6 +356,7 @@ def save_gemini_replicas_legacy_checkpoint(
         for f in futs:
             f.result()
     logger.info(f"GEMINI save timing: file write {time.time()-t0:.3f}s")
+    logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
 
 
 def _write_replica_file(path, magic, meta_bytes, mv):
@@ -360,11 +365,6 @@ def _write_replica_file(path, magic, meta_bytes, mv):
         f.write(_struct.pack("<4sQ", magic, len(meta_bytes)))
         f.write(meta_bytes)
         f.write(mv)
-
-    logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
-
-    if world_size > 1:
-        torch.distributed.barrier()
 
 
 # ---------------------------------------------------------------------------

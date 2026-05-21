@@ -29,6 +29,7 @@
 #include <cstring>
 #include <cerrno>
 #include <algorithm>
+#include <deque>
 #include <map>
 
 // RDMA headers
@@ -1507,17 +1508,38 @@ private:
     std::unique_ptr<IGeminiReplicasConnectionManager> connection_manager_;
     
     std::atomic<bool> initialized_{false};
-    
-    // Buffer management for exchange
-    uintptr_t send_buffer_addr_{0};
-    size_t send_buffer_size_{0};
-    
-    struct RecvBufferInfo {
-        int source_rank;
-        uintptr_t buffer_addr;
-        size_t buffer_size;
-    };
-    std::vector<RecvBufferInfo> recv_buffers_;
+
+    // ---- Worker-thread model (aligned with ecnaive) ----
+    // Persistent worker threads: one send_worker + one recv_worker per source.
+    // Main thread only submits tasks and polls atomic flags — never blocks on I/O.
+
+    bool workers_started_{false};
+    std::atomic<bool> stop_workers_{false};
+
+    // Send worker
+    std::thread send_worker_thread_;
+    std::mutex send_mutex_;
+    std::condition_variable send_cv_;
+    uintptr_t send_task_addr_{0};
+    size_t send_task_size_{0};
+    std::atomic<bool> send_ready_{false};
+    std::atomic<bool> send_done_{false};
+    std::atomic<bool> send_error_{false};
+    std::string send_error_msg_;
+    std::mutex send_error_mutex_;
+
+    // Recv workers (one per source rank)
+    std::vector<int> recv_source_ranks_;
+    std::vector<std::thread> recv_worker_threads_;
+    std::vector<std::unique_ptr<std::mutex>> recv_mutexes_;
+    std::vector<std::unique_ptr<std::condition_variable>> recv_cvs_;
+    std::vector<uintptr_t> recv_task_addrs_;
+    std::vector<size_t> recv_task_sizes_;
+    std::deque<std::atomic<bool>> recv_ready_;
+    std::deque<std::atomic<bool>> recv_done_;
+    std::deque<std::atomic<bool>> recv_error_;
+    std::vector<std::string> recv_error_msgs_;
+    std::mutex recv_error_mutex_;
 
 public:
     GeminiReplicasNative(
@@ -1563,6 +1585,7 @@ public:
     
     ~GeminiReplicasNative() {
         std::cout << "[Rank " << rank_ << "] Destroying GeminiReplicasNative" << std::endl;
+        stop_workers();
     }
     
     void finalize_connections() {
@@ -1629,164 +1652,226 @@ public:
         return {source_rank, received_size};
     }
     
-    void submit_send_buffer(uintptr_t buffer_addr, size_t buffer_size) {
-        /**
-         * Submit send buffer for later execution.
-         * 
-         * Args:
-         *   buffer_addr: Memory address of the buffer to send
-         *   buffer_size: Size of the buffer in bytes
-         */
-        if (!initialized_) {
-            throw std::runtime_error("GeminiReplicasNative not initialized");
+    // ==================== Worker-thread model ====================
+    // Persistent workers handle I/O; main thread only submits + polls.
+    // send_failures are safely isolated from recv_failures (unlike the
+    // old per-exchange std::thread that could std::terminate on recv throw).
+
+    void start_workers(const std::vector<int>& source_ranks) {
+        if (workers_started_) return;
+        workers_started_ = true;
+        recv_source_ranks_ = source_ranks;
+
+        int n_recv = static_cast<int>(source_ranks.size());
+        recv_mutexes_.reserve(n_recv);
+        recv_cvs_.reserve(n_recv);
+        recv_task_addrs_.resize(n_recv, 0);
+        recv_task_sizes_.resize(n_recv, 0);
+        recv_ready_.resize(n_recv);
+        recv_done_.resize(n_recv);
+        recv_error_.resize(n_recv);
+        recv_error_msgs_.resize(n_recv);
+        for (int i = 0; i < n_recv; ++i) {
+            recv_ready_[i] = false;
+            recv_done_[i] = false;
+            recv_error_[i] = false;
+            recv_mutexes_.emplace_back(std::make_unique<std::mutex>());
+            recv_cvs_.emplace_back(std::make_unique<std::condition_variable>());
         }
-        
-        send_buffer_addr_ = buffer_addr;
-        send_buffer_size_ = buffer_size;
-        
-        std::cout << "[Rank " << rank_ << "] Submitted send buffer: " 
+
+        send_worker_thread_ = std::thread(&GeminiReplicasNative::send_worker_func, this);
+        for (int i = 0; i < n_recv; ++i) {
+            recv_worker_threads_.emplace_back(
+                &GeminiReplicasNative::recv_worker_func, this, i);
+        }
+        std::cout << "[Rank " << rank_ << "] Workers started: 1 send + "
+                  << n_recv << " recv threads" << std::endl;
+    }
+
+    void stop_workers() {
+        bool expected = false;
+        if (!stop_workers_.compare_exchange_strong(expected, true))
+            return;
+
+        send_cv_.notify_all();
+        for (auto& cv : recv_cvs_) cv->notify_all();
+
+        if (send_worker_thread_.joinable()) send_worker_thread_.join();
+        for (auto& t : recv_worker_threads_)
+            if (t.joinable()) t.join();
+
+        workers_started_ = false;
+        std::cout << "[Rank " << rank_ << "] Workers stopped" << std::endl;
+    }
+
+private:
+    void send_worker_func() {
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lk(send_mutex_);
+                send_cv_.wait(lk, [this] {
+                    return stop_workers_ || send_ready_;
+                });
+            }
+            if (stop_workers_) break;
+            if (!send_ready_) continue;
+
+            try {
+                const uint8_t* data = reinterpret_cast<const uint8_t*>(send_task_addr_);
+                connection_manager_->broadcast_to_targets(data, send_task_size_);
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lk(send_error_mutex_);
+                send_error_msg_ = e.what();
+                send_error_ = true;
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(send_error_mutex_);
+                send_error_msg_ = "unknown send error";
+                send_error_ = true;
+            }
+
+            send_ready_ = false;
+            send_done_ = true;
+        }
+    }
+
+    void recv_worker_func(int idx) {
+        int source_rank = recv_source_ranks_[idx];
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lk(*recv_mutexes_[idx]);
+                recv_cvs_[idx]->wait(lk, [this, idx] {
+                    return stop_workers_ || recv_ready_[idx];
+                });
+            }
+            if (stop_workers_) break;
+            if (!recv_ready_[idx]) continue;
+
+            try {
+                uint8_t* buf = reinterpret_cast<uint8_t*>(recv_task_addrs_[idx]);
+                connection_manager_->receive_data_from_source(
+                    source_rank, buf, recv_task_sizes_[idx]);
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lk(recv_error_mutex_);
+                recv_error_msgs_[idx] = e.what();
+                recv_error_[idx] = true;
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(recv_error_mutex_);
+                recv_error_msgs_[idx] = "unknown recv error";
+                recv_error_[idx] = true;
+            }
+
+            recv_ready_[idx] = false;
+            recv_done_[idx] = true;
+        }
+    }
+
+public:
+    void reset_exchange_state() {
+        // Reset all per-exchange flags.  Workers are idle (ready=false, done=true).
+        send_ready_ = false;
+        send_done_ = false;
+        send_error_ = false;
+        send_task_addr_ = 0;
+        send_task_size_ = 0;
+        for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
+            recv_ready_[i] = false;
+            recv_done_[i] = false;
+            recv_error_[i] = false;
+            recv_task_addrs_[i] = 0;
+            recv_task_sizes_[i] = 0;
+        }
+    }
+
+public:
+    void submit_send_buffer(uintptr_t buffer_addr, size_t buffer_size) {
+        if (!initialized_)
+            throw std::runtime_error("GeminiReplicasNative not initialized");
+        if (!workers_started_)
+            throw std::runtime_error("Workers not started — call start_workers first");
+
+        send_task_addr_ = buffer_addr;
+        send_task_size_ = buffer_size;
+        send_ready_ = true;
+        send_done_ = false;
+        send_error_ = false;
+        send_cv_.notify_one();
+
+        std::cout << "[Rank " << rank_ << "] Submitted send buffer: "
                   << buffer_size << " bytes" << std::endl;
     }
-    
+
     void submit_recv_buffer(int source_rank, uintptr_t buffer_addr, size_t buffer_size) {
-        /**
-         * Submit receive buffer for a specific source rank.
-         * 
-         * Args:
-         *   source_rank: Rank to receive data from
-         *   buffer_addr: Memory address of the buffer to receive into
-         *   buffer_size: Size of the buffer in bytes
-         */
-        if (!initialized_) {
+        if (!initialized_)
             throw std::runtime_error("GeminiReplicasNative not initialized");
+        if (!workers_started_)
+            throw std::runtime_error("Workers not started — call start_workers first");
+
+        // Find the recv slot for this source_rank
+        int idx = -1;
+        for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
+            if (recv_source_ranks_[i] == source_rank) { idx = static_cast<int>(i); break; }
         }
-        
-        recv_buffers_.push_back({source_rank, buffer_addr, buffer_size});
-        
-        std::cout << "[Rank " << rank_ << "] Submitted recv buffer for source rank " 
+        if (idx < 0)
+            throw std::runtime_error("Source rank " + std::to_string(source_rank) +
+                                     " not in registered recv source_ranks");
+
+        recv_task_addrs_[idx] = buffer_addr;
+        recv_task_sizes_[idx] = buffer_size;
+        recv_ready_[idx] = true;
+        recv_done_[idx] = false;
+        recv_error_[idx] = false;
+        recv_cvs_[idx]->notify_one();
+
+        std::cout << "[Rank " << rank_ << "] Submitted recv buffer for source rank "
                   << source_rank << ": " << buffer_size << " bytes" << std::endl;
     }
-    
-    void execute_exchange() {
-        /**
-         * Execute concurrent send/receive operations using submitted buffers.
-         * 
-         * This method:
-         * 1. Starts a background thread to send data to all target ranks
-         * 2. Receives data from all source ranks (in any order, matched by source_rank)
-         * 3. Data is received directly into the pre-allocated buffers (no extra copy!)
-         * 
-         * Blocks until all operations are complete.
-         */
-        if (!initialized_) {
-            throw std::runtime_error("GeminiReplicasNative not initialized");
-        }
-        
-        if (send_buffer_addr_ == 0) {
-            throw std::runtime_error("Send buffer not submitted");
-        }
-        
-        std::cout << "[Rank " << rank_ << "] Starting exchange: send to " 
-                  << target_ranks_.size() << " targets, receive from " 
-                  << recv_buffers_.size() << " sources" << std::endl;
-        
-        // Create a map: source_rank -> buffer_info for fast lookup
-        std::map<int, RecvBufferInfo> recv_buffer_map;
-        for (const auto& recv_info : recv_buffers_) {
-            recv_buffer_map[recv_info.source_rank] = recv_info;
-        }
-        
-        // Start send in background thread
-        std::exception_ptr send_exception = nullptr;
-        std::thread send_thread([this, &send_exception]() {
-            try {
-                const uint8_t* data = reinterpret_cast<const uint8_t*>(send_buffer_addr_);
-                connection_manager_->broadcast_to_targets(data, send_buffer_size_);
-            } catch (...) {
-                send_exception = std::current_exception();
+
+    void wait_for_exchange_completion() {
+        // Busy-poll until all workers are done (same style as ecnaive).
+        int wait_count = 0;
+        while (true) {
+            bool all_done = send_done_;
+            if (all_done) {
+                for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
+                    if (!recv_done_[i]) { all_done = false; break; }
+                }
             }
-        });
-        
-        // Receive from all sources in main thread (in any order)
-        for (size_t i = 0; i < recv_buffers_.size(); ++i) {
-            std::cout << "[Rank " << rank_ << "] Waiting for data from any source (" 
-                      << (i + 1) << "/" << recv_buffers_.size() << ")..." << std::endl;
-            
-            if (use_rdma_) {
-                // RDMA mode: receive from any available source
-                // First, try to receive from any source to see who has data ready
-                auto unused_it = recv_buffer_map.begin();
-                if (unused_it == recv_buffer_map.end()) {
-                    throw std::runtime_error("No more receive buffers available");
+            // Also stop if any worker hit an error
+            bool any_error = send_error_;
+            if (!any_error) {
+                for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
+                    if (recv_error_[i]) { any_error = true; break; }
                 }
-                
-                int expected_source = unused_it->first;
-                const auto& recv_info = unused_it->second;
-                uint8_t* target_buffer = reinterpret_cast<uint8_t*>(recv_info.buffer_addr);
-                
-                std::cout << "[Rank " << rank_ << "] RDMA: Receiving from source rank " 
-                          << expected_source << " (buffer size: " 
-                          << recv_info.buffer_size << " bytes)..." << std::endl;
-                
-                // Use the new method to receive from specific source (avoids memcpy)
-                auto [actual_source_rank, data_size] = connection_manager_->receive_data_from_source(
-                    expected_source, target_buffer, recv_info.buffer_size
-                );
-                
-                std::cout << "[Rank " << rank_ << "] RDMA: Received " << data_size 
-                          << " bytes from source rank " << actual_source_rank << std::endl;
-                
-                // Remove from map
-                recv_buffer_map.erase(unused_it);
-            } else {
-                // ASIO mode: peek to get source_rank, then receive into specific buffer
-                auto [actual_source_rank, data_size, socket] = connection_manager_->peek_incoming_data();
-                
-                // Find the corresponding buffer
-                auto it = recv_buffer_map.find(actual_source_rank);
-                if (it == recv_buffer_map.end()) {
-                    throw std::runtime_error(
-                        "Received data from unexpected source rank " + std::to_string(actual_source_rank)
-                    );
-                }
-                
-                const auto& recv_info = it->second;
-                
-                if (data_size != recv_info.buffer_size) {
-                    std::cerr << "[Rank " << rank_ << "] Warning: Incoming data size " << data_size 
-                              << " bytes from rank " << actual_source_rank 
-                              << ", expected " << recv_info.buffer_size << " bytes" << std::endl;
-                }
-                
-                // Receive data directly into the target buffer (no extra copy!)
-                uint8_t* target_buffer = reinterpret_cast<uint8_t*>(recv_info.buffer_addr);
-                connection_manager_->receive_data_into_buffer(
-                    std::move(socket), target_buffer, recv_info.buffer_size, data_size
-                );
-                
-                std::cout << "[Rank " << rank_ << "] Received " << data_size 
-                          << " bytes from source rank " << actual_source_rank 
-                          << " directly into target buffer (zero-copy)" << std::endl;
-                
-                // Remove from map so we don't receive from the same source twice
-                recv_buffer_map.erase(it);
+            }
+            if (all_done || any_error) break;
+
+            if (wait_count % 200 == 0 && wait_count > 0) {
+                std::cout << "[Rank " << rank_ << "] Waiting for exchange (send="
+                          << send_done_ << " recvs_done=";
+                for (size_t i = 0; i < recv_source_ranks_.size(); ++i)
+                    std::cout << recv_done_[i];
+                std::cout << ")..." << std::endl;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            wait_count++;
+        }
+
+        // Re-throw any worker errors
+        if (send_error_) {
+            std::string msg;
+            { std::lock_guard<std::mutex> lk(send_error_mutex_); msg = send_error_msg_; }
+            throw std::runtime_error("[Rank " + std::to_string(rank_) + "] Send worker error: " + msg);
+        }
+        for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
+            if (recv_error_[i]) {
+                std::string msg;
+                { std::lock_guard<std::mutex> lk(recv_error_mutex_); msg = recv_error_msgs_[i]; }
+                throw std::runtime_error("[Rank " + std::to_string(rank_) + "] Recv worker error (src="
+                    + std::to_string(recv_source_ranks_[i]) + "): " + msg);
             }
         }
-        
-        // Wait for send thread to complete
-        send_thread.join();
-        
-        // Check for send exception
-        if (send_exception) {
-            std::rethrow_exception(send_exception);
-        }
-        
+
         std::cout << "[Rank " << rank_ << "] Exchange completed successfully" << std::endl;
-        
-        // Clear buffers for next exchange
-        send_buffer_addr_ = 0;
-        send_buffer_size_ = 0;
-        recv_buffers_.clear();
     }
     
     bool is_initialized() const {
@@ -1874,14 +1959,19 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
         .def("submit_send_buffer", &GeminiReplicasNative::submit_send_buffer,
              py::arg("buffer_addr"),
              py::arg("buffer_size"),
-             "Submit send buffer for later execution")
+             "Submit send buffer (wakes send worker, non-blocking)")
         .def("submit_recv_buffer", &GeminiReplicasNative::submit_recv_buffer,
              py::arg("source_rank"),
              py::arg("buffer_addr"),
              py::arg("buffer_size"),
-             "Submit receive buffer for a specific source rank")
-        .def("execute_exchange", &GeminiReplicasNative::execute_exchange,
-             "Execute concurrent send/receive operations")
+             "Submit receive buffer for a specific source rank (wakes recv worker, non-blocking)")
+        .def("start_workers", &GeminiReplicasNative::start_workers,
+             py::arg("source_ranks"),
+             "Start persistent send+recv worker threads (call after finalize_connections)")
+        .def("wait_for_exchange_completion", &GeminiReplicasNative::wait_for_exchange_completion,
+             "Block until all send/recv workers finish the current exchange (polls atomics, 5ms sleep)")
+        .def("reset_exchange_state", &GeminiReplicasNative::reset_exchange_state,
+             "Reset per-exchange flags for the next exchange")
         .def("is_initialized", &GeminiReplicasNative::is_initialized,
              "Check if fully initialized")
         .def("get_rank", &GeminiReplicasNative::get_rank,

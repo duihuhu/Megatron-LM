@@ -496,7 +496,10 @@ class GeminiReplicasManager:
             
             # Phase 2: Connect to all targets
             self._gemini_replicas_native.finalize_connections()
-            
+
+            # Start persistent send/recv worker threads (like ecnaive)
+            self._gemini_replicas_native.start_workers(net_config['source_ranks'])
+
             logger.info(f"Gemini Replicas: C++ native module fully initialized (rank={rank}, targets={net_config['target_ranks']}, mode={mode_str})")
             print(f"Gemini Replicas: [Rank {rank}] C++ native module fully initialized - {mode_str} connections ready")
             

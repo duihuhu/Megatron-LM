@@ -101,7 +101,7 @@ def _clear_accum_buffers(manager) -> None:
         manager.parity2_accum.zero_()
 
 
-def _encode_one_layer(
+def _prepare_one_layer(
     manager,
     native,
     tensor_buffer: torch.Tensor,
@@ -110,81 +110,124 @@ def _encode_one_layer(
     num_stripes: int,
     block_size: int,
     my_node: int,
-    gdr: bool,
-    world_size: int,
-    output_dir: str,
     layer_name: str,
-    rank: int,
-) -> None:
-    """Run async stripe encode pipeline. C++ poller writes per-stripe files."""
+    _dbg: bool = False,
+    _layer_stripe_bufs=None,
+    _layer_recv_bufs=None,
+    _layer_parity2_bufs=None,
+):
+    """Phase 1 (copy) + Phase 2a (post recvs). Returns state for _execute_one_layer."""
     stripe_plans = manager.stripe_plans
-    num_source_stripes = (n - 1) * (n - 2)
-
-    required_data = block_size * num_source_stripes
-    if layer_tensor_size > required_data:
-        logger.warning(
-            "FRCheck: layer tensor size %d > encoding capacity %d; truncating",
-            layer_tensor_size, required_data,
-        )
+    src_bufs = _layer_stripe_bufs if _layer_stripe_bufs is not None else manager.stripe_data_bufs
+    recv_bufs = _layer_recv_bufs if _layer_recv_bufs is not None else manager.recv_bufs
+    p2_bufs = _layer_parity2_bufs if _layer_parity2_bufs is not None else manager.parity2_bufs
 
     # Phase 1: Pre-copy all SOURCE stripe data to per-stripe buffers
+    _t_start, _t_copy = time.time(), 0.0
     roles = [0] * num_stripes
     data_addrs = [0] * num_stripes
     actual_sizes = [0] * num_stripes
-
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
 
     for stripe_id in range(num_stripes):
         plan = stripe_plans[stripe_id]
         roles[stripe_id] = int(plan.role)
-
         if plan.role == StripeRole.SOURCE:
             blk_idx = src_block_per_node[my_node]
             src_block_per_node[my_node] += 1
             src_offset = blk_idx * block_size
             ncopy = min(block_size, max(0, layer_tensor_size - src_offset))
             actual_sizes[stripe_id] = ncopy
-            buf = manager.stripe_data_bufs[stripe_id]
+            buf = src_bufs[stripe_id]
             if buf is not None:
                 if ncopy > 0:
+                    _t0 = time.time()
                     buf[:ncopy].copy_(tensor_buffer[src_offset : src_offset + ncopy])
+                    _t_copy += time.time() - _t0
                 if ncopy < block_size:
                     buf[ncopy:].zero_()
                 data_addrs[stripe_id] = buf.data_ptr()
 
+    if _dbg:
+        _t_elapsed = time.time() - _t_start
+        logger.info(
+            "[FRCHECK-DEBUG] %s Phase1 copy: %.4fs (src_copy=%.4fs zero=%.4fs) "
+            "total_bytes=%d",
+            layer_name, _t_elapsed, _t_copy, _t_elapsed - _t_copy,
+            sum(actual_sizes),
+        )
+
     # Phase 2a: Post all recv WRs (before barrier, before any sends)
-    recv_list = [(b.data_ptr() if b is not None else 0) for b in manager.recv_bufs]
-    p2_list = [(b.data_ptr() if b is not None else 0) for b in manager.parity2_bufs]
+    _t = time.time()
+    recv_list = [(b.data_ptr() if b is not None else 0) for b in recv_bufs]
+    p2_list = [(b.data_ptr() if b is not None else 0) for b in p2_bufs]
     native.submit_stripes_post_recvs(
-        num_stripes=num_stripes,
-        roles=roles,
-        block_size=block_size,
-        recv_bufs=recv_list,
-        parity2_addrs=p2_list,
+        num_stripes=num_stripes, roles=roles, block_size=block_size,
+        recv_bufs=recv_list, parity2_addrs=p2_list,
     )
+    _t_post_recv = time.time() - _t
 
-    if world_size > 1:
-        torch.distributed.barrier()
+    return {
+        "roles": roles, "data_addrs": data_addrs, "actual_sizes": actual_sizes,
+        "block_size": block_size, "num_stripes": num_stripes,
+        "recv_list": recv_list, "p2_list": p2_list,
+        "layer_name": layer_name,
+        "_t_copy_start": _t_start, "_t_copy": _t_copy, "_t_post_recv": _t_post_recv,
+    }
 
-    # Phase 2b: Post all send WRs + start poller (after barrier, all recvs ready)
+
+def _execute_one_layer(
+    manager,
+    native,
+    state: dict,
+    output_dir: str,
+    rank: int,
+    _dbg: bool = False,
+):
+    """Phase 2b (post sends) + Phase 3 (wait). Uses shared parity1_bufs."""
+    roles = state["roles"]
+    data_addrs = state["data_addrs"]
+    actual_sizes = state["actual_sizes"]
+    block_size = state["block_size"]
+    num_stripes = state["num_stripes"]
+    recv_list = state["recv_list"]
+    p2_list = state["p2_list"]
+    layer_name = state["layer_name"]
+
+    # Phase 2b: Post all send WRs + start poller
+    _t = time.time()
     p1_list = [(b.data_ptr() if b is not None else 0) for b in manager.parity1_bufs]
     native.set_defer_file_writes(True)
     native.submit_stripes_post_sends(
-        data_addrs=data_addrs,
-        actual_sizes=actual_sizes,
-        block_size=block_size,
-        recv_bufs=recv_list,
-        parity1_addrs=p1_list,
-        parity2_addrs=p2_list,
+        data_addrs=data_addrs, actual_sizes=actual_sizes, block_size=block_size,
+        recv_bufs=recv_list, parity1_addrs=p1_list, parity2_addrs=p2_list,
         g_tbls=native._get_g_tbls_ptr(),
-        output_dir=output_dir,
-        layer_name=layer_name,
-        rank=rank,
+        output_dir=output_dir, layer_name=layer_name, rank=rank,
     )
+    _t_post_send = time.time() - _t
 
-    # Phase 3: Wait for all stripes to complete (encoding only, no file writes)
+    # Phase 3: Wait for all stripes to complete
+    _t = time.time()
     native.wait_stripes_async()
+    _t_wait = time.time() - _t
     native.set_defer_file_writes(False)
+
+    if _dbg:
+        _t_copy_elapsed = state.get("_t_copy_start", 0)
+        _t_copy = state.get("_t_copy", 0)
+        _t_ph1 = (time.time() - _t_copy_elapsed) if _t_copy_elapsed > 0 else 0
+        _t_post_recv = state.get("_t_post_recv", 0)
+        poll_iters = native.get_poll_iters() if hasattr(native, "get_poll_iters") else -1
+        encode_ms = native.get_encode_ns() / 1e6 if hasattr(native, "get_encode_ns") else -1.0
+        _t_barrier = state.get("_t_barrier", 0)
+        _t_total = _t_ph1 + _t_post_recv + _t_barrier + _t_post_send + _t_wait
+        logger.info(
+            "[FRCHECK-DEBUG] %s encode phases: post_recv=%.4fs barrier=%.4fs "
+            "post_send=%.4fs wait_async=%.4fs total=%.4fs poll_iters=%d encode_ms=%.2f",
+            layer_name, _t_post_recv, _t_barrier, _t_post_send, _t_wait,
+            _t_total, poll_iters, encode_ms,
+        )
+
     return actual_sizes
 
 
@@ -304,6 +347,10 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
+    from megatron.training import get_args
+    args = get_args()
+    _dbg = getattr(args, "frcheck_debug", False)
+
     # 1. Decompose state_dict
     flatten_optimizer_fp32_params(state_dict)
     decomposed = decompose_state_dict(state_dict)
@@ -370,17 +417,39 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     # 4.5 Compute per-layer adaptive block sizes (first save, cached thereafter)
     manager.compute_layer_block_sizes(layer_groups)
 
+    if _dbg:
+        n_src_total = (n - 1) * (n - 2)
+        n_source_my = sum(1 for p in stripe_plans if p.role == StripeRole.SOURCE)
+        n_encoder_my = sum(1 for p in stripe_plans if p.role == StripeRole.ENCODER)
+        n_parity_my = sum(1 for p in stripe_plans if p.role == StripeRole.PARITY_TARGET)
+        logger.info(
+            "[FRCHECK-DEBUG] rank=%d n=%d stripes=%d roles(src=%d enc=%d par=%d) gdr=%s",
+            rank, n, num_stripes, n_source_my, n_encoder_my, n_parity_my, gdr,
+        )
+        for g in layer_groups:
+            lidx = g.layer_idx
+            blk = manager._layer_block_sizes[lidx]
+            cap = blk * n_source_my
+            pad = max(0, cap - g.total_bytes)
+            lname = f"layer_{lidx}" if lidx >= 0 else "layer_common"
+            logger.info(
+                "[FRCHECK-DEBUG] %s: total=%d blk=%d cap=%d nsrc=%d pad=%d (%.1f%%)",
+                lname, g.total_bytes, blk, cap, n_source_my, pad,
+                100.0 * pad / cap if cap > 0 else 0,
+            )
+
     # 5. Encode each layer (encoding only, no file writes)
     t0 = time.time()
     _layer_write_data = []
     for group in layer_groups:
         layer_name = f"layer_{group.layer_idx}" if group.layer_idx >= 0 else "layer_common"
-        layer_block_size = manager._layer_block_sizes[group.layer_idx]
+        layer_idx = group.layer_idx
+        layer_block_size = manager._layer_block_sizes[layer_idx]
 
         # Allocate or reuse cached per-layer contiguous buffer
         safety_margin = max(int(group.total_bytes * 0.01), 4096)
         layer_buf_size = group.total_bytes + safety_margin
-        tensor_buffer = manager.allocate_layer_buffer(group.layer_idx, layer_buf_size, gdr)
+        tensor_buffer = manager.allocate_layer_buffer(layer_idx, layer_buf_size, gdr)
 
         # Copy layer tensors into layer buffer and full_buf
         offset = 0
@@ -388,7 +457,6 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             tb = _to_device_view(tensor, buf_device)
             nbytes = tb.numel()
             tensor_buffer[offset : offset + nbytes].copy_(tb)
-            # Also copy to full_buf at global offset for main file write
             full_buf[_global_offsets[id(info)] : _global_offsets[id(info)] + nbytes].copy_(
                 _to_device_view(tensor, torch.device("cpu"))
             )
@@ -405,17 +473,47 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             layer_name, "GPU" if gdr else "CPU", layer_buf_size, layer_block_size,
         )
 
-        # Pre-create stripe directories so C++ poller's mkdir (single-level) succeeds
+        # Pre-create stripe directories
         layer_dir = checkpoint_dir / layer_name
         for sid in range(num_stripes):
             (layer_dir / f"stripe_{sid}").mkdir(parents=True, exist_ok=True)
 
-        # Stripe encode (encoding only, file writes deferred)
-        actual_sizes = _encode_one_layer(
+        # Per-layer buffers
+        src_b, recv_b, p2_b = manager.allocate_layer_encode_bufs(layer_idx, layer_block_size)
+
+        # Phase 1+2a: copy + post recvs
+        state = _prepare_one_layer(
             manager, native, tensor_buffer, group.total_bytes,
-            n, num_stripes, layer_block_size, my_node, gdr, world_size,
-            str(checkpoint_dir), layer_name, rank,
+            n, num_stripes, layer_block_size, my_node, layer_name,
+            _dbg=_dbg,
+            _layer_stripe_bufs=src_b, _layer_recv_bufs=recv_b, _layer_parity2_bufs=p2_b,
         )
+
+        # Barrier
+        if world_size > 1:
+            _t_bar = time.time()
+            torch.distributed.barrier()
+            state["_t_barrier"] = time.time() - _t_bar
+        else:
+            state["_t_barrier"] = 0
+
+        # Phase 2b+3: post sends + wait
+        actual_sizes = _execute_one_layer(
+            manager, native, state,
+            str(checkpoint_dir), rank, _dbg=_dbg,
+        )
+
+        if _dbg:
+            total_sent = sum(actual_sizes)
+            cap = layer_block_size * n_source_my
+            logger.info(
+                "[FRCHECK-DEBUG] %s encode: sent=%d cap=%d pad=%d (%.1f%%), "
+                "stripe_sizes=%s",
+                layer_name, total_sent, cap, cap - total_sent,
+                100.0 * total_sent / cap if cap > 0 else 0,
+                [actual_sizes[s] for s in range(num_stripes)
+                 if stripe_plans[s].role == StripeRole.SOURCE],
+            )
 
         _layer_write_data.append((
             layer_name, actual_sizes, addr, layer_block_size,

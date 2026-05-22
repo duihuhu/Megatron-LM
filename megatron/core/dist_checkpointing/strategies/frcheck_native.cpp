@@ -1392,6 +1392,9 @@ private:
     bool async_active_ = false;
     std::vector<uintptr_t> async_data_sizes_;
     bool defer_file_writes_ = false;
+    // Debug counters (reset per poller work batch)
+    std::atomic<int64_t> async_poll_iters_{0};
+    std::atomic<int64_t> async_encode_ns_{0};
 
     void async_poller_init() {
         async_poller_stop_ = false;
@@ -1417,8 +1420,10 @@ private:
     }
 
     void async_poller_shutdown() {
+        stopped_ = true;
         async_poller_stop_ = true;
         async_poller_cv_.notify_one();
+        async_done_cv_.notify_one();
         if (async_poller_.joinable()) async_poller_.join();
     }
 
@@ -1488,6 +1493,10 @@ public:
         if (!async_active_) throw std::runtime_error("FRCheck: async pipeline not active");
         unsigned char* tbls = reinterpret_cast<unsigned char*>(g_tbls);
 
+        // Reset debug counters for this batch
+        async_poll_iters_ = 0;
+        async_encode_ns_ = 0;
+
         // Store actual sizes for later file write
         async_data_sizes_ = actual_sizes;
 
@@ -1548,6 +1557,9 @@ public:
         }
     }
 
+    int64_t get_poll_iters() const { return async_poll_iters_.load(); }
+    int64_t get_encode_ns() const { return async_encode_ns_.load(); }
+
     uintptr_t _get_g_tbls_ptr() const { return (uintptr_t)g_tbls_; }
 
     void async_poller_loop_(
@@ -1560,6 +1572,7 @@ public:
     {
         ibv_wc wc_s, wc_r;
         while (async_done_count_ < num_stripes && !stopped_) {
+            async_poll_iters_++;
             int ns = ibv_poll_cq(rdma_send_cq_, 1, &wc_s);
             int nr = ibv_poll_cq(rdma_recv_cq_, 1, &wc_r);
             if (ns == 0 && nr == 0) {
@@ -1595,7 +1608,11 @@ public:
                             (unsigned char*)parity1_addrs[sidx],
                             (unsigned char*)parity2_addrs[sidx] };
                         job.parity_ptrs = pptr;
+                        auto _enc_start = std::chrono::steady_clock::now();
                         rs_pool_run_parallel_encode(job);
+                        auto _enc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - _enc_start).count();
+                        async_encode_ns_ += _enc_ns;
                         st.encode_done = true;
 
                         const auto& plan = stripe_plans_[sidx];
@@ -1677,7 +1694,6 @@ public:
 
     void cleanup_rdma_() {
         async_poller_shutdown();
-        rs_pool_shutdown();
         channel_owners_.clear();
         channels_.clear();
 
@@ -1963,6 +1979,8 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("g_tbls"),
              py::arg("output_dir"), py::arg("layer_name"), py::arg("rank"))
         .def("wait_stripes_async", &FRCheckNative::wait_stripes_async)
+        .def("get_poll_iters", &FRCheckNative::get_poll_iters)
+        .def("get_encode_ns", &FRCheckNative::get_encode_ns)
         .def("set_defer_file_writes", &FRCheckNative::set_defer_file_writes,
              py::arg("v"))
         .def("flush_stripe_files", &FRCheckNative::flush_stripe_files,

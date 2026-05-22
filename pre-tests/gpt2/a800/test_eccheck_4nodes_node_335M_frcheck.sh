@@ -130,6 +130,7 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
     --use-frcheck
+    #--frcheck-debug
     --frcheck-n 4
     --use-frcheck-software-failure 
     --frcheck-failed-ranks "4,5"

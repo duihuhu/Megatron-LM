@@ -746,7 +746,11 @@ private:
             wrs[i].sg_list = &sges[i];
             wrs[i].num_sge = 1;
             wrs[i].opcode = IBV_WR_SEND;
-            wrs[i].send_flags = (i == chunk_count - 1) ? IBV_SEND_SIGNALED : 0;
+            // Signal the last WR of each batch so we can poll per-batch.
+            // (The chain is broken at batch boundaries, so each batch must
+            // generate its own completion.)
+            bool is_batch_last = (i + 1 == chunk_count) || ((i + 1) % MAX_BATCH_WR == 0);
+            wrs[i].send_flags = is_batch_last ? IBV_SEND_SIGNALED : 0;
             wrs[i].next = (i < chunk_count - 1) ? &wrs[i + 1] : nullptr;
         }
         
@@ -763,31 +767,11 @@ private:
                 throw std::runtime_error("Failed to post send work request");
             }
 
-            // Poll completions for signaled requests in this batch.
-            // If no WR is signaled, post a zero-length NOP send to flush.
-            bool batch_has_signaled = false;
+            // Poll completions for signaled requests in this batch
             for (size_t i = batch_start; i < batch_end; ++i) {
                 if (wrs[i].send_flags & IBV_SEND_SIGNALED) {
                     poll_completion(send_cq_, 1);
-                    batch_has_signaled = true;
                 }
-            }
-            if (!batch_has_signaled) {
-                ibv_sge sge{};
-                sge.addr = reinterpret_cast<uint64_t>(data);
-                sge.length = 0;
-                sge.lkey = mr->lkey;
-                ibv_send_wr nop{};
-                nop.wr_id = chunk_count + batch_start;
-                nop.sg_list = &sge;
-                nop.num_sge = 1;
-                nop.opcode = IBV_WR_SEND;
-                nop.send_flags = IBV_SEND_SIGNALED;
-                ibv_send_wr* bad = nullptr;
-                if (ibv_post_send(qp, &nop, &bad) != 0) {
-                    throw std::runtime_error("Failed to post send flush work request");
-                }
-                poll_completion(send_cq_, 1);
             }
         }
     }

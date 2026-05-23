@@ -754,16 +754,40 @@ private:
         for (size_t batch_start = 0; batch_start < chunk_count; batch_start += MAX_BATCH_WR) {
             size_t batch_end = std::min(batch_start + MAX_BATCH_WR, chunk_count);
             
+            // Detach this batch's tail from the next batch
+            if (batch_end < chunk_count)
+                wrs[batch_end - 1].next = nullptr;
+
             ibv_send_wr* bad_wr = nullptr;
             if (ibv_post_send(qp, &wrs[batch_start], &bad_wr) != 0) {
                 throw std::runtime_error("Failed to post send work request");
             }
-            
-            // Poll completions for signaled requests
+
+            // Poll completions for signaled requests in this batch.
+            // If no WR is signaled, post a zero-length NOP send to flush.
+            bool batch_has_signaled = false;
             for (size_t i = batch_start; i < batch_end; ++i) {
                 if (wrs[i].send_flags & IBV_SEND_SIGNALED) {
                     poll_completion(send_cq_, 1);
+                    batch_has_signaled = true;
                 }
+            }
+            if (!batch_has_signaled) {
+                ibv_sge sge{};
+                sge.addr = reinterpret_cast<uint64_t>(data);
+                sge.length = 0;
+                sge.lkey = mr->lkey;
+                ibv_send_wr nop{};
+                nop.wr_id = chunk_count + batch_start;
+                nop.sg_list = &sge;
+                nop.num_sge = 1;
+                nop.opcode = IBV_WR_SEND;
+                nop.send_flags = IBV_SEND_SIGNALED;
+                ibv_send_wr* bad = nullptr;
+                if (ibv_post_send(qp, &nop, &bad) != 0) {
+                    throw std::runtime_error("Failed to post send flush work request");
+                }
+                poll_completion(send_cq_, 1);
             }
         }
     }
@@ -788,14 +812,19 @@ private:
             wrs[i].next = (i < chunk_count - 1) ? &wrs[i + 1] : nullptr;
         }
         
-        // Post receive work requests in batches
         for (size_t batch_start = 0; batch_start < chunk_count; batch_start += MAX_BATCH_WR) {
+            size_t batch_end = std::min(batch_start + MAX_BATCH_WR, chunk_count);
+
+            // Detach this batch's tail from the next batch
+            if (batch_end < chunk_count)
+                wrs[batch_end - 1].next = nullptr;
+
             ibv_recv_wr* bad_wr = nullptr;
             if (ibv_post_recv(qp, &wrs[batch_start], &bad_wr) != 0) {
                 throw std::runtime_error("Failed to post receive work request");
             }
         }
-        
+
         // Poll completions
         poll_completion(recv_cq_, chunk_count);
     }
@@ -1850,13 +1879,7 @@ private:
 
             try {
                 const uint8_t* data = reinterpret_cast<const uint8_t*>(send_task_addr_);
-                std::cout << "[Rank " << rank_ << "] send_worker broadcasting "
-                          << send_task_size_ << " bytes from 0x" << std::hex
-                          << send_task_addr_ << std::dec << std::endl;
-                auto t0 = std::chrono::steady_clock::now();
                 connection_manager_->broadcast_to_targets(data, send_task_size_);
-                auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                std::cout << "[Rank " << rank_ << "] send_worker broadcast done in " << dt << "s" << std::endl;
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(send_error_mutex_);
                 send_error_msg_ = e.what();
@@ -1886,14 +1909,8 @@ private:
 
             try {
                 uint8_t* buf = reinterpret_cast<uint8_t*>(recv_task_addrs_[idx]);
-                std::cout << "[Rank " << rank_ << "] recv_worker[" << idx << "] receiving "
-                          << recv_task_sizes_[idx] << " bytes from src " << source_rank
-                          << " into 0x" << std::hex << recv_task_addrs_[idx] << std::dec << std::endl;
-                auto t0 = std::chrono::steady_clock::now();
                 connection_manager_->receive_data_from_source(
                     source_rank, buf, recv_task_sizes_[idx]);
-                auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                std::cout << "[Rank " << rank_ << "] recv_worker[" << idx << "] recv done in " << dt << "s" << std::endl;
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(recv_error_mutex_);
                 recv_error_msgs_[idx] = e.what();
@@ -1978,12 +1995,6 @@ public:
 
     void wait_for_exchange_completion() {
         // Busy-poll until all workers are done (same style as ecnaive).
-        std::cout << "[Rank " << rank_ << "] wait_for_exchange: send_done=" << send_done_
-                  << " send_ready=" << send_ready_ << " send_error=" << send_error_
-                  << " recvs_done=";
-        for (size_t i = 0; i < recv_source_ranks_.size(); ++i)
-            std::cout << recv_done_[i];
-        std::cout << std::endl;
         int wait_count = 0;
         while (true) {
             bool all_done = send_done_;

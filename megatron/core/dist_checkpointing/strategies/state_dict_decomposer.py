@@ -91,6 +91,7 @@ class GlobalMetadataRegistry:
     """
     rank_metadata: Dict[int, List[TensorMetadata]] = field(default_factory=dict)
     rank_non_tensor_data: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    rank_flat_key_roots: Dict[int, list] = field(default_factory=dict)
     
     def get_send_list(self, my_rank: int) -> List[TensorMetadata]:
         """

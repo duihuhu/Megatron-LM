@@ -1256,22 +1256,17 @@ class FileSystemWriterAsync(FileSystemWriter):
                         source_ranks.append(src_rank)
                 
                 logger.info(f"Gemini Replicas rank {rank}: Will receive from {len(source_ranks)} source ranks: {source_ranks}")
-                
-                # Exchange buffer sizes using all_gather with gloo backend (for CPU tensors)
-                logger.info(f"Gemini Replicas rank {rank}: Exchanging buffer sizes via torch.distributed.all_gather...")
-                
-                # Create or get global gloo group for CPU tensor communication
-                from ..strategies.async_utils import get_or_create_global_gloo_group
-                global_gloo_group = get_or_create_global_gloo_group()
-                
-                size_tensor = torch.tensor([send_buffer_size], dtype=torch.long, device='cpu')
-                all_sizes = [torch.zeros_like(size_tensor) for _ in range(world_size)]
-                torch.distributed.all_gather(all_sizes, size_tensor, group=global_gloo_group)
-                
-                # Extract sizes for all ranks
-                rank_sizes = {r: all_sizes[r][0].item() for r in range(world_size)}
-                logger.info(f"Gemini Replicas rank {rank}: All rank buffer sizes: {rank_sizes}")
-                
+
+                # ===== Step 1: Get buffer sizes from global registry (aligned with EC schemes) =====
+                if hasattr(self, 'gemini_replicas_global_registry') and \
+                   self.gemini_replicas_global_registry is not None:
+                    registry = self.gemini_replicas_global_registry
+                    rank_sizes = {}
+                    for r in range(world_size):
+                        r_metadata = registry.rank_metadata.get(r, [])
+                        rank_sizes[r] = sum(m.size_bytes for m in r_metadata)
+                    logger.info(f"Gemini Replicas rank {rank}: Buffer sizes from registry: { {r: f'{s/(1024**2):.1f}MB' for r, s in rank_sizes.items()} }")
+
                 # ===== Step 2: Get or allocate receive buffers based on source rank sizes =====
                 logger.info(f"Gemini Replicas rank {rank}: Preparing receive buffers...")
                 receive_buffers = []
@@ -1336,11 +1331,14 @@ class FileSystemWriterAsync(FileSystemWriter):
                 
                 # ===== Step 4: Submit buffers to C++ and let it handle concurrent send/receive =====
                 logger.info(f"Gemini Replicas rank {rank}: Submitting buffers to C++ for send/receive...")
-                
+
+                # Reset exchange state before submission (aligns with gemini_replicas_legacy.py)
+                self._gemini_replicas_native.reset_exchange_state()
+
                 # Submit send buffer to C++
                 logger.info(f"Gemini Replicas rank {rank}: Submitting send buffer ({send_buffer_size / (1024**2):.2f} MB)...")
                 self._gemini_replicas_native.submit_send_buffer(send_buffer_addr, send_buffer_size)
-                
+
                 # Submit receive buffers to C++ for each source rank
                 for i, (src_rank, (recv_addr, recv_size)) in enumerate(zip(source_ranks, receive_buffer_addrs)):
                     logger.info(
@@ -1348,12 +1346,12 @@ class FileSystemWriterAsync(FileSystemWriter):
                         f"({recv_size / (1024**2):.2f} MB, {i+1}/{len(source_ranks)})..."
                     )
                     self._gemini_replicas_native.submit_recv_buffer(src_rank, recv_addr, recv_size)
-                
+
                 # Start concurrent send/receive in C++ (blocking until all operations complete)
                 logger.info(f"Gemini Replicas rank {rank}: Starting C++ send/receive operations...")
                 exchange_start = time()
-                
-                self._gemini_replicas_native.execute_exchange()
+
+                self._gemini_replicas_native.wait_for_exchange_completion()
                 
                 exchange_time = time() - exchange_start
                 

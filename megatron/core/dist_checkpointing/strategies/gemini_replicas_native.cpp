@@ -36,6 +36,7 @@
 #include <infiniband/verbs.h>
 
 #include "rdma_device_utils.h"
+#include <queue>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -814,11 +815,34 @@ public:
                 throw std::runtime_error("Failed to send size to target " + std::to_string(target_ranks_[i]));
             }
         }
-        // Wait for ACKs BEFORE RDMA send (receiver ACKs when recv WRs are posted)
-        for (size_t i = 0; i < target_ranks_.size(); ++i) {
-            char ack;
-            if (recv(control_socks_send_[i], &ack, 1, MSG_WAITALL) != 1 || ack != 'A') {
-                throw std::runtime_error("Failed to receive ACK from target " + std::to_string(target_ranks_[i]));
+        // Wait for ACKs from all targets (accept in any order).
+        // Using sequential recv() on each socket can cause distributed deadlock
+        // when combined with recv_mutex_ on the receiver side: if the first
+        // target's ACK is delayed (its recv worker is blocked behind another
+        // recv worker holding recv_mutex_ during RDMA), the sender hangs even
+        // though other targets already sent their ACKs.
+        std::vector<bool> acked(target_ranks_.size(), false);
+        size_t acked_count = 0;
+        while (acked_count < target_ranks_.size()) {
+            for (size_t i = 0; i < target_ranks_.size(); ++i) {
+                if (acked[i]) continue;
+                fd_set read_fds;
+                FD_ZERO(&read_fds);
+                FD_SET(control_socks_send_[i], &read_fds);
+                struct timeval tv = {0, 1000}; // 1 ms poll
+                int ret = select(control_socks_send_[i] + 1, &read_fds, nullptr, nullptr, &tv);
+                if (ret > 0) {
+                    char ack;
+                    if (recv(control_socks_send_[i], &ack, 1, MSG_WAITALL) != 1 || ack != 'A') {
+                        throw std::runtime_error("Failed to receive ACK from target "
+                            + std::to_string(target_ranks_[i]));
+                    }
+                    acked[i] = true;
+                    acked_count++;
+                }
+            }
+            if (acked_count < target_ranks_.size()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
 
@@ -854,57 +878,146 @@ public:
     }
     
     std::pair<int, size_t> receive_data(uint8_t* buffer, size_t buffer_size) override {
-        std::lock_guard<std::mutex> lock(recv_mutex_);
-        
         if (!connected_) {
             throw std::runtime_error("Not connected");
         }
-        
-        // Receive from any available source
-        for (size_t i = 0; i < control_socks_recv_.size(); ++i) {
-            fd_set read_fds;
-            FD_ZERO(&read_fds);
-            FD_SET(control_socks_recv_[i], &read_fds);
-            
-            struct timeval tv = {0, 1000}; // 1ms timeout
-            int ret = select(control_socks_recv_[i] + 1, &read_fds, nullptr, nullptr, &tv);
-            
-            if (ret > 0) {
-                return receive_data_from_qp(i, buffer, buffer_size);
+
+        // TCP handshake: find an available source, receive size, send ACK.
+        int found_idx = -1;
+        uint64_t size_net;
+        {
+            std::lock_guard<std::mutex> lock(recv_mutex_);
+
+            // Receive from any available source
+            for (size_t i = 0; i < control_socks_recv_.size(); ++i) {
+                fd_set read_fds;
+                FD_ZERO(&read_fds);
+                FD_SET(control_socks_recv_[i], &read_fds);
+
+                struct timeval tv = {0, 1000}; // 1ms timeout
+                int ret = select(control_socks_recv_[i] + 1, &read_fds, nullptr, nullptr, &tv);
+
+                if (ret > 0) {
+                    found_idx = static_cast<int>(i);
+                    break;
+                }
+            }
+
+            if (found_idx < 0) {
+                throw std::runtime_error("No data available from any source");
+            }
+
+            // Receive size
+            if (recv(control_socks_recv_[found_idx], &size_net, sizeof(size_net), MSG_WAITALL) != sizeof(size_net)) {
+                throw std::runtime_error("Failed to receive size from source");
+            }
+
+            // Send ACK
+            char ack = 'A';
+            if (send(control_socks_recv_[found_idx], &ack, 1, 0) != 1) {
+                throw std::runtime_error("Failed to send ACK");
             }
         }
-        
-        throw std::runtime_error("No data available from any source");
+        // Mutex released — RDMA transfer without blocking other recv workers.
+
+        size_t recv_size = be64toh(size_net);
+
+        if (recv_size > buffer_size) {
+            throw std::runtime_error("Received size exceeds buffer size");
+        }
+
+        // Find or use temp buffer for MR
+        ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(buffer), recv_size);
+        bool use_temp = (mr == nullptr);
+
+        if (use_temp) {
+            std::lock_guard<std::mutex> lock(recv_mutex_);
+            if (recv_size > temp_recv_buffer_.size()) {
+                throw std::runtime_error("Receive size exceeds temporary buffer size");
+            }
+            mr = temp_recv_mr_;
+            receive_data_chunked(temp_recv_buffer_.data(), recv_size, mr, recv_qps_[found_idx]);
+            std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
+        } else {
+            receive_data_chunked(buffer, recv_size, mr, recv_qps_[found_idx]);
+        }
+
+        return {recv_source_ranks_[found_idx], recv_size};
     }
     
     std::pair<int, size_t> receive_data_from_source(int source_rank, uint8_t* buffer, size_t buffer_size) override {
-        std::lock_guard<std::mutex> lock(recv_mutex_);
-        
         if (!connected_) {
             throw std::runtime_error("Not connected");
         }
-        
+
         // Find the QP index for this source rank
         auto it = std::find(recv_source_ranks_.begin(), recv_source_ranks_.end(), source_rank);
         if (it == recv_source_ranks_.end()) {
             throw std::runtime_error("Source rank " + std::to_string(source_rank) + " not found");
         }
-        
+
         size_t qp_idx = std::distance(recv_source_ranks_.begin(), it);
-        
-        // Wait for data from this specific source (with timeout)
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        FD_SET(control_socks_recv_[qp_idx], &read_fds);
-        
-        struct timeval tv = {30, 0}; // 30 second timeout
-        int ret = select(control_socks_recv_[qp_idx] + 1, &read_fds, nullptr, nullptr, &tv);
-        
-        if (ret <= 0) {
-            throw std::runtime_error("Timeout waiting for data from source rank " + std::to_string(source_rank));
+
+        // TCP handshake: receive size, send ACK.
+        // Only hold recv_mutex_ for the short TCP portion — not for the
+        // RDMA transfer which can take seconds.  This prevents recv workers
+        // from serializing on the mutex and creating a distributed deadlock
+        // with the sender's ACK-wait loop.
+        uint64_t size_net;
+        {
+            std::lock_guard<std::mutex> lock(recv_mutex_);
+
+            // Wait for data from this specific source (with timeout)
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(control_socks_recv_[qp_idx], &read_fds);
+
+            struct timeval tv = {30, 0}; // 30 second timeout
+            int ret = select(control_socks_recv_[qp_idx] + 1, &read_fds, nullptr, nullptr, &tv);
+
+            if (ret <= 0) {
+                throw std::runtime_error("Timeout waiting for data from source rank " + std::to_string(source_rank));
+            }
+
+            // Receive size
+            if (recv(control_socks_recv_[qp_idx], &size_net, sizeof(size_net), MSG_WAITALL) != sizeof(size_net)) {
+                throw std::runtime_error("Failed to receive size from source");
+            }
+
+            // Send ACK BEFORE releasing mutex — sender is blocked on recv() for this ACK.
+            // We must send it while holding the mutex so the sender can proceed with RDMA write.
+            char ack = 'A';
+            if (send(control_socks_recv_[qp_idx], &ack, 1, 0) != 1) {
+                throw std::runtime_error("Failed to send ACK");
+            }
         }
-        
-        return receive_data_from_qp(qp_idx, buffer, buffer_size);
+        // Mutex released — RDMA transfer runs without blocking other recv workers.
+
+        size_t recv_size = be64toh(size_net);
+
+        if (recv_size > buffer_size) {
+            throw std::runtime_error("Received size exceeds buffer size");
+        }
+
+        // Find or use temp buffer for MR
+        ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(buffer), recv_size);
+        bool use_temp = (mr == nullptr);
+
+        if (use_temp) {
+            // Temp buffer is shared — must hold mutex.
+            // In practice buffers are always pre-registered so this path is rare.
+            std::lock_guard<std::mutex> lock(recv_mutex_);
+            if (recv_size > temp_recv_buffer_.size()) {
+                throw std::runtime_error("Receive size exceeds temporary buffer size");
+            }
+            mr = temp_recv_mr_;
+            receive_data_chunked(temp_recv_buffer_.data(), recv_size, mr, recv_qps_[qp_idx]);
+            std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
+        } else {
+            receive_data_chunked(buffer, recv_size, mr, recv_qps_[qp_idx]);
+        }
+
+        return {recv_source_ranks_[qp_idx], recv_size};
     }
 
 private:
@@ -1396,20 +1509,9 @@ private:
     }
     
     void poll_completion(ibv_cq* cq, int num_completions) {
-        int polled = 0;
-        while (polled < num_completions) {
-            ibv_wc wc;
-            int n = ibv_poll_cq(cq, 1, &wc);
-            if (n < 0) {
-                throw std::runtime_error("Failed to poll completion queue");
-            }
-            if (n > 0) {
-                if (wc.status != IBV_WC_SUCCESS) {
-                    throw std::runtime_error("Work completion failed with status " + std::to_string(wc.status));
-                }
-                polled++;
-            }
-        }
+        // Use a timeout to avoid hanging forever if the remote side never responds.
+        // 60 seconds is generous for RDMA transfers.
+        poll_completion_timeout(cq, num_completions, 60);
     }
 
     // Like poll_completion but with a timeout (seconds). Used by warmup
@@ -1520,8 +1622,22 @@ private:
 };
 
 /**
+ * Send/Recv task structs for queue-based worker model (aligned with ecnaive).
+ * Sentinel tasks with addr=0 and size=0 signal completion to workers.
+ */
+struct SendTask {
+    uintptr_t addr;
+    size_t size;
+};
+
+struct RecvTask {
+    uintptr_t addr;
+    size_t size;
+};
+
+/**
  * Main Gemini Replicas Native Class
- * 
+ *
  * Provides Python interface for multi-replica data transfer.
  */
 class GeminiReplicasNative {
@@ -1537,32 +1653,28 @@ private:
 
     // ---- Worker-thread model (aligned with ecnaive) ----
     // Persistent worker threads: one send_worker + one recv_worker per source.
-    // Main thread only submits tasks and polls atomic flags — never blocks on I/O.
+    // Uses task queues with sentinels for completion detection (matches ecnaive pattern).
 
     bool workers_started_{false};
     std::atomic<bool> stop_workers_{false};
 
-    // Send worker
+    // Send worker (queue-based with sentinel completion)
     std::thread send_worker_thread_;
     std::mutex send_mutex_;
     std::condition_variable send_cv_;
-    uintptr_t send_task_addr_{0};
-    size_t send_task_size_{0};
-    std::atomic<bool> send_ready_{false};
-    std::atomic<bool> send_done_{false};
+    std::queue<SendTask> send_queue_;
+    std::atomic<bool> send_completed_{false};
     std::atomic<bool> send_error_{false};
     std::string send_error_msg_;
     std::mutex send_error_mutex_;
 
-    // Recv workers (one per source rank)
+    // Recv workers (one per source rank, queue-based with sentinel completion)
     std::vector<int> recv_source_ranks_;
     std::vector<std::thread> recv_worker_threads_;
     std::vector<std::unique_ptr<std::mutex>> recv_mutexes_;
     std::vector<std::unique_ptr<std::condition_variable>> recv_cvs_;
-    std::vector<uintptr_t> recv_task_addrs_;
-    std::vector<size_t> recv_task_sizes_;
-    std::deque<std::atomic<bool>> recv_ready_;
-    std::deque<std::atomic<bool>> recv_done_;
+    std::vector<std::queue<RecvTask>> recv_queues_;
+    std::deque<std::atomic<bool>> recv_completed_;
     std::deque<std::atomic<bool>> recv_error_;
     std::vector<std::string> recv_error_msgs_;
     std::mutex recv_error_mutex_;
@@ -1691,15 +1803,12 @@ public:
         int n_recv = static_cast<int>(source_ranks.size());
         recv_mutexes_.reserve(n_recv);
         recv_cvs_.reserve(n_recv);
-        recv_task_addrs_.resize(n_recv, 0);
-        recv_task_sizes_.resize(n_recv, 0);
-        recv_ready_.resize(n_recv);
-        recv_done_.resize(n_recv);
+        recv_queues_.resize(n_recv);
+        recv_completed_.resize(n_recv);
         recv_error_.resize(n_recv);
         recv_error_msgs_.resize(n_recv);
         for (int i = 0; i < n_recv; ++i) {
-            recv_ready_[i] = false;
-            recv_done_[i] = false;
+            recv_completed_[i] = false;
             recv_error_[i] = false;
             recv_mutexes_.emplace_back(std::make_unique<std::mutex>());
             recv_cvs_.emplace_back(std::make_unique<std::condition_variable>());
@@ -1733,18 +1842,27 @@ public:
 private:
     void send_worker_func() {
         while (true) {
+            SendTask task;
             {
                 std::unique_lock<std::mutex> lk(send_mutex_);
                 send_cv_.wait(lk, [this] {
-                    return stop_workers_ || send_ready_;
+                    return stop_workers_ || !send_queue_.empty();
                 });
+                if (stop_workers_ && send_queue_.empty()) break;
+                if (send_queue_.empty()) continue;
+                task = send_queue_.front();
+                send_queue_.pop();
             }
-            if (stop_workers_) break;
-            if (!send_ready_) continue;
+
+            // Sentinel: addr=0, size=0 signals completion
+            if (task.addr == 0 && task.size == 0) {
+                send_completed_ = true;
+                continue;
+            }
 
             try {
-                const uint8_t* data = reinterpret_cast<const uint8_t*>(send_task_addr_);
-                connection_manager_->broadcast_to_targets(data, send_task_size_);
+                const uint8_t* data = reinterpret_cast<const uint8_t*>(task.addr);
+                connection_manager_->broadcast_to_targets(data, task.size);
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(send_error_mutex_);
                 send_error_msg_ = e.what();
@@ -1754,28 +1872,34 @@ private:
                 send_error_msg_ = "unknown send error";
                 send_error_ = true;
             }
-
-            send_ready_ = false;
-            send_done_ = true;
         }
     }
 
     void recv_worker_func(int idx) {
         int source_rank = recv_source_ranks_[idx];
         while (true) {
+            RecvTask task;
             {
                 std::unique_lock<std::mutex> lk(*recv_mutexes_[idx]);
                 recv_cvs_[idx]->wait(lk, [this, idx] {
-                    return stop_workers_ || recv_ready_[idx];
+                    return stop_workers_ || !recv_queues_[idx].empty();
                 });
+                if (stop_workers_ && recv_queues_[idx].empty()) break;
+                if (recv_queues_[idx].empty()) continue;
+                task = recv_queues_[idx].front();
+                recv_queues_[idx].pop();
             }
-            if (stop_workers_) break;
-            if (!recv_ready_[idx]) continue;
+
+            // Sentinel: addr=0, size=0 signals completion
+            if (task.addr == 0 && task.size == 0) {
+                recv_completed_[idx] = true;
+                continue;
+            }
 
             try {
-                uint8_t* buf = reinterpret_cast<uint8_t*>(recv_task_addrs_[idx]);
+                uint8_t* buf = reinterpret_cast<uint8_t*>(task.addr);
                 connection_manager_->receive_data_from_source(
-                    source_rank, buf, recv_task_sizes_[idx]);
+                    source_rank, buf, task.size);
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(recv_error_mutex_);
                 recv_error_msgs_[idx] = e.what();
@@ -1785,26 +1909,24 @@ private:
                 recv_error_msgs_[idx] = "unknown recv error";
                 recv_error_[idx] = true;
             }
-
-            recv_ready_[idx] = false;
-            recv_done_[idx] = true;
         }
     }
 
 public:
     void reset_exchange_state() {
-        // Reset all per-exchange flags.  Workers are idle (ready=false, done=true).
-        send_ready_ = false;
-        send_done_ = false;
+        // Reset all per-exchange completion flags and drain any leftover tasks
+        // (should be empty after a completed exchange, but drain defensively).
+        send_completed_ = false;
         send_error_ = false;
-        send_task_addr_ = 0;
-        send_task_size_ = 0;
+        {
+            std::lock_guard<std::mutex> lk(send_mutex_);
+            while (!send_queue_.empty()) send_queue_.pop();
+        }
         for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
-            recv_ready_[i] = false;
-            recv_done_[i] = false;
+            recv_completed_[i] = false;
             recv_error_[i] = false;
-            recv_task_addrs_[i] = 0;
-            recv_task_sizes_[i] = 0;
+            std::lock_guard<std::mutex> lk(*recv_mutexes_[i]);
+            while (!recv_queues_[i].empty()) recv_queues_[i].pop();
         }
     }
 
@@ -1817,11 +1939,7 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(send_mutex_);
-            send_task_addr_ = buffer_addr;
-            send_task_size_ = buffer_size;
-            send_ready_ = true;
-            send_done_ = false;
-            send_error_ = false;
+            send_queue_.push({buffer_addr, buffer_size});
             send_cv_.notify_one();
         }
 
@@ -1846,11 +1964,7 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(*recv_mutexes_[idx]);
-            recv_task_addrs_[idx] = buffer_addr;
-            recv_task_sizes_[idx] = buffer_size;
-            recv_ready_[idx] = true;
-            recv_done_[idx] = false;
-            recv_error_[idx] = false;
+            recv_queues_[idx].push({buffer_addr, buffer_size});
             recv_cvs_[idx]->notify_one();
         }
 
@@ -1858,14 +1972,49 @@ public:
                   << source_rank << ": " << buffer_size << " bytes" << std::endl;
     }
 
+    void submit_send_sentinel() {
+        if (!workers_started_)
+            throw std::runtime_error("Workers not started");
+        {
+            std::lock_guard<std::mutex> lk(send_mutex_);
+            send_queue_.push({0, 0});  // sentinel
+            send_cv_.notify_one();
+        }
+    }
+
+    void submit_recv_sentinel(int source_rank) {
+        if (!workers_started_)
+            throw std::runtime_error("Workers not started");
+
+        int idx = -1;
+        for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
+            if (recv_source_ranks_[i] == source_rank) { idx = static_cast<int>(i); break; }
+        }
+        if (idx < 0)
+            throw std::runtime_error("Source rank " + std::to_string(source_rank) +
+                                     " not in registered recv source_ranks");
+
+        {
+            std::lock_guard<std::mutex> lk(*recv_mutexes_[idx]);
+            recv_queues_[idx].push({0, 0});  // sentinel
+            recv_cvs_[idx]->notify_one();
+        }
+    }
+
     void wait_for_exchange_completion() {
-        // Busy-poll until all workers are done (same style as ecnaive).
+        // Submit sentinels to signal completion to workers (ecnaive pattern).
+        submit_send_sentinel();
+        for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
+            submit_recv_sentinel(recv_source_ranks_[i]);
+        }
+
+        // Poll completion flags (ecnaive pattern: busy-wait with short sleep).
         int wait_count = 0;
         while (true) {
-            bool all_done = send_done_;
+            bool all_done = send_completed_;
             if (all_done) {
                 for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
-                    if (!recv_done_[i]) { all_done = false; break; }
+                    if (!recv_completed_[i]) { all_done = false; break; }
                 }
             }
             // Also stop if any worker hit an error
@@ -1879,12 +2028,12 @@ public:
 
             if (wait_count % 200 == 0 && wait_count > 0) {
                 std::cout << "[Rank " << rank_ << "] Waiting for exchange (send="
-                          << send_done_ << " recvs_done=";
+                          << (send_completed_ ? 1 : 0) << " recvs_done=";
                 for (size_t i = 0; i < recv_source_ranks_.size(); ++i)
-                    std::cout << recv_done_[i];
+                    std::cout << recv_completed_[i];
                 std::cout << ")..." << std::endl;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             wait_count++;
         }
 
@@ -2001,9 +2150,14 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
              py::arg("source_ranks"),
              "Start persistent send+recv worker threads (call after finalize_connections)")
         .def("wait_for_exchange_completion", &GeminiReplicasNative::wait_for_exchange_completion,
-             "Block until all send/recv workers finish the current exchange (polls atomics, 5ms sleep)")
+             "Submit sentinels and block until all send/recv workers finish (ecnaive pattern)")
         .def("reset_exchange_state", &GeminiReplicasNative::reset_exchange_state,
-             "Reset per-exchange flags for the next exchange")
+             "Reset per-exchange completion flags and drain queues for the next exchange")
+        .def("submit_send_sentinel", &GeminiReplicasNative::submit_send_sentinel,
+             "Submit a sentinel task to the send queue (signals completion)")
+        .def("submit_recv_sentinel", &GeminiReplicasNative::submit_recv_sentinel,
+             py::arg("source_rank"),
+             "Submit a sentinel task to a recv queue (signals completion)")
         .def("is_initialized", &GeminiReplicasNative::is_initialized,
              "Check if fully initialized")
         .def("get_rank", &GeminiReplicasNative::get_rank,

@@ -166,6 +166,7 @@ def save_gemini_replicas_legacy_checkpoint(
 
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
+    local_tensor_infos: List[Dict[str, Any]] = []  # for replica file metadata
     for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
         tensor_bytes = info.size_bytes
         tensor_bytes_view = _cpu_uint8_view(tensor)
@@ -191,6 +192,13 @@ def save_gemini_replicas_legacy_checkpoint(
                 source_rank=rank,
             )
         )
+        local_tensor_infos.append({
+            "key": info.key,
+            "shape": list(info.shape),
+            "dtype": str(info.dtype),
+            "offset": info.offset,
+            "size_bytes": info.size_bytes,
+        })
         offset += tensor_bytes
         decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
 
@@ -203,14 +211,35 @@ def save_gemini_replicas_legacy_checkpoint(
     logger.info(f"GEMINI save timing: RDMA reg tensor {time.time()-t0:.3f}s")
 
     t0 = time.time()
-    # Exchange buffer sizes via gloo all_gather
+    # ===== Metadata exchange via all_gather_object on NCCL (aligned with ecnaive/eccheck) =====
+    # Slim non_tensor_data to avoid OOM from large pickled objects (optimizer, rng state, etc.)
+    _NTD_SKIP_PREFIXES = ("optimizer", "rng_state", "rerun_state_machine", "args")
+    slim_ntd = {
+        k: v for k, v in decomposed.non_tensor_data.items()
+        if not k.startswith(_NTD_SKIP_PREFIXES)
+    }
+    rank_metadata, rank_non_tensor = _build_global_registry(local_tensor_metadata, slim_ntd)
+
+    # Compute buffer sizes from metadata (replaces separate gloo size exchange)
+    rank_sizes = {
+        r: sum(m.size_bytes for m in rank_metadata[r])
+        for r in range(world_size)
+    }
+
+    # Exchange flat_key_roots and tensor_infos (with local offsets) separately
+    # These are small — just top-level keys and per-tensor metadata dicts
+    my_flat_key_roots = list(decomposed.flat_key_roots) if decomposed.flat_key_roots else []
+    all_flat_key_roots: List[Any] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(all_flat_key_roots, my_flat_key_roots)
+    rank_flat_key_roots = {r: all_flat_key_roots[r] for r in range(world_size)}
+
+    all_tensor_infos: List[Any] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(all_tensor_infos, local_tensor_infos)
+    rank_tensor_infos = {r: all_tensor_infos[r] for r in range(world_size)}
+
+    logger.info(f"GEMINI save timing: meta exchange {time.time()-t0:.3f}s")
+
     send_buffer_size = total_tensor_size
-    global_gloo_group = get_or_create_global_gloo_group()
-    size_tensor = torch.tensor([send_buffer_size], dtype=torch.long, device="cpu")
-    all_sizes = [torch.zeros_like(size_tensor) for _ in range(world_size)]
-    torch.distributed.all_gather(all_sizes, size_tensor, group=global_gloo_group)
-    rank_sizes = {r: int(all_sizes[r][0].item()) for r in range(world_size)}
-    logger.info(f"GEMINI save timing: size exchange {time.time()-t0:.3f}s")
 
     # Determine source ranks (ranks whose target list includes us)
     target_ranks = manager._calculate_target_ranks(rank, world_size)
@@ -261,43 +290,16 @@ def save_gemini_replicas_legacy_checkpoint(
     native.wait_for_exchange_completion()
     logger.info(f"Gemini Replicas legacy save rank {rank}: C++ exchange done ({time.time()-t0:.3f}s)")
 
-    t0 = time.time()
-    # ===== Exchange metadata so replica files are self-contained =====
-    # Each rank needs to know every source rank's tensor_infos + non_tensor_data
-    # so that during hardware recovery the sender can provide full metadata.
-    # Exchange metadata needed for hardware recovery.
-    # Exclude large non-tensor keys that bloat pickle sizes — optimizer state,
-    # rng tensors embedded in lists, rerun state, and argparse namespace can
-    # be hundreds of MB or more after pickling and cause OOM when gathered
-    # across all ranks on the default (NCCL) pg.
-    _NTD_SKIP_PREFIXES = ("optimizer", "rng_state", "rerun_state_machine", "args")
-    slim_ntd = {
-        k: v for k, v in decomposed.non_tensor_data.items()
-        if not k.startswith(_NTD_SKIP_PREFIXES)
-    }
-    my_meta = {
-        "tensor_infos": [
-            {
-                "key": info.key,
-                "shape": list(info.shape),
-                "dtype": str(info.dtype),
-                "offset": info.offset,
-                "size_bytes": info.size_bytes,
-            }
-            for info in decomposed.tensor_infos
-        ],
-        "non_tensor_data": slim_ntd,
-        "tensor_buffer_size": total_tensor_size,
-        "flat_key_roots": list(decomposed.flat_key_roots)
-        if decomposed.flat_key_roots
-        else [],
-    }
-    all_meta: List[Any] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(
-        all_meta, my_meta, group=global_gloo_group,
-    )
-    rank_meta = {r: all_meta[r] for r in range(world_size)}
-    logger.info(f"GEMINI save timing: meta exchange {time.time()-t0:.3f}s")
+    # Build rank_meta from pre-exchanged data (meta exchange already done before C++ transfer).
+    # Format is compatible with the file writing code below.
+    rank_meta = {}
+    for r in range(world_size):
+        rank_meta[r] = {
+            "tensor_infos": rank_tensor_infos.get(r, []),
+            "non_tensor_data": rank_non_tensor.get(r, {}),
+            "tensor_buffer_size": rank_sizes.get(r, 0),
+            "flat_key_roots": rank_flat_key_roots.get(r, []),
+        }
 
     # Save .pt files
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)

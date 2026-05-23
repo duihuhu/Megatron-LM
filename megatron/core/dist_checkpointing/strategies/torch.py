@@ -816,6 +816,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.ecnaive_blocks = None  # 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1)
         self.ec_write_buckets = []  # WriteBuckets for 4 blocks
 
+        # Gemini Replicas state
+        self.gemini_replicas_global_registry = None
+
     def _get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank using the shared manager."""
         return self.eccheck_manager.get_p2p_partner_rank(my_rank, world_size)
@@ -1275,6 +1278,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             # Pass Gemini Replicas state to writer if available
             writer.decomposed_state_dict = self.decomposed_state_dict
             writer.preallocated_cpu_buffer = self.preallocated_cpu_buffer
+            # Pass global metadata registry (aligned with ecnaive/eccheck/eclatin)
+            if hasattr(self, 'gemini_replicas_global_registry'):
+                writer.gemini_replicas_global_registry = self.gemini_replicas_global_registry
             # Pass preallocated remote buffers (optimization: only allocate once)
             if hasattr(self, 'gemini_replicas_remote_buffers'):
                 writer.gemini_replicas_remote_buffers = self.gemini_replicas_remote_buffers
@@ -1636,18 +1642,30 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             f"Gemini Replicas: [Rank {rank}] Processed {byte_io_count} BytesIO items, {tensor_count} tensor items"
             + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
         )
-        
+
         # Calculate offsets for tensor data
         offset = 0
         for info in tensor_infos:
             info.offset = offset
             offset += info.size_bytes
-        
+
+        # Compute flat_key_roots from item keys (top-level checkpoint keys)
+        flat_key_roots = set()
+        for info in tensor_infos:
+            first_dot = info.key.find('.')
+            if first_dot >= 0:
+                flat_key_roots.add(info.key[:first_dot])
+        for key in non_tensor_data:
+            first_dot = key.find('.')
+            if first_dot >= 0:
+                flat_key_roots.add(key[:first_dot])
+
         # Create decomposed structure
         self.decomposed_state_dict = DecomposedStateDict(
             non_tensor_data=non_tensor_data,
             tensor_infos=tensor_infos,
             tensor_data=tensor_data_list,
+            flat_key_roots=flat_key_roots,
         )
         
         # Log statistics
@@ -1692,13 +1710,20 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             logger.info(f"Gemini Replicas: [Rank {rank}] Registering preallocated_cpu_buffer (send buffer) for RDMA")
             self.gemini_replicas_manager.register_buffer(self.preallocated_cpu_buffer)
         
-        # Step 3: Exchange buffer sizes and preallocate remote buffers (receive buffers)
-        # This optimization moves buffer allocation from _gemini_replicas_preload_to_continuous_buffer
-        # to here, so it only happens once in the first iteration
+        # Step 3: Exchange metadata and allocate remote buffers
+        # Uses the shared _broadcast_and_exchange_metadata (all_gather_object on NCCL),
+        # aligning with ecnaive/eccheck/eclatin instead of a separate gloo exchange.
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        
         if world_size > 1:
-            # Calculate source ranks (ranks that will send data to this rank)
+            # Step 3a: Broadcast and exchange metadata via all_gather_object (NCCL)
+            logger.info(f"Gemini Replicas: [Rank {rank}] Starting metadata exchange...")
+            meta_start = time()
+            self.gemini_replicas_global_registry = self._broadcast_and_exchange_metadata()
+            logger.info(
+                f"Gemini Replicas: [Rank {rank}] Metadata exchange completed in {time() - meta_start:.3f}s"
+            )
+
+            # Step 3b: Calculate source ranks
             source_ranks = []
             for src_rank in range(world_size):
                 if src_rank == rank:
@@ -1706,37 +1731,32 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 src_targets = self.gemini_replicas_manager._calculate_target_ranks(src_rank, world_size)
                 if rank in src_targets:
                     source_ranks.append(src_rank)
-            
+
             if len(source_ranks) > 0:
-                # Create or get global gloo group for CPU tensor communication
-                from ..strategies.async_utils import get_or_create_global_gloo_group
-                global_gloo_group = get_or_create_global_gloo_group()
-                
-                # Exchange buffer sizes using all_gather
-                local_buffer_size = total_tensor_size
-                size_tensor = torch.tensor([local_buffer_size], dtype=torch.long, device='cpu')
-                all_sizes = [torch.zeros_like(size_tensor) for _ in range(world_size)]
-                torch.distributed.all_gather(all_sizes, size_tensor, group=global_gloo_group)
-                
-                # Extract sizes for all ranks
-                rank_sizes = {r: all_sizes[r][0].item() for r in range(world_size)}
+                # Step 3c: Compute remote buffer sizes from registry metadata
+                registry = self.gemini_replicas_global_registry
+                rank_sizes = {}
+                for src_rank in source_ranks:
+                    src_metadata = registry.rank_metadata.get(src_rank, [])
+                    src_size = sum(m.size_bytes for m in src_metadata)
+                    rank_sizes[src_rank] = src_size
+
                 logger.info(
-                    f"Gemini Replicas: [Rank {rank}] Exchanged buffer sizes with all ranks: "
-                    f"local={local_buffer_size / (1024**2):.2f} MB, "
+                    f"Gemini Replicas: [Rank {rank}] Remote buffer sizes from registry: "
+                    f"{ {r: f'{s/(1024**2):.1f}MB' for r, s in rank_sizes.items()} }, "
                     f"sources={source_ranks}"
                 )
-                
+
                 # Initialize remote buffers dict if not exists
                 if not hasattr(self, 'gemini_replicas_remote_buffers'):
                     self.gemini_replicas_remote_buffers = {}
                 if not hasattr(self, 'gemini_replicas_remote_buffer_sizes'):
                     self.gemini_replicas_remote_buffer_sizes = {}
-                
-                # Allocate remote buffer for each source rank
+
+                # Step 3d: Allocate remote buffer for each source rank
                 for src_rank in source_ranks:
                     remote_buffer_size = rank_sizes[src_rank]
-                    
-                    # Allocate remote buffer if needed (or reuse existing)
+
                     recv_buffer_needs_registration = False
                     if src_rank not in self.gemini_replicas_remote_buffers or \
                        self.gemini_replicas_remote_buffers[src_rank] is None or \
@@ -1754,11 +1774,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                             f"Gemini Replicas: [Rank {rank}] Reusing existing remote buffer for source rank {src_rank}: "
                             f"{self.gemini_replicas_remote_buffers[src_rank].numel() / (1024**2):.2f} MB"
                         )
-                    
-                    # Store remote buffer size for later use
+
                     self.gemini_replicas_remote_buffer_sizes[src_rank] = remote_buffer_size
-                    
-                    # Register recv buffer for RDMA if enabled (on first allocation)
+
                     if self.gemini_replicas_manager.use_rdma and recv_buffer_needs_registration:
                         logger.info(
                             f"Gemini Replicas: [Rank {rank}] Registering remote buffer for source rank {src_rank} "
@@ -3367,10 +3385,12 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         local_tensor_metadata = self._prepare_local_metadata_for_broadcast(rank, world_size)
         local_non_tensor_data = self.decomposed_state_dict.non_tensor_data
         
-        # Package both together
+        # Package both together (plus flat_key_roots for self-contained replica files)
         local_package = {
             'tensor_metadata': local_tensor_metadata,
             'non_tensor_data': local_non_tensor_data,
+            'flat_key_roots': list(self.decomposed_state_dict.flat_key_roots)
+                if getattr(self.decomposed_state_dict, 'flat_key_roots', None) else [],
         }
         
         logger.info(
@@ -3385,21 +3405,24 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         all_packages = [None] * world_size
         torch.distributed.all_gather_object(all_packages, local_package)
         
-        # ===== Step 3: Build rank_metadata and rank_non_tensor_data dicts =====
+        # ===== Step 3: Build rank_metadata, rank_non_tensor_data, and rank_flat_key_roots dicts =====
         rank_metadata = {}
         rank_non_tensor_data = {}
+        rank_flat_key_roots = {}
         for i, package in enumerate(all_packages):
             rank_metadata[i] = package['tensor_metadata']
             rank_non_tensor_data[i] = package['non_tensor_data']
+            rank_flat_key_roots[i] = package.get('flat_key_roots', [])
         
         logger.info(
             f"EC-CHECK: [Rank {rank}] Received metadata from all {world_size} ranks"
         )
         
-        # Create registry with both tensor and non-tensor metadata
+        # Create registry with tensor, non-tensor, and flat_key_roots metadata
         registry = GlobalMetadataRegistry(
             rank_metadata=rank_metadata,
-            rank_non_tensor_data=rank_non_tensor_data
+            rank_non_tensor_data=rank_non_tensor_data,
+            rank_flat_key_roots=rank_flat_key_roots,
         )
         
         # Log statistics
@@ -7034,11 +7057,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 logger.info(f"rank: {rank}, data size: {replica_file_size / (1024**2):.2f} MB")
                 
                 # Submit send buffer to C++ module
+                recovery_native.reset_exchange_state()
                 recovery_native.submit_send_buffer(mmap_addr, replica_file_size)
-                
+
                 # Execute exchange (this will send data via ASIO)
                 logger.info(f"rank: {rank}, executing ASIO exchange...")
-                recovery_native.execute_exchange()
+                recovery_native.wait_for_exchange_completion()
                 
                 logger.info(f"rank: {rank}, data sent successfully to rank2 via C++ ASIO")
                 
@@ -7085,30 +7109,33 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 start_time = time()
                 recv_buffers = {}
                 source_ranks_to_recv = [0, 1, 3]
-                
+
                 logger.info(f"rank: {rank}, expecting data from source ranks: {source_ranks_to_recv}")
-                
+
+                # Reset exchange state before submission
+                recovery_native.reset_exchange_state()
+
                 # Use pre-allocated buffers for each source
                 for src_rank in source_ranks_to_recv:
                     src_size = int(all_sizes[src_rank][0].item())
-                    
+
                     # Get pre-allocated buffer or allocate dynamically
                     recv_buffer = self._get_gemini_replicas_recovery_buffer(src_rank, src_size)
                     recv_buffers[src_rank] = recv_buffer
-                    
+
                     # Submit receive buffer to C++ module
                     recv_addr = recv_buffer.data_ptr()
                     recovery_native.submit_recv_buffer(src_rank, recv_addr, src_size)
-                    
+
                     logger.info(f"rank: {rank}, submitted receive buffer for rank{src_rank}: {src_size / (1024**2):.2f} MB")
-                
+
                 # Step 3: Execute ASIO exchange (receive from all sources)
                 # Submit a dummy send buffer (rank2 doesn't send, but API may require it)
                 dummy_buffer = torch.zeros(8, dtype=torch.uint8)
                 recovery_native.submit_send_buffer(dummy_buffer.data_ptr(), 8)
-                
+
                 logger.info(f"rank: {rank}, executing C++ ASIO exchange to receive from all sources...")
-                recovery_native.execute_exchange()
+                recovery_native.wait_for_exchange_completion()
                 
                 end_time = time() - start_time
                 logger.info(f"rank: {rank}, data received successfully from all source ranks via C++ ASIO , use time {end_time:.2f}s")

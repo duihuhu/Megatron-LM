@@ -121,7 +121,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00015
-    --train-iters 2
+    --train-iters 10
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -167,7 +167,7 @@ EVAL_AND_LOGGING_ARGS=(
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）
     # ---------------------------------------------------------------------------
-    --gemini-replicas-num 2         # 默认 3。设为 2 即两副本，设为 N 即 N 副本
+    --gemini-replicas-num 3        # 默认 3。设为 2 即两副本，设为 N 即 N 副本
                                         # 在组内 round-robin 轮询放置副本
                                         # 容错能力 = num_replicas - 1 个 rank 同时故障
 

@@ -36,7 +36,6 @@
 #include <infiniband/verbs.h>
 
 #include "rdma_device_utils.h"
-#include <queue>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -1622,20 +1621,6 @@ private:
 };
 
 /**
- * Send/Recv task structs for queue-based worker model (aligned with ecnaive).
- * Sentinel tasks with addr=0 and size=0 signal completion to workers.
- */
-struct SendTask {
-    uintptr_t addr;
-    size_t size;
-};
-
-struct RecvTask {
-    uintptr_t addr;
-    size_t size;
-};
-
-/**
  * Main Gemini Replicas Native Class
  *
  * Provides Python interface for multi-replica data transfer.
@@ -1646,35 +1631,44 @@ private:
     int world_size_;
     std::vector<int> target_ranks_;
     bool use_rdma_;
-    
+
     std::unique_ptr<IGeminiReplicasConnectionManager> connection_manager_;
-    
+
     std::atomic<bool> initialized_{false};
 
     // ---- Worker-thread model (aligned with ecnaive) ----
     // Persistent worker threads: one send_worker + one recv_worker per source.
-    // Uses task queues with sentinels for completion detection (matches ecnaive pattern).
+    // Main thread only submits tasks and polls atomic flags — never blocks on I/O.
+    //
+    // NOTE: Gemini uses single-slot atomics (not queues+sentinels) because
+    // there is only 1 send + N recv tasks per exchange.  ecnaive uses
+    // per-channel queues because it has many tasks per channel.  Our simpler
+    // model avoids the sentinel ordering issues seen with queues.
 
     bool workers_started_{false};
     std::atomic<bool> stop_workers_{false};
 
-    // Send worker (queue-based with sentinel completion)
+    // Send worker (single-slot atomic)
     std::thread send_worker_thread_;
     std::mutex send_mutex_;
     std::condition_variable send_cv_;
-    std::queue<SendTask> send_queue_;
-    std::atomic<bool> send_completed_{false};
+    uintptr_t send_task_addr_{0};
+    size_t send_task_size_{0};
+    std::atomic<bool> send_ready_{false};
+    std::atomic<bool> send_done_{false};
     std::atomic<bool> send_error_{false};
     std::string send_error_msg_;
     std::mutex send_error_mutex_;
 
-    // Recv workers (one per source rank, queue-based with sentinel completion)
+    // Recv workers (one per source rank, single-slot atomics)
     std::vector<int> recv_source_ranks_;
     std::vector<std::thread> recv_worker_threads_;
     std::vector<std::unique_ptr<std::mutex>> recv_mutexes_;
     std::vector<std::unique_ptr<std::condition_variable>> recv_cvs_;
-    std::vector<std::queue<RecvTask>> recv_queues_;
-    std::deque<std::atomic<bool>> recv_completed_;
+    std::vector<uintptr_t> recv_task_addrs_;
+    std::vector<size_t> recv_task_sizes_;
+    std::deque<std::atomic<bool>> recv_ready_;
+    std::deque<std::atomic<bool>> recv_done_;
     std::deque<std::atomic<bool>> recv_error_;
     std::vector<std::string> recv_error_msgs_;
     std::mutex recv_error_mutex_;
@@ -1803,12 +1797,15 @@ public:
         int n_recv = static_cast<int>(source_ranks.size());
         recv_mutexes_.reserve(n_recv);
         recv_cvs_.reserve(n_recv);
-        recv_queues_.resize(n_recv);
-        recv_completed_.resize(n_recv);
+        recv_task_addrs_.resize(n_recv, 0);
+        recv_task_sizes_.resize(n_recv, 0);
+        recv_ready_.resize(n_recv);
+        recv_done_.resize(n_recv);
         recv_error_.resize(n_recv);
         recv_error_msgs_.resize(n_recv);
         for (int i = 0; i < n_recv; ++i) {
-            recv_completed_[i] = false;
+            recv_ready_[i] = false;
+            recv_done_[i] = false;
             recv_error_[i] = false;
             recv_mutexes_.emplace_back(std::make_unique<std::mutex>());
             recv_cvs_.emplace_back(std::make_unique<std::condition_variable>());
@@ -1842,27 +1839,18 @@ public:
 private:
     void send_worker_func() {
         while (true) {
-            SendTask task;
             {
                 std::unique_lock<std::mutex> lk(send_mutex_);
                 send_cv_.wait(lk, [this] {
-                    return stop_workers_ || !send_queue_.empty();
+                    return stop_workers_ || send_ready_;
                 });
-                if (stop_workers_ && send_queue_.empty()) break;
-                if (send_queue_.empty()) continue;
-                task = send_queue_.front();
-                send_queue_.pop();
             }
-
-            // Sentinel: addr=0, size=0 signals completion
-            if (task.addr == 0 && task.size == 0) {
-                send_completed_ = true;
-                continue;
-            }
+            if (stop_workers_) break;
+            if (!send_ready_) continue;
 
             try {
-                const uint8_t* data = reinterpret_cast<const uint8_t*>(task.addr);
-                connection_manager_->broadcast_to_targets(data, task.size);
+                const uint8_t* data = reinterpret_cast<const uint8_t*>(send_task_addr_);
+                connection_manager_->broadcast_to_targets(data, send_task_size_);
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(send_error_mutex_);
                 send_error_msg_ = e.what();
@@ -1872,34 +1860,28 @@ private:
                 send_error_msg_ = "unknown send error";
                 send_error_ = true;
             }
+
+            send_ready_ = false;
+            send_done_ = true;
         }
     }
 
     void recv_worker_func(int idx) {
         int source_rank = recv_source_ranks_[idx];
         while (true) {
-            RecvTask task;
             {
                 std::unique_lock<std::mutex> lk(*recv_mutexes_[idx]);
                 recv_cvs_[idx]->wait(lk, [this, idx] {
-                    return stop_workers_ || !recv_queues_[idx].empty();
+                    return stop_workers_ || recv_ready_[idx];
                 });
-                if (stop_workers_ && recv_queues_[idx].empty()) break;
-                if (recv_queues_[idx].empty()) continue;
-                task = recv_queues_[idx].front();
-                recv_queues_[idx].pop();
             }
-
-            // Sentinel: addr=0, size=0 signals completion
-            if (task.addr == 0 && task.size == 0) {
-                recv_completed_[idx] = true;
-                continue;
-            }
+            if (stop_workers_) break;
+            if (!recv_ready_[idx]) continue;
 
             try {
-                uint8_t* buf = reinterpret_cast<uint8_t*>(task.addr);
+                uint8_t* buf = reinterpret_cast<uint8_t*>(recv_task_addrs_[idx]);
                 connection_manager_->receive_data_from_source(
-                    source_rank, buf, task.size);
+                    source_rank, buf, recv_task_sizes_[idx]);
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(recv_error_mutex_);
                 recv_error_msgs_[idx] = e.what();
@@ -1909,24 +1891,26 @@ private:
                 recv_error_msgs_[idx] = "unknown recv error";
                 recv_error_[idx] = true;
             }
+
+            recv_ready_[idx] = false;
+            recv_done_[idx] = true;
         }
     }
 
 public:
     void reset_exchange_state() {
-        // Reset all per-exchange completion flags and drain any leftover tasks
-        // (should be empty after a completed exchange, but drain defensively).
-        send_completed_ = false;
+        // Reset all per-exchange flags.  Workers are idle (ready=false, done=true).
+        send_ready_ = false;
+        send_done_ = false;
         send_error_ = false;
-        {
-            std::lock_guard<std::mutex> lk(send_mutex_);
-            while (!send_queue_.empty()) send_queue_.pop();
-        }
+        send_task_addr_ = 0;
+        send_task_size_ = 0;
         for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
-            recv_completed_[i] = false;
+            recv_ready_[i] = false;
+            recv_done_[i] = false;
             recv_error_[i] = false;
-            std::lock_guard<std::mutex> lk(*recv_mutexes_[i]);
-            while (!recv_queues_[i].empty()) recv_queues_[i].pop();
+            recv_task_addrs_[i] = 0;
+            recv_task_sizes_[i] = 0;
         }
     }
 
@@ -1939,7 +1923,11 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(send_mutex_);
-            send_queue_.push({buffer_addr, buffer_size});
+            send_task_addr_ = buffer_addr;
+            send_task_size_ = buffer_size;
+            send_ready_ = true;
+            send_done_ = false;
+            send_error_ = false;
             send_cv_.notify_one();
         }
 
@@ -1964,7 +1952,11 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(*recv_mutexes_[idx]);
-            recv_queues_[idx].push({buffer_addr, buffer_size});
+            recv_task_addrs_[idx] = buffer_addr;
+            recv_task_sizes_[idx] = buffer_size;
+            recv_ready_[idx] = true;
+            recv_done_[idx] = false;
+            recv_error_[idx] = false;
             recv_cvs_[idx]->notify_one();
         }
 
@@ -1972,49 +1964,14 @@ public:
                   << source_rank << ": " << buffer_size << " bytes" << std::endl;
     }
 
-    void submit_send_sentinel() {
-        if (!workers_started_)
-            throw std::runtime_error("Workers not started");
-        {
-            std::lock_guard<std::mutex> lk(send_mutex_);
-            send_queue_.push({0, 0});  // sentinel
-            send_cv_.notify_one();
-        }
-    }
-
-    void submit_recv_sentinel(int source_rank) {
-        if (!workers_started_)
-            throw std::runtime_error("Workers not started");
-
-        int idx = -1;
-        for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
-            if (recv_source_ranks_[i] == source_rank) { idx = static_cast<int>(i); break; }
-        }
-        if (idx < 0)
-            throw std::runtime_error("Source rank " + std::to_string(source_rank) +
-                                     " not in registered recv source_ranks");
-
-        {
-            std::lock_guard<std::mutex> lk(*recv_mutexes_[idx]);
-            recv_queues_[idx].push({0, 0});  // sentinel
-            recv_cvs_[idx]->notify_one();
-        }
-    }
-
     void wait_for_exchange_completion() {
-        // Submit sentinels to signal completion to workers (ecnaive pattern).
-        submit_send_sentinel();
-        for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
-            submit_recv_sentinel(recv_source_ranks_[i]);
-        }
-
-        // Poll completion flags (ecnaive pattern: busy-wait with short sleep).
+        // Busy-poll until all workers are done (same style as ecnaive).
         int wait_count = 0;
         while (true) {
-            bool all_done = send_completed_;
+            bool all_done = send_done_;
             if (all_done) {
                 for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
-                    if (!recv_completed_[i]) { all_done = false; break; }
+                    if (!recv_done_[i]) { all_done = false; break; }
                 }
             }
             // Also stop if any worker hit an error
@@ -2028,12 +1985,12 @@ public:
 
             if (wait_count % 200 == 0 && wait_count > 0) {
                 std::cout << "[Rank " << rank_ << "] Waiting for exchange (send="
-                          << (send_completed_ ? 1 : 0) << " recvs_done=";
+                          << send_done_ << " recvs_done=";
                 for (size_t i = 0; i < recv_source_ranks_.size(); ++i)
-                    std::cout << recv_completed_[i];
+                    std::cout << recv_done_[i];
                 std::cout << ")..." << std::endl;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
             wait_count++;
         }
 
@@ -2150,14 +2107,9 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
              py::arg("source_ranks"),
              "Start persistent send+recv worker threads (call after finalize_connections)")
         .def("wait_for_exchange_completion", &GeminiReplicasNative::wait_for_exchange_completion,
-             "Submit sentinels and block until all send/recv workers finish (ecnaive pattern)")
+             "Block until all send/recv workers finish the current exchange (polls atomics, 5ms sleep)")
         .def("reset_exchange_state", &GeminiReplicasNative::reset_exchange_state,
-             "Reset per-exchange completion flags and drain queues for the next exchange")
-        .def("submit_send_sentinel", &GeminiReplicasNative::submit_send_sentinel,
-             "Submit a sentinel task to the send queue (signals completion)")
-        .def("submit_recv_sentinel", &GeminiReplicasNative::submit_recv_sentinel,
-             py::arg("source_rank"),
-             "Submit a sentinel task to a recv queue (signals completion)")
+             "Reset per-exchange flags for the next exchange")
         .def("is_initialized", &GeminiReplicasNative::is_initialized,
              "Check if fully initialized")
         .def("get_rank", &GeminiReplicasNative::get_rank,

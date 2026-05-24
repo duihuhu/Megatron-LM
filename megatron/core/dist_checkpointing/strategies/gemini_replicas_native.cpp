@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <deque>
 #include <map>
+#include <unordered_map>
 
 // RDMA headers
 #include <infiniband/verbs.h>
@@ -70,6 +71,17 @@ public:
         }
         return {actual_source, size};
     }
+
+    // Send data to a single target (not broadcast).  Reuses the existing
+    // connection to the given target index.  Protocol matches broadcast_to_targets:
+    // [source_rank(4B)][size(8B)][data] for ASIO, or size+ACK+RDMA for RDMA.
+    virtual void send_to_one_target(size_t target_idx, const uint8_t* data,
+                                    size_t size, int source_rank) = 0;
+
+    // Return the list of source ranks in recv connection order.
+    // Used by GeminiReplicasNative to build source_rank→index mapping for
+    // directed recv during hardware recovery.
+    virtual std::vector<int> get_recv_source_ranks() const = 0;
 };
 
 // RDMA-specific structures
@@ -225,14 +237,47 @@ public:
                     std::rethrow_exception(exceptions[i]);
                 } catch (const std::exception& e) {
                     throw std::runtime_error(
-                        "Failed to send to target rank " + std::to_string(target_ranks_[i]) + 
+                        "Failed to send to target rank " + std::to_string(target_ranks_[i]) +
                         ": " + e.what()
                     );
                 }
             }
         }
     }
-    
+
+    // ---- Directed P2P methods (for hardware recovery) ----
+
+    void send_to_one_target(size_t target_idx, const uint8_t* data,
+                            size_t size, int source_rank) override {
+        /**
+         * Send data to a single target rank (not broadcast).
+         * Protocol matches broadcast_to_targets: [source_rank(4B)][size(8B)][data]
+         * Uses synchronous blocking ASIO write on the specific socket.
+         */
+        if (!(*send_connected_[target_idx])) {
+            throw std::runtime_error("Send socket to target index "
+                + std::to_string(target_idx) + " not connected");
+        }
+        int32_t src = static_cast<int32_t>(source_rank);
+        boost::asio::write(*send_sockets_[target_idx],
+            boost::asio::buffer(&src, sizeof(src)));
+        uint64_t sz = static_cast<uint64_t>(size);
+        boost::asio::write(*send_sockets_[target_idx],
+            boost::asio::buffer(&sz, sizeof(sz)));
+        boost::asio::write(*send_sockets_[target_idx],
+            boost::asio::buffer(data, size));
+        std::cout << "[Rank " << rank_ << "] Sent " << size
+                  << " bytes to target rank " << target_ranks_[target_idx]
+                  << " (directed P2P)" << std::endl;
+    }
+
+    std::vector<int> get_recv_source_ranks() const override {
+        // ASIO uses a socket pool — no fixed source-rank to socket mapping.
+        // Directed recv will use the pool-based receive_data() with a
+        // source_rank verification (safe because recovery has only one sender).
+        return {};
+    }
+
     std::tuple<int, size_t, std::unique_ptr<boost::asio::ip::tcp::socket>> peek_incoming_data() {
         /**
          * Peek the next incoming connection to get source_rank and data size.
@@ -877,7 +922,54 @@ public:
             send_data_chunked(send_data, size, mr, send_qps_[i]);
         }
     }
-    
+
+    // ---- Directed P2P methods (for hardware recovery) ----
+
+    void send_to_one_target(size_t target_idx, const uint8_t* data,
+                            size_t size, int source_rank) override {
+        /**
+         * Send data to a single target via RDMA.
+         * Control channel handshake (size + ACK) on the specific control socket,
+         * then RDMA data transfer on the specific QP.
+         */
+        if (!connected_) {
+            throw std::runtime_error("Not connected");
+        }
+        // Step 1: TCP control — send size, wait for ACK
+        uint64_t sz = htobe64(size);
+        if (send(control_socks_send_[target_idx], &sz, sizeof(sz), MSG_NOSIGNAL)
+            != static_cast<ssize_t>(sizeof(sz))) {
+            throw std::runtime_error("Failed to send size to target rank "
+                + std::to_string(target_ranks_[target_idx]));
+        }
+        char ack;
+        if (recv(control_socks_send_[target_idx], &ack, 1, MSG_WAITALL) != 1 || ack != 'A') {
+            throw std::runtime_error("Failed to receive ACK from target rank "
+                + std::to_string(target_ranks_[target_idx]));
+        }
+
+        // Step 2: RDMA data transfer on the single QP
+        ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(data), size);
+        bool use_temp = (mr == nullptr);
+        if (use_temp) {
+            if (size > temp_send_buffer_.size()) {
+                throw std::runtime_error("Data size exceeds temporary send buffer size");
+            }
+            std::memcpy(temp_send_buffer_.data(), data, size);
+            mr = temp_send_mr_;
+        }
+        const uint8_t* send_data = use_temp ? temp_send_buffer_.data() : data;
+        send_data_chunked(send_data, size, mr, send_qps_[target_idx]);
+
+        std::cout << "[Rank " << rank_ << "] Sent " << size
+                  << " bytes to target rank " << target_ranks_[target_idx]
+                  << " via RDMA (directed P2P)" << std::endl;
+    }
+
+    std::vector<int> get_recv_source_ranks() const override {
+        return recv_source_ranks_;
+    }
+
     std::tuple<int, size_t, std::unique_ptr<boost::asio::ip::tcp::socket>> peek_incoming_data() override {
         // Not used for RDMA (handled in receive_data)
         throw std::runtime_error("peek_incoming_data not supported for RDMA");
@@ -1645,6 +1737,11 @@ private:
     std::vector<int> target_ranks_;
     bool use_rdma_;
 
+    // Rank→connection-index maps for directed P2P (hardware recovery).
+    // Built in finalize_connections() after connect_and_wait().
+    std::unordered_map<int, size_t> target_rank_to_idx_;
+    std::unordered_map<int, size_t> source_rank_to_idx_;
+
     std::unique_ptr<IGeminiReplicasConnectionManager> connection_manager_;
 
     std::atomic<bool> initialized_{false};
@@ -1739,14 +1836,83 @@ public:
          * Should be called after all ranks have started their acceptors.
          */
         std::cout << "[Rank " << rank_ << "] Finalizing connections (Phase 2)..." << std::endl;
-        
+
         connection_manager_->connect_and_wait();
-        
+
+        // Build rank→connection-index maps for directed P2P (hardware recovery)
+        for (size_t i = 0; i < target_ranks_.size(); ++i) {
+            target_rank_to_idx_[target_ranks_[i]] = i;
+        }
+        auto recv_src = connection_manager_->get_recv_source_ranks();
+        for (size_t i = 0; i < recv_src.size(); ++i) {
+            source_rank_to_idx_[recv_src[i]] = i;
+        }
+        std::cout << "[Rank " << rank_ << "] Built rank→idx maps: "
+                  << target_rank_to_idx_.size() << " targets, "
+                  << source_rank_to_idx_.size() << " sources" << std::endl;
+
         initialized_ = true;
-        
+
         std::cout << "[Rank " << rank_ << "] All connections finalized" << std::endl;
     }
-    
+
+    // ---- Directed P2P methods (for hardware recovery) ----
+
+    void send_to_rank(int target_rank, uintptr_t buffer_addr, size_t size) {
+        /**
+         * Send data to a single target rank over the existing connection.
+         * Synchronous, blocking — does not use worker threads.
+         */
+        if (!initialized_) {
+            throw std::runtime_error("GeminiReplicasNative not initialized");
+        }
+        auto it = target_rank_to_idx_.find(target_rank);
+        if (it == target_rank_to_idx_.end()) {
+            throw std::runtime_error("Target rank " + std::to_string(target_rank)
+                + " not in target_ranks_");
+        }
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(buffer_addr);
+        connection_manager_->send_to_one_target(it->second, data, size, rank_);
+    }
+
+    void recv_from_rank(int source_rank, uintptr_t buffer_addr, size_t expected_size) {
+        /**
+         * Receive data from a specific source rank over the existing connection.
+         * Synchronous, blocking — does not use worker threads.
+         *
+         * ASIO: uses the pool-based receive_data() with source_rank verification
+         *       (safe because hardware recovery has only one sender per receiver).
+         * RDMA: uses the indexed receive_data_from_source().
+         */
+        if (!initialized_) {
+            throw std::runtime_error("GeminiReplicasNative not initialized");
+        }
+        uint8_t* buffer = reinterpret_cast<uint8_t*>(buffer_addr);
+        if (use_rdma_) {
+            // RDMA: source_rank→QP index lookup + directed recv
+            auto result = connection_manager_->receive_data_from_source(
+                source_rank, buffer, expected_size);
+            if (result.second != expected_size) {
+                throw std::runtime_error("Size mismatch: expected "
+                    + std::to_string(expected_size) + " got "
+                    + std::to_string(result.second));
+            }
+        } else {
+            // ASIO: pool-based recv with source_rank verification
+            auto result = connection_manager_->receive_data(buffer, expected_size);
+            if (result.first != source_rank) {
+                throw std::runtime_error("Expected data from source "
+                    + std::to_string(source_rank) + " but got from "
+                    + std::to_string(result.first));
+            }
+            if (result.second != expected_size) {
+                throw std::runtime_error("Size mismatch: expected "
+                    + std::to_string(expected_size) + " got "
+                    + std::to_string(result.second));
+            }
+        }
+    }
+
     void broadcast_to_targets(uintptr_t buffer_addr, size_t buffer_size) {
         /**
          * Broadcast data to all target ranks.
@@ -2135,6 +2301,12 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
              "Register buffer for RDMA operations (RDMA mode only)")
         .def("unregister_buffer", &GeminiReplicasNative::unregister_buffer,
              py::arg("buffer_addr"),
-             "Unregister buffer for RDMA operations (RDMA mode only)");
+             "Unregister buffer for RDMA operations (RDMA mode only)")
+        .def("send_to_rank", &GeminiReplicasNative::send_to_rank,
+             py::arg("target_rank"), py::arg("buffer_addr"), py::arg("size"),
+             "Directed P2P send to a single target rank for hardware recovery (synchronous, blocking)")
+        .def("recv_from_rank", &GeminiReplicasNative::recv_from_rank,
+             py::arg("source_rank"), py::arg("buffer_addr"), py::arg("expected_size"),
+             "Directed P2P recv from a specific source rank for hardware recovery (synchronous, blocking)");
 }
 

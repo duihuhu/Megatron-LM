@@ -1061,8 +1061,12 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
                 blocks, checkpoint_dir, rank, rank_in_group, software_failure=True,
             )
         elif rank_in_group == 1:
+            # Buffer size must match rig=0's send size (max across group),
+            # not this rank's own tensor total, to avoid RDMA buffer overflow.
+            actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
             pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
-            recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
+            recovered_buffer = torch.empty(actual_tensor_bytes, dtype=torch.uint8, pin_memory=pin)
+            total_size = actual_tensor_bytes
         # rig=2/3: not participating in software failure
     elif rank_in_group == 2:
         # Hardware failure: rank_in_group 2 is the failed rank, data comes via network
@@ -1092,7 +1096,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     state_dict = _reconstruct_state_dict_from_eccheck_buffer(
         main_payload,
-        recovered_buffer=recovered_buffer if rank_in_group == 2 else None,
+        recovered_buffer=recovered_buffer if (
+            rank_in_group == 2 or (sw_failure and rank_in_group == 1)
+        ) else None,
     )
 
     if world_size > 1 and torch.distributed.is_initialized():

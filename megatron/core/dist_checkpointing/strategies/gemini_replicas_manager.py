@@ -698,11 +698,59 @@ class GeminiReplicasManager:
     def get_native_module(self):
         """Get the C++ native module instance."""
         return self._gemini_replicas_native
-    
+
     def is_initialized(self) -> bool:
         """Check if Gemini Replicas native module is initialized."""
         return self._gemini_replicas_native is not None
-    
+
+    def send_to_rank(self, target_rank: int, buffer: torch.Tensor) -> None:
+        """Directed P2P send to a single target rank for hardware recovery.
+
+        Uses the existing ASIO/RDMA connection (established during init), not
+        the broadcast worker threads.  Synchronous and blocking.
+
+        Args:
+            target_rank: Destination rank.
+            buffer: uint8 contiguous CPU tensor to send.
+        """
+        native = self._gemini_replicas_native
+        if native is None:
+            raise RuntimeError(
+                "Gemini Replicas native module not initialized "
+                "— call init_gemini_replicas_if_enabled() first"
+            )
+        buf = buffer.detach().contiguous().view(torch.uint8).reshape(-1)
+        if self.use_rdma:
+            self.register_buffer(buf)
+        native.send_to_rank(target_rank, int(buf.data_ptr()), buf.numel())
+
+    def recv_from_rank(self, source_rank: int, expected_size: int) -> torch.Tensor:
+        """Directed P2P recv from a specific source rank for hardware recovery.
+
+        Uses the existing ASIO/RDMA connection.  Synchronous and blocking.
+
+        Args:
+            source_rank: Rank to receive from.
+            expected_size: Exact number of bytes expected.
+
+        Returns:
+            uint8 contiguous CPU tensor with the received data.
+        """
+        native = self._gemini_replicas_native
+        if native is None:
+            raise RuntimeError(
+                "Gemini Replicas native module not initialized "
+                "— call init_gemini_replicas_if_enabled() first"
+            )
+        pin = self.gemini_replicas_pin_memory and torch.cuda.is_available()
+        buf = allocate_hugepage_tensor(
+            expected_size, fallback_pin_memory=pin, touch_pages=False,
+        )
+        if self.use_rdma:
+            self.register_buffer(buf)
+        native.recv_from_rank(source_rank, int(buf.data_ptr()), expected_size)
+        return buf
+
     def cleanup(self):
         """Cleanup resources."""
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0

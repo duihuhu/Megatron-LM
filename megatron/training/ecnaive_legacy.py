@@ -410,8 +410,8 @@ def _decode_data0_to_linear_first_half(
     data0_offset = 0
     block_elems = data0.numel()
     while src_pos < half_total:
-        remaining_in_pipe = pipeline_total_bytes - src_pos
-        take = min(ecnaive_buffer_size, remaining_in_pipe)
+        remaining_in_out = half_total - src_pos
+        take = min(ecnaive_buffer_size, remaining_in_out)
         aligned = ((data0_offset + 63) // 64) * 64
         if aligned + take > block_elems:
             logger.warning("EC-NAIVE legacy load: data0 exhausted during decode")
@@ -571,6 +571,8 @@ def _load_ecnaive_legacy_software_failure(
             block_files_legacy=block_files_legacy,
         )
         d21_buffer = torch.zeros(aligned_block_size, dtype=torch.uint8)
+        if manager.use_rdma:
+            manager.register_buffer(d21_buffer)
         native.software_recv_data1(int(d21_buffer.data_ptr()), d21_buffer.numel())
         logger.info(
             f"EC-NAIVE legacy sw: rank2 received d21 "
@@ -615,6 +617,8 @@ def _load_ecnaive_legacy_software_failure(
             legacy_name="recv_data1",
             block_files_legacy=block_files_legacy,
         )
+        if manager.use_rdma:
+            manager.register_buffer(d21_block)
         native.software_send_rank3_data1(int(d21_block.data_ptr()), d21_block.numel())
         logger.info(
             f"EC-NAIVE legacy sw: rank3 sent d21 "
@@ -639,8 +643,11 @@ def _load_ecnaive_legacy_software_failure(
     logger.info(
         f"EC-NAIVE legacy sw: done in {_time() - t_start:.2f}s (rank {rank})"
     )
-    manager.cleanup()
-    manager._ecnaive_native = None
+    # NOTE: do not call manager.cleanup() here in the software failure path.
+    # cleanup() calls native.stop() which tears down C++ resources, and the
+    # subsequent reference drop triggers the C++ destructor (double-free on the
+    # software-only RDMA channel).  The process exits shortly after load,
+    # so leaving cleanup to __del__ is safe.
 
     return state_dict
 

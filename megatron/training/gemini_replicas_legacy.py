@@ -32,10 +32,6 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     unflatten_optimizer_fp32_params,
 )
 
-from megatron.core.dist_checkpointing.strategies.async_utils import (
-    get_or_create_global_gloo_group,
-)
-
 logger = getLogger(__name__)
 
 
@@ -458,6 +454,54 @@ def _collect_metadata_for_failed_rank(
     )
 
 
+# ---------------------------------------------------------------------------
+# Replica file loading helpers (used by _run_hardware_recovery)
+# ---------------------------------------------------------------------------
+
+def _load_replica_metadata(replica_path: Path) -> Optional[Dict[str, Any]]:
+    """Load only the metadata portion of a replica file (no tensor data).
+
+    Used in Phase 2 to compute combined transfer size without loading the
+    full multi-GB tensor buffer into memory.
+    """
+    from megatron.training.legacy_io_utils import is_raw_format, MAGIC_GEMINI_REPLICA
+    try:
+        if is_raw_format(str(replica_path), MAGIC_GEMINI_REPLICA):
+            with open(str(replica_path), "rb") as _f:
+                _f.read(4)  # skip magic
+                meta_len = struct.unpack("<Q", _f.read(8))[0]
+                return pickle.loads(_f.read(meta_len))
+        else:
+            rp = torch.load(replica_path, map_location="cpu", weights_only=False)
+            return {
+                "source_tensor_infos": rp.get("source_tensor_infos", []),
+                "source_non_tensor_data": rp.get("source_non_tensor_data", {}),
+                "source_flat_key_roots": rp.get("source_flat_key_roots", []),
+                "source_tensor_buffer_size": rp.get("source_tensor_buffer_size", 0),
+            }
+    except Exception as e:
+        logger.warning(
+            f"Gemini Replicas: failed to load replica metadata from "
+            f"{replica_path}: {e}"
+        )
+        return None
+
+
+def _load_replica_full(replica_path: Path) -> Dict[str, Any]:
+    """Load a replica file including its tensor buffer."""
+    from megatron.training.legacy_io_utils import is_raw_format, MAGIC_GEMINI_REPLICA
+    if is_raw_format(str(replica_path), MAGIC_GEMINI_REPLICA):
+        with open(str(replica_path), "rb") as _f:
+            _f.read(4)  # skip magic
+            meta_len = struct.unpack("<Q", _f.read(8))[0]
+            rp = pickle.loads(_f.read(meta_len))
+            rp["tensor_buffer"] = torch.from_numpy(
+                np.frombuffer(_f.read(), dtype=np.uint8))
+            return rp
+    else:
+        return torch.load(replica_path, map_location="cpu", weights_only=False)
+
+
 def _run_hardware_recovery(
     manager: GeminiReplicasManager,
     checkpoint_dir: Path,
@@ -469,16 +513,17 @@ def _run_hardware_recovery(
 
     Protocol:
       Phase 1 — Health check: exchange who still has their main file.
-          If failed_override is set, those ranks are treated as failed
-          regardless of file existence (for software recovery testing).
-      Phase 2 — Role assignment (per group):
+      Phase 2 — Role assignment + size exchange:
           For each failed rank f, pick the first healthy rank in the group
-          that holds a replica of f's data.  That rank becomes the sender for f.
-      Phase 3 — Data transfer: senders load replica .pt files (which now
-          include source metadata) and use torch.distributed.send to push
-          both metadata and tensor data to the failed ranks (gloo backend).
+          that holds a replica of f's data.  Senders compute combined_size
+          (header + metadata + tensor) and all ranks exchange both assignments
+          and sizes via all_gather_object.
+      Phase 3 — Data transfer over C++ ASIO/RDMA connections:
+          Senders pack [header(8B)][metadata(pickled)][tensor_data] into a
+          single combined buffer and call manager.send_to_rank(f, combined).
+          Receivers call manager.recv_from_rank(sender, combined_size), then
+          parse the header to split metadata from tensor data.
     """
-    gloo_group = get_or_create_global_gloo_group()
 
     # Build per-rank group membership
     rank_to_group: Dict[int, List[int]] = {}
@@ -496,7 +541,6 @@ def _run_hardware_recovery(
     torch.distributed.all_gather_object(health_list, main_file_exists)
 
     if failed_override:
-        # Override: specified ranks are "failed", all others "healthy"
         healthy = {r for r in range(world_size) if r not in failed_override}
         failed = failed_override
     else:
@@ -535,9 +579,31 @@ def _run_hardware_recovery(
                     f"Gemini Replicas recovery: no replica found for failed rank {f}"
                 )
 
-        my_assignments = [
-            (f, s) for f, s in assignments.items() if s == rank
-        ]
+        # Compute combined sizes for the assignments where this rank is sender
+        my_assignments: List[Tuple[int, int]] = []
+        combined_sizes: Dict[int, int] = {}  # failed_rank → combined_size
+        for f, s in assignments.items():
+            if s == rank:
+                my_assignments.append((f, s))
+                # Load just enough to compute sizes (don't load full tensor yet)
+                replica_path = (
+                    checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{f}.pt"
+                )
+                rp = _load_replica_metadata(replica_path)
+                if rp is not None:
+                    tensor_buf_size = rp.get("source_tensor_buffer_size", 0)
+                    # Build metadata dict to measure its pickled size
+                    meta = {
+                        "tensor_infos": rp["source_tensor_infos"],
+                        "non_tensor_data": rp["source_non_tensor_data"],
+                        "flat_key_roots": rp["source_flat_key_roots"],
+                        "tensor_buffer_size": tensor_buf_size,
+                    }
+                    meta_bytes = pickle.dumps(meta)
+                    # combined = [header:8B][meta_bytes][tensor_data]
+                    combined_sizes[f] = 8 + len(meta_bytes) + tensor_buf_size
+
+        # Exchange assignments
         all_assignments: List[List[Tuple[int, int]]] = [None for _ in range(world_size)]
         torch.distributed.all_gather_object(all_assignments, my_assignments)
 
@@ -547,7 +613,16 @@ def _run_hardware_recovery(
                 for f, s in r_assign:
                     global_assignments[f] = s
 
-        # ---- Phase 3: send metadata + tensor data ----
+        # Exchange combined sizes so receivers know how much to recv
+        all_combined_sizes: List[Dict[int, int]] = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(all_combined_sizes, combined_sizes)
+
+        global_combined_sizes: Dict[int, int] = {}
+        for cs in all_combined_sizes:
+            if cs:
+                global_combined_sizes.update(cs)
+
+        # ---- Phase 3: send via C++ ASIO/RDMA ----
         for f, s in global_assignments.items():
             if s != rank:
                 continue
@@ -558,39 +633,34 @@ def _run_hardware_recovery(
                 f"Gemini Replicas recovery rank {rank}: loading replica for rank {f} "
                 f"from {replica_path}"
             )
-            from megatron.training.legacy_io_utils import is_raw_format, MAGIC_GEMINI_REPLICA
-            if is_raw_format(str(replica_path), MAGIC_GEMINI_REPLICA):
-                with open(str(replica_path), "rb") as _f:
-                    _f.read(4)  # skip magic
-                    meta_len = struct.unpack("<Q", _f.read(8))[0]
-                    rp = pickle.loads(_f.read(meta_len))
-                    rp["tensor_buffer"] = torch.from_numpy(
-                        np.frombuffer(_f.read(), dtype=np.uint8))
-            else:
-                rp = torch.load(replica_path, map_location="cpu", weights_only=False)
-
-            # Build metadata dict with everything the receiver needs
+            rp = _load_replica_full(replica_path)
             meta = {
                 "tensor_infos": rp["source_tensor_infos"],
                 "non_tensor_data": rp["source_non_tensor_data"],
                 "flat_key_roots": rp["source_flat_key_roots"],
                 "tensor_buffer_size": rp["source_tensor_buffer_size"],
             }
-            import pickle as _pickle
-            meta_bytes = _pickle.dumps(meta)
-
-            # Send: [metadata_size:8B][metadata_bytes][tensor_data]
-            meta_size_tensor = torch.tensor([len(meta_bytes)], dtype=torch.long)
-            torch.distributed.send(meta_size_tensor, dst=f, group=gloo_group)
-            meta_tensor = torch.frombuffer(bytearray(meta_bytes), dtype=torch.uint8)
-            torch.distributed.send(meta_tensor, dst=f, group=gloo_group)
+            meta_bytes = pickle.dumps(meta)
+            header = struct.pack("<Q", len(meta_bytes))
 
             replica_buffer = rp["tensor_buffer"]
             buf = replica_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
-            torch.distributed.send(buf, dst=f, group=gloo_group)
+
+            # Pack: [header:8B][meta_bytes][tensor_data]
+            combined = torch.cat([
+                torch.frombuffer(bytearray(header), dtype=torch.uint8),
+                torch.frombuffer(bytearray(meta_bytes), dtype=torch.uint8),
+                buf,
+            ])
+
             logger.info(
-                f"Gemini Replicas recovery rank {rank}: sent metadata + "
-                f"{buf.numel() / (1024**2):.2f} MB to rank {f}"
+                f"Gemini Replicas recovery rank {rank}: sending combined buffer "
+                f"({combined.numel() / (1024**2):.2f} MB) to rank {f} via "
+                f"{'RDMA' if manager.use_rdma else 'ASIO'}"
+            )
+            manager.send_to_rank(f, combined)
+            logger.info(
+                f"Gemini Replicas recovery rank {rank}: sent to rank {f}"
             )
 
     else:
@@ -612,26 +682,45 @@ def _run_hardware_recovery(
                 f"global_assignments={global_assignments}"
             )
 
-        # ---- Phase 3: receive metadata + tensor data ----
-        meta_size_tensor = torch.empty(1, dtype=torch.long)
-        torch.distributed.recv(meta_size_tensor, src=sender, group=gloo_group)
-        meta_size = int(meta_size_tensor[0].item())
+        # Exchange combined sizes
+        combined_sizes: Dict[int, int] = {}
+        all_combined_sizes: List[Dict[int, int]] = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(all_combined_sizes, combined_sizes)
 
-        meta_tensor = torch.empty(meta_size, dtype=torch.uint8)
-        torch.distributed.recv(meta_tensor, src=sender, group=gloo_group)
-        import pickle as _pickle
-        meta = _pickle.loads(meta_tensor.numpy().tobytes())
+        global_combined_sizes: Dict[int, int] = {}
+        for cs in all_combined_sizes:
+            if cs:
+                global_combined_sizes.update(cs)
+
+        combined_size = global_combined_sizes.get(rank)
+        if combined_size is None:
+            raise RuntimeError(
+                f"Gemini Replicas recovery rank {rank}: no combined size info. "
+                f"global_combined_sizes={global_combined_sizes}"
+            )
+
+        # ---- Phase 3: receive via C++ ASIO/RDMA ----
+        logger.info(
+            f"Gemini Replicas recovery rank {rank}: receiving "
+            f"{combined_size / (1024**2):.2f} MB from sender rank {sender} via "
+            f"{'RDMA' if manager.use_rdma else 'ASIO'}"
+        )
+        combined = manager.recv_from_rank(sender, combined_size)
+
+        # Parse combined buffer: [header:8B][meta_bytes][tensor_data]
+        header = combined[:8].numpy().tobytes()
+        meta_size = struct.unpack("<Q", header)[0]
+        meta_bytes = combined[8:8 + meta_size].numpy().tobytes()
+        meta = pickle.loads(meta_bytes)
 
         # Store metadata for reconstruction
         _recovery_meta[rank] = meta
 
-        buf_size = meta["tensor_buffer_size"]
-        recovered_buffer = torch.empty(buf_size, dtype=torch.uint8)
-        torch.distributed.recv(recovered_buffer, src=sender, group=gloo_group)
-
+        recovered_buffer = combined[8 + meta_size:combined_size].clone()
         logger.info(
-            f"Gemini Replicas recovery rank {rank}: received metadata + "
-            f"{buf_size / (1024**2):.2f} MB from sender rank {sender}"
+            f"Gemini Replicas recovery rank {rank}: received metadata "
+            f"({meta_size} B) + tensor data "
+            f"({recovered_buffer.numel() / (1024**2):.2f} MB) from sender {sender}"
         )
         return recovered_buffer
 

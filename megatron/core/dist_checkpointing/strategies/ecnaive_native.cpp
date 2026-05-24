@@ -3710,7 +3710,6 @@ private:
     AsioConnectionManager conn_;
     
     // RDMA resources
-    static constexpr int RDMA_NUM_SAVE_CHANNELS = 6;   // legacy, for k=2
     static constexpr int RDMA_NUM_LOAD_CHANNELS = 8;   // legacy, for k=2 load
     bool use_rdma_;
     ibv_context* rdma_context_;
@@ -3824,8 +3823,7 @@ private:
     std::unique_ptr<IConnectionChannel> recv_parity1_channel_;
     std::unique_ptr<IConnectionChannel> recv_parity0_channel_;
     std::unique_ptr<IConnectionChannel> recv_data1_channel_;
-    ibv_cq* rdma_send_cq_[6]{};
-    ibv_cq* rdma_recv_cq_[6]{};
+    // RDMA save CQs are stored in rdma_send_cqs_ / rdma_recv_cqs_ (sized to 2*num_channels_)
     
     // Load mode flags
     std::atomic<bool> is_load_mode_{false};
@@ -4003,21 +4001,24 @@ private:
             throw std::runtime_error("Failed to allocate protection domain");
         }
         
-        // Create 6 pairs of completion queues (one send_cq + one recv_cq per channel for 4-rank save)
-        for (int i = 0; i < RDMA_NUM_SAVE_CHANNELS; ++i) {
-            rdma_send_cq_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
-            rdma_recv_cq_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
-            if (!rdma_send_cq_[i] || !rdma_recv_cq_[i]) {
-                // Clean up already created CQs on failure
+        // Create 2 * num_channels_ CQ pairs: one send_cq + one recv_cq per save channel
+        int total_cqs = 2 * num_channels_;
+        rdma_send_cqs_.resize(total_cqs, nullptr);
+        rdma_recv_cqs_.resize(total_cqs, nullptr);
+        for (int i = 0; i < total_cqs; ++i) {
+            rdma_send_cqs_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            rdma_recv_cqs_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            if (!rdma_send_cqs_[i] || !rdma_recv_cqs_[i]) {
                 for (int j = 0; j < i; ++j) {
-                    if (rdma_send_cq_[j]) { ibv_destroy_cq(rdma_send_cq_[j]); rdma_send_cq_[j] = nullptr; }
-                    if (rdma_recv_cq_[j]) { ibv_destroy_cq(rdma_recv_cq_[j]); rdma_recv_cq_[j] = nullptr; }
+                    if (rdma_send_cqs_[j]) { ibv_destroy_cq(rdma_send_cqs_[j]); rdma_send_cqs_[j] = nullptr; }
+                    if (rdma_recv_cqs_[j]) { ibv_destroy_cq(rdma_recv_cqs_[j]); rdma_recv_cqs_[j] = nullptr; }
                 }
                 throw std::runtime_error("Failed to create completion queues for RDMA channel " + std::to_string(i));
             }
         }
-        
-        std::cout << "[ECNAIVE RDMA] RDMA resources initialized successfully (6 CQ pairs for save channels)" << std::endl;
+
+        std::cout << "[ECNAIVE RDMA] RDMA resources initialized successfully ("
+                  << total_cqs << " CQ pairs for save channels, k=" << k_ << ")" << std::endl;
     }
 
     // Load mode RDMA: 8 CQ pairs for rank2 recovery (8 recv channels). Call when init_ecnaive_load_connections.
@@ -4281,17 +4282,15 @@ private:
             rdma_registered_buffers_.clear();
         }
         
-        // Destroy 6 pairs of CQs
-        for (int i = 0; i < RDMA_NUM_SAVE_CHANNELS; ++i) {
-            if (rdma_send_cq_[i]) {
-                ibv_destroy_cq(rdma_send_cq_[i]);
-                rdma_send_cq_[i] = nullptr;
-            }
-            if (rdma_recv_cq_[i]) {
-                ibv_destroy_cq(rdma_recv_cq_[i]);
-                rdma_recv_cq_[i] = nullptr;
-            }
+        // Destroy save CQs from vectors (sized to 2 * num_channels_)
+        for (auto& cq : rdma_send_cqs_) {
+            if (cq) { ibv_destroy_cq(cq); cq = nullptr; }
         }
+        for (auto& cq : rdma_recv_cqs_) {
+            if (cq) { ibv_destroy_cq(cq); cq = nullptr; }
+        }
+        rdma_send_cqs_.clear();
+        rdma_recv_cqs_.clear();
         
         // Dealloc PD
         if (rdma_pd_) {
@@ -4461,7 +4460,7 @@ private:
             for (int i = 0; i < num_channels_; ++i) {
                 send_channels_[i] = std::make_unique<RdmaConnectionChannel>(
                     rdma_context_, rdma_pd_,
-                    rdma_send_cq_[i], rdma_recv_cq_[i],
+                    rdma_send_cqs_[i], rdma_recv_cqs_[i],
                     rdma_send_fds_[i], rdma_send_fds_[i],
                     &rdma_registered_buffers_, &rdma_buffer_mutex_,
                     rank_in_group_, 0);
@@ -4470,7 +4469,7 @@ private:
             for (int i = 0; i < num_channels_; ++i) {
                 recv_channels_[i] = std::make_unique<RdmaConnectionChannel>(
                     rdma_context_, rdma_pd_,
-                    rdma_send_cq_[i + num_channels_], rdma_recv_cq_[i + num_channels_],
+                    rdma_send_cqs_[i + num_channels_], rdma_recv_cqs_[i + num_channels_],
                     rdma_recv_fds_[i], rdma_recv_fds_[i],
                     &rdma_registered_buffers_, &rdma_buffer_mutex_,
                     rank_in_group_, 0);

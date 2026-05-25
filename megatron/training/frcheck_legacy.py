@@ -1275,13 +1275,19 @@ def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             )
             failed_ranks = []
         logger.info("FRCheck: software failure mode — failed ranks %s", failed_ranks)
-        return _recover_frcheck_legacy_software(checkpoint_name, failed_ranks)
+        t_load = time.time()
+        result = _recover_frcheck_legacy_software(checkpoint_name, failed_ranks)
+        logger.info("FRCheck load time (excl disk): %.2fs", time.time() - t_load)
+        return result
 
     # Check for hardware recovery mode
     if hw_failure:
         if failed_ranks:
             logger.info("FRCheck: hardware recovery mode — failed ranks %s", failed_ranks)
-            return recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
+            t_load = time.time()
+            result = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
+            logger.info("FRCheck load time (excl disk): %.2fs", time.time() - t_load)
+            return result
 
     raise NotImplementedError(
         "FRCheck legacy load (non-recovery) is not implemented; use a checkpoint saved "

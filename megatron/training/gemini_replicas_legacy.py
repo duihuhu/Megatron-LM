@@ -744,7 +744,6 @@ def load_gemini_replicas_legacy_checkpoint(
       Failed ranks recover from other ranks' replica files.  After recovery,
       the main .pt file is regenerated.
     """
-    start_time = time.time()
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = (
@@ -789,6 +788,8 @@ def load_gemini_replicas_legacy_checkpoint(
         main_payload = (read_raw_checkpoint(str(main_path), MAGIC_GEMINI)
                         if is_raw_format(str(main_path), MAGIC_GEMINI)
                         else torch.load(main_path, map_location="cpu", weights_only=False))
+
+    t_load = time.time()  # start timer after main payload disk I/O
 
     # ---- Software failure path ----
     # In software failure, all checkpoint files are intact on disk.
@@ -845,8 +846,10 @@ def load_gemini_replicas_legacy_checkpoint(
         else:
             failed_override = None  # auto-detect inside _run_hardware_recovery
 
-        # Step 1: Exchange all-to-all metadata
+        # Step 1: Exchange all-to-all metadata (includes disk reads)
         meta = _collect_metadata_for_failed_rank(checkpoint_dir, rank, world_size)
+
+        t_load = time.time()  # reset timer: recovery disk I/O done
 
         # Step 2: Recovery data transfer
         recovered_buffer = _run_hardware_recovery(
@@ -898,7 +901,7 @@ def load_gemini_replicas_legacy_checkpoint(
         manager.cleanup()
         manager._gemini_replicas_native = None
 
-    logger.info(f"GEMINI REPLICAS legacy load: done in {time.time() - start_time:.2f}s")
+    logger.info("GEMINI REPLICAS legacy load time (excl disk): %.2fs", time.time() - t_load)
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()

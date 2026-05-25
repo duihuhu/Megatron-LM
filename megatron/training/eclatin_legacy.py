@@ -849,6 +849,9 @@ def _run_eclatin_full_recovery(
         logger.info(
             f"ECLATIN legacy load: hw recovery done in {time() - start_time:.2f}s (rank_in_group=2)"
         )
+        logger.info(
+            "ECLATIN legacy load time (excl alloc/conn): %.2fs", time() - start_time,
+        )
     elif rank_in_group == 0:
         data2_addr = int(eclatin_blocks["data_block_2"].data_ptr())
         parity2_addr = int(eclatin_blocks["parity_block_2"].data_ptr())
@@ -892,7 +895,6 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     Load ECLATIN torch legacy checkpoint: run recovery (aligned with torch_dist), then reconstruct
     state_dict from main tensor_buffer (rank_in_group 2 may use recovered_buffer).
     """
-    start_time = time.time()
     from megatron.training import get_args
 
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
@@ -981,8 +983,6 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         main_payload,
         recovered_buffer=recovered_buffer if rank_in_group == 2 else None,
     )
-
-    logger.info(f"ECLATIN legacy load: done in {time.time() - start_time:.2f}s")
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()

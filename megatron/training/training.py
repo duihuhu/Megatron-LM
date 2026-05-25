@@ -1545,7 +1545,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 "[VERIFICATION] Layer-wise optimizer update was requested but not supported "
                 "by current optimizer. Falling back to standard update."
             )
+        t1 = time.time()
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        t2 = time.time()
+        print("optimzer update ", t2-t1)
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,

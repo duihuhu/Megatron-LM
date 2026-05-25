@@ -1,19 +1,19 @@
 #!/bin/bash
 
 # Script to run a single node in 4-node simulation (default 1 GPU per node)
-# Usage: ./test_eccheck_4nodes_node_335M_eccheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]
-# Example: ./test_eccheck_4nodes_node_335M_eccheck.sh 0 0
-# Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_eccheck.sh 0 2 3
+# Usage: ./test_eccheck_4nodes_node.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]
+# Example: ./test_eccheck_4nodes_node.sh 0 0
+# Example (2 GPUs per container): ./test_eccheck_4nodes_node.sh 0 2 3
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=eth0
+export NETIFACES_INTERFACE=bond0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-MASTER_ADDR=172.16.0.217
+MASTER_ADDR=10.0.0.62
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
@@ -21,9 +21,27 @@ NNODES=4
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
-export ECCHECK_INTERFACE=$NETIFACES_INTERFACE
-export MEGATRON_ECCHECK_LOAD_NET_TRACE=1
+export ECNAIVE_INTERFACE=$NETIFACES_INTERFACE
+export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
+export MEGATRON_ECNAIVE_LOAD_NET_TRACE=1
+export ECNAIVE_LOCAL_RANK_NIC_0=bond0
 
+#  priority from
+#  ┌──────────────────────────────────────────┬──────────────────────────┐
+#  │                 环境变量                 │           用途           │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ ECNAIVE_RANK_IP_0=10.0.0.1               │ 每个 rank 显式指定 IP    │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ ECNAIVE_LOCAL_RANK_NIC_0=mlx5_0          │ 每个 local_rank 绑定 NIC │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ ECNAIVE_NIC_LIST + ECNAIVE_RANKS_PER_NIC │ 批量 NIC 分配            │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ ECNAIVE_BASE_IP=10.0.0.1                 │ 所有 rank 同一 IP        │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ ECNAIVE_INTERFACE=bond0                  │ 从指定接口自动检测 IP    │
+#  ├──────────────────────────────────────────┼──────────────────────────┤
+#  │ MASTER_ADDR                              │ 最终 fallback            │
+#  └──────────────────────────────────────────┴──────────────────────────┘
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -42,7 +60,7 @@ done
 
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
     echo "Error: At least one GPU id must be specified."
-    echo "Usage: ./test_eccheck_4nodes_node_335M_eccheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]"
+    echo "Usage: ./test_eccheck_4nodes_node.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]"
     exit 1
 fi
 
@@ -58,16 +76,17 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs"
-CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-naive"
-DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
+TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
+CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-naive" #<Specify path>
+DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
 
 # Remaining args after node-rank and GPU ids are passed to the training script
 ARGS_TO_PASS=("$@")
 
-# fixed Model related configuration here, pls not overlap with json config
+# Model related configuration here, please do not overlap with json config
+
 HIDDEN_SIZE=4096
 NUM_ATTENTION_HEADS=32
 NUM_LAYERS=32 
@@ -121,7 +140,7 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 1
+    --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 4
 )
 
@@ -129,17 +148,32 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    --save $CHECKPOINT_PATH
-    --load $CHECKPOINT_PATH
+    --save $CHECKPOINT_PATH 
+    --use-ecnaive-software-failure
+    #--load $CHECKPOINT_PATH
     --eval-iters 1
-    --tensorboard-dir $TENSORBOARD_LOGS_PATH
+    --tensorboard-dir $TENSORBOARD_LOGS_PATH 
+    # --use-eccheck
+
+    # --use-gemini
+    # --use-gemini-optimized
+    # --use-gemini-software-failure
+    # --use-gemini-hardware-failure
+    # --use-distributed-optimizer
+    # --use-ecnaive-software-failure
     --use-ecnaive
-    #--use-eccheck-software-failure
-    --ckpt-format torch_dist
+    --ckpt-format torch
+    # --no-save-optim
+    # --no-load-optim
     --save-embeddings-separately
-    --timing-log-level 2
-    --timing-log-option all
     --use-rdma
+    --timing-log-level 2
+
+    # --- EC-NAIVE generalized parameters ---
+     --ecnaive-rs-k 6             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
+    #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
+    #--ecnaive-failed-ranks 1,2   # Comma-separated failed global ranks for software recovery
+    #                                Uses ISA-L RS decoding (GF(2^8)) to recover 1-2 lost blocks
 )
 
 mkdir -p logs
@@ -149,7 +183,7 @@ mkdir -p logs/csv
 # Print command if PRINT_CMD is set
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------

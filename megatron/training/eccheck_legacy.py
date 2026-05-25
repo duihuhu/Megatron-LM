@@ -1010,7 +1010,6 @@ def state_dict_from_eccheck_main_metadata_only(
 # ---------------------------------------------------------------------------
 
 def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
-    start_time = time.time()
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -1083,6 +1082,8 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 
+    t_load = time.time()  # after all alloc + block memcopy
+
     _run_eccheck_legacy_recovery(
         manager=manager,
         rank=rank,
@@ -1106,7 +1107,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     # Stop C++ load workers so they don't interfere with subsequent training.
     # The singleton manager will be reinitialized on the next save.
-    logger.info(f"ECCHECK legacy load: done in {time.time() - start_time:.2f}s")
+    logger.info("ECCHECK legacy load time (excl disk): %.2fs", time.time() - t_load)
     logger.info(f"ECCHECK legacy: cleaning up C++ module after recovery (rank {rank})")
     manager.cleanup()
     manager._eccheck_native = None

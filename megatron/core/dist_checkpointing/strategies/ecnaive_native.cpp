@@ -2827,53 +2827,64 @@ public:
     // Software failure mode interfaces (direct send/recv without pipeline)
 
     // rank3 software failure mode send d21 (once complete transmission)
+    // ---- Generalized software failure send/recv (supports any k) ----
+
+    // Legacy k=2 aliases for backward compat
     void software_send_rank3_data1(uintptr_t send_addr, size_t size) {
-        if (rank_ != 3) return;
-
-        if (!conn_.is_ecnaive_load_send_rank3_data1_connected()) {
-            std::cerr << "EC-NAIVE: [Rank 3] Software send socket not connected" << std::endl;
-            return;
-        }
-
-        if (use_rdma_ && rdma_software_load_channel_) {
-            std::cout << "[ECNAIVE RDMA] Load: Sending " << size << " bytes via RDMA" << std::endl;
-            rdma_software_load_channel_->send_data(reinterpret_cast<const uint8_t*>(send_addr), size);
-            std::cout << "EC-NAIVE: [Rank 3] Software sent d21 (RDMA, size=" << size << ")" << std::endl;
-            return;
-        }
-
-        auto& socket = conn_.get_ecnaive_load_send_rank3_data1_socket();
-        std::cout << "[ECNAIVE ASIO] Load: Sending " << size << " bytes via ASIO" << std::endl;
-        if (!send_with_size(socket, send_addr, size)) {
-            std::cerr << "EC-NAIVE: [Rank 3] Software send failed" << std::endl;
-        } else {
-            std::cout << "EC-NAIVE: [Rank 3] Software sent d21 (size=" << size << ")" << std::endl;
-        }
+        sw_send_data(0, send_addr, size);
+    }
+    void software_recv_data1(uintptr_t recv_addr, size_t size) {
+        sw_recv_data(0, recv_addr, size);
     }
 
-    // rank2 software failure mode receive d21 (once complete transmission)
-    void software_recv_data1(uintptr_t recv_addr, size_t size) {
-        if (rank_ != 2) return;
-
-        if (!conn_.is_ecnaive_load_recv_rank3_data1_connected()) {
-            std::cerr << "EC-NAIVE: [Rank 2] Software recv socket not connected" << std::endl;
+    void sw_send_data(int block_idx, uintptr_t send_addr, size_t size) {
+        // Forward to RANK2 (failed rank): try RDMA channel first, fall back to ASIO socket
+        if (use_rdma_ && block_idx >= 0 && static_cast<size_t>(block_idx) < rdma_sw_recovery_channels_.size()
+            && rdma_sw_recovery_channels_[block_idx]) {
+            rdma_sw_recovery_channels_[block_idx]->send_data(
+                reinterpret_cast<const uint8_t*>(send_addr), size);
             return;
         }
-
-        if (use_rdma_ && rdma_software_load_channel_) {
-            std::cout << "[ECNAIVE RDMA] Load: Receiving " << size << " bytes via RDMA" << std::endl;
-            rdma_software_load_channel_->receive_data(reinterpret_cast<uint8_t*>(recv_addr), size);
-            std::cout << "EC-NAIVE: [Rank 2] Software received d21 (RDMA, size=" << size << ")" << std::endl;
+        // ASIO fallback: only rank 3 connects for block 0 in legacy k=2 mode.
+        // Generalized mode uses sw_asio_send_sockets_ set up by init_ecnaive_load_sw_connect.
+        if (block_idx >= 0 && static_cast<size_t>(block_idx) < sw_asio_send_sockets_.size()
+            && sw_asio_send_sockets_[block_idx] && sw_asio_send_sockets_[block_idx]->is_open()) {
+            send_with_size(*sw_asio_send_sockets_[block_idx], send_addr, size);
             return;
         }
-
-        auto& socket = conn_.get_ecnaive_load_recv_rank3_data1_socket();
-        std::cout << "[ECNAIVE ASIO] Load: Receiving " << size << " bytes via ASIO" << std::endl;
-        if (!recv_with_size_bool(socket, reinterpret_cast<void*>(recv_addr), size)) {
-            std::cerr << "EC-NAIVE: [Rank 2] Software recv failed" << std::endl;
-        } else {
-            std::cout << "EC-NAIVE: [Rank 2] Software received d21 (size=" << size << ")" << std::endl;
+        // Legacy k=2 path: dedicated named socket
+        if (block_idx == 0 && conn_.is_ecnaive_load_send_rank3_data1_connected()) {
+            send_with_size(conn_.get_ecnaive_load_send_rank3_data1_socket(), send_addr, size);
+            return;
         }
+        std::cerr << "EC-NAIVE: sw_send_data(" << block_idx << ", " << size << "): no channel" << std::endl;
+    }
+
+    void sw_recv_data(int block_idx, uintptr_t recv_addr, size_t size) {
+        if (use_rdma_ && block_idx >= 0 && static_cast<size_t>(block_idx) < rdma_sw_recovery_channels_.size()
+            && rdma_sw_recovery_channels_[block_idx]) {
+            rdma_sw_recovery_channels_[block_idx]->receive_data(
+                reinterpret_cast<uint8_t*>(recv_addr), size);
+            return;
+        }
+        // ASIO generalized path
+        if (block_idx >= 0 && static_cast<size_t>(block_idx) < sw_asio_recv_sockets_.size()
+            && sw_asio_recv_sockets_[block_idx] && sw_asio_recv_sockets_[block_idx]->is_open()) {
+            if (!recv_with_size_bool(*sw_asio_recv_sockets_[block_idx],
+                                     reinterpret_cast<void*>(recv_addr), size)) {
+                std::cerr << "EC-NAIVE: sw_recv_data(" << block_idx << ") recv failed" << std::endl;
+            }
+            return;
+        }
+        // Legacy k=2 path
+        if (block_idx == 0 && conn_.is_ecnaive_load_recv_rank3_data1_connected()) {
+            if (!recv_with_size_bool(conn_.get_ecnaive_load_recv_rank3_data1_socket(),
+                                     reinterpret_cast<void*>(recv_addr), size)) {
+                std::cerr << "EC-NAIVE: sw_recv_data(0) legacy recv failed" << std::endl;
+            }
+            return;
+        }
+        std::cerr << "EC-NAIVE: sw_recv_data(" << block_idx << ", " << size << "): no channel" << std::endl;
     }
 
     // Wait for load completion (rank2 only)
@@ -3405,7 +3416,116 @@ public:
             }
         }
     }
-    
+
+    // ===== Generalized SW recovery connections (k-1 ports, any k >= 2) =====
+
+    void init_ecnaive_load_sw_bind_listen(
+        int rank_in_group, const std::string& receiver_ip,
+        int num_blocks, const std::vector<uint16_t>& ports) {
+        sw_recovery_num_blocks_ = num_blocks;
+        sw_asio_acceptors_.resize(num_blocks);
+        sw_asio_recv_sockets_.resize(num_blocks);
+        sw_asio_send_sockets_.resize(num_blocks);
+        rdma_sw_recovery_channels_.resize(num_blocks);
+        if (rank_in_group != 2) return;  // only the receiver binds/listens
+
+        for (int i = 0; i < num_blocks; ++i) {
+            sw_asio_acceptors_[i] = std::make_unique<boost::asio::ip::tcp::acceptor>(
+                sw_recovery_io_);
+            sw_asio_acceptors_[i]->open(boost::asio::ip::tcp::v4());
+            sw_asio_acceptors_[i]->set_option(
+                boost::asio::ip::tcp::acceptor::reuse_address(true));
+            sw_asio_acceptors_[i]->bind(
+                boost::asio::ip::tcp::endpoint(
+                    boost::asio::ip::address::from_string(receiver_ip), ports[i]));
+            sw_asio_acceptors_[i]->listen();
+        }
+        std::cout << "EC-NAIVE: [Rig 2] SW recovery bind/listen on " << num_blocks
+                  << " ports" << std::endl;
+    }
+
+    void init_ecnaive_load_sw_connect(
+        int rank_in_group, const std::string& receiver_ip,
+        int num_blocks, const std::vector<uint16_t>& ports) {
+        if (num_blocks != sw_recovery_num_blocks_) {
+            std::cerr << "EC-NAIVE: SW recovery port count mismatch "
+                      << num_blocks << " vs " << sw_recovery_num_blocks_ << std::endl;
+            return;
+        }
+        if (rank_in_group == 2) {
+            // Receiver: accept all connections
+            for (int i = 0; i < num_blocks; ++i) {
+                sw_asio_recv_sockets_[i] = std::make_unique<boost::asio::ip::tcp::socket>(
+                    sw_recovery_io_);
+                sw_asio_acceptors_[i]->accept(*sw_asio_recv_sockets_[i]);
+            }
+            std::cout << "EC-NAIVE: [Rig 2] SW recovery accepted " << num_blocks
+                      << " connections" << std::endl;
+        } else {
+            // Sender ranks: connect to receiver for blocks they own
+            for (int i = 0; i < num_blocks; ++i) {
+                sw_asio_send_sockets_[i] = std::make_unique<boost::asio::ip::tcp::socket>(
+                    sw_recovery_io_);
+                // Retry loop for connect (receiver may not be listening yet)
+                int max_retries = 10;
+                for (int retry = 0; retry < max_retries; ++retry) {
+                    try {
+                        sw_asio_send_sockets_[i]->connect(
+                            boost::asio::ip::tcp::endpoint(
+                                boost::asio::ip::address::from_string(receiver_ip),
+                                ports[i]));
+                        break;
+                    } catch (const boost::system::system_error&) {
+                        if (retry == max_retries - 1) throw;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                }
+            }
+        }
+
+        // RDMA channels (if enabled)
+        if (use_rdma_ && (rank_in_group == 2 ||
+            (rank_in_group >= 3 && rank_in_group < 3 + num_blocks))) {
+            if (!rdma_pd_) {
+                if (!rdma_context_) {
+                    if (ibv_fork_init() != 0) {
+                        std::cerr << "[ECNAIVE RDMA] WARNING: ibv_fork_init() failed." << std::endl;
+                    }
+                    int num_devices;
+                    ibv_device** device_list = ibv_get_device_list(&num_devices);
+                    if (device_list && num_devices > 0) {
+                        rdma_context_ = ibv_open_device(
+                            find_rdma_device_by_ip(recv_ips_[0], device_list, num_devices));
+                        ibv_free_device_list(device_list);
+                    }
+                }
+                if (rdma_context_) {
+                    rdma_pd_ = ibv_alloc_pd(rdma_context_);
+                }
+            }
+            for (int i = 0; i < num_blocks; ++i) {
+                int sock_fd = -1;
+                if (rank_in_group == 2 && sw_asio_recv_sockets_[i]) {
+                    sock_fd = sw_asio_recv_sockets_[i]->native_handle();
+                } else if (rank_in_group != 2 && sw_asio_send_sockets_[i]
+                           && sw_asio_send_sockets_[i]->is_open()) {
+                    sock_fd = sw_asio_send_sockets_[i]->native_handle();
+                }
+                if (sock_fd < 0) continue;
+                auto send_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+                auto recv_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+                rdma_sw_recovery_channels_[i] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, send_cq, recv_cq,
+                    sock_fd, sock_fd, &rdma_registered_buffers_, &rdma_buffer_mutex_,
+                    rank_in_group, 2);
+                rdma_sw_recovery_channels_[i]->exchange_and_connect(
+                    rank_in_group == 2);
+            }
+            std::cout << "EC-NAIVE: SW recovery RDMA channels initialized for "
+                      << num_blocks << " blocks" << std::endl;
+        }
+    }
+
     void wait_for_load_connections(int timeout_seconds = 30) {
         if (!is_load_mode_) {
             std::cerr << "ECLATIN: wait_for_load_connections called but not in load mode" << std::endl;
@@ -3731,10 +3851,17 @@ private:
 
     // Load mode RDMA channels
     std::vector<std::unique_ptr<RdmaConnectionChannel>> rdma_load_channels_;
-    // Software-only load RDMA: 1 channel
+    // Software-only load RDMA: 1 channel (legacy k=2, kept for backward compat)
     ibv_cq* rdma_software_load_send_cq_;
     ibv_cq* rdma_software_load_recv_cq_;
     std::unique_ptr<RdmaConnectionChannel> rdma_software_load_channel_;
+    // Generalized SW recovery: k-1 channels (one per non-local data block)
+    boost::asio::io_context sw_recovery_io_;
+    int sw_recovery_num_blocks_{0};
+    std::vector<std::unique_ptr<boost::asio::ip::tcp::acceptor>> sw_asio_acceptors_;
+    std::vector<std::unique_ptr<boost::asio::ip::tcp::socket>>   sw_asio_recv_sockets_;
+    std::vector<std::unique_ptr<boost::asio::ip::tcp::socket>>   sw_asio_send_sockets_;
+    std::vector<std::unique_ptr<RdmaConnectionChannel>> rdma_sw_recovery_channels_;
 
     // Save mode network config (generalized vectors)
     std::vector<std::string> send_ips_;
@@ -6143,6 +6270,23 @@ PYBIND11_MODULE(ecnaive_native, m) {
              "Software failure mode: rank2 receive d21 from rank3",
              pybind11::arg("recv_addr"),
              pybind11::arg("size"))
+        // Generalized SW recovery (k-1 ports, supports any k >= 2)
+        .def("init_ecnaive_load_sw_bind_listen",
+             &ECNaiveNative::init_ecnaive_load_sw_bind_listen,
+             "Generalized SW recovery phase 1: bind/listen on k-1 ports",
+             pybind11::arg("rank_in_group"), pybind11::arg("receiver_ip"),
+             pybind11::arg("num_blocks"), pybind11::arg("ports"))
+        .def("init_ecnaive_load_sw_connect",
+             &ECNaiveNative::init_ecnaive_load_sw_connect,
+             "Generalized SW recovery phase 2: accept (receiver) or connect (senders)",
+             pybind11::arg("rank_in_group"), pybind11::arg("receiver_ip"),
+             pybind11::arg("num_blocks"), pybind11::arg("ports"))
+        .def("sw_send_data", &ECNaiveNative::sw_send_data,
+             "Generalized SW recovery: send data block by index",
+             pybind11::arg("block_idx"), pybind11::arg("addr"), pybind11::arg("size"))
+        .def("sw_recv_data", &ECNaiveNative::sw_recv_data,
+             "Generalized SW recovery: receive data block by index",
+             pybind11::arg("block_idx"), pybind11::arg("addr"), pybind11::arg("size"))
         // Old load mode functions (kept for compatibility, may be removed later)
         .def("init_load_connections", &ECNaiveNative::init_load_connections,
              "Initialize load mode connections (rank0 recv, rank1/2/3 send)",

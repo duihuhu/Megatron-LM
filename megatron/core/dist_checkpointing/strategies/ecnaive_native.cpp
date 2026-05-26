@@ -2867,21 +2867,11 @@ public:
                 reinterpret_cast<uint8_t*>(recv_addr), size);
             return;
         }
-<<<<<<< HEAD
 
         if (use_rdma_ && rdma_software_load_channel_) {
             // std::cout << "[ECNAIVE RDMA] Load: Receiving " << size << " bytes via RDMA" << std::endl;
             rdma_software_load_channel_->receive_data(reinterpret_cast<uint8_t*>(recv_addr), size);
             std::cout << "EC-NAIVE: [Rank 2] Software received d21 (RDMA, size=" << size << ")" << std::endl;
-=======
-        // ASIO generalized path
-        if (block_idx >= 0 && static_cast<size_t>(block_idx) < sw_asio_recv_sockets_.size()
-            && sw_asio_recv_sockets_[block_idx] && sw_asio_recv_sockets_[block_idx]->is_open()) {
-            if (!recv_with_size_bool(*sw_asio_recv_sockets_[block_idx],
-                                     reinterpret_cast<void*>(recv_addr), size)) {
-                std::cerr << "EC-NAIVE: sw_recv_data(" << block_idx << ") recv failed" << std::endl;
-            }
->>>>>>> c063294050ce3998d2fd42c996bb28ac2c5c3f43
             return;
         }
         // Legacy k=2 path

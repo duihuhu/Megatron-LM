@@ -8,12 +8,12 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=bond0
+export NETIFACES_INTERFACE=eth0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-MASTER_ADDR=10.0.0.62
+MASTER_ADDR=172.16.0.224
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
@@ -109,7 +109,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00015
-    --train-iters 2
+    --train-iters 5
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -121,7 +121,7 @@ GPT_ARGS=(
     --use-mcore-models
     --transformer-impl transformer_engine
     --no-scatter-gather-tensors-in-pipeline
-    --num-layers 32
+    --num-layers $NUM_LAYERS
     --optimizer adam
     --loss-scale 8192
 )
@@ -143,8 +143,8 @@ EVAL_AND_LOGGING_ARGS=(
     #--use-eccheck-software-failure
     --ckpt-format torch
     --save-embeddings-separately
-    --timing-log-level 2
-    --timing-log-option all
+    # --timing-log-level 2
+    # --timing-log-option all
     --use-rdma
 )
 

@@ -2014,7 +2014,7 @@ private:
             // Send data using RDMA, ASIO, or NCCL
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_qp_) {
-                std::cout << "[EC-CHECK RDMA] Save_XOR_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
+                // std::cout << "[EC-CHECK RDMA] Save_XOR_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                 try {
                     rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_send_control_sock(),
                         rdma_xor_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
@@ -2029,7 +2029,7 @@ private:
 #endif
             if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_send_connected()) {
                 // ASIO send path (synchronous)
-                std::cout << "[EC-CHECK ASIO] XOR_Send: Sending " << task.size << " bytes via ASIO" << std::endl;
+                // std::cout << "[EC-CHECK ASIO] XOR_Send: Sending " << task.size << " bytes via ASIO" << std::endl;
                 uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.encoding_addr);
                 uint32_t size_net = htonl(static_cast<uint32_t>(task.size));  // Network byte order
                 
@@ -2172,7 +2172,7 @@ private:
             // Receive data using RDMA, ASIO, or NCCL
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_qp_) {
-                std::cout << "[EC-CHECK RDMA] Save_XOR_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                // std::cout << "[EC-CHECK RDMA] Save_XOR_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                 try {
                     size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
                         get_rdma_xor_recv_control_sock(), rdma_xor_recv_control_mutex_,
@@ -2191,7 +2191,7 @@ private:
 #endif
             if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_xor_recv_connected()) {
                 // ASIO recv path (synchronous)
-                std::cout << "[EC-CHECK ASIO] XOR_Recv: Receiving " << task.size << " bytes via ASIO" << std::endl;
+                // std::cout << "[EC-CHECK ASIO] XOR_Recv: Receiving " << task.size << " bytes via ASIO" << std::endl;
                 uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_addr);
                 uint32_t size_net;
                 
@@ -2567,7 +2567,7 @@ private:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_p2p_qp_) {
-                    std::cout << "[EC-CHECK RDMA] Save_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
+                    // std::cout << "[EC-CHECK RDMA] Save_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
                             rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
@@ -2579,7 +2579,7 @@ private:
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_send_connected()) {
                     // ASIO send path (synchronous)
                     const char* send_label = is_p2p_parity_sender() ? "parity" : "data";
-                    std::cout << "[EC-CHECK ASIO] P2P_Send: Sending " << task.size << " bytes (" << send_label << ") via ASIO" << std::endl;
+                    // std::cout << "[EC-CHECK ASIO] P2P_Send: Sending " << task.size << " bytes (" << send_label << ") via ASIO" << std::endl;
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.send_buffer_addr);
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));  // Network byte order
                     
@@ -2766,7 +2766,7 @@ private:
     
     // P2P Recv Worker - 专门接收P2P数据（独立线程，类似 recv_worker_1）
     void p2p_recv_worker() {
-        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker started" << std::endl;
+        // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker started" << std::endl;
         
         // NCCL is already initialized in main thread, no need to initialize here
         
@@ -2815,7 +2815,7 @@ private:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_p2p_qp_) {
-                    std::cout << "[EC-CHECK RDMA] Save_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                    // std::cout << "[EC-CHECK RDMA] Save_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
                             get_rdma_p2p_recv_control_sock(), rdma_p2p_recv_control_mutex_,
@@ -2835,7 +2835,7 @@ private:
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_recv_connected()) {
                     // ASIO recv path (synchronous)
                     const char* recv_label = is_p2p_parity_sender() ? "data" : "parity";
-                    std::cout << "[EC-CHECK ASIO] P2P_Recv: Receiving " << task.size << " bytes (" << recv_label << ") via ASIO" << std::endl;
+                    // std::cout << "[EC-CHECK ASIO] P2P_Recv: Receiving " << task.size << " bytes (" << recv_label << ") via ASIO" << std::endl;
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_buffer_addr);
                     uint32_t size_net;
                     
@@ -2887,8 +2887,8 @@ private:
                         } else {
                             // Map global p2p_partner_rank to communicator-internal rank (0 or 1)
                             int partner_rank_in_comm = (rank_ < p2p_partner_rank_) ? 0 : 1;
-                            std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: partner_rank_in_comm=" 
-                                      << partner_rank_in_comm << " (from global rank " << p2p_partner_rank_ << ")" << std::endl;
+                            // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: partner_rank_in_comm=" 
+                            //           << partner_rank_in_comm << " (from global rank " << p2p_partner_rank_ << ")" << std::endl;
                             if (partner_rank_in_comm < 0 || partner_rank_in_comm >= 2) {
                                 std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid partner_rank_in_comm=" 
                                           << partner_rank_in_comm << " (must be 0 or 1 for 2-rank communicator)" << std::endl;
@@ -2896,33 +2896,33 @@ private:
                                 std::cerr.flush();
                             } else {
                                 const char* recv_label = is_p2p_parity_sender() ? "data" : "parity";
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Starting NCCL recv ("
-                                          << recv_label << "), size=" << task.size
-                                          << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
+                                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Starting NCCL recv ("
+                                //           << recv_label << "), size=" << task.size
+                                //           << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
                                 std::cout.flush();
                                 
                                 ncclGroupStart();
                                 ncclRecv(reinterpret_cast<void*>(task.recv_buffer_addr), task.size,
                                          ncclUint8, partner_rank_in_comm, nccl_comm_p2p_recv_, 0);
                                 ncclGroupEnd();
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL GroupEnd completed, starting sync..." << std::endl;
+                                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL GroupEnd completed, starting sync..." << std::endl;
                                 
                                 // Synchronize NCCL operation
                                 sync_nccl_operation("P2P recv worker: NCCL recv");
-                                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL sync completed" << std::endl;
+                                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL sync completed" << std::endl;
                                 
                                 // Log will be handled in the common section after recv completes
                                 task_processed_nccl = true;
                             }
                         }
                     } else if (DISABLE_P2P_NCCL) {
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL DISABLED for debugging, task processed (no-op)" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: NCCL DISABLED for debugging, task processed (no-op)" << std::endl;
                         // Even when NCCL is disabled, the task is considered processed
                         // This ensures sentinel check logic works correctly
                         task_processed_nccl = true;
                     } else {
-                        std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Skipping NCCL (nccl_p2p_recv_initialized_=" 
-                                  << (nccl_p2p_recv_initialized_ ? "true" : "false") << ", world_size_=" << world_size_ << ")" << std::endl;
+                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Skipping NCCL (nccl_p2p_recv_initialized_=" 
+                        //           << (nccl_p2p_recv_initialized_ ? "true" : "false") << ", world_size_=" << world_size_ << ")" << std::endl;
                         task_processed_nccl = true;
                     }
                     task_processed = task_processed_nccl;
@@ -2934,8 +2934,8 @@ private:
                     task_processed = true;  // Mark as processed to avoid blocking
                 }
             } else {
-                std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Skipping recv (p2p_partner_rank_=" 
-                          << p2p_partner_rank_ << ", task.size=" << task.size << "), task processed" << std::endl;
+                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Skipping recv (p2p_partner_rank_=" 
+                //           << p2p_partner_rank_ << ", task.size=" << task.size << "), task processed" << std::endl;
                 task_processed = true;
             }
             
@@ -4583,7 +4583,7 @@ public:
             // Send encoding using RDMA or ASIO (load mode)
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_qp_) {
-                std::cout << "[EC-CHECK RDMA] Load_XOR_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
+                // std::cout << "[EC-CHECK RDMA] Load_XOR_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                 const auto t_net = std::chrono::steady_clock::now();
                 try {
                     rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_send_control_sock(),
@@ -4705,7 +4705,7 @@ public:
             // Receive encoding using RDMA or ASIO (load mode)
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_qp_) {
-                std::cout << "[EC-CHECK RDMA] Load_XOR_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                // std::cout << "[EC-CHECK RDMA] Load_XOR_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                 const auto t_net = std::chrono::steady_clock::now();
                 try {
                     size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
@@ -5438,7 +5438,7 @@ public:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_p2p_qp_) {
-                    std::cout << "[EC-CHECK RDMA] Load_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
+                    // std::cout << "[EC-CHECK RDMA] Load_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                     const auto t_net = std::chrono::steady_clock::now();
                     try {
                         rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
@@ -5562,7 +5562,7 @@ public:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_p2p_qp_) {
-                    std::cout << "[EC-CHECK RDMA] Load_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                    // std::cout << "[EC-CHECK RDMA] Load_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                     const auto t_net = std::chrono::steady_clock::now();
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
@@ -5726,7 +5726,7 @@ public:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_step6_p2p_qp_) {
-                    std::cout << "[EC-CHECK RDMA] Load_Step6_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
+                    // std::cout << "[EC-CHECK RDMA] Load_Step6_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                     const auto t_net = std::chrono::steady_clock::now();
                     try {
                         rdma_send_data_via_qp(rdma_step6_p2p_qp_, rdma_step6_p2p_send_cq_,
@@ -5831,7 +5831,7 @@ public:
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_step6_p2p_qp_) {
-                    std::cout << "[EC-CHECK RDMA] Load_Step6_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                    // std::cout << "[EC-CHECK RDMA] Load_Step6_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                     const auto t_net = std::chrono::steady_clock::now();
                     try {
                         size_t recv_size = rdma_receive_data_via_qp(rdma_step6_p2p_qp_, rdma_step6_p2p_recv_cq_,
@@ -5962,7 +5962,7 @@ public:
                 register_buffer(buffer_addr, size);
                 temp_reg = true;
             }
-            std::cout << "[EC-CHECK RDMA] Simple_P2P_Send: Sending " << size << " bytes via RDMA" << std::endl;
+            // std::cout << "[EC-CHECK RDMA] Simple_P2P_Send: Sending " << size << " bytes via RDMA" << std::endl;
             try {
                 rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
                     rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(buffer_addr), size);
@@ -6012,7 +6012,7 @@ public:
                 register_buffer(buffer_addr, size);
                 temp_reg = true;
             }
-            std::cout << "[EC-CHECK RDMA] Simple_P2P_Recv: Receiving " << size << " bytes via RDMA" << std::endl;
+            // std::cout << "[EC-CHECK RDMA] Simple_P2P_Recv: Receiving " << size << " bytes via RDMA" << std::endl;
             try {
                 rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_, get_rdma_p2p_recv_control_sock(),
                     rdma_p2p_recv_control_mutex_, reinterpret_cast<uint8_t*>(buffer_addr), size,
@@ -6335,7 +6335,7 @@ public:
 
     void rdma_send_data_via_qp(ibv_qp* qp, ibv_cq* send_cq, int control_sock, std::mutex& control_mutex,
                                const uint8_t* data, size_t size) {
-        std::cout << "[EC-CHECK RDMA] Sending " << size << " bytes via RDMA" << std::endl;
+        // std::cout << "[EC-CHECK RDMA] Sending " << size << " bytes via RDMA" << std::endl;
         static const size_t CHUNK_SIZE = 64ULL * 1024 * 1024;
         uint64_t size_net = htonll(static_cast<uint64_t>(size));
         {
@@ -6387,7 +6387,7 @@ public:
         size_t size;
         
         // Step 1: Receive size via control channel
-        std::cout << "[EC-CHECK RDMA] Receiving data via RDMA (buffer_size=" << buffer_size << ")" << std::endl;
+        // std::cout << "[EC-CHECK RDMA] Receiving data via RDMA (buffer_size=" << buffer_size << ")" << std::endl;
         {
             std::lock_guard<std::mutex> lock(control_mutex);
             if (::recv(control_sock, &size_net, sizeof(size_net), MSG_WAITALL) != sizeof(size_net))

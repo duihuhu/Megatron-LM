@@ -8,7 +8,7 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=bond0
+export NETIFACES_INTERFACE=eth0
 export FRCHECK_LOCAL_RANK_NIC_0=eth0
 export FRCHECK_LOCAL_RANK_NIC_1=eth0
 export FRCHECK_LOCAL_RANK_NIC_2=eth0
@@ -21,7 +21,7 @@ export FRCHECK_LOCAL_RANK_NIC_7=eth1
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-MASTER_ADDR=172.16.0.221
+MASTER_ADDR=172.16.0.224
 
 export ECCHECK_USE_ASIO=false
 export FRCHECK_INTERFACE=$NETIFACES_INTERFACE
@@ -149,7 +149,7 @@ EVAL_AND_LOGGING_ARGS=(
     --use-rdma
     --ckpt-format torch
     --save-embeddings-separately
-    --timing-log-level 2
+    # --timing-log-level 2
 )
 
 mkdir -p logs

@@ -8,7 +8,7 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=bond0
+export NETIFACES_INTERFACE=eth0
 export FRCHECK_LOCAL_RANK_NIC_0=eth0
 export FRCHECK_LOCAL_RANK_NIC_1=eth0
 export FRCHECK_LOCAL_RANK_NIC_2=eth0
@@ -21,7 +21,7 @@ export FRCHECK_LOCAL_RANK_NIC_7=eth1
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-MASTER_ADDR=172.16.0.221
+MASTER_ADDR=172.16.0.224
 
 export ECCHECK_USE_ASIO=false
 export FRCHECK_INTERFACE=$NETIFACES_INTERFACE
@@ -75,8 +75,10 @@ SHM_PKT="/dev/shm/shm_pkt"
 ARGS_TO_PASS=("$@")
 
 # Model configuration
-HIDDEN_SIZE=1024
-NUM_ATTENTION_HEADS=16
+HIDDEN_SIZE=4096
+NUM_ATTENTION_HEADS=32
+NUM_LAYERS=32
+
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
 MICRO_BATCH_SIZE=4
@@ -117,7 +119,7 @@ GPT_ARGS=(
     --use-mcore-models
     --transformer-impl transformer_engine
     --no-scatter-gather-tensors-in-pipeline
-    --num-layers 32
+    --num-layers $NUM_LAYERS
     --optimizer adam
     --loss-scale 8192
 )
@@ -145,7 +147,7 @@ EVAL_AND_LOGGING_ARGS=(
     --use-rdma
     --ckpt-format torch
     --save-embeddings-separately
-    --timing-log-level 2
+    # --timing-log-level 2
 )
 
 mkdir -p logs

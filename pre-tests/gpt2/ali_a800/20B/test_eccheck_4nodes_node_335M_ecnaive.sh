@@ -8,12 +8,12 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=bond0
+export NETIFACES_INTERFACE=eth0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-MASTER_ADDR=10.0.0.62
+MASTER_ADDR=172.16.0.224
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
@@ -172,7 +172,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --no-load-optim
     --save-embeddings-separately
     --use-rdma
-    --timing-log-level 2
+    # --timing-log-level 2
 
     # --- EC-NAIVE generalized parameters ---
      --ecnaive-rs-k 2             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)

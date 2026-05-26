@@ -1261,7 +1261,7 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         ecnaive_blocks=blocks,
     )
     logger.info(f"ECNAIVE save timing: encode {time.time()-t0:.3f}s")
-
+    torch.distributed.barrier()
     logger.info(f"EC-NAIVE legacy save: done in {time.time() - start_time:.2f}s")
 
     _save_ecnaive_pt_files(

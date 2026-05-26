@@ -132,6 +132,7 @@ GPT_ARGS=(
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 8
     --pipeline-model-parallel-size 4
+
 )
 
 EVAL_AND_LOGGING_ARGS=(

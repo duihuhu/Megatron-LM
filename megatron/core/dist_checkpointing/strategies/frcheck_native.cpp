@@ -111,6 +111,10 @@ struct RdmaBuffer {
 static constexpr size_t FRCHECK_TEMP_BUF_SIZE = 128ULL * 1024 * 1024; // 128 MB
 static constexpr size_t FRCHECK_RDMA_CHUNK = 64ULL * 1024 * 1024;     // 64 MB per RDMA op
 static constexpr int    FRCHECK_MAX_WR = 64;
+// Sentinel wr_id used to tag intermediate chunks of a logical chunked recv in
+// async mode, so the persistent poller can drain those completions without
+// counting them as a logical op. Must not collide with wr_id_encode() outputs.
+static constexpr uint64_t FRCHECK_WR_ID_CHUNK_SENTINEL = 0xFFFFFFFFFFFFFFFFULL;
 
 class FRCheckRdmaChannel {
 public:
@@ -338,6 +342,14 @@ public:
     ibv_cq* get_recv_cq() const { return recv_cq_; }
 
     void _send_chunked(const uint8_t* data, size_t total, ibv_mr* mr, uint64_t wr_id, bool sync) {
+        // Outer-chunk count for the whole logical transfer. In async mode only
+        // the very last outer chunk is signaled, so the persistent poller sees
+        // exactly one CQ entry per logical send (matching check_stripe_done_'s
+        // assumption of 1 op per logical send/recv).
+        size_t total_outer = total > 0
+            ? (total + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK
+            : 1;
+        size_t outer_idx = 0;
         size_t remaining = total, offset = 0;
         while (remaining > 0) {
             size_t nchunks = (std::min(remaining, FRCHECK_RDMA_CHUNK) + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK;
@@ -353,7 +365,16 @@ public:
                 wr[i].sg_list = &sge[i];
                 wr[i].num_sge = 1;
                 wr[i].opcode = IBV_WR_SEND;
-                wr[i].send_flags = (i + 1 == nchunks) ? IBV_SEND_SIGNALED : 0;
+                bool is_last_inner = (i + 1 == nchunks);
+                if (sync) {
+                    wr[i].send_flags = is_last_inner ? IBV_SEND_SIGNALED : 0;
+                } else {
+                    // Async: only the LAST chunk of the entire logical send is
+                    // signaled, so the poller sees exactly one completion.
+                    bool is_last_outer = (outer_idx + 1 == total_outer);
+                    wr[i].send_flags = (is_last_inner && is_last_outer)
+                        ? IBV_SEND_SIGNALED : 0;
+                }
                 wr[i].next = (i + 1 < nchunks) ? &wr[i + 1] : nullptr;
                 offset += cur;
                 remaining -= cur;
@@ -362,10 +383,20 @@ public:
             if (ibv_post_send(qp_, &wr[0], &bad))
                 throw std::runtime_error("FRCheck RDMA: post_send failed");
             if (sync) poll_cq(send_cq_, (int)nchunks);
+            outer_idx++;
         }
     }
 
     void _recv_chunked(uint8_t* buf, size_t total, ibv_mr* mr, uint64_t wr_id, bool sync) {
+        // Outer-chunk count for the whole logical transfer. Recv WRs always
+        // generate completions (no UNSIGNALED option), so in async mode we tag
+        // every intermediate chunk with a sentinel wr_id; the persistent poller
+        // drains those entries without counting them as a logical op. Only the
+        // last outer chunk carries the real wr_id.
+        size_t total_outer = total > 0
+            ? (total + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK
+            : 1;
+        size_t outer_idx = 0;
         size_t remaining = total, offset = 0;
         while (remaining > 0) {
             size_t nchunks = (std::min(remaining, FRCHECK_RDMA_CHUNK) + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK;
@@ -377,7 +408,14 @@ public:
                 sge[i].length = (uint32_t)cur;
                 sge[i].lkey = mr->lkey;
                 memset(&wr[i], 0, sizeof(wr[i]));
-                wr[i].wr_id = wr_id;
+                bool is_last_inner = (i + 1 == nchunks);
+                if (sync) {
+                    wr[i].wr_id = wr_id;
+                } else {
+                    bool is_last_outer = (outer_idx + 1 == total_outer);
+                    wr[i].wr_id = (is_last_inner && is_last_outer)
+                        ? wr_id : FRCHECK_WR_ID_CHUNK_SENTINEL;
+                }
                 wr[i].sg_list = &sge[i];
                 wr[i].num_sge = 1;
                 wr[i].next = (i + 1 < nchunks) ? &wr[i + 1] : nullptr;
@@ -388,6 +426,7 @@ public:
             if (ibv_post_recv(qp_, &wr[0], &bad))
                 throw std::runtime_error("FRCheck RDMA: post_recv failed");
             if (sync) poll_cq(recv_cq_, (int)nchunks);
+            outer_idx++;
         }
     }
 
@@ -1581,13 +1620,15 @@ public:
             }
             if (ns < 0 || nr < 0) break;
 
-            if (ns > 0) {
+            // Intermediate chunk completions carry a sentinel wr_id and must
+            // be drained from the CQ but not counted as logical ops.
+            if (ns > 0 && wc_s.wr_id != FRCHECK_WR_ID_CHUNK_SENTINEL) {
                 int sid = wr_id_stripe(wc_s.wr_id);
                 auto& st = async_stripes_[sid];
                 st.ops_done++;
                 check_stripe_done_(sid, parity1_addrs, parity2_addrs, data_addrs, block_size, layer_dir, rank);
             }
-            if (nr > 0) {
+            if (nr > 0 && wc_r.wr_id != FRCHECK_WR_ID_CHUNK_SENTINEL) {
                 int sid = wr_id_stripe(wc_r.wr_id);
                 auto& st = async_stripes_[sid];
                 if (st.role == (int)StripeRole::ENCODER) {

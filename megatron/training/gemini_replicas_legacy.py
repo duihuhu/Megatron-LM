@@ -47,6 +47,8 @@ def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
     return checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
 
 
+_BUILD_GLOBAL_REGISTRY_CACHE: Dict[tuple, tuple] = {}
+
 def _build_global_registry(
     local_metadata: List[TensorMetadata],
     local_non_tensor: Dict[str, Any],
@@ -55,12 +57,18 @@ def _build_global_registry(
         return {0: local_metadata}, {0: local_non_tensor}
 
     world_size = torch.distributed.get_world_size()
+    total_bytes = sum(m.size_bytes for m in local_metadata)
+    cache_key = (world_size, len(local_metadata), total_bytes)
+    if cache_key in _BUILD_GLOBAL_REGISTRY_CACHE:
+        return _BUILD_GLOBAL_REGISTRY_CACHE[cache_key]
+
     gathered_meta: List[Any] = [None for _ in range(world_size)]
     gathered_non_tensor: List[Any] = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(gathered_meta, local_metadata)
     torch.distributed.all_gather_object(gathered_non_tensor, local_non_tensor)
     rank_metadata = {r: gathered_meta[r] for r in range(world_size)}
     rank_non_tensor = {r: gathered_non_tensor[r] for r in range(world_size)}
+    _BUILD_GLOBAL_REGISTRY_CACHE[cache_key] = (rank_metadata, rank_non_tensor)
     return rank_metadata, rank_non_tensor
 
 
@@ -222,16 +230,12 @@ def save_gemini_replicas_legacy_checkpoint(
         for r in range(world_size)
     }
 
-    # Exchange flat_key_roots and tensor_infos (with local offsets) separately
-    # These are small — just top-level keys and per-tensor metadata dicts
+    # Exchange flat_key_roots and tensor_infos in a single all_gather_object
     my_flat_key_roots = list(decomposed.flat_key_roots) if decomposed.flat_key_roots else []
-    all_flat_key_roots: List[Any] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(all_flat_key_roots, my_flat_key_roots)
-    rank_flat_key_roots = {r: all_flat_key_roots[r] for r in range(world_size)}
-
-    all_tensor_infos: List[Any] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(all_tensor_infos, local_tensor_infos)
-    rank_tensor_infos = {r: all_tensor_infos[r] for r in range(world_size)}
+    all_meta: List[Any] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(all_meta, (my_flat_key_roots, local_tensor_infos))
+    rank_flat_key_roots = {r: all_meta[r][0] for r in range(world_size)}
+    rank_tensor_infos = {r: all_meta[r][1] for r in range(world_size)}
 
     logger.info(f"GEMINI save timing: meta exchange {time.time()-t0:.3f}s")
 

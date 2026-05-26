@@ -33,17 +33,25 @@ def _cpu_uint8_view(tensor: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(torch.uint8).reshape(-1)
 
 
+_BUILD_GLOBAL_REGISTRY_CACHE: Dict[tuple, tuple] = {}
+
 def _build_global_registry(local_metadata: List[TensorMetadata], local_non_tensor: Dict[str, Any]) -> Tuple[Dict[int, List[TensorMetadata]], Dict[int, Dict[str, Any]]]:
     if not torch.distributed.is_initialized():
         return {0: local_metadata}, {0: local_non_tensor}
 
     world_size = torch.distributed.get_world_size()
+    total_bytes = sum(m.size_bytes for m in local_metadata)
+    cache_key = (world_size, len(local_metadata), total_bytes)
+    if cache_key in _BUILD_GLOBAL_REGISTRY_CACHE:
+        return _BUILD_GLOBAL_REGISTRY_CACHE[cache_key]
+
     gathered_meta: List[Any] = [None for _ in range(world_size)]
     gathered_non_tensor: List[Any] = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(gathered_meta, local_metadata)
     torch.distributed.all_gather_object(gathered_non_tensor, local_non_tensor)
     rank_metadata = {r: gathered_meta[r] for r in range(world_size)}
     rank_non_tensor = {r: gathered_non_tensor[r] for r in range(world_size)}
+    _BUILD_GLOBAL_REGISTRY_CACHE[cache_key] = (rank_metadata, rank_non_tensor)
     return rank_metadata, rank_non_tensor
 
 

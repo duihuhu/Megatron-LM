@@ -161,7 +161,7 @@ EVAL_AND_LOGGING_ARGS=(
     #--load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
-
+    --timing-log-level 2
     # ---------------------------------------------------------------------------
     # 必选：启用 Gemini Replicas torch legacy checkpoint
     # ---------------------------------------------------------------------------

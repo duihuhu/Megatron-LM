@@ -47,7 +47,7 @@ export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
 # export GEMINI_REPLICAS_BASE_PORT=12345
 
 MASTER_PORT=6000
-NNODES=4
+NNODES=8
 
 # ---- 节点 rank 解析（第一个参数） ----
 NODE_RANK=0
@@ -83,7 +83,7 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs"
-CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-gemini-replicas-legacy"
+CHECKPOINT_PATH="/workspace/Megatron-LM/data/checkpoint/models/gpt2-345m-0-gemini-replicas-legacy"
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -91,9 +91,9 @@ SHM_PKT="/dev/shm/shm_pkt"
 ARGS_TO_PASS=("$@")
 
 # 模型固定参数
-HIDDEN_SIZE=5120
-NUM_ATTENTION_HEADS=40 
-NUM_LAYERS=64
+HIDDEN_SIZE=4096
+NUM_ATTENTION_HEADS=32
+NUM_LAYERS=32
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
@@ -123,7 +123,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00015
-    --train-iters 10
+    --train-iters 4
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -141,8 +141,8 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 2
-    --pipeline-model-parallel-size 4
+    --tensor-model-parallel-size 1
+    --pipeline-model-parallel-size 8
 )
 
 # =============================================================================
@@ -162,9 +162,9 @@ EVAL_AND_LOGGING_ARGS=(
     # 必选：启用 Gemini Replicas torch legacy checkpoint
     # ---------------------------------------------------------------------------
     # 启用 Gemini Replicas（替代原有的 --use-gemini，后者是两副本 EC 风格配对）
-#    --use-gemini-replicas
+    --use-gemini-replicas
     # 启用优化路径：使用连续 CPU buffer + C++ ASIO/RDMA 网络传输，跳过 torch.save 序列化开销
-#    --use-gemini-replicas-optimized
+    --use-gemini-replicas-optimized
 
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）
@@ -176,7 +176,7 @@ EVAL_AND_LOGGING_ARGS=(
     # ---------------------------------------------------------------------------
     # 分组大小：将 world 划分为独立组，副本仅在组内轮询
     # ---------------------------------------------------------------------------
-    --gemini-replicas-group-size 4   # 默认 None（全局轮询，不做分组）
+    --gemini-replicas-group-size 8   # 默认 None（全局轮询，不做分组）
                                         # 设 8 则每 8 个 rank 一组，每组独立
                                         # 必须能被 world_size 整除
                                         # 独立于节点数和每节点 rank 数，但数学上要求

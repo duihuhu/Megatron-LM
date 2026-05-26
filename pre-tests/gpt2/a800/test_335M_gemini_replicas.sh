@@ -47,7 +47,7 @@ export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
 # export GEMINI_REPLICAS_BASE_PORT=12345
 
 MASTER_PORT=6000
-NNODES=4
+NNODES=8
 
 # ---- 节点 rank 解析（第一个参数） ----
 NODE_RANK=0
@@ -121,7 +121,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00015
-    --train-iters 10
+    --train-iters 4
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -139,8 +139,8 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 2
-    --pipeline-model-parallel-size 4
+    --tensor-model-parallel-size 1
+    --pipeline-model-parallel-size 8
 )
 
 # =============================================================================
@@ -152,7 +152,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    #--load $CHECKPOINT_PATH          # 取消注释以测试 load
+    --load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
@@ -207,7 +207,7 @@ EVAL_AND_LOGGING_ARGS=(
     #   示例："2,3" 表示 rank2 和 rank3 当作故障处理。
     #
     --use-gemini-replicas-software-failure
-    --gemini-replicas-recovery-rank "2,3"
+    --gemini-replicas-recovery-rank "0"
 
     # ---------------------------------------------------------------------------
     # ckpt 格式：必须用 torch（legacy 路径）

@@ -3444,48 +3444,70 @@ public:
                   << " ports" << std::endl;
     }
 
-    void init_ecnaive_load_sw_connect(
-        int rank_in_group, const std::string& receiver_ip,
-        int num_blocks, const std::vector<uint16_t>& ports) {
+    // Phase 2a: receiver (rig=2) accepts on all k-1 ports, sets up RDMA channels
+    void init_ecnaive_load_sw_accept(
+        int rank_in_group, int num_blocks) {
+        if (rank_in_group != 2) return;
         if (num_blocks != sw_recovery_num_blocks_) {
             std::cerr << "EC-NAIVE: SW recovery port count mismatch "
                       << num_blocks << " vs " << sw_recovery_num_blocks_ << std::endl;
             return;
         }
-        if (rank_in_group == 2) {
-            // Receiver: accept all connections
+        for (int i = 0; i < num_blocks; ++i) {
+            sw_asio_recv_sockets_[i] = std::make_unique<boost::asio::ip::tcp::socket>(
+                sw_recovery_io_);
+            sw_asio_acceptors_[i]->accept(*sw_asio_recv_sockets_[i]);
+        }
+        std::cout << "EC-NAIVE: [Rig 2] SW recovery accepted " << num_blocks
+                  << " connections" << std::endl;
+
+        // RDMA channels on accepted sockets
+        if (use_rdma_) {
             for (int i = 0; i < num_blocks; ++i) {
-                sw_asio_recv_sockets_[i] = std::make_unique<boost::asio::ip::tcp::socket>(
-                    sw_recovery_io_);
-                sw_asio_acceptors_[i]->accept(*sw_asio_recv_sockets_[i]);
+                if (!sw_asio_recv_sockets_[i]) continue;
+                int sock_fd = sw_asio_recv_sockets_[i]->native_handle();
+                auto send_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+                auto recv_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+                rdma_sw_recovery_channels_[i] = std::make_unique<RdmaConnectionChannel>(
+                    rdma_context_, rdma_pd_, send_cq, recv_cq,
+                    sock_fd, sock_fd, &rdma_registered_buffers_, &rdma_buffer_mutex_,
+                    rank_in_group, 2);
+                rdma_sw_recovery_channels_[i]->exchange_and_connect(true);
             }
-            std::cout << "EC-NAIVE: [Rig 2] SW recovery accepted " << num_blocks
-                      << " connections" << std::endl;
-        } else {
-            // Sender ranks: connect to receiver for blocks they own
-            for (int i = 0; i < num_blocks; ++i) {
-                sw_asio_send_sockets_[i] = std::make_unique<boost::asio::ip::tcp::socket>(
-                    sw_recovery_io_);
-                // Retry loop for connect (receiver may not be listening yet)
-                int max_retries = 10;
-                for (int retry = 0; retry < max_retries; ++retry) {
-                    try {
-                        sw_asio_send_sockets_[i]->connect(
-                            boost::asio::ip::tcp::endpoint(
-                                boost::asio::ip::address::from_string(receiver_ip),
-                                ports[i]));
-                        break;
-                    } catch (const boost::system::system_error&) {
-                        if (retry == max_retries - 1) throw;
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    }
-                }
+            std::cout << "EC-NAIVE: SW recovery RDMA channels initialized (rig=2, "
+                      << num_blocks << " blocks)" << std::endl;
+        }
+    }
+
+    // Phase 2b: one sender connects to exactly one port (its block_idx)
+    void init_ecnaive_load_sw_connect_one(
+        int rank_in_group, const std::string& receiver_ip,
+        int block_idx, uint16_t port) {
+        if (rank_in_group == 2) return;  // receivers use init_ecnaive_load_sw_accept instead
+        if (block_idx < 0 || block_idx >= sw_recovery_num_blocks_) {
+            std::cerr << "EC-NAIVE: SW recovery connect_one: block_idx " << block_idx
+                      << " out of range [0, " << sw_recovery_num_blocks_ << ")" << std::endl;
+            return;
+        }
+        sw_asio_send_sockets_[block_idx] = std::make_unique<boost::asio::ip::tcp::socket>(
+            sw_recovery_io_);
+        int max_retries = 10;
+        for (int retry = 0; retry < max_retries; ++retry) {
+            try {
+                sw_asio_send_sockets_[block_idx]->connect(
+                    boost::asio::ip::tcp::endpoint(
+                        boost::asio::ip::address::from_string(receiver_ip), port));
+                break;
+            } catch (const boost::system::system_error&) {
+                if (retry == max_retries - 1) throw;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
+        std::cout << "EC-NAIVE: [Rig " << rank_in_group << "] SW recovery connected block_idx="
+                  << block_idx << " port=" << port << std::endl;
 
-        // RDMA channels (if enabled)
-        if (use_rdma_ && (rank_in_group == 2 ||
-            (rank_in_group >= 3 && rank_in_group < 3 + num_blocks))) {
+        // RDMA channel for this single connection
+        if (use_rdma_) {
             if (!rdma_pd_) {
                 if (!rdma_context_) {
                     if (ibv_fork_init() != 0) {
@@ -3503,26 +3525,14 @@ public:
                     rdma_pd_ = ibv_alloc_pd(rdma_context_);
                 }
             }
-            for (int i = 0; i < num_blocks; ++i) {
-                int sock_fd = -1;
-                if (rank_in_group == 2 && sw_asio_recv_sockets_[i]) {
-                    sock_fd = sw_asio_recv_sockets_[i]->native_handle();
-                } else if (rank_in_group != 2 && sw_asio_send_sockets_[i]
-                           && sw_asio_send_sockets_[i]->is_open()) {
-                    sock_fd = sw_asio_send_sockets_[i]->native_handle();
-                }
-                if (sock_fd < 0) continue;
-                auto send_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
-                auto recv_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
-                rdma_sw_recovery_channels_[i] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, send_cq, recv_cq,
-                    sock_fd, sock_fd, &rdma_registered_buffers_, &rdma_buffer_mutex_,
-                    rank_in_group, 2);
-                rdma_sw_recovery_channels_[i]->exchange_and_connect(
-                    rank_in_group == 2);
-            }
-            std::cout << "EC-NAIVE: SW recovery RDMA channels initialized for "
-                      << num_blocks << " blocks" << std::endl;
+            int sock_fd = sw_asio_send_sockets_[block_idx]->native_handle();
+            auto send_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            auto recv_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            rdma_sw_recovery_channels_[block_idx] = std::make_unique<RdmaConnectionChannel>(
+                rdma_context_, rdma_pd_, send_cq, recv_cq,
+                sock_fd, sock_fd, &rdma_registered_buffers_, &rdma_buffer_mutex_,
+                rank_in_group, 2);
+            rdma_sw_recovery_channels_[block_idx]->exchange_and_connect(false);
         }
     }
 
@@ -6276,11 +6286,15 @@ PYBIND11_MODULE(ecnaive_native, m) {
              "Generalized SW recovery phase 1: bind/listen on k-1 ports",
              pybind11::arg("rank_in_group"), pybind11::arg("receiver_ip"),
              pybind11::arg("num_blocks"), pybind11::arg("ports"))
-        .def("init_ecnaive_load_sw_connect",
-             &ECNaiveNative::init_ecnaive_load_sw_connect,
-             "Generalized SW recovery phase 2: accept (receiver) or connect (senders)",
+        .def("init_ecnaive_load_sw_accept",
+             &ECNaiveNative::init_ecnaive_load_sw_accept,
+             "SW recovery phase 2a: receiver accepts on all k-1 ports + RDMA channels",
+             pybind11::arg("rank_in_group"), pybind11::arg("num_blocks"))
+        .def("init_ecnaive_load_sw_connect_one",
+             &ECNaiveNative::init_ecnaive_load_sw_connect_one,
+             "SW recovery phase 2b: one sender connects to exactly one port for its block",
              pybind11::arg("rank_in_group"), pybind11::arg("receiver_ip"),
-             pybind11::arg("num_blocks"), pybind11::arg("ports"))
+             pybind11::arg("block_idx"), pybind11::arg("port"))
         .def("sw_send_data", &ECNaiveNative::sw_send_data,
              "Generalized SW recovery: send data block by index",
              pybind11::arg("block_idx"), pybind11::arg("addr"), pybind11::arg("size"))

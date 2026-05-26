@@ -21,27 +21,9 @@ NNODES=8
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
-export ECNAIVE_INTERFACE=$NETIFACES_INTERFACE
 export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
-export MEGATRON_ECNAIVE_LOAD_NET_TRACE=1
-export ECNAIVE_LOCAL_RANK_NIC_0=bond0
-
-#  priority from
-#  ┌──────────────────────────────────────────┬──────────────────────────┐
-#  │                 环境变量                 │           用途           │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ ECNAIVE_RANK_IP_0=10.0.0.1               │ 每个 rank 显式指定 IP    │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ ECNAIVE_LOCAL_RANK_NIC_0=mlx5_0          │ 每个 local_rank 绑定 NIC │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ ECNAIVE_NIC_LIST + ECNAIVE_RANKS_PER_NIC │ 批量 NIC 分配            │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ ECNAIVE_BASE_IP=10.0.0.1                 │ 所有 rank 同一 IP        │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ ECNAIVE_INTERFACE=bond0                  │ 从指定接口自动检测 IP    │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ MASTER_ADDR                              │ 最终 fallback            │
-#  └──────────────────────────────────────────┴──────────────────────────┘
+export ECLATIN_LOCAL_RANK_NIC_0=bond0
+export ECLATIN_LOCAL_RANK_NIC_1=bond0
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -77,7 +59,7 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-naive" #<Specify path>
+CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-eclatin" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -116,7 +98,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
     --lr 0.00015 
-    --train-iters 2
+    --train-iters 4
     --lr-decay-iters 320000 
     --lr-decay-style cosine 
     --min-lr 1.0e-5 
@@ -143,8 +125,8 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --use-ecnaive-software-failure
     #--load $CHECKPOINT_PATH
+    --use-eclatin-software-failure
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
@@ -155,19 +137,13 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-gemini-hardware-failure
     # --use-distributed-optimizer
     # --use-ecnaive-software-failure
-    --use-ecnaive
+    --use-eclatin
     --ckpt-format torch
     # --no-save-optim
     # --no-load-optim
     --save-embeddings-separately
     --use-rdma
     --timing-log-level 2
-
-    # --- EC-NAIVE generalized parameters ---
-     --ecnaive-rs-k 6             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
-    #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
-    #--ecnaive-failed-ranks 1,2   # Comma-separated failed global ranks for software recovery
-    #                                Uses ISA-L RS decoding (GF(2^8)) to recover 1-2 lost blocks
 )
 
 mkdir -p logs

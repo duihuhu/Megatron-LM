@@ -760,12 +760,26 @@ class ECNAIVEManager:
             rank_in_group, receiver_ip, num_blocks, sw_ports)
         torch.distributed.barrier()
 
-        # Phase 2: accept (receiver) or connect (senders) + RDMA channels
-        logger.info(f"EC-NAIVE: [Rank {rank}] SW recovery phase 2: connect")
-        native.init_ecnaive_load_sw_connect(
-            rank_in_group, receiver_ip, num_blocks, sw_ports)
+        # Phase 2: receiver accepts (blocking), senders each connect to exactly one port.
+        # Non-participating ranks skip entirely — they have no data block for the failed rank.
+        if rank_in_group == failed_rank_in_group:
+            logger.info("EC-NAIVE: [Rank %d] SW recovery phase 2: accepting %d connections",
+                        rank, num_blocks)
+            native.init_ecnaive_load_sw_accept(rank_in_group, num_blocks)
+        else:
+            block_idx = self.get_sw_recovery_block_idx_for_sender(
+                rank_in_group, failed_rank_in_group=failed_rank_in_group)
+            if block_idx >= 0:
+                logger.info("EC-NAIVE: [Rank %d] SW recovery phase 2: connecting block_idx=%d "
+                            "port=%d", rank, block_idx, sw_ports[block_idx])
+                native.init_ecnaive_load_sw_connect_one(
+                    rank_in_group, receiver_ip, block_idx, sw_ports[block_idx])
+            else:
+                logger.info("EC-NAIVE: [Rank %d] SW recovery phase 2: no block, skipping",
+                            rank)
         torch.distributed.barrier()
-        logger.info(f"EC-NAIVE: [Rank {rank}] SW recovery connections ready ({num_blocks} blocks)")
+        logger.info("EC-NAIVE: [Rank %d] SW recovery connections ready (%d blocks)",
+                    rank, num_blocks)
 
     def get_sw_recovery_block_idx_for_sender(
         self, sender_rank_in_group: int, failed_rank_in_group: int = 2

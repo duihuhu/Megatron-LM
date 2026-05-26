@@ -593,11 +593,12 @@ def _load_ecnaive_legacy_software_failure(
 
     block_files_legacy = main_payload.get("_block_files_legacy", None)
 
+    # Phase 1: ALL ranks must call init_ecnaive_sw_recovery because it contains
+    # barriers.  Non-participating ranks skip Phase 2 (connect) internally.
+    manager.init_ecnaive_sw_recovery(rank, world_size, failed_rank_in_group=failed_rig)
+
     if rank_in_group == failed_rig:
         # ---- FAILED RANK ----
-        # Phase 1: setup connections
-        manager.init_ecnaive_sw_recovery(rank, world_size, failed_rank_in_group=failed_rig)
-
         # Phase 2: local d_{2,0} + network d_{2,1}..d_{2,k-1}
         own_data0 = _load_ecnaive_block_file(
             checkpoint_dir, rank,
@@ -647,8 +648,7 @@ def _load_ecnaive_legacy_software_failure(
         sender_rig = rank_in_group
         j = (sender_rig - failed_rig + n) % n  # data block index j for this sender
         if 1 <= j < k:
-            manager.init_ecnaive_sw_recovery(rank, world_size, failed_rank_in_group=failed_rig)
-
+            # init_ecnaive_sw_recovery already called above for all ranks
             block_idx = j - 1  # 0-indexed for sw_send_data
 
             # recv file index on this sender: recv_{(sender_rig - failed_rig - 1 + n) % n}

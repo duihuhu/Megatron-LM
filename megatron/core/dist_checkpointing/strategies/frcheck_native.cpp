@@ -110,7 +110,7 @@ struct RdmaBuffer {
 // ---------------------------------------------------------------------------
 static constexpr size_t FRCHECK_TEMP_BUF_SIZE = 128ULL * 1024 * 1024; // 128 MB
 static constexpr size_t FRCHECK_RDMA_CHUNK = 64ULL * 1024 * 1024;     // 64 MB per RDMA op
-static constexpr int    FRCHECK_MAX_WR = 64;
+static constexpr int    FRCHECK_MAX_WR = 512;  // must exceed max_block_size/64MB × max_stripes_per_channel
 
 class FRCheckRdmaChannel {
 public:

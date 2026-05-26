@@ -143,7 +143,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --use-ecnaive-software-failure
+    
     --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
@@ -160,7 +160,8 @@ EVAL_AND_LOGGING_ARGS=(
     # --- EC-NAIVE generalized parameters ---
      --ecnaive-rs-k 6             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
     #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
-    #--ecnaive-failed-ranks 1   # Comma-separated failed global ranks for hardware recovery only; software recovery is set to 2
+    #--use-ecnaive-software-failure
+    --ecnaive-failed-ranks 1   # Comma-separated failed global ranks for hardware recovery only; software recovery is set to 2
     #                                Uses ISA-L RS decoding (GF(2^8)) to recover 1-2 lost blocks
 )
 

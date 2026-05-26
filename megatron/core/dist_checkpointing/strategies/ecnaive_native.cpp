@@ -176,7 +176,7 @@ private:
     std::mutex send_mutex_;
     std::mutex recv_mutex_;
     
-    static const size_t TEMP_BUFFER_SIZE = 128ULL * 1024 * 1024;  // 128 MB (reduced from 1GB to avoid RDMA memory limits)
+    static const size_t TEMP_BUFFER_SIZE = 512ULL * 1024 * 1024;  // 512 MB (sufficient for k=6 blocks ~200 MB each)
     static const size_t CHUNK_SIZE = 64 * 1024 * 1024;  // 64 MB per RDMA operation
     static const int MAX_WR = 64;
     static const int MAX_BATCH_WR = 32;

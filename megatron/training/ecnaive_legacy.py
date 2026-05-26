@@ -1123,7 +1123,10 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         data_labels = []
         parity_labels = []
         for _, label, _, _ in plan['surviving']:
-            surviving_tensors[label] = torch.zeros(block_data_size, dtype=torch.uint8)
+            buf = allocate_hugepage_tensor(block_data_size, fallback_pin_memory=True)
+            if manager.use_rdma:
+                manager.register_buffer(buf)
+            surviving_tensors[label] = buf
             if label.startswith('data_'):
                 data_labels.append(label)
             else:
@@ -1209,8 +1212,14 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     f"EC-NAIVE hw recovery: source rank {rank} missing block "
                     f"{label} for failed rank {dest_fr} at {block_path}"
                 )
-            payload = torch.load(block_path, map_location="cpu", weights_only=False)
-            block_tensor = payload["tensor"].contiguous().view(torch.uint8)[:block_data_size]
+            from megatron.training.legacy_io_utils import is_raw_format, read_raw_block, MAGIC_BLOCK
+            if is_raw_format(str(block_path), MAGIC_BLOCK):
+                block_tensor = read_raw_block(str(block_path), MAGIC_BLOCK)[:block_data_size]
+            else:
+                payload = torch.load(block_path, map_location="cpu", weights_only=False)
+                block_tensor = payload["tensor"].contiguous().view(torch.uint8)[:block_data_size]
+            if manager.use_rdma:
+                manager.register_buffer(block_tensor)
             block_tensors.append(block_tensor)  # keep alive
             send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
             logger.info(

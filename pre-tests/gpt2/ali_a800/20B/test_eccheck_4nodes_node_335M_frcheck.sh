@@ -130,7 +130,6 @@ MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 8
     --pipeline-model-parallel-size 4
     --sequence-parallel
-
 )
 
 EVAL_AND_LOGGING_ARGS=(

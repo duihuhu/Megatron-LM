@@ -33,6 +33,8 @@ def _cpu_uint8_view(tensor: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(torch.uint8).reshape(-1)
 
 
+_BUILD_GLOBAL_REGISTRY_CACHE: Dict[tuple, tuple] = {}
+
 def _build_global_registry(
     local_metadata: List[TensorMetadata], local_non_tensor: Dict[str, Any]
 ) -> Tuple[Dict[int, List[TensorMetadata]], Dict[int, Dict[str, Any]]]:
@@ -40,12 +42,18 @@ def _build_global_registry(
         return {0: local_metadata}, {0: local_non_tensor}
 
     world_size = torch.distributed.get_world_size()
+    total_bytes = sum(m.size_bytes for m in local_metadata)
+    cache_key = (world_size, len(local_metadata), total_bytes)
+    if cache_key in _BUILD_GLOBAL_REGISTRY_CACHE:
+        return _BUILD_GLOBAL_REGISTRY_CACHE[cache_key]
+
     gathered_meta: List[Any] = [None for _ in range(world_size)]
     gathered_non_tensor: List[Any] = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(gathered_meta, local_metadata)
     torch.distributed.all_gather_object(gathered_non_tensor, local_non_tensor)
     rank_metadata = {r: gathered_meta[r] for r in range(world_size)}
     rank_non_tensor = {r: gathered_non_tensor[r] for r in range(world_size)}
+    _BUILD_GLOBAL_REGISTRY_CACHE[cache_key] = (rank_metadata, rank_non_tensor)
     return rank_metadata, rank_non_tensor
 
 
@@ -850,6 +858,9 @@ def _run_eclatin_full_recovery(
         logger.info(
             f"ECLATIN legacy load: hw recovery done in {time() - start_time:.2f}s (rank_in_group=2)"
         )
+        logger.info(
+            "ECLATIN legacy load time (excl alloc/conn): %.2fs", time() - start_time,
+        )
     elif rank_in_group == 0:
         data2_addr = int(eclatin_blocks["data_block_2"].data_ptr())
         parity2_addr = int(eclatin_blocks["parity_block_2"].data_ptr())
@@ -893,7 +904,6 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     Load ECLATIN torch legacy checkpoint: run recovery (aligned with torch_dist), then reconstruct
     state_dict from main tensor_buffer (rank_in_group 2 may use recovered_buffer).
     """
-    start_time = time.time()
     from megatron.training import get_args
 
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
@@ -982,8 +992,6 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         main_payload,
         recovered_buffer=recovered_buffer if rank_in_group == 2 else None,
     )
-
-    logger.info(f"ECLATIN legacy load: done in {time.time() - start_time:.2f}s")
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()

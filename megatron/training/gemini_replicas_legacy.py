@@ -47,6 +47,8 @@ def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
     return checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
 
 
+_BUILD_GLOBAL_REGISTRY_CACHE: Dict[tuple, tuple] = {}
+
 def _build_global_registry(
     local_metadata: List[TensorMetadata],
     local_non_tensor: Dict[str, Any],
@@ -55,12 +57,18 @@ def _build_global_registry(
         return {0: local_metadata}, {0: local_non_tensor}
 
     world_size = torch.distributed.get_world_size()
+    total_bytes = sum(m.size_bytes for m in local_metadata)
+    cache_key = (world_size, len(local_metadata), total_bytes)
+    if cache_key in _BUILD_GLOBAL_REGISTRY_CACHE:
+        return _BUILD_GLOBAL_REGISTRY_CACHE[cache_key]
+
     gathered_meta: List[Any] = [None for _ in range(world_size)]
     gathered_non_tensor: List[Any] = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(gathered_meta, local_metadata)
     torch.distributed.all_gather_object(gathered_non_tensor, local_non_tensor)
     rank_metadata = {r: gathered_meta[r] for r in range(world_size)}
     rank_non_tensor = {r: gathered_non_tensor[r] for r in range(world_size)}
+    _BUILD_GLOBAL_REGISTRY_CACHE[cache_key] = (rank_metadata, rank_non_tensor)
     return rank_metadata, rank_non_tensor
 
 
@@ -222,16 +230,12 @@ def save_gemini_replicas_legacy_checkpoint(
         for r in range(world_size)
     }
 
-    # Exchange flat_key_roots and tensor_infos (with local offsets) separately
-    # These are small — just top-level keys and per-tensor metadata dicts
+    # Exchange flat_key_roots and tensor_infos in a single all_gather_object
     my_flat_key_roots = list(decomposed.flat_key_roots) if decomposed.flat_key_roots else []
-    all_flat_key_roots: List[Any] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(all_flat_key_roots, my_flat_key_roots)
-    rank_flat_key_roots = {r: all_flat_key_roots[r] for r in range(world_size)}
-
-    all_tensor_infos: List[Any] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(all_tensor_infos, local_tensor_infos)
-    rank_tensor_infos = {r: all_tensor_infos[r] for r in range(world_size)}
+    all_meta: List[Any] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(all_meta, (my_flat_key_roots, local_tensor_infos))
+    rank_flat_key_roots = {r: all_meta[r][0] for r in range(world_size)}
+    rank_tensor_infos = {r: all_meta[r][1] for r in range(world_size)}
 
     logger.info(f"GEMINI save timing: meta exchange {time.time()-t0:.3f}s")
 
@@ -746,7 +750,6 @@ def load_gemini_replicas_legacy_checkpoint(
       Failed ranks recover from other ranks' replica files.  After recovery,
       the main .pt file is regenerated.
     """
-    start_time = time.time()
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = (
@@ -791,6 +794,8 @@ def load_gemini_replicas_legacy_checkpoint(
         main_payload = (read_raw_checkpoint(str(main_path), MAGIC_GEMINI)
                         if is_raw_format(str(main_path), MAGIC_GEMINI)
                         else torch.load(main_path, map_location="cpu", weights_only=False))
+
+    t_load = time.time()  # start timer after main payload disk I/O
 
     # ---- Software failure path ----
     # In software failure, all checkpoint files are intact on disk.
@@ -847,8 +852,10 @@ def load_gemini_replicas_legacy_checkpoint(
         else:
             failed_override = None  # auto-detect inside _run_hardware_recovery
 
-        # Step 1: Exchange all-to-all metadata
+        # Step 1: Exchange all-to-all metadata (includes disk reads)
         meta = _collect_metadata_for_failed_rank(checkpoint_dir, rank, world_size)
+
+        t_load = time.time()  # reset timer: recovery disk I/O done
 
         # Step 2: Recovery data transfer
         recovered_buffer = _run_hardware_recovery(
@@ -900,7 +907,7 @@ def load_gemini_replicas_legacy_checkpoint(
         manager.cleanup()
         manager._gemini_replicas_native = None
 
-    logger.info(f"GEMINI REPLICAS legacy load: done in {time.time() - start_time:.2f}s")
+    logger.info("GEMINI REPLICAS legacy load time (excl disk): %.2fs", time.time() - t_load)
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()

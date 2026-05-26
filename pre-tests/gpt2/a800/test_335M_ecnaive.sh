@@ -17,7 +17,7 @@ MASTER_ADDR=10.0.0.62
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
-NNODES=4
+NNODES=8
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
@@ -86,28 +86,25 @@ SHM_PKT="/dev/shm/shm_pkt"
 ARGS_TO_PASS=("$@")
 
 # Model related configuration here, please do not overlap with json config
-
-HIDDEN_SIZE=4096
-NUM_ATTENTION_HEADS=32
-NUM_LAYERS=32 
-
+HIDDEN_SIZE=1024
+NUM_ATTENTION_HEADS=16
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
 MICRO_BATCH_SIZE=4
 GLOBAL_BATCH_SIZE=16
 
 DISTRIBUTED_ARGS=(
-    --nproc_per_node $GPUS_PER_NODE
-    --nnodes $NNODES
-    --node_rank $NODE_RANK
-    --master_addr $MASTER_ADDR
+    --nproc_per_node $GPUS_PER_NODE 
+    --nnodes $NNODES 
+    --node_rank $NODE_RANK 
+    --master_addr $MASTER_ADDR 
     --master_port $MASTER_PORT
 )
 
 DATA_ARGS=(
-    --vocab-file $VOCAB_FILE
-    --merge-file $MERGE_FILE
-    --mock-data
+    --vocab-file $VOCAB_FILE 
+    --merge-file $MERGE_FILE 
+    --mock-data 
 )
 
 GPT_ARGS=(
@@ -118,30 +115,27 @@ GPT_ARGS=(
     --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
-    --lr 0.00005 
-    --train-iters 1
+    --lr 0.00015 
+    --train-iters 4
     --lr-decay-iters 320000 
     --lr-decay-style cosine 
     --min-lr 1.0e-5 
     --weight-decay 1e-2 
-    --lr-warmup-fraction .05 
+    --lr-warmup-fraction .01 
     --clip-grad 1.0 
     --fp16 
     --tokenizer-type GPT2BPETokenizer 
     --use-mcore-models 
     --transformer-impl transformer_engine 
     --no-scatter-gather-tensors-in-pipeline 
-    --num-layers 32
+    --num-layers 24 
     --optimizer adam
-    --loss-scale-window 100
-    --initial-loss-scale 4096
-    --min-loss-scale 1.0
-    --hysteresis 2
+    --loss-scale 8192
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 2
-    --pipeline-model-parallel-size 4
+    --tensor-model-parallel-size 1
+    --pipeline-model-parallel-size 8
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -149,18 +143,12 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --use-ecnaive-software-failure
-    #--load $CHECKPOINT_PATH
+    
+    --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
 
-    # --use-gemini
-    # --use-gemini-optimized
-    # --use-gemini-software-failure
-    # --use-gemini-hardware-failure
-    # --use-distributed-optimizer
-    # --use-ecnaive-software-failure
     --use-ecnaive
     --ckpt-format torch
     # --no-save-optim
@@ -172,7 +160,8 @@ EVAL_AND_LOGGING_ARGS=(
     # --- EC-NAIVE generalized parameters ---
      --ecnaive-rs-k 6             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
     #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
-    #--ecnaive-failed-ranks 1,2   # Comma-separated failed global ranks for software recovery
+    #--use-ecnaive-software-failure
+    --ecnaive-failed-ranks 1   # Comma-separated failed global ranks for hardware recovery only; software recovery is set to 2
     #                                Uses ISA-L RS decoding (GF(2^8)) to recover 1-2 lost blocks
 )
 

@@ -709,7 +709,106 @@ class ECNAIVEManager:
             rank_in_group, rank2_ip, port
         )
         logger.info(f"EC-NAIVE: [Rank {rank}] Software-only load connection initialized (1 port)")
-    
+
+    # ---- Generalized SW recovery (k-1 ports, any k >= 2) ----
+
+    def init_ecnaive_sw_recovery(self, rank: int, world_size: int,
+                                  failed_rank_in_group: int = 2) -> None:
+        """Initialize generalized SW recovery with k-1 ports (one per non-local data block).
+
+        Replaces init_ecnaive_load_software_only for k > 2.  Sets up dedicated
+        ASIO/RDMA connections from each sender rank (holding one of the failed
+        rank's data blocks) to the receiver rank.
+        """
+        native = self._ecnaive_native
+        if native is None:
+            raise RuntimeError("EC-NAIVE native module not initialized for SW recovery")
+        k = self.ecnaive_k
+        num_blocks = k - 1  # d_{f,1} .. d_{f,k-1} from network, d_{f,0} local
+
+        # Network config: k-1 consecutive ports after the save ports
+        base_ip = resolve_ip("ECNAIVE", rank=rank)
+        master_port = int(os.environ.get('MASTER_PORT', '6000'))
+        base_port = int(os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000))
+        n = self.ecnaive_n
+        group_id = self._get_group_id(rank, world_size)
+        rank_in_group = self._get_rank_in_group(rank, world_size)
+        load_receiver_rank = (
+            self._get_rank_by_group_position(group_id, failed_rank_in_group, world_size)
+            if world_size >= n else failed_rank_in_group
+        )
+        # Place SW recovery ports after load ports: base + 1000 + group*100 + 100 (offset from load)
+        sw_base = base_port + 1200 + group_id * 200
+        sw_ports = [sw_base + j for j in range(num_blocks)]
+
+        # Exchange IPs
+        rank_ips = {}
+        if torch.distributed.is_initialized():
+            try:
+                ip_list = [None] * world_size
+                torch.distributed.all_gather_object(ip_list, base_ip)
+                for r, ip in enumerate(ip_list):
+                    rank_ips[r] = ip
+            except Exception:
+                for r in range(world_size):
+                    rank_ips[r] = base_ip
+        receiver_ip = rank_ips.get(load_receiver_rank, base_ip)
+
+        # Phase 1: bind/listen (receiver) + RDMA CQs (all ranks)
+        logger.info(f"EC-NAIVE: [Rank {rank}] SW recovery phase 1: {num_blocks} ports")
+        native.init_ecnaive_load_sw_bind_listen(
+            rank_in_group, receiver_ip, num_blocks, sw_ports)
+        torch.distributed.barrier()
+
+        # Phase 2: receiver accepts (blocking), senders each connect to exactly one port.
+        # Non-participating ranks skip entirely — they have no data block for the failed rank.
+        if rank_in_group == failed_rank_in_group:
+            logger.info("EC-NAIVE: [Rank %d] SW recovery phase 2: accepting %d connections",
+                        rank, num_blocks)
+            native.init_ecnaive_load_sw_accept(rank_in_group, num_blocks)
+        else:
+            block_idx = self.get_sw_recovery_block_idx_for_sender(
+                rank_in_group, failed_rank_in_group=failed_rank_in_group)
+            if block_idx >= 0:
+                logger.info("EC-NAIVE: [Rank %d] SW recovery phase 2: connecting block_idx=%d "
+                            "port=%d", rank, block_idx, sw_ports[block_idx])
+                native.init_ecnaive_load_sw_connect_one(
+                    rank_in_group, receiver_ip, block_idx, sw_ports[block_idx])
+            else:
+                logger.info("EC-NAIVE: [Rank %d] SW recovery phase 2: no block, skipping",
+                            rank)
+        torch.distributed.barrier()
+        logger.info("EC-NAIVE: [Rank %d] SW recovery connections ready (%d blocks)",
+                    rank, num_blocks)
+
+    def get_sw_recovery_block_idx_for_sender(
+        self, sender_rank_in_group: int, failed_rank_in_group: int = 2
+    ) -> int:
+        """Map sender's rank_in_group to the block_idx they hold for the failed rank.
+
+        During save, rank f's data block j is sent to rank (f+j)%n.
+        So rank s holds block j if s = (f+j)%n, i.e. j = (s-f)%n.
+        Returns block_idx = j-1 (0-indexed for d_{f,1}..d_{f,k-1}).
+        Returns -1 if this sender doesn't hold any data block.
+        """
+        n = self.ecnaive_n
+        k = self.ecnaive_k
+        j = (sender_rank_in_group - failed_rank_in_group + n) % n
+        if 1 <= j < k:
+            return j - 1  # block_idx 0 = d_{f,1}, ..., k-2 = d_{f,k-1}
+        return -1
+
+    def get_sw_recovery_sender_rank_for_block(
+        self, block_idx: int, failed_rank_in_group: int = 2, world_size: int = 8
+    ) -> int:
+        """Get the global rank of the sender holding data block j = block_idx+1."""
+        j = block_idx + 1
+        n = self.ecnaive_n
+        group_id = self._get_group_id(
+            self._get_rank_by_group_position(0, failed_rank_in_group, world_size), world_size)
+        sender_rig = (failed_rank_in_group + j) % n
+        return self._get_rank_by_group_position(group_id, sender_rig, world_size)
+
     def allocate_ecnaive_load_recv_buffers(self, global_registry: GlobalMetadataRegistry) -> Dict[str, torch.Tensor]:
         """
         Allocate recv buffers for rank2 load recovery.

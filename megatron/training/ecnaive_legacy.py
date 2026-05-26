@@ -33,17 +33,25 @@ def _cpu_uint8_view(tensor: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(torch.uint8).reshape(-1)
 
 
+_BUILD_GLOBAL_REGISTRY_CACHE: Dict[tuple, tuple] = {}
+
 def _build_global_registry(local_metadata: List[TensorMetadata], local_non_tensor: Dict[str, Any]) -> Tuple[Dict[int, List[TensorMetadata]], Dict[int, Dict[str, Any]]]:
     if not torch.distributed.is_initialized():
         return {0: local_metadata}, {0: local_non_tensor}
 
     world_size = torch.distributed.get_world_size()
+    total_bytes = sum(m.size_bytes for m in local_metadata)
+    cache_key = (world_size, len(local_metadata), total_bytes)
+    if cache_key in _BUILD_GLOBAL_REGISTRY_CACHE:
+        return _BUILD_GLOBAL_REGISTRY_CACHE[cache_key]
+
     gathered_meta: List[Any] = [None for _ in range(world_size)]
     gathered_non_tensor: List[Any] = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(gathered_meta, local_metadata)
     torch.distributed.all_gather_object(gathered_non_tensor, local_non_tensor)
     rank_metadata = {r: gathered_meta[r] for r in range(world_size)}
     rank_non_tensor = {r: gathered_non_tensor[r] for r in range(world_size)}
+    _BUILD_GLOBAL_REGISTRY_CACHE[cache_key] = (rank_metadata, rank_non_tensor)
     return rank_metadata, rank_non_tensor
 
 
@@ -522,6 +530,37 @@ def _load_ecnaive_block_file(
     return payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
 
 
+def _decode_data_block(
+    block: torch.Tensor,
+    pipeline_total_bytes: int,
+    block_idx: int,
+    block_data_size: int,
+    ecnaive_buffer_size: int,
+) -> torch.Tensor:
+    """Decode one padded data block into its linear segment of tensor_buffer.
+
+    During save, data block j covers bytes [j*block_data_size, (j+1)*block_data_size)
+    of the original tensor.  The block is written with 64-byte alignment between
+    ecnaive_buffer_size chunks.
+    """
+    start_byte = block_idx * block_data_size
+    end_byte = min(start_byte + block_data_size, pipeline_total_bytes)
+    actual = max(0, end_byte - start_byte)
+    out = torch.zeros(actual, dtype=torch.uint8, device=block.device)
+    src_pos = 0
+    block_offset = 0
+    while src_pos < actual:
+        take = min(ecnaive_buffer_size, actual - src_pos)
+        aligned = ((block_offset + 63) // 64) * 64
+        if aligned + take > block.numel():
+            logger.warning("EC-NAIVE: data block %d exhausted during decode", block_idx)
+            break
+        out[src_pos : src_pos + take].copy_(block[aligned : aligned + take])
+        block_offset = aligned + take
+        src_pos += take
+    return out
+
+
 def _load_ecnaive_legacy_software_failure(
     checkpoint_dir: Path,
     rank: int,
@@ -530,15 +569,12 @@ def _load_ecnaive_legacy_software_failure(
     main_payload: Dict[str, Any],
     global_registry: GlobalMetadataRegistry,
 ) -> Dict[str, Any]:
-    """EC-NAIVE legacy load software failure path.
+    """EC-NAIVE legacy load software failure path (generalized for any k >= 2).
 
-    Called when use_ecnaive_software_failure is True.
-    - rank_in_group=2 (failed): reads own_data0 from local disk, receives d_{2,1}
-      from rank_in_group=3 via C++ (1 port, ASIO or RDMA), concatenates the two
-      halves, and reconstructs state_dict.
-    - rank_in_group=3 (sender): reads recv_2 block from local disk and sends it
-      to rank_in_group=2 via C++.
-    - rank_in_group 0,1: no-op, reconstruct state_dict from main_payload tensor_buffer.
+    The failed rank (rig=2 by convention) reads d_{2,0} from local disk and
+    receives d_{2,1}..d_{2,k-1} from k-1 sender ranks via C++ ASIO/RDMA
+    (k-1 ports).  Sender ranks load their block files and send via C++.
+    Non-participating ranks just reconstruct from their own main.pt.
     """
     from time import time as _time
     t_start = _time()
@@ -547,53 +583,59 @@ def _load_ecnaive_legacy_software_failure(
     if native is None:
         raise RuntimeError("EC-NAIVE native module not initialized for sw recovery")
 
-    net_config = manager._get_ecnaive_load_network_config(rank, world_size)
-    rank_in_group = net_config['rank_in_group']
-
-    # Phase 1: 1-port software-only connection (1 barrier inside)
-    manager.init_ecnaive_load_software_only(rank, world_size, net_config=net_config)
+    k = manager.ecnaive_k
+    n = manager.ecnaive_n
+    rank_in_group = manager._get_rank_in_group(rank, world_size)
+    group_id = manager._get_group_id(rank, world_size)
+    failed_rig = 2
+    num_network_blocks = k - 1  # blocks d_{2,1} .. d_{2,k-1} come from network
 
     flat_key_roots = _infer_flat_key_roots(main_payload)
     pipeline_total_bytes = int(main_payload["pipeline_total_bytes"])
     actual_tensor_size = int(main_payload["actual_tensor_size"])
     aligned_block_size = int(main_payload["aligned_block_size"])
+    block_data_size = int(main_payload.get("block_data_size",
+                         (pipeline_total_bytes + k - 1) // k))
     tensor_infos = main_payload["tensor_infos"]
     non_tensor_data = main_payload["non_tensor_data"]
 
     block_files_legacy = main_payload.get("_block_files_legacy", None)
 
-    if rank_in_group == 2:
-        # ---- FAILED RANK: local d_{2,0} + network d_{2,1} ----
-        d20_block = _load_ecnaive_block_file(
+    # Phase 1: ALL ranks must call init_ecnaive_sw_recovery because it contains
+    # barriers.  Non-participating ranks skip Phase 2 (connect) internally.
+    manager.init_ecnaive_sw_recovery(rank, world_size, failed_rank_in_group=failed_rig)
+
+    if rank_in_group == failed_rig:
+        # ---- FAILED RANK ----
+        # Phase 2: local d_{2,0} + network d_{2,1}..d_{2,k-1}
+        own_data0 = _load_ecnaive_block_file(
             checkpoint_dir, rank,
             canonical_name="own_data0",
             legacy_name="data0",
             block_files_legacy=block_files_legacy,
         )
-        d21_buffer = torch.zeros(aligned_block_size, dtype=torch.uint8)
-        if manager.use_rdma:
-            manager.register_buffer(d21_buffer)
-        native.software_recv_data1(int(d21_buffer.data_ptr()), d21_buffer.numel())
-        logger.info(
-            f"EC-NAIVE legacy sw: rank2 received d21 "
-            f"({d21_buffer.numel()} bytes)"
-        )
+        recv_blocks = []
+        for j in range(1, k):
+            buf = torch.zeros(aligned_block_size, dtype=torch.uint8)
+            if manager.use_rdma:
+                manager.register_buffer(buf)
+            native.sw_recv_data(j - 1, int(buf.data_ptr()), buf.numel())
+            recv_blocks.append(buf)
+            logger.info(
+                "EC-NAIVE legacy sw: rank2 received d_2,%d (%d bytes)",
+                j, buf.numel(),
+            )
 
-        half = pipeline_total_bytes // 2
-        first = _decode_data0_to_linear_first_half(
-            d20_block, pipeline_total_bytes, manager.ecnaive_buffer_size,
-        )
-        second = _decode_data0_to_linear_first_half(
-            d21_buffer, pipeline_total_bytes, manager.ecnaive_buffer_size,
-        )
-
-        buf_len = max(pipeline_total_bytes, actual_tensor_size)
-        full_buf = torch.zeros(buf_len, dtype=torch.uint8)
-        full_buf[:half].copy_(first[:half])
-        remaining = buf_len - half
-        if remaining > 0:
-            m = min(second.numel(), remaining)
-            full_buf[half:half + m].copy_(second[:m])
+        # Decode and concatenate all k data blocks
+        decoded = []
+        for idx, blk in enumerate([own_data0] + recv_blocks):
+            decoded.append(_decode_data_block(
+                blk, pipeline_total_bytes, idx,
+                block_data_size, manager.ecnaive_buffer_size,
+            ))
+        full_buf = torch.cat(decoded, dim=0)
+        if actual_tensor_size > 0:
+            full_buf = full_buf[:actual_tensor_size]
 
         tensor_data = extract_tensors_from_continuous_buffer(full_buf, tensor_infos)
         decomposed = DecomposedStateDict(
@@ -605,37 +647,57 @@ def _load_ecnaive_legacy_software_failure(
         state_dict = reconstruct_state_dict(decomposed)
         unflatten_optimizer_fp32_params(state_dict)
         logger.info(
-            f"EC-NAIVE legacy sw: rank_in_group=2 recovered state_dict "
-            f"in {_time() - t_start:.2f}s"
-        )
-
-    elif rank_in_group == 3:
-        # ---- SOURCE RANK: send d_{2,1} to rank2 ----
-        d21_block = _load_ecnaive_block_file(
-            checkpoint_dir, rank,
-            canonical_name="recv_2",
-            legacy_name="recv_data1",
-            block_files_legacy=block_files_legacy,
-        )
-        if manager.use_rdma:
-            manager.register_buffer(d21_block)
-        native.software_send_rank3_data1(int(d21_block.data_ptr()), d21_block.numel())
-        logger.info(
-            f"EC-NAIVE legacy sw: rank3 sent d21 "
-            f"({d21_block.numel()} bytes)"
-        )
-        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
-            main_payload, flat_key_roots=flat_key_roots,
+            "EC-NAIVE legacy sw: rank_in_group=%d recovered state_dict in %.2fs",
+            failed_rig, _time() - t_start,
         )
 
     else:
-        # rank_in_group 0,1: no network participation
-        logger.info(
-            f"EC-NAIVE legacy sw: rank_in_group={rank_in_group} no-op"
-        )
-        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
-            main_payload, flat_key_roots=flat_key_roots,
-        )
+        # ---- SENDER RANK (if I hold a data block for the failed rank) ----
+        sender_rig = rank_in_group
+        j = (sender_rig - failed_rig + n) % n  # data block index j for this sender
+        if 1 <= j < k:
+            # init_ecnaive_sw_recovery already called above for all ranks
+            block_idx = j - 1  # 0-indexed for sw_send_data
+
+            # recv file index on this sender: recv_{(sender_rig - failed_rig - 1 + n) % n}
+            recv_idx = (sender_rig - failed_rig - 1 + n) % n
+            canonical_name = f"recv_{recv_idx}"
+
+            # Legacy names (k=2 backward compat)
+            if k == 2:
+                legacy_map_2 = {0: "recv_parity1", 1: "recv_parity0", 2: "recv_data1"}
+                legacy_name = legacy_map_2.get(recv_idx, canonical_name)
+            else:
+                legacy_name = canonical_name
+
+            block = _load_ecnaive_block_file(
+                checkpoint_dir, rank,
+                canonical_name=canonical_name,
+                legacy_name=legacy_name,
+                block_files_legacy=block_files_legacy,
+            )
+            if manager.use_rdma:
+                manager.register_buffer(block)
+            native.sw_send_data(block_idx, int(block.data_ptr()), block.numel())
+            logger.info(
+                "EC-NAIVE legacy sw: rig=%d sent d_2,%d (block_idx=%d, %d bytes)",
+                sender_rig, j, block_idx, block.numel(),
+            )
+            state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+                main_payload, flat_key_roots=flat_key_roots,
+            )
+        else:
+            # This rank is in group but doesn't hold a data block for the failed rank
+            # (parity channels only — not participating in SW recovery)
+            logger.info(
+                "EC-NAIVE legacy sw: righ=%d no data block, no-op", rank_in_group,
+            )
+            state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+                main_payload, flat_key_roots=flat_key_roots,
+            )
+
+    # NOTE: the old standalone else clause for ranks 0,1 (k=2) is absorbed into
+    # the generalized else branch above.
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -847,7 +909,6 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     reads d_{2,0} locally + receives d_{2,1} from rank_in_group=3 via C++
     (1 port), concatenates, and reconstructs.  No XOR decode or parity needed.
     """
-    start_time = time.time()
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -926,6 +987,8 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             for _n, t in ecnaive_blocks.items():
                 manager.register_buffer(t)
 
+    t_load = time.time()  # after all alloc + block memcopy
+
     _run_ecnaive_full_recovery(
         manager=manager,
         rank=rank,
@@ -955,7 +1018,7 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     # could access freed memory once local tensors (ecnaive_blocks, recv_buffers)
     # go out of scope. Also reset _ecnaive_native so the next save will
     # reinitialize the C++ module from scratch.
-    logger.info(f"EC-NAIVE legacy load: done in {time.time() - start_time:.2f}s")
+    logger.info("EC-NAIVE legacy load time (excl disk): %.2fs", time.time() - t_load)
     logger.info(f"EC-NAIVE legacy load: cleaning up native module (rank {rank})")
     manager.cleanup()
     manager._ecnaive_native = None
@@ -1068,7 +1131,10 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         data_labels = []
         parity_labels = []
         for _, label, _, _ in plan['surviving']:
-            surviving_tensors[label] = torch.zeros(block_data_size, dtype=torch.uint8)
+            buf = allocate_hugepage_tensor(block_data_size, fallback_pin_memory=True)
+            if manager.use_rdma:
+                manager.register_buffer(buf)
+            surviving_tensors[label] = buf
             if label.startswith('data_'):
                 data_labels.append(label)
             else:
@@ -1154,8 +1220,14 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     f"EC-NAIVE hw recovery: source rank {rank} missing block "
                     f"{label} for failed rank {dest_fr} at {block_path}"
                 )
-            payload = torch.load(block_path, map_location="cpu", weights_only=False)
-            block_tensor = payload["tensor"].contiguous().view(torch.uint8)[:block_data_size]
+            from megatron.training.legacy_io_utils import is_raw_format, read_raw_block, MAGIC_BLOCK
+            if is_raw_format(str(block_path), MAGIC_BLOCK):
+                block_tensor = read_raw_block(str(block_path), MAGIC_BLOCK)[:block_data_size]
+            else:
+                payload = torch.load(block_path, map_location="cpu", weights_only=False)
+                block_tensor = payload["tensor"].contiguous().view(torch.uint8)[:block_data_size]
+            if manager.use_rdma:
+                manager.register_buffer(block_tensor)
             block_tensors.append(block_tensor)  # keep alive
             send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
             logger.info(

@@ -91,8 +91,11 @@ SHM_PKT="/dev/shm/shm_pkt"
 ARGS_TO_PASS=("$@")
 
 # 模型固定参数
-HIDDEN_SIZE=1024
-NUM_ATTENTION_HEADS=16
+
+HIDDEN_SIZE=4096
+NUM_ATTENTION_HEADS=32
+NUM_LAYERS=32 
+
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
 MICRO_BATCH_SIZE=4
@@ -113,29 +116,32 @@ DATA_ARGS=(
 )
 
 GPT_ARGS=(
-    --no-async-tensor-model-parallel-allreduce
-    --hidden-size $HIDDEN_SIZE
-    --num-attention-heads $NUM_ATTENTION_HEADS
-    --seq-length $SEQ_LENGTH
-    --max-position-embeddings $MAX_POSITION_EMBEDDINGS
-    --micro-batch-size $MICRO_BATCH_SIZE
-    --global-batch-size $GLOBAL_BATCH_SIZE
-    --lr 0.00015
-    --train-iters 10
-    --lr-decay-iters 320000
-    --lr-decay-style cosine
-    --min-lr 1.0e-5
-    --weight-decay 1e-2
-    --lr-warmup-fraction .01
-    --clip-grad 1.0
-    --fp16
-    --tokenizer-type GPT2BPETokenizer
-    --use-mcore-models
-    --transformer-impl transformer_engine
-    --no-scatter-gather-tensors-in-pipeline
-    --num-layers 24
+    --no-async-tensor-model-parallel-allreduce 
+    --hidden-size $HIDDEN_SIZE 
+    --num-attention-heads $NUM_ATTENTION_HEADS 
+    --seq-length $SEQ_LENGTH 
+    --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
+    --micro-batch-size $MICRO_BATCH_SIZE 
+    --global-batch-size $GLOBAL_BATCH_SIZE 
+    --lr 0.00005 
+    --train-iters 3
+    --lr-decay-iters 320000 
+    --lr-decay-style cosine 
+    --min-lr 1.0e-5 
+    --weight-decay 1e-2 
+    --lr-warmup-fraction .05 
+    --clip-grad 1.0 
+    --fp16 
+    --tokenizer-type GPT2BPETokenizer 
+    --use-mcore-models 
+    --transformer-impl transformer_engine 
+    --no-scatter-gather-tensors-in-pipeline 
+    --num-layers 32
     --optimizer adam
-    --loss-scale 8192
+    --loss-scale-window 100
+    --initial-loss-scale 4096
+    --min-loss-scale 1.0
+    --hysteresis 2
 )
 
 MODEL_PARALLEL_ARGS=(
@@ -155,14 +161,14 @@ EVAL_AND_LOGGING_ARGS=(
     #--load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
-
+    --timing-log-level 2
     # ---------------------------------------------------------------------------
     # 必选：启用 Gemini Replicas torch legacy checkpoint
     # ---------------------------------------------------------------------------
     # 启用 Gemini Replicas（替代原有的 --use-gemini，后者是两副本 EC 风格配对）
-    # --use-gemini-replicas
+    --use-gemini-replicas
     # 启用优化路径：使用连续 CPU buffer + C++ ASIO/RDMA 网络传输，跳过 torch.save 序列化开销
-    # --use-gemini-replicas-optimized
+    --use-gemini-replicas-optimized
 
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）

@@ -8,20 +8,22 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=eth0
+export NETIFACES_INTERFACE=bond0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-MASTER_ADDR=172.16.0.216
+MASTER_ADDR=10.0.0.62
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
-NNODES=1
+NNODES=8
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export ECCHECK_INTERFACE=$NETIFACES_INTERFACE
+export ECCHECK_LOCAL_RANK_NIC_0=bond0
+export ECCHECK_LOCAL_RANK_NIC_1=bond0
 export MEGATRON_ECCHECK_LOAD_NET_TRACE=1
 
 # If first argument is a numeric node rank use it, otherwise default to 0
@@ -67,15 +69,13 @@ SHM_PKT="/dev/shm/shm_pkt"
 # Remaining args after node-rank and GPU ids are passed to the training script
 ARGS_TO_PASS=("$@")
 
-# fixed Model related configuration here, pls not overlap with json config
-HIDDEN_SIZE=1632
-NUM_ATTENTION_HEADS=24
-NUM_LAYERS=48 
-
+# Model related configuration here, please do not overlap with json config
+HIDDEN_SIZE=1024
+NUM_ATTENTION_HEADS=16
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
-MICRO_BATCH_SIZE=2
-GLOBAL_BATCH_SIZE=4
+MICRO_BATCH_SIZE=4
+GLOBAL_BATCH_SIZE=16
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -92,37 +92,34 @@ DATA_ARGS=(
 )
 
 GPT_ARGS=(
-    --no-async-tensor-model-parallel-allreduce 
-    --hidden-size $HIDDEN_SIZE 
-    --num-attention-heads $NUM_ATTENTION_HEADS 
-    --seq-length $SEQ_LENGTH 
-    --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
-    --micro-batch-size $MICRO_BATCH_SIZE 
-    --global-batch-size $GLOBAL_BATCH_SIZE 
-    --lr 0.00005 
-    --train-iters 10
-    --lr-decay-iters 320000 
-    --lr-decay-style cosine 
-    --min-lr 1.0e-5 
-    --weight-decay 1e-2 
-    --lr-warmup-fraction .05 
-    --clip-grad 1.0 
-    --fp16 
-    --tokenizer-type GPT2BPETokenizer 
-    --use-mcore-models 
-    --transformer-impl transformer_engine 
-    --no-scatter-gather-tensors-in-pipeline 
-    --num-layers 48
+    --no-async-tensor-model-parallel-allreduce
+    --hidden-size $HIDDEN_SIZE
+    --num-attention-heads $NUM_ATTENTION_HEADS
+    --seq-length $SEQ_LENGTH
+    --max-position-embeddings $MAX_POSITION_EMBEDDINGS
+    --micro-batch-size $MICRO_BATCH_SIZE
+    --global-batch-size $GLOBAL_BATCH_SIZE
+    --lr 0.00015
+    --train-iters 4
+    --lr-decay-iters 320000
+    --lr-decay-style cosine
+    --min-lr 1.0e-5
+    --weight-decay 1e-2
+    --lr-warmup-fraction .01
+    --clip-grad 1.0
+    --fp16
+    --tokenizer-type GPT2BPETokenizer
+    --use-mcore-models
+    --transformer-impl transformer_engine
+    --no-scatter-gather-tensors-in-pipeline
+    --num-layers 24
     --optimizer adam
-    --loss-scale-window 100
-    --initial-loss-scale 4096
-    --min-loss-scale 1.0
-    --hysteresis 2
+    --loss-scale 8192
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 8
-    --pipeline-model-parallel-size 1
+    --tensor-model-parallel-size 1
+    --pipeline-model-parallel-size 8
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -133,9 +130,9 @@ EVAL_AND_LOGGING_ARGS=(
     --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
-    #--use-eccheck
+    --use-eccheck
     #--use-eccheck-software-failure
-    --ckpt-format torch_dist
+    --ckpt-format torch
     --save-embeddings-separately
     --timing-log-level 2
     --timing-log-option all

@@ -160,7 +160,6 @@ class FRCheckManager:
         """Allocate or reuse cached full tensor buffer (grows-only)."""
         if self._full_buf is not None:
             if self._full_buf.numel() >= size_bytes:
-                self._full_buf.zero_()
                 return self._full_buf
         self._full_buf = allocate_hugepage_tensor(
             size_bytes, fallback_pin_memory=torch.cuda.is_available(),

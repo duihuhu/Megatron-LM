@@ -77,7 +77,7 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-naive" #<Specify path>
+CHECKPOINT_PATH="/workspace/Megatron-LM/data/checkpoint/models/gpt2-345m-0-naive" #<Specify path>
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -86,10 +86,9 @@ SHM_PKT="/dev/shm/shm_pkt"
 ARGS_TO_PASS=("$@")
 
 # Model related configuration here, please do not overlap with json config
-
-HIDDEN_SIZE=4096
-NUM_ATTENTION_HEADS=32
-NUM_LAYERS=32 
+HIDDEN_SIZE=5120
+NUM_ATTENTION_HEADS=40 
+NUM_LAYERS=64
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
@@ -111,39 +110,35 @@ DATA_ARGS=(
 )
 
 GPT_ARGS=(
-    --no-async-tensor-model-parallel-allreduce 
-    --hidden-size $HIDDEN_SIZE 
-    --num-attention-heads $NUM_ATTENTION_HEADS 
-    --seq-length $SEQ_LENGTH 
-    --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
-    --micro-batch-size $MICRO_BATCH_SIZE 
-    --global-batch-size $GLOBAL_BATCH_SIZE 
-    --lr 0.00005 
-    --train-iters 1
-    --lr-decay-iters 320000 
-    --lr-decay-style cosine 
-    --min-lr 1.0e-5 
-    --weight-decay 1e-2 
-    --lr-warmup-fraction .05 
-    --clip-grad 1.0 
-    --fp16 
-    --tokenizer-type GPT2BPETokenizer 
-    --use-mcore-models 
-    --transformer-impl transformer_engine 
-    --no-scatter-gather-tensors-in-pipeline 
-    --num-layers 32
+    --no-async-tensor-model-parallel-allreduce
+    --hidden-size $HIDDEN_SIZE
+    --num-attention-heads $NUM_ATTENTION_HEADS
+    --seq-length $SEQ_LENGTH
+    --max-position-embeddings $MAX_POSITION_EMBEDDINGS
+    --micro-batch-size $MICRO_BATCH_SIZE
+    --global-batch-size $GLOBAL_BATCH_SIZE
+    --lr 0.00015
+    --train-iters 4
+    --lr-decay-iters 320000
+    --lr-decay-style cosine
+    --min-lr 1.0e-5
+    --weight-decay 1e-2
+    --lr-warmup-fraction .01
+    --clip-grad 1.0
+    --fp16
+    --tokenizer-type GPT2BPETokenizer
+    --use-mcore-models
+    --transformer-impl transformer_engine
+    --no-scatter-gather-tensors-in-pipeline
+    --num-layers $NUM_LAYERS
     --optimizer adam
-    --loss-scale-window 100
-    --initial-loss-scale 4096
-    --min-loss-scale 1.0
-    --hysteresis 2
+    --loss-scale 8192
 )
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 2
     --pipeline-model-parallel-size 4
 )
-
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
@@ -170,7 +165,7 @@ EVAL_AND_LOGGING_ARGS=(
     --timing-log-level 2
 
     # --- EC-NAIVE generalized parameters ---
-     --ecnaive-rs-k 6             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
+     --ecnaive-rs-k 2             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
     #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
     #--ecnaive-failed-ranks 1,2   # Comma-separated failed global ranks for software recovery
     #                                Uses ISA-L RS decoding (GF(2^8)) to recover 1-2 lost blocks

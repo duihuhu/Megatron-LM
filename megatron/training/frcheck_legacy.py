@@ -6,6 +6,7 @@ independently so per-layer data fits within SOURCE stripe capacity.
 """
 
 import pickle
+import os
 import re
 import struct
 import time
@@ -661,6 +662,7 @@ def _recover_one_layer(
     """
     my_node = manager.rank_in_group + 1
     group_members = manager.group_member_ranks
+    _dbg = os.environ.get("FRCHECK_DEBUG", "0") == "1"
 
     if not manager.recovery_stripe_plans:
         return None
@@ -689,6 +691,13 @@ def _recover_one_layer(
             padded = torch.zeros(layer_block_size, dtype=torch.uint8)
             padded[:blk.numel()] = blk
             blk = padded
+        elif blk.numel() > layer_block_size:
+            logger.warning(
+                "FRCheck recovery: rank %d layer %s stripe %d block exceeds "
+                "layer_block_size (%d > %d), truncating",
+                rank, layer_name, sid, blk.numel(), layer_block_size,
+            )
+            blk = blk[:layer_block_size]
         blk = blk.contiguous()
         native.register_buffer(blk.data_ptr(), blk.numel())
         my_blocks[sid] = blk
@@ -710,124 +719,104 @@ def _recover_one_layer(
     # Tracks SOURCE block indices (matches save order: increment only for SOURCE stripes)
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
 
-    # ---- Batched pipeline (same pattern as save: post all recvs, then send all, then wait) ----
-    # Phase 1: ALL decoders start ALL recv threads for ALL stripes at once.
-    #   Uses C++ std::thread (batch call, no Python GIL — threads block on TCP
-    #   recv(size) until helpers send, no sleep needed).
-    #   Structure: stripe_recvs = [(stripe_id, recv_buf, helper_rig), ...]
-    stripe_recvs: List[Tuple[int, torch.Tensor, int]] = []
-    batch_helper_rigs: List[int] = []
-    batch_addrs: List[int] = []
-    batch_sizes: List[int] = []
-
-    for stri_plan in manager.recovery_stripe_plans:
-        sid = stri_plan['stripe_id']
-        decoder_node = stri_plan['decoder_node']
-        if my_node != decoder_node:
-            continue
-        for helper_node in stri_plan['helper_nodes']:
-            helper_rig = node_to_rig[helper_node]
-            recv_buf = allocate_hugepage_tensor(layer_block_size, fallback_pin_memory=True)
-            native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
-            stripe_recvs.append((sid, recv_buf, helper_rig))
-            batch_helper_rigs.append(helper_rig)
-            batch_addrs.append(recv_buf.data_ptr())
-            batch_sizes.append(recv_buf.numel())
-
-    if batch_helper_rigs:
-        logger.debug("FRCheck recovery %s: rank %d submitting %d batched recv tasks",
-                     layer_name, rank, len(batch_helper_rigs))
-        native.submit_batched_recv_tasks(batch_helper_rigs, batch_addrs, batch_sizes)
-
-    # Phase 2: ALL helpers send to their decoders.
-    #   This unblocks the matching C++ recv threads from Phase 1.
-    logger.debug("FRCheck recovery %s: rank %d Phase 2 send (%d helper stripes)",
-                 layer_name, rank, len(helper_stripes))
-    for stri_plan in manager.recovery_stripe_plans:
-        sid = stri_plan['stripe_id']
-        if my_node not in stri_plan['helper_nodes']:
-            continue
-        decoder_node = stri_plan['decoder_node']
-        decoder_rig = node_to_rig[decoder_node]
-        my_block = my_blocks.get(sid)
-        if my_block is None:
-            my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
-            native.register_buffer(my_block.data_ptr(), my_block.numel())
-        native.send_to_peer(decoder_rig, my_block.data_ptr(), my_block.numel())
-
-    # Phase 3: ALL decoders wait for recv threads, RS decode, send recovered to failed ranks.
-    #   Group recv bufs by stripe_id for access during decode.
-    if batch_helper_rigs:
-        logger.debug("FRCheck recovery %s: rank %d Phase 3 waiting for %d recv threads",
-                     layer_name, rank, len(batch_helper_rigs))
-        native.wait_batched_recv_tasks()
-        logger.debug("FRCheck recovery %s: rank %d Phase 3 recv done, decoding",
-                     layer_name, rank)
-
-    sid_to_recvs: Dict[int, List[Tuple[torch.Tensor, int]]] = {}
-    for sid, buf, helper_rig in stripe_recvs:
-        sid_to_recvs.setdefault(sid, []).append((buf, helper_rig))
-
+    # ---- Serial per-stripe pipeline (correctly pairs recv/send per stripe) ----
+    import threading
     recovered_bufs: Dict[int, torch.Tensor] = {}  # stripe_id → recovered block, for cleanup
 
     for stri_plan in manager.recovery_stripe_plans:
         sid = stri_plan['stripe_id']
         decoder_node = stri_plan['decoder_node']
-        if my_node != decoder_node:
-            continue
+        helper_nodes = stri_plan['helper_nodes']
+        failed_node = stri_plan['failed_node']
+        failed_pos = stri_plan['failed_pos']
+        decoder_pos = stri_plan['decoder_pos']
+        helper_positions = stri_plan['helper_positions']
+        original_role = stri_plan['original_role']
 
-        threads_and_bufs = sid_to_recvs.get(sid, [])
+        decoder_rig = node_to_rig[decoder_node]
+        failed_rig = node_to_rig[failed_node]
 
-        k = n - 2
-        survivor_positions = [stri_plan['decoder_pos']] + stri_plan['helper_positions']
-        survivor_addrs = []
-        my_block = my_blocks.get(sid)
-        if my_block is None:
-            my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
-        survivor_addrs.append(my_block.data_ptr())
-        for buf, _hrig in threads_and_bufs:
-            survivor_addrs.append(buf.data_ptr())
+        # --- Decoder: start recv threads for each helper ---
+        recv_threads = []
+        recv_bufs = []
+        if my_node == decoder_node:
+            for helper_node in helper_nodes:
+                helper_rig = node_to_rig[helper_node]
+                recv_buf = allocate_hugepage_tensor(layer_block_size, fallback_pin_memory=True)
+                recv_bufs.append(recv_buf)
+                native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
 
-        recovered = torch.zeros(layer_block_size, dtype=torch.uint8)
-        native.register_buffer(recovered.data_ptr(), recovered.numel())
-        native.submit_stripe_decode(
-            k=k,
-            survivor_positions=survivor_positions,
-            lost_position=stri_plan['failed_pos'],
-            survivor_addrs=survivor_addrs,
-            recovered_addr=recovered.data_ptr(),
-            block_size=layer_block_size,
-        )
+                def _recv_thread(rb=recv_buf, hrig=helper_rig):
+                    native.recv_from_peer(hrig, rb.data_ptr(), rb.numel())
 
-        failed_rig = node_to_rig[stri_plan['failed_node']]
-        native.send_to_peer(failed_rig, recovered.data_ptr(), recovered.numel())
-        recovered_bufs[sid] = recovered
+                t = threading.Thread(target=_recv_thread, daemon=True)
+                t.start()
+                recv_threads.append(t)
 
-    # Phase 4: Failed rank receives all decoded blocks
-    logger.debug("FRCheck recovery %s: rank %d Phase 4 recv (%d failed stripes)",
-                 layer_name, rank, len(failed_stripes))
-    for stri_plan in manager.recovery_stripe_plans:
-        sid = stri_plan['stripe_id']
-        if my_node != stri_plan['failed_node']:
-            continue
-        decoder_rig = node_to_rig[stri_plan['decoder_node']]
-        recv_buf = allocate_hugepage_tensor(layer_block_size, fallback_pin_memory=True)
-        native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
-        native.recv_from_peer(decoder_rig, recv_buf.data_ptr(), recv_buf.numel())
+        # Brief yield so decoder recv threads enter their TCP recv() calls
+        time.sleep(0.01)
 
-        # Only store SOURCE blocks; encoder/parity_target blocks are parity data
-        if layer_buf is not None and stri_plan['original_role'] == int(StripeRole.SOURCE):
-            blk_idx = src_block_per_node[my_node]
-            src_block_per_node[my_node] += 1
-            offset = blk_idx * layer_block_size
-            ncopy = min(layer_block_size, max(0, layer_total_bytes - offset))
-            if ncopy > 0:
-                layer_buf[offset:offset + ncopy].copy_(recv_buf[:ncopy])
-        del recv_buf
+        # --- Helpers: send blocks to decoder ---
+        if my_node in helper_nodes:
+            my_block = my_blocks.get(sid)
+            if my_block is None:
+                my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
+                native.register_buffer(my_block.data_ptr(), my_block.numel())
+            native.send_to_peer(decoder_rig, my_block.data_ptr(), my_block.numel())
 
-    # Cleanup: release decoder recv bufs and recovered bufs
-    for _sid, recv_buf, _hrig in stripe_recvs:
-        del recv_buf
+        # --- Decoder: join, decode, send to failed ---
+        if my_node == decoder_node:
+            for t in recv_threads:
+                t.join()
+
+            k = n - 2
+            survivor_positions = [decoder_pos] + helper_positions
+            survivor_addrs = []
+
+            my_block = my_blocks.get(sid)
+            if my_block is None:
+                my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
+            survivor_addrs.append(my_block.data_ptr())
+            for recv_buf in recv_bufs:
+                survivor_addrs.append(recv_buf.data_ptr())
+
+            recovered = torch.zeros(layer_block_size, dtype=torch.uint8)
+            native.register_buffer(recovered.data_ptr(), recovered.numel())
+            native.submit_stripe_decode(
+                k=k,
+                survivor_positions=survivor_positions,
+                lost_position=failed_pos,
+                survivor_addrs=survivor_addrs,
+                recovered_addr=recovered.data_ptr(),
+                block_size=layer_block_size,
+            )
+
+            native.send_to_peer(failed_rig, recovered.data_ptr(), recovered.numel())
+            recovered_bufs[sid] = recovered
+
+        # --- Failed rank: recv decoded block ---
+        if my_node == failed_node:
+            recv_buf = allocate_hugepage_tensor(layer_block_size, fallback_pin_memory=True)
+            native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
+            native.recv_from_peer(decoder_rig, recv_buf.data_ptr(), recv_buf.numel())
+
+            # Only store SOURCE blocks; encoder/parity_target blocks are parity data
+            if layer_buf is not None and original_role == int(StripeRole.SOURCE):
+                blk_idx = src_block_per_node[my_node]
+                src_block_per_node[my_node] += 1
+                offset = blk_idx * layer_block_size
+                ncopy = min(layer_block_size, max(0, layer_total_bytes - offset))
+                if ncopy > 0:
+                    layer_buf[offset:offset + ncopy].copy_(recv_buf[:ncopy])
+
+            del recv_buf
+
+        # Cleanup decoder recv bufs
+        if my_node == decoder_node:
+            for buf in recv_bufs:
+                del buf
+
+    # Cleanup recovered bufs
     for recovered in recovered_bufs.values():
         del recovered
 
@@ -1295,6 +1284,7 @@ def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         logger.info("FRCheck: software failure mode — failed ranks %s", failed_ranks)
         t_load = time.time()
         result = _recover_frcheck_legacy_software(checkpoint_name, failed_ranks)
+        FRCheckManager().cleanup()
         logger.info("FRCheck load time (excl disk): %.2fs", time.time() - t_load)
         return result
 
@@ -1304,6 +1294,9 @@ def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             logger.info("FRCheck: hardware recovery mode — failed ranks %s", failed_ranks)
             t_load = time.time()
             result = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
+            # Release RDMA resources (QPs, CQs, GPU buffer MRs) to prevent
+            # memory corruption with subsequent training / DataLoader.
+            FRCheckManager().cleanup()
             logger.info("FRCheck load time (excl disk): %.2fs", time.time() - t_load)
             return result
 

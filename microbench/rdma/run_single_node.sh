@@ -24,7 +24,11 @@
 #   MASTER_ADDR  (default 127.0.0.1)
 #   MASTER_PORT  (default 6000)
 #   MICROBENCH_PREFIX, MICROBENCH_PORT
-
+export ECNAIVE_LOCAL_RANK_NIC_0=bond0
+export ECNAIVE_LOCAL_RANK_NIC_1=bond0
+export MASTER_ADDR=10.0.0.62
+export MASTER_PORT=6000
+export NNODES=1
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

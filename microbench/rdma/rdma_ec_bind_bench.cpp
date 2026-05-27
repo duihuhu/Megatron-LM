@@ -366,6 +366,35 @@ void post_recv_chunked(ibv_qp* qp, ibv_cq* recv_cq, uint8_t* data, size_t total,
     }
 }
 
+// Post all recv WRs for the message, but do NOT poll CQ here.
+// The caller must poll for exactly the returned number of completions.
+int post_recv_chunked_only(ibv_qp* qp, uint8_t* data, size_t total, ibv_mr* mr) {
+    size_t offset = 0;
+    size_t remaining = total;
+    int posted = 0;
+    while (remaining > 0) {
+        const size_t chunk = std::min(remaining, kChunkSize);
+        ibv_sge sge{};
+        sge.addr = reinterpret_cast<uint64_t>(data + offset);
+        sge.length = static_cast<uint32_t>(chunk);
+        sge.lkey = mr->lkey;
+
+        ibv_recv_wr wr{};
+        wr.wr_id = 1;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+
+        ibv_recv_wr* bad = nullptr;
+        if (ibv_post_recv(qp, &wr, &bad)) {
+            die("ibv_post_recv failed");
+        }
+        offset += chunk;
+        remaining -= chunk;
+        ++posted;
+    }
+    return posted;
+}
+
 // Same control + RDMA order as ecnaive_native RdmaConnectionChannel.
 void send_message(int sock, ibv_qp* qp, ibv_cq* send_cq, const uint8_t* buf, size_t size,
                   ibv_mr* mr, int rank, int iter, const char* phase) {
@@ -386,11 +415,14 @@ void recv_message(int sock, ibv_qp* qp, ibv_cq* recv_cq, uint8_t* buf, size_t ca
     if (out_size > capacity) {
         die("peer message exceeds local buffer");
     }
-    uint8_t ack = 1;
-    send_all(sock, &ack, sizeof(ack));
+    // More robust ordering than the legacy path:
+    // Post ALL recv WRs first, then ACK, so sender won't post_send before we are ready.
     std::lock_guard<std::mutex> lock(g_recv_mutex);
     const std::string where = std::string(phase) + " recv iter=" + std::to_string(iter);
-    post_recv_chunked(qp, recv_cq, buf, out_size, mr, rank, where.c_str());
+    const int expected = post_recv_chunked_only(qp, buf, out_size, mr);
+    uint8_t ack = 1;
+    send_all(sock, &ack, sizeof(ack));
+    poll_cq(recv_cq, expected, where.c_str(), rank);
 }
 
 struct RdmaCtx {
@@ -509,10 +541,10 @@ double gib_per_sec(size_t bytes, int iters, double seconds) {
     return gib / seconds;
 }
 
-// Direction peer_rank -> rank: peer uses sock_out, rank uses sock_in.
+// Direction higher_rank -> lower_rank: higher uses sock_out, lower uses sock_in.
 void run_send_only_phase(const BenchConfig& cfg, int sock_out, int sock_in, RdmaCtx& rdma,
                          int iters, const char* label) {
-    const int sender_rank = cfg.peer_rank;
+    const int sender_rank = (cfg.rank > cfg.peer_rank) ? cfg.rank : cfg.peer_rank;
     const bool is_sender = (cfg.rank == sender_rank);
     const int sock = is_sender ? sock_out : sock_in;
 
@@ -551,7 +583,7 @@ void run_send_only_phase(const BenchConfig& cfg, int sock_out, int sock_in, Rdma
 
 void run_recv_only_phase(const BenchConfig& cfg, int sock_out, int sock_in, RdmaCtx& rdma,
                          int iters, const char* label) {
-    const int sender_rank = cfg.peer_rank;
+    const int sender_rank = (cfg.rank < cfg.peer_rank) ? cfg.rank : cfg.peer_rank;
     const bool is_receiver = (cfg.rank != sender_rank);
     const int sock = is_receiver ? sock_in : sock_out;
 

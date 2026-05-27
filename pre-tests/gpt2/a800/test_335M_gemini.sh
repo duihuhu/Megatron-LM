@@ -152,7 +152,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    --load $CHECKPOINT_PATH          # 取消注释以测试 load
+    #--load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
@@ -206,7 +206,7 @@ EVAL_AND_LOGGING_ARGS=(
     #   测试方法：save 完成后直接 load，加下面参数。
     #   示例："2,3" 表示 rank2 和 rank3 当作故障处理。
     #
-    --use-gemini-replicas-software-failure
+    #--use-gemini-replicas-software-failure
     --gemini-replicas-recovery-rank "0"
 
     # ---------------------------------------------------------------------------

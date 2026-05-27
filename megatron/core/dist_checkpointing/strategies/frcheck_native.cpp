@@ -833,6 +833,40 @@ public:
         ch->recv_data((uint8_t*)addr, size);
     }
 
+    // ---- Batched recovery recv (C++ std::thread, no Python GIL) ----
+    void submit_batched_recv_tasks(
+        const std::vector<int>& helper_rigs,
+        const std::vector<uintptr_t>& recv_addrs,
+        const std::vector<size_t>& sizes
+    ) {
+        // Clear any leftover threads (should already be joined by wait_batched_recv_tasks)
+        for (auto& t : batch_recv_threads_) {
+            if (t.joinable()) t.join();
+        }
+        batch_recv_threads_.clear();
+        batch_recv_done_ = false;
+        size_t n = helper_rigs.size();
+        batch_recv_threads_.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            int hrig = helper_rigs[i];
+            uintptr_t addr = recv_addrs[i];
+            size_t sz = sizes[i];
+            batch_recv_threads_.emplace_back([this, hrig, addr, sz]() {
+                recv_from_peer(hrig, addr, sz);
+            });
+        }
+        // Brief yield so all threads enter their TCP recv() before caller proceeds
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    void wait_batched_recv_tasks() {
+        for (auto& t : batch_recv_threads_) {
+            if (t.joinable()) t.join();
+        }
+        batch_recv_threads_.clear();
+        batch_recv_done_ = true;
+    }
+
     // ---- StripePlan queries for Python ----
     int get_role_for_stripe(int stripe_id) const {
         if (stripe_id < 0 || stripe_id >= (int)stripe_plans_.size())
@@ -1887,6 +1921,10 @@ private:
     std::array<uint64_t, kRsPoolWorkers> rs_pool_last_epoch_{};
     std::atomic<int> rs_pool_remaining_{0};
     RsEncodeJob rs_pool_shared_job_{};
+
+    // ---- Batched recovery recv threads (C++ std::thread, no Python GIL) ----
+    std::vector<std::thread> batch_recv_threads_;
+    std::atomic<bool> batch_recv_done_{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -1958,6 +1996,11 @@ PYBIND11_MODULE(frcheck_native, m) {
         .def("recv_from_peer", &FRCheckNative::recv_from_peer,
              py::arg("peer_rig"), py::arg("addr"), py::arg("size"),
              py::call_guard<py::gil_scoped_release>())
+        .def("submit_batched_recv_tasks", &FRCheckNative::submit_batched_recv_tasks,
+             py::arg("helper_rigs"), py::arg("recv_addrs"), py::arg("sizes"),
+             "Start C++ std::threads for batched recv_from_peer (no Python GIL)")
+        .def("wait_batched_recv_tasks", &FRCheckNative::wait_batched_recv_tasks,
+             "Join all batched recv threads, blocking until all complete")
 
         // StripePlan queries
         .def("get_role_for_stripe", &FRCheckNative::get_role_for_stripe,

@@ -125,18 +125,10 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    #--load $CHECKPOINT_PATH
-    --use-eclatin-software-failure
+    --load $CHECKPOINT_PATH
+    #--use-eclatin-software-failure # toggle for software failure; untoggled for hardware failure
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    # --use-eccheck
-
-    # --use-gemini
-    # --use-gemini-optimized
-    # --use-gemini-software-failure
-    # --use-gemini-hardware-failure
-    # --use-distributed-optimizer
-    # --use-ecnaive-software-failure
     --use-eclatin
     --ckpt-format torch
     # --no-save-optim

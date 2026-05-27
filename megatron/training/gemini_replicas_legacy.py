@@ -141,10 +141,21 @@ def state_dict_from_gemini_replicas_main_metadata_only(
 # Save
 # ---------------------------------------------------------------------------
 
+# Meta exchange cache: tensor_infos (shapes, keys, dtypes) and slimmed
+# non_tensor_data are identical across iterations for a fixed model.
+# Cache the first exchange to avoid repeated NCCL all_gather_object calls.
+_cached_rank_metadata: Optional[Dict[int, List[TensorMetadata]]] = None
+_cached_rank_non_tensor: Optional[Dict[int, Dict[str, Any]]] = None
+_cached_rank_flat_key_roots: Optional[Dict[int, list]] = None
+_cached_rank_tensor_infos: Optional[Dict[int, list]] = None
+
 
 def save_gemini_replicas_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str
 ) -> None:
+    global _cached_rank_metadata, _cached_rank_non_tensor
+    global _cached_rank_flat_key_roots, _cached_rank_tensor_infos
+
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = (
         torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -216,28 +227,40 @@ def save_gemini_replicas_legacy_checkpoint(
 
     t0 = time.time()
     # ===== Metadata exchange via all_gather_object on NCCL (aligned with ecnaive/eccheck) =====
-    # Slim non_tensor_data to avoid OOM from large pickled objects (optimizer, rng state, etc.)
-    _NTD_SKIP_PREFIXES = ("optimizer", "rng_state", "rerun_state_machine", "args")
-    slim_ntd = {
-        k: v for k, v in decomposed.non_tensor_data.items()
-        if not k.startswith(_NTD_SKIP_PREFIXES)
-    }
-    rank_metadata, rank_non_tensor = _build_global_registry(local_tensor_metadata, slim_ntd)
+    # Tensor shapes, keys, and dtypes are identical across iterations for a fixed model.
+    # Cache the results from the first exchange to skip expensive NCCL all_gather_object
+    # on subsequent iterations (~3s → 0s for 32 ranks, 3GB models).
+    if _cached_rank_tensor_infos is None:
+        _NTD_SKIP_PREFIXES = ("optimizer", "rng_state", "rerun_state_machine", "args")
+        slim_ntd = {
+            k: v for k, v in decomposed.non_tensor_data.items()
+            if not k.startswith(_NTD_SKIP_PREFIXES)
+        }
+        rank_metadata, rank_non_tensor = _build_global_registry(local_tensor_metadata, slim_ntd)
+
+        my_flat_key_roots = list(decomposed.flat_key_roots) if decomposed.flat_key_roots else []
+        all_meta: List[Any] = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(all_meta, (my_flat_key_roots, local_tensor_infos))
+        rank_flat_key_roots = {r: all_meta[r][0] for r in range(world_size)}
+        rank_tensor_infos = {r: all_meta[r][1] for r in range(world_size)}
+
+        _cached_rank_metadata = rank_metadata
+        _cached_rank_non_tensor = rank_non_tensor
+        _cached_rank_flat_key_roots = rank_flat_key_roots
+        _cached_rank_tensor_infos = rank_tensor_infos
+        logger.info(f"GEMINI save timing: meta exchange (first) {time.time()-t0:.3f}s")
+    else:
+        rank_metadata = _cached_rank_metadata
+        rank_non_tensor = _cached_rank_non_tensor
+        rank_flat_key_roots = _cached_rank_flat_key_roots
+        rank_tensor_infos = _cached_rank_tensor_infos
+        logger.info(f"GEMINI save timing: meta exchange (cached) {time.time()-t0:.3f}s")
 
     # Compute buffer sizes from metadata (replaces separate gloo size exchange)
     rank_sizes = {
         r: sum(m.size_bytes for m in rank_metadata[r])
         for r in range(world_size)
     }
-
-    # Exchange flat_key_roots and tensor_infos in a single all_gather_object
-    my_flat_key_roots = list(decomposed.flat_key_roots) if decomposed.flat_key_roots else []
-    all_meta: List[Any] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(all_meta, (my_flat_key_roots, local_tensor_infos))
-    rank_flat_key_roots = {r: all_meta[r][0] for r in range(world_size)}
-    rank_tensor_infos = {r: all_meta[r][1] for r in range(world_size)}
-
-    logger.info(f"GEMINI save timing: meta exchange {time.time()-t0:.3f}s")
 
     send_buffer_size = total_tensor_size
 
@@ -822,7 +845,7 @@ def load_gemini_replicas_legacy_checkpoint(
         )
         logger.info(
             f"GEMINI REPLICAS legacy SW recovery load: done in "
-            f"{time.time() - start_time:.2f}s"
+            f"{time.time() - t_load:.2f}s"
         )
         if world_size > 1 and torch.distributed.is_initialized():
             torch.distributed.barrier()

@@ -1,34 +1,20 @@
 cmake_minimum_required(VERSION 3.10)
-project(RdmaThroughputTest)
+project(RdmaMicrobench)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Find libibverbs
 find_library(IBVERBS_LIBRARY ibverbs REQUIRED)
-
 if(NOT IBVERBS_LIBRARY)
-    message(FATAL_ERROR "libibverbs not found. Please install RDMA libraries (e.g., sudo apt-get install libibverbs-dev)")
+    message(FATAL_ERROR "libibverbs not found (install libibverbs-dev)")
 endif()
 
-# Add executable
-add_executable(rdma_throughput_test rdma_throughput_test.cpp)
+set(STRATEGIES_DIR "${CMAKE_SOURCE_DIR}/../../megatron/core/dist_checkpointing/strategies")
 
-# Link libraries
-target_link_libraries(rdma_throughput_test
-    ${IBVERBS_LIBRARY}
-    pthread
-)
+add_executable(rdma_ec_bind_bench rdma_ec_bind_bench.cpp)
+target_include_directories(rdma_ec_bind_bench PRIVATE ${STRATEGIES_DIR})
+target_link_libraries(rdma_ec_bind_bench ${IBVERBS_LIBRARY} pthread)
+target_compile_options(rdma_ec_bind_bench PRIVATE -O3 -Wall -Wextra)
 
-# Compiler flags for optimization
-target_compile_options(rdma_throughput_test PRIVATE
-    -O3
-    -Wall
-    -Wextra
-)
-
-# Installation
-install(TARGETS rdma_throughput_test
-    RUNTIME DESTINATION bin
-)
+install(TARGETS rdma_ec_bind_bench RUNTIME DESTINATION bin)
 

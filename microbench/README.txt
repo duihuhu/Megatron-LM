@@ -8,7 +8,10 @@ Directory Structure
 
 microbench/
 ├── asio/     - TCP/IP based throughput test using Boost.Asio
-└── rdma/     - RDMA based throughput test using libibverbs
+└── rdma/     - RDMA microbenchmarks (libibverbs)
+    ├── rdma_ec_bind_bench.cpp   - EC/Gemini-aligned bind + QP + SEND/RECV
+    ├── bench_launcher.py        - torchrun 2-rank launcher (resolve_ip + all_gather)
+    └── run_torch_dist_2node.sh  - example 2-node wrapper
 
 ================================================================================
 ASIO (TCP/IP) Version
@@ -46,35 +49,63 @@ RDMA Version
 
 Location: microbench/rdma/
 
-Description:
-  - Uses libibverbs for RDMA operations
-  - Requires InfiniBand or RoCE hardware
-  - Zero-copy data transfer with kernel bypass
-  - Much lower latency and higher throughput than TCP/IP
-  - Uses RDMA WRITE operations
+EC/Gemini-aligned bench (recommended for multi-NIC / Aliyun):
+  - find_rdma_device_by_ip() from megatron/.../rdma_device_utils.h
+  - GID index 1, active_mtu, QP exchange over TCP (same as ecnaive_native)
+  - Chunked IBV_WR_SEND / IBV_WR_RECV (64 MiB chunks)
+  - Python bench_launcher.py uses network_utils.resolve_ip (ECNAIVE_*, GEMINI_REPLICAS_*, ...)
 
 Prerequisites:
-  - InfiniBand or RoCE network hardware
-  - libibverbs-dev package installed
-  - RDMA drivers configured
-  - C++14 compiler
+  - RoCE / InfiniBand hardware, libibverbs-dev, netifaces (for resolve_ip NIC binding)
+  - PyTorch, torchrun; 2 ranks (2 nodes x 1 GPU or 1 node x 2 processes)
 
-Install RDMA libraries (Ubuntu/Debian):
+Install:
   sudo apt-get install libibverbs-dev
+  pip install netifaces
 
 Build:
-  cd rdma
-  ./build.sh
-  # or
-  make
+  cd microbench/rdma
+  make rdma_ec_bind_bench
+  # or: ./build.sh
 
-Usage:
-  # Server
-  ./build/rdma_throughput_test server --port 12345 --threads 4 --size-mb 10
+Single-node (2 ranks, specify GPUs):
+  cd microbench/rdma
+  export ECNAIVE_LOCAL_RANK_NIC_0=eth0
+  export ECNAIVE_LOCAL_RANK_NIC_1=eth0   # or eth1 for second NIC
+  ./run_single_node.sh 0,1 --size-mb 64 --iterations 20
 
-  # Client
-  ./build/rdma_throughput_test client --host 192.168.1.100 --port 12345 \
-      --threads 4 --size-mb 10 --iterations 1000 --warmup 100
+  # Same without dedicated script:
+  SINGLE_NODE=1 CUDA_VISIBLE_DEVICES=0,1 ./run_torch_dist_2node.sh 0
+
+  # Dist on CPU only (RDMA C++ bench still needs RoCE):
+  ./run_single_node.sh --dist-backend gloo
+
+Two-node usage:
+  export ECNAIVE_LOCAL_RANK_NIC_0=eth0
+  export MASTER_ADDR=10.0.0.62 MASTER_PORT=6000
+
+  ./run_torch_dist_2node.sh 0 --size-mb 64 --iterations 50   # node 0
+  ./run_torch_dist_2node.sh 1 --size-mb 64 --iterations 50   # node 1
+
+  # Gemini Replicas prefix:
+  MICROBENCH_PREFIX=GEMINI_REPLICAS ./run_torch_dist_2node.sh 0
+
+Benchmark phases (default: all three):
+  1. send  - peer_rank -> rank, report sender GiB/s (outbound on sender)
+  2. recv  - same direction, report receiver GiB/s (inbound on receiver)
+  3. duplex - concurrent send on sock_out + recv on sock_in (two TCP ports)
+
+  Skip phases: --skip-send | --skip-recv | --skip-duplex
+
+Direct binary (no torch), after exchanging IPs manually:
+  # rank 0 (server):
+  ./build/rdma_ec_bind_bench --bind-ip 10.0.0.1 --peer-ip 10.0.0.2 --rank 0 --peer-rank 1
+  # rank 1 (client):
+  ./build/rdma_ec_bind_bench --bind-ip 10.0.0.2 --peer-ip 10.0.0.1 --rank 1 --peer-rank 0
+  Uses TCP ports P and P+1 (default P=19987).
+
+Legacy rdma_throughput_test (device_list[0], not production bind logic):
+  see pre-tests/gpt2/microbench/rdma/ if present
 
 ================================================================================
 Common Features

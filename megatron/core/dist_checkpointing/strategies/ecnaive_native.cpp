@@ -83,7 +83,7 @@ namespace {
 
 // RDMA structures (similar to Gemini)
 struct RdmaConnInfo {
-    uint32_t qp_num;
+    uint32_t qp_nums[2];  // two QPs per channel
     uint16_t lid;
     uint8_t gid[16];
 } __attribute__((packed));
@@ -152,9 +152,9 @@ private:
     // RDMA resources (shared across channels)
     ibv_context* context_;
     ibv_pd* pd_;
-    ibv_cq* send_cq_;
-    ibv_cq* recv_cq_;
-    ibv_qp* qp_;
+    ibv_cq* send_cq_[2];
+    ibv_cq* recv_cq_[2];
+    ibv_qp* qp_[2];
     
     // TCP control sockets for coordination
     int control_sock_send_;  // For sending size notifications
@@ -185,8 +185,6 @@ public:
     RdmaConnectionChannel(
         ibv_context* context,
         ibv_pd* pd,
-        ibv_cq* send_cq,
-        ibv_cq* recv_cq,
         int control_sock_send,
         int control_sock_recv,
         std::map<uintptr_t, RdmaBuffer>* registered_buffers,
@@ -196,9 +194,9 @@ public:
     )
         : context_(context),
           pd_(pd),
-          send_cq_(send_cq),
-          recv_cq_(recv_cq),
-          qp_(nullptr),
+          send_cq_{nullptr, nullptr},
+          recv_cq_{nullptr, nullptr},
+          qp_{nullptr, nullptr},
           control_sock_send_(control_sock_send),
           control_sock_recv_(control_sock_recv),
           registered_buffers_(registered_buffers),
@@ -209,95 +207,94 @@ public:
           peer_rank_(peer_rank),
           connected_(false)
     {
-        // Create QP
-        ibv_qp_init_attr qp_attr{};
-        qp_attr.send_cq = send_cq_;
-        qp_attr.recv_cq = recv_cq_;
-        qp_attr.qp_type = IBV_QPT_RC;
-        qp_attr.cap.max_send_wr = MAX_WR;
-        qp_attr.cap.max_recv_wr = MAX_WR;
-        qp_attr.cap.max_send_sge = 1;
-        qp_attr.cap.max_recv_sge = 1;
-        
-        qp_ = ibv_create_qp(pd_, &qp_attr);
-        if (!qp_) {
-            throw std::runtime_error("Failed to create QP for RDMA channel");
+        for (int i = 0; i < 2; ++i) {
+            send_cq_[i] = ibv_create_cq(context_, 256, nullptr, nullptr, 0);
+            recv_cq_[i] = ibv_create_cq(context_, 256, nullptr, nullptr, 0);
+            if (!send_cq_[i] || !recv_cq_[i])
+                throw std::runtime_error("Failed to create CQ[" + std::to_string(i) + "]");
+
+            ibv_qp_init_attr qp_attr{};
+            qp_attr.send_cq = send_cq_[i];
+            qp_attr.recv_cq = recv_cq_[i];
+            qp_attr.qp_type = IBV_QPT_RC;
+            qp_attr.cap.max_send_wr = MAX_WR;
+            qp_attr.cap.max_recv_wr = MAX_WR;
+            qp_attr.cap.max_send_sge = 1;
+            qp_attr.cap.max_recv_sge = 1;
+            qp_[i] = ibv_create_qp(pd_, &qp_attr);
+            if (!qp_[i]) throw std::runtime_error("Failed to create QP[" + std::to_string(i) + "]");
         }
-        
-        // Allocate temporary buffers
+
         temp_send_buffer_.resize(TEMP_BUFFER_SIZE);
         temp_recv_buffer_.resize(TEMP_BUFFER_SIZE);
-        
         temp_send_mr_ = ibv_reg_mr(pd_, temp_send_buffer_.data(), TEMP_BUFFER_SIZE,
                                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
         temp_recv_mr_ = ibv_reg_mr(pd_, temp_recv_buffer_.data(), TEMP_BUFFER_SIZE,
                                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-        
-        if (!temp_send_mr_ || !temp_recv_mr_) {
-            throw std::runtime_error("Failed to register temporary buffers");
-        }
+        if (!temp_send_mr_ || !temp_recv_mr_) throw std::runtime_error("Failed to register temporary buffers");
     }
-    
+
     ~RdmaConnectionChannel() {
         if (temp_send_mr_) ibv_dereg_mr(temp_send_mr_);
         if (temp_recv_mr_) ibv_dereg_mr(temp_recv_mr_);
-        if (qp_) ibv_destroy_qp(qp_);
+        for (int i = 0; i < 2; ++i) {
+            if (qp_[i]) ibv_destroy_qp(qp_[i]);
+            if (send_cq_[i]) ibv_destroy_cq(send_cq_[i]);
+            if (recv_cq_[i]) ibv_destroy_cq(recv_cq_[i]);
+        }
     }
     
     void connect_qp(const RdmaConnInfo& remote_info) {
-        // Transition QP to INIT
-        ibv_qp_attr attr{};
-        attr.qp_state = IBV_QPS_INIT;
-        attr.port_num = 1;
-        attr.pkey_index = 0;
-        attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
-        if (ibv_modify_qp(qp_, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
-            throw std::runtime_error("Failed to transition QP to INIT");
-        }
-        // Query port for active MTU (aligned with Gemini)
         ibv_port_attr port_attr;
-        if (ibv_query_port(context_, 1, &port_attr) != 0) {
+        if (ibv_query_port(context_, 1, &port_attr) != 0)
             throw std::runtime_error("Failed to query port for RTR");
-        }
         ibv_mtu mtu = port_attr.active_mtu;
-        // Transition QP to RTR: use active_mtu and GID/LID like Gemini
         bool use_gid = (remote_info.lid == 0);
-        attr = {};
-        attr.qp_state = IBV_QPS_RTR;
-        attr.path_mtu = mtu;
-        attr.dest_qp_num = remote_info.qp_num;
-        attr.rq_psn = 0;
-        attr.max_dest_rd_atomic = 1;
-        attr.min_rnr_timer = 12;
-        attr.ah_attr.is_global = use_gid ? 1 : 0;
-        attr.ah_attr.dlid = remote_info.lid;
-        attr.ah_attr.sl = 0;
-        attr.ah_attr.src_path_bits = 0;
-        attr.ah_attr.port_num = 1;
-        if (use_gid) {
-            std::memcpy(&attr.ah_attr.grh.dgid, remote_info.gid, 16);
-            attr.ah_attr.grh.flow_label = 0;
-            attr.ah_attr.grh.sgid_index = 1;
-            attr.ah_attr.grh.hop_limit = 255;
-            attr.ah_attr.grh.traffic_class = 0;
-        }
-        if (ibv_modify_qp(qp_, &attr,
-                IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
-            throw std::runtime_error("Failed to transition QP to RTR");
-        }
-        // Transition QP to RTS
-        attr = {};
-        attr.qp_state = IBV_QPS_RTS;
-        attr.timeout = 14;
-        attr.retry_cnt = 7;
-        attr.rnr_retry = 7;
-        attr.sq_psn = 0;
-        attr.max_rd_atomic = 1;
-        if (ibv_modify_qp(qp_, &attr,
-                IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-                IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC)) {
-            throw std::runtime_error("Failed to transition QP to RTS");
+
+        for (int i = 0; i < 2; ++i) {
+            ibv_qp_attr attr{};
+            attr.qp_state = IBV_QPS_INIT;
+            attr.port_num = 1;
+            attr.pkey_index = 0;
+            attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
+            if (ibv_modify_qp(qp_[i], &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS))
+                throw std::runtime_error("Failed to transition QP[" + std::to_string(i) + "] to INIT");
+
+            attr = {};
+            attr.qp_state = IBV_QPS_RTR;
+            attr.path_mtu = mtu;
+            attr.dest_qp_num = remote_info.qp_nums[i];
+            attr.rq_psn = 0;
+            attr.max_dest_rd_atomic = 1;
+            attr.min_rnr_timer = 12;
+            attr.ah_attr.is_global = use_gid ? 1 : 0;
+            attr.ah_attr.dlid = remote_info.lid;
+            attr.ah_attr.sl = 0;
+            attr.ah_attr.src_path_bits = 0;
+            attr.ah_attr.port_num = 1;
+            if (use_gid) {
+                std::memcpy(&attr.ah_attr.grh.dgid, remote_info.gid, 16);
+                attr.ah_attr.grh.flow_label = 0;
+                attr.ah_attr.grh.sgid_index = 1;
+                attr.ah_attr.grh.hop_limit = 255;
+                attr.ah_attr.grh.traffic_class = 0;
+            }
+            if (ibv_modify_qp(qp_[i], &attr,
+                    IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                    IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER))
+                throw std::runtime_error("Failed to transition QP[" + std::to_string(i) + "] to RTR");
+
+            attr = {};
+            attr.qp_state = IBV_QPS_RTS;
+            attr.timeout = 14;
+            attr.retry_cnt = 7;
+            attr.rnr_retry = 7;
+            attr.sq_psn = 0;
+            attr.max_rd_atomic = 1;
+            if (ibv_modify_qp(qp_[i], &attr,
+                    IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                    IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC))
+                throw std::runtime_error("Failed to transition QP[" + std::to_string(i) + "] to RTS");
         }
         connected_ = true;
     }
@@ -306,7 +303,8 @@ public:
     RdmaConnInfo get_local_conn_info() {
         RdmaConnInfo info;
         std::memset(&info, 0, sizeof(info));
-        info.qp_num = qp_->qp_num;
+        info.qp_nums[0] = qp_[0]->qp_num;
+        info.qp_nums[1] = qp_[1]->qp_num;
         ibv_port_attr port_attr;
         if (ibv_query_port(context_, 1, &port_attr) == 0) {
             info.lid = port_attr.lid;
@@ -344,7 +342,7 @@ public:
             throw std::runtime_error(std::string("RdmaConnectionChannel: failed to receive remote RdmaConnInfo (ret=") +
                 std::to_string(n_recv) + ", errno=" + std::to_string(err) + ": " + std::strerror(err) + ")");
         }
-        // std::cout << "[ECNAIVE RDMA] rank=" << rank_ << " exchange_and_connect: recv remote RdmaConnInfo done remote_qp=" << remote_info.qp_num << std::endl;
+        // std::cout << "[ECNAIVE RDMA] rank=" << rank_ << " exchange_and_connect: recv remote RdmaConnInfo done remote_qp=" << remote_info.qp_nums[i] << std::endl;
         // std::cout << "[ECNAIVE RDMA] rank=" << rank_ << " exchange_and_connect: connect_qp start" << std::endl;
         connect_qp(remote_info);
         // std::cout << "[ECNAIVE RDMA] rank=" << rank_ << " exchange_and_connect: connect_qp done" << std::endl;
@@ -452,79 +450,78 @@ private:
     }
     
     void send_data_chunked(const uint8_t* data, size_t total_size, ibv_mr* mr) {
-        size_t remaining = total_size;
-        size_t offset = 0;
-        
-        while (remaining > 0) {
-            size_t chunk_size = std::min(remaining, CHUNK_SIZE);
-            size_t chunk_count = (chunk_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-            
-            // Resize first so &sges[i] and &wrs[i+1] stay valid for the whole post_send call.
-            std::vector<ibv_sge> sges(chunk_count);
-            std::vector<ibv_send_wr> wrs(chunk_count);
-            
-            for (size_t i = 0; i < chunk_count; ++i) {
-                size_t current_size = std::min(CHUNK_SIZE, remaining);
-                
-                sges[i].addr = reinterpret_cast<uint64_t>(data + offset);
-                sges[i].length = static_cast<uint32_t>(current_size);
-                sges[i].lkey = mr->lkey;
-                
-                std::memset(&wrs[i], 0, sizeof(wrs[i]));
-                wrs[i].wr_id = i;
-                wrs[i].sg_list = &sges[i];
-                wrs[i].num_sge = 1;
-                wrs[i].opcode = IBV_WR_SEND;
-                wrs[i].send_flags = IBV_SEND_SIGNALED;
-                wrs[i].next = (i + 1 < chunk_count) ? &wrs[i + 1] : nullptr;
-                
-                offset += current_size;
-                remaining -= current_size;
+        size_t chunk_count = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        std::vector<ibv_sge> sges[2];
+        std::vector<ibv_send_wr> wrs[2];
+        size_t q_chunk_counts[2] = {(chunk_count + 1) / 2, chunk_count / 2};
+        for (int q = 0; q < 2; ++q) { sges[q].resize(q_chunk_counts[q]); wrs[q].resize(q_chunk_counts[q]); }
+
+        size_t offset = 0, q_pos[2] = {0, 0};
+        for (size_t c = 0; c < chunk_count; ++c) {
+            int q = c % 2;
+            size_t cur = std::min(CHUNK_SIZE, total_size - offset);
+            size_t idx = q_pos[q]++;
+            sges[q][idx].addr = reinterpret_cast<uint64_t>(data + offset);
+            sges[q][idx].length = static_cast<uint32_t>(cur);
+            sges[q][idx].lkey = mr->lkey;
+            std::memset(&wrs[q][idx], 0, sizeof(wrs[q][idx]));
+            wrs[q][idx].wr_id = idx;
+            wrs[q][idx].sg_list = &sges[q][idx];
+            wrs[q][idx].num_sge = 1;
+            wrs[q][idx].opcode = IBV_WR_SEND;
+            wrs[q][idx].send_flags = IBV_SEND_SIGNALED;
+            offset += cur;
+        }
+
+        for (int q = 0; q < 2; ++q) {
+            size_t posted = 0, q_total = q_chunk_counts[q];
+            while (posted < q_total) {
+                size_t batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), q_total - posted);
+                for (size_t i = posted; i < posted + batch_size - 1; ++i) wrs[q][i].next = &wrs[q][i + 1];
+                wrs[q][posted + batch_size - 1].next = nullptr;
+                ibv_send_wr* bad = nullptr;
+                if (ibv_post_send(qp_[q], &wrs[q][posted], &bad))
+                    throw std::runtime_error("Failed to post send on QP[" + std::to_string(q) + "]");
+                poll_completion(send_cq_[q], static_cast<int>(batch_size));
+                posted += batch_size;
             }
-            
-            ibv_send_wr* bad_wr = nullptr;
-            if (ibv_post_send(qp_, &wrs[0], &bad_wr)) {
-                throw std::runtime_error("Failed to post send work request");
-            }
-            
-            poll_completion(send_cq_, static_cast<int>(chunk_count));
         }
     }
     
     void receive_data_chunked(uint8_t* buffer, size_t total_size, ibv_mr* mr) {
-        size_t remaining = total_size;
-        size_t offset = 0;
-        
-        while (remaining > 0) {
-            size_t chunk_count = std::min(remaining, CHUNK_SIZE * MAX_BATCH_WR) / CHUNK_SIZE;
-            if (chunk_count == 0) chunk_count = 1;
-            
-            std::vector<ibv_sge> sges(chunk_count);
-            std::vector<ibv_recv_wr> wrs(chunk_count);
-            
-            for (size_t i = 0; i < chunk_count; ++i) {
-                size_t current_size = std::min(CHUNK_SIZE, remaining);
-                
-                sges[i].addr = reinterpret_cast<uint64_t>(buffer + offset);
-                sges[i].length = static_cast<uint32_t>(current_size);
-                sges[i].lkey = mr->lkey;
-                
-                std::memset(&wrs[i], 0, sizeof(wrs[i]));
-                wrs[i].wr_id = i;
-                wrs[i].sg_list = &sges[i];
-                wrs[i].num_sge = 1;
-                wrs[i].next = (i + 1 < chunk_count) ? &wrs[i + 1] : nullptr;
-                
-                offset += current_size;
-                remaining -= current_size;
+        size_t chunk_count = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        std::vector<ibv_sge> sges[2];
+        std::vector<ibv_recv_wr> wrs[2];
+        size_t q_chunk_counts[2] = {(chunk_count + 1) / 2, chunk_count / 2};
+        for (int q = 0; q < 2; ++q) { sges[q].resize(q_chunk_counts[q]); wrs[q].resize(q_chunk_counts[q]); }
+
+        size_t offset = 0, q_pos[2] = {0, 0};
+        for (size_t c = 0; c < chunk_count; ++c) {
+            int q = c % 2;
+            size_t cur = std::min(CHUNK_SIZE, total_size - offset);
+            size_t idx = q_pos[q]++;
+            sges[q][idx].addr = reinterpret_cast<uint64_t>(buffer + offset);
+            sges[q][idx].length = static_cast<uint32_t>(cur);
+            sges[q][idx].lkey = mr->lkey;
+            std::memset(&wrs[q][idx], 0, sizeof(wrs[q][idx]));
+            wrs[q][idx].wr_id = idx;
+            wrs[q][idx].sg_list = &sges[q][idx];
+            wrs[q][idx].num_sge = 1;
+            offset += cur;
+        }
+
+        for (int q = 0; q < 2; ++q) {
+            size_t posted = 0, q_total = q_chunk_counts[q];
+            while (posted < q_total) {
+                size_t batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), q_total - posted);
+                for (size_t i = posted; i < posted + batch_size - 1; ++i) wrs[q][i].next = &wrs[q][i + 1];
+                wrs[q][posted + batch_size - 1].next = nullptr;
+                ibv_recv_wr* bad = nullptr;
+                if (ibv_post_recv(qp_[q], &wrs[q][posted], &bad))
+                    throw std::runtime_error("Failed to post recv on QP[" + std::to_string(q) + "]");
+                poll_completion(recv_cq_[q], static_cast<int>(batch_size));
+                posted += batch_size;
             }
-            
-            ibv_recv_wr* bad_wr = nullptr;
-            if (ibv_post_recv(qp_, &wrs[0], &bad_wr)) {
-                throw std::runtime_error("Failed to post receive work request");
-            }
-            
-            poll_completion(recv_cq_, static_cast<int>(chunk_count));
         }
     }
     
@@ -3464,10 +3461,8 @@ public:
             for (int i = 0; i < num_blocks; ++i) {
                 if (!sw_asio_recv_sockets_[i]) continue;
                 int sock_fd = sw_asio_recv_sockets_[i]->native_handle();
-                auto send_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
-                auto recv_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
                 rdma_sw_recovery_channels_[i] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, send_cq, recv_cq,
+                    rdma_context_, rdma_pd_,
                     sock_fd, sock_fd, &rdma_registered_buffers_, &rdma_buffer_mutex_,
                     rank_in_group, 2);
                 rdma_sw_recovery_channels_[i]->exchange_and_connect(true);
@@ -3524,10 +3519,8 @@ public:
                 }
             }
             int sock_fd = sw_asio_send_sockets_[block_idx]->native_handle();
-            auto send_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
-            auto recv_cq = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
             rdma_sw_recovery_channels_[block_idx] = std::make_unique<RdmaConnectionChannel>(
-                rdma_context_, rdma_pd_, send_cq, recv_cq,
+                rdma_context_, rdma_pd_,
                 sock_fd, sock_fd, &rdma_registered_buffers_, &rdma_buffer_mutex_,
                 rank_in_group, 2);
             rdma_sw_recovery_channels_[block_idx]->exchange_and_connect(false);
@@ -4141,7 +4134,6 @@ private:
         rdma_send_cqs_.resize(total_cqs, nullptr);
         rdma_recv_cqs_.resize(total_cqs, nullptr);
         for (int i = 0; i < total_cqs; ++i) {
-            rdma_send_cqs_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
             rdma_recv_cqs_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
             if (!rdma_send_cqs_[i] || !rdma_recv_cqs_[i]) {
                 for (int j = 0; j < i; ++j) {
@@ -4161,7 +4153,6 @@ private:
         if (!use_rdma_ || rdma_pd_ == nullptr) return;
         std::cout << "[ECNAIVE RDMA] Initializing load RDMA resources (8 CQ pairs)..." << std::endl;
         for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS; ++i) {
-            rdma_load_send_cq_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
             rdma_load_recv_cq_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
             if (!rdma_load_send_cq_[i] || !rdma_load_recv_cq_[i]) {
                 for (int j = 0; j < i; ++j) {
@@ -4185,49 +4176,49 @@ private:
                 const int peer[] = {3, 0, 0, 1, 1, 1, 3, 0};
                 auto& c = conn_;
                 rdma_load_channels_[0] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[0], rdma_load_recv_cq_[0],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_recv_rank3_data1_socket().native_handle(),
                     c.get_ecnaive_load_recv_rank3_data1_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[0]);
                 rdma_load_channels_[0]->exchange_and_connect(false);
                 rdma_load_channels_[1] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[1], rdma_load_recv_cq_[1],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_recv_rank0_parity0_socket().native_handle(),
                     c.get_ecnaive_load_recv_rank0_parity0_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[1]);
                 rdma_load_channels_[1]->exchange_and_connect(false);
                 rdma_load_channels_[2] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[2], rdma_load_recv_cq_[2],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_recv_rank0_data0_socket().native_handle(),
                     c.get_ecnaive_load_recv_rank0_data0_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[2]);
                 rdma_load_channels_[2]->exchange_and_connect(false);
                 rdma_load_channels_[3] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[3], rdma_load_recv_cq_[3],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_recv_rank1_data1_socket().native_handle(),
                     c.get_ecnaive_load_recv_rank1_data1_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[3]);
                 rdma_load_channels_[3]->exchange_and_connect(false);
                 rdma_load_channels_[4] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[4], rdma_load_recv_cq_[4],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_recv_rank1_data0_socket().native_handle(),
                     c.get_ecnaive_load_recv_rank1_data0_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[4]);
                 rdma_load_channels_[4]->exchange_and_connect(false);
                 rdma_load_channels_[5] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[5], rdma_load_recv_cq_[5],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_recv_rank1_parity1_socket().native_handle(),
                     c.get_ecnaive_load_recv_rank1_parity1_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[5]);
                 rdma_load_channels_[5]->exchange_and_connect(false);
                 rdma_load_channels_[6] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[6], rdma_load_recv_cq_[6],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_recv_rank3_data0_socket().native_handle(),
                     c.get_ecnaive_load_recv_rank3_data0_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[6]);
                 rdma_load_channels_[6]->exchange_and_connect(false);
                 rdma_load_channels_[7] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[7], rdma_load_recv_cq_[7],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_recv_rank0_data1_socket().native_handle(),
                     c.get_ecnaive_load_recv_rank0_data1_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer[7]);
@@ -4237,19 +4228,19 @@ private:
                 std::cout << "[ECNAIVE RDMA] Creating 3 RDMA load channels (rank0 send)..." << std::endl;
                 auto& c = conn_;
                 rdma_load_channels_[1] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[1], rdma_load_recv_cq_[1],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_send_rank0_parity0_socket().native_handle(),
                     c.get_ecnaive_load_send_rank0_parity0_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
                 rdma_load_channels_[1]->exchange_and_connect(true);
                 rdma_load_channels_[2] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[2], rdma_load_recv_cq_[2],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_send_rank0_data0_socket().native_handle(),
                     c.get_ecnaive_load_send_rank0_data0_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
                 rdma_load_channels_[2]->exchange_and_connect(true);
                 rdma_load_channels_[7] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[7], rdma_load_recv_cq_[7],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_send_rank0_data1_socket().native_handle(),
                     c.get_ecnaive_load_send_rank0_data1_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
@@ -4259,19 +4250,19 @@ private:
                 std::cout << "[ECNAIVE RDMA] Creating 3 RDMA load channels (rank1 send)..." << std::endl;
                 auto& c = conn_;
                 rdma_load_channels_[3] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[3], rdma_load_recv_cq_[3],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_send_rank1_data1_socket().native_handle(),
                     c.get_ecnaive_load_send_rank1_data1_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
                 rdma_load_channels_[3]->exchange_and_connect(true);
                 rdma_load_channels_[4] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[4], rdma_load_recv_cq_[4],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_send_rank1_data0_socket().native_handle(),
                     c.get_ecnaive_load_send_rank1_data0_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
                 rdma_load_channels_[4]->exchange_and_connect(true);
                 rdma_load_channels_[5] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[5], rdma_load_recv_cq_[5],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_send_rank1_parity1_socket().native_handle(),
                     c.get_ecnaive_load_send_rank1_parity1_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
@@ -4281,13 +4272,13 @@ private:
                 std::cout << "[ECNAIVE RDMA] Creating 2 RDMA load channels (rank3 send)..." << std::endl;
                 auto& c = conn_;
                 rdma_load_channels_[0] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[0], rdma_load_recv_cq_[0],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_send_rank3_data1_socket().native_handle(),
                     c.get_ecnaive_load_send_rank3_data1_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
                 rdma_load_channels_[0]->exchange_and_connect(true);
                 rdma_load_channels_[6] = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_load_send_cq_[6], rdma_load_recv_cq_[6],
+                    rdma_context_, rdma_pd_,
                     c.get_ecnaive_load_send_rank3_data0_socket().native_handle(),
                     c.get_ecnaive_load_send_rank3_data0_socket().native_handle(),
                     &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
@@ -4354,7 +4345,7 @@ private:
                 std::cout << "[ECNAIVE RDMA] Creating software-only load channel (rank2 recv)..." << std::endl;
                 int sock = conn_.get_ecnaive_load_recv_rank3_data1_socket().native_handle();
                 rdma_software_load_channel_ = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_software_load_send_cq_, rdma_software_load_recv_cq_,
+                    rdma_context_, rdma_pd_,
                     sock, sock, &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 3);
                 rdma_software_load_channel_->exchange_and_connect(false);
                 std::cout << "[ECNAIVE RDMA] Software-only load channel connected (rank2)" << std::endl;
@@ -4362,7 +4353,7 @@ private:
                 std::cout << "[ECNAIVE RDMA] Creating software-only load channel (rank3 send)..." << std::endl;
                 int sock = conn_.get_ecnaive_load_send_rank3_data1_socket().native_handle();
                 rdma_software_load_channel_ = std::make_unique<RdmaConnectionChannel>(
-                    rdma_context_, rdma_pd_, rdma_software_load_send_cq_, rdma_software_load_recv_cq_,
+                    rdma_context_, rdma_pd_,
                     sock, sock, &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
                 rdma_software_load_channel_->exchange_and_connect(true);
                 std::cout << "[ECNAIVE RDMA] Software-only load channel connected (rank3)" << std::endl;
@@ -4595,7 +4586,6 @@ private:
             for (int i = 0; i < num_channels_; ++i) {
                 send_channels_[i] = std::make_unique<RdmaConnectionChannel>(
                     rdma_context_, rdma_pd_,
-                    rdma_send_cqs_[i], rdma_recv_cqs_[i],
                     rdma_send_fds_[i], rdma_send_fds_[i],
                     &rdma_registered_buffers_, &rdma_buffer_mutex_,
                     rank_in_group_, 0);
@@ -4604,7 +4594,6 @@ private:
             for (int i = 0; i < num_channels_; ++i) {
                 recv_channels_[i] = std::make_unique<RdmaConnectionChannel>(
                     rdma_context_, rdma_pd_,
-                    rdma_send_cqs_[i + num_channels_], rdma_recv_cqs_[i + num_channels_],
                     rdma_recv_fds_[i], rdma_recv_fds_[i],
                     &rdma_registered_buffers_, &rdma_buffer_mutex_,
                     rank_in_group_, 0);

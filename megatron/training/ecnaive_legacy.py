@@ -568,6 +568,7 @@ def _load_ecnaive_legacy_software_failure(
     manager: ECNAIVEManager,
     main_payload: Dict[str, Any],
     global_registry: GlobalMetadataRegistry,
+    timings: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """EC-NAIVE legacy load software failure path (generalized for any k >= 2).
 
@@ -575,9 +576,13 @@ def _load_ecnaive_legacy_software_failure(
     receives d_{2,1}..d_{2,k-1} from k-1 sender ranks via C++ ASIO/RDMA
     (k-1 ports).  Sender ranks load their block files and send via C++.
     Non-participating ranks just reconstruct from their own main.pt.
+
+    If *timings* dict is provided, it will be populated with:
+      init, xfer, rebuild_sd (all in seconds).
     """
     from time import time as _time
-    t_start = _time()
+    _t = timings if timings is not None else {}
+    _t0_func = _time()
 
     native = manager._ecnaive_native
     if native is None:
@@ -601,10 +606,11 @@ def _load_ecnaive_legacy_software_failure(
 
     block_files_legacy = main_payload.get("_block_files_legacy", None)
 
-    # Phase 1: ALL ranks must call init_ecnaive_sw_recovery because it contains
-    # barriers.  Non-participating ranks skip Phase 2 (connect) internally.
+    # Phase 1: setup (not timed) — RDMA connection setup + barrier
     manager.init_ecnaive_sw_recovery(rank, world_size, failed_rank_in_group=failed_rig)
 
+    # === timing: network/encode (C++ send/recv + decode + assemble) ===
+    _t0_net = _time()
     if rank_in_group == failed_rig:
         # ---- FAILED RANK ----
         # Phase 2: local d_{2,0} + network d_{2,1}..d_{2,k-1}
@@ -626,7 +632,7 @@ def _load_ecnaive_legacy_software_failure(
                 j, buf.numel(),
             )
 
-        # Decode and concatenate all k data blocks
+        # Decode gapped blocks → linear tensor_buffer
         decoded = []
         for idx, blk in enumerate([own_data0] + recv_blocks):
             decoded.append(_decode_data_block(
@@ -636,7 +642,9 @@ def _load_ecnaive_legacy_software_failure(
         full_buf = torch.cat(decoded, dim=0)
         if actual_tensor_size > 0:
             full_buf = full_buf[:actual_tensor_size]
+        _t['network_encode'] = _time() - _t0_net
 
+        _t0_rebuild = _time()
         tensor_data = extract_tensors_from_continuous_buffer(full_buf, tensor_infos)
         decomposed = DecomposedStateDict(
             non_tensor_data=non_tensor_data,
@@ -646,9 +654,10 @@ def _load_ecnaive_legacy_software_failure(
         )
         state_dict = reconstruct_state_dict(decomposed)
         unflatten_optimizer_fp32_params(state_dict)
+        _t['rebuild_sd'] = _time() - _t0_rebuild
         logger.info(
             "EC-NAIVE legacy sw: rank_in_group=%d recovered state_dict in %.2fs",
-            failed_rig, _time() - t_start,
+            failed_rig, _time() - _t0_func,
         )
 
     else:
@@ -683,18 +692,24 @@ def _load_ecnaive_legacy_software_failure(
                 "EC-NAIVE legacy sw: rig=%d sent d_2,%d (block_idx=%d, %d bytes)",
                 sender_rig, j, block_idx, block.numel(),
             )
+            _t['network_encode'] = _time() - _t0_net
+            _t0_rebuild = _time()
             state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
                 main_payload, flat_key_roots=flat_key_roots,
             )
+            _t['rebuild_sd'] = _time() - _t0_rebuild
         else:
             # This rank is in group but doesn't hold a data block for the failed rank
             # (parity channels only — not participating in SW recovery)
             logger.info(
                 "EC-NAIVE legacy sw: righ=%d no data block, no-op", rank_in_group,
             )
+            _t['network_encode'] = _time() - _t0_net
+            _t0_rebuild = _time()
             state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
                 main_payload, flat_key_roots=flat_key_roots,
             )
+            _t['rebuild_sd'] = _time() - _t0_rebuild
 
     # NOTE: the old standalone else clause for ranks 0,1 (k=2) is absorbed into
     # the generalized else branch above.
@@ -703,7 +718,7 @@ def _load_ecnaive_legacy_software_failure(
         torch.distributed.barrier()
 
     logger.info(
-        f"EC-NAIVE legacy sw: done in {_time() - t_start:.2f}s (rank {rank})"
+        f"EC-NAIVE legacy sw: done in {_time() - _t0_func:.2f}s (rank {rank})"
     )
     # NOTE: do not call manager.cleanup() here in the software failure path.
     # cleanup() calls native.stop() which tears down C++ resources, and the
@@ -943,20 +958,28 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     global_registry = GlobalMetadataRegistry(rank_metadata=rank_metadata, rank_non_tensor_data={})
 
     # ---- Software failure fast path ----
-    # In software failure, the failed rank's block files are on local disk.
-    # d_{2,0} is read locally; d_{2,1} is received from rank_in_group=3 via C++
-    # (1 port, ASIO or RDMA). No parity blocks or XOR decode needed.
     if bool(getattr(args, "use_ecnaive_software_failure", False)):
         logger.info("EC-NAIVE legacy: software failure recovery path")
-        return _load_ecnaive_legacy_software_failure(
+        _t: Dict[str, float] = {}
+        state_dict = _load_ecnaive_legacy_software_failure(
             checkpoint_dir=checkpoint_dir,
             rank=rank,
             world_size=world_size,
             manager=manager,
             main_payload=main_payload,
             global_registry=global_registry,
+            timings=_t,
         )
+        _t['total'] = _t.get('network_encode', 0) + _t.get('rebuild_sd', 0)
+        logger.info(
+            "EC-NAIVE legacy load timing (SW): "
+            "total=%(total).2fs network_encode=%(network_encode).2fs "
+            "rebuild_sd=%(rebuild_sd).2fs", _t
+        )
+        return state_dict
 
+    # ---- Hardware recovery ----
+    # Setup (not timed): init + buffer_alloc
     manager.init_ecnaive_load(rank, world_size)
 
     rank_in_group = manager._get_rank_in_group(rank, world_size)
@@ -987,8 +1010,9 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             for _n, t in ecnaive_blocks.items():
                 manager.register_buffer(t)
 
-    t_load = time.time()  # after all alloc + block memcopy
-
+    # === timing: network/encode (C++ pipeline) ===
+    _t_hw: Dict[str, float] = {}
+    _t0 = time.time()
     _run_ecnaive_full_recovery(
         manager=manager,
         rank=rank,
@@ -996,11 +1020,12 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         ecnaive_blocks=ecnaive_blocks,
         recv_buffers=recv_buffers,
     )
+    _t_hw['network_encode'] = time.time() - _t0
 
     # Backward compatibility: checkpoints saved before flat_key_roots existed.
-    # See _infer_flat_key_roots for the inference heuristic.
     flat_key_roots = _infer_flat_key_roots(main_payload)
 
+    _t0 = time.time()
     if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
@@ -1012,13 +1037,20 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             manager=manager,
             flat_key_roots=flat_key_roots,
         )
+    _t_hw['rebuild_sd'] = time.time() - _t0
+    _t_hw['total'] = _t_hw['network_encode'] + _t_hw['rebuild_sd']
+
+    logger.info(
+        "EC-NAIVE legacy load timing (HW): "
+        "total=%(total).2fs network_encode=%(network_encode).2fs "
+        "rebuild_sd=%(rebuild_sd).2fs", _t_hw
+    )
 
     # Clean up EC-NAIVE native module after load to prevent segfaults:
     # C++ worker threads and RDMA connections remain alive after recovery and
     # could access freed memory once local tensors (ecnaive_blocks, recv_buffers)
     # go out of scope. Also reset _ecnaive_native so the next save will
     # reinitialize the C++ module from scratch.
-    logger.info("EC-NAIVE legacy load time (excl disk): %.2fs", time.time() - t_load)
     logger.info(f"EC-NAIVE legacy load: cleaning up native module (rank {rank})")
     manager.cleanup()
     manager._ecnaive_native = None

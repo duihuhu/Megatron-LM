@@ -818,15 +818,13 @@ def load_gemini_replicas_legacy_checkpoint(
                         if is_raw_format(str(main_path), MAGIC_GEMINI)
                         else torch.load(main_path, map_location="cpu", weights_only=False))
 
-    t_load = time.time()  # start timer after main payload disk I/O
+    # ---- Timing collection (excl disk IO) ----
+    # network_encode: C++ ASIO/RDMA send/recv + block assembly (HW only; SW=0)
+    # rebuild_sd: extract + reconstruct + unflatten
+    # total: network_encode + rebuild_sd
+    _t: Dict[str, float] = {}
 
     # ---- Software failure path ----
-    # In software failure, all checkpoint files are intact on disk.
-    # Gemini Replicas is a replication scheme — each rank's main.pt contains its
-    # complete tensor data.  The "failed" rank simply loads from its own main.pt.
-    # No network transfer or C++ native module is needed.
-    # Parameters (num_replicas, group_size, world_size) have no effect here:
-    # each rank reads only its own local file.
     sw_failure = bool(getattr(args, "use_gemini_replicas_software_failure", False))
     if sw_failure:
         if main_payload is None:
@@ -834,20 +832,20 @@ def load_gemini_replicas_legacy_checkpoint(
                 f"Gemini Replicas software failure: rank {rank} main file not found "
                 f"at {main_path}. In software failure mode, main.pt must exist on disk."
             )
-        logger.info(
-            f"Gemini Replicas legacy SW failure: rank {rank} "
-            f"(recovery_ranks={recovery_ranks if recovery_rank_str else 'N/A'}, "
-            f"is_failed={is_failed}) loading directly from main.pt"
-        )
+        _t['network_encode'] = 0.0
+        _t0 = time.time()
         state_dict = _reconstruct_from_payload(
             tensor_infos=main_payload["tensor_infos"],
             non_tensor_data=main_payload["non_tensor_data"],
             tensor_buffer=main_payload["tensor_buffer"],
             flat_key_roots=_infer_flat_key_roots(main_payload),
         )
+        _t['rebuild_sd'] = time.time() - _t0
+        _t['total'] = _t['network_encode'] + _t['rebuild_sd']
         logger.info(
-            f"GEMINI REPLICAS legacy SW recovery load: done in "
-            f"{time.time() - t_load:.2f}s"
+            "GEMINI REPLICAS legacy load timing (SW): "
+            "total=%(total).2fs network_encode=%(network_encode).2fs "
+            "rebuild_sd=%(rebuild_sd).2fs", _t
         )
         if world_size > 1 and torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -855,11 +853,20 @@ def load_gemini_replicas_legacy_checkpoint(
 
     if not is_failed and all(health_list):
         # ---- Normal load ----
+        _t['network_encode'] = 0.0
+        _t0 = time.time()
         state_dict = _reconstruct_from_payload(
             tensor_infos=main_payload["tensor_infos"],
             non_tensor_data=main_payload["non_tensor_data"],
             tensor_buffer=main_payload["tensor_buffer"],
             flat_key_roots=_infer_flat_key_roots(main_payload),
+        )
+        _t['rebuild_sd'] = time.time() - _t0
+        _t['total'] = _t['network_encode'] + _t['rebuild_sd']
+        logger.info(
+            "GEMINI REPLICAS legacy load timing (normal): "
+            "total=%(total).2fs network_encode=%(network_encode).2fs "
+            "rebuild_sd=%(rebuild_sd).2fs", _t
         )
     else:
         # ---- Hardware recovery ----
@@ -868,25 +875,24 @@ def load_gemini_replicas_legacy_checkpoint(
             f"{sum(health_list)}/{world_size} healthy, entering recovery"
         )
 
-        # Build failed_override for _run_hardware_recovery
-        # (all ranks must agree on who is failed)
         if recovery_rank_str:
             failed_override = recovery_ranks
         else:
-            failed_override = None  # auto-detect inside _run_hardware_recovery
+            failed_override = None
 
-        # Step 1: Exchange all-to-all metadata (includes disk reads)
+        # Setup (not timed): metadata collection
         meta = _collect_metadata_for_failed_rank(checkpoint_dir, rank, world_size)
 
-        t_load = time.time()  # reset timer: recovery disk I/O done
-
-        # Step 2: Recovery data transfer
+        # === timing: network/encode (ASIO/RDMA send/recv) ===
+        _t0 = time.time()
         recovered_buffer = _run_hardware_recovery(
             manager, checkpoint_dir, rank, world_size,
             failed_override=failed_override,
         )
+        _t['network_encode'] = time.time() - _t0
 
-        # Step 3: Reconstruct
+        # Step 3: Reconstruct state dict
+        _t0 = time.time()
         if is_failed:
             if rank in _recovery_meta:
                 meta.update(_recovery_meta.pop(rank))
@@ -896,7 +902,7 @@ def load_gemini_replicas_legacy_checkpoint(
                 tensor_buffer=recovered_buffer,
                 flat_key_roots=set(meta.get("flat_key_roots", [])),
             )
-            # Regenerate main file (raw write, no torch.save)
+            # Regenerate main file
             from megatron.training.legacy_io_utils import write_raw_checkpoint, MAGIC_GEMINI
             regen_tensor = recovered_buffer.contiguous().view(torch.uint8)
             write_raw_checkpoint(
@@ -915,13 +921,20 @@ def load_gemini_replicas_legacy_checkpoint(
                 f"regenerated main file {main_path}"
             )
         else:
-            # Healthy rank — load normally
             state_dict = _reconstruct_from_payload(
                 tensor_infos=main_payload["tensor_infos"],
                 non_tensor_data=main_payload["non_tensor_data"],
                 tensor_buffer=main_payload["tensor_buffer"],
                 flat_key_roots=_infer_flat_key_roots(main_payload),
             )
+        _t['rebuild_sd'] = time.time() - _t0
+        _t['total'] = _t['network_encode'] + _t['rebuild_sd']
+
+        logger.info(
+            "GEMINI REPLICAS legacy load timing (HW): "
+            "total=%(total).2fs network_encode=%(network_encode).2fs "
+            "rebuild_sd=%(rebuild_sd).2fs", _t
+        )
 
     if manager._gemini_replicas_native is not None:
         logger.info(
@@ -929,8 +942,6 @@ def load_gemini_replicas_legacy_checkpoint(
         )
         manager.cleanup()
         manager._gemini_replicas_native = None
-
-    logger.info("GEMINI REPLICAS legacy load time (excl disk): %.2fs", time.time() - t_load)
 
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()

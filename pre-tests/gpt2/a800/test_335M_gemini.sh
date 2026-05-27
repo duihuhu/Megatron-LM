@@ -47,7 +47,7 @@ export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
 # export GEMINI_REPLICAS_BASE_PORT=12345
 
 MASTER_PORT=6000
-NNODES=8
+NNODES=4
 
 # ---- 节点 rank 解析（第一个参数） ----
 NODE_RANK=0
@@ -140,7 +140,7 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 8
+    --pipeline-model-parallel-size 4
 )
 
 # =============================================================================

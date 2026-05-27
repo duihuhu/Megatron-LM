@@ -19,7 +19,7 @@ export ECCHECK_USE_ASIO=false
 export FRCHECK_INTERFACE=$NETIFACES_INTERFACE
 export FRCHECK_BASE_IP=$MASTER_ADDR
 MASTER_PORT=6000
-NNODES=8
+NNODES=4
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
@@ -116,7 +116,7 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 8
+    --pipeline-model-parallel-size 4
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -131,7 +131,7 @@ EVAL_AND_LOGGING_ARGS=(
 
     --use-frcheck
     --frcheck-debug
-    --frcheck-n 8
+    --frcheck-n 4
     #--use-frcheck-software-failure 
     --frcheck-failed-ranks 0
     --frcheck-table-dir $FRCHECK_TABLE_DIR

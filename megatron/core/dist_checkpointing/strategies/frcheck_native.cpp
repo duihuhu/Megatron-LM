@@ -94,7 +94,7 @@ namespace py = pybind11;
 // RDMA structures
 // ---------------------------------------------------------------------------
 struct RdmaConnInfo {
-    uint32_t qp_num;
+    uint32_t qp_nums[2];   // two QPs per peer
     uint16_t lid;
     uint8_t gid[16];
 } __attribute__((packed));
@@ -119,28 +119,36 @@ static constexpr uint64_t FRCHECK_WR_ID_CHUNK_SENTINEL = 0xFFFFFFFFFFFFFFFFULL;
 class FRCheckRdmaChannel {
 public:
     FRCheckRdmaChannel(ibv_context* ctx, ibv_pd* pd,
-                       ibv_cq* send_cq, ibv_cq* recv_cq,
                        int tcp_sock, int peer_rank,
                        std::map<uintptr_t, RdmaBuffer>* bufs,
                        std::mutex* buf_mtx)
         : ctx_(ctx), pd_(pd),
-          send_cq_(send_cq), recv_cq_(recv_cq),
           tcp_sock_(tcp_sock), peer_rank_(peer_rank),
           bufs_(bufs), buf_mtx_(buf_mtx),
-          qp_(nullptr), temp_send_mr_(nullptr), temp_recv_mr_(nullptr),
+          send_cq_{nullptr, nullptr}, recv_cq_{nullptr, nullptr},
+          qp_{nullptr, nullptr},
+          temp_send_mr_(nullptr), temp_recv_mr_(nullptr),
           connected_(false)
     {
-        ibv_qp_init_attr attr{};
-        attr.send_cq = send_cq_;
-        attr.recv_cq = recv_cq_;
-        attr.qp_type = IBV_QPT_RC;
-        attr.cap.max_send_wr = FRCHECK_MAX_WR;
-        attr.cap.max_recv_wr = FRCHECK_MAX_WR;
-        attr.cap.max_send_sge = 1;
-        attr.cap.max_recv_sge = 1;
-        qp_ = ibv_create_qp(pd_, &attr);
-        if (!qp_)
-            throw std::runtime_error("FRCheck RDMA: failed to create QP");
+        // Create 2 QPs, each with its own CQ pair
+        for (int i = 0; i < 2; ++i) {
+            send_cq_[i] = ibv_create_cq(ctx_, FRCHECK_MAX_WR, nullptr, nullptr, 0);
+            recv_cq_[i] = ibv_create_cq(ctx_, FRCHECK_MAX_WR, nullptr, nullptr, 0);
+            if (!send_cq_[i] || !recv_cq_[i])
+                throw std::runtime_error("FRCheck RDMA: failed to create CQ[" + std::to_string(i) + "]");
+
+            ibv_qp_init_attr attr{};
+            attr.send_cq = send_cq_[i];
+            attr.recv_cq = recv_cq_[i];
+            attr.qp_type = IBV_QPT_RC;
+            attr.cap.max_send_wr = FRCHECK_MAX_WR;
+            attr.cap.max_recv_wr = FRCHECK_MAX_WR;
+            attr.cap.max_send_sge = 1;
+            attr.cap.max_recv_sge = 1;
+            qp_[i] = ibv_create_qp(pd_, &attr);
+            if (!qp_[i])
+                throw std::runtime_error("FRCheck RDMA: failed to create QP[" + std::to_string(i) + "]");
+        }
 
         temp_send_.resize(FRCHECK_TEMP_BUF_SIZE);
         temp_recv_.resize(FRCHECK_TEMP_BUF_SIZE);
@@ -155,7 +163,11 @@ public:
     ~FRCheckRdmaChannel() {
         if (temp_recv_mr_) ibv_dereg_mr(temp_recv_mr_);
         if (temp_send_mr_) ibv_dereg_mr(temp_send_mr_);
-        if (qp_) ibv_destroy_qp(qp_);
+        for (int i = 0; i < 2; ++i) {
+            if (qp_[i]) ibv_destroy_qp(qp_[i]);
+            if (send_cq_[i]) ibv_destroy_cq(send_cq_[i]);
+            if (recv_cq_[i]) ibv_destroy_cq(recv_cq_[i]);
+        }
         if (tcp_sock_ >= 0) close(tcp_sock_);
     }
 
@@ -251,7 +263,8 @@ private:
     RdmaConnInfo get_local_info() {
         RdmaConnInfo info;
         memset(&info, 0, sizeof(info));
-        info.qp_num = qp_->qp_num;
+        info.qp_nums[0] = qp_[0]->qp_num;
+        info.qp_nums[1] = qp_[1]->qp_num;
         ibv_port_attr pa;
         if (ibv_query_port(ctx_, 1, &pa) == 0)
             info.lid = pa.lid;
@@ -262,59 +275,61 @@ private:
     }
 
     void connect_qp(const RdmaConnInfo& remote) {
-        // INIT
-        ibv_qp_attr attr{};
-        attr.qp_state = IBV_QPS_INIT;
-        attr.port_num = 1;
-        attr.pkey_index = 0;
-        attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
-        if (ibv_modify_qp(qp_, &attr,
-                IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS))
-            throw std::runtime_error("FRCheck RDMA: INIT failed");
-
         ibv_port_attr pa;
         if (ibv_query_port(ctx_, 1, &pa) != 0)
             throw std::runtime_error("FRCheck RDMA: query port failed");
         ibv_mtu mtu = pa.active_mtu;
         bool use_gid = (remote.lid == 0);
 
-        // RTR
-        attr = {};
-        attr.qp_state = IBV_QPS_RTR;
-        attr.path_mtu = mtu;
-        attr.dest_qp_num = remote.qp_num;
-        attr.rq_psn = 0;
-        attr.max_dest_rd_atomic = 1;
-        attr.min_rnr_timer = 12;
-        attr.ah_attr.is_global = use_gid ? 1 : 0;
-        attr.ah_attr.dlid = remote.lid;
-        attr.ah_attr.sl = 0;
-        attr.ah_attr.src_path_bits = 0;
-        attr.ah_attr.port_num = 1;
-        if (use_gid) {
-            memcpy(&attr.ah_attr.grh.dgid, remote.gid, 16);
-            attr.ah_attr.grh.flow_label = 0;
-            attr.ah_attr.grh.sgid_index = 1;
-            attr.ah_attr.grh.hop_limit = 255;
-            attr.ah_attr.grh.traffic_class = 0;
-        }
-        if (ibv_modify_qp(qp_, &attr,
-                IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER))
-            throw std::runtime_error("FRCheck RDMA: RTR failed");
+        for (int i = 0; i < 2; ++i) {
+            // INIT
+            ibv_qp_attr attr{};
+            attr.qp_state = IBV_QPS_INIT;
+            attr.port_num = 1;
+            attr.pkey_index = 0;
+            attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
+            if (ibv_modify_qp(qp_[i], &attr,
+                    IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS))
+                throw std::runtime_error("FRCheck RDMA: QP[" + std::to_string(i) + "] INIT failed");
 
-        // RTS
-        attr = {};
-        attr.qp_state = IBV_QPS_RTS;
-        attr.timeout = 14;
-        attr.retry_cnt = 7;
-        attr.rnr_retry = 7;
-        attr.sq_psn = 0;
-        attr.max_rd_atomic = 1;
-        if (ibv_modify_qp(qp_, &attr,
-                IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-                IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC))
-            throw std::runtime_error("FRCheck RDMA: RTS failed");
+            // RTR
+            attr = {};
+            attr.qp_state = IBV_QPS_RTR;
+            attr.path_mtu = mtu;
+            attr.dest_qp_num = remote.qp_nums[i];
+            attr.rq_psn = 0;
+            attr.max_dest_rd_atomic = 1;
+            attr.min_rnr_timer = 12;
+            attr.ah_attr.is_global = use_gid ? 1 : 0;
+            attr.ah_attr.dlid = remote.lid;
+            attr.ah_attr.sl = 0;
+            attr.ah_attr.src_path_bits = 0;
+            attr.ah_attr.port_num = 1;
+            if (use_gid) {
+                memcpy(&attr.ah_attr.grh.dgid, remote.gid, 16);
+                attr.ah_attr.grh.flow_label = 0;
+                attr.ah_attr.grh.sgid_index = 1;
+                attr.ah_attr.grh.hop_limit = 255;
+                attr.ah_attr.grh.traffic_class = 0;
+            }
+            if (ibv_modify_qp(qp_[i], &attr,
+                    IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                    IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER))
+                throw std::runtime_error("FRCheck RDMA: QP[" + std::to_string(i) + "] RTR failed");
+
+            // RTS
+            attr = {};
+            attr.qp_state = IBV_QPS_RTS;
+            attr.timeout = 14;
+            attr.retry_cnt = 7;
+            attr.rnr_retry = 7;
+            attr.sq_psn = 0;
+            attr.max_rd_atomic = 1;
+            if (ibv_modify_qp(qp_[i], &attr,
+                    IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                    IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC))
+                throw std::runtime_error("FRCheck RDMA: QP[" + std::to_string(i) + "] RTS failed");
+        }
         connected_ = true;
     }
 
@@ -336,12 +351,12 @@ public:
         _recv_chunked(buf, total, mr, wr_id, false);
     }
 
-    // Poll a single completion, return its wr_id.
-    uint64_t poll_one_send_cq() { return _poll_one(send_cq_); }
-    uint64_t poll_one_recv_cq() { return _poll_one(recv_cq_); }
+    // Poll a single completion from either QP's send/recv CQ, return its wr_id.
+    uint64_t poll_one_send_cq(int qp_idx = 0) { return _poll_one(send_cq_[qp_idx]); }
+    uint64_t poll_one_recv_cq(int qp_idx = 0) { return _poll_one(recv_cq_[qp_idx]); }
 
-    ibv_cq* get_send_cq() const { return send_cq_; }
-    ibv_cq* get_recv_cq() const { return recv_cq_; }
+    ibv_cq* get_send_cq(int qp_idx = 0) const { return send_cq_[qp_idx]; }
+    ibv_cq* get_recv_cq(int qp_idx = 0) const { return recv_cq_[qp_idx]; }
 
     void _send_chunked(const uint8_t* data, size_t total, ibv_mr* mr, uint64_t wr_id, bool sync) {
         // Outer-chunk count for the whole logical transfer. In async mode only
@@ -354,6 +369,7 @@ public:
         size_t outer_idx = 0;
         size_t remaining = total, offset = 0;
         while (remaining > 0) {
+            int qp_idx = outer_idx % 2;  // round-robin striping
             size_t nchunks = (std::min(remaining, FRCHECK_RDMA_CHUNK) + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK;
             std::vector<ibv_sge> sge(nchunks);
             std::vector<ibv_send_wr> wr(nchunks);
@@ -371,8 +387,6 @@ public:
                 if (sync) {
                     wr[i].send_flags = is_last_inner ? IBV_SEND_SIGNALED : 0;
                 } else {
-                    // Async: only the LAST chunk of the entire logical send is
-                    // signaled, so the poller sees exactly one completion.
                     bool is_last_outer = (outer_idx + 1 == total_outer);
                     wr[i].send_flags = (is_last_inner && is_last_outer)
                         ? IBV_SEND_SIGNALED : 0;
@@ -382,9 +396,9 @@ public:
                 remaining -= cur;
             }
             ibv_send_wr* bad = nullptr;
-            if (ibv_post_send(qp_, &wr[0], &bad))
-                throw std::runtime_error("FRCheck RDMA: post_send failed");
-            if (sync) poll_cq(send_cq_, (int)nchunks);
+            if (ibv_post_send(qp_[qp_idx], &wr[0], &bad))
+                throw std::runtime_error("FRCheck RDMA: post_send failed on QP[" + std::to_string(qp_idx) + "]");
+            if (sync) poll_cq(send_cq_[qp_idx], (int)nchunks);
             outer_idx++;
         }
     }
@@ -401,6 +415,7 @@ public:
         size_t outer_idx = 0;
         size_t remaining = total, offset = 0;
         while (remaining > 0) {
+            int qp_idx = outer_idx % 2;  // round-robin striping
             size_t nchunks = (std::min(remaining, FRCHECK_RDMA_CHUNK) + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK;
             std::vector<ibv_sge> sge(nchunks);
             std::vector<ibv_recv_wr> wr(nchunks);
@@ -425,9 +440,9 @@ public:
                 remaining -= cur;
             }
             ibv_recv_wr* bad = nullptr;
-            if (ibv_post_recv(qp_, &wr[0], &bad))
-                throw std::runtime_error("FRCheck RDMA: post_recv failed");
-            if (sync) poll_cq(recv_cq_, (int)nchunks);
+            if (ibv_post_recv(qp_[qp_idx], &wr[0], &bad))
+                throw std::runtime_error("FRCheck RDMA: post_recv failed on QP[" + std::to_string(qp_idx) + "]");
+            if (sync) poll_cq(recv_cq_[qp_idx], (int)nchunks);
             outer_idx++;
         }
     }
@@ -460,13 +475,13 @@ public:
 
     ibv_context* ctx_;
     ibv_pd* pd_;
-    ibv_cq* send_cq_;
-    ibv_cq* recv_cq_;
     int tcp_sock_;
     int peer_rank_;
     std::map<uintptr_t, RdmaBuffer>* bufs_;
     std::mutex* buf_mtx_;
-    ibv_qp* qp_;
+    ibv_cq* send_cq_[2];
+    ibv_cq* recv_cq_[2];
+    ibv_qp* qp_[2];
     std::vector<uint8_t> temp_send_;
     std::vector<uint8_t> temp_recv_;
     ibv_mr* temp_send_mr_;
@@ -635,7 +650,7 @@ public:
                 throw std::runtime_error("FRCheck RDMA: failed to send rank to peer=" + std::to_string(peer));
 
             auto ch = std::make_unique<FRCheckRdmaChannel>(
-                rdma_ctx_, rdma_pd_, rdma_send_cq_, rdma_recv_cq_,
+                rdma_ctx_, rdma_pd_,
                 sock, peer, &registered_bufs_, &buf_mtx_);
             ch->exchange_and_connect();
             std::cout << "[FRCheck RDMA] rank=" << rank_in_group
@@ -664,7 +679,7 @@ public:
                       << " accepted from peer=" << peer << " fd=" << sock << std::endl;
 
             auto ch = std::make_unique<FRCheckRdmaChannel>(
-                rdma_ctx_, rdma_pd_, rdma_send_cq_, rdma_recv_cq_,
+                rdma_ctx_, rdma_pd_,
                 sock, peer, &registered_bufs_, &buf_mtx_);
             ch->exchange_and_connect();
             std::cout << "[FRCheck RDMA] rank=" << rank_in_group
@@ -1614,60 +1629,76 @@ public:
         ibv_wc wc_s, wc_r;
         while (async_done_count_ < num_stripes && !stopped_) {
             async_poll_iters_++;
-            int ns = ibv_poll_cq(rdma_send_cq_, 1, &wc_s);
-            int nr = ibv_poll_cq(rdma_recv_cq_, 1, &wc_r);
-            if (ns == 0 && nr == 0) {
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
-                continue;
-            }
-            if (ns < 0 || nr < 0) break;
+            bool any_completion = false;
 
-            // Intermediate chunk completions carry a sentinel wr_id and must
-            // be drained from the CQ but not counted as logical ops.
-            if (ns > 0 && wc_s.wr_id != FRCHECK_WR_ID_CHUNK_SENTINEL) {
-                int sid = wr_id_stripe(wc_s.wr_id);
-                auto& st = async_stripes_[sid];
-                st.ops_done++;
-                check_stripe_done_(sid, parity1_addrs, parity2_addrs, data_addrs, block_size, layer_dir, rank);
-            }
-            if (nr > 0 && wc_r.wr_id != FRCHECK_WR_ID_CHUNK_SENTINEL) {
-                int sid = wr_id_stripe(wc_r.wr_id);
-                auto& st = async_stripes_[sid];
-                if (st.role == (int)StripeRole::ENCODER) {
-                    st.recvs_done++;
-                    if (st.recvs_done == st.n_src && !st.encode_queued) {
-                        st.encode_queued = true;
-                        int sidx = st.stripe_id;
-                        RsEncodeJob job;
-                        job.len = (int)block_size;
-                        job.k = st.n_src;
-                        job.m = 2;
-                        job.g_tbls = g_tbls;
-                        std::vector<unsigned char*> dp(job.k);
-                        for (int i = 0; i < job.k; ++i)
-                            dp[i] = (unsigned char*)(recv_bufs[sidx] + i * block_size);
-                        job.data_ptrs = dp.data();
-                        unsigned char* pptr[2] = {
-                            (unsigned char*)parity1_addrs[sidx],
-                            (unsigned char*)parity2_addrs[sidx] };
-                        job.parity_ptrs = pptr;
-                        auto _enc_start = std::chrono::steady_clock::now();
-                        rs_pool_run_parallel_encode(job);
-                        auto _enc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - _enc_start).count();
-                        async_encode_ns_ += _enc_ns;
-                        st.encode_done = true;
-
-                        const auto& plan = stripe_plans_[sidx];
-                        int peer = plan.parity_target_node_id - 1;
-                        FRCheckRdmaChannel* ch = get_channel_(peer);
-                        ibv_mr* mr = ch->find_mr(parity2_addrs[sidx], block_size);
-                        ch->post_send((uint8_t*)parity2_addrs[sidx], block_size, mr,
-                                      wr_id_encode(sidx, st.n_src));
+            // Poll all per-channel CQs (2 send + 2 recv per channel)
+            for (auto* ch : channels_) {
+                if (!ch) continue;
+                // Poll send CQs
+                for (int q = 0; q < 2; ++q) {
+                    int ns = ibv_poll_cq(ch->get_send_cq(q), 1, &wc_s);
+                    if (ns < 0) { any_completion = false; goto poll_done; }
+                    if (ns > 0) {
+                        any_completion = true;
+                        if (wc_s.wr_id != FRCHECK_WR_ID_CHUNK_SENTINEL) {
+                            int sid = wr_id_stripe(wc_s.wr_id);
+                            auto& st = async_stripes_[sid];
+                            st.ops_done++;
+                            check_stripe_done_(sid, parity1_addrs, parity2_addrs, data_addrs, block_size, layer_dir, rank);
+                        }
                     }
                 }
-                st.ops_done++;
-                check_stripe_done_(sid, parity1_addrs, parity2_addrs, data_addrs, block_size, layer_dir, rank);
+                // Poll recv CQs
+                for (int q = 0; q < 2; ++q) {
+                    int nr = ibv_poll_cq(ch->get_recv_cq(q), 1, &wc_r);
+                    if (nr < 0) { any_completion = false; goto poll_done; }
+                    if (nr > 0) {
+                        any_completion = true;
+                        if (wc_r.wr_id != FRCHECK_WR_ID_CHUNK_SENTINEL) {
+                            int sid = wr_id_stripe(wc_r.wr_id);
+                            auto& st = async_stripes_[sid];
+                            if (st.role == (int)StripeRole::ENCODER) {
+                                st.recvs_done++;
+                                if (st.recvs_done == st.n_src && !st.encode_queued) {
+                                    st.encode_queued = true;
+                                    int sidx = st.stripe_id;
+                                    RsEncodeJob job;
+                                    job.len = (int)block_size;
+                                    job.k = st.n_src;
+                                    job.m = 2;
+                                    job.g_tbls = g_tbls;
+                                    std::vector<unsigned char*> dp(job.k);
+                                    for (int i = 0; i < job.k; ++i)
+                                        dp[i] = (unsigned char*)(recv_bufs[sidx] + i * block_size);
+                                    job.data_ptrs = dp.data();
+                                    unsigned char* pptr[2] = {
+                                        (unsigned char*)parity1_addrs[sidx],
+                                        (unsigned char*)parity2_addrs[sidx] };
+                                    job.parity_ptrs = pptr;
+                                    auto _enc_start = std::chrono::steady_clock::now();
+                                    rs_pool_run_parallel_encode(job);
+                                    auto _enc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - _enc_start).count();
+                                    async_encode_ns_ += _enc_ns;
+                                    st.encode_done = true;
+
+                                    const auto& plan = stripe_plans_[sidx];
+                                    int peer = plan.parity_target_node_id - 1;
+                                    FRCheckRdmaChannel* ch2 = get_channel_(peer);
+                                    ibv_mr* mr = ch2->find_mr(parity2_addrs[sidx], block_size);
+                                    ch2->post_send((uint8_t*)parity2_addrs[sidx], block_size, mr,
+                                                  wr_id_encode(sidx, st.n_src));
+                                }
+                            }
+                            st.ops_done++;
+                            check_stripe_done_(sid, parity1_addrs, parity2_addrs, data_addrs, block_size, layer_dir, rank);
+                        }
+                    }
+                }
+            }
+poll_done:
+            if (!any_completion) {
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
             }
         }
     }
@@ -1729,10 +1760,9 @@ public:
         if (!rdma_pd_)
             throw std::runtime_error("FRCheck RDMA: failed to alloc PD");
 
-        rdma_send_cq_ = ibv_create_cq(rdma_ctx_, FRCHECK_MAX_WR * 2, nullptr, nullptr, 0);
-        rdma_recv_cq_ = ibv_create_cq(rdma_ctx_, FRCHECK_MAX_WR * 2, nullptr, nullptr, 0);
-        if (!rdma_send_cq_ || !rdma_recv_cq_)
-            throw std::runtime_error("FRCheck RDMA: failed to create CQs");
+        // CQs are now created per-QP inside FRCheckRdmaChannel constructor.
+        // FRCHECK_MAX_WR * 2 was the old shared CQ depth; now each per-QP CQ
+        // uses FRCHECK_MAX_WR (64) depth for dedicated single-QP service.
     }
 
     void cleanup_rdma_() {
@@ -1757,8 +1787,8 @@ public:
         }
         registered_bufs_.clear();
 
-        if (rdma_recv_cq_) { ibv_destroy_cq(rdma_recv_cq_); rdma_recv_cq_ = nullptr; }
-        if (rdma_send_cq_) { ibv_destroy_cq(rdma_send_cq_); rdma_send_cq_ = nullptr; }
+        // CQs are owned by FRCheckRdmaChannel and destroyed in their destructors
+        // (triggered by channel_owners_.clear() above).
         if (rdma_pd_) { ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr; }
         if (rdma_ctx_) { ibv_close_device(rdma_ctx_); rdma_ctx_ = nullptr; }
         n_connected_ = 0;
@@ -1888,8 +1918,7 @@ private:
     // RDMA
     ibv_context* rdma_ctx_;
     ibv_pd* rdma_pd_;
-    ibv_cq* rdma_send_cq_ = nullptr;
-    ibv_cq* rdma_recv_cq_ = nullptr;
+    // CQs are now per-QP, owned by FRCheckRdmaChannel
 
     // Topology
     int group_size_ = 0;

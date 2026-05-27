@@ -3080,7 +3080,7 @@ private:
                 try {
 #if RDMA_AVAILABLE
                     if (use_rdma_ && rdma_save_channels_[2]) {
-                        std::cout << "[ECLATIN RDMA] Parity1_Recv1: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                        // std::cout << "[ECLATIN RDMA] Parity1_Recv1: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_save_channels_[2]->receive_data(reinterpret_cast<uint8_t*>(task.recv1_addr), task.size);
                         recv1_success = true;
                     } else
@@ -3110,7 +3110,7 @@ private:
                 try {
 #if RDMA_AVAILABLE
                     if (use_rdma_ && rdma_save_channels_[3]) {
-                        std::cout << "[ECLATIN RDMA] Parity1_Recv2: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                        // std::cout << "[ECLATIN RDMA] Parity1_Recv2: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_save_channels_[3]->receive_data(reinterpret_cast<uint8_t*>(task.recv2_addr), task.size);
                         recv2_success = true;
                     } else
@@ -3243,12 +3243,12 @@ private:
                 auto send_start = std::chrono::high_resolution_clock::now();
 #if RDMA_AVAILABLE
                 if (use_rdma_ && rdma_save_channels_[0]) {
-                    std::cout << "[ECLATIN RDMA] Parity1_Send1: Sending " << task.size << " bytes via RDMA" << std::endl;
+                    // std::cout << "[ECLATIN RDMA] Parity1_Send1: Sending " << task.size << " bytes via RDMA" << std::endl;
                     rdma_save_channels_[0]->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else
 #endif
                 {
-                    std::cout << "[ECLATIN ASIO] Parity1_Send1: Sending " << task.size << " bytes via ASIO" << std::endl;
+                    // std::cout << "[ECLATIN ASIO] Parity1_Send1: Sending " << task.size << " bytes via ASIO" << std::endl;
                     send_with_size(conn_.get_parity1_send1_socket(), task.addr, task.size);
                 }
                 auto send_end = std::chrono::high_resolution_clock::now();
@@ -3322,7 +3322,7 @@ private:
                 auto send_start = std::chrono::high_resolution_clock::now();
 #if RDMA_AVAILABLE
                 if (use_rdma_ && rdma_save_channels_[1]) {
-                    std::cout << "[ECLATIN RDMA] Parity1_Send2: Sending " << task.size << " bytes via RDMA" << std::endl;
+                    // std::cout << "[ECLATIN RDMA] Parity1_Send2: Sending " << task.size << " bytes via RDMA" << std::endl;
                     rdma_save_channels_[1]->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else
 #endif
@@ -3381,7 +3381,7 @@ private:
                             parity2_recv_xor_total_time_ms_.store(worker_total_time_ms);
                         }
                         parity2_recv_xor_completed_ = true;
-                        std::cout << "ECLATIN: Parity2_RecvXor worker completed" << std::endl;
+                        // std::cout << "ECLATIN: Parity2_RecvXor worker completed" << std::endl;
                         parity2_recv_xor_sentinel_received_ = false;
                         // Reset for next round
                         worker_start_time_set = false;
@@ -3422,7 +3422,7 @@ private:
                 try {
 #if RDMA_AVAILABLE
                     if (use_rdma_ && rdma_save_channels_[6]) {
-                        std::cout << "[ECLATIN RDMA] Parity2_Recv1: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                        // std::cout << "[ECLATIN RDMA] Parity2_Recv1: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_save_channels_[6]->receive_data(reinterpret_cast<uint8_t*>(task.recv1_addr), task.size);
                         recv1_success = true;
                     } else
@@ -3452,7 +3452,7 @@ private:
                 try {
 #if RDMA_AVAILABLE
                     if (use_rdma_ && rdma_save_channels_[7]) {
-                        std::cout << "[ECLATIN RDMA] Parity2_Recv2: Receiving " << task.size << " bytes via RDMA" << std::endl;
+                        // std::cout << "[ECLATIN RDMA] Parity2_Recv2: Receiving " << task.size << " bytes via RDMA" << std::endl;
                         rdma_save_channels_[7]->receive_data(reinterpret_cast<uint8_t*>(task.recv2_addr), task.size);
                         recv2_success = true;
                     } else
@@ -3529,7 +3529,7 @@ private:
                 std::lock_guard<std::mutex> lock(parity2_recv_xor_mutex_);
                 if (parity2_recv_xor_q_.empty()) {
                     parity2_recv_xor_completed_ = true;
-                    std::cout << "ECLATIN: Parity2_RecvXor worker completed" << std::endl;
+                    // std::cout << "ECLATIN: Parity2_RecvXor worker completed" << std::endl;
                     parity2_recv_xor_sentinel_received_ = false;
                 }
             }
@@ -3584,7 +3584,7 @@ private:
                 auto send_start = std::chrono::high_resolution_clock::now();
 #if RDMA_AVAILABLE
                 if (use_rdma_ && rdma_save_channels_[4]) {
-                    std::cout << "[ECLATIN RDMA] Parity2_Send1: Sending " << task.size << " bytes via RDMA" << std::endl;
+                    // std::cout << "[ECLATIN RDMA] Parity2_Send1: Sending " << task.size << " bytes via RDMA" << std::endl;
                     rdma_save_channels_[4]->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else
 #endif
@@ -3663,12 +3663,12 @@ private:
                 auto send_start = std::chrono::high_resolution_clock::now();
 #if RDMA_AVAILABLE
                 if (use_rdma_ && rdma_save_channels_[5]) {
-                    std::cout << "[ECLATIN RDMA] Parity2_Send2: Sending " << task.size << " bytes via RDMA" << std::endl;
+                    // std::cout << "[ECLATIN RDMA] Parity2_Send2: Sending " << task.size << " bytes via RDMA" << std::endl;
                     rdma_save_channels_[5]->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else
 #endif
                 {
-                    std::cout << "[ECLATIN ASIO] Parity2_Send2: Sending " << task.size << " bytes via ASIO" << std::endl;
+                    // std::cout << "[ECLATIN ASIO] Parity2_Send2: Sending " << task.size << " bytes via ASIO" << std::endl;
                     send_with_size(conn_.get_parity2_send2_socket(), task.addr, task.size);
                 }
                 auto send_end = std::chrono::high_resolution_clock::now();

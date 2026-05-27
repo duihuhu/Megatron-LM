@@ -513,7 +513,7 @@ def save_eccheck_legacy_checkpoint(
         blocks=blocks,
     )
     logger.info(f"ECCHECK save timing: encode {time.time()-t0:.3f}s")
-
+    torch.distributed.barrier()
     logger.info(f"ECCHECK legacy save: done in {time.time() - start_time:.2f}s")
 
     _save_eccheck_pt_files(

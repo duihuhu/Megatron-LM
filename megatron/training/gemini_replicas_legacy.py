@@ -366,7 +366,9 @@ def save_gemini_replicas_legacy_checkpoint(
             b = b.contiguous()
         replica_tasks.append((str(replica_file), meta_bytes, memoryview(b.numpy())))
 
+    torch.distributed.barrier()
     logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
+    
 
     # ---- Parallel writes ----
     import concurrent.futures

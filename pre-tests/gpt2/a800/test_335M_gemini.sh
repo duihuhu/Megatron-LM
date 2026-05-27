@@ -160,9 +160,9 @@ EVAL_AND_LOGGING_ARGS=(
     # 必选：启用 Gemini Replicas torch legacy checkpoint
     # ---------------------------------------------------------------------------
     # 启用 Gemini Replicas（替代原有的 --use-gemini，后者是两副本 EC 风格配对）
-    --use-gemini-replicas
+    # --use-gemini-replicas
     # 启用优化路径：使用连续 CPU buffer + C++ ASIO/RDMA 网络传输，跳过 torch.save 序列化开销
-    --use-gemini-replicas-optimized
+    # --use-gemini-replicas-optimized
 
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）

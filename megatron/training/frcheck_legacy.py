@@ -522,6 +522,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     logger.info(f"FRCHECK save timing: all layers encode {time.time()-t0:.3f}s")
 
+    torch.distributed.barrier()
     logger.info(f"FRCHECK legacy save: done in {time.time() - start_time:.2f}s")
 
     # Write per-layer stripe files + layer metadata (outside timing)

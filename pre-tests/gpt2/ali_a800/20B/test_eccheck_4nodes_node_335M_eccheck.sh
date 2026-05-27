@@ -8,12 +8,12 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
-export NETIFACES_INTERFACE=bond0
+export NETIFACES_INTERFACE=eth0
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-MASTER_ADDR=10.0.0.62
+MASTER_ADDR=172.16.0.224
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
@@ -132,6 +132,7 @@ GPT_ARGS=(
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 8
     --pipeline-model-parallel-size 4
+    --sequence-parallel
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -146,8 +147,8 @@ EVAL_AND_LOGGING_ARGS=(
     #--use-eccheck-software-failure
     --ckpt-format torch
     --save-embeddings-separately
-    --timing-log-level 2
-    --timing-log-option all
+    # --timing-log-level 2
+    # --timing-log-option all
     --use-rdma
 )
 

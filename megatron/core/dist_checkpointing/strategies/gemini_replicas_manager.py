@@ -189,11 +189,11 @@ class GeminiReplicasManager:
                 for i in range(self.num_replicas):
                     targets.append(group_members[(my_pos + i) % len(group_members)])
 
-                logger.info(
-                    f"Gemini Replicas: [Rank {my_rank}] node-aware targets: {targets} "
-                    f"({self.num_replicas} replicas, group_id={group_id}, "
-                    f"members={group_members}, nodes/group={gs})"
-                )
+                # logger.info(
+                #     f"Gemini Replicas: [Rank {my_rank}] node-aware targets: {targets} "
+                #     f"({self.num_replicas} replicas, group_id={group_id}, "
+                #     f"members={group_members}, nodes/group={gs})"
+                # )
                 return targets
             else:
                 logger.warning(

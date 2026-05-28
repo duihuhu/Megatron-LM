@@ -72,7 +72,7 @@ public:
 
 // RDMA connection info exchanged via TCP (same as rdma_throughput_test.cpp)
 struct RdmaConnInfo {
-    uint32_t qp_nums[2];   // two QPs per peer
+    uint32_t qp_num;
     uint16_t lid;
     uint8_t gid[16];
 } __attribute__((packed));
@@ -321,9 +321,9 @@ private:
     // ibverbs resources
     ibv_context* context_;
     ibv_pd* pd_;
-    ibv_cq* send_cq_[2];
-    ibv_cq* recv_cq_[2];
-    ibv_qp* qp_[2];
+    ibv_cq* send_cq_;
+    ibv_cq* recv_cq_;
+    ibv_qp* qp_;
     
     // TCP sockets for connection setup and control
     int listen_sock_;
@@ -372,21 +372,21 @@ public:
     )
         : context_(nullptr),
           pd_(nullptr),
-          send_cq_{nullptr, nullptr},
-          recv_cq_{nullptr, nullptr},
-          qp_{nullptr, nullptr},
+          send_cq_(nullptr),
+          recv_cq_(nullptr),
+          qp_(nullptr),
           listen_sock_(-1),
           control_sock_send_(-1),
           control_sock_recv_(-1),
+          temp_send_mr_(nullptr),
+          temp_recv_mr_(nullptr),
           rank_(rank),
           world_size_(world_size),
           partner_rank_(partner_rank),
           partner_ip_(partner_ip),
           partner_port_(partner_port),
           my_ip_(my_ip),
-          my_port_(my_port),
-          temp_send_mr_(nullptr),
-          temp_recv_mr_(nullptr)
+          my_port_(my_port)
     {
         std::cout << "[Gemini RDMA] Rank " << rank_ << " initializing RDMA connection manager (ibverbs)" << std::endl;
         std::cout << "[Gemini RDMA] Partner: Rank " << partner_rank_ 
@@ -486,164 +486,198 @@ public:
     }
     
 private:
-    // Helper: Send data in chunks with round-robin striping across 2 QPs
+    // Helper: Send data in chunks to avoid exceeding RDMA message size limits
+    // Optimized version: batch post send work requests in groups, then poll completions
     void send_data_chunked(const uint8_t* data, size_t total_size, ibv_mr* mr) {
         auto start_time = std::chrono::steady_clock::now();
-
+        
+        size_t offset = 0;
         size_t chunk_count = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
         size_t batch_count = (chunk_count + MAX_BATCH_WR - 1) / MAX_BATCH_WR;
-
-        std::cout << "[Gemini RDMA] Rank " << rank_ << " sending " << total_size
-                  << " bytes (" << (total_size / (1024.0 * 1024.0)) << " MB) in "
-                  << chunk_count << " chunks, " << batch_count << " batches (dual-QP striping)" << std::endl;
-
-        // Prepare work requests grouped by QP
-        std::vector<ibv_sge> sges[2];
-        std::vector<ibv_send_wr> wrs[2];
-        for (int q = 0; q < 2; ++q) {
-            size_t q_chunk_count = (chunk_count - q + 1) / 2; // even→QP0, odd→QP1
-            sges[q].resize(q_chunk_count);
-            wrs[q].resize(q_chunk_count);
-        }
-
-        // Build SGEs and WRs: chunk c → QP[c % 2]
-        size_t offset = 0;
-        size_t q_pos[2] = {0, 0};
-        for (size_t c = 0; c < chunk_count; ++c) {
-            int q = c % 2;
+        
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " sending " << total_size 
+                  << " bytes (" << (total_size / (1024.0 * 1024.0)) << " MB) in " 
+                  << chunk_count << " chunks, " << batch_count << " batches" << std::endl;
+        std::cout << "[Gemini RDMA] Config: MAX_WR=" << MAX_WR << ", MAX_BATCH_WR=" << MAX_BATCH_WR 
+                  << ", CHUNK_SIZE=" << (CHUNK_SIZE / (1024.0 * 1024.0)) << " MB" << std::endl;
+        
+        // Prepare all SGEs and work requests
+        std::vector<ibv_sge> sges(chunk_count);
+        std::vector<ibv_send_wr> wrs(chunk_count);
+        
+        size_t chunk_idx = 0;
+        while (offset < total_size) {
             size_t chunk_size = std::min(CHUNK_SIZE, total_size - offset);
-            size_t idx = q_pos[q]++;
-
-            sges[q][idx].addr = reinterpret_cast<uint64_t>(data + offset);
-            sges[q][idx].length = chunk_size;
-            sges[q][idx].lkey = mr->lkey;
-
-            memset(&wrs[q][idx], 0, sizeof(ibv_send_wr));
-            wrs[q][idx].wr_id = reinterpret_cast<uint64_t>(this) + offset;
-            wrs[q][idx].sg_list = &sges[q][idx];
-            wrs[q][idx].num_sge = 1;
-            wrs[q][idx].opcode = IBV_WR_SEND;
-            wrs[q][idx].send_flags = IBV_SEND_SIGNALED;
-            wrs[q][idx].next = nullptr;
-
+            
+            // Prepare SGE for this chunk
+            sges[chunk_idx].addr = reinterpret_cast<uint64_t>(data + offset);
+            sges[chunk_idx].length = chunk_size;
+            sges[chunk_idx].lkey = mr->lkey;
+            
+            // Prepare send work request
+            memset(&wrs[chunk_idx], 0, sizeof(ibv_send_wr));
+            wrs[chunk_idx].wr_id = reinterpret_cast<uint64_t>(this) + offset;
+            wrs[chunk_idx].sg_list = &sges[chunk_idx];
+            wrs[chunk_idx].num_sge = 1;
+            wrs[chunk_idx].opcode = IBV_WR_SEND;
+            wrs[chunk_idx].send_flags = IBV_SEND_SIGNALED;
+            wrs[chunk_idx].next = nullptr;  // Will be set when chaining
+            
             offset += chunk_size;
+            chunk_idx++;
         }
-
-        // Post each QP's chunks in batches, interleaving polls
-        for (int q = 0; q < 2; ++q) {
-            size_t q_total = q_pos[q];
-            size_t posted = 0;
-            while (posted < q_total) {
-                size_t batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), q_total - posted);
-                for (size_t i = posted; i < posted + batch_size - 1; ++i)
-                    wrs[q][i].next = &wrs[q][i + 1];
-                wrs[q][posted + batch_size - 1].next = nullptr;
-
-                ibv_send_wr* bad_wr;
-                int post_ret = ibv_post_send(qp_[q], &wrs[q][posted], &bad_wr);
-                if (post_ret != 0) {
-                    throw std::runtime_error("Failed to post RDMA send batch on QP[" + std::to_string(q) + "]");
-                }
-
-                try {
-                    poll_completion(send_cq_[q], batch_size);
-                } catch (const std::exception& e) {
-                    throw;
-                }
-
-                posted += batch_size;
+        
+        // Post work requests in batches with pipelined completion polling
+        // Strategy: post batch -> wait for completion -> post next batch
+        // This ensures QP capacity is not exceeded
+        size_t total_posted = 0;
+        
+        while (total_posted < chunk_count) {
+            size_t batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), chunk_count - total_posted);
+            
+            // Chain work requests in this batch
+            for (size_t i = total_posted; i < total_posted + batch_size - 1; ++i) {
+                wrs[i].next = &wrs[i + 1];
             }
+            wrs[total_posted + batch_size - 1].next = nullptr;
+            
+            std::cout << "[Gemini RDMA] Rank " << rank_ << " posting batch " << (total_posted / MAX_BATCH_WR + 1)
+                      << ": " << batch_size << " send work requests (total: " << (total_posted + batch_size) 
+                      << "/" << chunk_count << ")" << std::endl;
+            
+            // Post this batch
+            ibv_send_wr* bad_wr;
+            int post_ret = ibv_post_send(qp_, &wrs[total_posted], &bad_wr);
+            if (post_ret != 0) {
+                std::cerr << "[Gemini RDMA] ibv_post_send batch failed at offset " << total_posted 
+                          << " with error: " << post_ret << " (" << strerror(post_ret) << ")" << std::endl;
+                throw std::runtime_error("Failed to post RDMA send batch");
+            }
+            
+            // Wait for this batch to complete before posting next batch
+            // This ensures QP capacity is freed up
+            std::cout << "[Gemini RDMA] Rank " << rank_ << " waiting for batch " << (total_posted / MAX_BATCH_WR + 1)
+                      << " completions (" << batch_size << " WRs)..." << std::endl;
+            
+            try {
+                poll_completion(send_cq_, batch_size);
+            } catch (const std::exception& e) {
+                std::cerr << "[Gemini RDMA] Batch " << (total_posted / MAX_BATCH_WR + 1) 
+                          << " send completion failed: " << e.what() << std::endl;
+                throw;
+            }
+            
+            total_posted += batch_size;
         }
-
+        
         auto end_time = std::chrono::steady_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        double throughput_gbps = (total_size * 8.0) / (duration_ms * 1e6);
-
-        std::cout << "[Gemini RDMA] Rank " << rank_ << " all " << chunk_count << " chunks sent successfully in "
+        double throughput_gbps = (total_size * 8.0) / (duration_ms * 1e6);  // Gbps
+        
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " all " << chunk_count << " chunks sent successfully in " 
                   << duration_ms << " ms (" << throughput_gbps << " Gbps)" << std::endl;
     }
     
-    // Helper: Receive data in chunks with round-robin striping across 2 QPs
-    void receive_data_chunked(uint8_t* buffer, size_t total_size, ibv_mr* mr, bool use_temp) {
+    // Helper: Receive data in chunks
+    // Optimized version: pre-post recv work requests in groups, then poll completions
+    void receive_data_chunked(uint8_t* buffer, size_t total_size, ibv_mr* mr, bool use_temp, size_t already_posted = 0) {
         auto start_time = std::chrono::steady_clock::now();
-
-        size_t chunk_count = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        std::cout << "[Gemini RDMA] Rank " << rank_ << " receiving " << total_size
-                  << " bytes (" << (total_size / (1024.0 * 1024.0)) << " MB) in "
-                  << chunk_count << " chunks (dual-QP striping)" << std::endl;
-
-        // Prepare work requests grouped by QP
-        std::vector<ibv_sge> sges[2];
-        std::vector<ibv_recv_wr> wrs[2];
-        for (int q = 0; q < 2; ++q) {
-            size_t q_chunk_count = (chunk_count - q + 1) / 2;
-            sges[q].resize(q_chunk_count);
-            wrs[q].resize(q_chunk_count);
-        }
-
-        // Build SGEs and WRs: chunk c → QP[c % 2]
+        
         size_t offset = 0;
-        size_t q_pos[2] = {0, 0};
-        for (size_t c = 0; c < chunk_count; ++c) {
-            int q = c % 2;
-            size_t chunk_size = std::min(CHUNK_SIZE, total_size - offset);
-            size_t idx = q_pos[q]++;
-
-            sges[q][idx].addr = use_temp ? reinterpret_cast<uint64_t>(temp_recv_buffer_.data() + offset)
-                                        : reinterpret_cast<uint64_t>(buffer + offset);
-            sges[q][idx].length = chunk_size;
-            sges[q][idx].lkey = mr->lkey;
-
-            memset(&wrs[q][idx], 0, sizeof(ibv_recv_wr));
-            wrs[q][idx].wr_id = reinterpret_cast<uint64_t>(this) + offset;
-            wrs[q][idx].sg_list = &sges[q][idx];
-            wrs[q][idx].num_sge = 1;
-            wrs[q][idx].next = nullptr;
-
-            offset += chunk_size;
-        }
-
-        // Post all recv WRs on both QPs in batches, then poll all completions
-        for (int q = 0; q < 2; ++q) {
-            size_t q_total = q_pos[q];
-            size_t posted = 0;
-            while (posted < q_total) {
-                size_t batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), q_total - posted);
-                for (size_t i = posted; i < posted + batch_size - 1; ++i)
-                    wrs[q][i].next = &wrs[q][i + 1];
-                wrs[q][posted + batch_size - 1].next = nullptr;
-
+        size_t chunk_count = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        size_t batch_count = (chunk_count + MAX_BATCH_WR - 1) / MAX_BATCH_WR;
+        
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " receiving " << total_size 
+                  << " bytes (" << (total_size / (1024.0 * 1024.0)) << " MB) in " 
+                  << chunk_count << " chunks, " << batch_count << " batches" << std::endl;
+        
+        // Post remaining work requests if any, then poll all completions
+        size_t remaining_chunks = chunk_count - already_posted;
+        size_t total_posted = already_posted;
+        
+        if (remaining_chunks > 0) {
+            std::vector<ibv_sge> sges(remaining_chunks);
+            std::vector<ibv_recv_wr> wrs(remaining_chunks);
+            
+            // Calculate offset for remaining chunks
+            offset = already_posted * CHUNK_SIZE;
+            size_t chunk_idx = 0;
+            while (offset < total_size && chunk_idx < remaining_chunks) {
+                size_t chunk_size = std::min(CHUNK_SIZE, total_size - offset);
+                
+                // Prepare SGE for this chunk
+                sges[chunk_idx].addr = use_temp ? reinterpret_cast<uint64_t>(temp_recv_buffer_.data() + offset)
+                                                : reinterpret_cast<uint64_t>(buffer + offset);
+                sges[chunk_idx].length = chunk_size;
+                sges[chunk_idx].lkey = mr->lkey;
+                
+                // Prepare receive work request
+                memset(&wrs[chunk_idx], 0, sizeof(ibv_recv_wr));
+                wrs[chunk_idx].wr_id = reinterpret_cast<uint64_t>(this) + offset;
+                wrs[chunk_idx].sg_list = &sges[chunk_idx];
+                wrs[chunk_idx].num_sge = 1;
+                wrs[chunk_idx].next = nullptr;  // Will be set when chaining
+                
+                offset += chunk_size;
+                chunk_idx++;
+            }
+            
+            // Post remaining work requests in batches
+            while (total_posted < chunk_count) {
+                size_t batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), chunk_count - total_posted);
+                size_t batch_start_idx = total_posted - already_posted;
+                
+                // Chain work requests in this batch
+                for (size_t i = batch_start_idx; i < batch_start_idx + batch_size - 1; ++i) {
+                    wrs[i].next = &wrs[i + 1];
+                }
+                wrs[batch_start_idx + batch_size - 1].next = nullptr;
+                
+                std::cout << "[Gemini RDMA] Rank " << rank_ << " posting batch " << (total_posted / MAX_BATCH_WR + 1)
+                          << ": " << batch_size << " recv work requests (total: " << (total_posted + batch_size) 
+                          << "/" << chunk_count << ")" << std::endl;
+                
+                // Post this batch
                 ibv_recv_wr* bad_wr;
-                int post_ret = ibv_post_recv(qp_[q], &wrs[q][posted], &bad_wr);
+                int post_ret = ibv_post_recv(qp_, &wrs[batch_start_idx], &bad_wr);
                 if (post_ret != 0) {
-                    throw std::runtime_error("Failed to post RDMA recv batch on QP[" + std::to_string(q) + "]");
+                    std::cerr << "[Gemini RDMA] ibv_post_recv batch failed at offset " << total_posted 
+                              << " with error: " << post_ret << " (" << strerror(post_ret) << ")" << std::endl;
+                    throw std::runtime_error("Failed to post RDMA receive batch");
                 }
-                posted += batch_size;
+                
+                total_posted += batch_size;
             }
+        } else {
+            std::cout << "[Gemini RDMA] Rank " << rank_ << " all recv WRs already posted, polling completions..." << std::endl;
         }
-
-        // Poll completions for all chunks on both QPs
-        for (int q = 0; q < 2; ++q) {
-            size_t q_total = q_pos[q];
-            size_t polled = 0;
-            while (polled < q_total) {
-                size_t batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), q_total - polled);
-                try {
-                    poll_completion(recv_cq_[q], batch_size);
-                } catch (const std::exception& e) {
-                    throw;
-                }
-                polled += batch_size;
+        
+        // Poll completions for all chunks (including already posted first batch)
+        total_posted = 0;
+        while (total_posted < chunk_count) {
+            size_t batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), chunk_count - total_posted);
+            
+            std::cout << "[Gemini RDMA] Rank " << rank_ << " waiting for batch " << (total_posted / MAX_BATCH_WR + 1)
+                      << " completions (" << batch_size << " WRs)..." << std::endl;
+            
+            try {
+                poll_completion(recv_cq_, batch_size);
+            } catch (const std::exception& e) {
+                std::cerr << "[Gemini RDMA] Batch " << (total_posted / MAX_BATCH_WR + 1) 
+                          << " receive completion failed: " << e.what() << std::endl;
+                throw;
             }
+            
+            total_posted += batch_size;
         }
-
+        
         auto end_time = std::chrono::steady_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        double throughput_gbps = (total_size * 8.0) / (duration_ms * 1e6);
-
-        std::cout << "[Gemini RDMA] Rank " << rank_ << " all " << chunk_count << " chunks received successfully in "
+        double throughput_gbps = (total_size * 8.0) / (duration_ms * 1e6);  // Gbps
+        
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " all " << chunk_count << " chunks received successfully in " 
                   << duration_ms << " ms (" << throughput_gbps << " Gbps)" << std::endl;
-
+        
         // Copy from temporary buffer if needed
         if (use_temp) {
             std::memcpy(buffer, temp_recv_buffer_.data(), total_size);
@@ -717,90 +751,80 @@ public:
         }
         
         std::cout << "[Gemini RDMA] Rank " << rank_ << " expecting " << size << " bytes" << std::endl;
-
+        
         // Check if buffer is registered
         uintptr_t addr = reinterpret_cast<uintptr_t>(buffer);
         ibv_mr* mr = find_registered_mr(addr, size);
-
+        
         // If not registered, use temporary buffer (normal for small data like metadata)
         bool use_temp = false;
         if (!mr) {
-            std::cout << "[Gemini RDMA] Rank " << rank_ << " recv buffer NOT registered - using temp buffer ("
+            std::cout << "[Gemini RDMA] Rank " << rank_ << " recv buffer NOT registered - using temp buffer (" 
                       << size << " bytes)" << std::endl;
-
+            
             if (size > TEMP_BUFFER_SIZE) {
                 throw std::runtime_error("Data size exceeds temporary buffer size");
             }
-
+            
             // Use temporary buffer (already registered during initialization)
             mr = temp_recv_mr_;
             use_temp = true;
         } else {
             std::cout << "[Gemini RDMA] Rank " << rank_ << " recv buffer IS registered" << std::endl;
         }
-
-        // Post ALL recv WRs on both QPs BEFORE sending ACK.
-        // This ensures the receiver is ready when the sender starts posting send WRs.
-        // We don't poll yet — just post all WRs and send ACK right away.
-        {
-            size_t chunk_count = (size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-            std::vector<ibv_sge> sges[2];
-            std::vector<ibv_recv_wr> wrs[2];
-            size_t q_pos[2] = {0, 0};
-            for (int q = 0; q < 2; ++q) {
-                size_t q_chunk_count = (chunk_count - q + 1) / 2;
-                sges[q].resize(q_chunk_count);
-                wrs[q].resize(q_chunk_count);
-            }
-
-            size_t post_offset = 0;
-            for (size_t c = 0; c < chunk_count; ++c) {
-                int q = c % 2;
-                size_t chunk_size = std::min(CHUNK_SIZE, size - post_offset);
-                size_t idx = q_pos[q]++;
-
-                sges[q][idx].addr = use_temp
-                    ? reinterpret_cast<uint64_t>(temp_recv_buffer_.data() + post_offset)
-                    : reinterpret_cast<uint64_t>(buffer + post_offset);
-                sges[q][idx].length = chunk_size;
-                sges[q][idx].lkey = mr->lkey;
-                memset(&wrs[q][idx], 0, sizeof(ibv_recv_wr));
-                wrs[q][idx].wr_id = reinterpret_cast<uint64_t>(this) + post_offset;
-                wrs[q][idx].sg_list = &sges[q][idx];
-                wrs[q][idx].num_sge = 1;
-                wrs[q][idx].next = nullptr;
-                post_offset += chunk_size;
-            }
-
-            for (int q = 0; q < 2; ++q) {
-                size_t q_total = q_pos[q];
-                size_t posted = 0;
-                while (posted < q_total) {
-                    size_t batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), q_total - posted);
-                    for (size_t i = posted; i < posted + batch_size - 1; ++i)
-                        wrs[q][i].next = &wrs[q][i + 1];
-                    wrs[q][posted + batch_size - 1].next = nullptr;
-
-                    ibv_recv_wr* bad_wr;
-                    int post_ret = ibv_post_recv(qp_[q], &wrs[q][posted], &bad_wr);
-                    if (post_ret != 0)
-                        throw std::runtime_error("Failed to post recv WR batch on QP[" + std::to_string(q) + "]");
-                    posted += batch_size;
-                }
-            }
-            std::cout << "[Gemini RDMA] Rank " << rank_ << " posted all " << chunk_count
-                      << " recv WRs on both QPs" << std::endl;
+        
+        // Step 1: Prepare and post all recv WRs BEFORE sending ACK
+        // This ensures receiver is ready when sender receives ACK and posts send WRs
+        size_t chunk_count = (size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        size_t first_batch_size = std::min(static_cast<size_t>(MAX_BATCH_WR), chunk_count);
+        
+        // Prepare SGEs and work requests for first batch
+        std::vector<ibv_sge> first_batch_sges(first_batch_size);
+        std::vector<ibv_recv_wr> first_batch_wrs(first_batch_size);
+        
+        size_t offset = 0;
+        for (size_t i = 0; i < first_batch_size; ++i) {
+            size_t chunk_size = std::min(CHUNK_SIZE, size - offset);
+            
+            first_batch_sges[i].addr = use_temp ? reinterpret_cast<uint64_t>(temp_recv_buffer_.data() + offset)
+                                                : reinterpret_cast<uint64_t>(buffer + offset);
+            first_batch_sges[i].length = chunk_size;
+            first_batch_sges[i].lkey = mr->lkey;
+            
+            memset(&first_batch_wrs[i], 0, sizeof(ibv_recv_wr));
+            first_batch_wrs[i].wr_id = reinterpret_cast<uint64_t>(this) + offset;
+            first_batch_wrs[i].sg_list = &first_batch_sges[i];
+            first_batch_wrs[i].num_sge = 1;
+            first_batch_wrs[i].next = (i < first_batch_size - 1) ? &first_batch_wrs[i + 1] : nullptr;
+            
+            offset += chunk_size;
         }
-
-        // Send ACK AFTER posting all recv WRs
+        first_batch_wrs[first_batch_size - 1].next = nullptr;
+        
+        // Post first batch of recv WRs
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " posting first batch of " << first_batch_size 
+                  << " recv WRs before sending ACK..." << std::endl;
+        ibv_recv_wr* bad_wr;
+        int post_ret = ibv_post_recv(qp_, &first_batch_wrs[0], &bad_wr);
+        if (post_ret != 0) {
+            std::cerr << "[Gemini RDMA] ibv_post_recv first batch failed with error: " << post_ret 
+                      << " (" << strerror(post_ret) << ")" << std::endl;
+            throw std::runtime_error("Failed to post first batch of RDMA receive WRs");
+        }
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " posted first batch of recv WRs" << std::endl;
+        
+        // Step 2: Send ACK AFTER posting recv WRs
+        // This tells sender that receiver is ready to receive data
         uint8_t ack = 1;
         if (send(control_sock_recv_, &ack, sizeof(ack), 0) != sizeof(ack)) {
             throw std::runtime_error("Failed to send ACK to sender");
         }
-        std::cout << "[Gemini RDMA] Rank " << rank_ << " sent ACK to sender" << std::endl;
-
-        // Poll completions on both QPs
-        receive_data_chunked(buffer, size, mr, use_temp);
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " sent ACK to sender (after posting recv WRs)" << std::endl;
+        
+        // Step 3: Receive data in chunks (will handle remaining batches and polling)
+        receive_data_chunked(buffer, size, mr, use_temp, first_batch_size);
+        
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " received total " << size << " bytes" << std::endl;
         
         return size;
     }
@@ -864,50 +888,54 @@ private:
             throw std::runtime_error("Failed to allocate protection domain");
         }
         
-        // Create completion queues — one pair per QP
-        for (int i = 0; i < 2; ++i) {
-            send_cq_[i] = ibv_create_cq(context_, MAX_WR, nullptr, nullptr, 0);
-            if (!send_cq_[i]) {
-                throw std::runtime_error("Failed to create send completion queue[" + std::to_string(i) + "]");
-            }
-            recv_cq_[i] = ibv_create_cq(context_, MAX_WR, nullptr, nullptr, 0);
-            if (!recv_cq_[i]) {
-                throw std::runtime_error("Failed to create recv completion queue[" + std::to_string(i) + "]");
-            }
+        // Create completion queues
+        send_cq_ = ibv_create_cq(context_, MAX_WR, nullptr, nullptr, 0);
+        if (!send_cq_) {
+            throw std::runtime_error("Failed to create send completion queue");
         }
-
-        // Create Queue Pairs — each with its own CQ pair
-        for (int i = 0; i < 2; ++i) {
-            ibv_qp_init_attr qp_init_attr = {};
-            qp_init_attr.send_cq = send_cq_[i];
-            qp_init_attr.recv_cq = recv_cq_[i];
-            qp_init_attr.qp_type = IBV_QPT_RC;  // Reliable Connection
-            qp_init_attr.cap.max_send_wr = MAX_WR;
-            qp_init_attr.cap.max_recv_wr = MAX_WR;
-            qp_init_attr.cap.max_send_sge = MAX_SGE;
-            qp_init_attr.cap.max_recv_sge = MAX_SGE;
-
-            qp_[i] = ibv_create_qp(pd_, &qp_init_attr);
-            if (!qp_[i]) {
-                throw std::runtime_error("Failed to create queue pair[" + std::to_string(i) + "]");
-            }
-
-            std::cout << "[Gemini RDMA] Rank " << rank_ << " QP[" << i << "] capabilities:" << std::endl;
-            std::cout << "[Gemini RDMA]   max_send_wr: " << qp_init_attr.cap.max_send_wr << std::endl;
-            std::cout << "[Gemini RDMA]   max_recv_wr: " << qp_init_attr.cap.max_recv_wr << std::endl;
-
-            // Transition QP to INIT state
-            ibv_qp_attr qp_attr = {};
-            qp_attr.qp_state = IBV_QPS_INIT;
-            qp_attr.pkey_index = 0;
-            qp_attr.port_num = 1;
-            qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
-
-            if (ibv_modify_qp(qp_[i], &qp_attr,
-                              IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
-                throw std::runtime_error("Failed to modify QP[" + std::to_string(i) + "] to INIT");
-            }
+        
+        recv_cq_ = ibv_create_cq(context_, MAX_WR, nullptr, nullptr, 0);
+        if (!recv_cq_) {
+            throw std::runtime_error("Failed to create recv completion queue");
         }
+        
+        // Create Queue Pair
+        ibv_qp_init_attr qp_init_attr = {};
+        qp_init_attr.send_cq = send_cq_;
+        qp_init_attr.recv_cq = recv_cq_;
+        qp_init_attr.qp_type = IBV_QPT_RC;  // Reliable Connection
+        qp_init_attr.cap.max_send_wr = MAX_WR;
+        qp_init_attr.cap.max_recv_wr = MAX_WR;
+        qp_init_attr.cap.max_send_sge = MAX_SGE;
+        qp_init_attr.cap.max_recv_sge = MAX_SGE;
+        
+        qp_ = ibv_create_qp(pd_, &qp_init_attr);
+        if (!qp_) {
+            throw std::runtime_error("Failed to create queue pair");
+        }
+        
+        // Print actual QP capabilities (may be different from requested)
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " QP capabilities:" << std::endl;
+        std::cout << "[Gemini RDMA]   max_send_wr: " << qp_init_attr.cap.max_send_wr << std::endl;
+        std::cout << "[Gemini RDMA]   max_recv_wr: " << qp_init_attr.cap.max_recv_wr << std::endl;
+        std::cout << "[Gemini RDMA]   max_send_sge: " << qp_init_attr.cap.max_send_sge << std::endl;
+        std::cout << "[Gemini RDMA]   max_recv_sge: " << qp_init_attr.cap.max_recv_sge << std::endl;
+        std::cout << "[Gemini RDMA]   max_inline_data: " << qp_init_attr.cap.max_inline_data << std::endl;
+        
+        // Transition QP to INIT state
+        ibv_qp_attr qp_attr = {};
+        qp_attr.qp_state = IBV_QPS_INIT;
+        qp_attr.pkey_index = 0;
+        qp_attr.port_num = 1;
+        qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+        
+        if (ibv_modify_qp(qp_, &qp_attr,
+                          IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+            throw std::runtime_error("Failed to modify QP to INIT");
+        }
+        
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " RDMA resources initialized (QP number: " 
+                  << qp_->qp_num << ")" << std::endl;
         
         // Register temporary buffers for unregistered data (e.g., metadata)
         std::cout << "[Gemini RDMA] Rank " << rank_ << " registering temporary buffers (" 
@@ -1095,18 +1123,17 @@ private:
         ibv_port_attr port_attr;
         ibv_query_port(context_, 1, &port_attr);
         
-        info.qp_nums[0] = qp_[0]->qp_num;
-        info.qp_nums[1] = qp_[1]->qp_num;
+        info.qp_num = qp_->qp_num;
         info.lid = port_attr.lid;
-
+        
         // Try to get GID for RoCE
         ibv_gid gid;
         if (ibv_query_gid(context_, 1, 1, &gid) == 0) {
             std::memcpy(info.gid, &gid, 16);
         }
-
-        std::cout << "[Gemini RDMA] Rank " << rank_ << " local QP info: QP[0]=" << info.qp_nums[0]
-                  << " QP[1]=" << info.qp_nums[1] << ", LID=" << info.lid << std::endl;
+        
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " local QP info: QP=" << info.qp_num 
+                  << ", LID=" << info.lid << std::endl;
         
         return info;
     }
@@ -1125,13 +1152,12 @@ private:
             return false;
         }
         
-        std::cout << "[Gemini RDMA] Rank " << rank_ << " exchanged connection info - Remote QP[0]="
-                  << remote_info.qp_nums[0] << " QP[1]=" << remote_info.qp_nums[1]
-                  << ", LID=" << remote_info.lid << std::endl;
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " exchanged connection info - Remote QP=" 
+                  << remote_info.qp_num << ", LID=" << remote_info.lid << std::endl;
         return true;
     }
-
-    // Connect QPs to remote peer (same as rdma_throughput_test.cpp)
+    
+    // Connect QP to remote peer (same as rdma_throughput_test.cpp)
     bool connect_qp(const RdmaConnInfo& remote_info) {
         // Query port attributes to get active MTU
         ibv_port_attr port_attr;
@@ -1139,66 +1165,67 @@ private:
             std::cerr << "[Gemini RDMA] Failed to query port attributes" << std::endl;
             return false;
         }
-
+        
         // Use the active MTU (what the port is currently using)
         ibv_mtu mtu = port_attr.active_mtu;
-        std::cout << "[Gemini RDMA] Rank " << rank_ << " using MTU: " << mtu
-                  << " (1=" << IBV_MTU_256 << ", 2=" << IBV_MTU_512 << ", 3=" << IBV_MTU_1024
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " using MTU: " << mtu 
+                  << " (1=" << IBV_MTU_256 << ", 2=" << IBV_MTU_512 << ", 3=" << IBV_MTU_1024 
                   << ", 4=" << IBV_MTU_2048 << ", 5=" << IBV_MTU_4096 << ")" << std::endl;
-
+        
+        // Transition to RTR (Ready to Receive)
+        ibv_qp_attr qp_attr = {};
+        qp_attr.qp_state = IBV_QPS_RTR;
+        qp_attr.path_mtu = mtu;  // Use detected MTU instead of hardcoded 4096
+        qp_attr.dest_qp_num = remote_info.qp_num;
+        qp_attr.rq_psn = 0;
+        qp_attr.max_dest_rd_atomic = 1;
+        qp_attr.min_rnr_timer = 12;
+        
+        // Check if we should use GID (RoCE) or LID (InfiniBand)
         bool use_gid = (remote_info.lid == 0);
-
-        for (int i = 0; i < 2; ++i) {
-            // Transition to RTR (Ready to Receive)
-            ibv_qp_attr qp_attr = {};
-            qp_attr.qp_state = IBV_QPS_RTR;
-            qp_attr.path_mtu = mtu;
-            qp_attr.dest_qp_num = remote_info.qp_nums[i];
-            qp_attr.rq_psn = 0;
-            qp_attr.max_dest_rd_atomic = 1;
-            qp_attr.min_rnr_timer = 12;
-
-            qp_attr.ah_attr.is_global = use_gid ? 1 : 0;
-            qp_attr.ah_attr.dlid = remote_info.lid;
-            qp_attr.ah_attr.sl = 0;
-            qp_attr.ah_attr.src_path_bits = 0;
-            qp_attr.ah_attr.port_num = 1;
-
-            if (use_gid) {
-                std::memcpy(&qp_attr.ah_attr.grh.dgid, remote_info.gid, 16);
-                qp_attr.ah_attr.grh.flow_label = 0;
-                qp_attr.ah_attr.grh.sgid_index = 1;
-                qp_attr.ah_attr.grh.hop_limit = 255;
-                qp_attr.ah_attr.grh.traffic_class = 0;
-            }
-
-            int ret = ibv_modify_qp(qp_[i], &qp_attr,
-                              IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-                              IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
-            if (ret) {
-                std::cerr << "[Gemini RDMA] Failed to modify QP[" << i << "] to RTR: " << ret << std::endl;
-                return false;
-            }
-            std::cout << "[Gemini RDMA] Rank " << rank_ << " QP[" << i << "] transitioned to RTR" << std::endl;
-
-            // Transition to RTS (Ready to Send)
-            std::memset(&qp_attr, 0, sizeof(qp_attr));
-            qp_attr.qp_state = IBV_QPS_RTS;
-            qp_attr.sq_psn = 0;
-            qp_attr.timeout = 14;
-            qp_attr.retry_cnt = 7;
-            qp_attr.rnr_retry = 7;
-            qp_attr.max_rd_atomic = 1;
-
-            if (ibv_modify_qp(qp_[i], &qp_attr,
-                              IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-                              IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC)) {
-                std::cerr << "[Gemini RDMA] Failed to modify QP[" << i << "] to RTS" << std::endl;
-                return false;
-            }
-            std::cout << "[Gemini RDMA] Rank " << rank_ << " QP[" << i << "] transitioned to RTS" << std::endl;
+        
+        qp_attr.ah_attr.is_global = use_gid ? 1 : 0;
+        qp_attr.ah_attr.dlid = remote_info.lid;
+        qp_attr.ah_attr.sl = 0;
+        qp_attr.ah_attr.src_path_bits = 0;
+        qp_attr.ah_attr.port_num = 1;
+        
+        if (use_gid) {
+            std::memcpy(&qp_attr.ah_attr.grh.dgid, remote_info.gid, 16);
+            qp_attr.ah_attr.grh.flow_label = 0;
+            qp_attr.ah_attr.grh.sgid_index = 1; // GID index 1 for erdma (RoCE v2)
+            qp_attr.ah_attr.grh.hop_limit = 255;
+            qp_attr.ah_attr.grh.traffic_class = 0;
         }
-        std::cout << "[Gemini RDMA] Rank " << rank_ << " both QPs connected" << std::endl;
+        
+        int ret = ibv_modify_qp(qp_, &qp_attr,
+                          IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                          IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+        
+        if (ret) {
+            std::cerr << "[Gemini RDMA] Failed to modify QP to RTR: " << ret << std::endl;
+            return false;
+        }
+        
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " QP transitioned to RTR" << std::endl;
+        
+        // Transition to RTS (Ready to Send)
+        std::memset(&qp_attr, 0, sizeof(qp_attr));
+        qp_attr.qp_state = IBV_QPS_RTS;
+        qp_attr.sq_psn = 0;
+        qp_attr.timeout = 14;
+        qp_attr.retry_cnt = 7;
+        qp_attr.rnr_retry = 7;
+        qp_attr.max_rd_atomic = 1;
+        
+        if (ibv_modify_qp(qp_, &qp_attr,
+                          IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                          IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC)) {
+            std::cerr << "[Gemini RDMA] Failed to modify QP to RTS" << std::endl;
+            return false;
+        }
+        
+        std::cout << "[Gemini RDMA] Rank " << rank_ << " QP transitioned to RTS - connection ready" << std::endl;
         return true;
     }
     
@@ -1269,11 +1296,20 @@ private:
             temp_recv_mr_ = nullptr;
         }
         
-        // Destroy QPs and CQs
-        for (int i = 0; i < 2; ++i) {
-            if (qp_[i]) { ibv_destroy_qp(qp_[i]); qp_[i] = nullptr; }
-            if (send_cq_[i]) { ibv_destroy_cq(send_cq_[i]); send_cq_[i] = nullptr; }
-            if (recv_cq_[i]) { ibv_destroy_cq(recv_cq_[i]); recv_cq_[i] = nullptr; }
+        // Destroy QP
+        if (qp_) {
+            ibv_destroy_qp(qp_);
+            qp_ = nullptr;
+        }
+        
+        // Destroy CQs
+        if (send_cq_) {
+            ibv_destroy_cq(send_cq_);
+            send_cq_ = nullptr;
+        }
+        if (recv_cq_) {
+            ibv_destroy_cq(recv_cq_);
+            recv_cq_ = nullptr;
         }
         
         // Deallocate PD

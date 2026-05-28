@@ -1040,15 +1040,6 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         "rebuild_sd=%(rebuild_sd).2fs", _t_hw
     )
 
-    # Clean up EC-NAIVE native module after load to prevent segfaults:
-    # C++ worker threads and RDMA connections remain alive after recovery and
-    # could access freed memory once local tensors (ecnaive_blocks, recv_buffers)
-    # go out of scope. Also reset _ecnaive_native so the next save will
-    # reinitialize the C++ module from scratch.
-    logger.info(f"EC-NAIVE legacy load: cleaning up native module (rank {rank})")
-    manager.cleanup()
-    manager._ecnaive_native = None
-
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()
 
@@ -1234,8 +1225,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             f"EC-NAIVE hw recovery: rank {rank} recovered via RS decode "
             f"(k={ecnaive_k}, m={m}, lost_pos={lost_positions})"
         )
-        manager.cleanup()
-        manager._ecnaive_native = None
 
     elif my_contributions:
         # Source rank: read blocks from disk and send via C++ ASIO send channels
@@ -1299,6 +1288,10 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
     if world_size > 1:
         torch.distributed.barrier()
+
+    # NOTE: do not call manager.cleanup() or native.stop() here.
+    # The C++ destructor double-frees RDMA resources used during RS decode.
+    # The process exits shortly after load, so leaving cleanup to __del__ is safe.
 
     return state_dict
 

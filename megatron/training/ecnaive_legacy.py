@@ -1126,6 +1126,10 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
     torch.distributed.barrier()
 
+    # === timing: network/encode (C++ send/recv + RS decode + assemble) ===
+    _t: Dict[str, float] = {}
+    _t0_net = time.time()
+
     # Helper: resolve block file name from label and recv_slot
     legacy_recv_names = {0: "recv_parity1", 1: "recv_parity0", 2: "recv_data1"}
 
@@ -1222,13 +1226,16 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         tensor_buffer = torch.cat(ordered_blocks, dim=0)
         if actual_tensor_size > 0:
             tensor_buffer = tensor_buffer[:actual_tensor_size]
+        _t['network_encode'] = time.time() - _t0_net
 
+        _t0_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             {"tensor_buffer": tensor_buffer,
              "tensor_infos": tensor_infos,
              "non_tensor_data": main_payload.get("non_tensor_data", {})},
             flat_key_roots=flat_key_roots,
         )
+        _t['rebuild_sd'] = time.time() - _t0_rebuild
         logger.info(
             f"EC-NAIVE hw recovery: rank {rank} recovered via RS decode "
             f"(k={ecnaive_k}, m={m}, lost_pos={lost_positions})"
@@ -1273,18 +1280,28 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         native.submit_send_sentinels(num_channels)
         native.submit_recv_sentinels(num_channels)
         native.wait_for_encoding_completion()
+        _t['network_encode'] = time.time() - _t0_net
 
         # Load own state
+        _t0_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
+        _t['rebuild_sd'] = time.time() - _t0_rebuild
 
     else:
+        _t0_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
+        _t['rebuild_sd'] = time.time() - _t0_rebuild
 
-    logger.info(f"EC-NAIVE legacy hw recovery load: done in {time.time() - start_time:.2f}s")
+    _t['total'] = _t['network_encode'] + _t['rebuild_sd']
+    logger.info(
+        "EC-NAIVE legacy load timing (HW recovery): "
+        "total=%(total).2fs network_encode=%(network_encode).2fs "
+        "rebuild_sd=%(rebuild_sd).2fs", _t
+    )
 
     if world_size > 1:
         torch.distributed.barrier()

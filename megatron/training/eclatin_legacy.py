@@ -740,7 +740,6 @@ def _run_eclatin_full_recovery(
         if rank_in_group == 2:
             if recovered_buffer is None:
                 raise RuntimeError("ECLATIN legacy load: software failure path needs recovered_buffer")
-            start_time = time()
             actual_tensor_buffer_size = _max_tensor_bytes_from_registry(registry, world_size)
             half_actual_data = actual_tensor_buffer_size // 2
             if recovered_buffer.numel() >= total_size:
@@ -753,14 +752,6 @@ def _run_eclatin_full_recovery(
                     recovered_buffer[first_half_actual:total_size].copy_(
                         eclatin_blocks["data_block_2"][:second_half_size]
                     )
-            logger.info(
-                f"ECLATIN legacy load: rank_in_group 2 software failure recovery done in "
-                f"{time() - start_time:.2f}s"
-            )
-        else:
-            logger.info(
-                f"ECLATIN legacy load: rank_in_group {rank_in_group} no-op for software failure"
-            )
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return
@@ -855,12 +846,6 @@ def _run_eclatin_full_recovery(
                 recovered_buffer[first_half_actual:total_size].copy_(
                     eclatin_blocks["data_block_2"][:second_half_size]
                 )
-        logger.info(
-            f"ECLATIN legacy load: hw recovery done in {time() - start_time:.2f}s (rank_in_group=2)"
-        )
-        logger.info(
-            "ECLATIN legacy load time (excl alloc/conn): %.2fs", time() - start_time,
-        )
     elif rank_in_group == 0:
         data2_addr = int(eclatin_blocks["data_block_2"].data_ptr())
         parity2_addr = int(eclatin_blocks["parity_block_2"].data_ptr())
@@ -977,6 +962,9 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 
+    # === timing: network/encode (C++ XOR pipeline or SW memcpy assembly) ===
+    _t_ec: Dict[str, float] = {}
+    _t0 = time.time()
     _run_eclatin_full_recovery(
         manager=manager,
         rank=rank,
@@ -987,10 +975,22 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         total_size=total_size,
         registry=registry,
     )
+    _t_ec['network_encode'] = time.time() - _t0
 
+    # === timing: rebuild state_dict ===
+    _t0 = time.time()
     state_dict = _reconstruct_state_dict_from_eclatin_buffer(
         main_payload,
         recovered_buffer=recovered_buffer if rank_in_group == 2 else None,
+    )
+    _t_ec['rebuild_sd'] = time.time() - _t0
+    _t_ec['total'] = _t_ec['network_encode'] + _t_ec['rebuild_sd']
+
+    _mode = "SW" if sw_failure else "HW"
+    logger.info(
+        "ECLATIN legacy load timing (%s): "
+        "total=%(total).2fs network_encode=%(network_encode).2fs "
+        "rebuild_sd=%(rebuild_sd).2fs", _mode, _t_ec
     )
 
     if world_size > 1 and torch.distributed.is_initialized():

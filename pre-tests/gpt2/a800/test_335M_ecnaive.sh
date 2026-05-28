@@ -144,7 +144,7 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-interval 100
     --save $CHECKPOINT_PATH 
     
-    #--load $CHECKPOINT_PATH
+    --load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck

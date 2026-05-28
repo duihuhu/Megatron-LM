@@ -956,7 +956,6 @@ def recover_frcheck_legacy_hardware(
 
         # Load own state dict normally
         result = _reconstruct_from_main_payload(own_payload, flat_key_roots)
-        logger.info("FRCheck recovery: survivor rank %d done in %.2fs", rank, time.time() - start_time)
         return result
 
     # ---- Failed rank path ----
@@ -1009,17 +1008,9 @@ def recover_frcheck_legacy_hardware(
                     full_buf[offset:offset + size].copy_(layer_buf[offset:offset + size])
             total_recovered += actual_size
 
-    logger.info(
-        "FRCheck recovery: failed rank %d — recovered %d bytes in %.2fs",
-        rank, total_recovered, time.time() - t0,
-    )
-
-    # 5. Reconstruct state_dict from recovered full buffer.
-    #    Replace tensor_buffer with recovered data — main_payload's tensor_buffer
-    #    is either the failed rank's old file data (simulated) or a peer's (real).
+    # Reconstruct state_dict from recovered full buffer.
     main_payload['tensor_buffer'] = full_buf[:total_tensor_size].clone()
     result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
-    logger.info("FRCheck hardware recovery: done rank=%d in %.2fs", rank, time.time() - start_time)
     return result
 
 
@@ -1136,8 +1127,7 @@ def _recover_frcheck_legacy_software(
         flat_key_roots = main_payload.get("flat_key_roots", [])
         result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
         logger.info(
-            f"FRCheck SW recovery: rank {rank} (non-failed) loaded normally "
-            f"in {time.time() - start_time:.2f}s"
+            f"FRCheck SW recovery: rank {rank} (non-failed) loaded normally"
         )
         if world_size > 1 and torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -1239,9 +1229,6 @@ def _recover_frcheck_legacy_software(
     main_payload["tensor_buffer"] = full_buf[:total_tensor_size].clone()
     result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
 
-    logger.info(
-        f"FRCheck SW recovery: rank {rank} done in {time.time() - start_time:.2f}s"
-    )
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()
     return result
@@ -1282,22 +1269,36 @@ def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             )
             failed_ranks = []
         logger.info("FRCheck: software failure mode — failed ranks %s", failed_ranks)
-        t_load = time.time()
+        _t_fr: Dict[str, float] = {}
+        _t0 = time.time()
         result = _recover_frcheck_legacy_software(checkpoint_name, failed_ranks)
+        _t_fr['network_encode'] = time.time() - _t0
+        _t_fr['rebuild_sd'] = 0.0  # included in network_encode above (monolithic)
+        _t_fr['total'] = _t_fr['network_encode']
+        logger.info(
+            "FRCheck legacy load timing (SW): "
+            "total=%(total).2fs network_encode=%(network_encode).2fs "
+            "rebuild_sd=%(rebuild_sd).2fs", _t_fr
+        )
         FRCheckManager().cleanup()
-        logger.info("FRCheck load time (excl disk): %.2fs", time.time() - t_load)
         return result
 
     # Check for hardware recovery mode
     if hw_failure:
         if failed_ranks:
             logger.info("FRCheck: hardware recovery mode — failed ranks %s", failed_ranks)
-            t_load = time.time()
+            _t_fr: Dict[str, float] = {}
+            _t0 = time.time()
             result = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
-            # Release RDMA resources (QPs, CQs, GPU buffer MRs) to prevent
-            # memory corruption with subsequent training / DataLoader.
+            _t_fr['network_encode'] = time.time() - _t0
+            _t_fr['rebuild_sd'] = 0.0  # included in network_encode above (monolithic)
+            _t_fr['total'] = _t_fr['network_encode']
+            logger.info(
+                "FRCheck legacy load timing (HW): "
+                "total=%(total).2fs network_encode=%(network_encode).2fs "
+                "rebuild_sd=%(rebuild_sd).2fs", _t_fr
+            )
             FRCheckManager().cleanup()
-            logger.info("FRCheck load time (excl disk): %.2fs", time.time() - t_load)
             return result
 
     raise NotImplementedError(

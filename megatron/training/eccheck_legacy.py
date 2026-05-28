@@ -706,39 +706,20 @@ def _run_eccheck_legacy_recovery(
     # rank_in_group 1 receives into recovered_buffer.
     # This exercises the network path for worst-case recovery time measurement.
     if software_failure:
-        # Barrier before P2P: RDMA requires receiver to post recv WR before sender sends,
-        # otherwise RNR (Receiver Not Ready) causes "failed to receive ACK".
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
-        t_sw = time()
         if rank_in_group == 0:
             own_buf = blocks["own_buffer"].contiguous().view(torch.uint8).reshape(-1)
             actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
             send_size = min(actual_tensor_bytes, own_buf.numel())
             native.simple_p2p_send(int(own_buf.data_ptr()), send_size)
-            logger.info(
-                f"ECCHECK legacy sw: rig=0 sent {send_size} bytes to rig=1 "
-                f"in {time() - t_sw:.2f}s"
-            )
         elif rank_in_group == 1:
             if recovered_buffer is None:
                 raise RuntimeError("ECCHECK legacy: software failure needs recovered_buffer")
             native.simple_p2p_recv(
                 int(recovered_buffer.data_ptr()), recovered_buffer.numel()
             )
-            logger.info(
-                f"ECCHECK legacy sw: rig=1 recvd {recovered_buffer.numel()} bytes "
-                f"from rig=0 in {time() - t_sw:.2f}s"
-            )
-        elif rank_in_group == 2:
-            logger.info(
-                f"ECCHECK legacy sw: rig=2 no-op (not participating) "
-                f"in {time() - t_sw:.2f}s"
-            )
-        else:
-            logger.info(
-                f"ECCHECK legacy sw: rank_in_group {rank_in_group} no-op"
-            )
+        # rig=2/3: no-op
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         return
@@ -1090,8 +1071,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 
-    t_load = time.time()  # after all alloc + block memcopy
-
+    # === timing: network/encode (C++ P2P or XOR pipeline) ===
+    _t_ec: Dict[str, float] = {}
+    _t0 = time.time()
     _run_eccheck_legacy_recovery(
         manager=manager,
         rank=rank,
@@ -1102,12 +1084,24 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         total_size=total_size,
         registry=registry,
     )
+    _t_ec['network_encode'] = time.time() - _t0
 
+    # === timing: rebuild state_dict ===
+    _t0 = time.time()
     state_dict = _reconstruct_state_dict_from_eccheck_buffer(
         main_payload,
         recovered_buffer=recovered_buffer if (
             rank_in_group == 2 or (sw_failure and rank_in_group == 1)
         ) else None,
+    )
+    _t_ec['rebuild_sd'] = time.time() - _t0
+    _t_ec['total'] = _t_ec['network_encode'] + _t_ec['rebuild_sd']
+
+    _mode = "SW" if sw_failure else "HW"
+    logger.info(
+        "ECCHECK legacy load timing (%s): "
+        "total=%(total).2fs network_encode=%(network_encode).2fs "
+        "rebuild_sd=%(rebuild_sd).2fs", _mode, _t_ec
     )
 
     if world_size > 1 and torch.distributed.is_initialized():
@@ -1115,7 +1109,6 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     # Stop C++ load workers so they don't interfere with subsequent training.
     # The singleton manager will be reinitialized on the next save.
-    logger.info("ECCHECK legacy load time (excl disk): %.2fs", time.time() - t_load)
     logger.info(f"ECCHECK legacy: cleaning up C++ module after recovery (rank {rank})")
     manager.cleanup()
     manager._eccheck_native = None

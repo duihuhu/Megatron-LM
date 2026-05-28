@@ -125,8 +125,8 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    #--load $CHECKPOINT_PATH
-    #--use-eclatin-software-failure # toggle for software failure; untoggled for hardware failure
+    --load $CHECKPOINT_PATH # search "load timing" in logs
+    --use-eclatin-software-failure # toggle for software failure; untoggled for hardware failure
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --use-eclatin

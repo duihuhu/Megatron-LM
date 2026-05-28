@@ -448,21 +448,21 @@ def save_eccheck_legacy_checkpoint(
                     f"expected={tensor_bytes}, got={tensor_view.numel()}"
                 )
             tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
-        info.offset = offset
-        local_tensor_metadata.append(
-            TensorMetadata(
-                key=info.key,
-                shape=info.shape,
-                dtype=str(info.dtype),
-                size_bytes=info.size_bytes,
-                global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
-                shard_index=info.shard_index if info.shard_index is not None else 0,
-                chunk_type="data",
-                target_rank=rank,
-                source_rank=rank,
+            info.offset = offset
+            local_tensor_metadata.append(
+                TensorMetadata(
+                    key=info.key,
+                    shape=info.shape,
+                    dtype=str(info.dtype),
+                    size_bytes=info.size_bytes,
+                    global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
+                    shard_index=info.shard_index if info.shard_index is not None else 0,
+                    chunk_type="data",
+                    target_rank=rank,
+                    source_rank=rank,
+                )
             )
-        )
-        offset += tensor_bytes
+            offset += tensor_bytes
         decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
     d2h_stream.synchronize()
 

@@ -229,12 +229,9 @@ def save_gemini_replicas_legacy_checkpoint(
     # Cache the results from the first exchange to skip expensive NCCL all_gather_object
     # on subsequent iterations (~3s → 0s for 32 ranks, 3GB models).
     if _cached_rank_tensor_infos is None:
-        _NTD_SKIP_PREFIXES = ("optimizer", "rng_state", "rerun_state_machine", "args")
-        slim_ntd = {
-            k: v for k, v in decomposed.non_tensor_data.items()
-            if not k.startswith(_NTD_SKIP_PREFIXES)
-        }
-        rank_metadata, rank_non_tensor = _build_global_registry(local_tensor_metadata, slim_ntd)
+        rank_metadata, rank_non_tensor = _build_global_registry(
+            local_tensor_metadata, decomposed.non_tensor_data
+        )
 
         my_flat_key_roots = list(decomposed.flat_key_roots) if decomposed.flat_key_roots else []
         all_meta: List[Any] = [None for _ in range(world_size)]
@@ -849,8 +846,8 @@ def load_gemini_replicas_legacy_checkpoint(
             torch.distributed.barrier()
         return state_dict
 
-    if not is_failed and all(health_list):
-        # ---- Normal load ----
+    if not is_failed and all(health_list) and not recovery_rank_str:
+        # ---- Normal load (no recovery ranks specified, all files present) ----
         _t['network_encode'] = 0.0
         _t0 = time.time()
         state_dict = _reconstruct_from_payload(

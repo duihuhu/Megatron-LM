@@ -152,7 +152,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    --load $CHECKPOINT_PATH          # 取消注释以测试 load
+    #--load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 

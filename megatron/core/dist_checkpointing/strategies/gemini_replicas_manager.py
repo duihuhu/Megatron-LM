@@ -613,12 +613,12 @@ class GeminiReplicasManager:
         
         logger.info(f"Gemini Replicas: [Rank {rank}] Allocating preallocated buffer: {size_bytes / (1024**3):.2f} GB")
         
-        if self.gemini_replicas_pin_memory and torch.cuda.is_available():
-            self.preallocated_cpu_buffer = torch.empty(size_bytes, dtype=torch.uint8).pin_memory()
-            logger.info(f"Gemini Replicas: [Rank {rank}] Allocated pinned memory buffer")
-        else:
-            self.preallocated_cpu_buffer = torch.empty(size_bytes, dtype=torch.uint8)
-            logger.info(f"Gemini Replicas: [Rank {rank}] Allocated regular CPU buffer")
+        pin = self.gemini_replicas_pin_memory and torch.cuda.is_available()
+        self.preallocated_cpu_buffer = allocate_hugepage_tensor(
+            size_bytes, fallback_pin_memory=pin, touch_pages=False,
+        )
+        logger.info(f"Gemini Replicas: [Rank {rank}] Allocated preallocated buffer: "
+                     f"{size_bytes / (1024**3):.2f} GB (hugepage, pin={pin})")
 
     _cached_recv_buffers: Dict[int, torch.Tensor] = {}
 

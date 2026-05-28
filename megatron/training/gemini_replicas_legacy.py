@@ -35,12 +35,6 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
 logger = getLogger(__name__)
 
 
-def _cpu_uint8_view(tensor: torch.Tensor) -> torch.Tensor:
-    t = tensor.detach()
-    if t.device.type != "cpu":
-        t = t.to("cpu")
-    return t.contiguous().view(torch.uint8).reshape(-1)
-
 
 def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
     checkpoint_path = Path(checkpoint_name)
@@ -174,48 +168,52 @@ def save_gemini_replicas_legacy_checkpoint(
     total_tensor_size = decomposed.total_tensor_size_bytes
     logger.info(f"GEMINI save timing: decompose {time.time()-t0:.3f}s")
 
-    start_time = t0 = time.time()
+    start_time = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), 1024 * 1024)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
 
+    t0 = time.time()
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
     local_tensor_infos: List[Dict[str, Any]] = []  # for replica file metadata
-    for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
-        tensor_bytes = info.size_bytes
-        tensor_bytes_view = _cpu_uint8_view(tensor)
-        if tensor_bytes_view.numel() != tensor_bytes:
-            raise RuntimeError(
-                f"Gemini Replicas legacy save: tensor bytes mismatch for {info.key}, "
-                f"expected={tensor_bytes}, got={tensor_bytes_view.numel()}"
+    d2h_stream = torch.cuda.Stream()
+    with torch.cuda.stream(d2h_stream):
+        for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
+            tensor_bytes = info.size_bytes
+            tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+            if tensor_view.numel() != tensor_bytes:
+                raise RuntimeError(
+                    f"Gemini Replicas legacy save: tensor bytes mismatch for {info.key}, "
+                    f"expected={tensor_bytes}, got={tensor_view.numel()}"
+                )
+            tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
+            info.offset = offset
+            local_tensor_metadata.append(
+                TensorMetadata(
+                    key=info.key,
+                    shape=info.shape,
+                    dtype=str(info.dtype),
+                    size_bytes=info.size_bytes,
+                    global_offset=tuple(info.global_offset)
+                    if info.global_offset
+                    else tuple(),
+                    shard_index=info.shard_index if info.shard_index is not None else 0,
+                    chunk_type="data",
+                    target_rank=rank,
+                    source_rank=rank,
+                )
             )
-        tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_bytes_view)
-        info.offset = offset
-        local_tensor_metadata.append(
-            TensorMetadata(
-                key=info.key,
-                shape=info.shape,
-                dtype=str(info.dtype),
-                size_bytes=info.size_bytes,
-                global_offset=tuple(info.global_offset)
-                if info.global_offset
-                else tuple(),
-                shard_index=info.shard_index if info.shard_index is not None else 0,
-                chunk_type="data",
-                target_rank=rank,
-                source_rank=rank,
-            )
-        )
-        local_tensor_infos.append({
-            "key": info.key,
-            "shape": list(info.shape),
-            "dtype": str(info.dtype),
-            "offset": info.offset,
-            "size_bytes": info.size_bytes,
-        })
-        offset += tensor_bytes
-        decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
+            local_tensor_infos.append({
+                "key": info.key,
+                "shape": list(info.shape),
+                "dtype": str(info.dtype),
+                "offset": info.offset,
+                "size_bytes": info.size_bytes,
+            })
+            offset += tensor_bytes
+            decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
+    d2h_stream.synchronize()
 
     del decomposed.tensor_data  # drop remaining refs
     logger.info(f"GEMINI save timing: D2H+copy {time.time()-t0:.3f}s")

@@ -41,12 +41,6 @@ _FORMAT = "eccheck_torch_legacy"
 # Utility helpers
 # ---------------------------------------------------------------------------
 
-def _cpu_uint8_view(tensor: torch.Tensor) -> torch.Tensor:
-    t = tensor.detach()
-    if t.device.type != "cpu":
-        t = t.to("cpu")
-    return t.contiguous().view(torch.uint8).reshape(-1)
-
 
 def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
     checkpoint_path = Path(checkpoint_name)
@@ -443,15 +437,17 @@ def save_eccheck_legacy_checkpoint(
 
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
-    for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
-        tensor_bytes = info.size_bytes
-        tensor_bytes_view = _cpu_uint8_view(tensor)
-        if tensor_bytes_view.numel() != tensor_bytes:
-            raise RuntimeError(
-                f"ECCHECK legacy save: tensor bytes mismatch for {info.key}, "
-                f"expected={tensor_bytes}, got={tensor_bytes_view.numel()}"
-            )
-        tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_bytes_view)
+    d2h_stream = torch.cuda.Stream()
+    with torch.cuda.stream(d2h_stream):
+        for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
+            tensor_bytes = info.size_bytes
+            tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+            if tensor_view.numel() != tensor_bytes:
+                raise RuntimeError(
+                    f"ECCHECK legacy save: tensor bytes mismatch for {info.key}, "
+                    f"expected={tensor_bytes}, got={tensor_view.numel()}"
+                )
+            tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
         info.offset = offset
         local_tensor_metadata.append(
             TensorMetadata(
@@ -468,6 +464,7 @@ def save_eccheck_legacy_checkpoint(
         )
         offset += tensor_bytes
         decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
+    d2h_stream.synchronize()
 
     del decomposed.tensor_data  # drop remaining refs
     logger.info(f"ECCHECK save timing: D2H+copy {time.time()-t0:.3f}s")

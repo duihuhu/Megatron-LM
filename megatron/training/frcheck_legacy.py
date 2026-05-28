@@ -82,13 +82,6 @@ def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
     return base
 
 
-def _to_device_view(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Return a contiguous uint8 view of tensor on the given device."""
-    t = tensor.detach()
-    if t.device != device:
-        t = t.to(device, non_blocking=True)
-    return t.contiguous().view(torch.uint8).reshape(-1)
-
 
 def _stripes_per_role(stripe_plans: List, role: StripeRole) -> int:
     return sum(1 for sp in stripe_plans if sp.role == role)
@@ -452,17 +445,20 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         layer_buf_size = group.total_bytes + safety_margin
         tensor_buffer = manager.allocate_layer_buffer(layer_idx, layer_buf_size, gdr)
 
-        # Copy layer tensors into layer buffer and full_buf
+        # Copy layer tensors into layer buffer and full_buf (async D2H via dedicated stream)
         offset = 0
-        for info, tensor in zip(group.tensor_infos, group.tensor_data):
-            tb = _to_device_view(tensor, buf_device)
-            nbytes = tb.numel()
-            tensor_buffer[offset : offset + nbytes].copy_(tb)
-            full_buf[_global_offsets[id(info)] : _global_offsets[id(info)] + nbytes].copy_(
-                _to_device_view(tensor, torch.device("cpu"))
-            )
-            info.offset = offset
-            offset += nbytes
+        copy_stream = torch.cuda.Stream()
+        with torch.cuda.stream(copy_stream):
+            for info, tensor in zip(group.tensor_infos, group.tensor_data):
+                tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+                nbytes = tensor_view.numel()
+                tensor_buffer[offset : offset + nbytes].copy_(tensor_view, non_blocking=True)
+                full_buf[_global_offsets[id(info)] : _global_offsets[id(info)] + nbytes].copy_(
+                    tensor_view, non_blocking=True
+                )
+                info.offset = offset
+                offset += nbytes
+        copy_stream.synchronize()
 
         group.tensor_data = []  # free GPU refs for this layer
         addr = tensor_buffer.data_ptr()

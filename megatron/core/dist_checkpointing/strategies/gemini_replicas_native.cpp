@@ -1613,13 +1613,25 @@ private:
     }
     
     void poll_completion(ibv_cq* cq, int num_completions) {
-        // Use a timeout to avoid hanging forever if the remote side never responds.
-        // 60 seconds is generous for RDMA transfers.
-        poll_completion_timeout(cq, num_completions, 60);
+        // Tight spin on the hot path (matches ecnaive_native). No sleep between polls.
+        int polled = 0;
+        while (polled < num_completions) {
+            ibv_wc wc;
+            int n = ibv_poll_cq(cq, 1, &wc);
+            if (n < 0) {
+                throw std::runtime_error("Failed to poll completion queue");
+            }
+            if (n > 0) {
+                if (wc.status != IBV_WC_SUCCESS) {
+                    throw std::runtime_error("Work completion failed with status " + std::to_string(wc.status));
+                }
+                polled++;
+            }
+        }
     }
 
-    // Like poll_completion but with a timeout (seconds). Used by warmup
-    // to avoid hanging forever if a peer hasn't posted recv WRs yet.
+    // Spin with a deadline (seconds). Used by warmup to avoid hanging forever
+    // if a peer hasn't posted recv WRs yet.
     void poll_completion_timeout(ibv_cq* cq, int num_completions, int timeout_secs) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_secs);
         int polled = 0;
@@ -1641,7 +1653,6 @@ private:
                     + std::to_string(timeout_secs) + "s (got " + std::to_string(polled)
                     + "/" + std::to_string(num_completions) + " completions)");
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 

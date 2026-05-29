@@ -90,8 +90,8 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-merges.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/gpt2/20B/gpt2-20b-0/logs"
-CHECKPOINT_PATH="/dev/shm/models/gpt2-20b-0-gemini-3-replicas"
+TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/opt/7B/opt-7b-0/logs"
+CHECKPOINT_PATH="/dev/shm/models/opt-7b-0-gemini-2-replicas"
 # DATA_PATH="/workspace/Megatron-LM/pre-tests/opt/opt_data/wiki_text_sentence"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -100,8 +100,9 @@ ARGS_TO_PASS=("$@")
 
 # 模型固定参数
 HIDDEN_SIZE=5120
-NUM_ATTENTION_HEADS=40
-NUM_LAYERS=64 
+NUM_ATTENTION_HEADS=40 
+NUM_LAYERS=64
+
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
@@ -166,7 +167,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    #--load $CHECKPOINT_PATH          # 取消注释以测试 load
+    # --load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
@@ -181,7 +182,7 @@ EVAL_AND_LOGGING_ARGS=(
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）
     # ---------------------------------------------------------------------------
-    --gemini-replicas-num 3          # 默认 3。设为 2 即两副本，设为 N 即 N 副本
+    --gemini-replicas-num 2          # 默认 3。设为 2 即两副本，设为 N 即 N 副本
                                         # 在组内 round-robin 轮询放置副本
                                         # 容错能力 = num_replicas - 1 个 rank 同时故障
 
@@ -221,7 +222,7 @@ EVAL_AND_LOGGING_ARGS=(
     #   示例："2,3" 表示 rank2 和 rank3 当作故障处理。
     #
     #   --gemini-replicas-recovery-rank 2,3
-
+    #
     # ---------------------------------------------------------------------------
     # ckpt 格式：必须用 torch（legacy 路径）
     # ---------------------------------------------------------------------------

@@ -92,9 +92,10 @@ SHM_PKT="/dev/shm/shm_pkt"
 ARGS_TO_PASS=("$@")
 
 # Model related configuration here, please do not overlap with json config
-HIDDEN_SIZE=4096
-NUM_ATTENTION_HEADS=32
-NUM_LAYERS=32
+HIDDEN_SIZE=5120
+NUM_ATTENTION_HEADS=40 
+NUM_LAYERS=64
+
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH

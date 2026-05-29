@@ -90,8 +90,8 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-merges.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/gpt2/20B/gpt2-20b-0/logs"
-CHECKPOINT_PATH="/dev/shm/models/gpt2-20b-0-gemini-3-replicas"
+TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/opt/7B/opt-7b-0/logs"
+CHECKPOINT_PATH="/dev/shm/models/opt-7b-0-gemini-3-replicas"
 # DATA_PATH="/workspace/Megatron-LM/pre-tests/opt/opt_data/wiki_text_sentence"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -100,8 +100,9 @@ ARGS_TO_PASS=("$@")
 
 # 模型固定参数
 HIDDEN_SIZE=5120
-NUM_ATTENTION_HEADS=40
-NUM_LAYERS=64 
+NUM_ATTENTION_HEADS=40 
+NUM_LAYERS=64
+
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH

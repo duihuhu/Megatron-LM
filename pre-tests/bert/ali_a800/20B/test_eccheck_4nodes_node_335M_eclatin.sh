@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # Script to run a single node in 4-node simulation (default 1 GPU per node)
-# Usage: ./test_eccheck_4nodes_node_335M_eccheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]
-# Example: ./test_eccheck_4nodes_node_335M_eccheck.sh 0 0
-# Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_eccheck.sh 0 2 3
+# Usage: ./test_eccheck_4nodes_node.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]
+# Example: ./test_eccheck_4nodes_node.sh 0 0
+# Example (2 GPUs per container): ./test_eccheck_4nodes_node.sh 0 2 3
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
@@ -21,17 +21,15 @@ NNODES=4
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
-export ECCHECK_INTERFACE=$NETIFACES_INTERFACE
-export ECCHECK_LOCAL_RANK_NIC_0=eth0
-export ECCHECK_LOCAL_RANK_NIC_1=eth0
-export ECCHECK_LOCAL_RANK_NIC_2=eth0
-export ECCHECK_LOCAL_RANK_NIC_3=eth0  
-export ECCHECK_LOCAL_RANK_NIC_4=eth1
-export ECCHECK_LOCAL_RANK_NIC_5=eth1
-export ECCHECK_LOCAL_RANK_NIC_6=eth1
-export ECCHECK_LOCAL_RANK_NIC_7=eth1
-export MEGATRON_ECCHECK_LOAD_NET_TRACE=1
-
+export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
+export ECLATIN_LOCAL_RANK_NIC_0=eth0
+export ECLATIN_LOCAL_RANK_NIC_1=eth0
+export ECLATIN_LOCAL_RANK_NIC_2=eth0
+export ECLATIN_LOCAL_RANK_NIC_3=eth0
+export ECLATIN_LOCAL_RANK_NIC_4=eth1
+export ECLATIN_LOCAL_RANK_NIC_5=eth1
+export ECLATIN_LOCAL_RANK_NIC_6=eth1
+export ECLATIN_LOCAL_RANK_NIC_7=eth1
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -50,7 +48,7 @@ done
 
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
     echo "Error: At least one GPU id must be specified."
-    echo "Usage: ./test_eccheck_4nodes_node_335M_eccheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]"
+    echo "Usage: ./test_eccheck_4nodes_node.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]"
     exit 1
 fi
 
@@ -63,12 +61,12 @@ export CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_IDS[*]}")
 export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-VOCAB_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-vocab.json"
-MERGE_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-merges.txt"
+VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
+MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/gpt2/20B/gpt2-20b-0/logs"
-CHECKPOINT_PATH="/dev/shm/models/gpt2-20b-0-eccheck"
-# DATA_PATH="/workspace/Megatron-LM/pre-tests/opt/opt_data/wiki_text_sentence"
+TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
+CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-eclatin" #<Specify path>
+DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
 
 SHM_PKT="/dev/shm/shm_pkt"
 
@@ -76,15 +74,15 @@ SHM_PKT="/dev/shm/shm_pkt"
 ARGS_TO_PASS=("$@")
 
 # Model related configuration here, please do not overlap with json config
+# fixed Model related configuration here, pls not overlap with json config
 HIDDEN_SIZE=5120
-NUM_ATTENTION_HEADS=40
-NUM_LAYERS=64 
+NUM_ATTENTION_HEADS=40 
+NUM_LAYERS=64
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
 MICRO_BATCH_SIZE=4
 GLOBAL_BATCH_SIZE=16
-
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -101,27 +99,27 @@ DATA_ARGS=(
 )
 
 GPT_ARGS=(
-    --no-async-tensor-model-parallel-allreduce
-    --hidden-size $HIDDEN_SIZE
-    --num-attention-heads $NUM_ATTENTION_HEADS
-    --seq-length $SEQ_LENGTH
-    --max-position-embeddings $MAX_POSITION_EMBEDDINGS
-    --micro-batch-size $MICRO_BATCH_SIZE
-    --global-batch-size $GLOBAL_BATCH_SIZE
-    --lr 0.00005
-    --train-iters 20
-    --lr-decay-iters 320000
-    --lr-decay-style cosine
-    --min-lr 1.0e-5
-    --weight-decay 1e-2
-    --lr-warmup-fraction .05
-    --clip-grad 1.0
-    --fp16
-    --tokenizer-type GPT2BPETokenizer
-    --use-mcore-models
-    --transformer-impl transformer_engine
-    --no-scatter-gather-tensors-in-pipeline
-    --num-layers $NUM_LAYERS
+    --no-async-tensor-model-parallel-allreduce 
+    --hidden-size $HIDDEN_SIZE 
+    --num-attention-heads $NUM_ATTENTION_HEADS 
+    --seq-length $SEQ_LENGTH 
+    --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
+    --micro-batch-size $MICRO_BATCH_SIZE 
+    --global-batch-size $GLOBAL_BATCH_SIZE 
+    --lr 0.00005 
+    --train-iters 5
+    --lr-decay-iters 320000 
+    --lr-decay-style cosine 
+    --min-lr 1.0e-5 
+    --weight-decay 1e-2 
+    --lr-warmup-fraction .05 
+    --clip-grad 1.0 
+    --fp16 
+    --tokenizer-type GPT2BPETokenizer 
+    --use-mcore-models 
+    --transformer-impl transformer_engine 
+    --no-scatter-gather-tensors-in-pipeline 
+    --num-layers $NUM_LAYERS 
     --optimizer adam
     --loss-scale-window 100
     --initial-loss-scale 4096
@@ -133,23 +131,32 @@ MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 8
     --pipeline-model-parallel-size 4
     --sequence-parallel
+
 )
 
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    --save $CHECKPOINT_PATH
+    --save $CHECKPOINT_PATH 
     #--load $CHECKPOINT_PATH
     --eval-iters 1
-    --tensorboard-dir $TENSORBOARD_LOGS_PATH
-    --use-eccheck
-    #--use-eccheck-software-failure
+    --tensorboard-dir $TENSORBOARD_LOGS_PATH 
+    # --use-eccheck
+
+    # --use-gemini
+    # --use-gemini-optimized
+    # --use-gemini-software-failure
+    # --use-gemini-hardware-failure
+    # --use-distributed-optimizer
+    # --use-ecnaive-software-failure
+    --use-eclatin
     --ckpt-format torch
+    # --no-save-optim
+    # --no-load-optim
     --save-embeddings-separately
-    # --timing-log-level 2
-    # --timing-log-option all
     --use-rdma
+    # --timing-log-level 2
 )
 
 mkdir -p logs

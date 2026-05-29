@@ -1,0 +1,39 @@
+{
+    "class": "BERTMaskedWordPieceDataset",
+    "dataset_path": "/workspace/Megatron-LM/pre-tests/bert/bert_data/wiki_text_sentence",
+    "num_samples": 320,
+    "index_split": "train",
+    "random_seed": 1234,
+    "sequence_length": 1024,
+    "split": "949,50,1",
+    "split_matrix": [
+        [
+            0,
+            0.949
+        ],
+        [
+            0.949,
+            0.999
+        ],
+        [
+            0.999,
+            1.0
+        ]
+    ],
+    "tokenizer": {
+        "class": "_BertWordPieceTokenizer",
+        "tokenizer_path": [
+            "/workspace/Megatron-LM/pre-tests/bert/bert_data/vocab.txt"
+        ],
+        "lower_case": "False",
+        "vocab_extra_ids": "0"
+    },
+    "masking_probability": 0.15,
+    "short_sequence_probability": 0.1,
+    "masking_max_ngram": 3,
+    "masking_do_full_word": true,
+    "masking_do_permutation": false,
+    "masking_use_longer_ngrams": false,
+    "masking_use_geometric_distribution": false,
+    "classification_head": true
+}

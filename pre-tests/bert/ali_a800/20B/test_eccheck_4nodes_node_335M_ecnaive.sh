@@ -79,12 +79,12 @@ export CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_IDS[*]}")
 export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
-MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
+VOCAB_FILE="/workspace/Megatron-LM/pre-tests/bert/bert_data/vocab.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs" #<Specify path>
-CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-naive" #<Specify path>
-DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document" #<Specify path and file prefix>_text_document
+TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/bert/7B/bert-7b-0/logs"
+CHECKPOINT_PATH="/dev/shm/models/bert-7b-0-ecnaive"
+DATA_PATH="/workspace/Megatron-LM/pre-tests/bert/bert_data/wiki_text_sentence"
+DATA_CACHE_PATH="${DATA_CACHE_PATH:-/workspace/Megatron-LM/pre-tests/bert/bert_data/cache}"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
@@ -92,7 +92,6 @@ SHM_PKT="/dev/shm/shm_pkt"
 ARGS_TO_PASS=("$@")
 
 # Model related configuration here, please do not overlap with json config
-# fixed Model related configuration here, pls not overlap with json config
 HIDDEN_SIZE=5120
 NUM_ATTENTION_HEADS=40 
 NUM_LAYERS=64
@@ -103,17 +102,20 @@ MICRO_BATCH_SIZE=4
 GLOBAL_BATCH_SIZE=16
 
 DISTRIBUTED_ARGS=(
-    --nproc_per_node $GPUS_PER_NODE
-    --nnodes $NNODES
-    --node_rank $NODE_RANK
-    --master_addr $MASTER_ADDR
+    --nproc_per_node $GPUS_PER_NODE 
+    --nnodes $NNODES 
+    --node_rank $NODE_RANK 
+    --master_addr $MASTER_ADDR 
     --master_port $MASTER_PORT
 )
 
 DATA_ARGS=(
     --vocab-file $VOCAB_FILE
-    --merge-file $MERGE_FILE
-    --mock-data
+    # --merge-file $MERGE_FILE
+    --data-path $DATA_PATH
+    --data-cache-path $DATA_CACHE_PATH
+    --num-dataset-builder-threads 32
+    --split 949,50,1
 )
 
 GPT_ARGS=(
@@ -124,20 +126,20 @@ GPT_ARGS=(
     --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
-    --lr 0.00005 
-    --train-iters 5
-    --lr-decay-iters 320000 
-    --lr-decay-style cosine 
-    --min-lr 1.0e-5 
-    --weight-decay 1e-2 
-    --lr-warmup-fraction .05 
-    --clip-grad 1.0 
-    --fp16 
-    --tokenizer-type GPT2BPETokenizer 
-    --use-mcore-models 
-    --transformer-impl transformer_engine 
-    --no-scatter-gather-tensors-in-pipeline 
-    --num-layers $NUM_LAYERS 
+    --lr 0.00005
+    --train-iters 20
+    --lr-decay-iters 320000
+    --lr-decay-style cosine
+    --min-lr 1.0e-5
+    --weight-decay 1e-2
+    --lr-warmup-fraction .05
+    --clip-grad 1.0
+    --fp16
+    --tokenizer-type BertWordPieceCase
+    --use-mcore-models
+    --transformer-impl transformer_engine
+    --no-scatter-gather-tensors-in-pipeline
+    --num-layers $NUM_LAYERS
     --optimizer adam
     --loss-scale-window 100
     --initial-loss-scale 4096
@@ -189,7 +191,7 @@ mkdir -p logs/csv
 # Print command if PRINT_CMD is set
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_bert.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
@@ -201,7 +203,7 @@ export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \
 
 PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
-    pretrain_gpt.py \
+    pretrain_bert.py \
     ${GPT_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \

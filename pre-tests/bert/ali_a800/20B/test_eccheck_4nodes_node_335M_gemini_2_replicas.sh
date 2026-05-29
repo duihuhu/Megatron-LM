@@ -87,19 +87,18 @@ export CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_IDS[*]}")
 export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
-MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
+VOCAB_FILE="/workspace/Megatron-LM/pre-tests/bert/bert_data/vocab.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs"
-CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-gemini-replicas-legacy"
-DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
+TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/bert/7B/bert-7b-0/logs"
+CHECKPOINT_PATH="/dev/shm/models/bert-7b-0-gemini-2-replicas"
+DATA_PATH="/workspace/Megatron-LM/pre-tests/bert/bert_data/wiki_text_sentence"
+DATA_CACHE_PATH="${DATA_CACHE_PATH:-/workspace/Megatron-LM/pre-tests/bert/bert_data/cache}"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
 ARGS_TO_PASS=("$@")
 
 # 模型固定参数
-# fixed Model related configuration here, pls not overlap with json config
 HIDDEN_SIZE=5120
 NUM_ATTENTION_HEADS=40 
 NUM_LAYERS=64
@@ -119,32 +118,35 @@ DISTRIBUTED_ARGS=(
 
 DATA_ARGS=(
     --vocab-file $VOCAB_FILE
-    --merge-file $MERGE_FILE
-    --mock-data
+    # --merge-file $MERGE_FILE
+    --data-path $DATA_PATH
+    --data-cache-path $DATA_CACHE_PATH
+    --num-dataset-builder-threads 32
+    --split 949,50,1
 )
 
 GPT_ARGS=(
-    --no-async-tensor-model-parallel-allreduce 
-    --hidden-size $HIDDEN_SIZE 
-    --num-attention-heads $NUM_ATTENTION_HEADS 
-    --seq-length $SEQ_LENGTH 
-    --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
-    --micro-batch-size $MICRO_BATCH_SIZE 
-    --global-batch-size $GLOBAL_BATCH_SIZE 
-    --lr 0.00005 
-    --train-iters 10
-    --lr-decay-iters 320000 
-    --lr-decay-style cosine 
-    --min-lr 1.0e-5 
-    --weight-decay 1e-2 
-    --lr-warmup-fraction .05 
-    --clip-grad 1.0 
-    --fp16 
-    --tokenizer-type GPT2BPETokenizer 
-    --use-mcore-models 
-    --transformer-impl transformer_engine 
-    --no-scatter-gather-tensors-in-pipeline 
-    --num-layers $NUM_LAYERS 
+    --no-async-tensor-model-parallel-allreduce
+    --hidden-size $HIDDEN_SIZE
+    --num-attention-heads $NUM_ATTENTION_HEADS
+    --seq-length $SEQ_LENGTH
+    --max-position-embeddings $MAX_POSITION_EMBEDDINGS
+    --micro-batch-size $MICRO_BATCH_SIZE
+    --global-batch-size $GLOBAL_BATCH_SIZE
+    --lr 0.00005
+    --train-iters 20
+    --lr-decay-iters 320000
+    --lr-decay-style cosine
+    --min-lr 1.0e-5
+    --weight-decay 1e-2
+    --lr-warmup-fraction .05
+    --clip-grad 1.0
+    --fp16
+    --tokenizer-type BertWordPieceCase
+    --use-mcore-models
+    --transformer-impl transformer_engine
+    --no-scatter-gather-tensors-in-pipeline
+    --num-layers $NUM_LAYERS
     --optimizer adam
     --loss-scale-window 100
     --initial-loss-scale 4096
@@ -167,7 +169,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    #--load $CHECKPOINT_PATH          # 取消注释以测试 load
+    # --load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
@@ -222,7 +224,7 @@ EVAL_AND_LOGGING_ARGS=(
     #   示例："2,3" 表示 rank2 和 rank3 当作故障处理。
     #
     #   --gemini-replicas-recovery-rank 2,3
-
+    #
     # ---------------------------------------------------------------------------
     # ckpt 格式：必须用 torch（legacy 路径）
     # ---------------------------------------------------------------------------
@@ -266,7 +268,7 @@ mkdir -p logs/csv
 
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_bert.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
@@ -279,7 +281,7 @@ export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \
 
 PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
-    pretrain_gpt.py \
+    pretrain_bert.py \
     ${GPT_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \

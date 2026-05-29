@@ -152,7 +152,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    #--load $CHECKPOINT_PATH          # 取消注释以测试 load
+    --load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
@@ -208,7 +208,7 @@ EVAL_AND_LOGGING_ARGS=(
     #
     #--use-gemini-replicas-software-failure
     --use-gemini-replicas-hardware-failure
-    --gemini-replicas-recovery-rank "0"
+    --gemini-replicas-recovery-rank "0" # "0,1,2,3,4,5,6,7" for ali 8 ranks per node, untested yet
 
     # ---------------------------------------------------------------------------
     # ckpt 格式：必须用 torch（legacy 路径）

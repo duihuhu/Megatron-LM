@@ -429,6 +429,14 @@ private:
     boost::asio::ip::tcp::socket load_send_rank3_data1_socket_;
     boost::asio::ip::tcp::socket load_send_rank3_data2_socket_;
 
+    // Two-failures load mode (2 connections per rank: peer0 and peer1)
+    boost::asio::ip::tcp::socket load_twofail_peer0_socket_;
+    boost::asio::ip::tcp::socket load_twofail_peer1_socket_;
+    boost::asio::ip::tcp::acceptor load_twofail_peer0_acceptor_;
+    boost::asio::ip::tcp::acceptor load_twofail_peer1_acceptor_;
+    std::atomic<bool> load_twofail_peer0_connected_{false};
+    std::atomic<bool> load_twofail_peer1_connected_{false};
+
     std::atomic<bool> parity1_send1_connected_;
     std::atomic<bool> parity1_send2_connected_;
     std::atomic<bool> parity1_recv1_connected_;
@@ -490,6 +498,10 @@ public:
           load_send_rank1_parity1_socket_(io_context_),
           load_send_rank3_data1_socket_(io_context_),
           load_send_rank3_data2_socket_(io_context_),
+          load_twofail_peer0_socket_(io_context_),
+          load_twofail_peer1_socket_(io_context_),
+          load_twofail_peer0_acceptor_(io_context_),
+          load_twofail_peer1_acceptor_(io_context_),
           parity1_send1_connected_(false),
           parity1_send2_connected_(false),
           parity1_recv1_connected_(false),
@@ -526,6 +538,12 @@ public:
     boost::asio::ip::tcp::socket& get_load_send_rank1_parity1_socket() { return load_send_rank1_parity1_socket_; }
     boost::asio::ip::tcp::socket& get_load_send_rank3_data1_socket() { return load_send_rank3_data1_socket_; }
     boost::asio::ip::tcp::socket& get_load_send_rank3_data2_socket() { return load_send_rank3_data2_socket_; }
+
+    // Two-failures load getters
+    boost::asio::ip::tcp::socket& get_load_twofail_peer0_socket() { return load_twofail_peer0_socket_; }
+    boost::asio::ip::tcp::socket& get_load_twofail_peer1_socket() { return load_twofail_peer1_socket_; }
+    bool is_load_twofail_peer0_connected() const { return load_twofail_peer0_connected_; }
+    bool is_load_twofail_peer1_connected() const { return load_twofail_peer1_connected_; }
 
     // Parity 1 connection checks
     bool is_parity1_send1_connected() const { return parity1_send1_connected_; }
@@ -582,7 +600,15 @@ public:
     void accept_load_recv_rank1_parity1();
     void accept_load_recv_rank3_data1();
     void accept_load_recv_rank3_data2();
-    
+
+    // Two-failures load mode methods
+    void bind_listen_load_twofail_peer0(const std::string& listen_ip, uint16_t port);
+    void bind_listen_load_twofail_peer1(const std::string& listen_ip, uint16_t port);
+    void accept_load_twofail_peer0();
+    void accept_load_twofail_peer1();
+    void init_load_send_twofail_peer0(const std::string& partner_ip, uint16_t port);
+    void init_load_send_twofail_peer1(const std::string& partner_ip, uint16_t port);
+
     void wait_for_connections(int timeout_seconds = 30);
     void wait_for_load_connections(int timeout_seconds = 30);
     void cleanup();
@@ -785,6 +811,23 @@ void AsioConnectionManager::wait_for_load_connections(int timeout_seconds) {
             wait_count++;
             if (wait_count * 10 > timeout_seconds * 1000) {
                 std::cerr << "ECLATIN: [Rank 3] Timeout waiting for load connections" << std::endl;
+                break;
+            }
+        }
+    }
+    // Two-failures load: wait for peer0 and peer1 connections (recv or send)
+    if (load_twofail_peer0_connected_ || load_twofail_peer1_connected_) {
+        int wait_count = 0;
+        while (!(load_twofail_peer0_connected_ && load_twofail_peer1_connected_)) {
+            if (wait_count % 100 == 0) {
+                std::cout << "ECLATIN: [Two-fail] Waiting for load connections: "
+                          << "peer0=" << (load_twofail_peer0_connected_ ? "true" : "false")
+                          << ", peer1=" << (load_twofail_peer1_connected_ ? "true" : "false") << std::endl;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            wait_count++;
+            if (wait_count * 10 > timeout_seconds * 1000) {
+                std::cerr << "ECLATIN: [Two-fail] Timeout waiting for load connections" << std::endl;
                 break;
             }
         }
@@ -1106,6 +1149,82 @@ void AsioConnectionManager::accept_load_recv_rank3_data2() {
     }
 }
 
+// ── Two-failures load mode: bind+listen helpers ────────────────────────────
+
+void AsioConnectionManager::bind_listen_load_twofail_peer0(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    load_twofail_peer0_acceptor_.open(endpoint.protocol());
+    load_twofail_peer0_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    load_twofail_peer0_acceptor_.bind(endpoint);
+    load_twofail_peer0_acceptor_.listen();
+}
+
+void AsioConnectionManager::bind_listen_load_twofail_peer1(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    load_twofail_peer1_acceptor_.open(endpoint.protocol());
+    load_twofail_peer1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    load_twofail_peer1_acceptor_.bind(endpoint);
+    load_twofail_peer1_acceptor_.listen();
+}
+
+// ── Two-failures load mode: accept helpers ─────────────────────────────────
+
+void AsioConnectionManager::accept_load_twofail_peer0() {
+    try {
+        load_twofail_peer0_acceptor_.accept(load_twofail_peer0_socket_);
+        load_twofail_peer0_connected_ = true;
+        std::cout << "ASIO: load_twofail_peer0 connected" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_twofail_peer0 accept error: " << e.what() << std::endl;
+        load_twofail_peer0_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_load_twofail_peer1() {
+    try {
+        load_twofail_peer1_acceptor_.accept(load_twofail_peer1_socket_);
+        load_twofail_peer1_connected_ = true;
+        std::cout << "ASIO: load_twofail_peer1 connected" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_twofail_peer1 accept error: " << e.what() << std::endl;
+        load_twofail_peer1_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+// ── Two-failures load mode: connect helpers ────────────────────────────────
+
+void AsioConnectionManager::init_load_send_twofail_peer0(const std::string& partner_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(partner_ip, std::to_string(port));
+        boost::asio::connect(load_twofail_peer0_socket_, endpoints);
+        load_twofail_peer0_connected_ = true;
+        std::cout << "ASIO: load_twofail_peer0 send connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_twofail_peer0 send init error: " << e.what() << std::endl;
+        load_twofail_peer0_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_load_send_twofail_peer1(const std::string& partner_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(partner_ip, std::to_string(port));
+        boost::asio::connect(load_twofail_peer1_socket_, endpoints);
+        load_twofail_peer1_connected_ = true;
+        std::cout << "ASIO: load_twofail_peer1 send connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: load_twofail_peer1 send init error: " << e.what() << std::endl;
+        load_twofail_peer1_connected_ = false;
+        throw;
+    }
+}
+
 void AsioConnectionManager::cleanup() {
     // Parity 1 sockets
     if (parity1_send1_socket_.is_open()) parity1_send1_socket_.close();
@@ -1144,6 +1263,12 @@ void AsioConnectionManager::cleanup() {
     if (load_send_rank1_parity1_socket_.is_open()) load_send_rank1_parity1_socket_.close();
     if (load_send_rank3_data1_socket_.is_open()) load_send_rank3_data1_socket_.close();
     if (load_send_rank3_data2_socket_.is_open()) load_send_rank3_data2_socket_.close();
+
+    // Two-failures load sockets
+    if (load_twofail_peer0_socket_.is_open()) load_twofail_peer0_socket_.close();
+    if (load_twofail_peer1_socket_.is_open()) load_twofail_peer1_socket_.close();
+    if (load_twofail_peer0_acceptor_.is_open()) load_twofail_peer0_acceptor_.close();
+    if (load_twofail_peer1_acceptor_.is_open()) load_twofail_peer1_acceptor_.close();
 }
 
 
@@ -1312,6 +1437,8 @@ public:
         , rdma_recv_cq_{}
         , rdma_load_send_cq_{}
         , rdma_load_recv_cq_{}
+        , rdma_load_send_cq_two_fail_{}
+        , rdma_load_recv_cq_two_fail_{}
 #endif
     {
         const char* mode_str = use_rdma_ ? "RDMA" : "ASIO";
@@ -1361,6 +1488,8 @@ public:
             }
         }
 #endif
+        // Lazy-init zero buffer for 2-input XOR via xor_pool (resized on first use)
+        twofail_zero_buffer_.clear();
         start_threads();
         // std::cout << "ECLATIN: Pipeline started successfully" << std::endl;
     }
@@ -1769,7 +1898,56 @@ public:
         
         std::cout << "ECLATIN: [Rank_in_group " << rank_in_group << "] Load connections initialized" << std::endl;
     }
-    
+
+    void init_two_failures_load_connections(
+        int rank_in_group,
+        const std::string& peer0_ip, uint16_t peer0_port,
+        const std::string& peer1_ip, uint16_t peer1_port
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "ECLATIN: init_two_failures_load_connections called but not in load mode" << std::endl;
+            return;
+        }
+
+        std::cout << "ECLATIN: [Two-fail] rank_in_group " << rank_in_group
+                  << " initializing two-failures load connections..." << std::endl;
+
+        if (rank_in_group == 0 || rank_in_group == 1) {
+            // Failed ranks (0, 1): bind+listen on both peer ports, then accept in threads
+            std::cout << "ECLATIN: [Two-fail] Failed rank " << rank_in_group
+                      << " binding/listening peer0=" << peer0_ip << ":" << peer0_port
+                      << " peer1=" << peer1_ip << ":" << peer1_port << std::endl;
+            conn_.bind_listen_load_twofail_peer0(peer0_ip, peer0_port);
+            conn_.bind_listen_load_twofail_peer1(peer1_ip, peer1_port);
+
+            std::thread recv_init_thread([this]() {
+                std::thread t0([this]() { conn_.accept_load_twofail_peer0(); });
+                std::thread t1([this]() { conn_.accept_load_twofail_peer1(); });
+                t0.join();
+                t1.join();
+            });
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            recv_init_thread.detach();
+            std::cout << "ECLATIN: [Two-fail] Failed rank " << rank_in_group
+                      << " accept threads started" << std::endl;
+        } else if (rank_in_group == 2 || rank_in_group == 3) {
+            // Surviving ranks (2, 3): connect send sockets to both failed ranks
+            std::cout << "ECLATIN: [Two-fail] Surviving rank " << rank_in_group
+                      << " connecting to failed ranks..." << std::endl;
+            conn_.init_load_send_twofail_peer0(peer0_ip, peer0_port);
+            conn_.init_load_send_twofail_peer1(peer1_ip, peer1_port);
+            std::cout << "ECLATIN: [Two-fail] Surviving rank " << rank_in_group
+                      << " both send sockets connected" << std::endl;
+        } else {
+            std::cerr << "ECLATIN: [Two-fail] unexpected rank_in_group=" << rank_in_group << std::endl;
+            throw std::runtime_error("ECLATIN: init_two_failures_load_connections: unexpected rank_in_group");
+        }
+
+        std::cout << "ECLATIN: [Two-fail] rank_in_group " << rank_in_group
+                  << " load connections initialized" << std::endl;
+    }
+
     void wait_for_load_connections(int timeout_seconds = 30) {
         if (!is_load_mode_) {
             std::cerr << "ECLATIN: wait_for_load_connections called but not in load mode" << std::endl;
@@ -1784,6 +1962,17 @@ public:
                 init_rdma_load_channels();
             } catch (const std::exception& e) {
                 std::cerr << "ECLATIN: Load RDMA channels init failed: " << e.what() << std::endl;
+                throw;
+            }
+        }
+        // Two-failures RDMA load channels: init if twofail sockets are connected
+        if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_two_fail_[0] == nullptr &&
+            (conn_.is_load_twofail_peer0_connected() || conn_.is_load_twofail_peer1_connected())) {
+            try {
+                init_rdma_load_resources_two_fail();
+                init_rdma_load_channels_two_fail();
+            } catch (const std::exception& e) {
+                std::cerr << "ECLATIN: Two-fail load RDMA channels init failed: " << e.what() << std::endl;
                 throw;
             }
         }
@@ -1998,6 +2187,173 @@ public:
         std::cout << "ECLATIN: [Rank 2] Recovery completed successfully" << std::endl;
     }
 
+    // ── Two-failures load recovery ────────────────────────────────────────────
+    void load_recover_two_failures(
+        // 8 recv buffer addrs (4 from rank 2, 4 from rank 3)
+        uintptr_t r2_d2, uintptr_t r2_D2, uintptr_t r2_p2, uintptr_t r2_P2,
+        uintptr_t r3_d3, uintptr_t r3_D3, uintptr_t r3_p3, uintptr_t r3_P3,
+        // 2 recovered output addrs
+        uintptr_t recovered_data1,   // data_block_1 of this failed rank
+        uintptr_t recovered_data2,   // data_block_2 of this failed rank
+        int rank_in_group,           // 0 or 1 (determines recovery formula)
+        size_t size
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "ECLATIN: [Two-fail] load_recover_two_failures called but not in load mode" << std::endl;
+            return;
+        }
+
+        std::cout << "ECLATIN: [Two-fail] rank_in_group " << rank_in_group
+                  << " starting recovery (size=" << size << ")" << std::endl;
+
+        // Stage 1: Parallel receive 8 blocks (4 from peer0=rank2, 4 from peer1=rank3)
+        // Peer0 (rank 2) blocks: r2_d2, r2_D2, r2_p2, r2_P2
+        // Peer1 (rank 3) blocks: r3_d3, r3_D3, r3_p3, r3_P3
+        std::vector<std::exception_ptr> recv_exceptions(8);
+        std::vector<std::thread> recv_threads;
+
+        // ── Recv from peer0 (rank 2): 4 blocks ──
+        recv_threads.emplace_back([&]() {
+            try {
+#if RDMA_AVAILABLE
+                if (use_rdma_ && rdma_load_channels_two_fail_[0]) {
+                    rdma_load_channels_two_fail_[0]->receive_data(reinterpret_cast<uint8_t*>(r2_d2), size);
+                } else
+#endif
+                if (!recv_with_size_bool(conn_.get_load_twofail_peer0_socket(),
+                                        reinterpret_cast<void*>(r2_d2), size))
+                    throw std::runtime_error("Failed to receive r2_d2");
+            } catch (...) { recv_exceptions[0] = std::current_exception(); }
+        });
+        recv_threads.emplace_back([&]() {
+            try {
+                if (use_rdma_ && rdma_load_channels_two_fail_[1])
+                    rdma_load_channels_two_fail_[1]->receive_data(reinterpret_cast<uint8_t*>(r2_D2), size);
+                else if (!recv_with_size_bool(conn_.get_load_twofail_peer0_socket(),
+                                             reinterpret_cast<void*>(r2_D2), size))
+                    throw std::runtime_error("Failed to receive r2_D2");
+            } catch (...) { recv_exceptions[1] = std::current_exception(); }
+        });
+        recv_threads.emplace_back([&]() {
+            try {
+                if (use_rdma_ && rdma_load_channels_two_fail_[2])
+                    rdma_load_channels_two_fail_[2]->receive_data(reinterpret_cast<uint8_t*>(r2_p2), size);
+                else if (!recv_with_size_bool(conn_.get_load_twofail_peer0_socket(),
+                                             reinterpret_cast<void*>(r2_p2), size))
+                    throw std::runtime_error("Failed to receive r2_p2");
+            } catch (...) { recv_exceptions[2] = std::current_exception(); }
+        });
+        recv_threads.emplace_back([&]() {
+            try {
+                if (use_rdma_ && rdma_load_channels_two_fail_[3])
+                    rdma_load_channels_two_fail_[3]->receive_data(reinterpret_cast<uint8_t*>(r2_P2), size);
+                else if (!recv_with_size_bool(conn_.get_load_twofail_peer0_socket(),
+                                             reinterpret_cast<void*>(r2_P2), size))
+                    throw std::runtime_error("Failed to receive r2_P2");
+            } catch (...) { recv_exceptions[3] = std::current_exception(); }
+        });
+
+        // ── Recv from peer1 (rank 3): 4 blocks ──
+        recv_threads.emplace_back([&]() {
+            try {
+#if RDMA_AVAILABLE
+                if (use_rdma_ && rdma_load_channels_two_fail_[4]) {
+                    rdma_load_channels_two_fail_[4]->receive_data(reinterpret_cast<uint8_t*>(r3_d3), size);
+                } else
+#endif
+                if (!recv_with_size_bool(conn_.get_load_twofail_peer1_socket(),
+                                        reinterpret_cast<void*>(r3_d3), size))
+                    throw std::runtime_error("Failed to receive r3_d3");
+            } catch (...) { recv_exceptions[4] = std::current_exception(); }
+        });
+        recv_threads.emplace_back([&]() {
+            try {
+                if (use_rdma_ && rdma_load_channels_two_fail_[5])
+                    rdma_load_channels_two_fail_[5]->receive_data(reinterpret_cast<uint8_t*>(r3_D3), size);
+                else if (!recv_with_size_bool(conn_.get_load_twofail_peer1_socket(),
+                                             reinterpret_cast<void*>(r3_D3), size))
+                    throw std::runtime_error("Failed to receive r3_D3");
+            } catch (...) { recv_exceptions[5] = std::current_exception(); }
+        });
+        recv_threads.emplace_back([&]() {
+            try {
+                if (use_rdma_ && rdma_load_channels_two_fail_[6])
+                    rdma_load_channels_two_fail_[6]->receive_data(reinterpret_cast<uint8_t*>(r3_p3), size);
+                else if (!recv_with_size_bool(conn_.get_load_twofail_peer1_socket(),
+                                             reinterpret_cast<void*>(r3_p3), size))
+                    throw std::runtime_error("Failed to receive r3_p3");
+            } catch (...) { recv_exceptions[6] = std::current_exception(); }
+        });
+        recv_threads.emplace_back([&]() {
+            try {
+                if (use_rdma_ && rdma_load_channels_two_fail_[7])
+                    rdma_load_channels_two_fail_[7]->receive_data(reinterpret_cast<uint8_t*>(r3_P3), size);
+                else if (!recv_with_size_bool(conn_.get_load_twofail_peer1_socket(),
+                                             reinterpret_cast<void*>(r3_P3), size))
+                    throw std::runtime_error("Failed to receive r3_P3");
+            } catch (...) { recv_exceptions[7] = std::current_exception(); }
+        });
+
+        // Join all recv threads
+        for (auto& t : recv_threads) t.join();
+        for (size_t i = 0; i < recv_exceptions.size(); ++i)
+            if (recv_exceptions[i]) std::rethrow_exception(recv_exceptions[i]);
+
+        std::cout << "ECLATIN: [Two-fail] All 8 blocks received, starting XOR pool recovery" << std::endl;
+
+        // Lazy-init zero buffer for 2-input XOR via 16-thread pool
+        if (twofail_zero_buffer_.size() < size) {
+            twofail_zero_buffer_.resize(size, 0);
+        }
+
+        // Stage 2: XOR pool recovery using 16-thread pool with CPU affinity
+        // d0 = p2 XOR D3 (2-input via xor_pool with zero buffer)
+        // d1 = p3 XOR D2 (2-input via xor_pool with zero buffer)
+        // Allocate temporary buffers for d0 and d1
+        auto tmp_d0 = std::make_unique<uint8_t[]>(size);
+        auto tmp_d1 = std::make_unique<uint8_t[]>(size);
+
+        // d0 = p2 XOR D3
+        std::memcpy(tmp_d0.get(), reinterpret_cast<void*>(r2_p2), size);
+        xor_pool_run_parallel(
+            reinterpret_cast<uintptr_t>(tmp_d0.get()),
+            r3_D3,
+            reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+            static_cast<int>(size));
+
+        // d1 = p3 XOR D2
+        std::memcpy(tmp_d1.get(), reinterpret_cast<void*>(r3_p3), size);
+        xor_pool_run_parallel(
+            reinterpret_cast<uintptr_t>(tmp_d1.get()),
+            r2_D2,
+            reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+            static_cast<int>(size));
+
+        // Rank-specific data block recovery
+        if (rank_in_group == 0) {
+            // data_block_1 = d0, data_block_2 = D0 = P2 XOR d1
+            std::memcpy(reinterpret_cast<void*>(recovered_data1), tmp_d0.get(), size);
+            std::memcpy(reinterpret_cast<void*>(recovered_data2), reinterpret_cast<void*>(r2_P2), size);
+            xor_pool_run_parallel(
+                recovered_data2,
+                reinterpret_cast<uintptr_t>(tmp_d1.get()),
+                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+                static_cast<int>(size));
+        } else {  // rank_in_group == 1
+            // data_block_1 = d1, data_block_2 = D1 = P3 XOR d0
+            std::memcpy(reinterpret_cast<void*>(recovered_data1), tmp_d1.get(), size);
+            std::memcpy(reinterpret_cast<void*>(recovered_data2), reinterpret_cast<void*>(r3_P3), size);
+            xor_pool_run_parallel(
+                recovered_data2,
+                reinterpret_cast<uintptr_t>(tmp_d0.get()),
+                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+                static_cast<int>(size));
+        }
+
+        std::cout << "ECLATIN: [Two-fail] rank_in_group " << rank_in_group
+                  << " recovery completed successfully" << std::endl;
+    }
+
     // Unified send interface for other ranks (rank1, rank2, rank3) - parallel send two blocks
     void load_send_blocks(
         const std::string& block1_name,
@@ -2112,6 +2468,70 @@ public:
         }
         
         std::cout << "ECLATIN: Both blocks sent successfully" << std::endl;
+    }
+
+    // ── Two-failures load: send 4 blocks to a failed rank ─────────────────────
+    void load_send_all_blocks_two_fail(
+        const std::string& target_rank_in_group,  // "0" or "1" — which failed rank to send to
+        uintptr_t data1_addr, uintptr_t data2_addr,
+        uintptr_t parity1_addr, uintptr_t parity2_addr,
+        size_t size
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "ECLATIN: load_send_all_blocks_two_fail called but not in load mode" << std::endl;
+            return;
+        }
+
+        // Select peer socket: peer0 → rank_in_group 0, peer1 → rank_in_group 1
+        boost::asio::ip::tcp::socket* peer_sock =
+            (target_rank_in_group == "0")
+                ? &conn_.get_load_twofail_peer0_socket()
+                : &conn_.get_load_twofail_peer1_socket();
+
+        int rdma_ch_base = (target_rank_in_group == "0") ? 0 : 4;
+
+        std::cout << "ECLATIN: [Two-fail] Sending 4 blocks to failed rank "
+                  << target_rank_in_group << " (size=" << size << ")" << std::endl;
+
+        // Parallel send 4 blocks
+        std::array<std::exception_ptr, 4> send_exceptions;
+        std::array<std::thread, 4> send_threads;
+        std::array<uintptr_t, 4> addrs = {data1_addr, data2_addr, parity1_addr, parity2_addr};
+        std::array<std::string, 4> names = {"data1", "data2", "parity1", "parity2"};
+
+        for (int i = 0; i < 4; ++i) {
+            send_threads[static_cast<size_t>(i)] = std::thread([this, &addrs, &names, &send_exceptions,
+                                                                  peer_sock, rdma_ch_base, size, i]() {
+                try {
+#if RDMA_AVAILABLE
+                    int ch = rdma_ch_base + i;
+                    if (use_rdma_ && rdma_load_channels_two_fail_[ch]) {
+                        rdma_load_channels_two_fail_[ch]->send_data(
+                            reinterpret_cast<const uint8_t*>(addrs[static_cast<size_t>(i)]), size);
+                    } else
+#endif
+                    {
+                        if (peer_sock == nullptr || !peer_sock->is_open()) {
+                            throw std::runtime_error("ECLATIN: load_send_all_blocks_two_fail socket not available");
+                        }
+                        if (!send_with_size(*peer_sock, addrs[static_cast<size_t>(i)], size)) {
+                            throw std::runtime_error("ECLATIN: send failed for " + names[static_cast<size_t>(i)]);
+                        }
+                    }
+                    // std::cout << "ECLATIN: [Two-fail] Sent " << names[i] << " successfully" << std::endl;
+                } catch (...) {
+                    send_exceptions[static_cast<size_t>(i)] = std::current_exception();
+                }
+            });
+        }
+
+        for (int i = 0; i < 4; ++i) send_threads[static_cast<size_t>(i)].join();
+        for (int i = 0; i < 4; ++i)
+            if (send_exceptions[static_cast<size_t>(i)])
+                std::rethrow_exception(send_exceptions[static_cast<size_t>(i)]);
+
+        std::cout << "ECLATIN: [Two-fail] All 4 blocks sent to failed rank "
+                  << target_rank_in_group << " successfully" << std::endl;
     }
 
     // Layer-wise processing functions
@@ -2488,16 +2908,23 @@ private:
 #if RDMA_AVAILABLE
     static const int RDMA_NUM_SAVE_CHANNELS = 8;  // parity1 send1/send2, recv1/recv2; parity2 send1/send2, recv1/recv2
     static const int RDMA_NUM_LOAD_CHANNELS = 6;   // rank2 recv: rank0_data2, rank0_parity2, rank1_data1, rank1_parity1, rank3_data1, rank3_data2
+    static const int RDMA_NUM_LOAD_CHANNELS_TWO_FAIL = 8;  // two-fail: 4 blocks from each of 2 peers
     ibv_context* rdma_context_;
     ibv_pd* rdma_pd_;
     ibv_cq* rdma_send_cq_[RDMA_NUM_SAVE_CHANNELS];
     ibv_cq* rdma_recv_cq_[RDMA_NUM_SAVE_CHANNELS];
     ibv_cq* rdma_load_send_cq_[RDMA_NUM_LOAD_CHANNELS];
     ibv_cq* rdma_load_recv_cq_[RDMA_NUM_LOAD_CHANNELS];
+    ibv_cq* rdma_load_send_cq_two_fail_[RDMA_NUM_LOAD_CHANNELS_TWO_FAIL];
+    ibv_cq* rdma_load_recv_cq_two_fail_[RDMA_NUM_LOAD_CHANNELS_TWO_FAIL];
     std::map<uintptr_t, RdmaBuffer> rdma_registered_buffers_;
     std::mutex rdma_buffer_mutex_;
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_SAVE_CHANNELS> rdma_save_channels_;
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_LOAD_CHANNELS> rdma_load_channels_;
+    std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_LOAD_CHANNELS_TWO_FAIL> rdma_load_channels_two_fail_;
+
+    // Zero buffer for 2-input XOR via 16-thread pool (d_i = p_X XOR D_Y)
+    std::vector<uint8_t> twofail_zero_buffer_;
 #endif
 
     // ── XOR thread pool (matches ecnaive xor_pool) ──────
@@ -2975,6 +3402,75 @@ private:
         }
     }
 
+    // ── Two-failures RDMA load resource init ─────────────────────────────────
+
+    void init_rdma_load_resources_two_fail() {
+        if (!use_rdma_ || !rdma_pd_) return;
+        std::cout << "[ECLATIN RDMA] Initializing two-fail load RDMA resources (8 CQ pairs)..." << std::endl;
+        for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS_TWO_FAIL; ++i) {
+            rdma_load_send_cq_two_fail_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            rdma_load_recv_cq_two_fail_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            if (!rdma_load_send_cq_two_fail_[i] || !rdma_load_recv_cq_two_fail_[i]) {
+                for (int j = 0; j < i; ++j) {
+                    if (rdma_load_send_cq_two_fail_[j]) { ibv_destroy_cq(rdma_load_send_cq_two_fail_[j]); rdma_load_send_cq_two_fail_[j] = nullptr; }
+                    if (rdma_load_recv_cq_two_fail_[j]) { ibv_destroy_cq(rdma_load_recv_cq_two_fail_[j]); rdma_load_recv_cq_two_fail_[j] = nullptr; }
+                }
+                throw std::runtime_error("ECLATIN RDMA: Failed to create two-fail load CQs for channel " + std::to_string(i));
+            }
+        }
+        std::cout << "[ECLATIN RDMA] Two-fail load RDMA resources initialized (8 CQ pairs)" << std::endl;
+    }
+
+    void init_rdma_load_channels_two_fail() {
+        if (!use_rdma_ || !rdma_pd_) return;
+        int rank_for_log = (rank_in_group_ >= 0) ? rank_in_group_ : 0;
+        auto& c = conn_;
+
+        std::cout << "[ECLATIN RDMA] Creating 8 two-fail RDMA load channels (rank_in_group "
+                  << rank_in_group_ << ")..." << std::endl;
+
+        try {
+            if (rank_in_group_ == 0 || rank_in_group_ == 1) {
+                // Failed ranks: 8 recv channels (4 from rank2 peer0, 4 from rank3 peer1)
+                // Channels 0-3: peer0 (rank 2), Channels 4-7: peer1 (rank 3)
+                for (int i = 0; i < 8; ++i) {
+                    boost::asio::ip::tcp::socket& sock = (i < 4)
+                        ? c.get_load_twofail_peer0_socket()
+                        : c.get_load_twofail_peer1_socket();
+                    rdma_load_channels_two_fail_[i] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_,
+                        rdma_load_send_cq_two_fail_[i], rdma_load_recv_cq_two_fail_[i],
+                        sock.native_handle(), sock.native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log,
+                        (i < 4) ? 2 : 3);  // peer_rank: 2 for rank2, 3 for rank3
+                    rdma_load_channels_two_fail_[i]->exchange_and_connect(false);  // recv first
+                }
+                std::cout << "[ECLATIN RDMA] All 8 two-fail load channels connected (failed rank "
+                          << rank_in_group_ << ")" << std::endl;
+            } else if (rank_in_group_ == 2 || rank_in_group_ == 3) {
+                // Surviving ranks: 8 send channels (4 to rank0 peer0, 4 to rank1 peer1)
+                for (int i = 0; i < 8; ++i) {
+                    boost::asio::ip::tcp::socket& sock = (i < 4)
+                        ? c.get_load_twofail_peer0_socket()
+                        : c.get_load_twofail_peer1_socket();
+                    int target_rig = (i < 4) ? 0 : 1;  // peer0 → rank 0, peer1 → rank 1
+                    rdma_load_channels_two_fail_[i] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_,
+                        rdma_load_send_cq_two_fail_[i], rdma_load_recv_cq_two_fail_[i],
+                        sock.native_handle(), sock.native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, target_rig);
+                    rdma_load_channels_two_fail_[i]->exchange_and_connect(true);  // send first
+                }
+                std::cout << "[ECLATIN RDMA] All 8 two-fail load channels connected (surviving rank "
+                          << rank_in_group_ << ")" << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[ECLATIN RDMA] Failed to init two-fail load channels: " << e.what() << std::endl;
+            for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS_TWO_FAIL; ++i) rdma_load_channels_two_fail_[i].reset();
+            throw;
+        }
+    }
+
     void cleanup_rdma_resources() {
         if (!use_rdma_) return;
         std::cout << "[ECLATIN RDMA] Cleaning up RDMA resources..." << std::endl;
@@ -2984,6 +3480,9 @@ private:
         for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS; ++i) {
             rdma_load_channels_[i].reset();
         }
+        for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS_TWO_FAIL; ++i) {
+            rdma_load_channels_two_fail_[i].reset();
+        }
         for (int i = 0; i < RDMA_NUM_SAVE_CHANNELS; ++i) {
             if (rdma_send_cq_[i]) { ibv_destroy_cq(rdma_send_cq_[i]); rdma_send_cq_[i] = nullptr; }
             if (rdma_recv_cq_[i]) { ibv_destroy_cq(rdma_recv_cq_[i]); rdma_recv_cq_[i] = nullptr; }
@@ -2991,6 +3490,10 @@ private:
         for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS; ++i) {
             if (rdma_load_send_cq_[i]) { ibv_destroy_cq(rdma_load_send_cq_[i]); rdma_load_send_cq_[i] = nullptr; }
             if (rdma_load_recv_cq_[i]) { ibv_destroy_cq(rdma_load_recv_cq_[i]); rdma_load_recv_cq_[i] = nullptr; }
+        }
+        for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS_TWO_FAIL; ++i) {
+            if (rdma_load_send_cq_two_fail_[i]) { ibv_destroy_cq(rdma_load_send_cq_two_fail_[i]); rdma_load_send_cq_two_fail_[i] = nullptr; }
+            if (rdma_load_recv_cq_two_fail_[i]) { ibv_destroy_cq(rdma_load_recv_cq_two_fail_[i]); rdma_load_recv_cq_two_fail_[i] = nullptr; }
         }
         {
             std::lock_guard<std::mutex> lock(rdma_buffer_mutex_);
@@ -4789,6 +5292,32 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("block1_addr"),
              pybind11::arg("block2_name"),
              pybind11::arg("block2_addr"),
+             pybind11::arg("size"))
+        // Two-failures load functions
+        .def("init_two_failures_load_connections", &ECLATINNative::init_two_failures_load_connections,
+             "Initialize two-failures load connections (rank0/1 recv, rank2/3 send)",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("peer0_ip"),
+             pybind11::arg("peer0_port"),
+             pybind11::arg("peer1_ip"),
+             pybind11::arg("peer1_port"))
+        .def("load_recover_two_failures", &ECLATINNative::load_recover_two_failures,
+             "Two-failures recovery: recv 8 blocks + XOR pool recovery",
+             pybind11::arg("r2_d2"), pybind11::arg("r2_D2"),
+             pybind11::arg("r2_p2"), pybind11::arg("r2_P2"),
+             pybind11::arg("r3_d3"), pybind11::arg("r3_D3"),
+             pybind11::arg("r3_p3"), pybind11::arg("r3_P3"),
+             pybind11::arg("recovered_data1"),
+             pybind11::arg("recovered_data2"),
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("size"))
+        .def("load_send_all_blocks_two_fail", &ECLATINNative::load_send_all_blocks_two_fail,
+             "Send 4 blocks to a failed rank (for surviving ranks in two-failures)",
+             pybind11::arg("target_rank_in_group"),
+             pybind11::arg("data1_addr"),
+             pybind11::arg("data2_addr"),
+             pybind11::arg("parity1_addr"),
+             pybind11::arg("parity2_addr"),
              pybind11::arg("size"))
         .def("stop", &ECLATINNative::stop);
 }

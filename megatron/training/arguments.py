@@ -2296,6 +2296,10 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-eclatin-software-failure', action='store_true',
                        help='Enable ECLATIN checkpointing for software failure recovery. '
                             'When enabled, rank2 reads data_block_1 and data_block_2 from local files directly.')
+    group.add_argument('--use-eclatin-two-failures', action='store_true',
+                       help='Enable ECLATIN two-failure hardware recovery mode. '
+                            'rank_in_group 0 and 1 are treated as failed; they recover from '
+                            'surviving ranks 2 and 3 using RDMA transport and 16-thread XOR pool.')
     
     # EC-NAIVE (Erasure Coding Checkpoint with naive Reed-Solomon encoding) arguments
     group.add_argument('--use-ecnaive', action='store_true',

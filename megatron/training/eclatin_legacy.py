@@ -622,10 +622,10 @@ def _load_eclatin_blocks_from_disk_into(
     rank: int,
     rank_in_group: int,
     software_only: bool = False,
+    two_failures_survivor: bool = False,
 ) -> None:
     """
-    Load local block files into pre-allocated hugepage blocks (copy_, do not replace tensors).
-    software_only + rank_in_group 2: load data_block_1 and data_block_2 for software-failure path.
+    Load local block files into pre-allocated hugepage blocks.
     """
     if software_only and rank_in_group == 2:
         _copy_eclatin_block_file_into_tensor(
@@ -634,6 +634,14 @@ def _load_eclatin_blocks_from_disk_into(
         _copy_eclatin_block_file_into_tensor(
             checkpoint_dir, rank, "data_block_2", eclatin_blocks["data_block_2"]
         )
+        return
+
+    # Two-failures surviving ranks (2, 3): load ALL 4 blocks from disk
+    if two_failures_survivor and rank_in_group in (2, 3):
+        for block_name in ('data_block_1', 'data_block_2', 'parity_block_1', 'parity_block_2'):
+            _copy_eclatin_block_file_into_tensor(
+                checkpoint_dir, rank, block_name, eclatin_blocks[block_name]
+            )
         return
 
     if rank_in_group == 2:
@@ -881,6 +889,179 @@ def _run_eclatin_full_recovery(
     torch.distributed.barrier()
 
 
+def _run_eclatin_two_failures_recovery(
+    manager: ECLATINManager,
+    rank: int,
+    world_size: int,
+    eclatin_blocks: Dict[str, Any],
+    recv_buffers: Optional[Dict[str, torch.Tensor]],
+    recovered_buffer: Optional[torch.Tensor],
+    total_size: int,
+    registry: GlobalMetadataRegistry,
+) -> None:
+    """
+    Two-failures hardware recovery using native C++ module (RDMA + XOR pool).
+
+    Surviving ranks (2, 3) load all 4 blocks from disk and send to both failed ranks.
+    Failed ranks (0, 1) receive 8 blocks total and decode via inverse matrix.
+    """
+    native = manager._eclatin_native
+    if native is None:
+        raise RuntimeError("ECLATIN native module is not initialized")
+
+    net_config = manager._get_eclatin_network_config(rank, world_size)
+    rank_in_group = net_config["rank_in_group"]
+    rank_ips = net_config["rank_ips"]
+    ports = net_config["ports"]
+    group_id = net_config["group_id"]
+
+    aligned_half_block_size = eclatin_blocks["data_block_1"].numel()
+
+    # Map group positions to global ranks
+    failed_rank0 = manager._get_rank_by_group_position(group_id, 0, world_size)
+    failed_rank1 = manager._get_rank_by_group_position(group_id, 1, world_size)
+
+    native.set_load_mode(True, 10)  # 10 = two-failures mode (non-standard failed_rank)
+    logger.info("ECLATIN two-failures: set load mode")
+
+    # === FAILED RANK (0 or 1): receiver ===
+    if rank_in_group in (0, 1):
+        if recv_buffers is None or recovered_buffer is None:
+            raise RuntimeError(
+                "ECLATIN two-failures: failed rank needs recv_buffers and recovered_buffer"
+            )
+
+        # peer0 = rank 2, peer1 = rank 3
+        peer0_ip = rank_ips.get(
+            manager._get_rank_by_group_position(group_id, 2, world_size),
+            net_config["my_ip"],
+        )
+        peer1_ip = rank_ips.get(
+            manager._get_rank_by_group_position(group_id, 3, world_size),
+            net_config["my_ip"],
+        )
+
+        if rank_in_group == 0:
+            peer0_port = ports["twofail_r0_from_r2"]
+            peer1_port = ports["twofail_r0_from_r3"]
+        else:
+            peer0_port = ports["twofail_r1_from_r2"]
+            peer1_port = ports["twofail_r1_from_r3"]
+
+        logger.info(
+            f"ECLATIN two-failures: failed rank {rank_in_group} binding peer0={peer0_ip}:{peer0_port}, "
+            f"peer1={peer1_ip}:{peer1_port}"
+        )
+        native.init_two_failures_load_connections(
+            rank_in_group, peer0_ip, peer0_port, peer1_ip, peer1_port,
+        )
+
+    # === SURVIVING RANK (2 or 3): sender ===
+    elif rank_in_group in (2, 3):
+        peer0_ip = rank_ips.get(
+            manager._get_rank_by_group_position(group_id, 0, world_size),
+            net_config["my_ip"],
+        )
+        peer1_ip = rank_ips.get(
+            manager._get_rank_by_group_position(group_id, 1, world_size),
+            net_config["my_ip"],
+        )
+
+        if rank_in_group == 2:
+            peer0_port = ports["twofail_r0_from_r2"]
+            peer1_port = ports["twofail_r1_from_r2"]
+        else:
+            peer0_port = ports["twofail_r0_from_r3"]
+            peer1_port = ports["twofail_r1_from_r3"]
+
+        logger.info(
+            f"ECLATIN two-failures: surviving rank {rank_in_group} connecting to "
+            f"peer0={peer0_ip}:{peer0_port}, peer1={peer1_ip}:{peer1_port}"
+        )
+        native.init_two_failures_load_connections(
+            rank_in_group, peer0_ip, peer0_port, peer1_ip, peer1_port,
+        )
+    else:
+        raise RuntimeError(f"ECLATIN two-failures: unexpected rank_in_group={rank_in_group}")
+
+    torch.distributed.barrier()
+
+    native.wait_for_load_connections(timeout_seconds=30)
+    torch.distributed.barrier()
+
+    # === DATA TRANSFER ===
+    if rank_in_group in (0, 1):
+        # Failed rank: receive 8 blocks and XOR recover
+        r2_d2 = int(recv_buffers["r2_d2"].data_ptr())
+        r2_D2 = int(recv_buffers["r2_D2"].data_ptr())
+        r2_p2 = int(recv_buffers["r2_p2"].data_ptr())
+        r2_P2 = int(recv_buffers["r2_P2"].data_ptr())
+        r3_d3 = int(recv_buffers["r3_d3"].data_ptr())
+        r3_D3 = int(recv_buffers["r3_D3"].data_ptr())
+        r3_p3 = int(recv_buffers["r3_p3"].data_ptr())
+        r3_P3 = int(recv_buffers["r3_P3"].data_ptr())
+        recovered_data1 = int(eclatin_blocks["data_block_1"].data_ptr())
+        recovered_data2 = int(eclatin_blocks["data_block_2"].data_ptr())
+
+        logger.info(
+            f"ECLATIN two-failures: rank_in_group {rank_in_group} "
+            f"starting XOR pool recovery"
+        )
+        native.load_recover_two_failures(
+            r2_d2, r2_D2, r2_p2, r2_P2,
+            r3_d3, r3_D3, r3_p3, r3_P3,
+            recovered_data1, recovered_data2,
+            rank_in_group,
+            aligned_half_block_size,
+        )
+
+        # Copy recovered data to recovered_buffer
+        actual_tensor_buffer_size = _max_tensor_bytes_from_registry(registry, world_size)
+        half_actual_data = actual_tensor_buffer_size // 2
+        if recovered_buffer.numel() >= total_size:
+            first_half_actual = min(half_actual_data, total_size)
+            recovered_buffer[:first_half_actual].copy_(
+                eclatin_blocks["data_block_1"][:first_half_actual]
+            )
+            if total_size > half_actual_data:
+                second_half_size = total_size - half_actual_data
+                recovered_buffer[first_half_actual:total_size].copy_(
+                    eclatin_blocks["data_block_2"][:second_half_size]
+                )
+
+        logger.info(
+            f"ECLATIN two-failures: rank_in_group {rank_in_group} recovery completed"
+        )
+
+    elif rank_in_group in (2, 3):
+        # Surviving rank: send 4 blocks to each failed rank
+        data1_addr = int(eclatin_blocks["data_block_1"].data_ptr())
+        data2_addr = int(eclatin_blocks["data_block_2"].data_ptr())
+        parity1_addr = int(eclatin_blocks["parity_block_1"].data_ptr())
+        parity2_addr = int(eclatin_blocks["parity_block_2"].data_ptr())
+
+        logger.info(
+            f"ECLATIN two-failures: surviving rank {rank_in_group} "
+            f"sending blocks to both failed ranks"
+        )
+
+        # Send to rank 0 (peer0) and rank 1 (peer1)
+        native.load_send_all_blocks_two_fail(
+            "0", data1_addr, data2_addr, parity1_addr, parity2_addr,
+            aligned_half_block_size,
+        )
+        native.load_send_all_blocks_two_fail(
+            "1", data1_addr, data2_addr, parity1_addr, parity2_addr,
+            aligned_half_block_size,
+        )
+
+        logger.info(
+            f"ECLATIN two-failures: surviving rank {rank_in_group} send completed"
+        )
+
+    torch.distributed.barrier()
+
+
 def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     """
     Load ECLATIN torch legacy checkpoint: run recovery (aligned with torch_dist), then reconstruct
@@ -923,12 +1104,28 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     eclatin_blocks = _allocate_eclatin_blocks_legacy(manager, rank_metadata)
     rank_in_group = manager._get_rank_in_group(rank, world_size)
     sw_failure = bool(getattr(args, "use_eclatin_software_failure", False))
+    two_failures = bool(getattr(args, "use_eclatin_two_failures", False))
 
     recv_buffers: Optional[Dict[str, torch.Tensor]] = None
     recovered_buffer: Optional[torch.Tensor] = None
     total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
 
-    if rank_in_group == 2:
+    pin = torch.cuda.is_available() and getattr(manager, "eclatin_pin_memory", False)
+
+    if two_failures:
+        if rank_in_group in (0, 1):
+            recv_buffers = manager.allocate_eclatin_load_recv_buffers_two_fail(registry)
+            recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
+        elif rank_in_group in (2, 3):
+            _load_eclatin_blocks_from_disk_into(
+                eclatin_blocks, checkpoint_dir, rank, rank_in_group,
+                software_only=False, two_failures_survivor=True,
+            )
+        else:
+            raise RuntimeError(
+                f"ECLATIN two-failures: unexpected rank_in_group={rank_in_group}"
+            )
+    elif rank_in_group == 2:
         if sw_failure:
             _load_eclatin_blocks_from_disk_into(
                 eclatin_blocks,
@@ -939,7 +1136,6 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             )
         else:
             recv_buffers = manager.allocate_eclatin_load_recv_buffers(registry)
-        pin = torch.cuda.is_available() and getattr(manager, "eclatin_pin_memory", False)
         recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
     else:
         _load_eclatin_blocks_from_disk_into(
@@ -959,31 +1155,52 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 
-    # === timing: network/encode (C++ XOR pipeline or SW memcpy assembly) ===
+    # === timing: network/encode ===
     _t_ec: Dict[str, float] = {}
     _t0 = time.time()
-    _run_eclatin_full_recovery(
-        manager=manager,
-        rank=rank,
-        world_size=world_size,
-        eclatin_blocks=eclatin_blocks,
-        recv_buffers=recv_buffers,
-        recovered_buffer=recovered_buffer,
-        total_size=total_size,
-        registry=registry,
-    )
+    if two_failures:
+        _run_eclatin_two_failures_recovery(
+            manager=manager,
+            rank=rank,
+            world_size=world_size,
+            eclatin_blocks=eclatin_blocks,
+            recv_buffers=recv_buffers,
+            recovered_buffer=recovered_buffer,
+            total_size=total_size,
+            registry=registry,
+        )
+    else:
+        _run_eclatin_full_recovery(
+            manager=manager,
+            rank=rank,
+            world_size=world_size,
+            eclatin_blocks=eclatin_blocks,
+            recv_buffers=recv_buffers,
+            recovered_buffer=recovered_buffer,
+            total_size=total_size,
+            registry=registry,
+        )
     _t_ec['network_encode'] = time.time() - _t0
 
     # === timing: rebuild state_dict ===
     _t0 = time.time()
+    if two_failures:
+        use_recovered = rank_in_group in (0, 1)
+    else:
+        use_recovered = (rank_in_group == 2)
     state_dict = _reconstruct_state_dict_from_eclatin_buffer(
         main_payload,
-        recovered_buffer=recovered_buffer if rank_in_group == 2 else None,
+        recovered_buffer=recovered_buffer if use_recovered else None,
     )
     _t_ec['rebuild_sd'] = time.time() - _t0
     _t_ec['total'] = _t_ec['network_encode'] + _t_ec['rebuild_sd']
 
-    _mode = "SW" if sw_failure else "HW"
+    if two_failures:
+        _mode = "2F"
+    elif sw_failure:
+        _mode = "SW"
+    else:
+        _mode = "HW"
     logger.info(
         "ECLATIN legacy load timing (%s): "
         "total=%(total).2fs network_encode=%(network_encode).2fs "

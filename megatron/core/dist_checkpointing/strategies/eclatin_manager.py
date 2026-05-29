@@ -392,6 +392,15 @@ class ECLATINManager:
                     'load_send_rank3_data2': load_base_port + 5,
                 })
 
+        # Two-failures load mode ports (always added for all ranks)
+        two_fail_base_port = load_base_port + 50
+        ports.update({
+            'twofail_r0_from_r2': two_fail_base_port + 0,
+            'twofail_r0_from_r3': two_fail_base_port + 1,
+            'twofail_r1_from_r2': two_fail_base_port + 2,
+            'twofail_r1_from_r3': two_fail_base_port + 3,
+        })
+
         # Step 4: Exchange IP addresses via broadcast (more reliable than all_gather_object with NCCL)
         # Use sequential broadcast to avoid NCCL issues with Python objects
         rank_ips = {}
@@ -818,6 +827,62 @@ class ECLATINManager:
             f"{aligned_half_block_size / (1024**3):.2f} GB each"
         )
 
+        return recv_buffers
+
+    def allocate_eclatin_load_recv_buffers_two_fail(
+        self, global_registry: GlobalMetadataRegistry
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Allocate 8 recv buffers for two-failures recovery on failed ranks (0 or 1).
+
+        Each failed rank receives 4 blocks from surviving rank 2 and 4 blocks from
+        surviving rank 3, totalling 8 recv buffers.
+
+        Returns:
+            Dict with keys: r2_d2, r2_D2, r2_p2, r2_P2, r3_d3, r3_D3, r3_p3, r3_P3
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        rank_in_group = self._get_rank_in_group(rank, world_size)
+
+        if rank_in_group not in (0, 1):
+            logger.warning(
+                "ECLATIN: allocate_eclatin_load_recv_buffers_two_fail called on "
+                f"rank_in_group {rank_in_group}, expecting 0 or 1; returning empty dict"
+            )
+            return {}
+
+        max_total_bytes = 0
+        for r in range(world_size):
+            rank_metadata = global_registry.rank_metadata.get(r, [])
+            rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+            if rank_total_size > max_total_bytes:
+                max_total_bytes = rank_total_size
+
+        half_max_total_bytes = max_total_bytes // 2
+        aligned_half_block_size = (
+            (half_max_total_bytes + self.eclatin_buffer_size - 1) // self.eclatin_buffer_size
+        ) * self.eclatin_buffer_size
+
+        logger.info(
+            f"ECLATIN: Allocating 8 recv buffers for two-failures recovery\n"
+            f"  Pipeline max size: {max_total_bytes / (1024**3):.2f} GB\n"
+            f"  Aligned half block size: {aligned_half_block_size / (1024**3):.2f} GB\n"
+            f"  Total recv memory: {8 * aligned_half_block_size / (1024**3):.2f} GB"
+        )
+
+        recv_buffers = {}
+        for key in ['r2_d2', 'r2_D2', 'r2_p2', 'r2_P2',
+                     'r3_d3', 'r3_D3', 'r3_p3', 'r3_P3']:
+            recv_buffers[key] = torch.empty(
+                aligned_half_block_size, dtype=torch.uint8,
+                pin_memory=self.eclatin_pin_memory,
+            )
+
+        logger.info(
+            f"ECLATIN: Allocated 8 recv buffers for two-failures recovery: "
+            f"{aligned_half_block_size / (1024**3):.2f} GB each"
+        )
         return recv_buffers
 
     def _poll_and_release_buffers(self):

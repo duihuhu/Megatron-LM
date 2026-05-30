@@ -5067,6 +5067,17 @@ private:
 public:
     // ========== Generalized save submit interface ==========
 
+    // Expose ISA-L RS encode for HW recovery (callable from Python)
+    // Encodes k data blocks into 2 parity blocks using the ISA-L RS encoder
+    void encode_ec_blocks_public(
+            const std::vector<uintptr_t>& data_addrs,
+            uintptr_t parity0_addr,
+            uintptr_t parity1_addr,
+            size_t size)
+    {
+        encode_ec_blocks(data_addrs, parity0_addr, parity1_addr, size);
+    }
+
     // Submit one encoding + distribution operation for a chunk
     void submit_ecnaive_save_general(
             const std::vector<uintptr_t>& data_addrs,  // k data block addresses
@@ -6332,6 +6343,13 @@ PYBIND11_MODULE(ecnaive_native, m) {
              pybind11::arg("block1_addr"),
              pybind11::arg("block2_name"),
              pybind11::arg("block2_addr"),
+             pybind11::arg("size"))
+        // RS encode for HW recovery: encode k data blocks → 2 parity blocks
+        .def("encode_ec_blocks", &ECNaiveNative::encode_ec_blocks_public,
+             "Encode k data blocks into 2 parity blocks via ISA-L RS encoder",
+             pybind11::arg("data_addrs"),
+             pybind11::arg("parity0_addr"),
+             pybind11::arg("parity1_addr"),
              pybind11::arg("size"))
         // RS decode recovery (software recovery, synchronous)
         .def("submit_ecnaive_decode_recovery", &ECNaiveNative::submit_ecnaive_decode_recovery,

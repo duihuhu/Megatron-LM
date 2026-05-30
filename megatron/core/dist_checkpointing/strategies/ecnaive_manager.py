@@ -7,7 +7,7 @@ import queue
 import socket
 import threading
 from logging import getLogger
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from dataclasses import replace
@@ -91,6 +91,10 @@ class ECNAIVEManager:
         self.registered_buffers = {}  # {addr: (size, iteration)}
         self.current_iteration = 0
         self.preallocated_cpu_buffer: Optional[torch.Tensor] = None
+
+        # HW recovery: store recovered checkpoint blocks for cascading failure tolerance
+        # {global_rank: {"own_data0": tensor, "recv_0": tensor, ...}}
+        self._recovered_blocks: Dict[int, Dict[str, torch.Tensor]] = {}
 
         self._initialized = True
 
@@ -989,14 +993,82 @@ class ECNAIVEManager:
                 if source_global not in failed_set:
                     surviving.append((source_global, pname, -1, pname))
 
+            recv_block_recovery = self._compute_recv_block_recovery(
+                fr, failed_set, world_size
+            )
+
             result[fr] = {
                 'lost_positions': lost_positions,
                 'surviving': surviving,
+                'recv_block_recovery': recv_block_recovery,
                 'rank_in_group': rig,
                 'group_id': gid,
             }
 
         return result
+
+    def _compute_recv_block_recovery(
+        self, failed_rank: int, failed_set: set, world_size: int
+    ) -> List[Dict[str, Any]]:
+        """Compute recovery plan for the recv blocks on a failed rank.
+
+        Each recv block on the failed rank belongs to a different rank's codeword.
+        This method determines:
+        - Which rank's codeword the block belongs to (owner_rank)
+        - Whether the owner is also failed (owner_is_failed)
+        - The block type (data_j, parity0, parity1)
+        - The recovery method (decode for data blocks, encode for parity blocks)
+
+        For k=2 with n=4, recv slot layout on rank_in_group f:
+          recv_0: d_{(f-1),1}       → owner = f-1, type = data_1,  method = decode
+          recv_1: p_{(f-2),0}       → owner = f-2, type = parity0, method = encode
+          recv_2: p_{(f-3),1}       → owner = f-3, type = parity1, method = encode
+
+        Args:
+            failed_rank (int): Global rank that failed.
+            failed_set (set): Set of all failed global ranks.
+            world_size (int): Total world size.
+
+        Returns:
+            List[Dict]: One dict per recv block with keys:
+                recv_idx, owner_rank, owner_is_failed, block_type, recovery_method
+        """
+        n = self.ecnaive_n
+        k = self.ecnaive_k
+        rig = self._get_rank_in_group(failed_rank, world_size)
+        group_id = self._get_group_id(failed_rank, world_size)
+
+        recv_info: List[Dict[str, Any]] = []
+        for recv_idx in range(n - 1):
+            if recv_idx < k - 1:
+                # Data block d_{(f - recv_idx - 1), recv_idx + 1}
+                owner_rig = (rig - recv_idx - 1 + n) % n
+                block_type = f'data_{recv_idx + 1}'
+                recovery_method = 'decode'
+            elif recv_idx == k - 1:
+                # Parity0: p_{(f - k), 0}
+                owner_rig = (rig - k + n) % n
+                block_type = 'parity0'
+                recovery_method = 'encode'
+            else:  # recv_idx == k
+                # Parity1: p_{(f - k - 1), 1}
+                owner_rig = (rig - k - 1 + n) % n
+                block_type = 'parity1'
+                recovery_method = 'encode'
+
+            owner_rank = self._get_rank_by_group_position(
+                group_id, owner_rig, world_size
+            )
+            recv_info.append({
+                'recv_idx': recv_idx,
+                'owner_rank': owner_rank,
+                'owner_rig': owner_rig,
+                'owner_is_failed': owner_rank in failed_set,
+                'block_type': block_type,
+                'recovery_method': recovery_method,
+            })
+
+        return recv_info
 
     def get_send_channel_for_target(
         self, source_global_rank: int, target_global_rank: int, world_size: int
@@ -1458,7 +1530,49 @@ class ECNAIVEManager:
         except Exception as e:
             logger.error(f"EC-NAIVE: [Rank {rank}] Failed to unregister buffer: {e}")
             raise
-    
+
+    # ===== HW recovery: recovered checkpoint block storage =====
+
+    def store_recovered_blocks(self, rank: int, blocks: Dict[str, torch.Tensor]) -> None:
+        """Store recovered checkpoint blocks for cascading failure tolerance.
+
+        After HW recovery, the failed rank's n blocks (own_data0 + recv blocks)
+        are kept in memory so they can serve as source blocks if another rank
+        in the same group fails before the next checkpoint save.
+
+        Args:
+            rank (int): Global rank whose blocks were recovered.
+            blocks (Dict[str, torch.Tensor]): Dict with keys like
+                'own_data0', 'recv_0', ..., 'recv_{n-2}'.
+        """
+        self._recovered_blocks[rank] = blocks
+        logger.info(
+            f"EC-NAIVE: Stored {len(blocks)} recovered blocks for rank {rank}"
+        )
+
+    def get_recovered_blocks(self, rank: int) -> Optional[Dict[str, torch.Tensor]]:
+        """Get recovered checkpoint blocks for a rank, or None.
+
+        Args:
+            rank (int): Global rank.
+
+        Returns:
+            Optional[Dict[str, torch.Tensor]]: Recovered blocks dict or None.
+        """
+        return self._recovered_blocks.get(rank)
+
+    def clear_recovered_blocks(self, rank: Optional[int] = None) -> None:
+        """Clear recovered blocks. If rank is None, clear all.
+
+        Args:
+            rank (Optional[int]): Specific rank to clear, or None for all.
+        """
+        if rank is None:
+            self._recovered_blocks.clear()
+        else:
+            self._recovered_blocks.pop(rank, None)
+
+
     def cleanup(self):
         """Cleanup EC-NAIVE resources when manager is destroyed."""
         try:

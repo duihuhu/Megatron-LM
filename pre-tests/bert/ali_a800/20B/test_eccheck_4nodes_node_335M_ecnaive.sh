@@ -79,12 +79,12 @@ export CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_IDS[*]}")
 export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-VOCAB_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-vocab.json"
-MERGE_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-merges.txt"
+VOCAB_FILE="/workspace/Megatron-LM/pre-tests/bert/bert_data/vocab.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/opt/7B/opt-7b-0/logs"
-CHECKPOINT_PATH="/dev/shm/models/opt-7b-0-ecnaive"
-# DATA_PATH="/workspace/Megatron-LM/pre-tests/opt/opt_data/wiki_text_sentence"
+TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/bert/7B/bert-7b-0/logs"
+CHECKPOINT_PATH="/dev/shm/models/bert-7b-0-ecnaive"
+DATA_PATH="/workspace/Megatron-LM/pre-tests/bert/bert_data/wiki_text_sentence"
+DATA_CACHE_PATH="${DATA_CACHE_PATH:-/workspace/Megatron-LM/pre-tests/bert/bert_data/cache}"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
@@ -92,9 +92,9 @@ SHM_PKT="/dev/shm/shm_pkt"
 ARGS_TO_PASS=("$@")
 
 # Model related configuration here, please do not overlap with json config
-HIDDEN_SIZE=4096
-NUM_ATTENTION_HEADS=32
-NUM_LAYERS=32
+HIDDEN_SIZE=5120
+NUM_ATTENTION_HEADS=40 
+NUM_LAYERS=64
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
@@ -110,9 +110,12 @@ DISTRIBUTED_ARGS=(
 )
 
 DATA_ARGS=(
-    --vocab-file $VOCAB_FILE 
-    --merge-file $MERGE_FILE 
-    --mock-data 
+    --vocab-file $VOCAB_FILE
+    # --merge-file $MERGE_FILE
+    --data-path $DATA_PATH
+    --data-cache-path $DATA_CACHE_PATH
+    --num-dataset-builder-threads 32
+    --split 949,50,1
 )
 
 GPT_ARGS=(
@@ -132,7 +135,7 @@ GPT_ARGS=(
     --lr-warmup-fraction .05
     --clip-grad 1.0
     --fp16
-    --tokenizer-type GPT2BPETokenizer
+    --tokenizer-type BertWordPieceCase
     --use-mcore-models
     --transformer-impl transformer_engine
     --no-scatter-gather-tensors-in-pipeline
@@ -188,7 +191,7 @@ mkdir -p logs/csv
 # Print command if PRINT_CMD is set
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_bert.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
@@ -200,7 +203,7 @@ export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \
 
 PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
-    pretrain_gpt.py \
+    pretrain_bert.py \
     ${GPT_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \

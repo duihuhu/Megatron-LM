@@ -380,7 +380,8 @@ def _load_ecnaive_main_payload(
     chosen = gathered[rank]
     if chosen is None:
         raise FileNotFoundError(
-            f"EC-NAIVE legacy: ecnaive_main_rank{rank}.pt missing on all ranks under {checkpoint_dir}"
+            f"EC-NAIVE legacy: ecnaive_main_rank{rank}.pt missing on all ranks "
+            f"under {checkpoint_dir}"
         )
     return chosen
 

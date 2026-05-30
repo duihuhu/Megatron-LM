@@ -493,28 +493,37 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 )
             # Parse comma-separated list
             failed_ranks = [int(x.strip()) for x in ecnaive_failed_ranks_str.split(",")]
-            if len(failed_ranks) < 1 or len(failed_ranks) > 2:
+            if len(failed_ranks) < 1:
                 raise RuntimeError(
-                    f"EC-NAIVE --ecnaive-failed-ranks supports 1-2 ranks, got {len(failed_ranks)}"
+                    "EC-NAIVE --ecnaive-failed-ranks requires at least 1 rank"
                 )
             for fr in failed_ranks:
                 if fr < 0 or fr >= world_size:
                     raise RuntimeError(
                         f"EC-NAIVE --ecnaive-failed-ranks rank {fr} out of range [0, {world_size - 1}]"
                     )
-            if len(failed_ranks) == 2:
-                # Verify both in same group
-                from megatron.core.dist_checkpointing.strategies.ecnaive_manager import ECNAIVEManager
-                mgr = ECNAIVEManager()
-                mgr.ecnaive_n = ecnaive_n
-                mgr.ecnaive_k = ecnaive_k
-                g0 = mgr._get_group_id(failed_ranks[0], world_size)
-                g1 = mgr._get_group_id(failed_ranks[1], world_size)
-                if g0 != g1:
+            # Per-group validation: at most 2 failed ranks per group (RS 2+2 limit).
+            # Node-level failures (e.g. 4 ranks per node) are supported because the
+            # node-aware group layout puts each rank into a different group.
+            from megatron.core.dist_checkpointing.strategies.ecnaive_manager import ECNAIVEManager
+            mgr = ECNAIVEManager()
+            mgr.ecnaive_n = ecnaive_n
+            mgr.ecnaive_k = ecnaive_k
+            from collections import Counter
+            group_counts = Counter()
+            for fr in failed_ranks:
+                group_counts[mgr._get_group_id(fr, world_size)] += 1
+            max_per_group = ecnaive_n - ecnaive_k  # RS(k+2,k): redundancy = 2 parity blocks
+            for gid, count in group_counts.items():
+                if count > max_per_group:
                     raise RuntimeError(
-                        f"EC-NAIVE --ecnaive-failed-ranks: ranks {failed_ranks[0]} and "
-                        f"{failed_ranks[1]} are in different groups ({g0} vs {g1})"
+                        f"EC-NAIVE --ecnaive-failed-ranks: group {gid} has {count} failed ranks, "
+                        f"but RS({ecnaive_k}+2,{ecnaive_k}) supports at most {max_per_group} per group"
                     )
+            logger.info(
+                f"EC-NAIVE: {len(failed_ranks)} failed ranks across "
+                f"{len(group_counts)} group(s): {dict(group_counts)}"
+            )
             # Store parsed list back on args for downstream use
             args.ecnaive_failed_ranks_parsed = failed_ranks
     if getattr(args, "use_frcheck", False) and (
@@ -731,8 +740,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 torch.distributed.barrier()
 
     # And update the latest iteration
+    # Write from local rank 0 on every node (not just global rank 0) so the
+    # tracker file survives single-node failures.
+    is_local_rank0 = int(os.environ.get('LOCAL_RANK', 0)) == 0
     if not torch.distributed.is_initialized() \
-            or torch.distributed.get_rank() == 0:
+            or (torch.distributed.get_rank() == 0 or is_local_rank0):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
 
         if ckpt_type == CheckpointType.LOCAL:

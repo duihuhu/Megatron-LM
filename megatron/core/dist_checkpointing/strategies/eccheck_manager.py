@@ -85,6 +85,15 @@ class ECCHECKManager:
 
         self._initialized = True
 
+    @property
+    def is_two_failures_mode(self) -> bool:
+        """Whether the current load is in two-failure hardware recovery mode."""
+        try:
+            from megatron.training import get_args
+            return bool(getattr(get_args(), "use_eccheck_two_failures", False))
+        except Exception:
+            return False
+
     def allocate_preallocated_buffer(self, size_bytes: int):
         """Allocate or reuse cached CPU buffer.  Grows only when needed."""
         if self.preallocated_cpu_buffer is not None:

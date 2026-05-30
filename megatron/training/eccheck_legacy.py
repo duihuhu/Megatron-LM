@@ -580,6 +580,7 @@ def _load_eccheck_blocks_from_disk_into(
     rank: int,
     rank_in_group: int,
     software_failure: bool = False,
+    two_failures: bool = False,
 ) -> None:
     """Load block .pt files into pre-allocated P2P buffers.
 
@@ -593,6 +594,12 @@ def _load_eccheck_blocks_from_disk_into(
     - rank_in_group 0: loads own_buffer (to send to rig=1 via C++ P2P)
     - rank_in_group 1: loads nothing (receives from rig=0 via C++ P2P)
     - rank_in_group 2/3: not participating in software failure
+
+    Two-failures layout (use_eccheck_two_failures=True):
+    - rank_in_group 0 (survivor): loads partner_buffer (d1, to send to rig1)
+    - rank_in_group 1 (failed): loads nothing (receives d1 from rig0)
+    - rank_in_group 2 (failed): loads nothing (receives p2 from rig3, XOR recovers d2)
+    - rank_in_group 3 (survivor): loads own_buffer + partner_buffer (p3 + p2)
     """
     if software_failure:
         if rank_in_group == 0:
@@ -601,6 +608,26 @@ def _load_eccheck_blocks_from_disk_into(
             )
         # rig=1: will receive via C++ P2P, no local disk load
         # rig=2/3: not participating
+        return
+
+    if two_failures:
+        if rank_in_group == 0:
+            # Survivor: load d1 (partner_buffer) for sending to rig1
+            _copy_block_file_into_tensor(
+                checkpoint_dir, rank, "partner_buffer", blocks["partner_buffer"]
+            )
+        # rig=1: failed, loads nothing
+        # rig=2: failed, loads nothing
+        elif rank_in_group == 3:
+            # Survivor: load p3 (own_buffer = 2·d1⊕2·d3) and p2 (partner_buffer = d0⊕d2)
+            _copy_block_file_into_tensor(
+                checkpoint_dir, rank, "own_buffer", blocks["own_buffer"]
+            )
+            _copy_block_file_into_tensor(
+                checkpoint_dir, rank, "partner_buffer", blocks["partner_buffer"]
+            )
+        elif rank_in_group not in (0, 3):
+            pass  # rig1, rig2: no disk load
         return
 
     if rank_in_group == 2:
@@ -920,6 +947,304 @@ def _run_eccheck_legacy_recovery(
 
 
 # ---------------------------------------------------------------------------
+# Two-failure recovery pipeline (load)
+# ---------------------------------------------------------------------------
+
+def _run_eccheck_two_failures_recovery(
+    manager: ECCHECKManager,
+    rank: int,
+    world_size: int,
+    blocks: Dict[str, Any],
+    recovered_buffer: Optional[torch.Tensor],
+    total_size: int,
+    registry: GlobalMetadataRegistry,
+) -> None:
+    """Drive C++ two-failure recovery for ECCHECK legacy load.
+
+    Two physical nodes lost → rig1 and rig2 in each 4-rank group are failed.
+    Survivors rig0 and rig3 use bidirectional XOR exchange to recover
+    d2 (on rig2) and verify d3 (on rig3), then forward results via P2P.
+
+    Uses save-path 16-thread encode pool (ec_rs_encode_pool) and RDMA transport,
+    aligned with the save encoding pipeline.
+    """
+    from time import time
+
+    native = manager._eccheck_native
+    if native is None:
+        raise RuntimeError("ECCHECK native module is not initialized")
+
+    rank_in_group = manager._get_rank_in_group(rank, world_size)
+    is_failed = rank_in_group in (1, 2)
+    is_survivor = rank_in_group in (0, 3)
+
+    # Set C++ to two-failure mode (failed_rank=10, following ECLATIN convention)
+    native.set_load_mode(True, 10)
+    logger.info(
+        f"ECCHECK legacy two-failures: load mode set (failed_rank=10), "
+        f"rank={rank}, rank_in_group={rank_in_group}"
+    )
+
+    # Compute pipeline size
+    max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
+    if max_total_bytes == 0:
+        return
+    buffer_size = manager.eccheck_buffer_size
+
+    # Get buffer pools
+    buffers = manager.get_eccheck_buffers()
+    if buffers is None:
+        raise RuntimeError("ECCHECK legacy: buffer pools not initialized")
+    free_data_queue = buffers["free_data_buffer_queue"]
+    free_encoding_queue = buffers["free_encoding_buffer_queue"]
+    free_parity_queue = buffers["free_parity_buffer_queue"]
+    poll_and_release = buffers.get("poll_and_release_buffers")
+    active_event = buffers.get("buffer_poller_active_event")
+
+    def _get_free_data():
+        if poll_and_release is not None:
+            poll_and_release()
+        try:
+            return free_data_queue.get(timeout=5.0)
+        except queue.Empty:
+            logger.error("ECCHECK two-failures: timeout waiting for free data buffer")
+            return free_data_queue.get()
+
+    def _get_free_encoding():
+        if poll_and_release is not None:
+            poll_and_release()
+        try:
+            return free_encoding_queue.get(timeout=5.0)
+        except queue.Empty:
+            logger.error("ECCHECK two-failures: timeout waiting for free encoding buffer")
+            return free_encoding_queue.get()
+
+    def _get_free_parity():
+        if poll_and_release is not None:
+            poll_and_release()
+        try:
+            return free_parity_queue.get(timeout=5.0)
+        except queue.Empty:
+            logger.error("ECCHECK two-failures: timeout waiting for free parity buffer")
+            return free_parity_queue.get()
+
+    # Allocate recv encoding buffers
+    if manager.eccheck_recv_encoding_buffers is None:
+        manager.eccheck_recv_encoding_buffers = (
+            manager.allocate_recv_encoding_buffers_phase2(registry)
+        )
+    recv_buf1, recv_buf2 = manager.eccheck_recv_encoding_buffers
+    recv_base_1 = int(recv_buf1.data_ptr())
+    recv_base_2 = int(recv_buf2.data_ptr())
+
+    own_base = int(blocks["own_buffer"].data_ptr())
+    partner_base = int(blocks["partner_buffer"].data_ptr())
+    own_buf = blocks["own_buffer"]
+    partner_buf = blocks["partner_buffer"]
+
+    native.reset_encoding_completion_flags()
+    if active_event is not None:
+        active_event.set()
+
+    # ---- Phase 1: P2P data distribution (before encoding pipeline) ----
+    # Rig0 → Rig1: send d1 (partner_buffer)
+    # Rig3 → Rig2: send p2 = d0⊕d2 (partner_buffer)
+    if rank_in_group == 0:
+        native.simple_p2p_send(int(partner_buf.data_ptr()), partner_buf.numel())
+        logger.info(
+            f"ECCHECK two-failures: rig0 sent d1 to rig1 "
+            f"({partner_buf.numel() / (1024**3):.2f} GB)"
+        )
+    elif rank_in_group == 1:
+        native.simple_p2p_recv(int(partner_buf.data_ptr()), partner_buf.numel())
+        logger.info(
+            f"ECCHECK two-failures: rig1 received d1 from rig0 "
+            f"({partner_buf.numel() / (1024**3):.2f} GB)"
+        )
+    elif rank_in_group == 2:
+        native.simple_p2p_recv(int(own_buf.data_ptr()), own_buf.numel())
+        logger.info(
+            f"ECCHECK two-failures: rig2 received p2 from rig3 "
+            f"({own_buf.numel() / (1024**3):.2f} GB)"
+        )
+    elif rank_in_group == 3:
+        native.simple_p2p_send(int(partner_buf.data_ptr()), partner_buf.numel())
+        logger.info(
+            f"ECCHECK two-failures: rig3 sent p2 to rig2 "
+            f"({partner_buf.numel() / (1024**3):.2f} GB)"
+        )
+
+    processed = 0
+    own_offset = 0
+    partner_offset = 0
+    recv_offset_1 = 0
+    recv_offset_2 = 0
+
+    start_t = time()
+    try:
+        while processed < max_total_bytes:
+            remaining = max_total_bytes - processed
+            take = min(buffer_size, remaining)
+
+            # ---- Phase 2: copy data into chunk buffer ----
+            cur_buffer_addr = _get_free_data()
+            buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
+            buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
+
+            if rank_in_group == 0:
+                # Survivor: use d0 from own_buffer (loaded from disk)
+                src_off = processed
+                bytes_to_copy = min(take, own_buf.numel() - src_off)
+                if bytes_to_copy > 0:
+                    ctypes.memmove(buffer_array.contents,
+                                   own_base + src_off, bytes_to_copy)
+                if take > bytes_to_copy:
+                    ctypes.memset(
+                        ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
+                                    ctypes.POINTER(ctypes.c_uint8)),
+                        0, take - bytes_to_copy)
+            elif rank_in_group == 1:
+                # Failed: use d1 from partner_buffer (received via Phase 1 P2P from rig0)
+                src_off = processed
+                bytes_to_copy = min(take, partner_buf.numel() - src_off)
+                if bytes_to_copy > 0:
+                    ctypes.memmove(buffer_array.contents,
+                                   partner_base + src_off, bytes_to_copy)
+                if take > bytes_to_copy:
+                    ctypes.memset(
+                        ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
+                                    ctypes.POINTER(ctypes.c_uint8)),
+                        0, take - bytes_to_copy)
+            elif rank_in_group == 2:
+                # Failed: use p2 from own_buffer (received via Phase 1 P2P from rig3)
+                src_off = processed
+                bytes_to_copy = min(take, own_buf.numel() - src_off)
+                if bytes_to_copy > 0:
+                    ctypes.memmove(buffer_array.contents,
+                                   own_base + src_off, bytes_to_copy)
+                if take > bytes_to_copy:
+                    ctypes.memset(
+                        ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
+                                    ctypes.POINTER(ctypes.c_uint8)),
+                        0, take - bytes_to_copy)
+            elif rank_in_group == 3:
+                # Survivor: use d3 from own_buffer (loaded from disk)
+                src_off = processed
+                bytes_to_copy = min(take, own_buf.numel() - src_off)
+                if bytes_to_copy > 0:
+                    ctypes.memmove(buffer_array.contents,
+                                   own_base + src_off, bytes_to_copy)
+                if take > bytes_to_copy:
+                    ctypes.memset(
+                        ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
+                                    ctypes.POINTER(ctypes.c_uint8)),
+                        0, take - bytes_to_copy)
+            else:
+                ctypes.memset(buffer_array.contents, 0, take)
+
+            # ---- Phase 3: allocate encoding buffers (TWO per chunk) ----
+            enc_addr_0 = _get_free_encoding()  # for parity row 0
+            enc_addr_1 = _get_free_encoding()  # for parity row 1
+
+            # ---- Phase 3: XOR exchange (bidirectional) ----
+            # Each rank both sends and receives:
+            #   rig0 ↔ rig2  (parity row 0: rig0 sends enc_0(d0), recvs enc_0(p2), XOR → p0)
+            #   rig1 ↔ rig3  (parity row 1: rig1 sends enc_1(d1), recvs enc_1(p3), XOR → d2)
+
+            # Bounds check
+            own_offset_aligned = ((own_offset + 63) // 64) * 64
+            partner_offset_aligned = ((partner_offset + 63) // 64) * 64
+            p2p_rem_own = own_buf.numel() - own_offset_aligned
+            p2p_rem_partner = partner_buf.numel() - partner_offset_aligned
+            max_p2p = min(p2p_rem_own, p2p_rem_partner)
+
+            recv_offset_1_aligned = ((recv_offset_1 + 63) // 64) * 64
+            recv_offset_2_aligned = ((recv_offset_2 + 63) // 64) * 64
+            recv_rem_1 = recv_buf1.numel() - recv_offset_1_aligned
+            recv_rem_2 = recv_buf2.numel() - recv_offset_2_aligned
+            max_recv = min(recv_rem_1, recv_rem_2)
+
+            take_bounded = min(take, max_p2p, max_recv)
+            if take_bounded < 64:
+                logger.warning(
+                    f"ECCHECK two-failures: buffers exhausted at "
+                    f"{processed / (1024**3):.2f} GB"
+                )
+                break
+            take = take_bounded
+
+            # Addresses for encode output and recv
+            own_write_addr = own_base + own_offset_aligned
+            partner_write_addr = partner_base + partner_offset_aligned
+            recv_addr_1 = recv_base_1 + recv_offset_1_aligned
+            recv_addr_2 = recv_base_2 + recv_offset_2_aligned
+
+            # Advance offsets
+            if rank_in_group in (0, 1):
+                own_offset = own_offset_aligned + take
+            if rank_in_group in (2, 3):
+                partner_offset = partner_offset_aligned + take
+            recv_offset_1 = recv_offset_1_aligned + take
+            recv_offset_2 = recv_offset_2_aligned + take
+
+            # Phase 2b: dual-coefficient encoding → route to save-path 16-thread pool
+            native.submit_two_failure_encoding_chunk(
+                data_addr=cur_buffer_addr,
+                size=take,
+                enc_addr_0=enc_addr_0,
+                enc_addr_1=enc_addr_1,
+                recv_addr_1=recv_addr_1,
+                recv_addr_2=recv_addr_2,
+                recv_chunk_size=take,
+                own_write_addr=own_write_addr,
+                partner_write_addr=partner_write_addr,
+            )
+
+            processed += take
+
+        # Sentinels and completion
+        native.submit_two_failure_encoding_sentinels()
+        native.wait_for_encoding_completion()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        # ---- Phase 4: Extract recovered data ----
+        # rig2: own_buffer was written by C++ via XOR as d2 (gapped)
+        if rank_in_group == 2 and recovered_buffer is not None:
+            recovered_dense = _extract_dense_from_gapped_buffer(
+                own_buf, buffer_size, max_total_bytes,
+            )
+            actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
+            if recovered_buffer.numel() >= total_size:
+                n_copy = min(actual_tensor_bytes, total_size,
+                             recovered_dense.numel())
+                recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
+
+        # rig1: partner_buffer was written by C++ via P2P as d1 (gapped)
+        if rank_in_group == 1 and recovered_buffer is not None:
+            recovered_dense = _extract_dense_from_gapped_buffer(
+                partner_buf, buffer_size, max_total_bytes,
+            )
+            actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
+            if recovered_buffer.numel() >= total_size:
+                n_copy = min(actual_tensor_bytes, total_size,
+                             recovered_dense.numel())
+                recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
+
+        logger.info(
+            f"ECCHECK legacy: two-failure recovery pipeline done in "
+            f"{time() - start_t:.2f}s"
+        )
+
+    finally:
+        if active_event is not None:
+            active_event.clear()
+
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+# ---------------------------------------------------------------------------
 # State dict reconstruction
 # ---------------------------------------------------------------------------
 
@@ -1033,13 +1358,40 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     rank_in_group = manager._get_rank_in_group(rank, world_size)
     sw_failure = bool(getattr(args, "use_eccheck_software_failure", False))
+    two_failures = bool(getattr(args, "use_eccheck_two_failures", False))
     total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
 
     blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
 
     recovered_buffer: Optional[torch.Tensor] = None
 
-    if sw_failure:
+    if two_failures:
+        # Two physical nodes lost: rig1 and rig2 are failed.
+        # Survivors: rig0 and rig3.
+        pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
+        actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
+
+        if rank_in_group in (0, 3):
+            # Survivors: load existing blocks from disk
+            _load_eccheck_blocks_from_disk_into(
+                blocks, checkpoint_dir, rank, rank_in_group,
+                software_failure=False, two_failures=True,
+            )
+        elif rank_in_group in (1, 2):
+            # Failed ranks: allocate recovered_buffer
+            recovered_buffer = torch.empty(
+                actual_tensor_bytes, dtype=torch.uint8, pin_memory=pin
+            )
+            total_size = actual_tensor_bytes
+            logger.info(
+                f"ECCHECK two-failures: rig{rank_in_group} (failed) allocated "
+                f"recovered_buffer {actual_tensor_bytes / (1024**3):.2f} GB"
+            )
+        else:
+            raise RuntimeError(
+                f"ECCHECK two-failures: unexpected rank_in_group={rank_in_group}"
+            )
+    elif sw_failure:
         # Software failure: rig=0 sends own_buffer to rig=1 via C++ P2P
         if rank_in_group == 0:
             _load_eccheck_blocks_from_disk_into(
@@ -1071,30 +1423,48 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     # === timing: network/encode (C++ P2P or XOR pipeline) ===
     _t_ec: Dict[str, float] = {}
     _t0 = time.time()
-    _run_eccheck_legacy_recovery(
-        manager=manager,
-        rank=rank,
-        world_size=world_size,
-        blocks=blocks,
-        recv_buffers=None,
-        recovered_buffer=recovered_buffer,
-        total_size=total_size,
-        registry=registry,
-    )
+    if two_failures:
+        _run_eccheck_two_failures_recovery(
+            manager=manager,
+            rank=rank,
+            world_size=world_size,
+            blocks=blocks,
+            recovered_buffer=recovered_buffer,
+            total_size=total_size,
+            registry=registry,
+        )
+    else:
+        _run_eccheck_legacy_recovery(
+            manager=manager,
+            rank=rank,
+            world_size=world_size,
+            blocks=blocks,
+            recv_buffers=None,
+            recovered_buffer=recovered_buffer,
+            total_size=total_size,
+            registry=registry,
+        )
     _t_ec['network_encode'] = time.time() - _t0
 
     # === timing: rebuild state_dict ===
     _t0 = time.time()
+    if two_failures:
+        use_recovered = rank_in_group in (1, 2)
+    else:
+        use_recovered = rank_in_group == 2 or (sw_failure and rank_in_group == 1)
     state_dict = _reconstruct_state_dict_from_eccheck_buffer(
         main_payload,
-        recovered_buffer=recovered_buffer if (
-            rank_in_group == 2 or (sw_failure and rank_in_group == 1)
-        ) else None,
+        recovered_buffer=recovered_buffer if use_recovered else None,
     )
     _t_ec['rebuild_sd'] = time.time() - _t0
     _t_ec['total'] = _t_ec['network_encode'] + _t_ec['rebuild_sd']
 
-    _mode = "SW" if sw_failure else "HW"
+    if two_failures:
+        _mode = "2F"
+    elif sw_failure:
+        _mode = "SW"
+    else:
+        _mode = "HW"
     logger.info(
         "ECCHECK legacy load timing (%s): "
         "total=%(total).2fs network_encode=%(network_encode).2fs "

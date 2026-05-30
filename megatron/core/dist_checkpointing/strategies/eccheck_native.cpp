@@ -841,6 +841,7 @@ private:
     
     // Load mode configuration
     bool is_load_mode_;     // Flag indicating if in load mode (recovery pipeline)
+    bool is_two_failures_load_mode_; // Flag for two-failure hardware recovery mode
     int failed_rank_;       // Failed rank number (e.g., 2 for rank2 recovery scenario)
     
     // ASIO connection manager
@@ -909,20 +910,27 @@ private:
     void build_xor_config() {
         xor_config_.xor_partner_rank = paired_rank_;
         // Use rank_in_group_ (0-3) for XOR role; xor_partner_rank is global (set by Python).
-        if (is_load_mode_ && failed_rank_in_group_ == 2) {
-            // Load mode: rank_in_group 2 recovery scenario (same logic as 4-rank)
+        if (is_two_failures_load_mode_) {
+            // ── Two-failure hardware recovery (rig1+rig2 failed) ──
+            // XOR roles are INVERTED vs save mode:
+            //   Encoder thread 1 (parity row 0): rig0→rig2, rig1→rig3
+            //     → rig0 sends enc_0 to rig2, rig2 XORs to recover d2
+            //     → rig1 sends enc_0 to rig3, rig3 XORs to verify d3
+            //   Encoder thread 2 (parity row 1): rig2→rig0, rig3→rig1
+            //     → rig2 sends enc_1 to rig0, rig0 XORs → p0
+            //     → rig3 sends enc_1 to rig1, rig1 XORs → 2·d3 or d2
             if (rank_in_group_ == 0) {
-                xor_config_.thread0_is_receiver = true;
-                xor_config_.thread1_is_receiver = false;  // thread1 send to rank_in_group 2
+                xor_config_.thread0_is_receiver = false;  // thread1: send enc_0(d0) to rig2
+                xor_config_.thread1_is_receiver = true;   // thread2: recv enc_1(p2) from rig2, XOR
             } else if (rank_in_group_ == 1) {
-                xor_config_.thread0_is_receiver = true;
-                xor_config_.thread1_is_receiver = false;  // thread1 send to rank_in_group 3
+                xor_config_.thread0_is_receiver = false;  // thread1: send enc_0(d1) to rig3
+                xor_config_.thread1_is_receiver = true;   // thread2: recv enc_1(p3) from rig3, XOR
             } else if (rank_in_group_ == 2) {
-                xor_config_.thread0_is_receiver = false;
-                xor_config_.thread1_is_receiver = true;   // thread1 recv from rank_in_group 0, XOR to get d2
+                xor_config_.thread0_is_receiver = true;   // thread1: recv enc_0(d0) from rig0, XOR → d2
+                xor_config_.thread1_is_receiver = false;  // thread2: send enc_1(p2) to rig0
             } else if (rank_in_group_ == 3) {
-                xor_config_.thread0_is_receiver = false;
-                xor_config_.thread1_is_receiver = true;   // thread1 recv from rank_in_group 1, XOR to get d3
+                xor_config_.thread0_is_receiver = true;   // thread1: recv enc_0(d1) from rig1, XOR → d3
+                xor_config_.thread1_is_receiver = false;  // thread2: send enc_1(p3) to rig1
             } else {
                 xor_config_.xor_partner_rank = -1;
                 xor_config_.thread0_is_receiver = false;
@@ -3056,6 +3064,7 @@ public:
           rank_in_group_(rank_in_group >= 0 ? rank_in_group : rank),
           p2p_partner_rank_(p2p_partner_rank),
           failed_rank_in_group_(-1),
+          is_two_failures_load_mode_(false),
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_completed_(false), recv_worker_completed_(false),
           xor_worker_completed_(false), p2p_send_worker_completed_(false), p2p_recv_worker_completed_(false),
@@ -3171,6 +3180,7 @@ public:
           rank_in_group_(rank_in_group >= 0 ? rank_in_group : rank),
           p2p_partner_rank_(p2p_partner_rank),
           failed_rank_in_group_(-1),
+          is_two_failures_load_mode_(false),
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_completed_(false), recv_worker_completed_(false),
           xor_worker_completed_(false), p2p_send_worker_completed_(false), p2p_recv_worker_completed_(false),
@@ -3593,6 +3603,42 @@ public:
     }
     
     void wait_for_encoding_completion() {
+        if (is_two_failures_load_mode_) {
+            // Two-failure mode: wait for save-path workers (encoder threads,
+            // send/recv/xor/p2p) which are driven by encoding_tasks_1_/_2_ queues.
+            // Load workers are not used in this path.
+            int wait_count = 0;
+            while (true) {
+                bool all_completed = true;
+
+                if (!encoding_thread_1_completed_.load())  all_completed = false;
+                if (!encoding_thread_2_completed_.load())  all_completed = false;
+                if (!send_worker_completed_.load())         all_completed = false;
+                if (!recv_worker_completed_.load())         all_completed = false;
+                if (!xor_worker_completed_.load())          all_completed = false;
+                if (!p2p_send_worker_completed_.load())     all_completed = false;
+                if (!p2p_recv_worker_completed_.load())     all_completed = false;
+
+                if (all_completed) break;
+
+                if (++wait_count > 3000) {  // ~30s timeout
+                    std::cerr << "EC-CHECK: [Rank " << rank_
+                              << "] Two-failure wait_for_encoding_completion timeout:"
+                              << " enc1=" << encoding_thread_1_completed_.load()
+                              << " enc2=" << encoding_thread_2_completed_.load()
+                              << " send=" << send_worker_completed_.load()
+                              << " recv=" << recv_worker_completed_.load()
+                              << " xor=" << xor_worker_completed_.load()
+                              << " p2ps=" << p2p_send_worker_completed_.load()
+                              << " p2pr=" << p2p_recv_worker_completed_.load()
+                              << std::endl;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            // Two-failure encoding is CPU-only (ec_rs_encode_pool); no CUDA sync needed.
+            return;
+        }
         if (is_load_mode_) {
             // Load mode: 等待该 rank 实际使用的 load worker 完成
             int wait_count = 0;
@@ -4044,13 +4090,16 @@ public:
     void set_load_mode(bool is_load, int failed_rank) {
         is_load_mode_ = is_load;
         failed_rank_ = failed_rank;
+        // failed_rank=10 → two-failure hardware recovery (following ECLATIN convention)
+        is_two_failures_load_mode_ = (is_load && failed_rank == 10);
         failed_rank_in_group_ =
-            (failed_rank >= 0) ? (failed_rank % ECCHECK_RANKS_PER_GROUP) : -1;
+            (failed_rank >= 0 && failed_rank != 10) ? (failed_rank % ECCHECK_RANKS_PER_GROUP) : -1;
         // Rebuild XOR configuration (needs failed_rank_in_group_ for hardware recovery branches)
         build_xor_config();
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Set load mode: "
                   << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank
-                  << ", failed_rank_in_group=" << failed_rank_in_group_ << std::endl;
+                  << ", failed_rank_in_group=" << failed_rank_in_group_
+                  << ", two_failures=" << (is_two_failures_load_mode_ ? "true" : "false") << std::endl;
         
         // 新增：如果是 load mode，启动该 rank 实际使用的 load worker
         if (is_load && !load_encoder_worker_.joinable()) {
@@ -4218,10 +4267,86 @@ public:
             }
         }
     }
-    
-    // ========== Load Mode 实现（新增，写在文件末尾）==========
-    
-    // Load Encoder Worker - 独立的 load mode encoding worker
+
+    // ========== Two-Failure Encoding Submission ==========
+
+    void submit_two_failure_encoding_chunk(
+        uintptr_t data_addr, size_t size,
+        uintptr_t enc_addr_0, uintptr_t enc_addr_1,
+        uintptr_t recv_addr_1, uintptr_t recv_addr_2,
+        size_t recv_chunk_size,
+        uintptr_t own_write_addr, uintptr_t partner_write_addr
+    ) {
+        if (!is_two_failures_load_mode_) {
+            std::cerr << "EC-CHECK: [Rank " << rank_
+                      << "] submit_two_failure_encoding_chunk called but not in two-failure mode"
+                      << std::endl;
+            return;
+        }
+
+        // Submit TWO encoding tasks to save-path encoder threads.
+        // Encoder thread 1 (parity row 0): rig0→rig2, rig1→rig3
+        //   receivers: rig2, rig3 → parity_addr = own_write_addr for XOR output
+        //   senders:   rig0, rig1 → parity_addr = 0 (send via send_queue)
+        {
+            std::lock_guard<std::mutex> lock(encoding_tasks_1_mutex_);
+            encoding_tasks_1_.push({
+                data_addr, size, enc_addr_0,
+                recv_addr_1, recv_chunk_size,
+                own_write_addr,  // parity_addr: XOR destination (= own_buffer write offset)
+                own_write_addr, partner_write_addr
+            });
+        }
+        encoding_tasks_1_cv_.notify_one();
+
+        // Encoder thread 2 (parity row 1): rig2→rig0, rig3→rig1
+        //   receivers: rig0, rig1 → parity_addr = own_write_addr for XOR output
+        //   senders:   rig2, rig3 → parity_addr = 0 (send via send_queue)
+        {
+            std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_);
+            encoding_tasks_2_.push({
+                data_addr, size, enc_addr_1,
+                recv_addr_2, recv_chunk_size,
+                own_write_addr,  // parity_addr: XOR destination (= own_buffer write offset)
+                own_write_addr, partner_write_addr
+            });
+        }
+        encoding_tasks_2_cv_.notify_one();
+
+        // Track data buffer state for release coordination
+        {
+            std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
+            if (data_buffer_states_.find(data_addr) == data_buffer_states_.end()) {
+                data_buffer_states_[data_addr] = {false, false};
+            }
+        }
+    }
+
+    void submit_two_failure_encoding_sentinels() {
+        if (!is_two_failures_load_mode_) {
+            std::cerr << "EC-CHECK: [Rank " << rank_
+                      << "] submit_two_failure_encoding_sentinels called but not in two-failure mode"
+                      << std::endl;
+            return;
+        }
+
+        // Send sentinels to both encoder threads
+        {
+            std::lock_guard<std::mutex> lock(encoding_tasks_1_mutex_);
+            encoding_tasks_1_.push({0, 0, 0, 0, 0, 0, 0, 0});
+        }
+        encoding_tasks_1_cv_.notify_one();
+
+        {
+            std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_);
+            encoding_tasks_2_.push({0, 0, 0, 0, 0, 0, 0, 0});
+        }
+        encoding_tasks_2_cv_.notify_one();
+    }
+
+    // ========== Load Mode (新增，写在文件末尾)==========
+
+    // Load Encoder Worker - load mode encoding worker
     void load_encoder_worker() {
         std::cout << "EC-CHECK: [Rank " << rank_ << "] Load encoder worker started" << std::endl;
         bool encode_have_chunk = false;
@@ -6659,6 +6784,19 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("recv_chunk_size") = 0,
              pybind11::arg("parity_addr") = 0,
              pybind11::arg("p2p_partner_write_addr") = 0)
+        .def("submit_two_failure_encoding_chunk", &ECCHECKNative::submit_two_failure_encoding_chunk,
+             "Submit encoding chunk for two-failure recovery (bidirectional XOR exchange)",
+             pybind11::arg("data_addr") = 0,
+             pybind11::arg("size") = 0,
+             pybind11::arg("enc_addr_0") = 0,
+             pybind11::arg("enc_addr_1") = 0,
+             pybind11::arg("recv_addr_1") = 0,
+             pybind11::arg("recv_addr_2") = 0,
+             pybind11::arg("recv_chunk_size") = 0,
+             pybind11::arg("own_write_addr") = 0,
+             pybind11::arg("partner_write_addr") = 0)
+        .def("submit_two_failure_encoding_sentinels", &ECCHECKNative::submit_two_failure_encoding_sentinels,
+             "Submit sentinels to both encoder threads for two-failure recovery")
         .def("submit_load_step6_p2p_send", &ECCHECKNative::submit_load_step6_p2p_send,
              "Submit Step6 P2P send task (rank3 sends d3 to rank2)",
              pybind11::arg("parity_addr") = 0,

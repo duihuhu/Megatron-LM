@@ -2284,7 +2284,13 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-eccheck-software-failure', action='store_true',
                        help='Enable EC-CHECK checkpointing for software failure recovery. '
                             'When enabled, rank1 recovers d0 data block from rank0 using ASIO P2P communication.')
-    
+    group.add_argument('--use-eccheck-two-failures', action='store_true',
+                       help='Enable ECCHECK two-failure hardware recovery mode. '
+                            'rank_in_group 1 and 2 are treated as failed (node failure: '
+                            'two physical nodes lost). They recover via bidirectional XOR '
+                            'exchange with surviving ranks 0 and 3, using RDMA transport '
+                            'and 16-thread encode/XOR pool aligned with save path.')
+
     # ECLATIN (Erasure Coding Checkpoint with different pipeline) arguments
     group.add_argument('--use-eclatin', action='store_true',
                        help='Enable ECLATIN (Erasure Coding Checkpoint with different pipeline) '

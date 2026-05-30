@@ -1203,8 +1203,8 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         _mode = "HW"
     logger.info(
         "ECLATIN legacy load timing (%s): "
-        "total=%(total).2fs network_encode=%(network_encode).2fs "
-        "rebuild_sd=%(rebuild_sd).2fs", _mode, _t_ec
+        "total=%.2fs network_encode=%.2fs rebuild_sd=%.2fs",
+        _mode, _t_ec['total'], _t_ec['network_encode'], _t_ec['rebuild_sd'],
     )
 
     if world_size > 1 and torch.distributed.is_initialized():

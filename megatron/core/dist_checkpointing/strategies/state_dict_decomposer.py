@@ -73,6 +73,7 @@ class TensorMetadata:
     size_bytes: int
     global_offset: Tuple[int, ...]
     shard_index: int
+    offset: int = 0  # byte offset in tensor buffer (for reconstruction)
     chunk_type: str = 'data'
     target_rank: int = 0
     source_rank: int = 0

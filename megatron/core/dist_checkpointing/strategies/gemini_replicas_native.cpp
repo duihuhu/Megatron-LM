@@ -2296,6 +2296,8 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
         .def("start_workers", &GeminiReplicasNative::start_workers,
              py::arg("source_ranks"),
              "Start persistent send+recv worker threads (call after finalize_connections)")
+        .def("stop_workers", &GeminiReplicasNative::stop_workers,
+             "Stop all worker threads gracefully (for reinit during recovery)")
         .def("wait_for_exchange_completion", &GeminiReplicasNative::wait_for_exchange_completion,
              "Block until all send/recv workers finish the current exchange (polls atomics, 5ms sleep)")
         .def("reset_exchange_state", &GeminiReplicasNative::reset_exchange_state,

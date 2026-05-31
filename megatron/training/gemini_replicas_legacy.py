@@ -10,7 +10,7 @@ import struct
 import time
 from logging import getLogger
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -92,7 +92,8 @@ def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
         return set(main_payload["flat_key_roots"])
     flat_key_roots: Set[str] = set()
     for info in main_payload.get("tensor_infos", []):
-        first_seg = info["key"].split(".")[0]
+        key = info["key"] if isinstance(info, dict) else info.key
+        first_seg = key.split(".")[0]
         if first_seg == "model" or (
             first_seg.startswith("model")
             and len(first_seg) > 5
@@ -111,6 +112,12 @@ def state_dict_from_gemini_replicas_main_metadata_only(
         tb = main_payload["tensor_buffer"]
         buf = tb.detach().contiguous().reshape(-1).view(torch.uint8)
         tensor_infos = main_payload["tensor_infos"]
+        if tensor_infos and isinstance(tensor_infos[0], dict):
+            tensor_infos = [_dict_to_tensor_info(info) for info in tensor_infos]
+        elif tensor_infos and hasattr(tensor_infos[0], 'dtype') and isinstance(tensor_infos[0].dtype, str):
+            for info in tensor_infos:
+                ds = info.dtype
+                info.dtype = getattr(torch, ds.split(".")[-1]) if "." in ds else torch.float32
         tensor_data = extract_tensors_from_continuous_buffer(buf, tensor_infos)
         decomposed = DecomposedStateDict(
             non_tensor_data=main_payload["non_tensor_data"],
@@ -176,7 +183,6 @@ def save_gemini_replicas_legacy_checkpoint(
     t0 = time.time()
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
-    local_tensor_infos: List[Dict[str, Any]] = []  # for replica file metadata
     d2h_stream = torch.cuda.Stream()
     with torch.cuda.stream(d2h_stream):
         for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
@@ -195,6 +201,7 @@ def save_gemini_replicas_legacy_checkpoint(
                     shape=info.shape,
                     dtype=str(info.dtype),
                     size_bytes=info.size_bytes,
+                    offset=info.offset,
                     global_offset=tuple(info.global_offset)
                     if info.global_offset
                     else tuple(),
@@ -204,13 +211,6 @@ def save_gemini_replicas_legacy_checkpoint(
                     source_rank=rank,
                 )
             )
-            local_tensor_infos.append({
-                "key": info.key,
-                "shape": list(info.shape),
-                "dtype": str(info.dtype),
-                "offset": info.offset,
-                "size_bytes": info.size_bytes,
-            })
             offset += tensor_bytes
             decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
     d2h_stream.synchronize()
@@ -235,7 +235,7 @@ def save_gemini_replicas_legacy_checkpoint(
 
         my_flat_key_roots = list(decomposed.flat_key_roots) if decomposed.flat_key_roots else []
         all_meta: List[Any] = [None for _ in range(world_size)]
-        torch.distributed.all_gather_object(all_meta, (my_flat_key_roots, local_tensor_infos))
+        torch.distributed.all_gather_object(all_meta, (my_flat_key_roots, local_tensor_metadata))
         rank_flat_key_roots = {r: all_meta[r][0] for r in range(world_size)}
         rank_tensor_infos = {r: all_meta[r][1] for r in range(world_size)}
 
@@ -409,14 +409,30 @@ def _dict_to_tensor_info(info: Dict) -> Any:
 
 
 def _reconstruct_from_payload(
-    tensor_infos: List[Dict],
+    tensor_infos: Union[List[Dict], List[Any]],
     non_tensor_data: Dict[str, Any],
     tensor_buffer: torch.Tensor,
     flat_key_roots: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
-    """Reconstruct state_dict from metadata + tensor buffer."""
+    """Reconstruct state_dict from metadata + tensor buffer.
+
+    Supports both old format (tensor_infos as list of dicts) and new format
+    (tensor_infos as list of TensorMetadata objects, matching ecnaive/eclatin).
+    """
     tb = tensor_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
-    ti_objs = [_dict_to_tensor_info(info) for info in tensor_infos]
+    if tensor_infos and isinstance(tensor_infos[0], dict):
+        # Old format: dicts need full conversion (key, offset, dtype, etc.)
+        ti_objs = [_dict_to_tensor_info(info) for info in tensor_infos]
+    elif tensor_infos and hasattr(tensor_infos[0], 'dtype') and isinstance(tensor_infos[0].dtype, str):
+        # New format: TensorMetadata has str dtype → convert to torch.dtype for extract
+        ti_objs = []
+        for info in tensor_infos:
+            dtype_str = info.dtype
+            dt = getattr(torch, dtype_str.split(".")[-1]) if "." in dtype_str else torch.float32
+            info.dtype = dt
+            ti_objs.append(info)
+    else:
+        ti_objs = tensor_infos
     tensor_data = extract_tensors_from_continuous_buffer(tb, ti_objs)
     decomposed = DecomposedStateDict(
         non_tensor_data=non_tensor_data,
@@ -526,6 +542,193 @@ def _load_replica_full(replica_path: Path) -> Dict[str, Any]:
         return torch.load(replica_path, map_location="cpu", weights_only=False)
 
 
+# Module-level caches for passing all_gather results from prepare phase
+# to transfer phase (so timing only covers RDMA, not NCCL metadata exchange).
+_hw_assignments: Dict[int, Dict] = {}   # rank → {failed → sender, sender_rank, combined_size}
+_replica_needed: Dict[int, Dict] = {}    # rank → {src → sender}
+_replica_sizes: Dict[int, int] = {}      # src → combined_size
+_replica_failed_sources: Dict[int, List] = {}  # rank → [sources]
+_replica_failed: Set[int] = set()
+_replica_healthy: Set[int] = set()
+
+
+def _hw_recovery_prepare(
+    manager: GeminiReplicasManager,
+    checkpoint_dir: Path,
+    rank: int,
+    world_size: int,
+    rank_to_group: Dict[int, List[int]],
+    healthy: Set[int],
+    failed: Set[int],
+) -> None:
+    """Phase 2: role assignment + size exchange (all_gather — not timed)."""
+    if rank in healthy:
+        assignments: Dict[int, int] = {}
+        for f in sorted(failed):
+            f_group = set(rank_to_group.get(f, []))
+            f_targets = manager._calculate_target_ranks(f, world_size)
+            sender = None
+            for candidate in sorted(healthy):
+                if candidate not in f_group:
+                    continue
+                if candidate in f_targets:
+                    sender = candidate
+                    break
+            if sender is not None:
+                assignments[f] = sender
+                logger.info(
+                    f"Gemini Replicas recovery: failed rank {f} → sender {sender}"
+                )
+            else:
+                logger.warning(
+                    f"Gemini Replicas recovery: no replica found for failed rank {f}"
+                )
+
+        my_assignments: List[Tuple[int, int]] = []
+        combined_sizes: Dict[int, int] = {}
+        for f, s in assignments.items():
+            if s == rank:
+                my_assignments.append((f, s))
+                replica_path = (
+                    checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{f}.pt"
+                )
+                rp = _load_replica_metadata(replica_path)
+                if rp is not None:
+                    tensor_buf_size = rp.get("source_tensor_buffer_size", 0)
+                    meta = {
+                        "tensor_infos": rp["source_tensor_infos"],
+                        "non_tensor_data": rp["source_non_tensor_data"],
+                        "flat_key_roots": rp["source_flat_key_roots"],
+                        "tensor_buffer_size": tensor_buf_size,
+                    }
+                    meta_bytes = pickle.dumps(meta)
+                    combined_sizes[f] = 8 + len(meta_bytes) + tensor_buf_size
+
+        all_assignments = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(all_assignments, my_assignments)
+        global_assignments: Dict[int, int] = {}
+        for r_assign in all_assignments:
+            if r_assign:
+                for f, s in r_assign:
+                    global_assignments[f] = s
+
+        all_combined_sizes = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(all_combined_sizes, combined_sizes)
+        global_combined_sizes: Dict[int, int] = {}
+        for cs in all_combined_sizes:
+            if cs:
+                global_combined_sizes.update(cs)
+
+        _hw_assignments[rank] = {
+            "assignments": global_assignments,
+            "combined_sizes": global_combined_sizes,
+            "is_sender": True,
+        }
+    else:
+        my_assignments: List[Tuple[int, int]] = []
+        all_assignments = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(all_assignments, my_assignments)
+        global_assignments: Dict[int, int] = {}
+        for r_assign in all_assignments:
+            if r_assign:
+                for f, s in r_assign:
+                    global_assignments[f] = s
+
+        sender = global_assignments.get(rank)
+        if sender is None:
+            raise RuntimeError(
+                f"Gemini Replicas recovery rank {rank}: no sender assigned."
+            )
+
+        combined_sizes: Dict[int, int] = {}
+        all_combined_sizes = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(all_combined_sizes, combined_sizes)
+        global_combined_sizes: Dict[int, int] = {}
+        for cs in all_combined_sizes:
+            if cs:
+                global_combined_sizes.update(cs)
+
+        combined_size = global_combined_sizes.get(rank)
+        if combined_size is None:
+            raise RuntimeError(
+                f"Gemini Replicas recovery rank {rank}: no combined size info."
+            )
+
+        _hw_assignments[rank] = {
+            "sender": sender,
+            "combined_size": combined_size,
+            "is_sender": False,
+        }
+
+
+def _hw_recovery_transfer(
+    manager: GeminiReplicasManager,
+    checkpoint_dir: Path,
+    rank: int,
+    world_size: int,
+    failed: Set[int],
+) -> torch.Tensor:
+    """Phase 3: RDMA data transfer (timed)."""
+    info = _hw_assignments.pop(rank, {})
+    if not info:
+        return torch.zeros(0, dtype=torch.uint8)
+
+    if info["is_sender"]:
+        global_assignments = info["assignments"]
+        for f, s in global_assignments.items():
+            if s != rank:
+                continue
+            replica_path = (
+                checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{f}.pt"
+            )
+            logger.info(
+                f"Gemini Replicas recovery rank {rank}: loading replica for rank {f}"
+            )
+            rp = _load_replica_full(replica_path)
+            meta = {
+                "tensor_infos": rp["source_tensor_infos"],
+                "non_tensor_data": rp["source_non_tensor_data"],
+                "flat_key_roots": rp["source_flat_key_roots"],
+                "tensor_buffer_size": rp["source_tensor_buffer_size"],
+            }
+            meta_bytes = pickle.dumps(meta)
+            header = struct.pack("<Q", len(meta_bytes))
+            replica_buffer = rp["tensor_buffer"]
+            buf = replica_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
+            combined = torch.cat([
+                torch.frombuffer(bytearray(header), dtype=torch.uint8),
+                torch.frombuffer(bytearray(meta_bytes), dtype=torch.uint8),
+                buf,
+            ])
+            logger.info(
+                f"Gemini Replicas recovery rank {rank}: sending combined buffer "
+                f"({combined.numel() / (1024**2):.2f} MB) to rank {f}"
+            )
+            manager.send_to_rank(f, combined)
+            logger.info(f"Gemini Replicas recovery rank {rank}: sent to rank {f}")
+        return torch.zeros(0, dtype=torch.uint8)
+    else:
+        sender = info["sender"]
+        combined_size = info["combined_size"]
+        logger.info(
+            f"Gemini Replicas recovery rank {rank}: receiving "
+            f"{combined_size / (1024**2):.2f} MB from sender rank {sender}"
+        )
+        combined = manager.recv_from_rank(sender, combined_size)
+        header = combined[:8].numpy().tobytes()
+        meta_size = struct.unpack("<Q", header)[0]
+        meta_bytes = combined[8:8 + meta_size].numpy().tobytes()
+        meta = pickle.loads(meta_bytes)
+        _recovery_meta[rank] = meta
+        recovered_buffer = combined[8 + meta_size:combined_size].clone()
+        logger.info(
+            f"Gemini Replicas recovery rank {rank}: received metadata "
+            f"({meta_size} B) + tensor data "
+            f"({recovered_buffer.numel() / (1024**2):.2f} MB) from sender {sender}"
+        )
+        return recovered_buffer
+
+
 def _run_hardware_recovery(
     manager: GeminiReplicasManager,
     checkpoint_dir: Path,
@@ -578,21 +781,22 @@ def _run_hardware_recovery(
 
     if rank in healthy:
         # ---- Phase 2: role assignment (sender side) ----
+        # Sender is determined by replica topology, not file existence:
+        # a failed rank f's data was replicated to f's target ranks.
+        # The first healthy target rank serves as the sender.
         assignments: Dict[int, int] = {}
 
         for f in sorted(failed):
             f_group = set(rank_to_group.get(f, []))
+            f_targets = manager._calculate_target_ranks(f, world_size)
             sender = None
             for candidate in sorted(healthy):
                 if candidate not in f_group:
                     continue
-                replica_path = (
-                    checkpoint_dir
-                    / f"gemini_replicas_replica_rank{candidate}_from{f}.pt"
-                )
-                if replica_path.is_file():
-                    sender = candidate
-                    break
+                if candidate not in f_targets:
+                    continue
+                sender = candidate
+                break
             if sender is not None:
                 assignments[f] = sender
                 logger.info(
@@ -751,6 +955,227 @@ def _run_hardware_recovery(
     return torch.zeros(0, dtype=torch.uint8)
 
 
+def _replica_recovery_prepare(
+    manager: GeminiReplicasManager,
+    checkpoint_dir: Path,
+    rank: int,
+    world_size: int,
+    failed: Set[int],
+    healthy: Set[int],
+) -> None:
+    """Phase 4a: replica role assignment + size exchange (all_gather — not timed)."""
+    global _replica_needed, _replica_sizes, _replica_failed_sources, _replica_failed, _replica_healthy
+
+    failed_sources: Dict[int, List[int]] = {}
+    all_sources: Set[int] = set()
+    for f in failed:
+        sources: List[int] = []
+        for s in range(world_size):
+            if s == f:
+                continue
+            targets = manager._calculate_target_ranks(s, world_size)
+            if f in targets:
+                sources.append(s)
+                all_sources.add(s)
+        if sources:
+            failed_sources[f] = sources
+
+    _replica_failed_sources = failed_sources
+    _replica_failed = failed
+    _replica_healthy = healthy
+
+    if not all_sources:
+        _replica_needed = {}
+        _replica_sizes = {}
+        return
+
+    if rank in failed:
+        logger.info(
+            f"Gemini Replicas replica recovery rank {rank}: "
+            f"need replicas from sources {failed_sources.get(rank, [])}"
+        )
+
+    needed: Dict[int, int] = {}
+    for src in sorted(all_sources):
+        if src in healthy:
+            needed[src] = src
+        else:
+            src_targets = manager._calculate_target_ranks(src, world_size)
+            for candidate in sorted(healthy):
+                if candidate in src_targets:
+                    needed[src] = candidate
+                    break
+        if src not in needed:
+            logger.warning(
+                f"Gemini Replicas replica recovery rank {rank}: "
+                f"no source found for replica from rank {src}"
+            )
+
+    if not needed:
+        _replica_needed = {}
+        _replica_sizes = {}
+        return
+
+    my_needed: List[Tuple[int, int]] = [(src, snd) for src, snd in needed.items()]
+    all_needed: List[Any] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(all_needed, my_needed)
+
+    global_needed: Dict[int, int] = {}
+    for entry in all_needed:
+        if entry:
+            for src, snd in entry:
+                global_needed[src] = snd
+
+    combined_sizes: Dict[int, int] = {}
+    if rank in healthy:
+        for src, snd in global_needed.items():
+            if snd != rank:
+                continue
+            info = _read_source_data_for_replica(
+                checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt",
+                checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{src}.pt"
+                if src != rank else None,
+                rank, src,
+            )
+            if info is not None:
+                combined_sizes[src] = info[3]
+
+    all_sizes: List[Any] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(all_sizes, combined_sizes)
+    global_sizes: Dict[int, int] = {}
+    for entry in all_sizes:
+        if entry:
+            global_sizes.update(entry)
+
+    _replica_needed = global_needed
+    _replica_sizes = global_sizes
+
+
+def _recover_missing_replicas_transfer(
+    manager: GeminiReplicasManager,
+    checkpoint_dir: Path,
+    rank: int,
+    world_size: int,
+    failed: Set[int],
+) -> None:
+    """Phase 4b: replica data transfer via RDMA (timed)."""
+    global_needed = _replica_needed
+    global_sizes = _replica_sizes
+    failed_sources = _replica_failed_sources
+    healthy = _replica_healthy
+
+    if not global_needed:
+        return
+
+    if rank in healthy:
+        for src, snd in sorted(global_needed.items()):
+            if snd != rank:
+                continue
+            combined_size = global_sizes.get(src)
+            if combined_size is None:
+                continue
+
+            if src == rank:
+                mp = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
+                from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
+                payload = read_raw_checkpoint(str(mp), MAGIC_GEMINI)
+                meta = {
+                    "tensor_infos": payload["tensor_infos"],
+                    "non_tensor_data": payload["non_tensor_data"],
+                    "flat_key_roots": payload.get("flat_key_roots", []),
+                    "tensor_buffer_size": payload["tensor_buffer"].numel(),
+                }
+                buf = payload["tensor_buffer"].detach().contiguous().view(torch.uint8)
+            else:
+                rp = _load_replica_full(
+                    checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{src}.pt"
+                )
+                meta = {
+                    "tensor_infos": rp["source_tensor_infos"],
+                    "non_tensor_data": rp["source_non_tensor_data"],
+                    "flat_key_roots": rp.get("source_flat_key_roots", []),
+                    "tensor_buffer_size": rp["source_tensor_buffer_size"],
+                }
+                buf = rp["tensor_buffer"].detach().contiguous().view(torch.uint8)
+
+            meta_bytes = pickle.dumps(meta)
+            header = struct.pack("<Q", len(meta_bytes))
+            combined = torch.cat([
+                torch.frombuffer(bytearray(header), dtype=torch.uint8),
+                torch.frombuffer(bytearray(meta_bytes), dtype=torch.uint8),
+                buf,
+            ])
+
+            for f in sorted(failed):
+                if src not in failed_sources.get(f, []):
+                    continue
+                targets = manager._calculate_target_ranks(src, world_size)
+                if f in targets:
+                    logger.info(
+                        f"Gemini Replicas replica recovery rank {rank}: "
+                        f"sending replica for source {src} to failed rank {f} "
+                        f"({combined.numel() / (1024**2):.2f} MB)"
+                    )
+                    manager.send_to_rank(f, combined)
+    else:
+        my_sources = set(failed_sources.get(rank, []))
+        for src, snd in sorted(global_needed.items()):
+            if src not in my_sources:
+                continue
+            combined_size = global_sizes.get(src)
+            if combined_size is None:
+                continue
+            logger.info(
+                f"Gemini Replicas replica recovery rank {rank}: "
+                f"receiving replica for source {src} "
+                f"({combined_size / (1024**2):.2f} MB)"
+            )
+            combined = manager.recv_from_rank(snd, combined_size)
+            header = combined[:8].numpy().tobytes()
+            meta_size = struct.unpack("<Q", header)[0]
+            logger.info(
+                f"Gemini Replicas replica recovery rank {rank}: "
+                f"received replica for source {src} "
+                f"({(combined_size - 8 - meta_size) / (1024**2):.2f} MB in memory)"
+            )
+
+
+def _read_source_data_for_replica(
+    main_path: Path, replica_path: Optional[Path], rank: int, src_r: int
+) -> Optional[Tuple]:
+    """Read source data for replica recovery size computation."""
+    if src_r == rank:
+        from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
+        if not main_path.is_file():
+            return None
+        if is_raw_format(str(main_path), MAGIC_GEMINI):
+            payload = read_raw_checkpoint(str(main_path), MAGIC_GEMINI)
+            buf = payload["tensor_buffer"].detach().contiguous().view(torch.uint8)
+            meta = {
+                "tensor_infos": payload["tensor_infos"],
+                "non_tensor_data": payload["non_tensor_data"],
+                "flat_key_roots": payload.get("flat_key_roots", []),
+                "tensor_buffer_size": buf.numel(),
+            }
+            mb = pickle.dumps(meta)
+            return meta, mb, buf, 8 + len(mb) + buf.numel()
+        return None
+    else:
+        if replica_path is None:
+            return None
+        rp = _load_replica_metadata(replica_path)
+        if rp is None:
+            return None
+        meta = {
+            "tensor_infos": rp["source_tensor_infos"],
+            "non_tensor_data": rp["source_non_tensor_data"],
+            "flat_key_roots": rp.get("source_flat_key_roots", []),
+            "tensor_buffer_size": rp["source_tensor_buffer_size"],
+        }
+        mb = pickle.dumps(meta)
+        return meta, mb, None, 8 + len(mb) + meta["tensor_buffer_size"]
+
+
 def _recover_missing_replicas(
     manager: GeminiReplicasManager,
     checkpoint_dir: Path,
@@ -798,16 +1223,13 @@ def _recover_missing_replicas(
     needed: Dict[int, int] = {}  # source_rank → sender_rank
     for src in sorted(all_sources):
         if src in healthy:
-            # Source is healthy → use its own main.pt directly
+            # Source is healthy → use its own data directly
             needed[src] = src
         else:
-            # Source is also failed → find a healthy rank with a replica
+            # Source is failed → sender = first healthy rank in src's target list
+            src_targets = manager._calculate_target_ranks(src, world_size)
             for candidate in sorted(healthy):
-                replica_path = (
-                    checkpoint_dir
-                    / f"gemini_replicas_replica_rank{candidate}_from{src}.pt"
-                )
-                if replica_path.is_file():
+                if candidate in src_targets:
                     needed[src] = candidate
                     break
         if src not in needed:
@@ -883,6 +1305,9 @@ def _recover_missing_replicas(
         if entry:
             global_sizes.update(entry)
 
+    # Connections already rebuilt in Phase 3 (reinit_for_recovery);
+    # survivor↔failed topology is still active — no need to reinit again.
+
     # ---- Phase 4b: transfer replica data ----
     if rank in healthy:
         for src, snd in sorted(global_needed.items()):
@@ -925,8 +1350,10 @@ def _recover_missing_replicas(
                 buf,
             ])
 
-            # Find which failed rank needs this replica (target list of src includes f)
-            for f in failed:
+            # Send only to failed ranks that actually need this source
+            for f in sorted(failed):
+                if src not in failed_sources.get(f, []):
+                    continue
                 targets = manager._calculate_target_ranks(src, world_size)
                 if f in targets:
                     logger.info(
@@ -935,11 +1362,13 @@ def _recover_missing_replicas(
                         f"({combined.numel() / (1024**2):.2f} MB)"
                     )
                     manager.send_to_rank(f, combined)
-                    break
 
     else:
-        # Failed rank: receive replica data (sorted for deterministic ordering)
+        # Failed rank: receive replica data only for sources this rank needs
+        my_sources = set(failed_sources.get(rank, []))
         for src, snd in sorted(global_needed.items()):
+            if src not in my_sources:
+                continue
             combined_size = global_sizes.get(src)
             if combined_size is None:
                 continue
@@ -1087,16 +1516,43 @@ def load_gemini_replicas_legacy_checkpoint(
         # Setup (not timed): metadata collection
         meta = _collect_metadata_for_failed_rank(checkpoint_dir, rank, world_size)
 
-        # === timing: network/encode (ASIO/RDMA send/recv) ===
-        _t0 = time.time()
-        recovered_buffer = _run_hardware_recovery(
-            manager, checkpoint_dir, rank, world_size,
-            failed_override=failed_override,
-        )
-        _t['network_encode'] = time.time() - _t0
+        # Setup (not timed): group membership + health determination
+        rank_to_group: Dict[int, List[int]] = {}
+        for r in range(world_size):
+            if r not in rank_to_group:
+                members = manager.get_group_members(r, world_size)
+                for m in members:
+                    rank_to_group[m] = members
+        if failed_override:
+            healthy = {r for r in range(world_size) if r not in failed_override}
+            failed = failed_override
+        else:
+            healthy = {r for r, ok in enumerate(health_list) if ok}
+            failed = {r for r in range(world_size) if r not in healthy}
 
-        # Step 3: Reconstruct state dict
+        # Setup (not timed): role assignment (all_gather, not in network timing)
+        _hw_recovery_prepare(
+            manager, checkpoint_dir, rank, world_size,
+            rank_to_group, healthy, failed,
+        )
+        _replica_recovery_prepare(
+            manager, checkpoint_dir, rank, world_size, failed, healthy,
+        )
+
+        # Setup (not timed): rebuild connections for survivor↔failed topology
+        if failed_override:
+            manager.reinit_for_recovery(failed_override)
+
+        # === timing: network/encode (RDMA send/recv only) ===
         _t0 = time.time()
+        recovered_buffer = _hw_recovery_transfer(
+            manager, checkpoint_dir, rank, world_size, failed,
+        )
+        _recover_missing_replicas_transfer(
+            manager, checkpoint_dir, rank, world_size, failed,
+        )
+        _t['network_encode'] = time.time() - _t0  # RDMA transfer only (Phase 3 + Phase 4b)
+        _t0_sd = time.time()
         if is_failed:
             if rank in _recovery_meta:
                 meta.update(_recovery_meta.pop(rank))
@@ -1131,13 +1587,7 @@ def load_gemini_replicas_legacy_checkpoint(
                 tensor_buffer=main_payload["tensor_buffer"],
                 flat_key_roots=_infer_flat_key_roots(main_payload),
             )
-        _t['rebuild_sd'] = time.time() - _t0
-
-        # Phase 4: failed ranks recover replica data they were holding for others.
-        # ALL ranks must participate (uses all_gather + C++ send/recv).
-        _recover_missing_replicas(
-            manager, checkpoint_dir, rank, world_size, failed_override,
-        )
+        _t['rebuild_sd'] = time.time() - _t0_sd
         _t['total'] = _t['network_encode'] + _t['rebuild_sd']
 
         logger.info(

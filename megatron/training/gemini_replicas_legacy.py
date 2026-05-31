@@ -1562,24 +1562,6 @@ def load_gemini_replicas_legacy_checkpoint(
                 tensor_buffer=recovered_buffer,
                 flat_key_roots=set(meta.get("flat_key_roots", [])),
             )
-            # Regenerate main file
-            from megatron.training.legacy_io_utils import write_raw_checkpoint, MAGIC_GEMINI
-            regen_tensor = recovered_buffer.contiguous().view(torch.uint8)
-            write_raw_checkpoint(
-                str(main_path), MAGIC_GEMINI,
-                meta["non_tensor_data"], meta["tensor_infos"],
-                regen_tensor, meta["tensor_buffer_size"],
-                version=1, format="gemini_replicas_torch_legacy",
-                rank=rank, world_size=world_size,
-                num_replicas=manager.num_replicas,
-                group_size=manager.group_size,
-                tensor_buffer_size=meta["tensor_buffer_size"],
-                flat_key_roots=meta.get("flat_key_roots", []),
-            )
-            logger.info(
-                f"Gemini Replicas hardware recovery rank {rank}: "
-                f"regenerated main file {main_path}"
-            )
         else:
             state_dict = _reconstruct_from_payload(
                 tensor_infos=main_payload["tensor_infos"],

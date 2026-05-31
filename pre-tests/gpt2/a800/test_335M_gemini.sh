@@ -207,8 +207,8 @@ EVAL_AND_LOGGING_ARGS=(
     #   示例："2,3" 表示 rank2 和 rank3 当作故障处理。
     #
     #--use-gemini-replicas-software-failure
-    --use-gemini-replicas-hardware-failure
-    --gemini-replicas-recovery-rank "0,1" # "0,1,2,3,4,5,6,7" for ali 8 ranks per node, but untested yet
+    #--use-gemini-replicas-hardware-failure
+    --gemini-replicas-recovery-rank "0" # "0,1,2,3,4,5,6,7" for ali 8 ranks per node, but untested yet
 
     # ---------------------------------------------------------------------------
     # ckpt 格式：必须用 torch（legacy 路径）

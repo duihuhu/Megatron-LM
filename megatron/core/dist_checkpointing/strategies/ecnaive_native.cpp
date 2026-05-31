@@ -176,7 +176,7 @@ private:
     std::mutex send_mutex_;
     std::mutex recv_mutex_;
     
-    static const size_t TEMP_BUFFER_SIZE = 512ULL * 1024 * 1024;  // 512 MB (sufficient for k=6 blocks ~200 MB each)
+    static const size_t TEMP_BUFFER_SIZE = 128ULL * 1024 * 1024;  // 128 MB
     static const size_t CHUNK_SIZE = 64 * 1024 * 1024;  // 64 MB per RDMA operation
     static const int MAX_WR = 64;
     static const int MAX_BATCH_WR = 32;
@@ -4177,7 +4177,9 @@ private:
     // Create 8 RDMA load channels and connect QPs (after ASIO load connections are established).
     // rank2: 8 recv channels (we_send_first=false); rank0: ch 1,2,7; rank1: ch 3,4,5; rank3: ch 0,6.
     void init_rdma_load_channels() {
-        if (!use_rdma_ || !rdma_pd_) return;
+        if (!use_rdma_ || !rdma_pd_ || !rdma_context_) return;
+        // Guard: CQs must be initialized (Phase 1), channels not already created
+        if (!rdma_load_send_cq_[0]) return;
         int rank_for_log = (rank_ >= 0) ? rank_ : 0;
         try {
             if (rank_ == 2) {

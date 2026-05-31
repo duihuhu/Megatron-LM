@@ -740,9 +740,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 torch.distributed.barrier()
 
     # And update the latest iteration
-    # Write from local rank 0 on every node (not just global rank 0) so the
+    # Write from the first GPU on every node (not just global rank 0) so the
     # tracker file survives single-node failures.
-    is_local_rank0 = int(os.environ.get('LOCAL_RANK', 0)) == 0
+    is_local_rank0 = torch.cuda.is_available() and torch.cuda.current_device() == 0
     if not torch.distributed.is_initialized() \
             or (torch.distributed.get_rank() == 0 or is_local_rank0):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)

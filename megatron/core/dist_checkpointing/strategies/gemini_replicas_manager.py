@@ -751,10 +751,158 @@ class GeminiReplicasManager:
         native.recv_from_rank(source_rank, int(buf.data_ptr()), expected_size)
         return buf
 
+    def _stop_native_gracefully(self):
+        """Stop native workers and drop the C++ instance without crashing.
+
+        Workers are torn down via the destructor to avoid double-free of RDMA
+        resources that the C++ destructor also cleans up.
+        """
+        native = self._gemini_replicas_native
+        if native is not None:
+            try:
+                native.stop_workers()
+            except Exception:
+                pass
+            try:
+                native.stop()
+            except Exception:
+                pass
+            self._gemini_replicas_native = None
+
+    def reinit_for_recovery(self, recovery_ranks: set) -> None:
+        """Rebuild connections for HW recovery: survivor↔failed within group.
+
+        During recovery, a failed rank may need to receive replica data from a
+        healthy rank that was NOT in its save-time connection topology.  This
+        method tears down the existing connections and rebuilds them so that
+        every healthy rank can send to every failed rank in the same group.
+
+        Args:
+            recovery_ranks (set): Global ranks that need recovery (treated as
+                failed — their disk data is lost).
+        """
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+
+        if not recovery_ranks:
+            return
+
+        # ---- classify ranks ----
+        is_failed = rank in recovery_ranks
+        is_healthy = not is_failed
+
+        # Compute group memberships so we only connect within the same group
+        all_members = self.get_group_members(rank, world_size)
+        failed_in_group = recovery_ranks & set(all_members)
+        healthy_in_group = set(all_members) - failed_in_group
+
+        if not failed_in_group or not healthy_in_group:
+            return  # nothing to do — no failed ranks in this group
+
+        logger.info(
+            f"Gemini Replicas: [Rank {rank}] Reinitializing for recovery: "
+            f"failed_in_group={sorted(failed_in_group)}, "
+            f"healthy_in_group={sorted(healthy_in_group)}"
+        )
+
+        # ---- tear down old connections ----
+        self._stop_native_gracefully()
+
+        # ---- build recovery topology ----
+        base_ip = resolve_ip("GEMINI_REPLICAS", rank=rank)
+        master_port = int(os.environ.get('MASTER_PORT', '6000'))
+        # Use a different base port to avoid conflicts with the save connections
+        reco_base_port = int(os.environ.get(
+            'GEMINI_REPLICAS_RECOVERY_BASE_PORT',
+            master_port + 40000
+        ))
+
+        # Exchange IPs
+        rank_ips = {}
+        if torch.distributed.is_initialized():
+            try:
+                ip_list = [None] * world_size
+                torch.distributed.all_gather_object(ip_list, base_ip)
+                for r, ip in enumerate(ip_list):
+                    rank_ips[r] = ip
+            except Exception:
+                for r in range(world_size):
+                    rank_ips[r] = base_ip
+
+        # Recovery topology: survivors ↔ failed
+        # Each rank listens on its own port: reco_base_port + rank * 100
+        # Senders connect to the TARGET's listen port
+        PORT_STEP = 100
+        recv_port = reco_base_port + rank * PORT_STEP
+
+        if is_healthy:
+            target_ranks = sorted(failed_in_group)
+            target_ips = [rank_ips.get(t, base_ip) for t in target_ranks]
+            target_ports = [reco_base_port + t * PORT_STEP for t in target_ranks]
+            source_ranks = sorted(failed_in_group)
+            num_sources = len(source_ranks)
+        else:
+            target_ranks = sorted(healthy_in_group)
+            target_ips = [rank_ips.get(t, base_ip) for t in target_ranks]
+            target_ports = [reco_base_port + t * PORT_STEP for t in target_ranks]
+            source_ranks = sorted(healthy_in_group)
+            num_sources = len(source_ranks)
+
+        # ---- create new native module ----
+        try:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            import glob as _glob_module
+            so_files = _glob_module.glob(
+                os.path.join(current_dir, "gemini_replicas_native*.so")
+            )
+            if not so_files:
+                logger.error("Gemini Replicas: No .so found for recovery reinit")
+                return
+            import importlib.util as _importlib_util
+            so_path = so_files[0]
+            spec = _importlib_util.spec_from_file_location(
+                "gemini_replicas_native", so_path
+            )
+            gemini_replicas_native = _importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(gemini_replicas_native)
+
+            mode_str = "RDMA" if self.use_rdma else "ASIO"
+            logger.info(
+                f"Gemini Replicas recovery: [Rank {rank}] creating native module: "
+                f"targets={target_ranks}, sources={source_ranks} ({mode_str})"
+            )
+
+            # Barrier so everyone stops before reconnecting
+            torch.distributed.barrier()
+
+            self._gemini_replicas_native = gemini_replicas_native.GeminiReplicasNative(
+                rank, world_size,
+                target_ranks, target_ips, target_ports,
+                base_ip, recv_port, num_sources,
+                self.use_rdma,
+            )
+
+            torch.distributed.barrier()
+            self._gemini_replicas_native.finalize_connections()
+            self._gemini_replicas_native.start_workers(source_ranks)
+
+            logger.info(
+                f"Gemini Replicas recovery: [Rank {rank}] reinit complete, "
+                f"targets={target_ranks}, sources={source_ranks}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Gemini Replicas: [Rank {rank}] recovery reinit failed: {e}"
+            )
+            import traceback
+            traceback.print_exc()
+            self._gemini_replicas_native = None
+            raise
+
     def cleanup(self):
         """Cleanup resources."""
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        
+
         # Unregister all buffers for RDMA
         if self.use_rdma and self._gemini_replicas_native is not None:
             for buffer_addr in list(self.registered_buffers.keys()):
@@ -764,11 +912,11 @@ class GeminiReplicasManager:
                 except Exception as e:
                     logger.warning(f"Gemini Replicas: [Rank {rank}] Failed to unregister buffer during cleanup: {e}")
             self.registered_buffers.clear()
-        
+
         if self._gemini_replicas_native is not None:
             logger.info("Gemini Replicas: Cleaning up native module")
             self._gemini_replicas_native = None
-        
+
         self.preallocated_cpu_buffer = None
         self.decomposed_state_dict = None
         self.replica_buffers = []

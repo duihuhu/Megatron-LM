@@ -762,28 +762,12 @@ def _run_eclatin_full_recovery(
         raise RuntimeError("ECLATIN native module is not initialized")
 
     input_args = use_args()
+    if input_args.use_eclatin_software_failure:
+        # main.pt is intact — no network config, no transfer, no barrier needed.
+        return
+
     net_config = manager._get_eclatin_network_config(rank, world_size)
     rank_in_group = net_config["rank_in_group"]
-
-    if input_args.use_eclatin_software_failure:
-        if rank_in_group == 2:
-            if recovered_buffer is None:
-                raise RuntimeError("ECLATIN legacy load: software failure path needs recovered_buffer")
-            actual_tensor_buffer_size = _max_tensor_bytes_from_registry(registry, world_size)
-            half_actual_data = actual_tensor_buffer_size // 2
-            if recovered_buffer.numel() >= total_size:
-                first_half_actual = min(half_actual_data, total_size)
-                recovered_buffer[:first_half_actual].copy_(
-                    eclatin_blocks["data_block_1"][:first_half_actual]
-                )
-                if total_size > half_actual_data:
-                    second_half_size = total_size - half_actual_data
-                    recovered_buffer[first_half_actual:total_size].copy_(
-                        eclatin_blocks["data_block_2"][:second_half_size]
-                    )
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        return
 
     failed_rank = 2
     native.set_load_mode(True, failed_rank)
@@ -1155,16 +1139,25 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             )
     elif rank_in_group == 2:
         if sw_failure:
-            _load_eclatin_blocks_from_disk_into(
-                eclatin_blocks,
-                checkpoint_dir,
-                rank,
-                rank_in_group,
-                software_only=True,
+            # Allocate recovered_buffer and load block files directly into
+            # the right slices — avoids a separate eclatin_blocks allocation +
+            # later memcpy from blocks to recovered_buffer.
+            recovered_buffer = torch.empty(total_size, dtype=torch.uint8)
+            actual_max = _max_tensor_bytes_from_registry(registry, world_size)
+            half = actual_max // 2
+            first = min(half, total_size)
+            _copy_eclatin_block_file_into_tensor(
+                checkpoint_dir, rank, "data_block_1",
+                recovered_buffer[:first],
             )
+            if total_size > first:
+                _copy_eclatin_block_file_into_tensor(
+                    checkpoint_dir, rank, "data_block_2",
+                    recovered_buffer[first:total_size],
+                )
         else:
             recv_buffers = manager.allocate_eclatin_load_recv_buffers(registry)
-        recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
+            recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
     else:
         _load_eclatin_blocks_from_disk_into(
             eclatin_blocks,
@@ -1175,11 +1168,13 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         )
 
     if manager.use_rdma:
-        for key in ("data_block_1", "data_block_2", "parity_block_1", "parity_block_2"):
-            manager.register_buffer(eclatin_blocks[key])
-        if recv_buffers is not None:
-            for t in recv_buffers.values():
-                manager.register_buffer(t)
+        # SW failure: no network transfer, skip RDMA registration entirely
+        if not sw_failure:
+            for key in ("data_block_1", "data_block_2", "parity_block_1", "parity_block_2"):
+                manager.register_buffer(eclatin_blocks[key])
+            if recv_buffers is not None:
+                for t in recv_buffers.values():
+                    manager.register_buffer(t)
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 

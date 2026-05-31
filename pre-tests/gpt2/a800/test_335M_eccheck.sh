@@ -131,8 +131,8 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
     --use-eccheck
-    --use-eccheck-two-failures
-    # --use-eccheck-software-failure # toggle for software failure; untoggled for hardware failure
+    #--use-eccheck-two-failures
+    #--use-eccheck-software-failure # toggle for software failure; untoggled for hardware failure
     --ckpt-format torch
     --save-embeddings-separately
     --timing-log-level 2

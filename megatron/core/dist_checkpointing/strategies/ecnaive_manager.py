@@ -115,12 +115,21 @@ class ECNAIVEManager:
     _cached_block_size: int = 0
     _cached_blocks: Optional[List[torch.Tensor]] = None
 
-    def allocate_preallocated_blocks(self, count: int, aligned_size: int):
-        """Allocate or reuse cached persistent blocks (n = k+2 blocks)."""
+    def allocate_preallocated_blocks(self, count: int, aligned_size: int,
+                                      pin: Optional[bool] = None):
+        """Allocate or reuse cached persistent blocks (n = k+2 blocks).
+
+        Args:
+            count: Number of blocks.
+            aligned_size: Size of each block in bytes.
+            pin: Whether to pin memory. None = use manager default.
+                 Set False during load to avoid exhausting CUDA lockable memory.
+        """
         if (self._cached_blocks is not None and self._cached_block_count == count
                 and self._cached_block_size >= aligned_size):
             return self._cached_blocks
-        pin = self.ecnaive_pin_memory and torch.cuda.is_available()
+        if pin is None:
+            pin = self.ecnaive_pin_memory and torch.cuda.is_available()
         logger.info(
             f"ECNAIVE: Allocating {count} blocks: {aligned_size / (1024**3):.2f} GB each "
             f"({count * aligned_size / (1024**3):.2f} GB total, pin={pin})"

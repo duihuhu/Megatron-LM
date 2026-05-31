@@ -546,15 +546,39 @@ def _load_eccheck_main_payload(
             raise FileNotFoundError(f"ECCHECK legacy: missing main file {main_path}")
         return local_payload
 
-    gathered: List[Optional[Dict[str, Any]]] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(gathered, local_payload)
+    # Strip tensor_buffer before all_gather — it's multiple GB for large models
+    # and NCCL all_gather creates GPU staging buffers proportional to
+    # world_size × serialized_size → OOM on 7B+.
+    if local_payload is not None:
+        stripped: Dict[str, Any] = {}
+        for k, v in local_payload.items():
+            if k == "tensor_buffer":
+                continue
+            stripped[k] = v
+    else:
+        stripped = None
 
-    chosen = gathered[rank]
-    if chosen is None:
-        raise FileNotFoundError(
-            f"ECCHECK legacy: eccheck_main_rank{rank}.pt missing on all ranks under {checkpoint_dir}"
-        )
-    return chosen
+    gathered: List[Optional[Dict[str, Any]]] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, stripped)
+
+    if local_payload is not None:
+        return local_payload
+
+    # HW failure: local disk lost — recover metadata from another rank.
+    for r in range(world_size):
+        if gathered[r] is not None:
+            logger.info(
+                f"ECCHECK legacy: eccheck_main_rank{rank}.pt missing locally; "
+                f"recovered metadata from rank {r}"
+            )
+            result = dict(gathered[r])
+            result["tensor_buffer"] = None  # to be recovered via XOR decode
+            return result
+
+    raise FileNotFoundError(
+        f"ECCHECK legacy: eccheck_main_rank{rank}.pt missing on all ranks "
+        f"under {checkpoint_dir}"
+    )
 
 
 def _copy_block_file_into_tensor(

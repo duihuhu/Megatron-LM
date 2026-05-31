@@ -160,7 +160,7 @@ EVAL_AND_LOGGING_ARGS=(
      --ecnaive-rs-k 2             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
     #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
     #--use-ecnaive-software-failure
-    --ecnaive-failed-ranks 0,1   # Comma-separated failed global ranks for hardware recovery only; software recovery is set to 2
+    --ecnaive-failed-ranks 0   # Comma-separated failed global ranks for hardware recovery only; software recovery is set to 2
     #                                Uses ISA-L RS decoding (GF(2^8)) to recover 1-2 lost blocks
 )
 

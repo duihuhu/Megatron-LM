@@ -52,11 +52,16 @@ def _build_global_registry(local_metadata: List[TensorMetadata], local_non_tenso
 def _allocate_ecnaive_blocks(
     manager: ECNAIVEManager,
     rank_metadata: Dict[int, List[TensorMetadata]],
+    pin: bool = True,
 ) -> Dict[str, Any]:
-    """Allocate n persistent blocks for EC-NAIVE save (generalized k+2 scheme).
+    """Allocate n persistent blocks for EC-NAIVE save/load (generalized k+2 scheme).
 
     Each rank stores n blocks: 1 own data block + (n-1) blocks received from peers.
     Each block size = ceil(max_total_bytes / k / buffer_size) * buffer_size.
+
+    Args:
+        pin: Whether to pin CPU memory. True for save (DMA), False for load
+             (avoids exhausting CUDA lockable memory on large models).
     """
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -79,7 +84,7 @@ def _allocate_ecnaive_blocks(
         // manager.ecnaive_buffer_size
     ) * manager.ecnaive_buffer_size
 
-    slices = manager.allocate_preallocated_blocks(n, aligned_block_size)
+    slices = manager.allocate_preallocated_blocks(n, aligned_block_size, pin=pin)
 
     # Name blocks: own_data0 + recv_0 ... recv_{n-2}
     blocks: Dict[str, torch.Tensor] = {"own_data0": slices[0]}
@@ -374,16 +379,41 @@ def _load_ecnaive_main_payload(
             raise FileNotFoundError(f"EC-NAIVE legacy: missing main file {main_path}")
         return local_payload
 
-    gathered: List[Optional[Dict[str, Any]]] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(gathered, local_payload)
+    # all_gather_object pickles the entire payload including tensor_buffer
+    # (multiple GB for large models).  NCCL all_gather creates GPU staging
+    # buffers proportional to  world_size × serialized_size  → OOM on 7B+.
+    # Strip tensor_buffer before the collective; only exchange metadata.
+    if local_payload is not None:
+        stripped: Dict[str, Any] = {}
+        for k, v in local_payload.items():
+            if k == "tensor_buffer":
+                continue
+            stripped[k] = v
+    else:
+        stripped = None
 
-    chosen = gathered[rank]
-    if chosen is None:
-        raise FileNotFoundError(
-            f"EC-NAIVE legacy: ecnaive_main_rank{rank}.pt missing on all ranks "
-            f"under {checkpoint_dir}"
-        )
-    return chosen
+    gathered: List[Optional[Dict[str, Any]]] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, stripped)
+
+    if local_payload is not None:
+        return local_payload
+
+    # HW failure: local disk lost — recover metadata from another rank.
+    # tensor_buffer will be recovered through RS decode.
+    for r in range(world_size):
+        if gathered[r] is not None:
+            logger.info(
+                f"EC-NAIVE legacy: ecnaive_main_rank{rank}.pt missing locally; "
+                f"recovered metadata from rank {r}"
+            )
+            result = dict(gathered[r])
+            result["tensor_buffer"] = None  # to be recovered via RS decode
+            return result
+
+    raise FileNotFoundError(
+        f"EC-NAIVE legacy: ecnaive_main_rank{rank}.pt missing on all ranks "
+        f"under {checkpoint_dir}"
+    )
 
 
 def _load_blocks_from_disk(checkpoint_dir: Path, rank: int) -> Dict[str, torch.Tensor]:
@@ -577,7 +607,6 @@ def _load_ecnaive_legacy_software_failure(
     """
     from time import time as _time
     _t = timings if timings is not None else {}
-    _t0_func = _time()
 
     native = manager._ecnaive_native
     if native is None:
@@ -604,7 +633,7 @@ def _load_ecnaive_legacy_software_failure(
     # Phase 1: setup (not timed) — RDMA connection setup + barrier
     manager.init_ecnaive_sw_recovery(rank, world_size, failed_rank_in_group=failed_rig)
 
-    # === timing: network/encode (C++ send/recv + decode + assemble) ===
+    # === timing: network/encode ===
     _t0_net = _time()
     if rank_in_group == failed_rig:
         # ---- FAILED RANK ----
@@ -650,10 +679,6 @@ def _load_ecnaive_legacy_software_failure(
         state_dict = reconstruct_state_dict(decomposed)
         unflatten_optimizer_fp32_params(state_dict)
         _t['rebuild_sd'] = _time() - _t0_rebuild
-        logger.info(
-            "EC-NAIVE legacy sw: rank_in_group=%d recovered state_dict in %.2fs",
-            failed_rig, _time() - _t0_func,
-        )
 
     else:
         # ---- SENDER RANK (if I hold a data block for the failed rank) ----
@@ -712,9 +737,6 @@ def _load_ecnaive_legacy_software_failure(
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    logger.info(
-        f"EC-NAIVE legacy sw: done in {_time() - _t0_func:.2f}s (rank {rank})"
-    )
     # NOTE: do not call manager.cleanup() here in the software failure path.
     # cleanup() calls native.stop() which tears down C++ resources, and the
     # subsequent reference drop triggers the C++ destructor (double-free on the

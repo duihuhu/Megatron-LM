@@ -885,15 +885,24 @@ def recover_frcheck_legacy_hardware(
         except Exception as e:
             logger.warning("FRCheck recovery: failed to read main file: %s", e)
 
-    # Exchange payloads via all_gather so failed ranks get metadata
+    # Exchange payloads via all_gather so failed ranks get metadata.
+    # Strip tensor_buffer before all_gather — it's multiple GB for large
+    # models and NCCL all_gather creates GPU staging buffers proportional to
+    # world_size × serialized_size → OOM on 7B+.
     if world_size > 1 and torch.distributed.is_initialized():
+        if main_payload is not None:
+            stripped = {k: v for k, v in main_payload.items()
+                       if k != "tensor_buffer"}
+        else:
+            stripped = None
         gathered = [None] * world_size
-        torch.distributed.all_gather_object(gathered, main_payload)
+        torch.distributed.all_gather_object(gathered, stripped)
         if main_payload is None:
             # Find a valid payload from another rank
             for g in gathered:
                 if g is not None:
-                    main_payload = g
+                    main_payload = dict(g)
+                    main_payload["tensor_buffer"] = None
                     break
 
     if main_payload is None:

@@ -1510,8 +1510,8 @@ class ECNAIVEManager:
             
             # Print all registered buffers
             logger.info(f"EC-NAIVE: [Rank {rank}] All registered buffers:")
-            for addr, (size, iteration) in self.registered_buffers.items():
-                logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
+            # for addr, (size, iteration) in self.registered_buffers.items():
+            #     logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
         except Exception as e:
             logger.error(f"EC-NAIVE: [Rank {rank}] Failed to register buffer: {e}")
             raise

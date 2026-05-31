@@ -948,7 +948,7 @@ def _run_eclatin_two_failures_recovery(
     native.set_load_mode(True, 10)  # 10 = two-failures mode (non-standard failed_rank)
     logger.info("ECLATIN two-failures: set load mode")
 
-    # === FAILED RANK (0 or 1): receiver ===
+    # === FAILED RANK (0 or 1): receiver (phase 1: bind + start accept) ===
     if rank_in_group in (0, 1):
         if recv_buffers is None or recovered_buffer is None:
             raise RuntimeError(
@@ -980,8 +980,14 @@ def _run_eclatin_two_failures_recovery(
             rank_in_group, peer0_ip, peer0_port, peer1_ip, peer1_port,
         )
 
-    # === SURVIVING RANK (2 or 3): sender ===
-    elif rank_in_group in (2, 3):
+    elif rank_in_group not in (2, 3):
+        raise RuntimeError(f"ECLATIN two-failures: unexpected rank_in_group={rank_in_group}")
+
+    # Barrier: ensure failed ranks' accept threads are ready before survivors connect
+    torch.distributed.barrier()
+
+    # === SURVIVING RANK (2 or 3): sender (phase 2: connect) ===
+    if rank_in_group in (2, 3):
         peer0_ip = rank_ips.get(
             manager._get_rank_by_group_position(group_id, 0, world_size),
             net_config["my_ip"],
@@ -1005,8 +1011,6 @@ def _run_eclatin_two_failures_recovery(
         native.init_two_failures_load_connections(
             rank_in_group, peer0_ip, peer0_port, peer1_ip, peer1_port,
         )
-    else:
-        raise RuntimeError(f"ECLATIN two-failures: unexpected rank_in_group={rank_in_group}")
 
     torch.distributed.barrier()
 

@@ -1955,24 +1955,29 @@ public:
         }
         conn_.wait_for_load_connections(timeout_seconds);
 #if RDMA_AVAILABLE
-        // Create RDMA load channels after TCP connections are established (avoids deadlock with Python barrier)
-        if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_[0] == nullptr) {
-            try {
-                init_rdma_load_resources();
-                init_rdma_load_channels();
-            } catch (const std::exception& e) {
-                std::cerr << "ECLATIN: Load RDMA channels init failed: " << e.what() << std::endl;
-                throw;
-            }
-        }
-        // Two-failures RDMA load channels: init if twofail sockets are connected
-        if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_two_fail_[0] == nullptr &&
-            (conn_.is_load_twofail_peer0_connected() || conn_.is_load_twofail_peer1_connected())) {
+        // Two-failures RDMA load channels: init if twofail sockets are connected.
+        // Must check BEFORE normal load RDMA — twofail mode uses separate TCP sockets
+        // and a different channel layout; the normal-load path would use wrong sockets.
+        bool is_twofail = (failed_rank_in_group_ == 10 ||
+                           conn_.is_load_twofail_peer0_connected() ||
+                           conn_.is_load_twofail_peer1_connected());
+        if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_two_fail_[0] == nullptr && is_twofail) {
             try {
                 init_rdma_load_resources_two_fail();
                 init_rdma_load_channels_two_fail();
             } catch (const std::exception& e) {
                 std::cerr << "ECLATIN: Two-fail load RDMA channels init failed: " << e.what() << std::endl;
+                throw;
+            }
+        }
+        // Normal load RDMA channels (single-failure / software recovery).
+        // Only init when NOT in twofail mode — the twofail path uses its own RDMA channels.
+        else if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_[0] == nullptr) {
+            try {
+                init_rdma_load_resources();
+                init_rdma_load_channels();
+            } catch (const std::exception& e) {
+                std::cerr << "ECLATIN: Load RDMA channels init failed: " << e.what() << std::endl;
                 throw;
             }
         }

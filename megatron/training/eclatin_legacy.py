@@ -902,21 +902,20 @@ def _run_eclatin_full_recovery(
     torch.distributed.barrier()
 
 
-def _run_eclatin_two_failures_recovery(
+def _init_twofail_connections(
     manager: ECLATINManager,
     rank: int,
     world_size: int,
-    eclatin_blocks: Dict[str, Any],
-    recv_buffers: Optional[Dict[str, torch.Tensor]],
-    recovered_buffer: Optional[torch.Tensor],
-    total_size: int,
-    registry: GlobalMetadataRegistry,
 ) -> None:
     """
-    Two-failures hardware recovery using native C++ module (RDMA + XOR pool).
+    Phase 0: Establish all two-failure load connections before timing.
 
-    Surviving ranks (2, 3) load all 4 blocks from disk and send to both failed ranks.
-    Failed ranks (0, 1) receive 8 blocks total and decode via inverse matrix.
+    Connection topology per group (5 TCP connections):
+      - 1 survivor↔survivor: Node3 bind, Node4 connect (bidirectional)
+      - 4 survivor→failed: 2 from Node3 (→Node1, →Node2), 2 from Node4 (→Node1, →Node2)
+
+    Failed nodes (0, 1) bind+accept; Survivor nodes (2, 3) connect + bind (for exchange).
+    All connections are ready when this function returns.
     """
     native = manager._eclatin_native
     if native is None:
@@ -928,155 +927,285 @@ def _run_eclatin_two_failures_recovery(
     ports = net_config["ports"]
     group_id = net_config["group_id"]
 
-    aligned_half_block_size = eclatin_blocks["data_block_1"].numel()
+    # Set load mode (failed_rank=10 signals two-failure mode to C++ side)
+    native.set_load_mode(True, 10)
+    logger.info("ECLATIN two-failures: set load mode (failed_rank=10)")
 
     # Map group positions to global ranks
-    failed_rank0 = manager._get_rank_by_group_position(group_id, 0, world_size)
-    failed_rank1 = manager._get_rank_by_group_position(group_id, 1, world_size)
+    surv_rig2_rank = manager._get_rank_by_group_position(group_id, 2, world_size)
+    surv_rig3_rank = manager._get_rank_by_group_position(group_id, 3, world_size)
+    rig0_rank = manager._get_rank_by_group_position(group_id, 0, world_size)
+    rig1_rank = manager._get_rank_by_group_position(group_id, 1, world_size)
 
-    native.set_load_mode(True, 10)  # 10 = two-failures mode (non-standard failed_rank)
-    logger.info("ECLATIN two-failures: set load mode")
+    surv_exch_ip = rank_ips.get(surv_rig2_rank, net_config["my_ip"])
+    surv_exch_port = ports["twf_surv_exch"]
 
-    # === FAILED RANK (0 or 1): receiver (phase 1: bind + start accept) ===
-    if rank_in_group in (0, 1):
-        if recv_buffers is None or recovered_buffer is None:
-            raise RuntimeError(
-                "ECLATIN two-failures: failed rank needs recv_buffers and recovered_buffer"
-            )
+    rig0_ip = rank_ips.get(rig0_rank, net_config["my_ip"])
+    rig1_ip = rank_ips.get(rig1_rank, net_config["my_ip"])
 
-        # peer0 = rank 2, peer1 = rank 3
-        peer0_ip = rank_ips.get(
-            manager._get_rank_by_group_position(group_id, 2, world_size),
-            net_config["my_ip"],
-        )
-        peer1_ip = rank_ips.get(
-            manager._get_rank_by_group_position(group_id, 3, world_size),
-            net_config["my_ip"],
-        )
-
-        if rank_in_group == 0:
-            peer0_port = ports["twofail_r0_from_r2"]
-            peer1_port = ports["twofail_r0_from_r3"]
-        else:
-            peer0_port = ports["twofail_r1_from_r2"]
-            peer1_port = ports["twofail_r1_from_r3"]
-
-        logger.info(
-            f"ECLATIN two-failures: failed rank {rank_in_group} binding peer0={peer0_ip}:{peer0_port}, "
-            f"peer1={peer1_ip}:{peer1_port}"
-        )
-        native.init_two_failures_load_connections(
-            rank_in_group, peer0_ip, peer0_port, peer1_ip, peer1_port,
+    if rank_in_group == 2:
+        # Node3: bind surv_exch + connect → Node1 + connect → Node2
+        pass
+    elif rank_in_group == 3:
+        # Node4: connect surv_exch + connect → Node1 + connect → Node2
+        pass
+    elif rank_in_group == 0:
+        # Node1: accept from Node3 + accept from Node4
+        pass
+    elif rank_in_group == 1:
+        # Node2: accept from Node3 + accept from Node4
+        pass
+    else:
+        raise RuntimeError(
+            f"ECLATIN two-failures: unexpected rank_in_group={rank_in_group}"
         )
 
-    elif rank_in_group not in (2, 3):
-        raise RuntimeError(f"ECLATIN two-failures: unexpected rank_in_group={rank_in_group}")
+    logger.info(
+        f"ECLATIN two-failures: Phase 0 - establishing connections (rig{rank_in_group})"
+    )
 
-    # Barrier: ensure failed ranks' accept threads are ready before survivors connect
+    # ── Phase 0a: bind+listen only (synchronous, non-blocking) ────────────
+    # Must complete on all ranks before anyone tries to connect.
+    native.init_twofail_bind_phase(
+        rank_in_group,
+        surv_exch_ip, surv_exch_port,
+        rig0_ip, ports.get("twf_n1_from_n3", 0),
+        rig1_ip, ports.get("twf_n2_from_n3", 0),
+        rig0_ip, ports.get("twf_n1_from_n4", 0),
+        rig1_ip, ports.get("twf_n2_from_n4", 0),
+    )
     torch.distributed.barrier()
+    logger.info("ECLATIN two-failures: Phase 0a - all listeners ready")
 
-    # === SURVIVING RANK (2 or 3): sender (phase 2: connect) ===
-    if rank_in_group in (2, 3):
-        peer0_ip = rank_ips.get(
-            manager._get_rank_by_group_position(group_id, 0, world_size),
-            net_config["my_ip"],
-        )
-        peer1_ip = rank_ips.get(
-            manager._get_rank_by_group_position(group_id, 1, world_size),
-            net_config["my_ip"],
-        )
+    # ── Phase 0b: connect + accept ────────────────────────────────────────
+    native.init_twofail_connect_phase(
+        rank_in_group,
+        surv_exch_ip, surv_exch_port,
+        rig0_ip, ports.get("twf_n1_from_n3", 0),
+        rig1_ip, ports.get("twf_n2_from_n3", 0),
+        rig0_ip, ports.get("twf_n1_from_n4", 0),
+        rig1_ip, ports.get("twf_n2_from_n4", 0),
+    )
 
-        if rank_in_group == 2:
-            peer0_port = ports["twofail_r0_from_r2"]
-            peer1_port = ports["twofail_r1_from_r2"]
-        else:
-            peer0_port = ports["twofail_r0_from_r3"]
-            peer1_port = ports["twofail_r1_from_r3"]
-
-        logger.info(
-            f"ECLATIN two-failures: surviving rank {rank_in_group} connecting to "
-            f"peer0={peer0_ip}:{peer0_port}, peer1={peer1_ip}:{peer1_port}"
-        )
-        native.init_two_failures_load_connections(
-            rank_in_group, peer0_ip, peer0_port, peer1_ip, peer1_port,
-        )
-
+    # Wait for all connections to be established
     torch.distributed.barrier()
-
     native.wait_for_load_connections(timeout_seconds=30)
     torch.distributed.barrier()
+    logger.info("ECLATIN two-failures: Phase 0 - all connections established")
 
-    # === DATA TRANSFER ===
-    if rank_in_group in (0, 1):
-        # Failed rank: receive 8 blocks and XOR recover
-        r2_d2 = int(recv_buffers["r2_d2"].data_ptr())
-        r2_D2 = int(recv_buffers["r2_D2"].data_ptr())
-        r2_p2 = int(recv_buffers["r2_p2"].data_ptr())
-        r2_P2 = int(recv_buffers["r2_P2"].data_ptr())
-        r3_d3 = int(recv_buffers["r3_d3"].data_ptr())
-        r3_D3 = int(recv_buffers["r3_D3"].data_ptr())
-        r3_p3 = int(recv_buffers["r3_p3"].data_ptr())
-        r3_P3 = int(recv_buffers["r3_P3"].data_ptr())
-        recovered_data1 = int(eclatin_blocks["data_block_1"].data_ptr())
-        recovered_data2 = int(eclatin_blocks["data_block_2"].data_ptr())
 
+def _run_eclatin_two_failures_recovery(
+    manager: ECLATINManager,
+    rank: int,
+    world_size: int,
+    eclatin_blocks: Dict[str, Any],
+    recv_buffers: Optional[Dict[str, torch.Tensor]],
+    recovered_buffer: Optional[torch.Tensor],
+    surv_bufs: Optional[Dict[str, torch.Tensor]],
+    total_size: int,
+    registry: GlobalMetadataRegistry,
+) -> None:
+    """
+    Two-failures hardware recovery (3-step protocol).
+
+    All connections are established BEFORE this function (Phase 0, not timed).
+
+    Step 1: Survivor exchange — Node3↔Node4 exchange data blocks (b31,b32 ↔ b41,b42)
+    Step 2: XOR decode on survivors — compute 4 output blocks each (all 2-input, 2-pass)
+    Step 3: Survivors send to failed — 2 blocks/connection, failed nodes receive 4 blocks
+
+    Failed nodes (0, 1) simply receive 4 blocks and concatenate data_block_1 + data_block_2.
+    """
+    native = manager._eclatin_native
+    if native is None:
+        raise RuntimeError("ECLATIN native module is not initialized")
+
+    net_config = manager._get_eclatin_network_config(rank, world_size)
+    rank_in_group = net_config["rank_in_group"]
+
+    aligned_half_block_size = eclatin_blocks["data_block_1"].numel()
+
+    logger.info(
+        f"ECLATIN two-failures: starting 3-step recovery (rig{rank_in_group})"
+    )
+
+    # ================================================================
+    # Step 1: Survivor data exchange (rig2↔rig3 only)
+    # ================================================================
+    if rank_in_group == 2:
+        # Node3: send b31, b32; recv b41, b42 (Node4's data blocks)
+        peer_d1 = int(surv_bufs["peer_d1"].data_ptr())
+        peer_d2 = int(surv_bufs["peer_d2"].data_ptr())
+        own_d1 = int(eclatin_blocks["data_block_1"].data_ptr())
+        own_d2 = int(eclatin_blocks["data_block_2"].data_ptr())
         logger.info(
-            f"ECLATIN two-failures: rank_in_group {rank_in_group} "
-            f"starting XOR pool recovery"
+            f"ECLATIN two-failures: Node3 exchanging data blocks with Node4"
         )
-        native.load_recover_two_failures(
-            r2_d2, r2_D2, r2_p2, r2_P2,
-            r3_d3, r3_D3, r3_p3, r3_P3,
-            recovered_data1, recovered_data2,
-            rank_in_group,
-            aligned_half_block_size,
+        native.survivor_exchange_data(
+            rank_in_group, own_d1, own_d2, peer_d1, peer_d2, aligned_half_block_size,
         )
-
-        # Copy recovered data to recovered_buffer
-        actual_tensor_buffer_size = _max_tensor_bytes_from_registry(registry, world_size)
-        half_actual_data = actual_tensor_buffer_size // 2
-        if recovered_buffer.numel() >= total_size:
-            first_half_actual = min(half_actual_data, total_size)
-            recovered_buffer[:first_half_actual].copy_(
-                eclatin_blocks["data_block_1"][:first_half_actual]
-            )
-            if total_size > half_actual_data:
-                second_half_size = total_size - half_actual_data
-                recovered_buffer[first_half_actual:total_size].copy_(
-                    eclatin_blocks["data_block_2"][:second_half_size]
-                )
-
+    elif rank_in_group == 3:
+        # Node4: send b41, b42; recv b31, b32 (Node3's data blocks)
+        peer_d1 = int(surv_bufs["peer_d1"].data_ptr())
+        peer_d2 = int(surv_bufs["peer_d2"].data_ptr())
+        own_d1 = int(eclatin_blocks["data_block_1"].data_ptr())
+        own_d2 = int(eclatin_blocks["data_block_2"].data_ptr())
         logger.info(
-            f"ECLATIN two-failures: rank_in_group {rank_in_group} recovery completed"
+            f"ECLATIN two-failures: Node4 exchanging data blocks with Node3"
         )
-
-    elif rank_in_group in (2, 3):
-        # Surviving rank: send 4 blocks to each failed rank
-        data1_addr = int(eclatin_blocks["data_block_1"].data_ptr())
-        data2_addr = int(eclatin_blocks["data_block_2"].data_ptr())
-        parity1_addr = int(eclatin_blocks["parity_block_1"].data_ptr())
-        parity2_addr = int(eclatin_blocks["parity_block_2"].data_ptr())
-
-        logger.info(
-            f"ECLATIN two-failures: surviving rank {rank_in_group} "
-            f"sending blocks to both failed ranks"
-        )
-
-        # Send to rank 0 (peer0) and rank 1 (peer1)
-        native.load_send_all_blocks_two_fail(
-            "0", data1_addr, data2_addr, parity1_addr, parity2_addr,
-            aligned_half_block_size,
-        )
-        native.load_send_all_blocks_two_fail(
-            "1", data1_addr, data2_addr, parity1_addr, parity2_addr,
-            aligned_half_block_size,
-        )
-
-        logger.info(
-            f"ECLATIN two-failures: surviving rank {rank_in_group} send completed"
+        native.survivor_exchange_data(
+            rank_in_group, own_d1, own_d2, peer_d1, peer_d2, aligned_half_block_size,
         )
 
     torch.distributed.barrier()
+    logger.info("ECLATIN two-failures: Step 1 (survivor exchange) done")
+
+    # ================================================================
+    # Step 2: XOR decode on survivors (2-pass, all 2-input, 16-thread pool)
+    # ================================================================
+    if rank_in_group == 2:
+        # Node3 computes:
+        #   Pass 1:  b21 = peer_d2 ⊕ own_p1    (b42 ⊕ b33)
+        #            b12 = own_p2  ⊕ peer_d1    (b34 ⊕ b41)
+        #   Pass 2:  b14 = b21 ⊕ own_d2         (b21 ⊕ b32)
+        #            b23 = b12 ⊕ own_d1         (b12 ⊕ b31)
+        out1 = int(surv_bufs["out1"].data_ptr())  # b21 → Node2 d1
+        out2 = int(surv_bufs["out2"].data_ptr())  # b14 → Node1 p2
+        out3 = int(surv_bufs["out3"].data_ptr())  # b12 → Node1 d2
+        out4 = int(surv_bufs["out4"].data_ptr())  # b23 → Node2 p1
+        own_d1 = int(eclatin_blocks["data_block_1"].data_ptr())   # b31
+        own_d2 = int(eclatin_blocks["data_block_2"].data_ptr())   # b32
+        own_p1 = int(eclatin_blocks["parity_block_1"].data_ptr()) # b33
+        own_p2 = int(eclatin_blocks["parity_block_2"].data_ptr()) # b34
+        pd1 = int(surv_bufs["peer_d1"].data_ptr())  # b41 (recv'd from Node4)
+        pd2 = int(surv_bufs["peer_d2"].data_ptr())  # b42 (recv'd from Node4)
+        logger.info(
+            f"ECLATIN two-failures: Node3 starting XOR decode"
+        )
+        native.survivor_xor_decode(
+            rank_in_group,
+            out1, out2, out3, out4,
+            own_d1, own_d2, own_p1, own_p2,
+            pd1, pd2,
+            aligned_half_block_size,
+        )
+    elif rank_in_group == 3:
+        # Node4 computes:
+        #   Pass 1:  b11 = peer_d2 ⊕ own_p1    (b32 ⊕ b43)
+        #            b22 = own_p2  ⊕ peer_d1    (b44 ⊕ b31)
+        #   Pass 2:  b24 = b11 ⊕ own_d2         (b11 ⊕ b42)
+        #            b13 = b22 ⊕ own_d1         (b22 ⊕ b41)
+        out1 = int(surv_bufs["out1"].data_ptr())  # b11 → Node1 d1
+        out2 = int(surv_bufs["out2"].data_ptr())  # b24 → Node2 p2
+        out3 = int(surv_bufs["out3"].data_ptr())  # b22 → Node2 d2
+        out4 = int(surv_bufs["out4"].data_ptr())  # b13 → Node1 p1
+        own_d1 = int(eclatin_blocks["data_block_1"].data_ptr())   # b41
+        own_d2 = int(eclatin_blocks["data_block_2"].data_ptr())   # b42
+        own_p1 = int(eclatin_blocks["parity_block_1"].data_ptr()) # b43
+        own_p2 = int(eclatin_blocks["parity_block_2"].data_ptr()) # b44
+        pd1 = int(surv_bufs["peer_d1"].data_ptr())  # b31 (recv'd from Node3)
+        pd2 = int(surv_bufs["peer_d2"].data_ptr())  # b32 (recv'd from Node3)
+        logger.info(
+            f"ECLATIN two-failures: Node4 starting XOR decode"
+        )
+        native.survivor_xor_decode(
+            rank_in_group,
+            out1, out2, out3, out4,
+            own_d1, own_d2, own_p1, own_p2,
+            pd1, pd2,
+            aligned_half_block_size,
+        )
+
+    torch.distributed.barrier()
+    logger.info("ECLATIN two-failures: Step 2 (XOR decode) done")
+
+    # ================================================================
+    # Step 3: Survivors send to failed nodes
+    # ================================================================
+    if rank_in_group == 0:
+        # Node1: receive 4 blocks (b12,b14 from Node3 + b11,b13 from Node4)
+        n3_b12 = int(recv_buffers["n3_b12"].data_ptr())
+        n3_b14 = int(recv_buffers["n3_b14"].data_ptr())
+        n4_b11 = int(recv_buffers["n4_b11"].data_ptr())
+        n4_b13 = int(recv_buffers["n4_b13"].data_ptr())
+        logger.info("ECLATIN two-failures: Node1 receiving 4 blocks")
+        native.recv_four_blocks(
+            rank_in_group,
+            n4_b11, n3_b12, n4_b13, n3_b14,
+            aligned_half_block_size,
+        )
+        # Write to persistent blocks
+        eclatin_blocks["data_block_1"].copy_(recv_buffers["n4_b11"][:aligned_half_block_size])
+        eclatin_blocks["data_block_2"].copy_(recv_buffers["n3_b12"][:aligned_half_block_size])
+        eclatin_blocks["parity_block_1"].copy_(recv_buffers["n4_b13"][:aligned_half_block_size])
+        eclatin_blocks["parity_block_2"].copy_(recv_buffers["n3_b14"][:aligned_half_block_size])
+
+    elif rank_in_group == 1:
+        # Node2: receive 4 blocks (b21,b23 from Node3 + b22,b24 from Node4)
+        n3_b21 = int(recv_buffers["n3_b21"].data_ptr())
+        n3_b23 = int(recv_buffers["n3_b23"].data_ptr())
+        n4_b22 = int(recv_buffers["n4_b22"].data_ptr())
+        n4_b24 = int(recv_buffers["n4_b24"].data_ptr())
+        logger.info("ECLATIN two-failures: Node2 receiving 4 blocks")
+        native.recv_four_blocks(
+            rank_in_group,
+            n3_b21, n4_b22, n3_b23, n4_b24,
+            aligned_half_block_size,
+        )
+        # Write to persistent blocks
+        eclatin_blocks["data_block_1"].copy_(recv_buffers["n3_b21"][:aligned_half_block_size])
+        eclatin_blocks["data_block_2"].copy_(recv_buffers["n4_b22"][:aligned_half_block_size])
+        eclatin_blocks["parity_block_1"].copy_(recv_buffers["n3_b23"][:aligned_half_block_size])
+        eclatin_blocks["parity_block_2"].copy_(recv_buffers["n4_b24"][:aligned_half_block_size])
+
+    elif rank_in_group == 2:
+        # Node3: send b12,b14 → Node1; send b21,b23 → Node2
+        out1 = int(surv_bufs["out1"].data_ptr())  # b21 → Node2
+        out2 = int(surv_bufs["out2"].data_ptr())  # b14 → Node1
+        out3 = int(surv_bufs["out3"].data_ptr())  # b12 → Node1
+        out4 = int(surv_bufs["out4"].data_ptr())  # b23 → Node2
+        logger.info(
+            f"ECLATIN two-failures: Node3 sending blocks to failed nodes"
+        )
+        # Send to Node1 (rig0): b12, b14
+        native.send_two_blocks(rank_in_group, "0", out3, out2, aligned_half_block_size)
+        # Send to Node2 (rig1): b21, b23
+        native.send_two_blocks(rank_in_group, "1", out1, out4, aligned_half_block_size)
+
+    elif rank_in_group == 3:
+        # Node4: send b11,b13 → Node1; send b22,b24 → Node2
+        out1 = int(surv_bufs["out1"].data_ptr())  # b11 → Node1
+        out2 = int(surv_bufs["out2"].data_ptr())  # b24 → Node2
+        out3 = int(surv_bufs["out3"].data_ptr())  # b22 → Node2
+        out4 = int(surv_bufs["out4"].data_ptr())  # b13 → Node1
+        logger.info(
+            f"ECLATIN two-failures: Node4 sending blocks to failed nodes"
+        )
+        # Send to Node2 (rig1): b22, b24
+        native.send_two_blocks(rank_in_group, "1", out3, out2, aligned_half_block_size)
+        # Send to Node1 (rig0): b11, b13
+        native.send_two_blocks(rank_in_group, "0", out1, out4, aligned_half_block_size)
+
+    torch.distributed.barrier()
+    logger.info("ECLATIN two-failures: Step 3 (send to failed) done")
+
+    # Copy recovered data_block_1 + data_block_2 → recovered_buffer (failed nodes only)
+    if rank_in_group in (0, 1):
+        if recovered_buffer is not None and recovered_buffer.numel() >= total_size:
+            actual_max = _max_tensor_bytes_from_registry(registry, world_size)
+            half_actual = actual_max // 2
+            first = min(half_actual, total_size)
+            recovered_buffer[:first].copy_(
+                eclatin_blocks["data_block_1"][:first]
+            )
+            if total_size > first:
+                second = total_size - first
+                recovered_buffer[first:total_size].copy_(
+                    eclatin_blocks["data_block_2"][:second]
+                )
+            logger.info(
+                f"ECLATIN two-failures: rig{rank_in_group} recovered_buffer assembled"
+            )
 
 
 def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
@@ -1129,11 +1258,14 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     pin = torch.cuda.is_available() and getattr(manager, "eclatin_pin_memory", False)
 
+    surv_bufs: Optional[Dict[str, torch.Tensor]] = None
+
     if two_failures:
         if rank_in_group in (0, 1):
             recv_buffers = manager.allocate_eclatin_load_recv_buffers_two_fail(registry)
             recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
         elif rank_in_group in (2, 3):
+            surv_bufs = manager.allocate_twf_survivor_buffers(registry)
             _load_eclatin_blocks_from_disk_into(
                 eclatin_blocks, checkpoint_dir, rank, rank_in_group,
                 software_only=False, two_failures_survivor=True,
@@ -1180,8 +1312,19 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             if recv_buffers is not None:
                 for t in recv_buffers.values():
                     manager.register_buffer(t)
+            if surv_bufs is not None:
+                for t in surv_bufs.values():
+                    manager.register_buffer(t)
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
+
+    # === Phase 0: establish all connections (not timed) ===
+    if two_failures:
+        _init_twofail_connections(
+            manager=manager,
+            rank=rank,
+            world_size=world_size,
+        )
 
     # sync all ranks before timing
     torch.distributed.barrier()
@@ -1197,6 +1340,7 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             eclatin_blocks=eclatin_blocks,
             recv_buffers=recv_buffers,
             recovered_buffer=recovered_buffer,
+            surv_bufs=surv_bufs,
             total_size=total_size,
             registry=registry,
         )

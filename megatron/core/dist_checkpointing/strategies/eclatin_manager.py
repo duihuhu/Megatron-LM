@@ -393,12 +393,17 @@ class ECLATINManager:
                 })
 
         # Two-failures load mode ports (always added for all ranks)
+        # 5 ports per group:
+        #   surv_exch:    survivor↔survivor data exchange (Node3 bind, Node4 connect)
+        #   n1_from_n3/4: Node1 (failed rig0) accepts from Node3/Node4
+        #   n2_from_n3/4: Node2 (failed rig1) accepts from Node3/Node4
         two_fail_base_port = load_base_port + 50
         ports.update({
-            'twofail_r0_from_r2': two_fail_base_port + 0,
-            'twofail_r0_from_r3': two_fail_base_port + 1,
-            'twofail_r1_from_r2': two_fail_base_port + 2,
-            'twofail_r1_from_r3': two_fail_base_port + 3,
+            'twf_surv_exch':   two_fail_base_port + 0,
+            'twf_n1_from_n3':  two_fail_base_port + 1,
+            'twf_n1_from_n4':  two_fail_base_port + 2,
+            'twf_n2_from_n3':  two_fail_base_port + 3,
+            'twf_n2_from_n4':  two_fail_base_port + 4,
         })
 
         # Step 4: Exchange IP addresses via broadcast (more reliable than all_gather_object with NCCL)
@@ -833,13 +838,14 @@ class ECLATINManager:
         self, global_registry: GlobalMetadataRegistry
     ) -> Dict[str, torch.Tensor]:
         """
-        Allocate 8 recv buffers for two-failures recovery on failed ranks (0 or 1).
+        Allocate 4 recv buffers for two-failures recovery on failed ranks (0 or 1).
 
-        Each failed rank receives 4 blocks from surviving rank 2 and 4 blocks from
-        surviving rank 3, totalling 8 recv buffers.
+        Each failed rank receives 2 blocks from surviving rank 2 and 2 blocks from
+        surviving rank 3, totalling 4 recv buffers (down from 8 in the old scheme).
 
         Returns:
-            Dict with keys: r2_d2, r2_D2, r2_p2, r2_P2, r3_d3, r3_D3, r3_p3, r3_P3
+            rig0: {'n3_b12', 'n3_b14', 'n4_b11', 'n4_b13'}
+            rig1: {'n3_b21', 'n3_b23', 'n4_b22', 'n4_b24'}
         """
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -865,25 +871,92 @@ class ECLATINManager:
         ) * self.eclatin_buffer_size
 
         logger.info(
-            f"ECLATIN: Allocating 8 recv buffers for two-failures recovery\n"
+            f"ECLATIN: Allocating 4 recv buffers for two-failures recovery\n"
             f"  Pipeline max size: {max_total_bytes / (1024**3):.2f} GB\n"
             f"  Aligned half block size: {aligned_half_block_size / (1024**3):.2f} GB\n"
-            f"  Total recv memory: {8 * aligned_half_block_size / (1024**3):.2f} GB"
+            f"  Total recv memory: {4 * aligned_half_block_size / (1024**3):.2f} GB"
         )
 
+        if rank_in_group == 0:
+            keys = ['n3_b12', 'n3_b14', 'n4_b11', 'n4_b13']
+        else:
+            keys = ['n3_b21', 'n3_b23', 'n4_b22', 'n4_b24']
+
         recv_buffers = {}
-        for key in ['r2_d2', 'r2_D2', 'r2_p2', 'r2_P2',
-                     'r3_d3', 'r3_D3', 'r3_p3', 'r3_P3']:
+        for key in keys:
             recv_buffers[key] = torch.empty(
                 aligned_half_block_size, dtype=torch.uint8,
                 pin_memory=self.eclatin_pin_memory,
             )
 
         logger.info(
-            f"ECLATIN: Allocated 8 recv buffers for two-failures recovery: "
+            f"ECLATIN: Allocated 4 recv buffers for two-failures recovery (rig{rank_in_group}): "
             f"{aligned_half_block_size / (1024**3):.2f} GB each"
         )
         return recv_buffers
+
+    def allocate_twf_survivor_buffers(
+        self, global_registry: GlobalMetadataRegistry
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Allocate temporary buffers for survivors (rig2/rig3) during two-failure recovery.
+
+        Each survivor needs:
+        - 2 recv buffers for peer's data blocks (from survivor exchange step)
+        - 4 output buffers for XOR decode results
+
+        Returns:
+            Dict with keys: 'peer_d1', 'peer_d2', 'out1', 'out2', 'out3', 'out4'
+            (rig2: peer=Node4's b41,b42; rig3: peer=Node3's b31,b32)
+        """
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        rank_in_group = self._get_rank_in_group(rank, world_size)
+
+        if rank_in_group not in (2, 3):
+            logger.warning(
+                "ECLATIN: allocate_twf_survivor_buffers called on "
+                f"rank_in_group {rank_in_group}, expecting 2 or 3; returning empty dict"
+            )
+            return {}
+
+        max_total_bytes = 0
+        for r in range(world_size):
+            rank_metadata = global_registry.rank_metadata.get(r, [])
+            rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+            if rank_total_size > max_total_bytes:
+                max_total_bytes = rank_total_size
+
+        half_max_total_bytes = max_total_bytes // 2
+        aligned_half_block_size = (
+            (half_max_total_bytes + self.eclatin_buffer_size - 1) // self.eclatin_buffer_size
+        ) * self.eclatin_buffer_size
+
+        logger.info(
+            f"ECLATIN: Allocating 6 temp buffers for survivor two-failures (rig{rank_in_group})\n"
+            f"  Aligned half block size: {aligned_half_block_size / (1024**3):.2f} GB each\n"
+            f"  Total temp memory: {6 * aligned_half_block_size / (1024**3):.2f} GB"
+        )
+
+        buffers = {}
+        # 2 recv buffers for peer data blocks
+        for key in ['peer_d1', 'peer_d2']:
+            buffers[key] = torch.empty(
+                aligned_half_block_size, dtype=torch.uint8,
+                pin_memory=self.eclatin_pin_memory,
+            )
+        # 4 output buffers for XOR decode results
+        for key in ['out1', 'out2', 'out3', 'out4']:
+            buffers[key] = torch.empty(
+                aligned_half_block_size, dtype=torch.uint8,
+                pin_memory=self.eclatin_pin_memory,
+            )
+
+        logger.info(
+            f"ECLATIN: Allocated 6 temp buffers for survivor two-failures "
+            f"(rig{rank_in_group}): {aligned_half_block_size / (1024**3):.2f} GB each"
+        )
+        return buffers
 
     def _poll_and_release_buffers(self):
         """Poll C++ for buffers ready to be released and put them back to queues."""

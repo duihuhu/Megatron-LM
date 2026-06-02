@@ -1981,6 +1981,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
     # Model.
+    torch.distributed.barrier()
     load_model_start_time = time()
     strict = False if args.retro_add_retriever else strict
     if not skip_load_to_model_and_opt:
@@ -1993,9 +1994,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if 'model%d' % i not in state_dict:
                     continue
                 load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
-    torch.distributed.barrier()
     load_model_end_time = time()
     logger.info(f"load model time: {load_model_end_time - load_model_start_time:.4f}s")
+    torch.distributed.barrier()
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')

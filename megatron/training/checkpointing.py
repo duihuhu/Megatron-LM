@@ -1994,9 +1994,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if 'model%d' % i not in state_dict:
                     continue
                 load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
-    load_model_end_time = time()
-    logger.info(f"load model time: {load_model_end_time - load_model_start_time:.4f}s")
-    torch.distributed.barrier()
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
@@ -2091,6 +2088,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
+
+    load_model_end_time = time()
+    logger.info(f"load model+optimizer+rng time: {load_model_end_time - load_model_start_time:.4f}s")
 
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '

@@ -2406,62 +2406,39 @@ private:
             }
             
             if (task.p2p_own_write_addr != 0 && task.p2p_partner_write_addr != 0 && task.parity_addr != 0) {
-                if (is_load_mode_ && failed_rank_in_group_ == 2) {
-                    // Load mode: special handling for rank_in_group 2 and 3
-                    if (rank_in_group_ == 2) {
-                        // rank_in_group 2: after XOR get d2, submit Step6 recv task
-                        if (task.p2p_partner_write_addr != 0) {
-                            submit_load_step6_p2p_recv(task.p2p_partner_write_addr, task.size);
-                        }
-                        // Release parity buffer (d2 already written to own_buffer)
-                        if (task.parity_addr != 0) {
-                            std::lock_guard<std::mutex> lock(release_queue_mutex_);
-                            parity_buffers_to_release_.push(task.parity_addr);
-                        }
-                    } else if (rank_in_group_ == 3) {
-                        // rank_in_group 3: after XOR get d3, submit Step6 send task
-                        if (task.parity_addr != 0) {
-                            submit_load_step6_p2p_send(task.parity_addr, task.size);
-                        }
-                        // Do not release parity buffer here, wait for Step6 send completion
-                    } else {
-                        // Other ranks (0, 1) in load mode: release parity buffer
-                        if (task.parity_addr != 0) {
-                            std::lock_guard<std::mutex> lock(release_queue_mutex_);
-                            parity_buffers_to_release_.push(task.parity_addr);
-                        }
-                    }
-                } else {
-                    // Save mode: original logic
-                    uintptr_t send_buffer = is_p2p_parity_sender() ? task.parity_addr : task.data_addr;
-                    
-                    {
-                        std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
-                        p2p_send_queue_.push({
-                            send_buffer,
-                            task.p2p_own_write_addr,
-                            task.size,
-                            task.parity_addr,
-                            task.data_addr,
-                            false,  // is_load_mode_transfer
-                            false,  // is_step6_transfer
-                            0      // load_mode_data_addr (not needed for save mode)
-                        });
-                    }
-                    p2p_send_queue_cv_.notify_one();
-                    
-                    {
-                        std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
-                        p2p_recv_queue_.push({
-                            task.p2p_partner_write_addr,
-                            task.size,
-                            false,  // is_load_mode_transfer
-                            false,  // is_step6_transfer
-                            0       // data_buffer_addr
-                        });
-                    }
-                    p2p_recv_queue_cv_.notify_one();
+                // Release parity buffer after XOR (single-node recovery loads via this path too)
+                if (task.parity_addr != 0) {
+                    std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                    parity_buffers_to_release_.push(task.parity_addr);
                 }
+                uintptr_t send_buffer = is_p2p_parity_sender() ? task.parity_addr : task.data_addr;
+
+                {
+                    std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
+                    p2p_send_queue_.push({
+                        send_buffer,
+                        task.p2p_own_write_addr,
+                        task.size,
+                        task.parity_addr,
+                        task.data_addr,
+                        false,  // is_load_mode_transfer
+                        false,  // is_step6_transfer
+                        0      // load_mode_data_addr (not needed for save mode)
+                    });
+                }
+                p2p_send_queue_cv_.notify_one();
+
+                {
+                    std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
+                    p2p_recv_queue_.push({
+                        task.p2p_partner_write_addr,
+                        task.size,
+                        false,  // is_load_mode_transfer
+                        false,  // is_step6_transfer
+                        0       // data_buffer_addr
+                    });
+                }
+                p2p_recv_queue_cv_.notify_one();
             }
             
             {
@@ -5470,25 +5447,11 @@ public:
                 }
             }
             
-            // Handle Step6 P2P for rank_in_group 2 and 3
-            if (is_load_mode_ && failed_rank_in_group_ == 2) {
-                if (rank_in_group_ == 2) {
-                    // rank_in_group 2: XOR completed, get d2, submit Step6 recv task
-                    if (task.p2p_partner_write_addr != 0) {
-                        submit_load_step6_p2p_recv(task.p2p_partner_write_addr, task.size);
-                    }
-                    // Release parity buffer (d2 already written to own_buffer)
-                    if (task.parity_addr != 0) {
-                        std::lock_guard<std::mutex> lock(release_queue_mutex_);
-                        parity_buffers_to_release_.push(task.parity_addr);
-                    }
-                } else if (rank_in_group_ == 3) {
-                    // rank_in_group 3: XOR completed, get d3, submit Step6 send task
-                    if (task.parity_addr != 0) {
-                        submit_load_step6_p2p_send(task.parity_addr, task.size);
-                    }
-                    // Don't release parity buffer here, wait for Step6 send completion
-                }
+            // Release parity buffer after XOR (single-node recovery)
+            // Must release here to avoid pool exhaustion with large models (>24 chunks)
+            if (task.parity_addr != 0) {
+                std::lock_guard<std::mutex> lock(release_queue_mutex_);
+                parity_buffers_to_release_.push(task.parity_addr);
             }
             
             if (load_xor_worker_sentinel_received_.load()) {

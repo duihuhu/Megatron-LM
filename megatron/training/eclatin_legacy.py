@@ -794,8 +794,6 @@ def _run_eclatin_full_recovery(
             load_recv_rank3_data2_port,
         )
 
-    torch.distributed.barrier()
-
     if rank_in_group != 2:
         logger.info(
             f"ECLATIN legacy load: rank_in_group {rank_in_group} connecting load send sockets"
@@ -812,7 +810,6 @@ def _run_eclatin_full_recovery(
         )
 
     native.wait_for_load_connections(timeout_seconds=30)
-    torch.distributed.barrier()
 
     start_time = time()
     aligned_half_block_size = eclatin_blocks["data_block_1"].numel()
@@ -1178,6 +1175,9 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 
+    # sync all ranks before timing
+    torch.distributed.barrier()
+
     # === timing: network/encode ===
     _t_ec: Dict[str, float] = {}
     _t0 = time.time()
@@ -1204,6 +1204,9 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             registry=registry,
         )
     _t_ec['network_encode'] = time.time() - _t0
+
+    # sync all ranks before rebuild timing
+    torch.distributed.barrier()
 
     # === timing: rebuild state_dict ===
     _t0 = time.time()

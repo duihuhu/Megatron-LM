@@ -754,8 +754,6 @@ def _run_eccheck_legacy_recovery(
     # rank_in_group 1 receives into recovered_buffer.
     # This exercises the network path for worst-case recovery time measurement.
     if software_failure:
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
         if rank_in_group == 0:
             own_buf = blocks["own_buffer"].contiguous().view(torch.uint8).reshape(-1)
             actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
@@ -768,8 +766,6 @@ def _run_eccheck_legacy_recovery(
                 int(recovered_buffer.data_ptr()), recovered_buffer.numel()
             )
         # rig=2/3: no-op
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
         return
 
     # ---- hardware failure path (rank_in_group 2) ----
@@ -965,9 +961,6 @@ def _run_eccheck_legacy_recovery(
     finally:
         if active_event is not None:
             active_event.clear()
-
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
 
 
 # ---------------------------------------------------------------------------
@@ -1444,6 +1437,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 
+    # sync all ranks before timing
+    torch.distributed.barrier()
+
     # === timing: network/encode (C++ P2P or XOR pipeline) ===
     _t_ec: Dict[str, float] = {}
     _t0 = time.time()
@@ -1469,6 +1465,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             registry=registry,
         )
     _t_ec['network_encode'] = time.time() - _t0
+
+    # sync all ranks before rebuild timing
+    torch.distributed.barrier()
 
     # === timing: rebuild state_dict ===
     _t0 = time.time()

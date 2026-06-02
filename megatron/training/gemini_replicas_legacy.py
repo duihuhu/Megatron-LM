@@ -1543,6 +1543,9 @@ def load_gemini_replicas_legacy_checkpoint(
         if failed_override:
             manager.reinit_for_recovery(failed_override)
 
+        # sync all ranks before timing
+        torch.distributed.barrier()
+
         # === timing: network/encode (RDMA send/recv only) ===
         _t0 = time.time()
         recovered_buffer = _hw_recovery_transfer(
@@ -1552,6 +1555,9 @@ def load_gemini_replicas_legacy_checkpoint(
             manager, checkpoint_dir, rank, world_size, failed,
         )
         _t['network_encode'] = time.time() - _t0  # RDMA transfer only (Phase 3 + Phase 4b)
+
+        # sync all ranks before rebuild timing
+        torch.distributed.barrier()
         _t0_sd = time.time()
         if is_failed:
             if rank in _recovery_meta:

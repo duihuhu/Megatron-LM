@@ -88,8 +88,32 @@ DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
-ARGS_TO_PASS=("$@")
 
+MODE=save
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware)$ ]]; then
+    MODE="$1"
+    shift
+fi
+ARGS_TO_PASS=("$@")
+RECOVERY_MODE_ARGS=()
+case "$MODE" in
+    save)
+        ;;
+    software)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-gemini-replicas-software-failure
+            --gemini-replicas-recovery-rank "0"
+        )
+        ;;
+    hardware)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-gemini-replicas-hardware-failure
+            --gemini-replicas-recovery-rank "0"
+        )
+        ;;
+esac
 # 模型固定参数
 HIDDEN_SIZE=1024
 NUM_ATTENTION_HEADS=16
@@ -253,7 +277,7 @@ mkdir -p logs/csv
 
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} ${RECOVERY_MODE_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
@@ -271,5 +295,6 @@ PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
+    ${RECOVERY_MODE_ARGS[@]} \
     --distributed-backend nccl \
     ${ARGS_TO_PASS[@]}

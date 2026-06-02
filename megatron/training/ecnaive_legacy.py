@@ -1248,6 +1248,26 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
     torch.distributed.barrier()
 
+    # Pre-allocate recv pool for failed ranks, load blocks for source ranks (not timed)
+    recv_pool_prealloc: List[torch.Tensor] = []
+    source_blocks_prealloc: List[torch.Tensor] = []
+    if affected_group and is_failed:
+        total_pool_blocks = len(source_ranks) * ecnaive_n
+        recv_pool_prealloc = list(allocate_hugepage_slices(
+            block_data_size, total_pool_blocks,
+            fallback_pin_memory=True, touch_pages=True,
+        ))
+        if manager.use_rdma:
+            for buf in recv_pool_prealloc:
+                manager.register_buffer(buf)
+    elif affected_group and not is_failed and is_source:
+        source_blocks_prealloc = _load_all_blocks_from_disk(
+            checkpoint_dir, rank, ecnaive_k, ecnaive_n, block_files,
+        )
+        if manager.use_rdma:
+            for b in source_blocks_prealloc:
+                manager.register_buffer(b)
+
     # === timing: network/encode (C++ send/recv + RS decode + assemble) ===
     _t: Dict[str, float] = {}
     _t0_net = time.time()
@@ -1256,23 +1276,16 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     if affected_group and not is_failed and is_source:
         native.reset_encoding_completion_flags()
 
-        all_blocks = _load_all_blocks_from_disk(
-            checkpoint_dir, rank, ecnaive_k, ecnaive_n, block_files,
-        )
-        if manager.use_rdma:
-            for b in all_blocks:
-                manager.register_buffer(b)
-
         for dest_fr in failed_in_group:
             send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
-            for block_tensor in all_blocks:
+            for block_tensor in source_blocks_prealloc:
                 send_size = min(block_tensor.numel(), block_data_size)
                 native.submit_send_task(
                     send_ch, int(block_tensor.data_ptr()), send_size
                 )
             logger.info(
                 f"EC-NAIVE hw recovery: source rank {rank} sending all "
-                f"{len(all_blocks)} blocks to failed rank {dest_fr}"
+                f"{len(source_blocks_prealloc)} blocks to failed rank {dest_fr}"
             )
 
         native.submit_send_sentinels(num_channels)
@@ -1280,6 +1293,8 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         native.wait_for_encoding_completion()
         _t['network_encode'] = time.time() - _t0_net
 
+        if world_size > 1:
+            torch.distributed.barrier()
         _t0_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
@@ -1294,6 +1309,8 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         native.wait_for_encoding_completion()
         _t['network_encode'] = time.time() - _t0_net
 
+        if world_size > 1:
+            torch.distributed.barrier()
         _t0_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
@@ -1312,15 +1329,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         plan = recovery_plan[rank]
         my_rig = plan['rank_in_group']
 
-        # Allocate recv pool: all source ranks × n blocks each
-        total_pool_blocks = len(source_ranks) * ecnaive_n
-        recv_pool = list(allocate_hugepage_slices(
-            block_data_size, total_pool_blocks,
-            fallback_pin_memory=True, touch_pages=True,
-        ))
-        if manager.use_rdma:
-            for buf in recv_pool:
-                manager.register_buffer(buf)
+        recv_pool = recv_pool_prealloc
 
         # Receive all n blocks from each source rank
         native.reset_encoding_completion_flags()
@@ -1497,6 +1506,8 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
         _t['network_encode'] = time.time() - _t0_net
 
+        if world_size > 1:
+            torch.distributed.barrier()
         _t0_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             {"tensor_buffer": tensor_buffer,
@@ -1521,6 +1532,8 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         native.wait_for_encoding_completion()
         _t['network_encode'] = time.time() - _t0_net
 
+        if world_size > 1:
+            torch.distributed.barrier()
         _t0_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,

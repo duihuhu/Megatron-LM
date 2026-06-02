@@ -66,8 +66,28 @@ DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
-# Remaining args after node-rank and GPU ids are passed to the training script
+MODE=save
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware)$ ]]; then
+    MODE="$1"
+    shift
+fi
 ARGS_TO_PASS=("$@")
+RECOVERY_MODE_ARGS=()
+case "$MODE" in
+    save)
+        ;;
+    software)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-eccheck-software-failure
+        )
+        ;;
+    hardware)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+        )
+        ;;
+esac
 
 # Model related configuration here, please do not overlap with json config
 HIDDEN_SIZE=1024
@@ -127,11 +147,11 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    --load $CHECKPOINT_PATH
+    #--load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
     --use-eccheck
-    --use-eccheck-two-failures
+    #--use-eccheck-two-failures
     #--use-eccheck-software-failure # toggle for software failure; untoggled for hardware failure
     --ckpt-format torch
     --save-embeddings-separately
@@ -147,7 +167,7 @@ mkdir -p logs/csv
 # Print command if PRINT_CMD is set
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} ${RECOVERY_MODE_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
@@ -164,5 +184,6 @@ PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
+    ${RECOVERY_MODE_ARGS[@]} \
     --distributed-backend nccl \
     ${ARGS_TO_PASS[@]}

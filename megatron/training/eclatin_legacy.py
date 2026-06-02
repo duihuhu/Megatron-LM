@@ -781,6 +781,7 @@ def _run_eclatin_full_recovery(
     load_recv_rank3_data1_port = net_config["ports"]["load_recv_rank3_data1"]
     load_recv_rank3_data2_port = net_config["ports"]["load_recv_rank3_data2"]
 
+    # ---- Phase 1: establish ASIO load connections (not timed) ----
     if rank_in_group == 2:
         logger.info("ECLATIN legacy load: rank_in_group 2 init load accept connections")
         native.init_load_connections(
@@ -793,6 +794,9 @@ def _run_eclatin_full_recovery(
             load_recv_rank3_data1_port,
             load_recv_rank3_data2_port,
         )
+
+    # Protocol barrier: rank 2 must be listening before anyone connects
+    torch.distributed.barrier()
 
     if rank_in_group != 2:
         logger.info(
@@ -810,6 +814,10 @@ def _run_eclatin_full_recovery(
         )
 
     native.wait_for_load_connections(timeout_seconds=30)
+    # Protocol barrier: all connections established before data transfer
+    torch.distributed.barrier()
+
+    # ---- Phase 2: data transfer (timed) ----
 
     start_time = time()
     aligned_half_block_size = eclatin_blocks["data_block_1"].numel()

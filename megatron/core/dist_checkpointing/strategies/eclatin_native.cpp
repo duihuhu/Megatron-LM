@@ -429,13 +429,36 @@ private:
     boost::asio::ip::tcp::socket load_send_rank3_data1_socket_;
     boost::asio::ip::tcp::socket load_send_rank3_data2_socket_;
 
-    // Two-failures load mode (2 connections per rank: peer0 and peer1)
+    // Two-failures load mode (2 connections per rank: peer0 and peer1) [old scheme]
     boost::asio::ip::tcp::socket load_twofail_peer0_socket_;
     boost::asio::ip::tcp::socket load_twofail_peer1_socket_;
     boost::asio::ip::tcp::acceptor load_twofail_peer0_acceptor_;
     boost::asio::ip::tcp::acceptor load_twofail_peer1_acceptor_;
     std::atomic<bool> load_twofail_peer0_connected_{false};
     std::atomic<bool> load_twofail_peer1_connected_{false};
+
+    // New two-failures v2: 5 connections per group
+    //   surv_exch:  survivor↔survivor (rig2 bind, rig3 connect)
+    //   n1_from_n3: Node3→Node1 (rig0 bind, rig2 connect)
+    //   n1_from_n4: Node4→Node1 (rig0 bind, rig3 connect)
+    //   n2_from_n3: Node3→Node2 (rig1 bind, rig2 connect)
+    //   n2_from_n4: Node4→Node2 (rig1 bind, rig3 connect)
+    boost::asio::ip::tcp::socket twf_surv_exch_socket_;
+    boost::asio::ip::tcp::acceptor twf_surv_exch_acceptor_;
+    std::atomic<bool> twf_surv_exch_connected_{false};
+
+    boost::asio::ip::tcp::socket twf_n1_from_n3_socket_;
+    boost::asio::ip::tcp::socket twf_n1_from_n4_socket_;
+    boost::asio::ip::tcp::socket twf_n2_from_n3_socket_;
+    boost::asio::ip::tcp::socket twf_n2_from_n4_socket_;
+    boost::asio::ip::tcp::acceptor twf_n1_from_n3_acceptor_;
+    boost::asio::ip::tcp::acceptor twf_n1_from_n4_acceptor_;
+    boost::asio::ip::tcp::acceptor twf_n2_from_n3_acceptor_;
+    boost::asio::ip::tcp::acceptor twf_n2_from_n4_acceptor_;
+    std::atomic<bool> twf_n1_from_n3_connected_{false};
+    std::atomic<bool> twf_n1_from_n4_connected_{false};
+    std::atomic<bool> twf_n2_from_n3_connected_{false};
+    std::atomic<bool> twf_n2_from_n4_connected_{false};
 
     std::atomic<bool> parity1_send1_connected_;
     std::atomic<bool> parity1_send2_connected_;
@@ -502,6 +525,16 @@ public:
           load_twofail_peer1_socket_(io_context_),
           load_twofail_peer0_acceptor_(io_context_),
           load_twofail_peer1_acceptor_(io_context_),
+          twf_surv_exch_socket_(io_context_),
+          twf_surv_exch_acceptor_(io_context_),
+          twf_n1_from_n3_socket_(io_context_),
+          twf_n1_from_n4_socket_(io_context_),
+          twf_n2_from_n3_socket_(io_context_),
+          twf_n2_from_n4_socket_(io_context_),
+          twf_n1_from_n3_acceptor_(io_context_),
+          twf_n1_from_n4_acceptor_(io_context_),
+          twf_n2_from_n3_acceptor_(io_context_),
+          twf_n2_from_n4_acceptor_(io_context_),
           parity1_send1_connected_(false),
           parity1_send2_connected_(false),
           parity1_recv1_connected_(false),
@@ -539,11 +572,46 @@ public:
     boost::asio::ip::tcp::socket& get_load_send_rank3_data1_socket() { return load_send_rank3_data1_socket_; }
     boost::asio::ip::tcp::socket& get_load_send_rank3_data2_socket() { return load_send_rank3_data2_socket_; }
 
-    // Two-failures load getters
+    // Two-failures load getters [old scheme]
     boost::asio::ip::tcp::socket& get_load_twofail_peer0_socket() { return load_twofail_peer0_socket_; }
     boost::asio::ip::tcp::socket& get_load_twofail_peer1_socket() { return load_twofail_peer1_socket_; }
     bool is_load_twofail_peer0_connected() const { return load_twofail_peer0_connected_; }
     bool is_load_twofail_peer1_connected() const { return load_twofail_peer1_connected_; }
+
+    // Two-failures v2 getters
+    boost::asio::ip::tcp::socket& get_twf_surv_exch_socket() { return twf_surv_exch_socket_; }
+    bool is_twf_surv_exch_connected() const { return twf_surv_exch_connected_; }
+    boost::asio::ip::tcp::socket& get_twf_n1_n3_socket() { return twf_n1_from_n3_socket_; }
+    boost::asio::ip::tcp::socket& get_twf_n1_n4_socket() { return twf_n1_from_n4_socket_; }
+    boost::asio::ip::tcp::socket& get_twf_n2_n3_socket() { return twf_n2_from_n3_socket_; }
+    boost::asio::ip::tcp::socket& get_twf_n2_n4_socket() { return twf_n2_from_n4_socket_; }
+    bool is_twf_v2_connected() const {
+        return twf_surv_exch_connected_ ||
+               twf_n1_from_n3_connected_ || twf_n1_from_n4_connected_ ||
+               twf_n2_from_n3_connected_ || twf_n2_from_n4_connected_;
+    }
+
+    // Two-failures v2: bind+listen helpers (for failed nodes as acceptors, rig2 for surv_exch)
+    void bind_listen_twf_surv_exch(const std::string& listen_ip, uint16_t port);
+    void accept_twf_surv_exch();
+    void init_twf_surv_exch_send(const std::string& partner_ip, uint16_t port);
+
+    void bind_listen_twf_n1_from_n3(const std::string& listen_ip, uint16_t port);
+    void bind_listen_twf_n1_from_n4(const std::string& listen_ip, uint16_t port);
+    void bind_listen_twf_n2_from_n3(const std::string& listen_ip, uint16_t port);
+    void bind_listen_twf_n2_from_n4(const std::string& listen_ip, uint16_t port);
+
+    void accept_twf_n1_from_n3();
+    void accept_twf_n1_from_n4();
+    void accept_twf_n2_from_n3();
+    void accept_twf_n2_from_n4();
+
+    void init_twf_send_n1_from_n3(const std::string& partner_ip, uint16_t port);
+    void init_twf_send_n1_from_n4(const std::string& partner_ip, uint16_t port);
+    void init_twf_send_n2_from_n3(const std::string& partner_ip, uint16_t port);
+    void init_twf_send_n2_from_n4(const std::string& partner_ip, uint16_t port);
+
+    void wait_for_twf_v2_connections(int timeout_seconds);
 
     // Parity 1 connection checks
     bool is_parity1_send1_connected() const { return parity1_send1_connected_; }
@@ -1225,6 +1293,243 @@ void AsioConnectionManager::init_load_send_twofail_peer1(const std::string& part
     }
 }
 
+// ── Two-failures v2: survivor exchange bind+listen+accept ─────────────────
+
+void AsioConnectionManager::bind_listen_twf_surv_exch(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    twf_surv_exch_acceptor_.open(endpoint.protocol());
+    twf_surv_exch_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    twf_surv_exch_acceptor_.bind(endpoint);
+    twf_surv_exch_acceptor_.listen();
+}
+
+void AsioConnectionManager::accept_twf_surv_exch() {
+    try {
+        twf_surv_exch_acceptor_.accept(twf_surv_exch_socket_);
+        twf_surv_exch_connected_ = true;
+        std::cout << "ASIO: twf_surv_exch connected (accepted)" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: twf_surv_exch accept error: " << e.what() << std::endl;
+        twf_surv_exch_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::init_twf_surv_exch_send(const std::string& partner_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(partner_ip, std::to_string(port));
+        boost::asio::connect(twf_surv_exch_socket_, endpoints);
+        twf_surv_exch_connected_ = true;
+        std::cout << "ASIO: twf_surv_exch connected (connect)" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: twf_surv_exch connect error: " << e.what() << std::endl;
+        twf_surv_exch_connected_ = false;
+        throw;
+    }
+}
+
+// ── Two-failures v2: failed node bind+listen helpers ──────────────────────
+
+void AsioConnectionManager::bind_listen_twf_n1_from_n3(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    twf_n1_from_n3_acceptor_.open(endpoint.protocol());
+    twf_n1_from_n3_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    twf_n1_from_n3_acceptor_.bind(endpoint);
+    twf_n1_from_n3_acceptor_.listen();
+}
+
+void AsioConnectionManager::bind_listen_twf_n1_from_n4(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    twf_n1_from_n4_acceptor_.open(endpoint.protocol());
+    twf_n1_from_n4_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    twf_n1_from_n4_acceptor_.bind(endpoint);
+    twf_n1_from_n4_acceptor_.listen();
+}
+
+void AsioConnectionManager::bind_listen_twf_n2_from_n3(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    twf_n2_from_n3_acceptor_.open(endpoint.protocol());
+    twf_n2_from_n3_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    twf_n2_from_n3_acceptor_.bind(endpoint);
+    twf_n2_from_n3_acceptor_.listen();
+}
+
+void AsioConnectionManager::bind_listen_twf_n2_from_n4(const std::string& listen_ip, uint16_t port) {
+    boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
+    twf_n2_from_n4_acceptor_.open(endpoint.protocol());
+    twf_n2_from_n4_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    twf_n2_from_n4_acceptor_.bind(endpoint);
+    twf_n2_from_n4_acceptor_.listen();
+}
+
+// ── Two-failures v2: failed node accept helpers ───────────────────────────
+
+void AsioConnectionManager::accept_twf_n1_from_n3() {
+    try {
+        twf_n1_from_n3_acceptor_.accept(twf_n1_from_n3_socket_);
+        twf_n1_from_n3_connected_ = true;
+        std::cout << "ASIO: twf_n1_from_n3 connected (accepted)" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: twf_n1_from_n3 accept error: " << e.what() << std::endl;
+        twf_n1_from_n3_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_twf_n1_from_n4() {
+    try {
+        twf_n1_from_n4_acceptor_.accept(twf_n1_from_n4_socket_);
+        twf_n1_from_n4_connected_ = true;
+        std::cout << "ASIO: twf_n1_from_n4 connected (accepted)" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: twf_n1_from_n4 accept error: " << e.what() << std::endl;
+        twf_n1_from_n4_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_twf_n2_from_n3() {
+    try {
+        twf_n2_from_n3_acceptor_.accept(twf_n2_from_n3_socket_);
+        twf_n2_from_n3_connected_ = true;
+        std::cout << "ASIO: twf_n2_from_n3 connected (accepted)" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: twf_n2_from_n3 accept error: " << e.what() << std::endl;
+        twf_n2_from_n3_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::accept_twf_n2_from_n4() {
+    try {
+        twf_n2_from_n4_acceptor_.accept(twf_n2_from_n4_socket_);
+        twf_n2_from_n4_connected_ = true;
+        std::cout << "ASIO: twf_n2_from_n4 connected (accepted)" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: twf_n2_from_n4 accept error: " << e.what() << std::endl;
+        twf_n2_from_n4_connected_ = false;
+        connection_cv_.notify_all();
+    }
+}
+
+// ── Two-failures v2: survivor connect helpers ─────────────────────────────
+
+void AsioConnectionManager::init_twf_send_n1_from_n3(const std::string& partner_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(partner_ip, std::to_string(port));
+        boost::asio::connect(twf_n1_from_n3_socket_, endpoints);
+        twf_n1_from_n3_connected_ = true;
+        std::cout << "ASIO: twf_send_n1_from_n3 connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: twf_send_n1_from_n3 connect error: " << e.what() << std::endl;
+        twf_n1_from_n3_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_twf_send_n1_from_n4(const std::string& partner_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(partner_ip, std::to_string(port));
+        boost::asio::connect(twf_n1_from_n4_socket_, endpoints);
+        twf_n1_from_n4_connected_ = true;
+        std::cout << "ASIO: twf_send_n1_from_n4 connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: twf_send_n1_from_n4 connect error: " << e.what() << std::endl;
+        twf_n1_from_n4_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_twf_send_n2_from_n3(const std::string& partner_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(partner_ip, std::to_string(port));
+        boost::asio::connect(twf_n2_from_n3_socket_, endpoints);
+        twf_n2_from_n3_connected_ = true;
+        std::cout << "ASIO: twf_send_n2_from_n3 connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: twf_send_n2_from_n3 connect error: " << e.what() << std::endl;
+        twf_n2_from_n3_connected_ = false;
+        throw;
+    }
+}
+
+void AsioConnectionManager::init_twf_send_n2_from_n4(const std::string& partner_ip, uint16_t port) {
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(partner_ip, std::to_string(port));
+        boost::asio::connect(twf_n2_from_n4_socket_, endpoints);
+        twf_n2_from_n4_connected_ = true;
+        std::cout << "ASIO: twf_send_n2_from_n4 connected" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: twf_send_n2_from_n4 connect error: " << e.what() << std::endl;
+        twf_n2_from_n4_connected_ = false;
+        throw;
+    }
+}
+
+// ── Two-failures v2: wait for all connections ─────────────────────────────
+
+void AsioConnectionManager::wait_for_twf_v2_connections(int timeout_seconds) {
+    if (!is_twf_v2_connected()) return;
+
+    // Each rank waits for its subset of connections
+    // rig0: n1_from_n3 + n1_from_n4
+    // rig1: n2_from_n3 + n2_from_n4
+    // rig2: surv_exch + n1_from_n3 + n2_from_n3
+    // rig3: surv_exch + n1_from_n4 + n2_from_n4
+    //
+    // We wait until all connections that were initialized are established.
+    int wait_count = 0;
+    while (true) {
+        bool done = true;
+
+        // Check survivor exchange (rig2+rig3)
+        if (twf_surv_exch_acceptor_.is_open() || twf_surv_exch_connected_) {
+            if (!twf_surv_exch_connected_) done = false;
+        }
+
+        // Check survivor→failed connections
+        if (twf_n1_from_n3_acceptor_.is_open() || twf_n1_from_n3_connected_) {
+            if (!twf_n1_from_n3_connected_) done = false;
+        }
+        if (twf_n1_from_n4_acceptor_.is_open() || twf_n1_from_n4_connected_) {
+            if (!twf_n1_from_n4_connected_) done = false;
+        }
+        if (twf_n2_from_n3_acceptor_.is_open() || twf_n2_from_n3_connected_) {
+            if (!twf_n2_from_n3_connected_) done = false;
+        }
+        if (twf_n2_from_n4_acceptor_.is_open() || twf_n2_from_n4_connected_) {
+            if (!twf_n2_from_n4_connected_) done = false;
+        }
+
+        if (done) break;
+
+        if (wait_count % 100 == 0) {
+            std::cout << "ECLATIN: [Two-fail v2] Waiting for connections: "
+                      << "surv_exch=" << twf_surv_exch_connected_
+                      << " n1_n3=" << twf_n1_from_n3_connected_
+                      << " n1_n4=" << twf_n1_from_n4_connected_
+                      << " n2_n3=" << twf_n2_from_n3_connected_
+                      << " n2_n4=" << twf_n2_from_n4_connected_ << std::endl;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        wait_count++;
+        if (wait_count * 10 > timeout_seconds * 1000) {
+            std::cerr << "ECLATIN: [Two-fail v2] Timeout waiting for connections" << std::endl;
+            break;
+        }
+    }
+}
+
 void AsioConnectionManager::cleanup() {
     // Parity 1 sockets
     if (parity1_send1_socket_.is_open()) parity1_send1_socket_.close();
@@ -1264,11 +1569,23 @@ void AsioConnectionManager::cleanup() {
     if (load_send_rank3_data1_socket_.is_open()) load_send_rank3_data1_socket_.close();
     if (load_send_rank3_data2_socket_.is_open()) load_send_rank3_data2_socket_.close();
 
-    // Two-failures load sockets
+    // Two-failures load sockets [old scheme]
     if (load_twofail_peer0_socket_.is_open()) load_twofail_peer0_socket_.close();
     if (load_twofail_peer1_socket_.is_open()) load_twofail_peer1_socket_.close();
     if (load_twofail_peer0_acceptor_.is_open()) load_twofail_peer0_acceptor_.close();
     if (load_twofail_peer1_acceptor_.is_open()) load_twofail_peer1_acceptor_.close();
+
+    // Two-failures v2 load sockets
+    if (twf_surv_exch_socket_.is_open()) twf_surv_exch_socket_.close();
+    if (twf_surv_exch_acceptor_.is_open()) twf_surv_exch_acceptor_.close();
+    if (twf_n1_from_n3_socket_.is_open()) twf_n1_from_n3_socket_.close();
+    if (twf_n1_from_n4_socket_.is_open()) twf_n1_from_n4_socket_.close();
+    if (twf_n2_from_n3_socket_.is_open()) twf_n2_from_n3_socket_.close();
+    if (twf_n2_from_n4_socket_.is_open()) twf_n2_from_n4_socket_.close();
+    if (twf_n1_from_n3_acceptor_.is_open()) twf_n1_from_n3_acceptor_.close();
+    if (twf_n1_from_n4_acceptor_.is_open()) twf_n1_from_n4_acceptor_.close();
+    if (twf_n2_from_n3_acceptor_.is_open()) twf_n2_from_n3_acceptor_.close();
+    if (twf_n2_from_n4_acceptor_.is_open()) twf_n2_from_n4_acceptor_.close();
 }
 
 
@@ -1439,6 +1756,16 @@ public:
         , rdma_load_recv_cq_{}
         , rdma_load_send_cq_two_fail_{}
         , rdma_load_recv_cq_two_fail_{}
+        , rdma_twf_v2_sx_send_cq_{}
+        , rdma_twf_v2_sx_recv_cq_{}
+        , rdma_twf_v2_n1n3_send_cq_{}
+        , rdma_twf_v2_n1n3_recv_cq_{}
+        , rdma_twf_v2_n1n4_send_cq_{}
+        , rdma_twf_v2_n1n4_recv_cq_{}
+        , rdma_twf_v2_n2n3_send_cq_{}
+        , rdma_twf_v2_n2n3_recv_cq_{}
+        , rdma_twf_v2_n2n4_send_cq_{}
+        , rdma_twf_v2_n2n4_recv_cq_{}
 #endif
     {
         const char* mode_str = use_rdma_ ? "RDMA" : "ASIO";
@@ -1955,13 +2282,26 @@ public:
         }
         conn_.wait_for_load_connections(timeout_seconds);
 #if RDMA_AVAILABLE
-        // Two-failures RDMA load channels: init if twofail sockets are connected.
-        // Must check BEFORE normal load RDMA — twofail mode uses separate TCP sockets
-        // and a different channel layout; the normal-load path would use wrong sockets.
-        bool is_twofail = (failed_rank_in_group_ == 10 ||
-                           conn_.is_load_twofail_peer0_connected() ||
-                           conn_.is_load_twofail_peer1_connected());
-        if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_two_fail_[0] == nullptr && is_twofail) {
+        // Two-failures v2 RDMA init
+        bool is_twf_v2 = conn_.is_twf_v2_connected();
+
+        // v2 two-fail: init dedicated RDMA resources and channels
+        if (is_twf_v2 && use_rdma_ && rdma_pd_ && rdma_twf_v2_sx_send_cq_[0] == nullptr) {
+            try {
+                init_rdma_twf_v2_resources();
+                init_rdma_twf_v2_channels();
+            } catch (const std::exception& e) {
+                std::cerr << "ECLATIN: Two-fail v2 RDMA channels init failed: " << e.what() << std::endl;
+                throw;
+            }
+        }
+
+        // Two-failures RDMA load channels (old scheme only)
+        bool is_twofail_old = (!is_twf_v2) && (
+            failed_rank_in_group_ == 10 ||
+            conn_.is_load_twofail_peer0_connected() ||
+            conn_.is_load_twofail_peer1_connected());
+        if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_two_fail_[0] == nullptr && is_twofail_old) {
             try {
                 init_rdma_load_resources_two_fail();
                 init_rdma_load_channels_two_fail();
@@ -1971,8 +2311,8 @@ public:
             }
         }
         // Normal load RDMA channels (single-failure / software recovery).
-        // Only init when NOT in twofail mode — the twofail path uses its own RDMA channels.
-        else if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_[0] == nullptr) {
+        // Only init when NOT in any twofail mode.
+        else if (!is_twf_v2 && use_rdma_ && rdma_pd_ && rdma_load_send_cq_[0] == nullptr) {
             try {
                 init_rdma_load_resources();
                 init_rdma_load_channels();
@@ -2539,6 +2879,401 @@ public:
                   << target_rank_in_group << " successfully" << std::endl;
     }
 
+    // ── Two-failures v2: Phase 0a - bind+listen only (no blocking ops) ─────────
+
+    void init_twofail_bind_phase(
+        int rank_in_group,
+        const std::string& surv_exch_ip, uint16_t surv_exch_port,
+        const std::string& n1_ip, uint16_t n1_n3_port,
+        const std::string& n2_ip, uint16_t n2_n3_port,
+        const std::string& n1_ip2, uint16_t n1_n4_port,
+        const std::string& n2_ip2, uint16_t n2_n4_port
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "ECLATIN: init_twofail_bind_phase called but not in load mode" << std::endl;
+            return;
+        }
+
+        is_twofail_v2_ = true;
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " bind phase..." << std::endl;
+
+        // All bind+listen calls are synchronous and return immediately after listen().
+        // This ensures the kernel TCP backlog is ready before any connect() from Phase B.
+        if (rank_in_group == 2) {
+            // Node3: bind survivor exchange acceptor
+            conn_.bind_listen_twf_surv_exch(surv_exch_ip, surv_exch_port);
+        } else if (rank_in_group == 0) {
+            // Node1: bind acceptors for Node3 and Node4
+            conn_.bind_listen_twf_n1_from_n3(n1_ip, n1_n3_port);
+            conn_.bind_listen_twf_n1_from_n4(n1_ip2, n1_n4_port);
+        } else if (rank_in_group == 1) {
+            // Node2: bind acceptors for Node3 and Node4
+            conn_.bind_listen_twf_n2_from_n3(n2_ip, n2_n3_port);
+            conn_.bind_listen_twf_n2_from_n4(n2_ip2, n2_n4_port);
+        }
+        // rig3: nothing to bind (connects to all others)
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " bind phase complete" << std::endl;
+    }
+
+    // ── Two-failures v2: Phase 0b - connect + accept ──────────────────────────
+
+    void init_twofail_connect_phase(
+        int rank_in_group,
+        const std::string& surv_exch_ip, uint16_t surv_exch_port,
+        const std::string& n1_ip, uint16_t n1_n3_port,
+        const std::string& n2_ip, uint16_t n2_n3_port,
+        const std::string& n1_ip2, uint16_t n1_n4_port,
+        const std::string& n2_ip2, uint16_t n2_n4_port
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "ECLATIN: init_twofail_connect_phase called but not in load mode" << std::endl;
+            return;
+        }
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " connect phase..." << std::endl;
+
+        if (rank_in_group == 2) {
+            // Node3: start accept thread + connect to Node1 and Node2
+            std::thread surv_accept_thread([this]() {
+                conn_.accept_twf_surv_exch();
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            surv_accept_thread.detach();
+
+            conn_.init_twf_send_n1_from_n3(n1_ip, n1_n3_port);
+            conn_.init_twf_send_n2_from_n3(n2_ip, n2_n3_port);
+
+        } else if (rank_in_group == 3) {
+            // Node4: connect to survivor exchange + Node1 + Node2
+            conn_.init_twf_surv_exch_send(surv_exch_ip, surv_exch_port);
+            conn_.init_twf_send_n1_from_n4(n1_ip2, n1_n4_port);
+            conn_.init_twf_send_n2_from_n4(n2_ip2, n2_n4_port);
+
+        } else if (rank_in_group == 0) {
+            // Node1: start accept threads for Node3 and Node4
+            std::thread accept_thread([this]() {
+                std::thread t3([this]() { conn_.accept_twf_n1_from_n3(); });
+                std::thread t4([this]() { conn_.accept_twf_n1_from_n4(); });
+                t3.join();
+                t4.join();
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            accept_thread.detach();
+
+        } else if (rank_in_group == 1) {
+            // Node2: start accept threads for Node3 and Node4
+            std::thread accept_thread([this]() {
+                std::thread t3([this]() { conn_.accept_twf_n2_from_n3(); });
+                std::thread t4([this]() { conn_.accept_twf_n2_from_n4(); });
+                t3.join();
+                t4.join();
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            accept_thread.detach();
+
+        } else {
+            throw std::runtime_error(
+                "ECLATIN: init_twofail_connect_phase: unexpected rank_in_group=" +
+                std::to_string(rank_in_group));
+        }
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " connect phase complete" << std::endl;
+    }
+
+    // ── Two-failures v2: Step 1 - survivor data exchange ─────────────────────
+
+    void survivor_exchange_data(
+        int rank_in_group,
+        uintptr_t send_d1, uintptr_t send_d2,
+        uintptr_t recv_d1, uintptr_t recv_d2,
+        size_t size
+    ) {
+        if (!is_twofail_v2_) {
+            std::cerr << "ECLATIN: survivor_exchange_data called but not in two-fail v2 mode"
+                      << std::endl;
+            return;
+        }
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " exchanging data blocks (size=" << size << ")" << std::endl;
+
+        // RDMA path: parallel send+recv over dedicated channels
+        // Channel mapping: rig3 (send-first) sends on [2,3], recvs on [0,1]
+        //                  rig2 (recv-first) sends on [0,1], recvs on [2,3]
+        // This mirrors the exchange_and_connect order so that send_data on ch[N]
+        // is paired with receive_data on the same ch[N] across ranks.
+#if RDMA_AVAILABLE
+        if (use_rdma_ && rdma_twf_v2_survexch_channels_[0] && rdma_twf_v2_survexch_channels_[1] &&
+            rdma_twf_v2_survexch_channels_[2] && rdma_twf_v2_survexch_channels_[3]) {
+            // Serial on each side to avoid racy ::send()/::recv() on shared socket.
+            // rig3 sends first then recvs; rig2 recvs first then sends.
+            // RDMA data movement is async (ibv_post_send), so throughput is fine.
+            int si, ri;
+            if (rank_in_group == 3) { si = 2; ri = 0; }
+            else                    { si = 0; ri = 2; }
+            auto& ch_send1 = rdma_twf_v2_survexch_channels_[si];
+            auto& ch_send2 = rdma_twf_v2_survexch_channels_[si + 1];
+            auto& ch_recv1 = rdma_twf_v2_survexch_channels_[ri];
+            auto& ch_recv2 = rdma_twf_v2_survexch_channels_[ri + 1];
+
+            if (rank_in_group == 3) {
+                ch_send1->send_data(reinterpret_cast<const uint8_t*>(send_d1), size);
+                ch_send2->send_data(reinterpret_cast<const uint8_t*>(send_d2), size);
+                ch_recv1->receive_data(reinterpret_cast<uint8_t*>(recv_d1), size);
+                ch_recv2->receive_data(reinterpret_cast<uint8_t*>(recv_d2), size);
+            } else {
+                ch_recv1->receive_data(reinterpret_cast<uint8_t*>(recv_d1), size);
+                ch_recv2->receive_data(reinterpret_cast<uint8_t*>(recv_d2), size);
+                ch_send1->send_data(reinterpret_cast<const uint8_t*>(send_d1), size);
+                ch_send2->send_data(reinterpret_cast<const uint8_t*>(send_d2), size);
+            }
+
+            std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                      << " data exchange complete (RDMA)" << std::endl;
+            return;
+        }
+#endif
+
+        // TCP fallback: serialized to avoid interleaving on single socket
+        // rig3 (connector) sends first; rig2 (acceptor) recvs first
+        auto& sock = conn_.get_twf_surv_exch_socket();
+        if (rank_in_group == 3) {
+            if (!send_with_size(sock, send_d1, size))
+                throw std::runtime_error("TCP: Failed to send d1");
+            if (!send_with_size(sock, send_d2, size))
+                throw std::runtime_error("TCP: Failed to send d2");
+            if (!recv_with_size_bool(sock, reinterpret_cast<void*>(recv_d1), size))
+                throw std::runtime_error("TCP: Failed to recv peer d1");
+            if (!recv_with_size_bool(sock, reinterpret_cast<void*>(recv_d2), size))
+                throw std::runtime_error("TCP: Failed to recv peer d2");
+        } else {
+            if (!recv_with_size_bool(sock, reinterpret_cast<void*>(recv_d1), size))
+                throw std::runtime_error("TCP: Failed to recv peer d1");
+            if (!recv_with_size_bool(sock, reinterpret_cast<void*>(recv_d2), size))
+                throw std::runtime_error("TCP: Failed to recv peer d2");
+            if (!send_with_size(sock, send_d1, size))
+                throw std::runtime_error("TCP: Failed to send d1");
+            if (!send_with_size(sock, send_d2, size))
+                throw std::runtime_error("TCP: Failed to send d2");
+        }
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " data exchange complete (TCP)" << std::endl;
+    }
+
+    // ── Two-failures v2: Step 2 - XOR decode on survivor ─────────────────────
+
+    void survivor_xor_decode(
+        int rank_in_group,
+        uintptr_t out1, uintptr_t out2, uintptr_t out3, uintptr_t out4,
+        uintptr_t own_d1, uintptr_t own_d2, uintptr_t own_p1, uintptr_t own_p2,
+        uintptr_t peer_d1, uintptr_t peer_d2,
+        size_t size
+    ) {
+        if (!is_twofail_v2_) {
+            std::cerr << "ECLATIN: survivor_xor_decode called but not in two-fail v2 mode"
+                      << std::endl;
+            return;
+        }
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " starting XOR decode (size=" << size << ")" << std::endl;
+
+        // Lazy-init zero buffer for 2-input XOR via 16-thread pool (must be before XOR ops)
+        if (twofail_zero_buffer_.size() < size) {
+            twofail_zero_buffer_.resize(size, 0);
+        }
+
+        if (rank_in_group == 2) {
+            // Node3: 2-pass XOR
+            // Pass 1: out1 = peer_d2 XOR own_p1   (b21 = b42 ⊕ b33)
+            //         out3 = own_p2 XOR peer_d1    (b12 = b34 ⊕ b41)
+            std::memcpy(reinterpret_cast<void*>(out1), reinterpret_cast<void*>(peer_d2), size);
+            xor_pool_run_parallel(out1, own_p1,
+                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+                static_cast<int>(size));
+
+            std::memcpy(reinterpret_cast<void*>(out3), reinterpret_cast<void*>(own_p2), size);
+            xor_pool_run_parallel(out3, peer_d1,
+                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+                static_cast<int>(size));
+
+            // Pass 2: out2 = out1 XOR own_d2        (b14 = b21 ⊕ b32)
+            //         out4 = out3 XOR own_d1        (b23 = b12 ⊕ b31)
+            std::memcpy(reinterpret_cast<void*>(out2), reinterpret_cast<void*>(out1), size);
+            xor_pool_run_parallel(out2, own_d2,
+                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+                static_cast<int>(size));
+
+            std::memcpy(reinterpret_cast<void*>(out4), reinterpret_cast<void*>(out3), size);
+            xor_pool_run_parallel(out4, own_d1,
+                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+                static_cast<int>(size));
+
+        } else if (rank_in_group == 3) {
+            // Node4: 2-pass XOR
+            // Pass 1: out1 = peer_d2 XOR own_p1   (b11 = b32 ⊕ b43)
+            //         out3 = own_p2 XOR peer_d1    (b22 = b44 ⊕ b31)
+            std::memcpy(reinterpret_cast<void*>(out1), reinterpret_cast<void*>(peer_d2), size);
+            xor_pool_run_parallel(out1, own_p1,
+                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+                static_cast<int>(size));
+
+            std::memcpy(reinterpret_cast<void*>(out3), reinterpret_cast<void*>(own_p2), size);
+            xor_pool_run_parallel(out3, peer_d1,
+                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+                static_cast<int>(size));
+
+            // Pass 2: out2 = out1 XOR own_d2        (b24 = b11 ⊕ b42)
+            //         out4 = out3 XOR own_d1        (b13 = b22 ⊕ b41)
+            std::memcpy(reinterpret_cast<void*>(out2), reinterpret_cast<void*>(out1), size);
+            xor_pool_run_parallel(out2, own_d2,
+                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+                static_cast<int>(size));
+
+            std::memcpy(reinterpret_cast<void*>(out4), reinterpret_cast<void*>(out3), size);
+            xor_pool_run_parallel(out4, own_d1,
+                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
+                static_cast<int>(size));
+
+        } else {
+            throw std::runtime_error(
+                "ECLATIN: survivor_xor_decode: unexpected rank_in_group=" +
+                std::to_string(rank_in_group));
+        }
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " XOR decode complete" << std::endl;
+    }
+
+    // ── Two-failures v2: Step 3 - send 2 blocks to one failed rank ───────────
+
+    void send_two_blocks(
+        int rank_in_group,
+        const std::string& target_rig,
+        uintptr_t addr1, uintptr_t addr2,
+        size_t size
+    ) {
+        if (!is_twofail_v2_) {
+            std::cerr << "ECLATIN: send_two_blocks called but not in two-fail v2 mode"
+                      << std::endl;
+            return;
+        }
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " sending 2 blocks to rig" << target_rig
+                  << " (size=" << size << ")" << std::endl;
+
+        // Select channel array and TCP socket
+        auto* channels = static_cast<decltype(&rdma_twf_v2_n1n3_channels_)>(nullptr);
+        boost::asio::ip::tcp::socket* sock = nullptr;
+        if (rank_in_group == 2) {
+            if (target_rig == "0") { channels = &rdma_twf_v2_n1n3_channels_; sock = &conn_.get_twf_n1_n3_socket(); }
+            else                  { channels = &rdma_twf_v2_n2n3_channels_; sock = &conn_.get_twf_n2_n3_socket(); }
+        } else if (rank_in_group == 3) {
+            if (target_rig == "0") { channels = &rdma_twf_v2_n1n4_channels_; sock = &conn_.get_twf_n1_n4_socket(); }
+            else                  { channels = &rdma_twf_v2_n2n4_channels_; sock = &conn_.get_twf_n2_n4_socket(); }
+        } else {
+            throw std::runtime_error("ECLATIN: send_two_blocks: unexpected rank_in_group=" +
+                                     std::to_string(rank_in_group));
+        }
+
+        // RDMA path: serial to avoid ::send() race on shared control socket
+#if RDMA_AVAILABLE
+        if (use_rdma_ && (*channels)[0] && (*channels)[1]) {
+            (*channels)[0]->send_data(reinterpret_cast<const uint8_t*>(addr1), size);
+            (*channels)[1]->send_data(reinterpret_cast<const uint8_t*>(addr2), size);
+
+            std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                      << " sent 2 blocks to rig" << target_rig << " (RDMA)" << std::endl;
+            return;
+        }
+#endif
+
+        // TCP fallback: serialized over single socket
+        if (!send_with_size(*sock, addr1, size))
+            throw std::runtime_error("TCP: Failed to send block 1");
+        if (!send_with_size(*sock, addr2, size))
+            throw std::runtime_error("TCP: Failed to send block 2");
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " sent 2 blocks to rig" << target_rig << " (TCP)" << std::endl;
+    }
+
+    // ── Two-failures v2: Step 3 - failed node recv 4 blocks from 2 sockets ───
+
+    void recv_four_blocks(
+        int rank_in_group,
+        uintptr_t addr1, uintptr_t addr2, uintptr_t addr3, uintptr_t addr4,
+        size_t size
+    ) {
+        if (!is_twofail_v2_) {
+            std::cerr << "ECLATIN: recv_four_blocks called but not in two-fail v2 mode"
+                      << std::endl;
+            return;
+        }
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " receiving 4 blocks (size=" << size << ")" << std::endl;
+
+        // Select channel arrays and TCP sockets
+        // rig0: ch_n3 = n1n3 (addr2,addr4), ch_n4 = n1n4 (addr1,addr3)
+        // rig1: ch_n3 = n2n3 (addr1,addr3), ch_n4 = n2n4 (addr2,addr4)
+        auto* ch_n3 = static_cast<decltype(&rdma_twf_v2_n1n3_channels_)>(nullptr);
+        auto* ch_n4 = static_cast<decltype(&rdma_twf_v2_n1n4_channels_)>(nullptr);
+        boost::asio::ip::tcp::socket* sock_n3;
+        boost::asio::ip::tcp::socket* sock_n4;
+        uintptr_t a_n3[2], a_n4[2];
+
+        if (rank_in_group == 0) {
+            ch_n3 = &rdma_twf_v2_n1n3_channels_; ch_n4 = &rdma_twf_v2_n1n4_channels_;
+            sock_n3 = &conn_.get_twf_n1_n3_socket(); sock_n4 = &conn_.get_twf_n1_n4_socket();
+            a_n3[0] = addr2; a_n3[1] = addr4;
+            a_n4[0] = addr1; a_n4[1] = addr3;
+        } else if (rank_in_group == 1) {
+            ch_n3 = &rdma_twf_v2_n2n3_channels_; ch_n4 = &rdma_twf_v2_n2n4_channels_;
+            sock_n3 = &conn_.get_twf_n2_n3_socket(); sock_n4 = &conn_.get_twf_n2_n4_socket();
+            a_n3[0] = addr1; a_n3[1] = addr3;
+            a_n4[0] = addr2; a_n4[1] = addr4;
+        } else {
+            throw std::runtime_error("ECLATIN: recv_four_blocks: unexpected rank_in_group=" +
+                                     std::to_string(rank_in_group));
+        }
+
+        // RDMA path: serial per-socket to avoid ::recv() race on shared control fd
+#if RDMA_AVAILABLE
+        if (use_rdma_ && (*ch_n3)[0] && (*ch_n3)[1] && (*ch_n4)[0] && (*ch_n4)[1]) {
+            (*ch_n3)[0]->receive_data(reinterpret_cast<uint8_t*>(a_n3[0]), size);
+            (*ch_n3)[1]->receive_data(reinterpret_cast<uint8_t*>(a_n3[1]), size);
+            (*ch_n4)[0]->receive_data(reinterpret_cast<uint8_t*>(a_n4[0]), size);
+            (*ch_n4)[1]->receive_data(reinterpret_cast<uint8_t*>(a_n4[1]), size);
+
+            std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                      << " received all 4 blocks (RDMA)" << std::endl;
+            return;
+        }
+#endif
+
+        // TCP fallback: serialized to avoid interleaving on shared sockets
+        if (!recv_with_size_bool(*sock_n3, reinterpret_cast<void*>(a_n3[0]), size))
+            throw std::runtime_error("TCP: Failed to recv n3 block 1");
+        if (!recv_with_size_bool(*sock_n3, reinterpret_cast<void*>(a_n3[1]), size))
+            throw std::runtime_error("TCP: Failed to recv n3 block 2");
+        if (!recv_with_size_bool(*sock_n4, reinterpret_cast<void*>(a_n4[0]), size))
+            throw std::runtime_error("TCP: Failed to recv n4 block 1");
+        if (!recv_with_size_bool(*sock_n4, reinterpret_cast<void*>(a_n4[1]), size))
+            throw std::runtime_error("TCP: Failed to recv n4 block 2");
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " received all 4 blocks (TCP)" << std::endl;
+    }
+
     // Layer-wise processing functions
     void submit_layer_wise(
         int layer_id,
@@ -2883,6 +3618,7 @@ private:
     std::atomic<bool> is_load_mode_{false};
     int failed_rank_{-1};
     int failed_rank_in_group_{-1};  // failed rank within 4-rank group (for multi-group support)
+    bool is_twofail_v2_{false};     // two-failures v2 mode (survivor-side XOR decode)
 
     // Multi-rank: global rank, world size, rank within group (0..3 per group)
     int rank_{-1};
@@ -2914,6 +3650,8 @@ private:
     static const int RDMA_NUM_SAVE_CHANNELS = 8;  // parity1 send1/send2, recv1/recv2; parity2 send1/send2, recv1/recv2
     static const int RDMA_NUM_LOAD_CHANNELS = 6;   // rank2 recv: rank0_data2, rank0_parity2, rank1_data1, rank1_parity1, rank3_data1, rank3_data2
     static const int RDMA_NUM_LOAD_CHANNELS_TWO_FAIL = 8;  // two-fail: 4 blocks from each of 2 peers
+    static const int RDMA_NUM_TWF_V2_SURVEXCH = 4;  // v2 survivor exchange: 2 send + 2 recv
+    static const int RDMA_NUM_TWF_V2_PEER = 2;      // v2 per peer: 2 blocks per direction
     ibv_context* rdma_context_;
     ibv_pd* rdma_pd_;
     ibv_cq* rdma_send_cq_[RDMA_NUM_SAVE_CHANNELS];
@@ -2922,11 +3660,29 @@ private:
     ibv_cq* rdma_load_recv_cq_[RDMA_NUM_LOAD_CHANNELS];
     ibv_cq* rdma_load_send_cq_two_fail_[RDMA_NUM_LOAD_CHANNELS_TWO_FAIL];
     ibv_cq* rdma_load_recv_cq_two_fail_[RDMA_NUM_LOAD_CHANNELS_TWO_FAIL];
+    // v2 two-fail: survivor exchange (4 ch over twf_surv_exch)
+    ibv_cq* rdma_twf_v2_sx_send_cq_[RDMA_NUM_TWF_V2_SURVEXCH];
+    ibv_cq* rdma_twf_v2_sx_recv_cq_[RDMA_NUM_TWF_V2_SURVEXCH];
+    // v2 two-fail: peer connections (2 ch each over twf_n1_n3/n1_n4/n2_n3/n2_n4)
+    ibv_cq* rdma_twf_v2_n1n3_send_cq_[RDMA_NUM_TWF_V2_PEER];
+    ibv_cq* rdma_twf_v2_n1n3_recv_cq_[RDMA_NUM_TWF_V2_PEER];
+    ibv_cq* rdma_twf_v2_n1n4_send_cq_[RDMA_NUM_TWF_V2_PEER];
+    ibv_cq* rdma_twf_v2_n1n4_recv_cq_[RDMA_NUM_TWF_V2_PEER];
+    ibv_cq* rdma_twf_v2_n2n3_send_cq_[RDMA_NUM_TWF_V2_PEER];
+    ibv_cq* rdma_twf_v2_n2n3_recv_cq_[RDMA_NUM_TWF_V2_PEER];
+    ibv_cq* rdma_twf_v2_n2n4_send_cq_[RDMA_NUM_TWF_V2_PEER];
+    ibv_cq* rdma_twf_v2_n2n4_recv_cq_[RDMA_NUM_TWF_V2_PEER];
     std::map<uintptr_t, RdmaBuffer> rdma_registered_buffers_;
     std::mutex rdma_buffer_mutex_;
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_SAVE_CHANNELS> rdma_save_channels_;
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_LOAD_CHANNELS> rdma_load_channels_;
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_LOAD_CHANNELS_TWO_FAIL> rdma_load_channels_two_fail_;
+    // v2 two-fail RDMA channels
+    std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_SURVEXCH> rdma_twf_v2_survexch_channels_;
+    std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_PEER> rdma_twf_v2_n1n3_channels_;
+    std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_PEER> rdma_twf_v2_n1n4_channels_;
+    std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_PEER> rdma_twf_v2_n2n3_channels_;
+    std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_PEER> rdma_twf_v2_n2n4_channels_;
 
     // Zero buffer for 2-input XOR via 16-thread pool (d_i = p_X XOR D_Y)
     std::vector<uint8_t> twofail_zero_buffer_;
@@ -3476,6 +4232,146 @@ private:
         }
     }
 
+    // ── Two-failures v2 RDMA resources ────────────────────────────────────────
+
+    void init_rdma_twf_v2_resources() {
+        if (!use_rdma_ || !rdma_pd_) return;
+        std::cout << "[ECLATIN RDMA] Initializing two-fail v2 RDMA resources "
+                  << "(survexch=" << RDMA_NUM_TWF_V2_SURVEXCH
+                  << ", peers=" << (RDMA_NUM_TWF_V2_PEER * 4) << " CQ pairs)..." << std::endl;
+
+        // Survivor exchange: 4 CQ pairs
+        for (int i = 0; i < RDMA_NUM_TWF_V2_SURVEXCH; ++i) {
+            rdma_twf_v2_sx_send_cq_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            rdma_twf_v2_sx_recv_cq_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            if (!rdma_twf_v2_sx_send_cq_[i] || !rdma_twf_v2_sx_recv_cq_[i]) {
+                for (int j = 0; j <= i; ++j) {
+                    if (rdma_twf_v2_sx_send_cq_[j]) { ibv_destroy_cq(rdma_twf_v2_sx_send_cq_[j]); rdma_twf_v2_sx_send_cq_[j] = nullptr; }
+                    if (rdma_twf_v2_sx_recv_cq_[j]) { ibv_destroy_cq(rdma_twf_v2_sx_recv_cq_[j]); rdma_twf_v2_sx_recv_cq_[j] = nullptr; }
+                }
+                throw std::runtime_error("ECLATIN RDMA: Failed to create v2 surv exch CQs");
+            }
+        }
+        // Peer connections: 2 CQ pairs each × 4 peers
+        auto init_peer_cqs = [this](ibv_cq** send_cqs, ibv_cq** recv_cqs, const char* name) {
+            for (int i = 0; i < RDMA_NUM_TWF_V2_PEER; ++i) {
+                send_cqs[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+                recv_cqs[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+                if (!send_cqs[i] || !recv_cqs[i]) {
+                    for (int j = 0; j <= i; ++j) {
+                        if (send_cqs[j]) { ibv_destroy_cq(send_cqs[j]); send_cqs[j] = nullptr; }
+                        if (recv_cqs[j]) { ibv_destroy_cq(recv_cqs[j]); recv_cqs[j] = nullptr; }
+                    }
+                    throw std::runtime_error(std::string("ECLATIN RDMA: Failed to create v2 ") + name + " CQs");
+                }
+            }
+        };
+        init_peer_cqs(rdma_twf_v2_n1n3_send_cq_, rdma_twf_v2_n1n3_recv_cq_, "n1n3");
+        init_peer_cqs(rdma_twf_v2_n1n4_send_cq_, rdma_twf_v2_n1n4_recv_cq_, "n1n4");
+        init_peer_cqs(rdma_twf_v2_n2n3_send_cq_, rdma_twf_v2_n2n3_recv_cq_, "n2n3");
+        init_peer_cqs(rdma_twf_v2_n2n4_send_cq_, rdma_twf_v2_n2n4_recv_cq_, "n2n4");
+
+        std::cout << "[ECLATIN RDMA] Two-fail v2 RDMA resources initialized ("
+                  << RDMA_NUM_TWF_V2_SURVEXCH << "+" << (RDMA_NUM_TWF_V2_PEER * 4)
+                  << " CQ pairs)" << std::endl;
+    }
+
+    void init_rdma_twf_v2_channels() {
+        if (!use_rdma_ || !rdma_pd_) return;
+        AsioConnectionManager& c = conn_;
+        int rank_for_log = rank_in_group_;
+
+        std::cout << "[ECLATIN RDMA] Creating two-fail v2 RDMA channels (rig "
+                  << rank_in_group_ << ")..." << std::endl;
+
+        try {
+            // ── Survivor exchange channels (4) ────────────────────────────
+            // Only rig2 and rig3 have the surv_exch socket connected.
+            if (rank_in_group_ == 2 || rank_in_group_ == 3) {
+                bool surv_send_first = (rank_in_group_ == 3);
+                for (int i = 0; i < RDMA_NUM_TWF_V2_SURVEXCH; ++i) {
+                    auto& sock = c.get_twf_surv_exch_socket();
+                    rdma_twf_v2_survexch_channels_[i] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_,
+                        rdma_twf_v2_sx_send_cq_[i], rdma_twf_v2_sx_recv_cq_[i],
+                        sock.native_handle(), sock.native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log,
+                        (rank_in_group_ == 2) ? 3 : 2);
+                    rdma_twf_v2_survexch_channels_[i]->exchange_and_connect(surv_send_first);
+                }
+                std::cout << "[ECLATIN RDMA] v2 surv exch channels connected (rig"
+                          << rank_in_group_ << ")" << std::endl;
+            }
+
+            // ── Peer channels (2 each, 4 peers) ───────────────────────────
+            // Helper: init peer channels
+            auto init_peer_channels = [&](
+                std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_PEER>& channels,
+                ibv_cq** send_cqs, ibv_cq** recv_cqs,
+                boost::asio::ip::tcp::socket& sock,
+                bool send_first, int peer_rig, const char* name)
+            {
+                for (int i = 0; i < RDMA_NUM_TWF_V2_PEER; ++i) {
+                    channels[i] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_,
+                        send_cqs[i], recv_cqs[i],
+                        sock.native_handle(), sock.native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer_rig);
+                    channels[i]->exchange_and_connect(send_first);
+                }
+                std::cout << "[ECLATIN RDMA] v2 " << name << " channels connected (rig"
+                          << rank_in_group_ << ")" << std::endl;
+            };
+
+            // n1_n3: rig0 recv-first, rig2 send-first; peer_rig=0 for rig2, peer_rig=2 for rig0
+            if (rank_in_group_ == 0 || rank_in_group_ == 2) {
+                bool sf = (rank_in_group_ == 2);
+                int pr = (rank_in_group_ == 2) ? 0 : 2;
+                init_peer_channels(rdma_twf_v2_n1n3_channels_, rdma_twf_v2_n1n3_send_cq_,
+                                   rdma_twf_v2_n1n3_recv_cq_, c.get_twf_n1_n3_socket(),
+                                   sf, pr, "n1n3");
+            }
+            // n1_n4: rig0 recv-first, rig3 send-first
+            if (rank_in_group_ == 0 || rank_in_group_ == 3) {
+                bool sf = (rank_in_group_ == 3);
+                int pr = (rank_in_group_ == 3) ? 0 : 3;
+                init_peer_channels(rdma_twf_v2_n1n4_channels_, rdma_twf_v2_n1n4_send_cq_,
+                                   rdma_twf_v2_n1n4_recv_cq_, c.get_twf_n1_n4_socket(),
+                                   sf, pr, "n1n4");
+            }
+            // n2_n3: rig1 recv-first, rig2 send-first
+            if (rank_in_group_ == 1 || rank_in_group_ == 2) {
+                bool sf = (rank_in_group_ == 2);
+                int pr = (rank_in_group_ == 2) ? 1 : 2;
+                init_peer_channels(rdma_twf_v2_n2n3_channels_, rdma_twf_v2_n2n3_send_cq_,
+                                   rdma_twf_v2_n2n3_recv_cq_, c.get_twf_n2_n3_socket(),
+                                   sf, pr, "n2n3");
+            }
+            // n2_n4: rig1 recv-first, rig3 send-first
+            if (rank_in_group_ == 1 || rank_in_group_ == 3) {
+                bool sf = (rank_in_group_ == 3);
+                int pr = (rank_in_group_ == 3) ? 1 : 3;
+                init_peer_channels(rdma_twf_v2_n2n4_channels_, rdma_twf_v2_n2n4_send_cq_,
+                                   rdma_twf_v2_n2n4_recv_cq_, c.get_twf_n2_n4_socket(),
+                                   sf, pr, "n2n4");
+            }
+
+            std::cout << "[ECLATIN RDMA] All two-fail v2 channels connected (rig"
+                      << rank_in_group_ << ")" << std::endl;
+
+        } catch (const std::exception& e) {
+            std::cerr << "[ECLATIN RDMA] Failed to init two-fail v2 channels: " << e.what() << std::endl;
+            for (int i = 0; i < RDMA_NUM_TWF_V2_SURVEXCH; ++i) rdma_twf_v2_survexch_channels_[i].reset();
+            for (int i = 0; i < RDMA_NUM_TWF_V2_PEER; ++i) {
+                rdma_twf_v2_n1n3_channels_[i].reset();
+                rdma_twf_v2_n1n4_channels_[i].reset();
+                rdma_twf_v2_n2n3_channels_[i].reset();
+                rdma_twf_v2_n2n4_channels_[i].reset();
+            }
+            throw;
+        }
+    }
+
     void cleanup_rdma_resources() {
         if (!use_rdma_) return;
         std::cout << "[ECLATIN RDMA] Cleaning up RDMA resources..." << std::endl;
@@ -3500,6 +4396,23 @@ private:
             if (rdma_load_send_cq_two_fail_[i]) { ibv_destroy_cq(rdma_load_send_cq_two_fail_[i]); rdma_load_send_cq_two_fail_[i] = nullptr; }
             if (rdma_load_recv_cq_two_fail_[i]) { ibv_destroy_cq(rdma_load_recv_cq_two_fail_[i]); rdma_load_recv_cq_two_fail_[i] = nullptr; }
         }
+        // v2 two-fail channels
+        for (int i = 0; i < RDMA_NUM_TWF_V2_SURVEXCH; ++i) {
+            rdma_twf_v2_survexch_channels_[i].reset();
+            if (rdma_twf_v2_sx_send_cq_[i]) { ibv_destroy_cq(rdma_twf_v2_sx_send_cq_[i]); rdma_twf_v2_sx_send_cq_[i] = nullptr; }
+            if (rdma_twf_v2_sx_recv_cq_[i]) { ibv_destroy_cq(rdma_twf_v2_sx_recv_cq_[i]); rdma_twf_v2_sx_recv_cq_[i] = nullptr; }
+        }
+        auto cleanup_peer = [](auto& channels, ibv_cq** scqs, ibv_cq** rcqs) {
+            for (int i = 0; i < RDMA_NUM_TWF_V2_PEER; ++i) {
+                channels[i].reset();
+                if (scqs[i]) { ibv_destroy_cq(scqs[i]); scqs[i] = nullptr; }
+                if (rcqs[i]) { ibv_destroy_cq(rcqs[i]); rcqs[i] = nullptr; }
+            }
+        };
+        cleanup_peer(rdma_twf_v2_n1n3_channels_, rdma_twf_v2_n1n3_send_cq_, rdma_twf_v2_n1n3_recv_cq_);
+        cleanup_peer(rdma_twf_v2_n1n4_channels_, rdma_twf_v2_n1n4_send_cq_, rdma_twf_v2_n1n4_recv_cq_);
+        cleanup_peer(rdma_twf_v2_n2n3_channels_, rdma_twf_v2_n2n3_send_cq_, rdma_twf_v2_n2n3_recv_cq_);
+        cleanup_peer(rdma_twf_v2_n2n4_channels_, rdma_twf_v2_n2n4_send_cq_, rdma_twf_v2_n2n4_recv_cq_);
         {
             std::lock_guard<std::mutex> lock(rdma_buffer_mutex_);
             for (auto& [addr, buf] : rdma_registered_buffers_) {
@@ -5323,6 +6236,50 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("data2_addr"),
              pybind11::arg("parity1_addr"),
              pybind11::arg("parity2_addr"),
+             pybind11::arg("size"))
+        // Two-failures v2: new 3-step protocol (2-phase connection)
+        .def("init_twofail_bind_phase", &ECLATINNative::init_twofail_bind_phase,
+             "Phase 0a: bind+listen only (synchronous, no blocking)",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("surv_exch_ip"), pybind11::arg("surv_exch_port"),
+             pybind11::arg("n1_ip"), pybind11::arg("n1_n3_port"),
+             pybind11::arg("n2_ip"), pybind11::arg("n2_n3_port"),
+             pybind11::arg("n1_ip2"), pybind11::arg("n1_n4_port"),
+             pybind11::arg("n2_ip2"), pybind11::arg("n2_n4_port"))
+        .def("init_twofail_connect_phase", &ECLATINNative::init_twofail_connect_phase,
+             "Phase 0b: connect + accept (after barrier, all listeners ready)",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("surv_exch_ip"), pybind11::arg("surv_exch_port"),
+             pybind11::arg("n1_ip"), pybind11::arg("n1_n3_port"),
+             pybind11::arg("n2_ip"), pybind11::arg("n2_n3_port"),
+             pybind11::arg("n1_ip2"), pybind11::arg("n1_n4_port"),
+             pybind11::arg("n2_ip2"), pybind11::arg("n2_n4_port"))
+        .def("survivor_exchange_data", &ECLATINNative::survivor_exchange_data,
+             "Step 1: Survivor↔Survivor data block exchange",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("send_d1"), pybind11::arg("send_d2"),
+             pybind11::arg("recv_d1"), pybind11::arg("recv_d2"),
+             pybind11::arg("size"))
+        .def("survivor_xor_decode", &ECLATINNative::survivor_xor_decode,
+             "Step 2: XOR decode on survivor (2-pass, 2-input, 16-thread pool)",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("out1"), pybind11::arg("out2"),
+             pybind11::arg("out3"), pybind11::arg("out4"),
+             pybind11::arg("own_d1"), pybind11::arg("own_d2"),
+             pybind11::arg("own_p1"), pybind11::arg("own_p2"),
+             pybind11::arg("peer_d1"), pybind11::arg("peer_d2"),
+             pybind11::arg("size"))
+        .def("send_two_blocks", &ECLATINNative::send_two_blocks,
+             "Step 3: Survivor sends 2 blocks to a failed rank (parallel)",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("target_rig"),
+             pybind11::arg("addr1"), pybind11::arg("addr2"),
+             pybind11::arg("size"))
+        .def("recv_four_blocks", &ECLATINNative::recv_four_blocks,
+             "Step 3: Failed node receives 4 blocks from 2 survivors (parallel)",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("addr1"), pybind11::arg("addr2"),
+             pybind11::arg("addr3"), pybind11::arg("addr4"),
              pybind11::arg("size"))
         .def("stop", &ECLATINNative::stop);
 }

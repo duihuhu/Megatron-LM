@@ -672,9 +672,9 @@ def _load_ecnaive_legacy_software_failure(
     send_block_idx: int = -1
 
     if rank_in_group == failed_rig:
-        # Pre-allocate final tensor_buffer once
+        # Pre-allocate final tensor_buffer once (pinned for fast CPU→GPU copy)
         buf_len = max(actual_tensor_size, pipeline_total_bytes)
-        tensor_buffer = torch.zeros(buf_len, dtype=torch.uint8)
+        tensor_buffer = allocate_hugepage_tensor(buf_len, fallback_pin_memory=True)
         # Decode local d_{f,0} directly into tensor_buffer (no network dep)
         own_data0 = _load_ecnaive_block_file(
             checkpoint_dir, rank,
@@ -1500,7 +1500,14 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             raise RuntimeError(
                 f"EC-NAIVE hw recovery: missing own data blocks for rank {rank}"
             )
-        tensor_buffer = torch.cat([d0, d1], dim=0)
+        total = d0.numel() + d1.numel()
+        tensor_buffer = allocate_hugepage_tensor(
+            max(total, actual_tensor_size), fallback_pin_memory=True,
+        )
+        tensor_buffer[:d0.numel()].copy_(d0)
+        if actual_tensor_size > 0:
+            end = min(d1.numel(), max(0, actual_tensor_size - d0.numel()))
+            tensor_buffer[d0.numel():d0.numel() + end].copy_(d1[:end])
         if actual_tensor_size > 0:
             tensor_buffer = tensor_buffer[:actual_tensor_size]
 

@@ -2088,9 +2088,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
 
+
+    load_model_end_time = time()
+    logger.info(f"load model+optimizer+rng time: {load_model_end_time - load_model_start_time:.4f}s")
+
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
+
 
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '

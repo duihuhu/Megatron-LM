@@ -1994,6 +1994,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if 'model%d' % i not in state_dict:
                     continue
                 load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
+    # load_model_end_time = time()
+    # logger.info(f"load model time: {load_model_end_time - load_model_start_time:.4f}s")
+    # torch.distributed.barrier()
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
@@ -2103,6 +2106,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not torch.distributed.is_initialized() \
        or is_last_rank():
         wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
+    torch.distributed.barrier()
+    load_model_end_time = time()
+    logger.info(f"load model time: {load_model_end_time - load_model_start_time:.4f}s")
 
     torch.cuda.empty_cache()
 
@@ -2110,7 +2116,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         # Notify FT that a checkpoint was loaded.
         is_local_chkpt = (ckpt_type == CheckpointType.LOCAL)
         ft_integration.on_checkpoint_loaded(is_local_chkpt=is_local_chkpt)
-
+    
     return iteration, num_floating_point_operations_so_far
 
 

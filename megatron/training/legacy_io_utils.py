@@ -10,10 +10,13 @@ serialisation overhead.  Uses a short magic-number header so that old
 import os
 import pickle
 import struct
+from logging import getLogger
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+
+logger = getLogger(__name__)
 
 # ---- file-format constants --------------------------------------------------
 
@@ -125,6 +128,37 @@ def write_block_prepared(path: str, magic: bytes, mv: memoryview, size: int) -> 
 
 # ---- read helpers -----------------------------------------------------------
 
+def pin_uint8_tensor_if_available(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy a CPU uint8 tensor into pinned memory when CUDA is available."""
+    if (
+        not torch.is_tensor(tensor)
+        or tensor.device.type != "cpu"
+        or tensor.numel() == 0
+        or not torch.cuda.is_available()
+        or tensor.is_pinned()
+    ):
+        return tensor
+    try:
+        pinned = torch.empty(tensor.numel(), dtype=torch.uint8, pin_memory=True)
+        pinned.copy_(tensor.contiguous().view(torch.uint8).reshape(-1))
+        return pinned
+    except Exception as exc:
+        logger.warning(
+            "Unable to pin raw checkpoint tensor buffer; using pageable CPU memory: %s",
+            exc,
+        )
+        return tensor
+
+
+def pin_payload_tensor_buffer_if_available(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Pin payload['tensor_buffer'] in-place when present."""
+    tensor_buffer = payload.get("tensor_buffer")
+    if torch.is_tensor(tensor_buffer):
+        payload["tensor_buffer"] = pin_uint8_tensor_if_available(
+            tensor_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
+        )
+    return payload
+
 def _peek_magic(path: str) -> bytes:
     """Return the first 4 bytes of *path* without consuming the file."""
     with open(path, "rb") as f:
@@ -141,6 +175,7 @@ def _read_header(f: BinaryIO) -> Tuple[int, int, int]:
 def read_raw_checkpoint(
     path: str,
     expected_magic: bytes,
+    pin_tensor_buffer: bool = False,
 ) -> Dict[str, Any]:
     """Read a legacy main checkpoint file written by ``write_raw_checkpoint``.
 
@@ -163,6 +198,8 @@ def read_raw_checkpoint(
         # Read directly into a torch tensor (zero-copy from read buffer)
         raw = f.read(data_len)
         tensor = torch.from_numpy(np.frombuffer(raw, dtype=np.uint8))
+        if pin_tensor_buffer:
+            tensor = pin_uint8_tensor_if_available(tensor)
 
     result: Dict[str, Any] = {
         "non_tensor_data": non_tensor_data,
@@ -173,7 +210,11 @@ def read_raw_checkpoint(
     return result
 
 
-def read_raw_block(path: str, expected_magic: bytes) -> torch.Tensor:
+def read_raw_block(
+    path: str,
+    expected_magic: bytes,
+    pin_tensor: bool = False,
+) -> torch.Tensor:
     """Read a pure-data block file written by ``write_raw_block``."""
     with open(path, "rb") as f:
         magic = f.read(_HEADER_MAGIC_LEN)
@@ -183,7 +224,10 @@ def read_raw_block(path: str, expected_magic: bytes) -> torch.Tensor:
             )
         size = struct.unpack("<Q", f.read(8))[0]
         raw = f.read(size)
-    return torch.from_numpy(np.frombuffer(raw, dtype=np.uint8))
+    tensor = torch.from_numpy(np.frombuffer(raw, dtype=np.uint8))
+    if pin_tensor:
+        tensor = pin_uint8_tensor_if_available(tensor)
+    return tensor
 
 
 def is_raw_format(path: str, expected_magic: bytes) -> bool:
@@ -196,16 +240,32 @@ def is_raw_format(path: str, expected_magic: bytes) -> bool:
         return False
 
 
-def smart_load_checkpoint(path: str, expected_magic: bytes) -> Dict[str, Any]:
+def smart_load_checkpoint(
+    path: str,
+    expected_magic: bytes,
+    pin_tensor_buffer: bool = False,
+) -> Dict[str, Any]:
     """Load a main checkpoint file — raw format preferred, torch.load fallback."""
     if is_raw_format(path, expected_magic):
-        return read_raw_checkpoint(path, expected_magic)
-    return torch.load(path, map_location="cpu", weights_only=False)
+        return read_raw_checkpoint(
+            path, expected_magic, pin_tensor_buffer=pin_tensor_buffer,
+        )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if pin_tensor_buffer:
+        pin_payload_tensor_buffer_if_available(payload)
+    return payload
 
 
-def smart_load_block(path: str, expected_magic: bytes) -> torch.Tensor:
+def smart_load_block(
+    path: str,
+    expected_magic: bytes,
+    pin_tensor: bool = False,
+) -> torch.Tensor:
     """Load a block file — raw format preferred, torch.load fallback."""
     if is_raw_format(path, expected_magic):
-        return read_raw_block(path, expected_magic)
+        return read_raw_block(path, expected_magic, pin_tensor=pin_tensor)
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    return payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
+    tensor = payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
+    if pin_tensor:
+        tensor = pin_uint8_tensor_if_available(tensor)
+    return tensor

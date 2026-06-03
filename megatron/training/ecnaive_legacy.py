@@ -368,11 +368,17 @@ def _load_ecnaive_main_payload(
     main_path = checkpoint_dir / f"ecnaive_main_rank{rank}.pt"
     local_payload: Optional[Dict[str, Any]] = None
     if main_path.is_file():
-        from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_ECNAIVE
+        from megatron.training.legacy_io_utils import (
+            is_raw_format, read_raw_checkpoint, MAGIC_ECNAIVE,
+            pin_payload_tensor_buffer_if_available,
+        )
         if is_raw_format(str(main_path), MAGIC_ECNAIVE):
-            local_payload = read_raw_checkpoint(str(main_path), MAGIC_ECNAIVE)
+            local_payload = read_raw_checkpoint(
+                str(main_path), MAGIC_ECNAIVE, pin_tensor_buffer=True,
+            )
         else:
             local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+            pin_payload_tensor_buffer_if_available(local_payload)
 
     if world_size <= 1 or not torch.distributed.is_initialized():
         if local_payload is None:
@@ -417,17 +423,23 @@ def _load_ecnaive_main_payload(
 
 
 def _load_blocks_from_disk(checkpoint_dir: Path, rank: int) -> Dict[str, torch.Tensor]:
-    from megatron.training.legacy_io_utils import is_raw_format, read_raw_block, MAGIC_BLOCK
+    from megatron.training.legacy_io_utils import (
+        is_raw_format, read_raw_block, MAGIC_BLOCK, pin_uint8_tensor_if_available,
+    )
     blocks: Dict[str, torch.Tensor] = {}
     for block_name in ("data0", "recv_parity1", "recv_parity0", "recv_data1"):
         block_path = checkpoint_dir / f"ecnaive_block_rank{rank}_{block_name}.pt"
         if not block_path.is_file():
             raise FileNotFoundError(f"EC-NAIVE legacy: missing block file {block_path}")
         if is_raw_format(str(block_path), MAGIC_BLOCK):
-            blocks[block_name] = read_raw_block(str(block_path), MAGIC_BLOCK)
+            blocks[block_name] = read_raw_block(
+                str(block_path), MAGIC_BLOCK, pin_tensor=True,
+            )
         else:
             payload = torch.load(block_path, map_location="cpu", weights_only=False)
-            blocks[block_name] = payload["tensor"].contiguous().view(torch.uint8)
+            blocks[block_name] = pin_uint8_tensor_if_available(
+                payload["tensor"].contiguous().view(torch.uint8)
+            )
     return blocks
 
 
@@ -527,7 +539,9 @@ def _load_ecnaive_block_file(
     Returns:
         torch.Tensor of dtype uint8 with the block data.
     """
-    from megatron.training.legacy_io_utils import is_raw_format, read_raw_block, MAGIC_BLOCK
+    from megatron.training.legacy_io_utils import (
+        is_raw_format, read_raw_block, MAGIC_BLOCK, pin_uint8_tensor_if_available,
+    )
 
     candidates: List[Path] = []
 
@@ -550,9 +564,11 @@ def _load_ecnaive_block_file(
         )
 
     if is_raw_format(str(block_path), MAGIC_BLOCK):
-        return read_raw_block(str(block_path), MAGIC_BLOCK)
+        return read_raw_block(str(block_path), MAGIC_BLOCK, pin_tensor=True)
     payload = torch.load(str(block_path), map_location="cpu", weights_only=False)
-    return payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
+    return pin_uint8_tensor_if_available(
+        payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
+    )
 
 
 def _decode_data_block(
@@ -1118,7 +1134,9 @@ def _load_all_blocks_from_disk(
 
     Tries canonical filenames first, falls back to legacy names for k=2.
     """
-    from megatron.training.legacy_io_utils import is_raw_format, read_raw_block, MAGIC_BLOCK
+    from megatron.training.legacy_io_utils import (
+        is_raw_format, read_raw_block, MAGIC_BLOCK, pin_uint8_tensor_if_available,
+    )
 
     # Legacy name map for k=2 backward compatibility
     legacy_map: Dict[int, str] = {}
@@ -1152,12 +1170,14 @@ def _load_all_blocks_from_disk(
         for path in candidates:
             if path.is_file():
                 if is_raw_format(str(path), MAGIC_BLOCK):
-                    tensor = read_raw_block(str(path), MAGIC_BLOCK)
+                    tensor = read_raw_block(str(path), MAGIC_BLOCK, pin_tensor=True)
                 else:
                     payload = torch.load(
                         str(path), map_location="cpu", weights_only=False
                     )
-                    tensor = payload["tensor"].contiguous().view(torch.uint8)
+                    tensor = pin_uint8_tensor_if_available(
+                        payload["tensor"].contiguous().view(torch.uint8)
+                    )
                 break
 
         if tensor is None:

@@ -1340,7 +1340,9 @@ def _load_base_checkpoint(
                             f"No gemini_replicas_main_rank*.pt found in {ckpt_parent_path}"
                         )
                     from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_GEMINI
-                    payload = smart_load_checkpoint(str(marker), MAGIC_GEMINI)
+                    payload = smart_load_checkpoint(
+                        str(marker), MAGIC_GEMINI, pin_tensor_buffer=True,
+                    )
                     state_dict = state_dict_from_gemini_replicas_main_metadata_only(payload)
             elif args.use_ecnaive:
                 from .ecnaive_legacy import (
@@ -1374,7 +1376,9 @@ def _load_base_checkpoint(
                             f"No ecnaive_main_rank*.pt found in {ckpt_parent_path}"
                         )
                     from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECNAIVE
-                    payload = smart_load_checkpoint(str(marker), MAGIC_ECNAIVE)
+                    payload = smart_load_checkpoint(
+                        str(marker), MAGIC_ECNAIVE, pin_tensor_buffer=True,
+                    )
                     state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
             elif getattr(args, "use_eclatin", False):
                 from .eclatin_legacy import (
@@ -1395,7 +1399,9 @@ def _load_base_checkpoint(
                             f"No eclatin_main_rank*.pt found in {ckpt_parent_path}"
                         )
                     from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECLATIN
-                    payload = smart_load_checkpoint(str(marker), MAGIC_ECLATIN)
+                    payload = smart_load_checkpoint(
+                        str(marker), MAGIC_ECLATIN, pin_tensor_buffer=True,
+                    )
                     state_dict = state_dict_from_eclatin_main_metadata_only(payload)
             elif getattr(args, "use_frcheck", False):
                 from .frcheck_legacy import load_frcheck_legacy_checkpoint
@@ -1419,7 +1425,9 @@ def _load_base_checkpoint(
                             f"No eccheck_main_rank*.pt found in {ckpt_parent_path}"
                         )
                     from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECCHECK
-                    payload = smart_load_checkpoint(str(marker), MAGIC_ECCHECK)
+                    payload = smart_load_checkpoint(
+                        str(marker), MAGIC_ECCHECK, pin_tensor_buffer=True,
+                    )
                     state_dict = state_dict_from_eccheck_main_metadata_only(payload)
             else:
                 # ---- Marker-based auto-detection (backward compat) ----
@@ -1453,7 +1461,9 @@ def _load_base_checkpoint(
                         state_dict = load_eclatin_legacy_checkpoint(checkpoint_name)
                     else:
                         from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECLATIN
-                        payload = smart_load_checkpoint(str(eclatin_marker), MAGIC_ECLATIN)
+                        payload = smart_load_checkpoint(
+                            str(eclatin_marker), MAGIC_ECLATIN, pin_tensor_buffer=True,
+                        )
                         state_dict = state_dict_from_eclatin_main_metadata_only(payload)
                 else:
                     ecnaive_marker = None
@@ -1480,7 +1490,9 @@ def _load_base_checkpoint(
                             state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
                         else:
                             from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECNAIVE
-                            payload = smart_load_checkpoint(str(ecnaive_marker), MAGIC_ECNAIVE)
+                            payload = smart_load_checkpoint(
+                                str(ecnaive_marker), MAGIC_ECNAIVE, pin_tensor_buffer=True,
+                            )
                             state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
                     else:
                         frcheck_marker = None
@@ -1533,7 +1545,9 @@ def _load_base_checkpoint(
                                 state_dict = load_eccheck_legacy_checkpoint(checkpoint_name)
                             else:
                                 from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECCHECK
-                                payload = smart_load_checkpoint(str(eccheck_marker), MAGIC_ECCHECK)
+                                payload = smart_load_checkpoint(
+                                    str(eccheck_marker), MAGIC_ECCHECK, pin_tensor_buffer=True,
+                                )
                                 state_dict = state_dict_from_eccheck_main_metadata_only(payload)
                         else:
                             state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
@@ -1981,9 +1995,44 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
     # Model.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     torch.distributed.barrier()
     load_model_start_time = time()
+    load_model_start = time()
     strict = False if args.retro_add_retriever else strict
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    # model_sd_for_stats = state_dict.get('model')
+    # if isinstance(model_sd_for_stats, dict):
+    #     model_tensor_count = 0
+    #     model_non_tensor_count = 0
+    #     model_tensor_bytes = 0
+    #     model_non_contig_count = 0
+    #     model_pinned_count = 0
+    #     model_storage_ptrs = set()
+    #     for value in model_sd_for_stats.values():
+    #         if torch.is_tensor(value):
+    #             model_tensor_count += 1
+    #             model_tensor_bytes += value.numel() * value.element_size()
+    #             if not value.is_contiguous():
+    #                 model_non_contig_count += 1
+    #             if value.device.type == 'cpu' and value.is_pinned():
+    #                 model_pinned_count += 1
+    #             try:
+    #                 model_storage_ptrs.add(value.untyped_storage().data_ptr())
+    #             except Exception:
+    #                 model_storage_ptrs.add(value.storage().data_ptr())
+    #         else:
+    #             model_non_tensor_count += 1
+    #     logger.info(
+    #         f"[rank {rank}] model sd stats: tensors={model_tensor_count} "
+    #         f"non_tensors={model_non_tensor_count} "
+    #         f"bytes={model_tensor_bytes / (1024 ** 2):.2f} MiB "
+    #         f"storages={len(model_storage_ptrs)} "
+    #         f"non_contig={model_non_contig_count} "
+    #         f"pinned={model_pinned_count}"
+    #     )
+    model_submit_start = time()
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
             load_model_state_dict(ddp_model[0], state_dict['model'], strict)
@@ -1994,20 +2043,88 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if 'model%d' % i not in state_dict:
                     continue
                 load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
-    # load_model_end_time = time()
-    # logger.info(f"load model time: {load_model_end_time - load_model_start_time:.4f}s")
-    # torch.distributed.barrier()
+    model_submit_end = time()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    model_sync_end = time()
+    logger.info(
+        f"[rank {rank}] model load submit={model_submit_end - model_submit_start:.4f}s "
+        f"cuda_sync={model_sync_end - model_submit_end:.4f}s "
+        f"total={model_sync_end - model_submit_start:.4f}s"
+    )
+    logger.info(
+        f"[rank {rank}] load only model state before barrier time: "
+        f"{model_sync_end - load_model_start_time:.4f}s"
+    )
+    torch.distributed.barrier()
+    load_model_end_time = time()
+    logger.info(f"load only model state time: {load_model_end_time - load_model_start_time:.4f}s")
+    load_model_start_time = time()
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
     fix_query_key_value_ordering(model, checkpoint_version)
+
+    def collect_tensor_stats(obj):
+        tensor_count = 0
+        tensor_bytes = 0
+        non_contig_count = 0
+        pinned_count = 0
+        storage_ptrs = set()
+
+        def visit(value):
+            nonlocal tensor_count, tensor_bytes, non_contig_count, pinned_count
+            if torch.is_tensor(value):
+                tensor_count += 1
+                tensor_bytes += value.numel() * value.element_size()
+                if not value.is_contiguous():
+                    non_contig_count += 1
+                if value.device.type == 'cpu' and value.is_pinned():
+                    pinned_count += 1
+                try:
+                    storage_ptrs.add(value.untyped_storage().data_ptr())
+                except Exception:
+                    storage_ptrs.add(value.storage().data_ptr())
+            elif isinstance(value, dict):
+                for item in value.values():
+                    visit(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    visit(item)
+
+        visit(obj)
+        return tensor_count, tensor_bytes, len(storage_ptrs), non_contig_count, pinned_count
 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
             if not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
+                (
+                #     optim_tensor_count,
+                #     optim_tensor_bytes,
+                #     optim_storage_count,
+                #     optim_non_contig_count,
+                #     optim_pinned_count,
+                # ) = collect_tensor_stats(state_dict.get('optimizer'))
+                # logger.info(
+                #     f"[rank {rank}] optimizer sd stats: tensors={optim_tensor_count} "
+                #     f"bytes={optim_tensor_bytes / (1024 ** 2):.2f} MiB "
+                #     f"storages={optim_storage_count} "
+                #     f"non_contig={optim_non_contig_count} "
+                #     f"pinned={optim_pinned_count}"
+                )
+                optim_submit_start = time()
                 optimizer.load_state_dict(state_dict['optimizer'])
+                optim_submit_end = time()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                optim_sync_end = time()
+                logger.info(
+                    f"[rank {rank}] optimizer load submit={optim_submit_end - optim_submit_start:.4f}s "
+                    f"cuda_sync={optim_sync_end - optim_submit_end:.4f}s "
+                    f"total={optim_sync_end - optim_submit_start:.4f}s"
+                )
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
@@ -2089,8 +2206,17 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             sys.exit()
 
 
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    logger.info(
+        f"[rank {rank}] load optimizer+rng before barrier time: "
+        f"{time() - load_model_start_time:.4f}s"
+    )
+    torch.distributed.barrier()
     load_model_end_time = time()
     logger.info(f"load model+optimizer+rng time: {load_model_end_time - load_model_start_time:.4f}s")
+    load_model_start_time = time()
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
@@ -2109,6 +2235,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     torch.distributed.barrier()
     load_model_end_time = time()
     logger.info(f"load model time: {load_model_end_time - load_model_start_time:.4f}s")
+
+    logger.info(f"load model total time: {load_model_end_time - load_model_start:.4f}s")
 
     torch.cuda.empty_cache()
 

@@ -18,6 +18,10 @@ import torch
 from megatron.core.dist_checkpointing.strategies.gemini_replicas_manager import (
     GeminiReplicasManager,
 )
+from megatron.training.legacy_io_utils import (
+    pin_payload_tensor_buffer_if_available,
+    pin_uint8_tensor_if_available,
+)
 from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
     allocate_hugepage_tensor,
 )
@@ -461,9 +465,10 @@ def _collect_metadata_for_failed_rank(
     my_all_meta: Optional[Dict[str, Any]] = None
     if main_path.is_file():
         from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
-        own = (read_raw_checkpoint(str(main_path), MAGIC_GEMINI)
+        own = (read_raw_checkpoint(str(main_path), MAGIC_GEMINI, pin_tensor_buffer=True)
                if is_raw_format(str(main_path), MAGIC_GEMINI)
                else torch.load(main_path, map_location="cpu", weights_only=False))
+        pin_payload_tensor_buffer_if_available(own)
         my_all_meta = {
             "all_tensor_infos": own.get("all_tensor_infos", {}),
             "all_non_tensor_data": own.get("all_non_tensor_data", {}),
@@ -537,9 +542,12 @@ def _load_replica_full(replica_path: Path) -> Dict[str, Any]:
             rp = pickle.loads(_f.read(meta_len))
             rp["tensor_buffer"] = torch.from_numpy(
                 np.frombuffer(_f.read(), dtype=np.uint8))
+            rp["tensor_buffer"] = pin_uint8_tensor_if_available(rp["tensor_buffer"])
             return rp
     else:
-        return torch.load(replica_path, map_location="cpu", weights_only=False)
+        payload = torch.load(replica_path, map_location="cpu", weights_only=False)
+        pin_payload_tensor_buffer_if_available(payload)
+        return payload
 
 
 # Module-level caches for passing all_gather results from prepare phase
@@ -1078,7 +1086,9 @@ def _recover_missing_replicas_transfer(
             if src == rank:
                 mp = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
                 from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
-                payload = read_raw_checkpoint(str(mp), MAGIC_GEMINI)
+                payload = read_raw_checkpoint(
+                    str(mp), MAGIC_GEMINI, pin_tensor_buffer=True,
+                )
                 meta = {
                     "tensor_infos": payload["tensor_infos"],
                     "non_tensor_data": payload["non_tensor_data"],
@@ -1149,7 +1159,9 @@ def _read_source_data_for_replica(
         if not main_path.is_file():
             return None
         if is_raw_format(str(main_path), MAGIC_GEMINI):
-            payload = read_raw_checkpoint(str(main_path), MAGIC_GEMINI)
+            payload = read_raw_checkpoint(
+                str(main_path), MAGIC_GEMINI, pin_tensor_buffer=True,
+            )
             buf = payload["tensor_buffer"].detach().contiguous().view(torch.uint8)
             meta = {
                 "tensor_infos": payload["tensor_infos"],
@@ -1262,7 +1274,9 @@ def _recover_missing_replicas(
             if not mp.is_file():
                 return None
             if is_raw_format(str(mp), MAGIC_GEMINI):
-                payload = read_raw_checkpoint(str(mp), MAGIC_GEMINI)
+                payload = read_raw_checkpoint(
+                    str(mp), MAGIC_GEMINI, pin_tensor_buffer=True,
+                )
                 buf = payload["tensor_buffer"].detach().contiguous().view(torch.uint8)
                 meta = {
                     "tensor_infos": payload["tensor_infos"],
@@ -1321,7 +1335,9 @@ def _recover_missing_replicas(
                 # Sending own data: read from main.pt
                 mp = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
                 from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
-                payload = read_raw_checkpoint(str(mp), MAGIC_GEMINI)
+                payload = read_raw_checkpoint(
+                    str(mp), MAGIC_GEMINI, pin_tensor_buffer=True,
+                )
                 meta = {
                     "tensor_infos": payload["tensor_infos"],
                     "non_tensor_data": payload["non_tensor_data"],
@@ -1447,9 +1463,10 @@ def load_gemini_replicas_legacy_checkpoint(
     main_payload: Optional[Dict[str, Any]] = None
     if main_file_exists:
         from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
-        main_payload = (read_raw_checkpoint(str(main_path), MAGIC_GEMINI)
+        main_payload = (read_raw_checkpoint(str(main_path), MAGIC_GEMINI, pin_tensor_buffer=True)
                         if is_raw_format(str(main_path), MAGIC_GEMINI)
                         else torch.load(main_path, map_location="cpu", weights_only=False))
+        pin_payload_tensor_buffer_if_available(main_payload)
 
     # ---- Timing collection (excl disk IO) ----
     # network_encode: C++ ASIO/RDMA send/recv + block assembly (HW only; SW=0)

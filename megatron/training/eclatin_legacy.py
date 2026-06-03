@@ -381,6 +381,7 @@ def _save_eclatin_pt_files(
     tensor_infos: List[Any],
     blocks: Dict[str, Any],
     full_tensor_buffer: torch.Tensor,
+    all_tensor_infos: Optional[Dict[int, List[Any]]] = None,
 ) -> None:
     checkpoint_path = Path(checkpoint_name)
     checkpoint_dir = checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
@@ -406,6 +407,7 @@ def _save_eclatin_pt_files(
         "pipeline_total_bytes": blocks["pipeline_size"],
         "aligned_block_size": blocks["aligned_size"],
         "block_files": block_file_map,
+        "all_tensor_infos": all_tensor_infos if all_tensor_infos is not None else {},
     })
     buf = full_tensor_buffer[: blocks["actual_size"]]
     if not buf.is_contiguous():
@@ -537,6 +539,7 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         tensor_infos=decomposed.tensor_infos,
         blocks=blocks,
         full_tensor_buffer=tensor_buffer[:total_tensor_size],
+        all_tensor_infos=rank_metadata,
     )
 
     if world_size > 1:
@@ -609,13 +612,23 @@ def _load_eclatin_main_payload(checkpoint_dir: Path, rank: int, world_size: int)
     # HW failure: local disk lost — recover metadata from another rank.
     for r in range(world_size):
         if gathered[r] is not None:
-            logger.info(
-                f"ECLATIN legacy: eclatin_main_rank{rank}.pt missing locally; "
-                f"recovered metadata from rank {r}"
-            )
-            result = dict(gathered[r])
-            result["tensor_buffer"] = None  # to be recovered via XOR decode
-            return result
+            payload = dict(gathered[r])
+            all_ti = payload.get("all_tensor_infos")
+            if all_ti and rank in all_ti:
+                logger.info(
+                    f"ECLATIN legacy: eclatin_main_rank{rank}.pt missing locally; "
+                    f"recovered tensor_infos for rank {rank} from rank {r}"
+                )
+                payload["tensor_infos"] = all_ti[rank]
+                payload["tensor_buffer"] = None
+                return payload
+            if "tensor_infos" in payload:
+                logger.warning(
+                    f"ECLATIN legacy: using rank {r}'s tensor_infos as fallback "
+                    f"for rank {rank} — may be incorrect (old checkpoint format)"
+                )
+                payload["tensor_buffer"] = None
+                return payload
 
     raise FileNotFoundError(
         f"ECLATIN legacy: eclatin_main_rank{rank}.pt missing on all ranks "

@@ -254,6 +254,7 @@ def _save_ecnaive_pt_files(
     full_tensor_buffer: torch.Tensor,
     flat_key_roots: Optional[Set[str]] = None,
     manager: Optional[ECNAIVEManager] = None,
+    all_tensor_infos: Optional[Dict[int, List[Any]]] = None,
 ) -> None:
     checkpoint_path = Path(checkpoint_name)
     checkpoint_dir = checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
@@ -296,6 +297,7 @@ def _save_ecnaive_pt_files(
         "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
         "block_files": block_files,
         "_block_files_legacy": block_files_legacy,
+        "all_tensor_infos": all_tensor_infos if all_tensor_infos is not None else {},
     })
     buf = full_tensor_buffer[: blocks["actual_size"]]
     if not buf.is_contiguous():
@@ -399,16 +401,28 @@ def _load_ecnaive_main_payload(
         return local_payload
 
     # HW failure: local disk lost — recover metadata from another rank.
-    # tensor_buffer will be recovered through RS decode.
+    # main.pt stores all_tensor_infos (all ranks' metadata, like Gemini).
+    # Extract the correct rank's tensor_infos from any healthy source.
     for r in range(world_size):
         if gathered[r] is not None:
-            logger.info(
-                f"EC-NAIVE legacy: ecnaive_main_rank{rank}.pt missing locally; "
-                f"recovered metadata from rank {r}"
-            )
-            result = dict(gathered[r])
-            result["tensor_buffer"] = None  # to be recovered via RS decode
-            return result
+            payload = dict(gathered[r])
+            all_ti = payload.get("all_tensor_infos")
+            if all_ti and rank in all_ti:
+                logger.info(
+                    f"EC-NAIVE legacy: ecnaive_main_rank{rank}.pt missing locally; "
+                    f"recovered tensor_infos for rank {rank} from rank {r}"
+                )
+                payload["tensor_infos"] = all_ti[rank]
+                payload["tensor_buffer"] = None  # to be recovered via RS decode
+                return payload
+            # Backward compat: old checkpoints without all_tensor_infos
+            if "tensor_infos" in payload:
+                logger.warning(
+                    f"EC-NAIVE legacy: using rank {r}'s tensor_infos as fallback "
+                    f"for rank {rank} — may be incorrect (old checkpoint format)"
+                )
+                payload["tensor_buffer"] = None
+                return payload
 
     raise FileNotFoundError(
         f"EC-NAIVE legacy: ecnaive_main_rank{rank}.pt missing on all ranks "
@@ -1220,6 +1234,10 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     pipeline_total_bytes = int(main_payload.get("pipeline_total_bytes", 0))
     block_data_size = int(main_payload.get("block_data_size",
                           (pipeline_total_bytes + ecnaive_k - 1) // ecnaive_k))
+    # aligned_block_size = storage size of each block file (includes 64B alignment gaps)
+    aligned_block_size = int(main_payload.get("aligned_block_size",
+                             ((block_data_size + manager.ecnaive_buffer_size - 1)
+                              // manager.ecnaive_buffer_size) * manager.ecnaive_buffer_size))
     flat_key_roots = _infer_flat_key_roots(main_payload)
     actual_tensor_size = int(main_payload.get("actual_tensor_size", 0))
     num_channels = ecnaive_n - 1  # = k + 1
@@ -1253,8 +1271,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     source_blocks_prealloc: List[torch.Tensor] = []
     if affected_group and is_failed:
         total_pool_blocks = len(source_ranks) * ecnaive_n
+        # Use aligned_block_size (with 64B gaps) so send doesn't truncate last chunk
         recv_pool_prealloc = list(allocate_hugepage_slices(
-            block_data_size, total_pool_blocks,
+            aligned_block_size, total_pool_blocks,
             fallback_pin_memory=True, touch_pages=True,
         ))
         if manager.use_rdma:
@@ -1279,7 +1298,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         for dest_fr in failed_in_group:
             send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
             for block_tensor in source_blocks_prealloc:
-                send_size = min(block_tensor.numel(), block_data_size)
+                send_size = min(block_tensor.numel(), aligned_block_size)
                 native.submit_send_task(
                     send_ch, int(block_tensor.data_ptr()), send_size
                 )
@@ -1340,7 +1359,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 native.submit_recv_task(
                     recv_ch,
                     int(recv_pool[base + bi].data_ptr()),
-                    block_data_size,
+                    aligned_block_size,
                 )
             logger.info(
                 f"EC-NAIVE hw recovery: failed rank {rank} recv "
@@ -1396,23 +1415,52 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
         for owner_rig in owner_rigs:
             # Find which blocks of this codeword survive in recv_pool
-            surviving = {}  # label → tensor
-            lost = []       # list of lost data positions [0, 1]
+            raw_surviving = {}  # label → padded tensor (raw from recv_pool)
+            lost = []           # list of lost data positions [0, 1]
             for role, label in [('data0', 'data_0'), ('data1', 'data_1'),
                                 ('parity0', 'parity0'), ('parity1', 'parity1')]:
                 t = _find_block_in_pool(owner_rig, role)
                 if t is not None:
-                    surviving[label] = t
+                    raw_surviving[label] = t
             # Determine lost data positions
             for pos, label in enumerate(['data_0', 'data_1']):
-                if label not in surviving:
+                if label not in raw_surviving:
                     lost.append(pos)
             m_owner = len(lost)
 
+            # Strip padding from recv blocks (have 64B alignment gaps).
+            # own_data0 blocks are continuous (no gaps) — use as-is.
+            surviving: Dict[str, torch.Tensor] = {}
+            continuous_bufs: List[torch.Tensor] = []  # keep alive
+            for label, padded in raw_surviving.items():
+                # data_0 = own_data0 of source rank (continuous, no gaps)
+                # all others (data_1/parity0/parity1) are from recv slots (have 64B gaps)
+                if label != 'data_0':
+                    continuous = allocate_hugepage_tensor(
+                        block_data_size, fallback_pin_memory=True,
+                    )
+                    continuous_bufs.append(continuous)
+                    if label.startswith('data_'):
+                        pos = int(label.split('_')[1])
+                        _decode_block_direct(
+                            padded, continuous, 0,
+                            block_data_size, pipeline_total_bytes, pos,
+                            ecnaive_buffer_size_val,
+                        )
+                    else:
+                        _decode_block_direct(
+                            padded, continuous, 0,
+                            block_data_size, block_data_size, 0,
+                            ecnaive_buffer_size_val,
+                        )
+                    surviving[label] = continuous
+                else:
+                    # own_data0: continuous, no gaps, use directly (truncate if needed)
+                    surviving[label] = padded[:block_data_size]
+
             # Recover owner's data blocks
             if m_owner == 0:
-                data_blocks = [surviving['data_0'], surviving['data_1']]
-                recovered_data = data_blocks
+                recovered_data = [surviving['data_0'], surviving['data_1']]
             else:
                 # Build ordered surviving list: surviving data (sorted) + parity
                 data_labels = sorted(
@@ -1453,6 +1501,44 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     else:
                         recovered_data[pos] = recovered_blocks[ri]
                         ri += 1
+
+            # Debug: verify RS decode for self codeword
+            if args.ecnaive_hw_debug and owner_rig == my_rig and m_owner > 0:
+                d0 = recovered_data[0]
+                d1 = recovered_data[1]
+                surv_keys = list(surviving.keys())
+                logger.warning(
+                    f"EC-NAIVE hw debug: self codeword owner_rig={owner_rig} "
+                    f"k={ecnaive_k} m={m_owner} lost={lost} "
+                    f"surviving_keys={surv_keys}"
+                )
+                # Compare RS-decoded d0 with original d0 from main_payload
+                if owner_rig == my_rig and isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
+                    orig_tb = main_payload["tensor_buffer"].detach().reshape(-1).view(torch.uint8)
+                    orig_d0 = orig_tb[:block_data_size]
+                    d0_match = (d0[:orig_d0.numel()] == orig_d0).sum().item()
+                    d0_total = min(d0.numel(), orig_d0.numel())
+                    if d0_match < d0_total:
+                        first = (d0[:orig_d0.numel()] != orig_d0).nonzero(as_tuple=False)[0].item()
+                        logger.warning(
+                            f"EC-NAIVE hw debug: RSd0 vs orig_d0: "
+                            f"match={d0_match}/{d0_total} "
+                            f"first_mismatch_at={first} "
+                            f"RSd0={d0[first].item():02x} "
+                            f"orig={orig_d0[first].item():02x}"
+                        )
+
+                # p_{i,0} = d_{i,0} XOR d_{i,1} — verify via XOR for ALL bytes
+                if 'parity0' in surviving:
+                    if 0 in lost and 'data_1' in surviving and 'parity0' in surviving:
+                        expected_d0 = torch.bitwise_xor(
+                            surviving['data_1'], surviving['parity0']
+                        )
+                        total_match = (d0 == expected_d0).sum().item()
+                        logger.warning(
+                            f"EC-NAIVE hw debug: XOR RSd0 vs (d1^p0) total match: "
+                            f"{total_match}/{d0.numel()} ({100*total_match/d0.numel():.1f}%)"
+                        )
 
             # Now we have owner's data blocks. Compute parity via encode.
             parity0 = torch.zeros(block_data_size, dtype=torch.uint8)
@@ -1516,12 +1602,57 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         if world_size > 1:
             torch.distributed.barrier()
         _t0_rebuild = time.time()
-        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
-            {"tensor_buffer": tensor_buffer,
-             "tensor_infos": tensor_infos,
-             "non_tensor_data": main_payload.get("non_tensor_data", {})},
-            flat_key_roots=flat_key_roots,
-        )
+
+        # Debug: compare RS-recovered tensor_buffer with main_payload
+        if args.ecnaive_hw_debug and isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
+            orig_tb = main_payload["tensor_buffer"]
+            orig = orig_tb.detach().reshape(-1).view(torch.uint8)
+            recv = tensor_buffer.reshape(-1)
+            if orig.numel() == recv.numel():
+                mismatch = (orig[:recv.numel()] != recv).nonzero(as_tuple=False)
+                nz_orig = orig.nonzero(as_tuple=False).numel()
+                nz_recv = recv.nonzero(as_tuple=False).numel()
+                zero_orig = orig.numel() - nz_orig
+                zero_recv = recv.numel() - nz_recv
+                if mismatch.numel() > 0:
+                    first = mismatch[0].item()
+                    logger.error(
+                        f"EC-NAIVE hw debug: MISMATCH at byte {first}: "
+                        f"orig=0x{orig[first].item():02x} "
+                        f"recv=0x{recv[first].item():02x} "
+                        f"(total mismatches: {mismatch.numel()}/{orig.numel()})"
+                    )
+                else:
+                    logger.info(
+                        f"EC-NAIVE hw debug: tensor_buffer matches main_payload "
+                        f"({orig.numel()} bytes)"
+                    )
+                logger.warning(
+                    f"EC-NAIVE hw debug: zero-rate orig={zero_orig}/{orig.numel()} "
+                    f"({100*zero_orig/orig.numel():.1f}%) "
+                    f"recv={zero_recv}/{recv.numel()} "
+                    f"({100*zero_recv/recv.numel():.1f}%)"
+                )
+            else:
+                logger.error(
+                    f"EC-NAIVE hw debug: SIZE MISMATCH "
+                    f"orig={orig.numel()} vs recv={recv.numel()}"
+                )
+            # Use main_payload to continue training
+            logger.warning(
+                f"EC-NAIVE hw debug: rank {rank} rebuilding from main_payload "
+                f"instead of RS-recovered tensor_buffer"
+            )
+            state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+                main_payload, flat_key_roots=flat_key_roots,
+            )
+        else:
+            state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+                {"tensor_buffer": tensor_buffer,
+                 "tensor_infos": tensor_infos,
+                 "non_tensor_data": main_payload.get("non_tensor_data", {})},
+                flat_key_roots=flat_key_roots,
+            )
         _t['rebuild_sd'] = time.time() - _t0_rebuild
 
         logger.info(
@@ -1652,6 +1783,7 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         full_tensor_buffer=tensor_buffer[:total_tensor_size],
         flat_key_roots=decomposed.flat_key_roots,
         manager=manager,
+        all_tensor_infos=rank_metadata,  # store all ranks' metadata for HW recovery
     )
 
     if world_size > 1:

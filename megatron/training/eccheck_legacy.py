@@ -348,6 +348,7 @@ def _save_eccheck_pt_files(
     blocks: Dict[str, Any],
     full_tensor_buffer: torch.Tensor,
     flat_key_roots: Optional[Set[str]] = None,
+    all_tensor_infos: Optional[Dict[int, List[Any]]] = None,
 ) -> None:
     checkpoint_path = Path(checkpoint_name)
     checkpoint_dir = checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
@@ -372,6 +373,7 @@ def _save_eccheck_pt_files(
         "aligned_block_size": blocks["aligned_size"],
         "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
         "block_files": block_files,
+        "all_tensor_infos": all_tensor_infos if all_tensor_infos is not None else {},
     })
     buf = full_tensor_buffer[: blocks["actual_size"]]
     if not buf.is_contiguous():
@@ -520,6 +522,7 @@ def save_eccheck_legacy_checkpoint(
         tensor_infos=decomposed.tensor_infos,
         blocks=blocks,
         full_tensor_buffer=tensor_buffer[:total_tensor_size],
+        all_tensor_infos=rank_metadata,
     )
     if world_size > 1:
         torch.distributed.barrier()
@@ -567,13 +570,23 @@ def _load_eccheck_main_payload(
     # HW failure: local disk lost — recover metadata from another rank.
     for r in range(world_size):
         if gathered[r] is not None:
-            logger.info(
-                f"ECCHECK legacy: eccheck_main_rank{rank}.pt missing locally; "
-                f"recovered metadata from rank {r}"
-            )
-            result = dict(gathered[r])
-            result["tensor_buffer"] = None  # to be recovered via XOR decode
-            return result
+            payload = dict(gathered[r])
+            all_ti = payload.get("all_tensor_infos")
+            if all_ti and rank in all_ti:
+                logger.info(
+                    f"ECCHECK legacy: eccheck_main_rank{rank}.pt missing locally; "
+                    f"recovered tensor_infos for rank {rank} from rank {r}"
+                )
+                payload["tensor_infos"] = all_ti[rank]
+                payload["tensor_buffer"] = None
+                return payload
+            if "tensor_infos" in payload:
+                logger.warning(
+                    f"ECCHECK legacy: using rank {r}'s tensor_infos as fallback "
+                    f"for rank {rank} — may be incorrect (old checkpoint format)"
+                )
+                payload["tensor_buffer"] = None
+                return payload
 
     raise FileNotFoundError(
         f"ECCHECK legacy: eccheck_main_rank{rank}.pt missing on all ranks "
@@ -1490,8 +1503,8 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         _mode = "HW"
     logger.info(
         "ECCHECK legacy load timing (%s): "
-        "total=%(total).2fs network_encode=%(network_encode).2fs "
-        "rebuild_sd=%(rebuild_sd).2fs", _mode, _t_ec
+        "total=%.2fs network_encode=%.2fs rebuild_sd=%.2fs",
+        _mode, _t_ec['total'], _t_ec['network_encode'], _t_ec['rebuild_sd'],
     )
 
     if world_size > 1 and torch.distributed.is_initialized():

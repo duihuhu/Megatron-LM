@@ -104,6 +104,7 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --ecnaive-failed-ranks "0"
+            #--ecnaive-hw-debug
         )
         ;;
     hardware2)

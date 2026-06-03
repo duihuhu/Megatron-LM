@@ -4066,8 +4066,10 @@ private:
             throw std::runtime_error("ECNAIVE: Failed to allocate EC encoding tables");
         }
         
-        // Initialize tables using isa-l
-        ec_init_tables(k_, rows_, a_mat_, g_tbls_);
+        // Initialize tables using isa-l — only pass the parity rows (rows k..k+rows-1),
+        // not the full Vandermonde matrix (which includes data rows at positions 0..k-1).
+        // ec_init_tables expects a k×rows matrix; a_mat_ is k×(k+rows), so offset by k*k.
+        ec_init_tables(k_, rows_, a_mat_ + k_ * k_, g_tbls_);
         std::cout << "ECNAIVE: EC encoding tables initialized (k=" << k_ << ", rows=" << rows_ << ")" << std::endl;
     }
     

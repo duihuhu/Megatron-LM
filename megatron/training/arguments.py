@@ -2324,6 +2324,9 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-ecnaive-software-failure', action='store_true',
                        help='Enable EC-NAIVE checkpointing for software failure recovery. '
                             'When enabled, rank2 reads d21 from rank3 via network and merges with local d20.')
+    group.add_argument('--ecnaive-hw-debug', action='store_true',
+                       help='Debug HW recovery by using main.pt tensor_buffer directly '
+                            '(bypasses RS decode/encode).')
 
     group.add_argument('--use-frcheck', action='store_true',
                        help='Enable FRCheck legacy checkpoint skeleton: validates POA file via native module '

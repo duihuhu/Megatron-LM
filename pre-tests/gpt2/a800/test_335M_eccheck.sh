@@ -67,7 +67,7 @@ DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 SHM_PKT="/dev/shm/shm_pkt"
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -85,6 +85,12 @@ case "$MODE" in
     hardware)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
+        )
+        ;;
+    hardware2)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-eccheck-two-failures
         )
         ;;
 esac

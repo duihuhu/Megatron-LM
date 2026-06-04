@@ -733,11 +733,18 @@ def _load_ecnaive_legacy_software_failure(
     if world_size > 1:
         torch.distributed.barrier()
 
-    # === timing: network/encode (ASIO send/recv + decode) ===
+    # === timing: network/encode (ASIO send/recv only) ===
     _t0_net = _time()
     if rank_in_group == failed_rig:
         for idx, buf in enumerate(recv_blocks):
             native.sw_recv_data(idx, int(buf.data_ptr()), buf.numel())
+    elif send_block is not None:
+        native.sw_send_data(send_block_idx, int(send_block.data_ptr()), send_block.numel())
+    _t['network_encode'] = _time() - _t0_net
+
+    # Decode recv blocks → tensor_buffer (not timed)
+    if rank_in_group == failed_rig:
+        for idx, buf in enumerate(recv_blocks):
             _decode_block_direct(
                 buf, tensor_buffer, (idx + 1) * block_data_size,
                 block_data_size, pipeline_total_bytes, idx + 1,
@@ -747,13 +754,11 @@ def _load_ecnaive_legacy_software_failure(
                 "EC-NAIVE legacy sw: rank2 received d_2,%d (%d bytes)",
                 idx + 1, buf.numel(),
             )
-    elif send_block is not None:
-        native.sw_send_data(send_block_idx, int(send_block.data_ptr()), send_block.numel())
+    if send_block is not None:
         logger.info(
             "EC-NAIVE legacy sw: rig=%d sent (block_idx=%d, %d bytes)",
             rank_in_group, send_block_idx, send_block.numel(),
         )
-    _t['network_encode'] = _time() - _t0_net
 
     # sync all ranks before rebuild timing
     if world_size > 1:

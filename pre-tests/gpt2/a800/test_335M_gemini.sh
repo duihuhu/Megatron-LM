@@ -90,7 +90,7 @@ SHM_PKT="/dev/shm/shm_pkt"
 
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -111,6 +111,13 @@ case "$MODE" in
             --load $CHECKPOINT_PATH
             --use-gemini-replicas-hardware-failure
             --gemini-replicas-recovery-rank "0"
+        )
+        ;;
+    hardware2)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-gemini-replicas-hardware-failure
+            --gemini-replicas-recovery-rank "0,1"
         )
         ;;
 esac
@@ -176,7 +183,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    --load $CHECKPOINT_PATH          # 取消注释以测试 load
+    #--load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
@@ -191,7 +198,7 @@ EVAL_AND_LOGGING_ARGS=(
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）
     # ---------------------------------------------------------------------------
-    --gemini-replicas-num 3        # 默认 3。设为 2 即两副本，设为 N 即 N 副本
+    --gemini-replicas-num 2        # 默认 3。设为 2 即两副本，设为 N 即 N 副本
                                         # 在组内 round-robin 轮询放置副本
                                         # 容错能力 = num_replicas - 1 个 rank 同时故障
 
@@ -231,8 +238,8 @@ EVAL_AND_LOGGING_ARGS=(
     #   示例："2,3" 表示 rank2 和 rank3 当作故障处理。
     #
     #--use-gemini-replicas-software-failure
-    --use-gemini-replicas-hardware-failure
-    --gemini-replicas-recovery-rank "0,2" # "0,1,2,3,4,5,6,7" for ali 8 ranks per node, but untested yet
+    #--use-gemini-replicas-hardware-failure
+    #--gemini-replicas-recovery-rank "0,2" # "0,1,2,3,4,5,6,7" for ali 8 ranks per node, but untested yet
 
     # ---------------------------------------------------------------------------
     # ckpt 格式：必须用 torch（legacy 路径）

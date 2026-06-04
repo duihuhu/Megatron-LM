@@ -129,6 +129,7 @@ def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
 def _allocate_eccheck_blocks_legacy(
     manager: ECCHECKManager,
     rank_metadata: Dict[int, List[TensorMetadata]],
+    block_count: int = 2,
 ) -> Dict[str, Any]:
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -145,19 +146,21 @@ def _allocate_eccheck_blocks_legacy(
 
     aligned_size = (
         (max_total_bytes + manager.eccheck_buffer_size - 1)
-        // manager.eccheck_buffer_size + 1
+        // manager.eccheck_buffer_size
     ) * manager.eccheck_buffer_size
 
-    own_buffer, partner_buffer = manager.allocate_preallocated_blocks(2, aligned_size)
-
-    return {
-        "own_buffer": own_buffer,
-        "partner_buffer": partner_buffer,
+    slices = manager.allocate_preallocated_blocks(block_count, aligned_size)
+    result: Dict[str, Any] = {
+        "own_buffer": slices[0],
         "actual_size": own_total_size,
         "pipeline_size": max_total_bytes,
         "aligned_size": aligned_size,
-        "block_names": ["own_buffer", "partner_buffer"],
+        "block_names": ["own_buffer"],
     }
+    if block_count >= 2:
+        result["partner_buffer"] = slices[1]
+        result["block_names"].append("partner_buffer")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1391,62 +1394,49 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     two_failures = bool(getattr(args, "use_eccheck_two_failures", False))
     total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
 
-    blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
-
+    blocks: Dict[str, Any] = {}
     recovered_buffer: Optional[torch.Tensor] = None
 
     if two_failures:
-        # Two physical nodes lost: rig1 and rig2 are failed.
-        # Survivors: rig0 and rig3.
         pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
         actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
+        blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
 
         if rank_in_group in (0, 3):
-            # Survivors: load existing blocks from disk
             _load_eccheck_blocks_from_disk_into(
                 blocks, checkpoint_dir, rank, rank_in_group,
                 software_failure=False, two_failures=True,
             )
         elif rank_in_group in (1, 2):
-            # Failed ranks: allocate recovered_buffer
             recovered_buffer = torch.empty(
                 actual_tensor_bytes, dtype=torch.uint8, pin_memory=pin
             )
             total_size = actual_tensor_bytes
-            logger.info(
-                f"ECCHECK two-failures: rig{rank_in_group} (failed) allocated "
-                f"recovered_buffer {actual_tensor_bytes / (1024**3):.2f} GB"
-            )
-        else:
-            raise RuntimeError(
-                f"ECCHECK two-failures: unexpected rank_in_group={rank_in_group}"
-            )
     elif sw_failure:
-        # Software failure: rig=0 sends own_buffer to rig=1 via C++ P2P
         if rank_in_group == 0:
+            blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata, block_count=1)
             _load_eccheck_blocks_from_disk_into(
                 blocks, checkpoint_dir, rank, rank_in_group, software_failure=True,
             )
         elif rank_in_group == 1:
-            # Buffer size must match rig=0's send size (max across group),
-            # not this rank's own tensor total, to avoid RDMA buffer overflow.
             actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
             pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
             recovered_buffer = torch.empty(actual_tensor_bytes, dtype=torch.uint8, pin_memory=pin)
             total_size = actual_tensor_bytes
-        # rig=2/3: not participating in software failure
     elif rank_in_group == 2:
-        # Hardware failure: rank_in_group 2 is the failed rank, data comes via network
+        blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
         pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
         recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
     else:
+        blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
         _load_eccheck_blocks_from_disk_into(
             blocks, checkpoint_dir, rank, rank_in_group, software_failure=False,
         )
 
     if manager.use_rdma:
-        for t in [blocks["own_buffer"], blocks["partner_buffer"]]:
-            manager.register_buffer(t)
+        for key in ("own_buffer", "partner_buffer"):
+            if key in blocks:
+                manager.register_buffer(blocks[key])
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 

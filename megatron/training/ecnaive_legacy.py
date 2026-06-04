@@ -749,11 +749,18 @@ def _load_ecnaive_legacy_software_failure(
     if world_size > 1:
         torch.distributed.barrier()
 
-    # === timing: network/encode (ASIO send/recv + decode) ===
+    # === timing: network/encode (ASIO send/recv only) ===
     _t0_net = _time()
     if rank_in_group == failed_rig:
         for idx, buf in enumerate(recv_blocks):
             native.sw_recv_data(idx, int(buf.data_ptr()), buf.numel())
+    elif send_block is not None:
+        native.sw_send_data(send_block_idx, int(send_block.data_ptr()), send_block.numel())
+    _t['network_encode'] = _time() - _t0_net
+
+    # Decode recv blocks → tensor_buffer (not timed)
+    if rank_in_group == failed_rig:
+        for idx, buf in enumerate(recv_blocks):
             _decode_block_direct(
                 buf, tensor_buffer, (idx + 1) * block_data_size,
                 block_data_size, pipeline_total_bytes, idx + 1,
@@ -763,13 +770,11 @@ def _load_ecnaive_legacy_software_failure(
                 "EC-NAIVE legacy sw: rank2 received d_2,%d (%d bytes)",
                 idx + 1, buf.numel(),
             )
-    elif send_block is not None:
-        native.sw_send_data(send_block_idx, int(send_block.data_ptr()), send_block.numel())
+    if send_block is not None:
         logger.info(
             "EC-NAIVE legacy sw: rig=%d sent (block_idx=%d, %d bytes)",
             rank_in_group, send_block_idx, send_block.numel(),
         )
-    _t['network_encode'] = _time() - _t0_net
 
     # sync all ranks before rebuild timing
     if world_size > 1:
@@ -1307,12 +1312,12 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             for b in source_blocks_prealloc:
                 manager.register_buffer(b)
 
-    # === timing: network/encode (C++ send/recv + RS decode + assemble) ===
+    # === timing: network/encode (C++ send/recv + RS decode only) ===
     _t: Dict[str, float] = {}
-    _t0_net = time.time()
 
     # ── Pipeline: SOURCE ranks send all n blocks to each failed rank ──
     if affected_group and not is_failed and is_source:
+        _t0_net = time.time()
         native.reset_encoding_completion_flags()
 
         for dest_fr in failed_in_group:
@@ -1342,6 +1347,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
     elif affected_group and not is_failed and not is_source:
         # Survivor but not selected as source: no-op on channels
+        _t0_net = time.time()
         native.reset_encoding_completion_flags()
         native.submit_send_sentinels(num_channels)
         native.submit_recv_sentinels(num_channels)
@@ -1370,6 +1376,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
         recv_pool = recv_pool_prealloc
 
+        # === timing: network recv ===
+        _t0_net = time.time()
+
         # Receive all n blocks from each source rank
         native.reset_encoding_completion_flags()
         for si, src_rank in enumerate(source_ranks):
@@ -1390,7 +1399,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         native.submit_recv_sentinels(num_channels)
         native.wait_for_encoding_completion()
 
-        # ── Block locator ──────────────────────────────────────────
+        _t['network_recv'] = time.time() - _t0_net
+
+        # ── Block locator (not timed) ──────────────────────────────
         # Layout per source segment: [own_data0, recv_0, recv_1, recv_2]
         #   own_data0 of source s = d_{s,0}
         #   recv_0    of source s = d_{(s-1)%n, 1}
@@ -1448,41 +1459,24 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     lost.append(pos)
             m_owner = len(lost)
 
-            # Strip padding from recv blocks (have 64B alignment gaps).
-            # own_data0 blocks are continuous (no gaps) — use as-is.
+            # Use raw padded blocks directly — compute per-chunk aligned
+            # addresses for blocks from recv slots (data_1/parity0/parity1).
+            # own_data0 blocks are continuous (no gaps).
             surviving: Dict[str, torch.Tensor] = {}
-            continuous_bufs: List[torch.Tensor] = []  # keep alive
+            is_padded: Dict[str, bool] = {}
             for label, padded in raw_surviving.items():
-                # data_0 = own_data0 of source rank (continuous, no gaps)
-                # all others (data_1/parity0/parity1) are from recv slots (have 64B gaps)
                 if label != 'data_0':
-                    continuous = allocate_hugepage_tensor(
-                        block_data_size, fallback_pin_memory=True,
-                    )
-                    continuous_bufs.append(continuous)
-                    if label.startswith('data_'):
-                        pos = int(label.split('_')[1])
-                        _decode_block_direct(
-                            padded, continuous, 0,
-                            block_data_size, pipeline_total_bytes, pos,
-                            ecnaive_buffer_size_val,
-                        )
-                    else:
-                        _decode_block_direct(
-                            padded, continuous, 0,
-                            block_data_size, block_data_size, 0,
-                            ecnaive_buffer_size_val,
-                        )
-                    surviving[label] = continuous
+                    surviving[label] = padded
+                    is_padded[label] = True
                 else:
-                    # own_data0: continuous, no gaps, use directly (truncate if needed)
                     surviving[label] = padded[:block_data_size]
+                    is_padded[label] = False
 
             # Recover owner's data blocks
             if m_owner == 0:
                 recovered_data = [surviving['data_0'], surviving['data_1']]
+                is_padded_recovered = [False, is_padded.get('data_1', False)]
             else:
-                # Build ordered surviving list: surviving data (sorted) + parity
                 data_labels = sorted(
                     [l for l in surviving if l.startswith('data_')],
                     key=lambda x: int(x.split('_')[1]),
@@ -1492,16 +1486,23 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 surviving_block_data = [
                     surviving[l] for l in surviving_addrs_ordered
                 ]
+                is_padded_list = [is_padded[l] for l in surviving_addrs_ordered]
                 recovered_blocks = [
                     torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(m_owner)
                 ]
-                # RS decode per chunk (handles m=1 XOR and m=2 RS uniformly)
+                # Track per-block padded offsets (0 for continuous blocks)
+                pe_offsets = [0] * len(surviving_block_data)
                 src_pos = 0
                 while src_pos < block_data_size:
                     take = min(ecnaive_buffer_size_val, block_data_size - src_pos)
-                    surviving_chunk_addrs = [
-                        int(b.data_ptr()) + src_pos for b in surviving_block_data
-                    ]
+                    surviving_chunk_addrs = []
+                    for j, b in enumerate(surviving_block_data):
+                        if is_padded_list[j]:
+                            aligned = ((pe_offsets[j] + 63) // 64) * 64
+                            surviving_chunk_addrs.append(int(b.data_ptr()) + aligned)
+                            pe_offsets[j] = aligned + take
+                        else:
+                            surviving_chunk_addrs.append(int(b.data_ptr()) + src_pos)
                     recovered_chunk_addrs = [
                         int(b.data_ptr()) + src_pos for b in recovered_blocks
                     ]
@@ -1511,7 +1512,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     )
                     src_pos += take
 
-                # Assemble full data blocks
                 recovered_data = [None, None]
                 ri = 0
                 for pos in range(ecnaive_k):
@@ -1521,6 +1521,11 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     else:
                         recovered_data[pos] = recovered_blocks[ri]
                         ri += 1
+                # Track which recovered blocks are padded (for encode_ec_blocks)
+                is_padded_recovered = [
+                    is_padded.get(f'data_{pos}', False) and f'data_{pos}' in surviving
+                    for pos in range(ecnaive_k)
+                ]
 
             # Debug: verify RS decode for self codeword
             if args.ecnaive_hw_debug and owner_rig == my_rig and m_owner > 0:
@@ -1563,12 +1568,21 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             # Now we have owner's data blocks. Compute parity via encode.
             parity0 = torch.zeros(block_data_size, dtype=torch.uint8)
             parity1 = torch.zeros(block_data_size, dtype=torch.uint8)
+            # Per-block padded offsets for data inputs (0 for continuous)
+            pe_enc = [0, 0]
             src_pos = 0
             while src_pos < block_data_size:
                 take = min(ecnaive_buffer_size_val, block_data_size - src_pos)
+                data_addrs = []
+                for j in range(ecnaive_k):
+                    if j < len(is_padded_recovered) and is_padded_recovered[j]:
+                        aligned = ((pe_enc[j] + 63) // 64) * 64
+                        data_addrs.append(int(recovered_data[j].data_ptr()) + aligned)
+                        pe_enc[j] = aligned + take
+                    else:
+                        data_addrs.append(int(recovered_data[j].data_ptr()) + src_pos)
                 native.encode_ec_blocks(
-                    [int(recovered_data[0].data_ptr()) + src_pos,
-                     int(recovered_data[1].data_ptr()) + src_pos],
+                    data_addrs,
                     int(parity0.data_ptr()) + src_pos,
                     int(parity1.data_ptr()) + src_pos,
                     take,
@@ -1590,6 +1604,8 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             # data1 of owner: stored on rank (owner_rig+1)%n → recv_0
             if (owner_rig + 1) % ecnaive_n == my_rig:
                 recovered['recv_0'] = recovered_data[1].clone()
+
+        _t['network_encode'] = time.time() - _t0_net
 
         # ── Store recovered blocks ──
         if recovered:
@@ -1616,8 +1632,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             tensor_buffer[d0.numel():d0.numel() + end].copy_(d1[:end])
         if actual_tensor_size > 0:
             tensor_buffer = tensor_buffer[:actual_tensor_size]
-
-        _t['network_encode'] = time.time() - _t0_net
 
         if world_size > 1:
             torch.distributed.barrier()
@@ -1684,6 +1698,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         # ═══════════════════════════════════════════════════════════════
         # UNAFFECTED rank (different group): no-op on ASIO channels
         # ═══════════════════════════════════════════════════════════════
+        _t0_net = time.time()
         native.reset_encoding_completion_flags()
         native.submit_send_sentinels(num_channels)
         native.submit_recv_sentinels(num_channels)

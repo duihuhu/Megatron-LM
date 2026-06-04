@@ -1468,25 +1468,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 ]
                 is_padded_list = [is_padded[l] for l in surviving_addrs_ordered]
 
-                # Strip 64-byte-alignment gaps from padded blocks into
-                # continuous temporary buffers, then do a SINGLE RS decode
-                # call for the entire block (avoids per-chunk matrix invert+
-                # table init + 16-worker pool dispatch overhead — was ~24×).
-                continuous_surviving = []
-                for j, b in enumerate(surviving_block_data):
-                    if is_padded_list[j]:
-                        cont = torch.zeros(block_data_size, dtype=torch.uint8)
-                        pe = 0
-                        pos = 0
-                        while pos < block_data_size:
-                            take = min(ecnaive_buffer_size_val, block_data_size - pos)
-                            aligned = ((pe + 63) // 64) * 64
-                            cont[pos:pos + take].copy_(b[aligned:aligned + take])
-                            pe = aligned + take
-                            pos += take
-                        continuous_surviving.append(cont)
-                    else:
-                        continuous_surviving.append(b[:block_data_size])
+                # Blocks are continuous (save path no longer adds padding gaps).
+                # Slice to block_data_size and pass directly to RS decode.
+                continuous_surviving = [b[:block_data_size] for b in surviving_block_data]
 
                 recovered_blocks = [
                     torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(m_owner)
@@ -1552,23 +1536,8 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                         )
 
             # Now we have owner's data blocks. Compute parity via encode.
-            # Strip padding from recovered blocks into continuous buffers
-            # so we can call encode_ec_blocks once (avoid per-chunk pool dispatch).
-            encode_inputs = []
-            for j in range(ecnaive_k):
-                if j < len(is_padded_recovered) and is_padded_recovered[j]:
-                    cont = torch.zeros(block_data_size, dtype=torch.uint8)
-                    pe = 0
-                    pos = 0
-                    while pos < block_data_size:
-                        take = min(ecnaive_buffer_size_val, block_data_size - pos)
-                        aligned = ((pe + 63) // 64) * 64
-                        cont[pos:pos + take].copy_(recovered_data[j][aligned:aligned + take])
-                        pe = aligned + take
-                        pos += take
-                    encode_inputs.append(cont)
-                else:
-                    encode_inputs.append(recovered_data[j][:block_data_size])
+            # Blocks are continuous — slice and pass directly.
+            encode_inputs = [recovered_data[j][:block_data_size] for j in range(ecnaive_k)]
 
             parity0 = torch.zeros(block_data_size, dtype=torch.uint8)
             parity1 = torch.zeros(block_data_size, dtype=torch.uint8)

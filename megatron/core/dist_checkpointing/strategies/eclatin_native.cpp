@@ -321,6 +321,28 @@ public:
         if (qp_) ibv_destroy_qp(qp_);
     }
 
+    // Helper: receive exactly n bytes, handling partial reads from non-blocking sockets.
+    static void recv_all(int sock, void* buf, size_t n) {
+        size_t total = 0;
+        int retries = 0;
+        while (total < n) {
+            ssize_t r = recv(sock, static_cast<char*>(buf) + total, n - total, 0);
+            if (r > 0) {
+                total += r;
+                retries = 0;
+            } else if (r == 0) {
+                throw std::runtime_error("ECLATIN RDMA: connection closed during recv (got "
+                    + std::to_string(total) + " of " + std::to_string(n) + " bytes)");
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                if (++retries > 1000)
+                    throw std::runtime_error("ECLATIN RDMA: recv timed out after 1000 retries");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } else {
+                throw std::runtime_error("ECLATIN RDMA: recv error: " + std::string(std::strerror(errno)));
+            }
+        }
+    }
+
     void exchange_and_connect(bool we_send_first) {
         RdmaConnInfo local_info = get_local_conn_info();
         RdmaConnInfo remote_info;
@@ -329,11 +351,9 @@ public:
         if (we_send_first) {
             if (send(sock, &local_info, sizeof(local_info), 0) != static_cast<ssize_t>(sizeof(local_info)))
                 throw std::runtime_error("ECLATIN RDMA: failed to send local RdmaConnInfo");
-            if (recv(sock, &remote_info, sizeof(remote_info), MSG_WAITALL) != static_cast<ssize_t>(sizeof(remote_info)))
-                throw std::runtime_error("ECLATIN RDMA: failed to receive remote RdmaConnInfo");
+            recv_all(sock, &remote_info, sizeof(remote_info));
         } else {
-            if (recv(sock, &remote_info, sizeof(remote_info), MSG_WAITALL) != static_cast<ssize_t>(sizeof(remote_info)))
-                throw std::runtime_error("ECLATIN RDMA: failed to receive remote RdmaConnInfo");
+            recv_all(sock, &remote_info, sizeof(remote_info));
             if (send(sock, &local_info, sizeof(local_info), 0) != static_cast<ssize_t>(sizeof(local_info)))
                 throw std::runtime_error("ECLATIN RDMA: failed to send local RdmaConnInfo");
         }

@@ -129,10 +129,13 @@ def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
 def _allocate_eccheck_blocks_legacy(
     manager: ECCHECKManager,
     rank_metadata: Dict[int, List[TensorMetadata]],
+    block_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
     own_total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
+    if block_names is None:
+        block_names = ["own_buffer", "partner_buffer"]
 
     if world_size > 1:
         all_sizes = [
@@ -148,16 +151,19 @@ def _allocate_eccheck_blocks_legacy(
         // manager.eccheck_buffer_size + 1
     ) * manager.eccheck_buffer_size
 
-    own_buffer, partner_buffer = manager.allocate_preallocated_blocks(2, aligned_size)
+    allocated_blocks: Dict[str, torch.Tensor] = {}
+    if block_names:
+        buffers = manager.allocate_preallocated_blocks(len(block_names), aligned_size)
+        allocated_blocks = dict(zip(block_names, buffers))
 
-    return {
-        "own_buffer": own_buffer,
-        "partner_buffer": partner_buffer,
+    blocks = {
         "actual_size": own_total_size,
         "pipeline_size": max_total_bytes,
         "aligned_size": aligned_size,
-        "block_names": ["own_buffer", "partner_buffer"],
+        "block_names": block_names,
     }
+    blocks.update(allocated_blocks)
+    return blocks
 
 
 # ---------------------------------------------------------------------------
@@ -533,24 +539,47 @@ def save_eccheck_legacy_checkpoint(
 # ---------------------------------------------------------------------------
 
 def _load_eccheck_main_payload(
-    checkpoint_dir: Path, rank: int, world_size: int
+    checkpoint_dir: Path,
+    rank: int,
+    world_size: int,
+    load_tensor_buffer: bool = True,
 ) -> Dict[str, Any]:
     main_path = checkpoint_dir / f"eccheck_main_rank{rank}.pt"
     local_payload: Optional[Dict[str, Any]] = None
+    local_error: Optional[str] = None
     if main_path.is_file():
-        from megatron.training.legacy_io_utils import (
-            is_raw_format, read_raw_checkpoint, MAGIC_ECCHECK,
-            pin_payload_tensor_buffer_if_available,
-        )
-        if is_raw_format(str(main_path), MAGIC_ECCHECK):
-            local_payload = read_raw_checkpoint(
-                str(main_path), MAGIC_ECCHECK, pin_tensor_buffer=True,
+        try:
+            from megatron.training.legacy_io_utils import (
+                is_raw_format, read_raw_checkpoint, read_raw_checkpoint_metadata,
+                MAGIC_ECCHECK, pin_payload_tensor_buffer_if_available,
             )
-        else:
-            local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
-            pin_payload_tensor_buffer_if_available(local_payload)
+            if is_raw_format(str(main_path), MAGIC_ECCHECK):
+                if load_tensor_buffer:
+                    local_payload = read_raw_checkpoint(
+                        str(main_path), MAGIC_ECCHECK, pin_tensor_buffer=True,
+                    )
+                else:
+                    local_payload = read_raw_checkpoint_metadata(
+                        str(main_path), MAGIC_ECCHECK,
+                    )
+            else:
+                local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+                if load_tensor_buffer:
+                    pin_payload_tensor_buffer_if_available(local_payload)
+                else:
+                    logger.warning(
+                        "ECCHECK legacy: metadata-only load requested for old torch "
+                        "checkpoint format; tensor_buffer must still be deserialized"
+                    )
+                    local_payload["tensor_buffer"] = None
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
 
     if world_size <= 1 or not torch.distributed.is_initialized():
+        if local_error is not None:
+            raise RuntimeError(
+                f"ECCHECK legacy: failed reading main file {main_path}: {local_error}"
+            )
         if local_payload is None:
             raise FileNotFoundError(f"ECCHECK legacy: missing main file {main_path}")
         return local_payload
@@ -567,8 +596,25 @@ def _load_eccheck_main_payload(
     else:
         stripped = None
 
+    if local_error is not None:
+        stripped = {
+            "__eccheck_load_error__": local_error,
+            "__eccheck_load_path__": str(main_path),
+        }
+
     gathered: List[Optional[Dict[str, Any]]] = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(gathered, stripped)
+
+    load_errors = {
+        r: (payload.get("__eccheck_load_path__"), payload.get("__eccheck_load_error__"))
+        for r, payload in enumerate(gathered)
+        if payload is not None and "__eccheck_load_error__" in payload
+    }
+    if load_errors:
+        details = "; ".join(
+            f"rank {r} path={path}: {err}" for r, (path, err) in load_errors.items()
+        )
+        raise RuntimeError(f"ECCHECK legacy: failed reading main payload(s): {details}")
 
     if local_payload is not None:
         return local_payload
@@ -1365,11 +1411,29 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
-    main_payload = _load_eccheck_main_payload(checkpoint_dir, rank, world_size)
-
     from megatron.training import get_args
 
     args = get_args()
+    rank_in_group = ECCHECKManager._get_rank_in_group(rank, world_size) if world_size > 1 else 0
+    sw_failure = bool(getattr(args, "use_eccheck_software_failure", False))
+    two_failures = bool(getattr(args, "use_eccheck_two_failures", False))
+
+    load_tensor_buffer = True
+    if world_size > 1:
+        # Ranks rebuilt from EC/P2P data do not need the multi-GB main tensor
+        # buffer.  In SW mode, rig0 can rebuild from the same own_buffer it
+        # sends, and rig1 rebuilds from recovered_buffer.
+        if two_failures:
+            load_tensor_buffer = rank_in_group not in (1, 2)
+        elif sw_failure:
+            load_tensor_buffer = rank_in_group not in (0, 1)
+        else:
+            load_tensor_buffer = rank_in_group != 2
+
+    main_payload = _load_eccheck_main_payload(
+        checkpoint_dir, rank, world_size, load_tensor_buffer=load_tensor_buffer,
+    )
+
     if not getattr(args, "use_eccheck", False):
         logger.warning(
             "ECCHECK legacy load: args.use_eccheck is False; enabling for native module init"
@@ -1396,12 +1460,15 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     if world_size <= 1:
         return _reconstruct_state_dict_from_eccheck_buffer(main_payload, None)
 
-    rank_in_group = manager._get_rank_in_group(rank, world_size)
-    sw_failure = bool(getattr(args, "use_eccheck_software_failure", False))
-    two_failures = bool(getattr(args, "use_eccheck_two_failures", False))
     total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
 
-    blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
+    if sw_failure:
+        required_block_names = ["own_buffer"] if rank_in_group == 0 else []
+    else:
+        required_block_names = ["own_buffer", "partner_buffer"]
+    blocks = _allocate_eccheck_blocks_legacy(
+        manager, rank_metadata, block_names=required_block_names,
+    )
 
     recovered_buffer: Optional[torch.Tensor] = None
 
@@ -1455,8 +1522,8 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         )
 
     if manager.use_rdma:
-        for t in [blocks["own_buffer"], blocks["partner_buffer"]]:
-            manager.register_buffer(t)
+        for block_name in blocks.get("block_names", []):
+            manager.register_buffer(blocks[block_name])
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 
@@ -1496,6 +1563,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     _t0 = time.time()
     if two_failures:
         use_recovered = rank_in_group in (1, 2)
+    elif sw_failure and rank_in_group == 0:
+        use_recovered = True
+        recovered_buffer = blocks["own_buffer"]
     else:
         use_recovered = rank_in_group == 2 or (sw_failure and rank_in_group == 1)
     state_dict = _reconstruct_state_dict_from_eccheck_buffer(

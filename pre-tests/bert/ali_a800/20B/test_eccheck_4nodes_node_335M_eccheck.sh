@@ -1,9 +1,16 @@
 #!/bin/bash
 
 # Script to run a single node in 4-node simulation (default 1 GPU per node)
-# Usage: ./test_eccheck_4nodes_node_335M_eccheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]
+# Usage: ./test_eccheck_4nodes_node_335M_eccheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [mode] [additional_args...]
+#
+# mode (optional, default: save):
+#   save      - checkpoint save only (no load / recovery flags)
+#   software  - load checkpoint + software failure recovery
+#   hardware  - load checkpoint + hardware failure recovery
+#
 # Example: ./test_eccheck_4nodes_node_335M_eccheck.sh 0 0
-# Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_eccheck.sh 0 2 3
+# Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_eccheck.sh 0 2 3 software
+# Example (8 GPUs, hardware recovery): ./test_eccheck_4nodes_node_335M_eccheck.sh 0 0 1 2 3 4 5 6 7 hardware
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
@@ -50,8 +57,15 @@ done
 
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
     echo "Error: At least one GPU id must be specified."
-    echo "Usage: ./test_eccheck_4nodes_node_335M_eccheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]"
+    echo "Usage: $0 <node_rank> <gpu_id_0> [gpu_id_1 ...] [save|software|hardware] [additional_args...]"
     exit 1
+fi
+
+# ---- mode parsing (save | software | hardware, after GPU IDs) ----
+MODE=save
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware)$ ]]; then
+    MODE="$1"
+    shift
 fi
 
 GPUS_PER_NODE=${#GPU_IDS[@]}
@@ -65,8 +79,8 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/bert/bert_data/vocab.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/bert/7B/bert-7b-0/logs"
-CHECKPOINT_PATH="/dev/shm/models/bert-7b-0-eccheck"
+TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/bert/20B/bert-20b-0/logs"
+CHECKPOINT_PATH="/dev/shm/models/bert-20b-0-eccheck"
 DATA_PATH="/workspace/Megatron-LM/pre-tests/bert/bert_data/wiki_text_sentence"
 DATA_CACHE_PATH="${DATA_CACHE_PATH:-/workspace/Megatron-LM/pre-tests/bert/bert_data/cache}"
 
@@ -74,6 +88,24 @@ SHM_PKT="/dev/shm/shm_pkt"
 
 # Remaining args after node-rank and GPU ids are passed to the training script
 ARGS_TO_PASS=("$@")
+
+# Recovery mode args: enabled only for software / hardware load tests
+RECOVERY_MODE_ARGS=()
+case "$MODE" in
+    save)
+        ;;
+    software)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-eccheck-software-failure
+        )
+        ;;
+    hardware)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+        )
+        ;;
+esac
 
 # Model related configuration here, please do not overlap with json config
 HIDDEN_SIZE=5120
@@ -143,11 +175,9 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    #--load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
     --use-eccheck
-    #--use-eccheck-software-failure
     --ckpt-format torch
     --save-embeddings-separately
     # --timing-log-level 2
@@ -162,12 +192,12 @@ mkdir -p logs/csv
 # Print command if PRINT_CMD is set
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_bert.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK, mode=$MODE): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_bert.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} ${RECOVERY_MODE_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
 
-echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES"
+echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (mode=$MODE)"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 
 export USE_FLASH_ATTN=1 && \
@@ -179,5 +209,6 @@ PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
+    ${RECOVERY_MODE_ARGS[@]} \
     --distributed-backend nccl \
     ${ARGS_TO_PASS[@]}

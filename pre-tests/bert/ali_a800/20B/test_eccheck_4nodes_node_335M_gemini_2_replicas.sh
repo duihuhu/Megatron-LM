@@ -9,18 +9,18 @@
 # 与 ecnaive_legacy.py / frcheck_legacy.py 遵循相同模式。
 # =============================================================================
 #
-# 用法:
-#   ./test_eccheck_4nodes_node_335M_gemini_replicas_legacy.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]
+# Usage:
+#   ./test_eccheck_4nodes_node_335M_gemini_2_replicas.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [mode] [additional_args...]
 #
-# 示例:
-#   # 4 节点各 1 GPU (id 0)
-#   ./test_eccheck_4nodes_node_335M_gemini_replicas_legacy.sh 0 0
+# mode (optional, default: save):
+#   save      - checkpoint save only (no load / recovery flags)
+#   software  - load checkpoint + software failure recovery
+#   hardware  - load checkpoint + hardware failure recovery
 #
-#   # 4 节点各 8 GPU (id 0-7)
-#   ./test_eccheck_4nodes_node_335M_gemini_replicas_legacy.sh 0 0 1 2 3 4 5 6 7
-#
-#   # 4 节点各 2 GPU (id 2,3)，额外传入训练参数
-#   ./test_eccheck_4nodes_node_335M_gemini_replicas_legacy.sh 0 2 3 --train-iters 50
+# Example:
+#   ./test_eccheck_4nodes_node_335M_gemini_2_replicas.sh 0 0
+#   ./test_eccheck_4nodes_node_335M_gemini_2_replicas.sh 0 0 1 2 3 4 5 6 7 software
+#   ./test_eccheck_4nodes_node_335M_gemini_2_replicas.sh 0 2 3 hardware --train-iters 50
 # =============================================================================
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -77,8 +77,15 @@ done
 
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
     echo "Error: At least one GPU id must be specified."
-    echo "Usage: $0 <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]"
+    echo "Usage: $0 <node_rank> <gpu_id_0> [gpu_id_1 ...] [save|software|hardware] [additional_args...]"
     exit 1
+fi
+
+# ---- mode parsing (save | software | hardware, after GPU IDs) ----
+MODE=save
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware)$ ]]; then
+    MODE="$1"
+    shift
 fi
 
 GPUS_PER_NODE=${#GPU_IDS[@]}
@@ -89,14 +96,35 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/bert/bert_data/vocab.txt"
 
-TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/bert/7B/bert-7b-0/logs"
-CHECKPOINT_PATH="/dev/shm/models/bert-7b-0-gemini-2-replicas"
+TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/bert/20B/bert-20b-0/logs"
+CHECKPOINT_PATH="/dev/shm/models/bert-20b-0-gemini-2-replicas"
 DATA_PATH="/workspace/Megatron-LM/pre-tests/bert/bert_data/wiki_text_sentence"
 DATA_CACHE_PATH="${DATA_CACHE_PATH:-/workspace/Megatron-LM/pre-tests/bert/bert_data/cache}"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
 ARGS_TO_PASS=("$@")
+
+# Recovery mode args: enabled only for software / hardware load tests
+RECOVERY_MODE_ARGS=()
+case "$MODE" in
+    save)
+        ;;
+    software)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-gemini-replicas-software-failure
+            --gemini-replicas-recovery-rank "0,1,2,3,4,5,6,7"
+        )
+        ;;
+    hardware)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-gemini-replicas-hardware-failure
+            --gemini-replicas-recovery-rank "0,1,2,3,4,5,6,7"
+        )
+        ;;
+esac
 
 # 模型固定参数
 HIDDEN_SIZE=5120
@@ -169,7 +197,6 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 10
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    # --load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
@@ -268,12 +295,12 @@ mkdir -p logs/csv
 
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_bert.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK, mode=$MODE): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_bert.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} ${RECOVERY_MODE_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
 
-echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (Gemini Replicas Legacy)"
+echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (Gemini Replicas Legacy, mode=$MODE)"
 echo "WORLD_SIZE=$WORLD_SIZE  GPUS_PER_NODE=$GPUS_PER_NODE  NNODES=$NNODES"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 
@@ -286,5 +313,6 @@ PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
+    ${RECOVERY_MODE_ARGS[@]} \
     --distributed-backend nccl \
     ${ARGS_TO_PASS[@]}

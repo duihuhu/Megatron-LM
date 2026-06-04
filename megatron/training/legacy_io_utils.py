@@ -210,6 +210,33 @@ def read_raw_checkpoint(
     return result
 
 
+def read_raw_checkpoint_metadata(
+    path: str,
+    expected_magic: bytes,
+) -> Dict[str, Any]:
+    """Read only metadata from a raw legacy main checkpoint file."""
+    with open(path, "rb") as f:
+        magic = f.read(_HEADER_MAGIC_LEN)
+        if magic != expected_magic:
+            raise ValueError(
+                f"Unexpected magic {magic!r} (expected {expected_magic!r}) in {path}"
+            )
+        meta1_len, meta2_len, _data_len = _read_header(f)
+        extra_len = struct.unpack("<Q", f.read(8))[0]
+
+        non_tensor_data = pickle.loads(f.read(meta1_len))
+        tensor_infos = pickle.loads(f.read(meta2_len))
+        extra = pickle.loads(f.read(extra_len)) if extra_len else {}
+
+    result: Dict[str, Any] = {
+        "non_tensor_data": non_tensor_data,
+        "tensor_infos": tensor_infos,
+        "tensor_buffer": None,
+    }
+    result.update(extra)
+    return result
+
+
 def read_raw_block(
     path: str,
     expected_magic: bytes,

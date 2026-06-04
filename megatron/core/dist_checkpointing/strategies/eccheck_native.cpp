@@ -6425,15 +6425,8 @@ public:
                                const uint8_t* data, size_t size) {
         // std::cout << "[EC-CHECK RDMA] Sending " << size << " bytes via RDMA" << std::endl;
         static const size_t CHUNK_SIZE = 64ULL * 1024 * 1024;
+        static const int MAX_BATCH_WR = 32;
         uint64_t size_net = htonll(static_cast<uint64_t>(size));
-        {
-            std::lock_guard<std::mutex> lock(control_mutex);
-            if (::send(control_sock, &size_net, sizeof(size_net), 0) != sizeof(size_net))
-                throw std::runtime_error("EC-CHECK RDMA: failed to send size");
-            uint8_t ack;
-            if (::recv(control_sock, &ack, sizeof(ack), MSG_WAITALL) != sizeof(ack))
-                throw std::runtime_error("EC-CHECK RDMA: failed to receive ACK");
-        }
         ibv_mr* mr = rdma_find_mr(reinterpret_cast<uintptr_t>(data), size);
         const uint8_t* send_ptr = data;
         if (!mr) {
@@ -6443,26 +6436,47 @@ public:
             mr = rdma_temp_send_mr_;
             send_ptr = rdma_temp_send_buffer_.data();
         }
+
+        std::lock_guard<std::mutex> lock(control_mutex);
+        if (::send(control_sock, &size_net, sizeof(size_net), 0) != sizeof(size_net))
+            throw std::runtime_error("EC-CHECK RDMA: failed to send size");
+
         size_t remaining = size;
         size_t offset = 0;
         while (remaining > 0) {
-            size_t cur = std::min(remaining, CHUNK_SIZE);
-            ibv_sge sge{};
-            sge.addr = reinterpret_cast<uint64_t>(send_ptr + offset);
-            sge.length = cur;
-            sge.lkey = mr->lkey;
-            ibv_send_wr wr{};
-            wr.wr_id = 0;
-            wr.sg_list = &sge;
-            wr.num_sge = 1;
-            wr.opcode = IBV_WR_SEND;
-            wr.send_flags = IBV_SEND_SIGNALED;
+            int batch_count = static_cast<int>(std::min(
+                static_cast<size_t>(MAX_BATCH_WR),
+                (remaining + CHUNK_SIZE - 1) / CHUNK_SIZE));
+            if (batch_count == 0) batch_count = 1;
+
+            uint8_t ack;
+            if (::recv(control_sock, &ack, sizeof(ack), MSG_WAITALL) != sizeof(ack))
+                throw std::runtime_error("EC-CHECK RDMA: failed to receive ACK");
+
+            std::vector<ibv_sge> sges(batch_count);
+            std::vector<ibv_send_wr> wrs(batch_count);
+            int num_wrs = 0;
+            for (int i = 0; i < batch_count && remaining > 0; ++i) {
+                size_t cur = std::min(remaining, CHUNK_SIZE);
+                sges[i].addr = reinterpret_cast<uint64_t>(send_ptr + offset);
+                sges[i].length = cur;
+                sges[i].lkey = mr->lkey;
+                wrs[i].wr_id = i;
+                wrs[i].sg_list = &sges[i];
+                wrs[i].num_sge = 1;
+                wrs[i].opcode = IBV_WR_SEND;
+                wrs[i].send_flags = IBV_SEND_SIGNALED;
+                wrs[i].next = (i < batch_count - 1) ? &wrs[i + 1] : nullptr;
+                offset += cur;
+                remaining -= cur;
+                num_wrs++;
+            }
+            if (num_wrs > 0) wrs[num_wrs - 1].next = nullptr;
+
             ibv_send_wr* bad_wr = nullptr;
-            if (ibv_post_send(qp, &wr, &bad_wr))
+            if (ibv_post_send(qp, &wrs[0], &bad_wr))
                 throw std::runtime_error("EC-CHECK RDMA: failed to post send");
-            rdma_poll_completion(send_cq, 1);
-            offset += cur;
-            remaining -= cur;
+            rdma_poll_completion(send_cq, num_wrs);
         }
     }
 
@@ -6496,14 +6510,12 @@ public:
             use_temp = true;
         }
         
-        // Step 3: Pre-post all recv WRs BEFORE sending ACK
-        // This ensures sender can post send WRs immediately after receiving ACK
         size_t remaining = size;
         size_t offset = 0;
-        std::vector<std::vector<ibv_sge>> all_sges;
-        std::vector<std::vector<ibv_recv_wr>> all_wrs;
-        std::vector<int> all_num_wrs;
-        
+
+        // Step 3-6: Process in bounded batches.  Posting all WRs for a 20B
+        // checkpoint can exceed the QP recv queue depth before the ACK is sent.
+        const auto poll_t0 = std::chrono::steady_clock::now();
         while (remaining > 0) {
             int chunk_count = static_cast<int>(std::min(static_cast<size_t>(MAX_BATCH_WR),
                 (remaining + CHUNK_SIZE - 1) / CHUNK_SIZE));
@@ -6512,7 +6524,6 @@ public:
             std::vector<ibv_sge> sges(chunk_count);
             std::vector<ibv_recv_wr> wrs(chunk_count);
             int num_wrs = 0;
-            
             for (int i = 0; i < chunk_count && remaining > 0; ++i) {
                 size_t cur = std::min(CHUNK_SIZE, remaining);
                 sges[i].addr = reinterpret_cast<uint64_t>(recv_ptr + offset);
@@ -6527,32 +6538,22 @@ public:
                 num_wrs++;
             }
             if (num_wrs > 0) wrs[num_wrs - 1].next = nullptr;
-            
-            all_sges.push_back(std::move(sges));
-            all_wrs.push_back(std::move(wrs));
-            all_num_wrs.push_back(num_wrs);
-        }
-        
-        // Step 4: Post all recv WRs before sending ACK
-        for (size_t i = 0; i < all_wrs.size(); ++i) {
+
+            // Step 4: Post this bounded recv batch before sending ACK.
             ibv_recv_wr* bad_wr = nullptr;
-            if (ibv_post_recv(qp, &all_wrs[i][0], &bad_wr))
+            if (ibv_post_recv(qp, &wrs[0], &bad_wr))
                 throw std::runtime_error("EC-CHECK RDMA: failed to post recv");
-        }
-        
-        // Step 5: Send ACK after all recv WRs are posted
-        // This tells sender that receiver is ready to receive data
-        {
-            std::lock_guard<std::mutex> lock(control_mutex);
-            uint8_t ack = 1;
-            if (::send(control_sock, &ack, sizeof(ack), 0) != sizeof(ack))
-                throw std::runtime_error("EC-CHECK RDMA: failed to send ACK");
-        }
-        
-        // Step 6: Poll for completions (RDMA data path wait; excludes control-channel recv/post_recv setup)
-        const auto poll_t0 = std::chrono::steady_clock::now();
-        for (size_t i = 0; i < all_num_wrs.size(); ++i) {
-            rdma_poll_completion(recv_cq, all_num_wrs[i]);
+
+            // Step 5: Tell sender this batch is ready.
+            {
+                std::lock_guard<std::mutex> lock(control_mutex);
+                uint8_t ack = 1;
+                if (::send(control_sock, &ack, sizeof(ack), 0) != sizeof(ack))
+                    throw std::runtime_error("EC-CHECK RDMA: failed to send ACK");
+            }
+
+            // Step 6: Poll this batch before posting more WRs.
+            rdma_poll_completion(recv_cq, num_wrs);
         }
         const auto poll_t1 = std::chrono::steady_clock::now();
         if (rank_ == 2 && poll_lane != RdmaLoadRecvPollLane::None) {
@@ -6666,8 +6667,8 @@ public:
         if (it != rdma_registered_buffers_.end()) {
             ibv_dereg_mr(it->second.mr);
             rdma_registered_buffers_.erase(it);
-            std::cout << "[EC-CHECK RDMA] Rank " << rank_ << " buffer unregistered at " 
-                      << std::hex << addr << std::dec << std::endl;
+            // std::cout << "[EC-CHECK RDMA] Rank " << rank_ << " buffer unregistered at " 
+                    //   << std::hex << addr << std::dec << std::endl;
         }
 #else
         // No-op on non-Linux systems

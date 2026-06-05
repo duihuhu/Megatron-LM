@@ -214,16 +214,14 @@ def _encode_with_native(
             parity0_addr = get_free_parity_buffer()
             parity1_addr = get_free_parity_buffer()
 
-            # Aligned recv block write addresses
+            # Continuous recv block write addresses (no padding, aligned with ECLATIN)
             recv_write_addrs = []
             for i in range(num_recv):
-                aligned = ((recv_offsets[i] + 63) // 64) * 64
-                if aligned + take > aligned_block_size:
+                if recv_offsets[i] + take > aligned_block_size:
                     logger.warning("EC-NAIVE legacy: recv block %d exhausted", i)
-                    # reset to 0 to continue
-                    aligned = 0
-                recv_write_addrs.append(recv_bases[i] + aligned)
-                recv_offsets[i] = aligned + take
+                    recv_offsets[i] = 0
+                recv_write_addrs.append(recv_bases[i] + recv_offsets[i])
+                recv_offsets[i] += take
 
             # Submit to C++ native: encode k data → 2 parity, send/recv over network
             native.submit_ecnaive_save_general(
@@ -288,7 +286,7 @@ def _save_ecnaive_pt_files(
     meta1 = _pickle.dumps(non_tensor_data)
     meta2 = _pickle.dumps(tensor_infos)
     extra = _pickle.dumps({
-        "version": 2, "format": "ecnaive_torch_legacy", "rank": rank,
+        "version": 3, "format": "ecnaive_torch_legacy", "rank": rank,
         "ecnaive_k": k, "ecnaive_n": n,
         "actual_tensor_size": blocks["actual_size"],
         "pipeline_total_bytes": blocks["pipeline_size"],
@@ -685,22 +683,29 @@ def _load_ecnaive_legacy_software_failure(
     send_block: Optional[torch.Tensor] = None
     send_block_idx: int = -1
 
+    ckpt_ver = int(main_payload.get("version", 2))
+    has_padded_sw = ckpt_ver < 3
+
     if rank_in_group == failed_rig:
         # Pre-allocate final tensor_buffer once (pinned for fast CPU→GPU copy)
         buf_len = max(actual_tensor_size, pipeline_total_bytes)
         tensor_buffer = allocate_hugepage_tensor(buf_len, fallback_pin_memory=True)
-        # Decode local d_{f,0} directly into tensor_buffer (no network dep)
+        # Load local d_{f,0} into tensor_buffer
         own_data0 = _load_ecnaive_block_file(
             checkpoint_dir, rank,
             canonical_name="own_data0",
             legacy_name="data0",
             block_files_legacy=block_files_legacy,
         )
-        _decode_block_direct(
-            own_data0, tensor_buffer, 0,
-            block_data_size, pipeline_total_bytes, 0,
-            manager.ecnaive_buffer_size,
-        )
+        if has_padded_sw:
+            _decode_block_direct(
+                own_data0, tensor_buffer, 0,
+                block_data_size, pipeline_total_bytes, 0,
+                manager.ecnaive_buffer_size,
+            )
+        else:
+            n_copy = min(own_data0.numel(), block_data_size)
+            tensor_buffer[:n_copy].copy_(own_data0[:n_copy])
         own_data0 = None  # free ref
         for _j in range(1, k):
             buf = torch.zeros(aligned_block_size, dtype=torch.uint8)
@@ -745,11 +750,16 @@ def _load_ecnaive_legacy_software_failure(
     # Decode recv blocks → tensor_buffer (not timed)
     if rank_in_group == failed_rig:
         for idx, buf in enumerate(recv_blocks):
-            _decode_block_direct(
-                buf, tensor_buffer, (idx + 1) * block_data_size,
-                block_data_size, pipeline_total_bytes, idx + 1,
-                manager.ecnaive_buffer_size,
-            )
+            dst_off = (idx + 1) * block_data_size
+            if has_padded_sw:
+                _decode_block_direct(
+                    buf, tensor_buffer, dst_off,
+                    block_data_size, pipeline_total_bytes, idx + 1,
+                    manager.ecnaive_buffer_size,
+                )
+            else:
+                n_copy = min(buf.numel(), block_data_size)
+                tensor_buffer[dst_off:dst_off + n_copy].copy_(buf[:n_copy])
             logger.info(
                 "EC-NAIVE legacy sw: rank2 received d_2,%d (%d bytes)",
                 idx + 1, buf.numel(),
@@ -1239,10 +1249,18 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     pipeline_total_bytes = int(main_payload.get("pipeline_total_bytes", 0))
     block_data_size = int(main_payload.get("block_data_size",
                           (pipeline_total_bytes + ecnaive_k - 1) // ecnaive_k))
-    # aligned_block_size = storage size of each block file (includes 64B alignment gaps)
+    # version < 3: old checkpoints have 64B alignment gaps in recv blocks
+    # version >= 3: continuous (no padding, aligned with ECLATIN)
+    ckpt_version = int(main_payload.get("version", 3))
+    has_padded_recv = ckpt_version < 3
+
+    # old checkpoints: blocks have 64B gaps, use aligned_block_size for send/recv
+    # new checkpoints: continuous, use block_data_size
     aligned_block_size = int(main_payload.get("aligned_block_size",
                              ((block_data_size + manager.ecnaive_buffer_size - 1)
                               // manager.ecnaive_buffer_size) * manager.ecnaive_buffer_size))
+    recv_block_size = aligned_block_size if has_padded_recv else block_data_size
+
     flat_key_roots = _infer_flat_key_roots(main_payload)
     actual_tensor_size = int(main_payload.get("actual_tensor_size", 0))
     num_channels = ecnaive_n - 1  # = k + 1
@@ -1276,9 +1294,8 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     source_blocks_prealloc: List[torch.Tensor] = []
     if affected_group and is_failed:
         total_pool_blocks = len(source_ranks) * ecnaive_n
-        # Use aligned_block_size (with 64B gaps) so send doesn't truncate last chunk
         recv_pool_prealloc = list(allocate_hugepage_slices(
-            aligned_block_size, total_pool_blocks,
+            recv_block_size, total_pool_blocks,
             fallback_pin_memory=True, touch_pages=True,
         ))
         if manager.use_rdma:
@@ -1306,7 +1323,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         for dest_fr in failed_in_group:
             send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
             for block_tensor in source_blocks_prealloc:
-                send_size = min(block_tensor.numel(), aligned_block_size)
+                send_size = min(block_tensor.numel(), recv_block_size)
                 native.submit_send_task(
                     send_ch, int(block_tensor.data_ptr()), send_size
                 )
@@ -1367,7 +1384,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 native.submit_recv_task(
                     recv_ch,
                     int(recv_pool[base + bi].data_ptr()),
-                    aligned_block_size,
+                    recv_block_size,
                 )
             logger.info(
                 f"EC-NAIVE hw recovery: failed rank {rank} recv "
@@ -1459,7 +1476,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             surviving: Dict[str, torch.Tensor] = {}
             is_padded: Dict[str, bool] = {}
             for label, padded in raw_surviving.items():
-                if label != 'data_0':
+                # old checkpoints: recv slots (data_1/parity0/parity1) have 64B gaps
+                # new checkpoints: all blocks are continuous
+                if has_padded_recv and label != 'data_0':
                     surviving[label] = padded
                     is_padded[label] = True
                 else:
@@ -1486,7 +1505,11 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 # Slice to block_data_size and pass directly to RS decode.
                 continuous_surviving = [b[:block_data_size] for b in surviving_block_data]
 
-                recovered_blocks = recovered_slot_pool[:m_owner]
+                # Self codeword: decode directly into store_bufs (avoid overwrite by later owners)
+                recovered_blocks = (
+                    [store_bufs['own_data0'], store_bufs['my_data1']][:m_owner]
+                    if owner_rig == my_rig else recovered_slot_pool[:m_owner]
+                )
                 surviving_addrs = [int(b.data_ptr()) for b in continuous_surviving]
                 recovered_addrs = [int(b.data_ptr()) for b in recovered_blocks]
                 native.submit_ecnaive_decode_recovery(

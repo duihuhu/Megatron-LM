@@ -1487,30 +1487,20 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     surviving[l] for l in surviving_addrs_ordered
                 ]
                 is_padded_list = [is_padded[l] for l in surviving_addrs_ordered]
+
+                # Blocks are continuous (save path no longer adds padding gaps).
+                # Slice to block_data_size and pass directly to RS decode.
+                continuous_surviving = [b[:block_data_size] for b in surviving_block_data]
+
                 recovered_blocks = [
                     torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(m_owner)
                 ]
-                # Track per-block padded offsets (0 for continuous blocks)
-                pe_offsets = [0] * len(surviving_block_data)
-                src_pos = 0
-                while src_pos < block_data_size:
-                    take = min(ecnaive_buffer_size_val, block_data_size - src_pos)
-                    surviving_chunk_addrs = []
-                    for j, b in enumerate(surviving_block_data):
-                        if is_padded_list[j]:
-                            aligned = ((pe_offsets[j] + 63) // 64) * 64
-                            surviving_chunk_addrs.append(int(b.data_ptr()) + aligned)
-                            pe_offsets[j] = aligned + take
-                        else:
-                            surviving_chunk_addrs.append(int(b.data_ptr()) + src_pos)
-                    recovered_chunk_addrs = [
-                        int(b.data_ptr()) + src_pos for b in recovered_blocks
-                    ]
-                    native.submit_ecnaive_decode_recovery(
-                        ecnaive_k, m_owner, lost,
-                        surviving_chunk_addrs, recovered_chunk_addrs, take,
-                    )
-                    src_pos += take
+                surviving_addrs = [int(b.data_ptr()) for b in continuous_surviving]
+                recovered_addrs = [int(b.data_ptr()) for b in recovered_blocks]
+                native.submit_ecnaive_decode_recovery(
+                    ecnaive_k, m_owner, lost,
+                    surviving_addrs, recovered_addrs, block_data_size,
+                )
 
                 recovered_data = [None, None]
                 ri = 0
@@ -1566,28 +1556,17 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                         )
 
             # Now we have owner's data blocks. Compute parity via encode.
+            # Blocks are continuous — slice and pass directly.
+            encode_inputs = [recovered_data[j][:block_data_size] for j in range(ecnaive_k)]
+
             parity0 = torch.zeros(block_data_size, dtype=torch.uint8)
             parity1 = torch.zeros(block_data_size, dtype=torch.uint8)
-            # Per-block padded offsets for data inputs (0 for continuous)
-            pe_enc = [0, 0]
-            src_pos = 0
-            while src_pos < block_data_size:
-                take = min(ecnaive_buffer_size_val, block_data_size - src_pos)
-                data_addrs = []
-                for j in range(ecnaive_k):
-                    if j < len(is_padded_recovered) and is_padded_recovered[j]:
-                        aligned = ((pe_enc[j] + 63) // 64) * 64
-                        data_addrs.append(int(recovered_data[j].data_ptr()) + aligned)
-                        pe_enc[j] = aligned + take
-                    else:
-                        data_addrs.append(int(recovered_data[j].data_ptr()) + src_pos)
-                native.encode_ec_blocks(
-                    data_addrs,
-                    int(parity0.data_ptr()) + src_pos,
-                    int(parity1.data_ptr()) + src_pos,
-                    take,
-                )
-                src_pos += take
+            native.encode_ec_blocks(
+                [int(b.data_ptr()) for b in encode_inputs],
+                int(parity0.data_ptr()),
+                int(parity1.data_ptr()),
+                block_data_size,
+            )
 
             # Map recovered blocks to the right slots on THIS failed rank
             if owner_rig == my_rig:

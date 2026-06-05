@@ -188,7 +188,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --eval-iters 1
+    --eval-iters 10
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
 
@@ -211,6 +211,7 @@ EVAL_AND_LOGGING_ARGS=(
     #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
     # --ecnaive-failed-ranks "0,1,2,3,4,5,6,7"
     #                                Uses ISA-L RS decoding (GF(2^8)) to recover 1-2 lost blocks
+    # --no-load-optim
 )
 
 mkdir -p logs

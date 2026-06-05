@@ -1045,10 +1045,10 @@ class ECCHECKManager:
             return
         
         try:
-            logger.info(f"EC-CHECK: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
+            # logger.info(f"EC-CHECK: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
             self._eccheck_native.unregister_buffer(buffer_addr)
             del self.registered_buffers[buffer_addr]
-            logger.info(f"EC-CHECK: [Rank {rank}] Buffer unregistered successfully")
+            # logger.info(f"EC-CHECK: [Rank {rank}] Buffer unregistered successfully")
         except Exception as e:
             logger.error(f"EC-CHECK: [Rank {rank}] Failed to unregister buffer: {e}")
     
@@ -1096,7 +1096,7 @@ class ECCHECKManager:
                 logger.info(f"EC-CHECK: [Rank {rank}] Unregistering all RDMA buffers...")
                 for buffer_addr in list(self.registered_buffers.keys()):
                     try:
-                        logger.info(f"EC-CHECK: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x} during cleanup")
+                        # logger.info(f"EC-CHECK: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x} during cleanup")
                         self._eccheck_native.unregister_buffer(buffer_addr)
                     except Exception as e:
                         logger.warning(f"EC-CHECK: [Rank {rank}] Failed to unregister buffer during cleanup: {e}")

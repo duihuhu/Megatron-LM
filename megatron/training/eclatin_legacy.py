@@ -580,11 +580,17 @@ def _load_eclatin_main_payload(checkpoint_dir: Path, rank: int, world_size: int)
     main_path = checkpoint_dir / f"eclatin_main_rank{rank}.pt"
     local_payload: Optional[Dict[str, Any]] = None
     if main_path.is_file():
-        from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_ECLATIN
+        from megatron.training.legacy_io_utils import (
+            is_raw_format, read_raw_checkpoint, MAGIC_ECLATIN,
+            pin_payload_tensor_buffer_if_available,
+        )
         if is_raw_format(str(main_path), MAGIC_ECLATIN):
-            local_payload = read_raw_checkpoint(str(main_path), MAGIC_ECLATIN)
+            local_payload = read_raw_checkpoint(
+                str(main_path), MAGIC_ECLATIN, pin_tensor_buffer=True,
+            )
         else:
             local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+            pin_payload_tensor_buffer_if_available(local_payload)
 
     if world_size <= 1 or not torch.distributed.is_initialized():
         if local_payload is None:
@@ -642,12 +648,16 @@ def _copy_eclatin_block_file_into_tensor(
     block_path = checkpoint_dir / f"eclatin_block_rank{rank}_{block_name}.pt"
     if not block_path.is_file():
         raise FileNotFoundError(f"ECLATIN legacy load: missing block file {block_path}")
-    from megatron.training.legacy_io_utils import is_raw_format, read_raw_block, MAGIC_BLOCK
+    from megatron.training.legacy_io_utils import (
+        is_raw_format, read_raw_block, MAGIC_BLOCK, pin_uint8_tensor_if_available,
+    )
     if is_raw_format(str(block_path), MAGIC_BLOCK):
-        src = read_raw_block(str(block_path), MAGIC_BLOCK)
+        src = read_raw_block(str(block_path), MAGIC_BLOCK, pin_tensor=True)
     else:
         payload = torch.load(block_path, map_location="cpu", weights_only=False)
-        src = payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
+        src = pin_uint8_tensor_if_available(
+            payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
+        )
     dst = dest.contiguous().view(-1)
     n = min(src.numel(), dst.numel())
     dst[:n].copy_(src[:n])

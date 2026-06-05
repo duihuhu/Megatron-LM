@@ -1134,15 +1134,8 @@ def _replica_recovery_preload(
             # Read source data (disk I/O — outside timed window)
             if src == rank:
                 mp = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
-<<<<<<< HEAD
-                from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
-                payload = read_raw_checkpoint(
-                    str(mp), MAGIC_GEMINI, pin_tensor_buffer=True,
-                )
-=======
                 from megatron.training.legacy_io_utils import read_raw_checkpoint, MAGIC_GEMINI
                 payload = read_raw_checkpoint(str(mp), MAGIC_GEMINI)
->>>>>>> eb95703bcb969f57fa3428a042e6f082857a713b
                 meta = {
                     "tensor_infos": payload["tensor_infos"],
                     "non_tensor_data": payload["non_tensor_data"],

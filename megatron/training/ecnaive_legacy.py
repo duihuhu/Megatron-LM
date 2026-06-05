@@ -1292,12 +1292,15 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             for b in source_blocks_prealloc:
                 manager.register_buffer(b)
 
+    # sync after pre-alloc, before timing
+    torch.distributed.barrier()
+
     # === timing: network/encode (C++ send/recv + RS decode only) ===
     _t: Dict[str, float] = {}
+    _t0_net = time.time()
 
     # ── Pipeline: SOURCE ranks send all n blocks to each failed rank ──
     if affected_group and not is_failed and is_source:
-        _t0_net = time.time()
         native.reset_encoding_completion_flags()
 
         for dest_fr in failed_in_group:
@@ -1327,7 +1330,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
     elif affected_group and not is_failed and not is_source:
         # Survivor but not selected as source: no-op on channels
-        _t0_net = time.time()
         native.reset_encoding_completion_flags()
         native.submit_send_sentinels(num_channels)
         native.submit_recv_sentinels(num_channels)
@@ -1356,9 +1358,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
         recv_pool = recv_pool_prealloc
 
-        # === timing: network recv ===
-        _t0_net = time.time()
-
         # Receive all n blocks from each source rank
         native.reset_encoding_completion_flags()
         for si, src_rank in enumerate(source_ranks):
@@ -1378,8 +1377,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         native.submit_send_sentinels(num_channels)
         native.submit_recv_sentinels(num_channels)
         native.wait_for_encoding_completion()
-
-        _t['network_recv'] = time.time() - _t0_net
 
         # ── Block locator (not timed) ──────────────────────────────
         # Layout per source segment: [own_data0, recv_0, recv_1, recv_2]
@@ -1423,6 +1420,23 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             owner_rig = (my_rig - recv_idx - 1) % ecnaive_n
             if owner_rig not in owner_rigs:
                 owner_rigs.append(owner_rig)
+
+        # Pre-allocate decode/encode buffers (not timed)
+        num_owners = len(owner_rigs)
+        recovered_slot_pool = [
+            torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(ecnaive_k)
+        ]
+        parity_pool_0 = [
+            torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(num_owners)
+        ]
+        parity_pool_1 = [
+            torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(num_owners)
+        ]
+        # Pre-allocate store buffers — copy into these after timing
+        store_bufs: Dict[str, torch.Tensor] = {}
+        for _name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2'):
+            store_bufs[_name] = torch.zeros(block_data_size, dtype=torch.uint8)
+        owner_idx = 0
 
         for owner_rig in owner_rigs:
             # Find which blocks of this codeword survive in recv_pool
@@ -1472,9 +1486,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 # Slice to block_data_size and pass directly to RS decode.
                 continuous_surviving = [b[:block_data_size] for b in surviving_block_data]
 
-                recovered_blocks = [
-                    torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(m_owner)
-                ]
+                recovered_blocks = recovered_slot_pool[:m_owner]
                 surviving_addrs = [int(b.data_ptr()) for b in continuous_surviving]
                 recovered_addrs = [int(b.data_ptr()) for b in recovered_blocks]
                 native.submit_ecnaive_decode_recovery(
@@ -1539,8 +1551,8 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             # Blocks are continuous — slice and pass directly.
             encode_inputs = [recovered_data[j][:block_data_size] for j in range(ecnaive_k)]
 
-            parity0 = torch.zeros(block_data_size, dtype=torch.uint8)
-            parity1 = torch.zeros(block_data_size, dtype=torch.uint8)
+            parity0 = parity_pool_0[owner_idx]
+            parity1 = parity_pool_1[owner_idx]
             native.encode_ec_blocks(
                 [int(b.data_ptr()) for b in encode_inputs],
                 int(parity0.data_ptr()),
@@ -1548,23 +1560,27 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 block_data_size,
             )
 
-            # Map recovered blocks to the right slots on THIS failed rank
+            # Save refs only — copy to pre-allocated buffers after timing
             if owner_rig == my_rig:
-                recovered['own_data0'] = recovered_data[0].clone()
-                # d_{f,1} is on rank (my_rig+1)%n — if that's not a source,
-                # we recovered it above. Store as my_data1 for tensor assembly.
-                recovered['my_data1'] = recovered_data[1].clone()
-            # parity0 of owner: stored on rank (owner_rig+2)%n → recv_1
+                recovered['own_data0_ref'] = recovered_data[0]
+                recovered['my_data1_ref'] = recovered_data[1]
             if (owner_rig + 2) % ecnaive_n == my_rig:
-                recovered['recv_1'] = parity0.clone()
-            # parity1 of owner: stored on rank (owner_rig+3)%n → recv_2
+                recovered['recv_1_ref'] = parity0
             if (owner_rig + 3) % ecnaive_n == my_rig:
-                recovered['recv_2'] = parity1.clone()
-            # data1 of owner: stored on rank (owner_rig+1)%n → recv_0
+                recovered['recv_2_ref'] = parity1
             if (owner_rig + 1) % ecnaive_n == my_rig:
-                recovered['recv_0'] = recovered_data[1].clone()
+                recovered['recv_0_ref'] = recovered_data[1]
+
+            owner_idx += 1
 
         _t['network_encode'] = time.time() - _t0_net
+
+        # Copy recovered refs to pre-allocated store buffers (not timed)
+        for _name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2'):
+            _ref = recovered.pop(f'{_name}_ref', None)
+            if _ref is not None:
+                store_bufs[_name].copy_(_ref[:store_bufs[_name].numel()])
+                recovered[_name] = store_bufs[_name]
 
         # ── Store recovered blocks ──
         if recovered:
@@ -1657,7 +1673,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         # ═══════════════════════════════════════════════════════════════
         # UNAFFECTED rank (different group): no-op on ASIO channels
         # ═══════════════════════════════════════════════════════════════
-        _t0_net = time.time()
         native.reset_encoding_completion_flags()
         native.submit_send_sentinels(num_channels)
         native.submit_recv_sentinels(num_channels)

@@ -2170,8 +2170,9 @@ public:
         std::cout << "ECLATIN: [Rank_in_group " << rank_in_group << "] Initializing load connections..." << std::endl;
         
         if (rank_in_group == 2) {
-            // rank_in_group 2 (receiver): Initialize 6 recv sockets (accept connections from 0/1/3 in group)
-            // Step 1: First, bind and listen all acceptors synchronously (before accept)
+            // rank_in_group 2 (receiver): bind+listen 6 acceptors, then each accept
+            // thread does accept() + QP exchange inline (same thread → no boost::asio
+            // io_context race on socket native_handle).
             std::cout << "ECLATIN: [Rank_in_group 2] Binding and listening all acceptors..." << std::endl;
             try {
                 conn_.bind_listen_load_recv_rank0_data2(rank2_ip, load_recv_rank0_data2_port);
@@ -2180,66 +2181,147 @@ public:
                 conn_.bind_listen_load_recv_rank1_parity1(rank2_ip, load_recv_rank1_parity1_port);
                 conn_.bind_listen_load_recv_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
                 conn_.bind_listen_load_recv_rank3_data2(rank2_ip, load_recv_rank3_data2_port);
-                
                 std::cout << "ECLATIN: [Rank_in_group 2] All acceptors bound and listening" << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "ECLATIN: [Rank_in_group 2] Failed to bind/listen acceptors: " << e.what() << std::endl;
                 throw;
             }
-            
-            // Step 2: Start accept operations in separate threads (similar to EC-CHECK)
-            // These threads will block on accept() until connections arrive
-            std::thread recv_init_thread([this]() {
-                std::thread r0_d2([this]() {
-                    conn_.accept_load_recv_rank0_data2();
-                });
-                std::thread r0_p2([this]() {
-                    conn_.accept_load_recv_rank0_parity2();
-                });
-                std::thread r1_d1([this]() {
-                    conn_.accept_load_recv_rank1_data1();
-                });
-                std::thread r1_p1([this]() {
-                    conn_.accept_load_recv_rank1_parity1();
-                });
-                std::thread r3_d1([this]() {
-                    conn_.accept_load_recv_rank3_data1();
-                });
-                std::thread r3_d2([this]() {
-                    conn_.accept_load_recv_rank3_data2();
-                });
-                r0_d2.join();
-                r0_p2.join();
-                r1_d1.join();
-                r1_p1.join();
-                r3_d1.join();
-                r3_d2.join();
+
+            // Init RDMA resources now (accept threads will use them for QP exchange).
+            if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_[0] == nullptr) {
+                init_rdma_load_resources();
+            }
+
+            // Each accept thread: accept() → create channel → QP exchange → done.
+            // Overlaps accept+QP across 6 sockets; no detached thread → no race.
+            std::thread r0_d2([this, rank_in_group]() {
+                conn_.accept_load_recv_rank0_data2();
+                if (use_rdma_ && rdma_pd_) {
+                    rdma_load_channels_[0] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[0], rdma_load_recv_cq_[0],
+                        conn_.get_load_recv_rank0_data2_socket().native_handle(),
+                        conn_.get_load_recv_rank0_data2_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 0);
+                    rdma_load_channels_[0]->exchange_and_connect(false);
+                }
             });
-            
-            // Step 3: Small delay to ensure accept sockets are bound and listening (similar to EC-CHECK)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            
-            // Detach so rank2 returns and can reach barrier; RDMA load channels created in wait_for_load_connections()
-            recv_init_thread.detach();
-            
-            std::cout << "ECLATIN: [Rank_in_group 2] Accept threads started, waiting for connections..." << std::endl;
+            std::thread r0_p2([this, rank_in_group]() {
+                conn_.accept_load_recv_rank0_parity2();
+                if (use_rdma_ && rdma_pd_) {
+                    rdma_load_channels_[1] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[1], rdma_load_recv_cq_[1],
+                        conn_.get_load_recv_rank0_parity2_socket().native_handle(),
+                        conn_.get_load_recv_rank0_parity2_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 0);
+                    rdma_load_channels_[1]->exchange_and_connect(false);
+                }
+            });
+            std::thread r1_d1([this, rank_in_group]() {
+                conn_.accept_load_recv_rank1_data1();
+                if (use_rdma_ && rdma_pd_) {
+                    rdma_load_channels_[2] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[2], rdma_load_recv_cq_[2],
+                        conn_.get_load_recv_rank1_data1_socket().native_handle(),
+                        conn_.get_load_recv_rank1_data1_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 0);
+                    rdma_load_channels_[2]->exchange_and_connect(false);
+                }
+            });
+            std::thread r1_p1([this, rank_in_group]() {
+                conn_.accept_load_recv_rank1_parity1();
+                if (use_rdma_ && rdma_pd_) {
+                    rdma_load_channels_[3] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[3], rdma_load_recv_cq_[3],
+                        conn_.get_load_recv_rank1_parity1_socket().native_handle(),
+                        conn_.get_load_recv_rank1_parity1_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 0);
+                    rdma_load_channels_[3]->exchange_and_connect(false);
+                }
+            });
+            std::thread r3_d1([this, rank_in_group]() {
+                conn_.accept_load_recv_rank3_data1();
+                if (use_rdma_ && rdma_pd_) {
+                    rdma_load_channels_[4] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[4], rdma_load_recv_cq_[4],
+                        conn_.get_load_recv_rank3_data1_socket().native_handle(),
+                        conn_.get_load_recv_rank3_data1_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 0);
+                    rdma_load_channels_[4]->exchange_and_connect(false);
+                }
+            });
+            std::thread r3_d2([this, rank_in_group]() {
+                conn_.accept_load_recv_rank3_data2();
+                if (use_rdma_ && rdma_pd_) {
+                    rdma_load_channels_[5] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[5], rdma_load_recv_cq_[5],
+                        conn_.get_load_recv_rank3_data2_socket().native_handle(),
+                        conn_.get_load_recv_rank3_data2_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 0);
+                    rdma_load_channels_[5]->exchange_and_connect(false);
+                }
+            });
+            r0_d2.detach(); r0_p2.detach(); r1_d1.detach();
+            r1_p1.detach(); r3_d1.detach(); r3_d2.detach();
+            std::cout << "ECLATIN: [Rank_in_group 2] 6 accept+QP threads started (detached)" << std::endl;
         } else {
-            // rank_in_group 0/1/3: Initialize 2 send sockets each (connect to receiver in group)
+            // rank_in_group 0/1/3: TCP connect + QP exchange inline (same thread).
+            if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_[0] == nullptr) {
+                init_rdma_load_resources();
+            }
             if (rank_in_group == 0) {
-                std::cout << "ECLATIN: [Rank_in_group 0] Connecting load send sockets to receiver..." << std::endl;
+                std::cout << "ECLATIN: [Rank_in_group 0] Connecting + QP exchange..." << std::endl;
                 conn_.init_load_send_rank0_data2(rank2_ip, load_recv_rank0_data2_port);
                 conn_.init_load_send_rank0_parity2(rank2_ip, load_recv_rank0_parity2_port);
-                std::cout << "ECLATIN: [Rank_in_group 0] Load send sockets connected" << std::endl;
+                if (use_rdma_ && rdma_pd_) {
+                    rdma_load_channels_[0] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[0], rdma_load_recv_cq_[0],
+                        conn_.get_load_send_rank0_data2_socket().native_handle(),
+                        conn_.get_load_send_rank0_data2_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 2);
+                    rdma_load_channels_[0]->exchange_and_connect(true);
+                    rdma_load_channels_[1] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[1], rdma_load_recv_cq_[1],
+                        conn_.get_load_send_rank0_parity2_socket().native_handle(),
+                        conn_.get_load_send_rank0_parity2_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 2);
+                    rdma_load_channels_[1]->exchange_and_connect(true);
+                }
             } else if (rank_in_group == 1) {
-                std::cout << "ECLATIN: [Rank_in_group 1] Connecting load send sockets to receiver..." << std::endl;
+                std::cout << "ECLATIN: [Rank_in_group 1] Connecting + QP exchange..." << std::endl;
                 conn_.init_load_send_rank1_data1(rank2_ip, load_recv_rank1_data1_port);
                 conn_.init_load_send_rank1_parity1(rank2_ip, load_recv_rank1_parity1_port);
-                std::cout << "ECLATIN: [Rank_in_group 1] Load send sockets connected" << std::endl;
+                if (use_rdma_ && rdma_pd_) {
+                    rdma_load_channels_[2] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[2], rdma_load_recv_cq_[2],
+                        conn_.get_load_send_rank1_data1_socket().native_handle(),
+                        conn_.get_load_send_rank1_data1_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 2);
+                    rdma_load_channels_[2]->exchange_and_connect(true);
+                    rdma_load_channels_[3] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[3], rdma_load_recv_cq_[3],
+                        conn_.get_load_send_rank1_parity1_socket().native_handle(),
+                        conn_.get_load_send_rank1_parity1_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 2);
+                    rdma_load_channels_[3]->exchange_and_connect(true);
+                }
             } else if (rank_in_group == 3) {
-                std::cout << "ECLATIN: [Rank_in_group 3] Connecting load send sockets to receiver..." << std::endl;
+                std::cout << "ECLATIN: [Rank_in_group 3] Connecting + QP exchange..." << std::endl;
                 conn_.init_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
                 conn_.init_load_send_rank3_data2(rank2_ip, load_recv_rank3_data2_port);
-                std::cout << "ECLATIN: [Rank_in_group 3] Load send sockets connected" << std::endl;
+                if (use_rdma_ && rdma_pd_) {
+                    rdma_load_channels_[4] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[4], rdma_load_recv_cq_[4],
+                        conn_.get_load_send_rank3_data1_socket().native_handle(),
+                        conn_.get_load_send_rank3_data1_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 2);
+                    rdma_load_channels_[4]->exchange_and_connect(true);
+                    rdma_load_channels_[5] = std::make_unique<RdmaConnectionChannel>(
+                        rdma_context_, rdma_pd_, rdma_load_send_cq_[5], rdma_load_recv_cq_[5],
+                        conn_.get_load_send_rank3_data2_socket().native_handle(),
+                        conn_.get_load_send_rank3_data2_socket().native_handle(),
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group, 2);
+                    rdma_load_channels_[5]->exchange_and_connect(true);
+                }
             }
         }
         
@@ -2301,6 +2383,23 @@ public:
             return;
         }
         conn_.wait_for_load_connections(timeout_seconds);
+        // If RDMA load channels were started asynchronously (single-failure rank2),
+        // spin until the detached accept+QP threads have finished creating them.
+        if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_[0] != nullptr) {
+            int spin = 0;
+            // Each rank only creates a subset: rig2 creates [0..5], others create 2 each
+            int start_ch = 0, end_ch = RDMA_NUM_LOAD_CHANNELS;
+            if (rank_in_group_ == 0)      end_ch = 2;
+            else if (rank_in_group_ == 1) { start_ch = 2; end_ch = 4; }
+            else if (rank_in_group_ == 3) { start_ch = 4; end_ch = 6; }
+            for (int i = start_ch; i < end_ch; ++i) {
+                while (rdma_load_channels_[i] == nullptr) {
+                    if (++spin % 100 == 0)
+                        std::cout << "[ECLATIN RDMA] Waiting for load channel " << i << "..." << std::endl;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+        }
 #if RDMA_AVAILABLE
         // Two-failures v2 RDMA init
         bool is_twf_v2 = conn_.is_twf_v2_connected();
@@ -2331,7 +2430,8 @@ public:
             }
         }
         // Normal load RDMA channels (single-failure / software recovery).
-        // Only init when NOT in any twofail mode.
+        // init_load_connections already did accept+QP exchange inline for all ranks,
+        // so the channels should already exist.  Only init if guard says they don't.
         else if (!is_twf_v2 && use_rdma_ && rdma_pd_ && rdma_load_send_cq_[0] == nullptr) {
             try {
                 init_rdma_load_resources();

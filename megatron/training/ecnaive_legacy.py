@@ -1312,6 +1312,15 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     # Pre-allocate recv pool for failed ranks, load blocks for source ranks (not timed)
     recv_pool_prealloc: List[torch.Tensor] = []
     source_blocks_prealloc: List[torch.Tensor] = []
+    # Pre-computed decode layout and buffers for failed ranks (moved here to keep outside timing)
+    _rig_to_si: Dict[int, int] = {}
+    _owner_rigs: List[int] = []
+    _num_owners: int = 0
+    recovered_slot_pool_pre: List[torch.Tensor] = []
+    parity_pool_0_pre: List[torch.Tensor] = []
+    parity_pool_1_pre: List[torch.Tensor] = []
+    store_bufs_pre: Dict[str, torch.Tensor] = {}
+    tensor_buffer_pre: Optional[torch.Tensor] = None
     if affected_group and is_failed:
         total_pool_blocks = len(source_ranks) * ecnaive_n
         recv_pool_prealloc = list(allocate_hugepage_slices(
@@ -1321,6 +1330,34 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         if manager.use_rdma:
             for buf in recv_pool_prealloc:
                 manager.register_buffer(buf)
+        # Pre-compute block locator metadata
+        _source_rig_map = {r: manager._get_rank_in_group(r, world_size) for r in source_ranks}
+        _rig_to_si = {rig: si for si, (_, rig) in enumerate(
+            sorted(((r, _source_rig_map[r]) for r in source_ranks), key=lambda x: x[1])
+        )}
+        _owner_rigs = [my_rig]
+        for _recv_idx in range(ecnaive_n - 1):
+            _ow = (my_rig - _recv_idx - 1) % ecnaive_n
+            if _ow not in _owner_rigs:
+                _owner_rigs.append(_ow)
+        _num_owners = len(_owner_rigs)
+        # Pre-allocate decode/encode/store/tensor buffers
+        recovered_slot_pool_pre = [
+            torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners + ecnaive_k)
+        ]
+        parity_pool_0_pre = [
+            torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners)
+        ]
+        parity_pool_1_pre = [
+            torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners)
+        ]
+        store_bufs_pre = {
+            _name: torch.empty(block_data_size, dtype=torch.uint8)
+            for _name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2')
+        }
+        tensor_buffer_pre = allocate_hugepage_tensor(
+            max(block_data_size * ecnaive_k, actual_tensor_size), fallback_pin_memory=True,
+        )
     elif affected_group and not is_failed and is_source:
         source_blocks_prealloc = _load_all_blocks_from_disk(
             checkpoint_dir, rank, ecnaive_k, ecnaive_n, block_files,
@@ -1415,66 +1452,44 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         native.submit_recv_sentinels(num_channels)
         native.wait_for_encoding_completion()
 
-        # ── Block locator (not timed) ──────────────────────────────
+        _t['network_recv'] = time.time() - _t0_net
+
+        # ── Block locator ──────────────────────────────────────────
         # Layout per source segment: [own_data0, recv_0, recv_1, recv_2]
         #   own_data0 of source s = d_{s,0}
         #   recv_0    of source s = d_{(s-1)%n, 1}
         #   recv_1    of source s = p_{(s-2)%n, 0}   (parity0)
         #   recv_2    of source s = p_{(s-3)%n, 1}   (parity1)
-        source_rig_map = {r: manager._get_rank_in_group(r, world_size) for r in source_ranks}
-        rig_to_si = {rig: si for si, (_, rig) in enumerate(
-            sorted(((r, source_rig_map[r]) for r in source_ranks), key=lambda x: x[1])
-        )}
+        # (metadata and buffers pre-computed in the pre-alloc section before timing)
+        rig_to_si = _rig_to_si
+        owner_rigs = _owner_rigs
+        num_owners = _num_owners
+        recovered_slot_pool = recovered_slot_pool_pre
+        parity_pool_0 = parity_pool_0_pre
+        parity_pool_1 = parity_pool_1_pre
+        store_bufs = store_bufs_pre
 
         def _find_block_in_pool(owner_rig: int, role: str) -> Optional[torch.Tensor]:
             """Locate a specific block (role ∈ {data0,data1,parity0,parity1})
             of owner_rig in recv_pool.  Returns None if not found."""
             if role == 'data0':
-                # d_{owner,0} = own_data0 of source rank == owner_rig
                 si = rig_to_si.get(owner_rig)
                 return recv_pool[si * ecnaive_n] if si is not None else None
             elif role == 'data1':
-                # d_{owner,1} = recv_0 of source rank (owner+1)%n
                 si = rig_to_si.get((owner_rig + 1) % ecnaive_n)
                 return recv_pool[si * ecnaive_n + 1] if si is not None else None
             elif role == 'parity0':
-                # p_{owner,0} = recv_1 of source rank (owner+2)%n
                 si = rig_to_si.get((owner_rig + 2) % ecnaive_n)
                 return recv_pool[si * ecnaive_n + 2] if si is not None else None
             elif role == 'parity1':
-                # p_{owner,1} = recv_2 of source rank (owner+3)%n
                 si = rig_to_si.get((owner_rig + 3) % ecnaive_n)
                 return recv_pool[si * ecnaive_n + 3] if si is not None else None
             return None
 
-        # ── Unified recovery for each owner codeword ───────────────
         recovered: Dict[str, torch.Tensor] = {}
-        ecnaive_buffer_size_val = manager.ecnaive_buffer_size
-
-        # Collect all owner rigs we need: my own + owners of my recv slots
-        owner_rigs = [my_rig]
-        for recv_idx in range(ecnaive_n - 1):
-            owner_rig = (my_rig - recv_idx - 1) % ecnaive_n
-            if owner_rig not in owner_rigs:
-                owner_rigs.append(owner_rig)
-
-        # Pre-allocate decode/encode buffers (not timed)
-        num_owners = len(owner_rigs)
-        # num_owners + k: each non-self owner may need up to k distinct recovered blocks
-        recovered_slot_pool = [
-            torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(num_owners + ecnaive_k)
-        ]
-        parity_pool_0 = [
-            torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(num_owners)
-        ]
-        parity_pool_1 = [
-            torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(num_owners)
-        ]
-        # Pre-allocate store buffers — copy into these after timing
-        store_bufs: Dict[str, torch.Tensor] = {}
-        for _name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2'):
-            store_bufs[_name] = torch.zeros(block_data_size, dtype=torch.uint8)
         owner_idx = 0
+
+        _t0_decode = time.time()
 
         for owner_rig in owner_rigs:
             # Find which blocks of this codeword survive in recv_pool
@@ -1591,33 +1606,37 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                             f"{total_match}/{d0.numel()} ({100*total_match/d0.numel():.1f}%)"
                         )
 
-            # Now we have owner's data blocks. Compute parity via encode.
-            # Blocks are continuous — slice and pass directly.
-            encode_inputs = [recovered_data[j][:block_data_size] for j in range(ecnaive_k)]
-
-            parity0 = parity_pool_0[owner_idx]
-            parity1 = parity_pool_1[owner_idx]
-            native.encode_ec_blocks(
-                [int(b.data_ptr()) for b in encode_inputs],
-                int(parity0.data_ptr()),
-                int(parity1.data_ptr()),
-                block_data_size,
-            )
-
-            # Save refs only — copy to pre-allocated buffers after timing
+            # Save data refs (always needed, no compute required)
             if owner_rig == my_rig:
                 recovered['own_data0_ref'] = recovered_data[0]
                 recovered['my_data1_ref'] = recovered_data[1]
-            if (owner_rig + 2) % ecnaive_n == my_rig:
-                recovered['recv_1_ref'] = parity0
-            if (owner_rig + 3) % ecnaive_n == my_rig:
-                recovered['recv_2_ref'] = parity1
             if (owner_rig + 1) % ecnaive_n == my_rig:
                 recovered['recv_0_ref'] = recovered_data[1]
 
+            # Compute parity only when the output is actually stored by this rank.
+            # For k=2, n=4: out of 4 owner_rigs, exactly 2 produce used parity
+            # (owner_rig == my_rig and owner_rig == (my_rig-1)%n never do).
+            need_parity0 = (owner_rig + 2) % ecnaive_n == my_rig
+            need_parity1 = (owner_rig + 3) % ecnaive_n == my_rig
+            if need_parity0 or need_parity1:
+                encode_inputs = [recovered_data[j][:block_data_size] for j in range(ecnaive_k)]
+                parity0 = parity_pool_0[owner_idx]
+                parity1 = parity_pool_1[owner_idx]
+                native.encode_ec_blocks(
+                    [int(b.data_ptr()) for b in encode_inputs],
+                    int(parity0.data_ptr()),
+                    int(parity1.data_ptr()),
+                    block_data_size,
+                )
+                if need_parity0:
+                    recovered['recv_1_ref'] = parity0
+                if need_parity1:
+                    recovered['recv_2_ref'] = parity1
+
             owner_idx += 1
 
-        _t['network_encode'] = time.time() - _t0_net
+        _t['decode'] = time.time() - _t0_decode
+        _t['network_encode'] = _t['network_recv'] + _t['decode']
 
         # Copy recovered refs to pre-allocated store buffers (not timed)
         for _name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2'):
@@ -1641,10 +1660,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             raise RuntimeError(
                 f"EC-NAIVE hw recovery: missing own data blocks for rank {rank}"
             )
-        total = d0.numel() + d1.numel()
-        tensor_buffer = allocate_hugepage_tensor(
-            max(total, actual_tensor_size), fallback_pin_memory=True,
-        )
+        tensor_buffer = tensor_buffer_pre
         tensor_buffer[:d0.numel()].copy_(d0)
         if actual_tensor_size > 0:
             end = min(d1.numel(), max(0, actual_tensor_size - d0.numel()))
@@ -1732,10 +1748,12 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         _t['rebuild_sd'] = time.time() - _t0_rebuild
 
     _t['total'] = _t['network_encode'] + _t['rebuild_sd']
+    _recv = _t.get('network_recv', 0)
+    _decode = _t.get('decode', 0)
     logger.info(
         "EC-NAIVE legacy load timing (HW recovery): "
-        "total=%(total).2fs network_encode=%(network_encode).2fs "
-        "rebuild_sd=%(rebuild_sd).2fs", _t
+        "total=%(total).2fs network_recv=%(recv).2fs decode=%(dec).2fs rebuild_sd=%(rebuild_sd).2fs",
+        {'total': _t['total'], 'recv': _recv, 'dec': _decode, 'rebuild_sd': _t['rebuild_sd']},
     )
 
     if world_size > 1:

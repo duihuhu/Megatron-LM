@@ -843,16 +843,48 @@ void AsioConnectionManager::wait_for_connections(int timeout_seconds) {
 }
 
 void AsioConnectionManager::wait_for_load_connections(int timeout_seconds) {
-    // For rank2: wait for all 6 recv connections
-    // For rank0/1/3: wait for 2 send connections each
-    if (load_recv_rank0_data2_connected_ || load_recv_rank0_parity2_connected_ ||
-        load_recv_rank1_data1_connected_ || load_recv_rank1_parity1_connected_ ||
-        load_recv_rank3_data1_connected_ || load_recv_rank3_data2_connected_) {
-        // rank2: wait for all 6 recv connections
+    // Single-failure HW recovery: rank_in_group 2 is receiver (6 acceptors).
+    // Use acceptor.is_open() to detect the receiver role even before the first
+    // accept completes (mirrors wait_for_twf_v2_connections; fixes multi-node races).
+    const bool is_rank2_receiver =
+        load_recv_rank0_data2_acceptor_.is_open() ||
+        load_recv_rank0_parity2_acceptor_.is_open() ||
+        load_recv_rank1_data1_acceptor_.is_open() ||
+        load_recv_rank1_parity1_acceptor_.is_open() ||
+        load_recv_rank3_data1_acceptor_.is_open() ||
+        load_recv_rank3_data2_acceptor_.is_open();
+
+    if (is_rank2_receiver) {
         int wait_count = 0;
-        while (!(load_recv_rank0_data2_connected_ && load_recv_rank0_parity2_connected_ &&
-                 load_recv_rank1_data1_connected_ && load_recv_rank1_parity1_connected_ &&
-                 load_recv_rank3_data1_connected_ && load_recv_rank3_data2_connected_)) {
+        while (true) {
+            bool done = true;
+            if ((load_recv_rank0_data2_acceptor_.is_open() || load_recv_rank0_data2_connected_) &&
+                !load_recv_rank0_data2_connected_) {
+                done = false;
+            }
+            if ((load_recv_rank0_parity2_acceptor_.is_open() || load_recv_rank0_parity2_connected_) &&
+                !load_recv_rank0_parity2_connected_) {
+                done = false;
+            }
+            if ((load_recv_rank1_data1_acceptor_.is_open() || load_recv_rank1_data1_connected_) &&
+                !load_recv_rank1_data1_connected_) {
+                done = false;
+            }
+            if ((load_recv_rank1_parity1_acceptor_.is_open() || load_recv_rank1_parity1_connected_) &&
+                !load_recv_rank1_parity1_connected_) {
+                done = false;
+            }
+            if ((load_recv_rank3_data1_acceptor_.is_open() || load_recv_rank3_data1_connected_) &&
+                !load_recv_rank3_data1_connected_) {
+                done = false;
+            }
+            if ((load_recv_rank3_data2_acceptor_.is_open() || load_recv_rank3_data2_connected_) &&
+                !load_recv_rank3_data2_connected_) {
+                done = false;
+            }
+            if (done) {
+                break;
+            }
             if (wait_count % 100 == 0) {
                 std::cout << "ECLATIN: [Rank 2] Waiting for load connections: "
                           << "r0_d2=" << (load_recv_rank0_data2_connected_ ? "true" : "false")

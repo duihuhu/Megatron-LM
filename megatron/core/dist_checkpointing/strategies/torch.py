@@ -8742,7 +8742,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         net_config = self.eclatin_manager._get_eclatin_network_config(rank, world_size)
         rank_in_group = net_config['rank_in_group']
         load_receiver_rank = net_config['load_receiver_rank']
-        rank2_ip = net_config['rank_ips'].get(load_receiver_rank, net_config['my_ip'])
+        receiver_ip = net_config['rank_ips'].get(load_receiver_rank, net_config['my_ip'])
         
         # Ports are per-group (from current rank's config)
         load_recv_rank0_data2_port = net_config['ports']['load_recv_rank0_data2']
@@ -8757,7 +8757,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info(f"ECLATIN: [Rank {rank}] (rank_in_group 2) Initializing load accept connections...")
             self.eclatin_manager._eclatin_native.init_load_connections(
                 rank_in_group,
-                rank2_ip,
+                net_config['my_ip'],
                 load_recv_rank0_data2_port,
                 load_recv_rank0_parity2_port,
                 load_recv_rank1_data1_port,
@@ -8773,7 +8773,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info(f"ECLATIN: [Rank {rank}] (rank_in_group {rank_in_group}) Connecting load send sockets to receiver...")
             self.eclatin_manager._eclatin_native.init_load_connections(
                 rank_in_group,
-                rank2_ip,
+                receiver_ip,
                 load_recv_rank0_data2_port,
                 load_recv_rank0_parity2_port,
                 load_recv_rank1_data1_port,
@@ -9263,7 +9263,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         net_config = self.eclatin_manager._get_eclatin_network_config(rank, world_size)
         rank_in_group = net_config['rank_in_group']
         load_receiver_rank = net_config['load_receiver_rank']
-        rank2_ip = net_config['rank_ips'].get(load_receiver_rank, net_config['my_ip'])
+        receiver_ip = net_config['rank_ips'].get(load_receiver_rank, net_config['my_ip'])
         
         load_recv_rank0_data2_port = net_config['ports']['load_recv_rank0_data2']
         load_recv_rank0_parity2_port = net_config['ports']['load_recv_rank0_parity2']
@@ -9275,7 +9275,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if rank_in_group == 2:
             logger.info(f"ECLATIN Layerwise: [Rank {rank}] (rank_in_group 2) Initializing load accept connections...")
             self.eclatin_manager._eclatin_native.init_load_connections(
-                rank_in_group, rank2_ip,
+                rank_in_group, net_config['my_ip'],
                 load_recv_rank0_data2_port, load_recv_rank0_parity2_port,
                 load_recv_rank1_data1_port, load_recv_rank1_parity1_port,
                 load_recv_rank3_data1_port, load_recv_rank3_data2_port
@@ -9286,7 +9286,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         if rank_in_group != 2:
             logger.info(f"ECLATIN Layerwise: [Rank {rank}] (rank_in_group {rank_in_group}) Connecting load send sockets to receiver...")
             self.eclatin_manager._eclatin_native.init_load_connections(
-                rank_in_group, rank2_ip,
+                rank_in_group, receiver_ip,
                 load_recv_rank0_data2_port, load_recv_rank0_parity2_port,
                 load_recv_rank1_data1_port, load_recv_rank1_parity1_port,
                 load_recv_rank3_data1_port, load_recv_rank3_data2_port

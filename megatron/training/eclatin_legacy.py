@@ -796,7 +796,9 @@ def _run_eclatin_full_recovery(
     native.set_load_mode(True, failed_rank)
     logger.info(f"ECLATIN legacy load: set load mode (failed_rank={failed_rank})")
 
-    rank2_ip = net_config["rank_ips"].get(net_config["load_receiver_rank"], net_config["my_ip"])
+    receiver_ip = net_config["rank_ips"].get(
+        net_config["load_receiver_rank"], net_config["my_ip"]
+    )
     load_recv_rank0_data2_port = net_config["ports"]["load_recv_rank0_data2"]
     load_recv_rank0_parity2_port = net_config["ports"]["load_recv_rank0_parity2"]
     load_recv_rank1_data1_port = net_config["ports"]["load_recv_rank1_data1"]
@@ -811,7 +813,7 @@ def _run_eclatin_full_recovery(
         logger.info("ECLATIN legacy load: rank_in_group 2 init load accept connections")
         native.init_load_connections(
             rank_in_group,
-            rank2_ip,
+            net_config["my_ip"],
             load_recv_rank0_data2_port,
             load_recv_rank0_parity2_port,
             load_recv_rank1_data1_port,
@@ -829,7 +831,7 @@ def _run_eclatin_full_recovery(
         )
         native.init_load_connections(
             rank_in_group,
-            rank2_ip,
+            receiver_ip,
             load_recv_rank0_data2_port,
             load_recv_rank0_parity2_port,
             load_recv_rank1_data1_port,
@@ -840,6 +842,7 @@ def _run_eclatin_full_recovery(
 
     torch.distributed.barrier()
     native.wait_for_load_connections(timeout_seconds=30)
+    torch.distributed.barrier()
 
     start_time = time()
     aligned_half_block_size = eclatin_blocks["data_block_1"].numel()

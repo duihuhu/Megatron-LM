@@ -1460,8 +1460,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
         # Pre-allocate decode/encode buffers (not timed)
         num_owners = len(owner_rigs)
+        # num_owners + k: each non-self owner may need up to k distinct recovered blocks
         recovered_slot_pool = [
-            torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(ecnaive_k)
+            torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(num_owners + ecnaive_k)
         ]
         parity_pool_0 = [
             torch.zeros(block_data_size, dtype=torch.uint8) for _ in range(num_owners)
@@ -1525,11 +1526,11 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 # Slice to block_data_size and pass directly to RS decode.
                 continuous_surviving = [b[:block_data_size] for b in surviving_block_data]
 
-                # Self codeword: decode directly into store_bufs (avoid overwrite by later owners)
-                recovered_blocks = (
-                    [store_bufs['own_data0'], store_bufs['my_data1']][:m_owner]
-                    if owner_rig == my_rig else recovered_slot_pool[:m_owner]
-                )
+                if owner_rig == my_rig:
+                    recovered_blocks = [store_bufs['own_data0'], store_bufs['my_data1']][:m_owner]
+                else:
+                    base = owner_idx * ecnaive_k
+                    recovered_blocks = recovered_slot_pool[base : base + m_owner]
                 surviving_addrs = [int(b.data_ptr()) for b in continuous_surviving]
                 recovered_addrs = [int(b.data_ptr()) for b in recovered_blocks]
                 native.submit_ecnaive_decode_recovery(

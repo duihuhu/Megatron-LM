@@ -59,6 +59,10 @@ inline uint64_t ntohll(uint64_t value) {
 #include <isa-l/erasure_code.h>
 #include <isa-l/raid.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 
 namespace {
 
@@ -1729,11 +1733,44 @@ struct LayerWiseLoadTask {
 static constexpr int kEclatinXorPoolSize = 16;
 static constexpr const char* kEclatinXorCpuListEnv = "ECLATIN_XOR_CPU_LIST";
 
-struct EclatinXorJob {
+// Out-of-place 2-input XOR: dst[i] = src0[i] ^ src1[i] (no memcpy; AVX2 when available)
+static void xor_two_out_of_place(uint8_t* dst, const uint8_t* src0, const uint8_t* src1, size_t len) {
+#if defined(__AVX2__)
+    size_t i = 0;
+    const size_t simd_end = len & ~static_cast<size_t>(31);
+    for (; i < simd_end; i += 32) {
+        const __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src0 + i));
+        const __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src1 + i));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), _mm256_xor_si256(v0, v1));
+    }
+    for (; i < len; ++i) {
+        dst[i] = static_cast<uint8_t>(src0[i] ^ src1[i]);
+    }
+#else
+    for (size_t i = 0; i < len; ++i) {
+        dst[i] = static_cast<uint8_t>(src0[i] ^ src1[i]);
+    }
+#endif
+}
+
+struct EclatinXorStripeOp {
+    uintptr_t dst = 0;
+    uintptr_t src0 = 0;
+    uintptr_t src1 = 0;
+};
+
+enum class EclatinXorPoolJobKind : uint8_t {
+    ThreeInput = 0,
+    TwoStripe = 1,
+};
+
+struct EclatinXorPoolJob {
+    EclatinXorPoolJobKind kind = EclatinXorPoolJobKind::ThreeInput;
     int len = 0;
     uintptr_t dst = 0;
     uintptr_t src1 = 0;
     uintptr_t src2 = 0;
+    EclatinXorStripeOp stripe_op[2]{};
 };
 
 struct EclatinXorPoolCtx {
@@ -2620,11 +2657,11 @@ public:
         // data1 = rank0.data2 XOR rank1.parity1
         xor_threads.emplace_back([&]() {
             try {
-                std::memcpy(reinterpret_cast<void*>(recovered_data1_addr), 
-                           reinterpret_cast<void*>(rank0_data2_addr), size);
-                void* xor_array[2] = {reinterpret_cast<void*>(recovered_data1_addr), 
-                                     reinterpret_cast<void*>(rank1_parity1_addr)};
-                xor_gen(2, static_cast<int>(size), xor_array);
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(recovered_data1_addr),
+                    reinterpret_cast<const uint8_t*>(rank0_data2_addr),
+                    reinterpret_cast<const uint8_t*>(rank1_parity1_addr),
+                    size);
             } catch (...) {
                 xor_exceptions[0] = std::current_exception();
             }
@@ -2633,11 +2670,11 @@ public:
         // data2 = rank0.parity2 XOR rank1.data1
         xor_threads.emplace_back([&]() {
             try {
-                std::memcpy(reinterpret_cast<void*>(recovered_data2_addr), 
-                           reinterpret_cast<void*>(rank0_parity2_addr), size);
-                void* xor_array[2] = {reinterpret_cast<void*>(recovered_data2_addr), 
-                                     reinterpret_cast<void*>(rank1_data1_addr)};
-                xor_gen(2, static_cast<int>(size), xor_array);
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(recovered_data2_addr),
+                    reinterpret_cast<const uint8_t*>(rank0_parity2_addr),
+                    reinterpret_cast<const uint8_t*>(rank1_data1_addr),
+                    size);
             } catch (...) {
                 xor_exceptions[1] = std::current_exception();
             }
@@ -2646,11 +2683,11 @@ public:
         // parity1 = rank1.data1 XOR rank3.data2
         xor_threads.emplace_back([&]() {
             try {
-                std::memcpy(reinterpret_cast<void*>(recovered_parity1_addr), 
-                           reinterpret_cast<void*>(rank1_data1_addr), size);
-                void* xor_array[2] = {reinterpret_cast<void*>(recovered_parity1_addr), 
-                                     reinterpret_cast<void*>(rank3_data2_addr)};
-                xor_gen(2, static_cast<int>(size), xor_array);
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(recovered_parity1_addr),
+                    reinterpret_cast<const uint8_t*>(rank1_data1_addr),
+                    reinterpret_cast<const uint8_t*>(rank3_data2_addr),
+                    size);
             } catch (...) {
                 xor_exceptions[2] = std::current_exception();
             }
@@ -2659,11 +2696,11 @@ public:
         // parity2 = rank0.data2 XOR rank3.data1
         xor_threads.emplace_back([&]() {
             try {
-                std::memcpy(reinterpret_cast<void*>(recovered_parity2_addr), 
-                           reinterpret_cast<void*>(rank0_data2_addr), size);
-                void* xor_array[2] = {reinterpret_cast<void*>(recovered_parity2_addr), 
-                                     reinterpret_cast<void*>(rank3_data1_addr)};
-                xor_gen(2, static_cast<int>(size), xor_array);
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(recovered_parity2_addr),
+                    reinterpret_cast<const uint8_t*>(rank0_data2_addr),
+                    reinterpret_cast<const uint8_t*>(rank3_data1_addr),
+                    size);
             } catch (...) {
                 xor_exceptions[3] = std::current_exception();
             }
@@ -3237,68 +3274,25 @@ public:
         std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
                   << " starting XOR decode (size=" << size << ")" << std::endl;
 
-        // Lazy-init zero buffer for 2-input XOR via 16-thread pool (must be before XOR ops)
-        if (twofail_zero_buffer_.size() < size) {
-            twofail_zero_buffer_.resize(size, 0);
-        }
-
-        if (rank_in_group == 2) {
-            // Node3: 2-pass XOR
-            // Pass 1: out1 = peer_d2 XOR own_p1   (b21 = b42 ⊕ b33)
-            //         out3 = own_p2 XOR peer_d1    (b12 = b34 ⊕ b41)
-            std::memcpy(reinterpret_cast<void*>(out1), reinterpret_cast<void*>(peer_d2), size);
-            xor_pool_run_parallel(out1, own_p1,
-                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
-                static_cast<int>(size));
-
-            std::memcpy(reinterpret_cast<void*>(out3), reinterpret_cast<void*>(own_p2), size);
-            xor_pool_run_parallel(out3, peer_d1,
-                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
-                static_cast<int>(size));
-
-            // Pass 2: out2 = out1 XOR own_d2        (b14 = b21 ⊕ b32)
-            //         out4 = out3 XOR own_d1        (b23 = b12 ⊕ b31)
-            std::memcpy(reinterpret_cast<void*>(out2), reinterpret_cast<void*>(out1), size);
-            xor_pool_run_parallel(out2, own_d2,
-                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
-                static_cast<int>(size));
-
-            std::memcpy(reinterpret_cast<void*>(out4), reinterpret_cast<void*>(out3), size);
-            xor_pool_run_parallel(out4, own_d1,
-                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
-                static_cast<int>(size));
-
-        } else if (rank_in_group == 3) {
-            // Node4: 2-pass XOR
-            // Pass 1: out1 = peer_d2 XOR own_p1   (b11 = b32 ⊕ b43)
-            //         out3 = own_p2 XOR peer_d1    (b22 = b44 ⊕ b31)
-            std::memcpy(reinterpret_cast<void*>(out1), reinterpret_cast<void*>(peer_d2), size);
-            xor_pool_run_parallel(out1, own_p1,
-                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
-                static_cast<int>(size));
-
-            std::memcpy(reinterpret_cast<void*>(out3), reinterpret_cast<void*>(own_p2), size);
-            xor_pool_run_parallel(out3, peer_d1,
-                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
-                static_cast<int>(size));
-
-            // Pass 2: out2 = out1 XOR own_d2        (b24 = b11 ⊕ b42)
-            //         out4 = out3 XOR own_d1        (b13 = b22 ⊕ b41)
-            std::memcpy(reinterpret_cast<void*>(out2), reinterpret_cast<void*>(out1), size);
-            xor_pool_run_parallel(out2, own_d2,
-                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
-                static_cast<int>(size));
-
-            std::memcpy(reinterpret_cast<void*>(out4), reinterpret_cast<void*>(out3), size);
-            xor_pool_run_parallel(out4, own_d1,
-                reinterpret_cast<uintptr_t>(twofail_zero_buffer_.data()),
-                static_cast<int>(size));
-
-        } else {
+        if (rank_in_group != 2 && rank_in_group != 3) {
             throw std::runtime_error(
                 "ECLATIN: survivor_xor_decode: unexpected rank_in_group=" +
                 std::to_string(rank_in_group));
         }
+
+        const int xor_len = static_cast<int>(size);
+
+        // Pass 1 (parallel): out1 = peer_d2 XOR own_p1, out3 = own_p2 XOR peer_d1
+        xor_pool_run_parallel_two_stripe(
+            EclatinXorStripeOp{out1, peer_d2, own_p1},
+            EclatinXorStripeOp{out3, own_p2, peer_d1},
+            xor_len);
+
+        // Pass 2 (parallel): out2 = out1 XOR own_d2, out4 = out3 XOR own_d1
+        xor_pool_run_parallel_two_stripe(
+            EclatinXorStripeOp{out2, out1, own_d2},
+            EclatinXorStripeOp{out4, out3, own_d1},
+            xor_len);
 
         std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
                   << " XOR decode complete" << std::endl;
@@ -3358,6 +3352,52 @@ public:
                   << " sent 2 blocks to rig" << target_rig << " (TCP)" << std::endl;
     }
 
+    // Step 3: survivor sends 2 blocks to rig0 and rig1 in parallel (distinct peer sockets)
+    void send_to_both_failed_ranks(
+        int rank_in_group,
+        uintptr_t rig0_addr1, uintptr_t rig0_addr2,
+        uintptr_t rig1_addr1, uintptr_t rig1_addr2,
+        size_t size
+    ) {
+        if (!is_twofail_v2_) {
+            std::cerr << "ECLATIN: send_to_both_failed_ranks called but not in two-fail v2 mode"
+                      << std::endl;
+            return;
+        }
+        if (rank_in_group != 2 && rank_in_group != 3) {
+            throw std::runtime_error(
+                "ECLATIN: send_to_both_failed_ranks: unexpected rank_in_group=" +
+                std::to_string(rank_in_group));
+        }
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " sending to rig0 and rig1 in parallel (size=" << size << ")" << std::endl;
+
+        std::exception_ptr ex0;
+        std::exception_ptr ex1;
+        std::thread t0([&]() {
+            try {
+                send_two_blocks(rank_in_group, "0", rig0_addr1, rig0_addr2, size);
+            } catch (...) {
+                ex0 = std::current_exception();
+            }
+        });
+        std::thread t1([&]() {
+            try {
+                send_two_blocks(rank_in_group, "1", rig1_addr1, rig1_addr2, size);
+            } catch (...) {
+                ex1 = std::current_exception();
+            }
+        });
+        t0.join();
+        t1.join();
+        if (ex0) std::rethrow_exception(ex0);
+        if (ex1) std::rethrow_exception(ex1);
+
+        std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
+                  << " sent to both failed ranks" << std::endl;
+    }
+
     // ── Two-failures v2: Step 3 - failed node recv 4 blocks from 2 sockets ───
 
     void recv_four_blocks(
@@ -3398,29 +3438,67 @@ public:
                                      std::to_string(rank_in_group));
         }
 
-        // RDMA path: serial per-socket to avoid ::recv() race on shared control fd
+        // RDMA path: parallel recv on n3 and n4 sockets (serial within each peer's 2 channels)
 #if RDMA_AVAILABLE
         if (use_rdma_ && (*ch_n3)[0] && (*ch_n3)[1] && (*ch_n4)[0] && (*ch_n4)[1]) {
-            (*ch_n3)[0]->receive_data(reinterpret_cast<uint8_t*>(a_n3[0]), size);
-            (*ch_n3)[1]->receive_data(reinterpret_cast<uint8_t*>(a_n3[1]), size);
-            (*ch_n4)[0]->receive_data(reinterpret_cast<uint8_t*>(a_n4[0]), size);
-            (*ch_n4)[1]->receive_data(reinterpret_cast<uint8_t*>(a_n4[1]), size);
+            std::exception_ptr n3_ex;
+            std::exception_ptr n4_ex;
+            std::thread t_n3([&]() {
+                try {
+                    (*ch_n3)[0]->receive_data(reinterpret_cast<uint8_t*>(a_n3[0]), size);
+                    (*ch_n3)[1]->receive_data(reinterpret_cast<uint8_t*>(a_n3[1]), size);
+                } catch (...) {
+                    n3_ex = std::current_exception();
+                }
+            });
+            std::thread t_n4([&]() {
+                try {
+                    (*ch_n4)[0]->receive_data(reinterpret_cast<uint8_t*>(a_n4[0]), size);
+                    (*ch_n4)[1]->receive_data(reinterpret_cast<uint8_t*>(a_n4[1]), size);
+                } catch (...) {
+                    n4_ex = std::current_exception();
+                }
+            });
+            t_n3.join();
+            t_n4.join();
+            if (n3_ex) std::rethrow_exception(n3_ex);
+            if (n4_ex) std::rethrow_exception(n4_ex);
 
             std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
-                      << " received all 4 blocks (RDMA)" << std::endl;
+                      << " received all 4 blocks (RDMA, parallel n3/n4)" << std::endl;
             return;
         }
 #endif
 
-        // TCP fallback: serialized to avoid interleaving on shared sockets
-        if (!recv_with_size_bool(*sock_n3, reinterpret_cast<void*>(a_n3[0]), size))
-            throw std::runtime_error("TCP: Failed to recv n3 block 1");
-        if (!recv_with_size_bool(*sock_n3, reinterpret_cast<void*>(a_n3[1]), size))
-            throw std::runtime_error("TCP: Failed to recv n3 block 2");
-        if (!recv_with_size_bool(*sock_n4, reinterpret_cast<void*>(a_n4[0]), size))
-            throw std::runtime_error("TCP: Failed to recv n4 block 1");
-        if (!recv_with_size_bool(*sock_n4, reinterpret_cast<void*>(a_n4[1]), size))
-            throw std::runtime_error("TCP: Failed to recv n4 block 2");
+        // TCP fallback: parallel recv on n3 and n4 sockets
+        {
+            std::exception_ptr n3_ex;
+            std::exception_ptr n4_ex;
+            std::thread t_n3([&]() {
+                try {
+                    if (!recv_with_size_bool(*sock_n3, reinterpret_cast<void*>(a_n3[0]), size))
+                        throw std::runtime_error("TCP: Failed to recv n3 block 1");
+                    if (!recv_with_size_bool(*sock_n3, reinterpret_cast<void*>(a_n3[1]), size))
+                        throw std::runtime_error("TCP: Failed to recv n3 block 2");
+                } catch (...) {
+                    n3_ex = std::current_exception();
+                }
+            });
+            std::thread t_n4([&]() {
+                try {
+                    if (!recv_with_size_bool(*sock_n4, reinterpret_cast<void*>(a_n4[0]), size))
+                        throw std::runtime_error("TCP: Failed to recv n4 block 1");
+                    if (!recv_with_size_bool(*sock_n4, reinterpret_cast<void*>(a_n4[1]), size))
+                        throw std::runtime_error("TCP: Failed to recv n4 block 2");
+                } catch (...) {
+                    n4_ex = std::current_exception();
+                }
+            });
+            t_n3.join();
+            t_n4.join();
+            if (n3_ex) std::rethrow_exception(n3_ex);
+            if (n4_ex) std::rethrow_exception(n4_ex);
+        }
 
         std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
                   << " received all 4 blocks (TCP)" << std::endl;
@@ -3852,7 +3930,7 @@ private:
     std::atomic<uint64_t> xor_pool_epoch_{0};
     std::array<uint64_t, kEclatinXorPoolSize> xor_pool_last_epoch_{};
     std::atomic<int> xor_pool_remaining_{0};
-    EclatinXorJob xor_pool_shared_job_{};
+    EclatinXorPoolJob xor_pool_shared_job_{};
     std::mutex xor_pool_work_mutex_;  // serialize parity1/parity2 pool dispatch
 
     void start_threads() {
@@ -3948,11 +4026,10 @@ private:
         return nullptr;
     }
 
-    void xor_pool_execute_chunk(const EclatinXorJob& job, int wid) {
-        const size_t total = static_cast<size_t>(job.len);
+    static void xor_pool_chunk_range(int total_len, int wid, size_t& off, size_t& len) {
+        const size_t total = static_cast<size_t>(total_len);
         const size_t base = total / static_cast<size_t>(kEclatinXorPoolSize);
         const size_t rem = total % static_cast<size_t>(kEclatinXorPoolSize);
-        size_t off, len;
         if (wid < kEclatinXorPoolSize - 1) {
             off = static_cast<size_t>(wid) * base;
             len = base;
@@ -3960,6 +4037,12 @@ private:
             off = static_cast<size_t>(kEclatinXorPoolSize - 1) * base;
             len = base + rem;
         }
+    }
+
+    void xor_pool_execute_chunk(const EclatinXorPoolJob& job, int wid) {
+        size_t off = 0;
+        size_t len = 0;
+        xor_pool_chunk_range(job.len, wid, off, len);
         if (len == 0) return;
 
         uint8_t* dst = reinterpret_cast<uint8_t*>(job.dst) + off;
@@ -3968,6 +4051,23 @@ private:
 
         void* xa[3] = {dst, s1, s2};
         xor_gen(3, static_cast<int>(len), xa);
+    }
+
+    // dst = src0 XOR src1; out-of-place per stripe chunk inside each worker (no memcpy)
+    void xor_pool_execute_two_stripe_chunk(const EclatinXorPoolJob& job, int wid) {
+        size_t off = 0;
+        size_t len = 0;
+        xor_pool_chunk_range(job.len, wid, off, len);
+        if (len == 0) return;
+
+        for (int k = 0; k < 2; ++k) {
+            const auto& op = job.stripe_op[static_cast<size_t>(k)];
+            xor_two_out_of_place(
+                reinterpret_cast<uint8_t*>(op.dst) + off,
+                reinterpret_cast<const uint8_t*>(op.src0) + off,
+                reinterpret_cast<const uint8_t*>(op.src1) + off,
+                len);
+        }
     }
 
     void xor_pool_worker_loop(int wid) {
@@ -3991,10 +4091,14 @@ private:
             });
             if (xor_pool_stop_.load(std::memory_order_acquire)) break;
             uint64_t e = xor_pool_epoch_.load(std::memory_order_acquire);
-            EclatinXorJob local_copy = xor_pool_shared_job_;
+            EclatinXorPoolJob local_copy = xor_pool_shared_job_;
             lk.unlock();
 
-            xor_pool_execute_chunk(local_copy, wid);
+            if (local_copy.kind == EclatinXorPoolJobKind::TwoStripe) {
+                xor_pool_execute_two_stripe_chunk(local_copy, wid);
+            } else {
+                xor_pool_execute_chunk(local_copy, wid);
+            }
 
             {
                 std::lock_guard<std::mutex> guard(xor_pool_mutex_);
@@ -4006,11 +4110,11 @@ private:
         }
     }
 
-    void xor_pool_run_parallel(uintptr_t dst, uintptr_t src1, uintptr_t src2, int len) {
+    void xor_pool_dispatch_and_wait(const EclatinXorPoolJob& job) {
         {
             std::lock_guard<std::mutex> publish(xor_pool_mutex_);
             if (stop_.load(std::memory_order_acquire)) return;
-            xor_pool_shared_job_ = EclatinXorJob{len, dst, src1, src2};
+            xor_pool_shared_job_ = job;
             xor_pool_epoch_.fetch_add(1, std::memory_order_acq_rel);
             xor_pool_remaining_.store(kEclatinXorPoolSize, std::memory_order_release);
         }
@@ -4020,6 +4124,30 @@ private:
             return xor_pool_remaining_.load(std::memory_order_acquire) == 0 ||
                    stop_.load(std::memory_order_acquire);
         });
+    }
+
+    void xor_pool_run_parallel(uintptr_t dst, uintptr_t src1, uintptr_t src2, int len) {
+        EclatinXorPoolJob job;
+        job.kind = EclatinXorPoolJobKind::ThreeInput;
+        job.len = len;
+        job.dst = dst;
+        job.src1 = src1;
+        job.src2 = src2;
+        xor_pool_dispatch_and_wait(job);
+    }
+
+    // Two independent dst=src0 XOR src1 ops in one pool round (out-of-place per chunk in workers)
+    void xor_pool_run_parallel_two_stripe(
+        const EclatinXorStripeOp& op0,
+        const EclatinXorStripeOp& op1,
+        int len
+    ) {
+        EclatinXorPoolJob job;
+        job.kind = EclatinXorPoolJobKind::TwoStripe;
+        job.len = len;
+        job.stripe_op[0] = op0;
+        job.stripe_op[1] = op1;
+        xor_pool_dispatch_and_wait(job);
     }
 
     // ── Connection initialization ─────────────────────────────────────
@@ -6422,10 +6550,16 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("peer_d1"), pybind11::arg("peer_d2"),
              pybind11::arg("size"))
         .def("send_two_blocks", &ECLATINNative::send_two_blocks,
-             "Step 3: Survivor sends 2 blocks to a failed rank (parallel)",
+             "Step 3: Survivor sends 2 blocks to a failed rank",
              pybind11::arg("rank_in_group"),
              pybind11::arg("target_rig"),
              pybind11::arg("addr1"), pybind11::arg("addr2"),
+             pybind11::arg("size"))
+        .def("send_to_both_failed_ranks", &ECLATINNative::send_to_both_failed_ranks,
+             "Step 3: Survivor sends 2 blocks each to rig0 and rig1 in parallel",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("rig0_addr1"), pybind11::arg("rig0_addr2"),
+             pybind11::arg("rig1_addr1"), pybind11::arg("rig1_addr2"),
              pybind11::arg("size"))
         .def("recv_four_blocks", &ECLATINNative::recv_four_blocks,
              "Step 3: Failed node receives 4 blocks from 2 survivors (parallel)",

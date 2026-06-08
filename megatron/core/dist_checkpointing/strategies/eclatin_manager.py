@@ -393,17 +393,16 @@ class ECLATINManager:
                 })
 
         # Two-failures load mode ports (always added for all ranks)
-        # 5 ports per group:
-        #   surv_exch:    survivor↔survivor data exchange (Node3 bind, Node4 connect)
-        #   n1_from_n3/4: Node1 (failed rig0) accepts from Node3/Node4
-        #   n2_from_n3/4: Node2 (failed rig1) accepts from Node3/Node4
+        # 8 ports per group:
+        #   surv_exch base (+0..+3): 4 parallel survivor↔survivor channels
+        #   n1_from_n3/4, n2_from_n3/4: failed nodes accept from survivors
         two_fail_base_port = load_base_port + 50
         ports.update({
             'twf_surv_exch':   two_fail_base_port + 0,
-            'twf_n1_from_n3':  two_fail_base_port + 1,
-            'twf_n1_from_n4':  two_fail_base_port + 2,
-            'twf_n2_from_n3':  two_fail_base_port + 3,
-            'twf_n2_from_n4':  two_fail_base_port + 4,
+            'twf_n1_from_n3':  two_fail_base_port + 4,
+            'twf_n1_from_n4':  two_fail_base_port + 5,
+            'twf_n2_from_n3':  two_fail_base_port + 6,
+            'twf_n2_from_n4':  two_fail_base_port + 7,
         })
 
         # Step 4: Exchange IP addresses via broadcast (more reliable than all_gather_object with NCCL)

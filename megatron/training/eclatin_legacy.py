@@ -519,6 +519,7 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         manager.register_buffer(tensor_buffer)
     logger.info(f"ECLATIN save timing: RDMA reg {time.time()-t0:.3f}s")
 
+    torch.distributed.barrier()
     t0 = time.time()
     _encode_eclatin_with_native(
         manager=manager,
@@ -776,7 +777,7 @@ def _run_eclatin_full_recovery(
     recovered_buffer: Optional[torch.Tensor],
     total_size: int,
     registry: GlobalMetadataRegistry,
-) -> None:
+) -> float:
     from megatron.training import get_args as use_args
     from time import time
 
@@ -787,7 +788,7 @@ def _run_eclatin_full_recovery(
     input_args = use_args()
     if input_args.use_eclatin_software_failure:
         # main.pt is intact — no network config, no transfer, no barrier needed.
-        return
+        return 0.0
 
     net_config = manager._get_eclatin_network_config(rank, world_size)
     rank_in_group = net_config["rank_in_group"]
@@ -844,9 +845,9 @@ def _run_eclatin_full_recovery(
     native.wait_for_load_connections(timeout_seconds=30)
     torch.distributed.barrier()
 
-    start_time = time()
     aligned_half_block_size = eclatin_blocks["data_block_1"].numel()
 
+    t_net_start = time()
     if rank_in_group == 2:
         if recv_buffers is None or recovered_buffer is None:
             raise RuntimeError(
@@ -876,19 +877,6 @@ def _run_eclatin_full_recovery(
             recovered_parity2_addr,
             aligned_half_block_size,
         )
-
-        actual_tensor_buffer_size = _max_tensor_bytes_from_registry(registry, world_size)
-        half_actual_data = actual_tensor_buffer_size // 2
-        if recovered_buffer.numel() >= total_size:
-            first_half_actual = min(half_actual_data, total_size)
-            recovered_buffer[:first_half_actual].copy_(
-                eclatin_blocks["data_block_1"][:first_half_actual]
-            )
-            if total_size > half_actual_data:
-                second_half_size = total_size - half_actual_data
-                recovered_buffer[first_half_actual:total_size].copy_(
-                    eclatin_blocks["data_block_2"][:second_half_size]
-                )
     elif rank_in_group == 0:
         data2_addr = int(eclatin_blocks["data_block_2"].data_ptr())
         parity2_addr = int(eclatin_blocks["parity_block_2"].data_ptr())
@@ -923,8 +911,28 @@ def _run_eclatin_full_recovery(
         raise RuntimeError(
             f"ECLATIN legacy load: unexpected rank_in_group={rank_in_group}"
         )
+    t_network_encode = time() - t_net_start
+
+    if rank_in_group == 2 and recovered_buffer is not None:
+        actual_tensor_buffer_size = _max_tensor_bytes_from_registry(registry, world_size)
+        half_actual_data = actual_tensor_buffer_size // 2
+        if recovered_buffer.numel() >= total_size:
+            first_half_actual = min(half_actual_data, total_size)
+            recovered_buffer[:first_half_actual].copy_(
+                eclatin_blocks["data_block_1"][:first_half_actual]
+            )
+            if total_size > half_actual_data:
+                second_half_size = total_size - half_actual_data
+                recovered_buffer[first_half_actual:total_size].copy_(
+                    eclatin_blocks["data_block_2"][:second_half_size]
+                )
 
     torch.distributed.barrier()
+
+    logger.info(
+        f"ECLATIN legacy: hw recovery pipeline done in {t_network_encode:.2f}s"
+    )
+    return t_network_encode
 
 
 def _init_twofail_connections(
@@ -947,28 +955,42 @@ def _init_twofail_connections(
     logger.info("ECLATIN two-failures: set load mode (failed_rank=10)")
 
     surv_rig2_rank = manager._get_rank_by_group_position(group_id, 2, world_size)
-    surv_exch_ip = rank_ips.get(surv_rig2_rank, net_config["my_ip"])
-    surv_exch_port = ports["twf_surv_exch"]
+    surv_rig2_ip = rank_ips.get(surv_rig2_rank, net_config["my_ip"])
+    surv_exch_base_port = ports["twf_surv_exch"]
     rig0_ip = rank_ips.get(manager._get_rank_by_group_position(group_id, 0, world_size), net_config["my_ip"])
     rig1_ip = rank_ips.get(manager._get_rank_by_group_position(group_id, 1, world_size), net_config["my_ip"])
 
     logger.info(f"ECLATIN two-failures: Phase 0 - establishing connections (rig{rank_in_group})")
 
-    native.init_twofail_bind_phase(rank_in_group,
-        surv_exch_ip, surv_exch_port,
-        rig0_ip, ports.get("twf_n1_from_n3", 0),
-        rig1_ip, ports.get("twf_n2_from_n3", 0),
-        rig0_ip, ports.get("twf_n1_from_n4", 0),
-        rig1_ip, ports.get("twf_n2_from_n4", 0))
+    native.init_twofail_bind_phase(
+        rank_in_group,
+        surv_rig2_ip,
+        surv_exch_base_port,
+        rig0_ip,
+        ports.get("twf_n1_from_n3", 0),
+        rig1_ip,
+        ports.get("twf_n2_from_n3", 0),
+        rig0_ip,
+        ports.get("twf_n1_from_n4", 0),
+        rig1_ip,
+        ports.get("twf_n2_from_n4", 0),
+    )
     torch.distributed.barrier()
     logger.info("ECLATIN two-failures: Phase 0a - all listeners ready")
 
-    native.init_twofail_connect_phase(rank_in_group,
-        surv_exch_ip, surv_exch_port,
-        rig0_ip, ports.get("twf_n1_from_n3", 0),
-        rig1_ip, ports.get("twf_n2_from_n3", 0),
-        rig0_ip, ports.get("twf_n1_from_n4", 0),
-        rig1_ip, ports.get("twf_n2_from_n4", 0))
+    native.init_twofail_connect_phase(
+        rank_in_group,
+        surv_rig2_ip,
+        surv_exch_base_port,
+        rig0_ip,
+        ports.get("twf_n1_from_n3", 0),
+        rig1_ip,
+        ports.get("twf_n2_from_n3", 0),
+        rig0_ip,
+        ports.get("twf_n1_from_n4", 0),
+        rig1_ip,
+        ports.get("twf_n2_from_n4", 0),
+    )
 
     torch.distributed.barrier()
     native.wait_for_load_connections(timeout_seconds=30)
@@ -976,18 +998,44 @@ def _init_twofail_connections(
     logger.info("ECLATIN two-failures: Phase 0 - all connections established")
 
 
+_TWOFAIL_RECV_KEY_TO_BLOCK = {
+    0: {
+        "n4_b11": "data_block_1",
+        "n3_b12": "data_block_2",
+        "n4_b13": "parity_block_1",
+        "n3_b14": "parity_block_2",
+    },
+    1: {
+        "n3_b21": "data_block_1",
+        "n4_b22": "data_block_2",
+        "n3_b23": "parity_block_1",
+        "n4_b24": "parity_block_2",
+    },
+}
+
+
+def _twofail_recv_block_addrs(
+    eclatin_blocks: Dict[str, Any], rank_in_group: int
+) -> List[int]:
+    """Return recv_four_blocks addrs pointing directly into eclatin_blocks."""
+    key_map = _TWOFAIL_RECV_KEY_TO_BLOCK[rank_in_group]
+    recv_order = list(key_map.keys())
+    return [int(eclatin_blocks[key_map[k]].data_ptr()) for k in recv_order]
+
+
 def _run_eclatin_two_failures_recovery(
     manager: ECLATINManager,
     rank: int,
     world_size: int,
     eclatin_blocks: Dict[str, Any],
-    recv_buffers: Optional[Dict[str, torch.Tensor]],
     recovered_buffer: Optional[torch.Tensor],
     surv_bufs: Optional[Dict[str, torch.Tensor]],
     total_size: int,
     registry: GlobalMetadataRegistry,
-) -> None:
+) -> float:
     """3-step two-failures recovery (connections established in Phase 0)."""
+    from time import time
+
     native = manager._eclatin_native
     if native is None:
         raise RuntimeError("ECLATIN native module is not initialized")
@@ -997,18 +1045,22 @@ def _run_eclatin_two_failures_recovery(
     aligned_half_block_size = eclatin_blocks["data_block_1"].numel()
 
     logger.info(f"ECLATIN two-failures: starting 3-step recovery (rig{rank_in_group})")
+    t_network_encode = 0.0
 
     # === Step 1: Survivor exchange ===
+    _t0 = time()
     if rank_in_group in (2, 3):
         peer_d1 = int(surv_bufs["peer_d1"].data_ptr())
         peer_d2 = int(surv_bufs["peer_d2"].data_ptr())
         own_d1 = int(eclatin_blocks["data_block_1"].data_ptr())
         own_d2 = int(eclatin_blocks["data_block_2"].data_ptr())
         native.survivor_exchange_data(rank_in_group, own_d1, own_d2, peer_d1, peer_d2, aligned_half_block_size)
+    t_network_encode += time() - _t0
     torch.distributed.barrier()
     logger.info("ECLATIN two-failures: Step 1 (survivor exchange) done")
 
     # === Step 2: XOR decode ===
+    _t0 = time()
     if rank_in_group == 2:
         o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1','out2','out3','out4']]
         od1, od2, op1, op2 = [int(eclatin_blocks[k].data_ptr()) for k in
@@ -1021,37 +1073,28 @@ def _run_eclatin_two_failures_recovery(
             ['data_block_1','data_block_2','parity_block_1','parity_block_2']]
         pd1, pd2 = int(surv_bufs["peer_d1"].data_ptr()), int(surv_bufs["peer_d2"].data_ptr())
         native.survivor_xor_decode(rank_in_group, o1, o2, o3, o4, od1, od2, op1, op2, pd1, pd2, aligned_half_block_size)
+    t_network_encode += time() - _t0
     torch.distributed.barrier()
     logger.info("ECLATIN two-failures: Step 2 (XOR decode) done")
 
-    # === Step 3: Send to failed ===
-    if rank_in_group == 0:
-        a = [int(recv_buffers[k].data_ptr()) for k in ['n4_b11','n3_b12','n4_b13','n3_b14']]
+    # === Step 3: Send to failed (RDMA recv/send parallel across rig0 vs rig1 peers) ===
+    _t0 = time()
+    if rank_in_group in (0, 1):
+        a = _twofail_recv_block_addrs(eclatin_blocks, rank_in_group)
         native.recv_four_blocks(rank_in_group, a[0], a[1], a[2], a[3], aligned_half_block_size)
-        for blk, key in zip(a, ['n4_b11','n3_b12','n4_b13','n3_b14']):
-            eclatin_blocks[{'n4_b11':'data_block_1','n3_b12':'data_block_2',
-                            'n4_b13':'parity_block_1','n3_b14':'parity_block_2'}[key]].copy_(
-                recv_buffers[key][:aligned_half_block_size])
-    elif rank_in_group == 1:
-        a = [int(recv_buffers[k].data_ptr()) for k in ['n3_b21','n4_b22','n3_b23','n4_b24']]
-        native.recv_four_blocks(rank_in_group, a[0], a[1], a[2], a[3], aligned_half_block_size)
-        for blk, key in zip(a, ['n3_b21','n4_b22','n3_b23','n4_b24']):
-            eclatin_blocks[{'n3_b21':'data_block_1','n4_b22':'data_block_2',
-                            'n3_b23':'parity_block_1','n4_b24':'parity_block_2'}[key]].copy_(
-                recv_buffers[key][:aligned_half_block_size])
-    elif rank_in_group == 2:
+    elif rank_in_group in (2, 3):
         o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1','out2','out3','out4']]
-        native.send_two_blocks(rank_in_group, "0", o3, o2, aligned_half_block_size)
-        native.send_two_blocks(rank_in_group, "1", o1, o4, aligned_half_block_size)
-    elif rank_in_group == 3:
-        o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1','out2','out3','out4']]
-        native.send_two_blocks(rank_in_group, "1", o3, o2, aligned_half_block_size)
-        native.send_two_blocks(rank_in_group, "0", o1, o4, aligned_half_block_size)
+        if rank_in_group == 2:
+            native.send_to_both_failed_ranks(
+                rank_in_group, o3, o2, o1, o4, aligned_half_block_size)
+        else:
+            native.send_to_both_failed_ranks(
+                rank_in_group, o1, o4, o3, o2, aligned_half_block_size)
+    t_network_encode += time() - _t0
 
     torch.distributed.barrier()
     logger.info("ECLATIN two-failures: Step 3 (send to failed) done")
 
-    # Assemble recovered buffer
     if rank_in_group in (0, 1) and recovered_buffer is not None and recovered_buffer.numel() >= total_size:
         actual_max = _max_tensor_bytes_from_registry(registry, world_size)
         half_actual = actual_max // 2
@@ -1059,6 +1102,11 @@ def _run_eclatin_two_failures_recovery(
         recovered_buffer[:first].copy_(eclatin_blocks["data_block_1"][:first])
         if total_size > first:
             recovered_buffer[first:total_size].copy_(eclatin_blocks["data_block_2"][:total_size - first])
+
+    logger.info(
+        f"ECLATIN legacy: two-failure recovery pipeline done in {t_network_encode:.2f}s"
+    )
+    return t_network_encode
 
 
 def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
@@ -1115,7 +1163,6 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     if two_failures:
         if rank_in_group in (0, 1):
-            recv_buffers = manager.allocate_eclatin_load_recv_buffers_two_fail(registry)
             recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
         elif rank_in_group in (2, 3):
             surv_bufs = manager.allocate_twf_survivor_buffers(registry)
@@ -1176,23 +1223,20 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     torch.distributed.barrier()
 
-    # === timing: network/encode ===
-    _t_ec: Dict[str, float] = {}
-    _t0 = time.time()
+    # === timing: network/encode (C++ transfer/decode, excluding setup/copy) ===
     if two_failures:
-        _run_eclatin_two_failures_recovery(
+        network_encode = _run_eclatin_two_failures_recovery(
             manager=manager,
             rank=rank,
             world_size=world_size,
             eclatin_blocks=eclatin_blocks,
-            recv_buffers=recv_buffers,
             recovered_buffer=recovered_buffer,
             surv_bufs=surv_bufs,
             total_size=total_size,
             registry=registry,
         )
     else:
-        _run_eclatin_full_recovery(
+        network_encode = _run_eclatin_full_recovery(
             manager=manager,
             rank=rank,
             world_size=world_size,
@@ -1202,23 +1246,8 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             total_size=total_size,
             registry=registry,
         )
-    _t_ec['network_encode'] = time.time() - _t0
 
-    # sync all ranks before rebuild timing
     torch.distributed.barrier()
-
-    # === timing: rebuild state_dict ===
-    _t0 = time.time()
-    if two_failures:
-        use_recovered = rank_in_group in (0, 1)
-    else:
-        use_recovered = (rank_in_group == 2)
-    state_dict = _reconstruct_state_dict_from_eclatin_buffer(
-        main_payload,
-        recovered_buffer=recovered_buffer if use_recovered else None,
-    )
-    _t_ec['rebuild_sd'] = time.time() - _t0
-    _t_ec['total'] = _t_ec['network_encode'] + _t_ec['rebuild_sd']
 
     if two_failures:
         _mode = "2F"
@@ -1227,9 +1256,17 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     else:
         _mode = "HW"
     logger.info(
-        "ECLATIN legacy load timing (%s): "
-        "total=%.2fs network_encode=%.2fs rebuild_sd=%.2fs",
-        _mode, _t_ec['total'], _t_ec['network_encode'], _t_ec['rebuild_sd'],
+        "ECLATIN legacy load timing (%s): network_encode=%.2fs",
+        _mode, network_encode,
+    )
+
+    if two_failures:
+        use_recovered = rank_in_group in (0, 1)
+    else:
+        use_recovered = (rank_in_group == 2)
+    state_dict = _reconstruct_state_dict_from_eclatin_buffer(
+        main_payload,
+        recovered_buffer=recovered_buffer if use_recovered else None,
     )
 
     if world_size > 1 and torch.distributed.is_initialized():

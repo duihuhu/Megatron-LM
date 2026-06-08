@@ -57,13 +57,13 @@ done
 
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
     echo "Error: At least one GPU id must be specified."
-    echo "Usage: $0 <node_rank> <gpu_id_0> [gpu_id_1 ...] [save|software|hardware] [additional_args...]"
+    echo "Usage: $0 <node_rank> <gpu_id_0> [gpu_id_1 ...] [save|software|hardware|hardware2] [additional_args...]"
     exit 1
 fi
 
 # ---- mode parsing (save | software | hardware, after GPU IDs) ----
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -105,6 +105,12 @@ case "$MODE" in
             --load $CHECKPOINT_PATH
         )
         ;;
+    hardware2)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-eccheck-two-failures
+        )
+        ;;
 esac
 
 # Model related configuration here, please do not overlap with json config
@@ -144,7 +150,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00005
-    --train-iters 20
+    --train-iters 1
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5

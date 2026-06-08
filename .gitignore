@@ -21,3 +21,5 @@ data/
 package-lock.json
 package.json
 .claude
+CMakeFiles/
+cache/

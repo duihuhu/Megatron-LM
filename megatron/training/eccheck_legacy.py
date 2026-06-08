@@ -510,6 +510,7 @@ def save_eccheck_legacy_checkpoint(
         f"(actual: {total_tensor_size / (1024**3):.2f} GB)"
     )
 
+    torch.distributed.barrier()
     t0 = time.time()
     _encode_eccheck_with_native(
         manager=manager,
@@ -800,7 +801,7 @@ def _run_eccheck_legacy_recovery(
     recovered_buffer: Optional[torch.Tensor],
     total_size: int,
     registry: GlobalMetadataRegistry,
-) -> None:
+) -> float:
     """Drive C++ recovery for ECCHECK legacy load using submit_load_pipeline_chunk.
 
     Uses the same chunked pipeline API as the modern path but sources data
@@ -823,6 +824,7 @@ def _run_eccheck_legacy_recovery(
     # rank_in_group 1 receives into recovered_buffer.
     # This exercises the network path for worst-case recovery time measurement.
     if software_failure:
+        start_t = time()
         if rank_in_group == 0:
             own_buf = blocks["own_buffer"].contiguous().view(torch.uint8).reshape(-1)
             actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
@@ -835,7 +837,7 @@ def _run_eccheck_legacy_recovery(
                 int(recovered_buffer.data_ptr()), recovered_buffer.numel()
             )
         # rig=2/3: no-op
-        return
+        return time() - start_t
 
     # ---- hardware failure path (rank_in_group 2) ----
     failed_rank = 2
@@ -845,7 +847,7 @@ def _run_eccheck_legacy_recovery(
     # Compute pipeline size
     max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
     if max_total_bytes == 0:
-        return
+        return 0.0
     buffer_size = manager.eccheck_buffer_size
 
     # Get buffer pools (reuse save-time pools via manager)
@@ -906,7 +908,8 @@ def _run_eccheck_legacy_recovery(
     p2p_partner_offset = 0
     recv_offset2 = 0
 
-    start_t = time()
+    t_pipeline_net_start: Optional[float] = None
+    t_pipeline_net = 0.0
     try:
         while processed < max_total_bytes:
             remaining = max_total_bytes - processed
@@ -914,7 +917,7 @@ def _run_eccheck_legacy_recovery(
 
             cur_buffer_addr = _get_free_data()
 
-            # Copy source data from pre-loaded P2P block buffers
+            # Copy source data from pre-loaded P2P block buffers (not timed)
             buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
             buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
 
@@ -985,6 +988,8 @@ def _run_eccheck_legacy_recovery(
             else:
                 p2p_partner_write = 0
 
+            if t_pipeline_net_start is None:
+                t_pipeline_net_start = time()
             native.submit_load_pipeline_chunk(
                 step2_send_addr=step2_send_addr,
                 step2_recv_data_addr=step2_recv_data_addr,
@@ -1001,6 +1006,8 @@ def _run_eccheck_legacy_recovery(
             processed += take
 
         # Sentinels and completion
+        if t_pipeline_net_start is None:
+            t_pipeline_net_start = time()
         native.submit_load_encoding_sentinel()
         native.wait_for_xor_worker_completion()
 
@@ -1010,8 +1017,9 @@ def _run_eccheck_legacy_recovery(
         native.wait_for_encoding_completion()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        t_pipeline_net = time() - t_pipeline_net_start
 
-        # Extract recovered data from own_buffer for rank2.
+        # Extract recovered data from own_buffer for rank2 (not timed).
         # own_buf was written by C++ at 64B-aligned offsets with gaps between
         # chunks.  We iterate over the same chunk layout used during encoding
         # to reconstruct a dense buffer.
@@ -1025,11 +1033,15 @@ def _run_eccheck_legacy_recovery(
                              recovered_dense.numel())
                 recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
 
-        logger.info(f"ECCHECK legacy: hw recovery pipeline done in {time() - start_t:.2f}s")
+        logger.info(
+            f"ECCHECK legacy: hw recovery pipeline done in {t_pipeline_net:.2f}s"
+        )
 
     finally:
         if active_event is not None:
             active_event.clear()
+
+    return t_pipeline_net
 
 
 # ---------------------------------------------------------------------------
@@ -1044,7 +1056,7 @@ def _run_eccheck_two_failures_recovery(
     recovered_buffer: Optional[torch.Tensor],
     total_size: int,
     registry: GlobalMetadataRegistry,
-) -> None:
+) -> float:
     """Drive C++ two-failure recovery for ECCHECK legacy load.
 
     Two physical nodes lost → rig1 and rig2 in each 4-rank group are failed.
@@ -1074,7 +1086,7 @@ def _run_eccheck_two_failures_recovery(
     # Compute pipeline size
     max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
     if max_total_bytes == 0:
-        return
+        return 0.0
     buffer_size = manager.eccheck_buffer_size
 
     # Get buffer pools
@@ -1132,9 +1144,14 @@ def _run_eccheck_two_failures_recovery(
     if active_event is not None:
         active_event.set()
 
-    # ---- Phase 1: P2P data distribution (before encoding pipeline) ----
+    t_phase1_p2p = 0.0
+    t_pipeline_net = 0.0
+    t_pipeline_net_start: Optional[float] = None
+
+    # ---- Phase 1: P2P data distribution (timed as network) ----
     # Rig0 → Rig1: send d1 (partner_buffer)
     # Rig3 → Rig2: send p2 = d0⊕d2 (partner_buffer)
+    _t0 = time()
     if rank_in_group == 0:
         native.simple_p2p_send(int(partner_buf.data_ptr()), partner_buf.numel())
         logger.info(
@@ -1159,6 +1176,7 @@ def _run_eccheck_two_failures_recovery(
             f"ECCHECK two-failures: rig3 sent p2 to rig2 "
             f"({partner_buf.numel() / (1024**3):.2f} GB)"
         )
+    t_phase1_p2p = time() - _t0
 
     processed = 0
     own_offset = 0
@@ -1166,13 +1184,13 @@ def _run_eccheck_two_failures_recovery(
     recv_offset_1 = 0
     recv_offset_2 = 0
 
-    start_t = time()
+    network_encode = 0.0
     try:
         while processed < max_total_bytes:
             remaining = max_total_bytes - processed
             take = min(buffer_size, remaining)
 
-            # ---- Phase 2: copy data into chunk buffer ----
+            # ---- Phase 2: copy data into chunk buffer (local, not timed as network) ----
             cur_buffer_addr = _get_free_data()
             buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
             buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
@@ -1274,6 +1292,8 @@ def _run_eccheck_two_failures_recovery(
             recv_offset_2 = recv_offset_2_aligned + take
 
             # Phase 2b: dual-coefficient encoding → route to save-path 16-thread pool
+            if t_pipeline_net_start is None:
+                t_pipeline_net_start = time()
             native.submit_two_failure_encoding_chunk(
                 data_addr=cur_buffer_addr,
                 size=take,
@@ -1289,12 +1309,15 @@ def _run_eccheck_two_failures_recovery(
             processed += take
 
         # Sentinels and completion
+        if t_pipeline_net_start is None:
+            t_pipeline_net_start = time()
         native.submit_two_failure_encoding_sentinels()
         native.wait_for_encoding_completion()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        t_pipeline_net = time() - t_pipeline_net_start
 
-        # ---- Phase 4: Extract recovered data ----
+        # ---- Phase 4: Extract recovered data (not timed) ----
         # rig2: own_buffer was written by C++ via XOR as d2 (gapped)
         if rank_in_group == 2 and recovered_buffer is not None:
             recovered_dense = _extract_dense_from_gapped_buffer(
@@ -1317,9 +1340,10 @@ def _run_eccheck_two_failures_recovery(
                              recovered_dense.numel())
                 recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
 
+        network_encode = t_phase1_p2p + t_pipeline_net
         logger.info(
             f"ECCHECK legacy: two-failure recovery pipeline done in "
-            f"{time() - start_t:.2f}s"
+            f"{network_encode:.2f}s"
         )
 
     finally:
@@ -1328,6 +1352,8 @@ def _run_eccheck_two_failures_recovery(
 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
+
+    return network_encode
 
 
 # ---------------------------------------------------------------------------
@@ -1489,7 +1515,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             total_size = actual_tensor_bytes
     elif sw_failure:
         if rank_in_group == 0:
-            blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata, block_count=1)
+            blocks = _allocate_eccheck_blocks_legacy(
+                manager, rank_metadata, block_names=["own_buffer"],
+            )
             _load_eccheck_blocks_from_disk_into(
                 blocks, checkpoint_dir, rank, rank_in_group, software_failure=True,
             )
@@ -1517,11 +1545,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     # sync all ranks before timing
     torch.distributed.barrier()
 
-    # === timing: network/encode (C++ P2P or XOR pipeline) ===
-    _t_ec: Dict[str, float] = {}
-    _t0 = time.time()
+    # === timing: network/encode (C++ P2P or XOR pipeline, excluding setup/copy) ===
     if two_failures:
-        _run_eccheck_two_failures_recovery(
+        network_encode = _run_eccheck_two_failures_recovery(
             manager=manager,
             rank=rank,
             world_size=world_size,
@@ -1531,7 +1557,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             registry=registry,
         )
     else:
-        _run_eccheck_legacy_recovery(
+        network_encode = _run_eccheck_legacy_recovery(
             manager=manager,
             rank=rank,
             world_size=world_size,
@@ -1541,13 +1567,20 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             total_size=total_size,
             registry=registry,
         )
-    _t_ec['network_encode'] = time.time() - _t0
 
-    # sync all ranks before rebuild timing
     torch.distributed.barrier()
 
-    # === timing: rebuild state_dict ===
-    _t0 = time.time()
+    if two_failures:
+        _mode = "2F"
+    elif sw_failure:
+        _mode = "SW"
+    else:
+        _mode = "HW"
+    logger.info(
+        "ECCHECK legacy load timing (%s): network_encode=%.2fs",
+        _mode, network_encode,
+    )
+
     if two_failures:
         use_recovered = rank_in_group in (1, 2)
     elif sw_failure and rank_in_group == 0:
@@ -1558,20 +1591,6 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     state_dict = _reconstruct_state_dict_from_eccheck_buffer(
         main_payload,
         recovered_buffer=recovered_buffer if use_recovered else None,
-    )
-    _t_ec['rebuild_sd'] = time.time() - _t0
-    _t_ec['total'] = _t_ec['network_encode'] + _t_ec['rebuild_sd']
-
-    if two_failures:
-        _mode = "2F"
-    elif sw_failure:
-        _mode = "SW"
-    else:
-        _mode = "HW"
-    logger.info(
-        "ECCHECK legacy load timing (%s): "
-        "total=%.2fs network_encode=%.2fs rebuild_sd=%.2fs",
-        _mode, _t_ec['total'], _t_ec['network_encode'], _t_ec['rebuild_sd'],
     )
 
     if world_size > 1 and torch.distributed.is_initialized():

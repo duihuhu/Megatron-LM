@@ -594,6 +594,7 @@ private:
     std::condition_variable connection_cv_;
     std::mutex buffer_mutex_;
     std::mutex recv_mutex_;
+    std::mutex send_cq_poll_mutex_;
     
     // Rank information
     int rank_;
@@ -812,9 +813,11 @@ private:
                 throw std::runtime_error("Failed to post send work request");
             }
 
-            // Poll completions for signaled requests in this batch
+            // Poll completions for signaled requests in this batch.
+            // Serialize send_cq polls so parallel target sends do not steal WRs.
             for (size_t i = batch_start; i < batch_end; ++i) {
                 if (wrs[i].send_flags & IBV_SEND_SIGNALED) {
+                    std::lock_guard<std::mutex> cq_lock(send_cq_poll_mutex_);
                     poll_completion(send_cq_, 1);
                 }
             }
@@ -881,14 +884,22 @@ public:
         std::vector<bool> acked(target_ranks_.size(), false);
         size_t acked_count = 0;
         while (acked_count < target_ranks_.size()) {
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            int max_fd = 0;
             for (size_t i = 0; i < target_ranks_.size(); ++i) {
                 if (acked[i]) continue;
-                fd_set read_fds;
-                FD_ZERO(&read_fds);
                 FD_SET(control_socks_send_[i], &read_fds);
-                struct timeval tv = {0, 1000}; // 1 ms poll
-                int ret = select(control_socks_send_[i] + 1, &read_fds, nullptr, nullptr, &tv);
-                if (ret > 0) {
+                if (control_socks_send_[i] > max_fd) {
+                    max_fd = control_socks_send_[i];
+                }
+            }
+            struct timeval tv = {0, 500};
+            int ret = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
+            if (ret > 0) {
+                for (size_t i = 0; i < target_ranks_.size(); ++i) {
+                    if (acked[i]) continue;
+                    if (!FD_ISSET(control_socks_send_[i], &read_fds)) continue;
                     char ack;
                     if (recv(control_socks_send_[i], &ack, 1, MSG_WAITALL) != 1 || ack != 'A') {
                         throw std::runtime_error("Failed to receive ACK from target "
@@ -898,28 +909,51 @@ public:
                     acked_count++;
                 }
             }
-            if (acked_count < target_ranks_.size()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
         }
 
-        // Find or use temp buffer for MR
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(data), size);
-        bool use_temp = (mr == nullptr);
-
-        if (use_temp) {
-            if (size > temp_send_buffer_.size()) {
-                throw std::runtime_error("Data size exceeds temporary buffer size");
-            }
-            std::memcpy(temp_send_buffer_.data(), data, size);
-            mr = temp_send_mr_;
+        if (mr == nullptr) {
+            throw std::runtime_error(
+                "RDMA broadcast: send buffer is not registered (addr=0x"
+                + std::to_string(reinterpret_cast<uintptr_t>(data))
+                + ", size=" + std::to_string(size) + ")");
         }
 
-        const uint8_t* send_data = use_temp ? temp_send_buffer_.data() : data;
+        const uint8_t* send_data = data;
 
-        // Send data to all targets via RDMA
+        if (target_ranks_.size() <= 1) {
+            if (!target_ranks_.empty()) {
+                send_data_chunked(send_data, size, mr, send_qps_[0]);
+            }
+            return;
+        }
+
+        // Parallel RDMA send to all targets (wall time ~ max, not sum).
+        std::vector<std::exception_ptr> send_exceptions(target_ranks_.size());
+        std::vector<std::thread> send_threads;
+        send_threads.reserve(target_ranks_.size());
         for (size_t i = 0; i < target_ranks_.size(); ++i) {
-            send_data_chunked(send_data, size, mr, send_qps_[i]);
+            send_threads.emplace_back([this, i, send_data, size, mr, &send_exceptions]() {
+                try {
+                    send_data_chunked(send_data, size, mr, send_qps_[i]);
+                } catch (...) {
+                    send_exceptions[i] = std::current_exception();
+                }
+            });
+        }
+        for (auto& t : send_threads) {
+            t.join();
+        }
+        for (size_t i = 0; i < send_exceptions.size(); ++i) {
+            if (send_exceptions[i]) {
+                try {
+                    std::rethrow_exception(send_exceptions[i]);
+                } catch (const std::exception& e) {
+                    throw std::runtime_error(
+                        "Failed RDMA send to target rank " + std::to_string(target_ranks_[i])
+                        + ": " + e.what());
+                }
+            }
         }
     }
 
@@ -1794,6 +1828,9 @@ private:
     std::vector<std::string> recv_error_msgs_;
     std::mutex recv_error_mutex_;
 
+    std::mutex exchange_wait_mutex_;
+    std::condition_variable exchange_wait_cv_;
+
 public:
     GeminiReplicasNative(
         int rank, int world_size,
@@ -2027,6 +2064,22 @@ public:
     }
 
 private:
+    bool exchange_all_done_or_error() const {
+        if (send_error_.load()) return true;
+        for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
+            if (recv_error_[i].load()) return true;
+        }
+        if (!send_done_.load()) return false;
+        for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
+            if (!recv_done_[i].load()) return false;
+        }
+        return true;
+    }
+
+    void notify_exchange_waiters() {
+        exchange_wait_cv_.notify_all();
+    }
+
     void send_worker_func() {
         while (true) {
             {
@@ -2053,6 +2106,7 @@ private:
 
             send_ready_ = false;
             send_done_ = true;
+            notify_exchange_waiters();
         }
     }
 
@@ -2084,6 +2138,7 @@ private:
 
             recv_ready_[idx] = false;
             recv_done_[idx] = true;
+            notify_exchange_waiters();
         }
     }
 
@@ -2155,34 +2210,10 @@ public:
     }
 
     void wait_for_exchange_completion() {
-        // Busy-poll until all workers are done (same style as ecnaive).
-        int wait_count = 0;
-        while (true) {
-            bool all_done = send_done_;
-            if (all_done) {
-                for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
-                    if (!recv_done_[i]) { all_done = false; break; }
-                }
-            }
-            // Also stop if any worker hit an error
-            bool any_error = send_error_;
-            if (!any_error) {
-                for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
-                    if (recv_error_[i]) { any_error = true; break; }
-                }
-            }
-            if (all_done || any_error) break;
-
-            if (wait_count % 200 == 0 && wait_count > 0) {
-                std::cout << "[Rank " << rank_ << "] Waiting for exchange (send="
-                          << send_done_ << " recvs_done=";
-                for (size_t i = 0; i < recv_source_ranks_.size(); ++i)
-                    std::cout << recv_done_[i];
-                std::cout << ")..." << std::endl;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            wait_count++;
-        }
+        std::unique_lock<std::mutex> lk(exchange_wait_mutex_);
+        exchange_wait_cv_.wait(lk, [this] {
+            return exchange_all_done_or_error();
+        });
 
         // Re-throw any worker errors
         if (send_error_) {

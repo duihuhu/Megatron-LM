@@ -1,5 +1,6 @@
 import ctypes
 import queue
+import threading
 import time
 from logging import getLogger
 from pathlib import Path
@@ -1059,41 +1060,75 @@ def _run_eclatin_two_failures_recovery(
     torch.distributed.barrier()
     logger.info("ECLATIN two-failures: Step 1 (survivor exchange) done")
 
-    # === Step 2: XOR decode ===
-    _t0 = time()
-    if rank_in_group == 2:
-        o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1','out2','out3','out4']]
-        od1, od2, op1, op2 = [int(eclatin_blocks[k].data_ptr()) for k in
-            ['data_block_1','data_block_2','parity_block_1','parity_block_2']]
-        pd1, pd2 = int(surv_bufs["peer_d1"].data_ptr()), int(surv_bufs["peer_d2"].data_ptr())
-        native.survivor_xor_decode(rank_in_group, o1, o2, o3, o4, od1, od2, op1, op2, pd1, pd2, aligned_half_block_size)
-    elif rank_in_group == 3:
-        o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1','out2','out3','out4']]
-        od1, od2, op1, op2 = [int(eclatin_blocks[k].data_ptr()) for k in
-            ['data_block_1','data_block_2','parity_block_1','parity_block_2']]
-        pd1, pd2 = int(surv_bufs["peer_d1"].data_ptr()), int(surv_bufs["peer_d2"].data_ptr())
-        native.survivor_xor_decode(rank_in_group, o1, o2, o3, o4, od1, od2, op1, op2, pd1, pd2, aligned_half_block_size)
-    t_network_encode += time() - _t0
-    torch.distributed.barrier()
-    logger.info("ECLATIN two-failures: Step 2 (XOR decode) done")
+    # === Step 2 + 3 (overlapped): survivors XOR while failed ranks block in recv ===
+    recv_thread: Optional[threading.Thread] = None
+    recv_error: List[BaseException] = []
 
-    # === Step 3: Send to failed (RDMA recv/send parallel across rig0 vs rig1 peers) ===
-    _t0 = time()
     if rank_in_group in (0, 1):
-        a = _twofail_recv_block_addrs(eclatin_blocks, rank_in_group)
-        native.recv_four_blocks(rank_in_group, a[0], a[1], a[2], a[3], aligned_half_block_size)
-    elif rank_in_group in (2, 3):
-        o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1','out2','out3','out4']]
+        recv_addrs = _twofail_recv_block_addrs(eclatin_blocks, rank_in_group)
+
+        def _recv_worker() -> None:
+            try:
+                native.recv_four_blocks(
+                    rank_in_group,
+                    recv_addrs[0],
+                    recv_addrs[1],
+                    recv_addrs[2],
+                    recv_addrs[3],
+                    aligned_half_block_size,
+                )
+            except BaseException as exc:
+                recv_error.append(exc)
+
+        recv_thread = threading.Thread(target=_recv_worker, name=f"eclatin-twf-recv-rig{rank_in_group}")
+        _t0 = time()
+        recv_thread.start()
+        logger.info(
+            f"ECLATIN two-failures: rig{rank_in_group} recv thread started (overlaps survivor XOR)"
+        )
+    else:
+        _t0 = time()
+
+    if rank_in_group == 2:
+        o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1', 'out2', 'out3', 'out4']]
+        od1, od2, op1, op2 = [int(eclatin_blocks[k].data_ptr()) for k in
+            ['data_block_1', 'data_block_2', 'parity_block_1', 'parity_block_2']]
+        pd1, pd2 = int(surv_bufs["peer_d1"].data_ptr()), int(surv_bufs["peer_d2"].data_ptr())
+        native.survivor_xor_decode(
+            rank_in_group, o1, o2, o3, o4, od1, od2, op1, op2, pd1, pd2, aligned_half_block_size
+        )
+    elif rank_in_group == 3:
+        o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1', 'out2', 'out3', 'out4']]
+        od1, od2, op1, op2 = [int(eclatin_blocks[k].data_ptr()) for k in
+            ['data_block_1', 'data_block_2', 'parity_block_1', 'parity_block_2']]
+        pd1, pd2 = int(surv_bufs["peer_d1"].data_ptr()), int(surv_bufs["peer_d2"].data_ptr())
+        native.survivor_xor_decode(
+            rank_in_group, o1, o2, o3, o4, od1, od2, op1, op2, pd1, pd2, aligned_half_block_size
+        )
+
+    if rank_in_group in (2, 3):
+        t_network_encode += time() - _t0
+        logger.info("ECLATIN two-failures: Step 2 (XOR decode) done")
+
+        _t0 = time()
+        o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1', 'out2', 'out3', 'out4']]
         if rank_in_group == 2:
             native.send_to_both_failed_ranks(
                 rank_in_group, o3, o2, o1, o4, aligned_half_block_size)
         else:
             native.send_to_both_failed_ranks(
                 rank_in_group, o1, o4, o3, o2, aligned_half_block_size)
-    t_network_encode += time() - _t0
+        t_network_encode += time() - _t0
+        logger.info("ECLATIN two-failures: Step 3 (send to failed) done")
+
+    if recv_thread is not None:
+        recv_thread.join()
+        if recv_error:
+            raise recv_error[0]
+        t_network_encode += time() - _t0
+        logger.info("ECLATIN two-failures: Step 3 (recv from survivors) done")
 
     torch.distributed.barrier()
-    logger.info("ECLATIN two-failures: Step 3 (send to failed) done")
 
     if rank_in_group in (0, 1) and recovered_buffer is not None and recovered_buffer.numel() >= total_size:
         actual_max = _max_tensor_bytes_from_registry(registry, world_size)

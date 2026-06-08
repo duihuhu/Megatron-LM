@@ -156,6 +156,7 @@ private:
     bool connected_;
     std::mutex send_mutex_;
     std::mutex recv_mutex_;
+    std::mutex* shared_control_mutex_;  // optional: serializes TCP handshake when multiple QPs share one socket
     static const size_t TEMP_BUFFER_SIZE = 128ULL * 1024 * 1024;  // 128 MB (reduced from 1GB to avoid RDMA memory limits, matching ecnaive)
     static const size_t CHUNK_SIZE = 64 * 1024 * 1024;
     static const int MAX_WR = 64;
@@ -295,11 +296,13 @@ public:
     RdmaConnectionChannel(ibv_context* context, ibv_pd* pd, ibv_cq* send_cq, ibv_cq* recv_cq,
                            int control_sock_send, int control_sock_recv,
                            std::map<uintptr_t, RdmaBuffer>* registered_buffers, std::mutex* buffer_mutex,
-                           int rank, int peer_rank)
+                           int rank, int peer_rank,
+                           std::mutex* shared_control_mutex = nullptr)
         : context_(context), pd_(pd), send_cq_(send_cq), recv_cq_(recv_cq), qp_(nullptr),
           control_sock_send_(control_sock_send), control_sock_recv_(control_sock_recv),
           registered_buffers_(registered_buffers), buffer_mutex_(buffer_mutex),
-          temp_send_mr_(nullptr), temp_recv_mr_(nullptr), rank_(rank), peer_rank_(peer_rank), connected_(false) {
+          temp_send_mr_(nullptr), temp_recv_mr_(nullptr), rank_(rank), peer_rank_(peer_rank),
+          connected_(false), shared_control_mutex_(shared_control_mutex) {
         ibv_qp_init_attr qp_attr{};
         qp_attr.send_cq = send_cq_;
         qp_attr.recv_cq = recv_cq_;
@@ -367,33 +370,47 @@ public:
     void send_data(const uint8_t* data, size_t size) {
         std::lock_guard<std::mutex> lock(send_mutex_);
         if (!connected_) throw std::runtime_error("ECLATIN RDMA: channel not connected");
-        uint64_t size_network = htobe64(size);
-        if (send(control_sock_send_, &size_network, sizeof(size_network), 0) != sizeof(size_network))
-            throw std::runtime_error("ECLATIN RDMA: failed to send size");
-        uint8_t ack;
-        if (recv(control_sock_send_, &ack, sizeof(ack), MSG_WAITALL) != sizeof(ack))
-            throw std::runtime_error("ECLATIN RDMA: failed to receive ACK");
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(data), size);
+        const uint8_t* send_ptr = data;
         if (!mr) {
             if (size > TEMP_BUFFER_SIZE) throw std::runtime_error("ECLATIN RDMA: data exceeds temp buffer");
             memcpy(temp_send_buffer_.data(), data, size);
             mr = temp_send_mr_;
-            data = temp_send_buffer_.data();
+            send_ptr = temp_send_buffer_.data();
         }
-        send_data_chunked(data, size, mr);
+        {
+            std::unique_lock<std::mutex> ctrl_lock;
+            if (shared_control_mutex_) {
+                ctrl_lock = std::unique_lock<std::mutex>(*shared_control_mutex_);
+            }
+            uint64_t size_network = htobe64(size);
+            if (send(control_sock_send_, &size_network, sizeof(size_network), 0) != sizeof(size_network))
+                throw std::runtime_error("ECLATIN RDMA: failed to send size");
+            uint8_t ack;
+            if (recv(control_sock_send_, &ack, sizeof(ack), MSG_WAITALL) != sizeof(ack))
+                throw std::runtime_error("ECLATIN RDMA: failed to receive ACK");
+        }
+        send_data_chunked(send_ptr, size, mr);
     }
 
     size_t receive_data(uint8_t* buffer, size_t buffer_size) {
         std::lock_guard<std::mutex> lock(recv_mutex_);
         if (!connected_) throw std::runtime_error("ECLATIN RDMA: channel not connected");
-        uint64_t size_network;
-        if (recv(control_sock_recv_, &size_network, sizeof(size_network), MSG_WAITALL) != sizeof(size_network))
-            throw std::runtime_error("ECLATIN RDMA: failed to receive size");
-        size_t size = be64toh(size_network);
-        if (size > buffer_size) throw std::runtime_error("ECLATIN RDMA: received size exceeds buffer");
-        uint8_t ack = 1;
-        if (send(control_sock_recv_, &ack, sizeof(ack), 0) != sizeof(ack))
-            throw std::runtime_error("ECLATIN RDMA: failed to send ACK");
+        size_t size = 0;
+        {
+            std::unique_lock<std::mutex> ctrl_lock;
+            if (shared_control_mutex_) {
+                ctrl_lock = std::unique_lock<std::mutex>(*shared_control_mutex_);
+            }
+            uint64_t size_network;
+            if (recv(control_sock_recv_, &size_network, sizeof(size_network), MSG_WAITALL) != sizeof(size_network))
+                throw std::runtime_error("ECLATIN RDMA: failed to receive size");
+            size = be64toh(size_network);
+            if (size > buffer_size) throw std::runtime_error("ECLATIN RDMA: received size exceeds buffer");
+            uint8_t ack = 1;
+            if (send(control_sock_recv_, &ack, sizeof(ack), 0) != sizeof(ack))
+                throw std::runtime_error("ECLATIN RDMA: failed to send ACK");
+        }
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(buffer), size);
         bool use_temp = !mr;
         if (!mr) {
@@ -3192,39 +3209,64 @@ public:
         std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
                   << " exchanging data blocks (size=" << size << ")" << std::endl;
 
-        // RDMA path: parallel send+recv over dedicated channels
-        // Channel mapping: rig3 (send-first) sends on [2,3], recvs on [0,1]
-        //                  rig2 (recv-first) sends on [0,1], recvs on [2,3]
-        // This mirrors the exchange_and_connect order so that send_data on ch[N]
-        // is paired with receive_data on the same ch[N] across ranks.
+        // RDMA path: parallel d1/d2 transfer on paired channels (separate QPs, shared control socket)
+        // Channel mapping: rig3 sends on [2,3] and recvs on [0,1]; rig2 recvs on [2,3] and sends on [0,1]
 #if RDMA_AVAILABLE
         if (use_rdma_ && rdma_twf_v2_survexch_channels_[0] && rdma_twf_v2_survexch_channels_[1] &&
             rdma_twf_v2_survexch_channels_[2] && rdma_twf_v2_survexch_channels_[3]) {
-            // Serial on each side to avoid racy ::send()/::recv() on shared socket.
-            // rig3 sends first then recvs; rig2 recvs first then sends.
-            // RDMA data movement is async (ibv_post_send), so throughput is fine.
-            int si, ri;
-            if (rank_in_group == 3) { si = 2; ri = 0; }
-            else                    { si = 0; ri = 2; }
-            auto& ch_send1 = rdma_twf_v2_survexch_channels_[si];
-            auto& ch_send2 = rdma_twf_v2_survexch_channels_[si + 1];
-            auto& ch_recv1 = rdma_twf_v2_survexch_channels_[ri];
-            auto& ch_recv2 = rdma_twf_v2_survexch_channels_[ri + 1];
+            const int send_lo = (rank_in_group == 3) ? 2 : 0;
+            const int recv_lo = (rank_in_group == 3) ? 0 : 2;
+
+            auto run_parallel_pair = [&](int ch_a, uintptr_t addr_a, int ch_b, uintptr_t addr_b,
+                                         bool is_send) {
+                std::exception_ptr ex_a;
+                std::exception_ptr ex_b;
+                std::thread t_a([&]() {
+                    try {
+                        if (is_send) {
+                            rdma_twf_v2_survexch_channels_[ch_a]->send_data(
+                                reinterpret_cast<const uint8_t*>(addr_a), size);
+                        } else {
+                            rdma_twf_v2_survexch_channels_[ch_a]->receive_data(
+                                reinterpret_cast<uint8_t*>(addr_a), size);
+                        }
+                    } catch (...) {
+                        ex_a = std::current_exception();
+                    }
+                });
+                std::thread t_b([&]() {
+                    try {
+                        if (is_send) {
+                            rdma_twf_v2_survexch_channels_[ch_b]->send_data(
+                                reinterpret_cast<const uint8_t*>(addr_b), size);
+                        } else {
+                            rdma_twf_v2_survexch_channels_[ch_b]->receive_data(
+                                reinterpret_cast<uint8_t*>(addr_b), size);
+                        }
+                    } catch (...) {
+                        ex_b = std::current_exception();
+                    }
+                });
+                t_a.join();
+                t_b.join();
+                if (ex_a) std::rethrow_exception(ex_a);
+                if (ex_b) std::rethrow_exception(ex_b);
+            };
 
             if (rank_in_group == 3) {
-                ch_send1->send_data(reinterpret_cast<const uint8_t*>(send_d1), size);
-                ch_send2->send_data(reinterpret_cast<const uint8_t*>(send_d2), size);
-                ch_recv1->receive_data(reinterpret_cast<uint8_t*>(recv_d1), size);
-                ch_recv2->receive_data(reinterpret_cast<uint8_t*>(recv_d2), size);
+                // Phase 1: send own d1/d2 in parallel (paired with rig2 recv on ch 2,3)
+                run_parallel_pair(send_lo, send_d1, send_lo + 1, send_d2, true);
+                // Phase 2: recv peer d1/d2 in parallel (paired with rig2 send on ch 0,1)
+                run_parallel_pair(recv_lo, recv_d1, recv_lo + 1, recv_d2, false);
             } else {
-                ch_recv1->receive_data(reinterpret_cast<uint8_t*>(recv_d1), size);
-                ch_recv2->receive_data(reinterpret_cast<uint8_t*>(recv_d2), size);
-                ch_send1->send_data(reinterpret_cast<const uint8_t*>(send_d1), size);
-                ch_send2->send_data(reinterpret_cast<const uint8_t*>(send_d2), size);
+                // Phase 1: recv peer d1/d2 in parallel
+                run_parallel_pair(recv_lo, recv_d1, recv_lo + 1, recv_d2, false);
+                // Phase 2: send own d1/d2 in parallel
+                run_parallel_pair(send_lo, send_d1, send_lo + 1, send_d2, true);
             }
 
             std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
-                      << " data exchange complete (RDMA)" << std::endl;
+                      << " data exchange complete (RDMA, parallel d1/d2)" << std::endl;
             return;
         }
 #endif
@@ -3330,14 +3372,32 @@ public:
                                      std::to_string(rank_in_group));
         }
 
-        // RDMA path: serial to avoid ::send() race on shared control socket
+        // RDMA path: parallel send on 2 channels (shared control mutex serializes handshake only)
 #if RDMA_AVAILABLE
         if (use_rdma_ && (*channels)[0] && (*channels)[1]) {
-            (*channels)[0]->send_data(reinterpret_cast<const uint8_t*>(addr1), size);
-            (*channels)[1]->send_data(reinterpret_cast<const uint8_t*>(addr2), size);
+            std::exception_ptr ex_a;
+            std::exception_ptr ex_b;
+            std::thread t_a([&]() {
+                try {
+                    (*channels)[0]->send_data(reinterpret_cast<const uint8_t*>(addr1), size);
+                } catch (...) {
+                    ex_a = std::current_exception();
+                }
+            });
+            std::thread t_b([&]() {
+                try {
+                    (*channels)[1]->send_data(reinterpret_cast<const uint8_t*>(addr2), size);
+                } catch (...) {
+                    ex_b = std::current_exception();
+                }
+            });
+            t_a.join();
+            t_b.join();
+            if (ex_a) std::rethrow_exception(ex_a);
+            if (ex_b) std::rethrow_exception(ex_b);
 
             std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
-                      << " sent 2 blocks to rig" << target_rig << " (RDMA)" << std::endl;
+                      << " sent 2 blocks to rig" << target_rig << " (RDMA, parallel)" << std::endl;
             return;
         }
 #endif
@@ -3438,34 +3498,48 @@ public:
                                      std::to_string(rank_in_group));
         }
 
-        // RDMA path: parallel recv on n3 and n4 sockets (serial within each peer's 2 channels)
+        // RDMA path: parallel recv on n3/n4 peers and parallel within each peer's 2 channels
 #if RDMA_AVAILABLE
         if (use_rdma_ && (*ch_n3)[0] && (*ch_n3)[1] && (*ch_n4)[0] && (*ch_n4)[1]) {
-            std::exception_ptr n3_ex;
-            std::exception_ptr n4_ex;
-            std::thread t_n3([&]() {
+            std::exception_ptr recv_ex[4];
+            std::thread recv_threads[4];
+            recv_threads[0] = std::thread([&]() {
                 try {
                     (*ch_n3)[0]->receive_data(reinterpret_cast<uint8_t*>(a_n3[0]), size);
+                } catch (...) {
+                    recv_ex[0] = std::current_exception();
+                }
+            });
+            recv_threads[1] = std::thread([&]() {
+                try {
                     (*ch_n3)[1]->receive_data(reinterpret_cast<uint8_t*>(a_n3[1]), size);
                 } catch (...) {
-                    n3_ex = std::current_exception();
+                    recv_ex[1] = std::current_exception();
                 }
             });
-            std::thread t_n4([&]() {
+            recv_threads[2] = std::thread([&]() {
                 try {
                     (*ch_n4)[0]->receive_data(reinterpret_cast<uint8_t*>(a_n4[0]), size);
-                    (*ch_n4)[1]->receive_data(reinterpret_cast<uint8_t*>(a_n4[1]), size);
                 } catch (...) {
-                    n4_ex = std::current_exception();
+                    recv_ex[2] = std::current_exception();
                 }
             });
-            t_n3.join();
-            t_n4.join();
-            if (n3_ex) std::rethrow_exception(n3_ex);
-            if (n4_ex) std::rethrow_exception(n4_ex);
+            recv_threads[3] = std::thread([&]() {
+                try {
+                    (*ch_n4)[1]->receive_data(reinterpret_cast<uint8_t*>(a_n4[1]), size);
+                } catch (...) {
+                    recv_ex[3] = std::current_exception();
+                }
+            });
+            for (auto& t : recv_threads) {
+                t.join();
+            }
+            for (const auto& ex : recv_ex) {
+                if (ex) std::rethrow_exception(ex);
+            }
 
             std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
-                      << " received all 4 blocks (RDMA, parallel n3/n4)" << std::endl;
+                      << " received all 4 blocks (RDMA, parallel n3/n4 + parallel per peer)" << std::endl;
             return;
         }
 #endif
@@ -3909,6 +3983,11 @@ private:
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_LOAD_CHANNELS_TWO_FAIL> rdma_load_channels_two_fail_;
     // v2 two-fail RDMA channels
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_SURVEXCH> rdma_twf_v2_survexch_channels_;
+    std::mutex twf_survexch_control_mutex_;  // serializes TCP handshake across 4 QPs on one socket
+    std::mutex twf_n1n3_control_mutex_;
+    std::mutex twf_n1n4_control_mutex_;
+    std::mutex twf_n2n3_control_mutex_;
+    std::mutex twf_n2n4_control_mutex_;
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_PEER> rdma_twf_v2_n1n3_channels_;
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_PEER> rdma_twf_v2_n1n4_channels_;
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_PEER> rdma_twf_v2_n2n3_channels_;
@@ -4576,7 +4655,8 @@ private:
                         rdma_twf_v2_sx_send_cq_[i], rdma_twf_v2_sx_recv_cq_[i],
                         sock.native_handle(), sock.native_handle(),
                         &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log,
-                        (rank_in_group_ == 2) ? 3 : 2);
+                        (rank_in_group_ == 2) ? 3 : 2,
+                        &twf_survexch_control_mutex_);
                     rdma_twf_v2_survexch_channels_[i]->exchange_and_connect(surv_send_first);
                 }
                 std::cout << "[ECLATIN RDMA] v2 surv exch channels connected (rig"
@@ -4589,14 +4669,16 @@ private:
                 std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_PEER>& channels,
                 ibv_cq** send_cqs, ibv_cq** recv_cqs,
                 boost::asio::ip::tcp::socket& sock,
-                bool send_first, int peer_rig, const char* name)
+                bool send_first, int peer_rig, const char* name,
+                std::mutex* control_mutex)
             {
                 for (int i = 0; i < RDMA_NUM_TWF_V2_PEER; ++i) {
                     channels[i] = std::make_unique<RdmaConnectionChannel>(
                         rdma_context_, rdma_pd_,
                         send_cqs[i], recv_cqs[i],
                         sock.native_handle(), sock.native_handle(),
-                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer_rig);
+                        &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, peer_rig,
+                        control_mutex);
                     channels[i]->exchange_and_connect(send_first);
                 }
                 std::cout << "[ECLATIN RDMA] v2 " << name << " channels connected (rig"
@@ -4609,7 +4691,7 @@ private:
                 int pr = (rank_in_group_ == 2) ? 0 : 2;
                 init_peer_channels(rdma_twf_v2_n1n3_channels_, rdma_twf_v2_n1n3_send_cq_,
                                    rdma_twf_v2_n1n3_recv_cq_, c.get_twf_n1_n3_socket(),
-                                   sf, pr, "n1n3");
+                                   sf, pr, "n1n3", &twf_n1n3_control_mutex_);
             }
             // n1_n4: rig0 recv-first, rig3 send-first
             if (rank_in_group_ == 0 || rank_in_group_ == 3) {
@@ -4617,7 +4699,7 @@ private:
                 int pr = (rank_in_group_ == 3) ? 0 : 3;
                 init_peer_channels(rdma_twf_v2_n1n4_channels_, rdma_twf_v2_n1n4_send_cq_,
                                    rdma_twf_v2_n1n4_recv_cq_, c.get_twf_n1_n4_socket(),
-                                   sf, pr, "n1n4");
+                                   sf, pr, "n1n4", &twf_n1n4_control_mutex_);
             }
             // n2_n3: rig1 recv-first, rig2 send-first
             if (rank_in_group_ == 1 || rank_in_group_ == 2) {
@@ -4625,7 +4707,7 @@ private:
                 int pr = (rank_in_group_ == 2) ? 1 : 2;
                 init_peer_channels(rdma_twf_v2_n2n3_channels_, rdma_twf_v2_n2n3_send_cq_,
                                    rdma_twf_v2_n2n3_recv_cq_, c.get_twf_n2_n3_socket(),
-                                   sf, pr, "n2n3");
+                                   sf, pr, "n2n3", &twf_n2n3_control_mutex_);
             }
             // n2_n4: rig1 recv-first, rig3 send-first
             if (rank_in_group_ == 1 || rank_in_group_ == 3) {
@@ -4633,7 +4715,7 @@ private:
                 int pr = (rank_in_group_ == 3) ? 1 : 3;
                 init_peer_channels(rdma_twf_v2_n2n4_channels_, rdma_twf_v2_n2n4_send_cq_,
                                    rdma_twf_v2_n2n4_recv_cq_, c.get_twf_n2_n4_socket(),
-                                   sf, pr, "n2n4");
+                                   sf, pr, "n2n4", &twf_n2n4_control_mutex_);
             }
 
             std::cout << "[ECLATIN RDMA] All two-fail v2 channels connected (rig"

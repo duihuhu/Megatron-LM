@@ -940,15 +940,17 @@ class ECLATINManager:
         buffers = {}
         # 2 recv buffers for peer data blocks
         for key in ['peer_d1', 'peer_d2']:
-            buffers[key] = torch.empty(
-                aligned_half_block_size, dtype=torch.uint8,
-                pin_memory=self.eclatin_pin_memory,
+            buffers[key] = allocate_hugepage_tensor(
+                aligned_half_block_size,
+                fallback_pin_memory=self.eclatin_pin_memory,
+                touch_pages=True,
             )
         # 4 output buffers for XOR decode results
         for key in ['out1', 'out2', 'out3', 'out4']:
-            buffers[key] = torch.empty(
-                aligned_half_block_size, dtype=torch.uint8,
-                pin_memory=self.eclatin_pin_memory,
+            buffers[key] = allocate_hugepage_tensor(
+                aligned_half_block_size,
+                fallback_pin_memory=self.eclatin_pin_memory,
+                touch_pages=True,
             )
 
         logger.info(

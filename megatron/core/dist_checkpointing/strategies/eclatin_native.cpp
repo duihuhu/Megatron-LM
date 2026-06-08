@@ -1728,6 +1728,35 @@ struct TwofailPipelineTask {
     static TwofailPipelineTask make_sentinel() { return TwofailPipelineTask{}; }
 };
 
+enum class OnefailTaskKind : uint8_t { Send = 0, Recv = 1 };
+
+// Single-failure (rig2) chunked load pipeline task (size==0 is sentinel).
+struct OnefailPipelineTask {
+    size_t size{0};
+    int chunk_index{0};
+    OnefailTaskKind kind{OnefailTaskKind::Recv};
+    std::string send_b1_name;
+    std::string send_b2_name;
+    uintptr_t send_b1_addr{0};
+    uintptr_t send_b2_addr{0};
+    uintptr_t r0d2{0};
+    uintptr_t r0p2{0};
+    uintptr_t r1d1{0};
+    uintptr_t r1p1{0};
+    uintptr_t r3d1{0};
+    uintptr_t r3d2{0};
+    uintptr_t out_d1{0};
+    uintptr_t out_d2{0};
+    uintptr_t out_p1{0};
+    uintptr_t out_p2{0};
+    uintptr_t release_addrs[6]{};
+    int num_release{0};
+
+    bool is_sentinel() const { return size == 0; }
+
+    static OnefailPipelineTask make_sentinel() { return OnefailPipelineTask{}; }
+};
+
 struct TensorTransferInfo {
     uintptr_t gpu_data_ptr{0};
     size_t cpu_offset{0};
@@ -2215,6 +2244,8 @@ public:
         twofail_exch_cv_.notify_all();
         twofail_xor_cv_.notify_all();
         twofail_fwd_cv_.notify_all();
+        onefail_net_cv_.notify_all();
+        onefail_xor_cv_.notify_all();
         if (parity1_recv_xor_thread_.joinable()) parity1_recv_xor_thread_.join();
         if (parity1_send1_thread_.joinable()) parity1_send1_thread_.join();
         if (parity1_send2_thread_.joinable()) parity1_send2_thread_.join();
@@ -2226,6 +2257,8 @@ public:
         if (twofail_exch_thread_.joinable()) twofail_exch_thread_.join();
         if (twofail_xor_thread_.joinable()) twofail_xor_thread_.join();
         if (twofail_fwd_thread_.joinable()) twofail_fwd_thread_.join();
+        if (onefail_net_thread_.joinable()) onefail_net_thread_.join();
+        if (onefail_xor_thread_.joinable()) onefail_xor_thread_.join();
         xor_pool_shutdown();
 #if RDMA_AVAILABLE
         cleanup_rdma_resources();
@@ -2562,6 +2595,206 @@ public:
 #endif
     }
 
+    // ── One-fail (rig2) chunk-level helpers ──────────────────────────────────
+
+    void onefail_recv_chunk_(
+        uintptr_t rank0_data2_addr,
+        uintptr_t rank0_parity2_addr,
+        uintptr_t rank1_data1_addr,
+        uintptr_t rank1_parity1_addr,
+        uintptr_t rank3_data1_addr,
+        uintptr_t rank3_data2_addr,
+        size_t size
+    ) {
+        std::vector<std::exception_ptr> recv_exceptions(6);
+        std::vector<std::thread> recv_threads;
+
+        recv_threads.emplace_back([&]() {
+            try {
+#if RDMA_AVAILABLE
+                if (use_rdma_ && rdma_load_channels_[0]) {
+                    rdma_load_channels_[0]->receive_data(
+                        reinterpret_cast<uint8_t*>(rank0_data2_addr), size);
+                } else
+#endif
+                if (!recv_with_size_bool(conn_.get_load_recv_rank0_data2_socket(),
+                                        reinterpret_cast<void*>(rank0_data2_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank0_data2");
+                }
+            } catch (...) {
+                recv_exceptions[0] = std::current_exception();
+            }
+        });
+
+        recv_threads.emplace_back([&]() {
+            try {
+#if RDMA_AVAILABLE
+                if (use_rdma_ && rdma_load_channels_[1]) {
+                    rdma_load_channels_[1]->receive_data(
+                        reinterpret_cast<uint8_t*>(rank0_parity2_addr), size);
+                } else
+#endif
+                if (!recv_with_size_bool(conn_.get_load_recv_rank0_parity2_socket(),
+                                        reinterpret_cast<void*>(rank0_parity2_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank0_parity2");
+                }
+            } catch (...) {
+                recv_exceptions[1] = std::current_exception();
+            }
+        });
+
+        recv_threads.emplace_back([&]() {
+            try {
+#if RDMA_AVAILABLE
+                if (use_rdma_ && rdma_load_channels_[2]) {
+                    rdma_load_channels_[2]->receive_data(
+                        reinterpret_cast<uint8_t*>(rank1_data1_addr), size);
+                } else
+#endif
+                if (!recv_with_size_bool(conn_.get_load_recv_rank1_data1_socket(),
+                                        reinterpret_cast<void*>(rank1_data1_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank1_data1");
+                }
+            } catch (...) {
+                recv_exceptions[2] = std::current_exception();
+            }
+        });
+
+        recv_threads.emplace_back([&]() {
+            try {
+#if RDMA_AVAILABLE
+                if (use_rdma_ && rdma_load_channels_[3]) {
+                    rdma_load_channels_[3]->receive_data(
+                        reinterpret_cast<uint8_t*>(rank1_parity1_addr), size);
+                } else
+#endif
+                if (!recv_with_size_bool(conn_.get_load_recv_rank1_parity1_socket(),
+                                        reinterpret_cast<void*>(rank1_parity1_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank1_parity1");
+                }
+            } catch (...) {
+                recv_exceptions[3] = std::current_exception();
+            }
+        });
+
+        recv_threads.emplace_back([&]() {
+            try {
+#if RDMA_AVAILABLE
+                if (use_rdma_ && rdma_load_channels_[4]) {
+                    rdma_load_channels_[4]->receive_data(
+                        reinterpret_cast<uint8_t*>(rank3_data1_addr), size);
+                } else
+#endif
+                if (!recv_with_size_bool(conn_.get_load_recv_rank3_data1_socket(),
+                                        reinterpret_cast<void*>(rank3_data1_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank3_data1");
+                }
+            } catch (...) {
+                recv_exceptions[4] = std::current_exception();
+            }
+        });
+
+        recv_threads.emplace_back([&]() {
+            try {
+#if RDMA_AVAILABLE
+                if (use_rdma_ && rdma_load_channels_[5]) {
+                    rdma_load_channels_[5]->receive_data(
+                        reinterpret_cast<uint8_t*>(rank3_data2_addr), size);
+                } else
+#endif
+                if (!recv_with_size_bool(conn_.get_load_recv_rank3_data2_socket(),
+                                        reinterpret_cast<void*>(rank3_data2_addr), size)) {
+                    throw std::runtime_error("Failed to receive rank3_data2");
+                }
+            } catch (...) {
+                recv_exceptions[5] = std::current_exception();
+            }
+        });
+
+        for (auto& t : recv_threads) {
+            t.join();
+        }
+        for (size_t i = 0; i < recv_exceptions.size(); ++i) {
+            if (recv_exceptions[i]) {
+                std::rethrow_exception(recv_exceptions[i]);
+            }
+        }
+    }
+
+    void onefail_xor_chunk_(
+        uintptr_t rank0_data2_addr,
+        uintptr_t rank0_parity2_addr,
+        uintptr_t rank1_data1_addr,
+        uintptr_t rank1_parity1_addr,
+        uintptr_t rank3_data1_addr,
+        uintptr_t rank3_data2_addr,
+        uintptr_t recovered_data1_addr,
+        uintptr_t recovered_data2_addr,
+        uintptr_t recovered_parity1_addr,
+        uintptr_t recovered_parity2_addr,
+        size_t size
+    ) {
+        std::vector<std::exception_ptr> xor_exceptions(4);
+        std::vector<std::thread> xor_threads;
+
+        xor_threads.emplace_back([&]() {
+            try {
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(recovered_data1_addr),
+                    reinterpret_cast<const uint8_t*>(rank0_data2_addr),
+                    reinterpret_cast<const uint8_t*>(rank1_parity1_addr),
+                    size);
+            } catch (...) {
+                xor_exceptions[0] = std::current_exception();
+            }
+        });
+
+        xor_threads.emplace_back([&]() {
+            try {
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(recovered_data2_addr),
+                    reinterpret_cast<const uint8_t*>(rank0_parity2_addr),
+                    reinterpret_cast<const uint8_t*>(rank1_data1_addr),
+                    size);
+            } catch (...) {
+                xor_exceptions[1] = std::current_exception();
+            }
+        });
+
+        xor_threads.emplace_back([&]() {
+            try {
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(recovered_parity1_addr),
+                    reinterpret_cast<const uint8_t*>(rank1_data1_addr),
+                    reinterpret_cast<const uint8_t*>(rank3_data2_addr),
+                    size);
+            } catch (...) {
+                xor_exceptions[2] = std::current_exception();
+            }
+        });
+
+        xor_threads.emplace_back([&]() {
+            try {
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(recovered_parity2_addr),
+                    reinterpret_cast<const uint8_t*>(rank0_data2_addr),
+                    reinterpret_cast<const uint8_t*>(rank3_data1_addr),
+                    size);
+            } catch (...) {
+                xor_exceptions[3] = std::current_exception();
+            }
+        });
+
+        for (auto& t : xor_threads) {
+            t.join();
+        }
+        for (size_t i = 0; i < xor_exceptions.size(); ++i) {
+            if (xor_exceptions[i]) {
+                std::rethrow_exception(xor_exceptions[i]);
+            }
+        }
+    }
+
     // Unified recovery interface for rank2 (parallel recv + parallel XOR)
     void load_recover(
         // Receive buffers (6 blocks from other ranks)
@@ -2582,191 +2815,25 @@ public:
             std::cerr << "ECLATIN: [Rank 2] load_recover called but not in load mode" << std::endl;
             return;
         }
-        
+
         std::cout << "ECLATIN: [Rank 2] Starting recovery (size=" << size << ")" << std::endl;
-        
-        // Step 1: Parallel receive all 6 blocks using threads
-        std::vector<std::exception_ptr> recv_exceptions(6);
-        std::vector<std::thread> recv_threads;
-        
-        recv_threads.emplace_back([&]() {
-            try {
-#if RDMA_AVAILABLE
-                if (use_rdma_ && rdma_load_channels_[0]) {
-                    rdma_load_channels_[0]->receive_data(reinterpret_cast<uint8_t*>(rank0_data2_addr), size);
-                } else
-#endif
-                if (!recv_with_size_bool(conn_.get_load_recv_rank0_data2_socket(),
-                                        reinterpret_cast<void*>(rank0_data2_addr), size)) {
-                    throw std::runtime_error("Failed to receive rank0_data2");
-                }
-            } catch (...) {
-                recv_exceptions[0] = std::current_exception();
-            }
-        });
-        
-        recv_threads.emplace_back([&]() {
-            try {
-#if RDMA_AVAILABLE
-                if (use_rdma_ && rdma_load_channels_[1]) {
-                    rdma_load_channels_[1]->receive_data(reinterpret_cast<uint8_t*>(rank0_parity2_addr), size);
-                } else
-#endif
-                if (!recv_with_size_bool(conn_.get_load_recv_rank0_parity2_socket(),
-                                        reinterpret_cast<void*>(rank0_parity2_addr), size)) {
-                    throw std::runtime_error("Failed to receive rank0_parity2");
-                }
-            } catch (...) {
-                recv_exceptions[1] = std::current_exception();
-            }
-        });
-        
-        recv_threads.emplace_back([&]() {
-            try {
-#if RDMA_AVAILABLE
-                if (use_rdma_ && rdma_load_channels_[2]) {
-                    rdma_load_channels_[2]->receive_data(reinterpret_cast<uint8_t*>(rank1_data1_addr), size);
-                } else
-#endif
-                if (!recv_with_size_bool(conn_.get_load_recv_rank1_data1_socket(),
-                                        reinterpret_cast<void*>(rank1_data1_addr), size)) {
-                    throw std::runtime_error("Failed to receive rank1_data1");
-                }
-            } catch (...) {
-                recv_exceptions[2] = std::current_exception();
-            }
-        });
-        
-        recv_threads.emplace_back([&]() {
-            try {
-#if RDMA_AVAILABLE
-                if (use_rdma_ && rdma_load_channels_[3]) {
-                    rdma_load_channels_[3]->receive_data(reinterpret_cast<uint8_t*>(rank1_parity1_addr), size);
-                } else
-#endif
-                if (!recv_with_size_bool(conn_.get_load_recv_rank1_parity1_socket(),
-                                        reinterpret_cast<void*>(rank1_parity1_addr), size)) {
-                    throw std::runtime_error("Failed to receive rank1_parity1");
-                }
-            } catch (...) {
-                recv_exceptions[3] = std::current_exception();
-            }
-        });
-        
-        recv_threads.emplace_back([&]() {
-            try {
-#if RDMA_AVAILABLE
-                if (use_rdma_ && rdma_load_channels_[4]) {
-                    rdma_load_channels_[4]->receive_data(reinterpret_cast<uint8_t*>(rank3_data1_addr), size);
-                } else
-#endif
-                if (!recv_with_size_bool(conn_.get_load_recv_rank3_data1_socket(),
-                                        reinterpret_cast<void*>(rank3_data1_addr), size)) {
-                    throw std::runtime_error("Failed to receive rank3_data1");
-                }
-            } catch (...) {
-                recv_exceptions[4] = std::current_exception();
-            }
-        });
-        
-        recv_threads.emplace_back([&]() {
-            try {
-#if RDMA_AVAILABLE
-                if (use_rdma_ && rdma_load_channels_[5]) {
-                    rdma_load_channels_[5]->receive_data(reinterpret_cast<uint8_t*>(rank3_data2_addr), size);
-                } else
-#endif
-                if (!recv_with_size_bool(conn_.get_load_recv_rank3_data2_socket(),
-                                        reinterpret_cast<void*>(rank3_data2_addr), size)) {
-                    throw std::runtime_error("Failed to receive rank3_data2");
-                }
-            } catch (...) {
-                recv_exceptions[5] = std::current_exception();
-            }
-        });
-        
-        // Join all receive threads
-        for (auto& t : recv_threads) {
-            t.join();
-        }
-        
-        // Check for exceptions
-        for (size_t i = 0; i < recv_exceptions.size(); ++i) {
-            if (recv_exceptions[i]) {
-                std::rethrow_exception(recv_exceptions[i]);
-            }
-        }
-        
+
+        onefail_recv_chunk_(
+            rank0_data2_addr, rank0_parity2_addr,
+            rank1_data1_addr, rank1_parity1_addr,
+            rank3_data1_addr, rank3_data2_addr,
+            size);
+
         std::cout << "ECLATIN: [Rank 2] All 6 blocks received" << std::endl;
-        
-        // Step 2: Parallel XOR recoveries using threads
-        std::vector<std::exception_ptr> xor_exceptions(4);
-        std::vector<std::thread> xor_threads;
-        
-        // data1 = rank0.data2 XOR rank1.parity1
-        xor_threads.emplace_back([&]() {
-            try {
-                xor_two_out_of_place(
-                    reinterpret_cast<uint8_t*>(recovered_data1_addr),
-                    reinterpret_cast<const uint8_t*>(rank0_data2_addr),
-                    reinterpret_cast<const uint8_t*>(rank1_parity1_addr),
-                    size);
-            } catch (...) {
-                xor_exceptions[0] = std::current_exception();
-            }
-        });
-        
-        // data2 = rank0.parity2 XOR rank1.data1
-        xor_threads.emplace_back([&]() {
-            try {
-                xor_two_out_of_place(
-                    reinterpret_cast<uint8_t*>(recovered_data2_addr),
-                    reinterpret_cast<const uint8_t*>(rank0_parity2_addr),
-                    reinterpret_cast<const uint8_t*>(rank1_data1_addr),
-                    size);
-            } catch (...) {
-                xor_exceptions[1] = std::current_exception();
-            }
-        });
-        
-        // parity1 = rank1.data1 XOR rank3.data2
-        xor_threads.emplace_back([&]() {
-            try {
-                xor_two_out_of_place(
-                    reinterpret_cast<uint8_t*>(recovered_parity1_addr),
-                    reinterpret_cast<const uint8_t*>(rank1_data1_addr),
-                    reinterpret_cast<const uint8_t*>(rank3_data2_addr),
-                    size);
-            } catch (...) {
-                xor_exceptions[2] = std::current_exception();
-            }
-        });
-        
-        // parity2 = rank0.data2 XOR rank3.data1
-        xor_threads.emplace_back([&]() {
-            try {
-                xor_two_out_of_place(
-                    reinterpret_cast<uint8_t*>(recovered_parity2_addr),
-                    reinterpret_cast<const uint8_t*>(rank0_data2_addr),
-                    reinterpret_cast<const uint8_t*>(rank3_data1_addr),
-                    size);
-            } catch (...) {
-                xor_exceptions[3] = std::current_exception();
-            }
-        });
-        
-        // Join all XOR threads
-        for (auto& t : xor_threads) {
-            t.join();
-        }
-        
-        // Check for exceptions
-        for (size_t i = 0; i < xor_exceptions.size(); ++i) {
-            if (xor_exceptions[i]) {
-                std::rethrow_exception(xor_exceptions[i]);
-            }
-        }
-        
+
+        onefail_xor_chunk_(
+            rank0_data2_addr, rank0_parity2_addr,
+            rank1_data1_addr, rank1_parity1_addr,
+            rank3_data1_addr, rank3_data2_addr,
+            recovered_data1_addr, recovered_data2_addr,
+            recovered_parity1_addr, recovered_parity2_addr,
+            size);
+
         std::cout << "ECLATIN: [Rank 2] Recovery completed successfully" << std::endl;
     }
 
@@ -2937,23 +3004,13 @@ public:
                   << " recovery completed successfully" << std::endl;
     }
 
-    // Unified send interface for other ranks (rank1, rank2, rank3) - parallel send two blocks
-    void load_send_blocks(
+    void onefail_send_chunk_(
         const std::string& block1_name,
         uintptr_t block1_addr,
         const std::string& block2_name,
         uintptr_t block2_addr,
         size_t size
     ) {
-        if (!is_load_mode_) {
-            std::cerr << "ECLATIN: load_send_blocks called but not in load mode" << std::endl;
-            return;
-        }
-        
-        std::cout << "ECLATIN: Starting parallel send of " << block1_name 
-                  << " and " << block2_name << " to rank2 (size=" << size << ")" << std::endl;
-        
-        // Helper function to get socket by block name
         auto get_socket = [this](const std::string& block_name) -> boost::asio::ip::tcp::socket* {
             if (block_name == "rank0_data2") {
                 return &conn_.get_load_send_rank0_data2_socket();
@@ -2971,7 +3028,6 @@ public:
             return nullptr;
         };
 #if RDMA_AVAILABLE
-        // Helper: block_name -> load channel index (0..5)
         auto get_load_rdma_ch = [](const std::string& block_name) -> int {
             if (block_name == "rank0_data2") return 0;
             if (block_name == "rank0_parity2") return 1;
@@ -2982,74 +3038,82 @@ public:
             return -1;
         };
 #endif
-        
-        // Parallel send using two threads
+
         std::exception_ptr thread1_exception = nullptr;
         std::exception_ptr thread2_exception = nullptr;
-        
+
         std::thread thread1([&]() {
             try {
-                std::cout << "ECLATIN: Sending " << block1_name << " to rank2 (size=" << size << ")" << std::endl;
 #if RDMA_AVAILABLE
                 int ch1 = get_load_rdma_ch(block1_name);
                 if (use_rdma_ && ch1 >= 0 && rdma_load_channels_[ch1]) {
-                    rdma_load_channels_[ch1]->send_data(reinterpret_cast<const uint8_t*>(block1_addr), size);
+                    rdma_load_channels_[ch1]->send_data(
+                        reinterpret_cast<const uint8_t*>(block1_addr), size);
                 } else
 #endif
                 {
                     boost::asio::ip::tcp::socket* sock = get_socket(block1_name);
                     if (sock == nullptr || !sock->is_open()) {
-                        throw std::runtime_error("ECLATIN: load_send_blocks socket not available for " + block1_name);
+                        throw std::runtime_error(
+                            "ECLATIN: onefail_send_chunk socket not available for " + block1_name);
                     }
                     if (!send_with_size(*sock, block1_addr, size)) {
-                        throw std::runtime_error("ECLATIN: load_send_blocks send failed for " + block1_name);
+                        throw std::runtime_error(
+                            "ECLATIN: onefail_send_chunk send failed for " + block1_name);
                     }
                 }
-                std::cout << "ECLATIN: Successfully sent " << block1_name << " to rank2" << std::endl;
             } catch (...) {
                 thread1_exception = std::current_exception();
             }
         });
-        
+
         std::thread thread2([&]() {
             try {
-                std::cout << "ECLATIN: Sending " << block2_name << " to rank2 (size=" << size << ")" << std::endl;
 #if RDMA_AVAILABLE
                 int ch2 = get_load_rdma_ch(block2_name);
                 if (use_rdma_ && ch2 >= 0 && rdma_load_channels_[ch2]) {
-                    std::cout << "[ECLATIN RDMA] Load: Sending " << block2_name << " (" << size << " bytes) via RDMA" << std::endl;
-                    rdma_load_channels_[ch2]->send_data(reinterpret_cast<const uint8_t*>(block2_addr), size);
+                    rdma_load_channels_[ch2]->send_data(
+                        reinterpret_cast<const uint8_t*>(block2_addr), size);
                 } else
 #endif
                 {
-                    std::cout << "[ECLATIN ASIO] Load: Sending " << block2_name << " (" << size << " bytes) via ASIO" << std::endl;
                     boost::asio::ip::tcp::socket* sock = get_socket(block2_name);
                     if (sock == nullptr || !sock->is_open()) {
-                        throw std::runtime_error("ECLATIN: load_send_blocks socket not available for " + block2_name);
+                        throw std::runtime_error(
+                            "ECLATIN: onefail_send_chunk socket not available for " + block2_name);
                     }
                     if (!send_with_size(*sock, block2_addr, size)) {
-                        throw std::runtime_error("ECLATIN: load_send_blocks send failed for " + block2_name);
+                        throw std::runtime_error(
+                            "ECLATIN: onefail_send_chunk send failed for " + block2_name);
                     }
                 }
-                
-                std::cout << "ECLATIN: Successfully sent " << block2_name << " to rank2" << std::endl;
             } catch (...) {
                 thread2_exception = std::current_exception();
             }
         });
-        
-        // Join both threads
+
         thread1.join();
         thread2.join();
-        
-        // Check for exceptions
-        if (thread1_exception) {
-            std::rethrow_exception(thread1_exception);
+        if (thread1_exception) std::rethrow_exception(thread1_exception);
+        if (thread2_exception) std::rethrow_exception(thread2_exception);
+    }
+
+    // Unified send interface for other ranks (rank1, rank2, rank3) - parallel send two blocks
+    void load_send_blocks(
+        const std::string& block1_name,
+        uintptr_t block1_addr,
+        const std::string& block2_name,
+        uintptr_t block2_addr,
+        size_t size
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "ECLATIN: load_send_blocks called but not in load mode" << std::endl;
+            return;
         }
-        if (thread2_exception) {
-            std::rethrow_exception(thread2_exception);
-        }
-        
+
+        std::cout << "ECLATIN: Starting parallel send of " << block1_name
+                  << " and " << block2_name << " to rank2 (size=" << size << ")" << std::endl;
+        onefail_send_chunk_(block1_name, block1_addr, block2_name, block2_addr, size);
         std::cout << "ECLATIN: Both blocks sent successfully" << std::endl;
     }
 
@@ -3608,6 +3672,244 @@ public:
 
         std::cout << "ECLATIN: [Two-fail v2] rig" << rank_in_group
                   << " received all 4 blocks (TCP)" << std::endl;
+    }
+
+    // ── One-fail (rig2) chunked load pipeline ────────────────────────────────
+
+    void onefail_set_pipeline_error(std::exception_ptr ex) {
+        if (!ex) return;
+        std::lock_guard<std::mutex> lock(onefail_net_mutex_);
+        if (!onefail_pipeline_error_) {
+            onefail_pipeline_error_ = ex;
+        }
+    }
+
+    void onefail_rethrow_if_error() {
+        if (onefail_pipeline_error_) {
+            std::rethrow_exception(onefail_pipeline_error_);
+        }
+    }
+
+    void onefail_release_pool_buffers(const OnefailPipelineTask& task) {
+        if (task.num_release <= 0) return;
+        std::lock_guard<std::mutex> lock(onefail_release_mutex_);
+        for (int i = 0; i < task.num_release; ++i) {
+            if (task.release_addrs[i] != 0) {
+                onefail_buffers_to_release_.push(task.release_addrs[i]);
+            }
+        }
+    }
+
+    void reset_onefail_pipeline() {
+        onefail_pipeline_error_ = nullptr;
+        onefail_net_done_ = false;
+        onefail_xor_done_ = false;
+        {
+            std::lock_guard<std::mutex> lk(onefail_net_mutex_);
+            while (!onefail_net_q_.empty()) onefail_net_q_.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(onefail_xor_mutex_);
+            while (!onefail_xor_q_.empty()) onefail_xor_q_.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(onefail_release_mutex_);
+            while (!onefail_buffers_to_release_.empty()) onefail_buffers_to_release_.pop();
+        }
+        std::cout << "ECLATIN: [One-fail] pipeline reset (rig" << rank_in_group_ << ")" << std::endl;
+    }
+
+    void submit_onefail_send_chunk(
+        int /*rank_in_group*/,
+        const std::string& block1_name,
+        uintptr_t block1_addr,
+        const std::string& block2_name,
+        uintptr_t block2_addr,
+        size_t size,
+        int chunk_index
+    ) {
+        if (!is_load_mode_) {
+            throw std::runtime_error("ECLATIN: submit_onefail_send_chunk called but not in load mode");
+        }
+        OnefailPipelineTask task;
+        task.kind = OnefailTaskKind::Send;
+        task.size = size;
+        task.chunk_index = chunk_index;
+        task.send_b1_name = block1_name;
+        task.send_b2_name = block2_name;
+        task.send_b1_addr = block1_addr;
+        task.send_b2_addr = block2_addr;
+        task.num_release = 0;
+        {
+            std::lock_guard<std::mutex> lk(onefail_net_mutex_);
+            onefail_net_q_.push(task);
+        }
+        onefail_net_cv_.notify_one();
+    }
+
+    void submit_onefail_recv_chunk(
+        uintptr_t r0d2, uintptr_t r0p2,
+        uintptr_t r1d1, uintptr_t r1p1,
+        uintptr_t r3d1, uintptr_t r3d2,
+        uintptr_t out_d1, uintptr_t out_d2,
+        uintptr_t out_p1, uintptr_t out_p2,
+        size_t size, int chunk_index,
+        uintptr_t rel0, uintptr_t rel1, uintptr_t rel2,
+        uintptr_t rel3, uintptr_t rel4, uintptr_t rel5
+    ) {
+        if (!is_load_mode_) {
+            throw std::runtime_error("ECLATIN: submit_onefail_recv_chunk called but not in load mode");
+        }
+        OnefailPipelineTask task;
+        task.kind = OnefailTaskKind::Recv;
+        task.size = size;
+        task.chunk_index = chunk_index;
+        task.r0d2 = r0d2;
+        task.r0p2 = r0p2;
+        task.r1d1 = r1d1;
+        task.r1p1 = r1p1;
+        task.r3d1 = r3d1;
+        task.r3d2 = r3d2;
+        task.out_d1 = out_d1;
+        task.out_d2 = out_d2;
+        task.out_p1 = out_p1;
+        task.out_p2 = out_p2;
+        task.release_addrs[0] = rel0;
+        task.release_addrs[1] = rel1;
+        task.release_addrs[2] = rel2;
+        task.release_addrs[3] = rel3;
+        task.release_addrs[4] = rel4;
+        task.release_addrs[5] = rel5;
+        task.num_release = 6;
+        {
+            std::lock_guard<std::mutex> lk(onefail_net_mutex_);
+            onefail_net_q_.push(task);
+        }
+        onefail_net_cv_.notify_one();
+    }
+
+    void submit_onefail_pipeline_sentinels() {
+        OnefailPipelineTask sentinel = OnefailPipelineTask::make_sentinel();
+        {
+            std::lock_guard<std::mutex> lk(onefail_net_mutex_);
+            onefail_net_q_.push(sentinel);
+        }
+        onefail_net_cv_.notify_one();
+    }
+
+    std::vector<uintptr_t> get_onefail_buffers_to_release() {
+        std::vector<uintptr_t> out;
+        std::lock_guard<std::mutex> lk(onefail_release_mutex_);
+        while (!onefail_buffers_to_release_.empty()) {
+            out.push_back(onefail_buffers_to_release_.front());
+            onefail_buffers_to_release_.pop();
+        }
+        return out;
+    }
+
+    void wait_for_onefail_pipeline_completion() {
+        int spin = 0;
+        while (!onefail_net_done_ || !onefail_xor_done_) {
+            if (spin++ % 100 == 0) {
+                std::cout << "ECLATIN: [One-fail] waiting for pipeline workers: net="
+                          << onefail_net_done_.load() << " xor=" << onefail_xor_done_.load()
+                          << std::endl;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        onefail_rethrow_if_error();
+        std::cout << "ECLATIN: [One-fail] pipeline completed (rig" << rank_in_group_ << ")" << std::endl;
+    }
+
+    void onefail_net_worker() {
+        std::cout << "ECLATIN: [One-fail] net worker started (rig" << rank_in_group_ << ")" << std::endl;
+        while (!stop_.load()) {
+            OnefailPipelineTask task;
+            {
+                std::unique_lock<std::mutex> lk(onefail_net_mutex_);
+                onefail_net_cv_.wait(lk, [this] {
+                    return stop_.load() || !onefail_net_q_.empty();
+                });
+                if (stop_.load() && onefail_net_q_.empty()) break;
+                if (onefail_net_q_.empty()) continue;
+                task = onefail_net_q_.front();
+                onefail_net_q_.pop();
+            }
+            if (task.is_sentinel()) {
+                {
+                    std::lock_guard<std::mutex> lk(onefail_xor_mutex_);
+                    onefail_xor_q_.push(task);
+                }
+                onefail_xor_cv_.notify_one();
+                onefail_net_done_ = true;
+                continue;
+            }
+            try {
+                if (task.kind == OnefailTaskKind::Send) {
+                    onefail_send_chunk_(
+                        task.send_b1_name, task.send_b1_addr,
+                        task.send_b2_name, task.send_b2_addr,
+                        task.size);
+                } else if (rank_in_group_ == 2) {
+                    onefail_recv_chunk_(
+                        task.r0d2, task.r0p2, task.r1d1, task.r1p1,
+                        task.r3d1, task.r3d2, task.size);
+                    {
+                        std::lock_guard<std::mutex> lk(onefail_xor_mutex_);
+                        onefail_xor_q_.push(task);
+                    }
+                    onefail_xor_cv_.notify_one();
+                }
+            } catch (...) {
+                onefail_set_pipeline_error(std::current_exception());
+                onefail_net_done_ = true;
+                onefail_xor_done_ = true;
+                onefail_net_cv_.notify_all();
+                onefail_xor_cv_.notify_all();
+                continue;
+            }
+        }
+        std::cout << "ECLATIN: [One-fail] net worker done (rig" << rank_in_group_ << ")" << std::endl;
+    }
+
+    void onefail_xor_worker() {
+        std::cout << "ECLATIN: [One-fail] XOR worker started (rig" << rank_in_group_ << ")" << std::endl;
+        while (!stop_.load()) {
+            OnefailPipelineTask task;
+            {
+                std::unique_lock<std::mutex> lk(onefail_xor_mutex_);
+                onefail_xor_cv_.wait(lk, [this] {
+                    return stop_.load() || !onefail_xor_q_.empty();
+                });
+                if (stop_.load() && onefail_xor_q_.empty()) break;
+                if (onefail_xor_q_.empty()) continue;
+                task = onefail_xor_q_.front();
+                onefail_xor_q_.pop();
+            }
+            if (task.is_sentinel()) {
+                onefail_xor_done_ = true;
+                continue;
+            }
+            try {
+                if (rank_in_group_ == 2 && task.kind == OnefailTaskKind::Recv) {
+                    std::lock_guard<std::mutex> pool_lk(xor_pool_work_mutex_);
+                    onefail_xor_chunk_(
+                        task.r0d2, task.r0p2, task.r1d1, task.r1p1,
+                        task.r3d1, task.r3d2,
+                        task.out_d1, task.out_d2, task.out_p1, task.out_p2,
+                        task.size);
+                    onefail_release_pool_buffers(task);
+                }
+            } catch (...) {
+                onefail_set_pipeline_error(std::current_exception());
+                onefail_net_done_ = true;
+                onefail_xor_done_ = true;
+                onefail_net_cv_.notify_all();
+                onefail_xor_cv_.notify_all();
+                continue;
+            }
+        }
+        std::cout << "ECLATIN: [One-fail] XOR worker done (rig" << rank_in_group_ << ")" << std::endl;
     }
 
     // ── Two-fail v2: chunk-level helpers (pipeline workers + bulk pybind) ────
@@ -4279,6 +4581,21 @@ private:
     std::queue<uintptr_t> twofail_buffers_to_release_;
     std::mutex twofail_release_mutex_;
     std::exception_ptr twofail_pipeline_error_{nullptr};
+
+    // One-fail (rig2) chunked load pipeline (2-stage: net -> xor)
+    std::queue<OnefailPipelineTask> onefail_net_q_;
+    std::mutex onefail_net_mutex_;
+    std::condition_variable onefail_net_cv_;
+    std::queue<OnefailPipelineTask> onefail_xor_q_;
+    std::mutex onefail_xor_mutex_;
+    std::condition_variable onefail_xor_cv_;
+    std::thread onefail_net_thread_;
+    std::thread onefail_xor_thread_;
+    std::atomic<bool> onefail_net_done_{false};
+    std::atomic<bool> onefail_xor_done_{false};
+    std::queue<uintptr_t> onefail_buffers_to_release_;
+    std::mutex onefail_release_mutex_;
+    std::exception_ptr onefail_pipeline_error_{nullptr};
     
     // Layer-wise processing (save mode)
     std::queue<LayerWiseTask> layerwise_queue_;
@@ -4408,7 +4725,9 @@ private:
         twofail_exch_thread_ = std::thread(&ECLATINNative::twofail_exch_worker, this);
         twofail_xor_thread_ = std::thread(&ECLATINNative::twofail_xor_worker, this);
         twofail_fwd_thread_ = std::thread(&ECLATINNative::twofail_fwd_worker, this);
-        std::cout << "ECLATIN: All worker threads started (including layerwise load and twofail pipeline)" << std::endl;
+        onefail_net_thread_ = std::thread(&ECLATINNative::onefail_net_worker, this);
+        onefail_xor_thread_ = std::thread(&ECLATINNative::onefail_xor_worker, this);
+        std::cout << "ECLATIN: All worker threads started (including layerwise load, twofail and onefail pipelines)" << std::endl;
     }
 
     // ── XOR pool methods ──────────────────────────────────────────────
@@ -7059,6 +7378,30 @@ PYBIND11_MODULE(eclatin_native, m) {
              "Block until all twofail pipeline workers finish")
         .def("get_twofail_buffers_to_release", &ECLATINNative::get_twofail_buffers_to_release,
              "Poll pool buffer addresses ready for release after twofail pipeline")
+        .def("reset_onefail_pipeline", &ECLATINNative::reset_onefail_pipeline,
+             "Reset one-fail chunked load pipeline state")
+        .def("submit_onefail_send_chunk", &ECLATINNative::submit_onefail_send_chunk,
+             "Submit one sender load chunk to the one-fail pipeline",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("block1_name"), pybind11::arg("block1_addr"),
+             pybind11::arg("block2_name"), pybind11::arg("block2_addr"),
+             pybind11::arg("size"), pybind11::arg("chunk_index"))
+        .def("submit_onefail_recv_chunk", &ECLATINNative::submit_onefail_recv_chunk,
+             "Submit one rig2 recv+xor load chunk to the one-fail pipeline",
+             pybind11::arg("r0d2"), pybind11::arg("r0p2"),
+             pybind11::arg("r1d1"), pybind11::arg("r1p1"),
+             pybind11::arg("r3d1"), pybind11::arg("r3d2"),
+             pybind11::arg("out_d1"), pybind11::arg("out_d2"),
+             pybind11::arg("out_p1"), pybind11::arg("out_p2"),
+             pybind11::arg("size"), pybind11::arg("chunk_index"),
+             pybind11::arg("rel0"), pybind11::arg("rel1"), pybind11::arg("rel2"),
+             pybind11::arg("rel3"), pybind11::arg("rel4"), pybind11::arg("rel5"))
+        .def("submit_onefail_pipeline_sentinels", &ECLATINNative::submit_onefail_pipeline_sentinels,
+             "Submit pipeline sentinels to drain one-fail load workers")
+        .def("wait_for_onefail_pipeline_completion", &ECLATINNative::wait_for_onefail_pipeline_completion,
+             "Block until all one-fail load pipeline workers finish")
+        .def("get_onefail_buffers_to_release", &ECLATINNative::get_onefail_buffers_to_release,
+             "Poll recv pool buffer addresses ready for release after one-fail pipeline")
         .def("stop", &ECLATINNative::stop);
 }
 

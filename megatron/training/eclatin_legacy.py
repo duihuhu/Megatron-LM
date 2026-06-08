@@ -768,27 +768,15 @@ def _max_tensor_bytes_from_registry(registry: GlobalMetadataRegistry, world_size
     return max_bytes
 
 
-def _run_eclatin_full_recovery(
+def _init_onefail_load_connections(
     manager: ECLATINManager,
     rank: int,
     world_size: int,
-    eclatin_blocks: Dict[str, Any],
-    recv_buffers: Optional[Dict[str, torch.Tensor]],
-    recovered_buffer: Optional[torch.Tensor],
-    total_size: int,
-    registry: GlobalMetadataRegistry,
-) -> float:
-    from megatron.training import get_args as use_args
-    from time import time
-
+) -> None:
+    """Phase 0: establish single-failure load connections before timing."""
     native = manager._eclatin_native
     if native is None:
         raise RuntimeError("ECLATIN native module is not initialized")
-
-    input_args = use_args()
-    if input_args.use_eclatin_software_failure:
-        # main.pt is intact — no network config, no transfer, no barrier needed.
-        return 0.0
 
     net_config = manager._get_eclatin_network_config(rank, world_size)
     rank_in_group = net_config["rank_in_group"]
@@ -807,7 +795,6 @@ def _run_eclatin_full_recovery(
     load_recv_rank3_data1_port = net_config["ports"]["load_recv_rank3_data1"]
     load_recv_rank3_data2_port = net_config["ports"]["load_recv_rank3_data2"]
 
-    # Barrier: ensure all ranks reach this point before rig2 starts binding
     torch.distributed.barrier()
 
     if rank_in_group == 2:
@@ -823,7 +810,6 @@ def _run_eclatin_full_recovery(
             load_recv_rank3_data2_port,
         )
 
-    # Barrier: ensure rig2's acceptors are bound and listening
     torch.distributed.barrier()
 
     if rank_in_group != 2:
@@ -844,74 +830,139 @@ def _run_eclatin_full_recovery(
     torch.distributed.barrier()
     native.wait_for_load_connections(timeout_seconds=30)
     torch.distributed.barrier()
+    logger.info("ECLATIN one-fail: Phase 0 - all load connections established")
 
+
+def _run_eclatin_full_recovery(
+    manager: ECLATINManager,
+    rank: int,
+    world_size: int,
+    eclatin_blocks: Dict[str, Any],
+    recovered_buffer: Optional[torch.Tensor],
+    total_size: int,
+    registry: GlobalMetadataRegistry,
+) -> float:
+    from megatron.training import get_args as use_args
+    from time import time
+
+    native = manager._eclatin_native
+    if native is None:
+        raise RuntimeError("ECLATIN native module is not initialized")
+
+    input_args = use_args()
+    if input_args.use_eclatin_software_failure:
+        return 0.0
+
+    net_config = manager._get_eclatin_network_config(rank, world_size)
+    rank_in_group = net_config["rank_in_group"]
     aligned_half_block_size = eclatin_blocks["data_block_1"].numel()
+    chunk_size = manager.eclatin_buffer_size
 
-    t_net_start = time()
-    if rank_in_group == 2:
-        if recv_buffers is None or recovered_buffer is None:
-            raise RuntimeError(
-                "ECLATIN legacy load: rank_in_group 2 needs recv_buffers and recovered_buffer"
-            )
-        rank0_data2_addr = int(recv_buffers["rank0_data2"].data_ptr())
-        rank0_parity2_addr = int(recv_buffers["rank0_parity2"].data_ptr())
-        rank1_data1_addr = int(recv_buffers["rank1_data1"].data_ptr())
-        rank1_parity1_addr = int(recv_buffers["rank1_parity1"].data_ptr())
-        rank3_data1_addr = int(recv_buffers["rank3_data1"].data_ptr())
-        rank3_data2_addr = int(recv_buffers["rank3_data2"].data_ptr())
-        recovered_data1_addr = int(eclatin_blocks["data_block_1"].data_ptr())
-        recovered_data2_addr = int(eclatin_blocks["data_block_2"].data_ptr())
-        recovered_parity1_addr = int(eclatin_blocks["parity_block_1"].data_ptr())
-        recovered_parity2_addr = int(eclatin_blocks["parity_block_2"].data_ptr())
-
-        native.load_recover(
-            rank0_data2_addr,
-            rank0_parity2_addr,
-            rank1_data1_addr,
-            rank1_parity1_addr,
-            rank3_data1_addr,
-            rank3_data2_addr,
-            recovered_data1_addr,
-            recovered_data2_addr,
-            recovered_parity1_addr,
-            recovered_parity2_addr,
-            aligned_half_block_size,
-        )
-    elif rank_in_group == 0:
-        data2_addr = int(eclatin_blocks["data_block_2"].data_ptr())
-        parity2_addr = int(eclatin_blocks["parity_block_2"].data_ptr())
-        native.load_send_blocks(
-            "rank0_data2",
-            data2_addr,
-            "rank0_parity2",
-            parity2_addr,
-            aligned_half_block_size,
-        )
-    elif rank_in_group == 1:
-        data1_addr = int(eclatin_blocks["data_block_1"].data_ptr())
-        parity1_addr = int(eclatin_blocks["parity_block_1"].data_ptr())
-        native.load_send_blocks(
-            "rank1_data1",
-            data1_addr,
-            "rank1_parity1",
-            parity1_addr,
-            aligned_half_block_size,
-        )
-    elif rank_in_group == 3:
-        data1_addr = int(eclatin_blocks["data_block_1"].data_ptr())
-        data2_addr = int(eclatin_blocks["data_block_2"].data_ptr())
-        native.load_send_blocks(
-            "rank3_data1",
-            data1_addr,
-            "rank3_data2",
-            data2_addr,
-            aligned_half_block_size,
-        )
-    else:
+    buffers = manager.get_eclatin_buffers()
+    if buffers is None:
         raise RuntimeError(
-            f"ECLATIN legacy load: unexpected rank_in_group={rank_in_group}"
+            "ECLATIN one-fail: buffer pools are not initialized "
+            "(disable --use-eclatin-layerwise for legacy ECLATIN load)"
         )
-    t_network_encode = time() - t_net_start
+
+    free_recv_queue = buffers["free_recv_buffer_queue"]
+    active_event = buffers.get("buffer_poller_active_event")
+    poll_and_release = buffers.get("poll_and_release_buffers")
+
+    def get_free_recv_buffer() -> int:
+        if poll_and_release is not None:
+            poll_and_release()
+        try:
+            return free_recv_queue.get(timeout=5.0)
+        except queue.Empty:
+            logger.error("ECLATIN one-fail: timeout waiting for free recv buffer")
+            return free_recv_queue.get()
+
+    logger.info(
+        f"ECLATIN one-fail: starting chunked load recovery (rig{rank_in_group}), "
+        f"half_block={aligned_half_block_size / (1024**2):.0f} MB, "
+        f"chunk={chunk_size / (1024**2):.0f} MB"
+    )
+
+    torch.distributed.barrier()
+    native.reset_onefail_pipeline()
+
+    processed = 0
+    chunk_index = 0
+    t0 = time()
+
+    if active_event is not None:
+        active_event.set()
+
+    try:
+        while processed < aligned_half_block_size:
+            remaining = aligned_half_block_size - processed
+            take = min(chunk_size, remaining)
+            off = ((processed + 63) // 64) * 64
+
+            if rank_in_group == 2:
+                if recovered_buffer is None:
+                    raise RuntimeError(
+                        "ECLATIN one-fail: rank_in_group 2 needs recovered_buffer"
+                    )
+                r0d2 = get_free_recv_buffer()
+                r0p2 = get_free_recv_buffer()
+                r1d1 = get_free_recv_buffer()
+                r1p1 = get_free_recv_buffer()
+                r3d1 = get_free_recv_buffer()
+                r3d2 = get_free_recv_buffer()
+
+                out_d1 = int(eclatin_blocks["data_block_1"].data_ptr()) + off
+                out_d2 = int(eclatin_blocks["data_block_2"].data_ptr()) + off
+                out_p1 = int(eclatin_blocks["parity_block_1"].data_ptr()) + off
+                out_p2 = int(eclatin_blocks["parity_block_2"].data_ptr()) + off
+
+                native.submit_onefail_recv_chunk(
+                    r0d2, r0p2, r1d1, r1p1, r3d1, r3d2,
+                    out_d1, out_d2, out_p1, out_p2,
+                    take, chunk_index,
+                    r0d2, r0p2, r1d1, r1p1, r3d1, r3d2,
+                )
+            elif rank_in_group == 0:
+                d2 = int(eclatin_blocks["data_block_2"].data_ptr()) + off
+                p2 = int(eclatin_blocks["parity_block_2"].data_ptr()) + off
+                native.submit_onefail_send_chunk(
+                    rank_in_group, "rank0_data2", d2, "rank0_parity2", p2, take, chunk_index
+                )
+            elif rank_in_group == 1:
+                d1 = int(eclatin_blocks["data_block_1"].data_ptr()) + off
+                p1 = int(eclatin_blocks["parity_block_1"].data_ptr()) + off
+                native.submit_onefail_send_chunk(
+                    rank_in_group, "rank1_data1", d1, "rank1_parity1", p1, take, chunk_index
+                )
+            elif rank_in_group == 3:
+                d1 = int(eclatin_blocks["data_block_1"].data_ptr()) + off
+                d2 = int(eclatin_blocks["data_block_2"].data_ptr()) + off
+                native.submit_onefail_send_chunk(
+                    rank_in_group, "rank3_data1", d1, "rank3_data2", d2, take, chunk_index
+                )
+            else:
+                raise RuntimeError(
+                    f"ECLATIN one-fail: unexpected rank_in_group={rank_in_group}"
+                )
+
+            processed = off + take
+            chunk_index += 1
+            if poll_and_release is not None:
+                poll_and_release()
+    finally:
+        if active_event is not None:
+            active_event.clear()
+
+    native.submit_onefail_pipeline_sentinels()
+    native.wait_for_onefail_pipeline_completion()
+
+    if poll_and_release is not None:
+        for _ in range(20):
+            poll_and_release()
+
+    t_network_encode = time() - t0
+    torch.distributed.barrier()
 
     if rank_in_group == 2 and recovered_buffer is not None:
         actual_tensor_buffer_size = _max_tensor_bytes_from_registry(registry, world_size)
@@ -927,10 +978,9 @@ def _run_eclatin_full_recovery(
                     eclatin_blocks["data_block_2"][:second_half_size]
                 )
 
-    torch.distributed.barrier()
-
     logger.info(
-        f"ECLATIN legacy: hw recovery pipeline done in {t_network_encode:.2f}s"
+        f"ECLATIN legacy: one-fail chunked pipeline done in {t_network_encode:.2f}s "
+        f"({chunk_index} chunks)"
     )
     return t_network_encode
 
@@ -1210,7 +1260,6 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     sw_failure = bool(getattr(args, "use_eclatin_software_failure", False))
     two_failures = bool(getattr(args, "use_eclatin_two_failures", False))
 
-    recv_buffers: Optional[Dict[str, torch.Tensor]] = None
     recovered_buffer: Optional[torch.Tensor] = None
     total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
 
@@ -1247,7 +1296,6 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
                     recovered_buffer[first:total_size],
                 )
         else:
-            recv_buffers = manager.allocate_eclatin_load_recv_buffers(registry)
             recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
     else:
         _load_eclatin_blocks_from_disk_into(
@@ -1262,15 +1310,14 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         if not sw_failure:
             for key in ("data_block_1", "data_block_2", "parity_block_1", "parity_block_2"):
                 manager.register_buffer(eclatin_blocks[key])
-            if recv_buffers is not None:
-                for t in recv_buffers.values():
-                    manager.register_buffer(t)
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 
     # === Phase 0: establish connections (not timed) ===
     if two_failures:
         _init_twofail_connections(manager=manager, rank=rank, world_size=world_size)
+    elif not sw_failure:
+        _init_onefail_load_connections(manager=manager, rank=rank, world_size=world_size)
 
     torch.distributed.barrier()
 
@@ -1291,7 +1338,6 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             rank=rank,
             world_size=world_size,
             eclatin_blocks=eclatin_blocks,
-            recv_buffers=recv_buffers,
             recovered_buffer=recovered_buffer,
             total_size=total_size,
             registry=registry,

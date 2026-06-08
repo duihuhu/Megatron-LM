@@ -982,6 +982,16 @@ class ECLATINManager:
             except Exception:
                 logger.error(f"ECLATIN: Recv buffer queue is full, cannot release buffer {recv_addr}")
 
+        # Get twofail pipeline pool buffers ready for release
+        twofail_buffers = self._eclatin_native.get_twofail_buffers_to_release()
+        for data_addr in twofail_buffers:
+            try:
+                self._free_data_buffer_queue.put_nowait(data_addr)
+            except Exception:
+                logger.error(
+                    f"ECLATIN: Data buffer queue is full, cannot release twofail buffer {data_addr}"
+                )
+
     def _start_buffer_poller_thread(self):
         """Start a persistent background thread to poll and release buffers."""
         if hasattr(self, '_buffer_poller_thread') and self._buffer_poller_thread is not None:

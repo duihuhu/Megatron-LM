@@ -1,6 +1,5 @@
 import ctypes
 import queue
-import threading
 import time
 from logging import getLogger
 from pathlib import Path
@@ -1024,17 +1023,32 @@ def _twofail_recv_block_addrs(
     return [int(eclatin_blocks[key_map[k]].data_ptr()) for k in recv_order]
 
 
+def _twofail_recv_block_addrs(
+    eclatin_blocks: Dict[str, Any], rank_in_group: int
+) -> List[int]:
+    """Return recv_four_blocks addrs pointing directly into eclatin_blocks."""
+    key_map = _TWOFAIL_RECV_KEY_TO_BLOCK[rank_in_group]
+    recv_order = list(key_map.keys())
+    return [int(eclatin_blocks[key_map[k]].data_ptr()) for k in recv_order]
+
+
+def _twofail_recv_block_addrs_at_offset(
+    eclatin_blocks: Dict[str, Any], rank_in_group: int, offset: int
+) -> List[int]:
+    """Return recv addrs at byte offset within each eclatin block."""
+    return [addr + offset for addr in _twofail_recv_block_addrs(eclatin_blocks, rank_in_group)]
+
+
 def _run_eclatin_two_failures_recovery(
     manager: ECLATINManager,
     rank: int,
     world_size: int,
     eclatin_blocks: Dict[str, Any],
     recovered_buffer: Optional[torch.Tensor],
-    surv_bufs: Optional[Dict[str, torch.Tensor]],
     total_size: int,
     registry: GlobalMetadataRegistry,
 ) -> float:
-    """3-step two-failures recovery (connections established in Phase 0)."""
+    """Chunked two-failures recovery via C++ pipeline (connections established in Phase 0)."""
     from time import time
 
     native = manager._eclatin_native
@@ -1044,90 +1058,97 @@ def _run_eclatin_two_failures_recovery(
     net_config = manager._get_eclatin_network_config(rank, world_size)
     rank_in_group = net_config["rank_in_group"]
     aligned_half_block_size = eclatin_blocks["data_block_1"].numel()
+    chunk_size = manager.eclatin_buffer_size
 
-    logger.info(f"ECLATIN two-failures: starting 3-step recovery (rig{rank_in_group})")
-    t_network_encode = 0.0
+    buffers = manager.get_eclatin_buffers()
+    if buffers is None:
+        raise RuntimeError(
+            "ECLATIN two-failures: buffer pools are not initialized "
+            "(disable --use-eclatin-layerwise for legacy ECLATIN load)"
+        )
 
-    # === Step 1: Survivor exchange ===
-    _t0 = time()
-    if rank_in_group in (2, 3):
-        peer_d1 = int(surv_bufs["peer_d1"].data_ptr())
-        peer_d2 = int(surv_bufs["peer_d2"].data_ptr())
-        own_d1 = int(eclatin_blocks["data_block_1"].data_ptr())
-        own_d2 = int(eclatin_blocks["data_block_2"].data_ptr())
-        native.survivor_exchange_data(rank_in_group, own_d1, own_d2, peer_d1, peer_d2, aligned_half_block_size)
-    t_network_encode += time() - _t0
+    free_data_queue = buffers["free_data_buffer_queue"]
+    active_event = buffers.get("buffer_poller_active_event")
+    poll_and_release = buffers.get("poll_and_release_buffers")
+
+    def get_free_data_buffer() -> int:
+        if poll_and_release is not None:
+            poll_and_release()
+        try:
+            return free_data_queue.get(timeout=5.0)
+        except queue.Empty:
+            logger.error("ECLATIN two-failures: timeout waiting for free data buffer")
+            return free_data_queue.get()
+
+    logger.info(
+        f"ECLATIN two-failures: starting chunked pipeline recovery (rig{rank_in_group}), "
+        f"half_block={aligned_half_block_size / (1024**2):.0f} MB, "
+        f"chunk={chunk_size / (1024**2):.0f} MB"
+    )
+
     torch.distributed.barrier()
-    logger.info("ECLATIN two-failures: Step 1 (survivor exchange) done")
+    native.reset_twofail_pipeline()
 
-    # === Step 2 + 3 (overlapped): survivors XOR while failed ranks block in recv ===
-    recv_thread: Optional[threading.Thread] = None
-    recv_error: List[BaseException] = []
+    processed = 0
+    chunk_index = 0
+    t0 = time()
 
-    if rank_in_group in (0, 1):
-        recv_addrs = _twofail_recv_block_addrs(eclatin_blocks, rank_in_group)
+    if active_event is not None:
+        active_event.set()
 
-        def _recv_worker() -> None:
-            try:
-                native.recv_four_blocks(
+    try:
+        while processed < aligned_half_block_size:
+            remaining = aligned_half_block_size - processed
+            take = min(chunk_size, remaining)
+            off = ((processed + 63) // 64) * 64
+
+            if rank_in_group in (2, 3):
+                peer_d1 = get_free_data_buffer()
+                peer_d2 = get_free_data_buffer()
+                out1 = get_free_data_buffer()
+                out2 = get_free_data_buffer()
+                out3 = get_free_data_buffer()
+                out4 = get_free_data_buffer()
+
+                own_d1 = int(eclatin_blocks["data_block_1"].data_ptr()) + off
+                own_d2 = int(eclatin_blocks["data_block_2"].data_ptr()) + off
+                own_p1 = int(eclatin_blocks["parity_block_1"].data_ptr()) + off
+                own_p2 = int(eclatin_blocks["parity_block_2"].data_ptr()) + off
+
+                native.submit_twofail_survivor_chunk(
                     rank_in_group,
-                    recv_addrs[0],
-                    recv_addrs[1],
-                    recv_addrs[2],
-                    recv_addrs[3],
-                    aligned_half_block_size,
+                    own_d1, own_d2, own_p1, own_p2,
+                    peer_d1, peer_d2,
+                    out1, out2, out3, out4,
+                    take, chunk_index,
+                    peer_d1, peer_d2, out1, out2, out3, out4,
                 )
-            except BaseException as exc:
-                recv_error.append(exc)
+            elif rank_in_group in (0, 1):
+                recv_addrs = _twofail_recv_block_addrs_at_offset(
+                    eclatin_blocks, rank_in_group, off
+                )
+                native.submit_twofail_failed_chunk(
+                    rank_in_group,
+                    recv_addrs[0], recv_addrs[1], recv_addrs[2], recv_addrs[3],
+                    take, chunk_index,
+                )
 
-        recv_thread = threading.Thread(target=_recv_worker, name=f"eclatin-twf-recv-rig{rank_in_group}")
-        _t0 = time()
-        recv_thread.start()
-        logger.info(
-            f"ECLATIN two-failures: rig{rank_in_group} recv thread started (overlaps survivor XOR)"
-        )
-    else:
-        _t0 = time()
+            processed = off + take
+            chunk_index += 1
+            if poll_and_release is not None:
+                poll_and_release()
+    finally:
+        if active_event is not None:
+            active_event.clear()
 
-    if rank_in_group == 2:
-        o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1', 'out2', 'out3', 'out4']]
-        od1, od2, op1, op2 = [int(eclatin_blocks[k].data_ptr()) for k in
-            ['data_block_1', 'data_block_2', 'parity_block_1', 'parity_block_2']]
-        pd1, pd2 = int(surv_bufs["peer_d1"].data_ptr()), int(surv_bufs["peer_d2"].data_ptr())
-        native.survivor_xor_decode(
-            rank_in_group, o1, o2, o3, o4, od1, od2, op1, op2, pd1, pd2, aligned_half_block_size
-        )
-    elif rank_in_group == 3:
-        o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1', 'out2', 'out3', 'out4']]
-        od1, od2, op1, op2 = [int(eclatin_blocks[k].data_ptr()) for k in
-            ['data_block_1', 'data_block_2', 'parity_block_1', 'parity_block_2']]
-        pd1, pd2 = int(surv_bufs["peer_d1"].data_ptr()), int(surv_bufs["peer_d2"].data_ptr())
-        native.survivor_xor_decode(
-            rank_in_group, o1, o2, o3, o4, od1, od2, op1, op2, pd1, pd2, aligned_half_block_size
-        )
+    native.submit_twofail_pipeline_sentinels()
+    native.wait_for_twofail_pipeline_completion()
 
-    if rank_in_group in (2, 3):
-        t_network_encode += time() - _t0
-        logger.info("ECLATIN two-failures: Step 2 (XOR decode) done")
+    if poll_and_release is not None:
+        for _ in range(20):
+            poll_and_release()
 
-        _t0 = time()
-        o1, o2, o3, o4 = [int(surv_bufs[k].data_ptr()) for k in ['out1', 'out2', 'out3', 'out4']]
-        if rank_in_group == 2:
-            native.send_to_both_failed_ranks(
-                rank_in_group, o3, o2, o1, o4, aligned_half_block_size)
-        else:
-            native.send_to_both_failed_ranks(
-                rank_in_group, o1, o4, o3, o2, aligned_half_block_size)
-        t_network_encode += time() - _t0
-        logger.info("ECLATIN two-failures: Step 3 (send to failed) done")
-
-    if recv_thread is not None:
-        recv_thread.join()
-        if recv_error:
-            raise recv_error[0]
-        t_network_encode += time() - _t0
-        logger.info("ECLATIN two-failures: Step 3 (recv from survivors) done")
-
+    t_network_encode = time() - t0
     torch.distributed.barrier()
 
     if rank_in_group in (0, 1) and recovered_buffer is not None and recovered_buffer.numel() >= total_size:
@@ -1139,7 +1160,8 @@ def _run_eclatin_two_failures_recovery(
             recovered_buffer[first:total_size].copy_(eclatin_blocks["data_block_2"][:total_size - first])
 
     logger.info(
-        f"ECLATIN legacy: two-failure recovery pipeline done in {t_network_encode:.2f}s"
+        f"ECLATIN legacy: two-failure chunked pipeline done in {t_network_encode:.2f}s "
+        f"({chunk_index} chunks)"
     )
     return t_network_encode
 
@@ -1194,13 +1216,10 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     pin = torch.cuda.is_available() and getattr(manager, "eclatin_pin_memory", False)
 
-    surv_bufs: Optional[Dict[str, torch.Tensor]] = None
-
     if two_failures:
         if rank_in_group in (0, 1):
             recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
         elif rank_in_group in (2, 3):
-            surv_bufs = manager.allocate_twf_survivor_buffers(registry)
             _load_eclatin_blocks_from_disk_into(
                 eclatin_blocks, checkpoint_dir, rank, rank_in_group,
                 software_only=False, two_failures_survivor=True,
@@ -1246,9 +1265,6 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             if recv_buffers is not None:
                 for t in recv_buffers.values():
                     manager.register_buffer(t)
-            if surv_bufs is not None:
-                for t in surv_bufs.values():
-                    manager.register_buffer(t)
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 
@@ -1266,7 +1282,6 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             world_size=world_size,
             eclatin_blocks=eclatin_blocks,
             recovered_buffer=recovered_buffer,
-            surv_bufs=surv_bufs,
             total_size=total_size,
             registry=registry,
         )

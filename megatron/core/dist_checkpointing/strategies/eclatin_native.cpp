@@ -1702,6 +1702,32 @@ struct RecvXorTask {
     size_t size{0};
 };
 
+// Two-fail v2 chunked recovery pipeline task (size==0 is sentinel).
+struct TwofailPipelineTask {
+    size_t size{0};
+    int chunk_index{0};
+    uintptr_t own_d1{0};
+    uintptr_t own_d2{0};
+    uintptr_t own_p1{0};
+    uintptr_t own_p2{0};
+    uintptr_t peer_d1{0};
+    uintptr_t peer_d2{0};
+    uintptr_t out1{0};
+    uintptr_t out2{0};
+    uintptr_t out3{0};
+    uintptr_t out4{0};
+    uintptr_t recv_a1{0};
+    uintptr_t recv_a2{0};
+    uintptr_t recv_a3{0};
+    uintptr_t recv_a4{0};
+    uintptr_t release_addrs[6]{};
+    int num_release{0};
+
+    bool is_sentinel() const { return size == 0; }
+
+    static TwofailPipelineTask make_sentinel() { return TwofailPipelineTask{}; }
+};
+
 struct TensorTransferInfo {
     uintptr_t gpu_data_ptr{0};
     size_t cpu_offset{0};
@@ -2186,6 +2212,9 @@ public:
         parity2_recv_xor_cv_.notify_all();
         layerwise_cv_.notify_all();
         layerwise_load_cv_.notify_all();
+        twofail_exch_cv_.notify_all();
+        twofail_xor_cv_.notify_all();
+        twofail_fwd_cv_.notify_all();
         if (parity1_recv_xor_thread_.joinable()) parity1_recv_xor_thread_.join();
         if (parity1_send1_thread_.joinable()) parity1_send1_thread_.join();
         if (parity1_send2_thread_.joinable()) parity1_send2_thread_.join();
@@ -2194,6 +2223,9 @@ public:
         if (parity2_send2_thread_.joinable()) parity2_send2_thread_.join();
         if (layerwise_worker_thread_.joinable()) layerwise_worker_thread_.join();
         if (layerwise_load_worker_thread_.joinable()) layerwise_load_worker_thread_.join();
+        if (twofail_exch_thread_.joinable()) twofail_exch_thread_.join();
+        if (twofail_xor_thread_.joinable()) twofail_xor_thread_.join();
+        if (twofail_fwd_thread_.joinable()) twofail_fwd_thread_.join();
         xor_pool_shutdown();
 #if RDMA_AVAILABLE
         cleanup_rdma_resources();
@@ -3578,6 +3610,336 @@ public:
                   << " received all 4 blocks (TCP)" << std::endl;
     }
 
+    // ── Two-fail v2: chunk-level helpers (pipeline workers + bulk pybind) ────
+
+    void twofail_exchange_chunk_(
+        int rank_in_group,
+        uintptr_t send_d1, uintptr_t send_d2,
+        uintptr_t recv_d1, uintptr_t recv_d2,
+        size_t size
+    ) {
+        survivor_exchange_data(rank_in_group, send_d1, send_d2, recv_d1, recv_d2, size);
+    }
+
+    void twofail_xor_chunk_(
+        int rank_in_group,
+        uintptr_t out1, uintptr_t out2, uintptr_t out3, uintptr_t out4,
+        uintptr_t own_d1, uintptr_t own_d2, uintptr_t own_p1, uintptr_t own_p2,
+        uintptr_t peer_d1, uintptr_t peer_d2,
+        size_t size
+    ) {
+        survivor_xor_decode(
+            rank_in_group, out1, out2, out3, out4,
+            own_d1, own_d2, own_p1, own_p2, peer_d1, peer_d2, size);
+    }
+
+    void twofail_send_chunk_(
+        int rank_in_group,
+        uintptr_t rig0_a1, uintptr_t rig0_a2,
+        uintptr_t rig1_a1, uintptr_t rig1_a2,
+        size_t size
+    ) {
+        send_to_both_failed_ranks(rank_in_group, rig0_a1, rig0_a2, rig1_a1, rig1_a2, size);
+    }
+
+    void twofail_recv_chunk_(
+        int rank_in_group,
+        uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+        size_t size
+    ) {
+        recv_four_blocks(rank_in_group, a1, a2, a3, a4, size);
+    }
+
+    // ── Two-fail v2: chunked recovery pipeline ───────────────────────────────
+
+    void twofail_set_pipeline_error(std::exception_ptr ex) {
+        if (!ex) return;
+        std::lock_guard<std::mutex> lock(twofail_exch_mutex_);
+        if (!twofail_pipeline_error_) {
+            twofail_pipeline_error_ = ex;
+        }
+    }
+
+    void twofail_rethrow_if_error() {
+        if (twofail_pipeline_error_) {
+            std::rethrow_exception(twofail_pipeline_error_);
+        }
+    }
+
+    void twofail_release_pool_buffers(const TwofailPipelineTask& task) {
+        if (task.num_release <= 0) return;
+        std::lock_guard<std::mutex> lock(twofail_release_mutex_);
+        for (int i = 0; i < task.num_release; ++i) {
+            if (task.release_addrs[i] != 0) {
+                twofail_buffers_to_release_.push(task.release_addrs[i]);
+            }
+        }
+    }
+
+    void reset_twofail_pipeline() {
+        twofail_pipeline_error_ = nullptr;
+        twofail_exch_done_ = false;
+        twofail_xor_done_ = false;
+        twofail_fwd_done_ = false;
+        {
+            std::lock_guard<std::mutex> lk(twofail_exch_mutex_);
+            while (!twofail_exch_q_.empty()) twofail_exch_q_.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(twofail_xor_mutex_);
+            while (!twofail_xor_q_.empty()) twofail_xor_q_.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(twofail_fwd_mutex_);
+            while (!twofail_fwd_q_.empty()) twofail_fwd_q_.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(twofail_release_mutex_);
+            while (!twofail_buffers_to_release_.empty()) twofail_buffers_to_release_.pop();
+        }
+        std::cout << "ECLATIN: [Two-fail v2] pipeline reset (rig" << rank_in_group_ << ")" << std::endl;
+    }
+
+    void submit_twofail_survivor_chunk(
+        int rank_in_group,
+        uintptr_t own_d1, uintptr_t own_d2,
+        uintptr_t own_p1, uintptr_t own_p2,
+        uintptr_t peer_d1, uintptr_t peer_d2,
+        uintptr_t out1, uintptr_t out2, uintptr_t out3, uintptr_t out4,
+        size_t size, int chunk_index,
+        uintptr_t rel0, uintptr_t rel1, uintptr_t rel2,
+        uintptr_t rel3, uintptr_t rel4, uintptr_t rel5
+    ) {
+        if (!is_twofail_v2_) {
+            throw std::runtime_error("ECLATIN: submit_twofail_survivor_chunk called but not in two-fail v2 mode");
+        }
+        TwofailPipelineTask task;
+        task.size = size;
+        task.chunk_index = chunk_index;
+        task.own_d1 = own_d1;
+        task.own_d2 = own_d2;
+        task.own_p1 = own_p1;
+        task.own_p2 = own_p2;
+        task.peer_d1 = peer_d1;
+        task.peer_d2 = peer_d2;
+        task.out1 = out1;
+        task.out2 = out2;
+        task.out3 = out3;
+        task.out4 = out4;
+        task.release_addrs[0] = rel0;
+        task.release_addrs[1] = rel1;
+        task.release_addrs[2] = rel2;
+        task.release_addrs[3] = rel3;
+        task.release_addrs[4] = rel4;
+        task.release_addrs[5] = rel5;
+        task.num_release = 6;
+        {
+            std::lock_guard<std::mutex> lk(twofail_exch_mutex_);
+            twofail_exch_q_.push(task);
+        }
+        twofail_exch_cv_.notify_one();
+    }
+
+    void submit_twofail_failed_chunk(
+        int rank_in_group,
+        uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+        size_t size, int chunk_index
+    ) {
+        if (!is_twofail_v2_) {
+            throw std::runtime_error("ECLATIN: submit_twofail_failed_chunk called but not in two-fail v2 mode");
+        }
+        TwofailPipelineTask task;
+        task.size = size;
+        task.chunk_index = chunk_index;
+        task.recv_a1 = a1;
+        task.recv_a2 = a2;
+        task.recv_a3 = a3;
+        task.recv_a4 = a4;
+        task.num_release = 0;
+        {
+            std::lock_guard<std::mutex> lk(twofail_fwd_mutex_);
+            twofail_fwd_q_.push(task);
+        }
+        twofail_fwd_cv_.notify_one();
+    }
+
+    void submit_twofail_pipeline_sentinels() {
+        TwofailPipelineTask sentinel = TwofailPipelineTask::make_sentinel();
+        {
+            std::lock_guard<std::mutex> lk(twofail_exch_mutex_);
+            twofail_exch_q_.push(sentinel);
+        }
+        twofail_exch_cv_.notify_one();
+    }
+
+    std::vector<uintptr_t> get_twofail_buffers_to_release() {
+        std::vector<uintptr_t> out;
+        std::lock_guard<std::mutex> lk(twofail_release_mutex_);
+        while (!twofail_buffers_to_release_.empty()) {
+            out.push_back(twofail_buffers_to_release_.front());
+            twofail_buffers_to_release_.pop();
+        }
+        return out;
+    }
+
+    void wait_for_twofail_pipeline_completion() {
+        int spin = 0;
+        while (!twofail_exch_done_ || !twofail_xor_done_ || !twofail_fwd_done_) {
+            if (spin++ % 100 == 0) {
+                std::cout << "ECLATIN: [Two-fail v2] waiting for pipeline workers: exch="
+                          << twofail_exch_done_.load() << " xor=" << twofail_xor_done_.load()
+                          << " fwd=" << twofail_fwd_done_.load() << std::endl;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        twofail_rethrow_if_error();
+        std::cout << "ECLATIN: [Two-fail v2] pipeline completed (rig" << rank_in_group_ << ")" << std::endl;
+    }
+
+    void twofail_exch_worker() {
+        std::cout << "ECLATIN: [Two-fail v2] exchange worker started (rig" << rank_in_group_ << ")" << std::endl;
+        while (!stop_.load()) {
+            TwofailPipelineTask task;
+            {
+                std::unique_lock<std::mutex> lk(twofail_exch_mutex_);
+                twofail_exch_cv_.wait(lk, [this] {
+                    return stop_.load() || !twofail_exch_q_.empty();
+                });
+                if (stop_.load() && twofail_exch_q_.empty()) break;
+                if (twofail_exch_q_.empty()) continue;
+                task = twofail_exch_q_.front();
+                twofail_exch_q_.pop();
+            }
+            if (task.is_sentinel()) {
+                {
+                    std::lock_guard<std::mutex> lk(twofail_xor_mutex_);
+                    twofail_xor_q_.push(task);
+                }
+                twofail_xor_cv_.notify_one();
+                twofail_exch_done_ = true;
+                continue;
+            }
+            try {
+                if (rank_in_group_ == 2 || rank_in_group_ == 3) {
+                    twofail_exchange_chunk_(
+                        rank_in_group_, task.own_d1, task.own_d2,
+                        task.peer_d1, task.peer_d2, task.size);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(twofail_xor_mutex_);
+                    twofail_xor_q_.push(task);
+                }
+                twofail_xor_cv_.notify_one();
+            } catch (...) {
+                twofail_set_pipeline_error(std::current_exception());
+                twofail_exch_done_ = true;
+                twofail_xor_done_ = true;
+                twofail_fwd_done_ = true;
+                twofail_exch_cv_.notify_all();
+                twofail_xor_cv_.notify_all();
+                twofail_fwd_cv_.notify_all();
+                continue;
+            }
+        }
+        std::cout << "ECLATIN: [Two-fail v2] exchange worker done (rig" << rank_in_group_ << ")" << std::endl;
+    }
+
+    void twofail_xor_worker() {
+        std::cout << "ECLATIN: [Two-fail v2] XOR worker started (rig" << rank_in_group_ << ")" << std::endl;
+        while (!stop_.load()) {
+            TwofailPipelineTask task;
+            {
+                std::unique_lock<std::mutex> lk(twofail_xor_mutex_);
+                twofail_xor_cv_.wait(lk, [this] {
+                    return stop_.load() || !twofail_xor_q_.empty();
+                });
+                if (stop_.load() && twofail_xor_q_.empty()) break;
+                if (twofail_xor_q_.empty()) continue;
+                task = twofail_xor_q_.front();
+                twofail_xor_q_.pop();
+            }
+            if (task.is_sentinel()) {
+                {
+                    std::lock_guard<std::mutex> lk(twofail_fwd_mutex_);
+                    twofail_fwd_q_.push(task);
+                }
+                twofail_fwd_cv_.notify_one();
+                twofail_xor_done_ = true;
+                continue;
+            }
+            try {
+                if (rank_in_group_ == 2 || rank_in_group_ == 3) {
+                    std::lock_guard<std::mutex> pool_lk(xor_pool_work_mutex_);
+                    twofail_xor_chunk_(
+                        rank_in_group_, task.out1, task.out2, task.out3, task.out4,
+                        task.own_d1, task.own_d2, task.own_p1, task.own_p2,
+                        task.peer_d1, task.peer_d2, task.size);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(twofail_fwd_mutex_);
+                    twofail_fwd_q_.push(task);
+                }
+                twofail_fwd_cv_.notify_one();
+            } catch (...) {
+                twofail_set_pipeline_error(std::current_exception());
+                twofail_exch_done_ = true;
+                twofail_xor_done_ = true;
+                twofail_fwd_done_ = true;
+                twofail_exch_cv_.notify_all();
+                twofail_xor_cv_.notify_all();
+                twofail_fwd_cv_.notify_all();
+                continue;
+            }
+        }
+        std::cout << "ECLATIN: [Two-fail v2] XOR worker done (rig" << rank_in_group_ << ")" << std::endl;
+    }
+
+    void twofail_fwd_worker() {
+        std::cout << "ECLATIN: [Two-fail v2] forward worker started (rig" << rank_in_group_ << ")" << std::endl;
+        while (!stop_.load()) {
+            TwofailPipelineTask task;
+            {
+                std::unique_lock<std::mutex> lk(twofail_fwd_mutex_);
+                twofail_fwd_cv_.wait(lk, [this] {
+                    return stop_.load() || !twofail_fwd_q_.empty();
+                });
+                if (stop_.load() && twofail_fwd_q_.empty()) break;
+                if (twofail_fwd_q_.empty()) continue;
+                task = twofail_fwd_q_.front();
+                twofail_fwd_q_.pop();
+            }
+            if (task.is_sentinel()) {
+                twofail_fwd_done_ = true;
+                continue;
+            }
+            try {
+                if (rank_in_group_ == 2) {
+                    twofail_send_chunk_(
+                        rank_in_group_, task.out3, task.out2, task.out1, task.out4, task.size);
+                    twofail_release_pool_buffers(task);
+                } else if (rank_in_group_ == 3) {
+                    twofail_send_chunk_(
+                        rank_in_group_, task.out1, task.out4, task.out3, task.out2, task.size);
+                    twofail_release_pool_buffers(task);
+                } else if (rank_in_group_ == 0 || rank_in_group_ == 1) {
+                    twofail_recv_chunk_(
+                        rank_in_group_, task.recv_a1, task.recv_a2,
+                        task.recv_a3, task.recv_a4, task.size);
+                }
+            } catch (...) {
+                twofail_set_pipeline_error(std::current_exception());
+                twofail_exch_done_ = true;
+                twofail_xor_done_ = true;
+                twofail_fwd_done_ = true;
+                twofail_exch_cv_.notify_all();
+                twofail_xor_cv_.notify_all();
+                twofail_fwd_cv_.notify_all();
+                continue;
+            }
+        }
+        std::cout << "ECLATIN: [Two-fail v2] forward worker done (rig" << rank_in_group_ << ")" << std::endl;
+    }
+
     // Layer-wise processing functions
     void submit_layer_wise(
         int layer_id,
@@ -3897,6 +4259,26 @@ private:
     std::thread parity2_send1_thread_;
     std::thread parity2_send2_thread_;
     std::thread parity2_recv_xor_thread_;
+
+    // Two-fail v2 chunked recovery pipeline (3-stage: exchange -> xor -> forward)
+    std::queue<TwofailPipelineTask> twofail_exch_q_;
+    std::mutex twofail_exch_mutex_;
+    std::condition_variable twofail_exch_cv_;
+    std::queue<TwofailPipelineTask> twofail_xor_q_;
+    std::mutex twofail_xor_mutex_;
+    std::condition_variable twofail_xor_cv_;
+    std::queue<TwofailPipelineTask> twofail_fwd_q_;
+    std::mutex twofail_fwd_mutex_;
+    std::condition_variable twofail_fwd_cv_;
+    std::thread twofail_exch_thread_;
+    std::thread twofail_xor_thread_;
+    std::thread twofail_fwd_thread_;
+    std::atomic<bool> twofail_exch_done_{false};
+    std::atomic<bool> twofail_xor_done_{false};
+    std::atomic<bool> twofail_fwd_done_{false};
+    std::queue<uintptr_t> twofail_buffers_to_release_;
+    std::mutex twofail_release_mutex_;
+    std::exception_ptr twofail_pipeline_error_{nullptr};
     
     // Layer-wise processing (save mode)
     std::queue<LayerWiseTask> layerwise_queue_;
@@ -4023,7 +4405,10 @@ private:
         parity2_recv_xor_thread_ = std::thread(&ECLATINNative::parity2_recv_xor_worker, this);
         layerwise_worker_thread_ = std::thread(&ECLATINNative::layerwise_worker, this);
         layerwise_load_worker_thread_ = std::thread(&ECLATINNative::layerwise_load_worker, this);
-        std::cout << "ECLATIN: All worker threads started (including layerwise load)" << std::endl;
+        twofail_exch_thread_ = std::thread(&ECLATINNative::twofail_exch_worker, this);
+        twofail_xor_thread_ = std::thread(&ECLATINNative::twofail_xor_worker, this);
+        twofail_fwd_thread_ = std::thread(&ECLATINNative::twofail_fwd_worker, this);
+        std::cout << "ECLATIN: All worker threads started (including layerwise load and twofail pipeline)" << std::endl;
     }
 
     // ── XOR pool methods ──────────────────────────────────────────────
@@ -6649,6 +7034,31 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("addr1"), pybind11::arg("addr2"),
              pybind11::arg("addr3"), pybind11::arg("addr4"),
              pybind11::arg("size"))
+        .def("reset_twofail_pipeline", &ECLATINNative::reset_twofail_pipeline,
+             "Reset two-fail v2 chunked recovery pipeline state")
+        .def("submit_twofail_survivor_chunk", &ECLATINNative::submit_twofail_survivor_chunk,
+             "Submit one survivor recovery chunk to the pipeline",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("own_d1"), pybind11::arg("own_d2"),
+             pybind11::arg("own_p1"), pybind11::arg("own_p2"),
+             pybind11::arg("peer_d1"), pybind11::arg("peer_d2"),
+             pybind11::arg("out1"), pybind11::arg("out2"),
+             pybind11::arg("out3"), pybind11::arg("out4"),
+             pybind11::arg("size"), pybind11::arg("chunk_index"),
+             pybind11::arg("rel0"), pybind11::arg("rel1"), pybind11::arg("rel2"),
+             pybind11::arg("rel3"), pybind11::arg("rel4"), pybind11::arg("rel5"))
+        .def("submit_twofail_failed_chunk", &ECLATINNative::submit_twofail_failed_chunk,
+             "Submit one failed-rank recv chunk to the pipeline",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("a1"), pybind11::arg("a2"),
+             pybind11::arg("a3"), pybind11::arg("a4"),
+             pybind11::arg("size"), pybind11::arg("chunk_index"))
+        .def("submit_twofail_pipeline_sentinels", &ECLATINNative::submit_twofail_pipeline_sentinels,
+             "Submit pipeline sentinels to drain all twofail workers")
+        .def("wait_for_twofail_pipeline_completion", &ECLATINNative::wait_for_twofail_pipeline_completion,
+             "Block until all twofail pipeline workers finish")
+        .def("get_twofail_buffers_to_release", &ECLATINNative::get_twofail_buffers_to_release,
+             "Poll pool buffer addresses ready for release after twofail pipeline")
         .def("stop", &ECLATINNative::stop);
 }
 

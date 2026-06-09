@@ -6,7 +6,7 @@ import os
 import queue
 import threading
 from logging import getLogger
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -416,8 +416,9 @@ class GeminiReplicasManager:
             self._init_gemini_replicas_native()
             
         except Exception as e:
-            logger.warning(f"Gemini Replicas: Failed to initialize: {e}")
+            logger.error(f"Gemini Replicas: Failed to initialize: {e}")
             self._gemini_replicas_native = None
+            raise
     
     def _init_gemini_replicas_native(self):
         """Initialize Gemini Replicas C++ native module with ASIO or RDMA."""
@@ -497,6 +498,12 @@ class GeminiReplicasManager:
             # Phase 2: Connect to all targets
             self._gemini_replicas_native.finalize_connections()
 
+            # Post-finalize barrier (aligned with EC-NAIVE load: all TCP+RDMA ready)
+            torch.distributed.barrier()
+            logger.info(
+                f"Gemini Replicas: [Rank {rank}] All ranks finished Phase 2 connections"
+            )
+
             # Start persistent send/recv worker threads (like ecnaive)
             self._gemini_replicas_native.start_workers(net_config['source_ranks'])
 
@@ -508,7 +515,8 @@ class GeminiReplicasManager:
             import traceback
             traceback.print_exc()
             self._gemini_replicas_native = None
-    
+            raise
+
     def prepare_decomposed_state_dict(self, plan, planner):
         """
         Prepare decomposed state dict from SavePlan for efficient GPU-to-CPU transfer.
@@ -799,17 +807,65 @@ class GeminiReplicasManager:
             # Native teardown invalidates prior RDMA registrations.
             self.registered_buffers.clear()
 
-    def reinit_for_recovery(self, recovery_ranks: set) -> None:
-        """Rebuild connections for HW recovery: survivor↔failed within group.
+    def _compute_recovery_connection_ranks(
+        self,
+        rank: int,
+        recovery_ranks: Set[int],
+        main_assignments: Dict[int, int],
+        replica_needed: Dict[int, int],
+        replica_failed_sources: Dict[int, List[int]],
+        world_size: int,
+    ) -> Tuple[List[int], List[int]]:
+        """Build sparse sender↔receiver connection lists for recovery.
 
-        During recovery, a failed rank may need to receive replica data from a
-        healthy rank that was NOT in its save-time connection topology.  This
-        method tears down the existing connections and rebuilds them so that
-        every healthy rank can send to every failed rank in the same group.
+        Main recovery uses (failed → sender) from *main_assignments*.
+        Replica recovery adds (failed → sender) edges for each source replica
+        that a failed rank still needs.
+        """
+        target_set: Set[int] = set()
+        source_set: Set[int] = set()
+
+        for failed_rank, sender in main_assignments.items():
+            if failed_rank not in recovery_ranks:
+                continue
+            if sender == rank:
+                target_set.add(failed_rank)
+            if failed_rank == rank:
+                source_set.add(sender)
+
+        for failed_rank in recovery_ranks:
+            for src in replica_failed_sources.get(failed_rank, []):
+                sender = replica_needed.get(src)
+                if sender is None:
+                    continue
+                targets = self._calculate_target_ranks(src, world_size)
+                if failed_rank not in targets:
+                    continue
+                if sender == rank:
+                    target_set.add(failed_rank)
+                if failed_rank == rank:
+                    source_set.add(sender)
+
+        return sorted(target_set), sorted(source_set)
+
+    def reinit_for_recovery(
+        self,
+        recovery_ranks: set,
+        main_assignments: Optional[Dict[int, int]] = None,
+        replica_needed: Optional[Dict[int, int]] = None,
+        replica_failed_sources: Optional[Dict[int, List[int]]] = None,
+    ) -> None:
+        """Rebuild sparse P2P connections for HW recovery.
+
+        Only ranks that actually send or receive during recovery get new
+        connections.  Senders connect to their assigned failed ranks; failed
+        ranks accept from their assigned senders (main + replica recovery).
 
         Args:
-            recovery_ranks (set): Global ranks that need recovery (treated as
-                failed — their disk data is lost).
+            recovery_ranks: Global ranks that need recovery (disk data lost).
+            main_assignments: failed_rank → sender for main data recovery.
+            replica_needed: source_rank → sender for replica recovery.
+            replica_failed_sources: failed_rank → source ranks still needed.
         """
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
@@ -817,9 +873,9 @@ class GeminiReplicasManager:
         if not recovery_ranks:
             return
 
-        # ---- classify ranks ----
-        is_failed = rank in recovery_ranks
-        is_healthy = not is_failed
+        main_assignments = main_assignments or {}
+        replica_needed = replica_needed or {}
+        replica_failed_sources = replica_failed_sources or {}
 
         # Compute group memberships so we only connect within the same group
         all_members = self.get_group_members(rank, world_size)
@@ -829,10 +885,20 @@ class GeminiReplicasManager:
         if not failed_in_group or not healthy_in_group:
             return  # nothing to do — no failed ranks in this group
 
+        target_ranks, source_ranks = self._compute_recovery_connection_ranks(
+            rank,
+            recovery_ranks,
+            main_assignments,
+            replica_needed,
+            replica_failed_sources,
+            world_size,
+        )
+
         logger.info(
             f"Gemini Replicas: [Rank {rank}] Reinitializing for recovery: "
             f"failed_in_group={sorted(failed_in_group)}, "
-            f"healthy_in_group={sorted(healthy_in_group)}"
+            f"healthy_in_group={sorted(healthy_in_group)}, "
+            f"targets={target_ranks}, sources={source_ranks}"
         )
 
         # ---- tear down old connections ----
@@ -859,27 +925,28 @@ class GeminiReplicasManager:
                 for r in range(world_size):
                     rank_ips[r] = base_ip
 
-        # Recovery topology: survivors ↔ failed
         # Each rank listens on its own port: reco_base_port + rank * 100
         # Senders connect to the TARGET's listen port
         PORT_STEP = 100
         recv_port = reco_base_port + rank * PORT_STEP
+        target_ips = [rank_ips.get(t, base_ip) for t in target_ranks]
+        target_ports = [reco_base_port + t * PORT_STEP for t in target_ranks]
+        num_sources = len(source_ranks)
 
-        if is_healthy:
-            target_ranks = sorted(failed_in_group)
-            target_ips = [rank_ips.get(t, base_ip) for t in target_ranks]
-            target_ports = [reco_base_port + t * PORT_STEP for t in target_ranks]
-            source_ranks = sorted(failed_in_group)
-            num_sources = len(source_ranks)
-        else:
-            target_ranks = sorted(healthy_in_group)
-            target_ips = [rank_ips.get(t, base_ip) for t in target_ranks]
-            target_ports = [reco_base_port + t * PORT_STEP for t in target_ranks]
-            source_ranks = sorted(healthy_in_group)
-            num_sources = len(source_ranks)
-
-        # ---- create new native module ----
+        # ---- create new native module (or skip if this rank has no P2P role) ----
         try:
+            # Barrier so everyone tore down before reconnecting
+            torch.distributed.barrier()
+
+            if not target_ranks and not source_ranks:
+                logger.info(
+                    f"Gemini Replicas recovery: [Rank {rank}] no P2P role, "
+                    f"skipping native module creation"
+                )
+                torch.distributed.barrier()
+                torch.distributed.barrier()
+                return
+
             current_dir = os.path.dirname(os.path.abspath(__file__))
             import glob as _glob_module
             so_files = _glob_module.glob(
@@ -902,9 +969,6 @@ class GeminiReplicasManager:
                 f"targets={target_ranks}, sources={source_ranks} ({mode_str})"
             )
 
-            # Barrier so everyone stops before reconnecting
-            torch.distributed.barrier()
-
             self._gemini_replicas_native = gemini_replicas_native.GeminiReplicasNative(
                 rank, world_size,
                 target_ranks, target_ips, target_ports,
@@ -914,6 +978,14 @@ class GeminiReplicasManager:
 
             torch.distributed.barrier()
             self._gemini_replicas_native.finalize_connections()
+
+            # Post-finalize barrier (aligned with save-time init)
+            torch.distributed.barrier()
+            logger.info(
+                f"Gemini Replicas recovery: [Rank {rank}] "
+                f"All ranks finished recovery Phase 2 connections"
+            )
+
             self._gemini_replicas_native.start_workers(source_ranks)
 
             logger.info(

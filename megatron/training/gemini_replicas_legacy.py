@@ -671,6 +671,7 @@ def _hw_recovery_prepare(
             "sender": sender,
             "combined_size": combined_size,
             "is_sender": False,
+            "assignments": global_assignments,
         }
 
 
@@ -1725,9 +1726,15 @@ def load_gemini_replicas_legacy_checkpoint(
             manager, checkpoint_dir, rank, world_size, failed, healthy,
         )
 
-        # Setup (not timed): rebuild connections for survivor↔failed topology
+        # Setup (not timed): rebuild sparse P2P connections from role assignments
         if failed_override:
-            manager.reinit_for_recovery(failed_override)
+            main_assignments = _hw_assignments.get(rank, {}).get("assignments", {})
+            manager.reinit_for_recovery(
+                failed_override,
+                main_assignments=main_assignments,
+                replica_needed=_replica_needed,
+                replica_failed_sources=_replica_failed_sources,
+            )
 
         # Setup (not timed): preload files + exchange metadata via NCCL
         # All disk I/O and pickle serialization happens here, before the barrier.

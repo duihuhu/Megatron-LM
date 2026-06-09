@@ -44,6 +44,53 @@
 
 namespace py = pybind11;
 
+namespace {
+
+// Match gemini_native.cpp TCP connect retry (100 x 100ms).
+constexpr int kGeminiReplicasTcpConnectMaxRetries = 100;
+constexpr int kGeminiReplicasTcpConnectRetryDelayMs = 100;
+
+// Connect TCP socket with retry (aligned with gemini_native / FRCheck patterns).
+void asio_tcp_connect_with_retry(
+    boost::asio::io_context& io_ctx,
+    boost::asio::ip::tcp::socket& socket,
+    const std::string& host,
+    int port,
+    int rank,
+    int target_rank)
+{
+    boost::asio::ip::tcp::resolver resolver(io_ctx);
+    auto endpoints = resolver.resolve(host, std::to_string(port));
+
+    for (int attempt = 0; attempt < kGeminiReplicasTcpConnectMaxRetries; ++attempt) {
+        boost::system::error_code ec;
+        boost::asio::connect(socket, endpoints, ec);
+        if (!ec) {
+            if (attempt > 0) {
+                std::cout << "[Rank " << rank << "] TCP connected to target rank "
+                          << target_rank << " after " << (attempt + 1) << " attempts"
+                          << std::endl;
+            }
+            return;
+        }
+        if (attempt < kGeminiReplicasTcpConnectMaxRetries - 1) {
+            boost::system::error_code close_ec;
+            socket.close(close_ec);
+            socket = boost::asio::ip::tcp::socket(io_ctx);
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kGeminiReplicasTcpConnectRetryDelayMs));
+        } else {
+            throw std::runtime_error(
+                "Failed to connect to target rank " + std::to_string(target_rank) +
+                " at " + host + ":" + std::to_string(port) + " after " +
+                std::to_string(kGeminiReplicasTcpConnectMaxRetries) +
+                " attempts: " + ec.message());
+        }
+    }
+}
+
+}  // namespace
+
 // Forward declaration for interface
 class IGeminiReplicasConnectionManager {
 public:
@@ -476,36 +523,23 @@ private:
         }
         
         try {
-            boost::asio::ip::tcp::endpoint endpoint(
-                boost::asio::ip::address::from_string(target_ips_[target_idx]),
-                target_ports_[target_idx]
-            );
-            
             std::cout << "[Rank " << rank_ << "] Connecting to target rank " 
                       << target_ranks_[target_idx] << " at " 
                       << target_ips_[target_idx] << ":" << target_ports_[target_idx] << std::endl;
-            
-            // Retry logic for connection
-            int max_retries = 10;
-            for (int retry = 0; retry < max_retries; ++retry) {
-                try {
-                    send_sockets_[target_idx]->connect(endpoint);
-                    
-                    std::lock_guard<std::mutex> lock(connection_mutex_);
-                    *send_connected_[target_idx] = true;
-                    connection_cv_.notify_all();
-                    
-                    std::cout << "[Rank " << rank_ << "] Connected to target rank " 
-                              << target_ranks_[target_idx] << std::endl;
-                    return;
-                } catch (const std::exception& e) {
-                    if (retry < max_retries - 1) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                    } else {
-                        throw;
-                    }
-                }
-            }
+
+            send_sockets_[target_idx] =
+                std::make_unique<boost::asio::ip::tcp::socket>(io_context_);
+            asio_tcp_connect_with_retry(
+                io_context_, *send_sockets_[target_idx],
+                target_ips_[target_idx], target_ports_[target_idx],
+                rank_, target_ranks_[target_idx]);
+
+            std::lock_guard<std::mutex> lock(connection_mutex_);
+            *send_connected_[target_idx] = true;
+            connection_cv_.notify_all();
+
+            std::cout << "[Rank " << rank_ << "] Connected to target rank "
+                      << target_ranks_[target_idx] << std::endl;
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 "Failed to connect to target rank " + std::to_string(target_ranks_[target_idx]) + 
@@ -1451,13 +1485,11 @@ private:
                       << target_ranks_[target_idx] << " at "
                       << target_ips_[target_idx] << ":" << target_ports_[target_idx] << std::endl;
 
-            // ASIO synchronous connect (matching eccheck pattern).
-            // ASIO handles DNS resolution and retry internally.
             auto sock = std::make_unique<boost::asio::ip::tcp::socket>(io_context_);
-            boost::asio::ip::tcp::resolver resolver(io_context_);
-            auto endpoints = resolver.resolve(
-                target_ips_[target_idx], std::to_string(target_ports_[target_idx]));
-            boost::asio::connect(*sock, endpoints);
+            asio_tcp_connect_with_retry(
+                io_context_, *sock,
+                target_ips_[target_idx], target_ports_[target_idx],
+                rank_, target_ranks_[target_idx]);
             int fd = sock->native_handle();
             std::cout << "[Rank " << rank_ << "] TCP connected to target "
                       << target_ranks_[target_idx] << " (ASIO)" << std::endl;

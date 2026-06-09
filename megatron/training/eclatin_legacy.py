@@ -671,6 +671,7 @@ def _load_eclatin_blocks_from_disk_into(
     rank_in_group: int,
     software_only: bool = False,
     two_failures_survivor: bool = False,
+    no_shared_block: bool = False,
 ) -> None:
     """
     Load local block files into pre-allocated hugepage blocks.
@@ -693,6 +694,23 @@ def _load_eclatin_blocks_from_disk_into(
         return
 
     if rank_in_group == 2:
+        return
+
+    if no_shared_block:
+        if rank_in_group in (0, 1):
+            for block_name in ('data_block_1', 'data_block_2'):
+                _copy_eclatin_block_file_into_tensor(
+                    checkpoint_dir, rank, block_name, eclatin_blocks[block_name]
+                )
+        elif rank_in_group == 3:
+            for block_name in ('data_block_1', 'data_block_2', 'parity_block_1', 'parity_block_2'):
+                _copy_eclatin_block_file_into_tensor(
+                    checkpoint_dir, rank, block_name, eclatin_blocks[block_name]
+                )
+        else:
+            raise RuntimeError(
+                f"ECLATIN legacy load: unexpected rank_in_group={rank_in_group}"
+            )
         return
 
     if rank_in_group == 0:
@@ -774,58 +792,98 @@ def _init_onefail_load_connections(
     world_size: int,
 ) -> None:
     """Phase 0: establish single-failure load connections before timing."""
+    from megatron.training import get_args
+
     native = manager._eclatin_native
     if native is None:
         raise RuntimeError("ECLATIN native module is not initialized")
+
+    args = get_args()
+    no_shared = bool(getattr(args, "no_shared_block", False))
 
     net_config = manager._get_eclatin_network_config(rank, world_size)
     rank_in_group = net_config["rank_in_group"]
 
     failed_rank = 2
     native.set_load_mode(True, failed_rank)
-    logger.info(f"ECLATIN legacy load: set load mode (failed_rank={failed_rank})")
+    if no_shared:
+        native.set_no_shared_block(True)
+    logger.info(
+        f"ECLATIN legacy load: set load mode (failed_rank={failed_rank}, "
+        f"no_shared_block={no_shared})"
+    )
 
     receiver_ip = net_config["rank_ips"].get(
         net_config["load_receiver_rank"], net_config["my_ip"]
     )
-    load_recv_rank0_data2_port = net_config["ports"]["load_recv_rank0_data2"]
-    load_recv_rank0_parity2_port = net_config["ports"]["load_recv_rank0_parity2"]
-    load_recv_rank1_data1_port = net_config["ports"]["load_recv_rank1_data1"]
-    load_recv_rank1_parity1_port = net_config["ports"]["load_recv_rank1_parity1"]
-    load_recv_rank3_data1_port = net_config["ports"]["load_recv_rank3_data1"]
-    load_recv_rank3_data2_port = net_config["ports"]["load_recv_rank3_data2"]
 
     torch.distributed.barrier()
 
-    if rank_in_group == 2:
-        logger.info("ECLATIN legacy load: rank_in_group 2 init load accept connections")
-        native.init_load_connections(
-            rank_in_group,
-            net_config["my_ip"],
-            load_recv_rank0_data2_port,
-            load_recv_rank0_parity2_port,
-            load_recv_rank1_data1_port,
-            load_recv_rank1_parity1_port,
-            load_recv_rank3_data1_port,
-            load_recv_rank3_data2_port,
+    if no_shared:
+        ports = net_config["ports"]
+        ns_ports = (
+            ports["ns_recv_n1_d1"],
+            ports["ns_recv_n3_p1"],
+            ports["ns_recv_n0_d0"],
+            ports["ns_recv_n3_p0"],
+            ports["ns_recv_n1_d0"],
+            ports["ns_recv_n3_d1"],
+            ports["ns_recv_n0_d1"],
+            ports["ns_recv_n3_d0"],
         )
+        if rank_in_group == 2:
+            logger.info(
+                "ECLATIN legacy load: rank_in_group 2 init no-shared load accept connections"
+            )
+            native.init_load_connections_noshared(
+                rank_in_group, net_config["my_ip"], *ns_ports
+            )
+        torch.distributed.barrier()
+        if rank_in_group != 2:
+            logger.info(
+                f"ECLATIN legacy load: rank_in_group {rank_in_group} connecting "
+                f"no-shared load send sockets"
+            )
+            native.init_load_connections_noshared(
+                rank_in_group, receiver_ip, *ns_ports
+            )
+    else:
+        load_recv_rank0_data2_port = net_config["ports"]["load_recv_rank0_data2"]
+        load_recv_rank0_parity2_port = net_config["ports"]["load_recv_rank0_parity2"]
+        load_recv_rank1_data1_port = net_config["ports"]["load_recv_rank1_data1"]
+        load_recv_rank1_parity1_port = net_config["ports"]["load_recv_rank1_parity1"]
+        load_recv_rank3_data1_port = net_config["ports"]["load_recv_rank3_data1"]
+        load_recv_rank3_data2_port = net_config["ports"]["load_recv_rank3_data2"]
 
-    torch.distributed.barrier()
+        if rank_in_group == 2:
+            logger.info("ECLATIN legacy load: rank_in_group 2 init load accept connections")
+            native.init_load_connections(
+                rank_in_group,
+                net_config["my_ip"],
+                load_recv_rank0_data2_port,
+                load_recv_rank0_parity2_port,
+                load_recv_rank1_data1_port,
+                load_recv_rank1_parity1_port,
+                load_recv_rank3_data1_port,
+                load_recv_rank3_data2_port,
+            )
 
-    if rank_in_group != 2:
-        logger.info(
-            f"ECLATIN legacy load: rank_in_group {rank_in_group} connecting load send sockets"
-        )
-        native.init_load_connections(
-            rank_in_group,
-            receiver_ip,
-            load_recv_rank0_data2_port,
-            load_recv_rank0_parity2_port,
-            load_recv_rank1_data1_port,
-            load_recv_rank1_parity1_port,
-            load_recv_rank3_data1_port,
-            load_recv_rank3_data2_port,
-        )
+        torch.distributed.barrier()
+
+        if rank_in_group != 2:
+            logger.info(
+                f"ECLATIN legacy load: rank_in_group {rank_in_group} connecting load send sockets"
+            )
+            native.init_load_connections(
+                rank_in_group,
+                receiver_ip,
+                load_recv_rank0_data2_port,
+                load_recv_rank0_parity2_port,
+                load_recv_rank1_data1_port,
+                load_recv_rank1_parity1_port,
+                load_recv_rank3_data1_port,
+                load_recv_rank3_data2_port,
+            )
 
     torch.distributed.barrier()
     native.wait_for_load_connections(timeout_seconds=30)
@@ -852,6 +910,8 @@ def _run_eclatin_full_recovery(
     input_args = use_args()
     if input_args.use_eclatin_software_failure:
         return 0.0
+
+    no_shared = bool(getattr(input_args, "no_shared_block", False))
 
     net_config = manager._get_eclatin_network_config(rank, world_size)
     rank_in_group = net_config["rank_in_group"]
@@ -880,6 +940,7 @@ def _run_eclatin_full_recovery(
 
     logger.info(
         f"ECLATIN one-fail: starting chunked load recovery (rig{rank_in_group}), "
+        f"no_shared_block={no_shared}, "
         f"half_block={aligned_half_block_size / (1024**2):.0f} MB, "
         f"chunk={chunk_size / (1024**2):.0f} MB"
     )
@@ -905,42 +966,75 @@ def _run_eclatin_full_recovery(
                     raise RuntimeError(
                         "ECLATIN one-fail: rank_in_group 2 needs recovered_buffer"
                     )
-                r0d2 = get_free_recv_buffer()
-                r0p2 = get_free_recv_buffer()
-                r1d1 = get_free_recv_buffer()
-                r1p1 = get_free_recv_buffer()
-                r3d1 = get_free_recv_buffer()
-                r3d2 = get_free_recv_buffer()
+                out_d0 = int(eclatin_blocks["data_block_1"].data_ptr()) + off
+                out_d1 = int(eclatin_blocks["data_block_2"].data_ptr()) + off
+                out_p0 = int(eclatin_blocks["parity_block_1"].data_ptr()) + off
+                out_p1 = int(eclatin_blocks["parity_block_2"].data_ptr()) + off
 
-                out_d1 = int(eclatin_blocks["data_block_1"].data_ptr()) + off
-                out_d2 = int(eclatin_blocks["data_block_2"].data_ptr()) + off
-                out_p1 = int(eclatin_blocks["parity_block_1"].data_ptr()) + off
-                out_p2 = int(eclatin_blocks["parity_block_2"].data_ptr()) + off
+                if no_shared:
+                    recv_bufs = [get_free_recv_buffer() for _ in range(8)]
+                    native.submit_onefail_noshared_recv_chunk(
+                        recv_bufs[0], recv_bufs[1], recv_bufs[2], recv_bufs[3],
+                        recv_bufs[4], recv_bufs[5], recv_bufs[6], recv_bufs[7],
+                        out_d0, out_d1, out_p0, out_p1,
+                        take, chunk_index,
+                        recv_bufs[0], recv_bufs[1], recv_bufs[2], recv_bufs[3],
+                        recv_bufs[4], recv_bufs[5], recv_bufs[6], recv_bufs[7],
+                    )
+                else:
+                    r0d2 = get_free_recv_buffer()
+                    r0p2 = get_free_recv_buffer()
+                    r1d1 = get_free_recv_buffer()
+                    r1p1 = get_free_recv_buffer()
+                    r3d1 = get_free_recv_buffer()
+                    r3d2 = get_free_recv_buffer()
 
-                native.submit_onefail_recv_chunk(
-                    r0d2, r0p2, r1d1, r1p1, r3d1, r3d2,
-                    out_d1, out_d2, out_p1, out_p2,
-                    take, chunk_index,
-                    r0d2, r0p2, r1d1, r1p1, r3d1, r3d2,
-                )
+                    native.submit_onefail_recv_chunk(
+                        r0d2, r0p2, r1d1, r1p1, r3d1, r3d2,
+                        out_d0, out_d1, out_p0, out_p1,
+                        take, chunk_index,
+                        r0d2, r0p2, r1d1, r1p1, r3d1, r3d2,
+                    )
             elif rank_in_group == 0:
-                d2 = int(eclatin_blocks["data_block_2"].data_ptr()) + off
-                p2 = int(eclatin_blocks["parity_block_2"].data_ptr()) + off
-                native.submit_onefail_send_chunk(
-                    rank_in_group, "rank0_data2", d2, "rank0_parity2", p2, take, chunk_index
-                )
+                d0 = int(eclatin_blocks["data_block_1"].data_ptr()) + off
+                d1 = int(eclatin_blocks["data_block_2"].data_ptr()) + off
+                if no_shared:
+                    native.submit_onefail_send_chunk(
+                        rank_in_group, "ns_n0_d0", d0, "ns_n0_d1", d1, take, chunk_index
+                    )
+                else:
+                    p1 = int(eclatin_blocks["parity_block_2"].data_ptr()) + off
+                    native.submit_onefail_send_chunk(
+                        rank_in_group, "rank0_data2", d1, "rank0_parity2", p1, take, chunk_index
+                    )
             elif rank_in_group == 1:
-                d1 = int(eclatin_blocks["data_block_1"].data_ptr()) + off
-                p1 = int(eclatin_blocks["parity_block_1"].data_ptr()) + off
-                native.submit_onefail_send_chunk(
-                    rank_in_group, "rank1_data1", d1, "rank1_parity1", p1, take, chunk_index
-                )
+                d0 = int(eclatin_blocks["data_block_1"].data_ptr()) + off
+                d1 = int(eclatin_blocks["data_block_2"].data_ptr()) + off
+                if no_shared:
+                    native.submit_onefail_send_chunk(
+                        rank_in_group, "ns_n1_d1", d1, "ns_n1_d0", d0, take, chunk_index
+                    )
+                else:
+                    p0 = int(eclatin_blocks["parity_block_1"].data_ptr()) + off
+                    native.submit_onefail_send_chunk(
+                        rank_in_group, "rank1_data1", d0, "rank1_parity1", p0, take, chunk_index
+                    )
             elif rank_in_group == 3:
-                d1 = int(eclatin_blocks["data_block_1"].data_ptr()) + off
-                d2 = int(eclatin_blocks["data_block_2"].data_ptr()) + off
-                native.submit_onefail_send_chunk(
-                    rank_in_group, "rank3_data1", d1, "rank3_data2", d2, take, chunk_index
-                )
+                d0 = int(eclatin_blocks["data_block_1"].data_ptr()) + off
+                d1 = int(eclatin_blocks["data_block_2"].data_ptr()) + off
+                if no_shared:
+                    p0 = int(eclatin_blocks["parity_block_1"].data_ptr()) + off
+                    p1 = int(eclatin_blocks["parity_block_2"].data_ptr()) + off
+                    native.submit_onefail_send_chunk(
+                        rank_in_group, "ns_n3_p1", p1, "ns_n3_p0", p0, take, chunk_index
+                    )
+                    native.submit_onefail_send_chunk(
+                        rank_in_group, "ns_n3_d1", d1, "ns_n3_d0", d0, take, chunk_index
+                    )
+                else:
+                    native.submit_onefail_send_chunk(
+                        rank_in_group, "rank3_data1", d0, "rank3_data2", d1, take, chunk_index
+                    )
             else:
                 raise RuntimeError(
                     f"ECLATIN one-fail: unexpected rank_in_group={rank_in_group}"
@@ -1259,6 +1353,7 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     rank_in_group = manager._get_rank_in_group(rank, world_size)
     sw_failure = bool(getattr(args, "use_eclatin_software_failure", False))
     two_failures = bool(getattr(args, "use_eclatin_two_failures", False))
+    no_shared = bool(getattr(args, "no_shared_block", False))
 
     recovered_buffer: Optional[torch.Tensor] = None
     total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
@@ -1304,6 +1399,7 @@ def load_eclatin_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             rank,
             rank_in_group,
             software_only=False,
+            no_shared_block=no_shared,
         )
 
     if manager.use_rdma:

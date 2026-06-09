@@ -361,6 +361,23 @@ def validate_args(args, defaults={}):
             "At most one of --use-ecnaive, --use-eclatin, --use-frcheck, "
             "and --use-gemini-replicas may be enabled."
         )
+    if getattr(args, "no_shared_block", False):
+        if not getattr(args, "use_eclatin", False):
+            raise RuntimeError(
+                "--no-shared-block requires --use-eclatin."
+            )
+        if getattr(args, "use_eclatin_two_failures", False):
+            raise RuntimeError(
+                "--no-shared-block is incompatible with --use-eclatin-two-failures."
+            )
+        if getattr(args, "use_eclatin_software_failure", False):
+            raise RuntimeError(
+                "--no-shared-block is incompatible with --use-eclatin-software-failure."
+            )
+        if getattr(args, "use_eclatin_layerwise", False):
+            raise RuntimeError(
+                "--no-shared-block is incompatible with --use-eclatin-layerwise."
+            )
     if getattr(args, "use_frcheck", False):
         frcheck_path = getattr(args, "frcheck_table_path", None)
         frcheck_n = getattr(args, "frcheck_n", None)
@@ -2306,7 +2323,12 @@ def _add_checkpointing_args(parser):
                        help='Enable ECLATIN two-failure hardware recovery mode. '
                             'rank_in_group 0 and 1 are treated as failed; they recover from '
                             'surviving ranks 2 and 3 using RDMA transport and 16-thread XOR pool.')
-    
+    group.add_argument('--no-shared-block', action='store_true',
+                       help='ECLATIN HW1 load breakdown: recover node2 via 8 independent network '
+                            'blocks with no recv-buffer reuse in XOR (vs default 6-channel shared). '
+                            'Requires --load and --use-eclatin; incompatible with layerwise, '
+                            'software-failure, and two-failures modes.')
+
     # EC-NAIVE (Erasure Coding Checkpoint with naive Reed-Solomon encoding) arguments
     group.add_argument('--use-ecnaive', action='store_true',
                        help='Enable EC-NAIVE (Erasure Coding Checkpoint with naive Reed-Solomon encoding) '

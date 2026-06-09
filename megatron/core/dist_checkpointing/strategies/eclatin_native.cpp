@@ -428,6 +428,8 @@ public:
 #endif
 
 // ASIO connection manager (pattern from eccheck_native)
+static constexpr int NS_LOAD_NUM_CHANNELS = 8;
+
 class AsioConnectionManager {
 private:
     boost::asio::io_context io_context_;
@@ -526,6 +528,14 @@ private:
     std::atomic<bool> load_send_rank3_data1_connected_{false};
     std::atomic<bool> load_send_rank3_data2_connected_{false};
 
+    // No-shared-block HW1 load (8 independent channels, 0-based indexing)
+    std::vector<boost::asio::ip::tcp::socket> ns_load_recv_sockets_;
+    std::vector<boost::asio::ip::tcp::acceptor> ns_load_recv_acceptors_;
+    std::vector<boost::asio::ip::tcp::socket> ns_load_send_sockets_;
+    std::array<std::atomic<bool>, NS_LOAD_NUM_CHANNELS> ns_load_recv_connected_;
+    std::array<std::atomic<bool>, NS_LOAD_NUM_CHANNELS> ns_load_send_connected_;
+    std::atomic<bool> ns_load_active_{false};
+
     std::mutex connection_mutex_;
     std::condition_variable connection_cv_;
 
@@ -583,7 +593,15 @@ public:
           parity2_send1_connected_(false),
           parity2_send2_connected_(false),
           parity2_recv1_connected_(false),
-          parity2_recv2_connected_(false) {}
+          parity2_recv2_connected_(false) {
+        for (int i = 0; i < NS_LOAD_NUM_CHANNELS; ++i) {
+            ns_load_recv_sockets_.emplace_back(io_context_);
+            ns_load_recv_acceptors_.emplace_back(io_context_);
+            ns_load_send_sockets_.emplace_back(io_context_);
+            ns_load_recv_connected_[i] = false;
+            ns_load_send_connected_[i] = false;
+        }
+    }
 
     // Parity 1 getters
     boost::asio::ip::tcp::socket& get_parity1_send1_socket() { return parity1_send1_socket_; }
@@ -709,6 +727,19 @@ public:
     void accept_load_recv_rank1_parity1();
     void accept_load_recv_rank3_data1();
     void accept_load_recv_rank3_data2();
+
+    // No-shared-block HW1 load (8 channels)
+    void set_ns_load_active(bool active) { ns_load_active_ = active; }
+    bool is_ns_load_active() const { return ns_load_active_; }
+    void bind_listen_ns_load_recv(int channel, const std::string& listen_ip, uint16_t port);
+    void accept_ns_load_recv(int channel);
+    void init_ns_load_send(int channel, const std::string& rank2_ip, uint16_t port);
+    boost::asio::ip::tcp::socket& get_ns_load_recv_socket(int channel);
+    boost::asio::ip::tcp::socket& get_ns_load_send_socket(int channel);
+    bool is_ns_load_recv_connected(int channel) const;
+    bool is_ns_load_send_connected(int channel) const;
+    bool is_ns_load_recv_acceptor_open(int channel) const;
+    void wait_for_ns_load_connections(int rank_in_group, int timeout_seconds = 30);
 
     // Two-failures load mode methods
     void bind_listen_load_twofail_peer0(const std::string& listen_ip, uint16_t port);
@@ -864,6 +895,11 @@ void AsioConnectionManager::wait_for_connections(int timeout_seconds) {
 }
 
 void AsioConnectionManager::wait_for_load_connections(int timeout_seconds) {
+    if (ns_load_active_) {
+        std::cerr << "ECLATIN: wait_for_load_connections called in ns_load mode; "
+                  << "use wait_for_ns_load_connections instead" << std::endl;
+        return;
+    }
     // Single-failure HW recovery: rank_in_group 2 is receiver (6 acceptors).
     // Use acceptor.is_open() to detect the receiver role even before the first
     // accept completes (mirrors wait_for_twf_v2_connections; fixes multi-node races).
@@ -972,6 +1008,115 @@ void AsioConnectionManager::wait_for_load_connections(int timeout_seconds) {
                 break;
             }
         }
+    }
+}
+
+void AsioConnectionManager::bind_listen_ns_load_recv(
+    int channel, const std::string& listen_ip, uint16_t port
+) {
+    if (channel < 0 || channel >= NS_LOAD_NUM_CHANNELS) {
+        throw std::runtime_error("ASIO: bind_listen_ns_load_recv invalid channel");
+    }
+    boost::asio::ip::tcp::endpoint endpoint(
+        boost::asio::ip::address::from_string(listen_ip), port);
+    ns_load_recv_acceptors_[channel].open(endpoint.protocol());
+    ns_load_recv_acceptors_[channel].set_option(
+        boost::asio::ip::tcp::acceptor::reuse_address(true));
+    ns_load_recv_acceptors_[channel].bind(endpoint);
+    ns_load_recv_acceptors_[channel].listen();
+}
+
+void AsioConnectionManager::accept_ns_load_recv(int channel) {
+    if (channel < 0 || channel >= NS_LOAD_NUM_CHANNELS) {
+        throw std::runtime_error("ASIO: accept_ns_load_recv invalid channel");
+    }
+    try {
+        ns_load_recv_acceptors_[channel].accept(ns_load_recv_sockets_[channel]);
+        ns_load_recv_connected_[channel] = true;
+        std::cout << "ASIO: ns_load_recv ch" << channel << " connected" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: ns_load_recv ch" << channel << " accept error: " << e.what() << std::endl;
+        ns_load_recv_connected_[channel] = false;
+        connection_cv_.notify_all();
+    }
+}
+
+void AsioConnectionManager::init_ns_load_send(
+    int channel, const std::string& rank2_ip, uint16_t port
+) {
+    if (channel < 0 || channel >= NS_LOAD_NUM_CHANNELS) {
+        throw std::runtime_error("ASIO: init_ns_load_send invalid channel");
+    }
+    try {
+        boost::asio::ip::tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(rank2_ip, std::to_string(port));
+        boost::asio::connect(ns_load_send_sockets_[channel], endpoints);
+        ns_load_send_connected_[channel] = true;
+        std::cout << "ASIO: ns_load_send ch" << channel << " connected to rank2" << std::endl;
+        connection_cv_.notify_all();
+    } catch (const std::exception& e) {
+        std::cerr << "ASIO: ns_load_send ch" << channel << " init error: " << e.what() << std::endl;
+        ns_load_send_connected_[channel] = false;
+        throw;
+    }
+}
+
+boost::asio::ip::tcp::socket& AsioConnectionManager::get_ns_load_recv_socket(int channel) {
+    return ns_load_recv_sockets_.at(channel);
+}
+
+boost::asio::ip::tcp::socket& AsioConnectionManager::get_ns_load_send_socket(int channel) {
+    return ns_load_send_sockets_.at(channel);
+}
+
+bool AsioConnectionManager::is_ns_load_recv_connected(int channel) const {
+    return ns_load_recv_connected_.at(channel);
+}
+
+bool AsioConnectionManager::is_ns_load_send_connected(int channel) const {
+    return ns_load_send_connected_.at(channel);
+}
+
+bool AsioConnectionManager::is_ns_load_recv_acceptor_open(int channel) const {
+    return ns_load_recv_acceptors_.at(channel).is_open();
+}
+
+void AsioConnectionManager::wait_for_ns_load_connections(int rank_in_group, int timeout_seconds) {
+    auto wait_channels = [&](const std::vector<int>& channels, bool recv_side) {
+        int wait_count = 0;
+        while (true) {
+            bool done = true;
+            for (int ch : channels) {
+                bool connected = recv_side
+                    ? ns_load_recv_connected_[ch].load()
+                    : ns_load_send_connected_[ch].load();
+                if (!connected) {
+                    done = false;
+                    break;
+                }
+            }
+            if (done) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            wait_count++;
+            if (wait_count * 10 > timeout_seconds * 1000) {
+                std::cerr << "ECLATIN: Timeout waiting for ns_load connections (rig"
+                          << rank_in_group << ")" << std::endl;
+                break;
+            }
+        }
+    };
+
+    if (rank_in_group == 2) {
+        std::vector<int> all_channels(NS_LOAD_NUM_CHANNELS);
+        for (int i = 0; i < NS_LOAD_NUM_CHANNELS; ++i) all_channels[i] = i;
+        wait_channels(all_channels, true);
+    } else if (rank_in_group == 0) {
+        wait_channels({2, 6}, false);
+    } else if (rank_in_group == 1) {
+        wait_channels({0, 4}, false);
+    } else if (rank_in_group == 3) {
+        wait_channels({1, 3, 5, 7}, false);
     }
 }
 
@@ -1749,7 +1894,9 @@ struct OnefailPipelineTask {
     uintptr_t out_d2{0};
     uintptr_t out_p1{0};
     uintptr_t out_p2{0};
-    uintptr_t release_addrs[6]{};
+    uintptr_t ns_recv[NS_LOAD_NUM_CHANNELS]{};
+    bool noshared{false};
+    uintptr_t release_addrs[NS_LOAD_NUM_CHANNELS]{};
     int num_release{0};
 
     bool is_sentinel() const { return size == 0; }
@@ -1915,6 +2062,8 @@ public:
         , rdma_recv_cq_{}
         , rdma_load_send_cq_{}
         , rdma_load_recv_cq_{}
+        , rdma_load_send_cq_noshared_{}
+        , rdma_load_recv_cq_noshared_{}
         , rdma_load_send_cq_two_fail_{}
         , rdma_load_recv_cq_two_fail_{}
         , rdma_twf_v2_sx_send_cq_{}
@@ -2303,6 +2452,12 @@ public:
                   << ", failed_rank_in_group=" << failed_rank_in_group_ << std::endl;
     }
 
+    void set_no_shared_block(bool enabled) {
+        use_no_shared_block_ = enabled;
+        std::cout << "ECLATIN: Set no-shared-block mode: "
+                  << (enabled ? "true" : "false") << std::endl;
+    }
+
     void init_load_connections(
         int rank_in_group,
         const std::string& rank2_ip,
@@ -2479,6 +2634,88 @@ public:
         std::cout << "ECLATIN: [Rank_in_group " << rank_in_group << "] Load connections initialized" << std::endl;
     }
 
+    void init_load_connections_noshared(
+        int rank_in_group,
+        const std::string& rank2_ip,
+        uint16_t port_n1_d1,
+        uint16_t port_n3_p1,
+        uint16_t port_n0_d0,
+        uint16_t port_n3_p0,
+        uint16_t port_n1_d0,
+        uint16_t port_n3_d1,
+        uint16_t port_n0_d1,
+        uint16_t port_n3_d0
+    ) {
+        if (!is_load_mode_) {
+            std::cerr << "ECLATIN: init_load_connections_noshared called but not in load mode" << std::endl;
+            return;
+        }
+        if (!use_no_shared_block_) {
+            throw std::runtime_error(
+                "ECLATIN: init_load_connections_noshared requires no-shared-block mode");
+        }
+
+        const uint16_t ports[NS_LOAD_NUM_CHANNELS] = {
+            port_n1_d1, port_n3_p1, port_n0_d0, port_n3_p0,
+            port_n1_d0, port_n3_d1, port_n0_d1, port_n3_d0
+        };
+
+        conn_.set_ns_load_active(true);
+        std::cout << "ECLATIN: [Rank_in_group " << rank_in_group
+                  << "] Initializing no-shared load connections (8 channels)..." << std::endl;
+
+        if (rank_in_group == 2) {
+            const std::string listen_ip = rank2_ip;
+            for (int ch = 0; ch < NS_LOAD_NUM_CHANNELS; ++ch) {
+                conn_.bind_listen_ns_load_recv(ch, listen_ip, ports[ch]);
+            }
+            if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_noshared_[0] == nullptr) {
+                init_rdma_load_resources_noshared();
+            }
+            std::vector<std::thread> accept_threads;
+            accept_threads.reserve(NS_LOAD_NUM_CHANNELS);
+            for (int ch = 0; ch < NS_LOAD_NUM_CHANNELS; ++ch) {
+                accept_threads.emplace_back([this, ch]() {
+                    conn_.accept_ns_load_recv(ch);
+                    setup_ns_rdma_load_channel(ch, false, 0);
+                });
+            }
+            for (auto& t : accept_threads) {
+                t.detach();
+            }
+        } else {
+            if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_noshared_[0] == nullptr) {
+                init_rdma_load_resources_noshared();
+            }
+            if (rank_in_group == 0) {
+                conn_.init_ns_load_send(2, rank2_ip, ports[2]);
+                conn_.init_ns_load_send(6, rank2_ip, ports[6]);
+                setup_ns_rdma_load_channel(2, true, 2);
+                setup_ns_rdma_load_channel(6, true, 2);
+            } else if (rank_in_group == 1) {
+                conn_.init_ns_load_send(0, rank2_ip, ports[0]);
+                conn_.init_ns_load_send(4, rank2_ip, ports[4]);
+                setup_ns_rdma_load_channel(0, true, 2);
+                setup_ns_rdma_load_channel(4, true, 2);
+            } else if (rank_in_group == 3) {
+                conn_.init_ns_load_send(1, rank2_ip, ports[1]);
+                conn_.init_ns_load_send(3, rank2_ip, ports[3]);
+                conn_.init_ns_load_send(5, rank2_ip, ports[5]);
+                conn_.init_ns_load_send(7, rank2_ip, ports[7]);
+                setup_ns_rdma_load_channel(1, true, 2);
+                setup_ns_rdma_load_channel(3, true, 2);
+                setup_ns_rdma_load_channel(5, true, 2);
+                setup_ns_rdma_load_channel(7, true, 2);
+            } else {
+                throw std::runtime_error(
+                    "ECLATIN: init_load_connections_noshared unexpected rank_in_group");
+            }
+        }
+
+        std::cout << "ECLATIN: [Rank_in_group " << rank_in_group
+                  << "] No-shared load connections initialized" << std::endl;
+    }
+
     void init_two_failures_load_connections(
         int rank_in_group,
         const std::string& peer0_ip, uint16_t peer0_port,
@@ -2531,6 +2768,34 @@ public:
     void wait_for_load_connections(int timeout_seconds = 30) {
         if (!is_load_mode_) {
             std::cerr << "ECLATIN: wait_for_load_connections called but not in load mode" << std::endl;
+            return;
+        }
+        if (use_no_shared_block_) {
+            conn_.wait_for_ns_load_connections(rank_in_group_, timeout_seconds);
+#if RDMA_AVAILABLE
+            if (use_rdma_ && rdma_pd_ && rdma_load_send_cq_noshared_[0] != nullptr) {
+                std::vector<int> channels;
+                if (rank_in_group_ == 2) {
+                    for (int i = 0; i < NS_LOAD_NUM_CHANNELS; ++i) channels.push_back(i);
+                } else if (rank_in_group_ == 0) {
+                    channels = {2, 6};
+                } else if (rank_in_group_ == 1) {
+                    channels = {0, 4};
+                } else if (rank_in_group_ == 3) {
+                    channels = {1, 3, 5, 7};
+                }
+                int spin = 0;
+                for (int ch : channels) {
+                    while (rdma_load_channels_noshared_[ch] == nullptr) {
+                        if (++spin % 100 == 0) {
+                            std::cout << "[ECLATIN RDMA] Waiting for ns load channel "
+                                      << ch << "..." << std::endl;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
+                }
+            }
+#endif
             return;
         }
         conn_.wait_for_load_connections(timeout_seconds);
@@ -2795,6 +3060,123 @@ public:
         }
     }
 
+    static int ns_load_channel_from_name(const std::string& block_name) {
+        if (block_name == "ns_n1_d1") return 0;
+        if (block_name == "ns_n3_p1") return 1;
+        if (block_name == "ns_n0_d0") return 2;
+        if (block_name == "ns_n3_p0") return 3;
+        if (block_name == "ns_n1_d0") return 4;
+        if (block_name == "ns_n3_d1") return 5;
+        if (block_name == "ns_n0_d1") return 6;
+        if (block_name == "ns_n3_d0") return 7;
+        return -1;
+    }
+
+    void onefail_noshared_recv_chunk_(const uintptr_t recv_addrs[NS_LOAD_NUM_CHANNELS], size_t size) {
+        std::vector<std::exception_ptr> recv_exceptions(NS_LOAD_NUM_CHANNELS);
+        std::vector<std::thread> recv_threads;
+        recv_threads.reserve(NS_LOAD_NUM_CHANNELS);
+
+        for (int ch = 0; ch < NS_LOAD_NUM_CHANNELS; ++ch) {
+            recv_threads.emplace_back([&, ch]() {
+                try {
+#if RDMA_AVAILABLE
+                    if (use_rdma_ && rdma_load_channels_noshared_[ch]) {
+                        rdma_load_channels_noshared_[ch]->receive_data(
+                            reinterpret_cast<uint8_t*>(recv_addrs[ch]), size);
+                    } else
+#endif
+                    if (!recv_with_size_bool(conn_.get_ns_load_recv_socket(ch),
+                                            reinterpret_cast<void*>(recv_addrs[ch]), size)) {
+                        throw std::runtime_error(
+                            "Failed to receive ns_load channel " + std::to_string(ch));
+                    }
+                } catch (...) {
+                    recv_exceptions[ch] = std::current_exception();
+                }
+            });
+        }
+
+        for (auto& t : recv_threads) {
+            t.join();
+        }
+        for (int i = 0; i < NS_LOAD_NUM_CHANNELS; ++i) {
+            if (recv_exceptions[i]) {
+                std::rethrow_exception(recv_exceptions[i]);
+            }
+        }
+    }
+
+    void onefail_noshared_xor_chunk_(
+        const uintptr_t recv_addrs[NS_LOAD_NUM_CHANNELS],
+        uintptr_t out_d0,
+        uintptr_t out_d1,
+        uintptr_t out_p0,
+        uintptr_t out_p1,
+        size_t size
+    ) {
+        // node2_data0   = node1_data1  XOR node3_parity1  -> ch0 XOR ch1
+        // node2_data1   = node0_data0  XOR node3_parity0  -> ch2 XOR ch3
+        // node2_parity0 = node1_data0  XOR node3_data1    -> ch4 XOR ch5
+        // node2_parity1 = node0_data1  XOR node3_data0    -> ch6 XOR ch7
+        std::vector<std::exception_ptr> xor_exceptions(4);
+        std::vector<std::thread> xor_threads;
+
+        xor_threads.emplace_back([&]() {
+            try {
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(out_d0),
+                    reinterpret_cast<const uint8_t*>(recv_addrs[0]),
+                    reinterpret_cast<const uint8_t*>(recv_addrs[1]),
+                    size);
+            } catch (...) {
+                xor_exceptions[0] = std::current_exception();
+            }
+        });
+        xor_threads.emplace_back([&]() {
+            try {
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(out_d1),
+                    reinterpret_cast<const uint8_t*>(recv_addrs[2]),
+                    reinterpret_cast<const uint8_t*>(recv_addrs[3]),
+                    size);
+            } catch (...) {
+                xor_exceptions[1] = std::current_exception();
+            }
+        });
+        xor_threads.emplace_back([&]() {
+            try {
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(out_p0),
+                    reinterpret_cast<const uint8_t*>(recv_addrs[4]),
+                    reinterpret_cast<const uint8_t*>(recv_addrs[5]),
+                    size);
+            } catch (...) {
+                xor_exceptions[2] = std::current_exception();
+            }
+        });
+        xor_threads.emplace_back([&]() {
+            try {
+                xor_two_out_of_place(
+                    reinterpret_cast<uint8_t*>(out_p1),
+                    reinterpret_cast<const uint8_t*>(recv_addrs[6]),
+                    reinterpret_cast<const uint8_t*>(recv_addrs[7]),
+                    size);
+            } catch (...) {
+                xor_exceptions[3] = std::current_exception();
+            }
+        });
+
+        for (auto& t : xor_threads) {
+            t.join();
+        }
+        for (size_t i = 0; i < xor_exceptions.size(); ++i) {
+            if (xor_exceptions[i]) {
+                std::rethrow_exception(xor_exceptions[i]);
+            }
+        }
+    }
+
     // Unified recovery interface for rank2 (parallel recv + parallel XOR)
     void load_recover(
         // Receive buffers (6 blocks from other ranks)
@@ -3012,6 +3394,13 @@ public:
         size_t size
     ) {
         auto get_socket = [this](const std::string& block_name) -> boost::asio::ip::tcp::socket* {
+            if (use_no_shared_block_) {
+                int ch = ns_load_channel_from_name(block_name);
+                if (ch >= 0) {
+                    return &conn_.get_ns_load_send_socket(ch);
+                }
+                return nullptr;
+            }
             if (block_name == "rank0_data2") {
                 return &conn_.get_load_send_rank0_data2_socket();
             } else if (block_name == "rank0_parity2") {
@@ -3028,7 +3417,10 @@ public:
             return nullptr;
         };
 #if RDMA_AVAILABLE
-        auto get_load_rdma_ch = [](const std::string& block_name) -> int {
+        auto get_load_rdma_ch = [this](const std::string& block_name) -> int {
+            if (use_no_shared_block_) {
+                return ns_load_channel_from_name(block_name);
+            }
             if (block_name == "rank0_data2") return 0;
             if (block_name == "rank0_parity2") return 1;
             if (block_name == "rank1_data1") return 2;
@@ -3036,6 +3428,14 @@ public:
             if (block_name == "rank3_data1") return 4;
             if (block_name == "rank3_data2") return 5;
             return -1;
+        };
+        auto get_rdma_channel = [this](int ch) -> RdmaConnectionChannel* {
+            if (use_no_shared_block_) {
+                return (ch >= 0 && ch < NS_LOAD_NUM_CHANNELS)
+                    ? rdma_load_channels_noshared_[ch].get() : nullptr;
+            }
+            return (ch >= 0 && ch < RDMA_NUM_LOAD_CHANNELS)
+                ? rdma_load_channels_[ch].get() : nullptr;
         };
 #endif
 
@@ -3046,8 +3446,8 @@ public:
             try {
 #if RDMA_AVAILABLE
                 int ch1 = get_load_rdma_ch(block1_name);
-                if (use_rdma_ && ch1 >= 0 && rdma_load_channels_[ch1]) {
-                    rdma_load_channels_[ch1]->send_data(
+                if (use_rdma_ && ch1 >= 0 && get_rdma_channel(ch1)) {
+                    get_rdma_channel(ch1)->send_data(
                         reinterpret_cast<const uint8_t*>(block1_addr), size);
                 } else
 #endif
@@ -3071,8 +3471,8 @@ public:
             try {
 #if RDMA_AVAILABLE
                 int ch2 = get_load_rdma_ch(block2_name);
-                if (use_rdma_ && ch2 >= 0 && rdma_load_channels_[ch2]) {
-                    rdma_load_channels_[ch2]->send_data(
+                if (use_rdma_ && ch2 >= 0 && get_rdma_channel(ch2)) {
+                    get_rdma_channel(ch2)->send_data(
                         reinterpret_cast<const uint8_t*>(block2_addr), size);
                 } else
 #endif
@@ -3788,6 +4188,54 @@ public:
         onefail_net_cv_.notify_one();
     }
 
+    void submit_onefail_noshared_recv_chunk(
+        uintptr_t recv_n1_d1, uintptr_t recv_n3_p1,
+        uintptr_t recv_n0_d0, uintptr_t recv_n3_p0,
+        uintptr_t recv_n1_d0, uintptr_t recv_n3_d1,
+        uintptr_t recv_n0_d1, uintptr_t recv_n3_d0,
+        uintptr_t out_d0, uintptr_t out_d1,
+        uintptr_t out_p0, uintptr_t out_p1,
+        size_t size, int chunk_index,
+        uintptr_t rel0, uintptr_t rel1, uintptr_t rel2, uintptr_t rel3,
+        uintptr_t rel4, uintptr_t rel5, uintptr_t rel6, uintptr_t rel7
+    ) {
+        if (!is_load_mode_) {
+            throw std::runtime_error(
+                "ECLATIN: submit_onefail_noshared_recv_chunk called but not in load mode");
+        }
+        OnefailPipelineTask task;
+        task.kind = OnefailTaskKind::Recv;
+        task.noshared = true;
+        task.size = size;
+        task.chunk_index = chunk_index;
+        task.ns_recv[0] = recv_n1_d1;
+        task.ns_recv[1] = recv_n3_p1;
+        task.ns_recv[2] = recv_n0_d0;
+        task.ns_recv[3] = recv_n3_p0;
+        task.ns_recv[4] = recv_n1_d0;
+        task.ns_recv[5] = recv_n3_d1;
+        task.ns_recv[6] = recv_n0_d1;
+        task.ns_recv[7] = recv_n3_d0;
+        task.out_d1 = out_d0;
+        task.out_d2 = out_d1;
+        task.out_p1 = out_p0;
+        task.out_p2 = out_p1;
+        task.release_addrs[0] = rel0;
+        task.release_addrs[1] = rel1;
+        task.release_addrs[2] = rel2;
+        task.release_addrs[3] = rel3;
+        task.release_addrs[4] = rel4;
+        task.release_addrs[5] = rel5;
+        task.release_addrs[6] = rel6;
+        task.release_addrs[7] = rel7;
+        task.num_release = NS_LOAD_NUM_CHANNELS;
+        {
+            std::lock_guard<std::mutex> lk(onefail_net_mutex_);
+            onefail_net_q_.push(task);
+        }
+        onefail_net_cv_.notify_one();
+    }
+
     void submit_onefail_pipeline_sentinels() {
         OnefailPipelineTask sentinel = OnefailPipelineTask::make_sentinel();
         {
@@ -3851,9 +4299,13 @@ public:
                         task.send_b2_name, task.send_b2_addr,
                         task.size);
                 } else if (rank_in_group_ == 2) {
-                    onefail_recv_chunk_(
-                        task.r0d2, task.r0p2, task.r1d1, task.r1p1,
-                        task.r3d1, task.r3d2, task.size);
+                    if (task.noshared) {
+                        onefail_noshared_recv_chunk_(task.ns_recv, task.size);
+                    } else {
+                        onefail_recv_chunk_(
+                            task.r0d2, task.r0p2, task.r1d1, task.r1p1,
+                            task.r3d1, task.r3d2, task.size);
+                    }
                     {
                         std::lock_guard<std::mutex> lk(onefail_xor_mutex_);
                         onefail_xor_q_.push(task);
@@ -3893,11 +4345,18 @@ public:
             try {
                 if (rank_in_group_ == 2 && task.kind == OnefailTaskKind::Recv) {
                     std::lock_guard<std::mutex> pool_lk(xor_pool_work_mutex_);
-                    onefail_xor_chunk_(
-                        task.r0d2, task.r0p2, task.r1d1, task.r1p1,
-                        task.r3d1, task.r3d2,
-                        task.out_d1, task.out_d2, task.out_p1, task.out_p2,
-                        task.size);
+                    if (task.noshared) {
+                        onefail_noshared_xor_chunk_(
+                            task.ns_recv,
+                            task.out_d1, task.out_d2, task.out_p1, task.out_p2,
+                            task.size);
+                    } else {
+                        onefail_xor_chunk_(
+                            task.r0d2, task.r0p2, task.r1d1, task.r1p1,
+                            task.r3d1, task.r3d2,
+                            task.out_d1, task.out_d2, task.out_p1, task.out_p2,
+                            task.size);
+                    }
                     onefail_release_pool_buffers(task);
                 }
             } catch (...) {
@@ -4619,6 +5078,7 @@ private:
     
     // Load mode flags
     std::atomic<bool> is_load_mode_{false};
+    bool use_no_shared_block_{false};
     int failed_rank_{-1};
     int failed_rank_in_group_{-1};  // failed rank within 4-rank group (for multi-group support)
     bool is_twofail_v2_{false};     // two-failures v2 mode (survivor-side XOR decode)
@@ -4661,6 +5121,8 @@ private:
     ibv_cq* rdma_recv_cq_[RDMA_NUM_SAVE_CHANNELS];
     ibv_cq* rdma_load_send_cq_[RDMA_NUM_LOAD_CHANNELS];
     ibv_cq* rdma_load_recv_cq_[RDMA_NUM_LOAD_CHANNELS];
+    ibv_cq* rdma_load_send_cq_noshared_[NS_LOAD_NUM_CHANNELS];
+    ibv_cq* rdma_load_recv_cq_noshared_[NS_LOAD_NUM_CHANNELS];
     ibv_cq* rdma_load_send_cq_two_fail_[RDMA_NUM_LOAD_CHANNELS_TWO_FAIL];
     ibv_cq* rdma_load_recv_cq_two_fail_[RDMA_NUM_LOAD_CHANNELS_TWO_FAIL];
     // v2 two-fail: survivor exchange (4 ch over twf_surv_exch)
@@ -4679,6 +5141,7 @@ private:
     std::mutex rdma_buffer_mutex_;
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_SAVE_CHANNELS> rdma_save_channels_;
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_LOAD_CHANNELS> rdma_load_channels_;
+    std::array<std::unique_ptr<RdmaConnectionChannel>, NS_LOAD_NUM_CHANNELS> rdma_load_channels_noshared_;
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_LOAD_CHANNELS_TWO_FAIL> rdma_load_channels_two_fail_;
     // v2 two-fail RDMA channels
     std::array<std::unique_ptr<RdmaConnectionChannel>, RDMA_NUM_TWF_V2_SURVEXCH> rdma_twf_v2_survexch_channels_;
@@ -5141,6 +5604,54 @@ private:
         std::cout << "[ECLATIN RDMA] Load RDMA resources initialized (6 CQ pairs)" << std::endl;
     }
 
+    void init_rdma_load_resources_noshared() {
+        if (!use_rdma_ || !rdma_pd_) return;
+        if (rdma_load_send_cq_noshared_[0] != nullptr) return;
+        if (rdma_context_ == nullptr) {
+            init_rdma_resources();
+        }
+        std::cout << "[ECLATIN RDMA] Initializing no-shared load RDMA resources ("
+                  << NS_LOAD_NUM_CHANNELS << " CQ pairs)..." << std::endl;
+        for (int i = 0; i < NS_LOAD_NUM_CHANNELS; ++i) {
+            rdma_load_send_cq_noshared_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            rdma_load_recv_cq_noshared_[i] = ibv_create_cq(rdma_context_, 256, nullptr, nullptr, 0);
+            if (!rdma_load_send_cq_noshared_[i] || !rdma_load_recv_cq_noshared_[i]) {
+                for (int j = 0; j < i; ++j) {
+                    if (rdma_load_send_cq_noshared_[j]) {
+                        ibv_destroy_cq(rdma_load_send_cq_noshared_[j]);
+                        rdma_load_send_cq_noshared_[j] = nullptr;
+                    }
+                    if (rdma_load_recv_cq_noshared_[j]) {
+                        ibv_destroy_cq(rdma_load_recv_cq_noshared_[j]);
+                        rdma_load_recv_cq_noshared_[j] = nullptr;
+                    }
+                }
+                throw std::runtime_error(
+                    "ECLATIN RDMA: Failed to create no-shared load CQs for channel "
+                    + std::to_string(i));
+            }
+        }
+        std::cout << "[ECLATIN RDMA] No-shared load RDMA resources initialized ("
+                  << NS_LOAD_NUM_CHANNELS << " CQ pairs)" << std::endl;
+    }
+
+    void setup_ns_rdma_load_channel(int ch, bool is_sender, int peer_rank) {
+#if RDMA_AVAILABLE
+        if (!use_rdma_ || !rdma_pd_) return;
+        auto& sock = is_sender
+            ? conn_.get_ns_load_send_socket(ch)
+            : conn_.get_ns_load_recv_socket(ch);
+        rdma_load_channels_noshared_[ch] = std::make_unique<RdmaConnectionChannel>(
+            rdma_context_, rdma_pd_,
+            rdma_load_send_cq_noshared_[ch], rdma_load_recv_cq_noshared_[ch],
+            sock.native_handle(), sock.native_handle(),
+            &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_in_group_, peer_rank);
+        rdma_load_channels_noshared_[ch]->exchange_and_connect(is_sender);
+#else
+        (void)ch; (void)is_sender; (void)peer_rank;
+#endif
+    }
+
     void init_rdma_load_channels() {
         if (!use_rdma_ || !rdma_pd_) return;
         int rank_for_log = (rank_in_group_ >= 0) ? rank_in_group_ : 0;
@@ -5447,6 +5958,9 @@ private:
         for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS; ++i) {
             rdma_load_channels_[i].reset();
         }
+        for (int i = 0; i < NS_LOAD_NUM_CHANNELS; ++i) {
+            rdma_load_channels_noshared_[i].reset();
+        }
         for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS_TWO_FAIL; ++i) {
             rdma_load_channels_two_fail_[i].reset();
         }
@@ -5457,6 +5971,16 @@ private:
         for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS; ++i) {
             if (rdma_load_send_cq_[i]) { ibv_destroy_cq(rdma_load_send_cq_[i]); rdma_load_send_cq_[i] = nullptr; }
             if (rdma_load_recv_cq_[i]) { ibv_destroy_cq(rdma_load_recv_cq_[i]); rdma_load_recv_cq_[i] = nullptr; }
+        }
+        for (int i = 0; i < NS_LOAD_NUM_CHANNELS; ++i) {
+            if (rdma_load_send_cq_noshared_[i]) {
+                ibv_destroy_cq(rdma_load_send_cq_noshared_[i]);
+                rdma_load_send_cq_noshared_[i] = nullptr;
+            }
+            if (rdma_load_recv_cq_noshared_[i]) {
+                ibv_destroy_cq(rdma_load_recv_cq_noshared_[i]);
+                rdma_load_recv_cq_noshared_[i] = nullptr;
+            }
         }
         for (int i = 0; i < RDMA_NUM_LOAD_CHANNELS_TWO_FAIL; ++i) {
             if (rdma_load_send_cq_two_fail_[i]) { ibv_destroy_cq(rdma_load_send_cq_two_fail_[i]); rdma_load_send_cq_two_fail_[i] = nullptr; }
@@ -7244,6 +7768,9 @@ PYBIND11_MODULE(eclatin_native, m) {
              "Set load mode for recovery",
              pybind11::arg("is_load"),
              pybind11::arg("failed_rank") = -1)
+        .def("set_no_shared_block", &ECLATINNative::set_no_shared_block,
+             "Enable HW1 no-shared-block recovery breakdown mode",
+             pybind11::arg("enabled"))
         .def("init_load_connections", &ECLATINNative::init_load_connections,
              "Initialize load mode connections (rank_in_group 2 recv, 0/1/3 send)",
              pybind11::arg("rank_in_group"),
@@ -7254,6 +7781,18 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("load_recv_rank1_parity1_port"),
              pybind11::arg("load_recv_rank3_data1_port"),
              pybind11::arg("load_recv_rank3_data2_port"))
+        .def("init_load_connections_noshared", &ECLATINNative::init_load_connections_noshared,
+             "Initialize no-shared-block HW1 load connections (8 channels)",
+             pybind11::arg("rank_in_group"),
+             pybind11::arg("rank2_ip"),
+             pybind11::arg("port_n1_d1"),
+             pybind11::arg("port_n3_p1"),
+             pybind11::arg("port_n0_d0"),
+             pybind11::arg("port_n3_p0"),
+             pybind11::arg("port_n1_d0"),
+             pybind11::arg("port_n3_d1"),
+             pybind11::arg("port_n0_d1"),
+             pybind11::arg("port_n3_d0"))
         .def("wait_for_load_connections", &ECLATINNative::wait_for_load_connections,
              "Wait for load mode connections to be established",
              pybind11::arg("timeout_seconds") = 30)
@@ -7396,6 +7935,18 @@ PYBIND11_MODULE(eclatin_native, m) {
              pybind11::arg("size"), pybind11::arg("chunk_index"),
              pybind11::arg("rel0"), pybind11::arg("rel1"), pybind11::arg("rel2"),
              pybind11::arg("rel3"), pybind11::arg("rel4"), pybind11::arg("rel5"))
+        .def("submit_onefail_noshared_recv_chunk", &ECLATINNative::submit_onefail_noshared_recv_chunk,
+             "Submit one rig2 no-shared recv+xor load chunk (8 independent blocks)",
+             pybind11::arg("recv_n1_d1"), pybind11::arg("recv_n3_p1"),
+             pybind11::arg("recv_n0_d0"), pybind11::arg("recv_n3_p0"),
+             pybind11::arg("recv_n1_d0"), pybind11::arg("recv_n3_d1"),
+             pybind11::arg("recv_n0_d1"), pybind11::arg("recv_n3_d0"),
+             pybind11::arg("out_d0"), pybind11::arg("out_d1"),
+             pybind11::arg("out_p0"), pybind11::arg("out_p1"),
+             pybind11::arg("size"), pybind11::arg("chunk_index"),
+             pybind11::arg("rel0"), pybind11::arg("rel1"), pybind11::arg("rel2"),
+             pybind11::arg("rel3"), pybind11::arg("rel4"), pybind11::arg("rel5"),
+             pybind11::arg("rel6"), pybind11::arg("rel7"))
         .def("submit_onefail_pipeline_sentinels", &ECLATINNative::submit_onefail_pipeline_sentinels,
              "Submit pipeline sentinels to drain one-fail load workers")
         .def("wait_for_onefail_pipeline_completion", &ECLATINNative::wait_for_onefail_pipeline_completion,

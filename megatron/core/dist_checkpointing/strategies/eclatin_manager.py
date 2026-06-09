@@ -364,33 +364,67 @@ class ECLATINManager:
         rank_in_group = self._get_rank_in_group(rank, world_size)
         # Load mode ports (for rank_in_group 2 recovery): per-group base to avoid port conflict
         load_base_port = base_port + 1000 + group_id * 100
-        # Always add all 6 load_recv_* port keys (for rank_in_group 2 receiver)
-        # so all ranks can look them up unconditionally.
-        ports.update({
-            'load_recv_rank0_data2': load_base_port + 0,
-            'load_recv_rank0_parity2': load_base_port + 1,
-            'load_recv_rank1_data1': load_base_port + 2,
-            'load_recv_rank1_parity1': load_base_port + 3,
-            'load_recv_rank3_data1': load_base_port + 4,
-            'load_recv_rank3_data2': load_base_port + 5,
-        })
-        # Add per-rank send port keys for non-receiver ranks
-        if rank_in_group != 2:
-            if rank_in_group == 0:
-                ports.update({
-                    'load_send_rank0_data2': load_base_port + 0,
-                    'load_send_rank0_parity2': load_base_port + 1,
-                })
-            elif rank_in_group == 1:
-                ports.update({
-                    'load_send_rank1_data1': load_base_port + 2,
-                    'load_send_rank1_parity1': load_base_port + 3,
-                })
-            elif rank_in_group == 3:
-                ports.update({
-                    'load_send_rank3_data1': load_base_port + 4,
-                    'load_send_rank3_data2': load_base_port + 5,
-                })
+        from megatron.training import get_args as _get_args
+        _args = _get_args()
+        _no_shared = getattr(_args, "no_shared_block", False)
+
+        if _no_shared:
+            ports.update({
+                'ns_recv_n1_d1': load_base_port + 0,
+                'ns_recv_n3_p1': load_base_port + 1,
+                'ns_recv_n0_d0': load_base_port + 2,
+                'ns_recv_n3_p0': load_base_port + 3,
+                'ns_recv_n1_d0': load_base_port + 4,
+                'ns_recv_n3_d1': load_base_port + 5,
+                'ns_recv_n0_d1': load_base_port + 6,
+                'ns_recv_n3_d0': load_base_port + 7,
+            })
+            if rank_in_group != 2:
+                if rank_in_group == 0:
+                    ports.update({
+                        'ns_send_n0_d0': load_base_port + 2,
+                        'ns_send_n0_d1': load_base_port + 6,
+                    })
+                elif rank_in_group == 1:
+                    ports.update({
+                        'ns_send_n1_d1': load_base_port + 0,
+                        'ns_send_n1_d0': load_base_port + 4,
+                    })
+                elif rank_in_group == 3:
+                    ports.update({
+                        'ns_send_n3_p1': load_base_port + 1,
+                        'ns_send_n3_p0': load_base_port + 3,
+                        'ns_send_n3_d1': load_base_port + 5,
+                        'ns_send_n3_d0': load_base_port + 7,
+                    })
+        else:
+            # Always add all 6 load_recv_* port keys (for rank_in_group 2 receiver)
+            # so all ranks can look them up unconditionally.
+            ports.update({
+                'load_recv_rank0_data2': load_base_port + 0,
+                'load_recv_rank0_parity2': load_base_port + 1,
+                'load_recv_rank1_data1': load_base_port + 2,
+                'load_recv_rank1_parity1': load_base_port + 3,
+                'load_recv_rank3_data1': load_base_port + 4,
+                'load_recv_rank3_data2': load_base_port + 5,
+            })
+            # Add per-rank send port keys for non-receiver ranks
+            if rank_in_group != 2:
+                if rank_in_group == 0:
+                    ports.update({
+                        'load_send_rank0_data2': load_base_port + 0,
+                        'load_send_rank0_parity2': load_base_port + 1,
+                    })
+                elif rank_in_group == 1:
+                    ports.update({
+                        'load_send_rank1_data1': load_base_port + 2,
+                        'load_send_rank1_parity1': load_base_port + 3,
+                    })
+                elif rank_in_group == 3:
+                    ports.update({
+                        'load_send_rank3_data1': load_base_port + 4,
+                        'load_send_rank3_data2': load_base_port + 5,
+                    })
 
         # Two-failures load mode ports (always added for all ranks)
         # 8 ports per group:
@@ -701,6 +735,11 @@ class ECLATINManager:
         The 4 persistent blocks (data_block_1/2, parity_block_1/2) will be allocated
         in strategy after metadata exchange.
         """
+        from megatron.training import get_args
+        args = get_args()
+        if getattr(args, "no_shared_block", False):
+            self.eclatin_recv_buffers_count = 16
+
         rank = torch.distributed.get_rank()
         logger.info("ECLATIN: Initializing buffers for ECLATIN (data and recv pools only)")
         print(f"ECLATIN: Initializing buffers for ECLATIN (rank={rank}, data and recv pools only)")

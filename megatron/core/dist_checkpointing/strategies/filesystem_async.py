@@ -4847,7 +4847,6 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Return write_buckets with EC-CHECK continuous buffer
         # Buffer contains all tensor data in continuous memory
         
-        # todo(hucc):  mul write_buckets is for mul process write ,but here is one process write ,so we need to change the write_buckets to a list of write_buckets, leave it future
         result_buckets = []
         for i, bucket in enumerate(self.write_buckets):
             file_name, storage_key, (bytes_data, tensor_data) = bucket

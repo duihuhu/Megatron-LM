@@ -129,7 +129,7 @@ EVAL_AND_LOGGING_ARGS=(
     --use-gemini-hardware-failure
     --use-rdma
 
-    # --use-eclatin
+    # --use-checkcode
     --ckpt-format torch_dist
     # --no-save-optim
     # --no-load-optim

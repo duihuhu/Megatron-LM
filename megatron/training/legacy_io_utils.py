@@ -26,11 +26,11 @@ _HEADER_MAGIC_LEN = 4
 # Magic strings for each scheme's main checkpoint file
 MAGIC_ECCHECK = b"ECCK"
 MAGIC_ECNAIVE = b"ECNV"
-MAGIC_ECLATIN = b"ECLT"
+MAGIC_ECLATIN = b"ECLT"  # CheckCode on-disk magic (name unchanged for compat)
 MAGIC_GEMINI = b"GEMR"
 
 # Magic strings for block / replica files
-MAGIC_BLOCK = b"ECBK"  # generic block: ECCHECK / ECNAIVE / ECLATIN
+MAGIC_BLOCK = b"ECBK"  # generic block: ECCHECK / ECNAIVE / CheckCode (ECLATIN)
 MAGIC_GEMINI_REPLICA = b"GMRP"
 
 # ---- write helpers ----------------------------------------------------------

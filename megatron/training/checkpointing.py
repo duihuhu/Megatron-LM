@@ -96,7 +96,7 @@ def maybe_preinitialize_legacy_ec_modules():
     schemes = [
         ('use_eccheck',          'megatron.core.dist_checkpointing.strategies.eccheck_manager',           'ECCHECKManager',         'init_eccheck_if_enabled'),
         ('use_ecnaive',          'megatron.core.dist_checkpointing.strategies.ecnaive_manager',           'ECNAIVEManager',         'init_ecnaive_if_enabled'),
-        ('use_eclatin',          'megatron.core.dist_checkpointing.strategies.eclatin_manager',           'ECLATINManager',         'init_eclatin_if_enabled'),
+        ('use_eclatin',          'megatron.core.dist_checkpointing.strategies.checkcode_manager',           'ECLATINManager',         'init_eclatin_if_enabled'),
         ('use_gemini_replicas',  'megatron.core.dist_checkpointing.strategies.gemini_replicas_manager',   'GeminiReplicasManager',  'init_gemini_replicas_if_enabled'),
     ]
 
@@ -678,7 +678,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             else:
                 assert ckpt_type == CheckpointType.LEGACY
                 if getattr(args, "use_eclatin", False):
-                    from .eclatin_legacy import save_eclatin_legacy_checkpoint
+                    from .checkcode_legacy import save_eclatin_legacy_checkpoint
                     save_eclatin_legacy_checkpoint(state_dict, checkpoint_name)
                     checkpoint_name = str(Path(checkpoint_name).parent)
                 elif args.use_ecnaive:
@@ -1347,7 +1347,7 @@ def _load_base_checkpoint(
                     )
                     state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
             elif getattr(args, "use_eclatin", False):
-                from .eclatin_legacy import (
+                from .checkcode_legacy import (
                     load_eclatin_legacy_checkpoint,
                     state_dict_from_eclatin_main_metadata_only,
                 )
@@ -1415,7 +1415,7 @@ def _load_base_checkpoint(
                     if any_eclatin:
                         eclatin_marker = str(any_eclatin[0])
                 if eclatin_marker is not None:
-                    from .eclatin_legacy import (
+                    from .checkcode_legacy import (
                         load_eclatin_legacy_checkpoint,
                         state_dict_from_eclatin_main_metadata_only,
                     )

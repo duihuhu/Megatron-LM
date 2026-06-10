@@ -127,7 +127,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-gemini-software-failure
     # --use-gemini-hardware-failure
 
-    # --use-eclatin
+    # --use-checkcode
     --data-parallel-sharding-strategy optim_grads_params
     --use-distributed-optimizer
     --use-rdma

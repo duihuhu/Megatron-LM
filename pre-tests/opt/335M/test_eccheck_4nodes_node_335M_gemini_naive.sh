@@ -132,7 +132,7 @@ EVAL_AND_LOGGING_ARGS=(
     --use-gemini-software-failure
     # --use-gemini-hardware-failure
 
-    # --use-eclatin
+    # --use-checkcode
     --ckpt-format torch_dist
     --save-embeddings-separately
 )

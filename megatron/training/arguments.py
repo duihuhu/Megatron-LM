@@ -357,25 +357,25 @@ def validate_args(args, defaults={}):
     )
     if sum(_ec_legacy_flags) > 1:
         raise RuntimeError(
-            "At most one of --use-ecnaive, --use-eclatin, "
+            "At most one of --use-ecnaive, --use-checkcode, "
             "and --use-gemini-replicas may be enabled."
         )
     if getattr(args, "no_shared_block", False):
         if not getattr(args, "use_eclatin", False):
             raise RuntimeError(
-                "--no-shared-block requires --use-eclatin."
+                "--no-shared-block requires --use-checkcode."
             )
         if getattr(args, "use_eclatin_two_failures", False):
             raise RuntimeError(
-                "--no-shared-block is incompatible with --use-eclatin-two-failures."
+                "--no-shared-block is incompatible with --use-checkcode-two-failures."
             )
         if getattr(args, "use_eclatin_software_failure", False):
             raise RuntimeError(
-                "--no-shared-block is incompatible with --use-eclatin-software-failure."
+                "--no-shared-block is incompatible with --use-checkcode-software-failure."
             )
         if getattr(args, "use_eclatin_layerwise", False):
             raise RuntimeError(
-                "--no-shared-block is incompatible with --use-eclatin-layerwise."
+                "--no-shared-block is incompatible with --use-checkcode-layerwise."
             )
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
 
@@ -2290,25 +2290,33 @@ def _add_checkpointing_args(parser):
                             'exchange with surviving ranks 0 and 3, using RDMA transport '
                             'and 16-thread encode/XOR pool aligned with save path.')
 
-    # ECLATIN (Erasure Coding Checkpoint with different pipeline) arguments
-    group.add_argument('--use-eclatin', action='store_true',
-                       help='Enable ECLATIN (Erasure Coding Checkpoint with different pipeline) '
-                            'for serialization-free checkpoint encoding. Similar to EC-CHECK but '
-                            'uses a different internal pipeline structure for saving.')
-    group.add_argument('--use-eclatin-layerwise', action='store_true',
-                       help='Use layer-wise ECLATIN checkpointing mode. This enables layer-by-layer '
-                            'pipelined D2H transfer followed by encoding and network transmission.')
-    group.add_argument('--use-eclatin-software-failure', action='store_true',
-                       help='Enable ECLATIN checkpointing for software failure recovery. '
-                            'When enabled, rank2 reads data_block_1 and data_block_2 from local files directly.')
-    group.add_argument('--use-eclatin-two-failures', action='store_true',
-                       help='Enable ECLATIN two-failure hardware recovery mode. '
+    # CheckCode checkpoint arguments (sources: checkcode_*.py; internal dest use_eclatin)
+    _checkcode_alias = ' --use-eclatin is a deprecated alias.'
+    group.add_argument('--use-checkcode', '--use-eclatin', action='store_true',
+                       dest='use_eclatin',
+                       help='Enable CheckCode checkpoint encoding for serialization-free '
+                            'checkpoint save/load. Similar to EC-CHECK but uses a different '
+                            'internal pipeline structure.' + _checkcode_alias)
+    group.add_argument('--use-checkcode-layerwise', '--use-eclatin-layerwise',
+                       action='store_true', dest='use_eclatin_layerwise',
+                       help='Use layer-wise CheckCode checkpointing mode. Enables layer-by-layer '
+                            'pipelined D2H transfer followed by encoding and network transmission.'
+                            + _checkcode_alias)
+    group.add_argument('--use-checkcode-software-failure', '--use-eclatin-software-failure',
+                       action='store_true', dest='use_eclatin_software_failure',
+                       help='Enable CheckCode software failure recovery. When enabled, rank2 '
+                            'reads data_block_1 and data_block_2 from local files directly.'
+                            + _checkcode_alias)
+    group.add_argument('--use-checkcode-two-failures', '--use-eclatin-two-failures',
+                       action='store_true', dest='use_eclatin_two_failures',
+                       help='Enable CheckCode two-failure hardware recovery mode. '
                             'rank_in_group 0 and 1 are treated as failed; they recover from '
-                            'surviving ranks 2 and 3 using RDMA transport and 16-thread XOR pool.')
+                            'surviving ranks 2 and 3 using RDMA transport and 16-thread XOR pool.'
+                            + _checkcode_alias)
     group.add_argument('--no-shared-block', action='store_true',
-                       help='ECLATIN HW1 load breakdown: recover node2 via 8 independent network '
+                       help='CheckCode HW1 load breakdown: recover node2 via 8 independent network '
                             'blocks with no recv-buffer reuse in XOR (vs default 6-channel shared). '
-                            'Requires --load and --use-eclatin; incompatible with layerwise, '
+                            'Requires --load and --use-checkcode; incompatible with layerwise, '
                             'software-failure, and two-failures modes.')
 
     # EC-NAIVE (Erasure Coding Checkpoint with naive Reed-Solomon encoding) arguments

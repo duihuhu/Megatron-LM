@@ -60,7 +60,7 @@ from .base import (
 )
 from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .eccheck_manager import ECCHECKManager
-from .eclatin_manager import ECLATINManager
+from .checkcode_manager import ECLATINManager
 from .ecnaive_manager import ECNAIVEManager
 from .gemini_manager import GeminiManager
 from .gemini_replicas_manager import GeminiReplicasManager
@@ -5070,7 +5070,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         )
         
         # ===== Step 7: receiver (rank_in_group 2) in failed rank's group save recovered buffer =====
-        from .eclatin_manager import RANKS_PER_GROUP
+        from .checkcode_manager import RANKS_PER_GROUP
         failed_group_id = failed_rank // RANKS_PER_GROUP
         if rank_in_group == 2 and net_config['group_id'] == failed_group_id:
             logger.info(f"ECLATIN: [Rank {rank}] Saving recovered buffer for _load_eclatin_checkpoint")

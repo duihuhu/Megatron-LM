@@ -8,7 +8,7 @@
 #   CLEAR_CACHE=1 ./prepare_bert_cache.sh   # wipe stale cache before building
 #
 # Data-related args (train-iters, eval-interval, global-batch-size, etc.) must match
-# test_eccheck_4nodes_node_335M_eccheck.sh so cache hashes are identical.
+# test_2_7B_eccheck.sh so cache hashes are identical.
 
 set -euo pipefail
 
@@ -32,7 +32,7 @@ MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
 MICRO_BATCH_SIZE=4
 GLOBAL_BATCH_SIZE=16
 
-# Must match test_eccheck_4nodes_node_335M_eccheck.sh for cache hash consistency
+# Must match test_2_7B_eccheck.sh for cache hash consistency
 TRAIN_ITERS=4
 EVAL_INTERVAL=100
 EVAL_ITERS=1

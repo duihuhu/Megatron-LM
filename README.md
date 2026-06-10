@@ -32,8 +32,7 @@ Compile native extensions under `megatron/core/dist_checkpointing/strategies/`:
 
 ```bash
 # CheckCode (required for paper experiments)
-bash build_clean_checkcode.sh          # ASIO/TCP
-bash build_clean_checkcode.sh cuda     # + CUDA async D2H
+bash build_clean_checkcode.sh          
 
 # Baselines (only if you run those scripts)
 bash build_clean.sh                    # EC-CHECK

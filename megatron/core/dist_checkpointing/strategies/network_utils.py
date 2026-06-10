@@ -95,13 +95,13 @@ def resolve_ip(
         MASTER_ADDR                      # final fallback
 
     Args:
-        prefix: Environment variable prefix (e.g. ``"FRCHECK"``, ``"GEMINI"``).
+        prefix: Environment variable prefix (e.g. ``"GEMINI"``).
         rank: Current global rank. If None, auto-detected via
             ``torch.distributed.get_rank()``.
         local_rank: Local rank within the node. If None, auto-detected via
             ``LOCAL_RANK`` / ``OMPI_COMM_WORLD_LOCAL_RANK`` / ``SLURM_LOCALID``.
         fallback_prefixes: Additional prefixes to try for ``BASE_IP`` and
-            ``INTERFACE`` env vars (e.g. ``["ECLATIN"]`` for FRCheck).
+            ``INTERFACE`` env vars (e.g. ``["ECLATIN"]``).
 
     Returns:
         Resolved IP address string.

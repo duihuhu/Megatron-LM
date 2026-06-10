@@ -6,7 +6,7 @@
 # 使用 torch legacy 路径（torch.save → .pt 文件）进行多副本 checkpoint，
 # 替代原有的 distributed checkpoint（FileSystemWriterAsync + torch_dist）路径。
 #
-# 与 ecnaive_legacy.py / frcheck_legacy.py 遵循相同模式。
+# 与 ecnaive_legacy.py 遵循相同模式。
 # =============================================================================
 #
 # Usage:
@@ -67,7 +67,7 @@ if [ -n "$1" ]; then
 fi
 
 # ---- GPU ID 解析（后续连续数字参数） ----
-# 与 FRCheck 脚本相同：收集所有连续数字参数作为 GPU ID，
+# 收集所有连续数字参数作为 GPU ID，
 # 遇到第一个非数字参数停止收集，之后的参数透传给训练脚本。
 GPU_IDS=()
 while [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; do
@@ -230,7 +230,7 @@ EVAL_AND_LOGGING_ARGS=(
                                         # 必须能被 world_size 整除
                                         # 独立于节点数和每节点 rank 数，但数学上要求
                                         #   num_nodes % group_size == 0 才能启用
-                                        #   跨节点交错排列（FRCheck 同款布局）
+                                        #   跨节点交错排列
                                         # 每组内每个 rank 来自不同物理节点
 
     # ---------------------------------------------------------------------------

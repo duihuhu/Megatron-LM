@@ -353,12 +353,11 @@ def validate_args(args, defaults={}):
     _ec_legacy_flags = (
         bool(getattr(args, "use_ecnaive", False)),
         bool(getattr(args, "use_eclatin", False)),
-        bool(getattr(args, "use_frcheck", False)),
         bool(getattr(args, "use_gemini_replicas", False)),
     )
     if sum(_ec_legacy_flags) > 1:
         raise RuntimeError(
-            "At most one of --use-ecnaive, --use-eclatin, --use-frcheck, "
+            "At most one of --use-ecnaive, --use-eclatin, "
             "and --use-gemini-replicas may be enabled."
         )
     if getattr(args, "no_shared_block", False):
@@ -378,23 +377,6 @@ def validate_args(args, defaults={}):
             raise RuntimeError(
                 "--no-shared-block is incompatible with --use-eclatin-layerwise."
             )
-    if getattr(args, "use_frcheck", False):
-        frcheck_path = getattr(args, "frcheck_table_path", None)
-        frcheck_n = getattr(args, "frcheck_n", None)
-        frcheck_dir = getattr(args, "frcheck_table_dir", None)
-        if frcheck_path:
-            if not os.path.isfile(frcheck_path):
-                raise RuntimeError(f"FRCheck: --frcheck-table-path not found: {frcheck_path}")
-        else:
-            if frcheck_n is None or frcheck_n <= 0:
-                raise RuntimeError(
-                    "FRCheck: --frcheck-n must be provided and > 0 when --frcheck-table-path is not set."
-                )
-            if not frcheck_dir:
-                raise RuntimeError(
-                    "FRCheck: --frcheck-table-dir is required when --frcheck-table-path is not set."
-                )
-
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
 
     # Total model size.
@@ -2350,35 +2332,6 @@ def _add_checkpointing_args(parser):
                        help='Debug HW recovery by using main.pt tensor_buffer directly '
                             '(bypasses RS decode/encode).')
 
-    group.add_argument('--use-frcheck', action='store_true',
-                       help='Enable FRCheck legacy checkpoint skeleton: validates POA file via native module '
-                            'and writes layer/stripe directory layout with frcheck_torch_legacy metadata.')
-    group.add_argument('--frcheck-n', type=int, default=None,
-                       help='FRCheck group size n (POA columns). Used for node-aware grouping and automatic POA file selection.')
-    group.add_argument('--frcheck-table-dir', type=str, default=None,
-                       help='Directory containing FRCheck POA tables. Used with --frcheck-n when --frcheck-table-path is not set.')
-    group.add_argument('--frcheck-table-path', type=str, default=None,
-                       help='Path to POA table file (highest priority). If unset, manager resolves from --frcheck-table-dir and --frcheck-n.')
-    group.add_argument('--use-frcheck-hardware-failure', action='store_true',
-                       help='Enable FRCheck checkpointing for hardware failure recovery. '
-                            'When enabled, the load path uses RS decode over RDMA to recover '
-                            'failed ranks\' data from surviving ranks in the POA-based stripe group. '
-                            'Use --frcheck-failed-ranks to specify which ranks to treat as failed.')
-    group.add_argument('--frcheck-failed-ranks', type=str, default=None,
-                       help='Comma-separated list of global ranks to treat as failed '
-                            'for FRCheck hardware recovery (e.g. "1" or "1,2"). '
-                            'When set, these ranks force recovery from surviving stripe blocks '
-                            'even if their main files exist. '
-                            'Used with --use-frcheck-hardware-failure for testing.')
-    group.add_argument('--use-frcheck-software-failure', action='store_true',
-                       help='Enable FRCheck software failure recovery. '
-                            'Failed ranks read their SOURCE stripe blocks from local disk '
-                            'and reassemble. No network transfer needed — source data is always '
-                            'stored locally. Use with --frcheck-failed-ranks to specify which '
-                            'ranks to treat as failed.')
-    group.add_argument('--frcheck-debug', action='store_true',
-                       help='Enable detailed size/encoding debug logging for FRCheck operations.')
-
     # use gemini checkpointing arguments
     group.add_argument('--use-gemini', action='store_true',
                        help='Enable Gemini checkpointing. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')
@@ -2423,8 +2376,7 @@ def _add_checkpointing_args(parser):
                             'Ranks are divided into independent groups of this size, '
                             'and round-robin replica placement happens within each group. '
                             'Default: None (global round-robin across all ranks). '
-                            'Must evenly divide world_size when set. '
-                            'Similar to --frcheck-n for FRCheck.')
+                            'Must evenly divide world_size when set.')
     group.add_argument('--use-gemini-replicas-hardware-failure', action='store_true',
                        help='Enable Gemini Replicas checkpointing for hardware failure recovery. '
                             'When a rank fails (e.g., rank2), the failed rank recovers its data from other ranks '

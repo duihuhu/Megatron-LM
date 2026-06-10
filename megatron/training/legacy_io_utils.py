@@ -28,12 +28,10 @@ MAGIC_ECCHECK = b"ECCK"
 MAGIC_ECNAIVE = b"ECNV"
 MAGIC_ECLATIN = b"ECLT"
 MAGIC_GEMINI = b"GEMR"
-MAGIC_FRCHECK = b"FRCK"
 
 # Magic strings for block / replica files
 MAGIC_BLOCK = b"ECBK"  # generic block: ECCHECK / ECNAIVE / ECLATIN
 MAGIC_GEMINI_REPLICA = b"GMRP"
-MAGIC_FRCHECK_BLOCK = b"FRBK"
 
 # ---- write helpers ----------------------------------------------------------
 

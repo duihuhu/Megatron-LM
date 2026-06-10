@@ -121,7 +121,7 @@ class ECLATINManager:
                 self.register_buffer(b)
         return self._cached_blocks
 
-    # ---- Group layout methods (identical pattern to ECNAIVE / FRCheck) ----
+    # ---- Group layout methods (identical pattern to ECNAIVE) ----
 
     @staticmethod
     def _get_ranks_per_node() -> int:

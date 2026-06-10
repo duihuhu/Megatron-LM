@@ -526,36 +526,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             )
             # Store parsed list back on args for downstream use
             args.ecnaive_failed_ranks_parsed = failed_ranks
-    if getattr(args, "use_frcheck", False) and (
-        args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
-    ):
-        raise RuntimeError(
-            "FRCheck skeleton only supports torch checkpoint format and LEGACY checkpoints. "
-            "Please use --ckpt-format torch without distributed checkpoint save."
-        )
-    if getattr(args, "use_frcheck_hardware_failure", False):
-        if not getattr(args, "use_frcheck", False):
-            raise RuntimeError(
-                "FRCheck --use-frcheck-hardware-failure requires --use-frcheck"
-            )
-        frcheck_failed_ranks_str = getattr(args, "frcheck_failed_ranks", None)
-        if frcheck_failed_ranks_str is not None:
-            if not torch.distributed.is_initialized():
-                raise RuntimeError(
-                    "FRCheck --frcheck-failed-ranks requires torch.distributed to be initialized"
-                )
-            world_size = torch.distributed.get_world_size()
-            failed_ranks = [int(x.strip()) for x in frcheck_failed_ranks_str.split(",")]
-            if len(failed_ranks) < 1:
-                raise RuntimeError(
-                    f"FRCheck --frcheck-failed-ranks requires at least 1 rank, got {len(failed_ranks)}"
-                )
-            for fr in failed_ranks:
-                if fr < 0 or fr >= world_size:
-                    raise RuntimeError(
-                        f"FRCheck --frcheck-failed-ranks rank {fr} out of range [0, {world_size - 1}]"
-                    )
-            args.frcheck_failed_ranks_parsed = failed_ranks
     if getattr(args, "use_gemini_replicas", False) and (
         args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
     ):
@@ -714,10 +684,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 elif args.use_ecnaive:
                     from .ecnaive_legacy import save_ecnaive_legacy_checkpoint
                     save_ecnaive_legacy_checkpoint(state_dict, checkpoint_name)
-                    checkpoint_name = str(Path(checkpoint_name).parent)
-                elif getattr(args, "use_frcheck", False):
-                    from .frcheck_legacy import save_frcheck_legacy_checkpoint
-                    save_frcheck_legacy_checkpoint(state_dict, checkpoint_name)
                     checkpoint_name = str(Path(checkpoint_name).parent)
                 elif getattr(args, "use_gemini_replicas", False):
                     from .gemini_replicas_legacy import save_gemini_replicas_legacy_checkpoint
@@ -1403,9 +1369,6 @@ def _load_base_checkpoint(
                         str(marker), MAGIC_ECLATIN, pin_tensor_buffer=True,
                     )
                     state_dict = state_dict_from_eclatin_main_metadata_only(payload)
-            elif getattr(args, "use_frcheck", False):
-                from .frcheck_legacy import load_frcheck_legacy_checkpoint
-                state_dict = load_frcheck_legacy_checkpoint(checkpoint_name)
             elif getattr(args, "use_eccheck", False):
                 from .eccheck_legacy import (
                     load_eccheck_legacy_checkpoint,
@@ -1495,33 +1458,6 @@ def _load_base_checkpoint(
                             )
                             state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
                     else:
-                        frcheck_marker = None
-                        if torch.distributed.is_initialized():
-                            rank = torch.distributed.get_rank()
-                            frcheck_rank_marker = ckpt_parent_path / f"frcheck_main_rank{rank}.pt"
-                            if frcheck_rank_marker.is_file():
-                                frcheck_marker = str(frcheck_rank_marker)
-                        if frcheck_marker is None:
-                            frcheck_rank0 = ckpt_parent_path / "frcheck_main_rank0.pt"
-                            if frcheck_rank0.is_file():
-                                frcheck_marker = str(frcheck_rank0)
-                        if frcheck_marker is None:
-                            any_frcheck = sorted(ckpt_parent_path.glob("frcheck_main_rank*.pt"))
-                            if any_frcheck:
-                                frcheck_marker = str(any_frcheck[0])
-                        if frcheck_marker is not None:
-                            from .frcheck_legacy import load_frcheck_legacy_checkpoint
-                            logger.info("FRCheck: auto-detected format, loading via legacy path")
-                            # Hardware recovery requires explicit --use-frcheck-hardware-failure;
-                            # auto-detection loads metadata-only in single-process mode.
-                            if torch.distributed.is_initialized():
-                                state_dict = load_frcheck_legacy_checkpoint(checkpoint_name)
-                            else:
-                                # Metadata-only fallback for single-process inspection
-                                raise NotImplementedError(
-                                    "FRCheck legacy load without distributed init is not implemented. "
-                                    "Use --use-frcheck with distributed training."
-                                )
                         eccheck_marker = None
                         if torch.distributed.is_initialized():
                             rank = torch.distributed.get_rank()

@@ -119,7 +119,7 @@ class GeminiReplicasManager:
         """Calculate target ranks for replicas using round-robin strategy.
 
         When group_size is set, ranks are partitioned into node-interleaved groups
-        (one rank per node per group, following FRCheck's layout), and round-robin
+        (one rank per node per group, node-interleaved layout), and round-robin
         placement is confined within each group.  This ensures replicas of the same
         data land on different physical nodes.
 
@@ -151,7 +151,7 @@ class GeminiReplicasManager:
             )
             return targets
 
-        # --- node-interleaved grouping (FRCheck layout) ---
+        # --- node-interleaved grouping ---
         gs = self.group_size
         ranks_per_node = self._get_ranks_per_node()
 
@@ -169,7 +169,7 @@ class GeminiReplicasManager:
                 local_rank = my_rank % ranks_per_node
                 cluster_id = node_id % clusters
 
-                # group_id follows FRCheck: local_rank * clusters + cluster_id
+                # group_id: local_rank * clusters + cluster_id
                 group_id = local_rank * clusters + cluster_id
 
                 # Build ordered list of members in this group (rank_in_group 0..gs-1)

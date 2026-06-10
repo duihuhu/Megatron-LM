@@ -4001,7 +4001,7 @@ private:
     std::atomic<int> xor_pool_remaining_{0};
     XorStripeFourOps xor_pool_shared_job_{};
 
-    // EC RS pthread pool (encode + decode, same pattern as FRCheck rs_pool)
+    // EC RS pthread pool (encode + decode)
     static constexpr int kEcRsPoolSize = 16;
     std::array<pthread_t, kEcRsPoolSize> ec_rs_pool_threads_{};
     std::array<EcRsPoolWorkerCtx, kEcRsPoolSize> ec_rs_pool_ctx_{};
@@ -4085,7 +4085,7 @@ private:
             throw std::runtime_error("ECNAIVE: data_addrs size must equal k_");
         }
 
-        // Use 16-pthread pool when available (aligns with FRCheck rs_pool / ECLATIN xor_pool)
+        // Use 16-pthread pool when available (aligns with ECLATIN xor_pool)
         if (ec_rs_pool_inited_.load(std::memory_order_acquire)) {
             ec_rs_pool_run_encode(data_addrs, parity0_addr, parity1_addr, size);
             return;

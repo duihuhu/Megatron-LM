@@ -8,10 +8,10 @@ This repository is the **official implementation for our paper experiments**, bu
 
 | Role | CLI flag | Notes |
 |------|----------|-------|
-| **CheckCode (ours)** | `--use-checkcode` | Main method. Alias `--use-eclatin` is deprecated. |
-| Baseline: EC-CHECK | `--use-eccheck` | Early XOR-based EC checkpoint |
-| Baseline: EC-NAIVE | `--use-ecnaive` | ISA-L Reed–Solomon erasure coding |
-| Baseline: Gemini Replicas | `--use-gemini-replicas` | Multi-replica round-robin placement (`--gemini-replicas-num 2` or `3`) |
+| **CheckCode (ours)** | `--use-checkcode` |
+| Baseline: EC-CHECK | `--use-eccheck` |
+| Baseline: EC-NAIVE | `--use-ecnaive` |
+| Baseline: Gemini Replicas | `--use-gemini-replicas` |
 
 Paper scripts use the **legacy torch checkpoint path**: `--ckpt-format torch`, typically with `--use-rdma` and `--save-embeddings-separately`.
 
@@ -110,7 +110,6 @@ Smaller dev scripts (non-paper) live under `pre-tests/gpt2/a800/`, e.g. `test_33
 | Native encode/decode | `megatron/core/dist_checkpointing/strategies/checkcode_native.cpp` |
 | CLI arguments | `megatron/training/arguments.py` (`--use-checkcode`, …) |
 
-> **Partial rename:** user-facing name is CheckCode; on-disk checkpoints still use `eclatin_main_rank*.pt` and magic `ECLT` for backward compatibility. Environment variables remain `ECLATIN_*`.
 
 ## License
 

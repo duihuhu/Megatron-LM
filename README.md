@@ -6,8 +6,8 @@ This repository is the **official implementation for our paper experiments**, bu
 
 ## Methods
 
-| Role | CLI flag | Notes |
-|------|----------|-------|
+| Role | CLI flag |
+|------|----------|
 | **CheckCode (ours)** | `--use-checkcode` |
 | Baseline: EC-CHECK | `--use-eccheck` |
 | Baseline: EC-NAIVE | `--use-ecnaive` |

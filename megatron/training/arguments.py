@@ -394,6 +394,12 @@ def validate_args(args, defaults={}):
                 raise RuntimeError(
                     "FRCheck: --frcheck-table-dir is required when --frcheck-table-path is not set."
                 )
+        if getattr(args, "use_rdma", False) and getattr(args, "num_workers", 0) > 0:
+            print(
+                "FRCheck: forcing --num-workers 0 because forked DataLoader workers are "
+                "unsafe after RDMA/CUDA initialization"
+            )
+            args.num_workers = 0
 
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
 

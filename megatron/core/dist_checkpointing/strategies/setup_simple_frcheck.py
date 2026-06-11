@@ -30,16 +30,31 @@ if not torch_include:
     print("Warning: No torch include paths found, using fallback")
     torch_include = [torch_dir]
 
+cuda_include = []
+cuda_lib_dirs = []
+for cuda_root in ("/usr/local/cuda", os.environ.get("CUDA_HOME", "")):
+    if not cuda_root:
+        continue
+    inc = os.path.join(cuda_root, "include")
+    lib64 = os.path.join(cuda_root, "lib64")
+    if os.path.exists(os.path.join(inc, "cuda_runtime.h")):
+        cuda_include.append(inc)
+        if os.path.isdir(lib64):
+            cuda_lib_dirs.append(lib64)
+        break
+
 pybind11_include = pybind11.get_include()
 print(f"PyBind11 include: {pybind11_include}")
+if cuda_include:
+    print(f"CUDA include: {cuda_include[0]}")
 
 ext_modules = [
     Pybind11Extension(
         "frcheck_native",
         sources=["frcheck_native.cpp"],
-        include_dirs=[*torch_include, pybind11_include],
-        libraries=["ibverbs", "isal", "pthread"],
-        library_dirs=[],
+        include_dirs=[*torch_include, *cuda_include, pybind11_include],
+        libraries=["ibverbs", "isal", "pthread", "cudart"],
+        library_dirs=cuda_lib_dirs,
         cxx_std=17,
         language="c++",
         extra_compile_args=[

@@ -11,8 +11,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <iostream>
 #include <cerrno>
 #include <condition_variable>
@@ -30,6 +32,8 @@
 #include <thread>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 // RDMA headers
 #include <infiniband/verbs.h>
 
@@ -37,38 +41,6 @@
 
 // ISA-L erasure coding
 #include <isa-l/erasure_code.h>
-
-// Per-stripe file header (matches legacy_io_utils binary format)
-struct __attribute__((packed)) StripeFileHeader {
-    char magic[4];        // "FRBK"
-    uint32_t stripe_id;
-    uint32_t role;        // 0=SOURCE, 1=ENCODER, 2=PARITY_TARGET
-    uint64_t data_size;   // actual payload bytes following header
-    uint64_t block_size;  // nominal block size
-};
-
-static void write_stripe_file(const std::string& layer_dir, int stripe_id, int role,
-                               int rank, const uint8_t* data, uint64_t data_size,
-                               uint64_t block_size, const char* suffix = "") {
-    std::string dir = layer_dir + "/stripe_" + std::to_string(stripe_id);
-    mkdir(dir.c_str(), 0755);
-    std::string path = dir + "/frcheck_shard_rank" + std::to_string(rank) + suffix + ".pt";
-    FILE* fp = fopen(path.c_str(), "wb");
-    if (!fp) {
-        std::cerr << "[FRCheck] WARNING: failed to open " << path << std::endl;
-        return;
-    }
-    StripeFileHeader hdr{};
-    memcpy(hdr.magic, "FRBK", 4);
-    hdr.stripe_id = (uint32_t)stripe_id;
-    hdr.role = (uint32_t)role;
-    hdr.data_size = data_size;
-    hdr.block_size = block_size;
-    fwrite(&hdr, sizeof(hdr), 1, fp);
-    if (data_size > 0 && data)
-        fwrite(data, 1, (size_t)data_size, fp);
-    fclose(fp);
-}
 
 // RS encode thread pool
 static constexpr int kRsPoolSize = 16;
@@ -111,10 +83,6 @@ struct RdmaBuffer {
 static constexpr size_t FRCHECK_TEMP_BUF_SIZE = 128ULL * 1024 * 1024; // 128 MB
 static constexpr size_t FRCHECK_RDMA_CHUNK = 64ULL * 1024 * 1024;     // 64 MB per RDMA op
 static constexpr int    FRCHECK_MAX_WR = 64;
-// Sentinel wr_id used to tag intermediate chunks of a logical chunked recv in
-// async mode, so the persistent poller can drain those completions without
-// counting them as a logical op. Must not collide with wr_id_encode() outputs.
-static constexpr uint64_t FRCHECK_WR_ID_CHUNK_SENTINEL = 0xFFFFFFFFFFFFFFFFULL;
 
 class FRCheckRdmaChannel {
 public:
@@ -319,39 +287,14 @@ private:
     }
 
     void send_chunked(const uint8_t* data, size_t total, ibv_mr* mr) {
-        _send_chunked(data, total, mr, 0, true);
+        _send_chunked(data, total, mr);
     }
 
     void recv_chunked(uint8_t* buf, size_t total, ibv_mr* mr) {
-        _recv_chunked(buf, total, mr, 0, true);
+        _recv_chunked(buf, total, mr);
     }
 
-public:
-    // Async post (no TCP handshake, no poll). Only last WR signaled → 1 CQ completion.
-    void post_send(const uint8_t* data, size_t total, ibv_mr* mr, uint64_t wr_id) {
-        _send_chunked(data, total, mr, wr_id, false);
-    }
-
-    void post_recv(uint8_t* buf, size_t total, ibv_mr* mr, uint64_t wr_id) {
-        _recv_chunked(buf, total, mr, wr_id, false);
-    }
-
-    // Poll a single completion, return its wr_id.
-    uint64_t poll_one_send_cq() { return _poll_one(send_cq_); }
-    uint64_t poll_one_recv_cq() { return _poll_one(recv_cq_); }
-
-    ibv_cq* get_send_cq() const { return send_cq_; }
-    ibv_cq* get_recv_cq() const { return recv_cq_; }
-
-    void _send_chunked(const uint8_t* data, size_t total, ibv_mr* mr, uint64_t wr_id, bool sync) {
-        // Outer-chunk count for the whole logical transfer. In async mode only
-        // the very last outer chunk is signaled, so the persistent poller sees
-        // exactly one CQ entry per logical send (matching check_stripe_done_'s
-        // assumption of 1 op per logical send/recv).
-        size_t total_outer = total > 0
-            ? (total + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK
-            : 1;
-        size_t outer_idx = 0;
+    void _send_chunked(const uint8_t* data, size_t total, ibv_mr* mr) {
         size_t remaining = total, offset = 0;
         while (remaining > 0) {
             size_t nchunks = (std::min(remaining, FRCHECK_RDMA_CHUNK) + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK;
@@ -363,20 +306,10 @@ public:
                 sge[i].length = (uint32_t)cur;
                 sge[i].lkey = mr->lkey;
                 memset(&wr[i], 0, sizeof(wr[i]));
-                wr[i].wr_id = wr_id;
                 wr[i].sg_list = &sge[i];
                 wr[i].num_sge = 1;
                 wr[i].opcode = IBV_WR_SEND;
-                bool is_last_inner = (i + 1 == nchunks);
-                if (sync) {
-                    wr[i].send_flags = is_last_inner ? IBV_SEND_SIGNALED : 0;
-                } else {
-                    // Async: only the LAST chunk of the entire logical send is
-                    // signaled, so the poller sees exactly one completion.
-                    bool is_last_outer = (outer_idx + 1 == total_outer);
-                    wr[i].send_flags = (is_last_inner && is_last_outer)
-                        ? IBV_SEND_SIGNALED : 0;
-                }
+                wr[i].send_flags = (i + 1 == nchunks) ? IBV_SEND_SIGNALED : 0;
                 wr[i].next = (i + 1 < nchunks) ? &wr[i + 1] : nullptr;
                 offset += cur;
                 remaining -= cur;
@@ -384,21 +317,11 @@ public:
             ibv_send_wr* bad = nullptr;
             if (ibv_post_send(qp_, &wr[0], &bad))
                 throw std::runtime_error("FRCheck RDMA: post_send failed");
-            if (sync) poll_cq(send_cq_, (int)nchunks);
-            outer_idx++;
+            poll_cq(send_cq_, (int)nchunks);
         }
     }
 
-    void _recv_chunked(uint8_t* buf, size_t total, ibv_mr* mr, uint64_t wr_id, bool sync) {
-        // Outer-chunk count for the whole logical transfer. Recv WRs always
-        // generate completions (no UNSIGNALED option), so in async mode we tag
-        // every intermediate chunk with a sentinel wr_id; the persistent poller
-        // drains those entries without counting them as a logical op. Only the
-        // last outer chunk carries the real wr_id.
-        size_t total_outer = total > 0
-            ? (total + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK
-            : 1;
-        size_t outer_idx = 0;
+    void _recv_chunked(uint8_t* buf, size_t total, ibv_mr* mr) {
         size_t remaining = total, offset = 0;
         while (remaining > 0) {
             size_t nchunks = (std::min(remaining, FRCHECK_RDMA_CHUNK) + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK;
@@ -410,14 +333,6 @@ public:
                 sge[i].length = (uint32_t)cur;
                 sge[i].lkey = mr->lkey;
                 memset(&wr[i], 0, sizeof(wr[i]));
-                bool is_last_inner = (i + 1 == nchunks);
-                if (sync) {
-                    wr[i].wr_id = wr_id;
-                } else {
-                    bool is_last_outer = (outer_idx + 1 == total_outer);
-                    wr[i].wr_id = (is_last_inner && is_last_outer)
-                        ? wr_id : FRCHECK_WR_ID_CHUNK_SENTINEL;
-                }
                 wr[i].sg_list = &sge[i];
                 wr[i].num_sge = 1;
                 wr[i].next = (i + 1 < nchunks) ? &wr[i + 1] : nullptr;
@@ -427,8 +342,7 @@ public:
             ibv_recv_wr* bad = nullptr;
             if (ibv_post_recv(qp_, &wr[0], &bad))
                 throw std::runtime_error("FRCheck RDMA: post_recv failed");
-            if (sync) poll_cq(recv_cq_, (int)nchunks);
-            outer_idx++;
+            poll_cq(recv_cq_, (int)nchunks);
         }
     }
 
@@ -443,18 +357,6 @@ public:
                     throw std::runtime_error("FRCheck RDMA: CQ error status=" + std::to_string(wc[i].status));
                 ++done;
             }
-        }
-    }
-
-    uint64_t _poll_one(ibv_cq* cq) {
-        ibv_wc wc;
-        while (true) {
-            int n = ibv_poll_cq(cq, 1, &wc);
-            if (n < 0) throw std::runtime_error("FRCheck RDMA: poll CQ error");
-            if (n == 0) { usleep(1); continue; }
-            if (wc.status != IBV_WC_SUCCESS)
-                throw std::runtime_error("FRCheck RDMA: CQ error status=" + std::to_string(wc.status));
-            return wc.wr_id;
         }
     }
 
@@ -556,7 +458,7 @@ public:
     std::string path() const { return poa_path_; }
     void stop() {
         if (stopped_.exchange(true)) return; // already stopped
-        // Shut down RS pool inline (pthread_join), matching ECLATIN/ECNAIVE/ECCheck pattern
+        encoding_workers_shutdown();
         rs_pool_shutdown();
     }
     bool is_stopped() const { return stopped_; }
@@ -677,9 +579,9 @@ public:
         std::cout << "[FRCheck RDMA] rank=" << rank_in_group
                   << " all " << group_size_ << " nodes connected" << std::endl;
 
-        // Init RS encode thread pool + async poller
+        // Init RS encode thread pool + ECLATIN-style encoding workers
         rs_pool_init();
-        async_poller_init();
+        encoding_workers_init();
 
         // Pre-compile stripe plans
         compile_stripe_plans_();
@@ -766,7 +668,7 @@ public:
                 FRCheckRdmaChannel* ch = get_channel_(src_node);
                 if (!ch) throw std::runtime_error("FRCheck: no channel from source");
                 uintptr_t this_recv = recv_buf_addr + i * block_size;
-                ch->recv_data((uint8_t*)this_recv, recv_buf_size);
+                ch->recv_data((uint8_t*)this_recv, block_size);
             }
 
             // RS encode via ISA-L (16-worker pool matching ecnaive xor_pool)
@@ -1074,10 +976,10 @@ private:
         int k = n_ - 2;       // data blocks per stripe
         int rows = 2;         // parity blocks
         int m = k + rows;     // total blocks per stripe (= n)
-        // RS matrix: k × m (matches ecnaive)
+        // RS matrix: m × k (matches ecnaive); top k rows are identity, bottom rows parity
         a_mat_ = (unsigned char*)malloc((size_t)k * (size_t)m);
         if (!a_mat_) throw std::runtime_error("FRCheck: failed to alloc RS matrix");
-        gf_gen_rs_matrix(a_mat_, k, rows);
+        gf_gen_rs_matrix(a_mat_, m, k);
 
         // Encoding tables: 32 * k * rows (matches ecnaive)
         size_t gtbls_size = 32 * (size_t)k * (size_t)rows;
@@ -1089,7 +991,8 @@ private:
             free(a_mat_); a_mat_ = nullptr;
             throw std::runtime_error("FRCheck: failed to alloc encode tables");
         }
-        ec_init_tables(k, rows, a_mat_, g_tbls_);
+        // ec_init_tables expects k×rows parity coeffs only; skip identity rows 0..k-1
+        ec_init_tables(k, rows, a_mat_ + k * k, g_tbls_);
     }
 
     // ---- RS decode table init (hardware recovery) ----
@@ -1306,409 +1209,443 @@ private:
         });
     }
 
-    // ---- Compute worker (async encode + file write) ----
-    struct ComputeJob {
-        int stripe_id;
-        size_t block_size;
-        int k;                  // n_src = n-2
-        uintptr_t recv_buf_addr;
-        uintptr_t parity1_out_addr;
-        uintptr_t parity2_out_addr;
-        unsigned char* g_tbls;
-        std::string layer_dir;
-        int rank;
-        int parity_target_rig;  // peer rig to send parity2 to
+    // ---- ECLATIN-style encoding worker pipelines ----
+    struct SourceSendTask {
+        int stripe_id = 0;
+        uintptr_t gpu_addr = 0;
+        uintptr_t cpu_mirror_addr = 0;
+        size_t block_size = 0;
     };
 
-    std::thread compute_worker_;
-    std::atomic<bool> compute_worker_stop_{false};
-    std::queue<ComputeJob> compute_queue_;
-    std::mutex compute_mtx_;
-    std::condition_variable compute_cv_;
+    struct EncoderTask {
+        int stripe_id = 0;
+        uintptr_t recv_buf_addr = 0;
+        uintptr_t p1_addr = 0;
+        uintptr_t p2_addr = 0;
+        size_t block_size = 0;
+        int n_src = 0;
+        std::array<int, 4> src_peer_rigs{};
+        std::array<uintptr_t, 4> local_src_addrs{};
+        int par_peer_rig = -1;
+    };
 
-    void push_compute_job(const ComputeJob& job) {
+    struct ParityRecvTask {
+        int stripe_id = 0;
+        uintptr_t p2_in_addr = 0;
+        size_t block_size = 0;
+        int enc_peer_rig = -1;
+    };
+
+    std::thread source_send_thread_;
+    std::mutex source_send_mtx_;
+    std::condition_variable source_send_cv_;
+    std::queue<SourceSendTask> source_send_q_;
+    bool source_send_completed_ = false;
+    bool source_send_sentinel_received_ = false;
+
+    std::thread encoder_thread_;
+    std::mutex encoder_mtx_;
+    std::condition_variable encoder_cv_;
+    std::queue<EncoderTask> encoder_q_;
+    bool encoder_completed_ = false;
+    bool encoder_sentinel_received_ = false;
+
+    std::thread parity_recv_thread_;
+    std::mutex parity_recv_mtx_;
+    std::condition_variable parity_recv_cv_;
+    std::queue<ParityRecvTask> parity_recv_q_;
+    bool parity_recv_completed_ = false;
+    bool parity_recv_sentinel_received_ = false;
+
+    std::atomic<bool> encoding_workers_stop_{false};
+    bool wait_source_send_ = false;
+    bool wait_encoder_ = false;
+    bool wait_parity_recv_ = false;
+
+    std::mutex stripe_mtx_;
+    std::condition_variable stripe_cv_;
+    std::vector<int> stripe_pending_;
+    std::vector<int> stripe_completed_;
+
+    void init_stripe_tracking_() {
+        int ns = std::max(1, (int)stripe_plans_.size());
+        stripe_pending_.assign(ns, 0);
+        stripe_completed_.assign(ns, 0);
+    }
+
+    void mark_stripe_submitted_(int stripe_id) {
+        if (stripe_id < 0 || stripe_id >= (int)stripe_pending_.size()) return;
+        std::lock_guard<std::mutex> lk(stripe_mtx_);
+        stripe_pending_[stripe_id]++;
+    }
+
+    void mark_stripe_done_(int stripe_id) {
+        if (stripe_id < 0 || stripe_id >= (int)stripe_pending_.size()) return;
         {
-            std::lock_guard<std::mutex> lk(compute_mtx_);
-            compute_queue_.push(job);
+            std::lock_guard<std::mutex> lk(stripe_mtx_);
+            stripe_completed_[stripe_id]++;
         }
-        compute_cv_.notify_one();
+        stripe_cv_.notify_all();
     }
 
-    ComputeJob pop_compute_job() {
-        std::unique_lock<std::mutex> lk(compute_mtx_);
-        compute_cv_.wait(lk, [this]() {
-            return !compute_queue_.empty() || compute_worker_stop_;
-        });
-        if (compute_queue_.empty()) return ComputeJob{};
-        ComputeJob job = compute_queue_.front();
-        compute_queue_.pop();
-        return job;
+    static bool is_source_send_sentinel(const SourceSendTask& t) {
+        return t.gpu_addr == 0 && t.block_size == 0;
+    }
+    static bool is_encoder_sentinel(const EncoderTask& t) {
+        return t.recv_buf_addr == 0 && t.p1_addr == 0 && t.p2_addr == 0 && t.block_size == 0;
+    }
+    static bool is_parity_recv_sentinel(const ParityRecvTask& t) {
+        return t.p2_in_addr == 0 && t.block_size == 0;
     }
 
-    void compute_worker_loop() {
-        while (!compute_worker_stop_) {
-            ComputeJob job = pop_compute_job();
-            if (compute_worker_stop_) break;
+    void encoding_workers_init() {
+        encoding_workers_stop_ = false;
+        source_send_thread_ = std::thread(&FRCheckNative::source_send_worker, this);
+        encoder_thread_ = std::thread(&FRCheckNative::encoder_worker, this);
+        parity_recv_thread_ = std::thread(&FRCheckNative::parity_recv_worker, this);
+        std::cout << "FRCheck: encoding worker threads started" << std::endl;
+    }
 
-            // 1. RS encode via 16-worker pool (blocks this thread, not poller)
+    void encoding_workers_shutdown() {
+        encoding_workers_stop_ = true;
+        source_send_cv_.notify_one();
+        encoder_cv_.notify_one();
+        parity_recv_cv_.notify_one();
+        if (source_send_thread_.joinable()) source_send_thread_.join();
+        if (encoder_thread_.joinable()) encoder_thread_.join();
+        if (parity_recv_thread_.joinable()) parity_recv_thread_.join();
+    }
+
+    void maybe_complete_after_sentinel_(
+        bool sentinel_received, std::mutex& mtx, std::queue<SourceSendTask>& q, bool& completed,
+        bool& sentinel_flag)
+    {
+        if (!sentinel_received) return;
+        std::lock_guard<std::mutex> lk(mtx);
+        if (q.empty()) {
+            completed = true;
+            sentinel_flag = false;
+        }
+    }
+
+    void maybe_complete_encoder_after_sentinel_() {
+        if (!encoder_sentinel_received_) return;
+        std::lock_guard<std::mutex> lk(encoder_mtx_);
+        if (encoder_q_.empty()) {
+            encoder_completed_ = true;
+            encoder_sentinel_received_ = false;
+        }
+    }
+
+    void maybe_complete_parity_after_sentinel_() {
+        if (!parity_recv_sentinel_received_) return;
+        std::lock_guard<std::mutex> lk(parity_recv_mtx_);
+        if (parity_recv_q_.empty()) {
+            parity_recv_completed_ = true;
+            parity_recv_sentinel_received_ = false;
+        }
+    }
+
+    void source_send_worker() {
+        while (!encoding_workers_stop_) {
+            SourceSendTask task;
+            {
+                std::unique_lock<std::mutex> lk(source_send_mtx_);
+                source_send_cv_.wait(lk, [this] {
+                    return encoding_workers_stop_ || !source_send_q_.empty();
+                });
+                if (encoding_workers_stop_) break;
+                task = source_send_q_.front();
+                source_send_q_.pop();
+            }
+
+            if (is_source_send_sentinel(task)) {
+                source_send_sentinel_received_ = true;
+                maybe_complete_after_sentinel_(
+                    true, source_send_mtx_, source_send_q_, source_send_completed_,
+                    source_send_sentinel_received_);
+                continue;
+            }
+
+            const auto& plan = stripe_plans_.at(task.stripe_id);
+            FRCheckRdmaChannel* ch = get_channel_(plan.encoder_node_id - 1);
+            if (!ch) throw std::runtime_error("FRCheck source_send: no channel to encoder");
+
+            ch->send_data(reinterpret_cast<const uint8_t*>(task.gpu_addr), task.block_size);
+            if (task.cpu_mirror_addr != 0) {
+                cudaError_t err = cudaMemcpy(
+                    reinterpret_cast<void*>(task.cpu_mirror_addr),
+                    reinterpret_cast<const void*>(task.gpu_addr),
+                    task.block_size,
+                    cudaMemcpyDeviceToHost);
+                if (err != cudaSuccess) {
+                    throw std::runtime_error(
+                        std::string("FRCheck source_send: D2H failed: ") +
+                        cudaGetErrorString(err));
+                }
+            }
+
+            mark_stripe_done_(task.stripe_id);
+
+            maybe_complete_after_sentinel_(
+                source_send_sentinel_received_, source_send_mtx_, source_send_q_,
+                source_send_completed_, source_send_sentinel_received_);
+        }
+    }
+
+    void encoder_worker() {
+        while (!encoding_workers_stop_) {
+            EncoderTask task;
+            {
+                std::unique_lock<std::mutex> lk(encoder_mtx_);
+                encoder_cv_.wait(lk, [this] {
+                    return encoding_workers_stop_ || !encoder_q_.empty();
+                });
+                if (encoding_workers_stop_) break;
+                task = encoder_q_.front();
+                encoder_q_.pop();
+            }
+
+            if (is_encoder_sentinel(task)) {
+                encoder_sentinel_received_ = true;
+                maybe_complete_encoder_after_sentinel_();
+                continue;
+            }
+
+            std::vector<std::thread> recv_threads;
+            std::vector<std::exception_ptr> recv_exceptions(task.n_src);
+            for (int i = 0; i < task.n_src; ++i) {
+                recv_exceptions[i] = nullptr;
+                recv_threads.emplace_back([&, i]() {
+                    try {
+                        uintptr_t dst = task.recv_buf_addr + (uintptr_t)i * task.block_size;
+                        if (task.src_peer_rigs[i] == rank_in_group_) {
+                            if (task.local_src_addrs[i] != 0) {
+                                std::memcpy(
+                                    reinterpret_cast<void*>(dst),
+                                    reinterpret_cast<const void*>(task.local_src_addrs[i]),
+                                    task.block_size);
+                            }
+                            return;
+                        }
+                        FRCheckRdmaChannel* ch = get_channel_(task.src_peer_rigs[i]);
+                        if (!ch) throw std::runtime_error("FRCheck encoder: no channel from source");
+                        ch->recv_data(reinterpret_cast<uint8_t*>(dst), task.block_size);
+                    } catch (...) {
+                        recv_exceptions[i] = std::current_exception();
+                    }
+                });
+            }
+            for (auto& t : recv_threads) t.join();
+            for (int i = 0; i < task.n_src; ++i) {
+                if (recv_exceptions[i]) std::rethrow_exception(recv_exceptions[i]);
+            }
+
+            std::vector<unsigned char*> data_ptrs((size_t)task.n_src);
+            for (int i = 0; i < task.n_src; ++i)
+                data_ptrs[i] = reinterpret_cast<unsigned char*>(
+                    task.recv_buf_addr + (uintptr_t)i * task.block_size);
+            unsigned char* parity_ptrs[2] = {
+                reinterpret_cast<unsigned char*>(task.p1_addr),
+                reinterpret_cast<unsigned char*>(task.p2_addr),
+            };
+
             RsEncodeJob rs;
-            rs.len = (int)job.block_size;
-            rs.k = job.k;
+            rs.len = (int)task.block_size;
+            rs.k = task.n_src;
             rs.m = 2;
-            rs.g_tbls = job.g_tbls;
-            std::vector<unsigned char*> dp((size_t)job.k);
-            for (int i = 0; i < job.k; ++i)
-                dp[i] = (unsigned char*)(job.recv_buf_addr + i * job.block_size);
-            rs.data_ptrs = dp.data();
-            unsigned char* pptr[2] = {
-                (unsigned char*)job.parity1_out_addr,
-                (unsigned char*)job.parity2_out_addr };
-            rs.parity_ptrs = pptr;
+            rs.g_tbls = g_tbls_;
+            rs.data_ptrs = data_ptrs.data();
+            rs.parity_ptrs = parity_ptrs;
             rs_pool_run_parallel_encode(rs);
 
-            // 2. Post parity2 send to target (non-blocking RDMA WR)
-            FRCheckRdmaChannel* ch = get_channel_(job.parity_target_rig);
-            ibv_mr* mr = ch->find_mr(job.parity2_out_addr, job.block_size);
-            ch->post_send((uint8_t*)job.parity2_out_addr, job.block_size, mr,
-                          wr_id_encode(job.stripe_id, job.k));
+            FRCheckRdmaChannel* ch = get_channel_(task.par_peer_rig);
+            if (!ch) throw std::runtime_error("FRCheck encoder: no channel to parity target");
+            ch->send_data(reinterpret_cast<const uint8_t*>(task.p2_addr), task.block_size);
 
-            // 3. Write per-stripe parity files
-            write_stripe_file(job.layer_dir, job.stripe_id, 1, job.rank,
-                (const uint8_t*)job.parity1_out_addr, job.block_size, job.block_size, "_p1");
-            write_stripe_file(job.layer_dir, job.stripe_id, 2, job.rank,
-                (const uint8_t*)job.parity2_out_addr, job.block_size, job.block_size, "_p2");
+            mark_stripe_done_(task.stripe_id);
 
-            // 4. Mark stripe done
-            auto& st = async_stripes_[job.stripe_id];
-            st.encode_done = true;
-            st.all_done = true;
-            async_done_count_++;
+            maybe_complete_encoder_after_sentinel_();
         }
     }
 
-    // ---- Stripe async pipeline ----
-    struct StripeAsyncState {
-        int stripe_id;
-        int role;
-        int slot;
-        int ops_done = 0;
-        bool all_done = false;
-        // ENCODER:
-        int n_src = 0;
-        int recvs_done = 0;
-        bool encode_queued = false;
-        bool encode_done = false;
-    };
-
-    static uint64_t wr_id_encode(int stripe_id, int sub) {
-        return ((uint64_t)(unsigned)stripe_id << 16) | (uint64_t)(sub & 0xFFFF);
-    }
-    static int wr_id_stripe(uint64_t id) { return (int)(id >> 16); }
-    static int wr_id_sub(uint64_t id) { return (int)(id & 0xFFFF); }
-
-    std::vector<StripeAsyncState> async_stripes_;
-    // Persistent async poller (created once, reused across layers)
-    struct AsyncPollerWork {
-        std::string layer_dir;
-        int rank;
-        size_t block_size;
-        unsigned char* g_tbls;
-        std::vector<uintptr_t> recv_bufs;
-        std::vector<uintptr_t> parity1_addrs;
-        std::vector<uintptr_t> parity2_addrs;
-        std::vector<uintptr_t> data_addrs;
-    };
-
-    std::thread async_poller_;
-    std::atomic<bool> async_poller_stop_{false};
-    std::mutex async_poller_mtx_;
-    std::condition_variable async_poller_cv_;
-    std::condition_variable async_done_cv_;
-    AsyncPollerWork async_poller_data_;
-    bool async_poller_work_ready_ = false;
-
-    // Per-call state (reset each submit)
-    std::atomic<int> async_done_count_{0};
-    int async_total_stripes_ = 0;
-    bool async_active_ = false;
-    std::vector<uintptr_t> async_data_sizes_;
-    bool defer_file_writes_ = false;
-    // Debug counters (reset per poller work batch)
-    std::atomic<int64_t> async_poll_iters_{0};
-    std::atomic<int64_t> async_encode_ns_{0};
-
-    void async_poller_init() {
-        async_poller_stop_ = false;
-        async_poller_ = std::thread([this]() {
-            while (!async_poller_stop_) {
-                AsyncPollerWork work;
-                {
-                    std::unique_lock<std::mutex> lk(async_poller_mtx_);
-                    async_poller_cv_.wait(lk, [this]() {
-                        return async_poller_work_ready_ || async_poller_stop_;
-                    });
-                    if (async_poller_stop_) break;
-                    if (!async_poller_work_ready_) continue;
-                    work = async_poller_data_;
-                    async_poller_work_ready_ = false;
-                }
-                async_poller_loop_(async_total_stripes_, work.g_tbls,
-                                   work.recv_bufs, work.parity1_addrs, work.parity2_addrs,
-                                   work.data_addrs, work.block_size, work.layer_dir, work.rank);
-                async_done_cv_.notify_one();
+    void parity_recv_worker() {
+        while (!encoding_workers_stop_) {
+            ParityRecvTask task;
+            {
+                std::unique_lock<std::mutex> lk(parity_recv_mtx_);
+                parity_recv_cv_.wait(lk, [this] {
+                    return encoding_workers_stop_ || !parity_recv_q_.empty();
+                });
+                if (encoding_workers_stop_) break;
+                task = parity_recv_q_.front();
+                parity_recv_q_.pop();
             }
-        });
-    }
 
-    void async_poller_shutdown() {
-        stopped_ = true;
-        async_poller_stop_ = true;
-        async_poller_cv_.notify_one();
-        async_done_cv_.notify_one();
-        if (async_poller_.joinable()) async_poller_.join();
+            if (is_parity_recv_sentinel(task)) {
+                parity_recv_sentinel_received_ = true;
+                maybe_complete_parity_after_sentinel_();
+                continue;
+            }
+
+            FRCheckRdmaChannel* ch = get_channel_(task.enc_peer_rig);
+            if (!ch) throw std::runtime_error("FRCheck parity_recv: no channel from encoder");
+            ch->recv_data(reinterpret_cast<uint8_t*>(task.p2_in_addr), task.block_size);
+
+            mark_stripe_done_(task.stripe_id);
+
+            maybe_complete_parity_after_sentinel_();
+        }
     }
 
 public:
-    void submit_stripes_post_recvs(
-        int num_stripes,
-        const std::vector<int>& roles,
-        size_t block_size,
-        const std::vector<uintptr_t>& recv_bufs,
-        const std::vector<uintptr_t>& parity2_addrs)
-    {
-        if (async_active_) throw std::runtime_error("FRCheck: async pipeline already active");
+    void reset_encoding_completion() {
+        wait_source_send_ = false;
+        wait_encoder_ = false;
+        wait_parity_recv_ = false;
+        source_send_completed_ = false;
+        encoder_completed_ = false;
+        parity_recv_completed_ = false;
+        source_send_sentinel_received_ = false;
+        encoder_sentinel_received_ = false;
+        parity_recv_sentinel_received_ = false;
 
-        async_stripes_.clear();
-        async_stripes_.reserve(num_stripes);
-        for (int sid = 0; sid < num_stripes; ++sid) {
-            StripeAsyncState st{};
-            st.stripe_id = sid;
-            st.role = roles[sid];
-            st.slot = sid;
-            st.ops_done = 0;
-            st.all_done = false;
-            st.recvs_done = 0;
-            st.encode_queued = false;
-            st.encode_done = false;
-            st.n_src = (st.role == 1) ? (int)stripe_plans_[sid].source_node_ids.size() : 0;
-            async_stripes_.push_back(std::move(st));
-        }
-        async_total_stripes_ = num_stripes;
-        async_done_count_ = 0;
-        async_active_ = true;
-
-        // Post all recv WRs (before barrier, before any sends)
-        for (int sid = 0; sid < num_stripes; ++sid) {
-            const auto& plan = stripe_plans_[sid];
-            auto& st = async_stripes_[sid];
-            if (st.role == (int)StripeRole::ENCODER) {
-                for (int i = 0; i < st.n_src; ++i) {
-                    int peer = plan.source_node_ids[i] - 1;
-                    FRCheckRdmaChannel* ch = get_channel_(peer);
-                    uint8_t* dst = (uint8_t*)(recv_bufs[sid] + i * block_size);
-                    ch->post_recv(dst, block_size, get_recv_mr(recv_bufs[sid], block_size),
-                                  wr_id_encode(sid, i));
-                }
-            } else if (st.role == (int)StripeRole::PARITY_TARGET) {
-                int peer = plan.encoder_node_id - 1;
-                FRCheckRdmaChannel* ch = get_channel_(peer);
-                ch->post_recv((uint8_t*)parity2_addrs[sid], block_size,
-                              get_recv_mr(parity2_addrs[sid], block_size),
-                              wr_id_encode(sid, 0));
-            }
-        }
-    }
-
-    void submit_stripes_post_sends(
-        const std::vector<uintptr_t>& data_addrs,
-        const std::vector<uintptr_t>& actual_sizes,
-        size_t block_size,
-        const std::vector<uintptr_t>& recv_bufs,
-        const std::vector<uintptr_t>& parity1_addrs,
-        const std::vector<uintptr_t>& parity2_addrs,
-        uintptr_t g_tbls,
-        const std::string& output_dir,
-        const std::string& layer_name,
-        int rank)
-    {
-        if (!async_active_) throw std::runtime_error("FRCheck: async pipeline not active");
-        unsigned char* tbls = reinterpret_cast<unsigned char*>(g_tbls);
-
-        // Reset debug counters for this batch
-        async_poll_iters_ = 0;
-        async_encode_ns_ = 0;
-
-        // Store actual sizes for later file write
-        async_data_sizes_ = actual_sizes;
-
-        // Post all send WRs (after barrier, recvs already posted on all ranks)
-        for (int sid = 0; sid < async_total_stripes_; ++sid) {
-            const auto& plan = stripe_plans_[sid];
-            auto& st = async_stripes_[sid];
-            if (st.role == (int)StripeRole::SOURCE) {
-                int peer = plan.encoder_node_id - 1;
-                FRCheckRdmaChannel* ch = get_channel_(peer);
-                const uint8_t* data = (const uint8_t*)data_addrs[sid];
-                ibv_mr* mr = ch->find_mr((uintptr_t)data, block_size);
-                if (!mr) {
-                    ch->send_data(data, block_size); // fallback sync
-                } else {
-                    ch->post_send(data, block_size, mr, wr_id_encode(sid, 0));
-                }
-            }
-        }
-
-        // Signal persistent poller thread with new work
-        std::string layer_dir = output_dir + "/" + layer_name;
+        init_stripe_tracking_();
         {
-            std::lock_guard<std::mutex> lk(async_poller_mtx_);
-            async_poller_data_ = {layer_dir, rank, block_size, tbls,
-                                  recv_bufs, parity1_addrs, parity2_addrs, data_addrs};
-            async_poller_work_ready_ = true;
+            std::lock_guard<std::mutex> lk(stripe_mtx_);
+            std::fill(stripe_pending_.begin(), stripe_pending_.end(), 0);
+            std::fill(stripe_completed_.begin(), stripe_completed_.end(), 0);
         }
-        async_poller_cv_.notify_one();
-    }
 
-    void wait_stripes_async() {
-        std::unique_lock<std::mutex> lk(async_poller_mtx_);
-        async_done_cv_.wait(lk, [this]() {
-            return async_done_count_ >= async_total_stripes_ || stopped_;
-        });
-        async_active_ = false;
-    }
-
-    void set_defer_file_writes(bool v) { defer_file_writes_ = v; }
-
-    void flush_stripe_files(const std::string& layer_dir, int rank,
-                            const std::vector<uintptr_t>& parity1_addrs,
-                            const std::vector<uintptr_t>& parity2_addrs,
-                            size_t block_size) {
-        for (int sid = 0; sid < (int)async_stripes_.size(); ++sid) {
-            auto& st = async_stripes_[sid];
-            if (!st.all_done) continue;
-            if (st.role == (int)StripeRole::ENCODER) {
-                write_stripe_file(layer_dir, sid, 1, rank,
-                    (const uint8_t*)parity1_addrs[sid], block_size, block_size, "_p1");
-                write_stripe_file(layer_dir, sid, 2, rank,
-                    (const uint8_t*)parity2_addrs[sid], block_size, block_size, "_p2");
-            } else if (st.role == (int)StripeRole::PARITY_TARGET) {
-                write_stripe_file(layer_dir, sid, st.role, rank,
-                    (const uint8_t*)parity2_addrs[sid], block_size, block_size);
-            }
+        {
+            std::lock_guard<std::mutex> lk(source_send_mtx_);
+            while (!source_send_q_.empty()) source_send_q_.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(encoder_mtx_);
+            while (!encoder_q_.empty()) encoder_q_.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(parity_recv_mtx_);
+            while (!parity_recv_q_.empty()) parity_recv_q_.pop();
         }
     }
 
-    int64_t get_poll_iters() const { return async_poll_iters_.load(); }
-    int64_t get_encode_ns() const { return async_encode_ns_.load(); }
-
-    uintptr_t _get_g_tbls_ptr() const { return (uintptr_t)g_tbls_; }
-
-    void async_poller_loop_(
-        int num_stripes, unsigned char* g_tbls,
-        std::vector<uintptr_t> recv_bufs,
-        std::vector<uintptr_t> parity1_addrs,
-        std::vector<uintptr_t> parity2_addrs,
-        std::vector<uintptr_t> data_addrs,
-        size_t block_size, const std::string& layer_dir, int rank)
+    void submit_source_send(
+        int stripe_id, uintptr_t gpu_addr, uintptr_t cpu_mirror_addr, size_t block_size)
     {
-        ibv_wc wc_s, wc_r;
-        while (async_done_count_ < num_stripes && !stopped_) {
-            async_poll_iters_++;
-            int ns = ibv_poll_cq(rdma_send_cq_, 1, &wc_s);
-            int nr = ibv_poll_cq(rdma_recv_cq_, 1, &wc_r);
-            if (ns == 0 && nr == 0) {
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
-                continue;
-            }
-            if (ns < 0 || nr < 0) break;
-
-            // Intermediate chunk completions carry a sentinel wr_id and must
-            // be drained from the CQ but not counted as logical ops.
-            if (ns > 0 && wc_s.wr_id != FRCHECK_WR_ID_CHUNK_SENTINEL) {
-                int sid = wr_id_stripe(wc_s.wr_id);
-                auto& st = async_stripes_[sid];
-                st.ops_done++;
-                check_stripe_done_(sid, parity1_addrs, parity2_addrs, data_addrs, block_size, layer_dir, rank);
-            }
-            if (nr > 0 && wc_r.wr_id != FRCHECK_WR_ID_CHUNK_SENTINEL) {
-                int sid = wr_id_stripe(wc_r.wr_id);
-                auto& st = async_stripes_[sid];
-                if (st.role == (int)StripeRole::ENCODER) {
-                    st.recvs_done++;
-                    if (st.recvs_done == st.n_src && !st.encode_queued) {
-                        st.encode_queued = true;
-                        int sidx = st.stripe_id;
-                        RsEncodeJob job;
-                        job.len = (int)block_size;
-                        job.k = st.n_src;
-                        job.m = 2;
-                        job.g_tbls = g_tbls;
-                        std::vector<unsigned char*> dp(job.k);
-                        for (int i = 0; i < job.k; ++i)
-                            dp[i] = (unsigned char*)(recv_bufs[sidx] + i * block_size);
-                        job.data_ptrs = dp.data();
-                        unsigned char* pptr[2] = {
-                            (unsigned char*)parity1_addrs[sidx],
-                            (unsigned char*)parity2_addrs[sidx] };
-                        job.parity_ptrs = pptr;
-                        auto _enc_start = std::chrono::steady_clock::now();
-                        rs_pool_run_parallel_encode(job);
-                        auto _enc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - _enc_start).count();
-                        async_encode_ns_ += _enc_ns;
-                        st.encode_done = true;
-
-                        const auto& plan = stripe_plans_[sidx];
-                        int peer = plan.parity_target_node_id - 1;
-                        FRCheckRdmaChannel* ch = get_channel_(peer);
-                        ibv_mr* mr = ch->find_mr(parity2_addrs[sidx], block_size);
-                        ch->post_send((uint8_t*)parity2_addrs[sidx], block_size, mr,
-                                      wr_id_encode(sidx, st.n_src));
-                    }
-                }
-                st.ops_done++;
-                check_stripe_done_(sid, parity1_addrs, parity2_addrs, data_addrs, block_size, layer_dir, rank);
-            }
+        if (stopped_) return;
+        SourceSendTask task{stripe_id, gpu_addr, cpu_mirror_addr, block_size};
+        mark_stripe_submitted_(stripe_id);
+        {
+            std::lock_guard<std::mutex> lk(source_send_mtx_);
+            source_send_q_.push(task);
+            wait_source_send_ = true;
         }
+        source_send_cv_.notify_one();
     }
 
-    void check_stripe_done_(int sid,
-                            const std::vector<uintptr_t>& parity1_addrs,
-                            const std::vector<uintptr_t>& parity2_addrs,
-                            const std::vector<uintptr_t>& data_addrs,
-                            size_t blk, const std::string& layer_dir, int rank) {
-        auto& st = async_stripes_[sid];
-        if (st.all_done) return;
-        int need = 1;
-        if (st.role == (int)StripeRole::ENCODER)
-            need = st.n_src + 1;
-        if (st.ops_done >= need && (!(st.role == (int)StripeRole::ENCODER) || st.encode_done)) {
-            if (!defer_file_writes_) {
-                if (st.role == (int)StripeRole::SOURCE) {
-                    // SOURCE write handled in Python (GPU buffers not fwrite-safe)
-                } else if (st.role == (int)StripeRole::ENCODER) {
-                    write_stripe_file(layer_dir, sid, 1, rank,
-                        (const uint8_t*)parity1_addrs[sid], blk, blk, "_p1");
-                    write_stripe_file(layer_dir, sid, 2, rank,
-                        (const uint8_t*)parity2_addrs[sid], blk, blk, "_p2");
-                } else if (st.role == (int)StripeRole::PARITY_TARGET) {
-                    write_stripe_file(layer_dir, sid, st.role, rank,
-                        (const uint8_t*)parity2_addrs[sid], blk, blk);
-                }
-            }
-            st.all_done = true;
-            async_done_count_++;
+    void submit_encoder_encode(
+        int stripe_id, uintptr_t recv_buf_addr, uintptr_t p1_addr,
+        uintptr_t p2_addr, size_t block_size,
+        const std::vector<uintptr_t>& local_src_addrs)
+    {
+        if (stopped_) return;
+        if (stripe_id < 0 || stripe_id >= (int)stripe_plans_.size())
+            throw std::runtime_error("FRCheck: invalid stripe_id");
+
+        const auto& plan = stripe_plans_[stripe_id];
+        EncoderTask task;
+        task.stripe_id = stripe_id;
+        task.recv_buf_addr = recv_buf_addr;
+        task.p1_addr = p1_addr;
+        task.p2_addr = p2_addr;
+        task.block_size = block_size;
+        task.n_src = (int)plan.source_node_ids.size();
+        for (int i = 0; i < task.n_src; ++i) {
+            task.src_peer_rigs[i] = plan.source_node_ids[i] - 1;
+            task.local_src_addrs[i] = (i < (int)local_src_addrs.size())
+                ? local_src_addrs[i] : 0;
         }
+        task.par_peer_rig = plan.parity_target_node_id - 1;
+
+        mark_stripe_submitted_(stripe_id);
+        {
+            std::lock_guard<std::mutex> lk(encoder_mtx_);
+            encoder_q_.push(task);
+            wait_encoder_ = true;
+        }
+        encoder_cv_.notify_one();
     }
 
-    ibv_mr* get_recv_mr(uintptr_t addr, size_t size) {
-        for (auto* ch : channels_) {
-            if (ch) {
-                ibv_mr* mr = ch->find_mr(addr, size);
-                if (mr) return mr;
-            }
+    void submit_parity_recv(int stripe_id, uintptr_t p2_in_addr, size_t block_size) {
+        if (stopped_) return;
+        if (stripe_id < 0 || stripe_id >= (int)stripe_plans_.size())
+            throw std::runtime_error("FRCheck: invalid stripe_id");
+
+        const auto& plan = stripe_plans_[stripe_id];
+        ParityRecvTask task;
+        task.stripe_id = stripe_id;
+        task.p2_in_addr = p2_in_addr;
+        task.block_size = block_size;
+        task.enc_peer_rig = plan.encoder_node_id - 1;
+
+        mark_stripe_submitted_(stripe_id);
+        {
+            std::lock_guard<std::mutex> lk(parity_recv_mtx_);
+            parity_recv_q_.push(task);
+            wait_parity_recv_ = true;
         }
-        throw std::runtime_error("FRCheck async: recv buffer not registered");
+        parity_recv_cv_.notify_one();
+    }
+
+    void submit_source_send_sentinel() {
+        SourceSendTask task{};
+        {
+            std::lock_guard<std::mutex> lk(source_send_mtx_);
+            source_send_q_.push(task);
+            wait_source_send_ = true;
+        }
+        source_send_cv_.notify_one();
+    }
+
+    void submit_encoder_sentinel() {
+        EncoderTask task{};
+        {
+            std::lock_guard<std::mutex> lk(encoder_mtx_);
+            encoder_q_.push(task);
+            wait_encoder_ = true;
+        }
+        encoder_cv_.notify_one();
+    }
+
+    void submit_parity_recv_sentinel() {
+        ParityRecvTask task{};
+        {
+            std::lock_guard<std::mutex> lk(parity_recv_mtx_);
+            parity_recv_q_.push(task);
+            wait_parity_recv_ = true;
+        }
+        parity_recv_cv_.notify_one();
+    }
+
+    void wait_stripe(int stripe_id) {
+        if (stripe_id < 0 || stripe_id >= (int)stripe_pending_.size()) return;
+        std::unique_lock<std::mutex> lk(stripe_mtx_);
+        stripe_cv_.wait(lk, [&] {
+            return stripe_completed_[stripe_id] >= stripe_pending_[stripe_id];
+        });
+    }
+
+    void wait_for_encoding_completion() {
+        while (!stopped_) {
+            bool done = true;
+            if (wait_source_send_ && !source_send_completed_) done = false;
+            if (wait_encoder_ && !encoder_completed_) done = false;
+            if (wait_parity_recv_ && !parity_recv_completed_) done = false;
+            if (done) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     }
 
     // ---- RDMA device init ----
@@ -1736,7 +1673,7 @@ public:
     }
 
     void cleanup_rdma_() {
-        async_poller_shutdown();
+        encoding_workers_shutdown();
         channel_owners_.clear();
         channels_.clear();
 
@@ -1873,6 +1810,7 @@ private:
             }
             stripe_plans_.push_back(std::move(plan));
         }
+        init_stripe_tracking_();
     }
 
     // ---- data members ----
@@ -2011,23 +1949,20 @@ PYBIND11_MODULE(frcheck_native, m) {
         .def("get_parity_target_node_id", &FRCheckNative::get_parity_target_node_id,
              py::arg("stripe_id"))
 
-        // Async stripe pipeline (three-phase: recvs → barrier → sends+poller → wait)
-        .def("submit_stripes_post_recvs", &FRCheckNative::submit_stripes_post_recvs,
-             py::arg("num_stripes"), py::arg("roles"),
-             py::arg("block_size"), py::arg("recv_bufs"), py::arg("parity2_addrs"))
-        .def("submit_stripes_post_sends", &FRCheckNative::submit_stripes_post_sends,
-             py::arg("data_addrs"), py::arg("actual_sizes"), py::arg("block_size"),
-             py::arg("recv_bufs"), py::arg("parity1_addrs"), py::arg("parity2_addrs"),
-             py::arg("g_tbls"),
-             py::arg("output_dir"), py::arg("layer_name"), py::arg("rank"))
-        .def("wait_stripes_async", &FRCheckNative::wait_stripes_async)
-        .def("get_poll_iters", &FRCheckNative::get_poll_iters)
-        .def("get_encode_ns", &FRCheckNative::get_encode_ns)
-        .def("set_defer_file_writes", &FRCheckNative::set_defer_file_writes,
-             py::arg("v"))
-        .def("flush_stripe_files", &FRCheckNative::flush_stripe_files,
-             py::arg("layer_dir"), py::arg("rank"),
-             py::arg("parity1_addrs"), py::arg("parity2_addrs"),
+        // ECLATIN-style encoding worker pipeline
+        .def("reset_encoding_completion", &FRCheckNative::reset_encoding_completion)
+        .def("submit_source_send", &FRCheckNative::submit_source_send,
+             py::arg("stripe_id"), py::arg("gpu_addr"), py::arg("cpu_mirror_addr"),
              py::arg("block_size"))
-        .def("_get_g_tbls_ptr", &FRCheckNative::_get_g_tbls_ptr);
+        .def("submit_encoder_encode", &FRCheckNative::submit_encoder_encode,
+             py::arg("stripe_id"), py::arg("recv_buf_addr"), py::arg("p1_addr"),
+             py::arg("p2_addr"), py::arg("block_size"), py::arg("local_src_addrs"))
+        .def("submit_parity_recv", &FRCheckNative::submit_parity_recv,
+             py::arg("stripe_id"), py::arg("p2_in_addr"), py::arg("block_size"))
+        .def("submit_source_send_sentinel", &FRCheckNative::submit_source_send_sentinel)
+        .def("submit_encoder_sentinel", &FRCheckNative::submit_encoder_sentinel)
+        .def("submit_parity_recv_sentinel", &FRCheckNative::submit_parity_recv_sentinel)
+        .def("wait_stripe", &FRCheckNative::wait_stripe, py::arg("stripe_id"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("wait_for_encoding_completion", &FRCheckNative::wait_for_encoding_completion);
 }

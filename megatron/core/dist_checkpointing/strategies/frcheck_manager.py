@@ -45,6 +45,16 @@ class StripePlan:
     parity_target_node_id: int = -1
 
 
+@dataclass
+class LayerStripeBufs:
+    """Per-layer per-stripe encode buffers (independent across layers)."""
+    stripe_data_bufs: List[Optional[torch.Tensor]]
+    source_mirror_bufs: List[Optional[torch.Tensor]]
+    recv_bufs: List[Optional[torch.Tensor]]
+    parity1_bufs: List[Optional[torch.Tensor]]
+    parity2_bufs: List[Optional[torch.Tensor]]
+
+
 class FRCheckManager:
     """Singleton for FRCheck C++ module, RDMA topology, and stripe plan compilation."""
 
@@ -78,9 +88,11 @@ class FRCheckManager:
         self.gdr_available: bool = False
         self.num_stripes: int = 0
         self.num_source_stripes: int = 0  # My SOURCE stripe count
-        # Per-stripe buffers for source data (async pipeline)
+        # Per-layer per-stripe encode buffers (keyed by layer_idx)
+        self.layer_stripe_bufs: Dict[int, LayerStripeBufs] = {}
+        self._layer_stripe_alloc_sizes: Dict[int, int] = {}
+        # Legacy single-layer aliases (first allocated layer, for backward compat)
         self.stripe_data_bufs: List[Optional[torch.Tensor]] = []
-        # Per-stripe recv/parity buffers (avoids slot reuse race with RDMA)
         self.recv_bufs: List[Optional[torch.Tensor]] = []
         self.parity1_bufs: List[Optional[torch.Tensor]] = []
         self.parity2_bufs: List[Optional[torch.Tensor]] = []
@@ -104,58 +116,6 @@ class FRCheckManager:
     _rdma_registered_addrs: set = set()
     _layer_block_sizes: Optional[Dict[int, int]] = None  # layer_idx → block_size
     _full_buf: Optional[torch.Tensor] = None
-    _cached_layer_bufs: Dict[int, tuple] = {}  # layer_idx → (src_bufs, recv_bufs, p2_bufs)
-    _per_layer_buf_alloc_sizes: Dict[int, int] = {}  # layer_idx → block_size
-
-    def allocate_layer_encode_bufs(self, layer_idx: int, block_sz: int):
-        """Allocate per-layer source/recv/parity2 buffers for merged-barrier encode.
-
-        Returns (stripe_data_bufs, recv_bufs, parity2_bufs) — per-layer copies of the
-        shared per-stripe buffers, so that all layers can post recv WRs before the
-        single global barrier without overwriting each other's data.
-        """
-        prev_sz = self._per_layer_buf_alloc_sizes.get(layer_idx, 0)
-        if prev_sz >= block_sz and layer_idx in self._cached_layer_bufs:
-            return self._cached_layer_bufs[layer_idx]
-
-        native = self._frcheck_native
-        src_indices = [sid for sid in range(self.num_stripes)
-                       if self.stripe_plans[sid].role == StripeRole.SOURCE]
-        enc_indices = [sid for sid in range(self.num_stripes)
-                       if self.stripe_plans[sid].role == StripeRole.ENCODER]
-        par_indices = [sid for sid in range(self.num_stripes)
-                       if self.stripe_plans[sid].role == StripeRole.PARITY_TARGET]
-        recv_total = (self.frcheck_n - 2) * block_sz
-
-        stripe_data_bufs = [None] * self.num_stripes
-        recv_bufs = [None] * self.num_stripes
-        parity2_bufs = [None] * self.num_stripes
-
-        if src_indices:
-            src_slices = allocate_hugepage_slices(block_sz, len(src_indices), fallback_pin_memory=True)
-            for slot, sid in enumerate(src_indices):
-                stripe_data_bufs[sid] = src_slices[slot]
-                native.register_buffer(stripe_data_bufs[sid].data_ptr(), stripe_data_bufs[sid].numel())
-
-        if enc_indices:
-            r_slices = allocate_hugepage_slices(recv_total, len(enc_indices), fallback_pin_memory=True)
-            p2_slices = allocate_hugepage_slices(block_sz, len(enc_indices), fallback_pin_memory=True)
-            for slot, sid in enumerate(enc_indices):
-                recv_bufs[sid] = r_slices[slot]
-                parity2_bufs[sid] = p2_slices[slot]
-                native.register_buffer(recv_bufs[sid].data_ptr(), recv_bufs[sid].numel())
-                native.register_buffer(parity2_bufs[sid].data_ptr(), parity2_bufs[sid].numel())
-
-        if par_indices:
-            p2_slices = allocate_hugepage_slices(block_sz, len(par_indices), fallback_pin_memory=True)
-            for slot, sid in enumerate(par_indices):
-                parity2_bufs[sid] = p2_slices[slot]
-                native.register_buffer(parity2_bufs[sid].data_ptr(), parity2_bufs[sid].numel())
-
-        self._cached_layer_bufs[layer_idx] = (stripe_data_bufs, recv_bufs, parity2_bufs)
-        self._per_layer_buf_alloc_sizes[layer_idx] = block_sz
-        return stripe_data_bufs, recv_bufs, parity2_bufs
-
     def allocate_full_buf(self, size_bytes: int):
         """Allocate or reuse cached full tensor buffer (grows-only)."""
         if self._full_buf is not None:
@@ -217,15 +177,27 @@ class FRCheckManager:
                 bs = int(((sz + n_src - 1) // n_src + 4095) & ~4095)
                 self._layer_block_sizes[lidx] = max(bs, 4096)
 
-        # Allocate per-stripe buffers sized for the max block across all layers
+        native = self._frcheck_native
         max_blk = max(self._layer_block_sizes.values()) if self._layer_block_sizes else self.block_size
-        self._allocate_per_stripe_bufs(self._frcheck_native, max_blk)
+        for g in layer_groups:
+            lidx = g.layer_idx
+            bs = self._layer_block_sizes[lidx]
+            if native is not None:
+                self._allocate_layer_stripe_bufs(native, lidx, bs)
 
         logger.info(
             "FRCheck: computed per-layer block sizes (max=%dMB): %s",
             max_blk // (1024*1024),
             [(f"layer_{k}", f"{v//(1024*1024)}MB") for k, v
              in sorted(self._layer_block_sizes.items())])
+
+    def get_layer_stripe_bufs(self, layer_idx: int) -> LayerStripeBufs:
+        bufs = self.layer_stripe_bufs.get(layer_idx)
+        if bufs is None:
+            raise RuntimeError(
+                f"FRCheck: stripe buffers not allocated for layer_idx={layer_idx}"
+            )
+        return bufs
 
     def init_frcheck_if_enabled(self) -> None:
         """Load native .so, init RDMA, compile stripe plans."""
@@ -556,11 +528,13 @@ class FRCheckManager:
             buf_type, default_block_size, recv_total,
         )
 
-    def _allocate_per_stripe_bufs(self, native, block_sz: int) -> None:
-        """Allocate per-stripe buffers with given block size."""
-        if hasattr(self, '_per_stripe_alloc_size') and self._per_stripe_alloc_size >= block_sz:
-            return  # already allocated with sufficient size
-        self._per_stripe_alloc_size = block_sz
+    def _allocate_layer_stripe_bufs(self, native, layer_idx: int, block_sz: int) -> None:
+        """Allocate per-stripe buffers for one layer (grows-only per layer_idx)."""
+        prev = self._layer_stripe_alloc_sizes.get(layer_idx, 0)
+        if prev >= block_sz and layer_idx in self.layer_stripe_bufs:
+            return
+
+        self._layer_stripe_alloc_sizes[layer_idx] = block_sz
         recv_total = (self.frcheck_n - 2) * block_sz
 
         src_indices = [sid for sid in range(self.num_stripes)
@@ -570,44 +544,80 @@ class FRCheckManager:
         par_indices = [sid for sid in range(self.num_stripes)
                        if self.stripe_plans[sid].role == StripeRole.PARITY_TARGET]
 
-        self.stripe_data_bufs = [None] * self.num_stripes
-        self.recv_bufs = [None] * self.num_stripes
-        self.parity1_bufs = [None] * self.num_stripes
-        self.parity2_bufs = [None] * self.num_stripes
+        stripe_data_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
+        source_mirror_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
+        recv_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
+        parity1_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
+        parity2_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
 
         if src_indices:
             if self.gdr_available:
                 base = torch.cuda.ByteTensor(block_sz * len(src_indices))
+                mirror_slices = allocate_hugepage_slices(
+                    block_sz, len(src_indices), fallback_pin_memory=True
+                )
                 for slot, sid in enumerate(src_indices):
-                    self.stripe_data_bufs[sid] = base[slot * block_sz : (slot + 1) * block_sz]
-                    native.register_buffer(self.stripe_data_bufs[sid].data_ptr(), self.stripe_data_bufs[sid].numel())
+                    stripe_data_bufs[sid] = base[slot * block_sz : (slot + 1) * block_sz]
+                    source_mirror_bufs[sid] = mirror_slices[slot]
+                    native.register_buffer(
+                        stripe_data_bufs[sid].data_ptr(), stripe_data_bufs[sid].numel()
+                    )
             else:
-                slices = allocate_hugepage_slices(block_sz, len(src_indices), fallback_pin_memory=True)
+                slices = allocate_hugepage_slices(
+                    block_sz, len(src_indices), fallback_pin_memory=True
+                )
                 for slot, sid in enumerate(src_indices):
-                    self.stripe_data_bufs[sid] = slices[slot]
-                    native.register_buffer(self.stripe_data_bufs[sid].data_ptr(), self.stripe_data_bufs[sid].numel())
+                    stripe_data_bufs[sid] = slices[slot]
+                    native.register_buffer(
+                        stripe_data_bufs[sid].data_ptr(), stripe_data_bufs[sid].numel()
+                    )
 
         if enc_indices:
-            r_slices = allocate_hugepage_slices(recv_total, len(enc_indices), fallback_pin_memory=True)
-            p1_slices = allocate_hugepage_slices(block_sz, len(enc_indices), fallback_pin_memory=True)
-            p2_slices = allocate_hugepage_slices(block_sz, len(enc_indices), fallback_pin_memory=True)
+            r_slices = allocate_hugepage_slices(
+                recv_total, len(enc_indices), fallback_pin_memory=True
+            )
+            p1_slices = allocate_hugepage_slices(
+                block_sz, len(enc_indices), fallback_pin_memory=True
+            )
+            p2_slices = allocate_hugepage_slices(
+                block_sz, len(enc_indices), fallback_pin_memory=True
+            )
             for slot, sid in enumerate(enc_indices):
-                self.recv_bufs[sid] = r_slices[slot]
-                self.parity1_bufs[sid] = p1_slices[slot]
-                self.parity2_bufs[sid] = p2_slices[slot]
-                native.register_buffer(self.recv_bufs[sid].data_ptr(), self.recv_bufs[sid].numel())
-                native.register_buffer(self.parity1_bufs[sid].data_ptr(), self.parity1_bufs[sid].numel())
-                native.register_buffer(self.parity2_bufs[sid].data_ptr(), self.parity2_bufs[sid].numel())
+                recv_bufs[sid] = r_slices[slot]
+                parity1_bufs[sid] = p1_slices[slot]
+                parity2_bufs[sid] = p2_slices[slot]
+                native.register_buffer(recv_bufs[sid].data_ptr(), recv_bufs[sid].numel())
+                native.register_buffer(parity1_bufs[sid].data_ptr(), parity1_bufs[sid].numel())
+                native.register_buffer(parity2_bufs[sid].data_ptr(), parity2_bufs[sid].numel())
 
         if par_indices:
-            p2_slices = allocate_hugepage_slices(block_sz, len(par_indices), fallback_pin_memory=True)
+            p2_slices = allocate_hugepage_slices(
+                block_sz, len(par_indices), fallback_pin_memory=True
+            )
             for slot, sid in enumerate(par_indices):
-                self.parity2_bufs[sid] = p2_slices[slot]
-                native.register_buffer(self.parity2_bufs[sid].data_ptr(), self.parity2_bufs[sid].numel())
+                parity2_bufs[sid] = p2_slices[slot]
+                native.register_buffer(parity2_bufs[sid].data_ptr(), parity2_bufs[sid].numel())
 
+        layer_bufs = LayerStripeBufs(
+            stripe_data_bufs=stripe_data_bufs,
+            source_mirror_bufs=source_mirror_bufs,
+            recv_bufs=recv_bufs,
+            parity1_bufs=parity1_bufs,
+            parity2_bufs=parity2_bufs,
+        )
+        self.layer_stripe_bufs[layer_idx] = layer_bufs
+
+        if not self.stripe_data_bufs:
+            self.stripe_data_bufs = stripe_data_bufs
+            self.recv_bufs = recv_bufs
+            self.parity1_bufs = parity1_bufs
+            self.parity2_bufs = parity2_bufs
+
+        lname = f"layer_{layer_idx}" if layer_idx >= 0 else "layer_common"
         logger.info(
-            "FRCheck: allocated per-stripe bufs blk=%dMB: %d source, %d enc, %d par",
-            block_sz // (1024*1024), len(src_indices), len(enc_indices), len(par_indices),
+            "FRCheck: allocated %s stripe bufs blk=%dMB: %d source, %d enc, %d par",
+            lname, block_sz // (1024 * 1024),
+            len(src_indices), len(enc_indices), len(par_indices),
         )
 
     def _compile_stripe_plans(self) -> None:
@@ -870,12 +880,22 @@ class FRCheckManager:
         elif exc:
             logger.warning("FRCheck: stop() failed: %s", exc[0])
 
+    def end_recovery(self) -> None:
+        """Clear recovery-mode state without tearing down RDMA / RS pool."""
+        self.is_recovery_mode = False
+        self.failed_global_ranks = []
+        self.recovery_stripe_plans = []
+        self.recovery_helper_bufs = []
+        self.recovery_decoder_bufs = []
+        self.recovery_failed_bufs = []
+
     def cleanup(self) -> None:
         self.stop(timeout=5.0)  # shorter timeout at explicit cleanup
         self._frcheck_native = None
         self.stripe_plans.clear()
         self._cached_layer_buffers = {}
         self._rdma_registered_addrs = set()
+        self.end_recovery()
 
     def __del__(self):
         try:

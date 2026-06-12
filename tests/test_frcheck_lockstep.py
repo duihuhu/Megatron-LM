@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test FRCheck lockstep worker pipeline (submit_source_send + wait_stripe)."""
+"""Test FRCheck stripe-FIFO encode (multi-lane, batch submit, parallel workers)."""
 
 import importlib.util
 import os
@@ -20,6 +20,10 @@ spec.loader.exec_module(native_mod)
 
 
 def main():
+    if not native_mod.FRCheckNative.gdr_available():
+        print("SKIP: GDR not available (nvidia-peermem required)", flush=True)
+        return
+
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     n = 4
@@ -31,51 +35,106 @@ def main():
 
     base_port = int(os.environ.get("FRCHECK_BASE_PORT", "26050"))
     native.init_rdma(n, rank, base_port, "127.0.0.1", ["127.0.0.1"] * n, True)
+    dist.barrier()
 
     bs = 4096
     recv_total = (n - 2) * bs
-    data = torch.zeros(bs, dtype=torch.uint8, device="cpu", pin_memory=True)
-    mirror = torch.zeros(bs, dtype=torch.uint8, device="cpu", pin_memory=True)
-    recv = torch.zeros(recv_total, dtype=torch.uint8, device="cpu", pin_memory=True)
-    p1 = torch.zeros(bs, dtype=torch.uint8, device="cpu", pin_memory=True)
-    p2 = torch.zeros(bs, dtype=torch.uint8, device="cpu", pin_memory=True)
+    num_stripes = native.num_stripes()
 
-    native.register_buffer(data.data_ptr(), data.numel())
-    native.register_buffer(recv.data_ptr(), recv.numel())
-    native.register_buffer(p1.data_ptr(), p1.numel())
-    native.register_buffer(p2.data_ptr(), p2.numel())
+    n_source_my = sum(
+        1 for sid in range(num_stripes) if native.get_role_for_stripe(sid) == 0
+    )
+    layer_capacity = max(n_source_my, 1) * bs
 
-    native.reset_encoding_completion()
-    for sid in range(native.num_stripes()):
-        dist.barrier()
+    layer_buf_gpu = torch.zeros(layer_capacity, dtype=torch.uint8, device="cuda")
+    layer_mirror = torch.zeros(
+        layer_capacity, dtype=torch.uint8, device="cpu", pin_memory=True,
+    )
+    recv_bufs = [
+        torch.zeros(recv_total, dtype=torch.uint8, device="cpu", pin_memory=True)
+        for _ in range(num_stripes)
+    ]
+    p1_bufs = [
+        torch.zeros(bs, dtype=torch.uint8, device="cpu", pin_memory=True)
+        for _ in range(num_stripes)
+    ]
+    p2_bufs = [
+        torch.zeros(bs, dtype=torch.uint8, device="cpu", pin_memory=True)
+        for _ in range(num_stripes)
+    ]
+
+    native.register_buffer(layer_buf_gpu.data_ptr(), layer_buf_gpu.numel())
+    native.register_buffer(layer_mirror.data_ptr(), layer_mirror.numel())
+    for sid in range(num_stripes):
+        native.register_buffer(recv_bufs[sid].data_ptr(), recv_bufs[sid].numel())
+        native.register_buffer(p1_bufs[sid].data_ptr(), p1_bufs[sid].numel())
+        native.register_buffer(p2_bufs[sid].data_ptr(), p2_bufs[sid].numel())
+
+    layer_base = layer_buf_gpu.data_ptr()
+    mirror_base = layer_mirror.data_ptr()
+    src_block_per_node = 0
+
+    native.reset_encoding_batch()
+    for sid in range(num_stripes):
         role = native.get_role_for_stripe(sid)
+        source_data = 0
+        source_mirror = 0
+        recv_buf = 0
+        p1 = 0
+        p2_out = 0
+        p2_in = 0
+        local_src = []
+
         if role == 0:
-            data.fill_((rank * 100 + sid) % 256)
-            native.submit_source_send(sid, data.data_ptr(), 0, bs)
+            blk_idx = src_block_per_node
+            src_block_per_node += 1
+            off = blk_idx * bs
+            layer_buf_gpu[off : off + bs].fill_((rank * 100 + sid) % 256)
+            source_data = layer_base + off
+            source_mirror = mirror_base + off
         elif role == 1:
-            recv.zero_()
-            p1.zero_()
-            p2.zero_()
+            recv_bufs[sid].zero_()
+            p1_bufs[sid].zero_()
+            p2_bufs[sid].zero_()
             srcs = native.get_source_node_ids(sid)
             local = [0, 0, 0, 0]
             for i, node in enumerate(srcs):
                 if node - 1 == rank:
-                    slot = i * bs
-                    recv[slot : slot + bs].fill_((rank * 100 + sid) % 256)
-                    local[i] = recv.data_ptr() + slot
-            native.submit_encoder_encode(
-                sid, recv.data_ptr(), p1.data_ptr(), p2.data_ptr(), bs, local
-            )
+                    blk_idx = src_block_per_node
+                    src_block_per_node += 1
+                    off = blk_idx * bs
+                    layer_buf_gpu[off : off + bs].fill_((rank * 100 + sid) % 256)
+                    local[i] = layer_base + off
+            recv_buf = recv_bufs[sid].data_ptr()
+            p1 = p1_bufs[sid].data_ptr()
+            p2_out = p2_bufs[sid].data_ptr()
+            local_src = local
         elif role == 2:
-            p2.zero_()
-            native.submit_parity_recv(sid, p2.data_ptr(), bs)
-        native.wait_stripe(sid)
-        dist.barrier()
+            p2_bufs[sid].zero_()
+            p2_in = p2_bufs[sid].data_ptr()
 
+        native.submit_stripe_chunk(
+            sid,
+            source_data,
+            source_mirror,
+            recv_buf,
+            p1,
+            p2_out,
+            p2_in,
+            bs,
+            local_src,
+        )
+
+    native.submit_encoding_sentinel()
+    native.wait_encoding_batch()
+
+    sample_p2 = p2_bufs[0][0].item() if p2_bufs else 0
     print(
-        f"[Rank {rank}] lockstep worker test PASSED "
-        f"p2[0]={p2[0].item()}"
+        f"[Rank {rank}] stripe-FIFO worker test PASSED p2[0]={sample_p2}",
+        flush=True,
     )
+
+    dist.barrier()
     native.stop()
     print(f"[Rank {rank}] done", flush=True)
 

@@ -47,9 +47,9 @@ class StripePlan:
 
 @dataclass
 class LayerStripeBufs:
-    """Per-layer per-stripe encode buffers (independent across layers)."""
-    stripe_data_bufs: List[Optional[torch.Tensor]]
-    source_mirror_bufs: List[Optional[torch.Tensor]]
+    """Per-layer encode buffers: one GPU source region + CPU mirror + stripe role bufs."""
+    layer_buf_gpu: torch.Tensor
+    layer_mirror_cpu: torch.Tensor
     recv_bufs: List[Optional[torch.Tensor]]
     parity1_bufs: List[Optional[torch.Tensor]]
     parity2_bufs: List[Optional[torch.Tensor]]
@@ -85,14 +85,12 @@ class FRCheckManager:
         # RDMA / stripe encode
         self.stripe_plans: List[StripePlan] = []
         self.block_size: int = 0
-        self.gdr_available: bool = False
         self.num_stripes: int = 0
         self.num_source_stripes: int = 0  # My SOURCE stripe count
-        # Per-layer per-stripe encode buffers (keyed by layer_idx)
+        # Per-layer encode buffers (keyed by layer_idx)
         self.layer_stripe_bufs: Dict[int, LayerStripeBufs] = {}
         self._layer_stripe_alloc_sizes: Dict[int, int] = {}
         # Legacy single-layer aliases (first allocated layer, for backward compat)
-        self.stripe_data_bufs: List[Optional[torch.Tensor]] = []
         self.recv_bufs: List[Optional[torch.Tensor]] = []
         self.parity1_bufs: List[Optional[torch.Tensor]] = []
         self.parity2_bufs: List[Optional[torch.Tensor]] = []
@@ -112,7 +110,6 @@ class FRCheckManager:
 
         self._initialized = True
 
-    _cached_layer_buffers: Dict[int, torch.Tensor] = {}
     _rdma_registered_addrs: set = set()
     _layer_block_sizes: Optional[Dict[int, int]] = None  # layer_idx → block_size
     _full_buf: Optional[torch.Tensor] = None
@@ -126,24 +123,33 @@ class FRCheckManager:
         )
         return self._full_buf
 
-    def allocate_layer_buffer(self, layer_idx: int, size_bytes: int, gdr: bool):
-        """Allocate or reuse a cached per-layer tensor_buffer."""
-        cached = self._cached_layer_buffers.get(layer_idx)
-        if cached is not None and cached.numel() >= size_bytes:
-            return cached
-        if gdr:
-            buf = torch.empty(size_bytes, dtype=torch.uint8, device="cuda")
-        else:
-            buf = allocate_hugepage_tensor(size_bytes, fallback_pin_memory=True)
-        self._cached_layer_buffers[layer_idx] = buf
-        return buf
+    def get_layer_capacity_bytes(self, layer_idx: int) -> int:
+        """Total GPU/CPU mirror bytes for one layer (n_src * block_size)."""
+        bs = self._layer_block_sizes.get(layer_idx) if self._layer_block_sizes else None
+        if bs is None:
+            raise RuntimeError(
+                f"FRCheck: block size not computed for layer_idx={layer_idx}"
+            )
+        n_src = (self.frcheck_n - 1) * (self.frcheck_n - 2)
+        return n_src * bs
 
     def compute_layer_block_sizes(self, layer_groups) -> None:
         """All_gather per-layer sizes across world, keep max in my group."""
         if self._layer_block_sizes is not None:
             return
         if not torch.distributed.is_initialized():
-            self._layer_block_sizes = {-1: self.block_size}
+            n_src = (self.frcheck_n - 1) * (self.frcheck_n - 2)
+            self._layer_block_sizes = {}
+            for g in layer_groups:
+                sz = g.total_bytes
+                bs = int(((sz + n_src - 1) // n_src + 4095) & ~4095)
+                self._layer_block_sizes[g.layer_idx] = max(bs, 4096)
+            native = self._frcheck_native
+            for g in layer_groups:
+                if native is not None:
+                    self._allocate_layer_stripe_bufs(
+                        native, g.layer_idx, self._layer_block_sizes[g.layer_idx],
+                    )
             return
         ws = torch.distributed.get_world_size()
         n_src = (self.frcheck_n - 1) * (self.frcheck_n - 2)
@@ -215,14 +221,17 @@ class FRCheckManager:
         self._validate_and_build_grouping(n)
         self._init_frcheck_native(path)
 
-        # Detect GDR capability and num_stripes (available from POA, no RDMA needed)
         native = self._frcheck_native
         if native is not None:
-            self.gdr_available = native.gdr_available()
+            if not native.gdr_available():
+                raise RuntimeError(
+                    "FRCheck requires GDR (nvidia-peermem module). "
+                    "Load nvidia-peermem and ensure IB GPU Direct RDMA is available."
+                )
+            native.set_require_registered_mr(True)
             self.num_stripes = native.num_stripes()
         logger.info(
-            "FRCheck: GDR %s, n=%d num_stripes=%d",
-            "available" if self.gdr_available else "not available",
+            "FRCheck: GDR required (enabled), n=%d num_stripes=%d",
             self.frcheck_n, self.num_stripes,
         )
 
@@ -499,7 +508,12 @@ class FRCheckManager:
 
     def _resolve_my_ip(self) -> str:
         """Determine my IP for listen socket, with multi-NIC per-rank support."""
-        return resolve_ip("FRCHECK", fallback_prefixes=["ECLATIN"])
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else None
+        )
+        return resolve_ip("FRCHECK", rank=rank, fallback_prefixes=["ECLATIN"])
 
     def _allocate_default_buffers(self, native, n: int) -> None:
         """Allocate back-compat data/recv/parity buffers."""
@@ -508,24 +522,18 @@ class FRCheckManager:
         self.block_size = default_block_size
         recv_total = (n - 2) * default_block_size
 
-        # Placeholder data_buffer (per-stripe bufs allocated after stripe plans compiled)
-        if self.gdr_available:
-            self.data_buffer = torch.cuda.ByteTensor(default_block_size)
-        else:
-            self.data_buffer = allocate_hugepage_tensor(
-                default_block_size, fallback_pin_memory=True
-            )
+        native.set_require_registered_mr(True)
+
+        self.data_buffer = torch.cuda.ByteTensor(default_block_size)
         native.register_buffer(self.data_buffer.data_ptr(), self.data_buffer.numel())
 
-        # Backward-compat single buffers for sync path / tests
         self.recv_buffer = allocate_hugepage_tensor(recv_total, fallback_pin_memory=True)
         self.parity1_buffer = allocate_hugepage_tensor(default_block_size, fallback_pin_memory=True)
         self.parity2_buffer = allocate_hugepage_tensor(default_block_size, fallback_pin_memory=True)
 
-        buf_type = "GPU" if self.gdr_available else "CPU"
         logger.info(
-            "FRCheck: allocated %s buffers block_size=%s recv_total=%s",
-            buf_type, default_block_size, recv_total,
+            "FRCheck: allocated GPU default buffer block_size=%s recv_total=%s",
+            default_block_size, recv_total,
         )
 
     def _allocate_layer_stripe_bufs(self, native, layer_idx: int, block_sz: int) -> None:
@@ -534,43 +542,32 @@ class FRCheckManager:
         if prev >= block_sz and layer_idx in self.layer_stripe_bufs:
             return
 
+        n_src = (self.frcheck_n - 1) * (self.frcheck_n - 2)
+        layer_capacity = n_src * block_sz
         self._layer_stripe_alloc_sizes[layer_idx] = block_sz
         recv_total = (self.frcheck_n - 2) * block_sz
 
-        src_indices = [sid for sid in range(self.num_stripes)
-                       if self.stripe_plans[sid].role == StripeRole.SOURCE]
+        native.set_require_registered_mr(True)
+
         enc_indices = [sid for sid in range(self.num_stripes)
                        if self.stripe_plans[sid].role == StripeRole.ENCODER]
         par_indices = [sid for sid in range(self.num_stripes)
                        if self.stripe_plans[sid].role == StripeRole.PARITY_TARGET]
 
-        stripe_data_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
-        source_mirror_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
+        layer_buf_gpu = torch.zeros(layer_capacity, dtype=torch.uint8, device="cuda")
+        layer_mirror_cpu = allocate_hugepage_tensor(
+            layer_capacity, fallback_pin_memory=True,
+        )
+        layer_mirror_cpu.zero_()
+
+        buf_addr = layer_buf_gpu.data_ptr()
+        if buf_addr not in self._rdma_registered_addrs:
+            native.register_buffer(buf_addr, layer_buf_gpu.numel())
+            self._rdma_registered_addrs.add(buf_addr)
+
         recv_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
         parity1_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
         parity2_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
-
-        if src_indices:
-            if self.gdr_available:
-                base = torch.cuda.ByteTensor(block_sz * len(src_indices))
-                mirror_slices = allocate_hugepage_slices(
-                    block_sz, len(src_indices), fallback_pin_memory=True
-                )
-                for slot, sid in enumerate(src_indices):
-                    stripe_data_bufs[sid] = base[slot * block_sz : (slot + 1) * block_sz]
-                    source_mirror_bufs[sid] = mirror_slices[slot]
-                    native.register_buffer(
-                        stripe_data_bufs[sid].data_ptr(), stripe_data_bufs[sid].numel()
-                    )
-            else:
-                slices = allocate_hugepage_slices(
-                    block_sz, len(src_indices), fallback_pin_memory=True
-                )
-                for slot, sid in enumerate(src_indices):
-                    stripe_data_bufs[sid] = slices[slot]
-                    native.register_buffer(
-                        stripe_data_bufs[sid].data_ptr(), stripe_data_bufs[sid].numel()
-                    )
 
         if enc_indices:
             r_slices = allocate_hugepage_slices(
@@ -599,25 +596,25 @@ class FRCheckManager:
                 native.register_buffer(parity2_bufs[sid].data_ptr(), parity2_bufs[sid].numel())
 
         layer_bufs = LayerStripeBufs(
-            stripe_data_bufs=stripe_data_bufs,
-            source_mirror_bufs=source_mirror_bufs,
+            layer_buf_gpu=layer_buf_gpu,
+            layer_mirror_cpu=layer_mirror_cpu,
             recv_bufs=recv_bufs,
             parity1_bufs=parity1_bufs,
             parity2_bufs=parity2_bufs,
         )
         self.layer_stripe_bufs[layer_idx] = layer_bufs
 
-        if not self.stripe_data_bufs:
-            self.stripe_data_bufs = stripe_data_bufs
+        if not self.recv_bufs:
             self.recv_bufs = recv_bufs
             self.parity1_bufs = parity1_bufs
             self.parity2_bufs = parity2_bufs
 
         lname = f"layer_{layer_idx}" if layer_idx >= 0 else "layer_common"
         logger.info(
-            "FRCheck: allocated %s stripe bufs blk=%dMB: %d source, %d enc, %d par",
-            lname, block_sz // (1024 * 1024),
-            len(src_indices), len(enc_indices), len(par_indices),
+            "FRCheck: allocated layer bufs blk=%dMB cap=%dMB: %d enc, %d par",
+            block_sz // (1024 * 1024),
+            layer_capacity // (1024 * 1024),
+            len(enc_indices), len(par_indices),
         )
 
     def _compile_stripe_plans(self) -> None:
@@ -644,34 +641,6 @@ class FRCheckManager:
             {r.name: sum(1 for p in self.stripe_plans if p.role == r)
              for r in StripeRole},
         )
-
-    def submit_stripe(self, stripe_id: int) -> None:
-        """Encode a single stripe using pre-allocated buffers."""
-        native = self._frcheck_native
-        if native is None:
-            raise RuntimeError("FRCheck: native module not available")
-        native.submit_stripe_encode(
-            stripe_id=stripe_id,
-            my_data_addr=self.data_buffer.data_ptr(),
-            block_size=self.block_size,
-            recv_buf_addr=self.recv_buffer.data_ptr(),
-            recv_buf_size=self.recv_buffer.numel(),
-            parity1_out_addr=self.parity1_buffer.data_ptr(),
-            parity2_out_addr=self.parity2_buffer.data_ptr(),
-            parity2_in_addr=self.parity2_buffer.data_ptr(),
-        )
-
-        # Accumulate parity results (ENCODER / PARITY_TARGET only)
-        plan = self.stripe_plans[stripe_id]
-        off = stripe_id * self.block_size
-        if plan.role == StripeRole.ENCODER:
-            self.parity1_accum[off : off + self.block_size].copy_(
-                self.parity1_buffer[:].view(torch.uint8)
-            )
-        elif plan.role == StripeRole.PARITY_TARGET:
-            self.parity2_accum[off : off + self.block_size].copy_(
-                self.parity2_buffer[:].view(torch.uint8)
-            )
 
     def get_native(self) -> Any:
         return self._frcheck_native
@@ -754,25 +723,14 @@ class FRCheckManager:
                 from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
                     allocate_hugepage_slices, allocate_hugepage_tensor,
                 )
-                if self.gdr_available:
-                    self.recovery_decoder_bufs[sid] = torch.cuda.ByteTensor(recv_sz + block_sz)
-                else:
-                    self.recovery_decoder_bufs[sid] = allocate_hugepage_tensor(
-                        recv_sz + block_sz, fallback_pin_memory=True)
+                self.recovery_decoder_bufs[sid] = torch.cuda.ByteTensor(recv_sz + block_sz)
                 native.register_buffer(
                     self.recovery_decoder_bufs[sid].data_ptr(),
                     self.recovery_decoder_bufs[sid].numel())
 
             elif my_node in plan['helper_nodes']:
                 # Allocate block-sized buffer for reading from disk
-                if self.gdr_available:
-                    self.recovery_helper_bufs[sid] = torch.cuda.ByteTensor(block_sz)
-                else:
-                    from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
-                        allocate_hugepage_tensor,
-                    )
-                    self.recovery_helper_bufs[sid] = allocate_hugepage_tensor(
-                        block_sz, fallback_pin_memory=True)
+                self.recovery_helper_bufs[sid] = torch.cuda.ByteTensor(block_sz)
                 native.register_buffer(
                     self.recovery_helper_bufs[sid].data_ptr(),
                     self.recovery_helper_bufs[sid].numel())
@@ -858,27 +816,31 @@ class FRCheckManager:
 
         return recovery_contexts
 
-    def stop(self, timeout: float = 10.0) -> None:
-        """Stop C++ encode workers with a timeout to prevent hangs on exit."""
+    def _unregister_all_buffers(self) -> None:
+        """Unregister all RDMA-registered buffers (ECLATIN-style cleanup)."""
+        native = self._frcheck_native
+        if native is None:
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        for addr in list(self._rdma_registered_addrs):
+            try:
+                native.unregister_buffer(addr)
+            except Exception as e:
+                logger.warning(
+                    "FRCheck: rank %d failed to unregister buffer 0x%x: %s",
+                    rank, addr, e,
+                )
+        self._rdma_registered_addrs.clear()
+
+    def stop(self) -> None:
+        """Stop C++ encode workers and RS pool (synchronous, ECLATIN-style)."""
         if self._frcheck_native is None or not hasattr(self._frcheck_native, "stop"):
             return
-        import threading
-        exc = []
-        def _do_stop():
-            try:
-                self._frcheck_native.stop()
-            except Exception as e:
-                exc.append(e)
-        t = threading.Thread(target=_do_stop, daemon=True)
-        t.start()
-        t.join(timeout=timeout)
-        if t.is_alive():
-            logger.warning(
-                "FRCheck: C++ stop() timed out after %.1fs — encode pool threads "
-                "will be reclaimed by the OS on exit", timeout,
-            )
-        elif exc:
-            logger.warning("FRCheck: stop() failed: %s", exc[0])
+        try:
+            self._frcheck_native.stop()
+            logger.info("FRCheck: C++ native module stopped")
+        except Exception as e:
+            logger.warning("FRCheck: stop() failed: %s", e)
 
     def end_recovery(self) -> None:
         """Clear recovery-mode state without tearing down RDMA / RS pool."""
@@ -889,16 +851,31 @@ class FRCheckManager:
         self.recovery_decoder_bufs = []
         self.recovery_failed_bufs = []
 
-    def cleanup(self) -> None:
-        self.stop(timeout=5.0)  # shorter timeout at explicit cleanup
-        self._frcheck_native = None
-        self.stripe_plans.clear()
-        self._cached_layer_buffers = {}
-        self._rdma_registered_addrs = set()
-        self.end_recovery()
+    def cleanup(self, teardown: bool = False) -> None:
+        """Cleanup FRCheck resources (ECLATIN-style).
+
+        Save/train/eval: do not call — native module stays alive for reuse.
+        Load path: call with teardown=True after recovery completes.
+        """
+        if not teardown:
+            return
+        try:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                torch.distributed.barrier()
+            self._unregister_all_buffers()
+            self.stop()
+            self._frcheck_native = None
+            self.stripe_plans.clear()
+            self.layer_stripe_bufs.clear()
+            self._layer_stripe_alloc_sizes.clear()
+            self._layer_block_sizes = None
+            self.end_recovery()
+            logger.info("FRCheck: native module torn down after load (rank=%d)", rank)
+        except Exception as e:
+            logger.warning("FRCheck: error during manager cleanup: %s", e)
 
     def __del__(self):
-        try:
-            self.cleanup()
-        except Exception:
-            pass
+        # Do not stop native here — save/eval keep resources alive (ECLATIN save path).
+        # Load path calls cleanup(teardown=True) explicitly before returning state_dict.
+        pass

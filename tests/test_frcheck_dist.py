@@ -7,13 +7,13 @@ Usage:
 
 Tests:
   - RDMA full-mesh connection establishment
-  - submit_stripe_encode pipeline (SOURCE→ENCODER→PARITY_TARGET)
+  - submit_stripe_chunk pipeline (SOURCE->ENCODER->PARITY_TARGET)
   - Data integrity across the encode pipeline
 """
 
-import sys, os
+import sys
+import os
 
-# Filter out the strategies dir which has a torch.py that shadows real torch
 sys.path = [p for p in sys.path if 'dist_checkpointing/strategies' not in p]
 
 import torch
@@ -40,14 +40,15 @@ def init_distributed():
 
 def frcheck_dist_test():
     """Test FRCheck RDMA pipeline with 4 processes."""
+    if not native_mod.FRCheckNative.gdr_available():
+        print("SKIP: GDR not available (nvidia-peermem required)")
+        return
+
     rank, world_size = init_distributed()
     n = 4
 
     assert world_size == n, f"This test requires exactly {n} processes"
 
-    # All ranks use the same base_port; each rank listens on base_port + rank_in_group.
-    # The base port is MASTER_PORT + 20000 (or FRCHECK_BASE_PORT if set).
-    # On a single machine, use an unambiguous base port.
     master_port = int(os.environ.get('MASTER_PORT', '6000'))
     base_port = int(os.environ.get('FRCHECK_BASE_PORT', str(master_port + 20000)))
 
@@ -56,18 +57,14 @@ def frcheck_dist_test():
 
     print(f"[Rank {rank}] Starting FRCheck distributed test (world_size={world_size})")
 
-    # Load native module with POA
     native = native_mod.FRCheckNative(POA_PATH)
     native.compile_plans(rank)
     assert native.n() == n, f"n={native.n()} != expected {n}"
     assert native.num_stripes() == n * (n - 1), \
         f"num_stripes={native.num_stripes()} != {n * (n - 1)}"
 
-    # Init RDMA full-mesh
     my_ip = '127.0.0.1'
     peer_ips = ['127.0.0.1'] * n
-
-    # Use per-rank acceptor port
     listen_port = base_port + rank
     print(f"[Rank {rank}] RDMA init: base_port={base_port}, listen_port={listen_port}, IP={my_ip}")
 
@@ -82,77 +79,113 @@ def frcheck_dist_test():
         )
     except RuntimeError as e:
         print(f"[Rank {rank}] RDMA init failed: {e}")
-        # Cleanup and exit
         if dist.is_initialized():
             dist.destroy_process_group()
         raise
 
     print(f"[Rank {rank}] RDMA full-mesh connected: group_size={native.group_size()}")
+    dist.barrier()
 
-    # Register buffers for stripe encode
-    block_size = 4096  # small block for testing
-    recv_total = (n - 2) * block_size  # encoder receives n-2 blocks
+    block_size = 4096
+    recv_total = (n - 2) * block_size
+    num_stripes = native.num_stripes()
 
-    data_buf = torch.zeros(block_size, dtype=torch.uint8, device='cpu')
-    recv_buf = torch.zeros(recv_total, dtype=torch.uint8, device='cpu')
-    parity1_buf = torch.zeros(block_size, dtype=torch.uint8, device='cpu')
-    parity2_buf = torch.zeros(block_size, dtype=torch.uint8, device='cpu')
+    n_source_my = sum(
+        1 for sid in range(num_stripes) if native.get_role_for_stripe(sid) == 0
+    )
+    layer_capacity = max(n_source_my, 1) * block_size
 
-    native.register_buffer(data_buf.data_ptr(), data_buf.numel())
+    layer_buf_gpu = torch.zeros(layer_capacity, dtype=torch.uint8, device=device)
+    layer_mirror = torch.zeros(
+        layer_capacity, dtype=torch.uint8, device='cpu', pin_memory=True,
+    )
+    recv_buf = torch.zeros(recv_total, dtype=torch.uint8, device='cpu', pin_memory=True)
+    parity1_buf = torch.zeros(block_size, dtype=torch.uint8, device='cpu', pin_memory=True)
+    parity2_buf = torch.zeros(block_size, dtype=torch.uint8, device='cpu', pin_memory=True)
+
+    native.register_buffer(layer_buf_gpu.data_ptr(), layer_buf_gpu.numel())
+    native.register_buffer(layer_mirror.data_ptr(), layer_mirror.numel())
     native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
     native.register_buffer(parity1_buf.data_ptr(), parity1_buf.numel())
     native.register_buffer(parity2_buf.data_ptr(), parity2_buf.numel())
 
     print(f"[Rank {rank}] Buffers registered: block_size={block_size}")
 
-    # Fill data buffer with rank-specific pattern
-    for i in range(block_size // 4):
-        data_buf[i * 4:(i + 1) * 4] = torch.tensor([rank, (rank + 1) % 256,
-                                                      (rank + 2) % 256, (rank + 3) % 256],
-                                                     dtype=torch.uint8)
+    layer_base = layer_buf_gpu.data_ptr()
+    mirror_base = layer_mirror.data_ptr()
+    src_block_per_node = 0
 
-    # Process all stripes
-    roles_seen = {0: 0, 1: 0, 2: 0}  # SOURCE, ENCODER, PARITY_TARGET
+    roles_seen = {0: 0, 1: 0, 2: 0}
     stripe_results = []
 
-    for sid in range(native.num_stripes()):
+    native.reset_encoding_batch()
+    for sid in range(num_stripes):
         role = native.get_role_for_stripe(sid)
         roles_seen[role] += 1
 
-        # For SOURCE: fill data_buf with unique pattern per stripe
-        if role == 0:  # SOURCE
-            val = rank * 100 + sid
-            data_buf.fill_(val % 256)
-        elif role == 1:  # ENCODER
-            recv_buf.zero_()
-        elif role == 2:  # PARITY_TARGET
-            parity2_buf.zero_()
+        source_data = 0
+        source_mirror = 0
+        recv_addr = 0
+        p1 = 0
+        p2_out = 0
+        p2_in = 0
+        local_src = []
 
-        # Submit stripe encode
-        native.submit_stripe_encode(
-            stripe_id=sid,
-            my_data_addr=data_buf.data_ptr(),
-            block_size=block_size,
-            recv_buf_addr=recv_buf.data_ptr(),
-            recv_buf_size=recv_buf.numel(),
-            parity1_out_addr=parity1_buf.data_ptr(),
-            parity2_out_addr=parity2_buf.data_ptr(),
-            parity2_in_addr=parity2_buf.data_ptr(),
+        if role == 0:
+            val = rank * 100 + sid
+            blk_idx = src_block_per_node
+            src_block_per_node += 1
+            off = blk_idx * block_size
+            layer_buf_gpu[off : off + block_size].fill_(val % 256)
+            source_data = layer_base + off
+            source_mirror = mirror_base + off
+        elif role == 1:
+            recv_buf.zero_()
+            parity1_buf.zero_()
+            parity2_buf.zero_()
+            srcs = native.get_source_node_ids(sid)
+            local = [0, 0, 0, 0]
+            for i, node in enumerate(srcs):
+                if node - 1 == rank:
+                    blk_idx = src_block_per_node
+                    src_block_per_node += 1
+                    off = blk_idx * block_size
+                    layer_buf_gpu[off : off + block_size].fill_((rank * 100 + sid) % 256)
+                    local[i] = layer_base + off
+            recv_addr = recv_buf.data_ptr()
+            p1 = parity1_buf.data_ptr()
+            p2_out = parity2_buf.data_ptr()
+            local_src = local
+        elif role == 2:
+            parity2_buf.zero_()
+            p2_in = parity2_buf.data_ptr()
+
+        native.submit_stripe_chunk(
+            sid,
+            source_data,
+            source_mirror,
+            recv_addr,
+            p1,
+            p2_out,
+            p2_in,
+            block_size,
+            local_src,
         )
 
         result = {
             'stripe_id': sid,
             'role': role,
-            'data': data_buf[0:8].clone(),
+            'data': layer_mirror[0:8].clone() if role == 0 else parity1_buf[0:8].clone(),
             'parity1': parity1_buf[0:8].clone(),
             'parity2': parity2_buf[0:8].clone(),
         }
         stripe_results.append(result)
 
-    # Sync all ranks before reading results
+    native.submit_encoding_sentinel()
+    native.wait_encoding_batch()
+
     dist.barrier()
 
-    # Report results
     role_name = {0: 'SOURCE', 1: 'ENCODER', 2: 'PARITY_TARGET'}
     print(f"\n[Rank {rank}] Role distribution: "
           f"SOURCE={roles_seen[0]} ENCODER={roles_seen[1]} PARITY_TARGET={roles_seen[2]}")
@@ -162,7 +195,6 @@ def frcheck_dist_test():
         print(f"  stripe {r['stripe_id']:2d} [{tag:14s}] data={r['data'].tolist()}  "
               f"p1={r['parity1'].tolist()}  p2={r['parity2'].tolist()}")
 
-    # Cleanup
     native.stop()
     dist.barrier()
     print(f"[Rank {rank}] FRCheck distributed test PASSED")

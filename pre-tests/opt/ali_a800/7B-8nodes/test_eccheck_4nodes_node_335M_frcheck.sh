@@ -148,7 +148,6 @@ EVAL_AND_LOGGING_ARGS=(
     --frcheck-table-dir $FRCHECK_TABLE_DIR
     --frcheck-failed-ranks 0,1
     --use-frcheck-hardware-failure
-    --use-rdma
     --ckpt-format torch
     --save-embeddings-separately
     # --timing-log-level 2

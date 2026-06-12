@@ -987,6 +987,11 @@ def pretrain(
     ft_integration.shutdown()
     one_logger_utils.finish()
 
+    from megatron.training import get_args as _get_args
+    if getattr(_get_args(), "use_frcheck", False):
+        from megatron.training.frcheck_legacy import _teardown_frcheck_after_training
+        _teardown_frcheck_after_training()
+
 
 def update_train_iters(args):
 

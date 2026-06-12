@@ -105,7 +105,7 @@ if ls frcheck_native.cpython-*.so 1>/dev/null 2>&1; then
 
     echo ""
     echo "Usage:"
-    echo "  Training:  --use-frcheck --frcheck-n 4 --frcheck-table-dir <dir> --use-rdma"
+    echo "  Training:  --use-frcheck --frcheck-n 4 --frcheck-table-dir <dir>"
     echo "  GDR mode:  (automatic if nvidia-peermem loaded)"
     echo ""
 else

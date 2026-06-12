@@ -161,13 +161,12 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
     --use-frcheck
-    --frcheck-debug
+    #--frcheck-debug
     --frcheck-n 4
     #--use-frcheck-software-failure 
     #--frcheck-failed-ranks 0
     --frcheck-table-dir $FRCHECK_TABLE_DIR
     #--use-frcheck-hardware-failure
-    --use-rdma
     --ckpt-format torch
     --save-embeddings-separately
     --timing-log-level 2

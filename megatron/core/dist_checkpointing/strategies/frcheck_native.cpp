@@ -7,6 +7,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -84,20 +85,33 @@ static constexpr size_t FRCHECK_TEMP_BUF_SIZE = 128ULL * 1024 * 1024; // 128 MB
 static constexpr size_t FRCHECK_RDMA_CHUNK = 64ULL * 1024 * 1024;     // 64 MB per RDMA op
 static constexpr int    FRCHECK_MAX_WR = 64;
 
+struct ConnectHello {
+    int32_t rank;
+    int32_t lane_id;
+};
+
 class FRCheckRdmaChannel {
 public:
+    // ECLATIN/ECNaive-aligned: each channel owns dedicated send/recv CQs.
     FRCheckRdmaChannel(ibv_context* ctx, ibv_pd* pd,
-                       ibv_cq* send_cq, ibv_cq* recv_cq,
                        int tcp_sock, int peer_rank,
                        std::map<uintptr_t, RdmaBuffer>* bufs,
                        std::mutex* buf_mtx)
         : ctx_(ctx), pd_(pd),
-          send_cq_(send_cq), recv_cq_(recv_cq),
+          send_cq_(nullptr), recv_cq_(nullptr),
           tcp_sock_(tcp_sock), peer_rank_(peer_rank),
           bufs_(bufs), buf_mtx_(buf_mtx),
           qp_(nullptr), temp_send_mr_(nullptr), temp_recv_mr_(nullptr),
           connected_(false)
     {
+        send_cq_ = ibv_create_cq(ctx_, 256, nullptr, nullptr, 0);
+        recv_cq_ = ibv_create_cq(ctx_, 256, nullptr, nullptr, 0);
+        if (!send_cq_ || !recv_cq_) {
+            if (send_cq_) { ibv_destroy_cq(send_cq_); send_cq_ = nullptr; }
+            if (recv_cq_) { ibv_destroy_cq(recv_cq_); recv_cq_ = nullptr; }
+            throw std::runtime_error("FRCheck RDMA: failed to create per-channel CQs");
+        }
+
         ibv_qp_init_attr attr{};
         attr.send_cq = send_cq_;
         attr.recv_cq = recv_cq_;
@@ -124,11 +138,21 @@ public:
         if (temp_recv_mr_) ibv_dereg_mr(temp_recv_mr_);
         if (temp_send_mr_) ibv_dereg_mr(temp_send_mr_);
         if (qp_) ibv_destroy_qp(qp_);
+        if (recv_cq_) { ibv_destroy_cq(recv_cq_); recv_cq_ = nullptr; }
+        if (send_cq_) { ibv_destroy_cq(send_cq_); send_cq_ = nullptr; }
         if (tcp_sock_ >= 0) close(tcp_sock_);
     }
 
     int peer_rank() const { return peer_rank_; }
     bool is_connected() const { return connected_; }
+
+    // Break blocking send/recv during shutdown (ECLATIN-style conn cleanup).
+    void abort_connection() {
+        connected_ = false;
+        if (tcp_sock_ >= 0) {
+            shutdown(tcp_sock_, SHUT_RDWR);
+        }
+    }
 
     ibv_mr* find_mr(uintptr_t addr, size_t size) {
         std::lock_guard<std::mutex> lock(*buf_mtx_);
@@ -157,7 +181,7 @@ public:
     }
 
     // RDMA SEND data to peer (blocking)
-    void send_data(const uint8_t* data, size_t size) {
+    void send_data(const uint8_t* data, size_t size, bool require_registered_mr = false) {
         std::lock_guard<std::mutex> lock(send_mtx_);
         if (!connected_)
             throw std::runtime_error("FRCheck RDMA: channel not connected");
@@ -172,6 +196,11 @@ public:
 
         ibv_mr* mr = find_mr((uintptr_t)data, size);
         if (!mr) {
+            if (require_registered_mr) {
+                throw std::runtime_error(
+                    "FRCheck RDMA: unregistered send buffer in save pipeline (addr=0x" +
+                    std::to_string((uintptr_t)data) + ")");
+            }
             if (size > FRCHECK_TEMP_BUF_SIZE)
                 throw std::runtime_error("FRCheck RDMA: data exceeds temp buffer");
             memcpy(temp_send_.data(), data, size);
@@ -182,7 +211,7 @@ public:
     }
 
     // RDMA RECEIVE data from peer (blocking)
-    size_t recv_data(uint8_t* buf, size_t buf_size) {
+    size_t recv_data(uint8_t* buf, size_t buf_size, bool require_registered_mr = false) {
         std::lock_guard<std::mutex> lock(recv_mtx_);
         if (!connected_)
             throw std::runtime_error("FRCheck RDMA: channel not connected");
@@ -204,6 +233,11 @@ public:
         uint8_t* target = buf;
         bool use_temp = false;
         if (!mr) {
+            if (require_registered_mr) {
+                throw std::runtime_error(
+                    "FRCheck RDMA: unregistered recv buffer in save pipeline (addr=0x" +
+                    std::to_string((uintptr_t)buf) + ")");
+            }
             if (size > FRCHECK_TEMP_BUF_SIZE)
                 throw std::runtime_error("FRCheck RDMA: recv exceeds temp buffer");
             mr = temp_recv_mr_;
@@ -346,15 +380,17 @@ private:
         }
     }
 
+    // ECLATIN-style: poll one completion at a time on this channel's private CQ.
     void poll_cq(ibv_cq* cq, int count) {
-        ibv_wc wc[FRCHECK_MAX_WR];
         int done = 0;
         while (done < count) {
-            int n = ibv_poll_cq(cq, std::min(count - done, FRCHECK_MAX_WR), wc);
+            ibv_wc wc;
+            int n = ibv_poll_cq(cq, 1, &wc);
             if (n < 0) throw std::runtime_error("FRCheck RDMA: poll CQ error");
-            for (int i = 0; i < n; ++i) {
-                if (wc[i].status != IBV_WC_SUCCESS)
-                    throw std::runtime_error("FRCheck RDMA: CQ error status=" + std::to_string(wc[i].status));
+            if (n > 0) {
+                if (wc.status != IBV_WC_SUCCESS)
+                    throw std::runtime_error(
+                        "FRCheck RDMA: CQ error status=" + std::to_string(wc.status));
                 ++done;
             }
         }
@@ -443,8 +479,8 @@ public:
     }
 
     ~FRCheckNative() {
-        stop();
-        cleanup_rdma_();
+        // Lightweight destructor: free POA/ISA-L tables only.
+        // Full RDMA/worker teardown is explicit via stop() (ECLATIN-style).
         if (a_mat_) { free(a_mat_); a_mat_ = nullptr; }
         if (g_tbls_) { free(g_tbls_); g_tbls_ = nullptr; }
         if (decode_tbls_) { free(decode_tbls_); decode_tbls_ = nullptr; }
@@ -457,9 +493,20 @@ public:
     std::vector<int> row(int r) const { return table_.at(r); }
     std::string path() const { return poa_path_; }
     void stop() {
-        if (stopped_.exchange(true)) return; // already stopped
-        encoding_workers_shutdown();
+        if (stopped_.exchange(true)) return;
+
+        encoding_workers_stop_ = true;
+        source_cv_.notify_all();
+        encoder_cv_.notify_all();
+        parity_cv_.notify_all();
+        mirror_cv_.notify_all();
+        encoding_wait_cv_.notify_all();
+
+        abort_all_channels_();
+        encoding_workers_join_();
+        mirror_worker_shutdown();
         rs_pool_shutdown();
+        cleanup_rdma_();
     }
     bool is_stopped() const { return stopped_; }
 
@@ -504,80 +551,88 @@ public:
             throw std::runtime_error("FRCheck RDMA: invalid listen IP: " + my_ip);
         if (bind(acceptor_fd_, (struct sockaddr*)&listen_addr, sizeof(listen_addr)) < 0)
             throw std::runtime_error("FRCheck RDMA: bind failed on port " + std::to_string(listen_port));
-        if (listen(acceptor_fd_, group_size) < 0)
+        if (listen(acceptor_fd_, std::max(group_size * 16, 128)) < 0)
             throw std::runtime_error("FRCheck RDMA: listen failed");
+
+        num_lanes_ = (int)table_.size();
+        if (num_lanes_ <= 0)
+            throw std::runtime_error("FRCheck RDMA: POA table has no stripes");
+        std::cout << "[FRCheck RDMA] rank=" << rank_in_group
+                  << " num_lanes=" << num_lanes_
+                  << " (connections per peer=" << num_lanes_ << ")" << std::endl;
 
         // Launch accept thread
         acceptor_thread_stop_ = false;
         accept_thread_ = std::thread([this]() { accept_loop_(); });
 
-        // For i = 0..group_size-1, i != rank_in_group
-        // If i < rank_in_group: connect to i's acceptor
-        // (if i > rank_in_group, i will connect to us, handled by accept_loop_)
+        // channels_[peer_rg][lane_id] = channel (lane_id == stripe_id)
+        channels_.assign(group_size, std::vector<FRCheckRdmaChannel*>(num_lanes_, nullptr));
 
-        // Collection for channels: channels_[peer_rg] = channel
-        // First reserve space
-        channels_.assign(group_size, nullptr);
-
-        // Connect to lower ranks
-        for (int peer = 0; peer < rank_in_group; ++peer) {
+        auto connect_outbound = [&](int peer, int lane) {
             uint16_t peer_port = base_port + (uint16_t)peer;
             std::string peer_ip = (peer < (int)peer_ips.size()) ? peer_ips[peer] : my_ip;
-            std::cout << "[FRCheck RDMA] rank=" << rank_in_group
-                      << " connecting to peer=" << peer
-                      << " at " << peer_ip << ":" << peer_port << std::endl;
-
             int sock = create_tcp_connect(peer_ip, peer_port);
-            std::cout << "[FRCheck RDMA] rank=" << rank_in_group
-                      << " connected to peer=" << peer << " fd=" << sock << std::endl;
-
-            // Send my rank to the acceptor before QP exchange
-            int my_rank = rank_in_group_;
-            if (send(sock, &my_rank, sizeof(my_rank), 0) != (ssize_t)sizeof(my_rank))
-                throw std::runtime_error("FRCheck RDMA: failed to send rank to peer=" + std::to_string(peer));
-
+            ConnectHello hello{rank_in_group_, lane};
+            if (send(sock, &hello, sizeof(hello), 0) != (ssize_t)sizeof(hello)) {
+                close(sock);
+                throw std::runtime_error(
+                    "FRCheck RDMA: failed to send hello to peer=" + std::to_string(peer) +
+                    " lane=" + std::to_string(lane));
+            }
             auto ch = std::make_unique<FRCheckRdmaChannel>(
-                rdma_ctx_, rdma_pd_, rdma_send_cq_, rdma_recv_cq_,
+                rdma_ctx_, rdma_pd_,
                 sock, peer, &registered_bufs_, &buf_mtx_);
             ch->exchange_and_connect();
-            std::cout << "[FRCheck RDMA] rank=" << rank_in_group
-                      << " RDMA connected to peer=" << peer << std::endl;
-            channels_[peer] = ch.release(); // owned, will be freed in cleanup
-            channel_owners_.push_back(std::unique_ptr<FRCheckRdmaChannel>(channels_[peer]));
+            channels_[peer][lane] = ch.release();
+            channel_owners_.push_back(
+                std::unique_ptr<FRCheckRdmaChannel>(channels_[peer][lane]));
+        };
+
+        // Connect to lower ranks: one TCP+QP per (peer, stripe lane)
+        for (int peer = 0; peer < rank_in_group; ++peer) {
+            for (int lane = 0; lane < num_lanes_; ++lane) {
+                std::cout << "[FRCheck RDMA] rank=" << rank_in_group
+                          << " connecting to peer=" << peer << " lane=" << lane << std::endl;
+                connect_outbound(peer, lane);
+            }
         }
 
-        // Wait for higher ranks to connect to us
-        // The accept_loop_ collects accepted connections into accepted_queue_
+        // Wait for higher ranks to connect (one connection per lane)
         for (int peer = rank_in_group + 1; peer < group_size; ++peer) {
-            std::cout << "[FRCheck RDMA] rank=" << rank_in_group
-                      << " waiting for accept from peer=" << peer << std::endl;
-            int sock;
-            {
-                std::unique_lock<std::mutex> lk(accept_mtx_);
-                accept_cv_.wait(lk, [this, peer]() {
-                    return accepted_queue_.count(peer) > 0 || acceptor_thread_stop_;
-                });
-                if (acceptor_thread_stop_)
-                    throw std::runtime_error("FRCheck: acceptor thread stopped prematurely");
-                sock = accepted_queue_[peer];
-                accepted_queue_.erase(peer);
+            for (int lane = 0; lane < num_lanes_; ++lane) {
+                std::cout << "[FRCheck RDMA] rank=" << rank_in_group
+                          << " waiting for accept from peer=" << peer
+                          << " lane=" << lane << std::endl;
+                int sock;
+                {
+                    std::unique_lock<std::mutex> lk(accept_mtx_);
+                    accept_cv_.wait(lk, [this, peer, lane]() {
+                        return (accepted_queue_.count(peer) &&
+                                accepted_queue_[peer].count(lane)) ||
+                               acceptor_thread_stop_.load();
+                    });
+                    if (acceptor_thread_stop_)
+                        throw std::runtime_error("FRCheck: acceptor thread stopped prematurely");
+                    sock = accepted_queue_[peer][lane];
+                    accepted_queue_[peer].erase(lane);
+                    if (accepted_queue_[peer].empty())
+                        accepted_queue_.erase(peer);
+                }
+                auto ch = std::make_unique<FRCheckRdmaChannel>(
+                    rdma_ctx_, rdma_pd_,
+                    sock, peer, &registered_bufs_, &buf_mtx_);
+                ch->exchange_and_connect();
+                channels_[peer][lane] = ch.release();
+                channel_owners_.push_back(
+                    std::unique_ptr<FRCheckRdmaChannel>(channels_[peer][lane]));
             }
-            std::cout << "[FRCheck RDMA] rank=" << rank_in_group
-                      << " accepted from peer=" << peer << " fd=" << sock << std::endl;
-
-            auto ch = std::make_unique<FRCheckRdmaChannel>(
-                rdma_ctx_, rdma_pd_, rdma_send_cq_, rdma_recv_cq_,
-                sock, peer, &registered_bufs_, &buf_mtx_);
-            ch->exchange_and_connect();
-            std::cout << "[FRCheck RDMA] rank=" << rank_in_group
-                      << " RDMA connected to peer=" << peer << std::endl;
-            channels_[peer] = ch.release();
-            channel_owners_.push_back(std::unique_ptr<FRCheckRdmaChannel>(channels_[peer]));
         }
 
         n_connected_ = group_size_;
         std::cout << "[FRCheck RDMA] rank=" << rank_in_group
-                  << " all " << group_size_ << " nodes connected" << std::endl;
+                  << " all " << group_size_ << " peers x " << num_lanes_
+                  << " lanes connected (per-channel CQ pairs="
+                  << (group_size_ - 1) * num_lanes_ << ")" << std::endl;
 
         // Init RS encode thread pool + ECLATIN-style encoding workers
         rs_pool_init();
@@ -597,9 +652,12 @@ public:
                                  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                  IBV_ACCESS_REMOTE_READ);
         if (!mr) {
-            // ibv_reg_mr can fail for GPU pointers without nvidia-peermem.
-            // Don't throw — omit from registered bufs so send/recv will
-            // transparently fall back to temp-buffer memcpy.
+            if (require_registered_mr_) {
+                throw std::runtime_error(
+                    "FRCheck RDMA: ibv_reg_mr failed for save pipeline (addr=0x" +
+                    std::to_string(addr) + " size=" + std::to_string(size) +
+                    ", GPU pointers need nvidia-peermem for GDR)");
+            }
             std::cerr << "[FRCheck RDMA] WARNING: ibv_reg_mr failed for addr=0x"
                       << std::hex << addr << " size=" << std::dec << size
                       << " (GPU pointers need nvidia-peermem for GDR)" << std::endl;
@@ -629,89 +687,6 @@ public:
             if (line.rfind("nvidia-peermem", 0) == 0) return true;
         }
         return false;
-    }
-
-    // ---- Stripe encode ----
-    // Called by ALL ranks in the group for the same stripe.
-    // Each rank passes its own data buffer and parity output buffer.
-    // Internally determines role from pre-compiled StripePlan and acts accordingly.
-    void submit_stripe_encode(
-        int stripe_id,
-        uintptr_t my_data_addr,    // This rank's data (source) or zeros (if IDLE/ENCODER with own data)
-        size_t block_size,         // Size per data block
-        uintptr_t recv_buf_addr,   // Buffer to receive incoming data (encoder/parity_target)
-        size_t recv_buf_size,      // Size of recv buffer
-        uintptr_t parity1_out_addr, // Parity1 output (encoder only, kept locally)
-        uintptr_t parity2_out_addr, // Parity2 output (encoder only, sent to target)
-        uintptr_t parity2_in_addr   // Parity2 receive (parity_target only)
-    ) {
-        if (stopped_) return;
-        if (stripe_id < 0 || stripe_id >= (int)stripe_plans_.size())
-            throw std::runtime_error("FRCheck: invalid stripe_id");
-
-        const auto& plan = stripe_plans_[stripe_id];
-
-        switch (plan.role) {
-        case StripeRole::SOURCE: {
-            // Send my data to encoder
-            FRCheckRdmaChannel* ch = get_channel_(plan.encoder_node_id - 1);
-            if (!ch) throw std::runtime_error("FRCheck: no channel to encoder");
-            ch->send_data((const uint8_t*)my_data_addr, block_size);
-            break;
-        }
-        case StripeRole::ENCODER: {
-            // Receive data from all sources
-            size_t n_src = plan.source_node_ids.size();
-            // Each source places its data sequentially into recv_buf
-            for (size_t i = 0; i < n_src; ++i) {
-                int src_node = plan.source_node_ids[i] - 1; // 0-based
-                FRCheckRdmaChannel* ch = get_channel_(src_node);
-                if (!ch) throw std::runtime_error("FRCheck: no channel from source");
-                uintptr_t this_recv = recv_buf_addr + i * block_size;
-                ch->recv_data((uint8_t*)this_recv, block_size);
-            }
-
-            // RS encode via ISA-L (16-worker pool matching ecnaive xor_pool)
-            {
-                int k = (int)n_src;
-                int m = 2;
-                std::vector<unsigned char*> data_ptrs(k);
-                for (int i = 0; i < k; ++i)
-                    data_ptrs[i] = (unsigned char*)recv_buf_addr + i * block_size;
-                unsigned char* parity_ptrs[2] = {
-                    (unsigned char*)parity1_out_addr,
-                    (unsigned char*)parity2_out_addr,
-                };
-
-                if (rs_pool_inited_.load(std::memory_order_acquire)) {
-                    RsEncodeJob job;
-                    job.len = (int)block_size;
-                    job.k = k;
-                    job.m = m;
-                    job.g_tbls = g_tbls_;
-                    job.data_ptrs = data_ptrs.data();
-                    job.parity_ptrs = parity_ptrs;
-                    rs_pool_run_parallel_encode(job);
-                } else {
-                    ec_encode_data((int)block_size, k, m,
-                                   g_tbls_, data_ptrs.data(), parity_ptrs);
-                }
-            }
-
-            // Send parity2 to target
-            FRCheckRdmaChannel* ch = get_channel_(plan.parity_target_node_id - 1);
-            if (!ch) throw std::runtime_error("FRCheck: no channel to parity target");
-            ch->send_data((const uint8_t*)parity2_out_addr, block_size);
-            break;
-        }
-        case StripeRole::PARITY_TARGET: {
-            // Receive parity2 from encoder
-            FRCheckRdmaChannel* ch = get_channel_(plan.encoder_node_id - 1);
-            if (!ch) throw std::runtime_error("FRCheck: no channel from encoder");
-            ch->recv_data((uint8_t*)parity2_in_addr, block_size);
-            break;
-        }
-        }
     }
 
     // ---- Stripe decode (hardware recovery) ----
@@ -764,17 +739,27 @@ public:
     }
 
     // ---- Point-to-point RDMA (for recovery) ----
-    void send_to_peer(int peer_rig, uintptr_t addr, size_t size) {
-        FRCheckRdmaChannel* ch = get_channel_(peer_rig);
-        if (!ch) throw std::runtime_error("FRCheck send_to_peer: no channel to rig " + std::to_string(peer_rig));
-        ch->send_data((const uint8_t*)addr, size);
+    void send_to_peer(int peer_rig, int stripe_id, uintptr_t addr, size_t size) {
+        FRCheckRdmaChannel* ch = get_channel_(peer_rig, stripe_id);
+        if (!ch) {
+            throw std::runtime_error(
+                "FRCheck send_to_peer: no channel to rig " + std::to_string(peer_rig) +
+                " lane " + std::to_string(stripe_id));
+        }
+        ch->send_data((const uint8_t*)addr, size, false);
     }
 
-    void recv_from_peer(int peer_rig, uintptr_t addr, size_t size) {
-        FRCheckRdmaChannel* ch = get_channel_(peer_rig);
-        if (!ch) throw std::runtime_error("FRCheck recv_from_peer: no channel from rig " + std::to_string(peer_rig));
-        ch->recv_data((uint8_t*)addr, size);
+    void recv_from_peer(int peer_rig, int stripe_id, uintptr_t addr, size_t size) {
+        FRCheckRdmaChannel* ch = get_channel_(peer_rig, stripe_id);
+        if (!ch) {
+            throw std::runtime_error(
+                "FRCheck recv_from_peer: no channel from rig " + std::to_string(peer_rig) +
+                " lane " + std::to_string(stripe_id));
+        }
+        ch->recv_data((uint8_t*)addr, size, false);
     }
+
+    void set_require_registered_mr(bool require) { require_registered_mr_ = require; }
 
     // ---- StripePlan queries for Python ----
     int get_role_for_stripe(int stripe_id) const {
@@ -1128,7 +1113,7 @@ private:
         if (!rs_pool_inited_.load(std::memory_order_acquire)) return;
         rs_pool_stop_.store(true, std::memory_order_release);
         rs_pool_worker_cv_.notify_all();
-        rs_pool_coordinator_cv_.notify_one(); // unblock any stuck rs_pool_run_parallel_encode
+        rs_pool_coordinator_cv_.notify_all();
         for (int i = 0; i < kRsPoolSize; ++i) pthread_join(rs_pool_threads_[i], nullptr);
         rs_pool_inited_.store(false, std::memory_order_release);
         std::cout << "FRCheck: RS encode pool shut down" << std::endl;
@@ -1209,193 +1194,343 @@ private:
         });
     }
 
-    // ---- ECLATIN-style encoding worker pipelines ----
-    struct SourceSendTask {
+    // ---- EC-aligned role encoding workers (1 thread per role) ----
+    struct StripeChunkTask {
         int stripe_id = 0;
-        uintptr_t gpu_addr = 0;
-        uintptr_t cpu_mirror_addr = 0;
+        StripeRole role = StripeRole::SOURCE;
         size_t block_size = 0;
-    };
-
-    struct EncoderTask {
-        int stripe_id = 0;
+        uintptr_t source_data = 0;
+        uintptr_t source_mirror = 0;
         uintptr_t recv_buf_addr = 0;
         uintptr_t p1_addr = 0;
-        uintptr_t p2_addr = 0;
-        size_t block_size = 0;
+        uintptr_t p2_out_addr = 0;
+        uintptr_t p2_in_addr = 0;
         int n_src = 0;
-        std::array<int, 4> src_peer_rigs{};
-        std::array<uintptr_t, 4> local_src_addrs{};
+        std::vector<int> src_peer_rigs;
+        std::vector<uintptr_t> local_src_addrs;
+        int enc_peer_rig = -1;
         int par_peer_rig = -1;
     };
 
-    struct ParityRecvTask {
-        int stripe_id = 0;
-        uintptr_t p2_in_addr = 0;
+    struct MirrorTask {
+        uintptr_t gpu_addr = 0;
+        uintptr_t cpu_addr = 0;
         size_t block_size = 0;
-        int enc_peer_rig = -1;
     };
 
-    std::thread source_send_thread_;
-    std::mutex source_send_mtx_;
-    std::condition_variable source_send_cv_;
-    std::queue<SourceSendTask> source_send_q_;
-    bool source_send_completed_ = false;
-    bool source_send_sentinel_received_ = false;
+    std::thread mirror_thread_;
+    std::mutex mirror_mtx_;
+    std::condition_variable mirror_cv_;
+    std::queue<MirrorTask> mirror_q_;
+    std::atomic<bool> mirror_stop_{false};
+    std::atomic<bool> mirror_idle_{true};
+    cudaStream_t d2h_stream_ = nullptr;
 
-    std::thread encoder_thread_;
+    std::queue<StripeChunkTask> source_q_;
+    std::mutex source_mtx_;
+    std::condition_variable source_cv_;
+    bool source_sentinel_received_ = false;
+    bool source_completed_ = false;
+    bool wait_source_ = false;
+
+    std::queue<StripeChunkTask> encoder_q_;
     std::mutex encoder_mtx_;
     std::condition_variable encoder_cv_;
-    std::queue<EncoderTask> encoder_q_;
-    bool encoder_completed_ = false;
     bool encoder_sentinel_received_ = false;
-
-    std::thread parity_recv_thread_;
-    std::mutex parity_recv_mtx_;
-    std::condition_variable parity_recv_cv_;
-    std::queue<ParityRecvTask> parity_recv_q_;
-    bool parity_recv_completed_ = false;
-    bool parity_recv_sentinel_received_ = false;
-
-    std::atomic<bool> encoding_workers_stop_{false};
-    bool wait_source_send_ = false;
+    bool encoder_completed_ = false;
     bool wait_encoder_ = false;
-    bool wait_parity_recv_ = false;
 
-    std::mutex stripe_mtx_;
-    std::condition_variable stripe_cv_;
-    std::vector<int> stripe_pending_;
-    std::vector<int> stripe_completed_;
+    std::queue<StripeChunkTask> parity_q_;
+    std::mutex parity_mtx_;
+    std::condition_variable parity_cv_;
+    bool parity_sentinel_received_ = false;
+    bool parity_completed_ = false;
+    bool wait_parity_ = false;
 
-    void init_stripe_tracking_() {
-        int ns = std::max(1, (int)stripe_plans_.size());
-        stripe_pending_.assign(ns, 0);
-        stripe_completed_.assign(ns, 0);
-    }
+    std::thread source_thread_;
+    std::thread encoder_thread_;
+    std::thread parity_thread_;
+    std::atomic<bool> encoding_workers_stop_{false};
+    std::atomic<int> source_active_{0};
+    std::atomic<int> encoder_active_{0};
+    std::atomic<int> parity_active_{0};
+    std::atomic<int> pending_chunks_{0};
+    bool encoding_batch_completed_ = false;
+    std::mutex encoding_wait_mtx_;
+    std::condition_variable encoding_wait_cv_;
 
-    void mark_stripe_submitted_(int stripe_id) {
-        if (stripe_id < 0 || stripe_id >= (int)stripe_pending_.size()) return;
-        std::lock_guard<std::mutex> lk(stripe_mtx_);
-        stripe_pending_[stripe_id]++;
+    static bool is_source_sentinel_(const StripeChunkTask& t) {
+        return t.source_data == 0 && t.block_size == 0;
     }
-
-    void mark_stripe_done_(int stripe_id) {
-        if (stripe_id < 0 || stripe_id >= (int)stripe_pending_.size()) return;
-        {
-            std::lock_guard<std::mutex> lk(stripe_mtx_);
-            stripe_completed_[stripe_id]++;
-        }
-        stripe_cv_.notify_all();
+    static bool is_encoder_sentinel_(const StripeChunkTask& t) {
+        return t.recv_buf_addr == 0 && t.p1_addr == 0 &&
+               t.p2_out_addr == 0 && t.block_size == 0;
     }
-
-    static bool is_source_send_sentinel(const SourceSendTask& t) {
-        return t.gpu_addr == 0 && t.block_size == 0;
-    }
-    static bool is_encoder_sentinel(const EncoderTask& t) {
-        return t.recv_buf_addr == 0 && t.p1_addr == 0 && t.p2_addr == 0 && t.block_size == 0;
-    }
-    static bool is_parity_recv_sentinel(const ParityRecvTask& t) {
+    static bool is_parity_sentinel_(const StripeChunkTask& t) {
         return t.p2_in_addr == 0 && t.block_size == 0;
     }
 
-    void encoding_workers_init() {
-        encoding_workers_stop_ = false;
-        source_send_thread_ = std::thread(&FRCheckNative::source_send_worker, this);
-        encoder_thread_ = std::thread(&FRCheckNative::encoder_worker, this);
-        parity_recv_thread_ = std::thread(&FRCheckNative::parity_recv_worker, this);
-        std::cout << "FRCheck: encoding worker threads started" << std::endl;
+    void notify_encoding_wait_() {
+        encoding_wait_cv_.notify_all();
     }
 
-    void encoding_workers_shutdown() {
-        encoding_workers_stop_ = true;
-        source_send_cv_.notify_one();
-        encoder_cv_.notify_one();
-        parity_recv_cv_.notify_one();
-        if (source_send_thread_.joinable()) source_send_thread_.join();
-        if (encoder_thread_.joinable()) encoder_thread_.join();
-        if (parity_recv_thread_.joinable()) parity_recv_thread_.join();
+    void maybe_complete_encoding_batch_() {
+        if (pending_chunks_.load(std::memory_order_acquire) != 0) return;
+        if (source_active_.load(std::memory_order_acquire) != 0) return;
+        if (encoder_active_.load(std::memory_order_acquire) != 0) return;
+        if (parity_active_.load(std::memory_order_acquire) != 0) return;
+        if (wait_source_ && !source_completed_) return;
+        if (wait_encoder_ && !encoder_completed_) return;
+        if (wait_parity_ && !parity_completed_) return;
+        std::lock_guard<std::mutex> lk(encoding_wait_mtx_);
+        if (encoding_batch_completed_) return;
+        encoding_batch_completed_ = true;
+        notify_encoding_wait_();
     }
 
-    void maybe_complete_after_sentinel_(
-        bool sentinel_received, std::mutex& mtx, std::queue<SourceSendTask>& q, bool& completed,
-        bool& sentinel_flag)
-    {
-        if (!sentinel_received) return;
-        std::lock_guard<std::mutex> lk(mtx);
-        if (q.empty()) {
-            completed = true;
-            sentinel_flag = false;
+    void maybe_complete_source_after_sentinel_() {
+        if (!source_sentinel_received_) return;
+        if (source_active_.load(std::memory_order_acquire) != 0) return;
+        std::lock_guard<std::mutex> lk(source_mtx_);
+        if (source_q_.empty()) {
+            source_completed_ = true;
+            source_sentinel_received_ = false;
+            maybe_complete_encoding_batch_();
         }
     }
 
     void maybe_complete_encoder_after_sentinel_() {
         if (!encoder_sentinel_received_) return;
+        if (encoder_active_.load(std::memory_order_acquire) != 0) return;
         std::lock_guard<std::mutex> lk(encoder_mtx_);
         if (encoder_q_.empty()) {
             encoder_completed_ = true;
             encoder_sentinel_received_ = false;
+            maybe_complete_encoding_batch_();
         }
     }
 
     void maybe_complete_parity_after_sentinel_() {
-        if (!parity_recv_sentinel_received_) return;
-        std::lock_guard<std::mutex> lk(parity_recv_mtx_);
-        if (parity_recv_q_.empty()) {
-            parity_recv_completed_ = true;
-            parity_recv_sentinel_received_ = false;
+        if (!parity_sentinel_received_) return;
+        if (parity_active_.load(std::memory_order_acquire) != 0) return;
+        std::lock_guard<std::mutex> lk(parity_mtx_);
+        if (parity_q_.empty()) {
+            parity_completed_ = true;
+            parity_sentinel_received_ = false;
+            maybe_complete_encoding_batch_();
         }
     }
 
-    void source_send_worker() {
-        while (!encoding_workers_stop_) {
-            SourceSendTask task;
+    void push_mirror_task_(uintptr_t gpu_addr, uintptr_t cpu_addr, size_t block_size) {
+        MirrorTask mt{gpu_addr, cpu_addr, block_size};
+        {
+            std::lock_guard<std::mutex> lk(mirror_mtx_);
+            mirror_q_.push(mt);
+            mirror_idle_ = false;
+        }
+        mirror_cv_.notify_one();
+    }
+
+    void mirror_worker_() {
+        while (!mirror_stop_.load()) {
+            MirrorTask task;
             {
-                std::unique_lock<std::mutex> lk(source_send_mtx_);
-                source_send_cv_.wait(lk, [this] {
-                    return encoding_workers_stop_ || !source_send_q_.empty();
+                std::unique_lock<std::mutex> lk(mirror_mtx_);
+                mirror_cv_.wait(lk, [this] {
+                    return mirror_stop_.load() || !mirror_q_.empty();
+                });
+                if (mirror_stop_.load() && mirror_q_.empty()) break;
+                task = mirror_q_.front();
+                mirror_q_.pop();
+                mirror_idle_ = false;
+            }
+            cudaError_t err = cudaMemcpyAsync(
+                reinterpret_cast<void*>(task.cpu_addr),
+                reinterpret_cast<const void*>(task.gpu_addr),
+                task.block_size,
+                cudaMemcpyDeviceToHost,
+                d2h_stream_);
+            if (err != cudaSuccess) {
+                std::cerr << "FRCheck mirror_worker: async D2H failed: "
+                          << cudaGetErrorString(err) << std::endl;
+            }
+            {
+                std::lock_guard<std::mutex> lk(mirror_mtx_);
+                if (mirror_q_.empty()) mirror_idle_ = true;
+            }
+            mirror_cv_.notify_all();
+        }
+    }
+
+    void mirror_worker_init() {
+        mirror_stop_ = false;
+        mirror_idle_ = true;
+        if (d2h_stream_ == nullptr) {
+            cudaError_t err = cudaStreamCreate(&d2h_stream_);
+            if (err != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("FRCheck: cudaStreamCreate(d2h_stream) failed: ") +
+                    cudaGetErrorString(err));
+            }
+        }
+        mirror_thread_ = std::thread([this]() { mirror_worker_(); });
+    }
+
+    void mirror_worker_shutdown() {
+        mirror_stop_ = true;
+        mirror_cv_.notify_all();
+        if (mirror_thread_.joinable()) mirror_thread_.join();
+        if (d2h_stream_ != nullptr) {
+            cudaStreamSynchronize(d2h_stream_);
+            cudaStreamDestroy(d2h_stream_);
+            d2h_stream_ = nullptr;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mirror_mtx_);
+            while (!mirror_q_.empty()) mirror_q_.pop();
+            mirror_idle_ = true;
+        }
+    }
+
+    void execute_source_chunk_(const StripeChunkTask& task) {
+        const auto& plan = stripe_plans_.at(task.stripe_id);
+        FRCheckRdmaChannel* ch = get_channel_(plan.encoder_node_id - 1, task.stripe_id);
+        if (!ch) throw std::runtime_error("FRCheck source: no channel to encoder");
+        ch->send_data(
+            reinterpret_cast<const uint8_t*>(task.source_data),
+            task.block_size,
+            require_registered_mr_);
+        if (task.source_mirror != 0) {
+            push_mirror_task_(task.source_data, task.source_mirror, task.block_size);
+        }
+    }
+
+    void execute_encoder_chunk_(const StripeChunkTask& task) {
+        std::vector<std::thread> recv_threads;
+        std::vector<std::exception_ptr> recv_exceptions((size_t)task.n_src);
+        for (int i = 0; i < task.n_src; ++i) {
+            recv_exceptions[(size_t)i] = nullptr;
+            recv_threads.emplace_back([&, i]() {
+                try {
+                    if (task.src_peer_rigs[(size_t)i] == rank_in_group_) return;
+                    uintptr_t dst = task.recv_buf_addr + (uintptr_t)i * task.block_size;
+                    FRCheckRdmaChannel* ch = get_channel_(task.src_peer_rigs[(size_t)i], task.stripe_id);
+                    if (!ch) throw std::runtime_error("FRCheck encoder: no channel from source");
+                    ch->recv_data(
+                        reinterpret_cast<uint8_t*>(dst),
+                        task.block_size,
+                        require_registered_mr_);
+                } catch (...) {
+                    recv_exceptions[(size_t)i] = std::current_exception();
+                }
+            });
+        }
+        for (auto& t : recv_threads) t.join();
+        for (int i = 0; i < task.n_src; ++i) {
+            if (recv_exceptions[(size_t)i]) {
+                if (encoding_workers_stop_) return;
+                std::rethrow_exception(recv_exceptions[(size_t)i]);
+            }
+        }
+        if (encoding_workers_stop_) return;
+
+        for (int i = 0; i < task.n_src; ++i) {
+            if (task.src_peer_rigs[(size_t)i] != rank_in_group_) continue;
+            uintptr_t local = 0;
+            if ((size_t)i < task.local_src_addrs.size())
+                local = task.local_src_addrs[(size_t)i];
+            if (local == 0) continue;
+            uintptr_t dst = task.recv_buf_addr + (uintptr_t)i * task.block_size;
+            cudaError_t err = cudaMemcpy(
+                reinterpret_cast<void*>(dst),
+                reinterpret_cast<const void*>(local),
+                task.block_size,
+                cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess) {
+                throw std::runtime_error(
+                    std::string("FRCheck encoder: self-source D2H failed: ") +
+                    cudaGetErrorString(err));
+            }
+        }
+
+        std::vector<unsigned char*> data_ptrs((size_t)task.n_src);
+        for (int i = 0; i < task.n_src; ++i)
+            data_ptrs[(size_t)i] = reinterpret_cast<unsigned char*>(
+                task.recv_buf_addr + (uintptr_t)i * task.block_size);
+        unsigned char* parity_ptrs[2] = {
+            reinterpret_cast<unsigned char*>(task.p1_addr),
+            reinterpret_cast<unsigned char*>(task.p2_out_addr),
+        };
+
+        RsEncodeJob rs;
+        rs.len = (int)task.block_size;
+        rs.k = task.n_src;
+        rs.m = 2;
+        rs.g_tbls = g_tbls_;
+        rs.data_ptrs = data_ptrs.data();
+        rs.parity_ptrs = parity_ptrs;
+        rs_pool_run_parallel_encode(rs);
+
+        FRCheckRdmaChannel* ch = get_channel_(task.par_peer_rig, task.stripe_id);
+        if (!ch) throw std::runtime_error("FRCheck encoder: no channel to parity target");
+        ch->send_data(
+            reinterpret_cast<const uint8_t*>(task.p2_out_addr),
+            task.block_size,
+            require_registered_mr_);
+    }
+
+    void execute_parity_chunk_(const StripeChunkTask& task) {
+        FRCheckRdmaChannel* ch = get_channel_(task.enc_peer_rig, task.stripe_id);
+        if (!ch) throw std::runtime_error("FRCheck parity: no channel from encoder");
+        ch->recv_data(
+            reinterpret_cast<uint8_t*>(task.p2_in_addr),
+            task.block_size,
+            require_registered_mr_);
+    }
+
+    void source_worker_loop_() {
+        while (!encoding_workers_stop_) {
+            StripeChunkTask task;
+            {
+                std::unique_lock<std::mutex> lk(source_mtx_);
+                source_cv_.wait(lk, [this] {
+                    return encoding_workers_stop_ || !source_q_.empty();
                 });
                 if (encoding_workers_stop_) break;
-                task = source_send_q_.front();
-                source_send_q_.pop();
+                task = source_q_.front();
+                source_q_.pop();
             }
 
-            if (is_source_send_sentinel(task)) {
-                source_send_sentinel_received_ = true;
-                maybe_complete_after_sentinel_(
-                    true, source_send_mtx_, source_send_q_, source_send_completed_,
-                    source_send_sentinel_received_);
+            if (is_source_sentinel_(task)) {
+                source_sentinel_received_ = true;
+                maybe_complete_source_after_sentinel_();
                 continue;
             }
 
-            const auto& plan = stripe_plans_.at(task.stripe_id);
-            FRCheckRdmaChannel* ch = get_channel_(plan.encoder_node_id - 1);
-            if (!ch) throw std::runtime_error("FRCheck source_send: no channel to encoder");
-
-            ch->send_data(reinterpret_cast<const uint8_t*>(task.gpu_addr), task.block_size);
-            if (task.cpu_mirror_addr != 0) {
-                cudaError_t err = cudaMemcpy(
-                    reinterpret_cast<void*>(task.cpu_mirror_addr),
-                    reinterpret_cast<const void*>(task.gpu_addr),
-                    task.block_size,
-                    cudaMemcpyDeviceToHost);
-                if (err != cudaSuccess) {
-                    throw std::runtime_error(
-                        std::string("FRCheck source_send: D2H failed: ") +
-                        cudaGetErrorString(err));
-                }
+            source_active_.fetch_add(1, std::memory_order_acq_rel);
+            try {
+                execute_source_chunk_(task);
+            } catch (const std::exception& e) {
+                source_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (encoding_workers_stop_) return;
+                std::cerr << "FRCheck source_worker: " << e.what() << std::endl;
+                return;
+            } catch (...) {
+                source_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (encoding_workers_stop_) return;
+                throw;
             }
-
-            mark_stripe_done_(task.stripe_id);
-
-            maybe_complete_after_sentinel_(
-                source_send_sentinel_received_, source_send_mtx_, source_send_q_,
-                source_send_completed_, source_send_sentinel_received_);
+            source_active_.fetch_sub(1, std::memory_order_acq_rel);
+            pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+            maybe_complete_source_after_sentinel_();
         }
     }
 
-    void encoder_worker() {
+    void encoder_worker_loop_() {
         while (!encoding_workers_stop_) {
-            EncoderTask task;
+            StripeChunkTask task;
             {
                 std::unique_lock<std::mutex> lk(encoder_mtx_);
                 encoder_cv_.wait(lk, [this] {
@@ -1406,148 +1541,148 @@ private:
                 encoder_q_.pop();
             }
 
-            if (is_encoder_sentinel(task)) {
+            if (is_encoder_sentinel_(task)) {
                 encoder_sentinel_received_ = true;
                 maybe_complete_encoder_after_sentinel_();
                 continue;
             }
 
-            std::vector<std::thread> recv_threads;
-            std::vector<std::exception_ptr> recv_exceptions(task.n_src);
-            for (int i = 0; i < task.n_src; ++i) {
-                recv_exceptions[i] = nullptr;
-                recv_threads.emplace_back([&, i]() {
-                    try {
-                        uintptr_t dst = task.recv_buf_addr + (uintptr_t)i * task.block_size;
-                        if (task.src_peer_rigs[i] == rank_in_group_) {
-                            if (task.local_src_addrs[i] != 0) {
-                                std::memcpy(
-                                    reinterpret_cast<void*>(dst),
-                                    reinterpret_cast<const void*>(task.local_src_addrs[i]),
-                                    task.block_size);
-                            }
-                            return;
-                        }
-                        FRCheckRdmaChannel* ch = get_channel_(task.src_peer_rigs[i]);
-                        if (!ch) throw std::runtime_error("FRCheck encoder: no channel from source");
-                        ch->recv_data(reinterpret_cast<uint8_t*>(dst), task.block_size);
-                    } catch (...) {
-                        recv_exceptions[i] = std::current_exception();
-                    }
-                });
+            encoder_active_.fetch_add(1, std::memory_order_acq_rel);
+            try {
+                execute_encoder_chunk_(task);
+            } catch (const std::exception& e) {
+                encoder_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (encoding_workers_stop_) return;
+                std::cerr << "FRCheck encoder_worker: " << e.what() << std::endl;
+                return;
+            } catch (...) {
+                encoder_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (encoding_workers_stop_) return;
+                throw;
             }
-            for (auto& t : recv_threads) t.join();
-            for (int i = 0; i < task.n_src; ++i) {
-                if (recv_exceptions[i]) std::rethrow_exception(recv_exceptions[i]);
-            }
-
-            std::vector<unsigned char*> data_ptrs((size_t)task.n_src);
-            for (int i = 0; i < task.n_src; ++i)
-                data_ptrs[i] = reinterpret_cast<unsigned char*>(
-                    task.recv_buf_addr + (uintptr_t)i * task.block_size);
-            unsigned char* parity_ptrs[2] = {
-                reinterpret_cast<unsigned char*>(task.p1_addr),
-                reinterpret_cast<unsigned char*>(task.p2_addr),
-            };
-
-            RsEncodeJob rs;
-            rs.len = (int)task.block_size;
-            rs.k = task.n_src;
-            rs.m = 2;
-            rs.g_tbls = g_tbls_;
-            rs.data_ptrs = data_ptrs.data();
-            rs.parity_ptrs = parity_ptrs;
-            rs_pool_run_parallel_encode(rs);
-
-            FRCheckRdmaChannel* ch = get_channel_(task.par_peer_rig);
-            if (!ch) throw std::runtime_error("FRCheck encoder: no channel to parity target");
-            ch->send_data(reinterpret_cast<const uint8_t*>(task.p2_addr), task.block_size);
-
-            mark_stripe_done_(task.stripe_id);
-
+            encoder_active_.fetch_sub(1, std::memory_order_acq_rel);
+            pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
             maybe_complete_encoder_after_sentinel_();
         }
     }
 
-    void parity_recv_worker() {
+    void parity_worker_loop_() {
         while (!encoding_workers_stop_) {
-            ParityRecvTask task;
+            StripeChunkTask task;
             {
-                std::unique_lock<std::mutex> lk(parity_recv_mtx_);
-                parity_recv_cv_.wait(lk, [this] {
-                    return encoding_workers_stop_ || !parity_recv_q_.empty();
+                std::unique_lock<std::mutex> lk(parity_mtx_);
+                parity_cv_.wait(lk, [this] {
+                    return encoding_workers_stop_ || !parity_q_.empty();
                 });
                 if (encoding_workers_stop_) break;
-                task = parity_recv_q_.front();
-                parity_recv_q_.pop();
+                task = parity_q_.front();
+                parity_q_.pop();
             }
 
-            if (is_parity_recv_sentinel(task)) {
-                parity_recv_sentinel_received_ = true;
+            if (is_parity_sentinel_(task)) {
+                parity_sentinel_received_ = true;
                 maybe_complete_parity_after_sentinel_();
                 continue;
             }
 
-            FRCheckRdmaChannel* ch = get_channel_(task.enc_peer_rig);
-            if (!ch) throw std::runtime_error("FRCheck parity_recv: no channel from encoder");
-            ch->recv_data(reinterpret_cast<uint8_t*>(task.p2_in_addr), task.block_size);
-
-            mark_stripe_done_(task.stripe_id);
-
+            parity_active_.fetch_add(1, std::memory_order_acq_rel);
+            try {
+                execute_parity_chunk_(task);
+            } catch (const std::exception& e) {
+                parity_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (encoding_workers_stop_) return;
+                std::cerr << "FRCheck parity_worker: " << e.what() << std::endl;
+                return;
+            } catch (...) {
+                parity_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (encoding_workers_stop_) return;
+                throw;
+            }
+            parity_active_.fetch_sub(1, std::memory_order_acq_rel);
+            pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
             maybe_complete_parity_after_sentinel_();
         }
     }
 
+    void encoding_workers_init() {
+        encoding_workers_stop_ = false;
+        mirror_worker_init();
+        source_thread_ = std::thread(&FRCheckNative::source_worker_loop_, this);
+        encoder_thread_ = std::thread(&FRCheckNative::encoder_worker_loop_, this);
+        parity_thread_ = std::thread(&FRCheckNative::parity_worker_loop_, this);
+        std::cout << "FRCheck: role encoding workers started "
+                  << "(source/encoder/parity x1 + mirror)" << std::endl;
+    }
+
+    void encoding_workers_join_() {
+        if (source_thread_.joinable()) source_thread_.join();
+        if (encoder_thread_.joinable()) encoder_thread_.join();
+        if (parity_thread_.joinable()) parity_thread_.join();
+    }
+
+    void abort_all_channels_() {
+        for (auto& peer_row : channels_) {
+            for (auto* ch : peer_row) {
+                if (ch) ch->abort_connection();
+            }
+        }
+    }
+
+    void encoding_workers_shutdown() {
+        encoding_workers_stop_ = true;
+        source_cv_.notify_all();
+        encoder_cv_.notify_all();
+        parity_cv_.notify_all();
+        mirror_cv_.notify_all();
+        encoding_wait_cv_.notify_all();
+        abort_all_channels_();
+        encoding_workers_join_();
+        mirror_worker_shutdown();
+    }
+
 public:
     void reset_encoding_completion() {
-        wait_source_send_ = false;
+        encoding_batch_completed_ = false;
+        pending_chunks_.store(0, std::memory_order_release);
+        source_active_.store(0, std::memory_order_release);
+        encoder_active_.store(0, std::memory_order_release);
+        parity_active_.store(0, std::memory_order_release);
+        wait_source_ = false;
         wait_encoder_ = false;
-        wait_parity_recv_ = false;
-        source_send_completed_ = false;
+        wait_parity_ = false;
+        source_completed_ = false;
         encoder_completed_ = false;
-        parity_recv_completed_ = false;
-        source_send_sentinel_received_ = false;
+        parity_completed_ = false;
+        source_sentinel_received_ = false;
         encoder_sentinel_received_ = false;
-        parity_recv_sentinel_received_ = false;
-
-        init_stripe_tracking_();
+        parity_sentinel_received_ = false;
         {
-            std::lock_guard<std::mutex> lk(stripe_mtx_);
-            std::fill(stripe_pending_.begin(), stripe_pending_.end(), 0);
-            std::fill(stripe_completed_.begin(), stripe_completed_.end(), 0);
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(source_send_mtx_);
-            while (!source_send_q_.empty()) source_send_q_.pop();
+            std::lock_guard<std::mutex> lk(source_mtx_);
+            while (!source_q_.empty()) source_q_.pop();
         }
         {
             std::lock_guard<std::mutex> lk(encoder_mtx_);
             while (!encoder_q_.empty()) encoder_q_.pop();
         }
         {
-            std::lock_guard<std::mutex> lk(parity_recv_mtx_);
-            while (!parity_recv_q_.empty()) parity_recv_q_.pop();
+            std::lock_guard<std::mutex> lk(parity_mtx_);
+            while (!parity_q_.empty()) parity_q_.pop();
         }
     }
 
-    void submit_source_send(
-        int stripe_id, uintptr_t gpu_addr, uintptr_t cpu_mirror_addr, size_t block_size)
-    {
-        if (stopped_) return;
-        SourceSendTask task{stripe_id, gpu_addr, cpu_mirror_addr, block_size};
-        mark_stripe_submitted_(stripe_id);
-        {
-            std::lock_guard<std::mutex> lk(source_send_mtx_);
-            source_send_q_.push(task);
-            wait_source_send_ = true;
-        }
-        source_send_cv_.notify_one();
-    }
-
-    void submit_encoder_encode(
-        int stripe_id, uintptr_t recv_buf_addr, uintptr_t p1_addr,
-        uintptr_t p2_addr, size_t block_size,
+    void submit_stripe_chunk(
+        int stripe_id,
+        uintptr_t source_data_addr,
+        uintptr_t source_mirror_addr,
+        uintptr_t recv_buf_addr,
+        uintptr_t p1_addr,
+        uintptr_t p2_out_addr,
+        uintptr_t p2_in_addr,
+        size_t block_size,
         const std::vector<uintptr_t>& local_src_addrs)
     {
         if (stopped_) return;
@@ -1555,99 +1690,115 @@ public:
             throw std::runtime_error("FRCheck: invalid stripe_id");
 
         const auto& plan = stripe_plans_[stripe_id];
-        EncoderTask task;
+        StripeChunkTask task;
         task.stripe_id = stripe_id;
-        task.recv_buf_addr = recv_buf_addr;
-        task.p1_addr = p1_addr;
-        task.p2_addr = p2_addr;
+        task.role = plan.role;
         task.block_size = block_size;
-        task.n_src = (int)plan.source_node_ids.size();
-        for (int i = 0; i < task.n_src; ++i) {
-            task.src_peer_rigs[i] = plan.source_node_ids[i] - 1;
-            task.local_src_addrs[i] = (i < (int)local_src_addrs.size())
-                ? local_src_addrs[i] : 0;
-        }
-        task.par_peer_rig = plan.parity_target_node_id - 1;
 
-        mark_stripe_submitted_(stripe_id);
-        {
-            std::lock_guard<std::mutex> lk(encoder_mtx_);
-            encoder_q_.push(task);
-            wait_encoder_ = true;
+        switch (plan.role) {
+        case StripeRole::SOURCE:
+            if (source_data_addr == 0) return;
+            task.source_data = source_data_addr;
+            task.source_mirror = source_mirror_addr;
+            pending_chunks_.fetch_add(1, std::memory_order_acq_rel);
+            {
+                std::lock_guard<std::mutex> lk(source_mtx_);
+                source_q_.push(std::move(task));
+                wait_source_ = true;
+                source_completed_ = false;
+            }
+            source_cv_.notify_all();
+            break;
+        case StripeRole::ENCODER:
+            task.recv_buf_addr = recv_buf_addr;
+            task.p1_addr = p1_addr;
+            task.p2_out_addr = p2_out_addr;
+            task.n_src = (int)plan.source_node_ids.size();
+            task.src_peer_rigs.resize((size_t)task.n_src);
+            for (int i = 0; i < task.n_src; ++i)
+                task.src_peer_rigs[(size_t)i] = plan.source_node_ids[(size_t)i] - 1;
+            task.local_src_addrs = local_src_addrs;
+            task.par_peer_rig = plan.parity_target_node_id - 1;
+            pending_chunks_.fetch_add(1, std::memory_order_acq_rel);
+            {
+                std::lock_guard<std::mutex> lk(encoder_mtx_);
+                encoder_q_.push(std::move(task));
+                wait_encoder_ = true;
+                encoder_completed_ = false;
+            }
+            encoder_cv_.notify_all();
+            break;
+        case StripeRole::PARITY_TARGET:
+            task.p2_in_addr = p2_in_addr;
+            task.enc_peer_rig = plan.encoder_node_id - 1;
+            pending_chunks_.fetch_add(1, std::memory_order_acq_rel);
+            {
+                std::lock_guard<std::mutex> lk(parity_mtx_);
+                parity_q_.push(std::move(task));
+                wait_parity_ = true;
+                parity_completed_ = false;
+            }
+            parity_cv_.notify_all();
+            break;
         }
-        encoder_cv_.notify_one();
     }
 
-    void submit_parity_recv(int stripe_id, uintptr_t p2_in_addr, size_t block_size) {
-        if (stopped_) return;
-        if (stripe_id < 0 || stripe_id >= (int)stripe_plans_.size())
-            throw std::runtime_error("FRCheck: invalid stripe_id");
-
-        const auto& plan = stripe_plans_[stripe_id];
-        ParityRecvTask task;
-        task.stripe_id = stripe_id;
-        task.p2_in_addr = p2_in_addr;
-        task.block_size = block_size;
-        task.enc_peer_rig = plan.encoder_node_id - 1;
-
-        mark_stripe_submitted_(stripe_id);
-        {
-            std::lock_guard<std::mutex> lk(parity_recv_mtx_);
-            parity_recv_q_.push(task);
-            wait_parity_recv_ = true;
-        }
-        parity_recv_cv_.notify_one();
+    void reset_encoding_batch() {
+        reset_encoding_completion();
     }
 
-    void submit_source_send_sentinel() {
-        SourceSendTask task{};
-        {
-            std::lock_guard<std::mutex> lk(source_send_mtx_);
-            source_send_q_.push(task);
-            wait_source_send_ = true;
+    void submit_encoding_sentinel() {
+        StripeChunkTask sentinel{};
+        if (wait_source_) {
+            {
+                std::lock_guard<std::mutex> lk(source_mtx_);
+                source_q_.push(sentinel);
+            }
+            source_cv_.notify_all();
         }
-        source_send_cv_.notify_one();
+        if (wait_encoder_) {
+            {
+                std::lock_guard<std::mutex> lk(encoder_mtx_);
+                encoder_q_.push(sentinel);
+            }
+            encoder_cv_.notify_all();
+        }
+        if (wait_parity_) {
+            {
+                std::lock_guard<std::mutex> lk(parity_mtx_);
+                parity_q_.push(sentinel);
+            }
+            parity_cv_.notify_all();
+        }
+        maybe_complete_encoding_batch_();
     }
 
-    void submit_encoder_sentinel() {
-        EncoderTask task{};
-        {
-            std::lock_guard<std::mutex> lk(encoder_mtx_);
-            encoder_q_.push(task);
-            wait_encoder_ = true;
-        }
-        encoder_cv_.notify_one();
-    }
-
-    void submit_parity_recv_sentinel() {
-        ParityRecvTask task{};
-        {
-            std::lock_guard<std::mutex> lk(parity_recv_mtx_);
-            parity_recv_q_.push(task);
-            wait_parity_recv_ = true;
-        }
-        parity_recv_cv_.notify_one();
-    }
-
-    void wait_stripe(int stripe_id) {
-        if (stripe_id < 0 || stripe_id >= (int)stripe_pending_.size()) return;
-        std::unique_lock<std::mutex> lk(stripe_mtx_);
-        stripe_cv_.wait(lk, [&] {
-            return stripe_completed_[stripe_id] >= stripe_pending_[stripe_id];
-        });
+    void wait_encoding_batch() {
+        wait_for_encoding_completion();
+        wait_mirror_completion();
     }
 
     void wait_for_encoding_completion() {
-        while (!stopped_) {
-            bool done = true;
-            if (wait_source_send_ && !source_send_completed_) done = false;
-            if (wait_encoder_ && !encoder_completed_) done = false;
-            if (wait_parity_recv_ && !parity_recv_completed_) done = false;
-            if (done) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
+        std::unique_lock<std::mutex> lk(encoding_wait_mtx_);
+        encoding_wait_cv_.wait(lk, [this] {
+            return stopped_.load() || encoding_batch_completed_;
+        });
     }
 
+    void wait_mirror_completion() {
+        std::unique_lock<std::mutex> lk(mirror_mtx_);
+        mirror_cv_.wait(lk, [this] {
+            return (mirror_idle_.load() && mirror_q_.empty()) ||
+                   stopped_.load() || mirror_stop_.load();
+        });
+        if (d2h_stream_ != nullptr) {
+            cudaError_t err = cudaStreamSynchronize(d2h_stream_);
+            if (err != cudaSuccess) {
+                std::cerr << "FRCheck wait_mirror: d2h_stream sync failed: "
+                          << cudaGetErrorString(err) << std::endl;
+            }
+        }
+    }
     // ---- RDMA device init ----
     void init_ibv_() {
         if (ibv_fork_init() != 0)
@@ -1665,23 +1816,20 @@ public:
         rdma_pd_ = ibv_alloc_pd(rdma_ctx_);
         if (!rdma_pd_)
             throw std::runtime_error("FRCheck RDMA: failed to alloc PD");
-
-        rdma_send_cq_ = ibv_create_cq(rdma_ctx_, FRCHECK_MAX_WR * 2, nullptr, nullptr, 0);
-        rdma_recv_cq_ = ibv_create_cq(rdma_ctx_, FRCHECK_MAX_WR * 2, nullptr, nullptr, 0);
-        if (!rdma_send_cq_ || !rdma_recv_cq_)
-            throw std::runtime_error("FRCheck RDMA: failed to create CQs");
     }
 
     void cleanup_rdma_() {
-        encoding_workers_shutdown();
+        if (rdma_cleaned_up_.exchange(true)) return;
+
+        if (!stopped_.load()) {
+            encoding_workers_shutdown();
+        }
         channel_owners_.clear();
         channels_.clear();
 
-        if (acceptor_thread_stop_.load()) {
-            // already stopped
-        }
         acceptor_thread_stop_ = true;
         if (acceptor_fd_ >= 0) {
+            shutdown(acceptor_fd_, SHUT_RDWR);
             close(acceptor_fd_);
             acceptor_fd_ = -1;
         }
@@ -1694,8 +1842,6 @@ public:
         }
         registered_bufs_.clear();
 
-        if (rdma_recv_cq_) { ibv_destroy_cq(rdma_recv_cq_); rdma_recv_cq_ = nullptr; }
-        if (rdma_send_cq_) { ibv_destroy_cq(rdma_send_cq_); rdma_send_cq_ = nullptr; }
         if (rdma_pd_) { ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr; }
         if (rdma_ctx_) { ibv_close_device(rdma_ctx_); rdma_ctx_ = nullptr; }
         n_connected_ = 0;
@@ -1737,25 +1883,37 @@ public:
     void accept_loop_() {
         while (!acceptor_thread_stop_) {
             try {
+                if (acceptor_fd_ < 0) break;
+                struct pollfd pfd;
+                pfd.fd = acceptor_fd_;
+                pfd.events = POLLIN;
+                int pr = poll(&pfd, 1, 100);
+                if (pr < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (pr == 0) continue;
+
                 struct sockaddr_in peer_addr;
                 socklen_t addrlen = sizeof(peer_addr);
                 int fd = accept(acceptor_fd_,
                                 (struct sockaddr*)&peer_addr, &addrlen);
                 if (fd < 0) {
+                    if (errno == EINTR) continue;
                     if (errno == EINVAL || errno == EBADF) break; // closed
                     continue;
                 }
-                // Receive peer rank identifier
-                int peer_rank = -1;
-                ssize_t nr = recv(fd, &peer_rank, sizeof(peer_rank), MSG_WAITALL);
-                if (nr != sizeof(peer_rank)) {
-                    std::cerr << "[FRCheck RDMA] accept: failed to recv peer rank" << std::endl;
+                // Receive peer rank + lane (stripe_id)
+                ConnectHello hello{};
+                ssize_t nr = recv(fd, &hello, sizeof(hello), MSG_WAITALL);
+                if (nr != (ssize_t)sizeof(hello)) {
+                    std::cerr << "[FRCheck RDMA] accept: failed to recv connect hello" << std::endl;
                     close(fd);
                     continue;
                 }
                 {
                     std::lock_guard<std::mutex> lk(accept_mtx_);
-                    accepted_queue_[peer_rank] = fd;
+                    accepted_queue_[hello.rank][hello.lane_id] = fd;
                 }
                 accept_cv_.notify_all();
             } catch (const std::exception& e) {
@@ -1767,10 +1925,12 @@ public:
     }
 
     // ---- Channel access ----
-    FRCheckRdmaChannel* get_channel_(int peer_rg) {
+    FRCheckRdmaChannel* get_channel_(int peer_rg, int stripe_id) {
         if (peer_rg < 0 || peer_rg >= group_size_ || peer_rg == rank_in_group_)
             return nullptr;
-        return channels_[peer_rg];
+        if (stripe_id < 0 || stripe_id >= num_lanes_)
+            return nullptr;
+        return channels_[peer_rg][stripe_id];
     }
 
 public:
@@ -1810,7 +1970,6 @@ private:
             }
             stripe_plans_.push_back(std::move(plan));
         }
-        init_stripe_tracking_();
     }
 
     // ---- data members ----
@@ -1822,12 +1981,11 @@ private:
     unsigned char* g_tbls_ = nullptr; // ISA-L RS encode tables (32*k_*rows_)
     unsigned char* decode_tbls_ = nullptr; // ISA-L RS decode tables (for recovery)
     std::atomic<bool> stopped_;
+    std::atomic<bool> rdma_cleaned_up_{false};
 
     // RDMA
     ibv_context* rdma_ctx_;
     ibv_pd* rdma_pd_;
-    ibv_cq* rdma_send_cq_ = nullptr;
-    ibv_cq* rdma_recv_cq_ = nullptr;
 
     // Topology
     int group_size_ = 0;
@@ -1835,9 +1993,11 @@ private:
     int n_connected_ = 0;
     std::string my_ip_;
 
-    // Channels: index by peer rank_in_group (0..group_size-1), null for self
-    std::vector<FRCheckRdmaChannel*> channels_;
+    // Channels: index by peer rank_in_group and stripe lane (lane_id == stripe_id)
+    int num_lanes_ = 0;
+    std::vector<std::vector<FRCheckRdmaChannel*>> channels_;
     std::vector<std::unique_ptr<FRCheckRdmaChannel>> channel_owners_;
+    bool require_registered_mr_ = true;
 
     // Registered buffers (shared across channels)
     std::map<uintptr_t, RdmaBuffer> registered_bufs_;
@@ -1847,7 +2007,7 @@ private:
     int acceptor_fd_ = -1;
     std::thread accept_thread_;
     std::atomic<bool> acceptor_thread_stop_{false};
-    std::map<int, int> accepted_queue_; // peer_rank -> fd
+    std::map<int, std::map<int, int>> accepted_queue_; // peer_rank -> lane_id -> fd
     std::mutex accept_mtx_;
     std::condition_variable accept_cv_;
 
@@ -1912,17 +2072,6 @@ PYBIND11_MODULE(frcheck_native, m) {
         // GDR capability
         .def_static("gdr_available", &FRCheckNative::gdr_available)
 
-        // Stripe encode
-        .def("submit_stripe_encode", &FRCheckNative::submit_stripe_encode,
-             py::arg("stripe_id"),
-             py::arg("my_data_addr"),
-             py::arg("block_size"),
-             py::arg("recv_buf_addr"),
-             py::arg("recv_buf_size"),
-             py::arg("parity1_out_addr"),
-             py::arg("parity2_out_addr"),
-             py::arg("parity2_in_addr"))
-
         // Stripe decode (hardware recovery)
         .def("submit_stripe_decode", &FRCheckNative::submit_stripe_decode,
              py::arg("k"),
@@ -1934,11 +2083,15 @@ PYBIND11_MODULE(frcheck_native, m) {
 
         // Point-to-point RDMA send/recv (for recovery, GIL released for threading)
         .def("send_to_peer", &FRCheckNative::send_to_peer,
-             py::arg("peer_rig"), py::arg("addr"), py::arg("size"),
+             py::arg("peer_rig"), py::arg("stripe_id"),
+             py::arg("addr"), py::arg("size"),
              py::call_guard<py::gil_scoped_release>())
         .def("recv_from_peer", &FRCheckNative::recv_from_peer,
-             py::arg("peer_rig"), py::arg("addr"), py::arg("size"),
+             py::arg("peer_rig"), py::arg("stripe_id"),
+             py::arg("addr"), py::arg("size"),
              py::call_guard<py::gil_scoped_release>())
+        .def("set_require_registered_mr", &FRCheckNative::set_require_registered_mr,
+             py::arg("require"))
         // StripePlan queries
         .def("get_role_for_stripe", &FRCheckNative::get_role_for_stripe,
              py::arg("stripe_id"))
@@ -1949,20 +2102,23 @@ PYBIND11_MODULE(frcheck_native, m) {
         .def("get_parity_target_node_id", &FRCheckNative::get_parity_target_node_id,
              py::arg("stripe_id"))
 
-        // ECLATIN-style encoding worker pipeline
+        // Stripe-FIFO encoding pipeline
         .def("reset_encoding_completion", &FRCheckNative::reset_encoding_completion)
-        .def("submit_source_send", &FRCheckNative::submit_source_send,
-             py::arg("stripe_id"), py::arg("gpu_addr"), py::arg("cpu_mirror_addr"),
-             py::arg("block_size"))
-        .def("submit_encoder_encode", &FRCheckNative::submit_encoder_encode,
-             py::arg("stripe_id"), py::arg("recv_buf_addr"), py::arg("p1_addr"),
-             py::arg("p2_addr"), py::arg("block_size"), py::arg("local_src_addrs"))
-        .def("submit_parity_recv", &FRCheckNative::submit_parity_recv,
-             py::arg("stripe_id"), py::arg("p2_in_addr"), py::arg("block_size"))
-        .def("submit_source_send_sentinel", &FRCheckNative::submit_source_send_sentinel)
-        .def("submit_encoder_sentinel", &FRCheckNative::submit_encoder_sentinel)
-        .def("submit_parity_recv_sentinel", &FRCheckNative::submit_parity_recv_sentinel)
-        .def("wait_stripe", &FRCheckNative::wait_stripe, py::arg("stripe_id"),
+        .def("reset_encoding_batch", &FRCheckNative::reset_encoding_batch)
+        .def("submit_stripe_chunk", &FRCheckNative::submit_stripe_chunk,
+             py::arg("stripe_id"),
+             py::arg("source_data_addr"),
+             py::arg("source_mirror_addr"),
+             py::arg("recv_buf_addr"),
+             py::arg("p1_addr"),
+             py::arg("p2_out_addr"),
+             py::arg("p2_in_addr"),
+             py::arg("block_size"),
+             py::arg("local_src_addrs"))
+        .def("submit_encoding_sentinel", &FRCheckNative::submit_encoding_sentinel)
+        .def("wait_for_encoding_completion", &FRCheckNative::wait_for_encoding_completion,
              py::call_guard<py::gil_scoped_release>())
-        .def("wait_for_encoding_completion", &FRCheckNative::wait_for_encoding_completion);
+        .def("wait_encoding_batch", &FRCheckNative::wait_encoding_batch,
+             py::call_guard<py::gil_scoped_release>())
+        .def("wait_mirror_completion", &FRCheckNative::wait_mirror_completion);
 }

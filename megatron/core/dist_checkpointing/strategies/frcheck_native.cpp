@@ -81,7 +81,6 @@ struct RdmaBuffer {
 // ---------------------------------------------------------------------------
 // RdmaConnectionChannel — wraps a TCP socket for QP exchange + RDMA send/recv
 // ---------------------------------------------------------------------------
-static constexpr size_t FRCHECK_TEMP_BUF_SIZE = 128ULL * 1024 * 1024; // 128 MB
 static constexpr size_t FRCHECK_RDMA_CHUNK = 64ULL * 1024 * 1024;     // 64 MB per RDMA op
 static constexpr int    FRCHECK_MAX_WR = 64;
 
@@ -101,7 +100,7 @@ public:
           send_cq_(nullptr), recv_cq_(nullptr),
           tcp_sock_(tcp_sock), peer_rank_(peer_rank),
           bufs_(bufs), buf_mtx_(buf_mtx),
-          qp_(nullptr), temp_send_mr_(nullptr), temp_recv_mr_(nullptr),
+          qp_(nullptr),
           connected_(false)
     {
         send_cq_ = ibv_create_cq(ctx_, 256, nullptr, nullptr, 0);
@@ -123,20 +122,9 @@ public:
         qp_ = ibv_create_qp(pd_, &attr);
         if (!qp_)
             throw std::runtime_error("FRCheck RDMA: failed to create QP");
-
-        temp_send_.resize(FRCHECK_TEMP_BUF_SIZE);
-        temp_recv_.resize(FRCHECK_TEMP_BUF_SIZE);
-        temp_send_mr_ = ibv_reg_mr(pd_, temp_send_.data(), FRCHECK_TEMP_BUF_SIZE,
-                                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-        temp_recv_mr_ = ibv_reg_mr(pd_, temp_recv_.data(), FRCHECK_TEMP_BUF_SIZE,
-                                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-        if (!temp_send_mr_ || !temp_recv_mr_)
-            throw std::runtime_error("FRCheck RDMA: failed to register temp MRs");
     }
 
     ~FRCheckRdmaChannel() {
-        if (temp_recv_mr_) ibv_dereg_mr(temp_recv_mr_);
-        if (temp_send_mr_) ibv_dereg_mr(temp_send_mr_);
         if (qp_) ibv_destroy_qp(qp_);
         if (recv_cq_) { ibv_destroy_cq(recv_cq_); recv_cq_ = nullptr; }
         if (send_cq_) { ibv_destroy_cq(send_cq_); send_cq_ = nullptr; }
@@ -181,7 +169,7 @@ public:
     }
 
     // RDMA SEND data to peer (blocking)
-    void send_data(const uint8_t* data, size_t size, bool require_registered_mr = false) {
+    void send_data(const uint8_t* data, size_t size) {
         std::lock_guard<std::mutex> lock(send_mtx_);
         if (!connected_)
             throw std::runtime_error("FRCheck RDMA: channel not connected");
@@ -196,22 +184,15 @@ public:
 
         ibv_mr* mr = find_mr((uintptr_t)data, size);
         if (!mr) {
-            if (require_registered_mr) {
-                throw std::runtime_error(
-                    "FRCheck RDMA: unregistered send buffer in save pipeline (addr=0x" +
-                    std::to_string((uintptr_t)data) + ")");
-            }
-            if (size > FRCHECK_TEMP_BUF_SIZE)
-                throw std::runtime_error("FRCheck RDMA: data exceeds temp buffer");
-            memcpy(temp_send_.data(), data, size);
-            mr = temp_send_mr_;
-            data = temp_send_.data();
+            throw std::runtime_error(
+                "FRCheck RDMA: unregistered send buffer (addr=0x" +
+                std::to_string((uintptr_t)data) + " size=" + std::to_string(size) + ")");
         }
         send_chunked(data, size, mr);
     }
 
     // RDMA RECEIVE data from peer (blocking)
-    size_t recv_data(uint8_t* buf, size_t buf_size, bool require_registered_mr = false) {
+    size_t recv_data(uint8_t* buf, size_t buf_size) {
         std::lock_guard<std::mutex> lock(recv_mtx_);
         if (!connected_)
             throw std::runtime_error("FRCheck RDMA: channel not connected");
@@ -230,22 +211,12 @@ public:
             throw std::runtime_error("FRCheck RDMA: failed to send ack");
 
         ibv_mr* mr = find_mr((uintptr_t)buf, size);
-        uint8_t* target = buf;
-        bool use_temp = false;
         if (!mr) {
-            if (require_registered_mr) {
-                throw std::runtime_error(
-                    "FRCheck RDMA: unregistered recv buffer in save pipeline (addr=0x" +
-                    std::to_string((uintptr_t)buf) + ")");
-            }
-            if (size > FRCHECK_TEMP_BUF_SIZE)
-                throw std::runtime_error("FRCheck RDMA: recv exceeds temp buffer");
-            mr = temp_recv_mr_;
-            target = temp_recv_.data();
-            use_temp = true;
+            throw std::runtime_error(
+                "FRCheck RDMA: unregistered recv buffer (addr=0x" +
+                std::to_string((uintptr_t)buf) + " size=" + std::to_string(size) + ")");
         }
-        recv_chunked(target, size, mr);
-        if (use_temp) memcpy(buf, temp_recv_.data(), size);
+        recv_chunked(buf, size, mr);
         return size;
     }
 
@@ -405,10 +376,6 @@ private:
     std::map<uintptr_t, RdmaBuffer>* bufs_;
     std::mutex* buf_mtx_;
     ibv_qp* qp_;
-    std::vector<uint8_t> temp_send_;
-    std::vector<uint8_t> temp_recv_;
-    ibv_mr* temp_send_mr_;
-    ibv_mr* temp_recv_mr_;
     bool connected_;
     std::mutex send_mtx_;
     std::mutex recv_mtx_;
@@ -591,8 +558,6 @@ public:
         // Connect to lower ranks: one TCP+QP per (peer, stripe lane)
         for (int peer = 0; peer < rank_in_group; ++peer) {
             for (int lane = 0; lane < num_lanes_; ++lane) {
-                std::cout << "[FRCheck RDMA] rank=" << rank_in_group
-                          << " connecting to peer=" << peer << " lane=" << lane << std::endl;
                 connect_outbound(peer, lane);
             }
         }
@@ -600,9 +565,6 @@ public:
         // Wait for higher ranks to connect (one connection per lane)
         for (int peer = rank_in_group + 1; peer < group_size; ++peer) {
             for (int lane = 0; lane < num_lanes_; ++lane) {
-                std::cout << "[FRCheck RDMA] rank=" << rank_in_group
-                          << " waiting for accept from peer=" << peer
-                          << " lane=" << lane << std::endl;
                 int sock;
                 {
                     std::unique_lock<std::mutex> lk(accept_mtx_);
@@ -746,7 +708,7 @@ public:
                 "FRCheck send_to_peer: no channel to rig " + std::to_string(peer_rig) +
                 " lane " + std::to_string(stripe_id));
         }
-        ch->send_data((const uint8_t*)addr, size, false);
+        ch->send_data((const uint8_t*)addr, size);
     }
 
     void recv_from_peer(int peer_rig, int stripe_id, uintptr_t addr, size_t size) {
@@ -756,7 +718,7 @@ public:
                 "FRCheck recv_from_peer: no channel from rig " + std::to_string(peer_rig) +
                 " lane " + std::to_string(stripe_id));
         }
-        ch->recv_data((uint8_t*)addr, size, false);
+        ch->recv_data((uint8_t*)addr, size);
     }
 
     void set_require_registered_mr(bool require) { require_registered_mr_ = require; }
@@ -1398,8 +1360,7 @@ private:
         if (!ch) throw std::runtime_error("FRCheck source: no channel to encoder");
         ch->send_data(
             reinterpret_cast<const uint8_t*>(task.source_data),
-            task.block_size,
-            require_registered_mr_);
+            task.block_size);
         if (task.source_mirror != 0) {
             push_mirror_task_(task.source_data, task.source_mirror, task.block_size);
         }
@@ -1418,8 +1379,7 @@ private:
                     if (!ch) throw std::runtime_error("FRCheck encoder: no channel from source");
                     ch->recv_data(
                         reinterpret_cast<uint8_t*>(dst),
-                        task.block_size,
-                        require_registered_mr_);
+                        task.block_size);
                 } catch (...) {
                     recv_exceptions[(size_t)i] = std::current_exception();
                 }
@@ -1475,8 +1435,7 @@ private:
         if (!ch) throw std::runtime_error("FRCheck encoder: no channel to parity target");
         ch->send_data(
             reinterpret_cast<const uint8_t*>(task.p2_out_addr),
-            task.block_size,
-            require_registered_mr_);
+            task.block_size);
     }
 
     void execute_parity_chunk_(const StripeChunkTask& task) {
@@ -1484,8 +1443,7 @@ private:
         if (!ch) throw std::runtime_error("FRCheck parity: no channel from encoder");
         ch->recv_data(
             reinterpret_cast<uint8_t*>(task.p2_in_addr),
-            task.block_size,
-            require_registered_mr_);
+            task.block_size);
     }
 
     void source_worker_loop_() {

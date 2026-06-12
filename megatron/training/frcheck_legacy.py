@@ -10,6 +10,7 @@ import pickle
 import os
 import re
 import struct
+import threading
 import time
 from logging import getLogger
 from pathlib import Path
@@ -21,6 +22,7 @@ from dataclasses import dataclass
 from megatron.core.dist_checkpointing.strategies.frcheck_manager import (
     FRCheckManager,
     LayerStripeBufs,
+    StripePlan,
     StripeRole,
 )
 from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
@@ -61,6 +63,7 @@ class _RecoveryBufPool:
     decoder_recv_bufs: List[torch.Tensor]
     failed_recv_buf: Optional[torch.Tensor]
     decoder_recovered_buf: Optional[torch.Tensor]
+    decoder_recovered_buf2: Optional[torch.Tensor]
     failed_layer_buf: Optional[torch.Tensor]
     max_block_size: int
 
@@ -858,28 +861,59 @@ def _read_stripe_block(
     return _read_frbk_block(str(filepath))
 
 
+def _assert_frcheck_main_metadata_only(main_path: Path) -> None:
+    """Reject legacy main files that embed tensor payload (pre-metadata-only save)."""
+    from megatron.training.legacy_io_utils import (
+        MAGIC_FRCHECK,
+        _HEADER_MAGIC_LEN,
+        _read_header,
+        is_raw_format,
+    )
+    if is_raw_format(str(main_path), MAGIC_FRCHECK):
+        with open(main_path, "rb") as f:
+            magic = f.read(_HEADER_MAGIC_LEN)
+            if magic != MAGIC_FRCHECK:
+                return
+            _, _, data_len = _read_header(f)
+            if data_len > 0:
+                raise RuntimeError(
+                    f"FRCheck load: main file {main_path} has data_len={data_len} "
+                    "(legacy payload format). Re-save with metadata-only main + FRBK blocks."
+                )
+        return
+    payload = torch.load(main_path, map_location="cpu", weights_only=False)
+    tb = payload.get("tensor_buffer")
+    if torch.is_tensor(tb) and tb.numel() > 0:
+        raise RuntimeError(
+            f"FRCheck load: main file {main_path} contains tensor_buffer "
+            "(legacy format). Re-save with metadata-only main + FRBK blocks."
+        )
+
+
 def _read_local_frcheck_main_payload(
     checkpoint_dir: Path,
     rank: int,
-    load_tensor_buffer: bool = True,
+    load_tensor_buffer: bool = False,
 ) -> Dict[str, Any]:
     """Read this rank's main.pt from local disk only (no collective)."""
     main_path = checkpoint_dir / f"frcheck_main_rank{rank}.pt"
     if not main_path.is_file():
         raise FileNotFoundError(f"FRCheck legacy: missing main file {main_path}")
+    if load_tensor_buffer:
+        raise RuntimeError(
+            "FRCheck load: load_tensor_buffer=True is no longer supported; "
+            "assemble from local FRBK SOURCE blocks instead."
+        )
+    _assert_frcheck_main_metadata_only(main_path)
     from megatron.training.legacy_io_utils import (
         is_raw_format,
-        read_raw_checkpoint,
         read_raw_checkpoint_metadata,
         MAGIC_FRCHECK,
     )
     if is_raw_format(str(main_path), MAGIC_FRCHECK):
-        if load_tensor_buffer:
-            return read_raw_checkpoint(str(main_path), MAGIC_FRCHECK)
         return read_raw_checkpoint_metadata(str(main_path), MAGIC_FRCHECK)
     payload = torch.load(main_path, map_location="cpu", weights_only=False)
-    if not load_tensor_buffer:
-        payload["tensor_buffer"] = None
+    payload["tensor_buffer"] = None
     return payload
 
 
@@ -887,7 +921,7 @@ def _load_frcheck_main_payload(
     checkpoint_dir: Path,
     rank: int,
     world_size: int,
-    load_tensor_buffer: bool = True,
+    load_tensor_buffer: bool = False,
 ) -> Dict[str, Any]:
     """Load main payload; recover failed-rank metadata from group fields in main."""
     main_path = checkpoint_dir / f"frcheck_main_rank{rank}.pt"
@@ -1032,6 +1066,7 @@ def _allocate_recovery_buf_pool(
     is_failed: bool,
     is_decoder: bool,
     is_helper: bool,
+    dual_failure: bool = False,
 ) -> Optional[_RecoveryBufPool]:
     """Pre-allocate stripe recovery buffers once before the per-layer network loop."""
     num_helper = max(n - 3, 0)
@@ -1055,6 +1090,10 @@ def _allocate_recovery_buf_pool(
         allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
         if is_decoder else None
     )
+    decoder_recovered_buf2 = (
+        allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
+        if is_decoder and dual_failure else None
+    )
     failed_layer_buf = (
         allocate_hugepage_tensor(
             num_source_stripes * max_block_size, fallback_pin_memory=True,
@@ -1066,6 +1105,7 @@ def _allocate_recovery_buf_pool(
         decoder_recv_bufs
         + ([failed_recv_buf] if failed_recv_buf is not None else [])
         + ([decoder_recovered_buf] if decoder_recovered_buf is not None else [])
+        + ([decoder_recovered_buf2] if decoder_recovered_buf2 is not None else [])
         + ([failed_layer_buf] if failed_layer_buf is not None else [])
     ):
         native.register_buffer(buf.data_ptr(), buf.numel())
@@ -1074,9 +1114,16 @@ def _allocate_recovery_buf_pool(
         decoder_recv_bufs=decoder_recv_bufs,
         failed_recv_buf=failed_recv_buf,
         decoder_recovered_buf=decoder_recovered_buf,
+        decoder_recovered_buf2=decoder_recovered_buf2,
         failed_layer_buf=failed_layer_buf,
         max_block_size=max_block_size,
     )
+
+
+def _is_failed_in_recovery_plan(plan: Dict, my_node: int) -> bool:
+    if plan.get('dual_failure'):
+        return my_node in plan['failed_nodes']
+    return my_node == plan.get('failed_node')
 
 
 def _map_layer_buf_to_full_buf(
@@ -1208,6 +1255,284 @@ def _preload_recovery_stripe_blocks(
 # Per-layer recovery pipeline (network + decode only)
 # ---------------------------------------------------------------------------
 
+def _decoder_post_helper_recvs(
+    native,
+    my_node: int,
+    decoder_node: int,
+    helper_nodes: List[int],
+    node_to_rig: Dict[int, int],
+    sid: int,
+    layer_block_size: int,
+    buf_pool: Optional[_RecoveryBufPool],
+    layer_timing: Dict[str, float],
+) -> Tuple[List[threading.Thread], List[torch.Tensor]]:
+    """Decoder posts async recvs from helpers; returns threads and recv buffers."""
+    recv_threads: List[threading.Thread] = []
+    recv_bufs: List[torch.Tensor] = []
+    if my_node != decoder_node:
+        return recv_threads, recv_bufs
+
+    recv_ready = threading.Event()
+    recv_ready_count = {'n': 0}
+    recv_ready_lock = threading.Lock()
+    n_helper_recvs = len(helper_nodes)
+
+    for hi, helper_node in enumerate(helper_nodes):
+        helper_rig = node_to_rig[helper_node]
+        if buf_pool is not None and hi < len(buf_pool.decoder_recv_bufs):
+            recv_buf = buf_pool.decoder_recv_bufs[hi][:layer_block_size]
+        else:
+            recv_buf = allocate_hugepage_tensor(
+                layer_block_size, fallback_pin_memory=True,
+            )
+            native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
+        recv_bufs.append(recv_buf)
+
+        def _recv_thread(
+            rb=recv_buf, hrig=helper_rig, timing=layer_timing,
+            ready=recv_ready, ready_count=recv_ready_count,
+            ready_lock=recv_ready_lock, n_ready=n_helper_recvs,
+        ):
+            with ready_lock:
+                ready_count['n'] += 1
+                if ready_count['n'] >= n_ready:
+                    ready.set()
+            _t0 = time.time()
+            native.recv_from_peer(hrig, sid, rb.data_ptr(), rb.numel())
+            timing['rdma_xfer_s'] += time.time() - _t0
+
+        t = threading.Thread(target=_recv_thread, daemon=True)
+        t.start()
+        recv_threads.append(t)
+
+    if n_helper_recvs > 0:
+        recv_ready.wait(timeout=30.0)
+    return recv_threads, recv_bufs
+
+
+def _helper_send_block_to_decoder(
+    native,
+    my_node: int,
+    helper_nodes: List[int],
+    decoder_rig: int,
+    sid: int,
+    layer_block_size: int,
+    my_blocks: Dict[int, torch.Tensor],
+    layer_timing: Dict[str, float],
+) -> None:
+    if my_node not in helper_nodes:
+        return
+    my_block = my_blocks.get(sid)
+    if my_block is None:
+        my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
+        native.register_buffer(my_block.data_ptr(), my_block.numel())
+    _t0 = time.time()
+    native.send_to_peer(decoder_rig, sid, my_block.data_ptr(), my_block.numel())
+    layer_timing['rdma_xfer_s'] += time.time() - _t0
+
+
+def _decoder_survivor_addrs(
+    my_blocks: Dict[int, torch.Tensor],
+    sid: int,
+    layer_block_size: int,
+    recv_bufs: List[torch.Tensor],
+) -> List[int]:
+    my_block = my_blocks.get(sid)
+    if my_block is None:
+        my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
+    addrs = [my_block.data_ptr()]
+    addrs.extend(rb.data_ptr() for rb in recv_bufs)
+    return addrs
+
+
+def _alloc_decoder_recovered_buf(
+    buf_pool: Optional[_RecoveryBufPool],
+    layer_block_size: int,
+    slot: int,
+    native,
+) -> torch.Tensor:
+    if buf_pool is not None:
+        if slot == 0 and buf_pool.decoder_recovered_buf is not None:
+            return buf_pool.decoder_recovered_buf[:layer_block_size]
+        if slot == 1 and buf_pool.decoder_recovered_buf2 is not None:
+            return buf_pool.decoder_recovered_buf2[:layer_block_size]
+    recovered = torch.zeros(layer_block_size, dtype=torch.uint8)
+    native.register_buffer(recovered.data_ptr(), recovered.numel())
+    return recovered
+
+
+def _recover_one_stripe_single(
+    native,
+    stri_plan: Dict,
+    my_node: int,
+    n: int,
+    node_to_rig: Dict[int, int],
+    layer_block_size: int,
+    layer_total_bytes: int,
+    layer_buf: Optional[torch.Tensor],
+    my_blocks: Dict[int, torch.Tensor],
+    src_block_per_node: Dict[int, int],
+    buf_pool: Optional[_RecoveryBufPool],
+    layer_timing: Dict[str, float],
+    recv_threads: List[threading.Thread],
+    recv_bufs: List[torch.Tensor],
+) -> None:
+    sid = stri_plan['stripe_id']
+    decoder_node = stri_plan['decoder_node']
+    helper_nodes = stri_plan['helper_nodes']
+    failed_node = stri_plan['failed_node']
+    failed_pos = stri_plan['failed_pos']
+    decoder_pos = stri_plan['decoder_pos']
+    helper_positions = stri_plan['helper_positions']
+    original_role = stri_plan['original_role']
+    decoder_rig = node_to_rig[decoder_node]
+    failed_rig = node_to_rig[failed_node]
+
+    _helper_send_block_to_decoder(
+        native, my_node, helper_nodes, decoder_rig, sid,
+        layer_block_size, my_blocks, layer_timing,
+    )
+
+    if my_node == decoder_node:
+        for t in recv_threads:
+            t.join()
+
+        survivor_positions = [decoder_pos] + helper_positions
+        survivor_addrs = _decoder_survivor_addrs(
+            my_blocks, sid, layer_block_size, recv_bufs,
+        )
+        recovered = _alloc_decoder_recovered_buf(
+            buf_pool, layer_block_size, 0, native,
+        )
+        _t0 = time.time()
+        native.submit_stripe_decode(
+            k=n - 2,
+            survivor_positions=survivor_positions,
+            lost_position=failed_pos,
+            survivor_addrs=survivor_addrs,
+            recovered_addr=recovered.data_ptr(),
+            block_size=layer_block_size,
+        )
+        layer_timing['decode_s'] += time.time() - _t0
+
+        _t0 = time.time()
+        native.send_to_peer(failed_rig, sid, recovered.data_ptr(), recovered.numel())
+        layer_timing['rdma_xfer_s'] += time.time() - _t0
+
+    if my_node == failed_node:
+        if buf_pool is not None and buf_pool.failed_recv_buf is not None:
+            recv_buf = buf_pool.failed_recv_buf[:layer_block_size]
+        else:
+            recv_buf = allocate_hugepage_tensor(
+                layer_block_size, fallback_pin_memory=True,
+            )
+            native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
+        _t0 = time.time()
+        native.recv_from_peer(decoder_rig, sid, recv_buf.data_ptr(), recv_buf.numel())
+        layer_timing['rdma_xfer_s'] += time.time() - _t0
+
+        if layer_buf is not None and original_role == int(StripeRole.SOURCE):
+            blk_idx = src_block_per_node[my_node]
+            src_block_per_node[my_node] += 1
+            offset = blk_idx * layer_block_size
+            ncopy = min(layer_block_size, max(0, layer_total_bytes - offset))
+            if ncopy > 0:
+                layer_buf[offset:offset + ncopy].copy_(recv_buf[:ncopy])
+
+
+def _recover_one_stripe_dual(
+    native,
+    stri_plan: Dict,
+    my_node: int,
+    n: int,
+    node_to_rig: Dict[int, int],
+    layer_block_size: int,
+    layer_total_bytes: int,
+    layer_buf: Optional[torch.Tensor],
+    my_blocks: Dict[int, torch.Tensor],
+    src_block_per_node: Dict[int, int],
+    buf_pool: Optional[_RecoveryBufPool],
+    layer_timing: Dict[str, float],
+    recv_threads: List[threading.Thread],
+    recv_bufs: List[torch.Tensor],
+) -> None:
+    """Dual failure: helpers send once; decoder RS-decodes twice and sends in parallel."""
+    sid = stri_plan['stripe_id']
+    decoder_node = stri_plan['decoder_node']
+    helper_nodes = stri_plan['helper_nodes']
+    decoder_pos = stri_plan['decoder_pos']
+    helper_positions = stri_plan['helper_positions']
+    survivor_positions = stri_plan['survivor_positions']
+    failed_targets = stri_plan['failed_targets']
+    decoder_rig = node_to_rig[decoder_node]
+
+    _helper_send_block_to_decoder(
+        native, my_node, helper_nodes, decoder_rig, sid,
+        layer_block_size, my_blocks, layer_timing,
+    )
+
+    if my_node == decoder_node:
+        for t in recv_threads:
+            t.join()
+
+        survivor_addrs = _decoder_survivor_addrs(
+            my_blocks, sid, layer_block_size, recv_bufs,
+        )
+        send_jobs: List[Tuple[int, torch.Tensor]] = []
+        for slot, target in enumerate(failed_targets):
+            recovered = _alloc_decoder_recovered_buf(
+                buf_pool, layer_block_size, slot, native,
+            )
+            _t0 = time.time()
+            native.submit_stripe_decode(
+                k=n - 2,
+                survivor_positions=survivor_positions,
+                lost_position=target['failed_pos'],
+                survivor_addrs=survivor_addrs,
+                recovered_addr=recovered.data_ptr(),
+                block_size=layer_block_size,
+            )
+            layer_timing['decode_s'] += time.time() - _t0
+            failed_rig = node_to_rig[target['failed_node']]
+            send_jobs.append((failed_rig, recovered))
+
+        send_threads: List[threading.Thread] = []
+        for failed_rig, recovered in send_jobs:
+            def _send(frig=failed_rig, rec=recovered, timing=layer_timing):
+                _t0 = time.time()
+                native.send_to_peer(frig, sid, rec.data_ptr(), rec.numel())
+                timing['rdma_xfer_s'] += time.time() - _t0
+
+            t = threading.Thread(target=_send, daemon=True)
+            t.start()
+            send_threads.append(t)
+        for t in send_threads:
+            t.join()
+
+    for target in failed_targets:
+        if my_node != target['failed_node']:
+            continue
+        if buf_pool is not None and buf_pool.failed_recv_buf is not None:
+            recv_buf = buf_pool.failed_recv_buf[:layer_block_size]
+        else:
+            recv_buf = allocate_hugepage_tensor(
+                layer_block_size, fallback_pin_memory=True,
+            )
+            native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
+        _t0 = time.time()
+        native.recv_from_peer(decoder_rig, sid, recv_buf.data_ptr(), recv_buf.numel())
+        layer_timing['rdma_xfer_s'] += time.time() - _t0
+
+        original_role = target['original_role']
+        if layer_buf is not None and original_role == int(StripeRole.SOURCE):
+            blk_idx = src_block_per_node[my_node]
+            src_block_per_node[my_node] += 1
+            offset = blk_idx * layer_block_size
+            ncopy = min(layer_block_size, max(0, layer_total_bytes - offset))
+            if ncopy > 0:
+                layer_buf[offset:offset + ncopy].copy_(recv_buf[:ncopy])
+
+
 def _recover_one_layer_network(
     manager,
     native,
@@ -1238,7 +1563,9 @@ def _recover_one_layer_network(
 
     decoder_stripes = [p for p in manager.recovery_stripe_plans if my_node == p['decoder_node']]
     helper_stripes = [p for p in manager.recovery_stripe_plans if my_node in p['helper_nodes']]
-    failed_stripes = [p for p in manager.recovery_stripe_plans if my_node == p['failed_node']]
+    failed_stripes = [
+        p for p in manager.recovery_stripe_plans if _is_failed_in_recovery_plan(p, my_node)
+    ]
     is_failed = len(failed_stripes) > 0
 
     logger.info(
@@ -1268,136 +1595,33 @@ def _recover_one_layer_network(
             )
         layer_buf.zero_()
 
-    # Node ID → rig mapping
     node_to_rig = {i + 1: i for i in range(n)}
-
-    # Tracks SOURCE block indices (matches save order: increment only for SOURCE stripes)
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
-
-    import threading
 
     for stri_plan in manager.recovery_stripe_plans:
         sid = stri_plan['stripe_id']
         decoder_node = stri_plan['decoder_node']
         helper_nodes = stri_plan['helper_nodes']
-        failed_node = stri_plan['failed_node']
-        failed_pos = stri_plan['failed_pos']
-        decoder_pos = stri_plan['decoder_pos']
-        helper_positions = stri_plan['helper_positions']
-        original_role = stri_plan['original_role']
 
-        decoder_rig = node_to_rig[decoder_node]
-        failed_rig = node_to_rig[failed_node]
+        recv_threads, recv_bufs = _decoder_post_helper_recvs(
+            native, my_node, decoder_node, helper_nodes, node_to_rig,
+            sid, layer_block_size, buf_pool, layer_timing,
+        )
 
-        # --- Decoder: post async recvs; helpers send after recvs are posted ---
-        recv_threads: List[threading.Thread] = []
-        recv_bufs: List[torch.Tensor] = []
-        recv_ready = threading.Event()
-        recv_ready_count = {'n': 0}
-        recv_ready_lock = threading.Lock()
-        n_helper_recvs = len(helper_nodes) if my_node == decoder_node else 0
-
-        if my_node == decoder_node:
-            for hi, helper_node in enumerate(helper_nodes):
-                helper_rig = node_to_rig[helper_node]
-                if (
-                    buf_pool is not None
-                    and hi < len(buf_pool.decoder_recv_bufs)
-                ):
-                    recv_buf = buf_pool.decoder_recv_bufs[hi][:layer_block_size]
-                else:
-                    recv_buf = allocate_hugepage_tensor(
-                        layer_block_size, fallback_pin_memory=True,
-                    )
-                    native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
-                recv_bufs.append(recv_buf)
-
-                def _recv_thread(
-                    rb=recv_buf, hrig=helper_rig, timing=layer_timing,
-                    ready=recv_ready, ready_count=recv_ready_count,
-                    ready_lock=recv_ready_lock, n_ready=n_helper_recvs,
-                ):
-                    with ready_lock:
-                        ready_count['n'] += 1
-                        if ready_count['n'] >= n_ready:
-                            ready.set()
-                    _t0 = time.time()
-                    native.recv_from_peer(hrig, sid, rb.data_ptr(), rb.numel())
-                    timing['rdma_xfer_s'] += time.time() - _t0
-
-                t = threading.Thread(target=_recv_thread, daemon=True)
-                t.start()
-                recv_threads.append(t)
-
-            if n_helper_recvs > 0:
-                recv_ready.wait(timeout=30.0)
-
-        # --- Helpers: send blocks to decoder ---
-        if my_node in helper_nodes:
-            my_block = my_blocks.get(sid)
-            if my_block is None:
-                my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
-                native.register_buffer(my_block.data_ptr(), my_block.numel())
-            _t0 = time.time()
-            native.send_to_peer(decoder_rig, sid, my_block.data_ptr(), my_block.numel())
-            layer_timing['rdma_xfer_s'] += time.time() - _t0
-
-        # --- Decoder: join, decode, send to failed ---
-        if my_node == decoder_node:
-            for t in recv_threads:
-                t.join()
-
-            k = n - 2
-            survivor_positions = [decoder_pos] + helper_positions
-            survivor_addrs = []
-
-            my_block = my_blocks.get(sid)
-            if my_block is None:
-                my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
-            survivor_addrs.append(my_block.data_ptr())
-            for recv_buf in recv_bufs:
-                survivor_addrs.append(recv_buf.data_ptr())
-
-            if buf_pool is not None and buf_pool.decoder_recovered_buf is not None:
-                recovered = buf_pool.decoder_recovered_buf[:layer_block_size]
-            else:
-                recovered = torch.zeros(layer_block_size, dtype=torch.uint8)
-                native.register_buffer(recovered.data_ptr(), recovered.numel())
-            _t0 = time.time()
-            native.submit_stripe_decode(
-                k=k,
-                survivor_positions=survivor_positions,
-                lost_position=failed_pos,
-                survivor_addrs=survivor_addrs,
-                recovered_addr=recovered.data_ptr(),
-                block_size=layer_block_size,
+        if stri_plan.get('dual_failure'):
+            _recover_one_stripe_dual(
+                native, stri_plan, my_node, n, node_to_rig,
+                layer_block_size, layer_total_bytes, layer_buf, my_blocks,
+                src_block_per_node, buf_pool, layer_timing,
+                recv_threads, recv_bufs,
             )
-            layer_timing['decode_s'] += time.time() - _t0
-
-            _t0 = time.time()
-            native.send_to_peer(failed_rig, sid, recovered.data_ptr(), recovered.numel())
-            layer_timing['rdma_xfer_s'] += time.time() - _t0
-
-        # --- Failed rank: recv decoded block ---
-        if my_node == failed_node:
-            if buf_pool is not None and buf_pool.failed_recv_buf is not None:
-                recv_buf = buf_pool.failed_recv_buf[:layer_block_size]
-            else:
-                recv_buf = allocate_hugepage_tensor(
-                    layer_block_size, fallback_pin_memory=True,
-                )
-                native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
-            _t0 = time.time()
-            native.recv_from_peer(decoder_rig, sid, recv_buf.data_ptr(), recv_buf.numel())
-            layer_timing['rdma_xfer_s'] += time.time() - _t0
-
-            if layer_buf is not None and original_role == int(StripeRole.SOURCE):
-                blk_idx = src_block_per_node[my_node]
-                src_block_per_node[my_node] += 1
-                offset = blk_idx * layer_block_size
-                ncopy = min(layer_block_size, max(0, layer_total_bytes - offset))
-                if ncopy > 0:
-                    layer_buf[offset:offset + ncopy].copy_(recv_buf[:ncopy])
+        else:
+            _recover_one_stripe_single(
+                native, stri_plan, my_node, n, node_to_rig,
+                layer_block_size, layer_total_bytes, layer_buf, my_blocks,
+                src_block_per_node, buf_pool, layer_timing,
+                recv_threads, recv_bufs,
+            )
 
     if is_failed:
         n_stored = src_block_per_node.get(my_node, 0)
@@ -1494,22 +1718,11 @@ def recover_frcheck_legacy_hardware(
     )
 
     # All ranks must participate in the same metadata all_gather (failed ranks may
-    # lack local main.pt). Survivors load tensor_buffer locally afterward.
-    survivor_main_cached: Optional[Dict[str, Any]] = None
+    # lack local main.pt).
     t_main = time.time()
     main_payload = _load_frcheck_main_payload(
         checkpoint_dir, rank, world_size, load_tensor_buffer=False,
     )
-    if is_survivor:
-        main_path = checkpoint_dir / f"frcheck_main_rank{rank}.pt"
-        if main_path.is_file():
-            local_full = _read_local_frcheck_main_payload(
-                checkpoint_dir, rank, load_tensor_buffer=True,
-            )
-            survivor_main_cached = dict(main_payload)
-            survivor_main_cached["tensor_buffer"] = local_full.get("tensor_buffer")
-        else:
-            survivor_main_cached = main_payload
     timings['main_io'] = time.time() - t_main
 
     all_tensor_infos, all_layer_order, all_layer_metadata = _frcheck_metadata_from_payload(
@@ -1587,6 +1800,7 @@ def recover_frcheck_legacy_hardware(
     )
     buf_pool = _allocate_recovery_buf_pool(
         native, n, max_block_size, is_failed, is_decoder, is_helper,
+        dual_failure=getattr(manager, 'recovery_dual_failure', False),
     )
 
     full_buf = None
@@ -1667,12 +1881,9 @@ def recover_frcheck_legacy_hardware(
 
     t_rebuild = time.time()
     if is_survivor:
-        own_payload = survivor_main_cached
-        if own_payload is None:
-            own_payload = _read_local_frcheck_main_payload(
-                checkpoint_dir, rank, load_tensor_buffer=True,
-            )
-        result = _reconstruct_from_main_payload(own_payload, flat_key_roots)
+        result = _assemble_state_dict_from_local_blocks(
+            checkpoint_name, main_payload=main_payload, teardown_native=False,
+        )
     else:
         main_payload['tensor_buffer'] = full_buf[:total_tensor_size].clone()
         result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
@@ -1683,18 +1894,19 @@ def recover_frcheck_legacy_hardware(
 
 
 def _reconstruct_from_main_payload(main_payload: Dict, flat_key_roots: list = None) -> Dict[str, Any]:
-    """Reconstruct state_dict from a main payload that contains tensor_infos + tensor_buffer."""
+    """Reconstruct state_dict from metadata + assembled tensor_buffer."""
     tensor_infos = main_payload.get("tensor_infos", [])
     non_tensor_data = main_payload.get("non_tensor_data", {})
     flat_key_roots = flat_key_roots or main_payload.get("flat_key_roots", [])
 
-    # Check if tensor_buffer is in the payload
     tensor_buffer = main_payload.get("tensor_buffer")
-    if tensor_buffer is not None:
-        buf = tensor_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
-        tensor_data = extract_tensors_from_continuous_buffer(buf, tensor_infos)
-    else:
-        tensor_data = []
+    if tensor_buffer is None:
+        raise RuntimeError(
+            "FRCheck load: tensor_buffer missing in main payload; "
+            "assemble from local FRBK SOURCE blocks before reconstruct."
+        )
+    buf = tensor_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
+    tensor_data = extract_tensors_from_continuous_buffer(buf, tensor_infos)
 
     decomposed = DecomposedStateDict(
         non_tensor_data=non_tensor_data,
@@ -1711,135 +1923,100 @@ def _reconstruct_from_main_payload(main_payload: Dict, flat_key_roots: list = No
 
 
 # ---------------------------------------------------------------------------
-# Software failure recovery helpers
+# Load from local SOURCE FRBK blocks (metadata-only main)
 # ---------------------------------------------------------------------------
 
-def _parse_poa_table(poa_path: str, n: int) -> List[List[int]]:
-    """Parse POA table text file.
+def _compile_stripe_plans_for_load(
+    poa_path: str, rank_in_group: int,
+) -> List[StripePlan]:
+    """Lightweight POA compile for load (no RDMA init)."""
+    import glob
+    import importlib.util
+    import os
 
-    Format: lines starting with # are comments. Data lines have n
-    space-separated integers (1-based node IDs).
+    from megatron.core.dist_checkpointing.strategies import frcheck_manager as _fm
 
-    Returns list of rows, each a list of n ints.
-    """
-    rows: List[List[int]] = []
-    with open(poa_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) != n:
-                continue
-            rows.append([int(p) for p in parts])
-    if len(rows) != n * (n - 1):
-        logger.warning(
-            f"FRCheck: POA table at {poa_path} has {len(rows)} rows, "
-            f"expected {n * (n - 1)} for n={n}"
+    strategies_dir = os.path.dirname(os.path.abspath(_fm.__file__))
+    so_files = glob.glob(os.path.join(strategies_dir, "frcheck_native*.so"))
+    if not so_files:
+        raise RuntimeError("FRCheck load: frcheck_native*.so not found")
+    spec = importlib.util.spec_from_file_location("frcheck_native", so_files[0])
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    native = mod.FRCheckNative(poa_path)
+    native.compile_plans(rank_in_group)
+    stripe_plans: List[StripePlan] = []
+    for sid in range(native.num_stripes()):
+        stripe_plans.append(
+            StripePlan(
+                stripe_id=sid,
+                row=list(native.row(sid)),
+                role=StripeRole(native.get_role_for_stripe(sid)),
+                source_node_ids=list(native.get_source_node_ids(sid)),
+                encoder_node_id=native.get_encoder_node_id(sid),
+                parity_target_node_id=native.get_parity_target_node_id(sid),
+            )
         )
-    return rows
+    return stripe_plans
 
 
-def _find_source_stripes(
-    poa_rows: List[List[int]], my_node: int, n: int
-) -> List[Tuple[int, int]]:
-    """Find stripes where *my_node* (1-based) is a SOURCE.
-
-    Returns list of (stripe_id, blk_idx) sorted by stripe_id.
-    blk_idx is the 0-based accumulation index for SOURCE blocks of this node.
-    """
-    k = n - 2  # SOURCE columns are 0 .. k-1
+def _enumerate_source_stripes(stripe_plans: List[StripePlan]) -> List[Tuple[int, int]]:
+    """Return (stripe_id, blk_idx) for each SOURCE stripe (matches save order)."""
     result: List[Tuple[int, int]] = []
     blk_idx = 0
-    for stripe_id, row in enumerate(poa_rows):
-        for col in range(k):
-            if row[col] == my_node:
-                result.append((stripe_id, blk_idx))
-                blk_idx += 1
-                break
+    for plan in stripe_plans:
+        if plan.role == StripeRole.SOURCE:
+            result.append((plan.stripe_id, blk_idx))
+            blk_idx += 1
     return result
 
 
-def _recover_frcheck_legacy_software(
-    checkpoint_name: str, failed_ranks: List[int]
+def _assemble_state_dict_from_local_blocks(
+    checkpoint_name: str,
+    main_payload: Optional[Dict[str, Any]] = None,
+    teardown_native: bool = True,
 ) -> Dict[str, Any]:
-    """FRCheck legacy software failure recovery.
-
-    Failed ranks read their SOURCE stripe blocks from local disk and reassemble
-    the tensor buffer. Non-failed ranks load from main.pt directly.
-    No network transfer — source data is always stored locally.
-    """
-    start_time = time.time()
+    """Assemble state_dict from metadata-only main + local SOURCE FRBK shards."""
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    world_size = (
+        torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    )
 
-    # --- Load main payload for metadata ---
+    if main_payload is None:
+        main_payload = _load_frcheck_main_payload(
+            checkpoint_dir, rank, world_size, load_tensor_buffer=False,
+        )
+
     main_path = checkpoint_dir / f"frcheck_main_rank{rank}.pt"
-    if not main_path.is_file():
-        raise FileNotFoundError(
-            f"FRCheck SW recovery: missing main file {main_path}. "
-            f"In software failure, main.pt must exist on disk."
-        )
-
-    from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_FRCHECK
-    if is_raw_format(str(main_path), MAGIC_FRCHECK):
-        main_payload = read_raw_checkpoint(str(main_path), MAGIC_FRCHECK)
-    else:
-        main_payload = torch.load(main_path, map_location="cpu", weights_only=False)
-
-    is_failed = rank in failed_ranks
-
-    if not is_failed:
-        # --- Non-failed rank: normal load from main.pt ---
-        flat_key_roots = main_payload.get("flat_key_roots", [])
-        result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
-        logger.info(
-            f"FRCheck SW recovery: rank {rank} (non-failed) loaded normally"
-        )
-        _teardown_frcheck_native_after_load()
-        return result
-
-    # --- Failed rank: recover from local SOURCE stripe blocks ---
-    n = int(main_payload.get("n", 0))
-    if n < 3:
-        raise RuntimeError(f"FRCheck SW recovery: invalid n={n} in main payload")
+    if main_path.is_file():
+        _assert_frcheck_main_metadata_only(main_path)
 
     poa_path = main_payload.get("poa_path", "")
     if not poa_path:
-        raise RuntimeError("FRCheck SW recovery: poa_path not found in main payload")
+        raise RuntimeError("FRCheck load: poa_path missing in main metadata")
 
+    rank_in_group = int(main_payload.get("rank_in_group", 0))
     layer_names = main_payload.get("layer_names", [])
     if not layer_names:
-        raise RuntimeError("FRCheck SW recovery: layer_names empty in main payload")
+        raise RuntimeError("FRCheck load: layer_names empty in main metadata")
 
     total_tensor_size = int(main_payload.get("actual_tensor_size", 0))
     global_tensor_infos = main_payload.get("tensor_infos", [])
-    non_tensor_data = main_payload.get("non_tensor_data", {})
     flat_key_roots = main_payload.get("flat_key_roots", [])
 
-    my_node = main_payload.get("rank_in_group", 0) + 1  # 1-based node id
+    stripe_plans = _compile_stripe_plans_for_load(poa_path, rank_in_group)
+    source_stripes = _enumerate_source_stripes(stripe_plans)
+    num_source = len(source_stripes)
 
     logger.info(
-        f"FRCheck SW recovery: rank {rank} (failed) — n={n}, my_node={my_node}, "
-        f"layers={len(layer_names)}, total_tensor={total_tensor_size / (1024**2):.1f} MB"
+        "FRCheck load: rank=%d assembling from %d SOURCE stripes, layers=%d",
+        rank, num_source, len(layer_names),
     )
 
-    # Parse POA table once
-    poa_rows = _parse_poa_table(poa_path, n)
-    source_stripes_global = _find_source_stripes(poa_rows, my_node, n)
-    num_source = len(source_stripes_global)
-    logger.info(
-        f"FRCheck SW recovery: rank {rank} has {num_source} SOURCE stripes"
-    )
-
-    # Allocate full recovered buffer
     safety_margin = max(int(total_tensor_size * 0.01), 4096)
     full_buf = torch.zeros(total_tensor_size + safety_margin, dtype=torch.uint8)
-
-    # Recover each layer: build per-layer buffer from source blocks,
-    # then map to full_buf using global tensor_infos offsets.
-    # Build a key→(layer_buf, local_offset) lookup from layer_infos.
     key_to_local: Dict[str, Tuple[torch.Tensor, int]] = {}
 
     for layer_name in layer_names:
@@ -1847,16 +2024,17 @@ def _recover_frcheck_legacy_software(
         layer_main_path = layer_dir / f"frcheck_layer_main_rank{rank}.pt"
         if not layer_main_path.is_file():
             logger.warning(
-                f"FRCheck SW recovery: missing layer_main for {layer_name}, skipping"
+                "FRCheck load: missing layer_main for %s, skipping", layer_name,
             )
             continue
 
         layer_meta = torch.load(layer_main_path, map_location="cpu", weights_only=False)
-        layer_block_size = layer_meta.get("block_size", 64 * 1024 * 1024)
+        layer_block_size = int(layer_meta.get("block_size", 0))
+        if layer_block_size <= 0:
+            raise RuntimeError(
+                f"FRCheck load: invalid block_size for layer {layer_name}"
+            )
         layer_infos = layer_meta.get("tensor_infos", [])
-        layer_tensor_size = layer_meta.get("actual_tensor_size", 0)
-
-        source_stripes = _find_source_stripes(poa_rows, my_node, n)
         layer_buf = torch.zeros(num_source * layer_block_size, dtype=torch.uint8)
 
         for stripe_id, blk_idx in source_stripes:
@@ -1866,105 +2044,80 @@ def _recover_frcheck_legacy_software(
             blk = _read_frbk_block(str(block_path))
             if blk is None:
                 logger.warning(
-                    f"FRCheck SW recovery: missing block {block_path}, skipping"
+                    "FRCheck load: missing block %s, skipping stripe", block_path,
                 )
                 continue
             src_offset = blk_idx * layer_block_size
-            ncopy = min(blk.numel(), max(0, layer_tensor_size - src_offset))
-            if ncopy > 0:
-                layer_buf[src_offset:src_offset + ncopy].copy_(blk[:ncopy])
+            copy_len = min(layer_block_size, blk.numel())
+            layer_buf[src_offset:src_offset + copy_len].copy_(blk[:copy_len])
 
-        # Build lookup: tensor key -> (layer_buf, local_offset)
         for info in layer_infos:
             key = getattr(info, "key", "")
-            local_offset = getattr(info, "offset", 0)
-            key_to_local[key] = (layer_buf, local_offset)
+            if key:
+                key_to_local[key] = (layer_buf, getattr(info, "offset", 0))
 
-    # Map global tensor_infos → full_buf using key→local lookup
     for global_info in global_tensor_infos:
         key = getattr(global_info, "key", "")
-        if key in key_to_local:
-            layer_buf, local_offset = key_to_local[key]
-            global_offset = getattr(global_info, "offset", 0)
-            size = getattr(global_info, "size_bytes", 0)
-            if size > 0 and global_offset + size <= full_buf.numel():
-                full_buf[global_offset:global_offset + size].copy_(
-                    layer_buf[local_offset:local_offset + size]
-                )
+        if key not in key_to_local:
+            continue
+        layer_buf, local_offset = key_to_local[key]
+        global_offset = getattr(global_info, "offset", 0)
+        size = getattr(global_info, "size_bytes", 0)
+        if size > 0 and global_offset + size <= full_buf.numel():
+            full_buf[global_offset:global_offset + size].copy_(
+                layer_buf[local_offset:local_offset + size]
+            )
 
-    # Reconstruct state dict from recovered full buffer
-    main_payload["tensor_buffer"] = full_buf[:total_tensor_size].clone()
-    result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
-
-    _teardown_frcheck_native_after_load()
+    payload = dict(main_payload)
+    payload["tensor_buffer"] = full_buf[:total_tensor_size].clone()
+    result = _reconstruct_from_main_payload(payload, flat_key_roots)
+    if teardown_native:
+        _teardown_frcheck_native_after_load()
     return result
 
 
 def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     """Load FRCheck legacy checkpoint.
 
-    Supports three modes:
-    - Software failure (--use-frcheck-software-failure): failed ranks read
-      SOURCE stripe blocks from local disk and reassemble.
-    - Hardware failure (--use-frcheck-hardware-failure): failed ranks recover
-      via RDMA RS decode from surviving ranks.
+    Default: all ranks assemble tensor data from local SOURCE FRBK blocks;
+    main files provide metadata only.
+
+    Hardware recovery (--use-frcheck-hardware-failure): failed ranks recover
+    via RDMA RS decode; survivors assemble from local blocks like normal load.
     """
     from megatron.training import get_args
     args = get_args()
 
-    sw_failure = getattr(args, "use_frcheck_software_failure", False)
     hw_failure = getattr(args, "use_frcheck_hardware_failure", False)
     failed_ranks_str = getattr(args, "frcheck_failed_ranks", None)
     failed_ranks_parsed = getattr(args, "frcheck_failed_ranks_parsed", None)
     logger.info(
-        "FRCheck load: sw_failure=%s hw_failure=%s failed_ranks_raw=%r failed_ranks_parsed=%r",
-        sw_failure, hw_failure, failed_ranks_str, failed_ranks_parsed,
+        "FRCheck load: hw_failure=%s failed_ranks_raw=%r failed_ranks_parsed=%r",
+        hw_failure, failed_ranks_str, failed_ranks_parsed,
     )
 
-    # Resolve failed ranks list
     failed_ranks = failed_ranks_parsed
     if failed_ranks is None and failed_ranks_str:
         failed_ranks = [int(x.strip()) for x in failed_ranks_str.split(",")]
 
-    # Check for software failure mode
-    if sw_failure:
-        if not failed_ranks:
-            logger.warning(
-                "FRCheck: --use-frcheck-software-failure set but no "
-                "--frcheck-failed-ranks provided"
-            )
-            failed_ranks = []
-        logger.info("FRCheck: software failure mode — failed ranks %s", failed_ranks)
-        _t_fr: Dict[str, float] = {}
-        _t0 = time.time()
-        result = _recover_frcheck_legacy_software(checkpoint_name, failed_ranks)
-        _t_fr['network_encode'] = time.time() - _t0
-        _t_fr['rebuild_sd'] = 0.0
-        _t_fr['total'] = _t_fr['network_encode']
+    if hw_failure and failed_ranks:
+        logger.info("FRCheck: hardware recovery mode — failed ranks %s", failed_ranks)
+        result, _t_fr = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
+        _t_fr['total'] = _t_fr['network_encode'] + _t_fr['rebuild_sd']
         logger.info(
-            "FRCheck legacy load timing (SW): "
-            "total=%(total).2fs network_encode=%(network_encode).2fs "
-            "rebuild_sd=%(rebuild_sd).2fs", _t_fr
+            "FRCheck legacy load timing (HW): "
+            "total=%(total).2fs prep=%(prep).2fs main_io=%(main_io).2fs "
+            "disk_io=%(disk_io).2fs network_encode=%(network_encode).2fs "
+            "rebuild_sd=%(rebuild_sd).2fs rdma_xfer=%(rdma_xfer).2fs "
+            "decode=%(decode).2fs (prep excluded from total)",
+            _t_fr,
         )
         return result
 
-    # Check for hardware recovery mode
-    if hw_failure:
-        if failed_ranks:
-            logger.info("FRCheck: hardware recovery mode — failed ranks %s", failed_ranks)
-            result, _t_fr = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
-            _t_fr['total'] = _t_fr['network_encode'] + _t_fr['rebuild_sd']
-            logger.info(
-                "FRCheck legacy load timing (HW): "
-                "total=%(total).2fs prep=%(prep).2fs main_io=%(main_io).2fs "
-                "disk_io=%(disk_io).2fs network_encode=%(network_encode).2fs "
-                "rebuild_sd=%(rebuild_sd).2fs rdma_xfer=%(rdma_xfer).2fs "
-                "decode=%(decode).2fs (prep excluded from total)",
-                _t_fr,
-            )
-            return result
-
-    raise NotImplementedError(
-        "FRCheck legacy load (non-recovery) is not implemented; use a checkpoint saved "
-        "with another format or extend load_frcheck_legacy_checkpoint."
+    t0 = time.time()
+    result = _assemble_state_dict_from_local_blocks(checkpoint_name)
+    logger.info(
+        "FRCheck legacy load timing: assemble_from_blocks %.2fs",
+        time.time() - t0,
     )
+    return result

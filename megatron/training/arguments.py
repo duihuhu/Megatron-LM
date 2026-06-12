@@ -2376,12 +2376,6 @@ def _add_checkpointing_args(parser):
                             'When set, these ranks force recovery from surviving stripe blocks '
                             'even if their main files exist. '
                             'Used with --use-frcheck-hardware-failure for testing.')
-    group.add_argument('--use-frcheck-software-failure', action='store_true',
-                       help='Enable FRCheck software failure recovery. '
-                            'Failed ranks read their SOURCE stripe blocks from local disk '
-                            'and reassemble. No network transfer needed — source data is always '
-                            'stored locally. Use with --frcheck-failed-ranks to specify which '
-                            'ranks to treat as failed.')
     group.add_argument('--frcheck-debug', action='store_true',
                        help='Enable detailed size/encoding debug logging for FRCheck operations.')
 

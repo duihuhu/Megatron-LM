@@ -103,6 +103,7 @@ class FRCheckManager:
         self.is_recovery_mode: bool = False
         self.failed_global_ranks: List[int] = []
         self.recovery_stripe_plans: List[Dict] = []  # Per-stripe recovery plan
+        self.recovery_dual_failure: bool = False
         # Per-stripe recovery buffers
         self.recovery_helper_bufs: List[Optional[torch.Tensor]] = []
         self.recovery_decoder_bufs: List[Optional[torch.Tensor]] = []
@@ -662,6 +663,16 @@ class FRCheckManager:
 
     # ---- Hardware recovery ----
 
+    @staticmethod
+    def _role_for_node_in_row(row: List[int], node_id: int, n: int) -> StripeRole:
+        """Stripe role for a node id (1-based) in a POA row."""
+        pos = row.index(node_id)
+        if pos < n - 2:
+            return StripeRole.SOURCE
+        if pos == n - 2:
+            return StripeRole.ENCODER
+        return StripeRole.PARITY_TARGET
+
     def _compile_recovery_plans(self, failed_rank_node: int) -> List[Dict]:
         """For each stripe, compute recovery roles (DECODER/HELPER/FAILED_RANK)
         given the failed rank's node id (1-based in the POA table).
@@ -688,12 +699,62 @@ class FRCheckManager:
 
             plans.append({
                 'stripe_id': sid,
+                'dual_failure': False,
                 'failed_node': failed_rank_node,
                 'failed_pos': failed_pos,
                 'decoder_node': decoder_node,
                 'decoder_pos': decoder_pos,
                 'helper_nodes': helper_nodes,
                 'helper_positions': helper_positions,
+                'original_role': int(sp.role),
+            })
+        return plans
+
+    def _compile_recovery_plans_dual(self, failed_nodes: List[int]) -> List[Dict]:
+        """Per-stripe dual-failure plan: helpers send once, decoder recovers both erasures."""
+        if len(failed_nodes) != 2:
+            raise RuntimeError(
+                f"FRCheck dual recovery requires exactly 2 failed nodes, got {failed_nodes}"
+            )
+        n = self.frcheck_n
+        failed_set = set(failed_nodes)
+        plans = []
+        for sp in self.stripe_plans:
+            row = sp.row
+            sid = sp.stripe_id
+            failed_targets = []
+            for fn in failed_nodes:
+                try:
+                    fp = row.index(fn)
+                except ValueError:
+                    raise RuntimeError(
+                        f"FRCheck dual recovery: failed node {fn} missing in stripe {sid}"
+                    )
+                failed_targets.append({
+                    'failed_node': fn,
+                    'failed_pos': fp,
+                    'original_role': int(
+                        self._role_for_node_in_row(row, fn, n)
+                    ),
+                })
+            survivor_positions = [i for i in range(n) if row[i] not in failed_set]
+            if len(survivor_positions) != n - 2:
+                raise RuntimeError(
+                    f"FRCheck dual recovery: stripe {sid} expected {n - 2} survivors, "
+                    f"got {len(survivor_positions)}"
+                )
+            decoder_pos = survivor_positions[0]
+            helper_positions = survivor_positions[1:]
+            plans.append({
+                'stripe_id': sid,
+                'dual_failure': True,
+                'failed_nodes': list(failed_nodes),
+                'failed_targets': failed_targets,
+                'decoder_node': row[decoder_pos],
+                'decoder_pos': decoder_pos,
+                'helper_nodes': [row[p] for p in helper_positions],
+                'helper_positions': helper_positions,
+                'survivor_positions': survivor_positions,
                 'original_role': int(sp.role),
             })
         return plans
@@ -747,14 +808,13 @@ class FRCheckManager:
                     self.recovery_failed_bufs[sid].numel())
 
     def init_frcheck_hardware_recovery(self, failed_global_ranks: List[int]) -> Dict[int, Dict]:
-        """Initialize hardware recovery mode for a list of failed global ranks.
+        """Initialize hardware recovery mode for up to 2 failed ranks per POA group.
 
-        Each failed rank is in a different POA group (same-node failure pattern).
-        Returns a dict mapping failed_global_rank → recovery context with:
-          - 'group_id': group that contains this failed rank
-          - 'failed_rig': rank_in_group of the failed rank
-          - 'failed_node': 1-based node id in the POA table
-          - 'recovery_plans': per-stripe recovery plan
+        Single failure: per-failed-rank cyclic decoder/helper plan (HW1).
+        Dual failure: one plan per stripe; helpers send once, decoder recovers both
+        erasures and sends to both failed ranks (HW2).
+
+        Returns a dict mapping failed_global_rank → recovery context.
         """
         if not torch.distributed.is_initialized():
             raise RuntimeError("FRCheck hardware recovery requires torch.distributed")
@@ -762,13 +822,20 @@ class FRCheckManager:
         world_size = torch.distributed.get_world_size()
         my_rank = torch.distributed.get_rank()
 
+        if len(failed_global_ranks) > 2:
+            raise RuntimeError(
+                f"FRCheck hardware recovery supports at most 2 failed ranks, "
+                f"got {failed_global_ranks}"
+            )
+
         self.is_recovery_mode = True
         self.failed_global_ranks = list(failed_global_ranks)
+        self.recovery_dual_failure = False
 
         recovery_contexts: Dict[int, Dict] = {}
+        failed_in_my_group: List[int] = []
 
         for failed_rank in failed_global_ranks:
-            # Determine which group this failed rank belongs to
             group_id = self._get_group_id(failed_rank, world_size, self.frcheck_n)
             failed_rig = self._get_rank_in_group(failed_rank, world_size, self.frcheck_n)
             failed_node = failed_rig + 1  # 1-based in POA
@@ -777,9 +844,11 @@ class FRCheckManager:
                 'group_id': group_id,
                 'failed_rig': failed_rig,
                 'failed_node': failed_node,
-                'recovery_plans': self._compile_recovery_plans(failed_node),
             }
             recovery_contexts[failed_rank] = ctx
+
+            if group_id == self.group_id:
+                failed_in_my_group.append(failed_rank)
 
             if my_rank == failed_rank:
                 logger.info(
@@ -790,16 +859,33 @@ class FRCheckManager:
                     "FRCheck hardware recovery: I am in group %d with failed rank %d (rig %d)",
                     group_id, failed_rank, failed_rig)
 
-        # If I'm in a group with a failed rank, compile my per-stripe recovery role
-        my_recovery_ctx = None
-        for fr, ctx in recovery_contexts.items():
-            if ctx['group_id'] == self.group_id:
-                my_recovery_ctx = ctx
-                break
+        if len(failed_in_my_group) > 2:
+            raise RuntimeError(
+                f"FRCheck: at most 2 failed ranks per POA group, "
+                f"got {failed_in_my_group} in group {self.group_id}"
+            )
 
-        if my_recovery_ctx is not None:
-            self.recovery_stripe_plans = my_recovery_ctx['recovery_plans']
-            # Determine my role for each stripe and summary
+        if failed_in_my_group:
+            if len(failed_in_my_group) == 2:
+                failed_nodes = sorted(
+                    recovery_contexts[fr]['failed_node'] for fr in failed_in_my_group
+                )
+                self.recovery_stripe_plans = self._compile_recovery_plans_dual(
+                    failed_nodes
+                )
+                self.recovery_dual_failure = True
+                for fr in failed_in_my_group:
+                    recovery_contexts[fr]['recovery_plans'] = self.recovery_stripe_plans
+                logger.info(
+                    "FRCheck recovery: dual-failure mode failed_nodes=%s (%d stripes)",
+                    failed_nodes, len(self.recovery_stripe_plans),
+                )
+            else:
+                fr = failed_in_my_group[0]
+                failed_node = recovery_contexts[fr]['failed_node']
+                self.recovery_stripe_plans = self._compile_recovery_plans(failed_node)
+                recovery_contexts[fr]['recovery_plans'] = self.recovery_stripe_plans
+
             my_node = self.rank_in_group + 1
             n_decoder = n_helper = n_failed = 0
             for plan in self.recovery_stripe_plans:
@@ -807,12 +893,17 @@ class FRCheckManager:
                     n_decoder += 1
                 elif my_node in plan['helper_nodes']:
                     n_helper += 1
-                elif my_node == plan['failed_node']:
+                elif plan.get('dual_failure'):
+                    if my_node in plan['failed_nodes']:
+                        n_failed += 1
+                elif my_node == plan.get('failed_node'):
                     n_failed += 1
             logger.info(
                 "FRCheck recovery: my roles — %d decoder, %d helper, %d failed "
-                "(total %d relevant stripes)",
-                n_decoder, n_helper, n_failed, len(self.recovery_stripe_plans))
+                "(total %d stripes, dual=%s)",
+                n_decoder, n_helper, n_failed, len(self.recovery_stripe_plans),
+                self.recovery_dual_failure,
+            )
 
         return recovery_contexts
 
@@ -847,6 +938,7 @@ class FRCheckManager:
         self.is_recovery_mode = False
         self.failed_global_ranks = []
         self.recovery_stripe_plans = []
+        self.recovery_dual_failure = False
         self.recovery_helper_bufs = []
         self.recovery_decoder_bufs = []
         self.recovery_failed_bufs = []

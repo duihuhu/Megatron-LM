@@ -129,7 +129,6 @@ def frcheck_dist_test():
         p1 = 0
         p2_out = 0
         p2_in = 0
-        local_src = []
 
         if role == 0:
             val = rank * 100 + sid
@@ -143,19 +142,9 @@ def frcheck_dist_test():
             recv_buf.zero_()
             parity1_buf.zero_()
             parity2_buf.zero_()
-            srcs = native.get_source_node_ids(sid)
-            local = [0, 0, 0, 0]
-            for i, node in enumerate(srcs):
-                if node - 1 == rank:
-                    blk_idx = src_block_per_node
-                    src_block_per_node += 1
-                    off = blk_idx * block_size
-                    layer_buf_gpu[off : off + block_size].fill_((rank * 100 + sid) % 256)
-                    local[i] = layer_base + off
             recv_addr = recv_buf.data_ptr()
             p1 = parity1_buf.data_ptr()
             p2_out = parity2_buf.data_ptr()
-            local_src = local
         elif role == 2:
             parity2_buf.zero_()
             p2_in = parity2_buf.data_ptr()
@@ -169,7 +158,6 @@ def frcheck_dist_test():
             p2_out,
             p2_in,
             block_size,
-            local_src,
         )
 
         result = {

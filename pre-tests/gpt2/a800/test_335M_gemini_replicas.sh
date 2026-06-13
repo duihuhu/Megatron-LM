@@ -152,7 +152,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    --load $CHECKPOINT_PATH          # 取消注释以测试 load
+    #--load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
@@ -160,21 +160,21 @@ EVAL_AND_LOGGING_ARGS=(
     # 必选：启用 Gemini Replicas torch legacy checkpoint
     # ---------------------------------------------------------------------------
     # 启用 Gemini Replicas（替代原有的 --use-gemini，后者是两副本 EC 风格配对）
-    # --use-gemini-replicas
+    --use-gemini-replicas
     # 启用优化路径：使用连续 CPU buffer + C++ ASIO/RDMA 网络传输，跳过 torch.save 序列化开销
-    # --use-gemini-replicas-optimized
+    --use-gemini-replicas-optimized
 
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）
     # ---------------------------------------------------------------------------
-    --gemini-replicas-num 3        # 默认 3。设为 2 即两副本，设为 N 即 N 副本
+    --gemini-replicas-num 2        # 默认 3。设为 2 即两副本，设为 N 即 N 副本
                                         # 在组内 round-robin 轮询放置副本
                                         # 容错能力 = num_replicas - 1 个 rank 同时故障
 
     # ---------------------------------------------------------------------------
     # 分组大小：将 world 划分为独立组，副本仅在组内轮询
     # ---------------------------------------------------------------------------
-    --gemini-replicas-group-size 4   # 默认 None（全局轮询，不做分组）
+    --gemini-replicas-group-size 8   # 默认 None（全局轮询，不做分组）
                                         # 设 8 则每 8 个 rank 一组，每组独立
                                         # 必须能被 world_size 整除
                                         # 独立于节点数和每节点 rank 数，但数学上要求
@@ -206,8 +206,8 @@ EVAL_AND_LOGGING_ARGS=(
     #   测试方法：save 完成后直接 load，加下面参数。
     #   示例："2,3" 表示 rank2 和 rank3 当作故障处理。
     #
-    --use-gemini-replicas-software-failure
-    --gemini-replicas-recovery-rank "0"
+    #--use-gemini-replicas-software-failure
+    #--gemini-replicas-recovery-rank "0"
 
     # ---------------------------------------------------------------------------
     # ckpt 格式：必须用 torch（legacy 路径）

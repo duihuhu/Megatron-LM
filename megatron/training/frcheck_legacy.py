@@ -75,6 +75,7 @@ class _LayerEncodeResult:
     actual_sizes: List[int]
     tensor_infos: List
     total_bytes: int
+    n_filled_blocks: int = 0
 
 
 @dataclass
@@ -87,8 +88,8 @@ class _LayerEncodeSubmitState:
     actual_sizes: List[int]
     data_addrs: List[int]
     mirror_addrs: List[int]
-    source_blk_idx: List[int]
     layer_buf_base: int
+    n_filled_blocks: int = 0
 
 
 def _group_by_layer(decomposed) -> List[_LayerGroup]:
@@ -181,35 +182,6 @@ def _primary_failed_rank_in_group(
 
 
 
-def _stripes_per_role(stripe_plans: List, role: StripeRole) -> int:
-    return sum(1 for sp in stripe_plans if sp.role == role)
-
-
-def _clear_accum_buffers(manager) -> None:
-    """Zero parity accumulation buffers for a fresh layer."""
-    if manager.parity1_accum is not None:
-        manager.parity1_accum.zero_()
-    if manager.parity2_accum is not None:
-        manager.parity2_accum.zero_()
-
-
-def _build_local_src_addrs(
-    plan,
-    my_node: int,
-    layer_buf_base: int,
-    block_size: int,
-    blk_idx: int,
-) -> List[int]:
-    """Build per-source local buffer addresses for encoder self-source slots."""
-    addrs = [0, 0, 0, 0]
-    if blk_idx < 0:
-        return addrs
-    for i, node_id in enumerate(plan.source_node_ids):
-        if node_id == my_node:
-            addrs[i] = layer_buf_base + blk_idx * block_size
-    return addrs
-
-
 def _register_layer_stripe_bufs(manager, native, layer_bufs: LayerStripeBufs) -> None:
     """Register per-stripe recv/parity buffers for RDMA."""
     for buf_list in (
@@ -248,23 +220,21 @@ def _prep_layer_phase1(
     data_addrs = [0] * num_stripes
     mirror_addrs = [0] * num_stripes
     actual_sizes = [0] * num_stripes
-    source_blk_idx = [-1] * num_stripes
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
+    n_filled_blocks = (layer_tensor_size + block_size - 1) // block_size if block_size > 0 else 0
+    n_filled_blocks = min(n_filled_blocks, (n - 1) * (n - 2))  # cap at n_src
 
     for stripe_id in range(num_stripes):
         plan = stripe_plans[stripe_id]
         if plan.role == StripeRole.SOURCE:
             blk_idx = src_block_per_node[my_node]
             src_block_per_node[my_node] += 1
-            src_offset = blk_idx * block_size
-            data_addrs[stripe_id] = layer_base + src_offset
-            mirror_addrs[stripe_id] = mirror_base + src_offset
-            source_blk_idx[stripe_id] = blk_idx
-            actual_sizes[stripe_id] = block_size
-        elif plan.role == StripeRole.ENCODER and my_node in plan.source_node_ids:
-            blk_idx = src_block_per_node[my_node]
-            src_block_per_node[my_node] += 1
-            source_blk_idx[stripe_id] = blk_idx
+            if blk_idx < n_filled_blocks:
+                src_offset = blk_idx * block_size
+                data_addrs[stripe_id] = layer_base + src_offset
+                mirror_addrs[stripe_id] = mirror_base + src_offset
+                actual_sizes[stripe_id] = block_size
+            # else: stays 0 → submit and disk write will skip
 
     if _dbg:
         logger.info(
@@ -282,8 +252,8 @@ def _prep_layer_phase1(
         actual_sizes=actual_sizes,
         data_addrs=data_addrs,
         mirror_addrs=mirror_addrs,
-        source_blk_idx=source_blk_idx,
         layer_buf_base=layer_base,
+        n_filled_blocks=n_filled_blocks,
     )
 
 
@@ -294,6 +264,7 @@ def _submit_stripe_chunk(
     layer_bufs: LayerStripeBufs,
     my_node: int,
     stripe_id: int,
+    encoder_active_mask: Optional[List[int]] = None,
     _dbg: bool = False,
 ) -> None:
     """Submit one segment x stripe chunk via stripe-FIFO API."""
@@ -311,7 +282,7 @@ def _submit_stripe_chunk(
     p1 = 0
     p2_out = 0
     p2_in = 0
-    local_src: List[int] = []
+    src_active = []
 
     if plan.role == StripeRole.SOURCE:
         if state.data_addrs[stripe_id] == 0:
@@ -327,10 +298,9 @@ def _submit_stripe_chunk(
         recv_buf = rb.data_ptr()
         p1 = p1b.data_ptr()
         p2_out = p2b.data_ptr()
-        local_src = _build_local_src_addrs(
-            plan, my_node, state.layer_buf_base, block_size,
-            state.source_blk_idx[stripe_id],
-        )
+        # Convert bool list to uint8 list for C++
+        if encoder_active_mask is not None:
+            src_active = [1 if v else 0 for v in encoder_active_mask]
     elif plan.role == StripeRole.PARITY_TARGET:
         p2b = p2_bufs[stripe_id]
         if p2b is None:
@@ -346,7 +316,7 @@ def _submit_stripe_chunk(
         p2_out,
         p2_in,
         block_size,
-        local_src,
+        src_active,
     )
     if _dbg:
         logger.info(
@@ -365,10 +335,36 @@ def _submit_encoding_network(
 ) -> None:
     """Segment x stripe submit loop (stripe-FIFO); caller waits separately."""
     native.reset_encoding_batch()
+    stripe_plans = manager.stripe_plans
+    n = manager.frcheck_n
+
     for state, layer_bufs in submit_states:
+        lidx = state.layer_idx
+
+        # Pre-compute per-source-node block indices across all stripes
+        # so we can determine which source ranks have data for each encoder stripe.
+        src_blk_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
+        encoder_active_masks: Dict[int, List[int]] = {}  # stripe_id → list of 0/1 per source
+
+        for sid in range(num_stripes):
+            plan = stripe_plans[sid]
+            if plan.role == StripeRole.ENCODER:
+                mask = []
+                for src_node in plan.source_node_ids:
+                    b = src_blk_per_node.get(src_node, 0)
+                    nf = manager.get_n_filled_for_node(lidx, src_node)
+                    mask.append(1 if b < nf else 0)
+                encoder_active_masks[sid] = mask
+            # Advance block index for each source in this stripe.
+            # All ranks see the same POA table, so blk_idx matches the source rank's own tracking.
+            for src_node in plan.source_node_ids:
+                src_blk_per_node[src_node] = src_blk_per_node.get(src_node, 0) + 1
+
         for stripe_id in range(num_stripes):
+            active_mask = encoder_active_masks.get(stripe_id)
             _submit_stripe_chunk(
-                manager, native, state, layer_bufs, my_node, stripe_id, _dbg,
+                manager, native, state, layer_bufs, my_node, stripe_id,
+                encoder_active_mask=active_mask, _dbg=_dbg,
             )
     native.submit_encoding_sentinel()
 
@@ -433,8 +429,8 @@ def _save_frcheck_stripe_files(
             plan = stripe_plans[sid]
             if plan.role == StripeRole.SOURCE:
                 blk_idx = _source_blk_idx_for_stripe(stripe_plans, sid)
-                if blk_idx < 0:
-                    continue
+                if blk_idx < 0 or blk_idx >= result.n_filled_blocks:
+                    continue  # skip zero-padded block
                 src_buf = layer_mirror[
                     blk_idx * block_size : (blk_idx + 1) * block_size
                 ]
@@ -447,10 +443,7 @@ def _save_frcheck_stripe_files(
                     layer_name, block_size, sid, 1, block_size,
                     layer_bufs.parity1_bufs[sid], "_p1",
                 ))
-                jobs.append((
-                    layer_name, block_size, sid, 2, block_size,
-                    layer_bufs.parity2_bufs[sid], "_p2",
-                ))
+                # P2 is written by PARITY_TARGET (not duplicated here)
             elif plan.role == StripeRole.PARITY_TARGET:
                 jobs.append((
                     layer_name, block_size, sid, 2, block_size,
@@ -469,69 +462,6 @@ def _save_frcheck_stripe_files(
         ]
         for fut in futures:
             fut.result()
-
-
-def _write_layer_shards(
-    manager,
-    checkpoint_dir: Path,
-    layer_name: str,
-    rank: int,
-    rg: int,
-    n_source_my: int,
-    n_encoder_my: int,
-    n_parity_my: int,
-    block_size: int,
-    gdr: bool,
-    tensor_buffer: Optional[torch.Tensor],
-) -> None:
-    """Write aggregated source / parity1 / parity2 shards for one layer."""
-    layer_dir = checkpoint_dir / layer_name
-    layer_dir.mkdir(parents=True, exist_ok=True)
-
-    from megatron.training.legacy_io_utils import write_raw_block, MAGIC_FRCHECK, MAGIC_FRCHECK_BLOCK
-    import struct
-
-    if n_source_my > 0 and tensor_buffer is not None:
-        source_size = n_source_my * block_size
-        source_data = tensor_buffer[:source_size]
-        if gdr:
-            source_data = source_data.cpu()
-        meta = pickle.dumps({
-            "version": 2, "format": "frcheck_torch_legacy", "rank": rank,
-            "layer_name": layer_name, "rank_in_group": rg, "role": "SOURCE",
-            "num_blocks": n_source_my, "block_size": block_size,
-        })
-        sp = str(layer_dir / f"frcheck_source_rank{rank}.pt")
-        with open(sp, "wb") as _f:
-            _f.write(struct.pack("<4sQ", MAGIC_FRCHECK_BLOCK, len(meta)))
-            _f.write(meta)
-            _f.write(memoryview(source_data[:source_size].numpy()))
-
-    if n_encoder_my > 0:
-        encoder_size = n_encoder_my * block_size
-        meta = pickle.dumps({
-            "version": 2, "format": "frcheck_torch_legacy", "rank": rank,
-            "layer_name": layer_name, "rank_in_group": rg, "role": "ENCODER",
-            "num_blocks": n_encoder_my, "block_size": block_size,
-        })
-        ep = str(layer_dir / f"frcheck_encoder_rank{rank}.pt")
-        with open(ep, "wb") as _f:
-            _f.write(struct.pack("<4sQ", MAGIC_FRCHECK_BLOCK, len(meta)))
-            _f.write(meta)
-            _f.write(memoryview(manager.parity1_accum[:encoder_size].numpy()))
-
-    if n_parity_my > 0:
-        par_size = n_parity_my * block_size
-        meta = pickle.dumps({
-            "version": 2, "format": "frcheck_torch_legacy", "rank": rank,
-            "layer_name": layer_name, "rank_in_group": rg, "role": "PARITY_TARGET",
-            "num_blocks": n_parity_my, "block_size": block_size,
-        })
-        pp = str(layer_dir / f"frcheck_parity2_rank{rank}.pt")
-        with open(pp, "wb") as _f:
-            _f.write(struct.pack("<4sQ", MAGIC_FRCHECK_BLOCK, len(meta)))
-            _f.write(meta)
-            _f.write(memoryview(manager.parity2_accum[:par_size].numpy()))
 
 
 def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
@@ -566,6 +496,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     native = manager.get_native()
     if native is None:
         raise RuntimeError("FRCheck legacy save: native module not available")
+    native.set_debug(_dbg)
     if native.group_size() != native.n():
         raise RuntimeError(
             f"FRCheck legacy save: group_size={native.group_size()} != n={native.n()}"
@@ -611,17 +542,36 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             "[FRCHECK-DEBUG] rank=%d n=%d stripes=%d roles(src=%d enc=%d par=%d) gdr=True",
             rank, n, num_stripes, n_source_my, n_encoder_my, n_parity_my,
         )
+        total_cap = 0
+        total_data = 0
         for g in layer_groups:
             lidx = g.layer_idx
             blk = manager._layer_block_sizes[lidx]
             cap = blk * n_source_my
             pad = max(0, cap - g.total_bytes)
+            pct = 100.0 * pad / cap if cap > 0 else 0
             lname = f"layer_{lidx}" if lidx >= 0 else "layer_common"
+            ns = sum(1 for p in stripe_plans if p.role == StripeRole.SOURCE)
+            ne = sum(1 for p in stripe_plans if p.role == StripeRole.ENCODER)
+            nt = sum(1 for p in stripe_plans if p.role == StripeRole.PARITY_TARGET)
+            disk_est = (ns + ne + nt) * blk  # EC expansion: src data + P1 + P2
             logger.info(
-                "[FRCHECK-DEBUG] %s: total=%d blk=%d cap=%d nsrc=%d pad=%d (%.1f%%)",
-                lname, g.total_bytes, blk, cap, n_source_my, pad,
-                100.0 * pad / cap if cap > 0 else 0,
+                "[FRCHECK-DEBUG] %s: data=%.1fMB cap=%.1fMB blk=%.1fMB pad=%.1fMB(%d%%) "
+                "disk_est=%.1fMB (src=%d+P1=%d+P2=%d stripes)",
+                lname,
+                g.total_bytes / 1e6, cap / 1e6, blk / 1e6,
+                pad / 1e6, int(pct),
+                disk_est / 1e6, ns, ne, nt,
             )
+            total_cap += cap
+            total_data += g.total_bytes
+        total_pad = total_cap - total_data
+        total_pct = 100.0 * total_pad / total_cap if total_cap > 0 else 0
+        logger.info(
+            "[FRCHECK-DEBUG] rank=%d TOTAL: data=%.1fMB cap=%.1fMB pad=%.1fMB(%.0f%%)",
+            rank, total_data / 1e6, total_cap / 1e6,
+            total_pad / 1e6, total_pct,
+        )
 
     # 5. Phase A: prep all layers (copy + register), then Phase B: batch network encode
     t_prep = time.time()
@@ -668,16 +618,11 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         submit_states.append((state, layer_bufs))
 
         if _dbg:
-            n_source_my = sum(1 for p in stripe_plans if p.role == StripeRole.SOURCE)
-            total_sent = sum(state.actual_sizes)
-            cap = layer_block_size * n_source_my
+            n_src_my = sum(1 for p in stripe_plans if p.role == StripeRole.SOURCE)
             logger.info(
-                "[FRCHECK-DEBUG] %s prep: sent=%d cap=%d pad=%d (%.1f%%), "
-                "stripe_sizes=%s",
-                layer_name, total_sent, cap, cap - total_sent,
-                100.0 * total_sent / cap if cap > 0 else 0,
-                [state.actual_sizes[s] for s in range(num_stripes)
-                 if stripe_plans[s].role == StripeRole.SOURCE],
+                "[FRCHECK-DEBUG] %s prep: copy=%d bytes → buf=%d bytes (%d src stripes)",
+                layer_name, group.total_bytes,
+                layer_buf_gpu.numel(), n_src_my,
             )
 
         encode_results.append(_LayerEncodeResult(
@@ -687,6 +632,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             actual_sizes=state.actual_sizes,
             tensor_infos=group.tensor_infos,
             total_bytes=group.total_bytes,
+            n_filled_blocks=state.n_filled_blocks,
         ))
 
     t_prep_elapsed = time.time() - t_prep

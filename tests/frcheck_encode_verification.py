@@ -67,8 +67,7 @@ for layer in LAYERS:
             "d0": rank_dir(src_r[0], use_sub) / layer / f"stripe_{sid}" / f"frcheck_shard_rank{src_r[0]}.pt",
             "d1": rank_dir(src_r[1], use_sub) / layer / f"stripe_{sid}" / f"frcheck_shard_rank{src_r[1]}.pt",
             "p1": rank_dir(enc_r, use_sub) / layer / f"stripe_{sid}" / f"frcheck_shard_rank{enc_r}_p1.pt",
-            "p2": rank_dir(enc_r, use_sub) / layer / f"stripe_{sid}" / f"frcheck_shard_rank{enc_r}_p2.pt",
-            "tgt": rank_dir(par_r, use_sub) / layer / f"stripe_{sid}" / f"frcheck_shard_rank{par_r}.pt",
+            "p2": rank_dir(par_r, use_sub) / layer / f"stripe_{sid}" / f"frcheck_shard_rank{par_r}.pt",
         }
         if not all(p.is_file() for p in paths.values()):
             layer_miss += 1
@@ -77,17 +76,16 @@ for layer in LAYERS:
         d1, _, _ = read_frbk(paths["d1"])
         p1d, _, _ = read_frbk(paths["p1"])
         p2d, _, _ = read_frbk(paths["p2"])
-        tgt, _, _ = read_frbk(paths["tgt"])
-        actual = min(sz0, len(d0), len(d1), len(p1d), len(p2d), len(tgt))
+        actual = min(sz0, len(d0), len(d1), len(p1d), len(p2d))
         d0, d1 = d0[:actual], d1[:actual]
         p1e, p2e = rs_encode(d0, d1)
-        m1, m2, mt = pct(p1e, p1d), pct(p2e, p2d), pct(p2e, tgt)
-        ok = m1 > 99.99 and m2 > 99.99 and mt > 99.99
+        m1, m2 = pct(p1e, p1d), pct(p2e, p2d)
+        ok = m1 > 99.99 and m2 > 99.99
         if ok:
             layer_ok += 1
         else:
             layer_bad += 1
-            print(f"FAIL {layer} sid={sid} POA={row}: p1_rs={m1:.2f}% p2_rs={m2:.2f}% p2_vs_tgt={mt:.2f}% actual={actual}")
+            print(f"FAIL {layer} sid={sid} POA={row}: p1_rs={m1:.2f}% p2_rs={m2:.2f}% actual={actual}")
     print(f"{layer}: OK={layer_ok}/12 bad={layer_bad} missing={layer_miss}")
     grand["ok"] += layer_ok
     grand["bad"] += layer_bad

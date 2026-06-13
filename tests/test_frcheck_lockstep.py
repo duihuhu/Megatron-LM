@@ -83,7 +83,6 @@ def main():
         p1 = 0
         p2_out = 0
         p2_in = 0
-        local_src = []
 
         if role == 0:
             blk_idx = src_block_per_node
@@ -96,19 +95,9 @@ def main():
             recv_bufs[sid].zero_()
             p1_bufs[sid].zero_()
             p2_bufs[sid].zero_()
-            srcs = native.get_source_node_ids(sid)
-            local = [0, 0, 0, 0]
-            for i, node in enumerate(srcs):
-                if node - 1 == rank:
-                    blk_idx = src_block_per_node
-                    src_block_per_node += 1
-                    off = blk_idx * bs
-                    layer_buf_gpu[off : off + bs].fill_((rank * 100 + sid) % 256)
-                    local[i] = layer_base + off
             recv_buf = recv_bufs[sid].data_ptr()
             p1 = p1_bufs[sid].data_ptr()
             p2_out = p2_bufs[sid].data_ptr()
-            local_src = local
         elif role == 2:
             p2_bufs[sid].zero_()
             p2_in = p2_bufs[sid].data_ptr()
@@ -122,7 +111,6 @@ def main():
             p2_out,
             p2_in,
             bs,
-            local_src,
         )
 
     native.submit_encoding_sentinel()

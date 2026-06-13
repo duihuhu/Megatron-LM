@@ -113,6 +113,7 @@ class FRCheckManager:
 
     _rdma_registered_addrs: set = set()
     _layer_block_sizes: Optional[Dict[int, int]] = None  # layer_idx → block_size
+    _layer_per_rank_bytes: Optional[Dict[int, Dict[int, int]]] = None  # layer_idx → {rank_in_group(0-based): total_bytes}
     _full_buf: Optional[torch.Tensor] = None
     def allocate_full_buf(self, size_bytes: int):
         """Allocate or reuse cached full tensor buffer (grows-only)."""
@@ -133,6 +134,20 @@ class FRCheckManager:
             )
         n_src = (self.frcheck_n - 1) * (self.frcheck_n - 2)
         return n_src * bs
+
+    def get_n_filled_for_node(self, layer_idx: int, node_id: int) -> int:
+        """Number of non-zero source blocks for POA node (1-based) in this layer."""
+        if self._layer_per_rank_bytes is None:
+            return 0
+        per_rank = self._layer_per_rank_bytes.get(layer_idx, {})
+        rank_in_group = node_id - 1
+        total_bytes = per_rank.get(rank_in_group, 0)
+        if total_bytes <= 0:
+            return 0
+        bs = self._layer_block_sizes.get(layer_idx, 0) if self._layer_block_sizes else 0
+        if bs <= 0:
+            return 0
+        return (total_bytes + bs - 1) // bs
 
     def compute_layer_block_sizes(self, layer_groups) -> None:
         """All_gather per-layer sizes across world, keep max in my group."""
@@ -183,6 +198,18 @@ class FRCheckManager:
                 sz = max(vals)
                 bs = int(((sz + n_src - 1) // n_src + 4095) & ~4095)
                 self._layer_block_sizes[lidx] = max(bs, 4096)
+
+        # Persist per-rank per-layer sizes for encoder active-mask computation
+        if self.group_member_ranks is not None and all_group_sizes is not None:
+            self._layer_per_rank_bytes = {}
+            for g in layer_groups:
+                lidx = g.layer_idx
+                per_rank: Dict[int, int] = {}
+                for rig, global_r in enumerate(self.group_member_ranks):
+                    d = all_group_sizes[global_r]
+                    if d is not None and lidx in d:
+                        per_rank[rig] = d[lidx]
+                self._layer_per_rank_bytes[lidx] = per_rank
 
         native = self._frcheck_native
         max_blk = max(self._layer_block_sizes.values()) if self._layer_block_sizes else self.block_size

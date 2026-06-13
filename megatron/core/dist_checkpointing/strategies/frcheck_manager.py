@@ -905,6 +905,13 @@ class FRCheckManager:
                 self.recovery_dual_failure,
             )
 
+            native = self._frcheck_native
+            if native is not None:
+                failed_nodes = sorted(
+                    recovery_contexts[fr]['failed_node'] for fr in failed_in_my_group
+                )
+                native.init_recovery_plans(failed_nodes)
+
         return recovery_contexts
 
     def _unregister_all_buffers(self) -> None:

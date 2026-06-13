@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -395,6 +396,27 @@ struct StripePlan {
     std::vector<int> source_node_ids;   // node IDs of sources (row[0..n-3])
 };
 
+struct RecoveryFailedTarget {
+    int failed_node = 0;
+    int failed_pos = 0;
+    int original_role = 0;
+};
+
+struct RecoveryStripePlan {
+    int stripe_id = 0;
+    bool dual_failure = false;
+    int failed_node = 0;
+    int failed_pos = 0;
+    int decoder_node = 0;
+    int decoder_pos = 0;
+    std::vector<int> helper_nodes;
+    std::vector<int> helper_positions;
+    std::vector<int> survivor_positions;
+    std::vector<int> failed_nodes;
+    std::vector<RecoveryFailedTarget> failed_targets;
+    int original_role = 0;
+};
+
 // ---------------------------------------------------------------------------
 // POA file helpers
 // ---------------------------------------------------------------------------
@@ -463,14 +485,20 @@ public:
         if (stopped_.exchange(true)) return;
 
         encoding_workers_stop_ = true;
+        recovery_workers_stop_ = true;
         source_cv_.notify_all();
         encoder_cv_.notify_all();
         parity_cv_.notify_all();
         mirror_cv_.notify_all();
         encoding_wait_cv_.notify_all();
+        helper_cv_.notify_all();
+        decoder_cv_.notify_all();
+        failed_cv_.notify_all();
+        recovery_wait_cv_.notify_all();
 
         abort_all_channels_();
         encoding_workers_join_();
+        recovery_workers_join_();
         mirror_worker_shutdown();
         rs_pool_shutdown();
         cleanup_rdma_();
@@ -722,6 +750,185 @@ public:
     }
 
     void set_require_registered_mr(bool require) { require_registered_mr_ = require; }
+
+    // ---- Hardware recovery batch pipeline ----
+    void init_recovery_plans(const std::vector<int>& failed_nodes_1based) {
+        if (failed_nodes_1based.empty())
+            throw std::runtime_error("FRCheck: init_recovery_plans requires failed nodes");
+        if (failed_nodes_1based.size() > 2)
+            throw std::runtime_error("FRCheck: at most 2 failed nodes per group");
+        if (stripe_plans_.empty())
+            throw std::runtime_error("FRCheck: compile_plans must run before init_recovery_plans");
+
+        recovery_plans_.clear();
+        recovery_dual_failure_ = (failed_nodes_1based.size() == 2);
+
+        if (recovery_dual_failure_) {
+            compile_recovery_plans_dual_(failed_nodes_1based);
+        } else {
+            compile_recovery_plans_single_(failed_nodes_1based[0]);
+        }
+    }
+
+    void reset_recovery_batch() {
+        if (recovery_batch_active_)
+            throw std::runtime_error("FRCheck: recovery batch already active");
+        if (encoding_batch_active_)
+            throw std::runtime_error("FRCheck: encode batch active, cannot start recovery batch");
+
+        ensure_recovery_workers_();
+        reset_recovery_completion_();
+        recovery_batch_active_ = true;
+    }
+
+    void submit_recovery_stripe(
+        int stripe_id,
+        size_t block_size,
+        uintptr_t helper_block_addr,
+        uintptr_t decoder_self_block_addr,
+        const std::vector<uintptr_t>& decoder_helper_recv_addrs,
+        const std::vector<uintptr_t>& decoder_recovered_addrs,
+        uintptr_t failed_recv_buf_addr,
+        uintptr_t failed_layer_buf_addr,
+        size_t failed_layer_offset,
+        size_t failed_ncopy,
+        bool store_to_layer_buf)
+    {
+        if (stopped_) return;
+        if (!recovery_batch_active_)
+            throw std::runtime_error("FRCheck: submit_recovery_stripe without reset_recovery_batch");
+        if (stripe_id < 0 || stripe_id >= (int)recovery_plans_.size())
+            throw std::runtime_error("FRCheck: invalid recovery stripe_id");
+
+        const RecoveryStripePlan& plan = recovery_plans_[stripe_id];
+        int my_node = rank_in_group_ + 1;
+
+        auto is_helper = [&]() {
+            return std::find(plan.helper_nodes.begin(), plan.helper_nodes.end(), my_node)
+                   != plan.helper_nodes.end();
+        };
+
+        if (is_helper() && helper_block_addr != 0) {
+            RecoveryHelperTask task;
+            task.stripe_id = stripe_id;
+            task.block_size = block_size;
+            task.helper_block = helper_block_addr;
+            task.decoder_rig = plan.decoder_node - 1;
+            pending_recovery_chunks_.fetch_add(1, std::memory_order_acq_rel);
+            {
+                std::lock_guard<std::mutex> lk(helper_mtx_);
+                helper_q_.push(std::move(task));
+                wait_helper_ = true;
+                helper_completed_ = false;
+            }
+            helper_cv_.notify_all();
+        }
+
+        if (my_node == plan.decoder_node && decoder_self_block_addr != 0) {
+            RecoveryDecoderTask task;
+            task.stripe_id = stripe_id;
+            task.block_size = block_size;
+            task.self_block = decoder_self_block_addr;
+            task.helper_recv_bufs = decoder_helper_recv_addrs;
+            for (int hn : plan.helper_nodes)
+                task.helper_rigs.push_back(hn - 1);
+            task.recovered_bufs = decoder_recovered_addrs;
+            task.dual_failure = plan.dual_failure;
+            task.survivor_positions = plan.survivor_positions;
+            if (!plan.dual_failure) {
+                task.failed_pos = plan.failed_pos;
+                task.failed_rigs.push_back(plan.failed_node - 1);
+            } else {
+                for (const auto& ft : plan.failed_targets) {
+                    task.failed_positions.push_back(ft.failed_pos);
+                    task.failed_rigs.push_back(ft.failed_node - 1);
+                }
+            }
+            pending_recovery_chunks_.fetch_add(1, std::memory_order_acq_rel);
+            {
+                std::lock_guard<std::mutex> lk(decoder_mtx_);
+                decoder_q_.push(std::move(task));
+                wait_decoder_ = true;
+                decoder_completed_ = false;
+            }
+            decoder_cv_.notify_all();
+        }
+
+        if (!plan.dual_failure) {
+            if (my_node == plan.failed_node && failed_recv_buf_addr != 0) {
+                RecoveryFailedTask task;
+                task.stripe_id = stripe_id;
+                task.block_size = block_size;
+                task.recv_buf = failed_recv_buf_addr;
+                task.decoder_rig = plan.decoder_node - 1;
+                task.layer_buf = failed_layer_buf_addr;
+                task.layer_offset = failed_layer_offset;
+                task.ncopy = failed_ncopy;
+                task.store_to_layer = store_to_layer_buf;
+                pending_recovery_chunks_.fetch_add(1, std::memory_order_acq_rel);
+                {
+                    std::lock_guard<std::mutex> lk(failed_mtx_);
+                    failed_q_.push(std::move(task));
+                    wait_failed_ = true;
+                    failed_completed_ = false;
+                }
+                failed_cv_.notify_all();
+            }
+        } else {
+            for (const auto& ft : plan.failed_targets) {
+                if (my_node != ft.failed_node || failed_recv_buf_addr == 0)
+                    continue;
+                RecoveryFailedTask task;
+                task.stripe_id = stripe_id;
+                task.block_size = block_size;
+                task.recv_buf = failed_recv_buf_addr;
+                task.decoder_rig = plan.decoder_node - 1;
+                task.layer_buf = failed_layer_buf_addr;
+                task.layer_offset = failed_layer_offset;
+                task.ncopy = failed_ncopy;
+                task.store_to_layer = store_to_layer_buf;
+                pending_recovery_chunks_.fetch_add(1, std::memory_order_acq_rel);
+                {
+                    std::lock_guard<std::mutex> lk(failed_mtx_);
+                    failed_q_.push(std::move(task));
+                    wait_failed_ = true;
+                    failed_completed_ = false;
+                }
+                failed_cv_.notify_all();
+                break;
+            }
+        }
+    }
+
+    void submit_recovery_sentinel() {
+        RecoveryHelperTask h_sentinel{};
+        RecoveryDecoderTask d_sentinel{};
+        RecoveryFailedTask f_sentinel{};
+        if (wait_helper_) {
+            std::lock_guard<std::mutex> lk(helper_mtx_);
+            helper_q_.push(h_sentinel);
+        }
+        if (wait_decoder_) {
+            std::lock_guard<std::mutex> lk(decoder_mtx_);
+            decoder_q_.push(d_sentinel);
+        }
+        if (wait_failed_) {
+            std::lock_guard<std::mutex> lk(failed_mtx_);
+            failed_q_.push(f_sentinel);
+        }
+        helper_cv_.notify_all();
+        decoder_cv_.notify_all();
+        failed_cv_.notify_all();
+        maybe_complete_recovery_batch_();
+    }
+
+    void wait_recovery_batch() {
+        std::unique_lock<std::mutex> lk(recovery_wait_mtx_);
+        recovery_wait_cv_.wait(lk, [this] {
+            return stopped_.load() || recovery_batch_completed_;
+        });
+        recovery_batch_active_ = false;
+    }
 
     // ---- StripePlan queries for Python ----
     int get_role_for_stripe(int stripe_id) const {
@@ -1644,6 +1851,10 @@ public:
         const std::vector<uintptr_t>& local_src_addrs)
     {
         if (stopped_) return;
+        if (recovery_batch_active_)
+            throw std::runtime_error(
+                "FRCheck: recovery batch active, cannot submit_stripe_chunk");
+        encoding_batch_active_ = true;
         if (stripe_id < 0 || stripe_id >= (int)stripe_plans_.size())
             throw std::runtime_error("FRCheck: invalid stripe_id");
 
@@ -1734,6 +1945,7 @@ public:
     void wait_encoding_batch() {
         wait_for_encoding_completion();
         wait_mirror_completion();
+        encoding_batch_active_ = false;
     }
 
     void wait_for_encoding_completion() {
@@ -1757,6 +1969,426 @@ public:
             }
         }
     }
+
+    // ---- Recovery worker tasks ----
+    struct RecoveryHelperTask {
+        int stripe_id = 0;
+        size_t block_size = 0;
+        uintptr_t helper_block = 0;
+        int decoder_rig = -1;
+    };
+
+    struct RecoveryDecoderTask {
+        int stripe_id = 0;
+        size_t block_size = 0;
+        uintptr_t self_block = 0;
+        std::vector<uintptr_t> helper_recv_bufs;
+        std::vector<int> helper_rigs;
+        std::vector<uintptr_t> recovered_bufs;
+        bool dual_failure = false;
+        std::vector<int> survivor_positions;
+        int failed_pos = 0;
+        std::vector<int> failed_positions;
+        std::vector<int> failed_rigs;
+    };
+
+    struct RecoveryFailedTask {
+        int stripe_id = 0;
+        size_t block_size = 0;
+        uintptr_t recv_buf = 0;
+        int decoder_rig = -1;
+        uintptr_t layer_buf = 0;
+        size_t layer_offset = 0;
+        size_t ncopy = 0;
+        bool store_to_layer = false;
+    };
+
+    static bool is_recovery_helper_sentinel_(const RecoveryHelperTask& t) {
+        return t.block_size == 0 && t.helper_block == 0;
+    }
+    static bool is_recovery_decoder_sentinel_(const RecoveryDecoderTask& t) {
+        return t.block_size == 0 && t.self_block == 0;
+    }
+    static bool is_recovery_failed_sentinel_(const RecoveryFailedTask& t) {
+        return t.block_size == 0 && t.recv_buf == 0;
+    }
+
+    static StripeRole role_for_node_in_row_(const std::vector<int>& row, int node_id, int n) {
+        auto it = std::find(row.begin(), row.end(), node_id);
+        if (it == row.end())
+            throw std::runtime_error("FRCheck recovery: node not in POA row");
+        int pos = (int)std::distance(row.begin(), it);
+        if (pos < n - 2) return StripeRole::SOURCE;
+        if (pos == n - 2) return StripeRole::ENCODER;
+        return StripeRole::PARITY_TARGET;
+    }
+
+    void compile_recovery_plans_single_(int failed_rank_node) {
+        recovery_plans_.resize(stripe_plans_.size());
+        for (const auto& sp : stripe_plans_) {
+            const auto& row = sp.row;
+            int sid = sp.stripe_id;
+            auto it = std::find(row.begin(), row.end(), failed_rank_node);
+            if (it == row.end()) continue;
+
+            int failed_pos = (int)std::distance(row.begin(), it);
+            int decoder_pos = (failed_pos + 1) % n_;
+            std::vector<int> helper_positions;
+            for (int i = 0; i < n_ - 3; ++i)
+                helper_positions.push_back((failed_pos + 2 + i) % n_);
+
+            RecoveryStripePlan plan;
+            plan.stripe_id = sid;
+            plan.dual_failure = false;
+            plan.failed_node = failed_rank_node;
+            plan.failed_pos = failed_pos;
+            plan.decoder_node = row[decoder_pos];
+            plan.decoder_pos = decoder_pos;
+            for (int p : helper_positions) {
+                plan.helper_positions.push_back(p);
+                plan.helper_nodes.push_back(row[p]);
+            }
+            plan.survivor_positions = {decoder_pos};
+            plan.survivor_positions.insert(
+                plan.survivor_positions.end(),
+                helper_positions.begin(), helper_positions.end());
+            plan.original_role = (int)sp.role;
+            recovery_plans_[sid] = std::move(plan);
+        }
+    }
+
+    void compile_recovery_plans_dual_(const std::vector<int>& failed_nodes) {
+        std::set<int> failed_set(failed_nodes.begin(), failed_nodes.end());
+        recovery_plans_.resize(stripe_plans_.size());
+        for (const auto& sp : stripe_plans_) {
+            const auto& row = sp.row;
+            int sid = sp.stripe_id;
+
+            RecoveryStripePlan plan;
+            plan.stripe_id = sid;
+            plan.dual_failure = true;
+            plan.failed_nodes = failed_nodes;
+
+            for (int fn : failed_nodes) {
+                auto it = std::find(row.begin(), row.end(), fn);
+                if (it == row.end()) {
+                    throw std::runtime_error(
+                        "FRCheck dual recovery: failed node " + std::to_string(fn) +
+                        " missing in stripe " + std::to_string(sid));
+                }
+                int fp = (int)std::distance(row.begin(), it);
+                RecoveryFailedTarget ft;
+                ft.failed_node = fn;
+                ft.failed_pos = fp;
+                ft.original_role = (int)role_for_node_in_row_(row, fn, n_);
+                plan.failed_targets.push_back(ft);
+            }
+
+            for (int i = 0; i < n_; ++i) {
+                if (failed_set.count(row[i]) == 0)
+                    plan.survivor_positions.push_back(i);
+            }
+            if ((int)plan.survivor_positions.size() != n_ - 2) {
+                throw std::runtime_error(
+                    "FRCheck dual recovery: stripe " + std::to_string(sid) +
+                    " survivor count mismatch");
+            }
+            int decoder_pos = plan.survivor_positions[0];
+            plan.decoder_pos = decoder_pos;
+            plan.decoder_node = row[decoder_pos];
+            for (size_t i = 1; i < plan.survivor_positions.size(); ++i) {
+                int p = plan.survivor_positions[i];
+                plan.helper_positions.push_back(p);
+                plan.helper_nodes.push_back(row[p]);
+            }
+            plan.original_role = (int)sp.role;
+            recovery_plans_[sid] = std::move(plan);
+        }
+    }
+
+    void execute_recovery_helper_(const RecoveryHelperTask& task) {
+        send_to_peer(task.decoder_rig, task.stripe_id,
+                     task.helper_block, task.block_size);
+    }
+
+    void execute_recovery_decoder_(const RecoveryDecoderTask& task) {
+        std::vector<std::thread> recv_threads;
+        std::vector<std::exception_ptr> recv_errors(task.helper_rigs.size());
+
+        for (size_t hi = 0; hi < task.helper_rigs.size(); ++hi) {
+            recv_errors[hi] = nullptr;
+            recv_threads.emplace_back([&, hi]() {
+                try {
+                    if (hi >= task.helper_recv_bufs.size())
+                        throw std::runtime_error("FRCheck recovery: missing helper recv buf");
+                    recv_from_peer(
+                        task.helper_rigs[hi], task.stripe_id,
+                        task.helper_recv_bufs[hi], task.block_size);
+                } catch (...) {
+                    recv_errors[hi] = std::current_exception();
+                }
+            });
+        }
+        for (auto& t : recv_threads) t.join();
+        for (size_t hi = 0; hi < recv_errors.size(); ++hi) {
+            if (recv_errors[hi]) std::rethrow_exception(recv_errors[hi]);
+        }
+
+        int k = n_ - 2;
+        std::vector<uintptr_t> survivor_addrs;
+        survivor_addrs.push_back(task.self_block);
+        for (uintptr_t addr : task.helper_recv_bufs)
+            survivor_addrs.push_back(addr);
+
+        if (!task.dual_failure) {
+            if (task.recovered_bufs.empty())
+                throw std::runtime_error("FRCheck recovery: missing recovered buffer");
+            submit_stripe_decode(
+                k, task.survivor_positions, task.failed_pos,
+                survivor_addrs, task.recovered_bufs[0], task.block_size);
+            if (task.failed_rigs.empty())
+                throw std::runtime_error("FRCheck recovery: missing failed rig");
+            send_to_peer(task.failed_rigs[0], task.stripe_id,
+                         task.recovered_bufs[0], task.block_size);
+        } else {
+            if (task.recovered_bufs.size() < task.failed_positions.size())
+                throw std::runtime_error("FRCheck recovery: insufficient recovered buffers");
+            std::vector<std::thread> send_threads;
+            for (size_t slot = 0; slot < task.failed_positions.size(); ++slot) {
+                submit_stripe_decode(
+                    k, task.survivor_positions, task.failed_positions[slot],
+                    survivor_addrs, task.recovered_bufs[slot], task.block_size);
+                int frig = task.failed_rigs[slot];
+                uintptr_t rec = task.recovered_bufs[slot];
+                send_threads.emplace_back([this, frig, rec, sid = task.stripe_id, bs = task.block_size]() {
+                    send_to_peer(frig, sid, rec, bs);
+                });
+            }
+            for (auto& t : send_threads) t.join();
+        }
+    }
+
+    void execute_recovery_failed_(const RecoveryFailedTask& task) {
+        recv_from_peer(task.decoder_rig, task.stripe_id,
+                       task.recv_buf, task.block_size);
+        if (task.store_to_layer && task.layer_buf != 0 && task.ncopy > 0) {
+            std::memcpy(
+                reinterpret_cast<void*>(task.layer_buf + task.layer_offset),
+                reinterpret_cast<const void*>(task.recv_buf),
+                task.ncopy);
+        }
+    }
+
+    void helper_worker_loop_() {
+        while (!recovery_workers_stop_) {
+            RecoveryHelperTask task;
+            {
+                std::unique_lock<std::mutex> lk(helper_mtx_);
+                helper_cv_.wait(lk, [this] {
+                    return recovery_workers_stop_ || !helper_q_.empty();
+                });
+                if (recovery_workers_stop_) break;
+                task = helper_q_.front();
+                helper_q_.pop();
+            }
+            if (is_recovery_helper_sentinel_(task)) {
+                helper_sentinel_received_ = true;
+                maybe_complete_helper_after_sentinel_();
+                continue;
+            }
+            helper_active_.fetch_add(1, std::memory_order_acq_rel);
+            try {
+                execute_recovery_helper_(task);
+            } catch (const std::exception& e) {
+                helper_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (recovery_workers_stop_) return;
+                std::cerr << "FRCheck helper_worker: " << e.what() << std::endl;
+                return;
+            } catch (...) {
+                helper_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (recovery_workers_stop_) return;
+                throw;
+            }
+            helper_active_.fetch_sub(1, std::memory_order_acq_rel);
+            pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+            maybe_complete_helper_after_sentinel_();
+        }
+    }
+
+    void decoder_worker_loop_() {
+        while (!recovery_workers_stop_) {
+            RecoveryDecoderTask task;
+            {
+                std::unique_lock<std::mutex> lk(decoder_mtx_);
+                decoder_cv_.wait(lk, [this] {
+                    return recovery_workers_stop_ || !decoder_q_.empty();
+                });
+                if (recovery_workers_stop_) break;
+                task = decoder_q_.front();
+                decoder_q_.pop();
+            }
+            if (is_recovery_decoder_sentinel_(task)) {
+                decoder_sentinel_received_ = true;
+                maybe_complete_decoder_after_sentinel_();
+                continue;
+            }
+            decoder_active_.fetch_add(1, std::memory_order_acq_rel);
+            try {
+                execute_recovery_decoder_(task);
+            } catch (const std::exception& e) {
+                decoder_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (recovery_workers_stop_) return;
+                std::cerr << "FRCheck decoder_worker: " << e.what() << std::endl;
+                return;
+            } catch (...) {
+                decoder_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (recovery_workers_stop_) return;
+                throw;
+            }
+            decoder_active_.fetch_sub(1, std::memory_order_acq_rel);
+            pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+            maybe_complete_decoder_after_sentinel_();
+        }
+    }
+
+    void failed_worker_loop_() {
+        while (!recovery_workers_stop_) {
+            RecoveryFailedTask task;
+            {
+                std::unique_lock<std::mutex> lk(failed_mtx_);
+                failed_cv_.wait(lk, [this] {
+                    return recovery_workers_stop_ || !failed_q_.empty();
+                });
+                if (recovery_workers_stop_) break;
+                task = failed_q_.front();
+                failed_q_.pop();
+            }
+            if (is_recovery_failed_sentinel_(task)) {
+                failed_sentinel_received_ = true;
+                maybe_complete_failed_after_sentinel_();
+                continue;
+            }
+            failed_active_.fetch_add(1, std::memory_order_acq_rel);
+            try {
+                execute_recovery_failed_(task);
+            } catch (const std::exception& e) {
+                failed_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (recovery_workers_stop_) return;
+                std::cerr << "FRCheck failed_worker: " << e.what() << std::endl;
+                return;
+            } catch (...) {
+                failed_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (recovery_workers_stop_) return;
+                throw;
+            }
+            failed_active_.fetch_sub(1, std::memory_order_acq_rel);
+            pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+            maybe_complete_failed_after_sentinel_();
+        }
+    }
+
+    void ensure_recovery_workers_() {
+        if (recovery_workers_inited_) return;
+        recovery_workers_stop_ = false;
+        helper_thread_ = std::thread(&FRCheckNative::helper_worker_loop_, this);
+        decoder_thread_ = std::thread(&FRCheckNative::decoder_worker_loop_, this);
+        failed_thread_ = std::thread(&FRCheckNative::failed_worker_loop_, this);
+        recovery_workers_inited_ = true;
+        std::cout << "FRCheck: recovery workers started (helper/decoder/failed x1)"
+                  << std::endl;
+    }
+
+    void recovery_workers_join_() {
+        if (helper_thread_.joinable()) helper_thread_.join();
+        if (decoder_thread_.joinable()) decoder_thread_.join();
+        if (failed_thread_.joinable()) failed_thread_.join();
+        recovery_workers_inited_ = false;
+    }
+
+    void notify_recovery_wait_() { recovery_wait_cv_.notify_all(); }
+
+    void maybe_complete_recovery_batch_() {
+        if (pending_recovery_chunks_.load(std::memory_order_acquire) != 0) return;
+        if (helper_active_.load(std::memory_order_acquire) != 0) return;
+        if (decoder_active_.load(std::memory_order_acquire) != 0) return;
+        if (failed_active_.load(std::memory_order_acquire) != 0) return;
+        if (wait_helper_ && !helper_completed_) return;
+        if (wait_decoder_ && !decoder_completed_) return;
+        if (wait_failed_ && !failed_completed_) return;
+        std::lock_guard<std::mutex> lk(recovery_wait_mtx_);
+        if (recovery_batch_completed_) return;
+        recovery_batch_completed_ = true;
+        notify_recovery_wait_();
+    }
+
+    void maybe_complete_helper_after_sentinel_() {
+        if (!helper_sentinel_received_) return;
+        if (helper_active_.load(std::memory_order_acquire) != 0) return;
+        std::lock_guard<std::mutex> lk(helper_mtx_);
+        if (helper_q_.empty()) {
+            helper_completed_ = true;
+            helper_sentinel_received_ = false;
+            maybe_complete_recovery_batch_();
+        }
+    }
+
+    void maybe_complete_decoder_after_sentinel_() {
+        if (!decoder_sentinel_received_) return;
+        if (decoder_active_.load(std::memory_order_acquire) != 0) return;
+        std::lock_guard<std::mutex> lk(decoder_mtx_);
+        if (decoder_q_.empty()) {
+            decoder_completed_ = true;
+            decoder_sentinel_received_ = false;
+            maybe_complete_recovery_batch_();
+        }
+    }
+
+    void maybe_complete_failed_after_sentinel_() {
+        if (!failed_sentinel_received_) return;
+        if (failed_active_.load(std::memory_order_acquire) != 0) return;
+        std::lock_guard<std::mutex> lk(failed_mtx_);
+        if (failed_q_.empty()) {
+            failed_completed_ = true;
+            failed_sentinel_received_ = false;
+            maybe_complete_recovery_batch_();
+        }
+    }
+
+    void reset_recovery_completion_() {
+        recovery_batch_completed_ = false;
+        pending_recovery_chunks_.store(0, std::memory_order_release);
+        helper_active_.store(0, std::memory_order_release);
+        decoder_active_.store(0, std::memory_order_release);
+        failed_active_.store(0, std::memory_order_release);
+        wait_helper_ = false;
+        wait_decoder_ = false;
+        wait_failed_ = false;
+        helper_completed_ = false;
+        decoder_completed_ = false;
+        failed_completed_ = false;
+        helper_sentinel_received_ = false;
+        decoder_sentinel_received_ = false;
+        failed_sentinel_received_ = false;
+        {
+            std::lock_guard<std::mutex> lk(helper_mtx_);
+            while (!helper_q_.empty()) helper_q_.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(decoder_mtx_);
+            while (!decoder_q_.empty()) decoder_q_.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(failed_mtx_);
+            while (!failed_q_.empty()) failed_q_.pop();
+        }
+    }
+
     // ---- RDMA device init ----
     void init_ibv_() {
         if (ibv_fork_init() != 0)
@@ -1972,6 +2604,42 @@ private:
     // Stripe plans (pre-compiled)
     std::vector<StripePlan> stripe_plans_;
 
+    // Hardware recovery
+    std::vector<RecoveryStripePlan> recovery_plans_;
+    bool recovery_dual_failure_ = false;
+    bool recovery_batch_active_ = false;
+    bool encoding_batch_active_ = false;
+    bool recovery_workers_inited_ = false;
+    std::atomic<bool> recovery_workers_stop_{false};
+    std::queue<RecoveryHelperTask> helper_q_;
+    std::mutex helper_mtx_;
+    std::condition_variable helper_cv_;
+    bool helper_sentinel_received_ = false;
+    bool helper_completed_ = false;
+    bool wait_helper_ = false;
+    std::queue<RecoveryDecoderTask> decoder_q_;
+    std::mutex decoder_mtx_;
+    std::condition_variable decoder_cv_;
+    bool decoder_sentinel_received_ = false;
+    bool decoder_completed_ = false;
+    bool wait_decoder_ = false;
+    std::queue<RecoveryFailedTask> failed_q_;
+    std::mutex failed_mtx_;
+    std::condition_variable failed_cv_;
+    bool failed_sentinel_received_ = false;
+    bool failed_completed_ = false;
+    bool wait_failed_ = false;
+    std::thread helper_thread_;
+    std::thread decoder_thread_;
+    std::thread failed_thread_;
+    std::atomic<int> pending_recovery_chunks_{0};
+    std::atomic<int> helper_active_{0};
+    std::atomic<int> decoder_active_{0};
+    std::atomic<int> failed_active_{0};
+    bool recovery_batch_completed_ = false;
+    std::mutex recovery_wait_mtx_;
+    std::condition_variable recovery_wait_cv_;
+
     // ---- RS encode thread pool (matches ecnaive xor_pool pattern) ----
     static constexpr int kRsPoolWorkers = 16;
     std::array<pthread_t, kRsPoolWorkers> rs_pool_threads_{};
@@ -2050,6 +2718,27 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("set_require_registered_mr", &FRCheckNative::set_require_registered_mr,
              py::arg("require"))
+
+        // Hardware recovery batch pipeline
+        .def("init_recovery_plans", &FRCheckNative::init_recovery_plans,
+             py::arg("failed_nodes_1based"))
+        .def("reset_recovery_batch", &FRCheckNative::reset_recovery_batch)
+        .def("submit_recovery_stripe", &FRCheckNative::submit_recovery_stripe,
+             py::arg("stripe_id"),
+             py::arg("block_size"),
+             py::arg("helper_block_addr"),
+             py::arg("decoder_self_block_addr"),
+             py::arg("decoder_helper_recv_addrs"),
+             py::arg("decoder_recovered_addrs"),
+             py::arg("failed_recv_buf_addr"),
+             py::arg("failed_layer_buf_addr"),
+             py::arg("failed_layer_offset"),
+             py::arg("failed_ncopy"),
+             py::arg("store_to_layer_buf"))
+        .def("submit_recovery_sentinel", &FRCheckNative::submit_recovery_sentinel)
+        .def("wait_recovery_batch", &FRCheckNative::wait_recovery_batch,
+             py::call_guard<py::gil_scoped_release>())
+
         // StripePlan queries
         .def("get_role_for_stripe", &FRCheckNative::get_role_for_stripe,
              py::arg("stripe_id"))

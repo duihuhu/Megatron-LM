@@ -10,7 +10,6 @@ import pickle
 import os
 import re
 import struct
-import threading
 import time
 from logging import getLogger
 from pathlib import Path
@@ -831,6 +830,24 @@ def _read_frbk_block(filepath: str) -> Optional[torch.Tensor]:
     return data
 
 
+def _read_frbk_block_into(dst: torch.Tensor, filepath: str) -> int:
+    """Read FRBK payload directly into dst. Returns bytes written."""
+    path = Path(filepath)
+    if not path.is_file():
+        return 0
+    with open(path, "rb") as f:
+        hdr = f.read(28)
+        if len(hdr) < 28:
+            return 0
+        magic, _stripe_id, _role, data_size, _block_sz = struct.unpack("<4sIIQQ", hdr)
+        if magic != b"FRBK":
+            return 0
+        ncopy = min(int(data_size), dst.numel())
+        if ncopy > 0:
+            f.readinto(dst[:ncopy].numpy())
+        return ncopy
+
+
 def _stripe_block_path(
     checkpoint_dir: Path,
     layer_name: str,
@@ -1192,6 +1209,7 @@ def _preload_recovery_stripe_blocks(
     my_node: int,
     saved_block_size: int,
     all_frcheck_dirs: List[Optional[Path]],
+    block_cache: Optional[Dict[Tuple[str, int, int], torch.Tensor]] = None,
 ) -> Dict[int, Dict[int, torch.Tensor]]:
     """Read decoder/helper stripe blocks keyed by encode iteration index."""
     import concurrent.futures
@@ -1217,6 +1235,8 @@ def _preload_recovery_stripe_blocks(
         logger.warning("FRCheck recovery: missing frcheck dir for participant=%d", rank)
         return result
 
+    cache = block_cache if block_cache is not None else {}
+
     def _load_one(job: Tuple[int, Dict]) -> Tuple[int, int, torch.Tensor]:
         encode_iter, plan = job
         if encode_iter >= len(my_order):
@@ -1227,16 +1247,24 @@ def _preload_recovery_stripe_blocks(
             meta.get("block_size", saved_block_size) or saved_block_size
         )
         sid = plan['stripe_id']
-        blk = _read_stripe_block(
-            participant_frcheck_dir,
-            layer_name,
-            sid,
-            rank,
-            plan['original_role'],
-        )
-        blk = _normalize_stripe_block(
-            blk, layer_block_size, rank, layer_name, sid,
-        )
+        role = int(plan['original_role'])
+        cache_key = (layer_name, sid, role)
+        cached = cache.get(cache_key)
+        if cached is not None and cached.numel() >= layer_block_size:
+            blk = cached
+        else:
+            blk = _read_stripe_block(
+                participant_frcheck_dir,
+                layer_name,
+                sid,
+                rank,
+                role,
+            )
+            blk = _normalize_stripe_block(
+                blk, layer_block_size, rank, layer_name, sid,
+            )
+            if cache_key not in cache:
+                cache[cache_key] = blk
         return encode_iter, sid, blk
 
     jobs = [
@@ -1251,291 +1279,78 @@ def _preload_recovery_stripe_blocks(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Per-layer recovery pipeline (network + decode only)
-# ---------------------------------------------------------------------------
-
-def _decoder_post_helper_recvs(
-    native,
+def _prep_survivor_hw_disk(
+    manager: FRCheckManager,
+    checkpoint_dir: Path,
+    rank: int,
+    main_payload: Dict[str, Any],
+    n_encode_iters: int,
+    all_layer_order: Dict[int, List[str]],
+    all_layer_metadata: Dict[int, Dict[str, Dict[str, Any]]],
+    recovery_stripe_plans: List[Dict],
+    saved_block_size: int,
     my_node: int,
-    decoder_node: int,
-    helper_nodes: List[int],
-    node_to_rig: Dict[int, int],
-    sid: int,
-    layer_block_size: int,
-    buf_pool: Optional[_RecoveryBufPool],
-    layer_timing: Dict[str, float],
-) -> Tuple[List[threading.Thread], List[torch.Tensor]]:
-    """Decoder posts async recvs from helpers; returns threads and recv buffers."""
-    recv_threads: List[threading.Thread] = []
-    recv_bufs: List[torch.Tensor] = []
-    if my_node != decoder_node:
-        return recv_threads, recv_bufs
+    all_frcheck_dirs: List[Optional[Path]],
+    preload_recovery: bool,
+) -> Tuple[torch.Tensor, Dict[int, Dict[int, torch.Tensor]]]:
+    """Assemble local full_buf and recovery preload blocks before network recovery."""
+    total_tensor_size = int(main_payload.get("actual_tensor_size", 0))
+    safety_margin = max(int(total_tensor_size * 0.01), 4096)
+    full_buf = manager.allocate_full_buf(total_tensor_size + safety_margin)
+    full_buf.zero_()
 
-    recv_ready = threading.Event()
-    recv_ready_count = {'n': 0}
-    recv_ready_lock = threading.Lock()
-    n_helper_recvs = len(helper_nodes)
+    cache_source_keys: Set[Tuple[str, int, int]] = set()
+    my_order = all_layer_order.get(rank, [])
+    if preload_recovery and recovery_stripe_plans:
+        participating = [
+            p for p in recovery_stripe_plans
+            if my_node == p['decoder_node'] or my_node in p['helper_nodes']
+        ]
+        for encode_iter in range(n_encode_iters):
+            if encode_iter >= len(my_order):
+                continue
+            layer_name = my_order[encode_iter]
+            for plan in participating:
+                if int(plan['original_role']) == int(StripeRole.SOURCE):
+                    cache_source_keys.add(
+                        (layer_name, plan['stripe_id'], int(StripeRole.SOURCE))
+                    )
 
-    for hi, helper_node in enumerate(helper_nodes):
-        helper_rig = node_to_rig[helper_node]
-        if buf_pool is not None and hi < len(buf_pool.decoder_recv_bufs):
-            recv_buf = buf_pool.decoder_recv_bufs[hi][:layer_block_size]
-        else:
-            recv_buf = allocate_hugepage_tensor(
-                layer_block_size, fallback_pin_memory=True,
-            )
-            native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
-        recv_bufs.append(recv_buf)
-
-        def _recv_thread(
-            rb=recv_buf, hrig=helper_rig, timing=layer_timing,
-            ready=recv_ready, ready_count=recv_ready_count,
-            ready_lock=recv_ready_lock, n_ready=n_helper_recvs,
-        ):
-            with ready_lock:
-                ready_count['n'] += 1
-                if ready_count['n'] >= n_ready:
-                    ready.set()
-            _t0 = time.time()
-            native.recv_from_peer(hrig, sid, rb.data_ptr(), rb.numel())
-            timing['rdma_xfer_s'] += time.time() - _t0
-
-        t = threading.Thread(target=_recv_thread, daemon=True)
-        t.start()
-        recv_threads.append(t)
-
-    if n_helper_recvs > 0:
-        recv_ready.wait(timeout=30.0)
-    return recv_threads, recv_bufs
-
-
-def _helper_send_block_to_decoder(
-    native,
-    my_node: int,
-    helper_nodes: List[int],
-    decoder_rig: int,
-    sid: int,
-    layer_block_size: int,
-    my_blocks: Dict[int, torch.Tensor],
-    layer_timing: Dict[str, float],
-) -> None:
-    if my_node not in helper_nodes:
-        return
-    my_block = my_blocks.get(sid)
-    if my_block is None:
-        my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
-        native.register_buffer(my_block.data_ptr(), my_block.numel())
-    _t0 = time.time()
-    native.send_to_peer(decoder_rig, sid, my_block.data_ptr(), my_block.numel())
-    layer_timing['rdma_xfer_s'] += time.time() - _t0
-
-
-def _decoder_survivor_addrs(
-    my_blocks: Dict[int, torch.Tensor],
-    sid: int,
-    layer_block_size: int,
-    recv_bufs: List[torch.Tensor],
-) -> List[int]:
-    my_block = my_blocks.get(sid)
-    if my_block is None:
-        my_block = torch.zeros(layer_block_size, dtype=torch.uint8)
-    addrs = [my_block.data_ptr()]
-    addrs.extend(rb.data_ptr() for rb in recv_bufs)
-    return addrs
-
-
-def _alloc_decoder_recovered_buf(
-    buf_pool: Optional[_RecoveryBufPool],
-    layer_block_size: int,
-    slot: int,
-    native,
-) -> torch.Tensor:
-    if buf_pool is not None:
-        if slot == 0 and buf_pool.decoder_recovered_buf is not None:
-            return buf_pool.decoder_recovered_buf[:layer_block_size]
-        if slot == 1 and buf_pool.decoder_recovered_buf2 is not None:
-            return buf_pool.decoder_recovered_buf2[:layer_block_size]
-    recovered = torch.zeros(layer_block_size, dtype=torch.uint8)
-    native.register_buffer(recovered.data_ptr(), recovered.numel())
-    return recovered
-
-
-def _recover_one_stripe_single(
-    native,
-    stri_plan: Dict,
-    my_node: int,
-    n: int,
-    node_to_rig: Dict[int, int],
-    layer_block_size: int,
-    layer_total_bytes: int,
-    layer_buf: Optional[torch.Tensor],
-    my_blocks: Dict[int, torch.Tensor],
-    src_block_per_node: Dict[int, int],
-    buf_pool: Optional[_RecoveryBufPool],
-    layer_timing: Dict[str, float],
-    recv_threads: List[threading.Thread],
-    recv_bufs: List[torch.Tensor],
-) -> None:
-    sid = stri_plan['stripe_id']
-    decoder_node = stri_plan['decoder_node']
-    helper_nodes = stri_plan['helper_nodes']
-    failed_node = stri_plan['failed_node']
-    failed_pos = stri_plan['failed_pos']
-    decoder_pos = stri_plan['decoder_pos']
-    helper_positions = stri_plan['helper_positions']
-    original_role = stri_plan['original_role']
-    decoder_rig = node_to_rig[decoder_node]
-    failed_rig = node_to_rig[failed_node]
-
-    _helper_send_block_to_decoder(
-        native, my_node, helper_nodes, decoder_rig, sid,
-        layer_block_size, my_blocks, layer_timing,
+    block_cache: Dict[Tuple[str, int, int], torch.Tensor] = {}
+    _build_full_buf_from_local_blocks(
+        checkpoint_dir,
+        rank,
+        main_payload,
+        out_buf=full_buf,
+        source_block_cache=block_cache,
+        cache_source_keys=cache_source_keys,
     )
 
-    if my_node == decoder_node:
-        for t in recv_threads:
-            t.join()
-
-        survivor_positions = [decoder_pos] + helper_positions
-        survivor_addrs = _decoder_survivor_addrs(
-            my_blocks, sid, layer_block_size, recv_bufs,
+    preloaded: Dict[int, Dict[int, torch.Tensor]] = {
+        i: {} for i in range(n_encode_iters)
+    }
+    if preload_recovery:
+        preloaded = _preload_recovery_stripe_blocks(
+            n_encode_iters,
+            all_layer_order,
+            all_layer_metadata,
+            recovery_stripe_plans,
+            rank,
+            my_node,
+            saved_block_size,
+            all_frcheck_dirs,
+            block_cache=block_cache,
         )
-        recovered = _alloc_decoder_recovered_buf(
-            buf_pool, layer_block_size, 0, native,
-        )
-        _t0 = time.time()
-        native.submit_stripe_decode(
-            k=n - 2,
-            survivor_positions=survivor_positions,
-            lost_position=failed_pos,
-            survivor_addrs=survivor_addrs,
-            recovered_addr=recovered.data_ptr(),
-            block_size=layer_block_size,
-        )
-        layer_timing['decode_s'] += time.time() - _t0
-
-        _t0 = time.time()
-        native.send_to_peer(failed_rig, sid, recovered.data_ptr(), recovered.numel())
-        layer_timing['rdma_xfer_s'] += time.time() - _t0
-
-    if my_node == failed_node:
-        if buf_pool is not None and buf_pool.failed_recv_buf is not None:
-            recv_buf = buf_pool.failed_recv_buf[:layer_block_size]
-        else:
-            recv_buf = allocate_hugepage_tensor(
-                layer_block_size, fallback_pin_memory=True,
-            )
-            native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
-        _t0 = time.time()
-        native.recv_from_peer(decoder_rig, sid, recv_buf.data_ptr(), recv_buf.numel())
-        layer_timing['rdma_xfer_s'] += time.time() - _t0
-
-        if layer_buf is not None and original_role == int(StripeRole.SOURCE):
-            blk_idx = src_block_per_node[my_node]
-            src_block_per_node[my_node] += 1
-            offset = blk_idx * layer_block_size
-            ncopy = min(layer_block_size, max(0, layer_total_bytes - offset))
-            if ncopy > 0:
-                layer_buf[offset:offset + ncopy].copy_(recv_buf[:ncopy])
+    return full_buf, preloaded
 
 
-def _recover_one_stripe_dual(
+# ---------------------------------------------------------------------------
+# Per-layer recovery pipeline (C++ batch network)
+# ---------------------------------------------------------------------------
+
+def _submit_recovery_network(
     native,
-    stri_plan: Dict,
-    my_node: int,
-    n: int,
-    node_to_rig: Dict[int, int],
-    layer_block_size: int,
-    layer_total_bytes: int,
-    layer_buf: Optional[torch.Tensor],
-    my_blocks: Dict[int, torch.Tensor],
-    src_block_per_node: Dict[int, int],
-    buf_pool: Optional[_RecoveryBufPool],
-    layer_timing: Dict[str, float],
-    recv_threads: List[threading.Thread],
-    recv_bufs: List[torch.Tensor],
-) -> None:
-    """Dual failure: helpers send once; decoder RS-decodes twice and sends in parallel."""
-    sid = stri_plan['stripe_id']
-    decoder_node = stri_plan['decoder_node']
-    helper_nodes = stri_plan['helper_nodes']
-    decoder_pos = stri_plan['decoder_pos']
-    helper_positions = stri_plan['helper_positions']
-    survivor_positions = stri_plan['survivor_positions']
-    failed_targets = stri_plan['failed_targets']
-    decoder_rig = node_to_rig[decoder_node]
-
-    _helper_send_block_to_decoder(
-        native, my_node, helper_nodes, decoder_rig, sid,
-        layer_block_size, my_blocks, layer_timing,
-    )
-
-    if my_node == decoder_node:
-        for t in recv_threads:
-            t.join()
-
-        survivor_addrs = _decoder_survivor_addrs(
-            my_blocks, sid, layer_block_size, recv_bufs,
-        )
-        send_jobs: List[Tuple[int, torch.Tensor]] = []
-        for slot, target in enumerate(failed_targets):
-            recovered = _alloc_decoder_recovered_buf(
-                buf_pool, layer_block_size, slot, native,
-            )
-            _t0 = time.time()
-            native.submit_stripe_decode(
-                k=n - 2,
-                survivor_positions=survivor_positions,
-                lost_position=target['failed_pos'],
-                survivor_addrs=survivor_addrs,
-                recovered_addr=recovered.data_ptr(),
-                block_size=layer_block_size,
-            )
-            layer_timing['decode_s'] += time.time() - _t0
-            failed_rig = node_to_rig[target['failed_node']]
-            send_jobs.append((failed_rig, recovered))
-
-        send_threads: List[threading.Thread] = []
-        for failed_rig, recovered in send_jobs:
-            def _send(frig=failed_rig, rec=recovered, timing=layer_timing):
-                _t0 = time.time()
-                native.send_to_peer(frig, sid, rec.data_ptr(), rec.numel())
-                timing['rdma_xfer_s'] += time.time() - _t0
-
-            t = threading.Thread(target=_send, daemon=True)
-            t.start()
-            send_threads.append(t)
-        for t in send_threads:
-            t.join()
-
-    for target in failed_targets:
-        if my_node != target['failed_node']:
-            continue
-        if buf_pool is not None and buf_pool.failed_recv_buf is not None:
-            recv_buf = buf_pool.failed_recv_buf[:layer_block_size]
-        else:
-            recv_buf = allocate_hugepage_tensor(
-                layer_block_size, fallback_pin_memory=True,
-            )
-            native.register_buffer(recv_buf.data_ptr(), recv_buf.numel())
-        _t0 = time.time()
-        native.recv_from_peer(decoder_rig, sid, recv_buf.data_ptr(), recv_buf.numel())
-        layer_timing['rdma_xfer_s'] += time.time() - _t0
-
-        original_role = target['original_role']
-        if layer_buf is not None and original_role == int(StripeRole.SOURCE):
-            blk_idx = src_block_per_node[my_node]
-            src_block_per_node[my_node] += 1
-            offset = blk_idx * layer_block_size
-            ncopy = min(layer_block_size, max(0, layer_total_bytes - offset))
-            if ncopy > 0:
-                layer_buf[offset:offset + ncopy].copy_(recv_buf[:ncopy])
-
-
-def _recover_one_layer_network(
     manager,
-    native,
     layer_name: str,
     layer_block_size: int,
     layer_total_bytes: int,
@@ -1544,17 +1359,7 @@ def _recover_one_layer_network(
     preloaded_blocks: Dict[int, torch.Tensor],
     buf_pool: Optional[_RecoveryBufPool] = None,
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
-    """Run stripe-level RS decode recovery for one layer.
-
-    Uses RDMA point-to-point for data transfer (send_to_peer / recv_from_peer).
-    Three task types per stripe: HELPER, DECODER, FAILED_RANK.
-
-    Processes stripes in a batched loop: per stripe, decoder posts recvs in threads
-    (GIL released during recv_from_peer), helpers send, decoder decodes and sends
-    to failed rank. No inter-stripe barriers — the TCP handshake in send_data/recv_data
-    provides per-channel synchronization. For n≤8 and typical block sizes, the RS pool
-    is the bottleneck, not stripe dispatch.
-    """
+    """Submit one layer of stripe recovery via C++ batch pipeline."""
     my_node = manager.rank_in_group + 1
     layer_timing: Dict[str, float] = {'rdma_xfer_s': 0.0, 'decode_s': 0.0}
 
@@ -1586,42 +1391,93 @@ def _recover_one_layer_network(
     layer_buf = None
     if is_failed:
         if buf_pool is not None and buf_pool.failed_layer_buf is not None:
-            layer_buf = buf_pool.failed_layer_buf[
-                : num_source_stripes * layer_block_size
-            ]
+            layer_buf = buf_pool.failed_layer_buf[: num_source_stripes * layer_block_size]
         else:
             layer_buf = allocate_hugepage_tensor(
                 num_source_stripes * layer_block_size, fallback_pin_memory=True,
             )
+            native.register_buffer(layer_buf.data_ptr(), layer_buf.numel())
         layer_buf.zero_()
 
-    node_to_rig = {i + 1: i for i in range(n)}
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
 
+    native.reset_recovery_batch()
     for stri_plan in manager.recovery_stripe_plans:
         sid = stri_plan['stripe_id']
-        decoder_node = stri_plan['decoder_node']
-        helper_nodes = stri_plan['helper_nodes']
+        helper_block_addr = 0
+        decoder_self_block_addr = 0
+        decoder_helper_recv_addrs: List[int] = []
+        decoder_recovered_addrs: List[int] = []
+        failed_recv_buf_addr = 0
+        failed_layer_buf_addr = 0
+        failed_layer_offset = 0
+        failed_ncopy = 0
+        store_to_layer_buf = False
 
-        recv_threads, recv_bufs = _decoder_post_helper_recvs(
-            native, my_node, decoder_node, helper_nodes, node_to_rig,
-            sid, layer_block_size, buf_pool, layer_timing,
+        if my_node in stri_plan['helper_nodes']:
+            blk = my_blocks.get(sid)
+            if blk is not None:
+                helper_block_addr = blk.data_ptr()
+
+        if my_node == stri_plan['decoder_node']:
+            blk = my_blocks.get(sid)
+            if blk is not None:
+                decoder_self_block_addr = blk.data_ptr()
+            if buf_pool is not None:
+                for hi in range(len(stri_plan['helper_nodes'])):
+                    if hi < len(buf_pool.decoder_recv_bufs):
+                        rb = buf_pool.decoder_recv_bufs[hi][:layer_block_size]
+                        decoder_helper_recv_addrs.append(rb.data_ptr())
+                if buf_pool.decoder_recovered_buf is not None:
+                    decoder_recovered_addrs.append(
+                        buf_pool.decoder_recovered_buf[:layer_block_size].data_ptr()
+                    )
+                if stri_plan.get('dual_failure') and buf_pool.decoder_recovered_buf2 is not None:
+                    decoder_recovered_addrs.append(
+                        buf_pool.decoder_recovered_buf2[:layer_block_size].data_ptr()
+                    )
+
+        if _is_failed_in_recovery_plan(stri_plan, my_node):
+            if buf_pool is not None and buf_pool.failed_recv_buf is not None:
+                failed_recv_buf_addr = buf_pool.failed_recv_buf[:layer_block_size].data_ptr()
+            if layer_buf is not None:
+                failed_layer_buf_addr = layer_buf.data_ptr()
+
+            if stri_plan.get('dual_failure'):
+                original_role = None
+                for target in stri_plan['failed_targets']:
+                    if target['failed_node'] == my_node:
+                        original_role = target['original_role']
+                        break
+            else:
+                original_role = stri_plan.get('original_role')
+
+            if layer_buf is not None and original_role == int(StripeRole.SOURCE):
+                store_to_layer_buf = True
+                blk_idx = src_block_per_node[my_node]
+                src_block_per_node[my_node] += 1
+                failed_layer_offset = blk_idx * layer_block_size
+                failed_ncopy = min(
+                    layer_block_size,
+                    max(0, layer_total_bytes - failed_layer_offset),
+                )
+
+        native.submit_recovery_stripe(
+            sid,
+            layer_block_size,
+            helper_block_addr,
+            decoder_self_block_addr,
+            decoder_helper_recv_addrs,
+            decoder_recovered_addrs,
+            failed_recv_buf_addr,
+            failed_layer_buf_addr,
+            failed_layer_offset,
+            failed_ncopy,
+            store_to_layer_buf,
         )
 
-        if stri_plan.get('dual_failure'):
-            _recover_one_stripe_dual(
-                native, stri_plan, my_node, n, node_to_rig,
-                layer_block_size, layer_total_bytes, layer_buf, my_blocks,
-                src_block_per_node, buf_pool, layer_timing,
-                recv_threads, recv_bufs,
-            )
-        else:
-            _recover_one_stripe_single(
-                native, stri_plan, my_node, n, node_to_rig,
-                layer_block_size, layer_total_bytes, layer_buf, my_blocks,
-                src_block_per_node, buf_pool, layer_timing,
-                recv_threads, recv_bufs,
-            )
+    native.submit_recovery_sentinel()
+    native.wait_recovery_batch()
 
     if is_failed:
         n_stored = src_block_per_node.get(my_node, 0)
@@ -1631,6 +1487,24 @@ def _recover_one_layer_network(
         )
 
     return layer_buf, layer_timing
+
+
+def _recover_one_layer_network(
+    manager,
+    native,
+    layer_name: str,
+    layer_block_size: int,
+    layer_total_bytes: int,
+    n: int,
+    rank: int,
+    preloaded_blocks: Dict[int, torch.Tensor],
+    buf_pool: Optional[_RecoveryBufPool] = None,
+) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+    """Run stripe-level RS decode recovery for one layer via C++ batch pipeline."""
+    return _submit_recovery_network(
+        native, manager, layer_name, layer_block_size, layer_total_bytes,
+        n, rank, preloaded_blocks, buf_pool,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1676,9 +1550,9 @@ def recover_frcheck_legacy_hardware(
     """Main entry point for FRCheck hardware recovery.
 
     Phases (timed separately):
-    1. prep — RDMA init, main I/O, stripe preload, buffer pools (before network_encode)
+    1. prep — RDMA init, main I/O, disk assemble + recovery preload (before network_encode)
     2. network_encode — per-layer RDMA RS recovery only
-    3. rebuild_sd — reconstruct state_dict (survivor reuses cached main payload)
+    3. rebuild_sd — metadata-only state_dict reconstruct (survivors use prep full_buf)
     """
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -1763,29 +1637,44 @@ def recover_frcheck_legacy_hardware(
     my_node = manager.rank_in_group + 1
 
     t_disk = time.time()
-    if involved and not is_failed:
-        preloaded = _preload_recovery_stripe_blocks(
-            n_encode_iters, all_layer_order, all_layer_metadata,
-            manager.recovery_stripe_plans, rank, my_node, saved_block_size,
+    preloaded: Dict[int, Dict[int, torch.Tensor]] = {
+        i: {} for i in range(n_encode_iters)
+    }
+    full_buf = None
+    if is_survivor:
+        full_buf, preloaded = _prep_survivor_hw_disk(
+            manager,
+            checkpoint_dir,
+            rank,
+            main_payload,
+            n_encode_iters,
+            all_layer_order,
+            all_layer_metadata,
+            manager.recovery_stripe_plans,
+            saved_block_size,
+            my_node,
             all_frcheck_dirs,
+            preload_recovery=bool(manager.recovery_stripe_plans),
         )
         for blocks in preloaded.values():
             for blk in blocks.values():
                 if blk.numel() > 1:
                     native.register_buffer(blk.data_ptr(), blk.numel())
-    else:
-        preloaded = {i: {} for i in range(n_encode_iters)}
+        logger.info(
+            "FRCheck recovery: survivor disk prep rank=%d preload_blocks=%d",
+            rank, sum(len(blocks) for blocks in preloaded.values()),
+        )
     n_disk_blocks = sum(len(blocks) for blocks in preloaded.values())
     timings['disk_io'] = time.time() - t_disk
-    if involved:
+    if is_survivor or involved:
         logger.info(
-            "FRCheck recovery: disk preload rank=%d blocks=%d time=%.2fs",
+            "FRCheck recovery: disk prep rank=%d blocks=%d time=%.2fs",
             rank, n_disk_blocks, timings['disk_io'],
         )
 
     if is_survivor and not involved:
         logger.info(
-            "FRCheck recovery: rank %d not involved in recovery, loading directly",
+            "FRCheck recovery: rank %d not involved in recovery, local load only",
             rank,
         )
 
@@ -1803,7 +1692,6 @@ def recover_frcheck_legacy_hardware(
         dual_failure=getattr(manager, 'recovery_dual_failure', False),
     )
 
-    full_buf = None
     if is_failed:
         safety_margin = max(int(total_tensor_size * 0.01), 4096)
         full_buf = manager.allocate_full_buf(total_tensor_size + safety_margin)
@@ -1880,13 +1768,8 @@ def recover_frcheck_legacy_hardware(
     timings['network_encode'] = time.time() - t_net
 
     t_rebuild = time.time()
-    if is_survivor:
-        result = _assemble_state_dict_from_local_blocks(
-            checkpoint_name, main_payload=main_payload, teardown_native=False,
-        )
-    else:
-        main_payload['tensor_buffer'] = full_buf[:total_tensor_size].clone()
-        result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
+    main_payload['tensor_buffer'] = full_buf[:total_tensor_size]
+    result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
     timings['rebuild_sd'] = time.time() - t_rebuild
 
     _teardown_frcheck_native_after_load()
@@ -1972,27 +1855,15 @@ def _enumerate_source_stripes(stripe_plans: List[StripePlan]) -> List[Tuple[int,
     return result
 
 
-def _assemble_state_dict_from_local_blocks(
-    checkpoint_name: str,
-    main_payload: Optional[Dict[str, Any]] = None,
-    teardown_native: bool = True,
-) -> Dict[str, Any]:
-    """Assemble state_dict from metadata-only main + local SOURCE FRBK shards."""
-    checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    world_size = (
-        torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-    )
-
-    if main_payload is None:
-        main_payload = _load_frcheck_main_payload(
-            checkpoint_dir, rank, world_size, load_tensor_buffer=False,
-        )
-
-    main_path = checkpoint_dir / f"frcheck_main_rank{rank}.pt"
-    if main_path.is_file():
-        _assert_frcheck_main_metadata_only(main_path)
-
+def _build_full_buf_from_local_blocks(
+    checkpoint_dir: Path,
+    rank: int,
+    main_payload: Dict[str, Any],
+    out_buf: Optional[torch.Tensor] = None,
+    source_block_cache: Optional[Dict[Tuple[str, int, int], torch.Tensor]] = None,
+    cache_source_keys: Optional[Set[Tuple[str, int, int]]] = None,
+) -> torch.Tensor:
+    """Assemble rank-local tensor bytes into full_buf from SOURCE FRBK shards."""
     poa_path = main_payload.get("poa_path", "")
     if not poa_path:
         raise RuntimeError("FRCheck load: poa_path missing in main metadata")
@@ -2004,7 +1875,6 @@ def _assemble_state_dict_from_local_blocks(
 
     total_tensor_size = int(main_payload.get("actual_tensor_size", 0))
     global_tensor_infos = main_payload.get("tensor_infos", [])
-    flat_key_roots = main_payload.get("flat_key_roots", [])
 
     stripe_plans = _compile_stripe_plans_for_load(poa_path, rank_in_group)
     source_stripes = _enumerate_source_stripes(stripe_plans)
@@ -2016,7 +1886,18 @@ def _assemble_state_dict_from_local_blocks(
     )
 
     safety_margin = max(int(total_tensor_size * 0.01), 4096)
-    full_buf = torch.zeros(total_tensor_size + safety_margin, dtype=torch.uint8)
+    if out_buf is not None:
+        if out_buf.numel() < total_tensor_size + safety_margin:
+            raise RuntimeError(
+                f"FRCheck load: out_buf too small ({out_buf.numel()} "
+                f"< {total_tensor_size + safety_margin})"
+            )
+        full_buf = out_buf
+    else:
+        full_buf = torch.zeros(total_tensor_size + safety_margin, dtype=torch.uint8)
+
+    cache = source_block_cache if source_block_cache is not None else {}
+    cache_keys = cache_source_keys if cache_source_keys is not None else set()
     key_to_local: Dict[str, Tuple[torch.Tensor, int]] = {}
 
     for layer_name in layer_names:
@@ -2041,15 +1922,17 @@ def _assemble_state_dict_from_local_blocks(
             block_path = (
                 layer_dir / f"stripe_{stripe_id}" / f"frcheck_shard_rank{rank}.pt"
             )
-            blk = _read_frbk_block(str(block_path))
-            if blk is None:
+            src_offset = blk_idx * layer_block_size
+            dst_slice = layer_buf[src_offset:src_offset + layer_block_size]
+            copy_len = _read_frbk_block_into(dst_slice, str(block_path))
+            if copy_len == 0:
                 logger.warning(
                     "FRCheck load: missing block %s, skipping stripe", block_path,
                 )
                 continue
-            src_offset = blk_idx * layer_block_size
-            copy_len = min(layer_block_size, blk.numel())
-            layer_buf[src_offset:src_offset + copy_len].copy_(blk[:copy_len])
+            cache_key = (layer_name, stripe_id, int(StripeRole.SOURCE))
+            if cache_key in cache_keys:
+                cache[cache_key] = dst_slice[:layer_block_size].clone()
 
         for info in layer_infos:
             key = getattr(info, "key", "")
@@ -2068,8 +1951,36 @@ def _assemble_state_dict_from_local_blocks(
                 layer_buf[local_offset:local_offset + size]
             )
 
+    return full_buf
+
+
+def _assemble_state_dict_from_local_blocks(
+    checkpoint_name: str,
+    main_payload: Optional[Dict[str, Any]] = None,
+    teardown_native: bool = True,
+) -> Dict[str, Any]:
+    """Assemble state_dict from metadata-only main + local SOURCE FRBK shards."""
+    checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = (
+        torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    )
+
+    if main_payload is None:
+        main_payload = _load_frcheck_main_payload(
+            checkpoint_dir, rank, world_size, load_tensor_buffer=False,
+        )
+
+    main_path = checkpoint_dir / f"frcheck_main_rank{rank}.pt"
+    if main_path.is_file():
+        _assert_frcheck_main_metadata_only(main_path)
+
+    flat_key_roots = main_payload.get("flat_key_roots", [])
+    total_tensor_size = int(main_payload.get("actual_tensor_size", 0))
+    full_buf = _build_full_buf_from_local_blocks(checkpoint_dir, rank, main_payload)
+
     payload = dict(main_payload)
-    payload["tensor_buffer"] = full_buf[:total_tensor_size].clone()
+    payload["tensor_buffer"] = full_buf[:total_tensor_size]
     result = _reconstruct_from_main_payload(payload, flat_key_roots)
     if teardown_native:
         _teardown_frcheck_native_after_load()

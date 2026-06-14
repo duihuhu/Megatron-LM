@@ -481,25 +481,25 @@ public:
     int entry(int r, int c) const { return table_.at(r).at(c); }
     std::vector<int> row(int r) const { return table_.at(r); }
     std::string path() const { return poa_path_; }
+    void abort_all_channels_() {
+        for (auto& peer_row : channels_) {
+            for (auto* ch : peer_row) {
+                if (ch) ch->abort_connection();
+            }
+        }
+    }
     void stop() {
         if (stopped_.exchange(true)) return;
 
-        encoding_workers_stop_ = true;
         recovery_workers_stop_ = true;
-        source_cv_.notify_all();
-        encoder_recv_cv_.notify_all();
-        encoder_encode_cv_.notify_all();
-        encoder_send_cv_.notify_all();
-        parity_cv_.notify_all();
         mirror_cv_.notify_all();
-        encoding_wait_cv_.notify_all();
         helper_cv_.notify_all();
         decoder_cv_.notify_all();
         failed_cv_.notify_all();
         recovery_wait_cv_.notify_all();
 
         abort_all_channels_();
-        encoding_workers_join_();
+        shutdown_stripe_workers();
         recovery_workers_join_();
         mirror_worker_shutdown();
         rs_pool_shutdown();
@@ -629,12 +629,15 @@ public:
                   << " lanes connected (per-channel CQ pairs="
                   << (group_size_ - 1) * num_lanes_ << ")" << std::endl;
 
-        // Init RS encode thread pool + ECLATIN-style encoding workers
+        // Init RS encode thread pool
         rs_pool_init();
-        encoding_workers_init();
 
         // Pre-compile stripe plans
         compile_stripe_plans_();
+
+        // Start per-stripe workers (needs stripe_plans_ populated)
+        mirror_worker_init();
+        init_stripe_workers();
     }
 
     int group_size() const { return group_size_; }
@@ -1403,146 +1406,131 @@ private:
     std::atomic<bool> mirror_idle_{true};
     cudaStream_t d2h_stream_ = nullptr;
 
-    std::queue<StripeChunkTask> source_q_;
-    std::mutex source_mtx_;
-    std::condition_variable source_cv_;
-    bool source_sentinel_received_ = false;
-    bool source_completed_ = false;
-    bool wait_source_ = false;
+    // ---- Per-layer shared task queue + thread pool ----
+    // Python pushes only active-stripe tasks; n workers pop-and-execute.
+    // No per-stripe CVs, no fixed assignment, no skipping logic.
 
-    // Encoder 3-stage pipeline: recv → encode → send
-    std::queue<StripeChunkTask> encoder_recv_q_;
-    std::mutex encoder_recv_mtx_;
-    std::condition_variable encoder_recv_cv_;
+    struct LayerTask {
+        int stripe_id;
+        StripeRole role;
+        uintptr_t buf0 = 0;  // SOURCE: data addr, ENCODER: recv buf, PARITY: p2_in
+        uintptr_t buf1 = 0;  // SOURCE: mirror addr, ENCODER: p1 addr
+        uintptr_t buf2 = 0;  // ENCODER: p2_out addr
+        size_t    block_sz = 0;
+        std::vector<uint8_t> src_mask;
+        // Pre-computed peer info (same for all layers)
+        std::vector<int> src_peer_rigs;
+        int enc_peer_rig = -1;
+        int par_peer_rig = -1;
+    };
 
-    std::queue<StripeChunkTask> encoder_encode_q_;
-    std::mutex encoder_encode_mtx_;
-    std::condition_variable encoder_encode_cv_;
+    // Pre-computed per-stripe peer info (populated once, read by tasks)
+    std::vector<LayerTask> stripe_info_;
 
-    std::queue<StripeChunkTask> encoder_send_q_;
-    std::mutex encoder_send_mtx_;
-    std::condition_variable encoder_send_cv_;
+    std::queue<LayerTask> task_q_;
+    std::mutex task_mtx_;
+    std::condition_variable task_cv_;
+    std::atomic<int> task_done_{0};
+    std::atomic<int> task_total_{0};
+    std::mutex layer_done_mtx_;
+    std::condition_variable layer_done_cv_;
+    std::mutex encoder_encode_mtx_;  // serializes RS pool access
 
-    bool encoder_sentinel_received_ = false;
-    bool encoder_completed_ = false;
-    bool wait_encoder_ = false;
+    std::vector<std::thread> pool_threads_;
+    std::atomic<bool> pool_stop_{false};
 
-    std::queue<StripeChunkTask> parity_q_;
-    std::mutex parity_mtx_;
-    std::condition_variable parity_cv_;
-    bool parity_sentinel_received_ = false;
-    bool parity_completed_ = false;
-    bool wait_parity_ = false;
+    bool debug_ = false;
 
-    std::vector<std::thread> source_threads_;
-    std::thread encoder_recv_thread_;
-    std::thread encoder_encode_thread_;
-    std::thread encoder_send_thread_;
-    std::thread parity_thread_;
-    std::atomic<bool> encoding_workers_stop_{false};
-    std::atomic<int> source_active_{0};
-    std::atomic<int> encoder_active_{0};
-    std::atomic<int> parity_active_{0};
-    std::atomic<int> pending_chunks_{0};
-    bool encoding_batch_completed_ = false;
-    std::mutex encoding_wait_mtx_;
-    std::condition_variable encoding_wait_cv_;
+    void pool_worker_() {
+        while (!pool_stop_.load(std::memory_order_acquire)) {
+            LayerTask task;
+            {
+                std::unique_lock<std::mutex> lk(task_mtx_);
+                task_cv_.wait(lk, [this] {
+                    return pool_stop_.load(std::memory_order_acquire) || !task_q_.empty();
+                });
+                if (pool_stop_.load(std::memory_order_acquire) && task_q_.empty()) break;
+                task = std::move(task_q_.front());
+                task_q_.pop();
+            }
 
-    bool debug_ = false;  // frcheck debug flag (set from Python)
+            try {
+                switch (task.role) {
+                case StripeRole::SOURCE:
+                    execute_source(task);
+                    break;
+                case StripeRole::ENCODER:
+                    execute_encoder(task);
+                    break;
+                case StripeRole::PARITY_TARGET:
+                    execute_parity(task);
+                    break;
+                default: break;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "FRCheck pool worker: stripe " << task.stripe_id
+                          << " " << e.what() << std::endl;
+            }
 
-    // Per-stage wall-time accumulators (microseconds), only populated when debug_=true
-    std::atomic<int64_t> source_time_us_{0};
-    std::atomic<int64_t> encoder_recv_time_us_{0};
-    std::atomic<int64_t> encoder_encode_time_us_{0};
-    std::atomic<int64_t> encoder_send_time_us_{0};
-    std::atomic<int64_t> parity_time_us_{0};
-
-    static bool is_source_sentinel_(const StripeChunkTask& t) {
-        return t.source_data == 0 && t.block_size == 0;
-    }
-    static bool is_encoder_sentinel_(const StripeChunkTask& t) {
-        return t.recv_buf_addr == 0 && t.p1_addr == 0 &&
-               t.p2_out_addr == 0 && t.block_size == 0;
-    }
-    static bool is_parity_sentinel_(const StripeChunkTask& t) {
-        return t.p2_in_addr == 0 && t.block_size == 0;
-    }
-
-    void notify_encoding_wait_() {
-        encoding_wait_cv_.notify_all();
-    }
-
-    void maybe_complete_encoding_batch_() {
-        if (pending_chunks_.load(std::memory_order_acquire) != 0) return;
-        if (source_active_.load(std::memory_order_acquire) != 0) return;
-        if (encoder_active_.load(std::memory_order_acquire) != 0) return;
-        if (parity_active_.load(std::memory_order_acquire) != 0) return;
-        if (wait_source_ && !source_completed_) return;
-        if (wait_encoder_ && !encoder_completed_) return;
-        if (wait_parity_ && !parity_completed_) return;
-        std::lock_guard<std::mutex> lk(encoding_wait_mtx_);
-        if (encoding_batch_completed_) return;
-        if (debug_) {
-            int64_t src_us  = source_time_us_.load(std::memory_order_relaxed);
-            int64_t recv_us = encoder_recv_time_us_.load(std::memory_order_relaxed);
-            int64_t enc_us  = encoder_encode_time_us_.load(std::memory_order_relaxed);
-            int64_t send_us = encoder_send_time_us_.load(std::memory_order_relaxed);
-            int64_t par_us  = parity_time_us_.load(std::memory_order_relaxed);
-            double total_s = (double)(src_us + recv_us + enc_us + send_us + par_us) / 1e6;
-            std::cout << "[FRCHECK-DEBUG] per-stage wall time (rank "
-                      << rank_in_group_ << "):"
-                      << " source=" << (double)src_us / 1e3 << "ms"
-                      << " enc_recv=" << (double)recv_us / 1e3 << "ms"
-                      << " enc_encode=" << (double)enc_us / 1e3 << "ms"
-                      << " enc_send=" << (double)send_us / 1e3 << "ms"
-                      << " parity=" << (double)par_us / 1e3 << "ms"
-                      << " sum=" << total_s << "s"
-                      << std::endl;
-        }
-        encoding_batch_completed_ = true;
-        notify_encoding_wait_();
-    }
-
-    void maybe_complete_source_after_sentinel_() {
-        if (!source_sentinel_received_) return;
-        if (source_active_.load(std::memory_order_acquire) != 0) return;
-        std::lock_guard<std::mutex> lk(source_mtx_);
-        if (source_q_.empty()) {
-            source_completed_ = true;
-            source_sentinel_received_ = false;
-            maybe_complete_encoding_batch_();
+            int done = task_done_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (done == task_total_) {
+                std::lock_guard<std::mutex> lk(layer_done_mtx_);
+                layer_done_cv_.notify_all();
+            }
         }
     }
 
-    void maybe_complete_encoder_after_sentinel_() {
-        if (!encoder_sentinel_received_) return;
-        if (encoder_active_.load(std::memory_order_acquire) != 0) return;
-        {
-            std::lock_guard<std::mutex> lk(encoder_recv_mtx_);
-            if (!encoder_recv_q_.empty()) return;
+    void execute_source(const LayerTask& t) {
+        FRCheckRdmaChannel* ch = get_channel_(t.enc_peer_rig, t.stripe_id);
+        if (!ch) throw std::runtime_error("FRCheck source: no channel");
+        ch->send_data((const uint8_t*)t.buf0, t.block_sz);
+        if (t.buf1 != 0)
+            push_mirror_task_(t.buf0, t.buf1, t.block_sz);
+    }
+
+    void execute_encoder(const LayerTask& t) {
+        int n_src = (int)t.src_peer_rigs.size();
+        std::vector<std::thread> recv_threads;
+        std::vector<std::exception_ptr> recv_exceptions((size_t)n_src);
+        for (int i = 0; i < n_src; ++i) {
+            recv_exceptions[(size_t)i] = nullptr;
+            if (!t.src_mask.empty() && (size_t)i < t.src_mask.size() && t.src_mask[(size_t)i] == 0)
+                continue;
+            recv_threads.emplace_back([&, i]() {
+                try {
+                    if (t.src_peer_rigs[(size_t)i] == rank_in_group_) return;
+                    uintptr_t dst = t.buf0 + (uintptr_t)i * t.block_sz;
+                    FRCheckRdmaChannel* ch = get_channel_(t.src_peer_rigs[(size_t)i], t.stripe_id);
+                    if (!ch) throw std::runtime_error("FRCheck encoder recv: no channel");
+                    ch->recv_data((uint8_t*)dst, t.block_sz);
+                } catch (...) { recv_exceptions[(size_t)i] = std::current_exception(); }
+            });
         }
+        for (auto& th : recv_threads) th.join();
+        for (int i = 0; i < n_src; ++i)
+            if (recv_exceptions[(size_t)i]) std::rethrow_exception(recv_exceptions[(size_t)i]);
+
+        std::vector<unsigned char*> data_ptrs((size_t)n_src);
+        for (int i = 0; i < n_src; ++i)
+            data_ptrs[(size_t)i] = (unsigned char*)(t.buf0 + (uintptr_t)i * t.block_sz);
+        unsigned char* parity_ptrs[2] = { (unsigned char*)t.buf1, (unsigned char*)t.buf2 };
+        RsEncodeJob rs;
+        rs.len = (int)t.block_sz; rs.k = n_src; rs.m = 2;
+        rs.g_tbls = g_tbls_; rs.data_ptrs = data_ptrs.data(); rs.parity_ptrs = parity_ptrs;
         {
             std::lock_guard<std::mutex> lk(encoder_encode_mtx_);
-            if (!encoder_encode_q_.empty()) return;
+            rs_pool_run_parallel_encode(rs);
         }
-        {
-            std::lock_guard<std::mutex> lk(encoder_send_mtx_);
-            if (!encoder_send_q_.empty()) return;
-        }
-        encoder_completed_ = true;
-        encoder_sentinel_received_ = false;
-        maybe_complete_encoding_batch_();
+
+        FRCheckRdmaChannel* ch = get_channel_(t.par_peer_rig, t.stripe_id);
+        if (!ch) throw std::runtime_error("FRCheck encoder send: no channel");
+        ch->send_data((const uint8_t*)t.buf2, t.block_sz);
     }
 
-    void maybe_complete_parity_after_sentinel_() {
-        if (!parity_sentinel_received_) return;
-        if (parity_active_.load(std::memory_order_acquire) != 0) return;
-        std::lock_guard<std::mutex> lk(parity_mtx_);
-        if (parity_q_.empty()) {
-            parity_completed_ = true;
-            parity_sentinel_received_ = false;
-            maybe_complete_encoding_batch_();
-        }
+    void execute_parity(const LayerTask& t) {
+        FRCheckRdmaChannel* ch = get_channel_(t.enc_peer_rig, t.stripe_id);
+        if (!ch) throw std::runtime_error("FRCheck parity: no channel");
+        ch->recv_data((uint8_t*)t.buf0, t.block_sz);
     }
 
     void push_mirror_task_(uintptr_t gpu_addr, uintptr_t cpu_addr, size_t block_size) {
@@ -1616,551 +1604,106 @@ private:
         }
     }
 
-    void execute_source_chunk_(const StripeChunkTask& task) {
-        const auto& plan = stripe_plans_.at(task.stripe_id);
-        FRCheckRdmaChannel* ch = get_channel_(plan.encoder_node_id - 1, task.stripe_id);
-        if (!ch) throw std::runtime_error("FRCheck source: no channel to encoder");
-        ch->send_data(
-            reinterpret_cast<const uint8_t*>(task.source_data),
-            task.block_size);
-        if (task.source_mirror != 0) {
-            push_mirror_task_(task.source_data, task.source_mirror, task.block_size);
-        }
-    }
-
-    void execute_encoder_recv_(const StripeChunkTask& task) {
-        // Parallel RDMA RECV from active source nodes only;
-        // inactive sources stay zero (recv_buf is zero-initialized by Python).
-        std::vector<std::thread> recv_threads;
-        std::vector<std::exception_ptr> recv_exceptions((size_t)task.n_src);
-        for (int i = 0; i < task.n_src; ++i) {
-            recv_exceptions[(size_t)i] = nullptr;
-
-            // Skip inactive sources (slot stays zero)
-            if (!task.source_active_mask.empty() &&
-                (size_t)i < task.source_active_mask.size() &&
-                task.source_active_mask[(size_t)i] == 0)
-                continue;
-
-            recv_threads.emplace_back([&, i]() {
-                try {
-                    if (task.src_peer_rigs[(size_t)i] == rank_in_group_) return;
-                    uintptr_t dst = task.recv_buf_addr + (uintptr_t)i * task.block_size;
-                    FRCheckRdmaChannel* ch = get_channel_(task.src_peer_rigs[(size_t)i], task.stripe_id);
-                    if (!ch) throw std::runtime_error("FRCheck encoder recv: no channel from source");
-                    ch->recv_data(
-                        reinterpret_cast<uint8_t*>(dst),
-                        task.block_size);
-                } catch (...) {
-                    recv_exceptions[(size_t)i] = std::current_exception();
-                }
-            });
-        }
-        for (auto& t : recv_threads) t.join();
-        for (int i = 0; i < task.n_src; ++i) {
-            if (recv_exceptions[(size_t)i]) {
-                if (encoding_workers_stop_) return;
-                std::rethrow_exception(recv_exceptions[(size_t)i]);
-            }
-        }
-    }
-
-    void execute_encoder_encode_(const StripeChunkTask& task) {
-        // RS encode on CPU: n_src data blocks → 2 parity blocks
-        std::vector<unsigned char*> data_ptrs((size_t)task.n_src);
-        for (int i = 0; i < task.n_src; ++i)
-            data_ptrs[(size_t)i] = reinterpret_cast<unsigned char*>(
-                task.recv_buf_addr + (uintptr_t)i * task.block_size);
-        unsigned char* parity_ptrs[2] = {
-            reinterpret_cast<unsigned char*>(task.p1_addr),
-            reinterpret_cast<unsigned char*>(task.p2_out_addr),
-        };
-
-        RsEncodeJob rs;
-        rs.len = (int)task.block_size;
-        rs.k = task.n_src;
-        rs.m = 2;
-        rs.g_tbls = g_tbls_;
-        rs.data_ptrs = data_ptrs.data();
-        rs.parity_ptrs = parity_ptrs;
-        rs_pool_run_parallel_encode(rs);
-    }
-
-    void execute_encoder_send_(const StripeChunkTask& task) {
-        // RDMA SEND p2 to parity target
-        FRCheckRdmaChannel* ch = get_channel_(task.par_peer_rig, task.stripe_id);
-        if (!ch) throw std::runtime_error("FRCheck encoder send: no channel to parity target");
-        ch->send_data(
-            reinterpret_cast<const uint8_t*>(task.p2_out_addr),
-            task.block_size);
-    }
-
-    void execute_parity_chunk_(const StripeChunkTask& task) {
-        FRCheckRdmaChannel* ch = get_channel_(task.enc_peer_rig, task.stripe_id);
-        if (!ch) throw std::runtime_error("FRCheck parity: no channel from encoder");
-        ch->recv_data(
-            reinterpret_cast<uint8_t*>(task.p2_in_addr),
-            task.block_size);
-    }
-
-    void source_worker_loop_() {
-        while (!encoding_workers_stop_) {
-            StripeChunkTask task;
-            {
-                std::unique_lock<std::mutex> lk(source_mtx_);
-                source_cv_.wait(lk, [this] {
-                    return encoding_workers_stop_ || !source_q_.empty();
-                });
-                if (encoding_workers_stop_) break;
-                task = source_q_.front();
-                source_q_.pop();
-            }
-
-            if (is_source_sentinel_(task)) {
-                source_sentinel_received_ = true;
-                maybe_complete_source_after_sentinel_();
-                continue;
-            }
-
-            source_active_.fetch_add(1, std::memory_order_acq_rel);
-            try {
-                auto _t0 = debug_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                execute_source_chunk_(task);
-                if (debug_) {
-                    auto _t1 = std::chrono::steady_clock::now();
-                    source_time_us_.fetch_add(
-                        std::chrono::duration_cast<std::chrono::microseconds>(_t1 - _t0).count(),
-                        std::memory_order_relaxed);
-                }
-            } catch (const std::exception& e) {
-                source_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-                if (encoding_workers_stop_) return;
-                if (debug_) std::cerr << "FRCheck source_worker: " << e.what() << std::endl;
-                return;
-            } catch (...) {
-                source_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-                if (encoding_workers_stop_) return;
-                throw;
-            }
-            source_active_.fetch_sub(1, std::memory_order_acq_rel);
-            pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-            maybe_complete_source_after_sentinel_();
-        }
-    }
-
-    // ---- Encoder 3-stage pipeline ----
-    // Stage 1: RDMA RECV from sources (keeps RECV posted so SOURCE ranks can SEND continuously)
-    void encoder_recv_loop_() {
-        while (!encoding_workers_stop_) {
-            StripeChunkTask task;
-            {
-                std::unique_lock<std::mutex> lk(encoder_recv_mtx_);
-                encoder_recv_cv_.wait(lk, [this] {
-                    return encoding_workers_stop_ || !encoder_recv_q_.empty();
-                });
-                if (encoding_workers_stop_) break;
-                task = encoder_recv_q_.front();
-                encoder_recv_q_.pop();
-            }
-
-            if (is_encoder_sentinel_(task)) {
-                // Propagate sentinel to next stage
-                {
-                    std::lock_guard<std::mutex> lk(encoder_encode_mtx_);
-                    encoder_encode_q_.push(task);
-                }
-                encoder_encode_cv_.notify_all();
-                continue;
-            }
-
-            try {
-                auto _t0 = debug_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                execute_encoder_recv_(task);
-                if (debug_) {
-                    auto _t1 = std::chrono::steady_clock::now();
-                    encoder_recv_time_us_.fetch_add(
-                        std::chrono::duration_cast<std::chrono::microseconds>(_t1 - _t0).count(),
-                        std::memory_order_relaxed);
-                }
-            } catch (const std::exception& e) {
-                encoder_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-                if (encoding_workers_stop_) return;
-                if (debug_) std::cerr << "FRCheck encoder_recv: " << e.what() << std::endl;
-                return;
-            } catch (...) {
-                encoder_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-                if (encoding_workers_stop_) return;
-                throw;
-            }
-
-            // Push to encode stage
-            {
-                std::lock_guard<std::mutex> lk(encoder_encode_mtx_);
-                encoder_encode_q_.push(std::move(task));
-            }
-            encoder_encode_cv_.notify_all();
-        }
-    }
-
-    // Stage 2: RS encode (CPU via ISA-L thread pool)
-    void encoder_encode_loop_() {
-        while (!encoding_workers_stop_) {
-            StripeChunkTask task;
-            {
-                std::unique_lock<std::mutex> lk(encoder_encode_mtx_);
-                encoder_encode_cv_.wait(lk, [this] {
-                    return encoding_workers_stop_ || !encoder_encode_q_.empty();
-                });
-                if (encoding_workers_stop_) break;
-                task = encoder_encode_q_.front();
-                encoder_encode_q_.pop();
-            }
-
-            if (is_encoder_sentinel_(task)) {
-                // Propagate sentinel to next stage
-                {
-                    std::lock_guard<std::mutex> lk(encoder_send_mtx_);
-                    encoder_send_q_.push(task);
-                }
-                encoder_send_cv_.notify_all();
-                continue;
-            }
-
-            try {
-                auto _t0 = debug_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                execute_encoder_encode_(task);
-                if (debug_) {
-                    auto _t1 = std::chrono::steady_clock::now();
-                    encoder_encode_time_us_.fetch_add(
-                        std::chrono::duration_cast<std::chrono::microseconds>(_t1 - _t0).count(),
-                        std::memory_order_relaxed);
-                }
-            } catch (const std::exception& e) {
-                encoder_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-                if (encoding_workers_stop_) return;
-                if (debug_) std::cerr << "FRCheck encoder_encode: " << e.what() << std::endl;
-                return;
-            } catch (...) {
-                encoder_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-                if (encoding_workers_stop_) return;
-                throw;
-            }
-
-            // Push to send stage
-            {
-                std::lock_guard<std::mutex> lk(encoder_send_mtx_);
-                encoder_send_q_.push(std::move(task));
-            }
-            encoder_send_cv_.notify_all();
-        }
-    }
-
-    // Stage 3: RDMA SEND p2 to parity target
-    void encoder_send_loop_() {
-        while (!encoding_workers_stop_) {
-            StripeChunkTask task;
-            {
-                std::unique_lock<std::mutex> lk(encoder_send_mtx_);
-                encoder_send_cv_.wait(lk, [this] {
-                    return encoding_workers_stop_ || !encoder_send_q_.empty();
-                });
-                if (encoding_workers_stop_) break;
-                task = encoder_send_q_.front();
-                encoder_send_q_.pop();
-            }
-
-            if (is_encoder_sentinel_(task)) {
-                encoder_sentinel_received_ = true;
-                maybe_complete_encoder_after_sentinel_();
-                continue;
-            }
-
-            try {
-                auto _t0 = debug_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                execute_encoder_send_(task);
-                if (debug_) {
-                    auto _t1 = std::chrono::steady_clock::now();
-                    encoder_send_time_us_.fetch_add(
-                        std::chrono::duration_cast<std::chrono::microseconds>(_t1 - _t0).count(),
-                        std::memory_order_relaxed);
-                }
-            } catch (const std::exception& e) {
-                encoder_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-                if (encoding_workers_stop_) return;
-                if (debug_) std::cerr << "FRCheck encoder_send: " << e.what() << std::endl;
-                return;
-            } catch (...) {
-                encoder_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-                if (encoding_workers_stop_) return;
-                throw;
-            }
-            encoder_active_.fetch_sub(1, std::memory_order_acq_rel);
-            pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-            maybe_complete_encoder_after_sentinel_();
-        }
-    }
-
-    void parity_worker_loop_() {
-        while (!encoding_workers_stop_) {
-            StripeChunkTask task;
-            {
-                std::unique_lock<std::mutex> lk(parity_mtx_);
-                parity_cv_.wait(lk, [this] {
-                    return encoding_workers_stop_ || !parity_q_.empty();
-                });
-                if (encoding_workers_stop_) break;
-                task = parity_q_.front();
-                parity_q_.pop();
-            }
-
-            if (is_parity_sentinel_(task)) {
-                parity_sentinel_received_ = true;
-                maybe_complete_parity_after_sentinel_();
-                continue;
-            }
-
-            parity_active_.fetch_add(1, std::memory_order_acq_rel);
-            try {
-                auto _t0 = debug_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                execute_parity_chunk_(task);
-                if (debug_) {
-                    auto _t1 = std::chrono::steady_clock::now();
-                    parity_time_us_.fetch_add(
-                        std::chrono::duration_cast<std::chrono::microseconds>(_t1 - _t0).count(),
-                        std::memory_order_relaxed);
-                }
-            } catch (const std::exception& e) {
-                parity_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-                if (encoding_workers_stop_) return;
-                if (debug_) std::cerr << "FRCheck parity_worker: " << e.what() << std::endl;
-                return;
-            } catch (...) {
-                parity_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-                if (encoding_workers_stop_) return;
-                throw;
-            }
-            parity_active_.fetch_sub(1, std::memory_order_acq_rel);
-            pending_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-            maybe_complete_parity_after_sentinel_();
-        }
-    }
-
-    void encoding_workers_init() {
-        encoding_workers_stop_ = false;
-        mirror_worker_init();
-        static constexpr int kSourceThreads = 4;
-        source_threads_.reserve(kSourceThreads);
-        for (int i = 0; i < kSourceThreads; ++i)
-            source_threads_.emplace_back(&FRCheckNative::source_worker_loop_, this);
-        encoder_recv_thread_ = std::thread(&FRCheckNative::encoder_recv_loop_, this);
-        encoder_encode_thread_ = std::thread(&FRCheckNative::encoder_encode_loop_, this);
-        encoder_send_thread_ = std::thread(&FRCheckNative::encoder_send_loop_, this);
-        parity_thread_ = std::thread(&FRCheckNative::parity_worker_loop_, this);
-        if (debug_)
-            std::cout << "FRCheck: role encoding workers started "
-                      << "(source×" << kSourceThreads
-                      << " + encoder×3 [recv/encode/send] + parity + mirror)" << std::endl;
-    }
-
-    void encoding_workers_join_() {
-        for (auto& t : source_threads_)
-            if (t.joinable()) t.join();
-        if (encoder_recv_thread_.joinable()) encoder_recv_thread_.join();
-        if (encoder_encode_thread_.joinable()) encoder_encode_thread_.join();
-        if (encoder_send_thread_.joinable()) encoder_send_thread_.join();
-        if (parity_thread_.joinable()) parity_thread_.join();
-    }
-
-    void abort_all_channels_() {
-        for (auto& peer_row : channels_) {
-            for (auto* ch : peer_row) {
-                if (ch) ch->abort_connection();
-            }
-        }
-    }
-
-    void encoding_workers_shutdown() {
-        encoding_workers_stop_ = true;
-        source_cv_.notify_all();
-        encoder_recv_cv_.notify_all();
-        encoder_encode_cv_.notify_all();
-        encoder_send_cv_.notify_all();
-        parity_cv_.notify_all();
-        mirror_cv_.notify_all();
-        encoding_wait_cv_.notify_all();
-        abort_all_channels_();
-        encoding_workers_join_();
-        mirror_worker_shutdown();
-    }
-
 public:
-    void reset_encoding_completion() {
-        encoding_batch_completed_ = false;
-        pending_chunks_.store(0, std::memory_order_release);
-        source_active_.store(0, std::memory_order_release);
-        encoder_active_.store(0, std::memory_order_release);
-        parity_active_.store(0, std::memory_order_release);
-        wait_source_ = false;
-        wait_encoder_ = false;
-        wait_parity_ = false;
-        source_completed_ = false;
-        encoder_completed_ = false;
-        parity_completed_ = false;
-        source_sentinel_received_ = false;
-        encoder_sentinel_received_ = false;
-        parity_sentinel_received_ = false;
-        source_time_us_.store(0, std::memory_order_relaxed);
-        encoder_recv_time_us_.store(0, std::memory_order_relaxed);
-        encoder_encode_time_us_.store(0, std::memory_order_relaxed);
-        encoder_send_time_us_.store(0, std::memory_order_relaxed);
-        parity_time_us_.store(0, std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lk(source_mtx_);
-            while (!source_q_.empty()) source_q_.pop();
+    void init_stripe_workers() {
+        int ns = (int)stripe_plans_.size();
+        stripe_info_.resize((size_t)ns);
+        for (int i = 0; i < ns; ++i) {
+            auto& si = stripe_info_[(size_t)i];
+            si.stripe_id = i;
+            si.role = stripe_plans_[i].role;
+            si.src_peer_rigs.resize(stripe_plans_[i].source_node_ids.size());
+            for (size_t j = 0; j < stripe_plans_[i].source_node_ids.size(); ++j)
+                si.src_peer_rigs[j] = stripe_plans_[i].source_node_ids[j] - 1;
+            si.enc_peer_rig = stripe_plans_[i].encoder_node_id - 1;
+            si.par_peer_rig = stripe_plans_[i].parity_target_node_id - 1;
         }
+        pool_stop_.store(false, std::memory_order_release);
+        int nw = n_;
+        pool_threads_.reserve((size_t)nw);
+        for (int w = 0; w < nw; ++w)
+            pool_threads_.emplace_back(&FRCheckNative::pool_worker_, this);
+        if (debug_)
+            std::cout << "FRCheck: pool of " << nw << " workers for " << ns << " stripes" << std::endl;
+    }
+
+    void shutdown_stripe_workers() {
+        pool_stop_.store(true, std::memory_order_release);
+        task_cv_.notify_all();
+        for (auto& t : pool_threads_)
+            if (t.joinable()) t.join();
+        pool_threads_.clear();
+    }
+
+    void submit_source(int sid, uintptr_t data, uintptr_t mirror, size_t bs) {
+        LayerTask t = stripe_info_[(size_t)sid];
+        t.buf0 = data;
+        t.buf1 = mirror;
+        t.block_sz = bs;
+        task_total_.fetch_add(1, std::memory_order_acq_rel);
         {
-            std::lock_guard<std::mutex> lk(encoder_recv_mtx_);
-            while (!encoder_recv_q_.empty()) encoder_recv_q_.pop();
+            std::lock_guard<std::mutex> lk(task_mtx_);
+            task_q_.push(std::move(t));
         }
+        task_cv_.notify_one();
+    }
+
+    void submit_encoder(int sid, uintptr_t recv, uintptr_t p1, uintptr_t p2, size_t bs,
+                        const std::vector<uint8_t>& mask) {
+        LayerTask t = stripe_info_[(size_t)sid];
+        t.buf0 = recv;
+        t.buf1 = p1;
+        t.buf2 = p2;
+        t.block_sz = bs;
+        t.src_mask = mask;
+        task_total_.fetch_add(1, std::memory_order_acq_rel);
         {
-            std::lock_guard<std::mutex> lk(encoder_encode_mtx_);
-            while (!encoder_encode_q_.empty()) encoder_encode_q_.pop();
+            std::lock_guard<std::mutex> lk(task_mtx_);
+            task_q_.push(std::move(t));
         }
+        task_cv_.notify_one();
+    }
+
+    void submit_parity(int sid, uintptr_t p2_in, size_t bs) {
+        LayerTask t = stripe_info_[(size_t)sid];
+        t.buf0 = p2_in;
+        t.block_sz = bs;
+        task_total_.fetch_add(1, std::memory_order_acq_rel);
         {
-            std::lock_guard<std::mutex> lk(encoder_send_mtx_);
-            while (!encoder_send_q_.empty()) encoder_send_q_.pop();
+            std::lock_guard<std::mutex> lk(task_mtx_);
+            task_q_.push(std::move(t));
         }
+        task_cv_.notify_one();
+    }
+
+    void reset_layer() {
+        task_done_.store(0, std::memory_order_release);
+        task_total_.store(0, std::memory_order_release);
         {
-            std::lock_guard<std::mutex> lk(parity_mtx_);
-            while (!parity_q_.empty()) parity_q_.pop();
+            std::lock_guard<std::mutex> lk(task_mtx_);
+            while (!task_q_.empty()) task_q_.pop();
         }
     }
 
-    void submit_stripe_chunk(
-        int stripe_id,
-        uintptr_t source_data_addr,
-        uintptr_t source_mirror_addr,
-        uintptr_t recv_buf_addr,
-        uintptr_t p1_addr,
-        uintptr_t p2_out_addr,
-        uintptr_t p2_in_addr,
-        size_t block_size,
-        const std::vector<uint8_t>& source_active_mask = {})
-    {
-        if (stopped_) return;
-        if (recovery_batch_active_)
-            throw std::runtime_error(
-                "FRCheck: recovery batch active, cannot submit_stripe_chunk");
-        encoding_batch_active_ = true;
-        if (stripe_id < 0 || stripe_id >= (int)stripe_plans_.size())
-            throw std::runtime_error("FRCheck: invalid stripe_id");
+    void wait_layer() {
+        int total = task_total_.load(std::memory_order_acquire);
+        if (total == 0) return;
 
-        const auto& plan = stripe_plans_[stripe_id];
-        StripeChunkTask task;
-        task.stripe_id = stripe_id;
-        task.role = plan.role;
-        task.block_size = block_size;
+        std::thread diag([this, total]() {
+            for (int i = 0; i < 6; ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                int done = task_done_.load(std::memory_order_acquire);
+                if (done >= total) return;
+                std::cerr << "[FRCHECK-DIAG] rank " << rank_in_group_
+                          << " done=" << done << "/" << total
+                          << " after " << ((i+1)*5) << "s" << std::endl;
+            }
+        });
+        diag.detach();
 
-        switch (plan.role) {
-        case StripeRole::SOURCE:
-            if (source_data_addr == 0) return;
-            task.source_data = source_data_addr;
-            task.source_mirror = source_mirror_addr;
-            pending_chunks_.fetch_add(1, std::memory_order_acq_rel);
-            {
-                std::lock_guard<std::mutex> lk(source_mtx_);
-                source_q_.push(std::move(task));
-                wait_source_ = true;
-                source_completed_ = false;
-            }
-            source_cv_.notify_all();
-            break;
-        case StripeRole::ENCODER:
-            task.recv_buf_addr = recv_buf_addr;
-            task.p1_addr = p1_addr;
-            task.p2_out_addr = p2_out_addr;
-            task.n_src = (int)plan.source_node_ids.size();
-            task.src_peer_rigs.resize((size_t)task.n_src);
-            for (int i = 0; i < task.n_src; ++i)
-                task.src_peer_rigs[(size_t)i] = plan.source_node_ids[(size_t)i] - 1;
-            task.source_active_mask = source_active_mask;
-            task.par_peer_rig = plan.parity_target_node_id - 1;
-            pending_chunks_.fetch_add(1, std::memory_order_acq_rel);
-            encoder_active_.fetch_add(1, std::memory_order_acq_rel);
-            {
-                std::lock_guard<std::mutex> lk(encoder_recv_mtx_);
-                encoder_recv_q_.push(std::move(task));
-                wait_encoder_ = true;
-                encoder_completed_ = false;
-            }
-            encoder_recv_cv_.notify_all();
-            break;
-        case StripeRole::PARITY_TARGET:
-            task.p2_in_addr = p2_in_addr;
-            task.enc_peer_rig = plan.encoder_node_id - 1;
-            pending_chunks_.fetch_add(1, std::memory_order_acq_rel);
-            {
-                std::lock_guard<std::mutex> lk(parity_mtx_);
-                parity_q_.push(std::move(task));
-                wait_parity_ = true;
-                parity_completed_ = false;
-            }
-            parity_cv_.notify_all();
-            break;
-        }
-    }
-
-    void reset_encoding_batch() {
-        reset_encoding_completion();
-    }
-
-    void submit_encoding_sentinel() {
-        StripeChunkTask sentinel{};
-        if (wait_source_) {
-            {
-                std::lock_guard<std::mutex> lk(source_mtx_);
-                source_q_.push(sentinel);
-            }
-            source_cv_.notify_all();
-        }
-        if (wait_encoder_) {
-            // Sentinel flows through all 3 encoder pipeline stages
-            {
-                std::lock_guard<std::mutex> lk(encoder_recv_mtx_);
-                encoder_recv_q_.push(sentinel);
-            }
-            encoder_recv_cv_.notify_all();
-        }
-        if (wait_parity_) {
-            {
-                std::lock_guard<std::mutex> lk(parity_mtx_);
-                parity_q_.push(sentinel);
-            }
-            parity_cv_.notify_all();
-        }
-        maybe_complete_encoding_batch_();
-    }
-
-    void wait_encoding_batch() {
-        wait_for_encoding_completion();
-        wait_mirror_completion();
-        encoding_batch_active_ = false;
-    }
-
-    void wait_for_encoding_completion() {
-        std::unique_lock<std::mutex> lk(encoding_wait_mtx_);
-        encoding_wait_cv_.wait(lk, [this] {
-            return stopped_.load() || encoding_batch_completed_;
+        std::unique_lock<std::mutex> lk(layer_done_mtx_);
+        layer_done_cv_.wait(lk, [this, total] {
+            return task_done_.load(std::memory_order_acquire) >= total;
         });
     }
 
@@ -2621,7 +2164,7 @@ public:
         if (rdma_cleaned_up_.exchange(true)) return;
 
         if (!stopped_.load()) {
-            encoding_workers_shutdown();
+            shutdown_stripe_workers();
         }
         channel_owners_.clear();
         channels_.clear();
@@ -2960,23 +2503,17 @@ PYBIND11_MODULE(frcheck_native, m) {
         .def("get_parity_target_node_id", &FRCheckNative::get_parity_target_node_id,
              py::arg("stripe_id"))
 
-        // Stripe-FIFO encoding pipeline
-        .def("reset_encoding_completion", &FRCheckNative::reset_encoding_completion)
-        .def("reset_encoding_batch", &FRCheckNative::reset_encoding_batch)
-        .def("submit_stripe_chunk", &FRCheckNative::submit_stripe_chunk,
-             py::arg("stripe_id"),
-             py::arg("source_data_addr"),
-             py::arg("source_mirror_addr"),
-             py::arg("recv_buf_addr"),
-             py::arg("p1_addr"),
-             py::arg("p2_out_addr"),
-             py::arg("p2_in_addr"),
-             py::arg("block_size"),
+        // Per-stripe worker encoding API
+        .def("reset_layer", &FRCheckNative::reset_layer)
+        .def("submit_source", &FRCheckNative::submit_source,
+             py::arg("stripe_id"), py::arg("data_addr"), py::arg("mirror_addr"), py::arg("block_size"))
+        .def("submit_encoder", &FRCheckNative::submit_encoder,
+             py::arg("stripe_id"), py::arg("recv_addr"), py::arg("p1_addr"),
+             py::arg("p2_addr"), py::arg("block_size"),
              py::arg("source_active_mask") = std::vector<uint8_t>())
-        .def("submit_encoding_sentinel", &FRCheckNative::submit_encoding_sentinel)
-        .def("wait_for_encoding_completion", &FRCheckNative::wait_for_encoding_completion,
-             py::call_guard<py::gil_scoped_release>())
-        .def("wait_encoding_batch", &FRCheckNative::wait_encoding_batch,
+        .def("submit_parity", &FRCheckNative::submit_parity,
+             py::arg("stripe_id"), py::arg("p2_in_addr"), py::arg("block_size"))
+        .def("wait_layer", &FRCheckNative::wait_layer,
              py::call_guard<py::gil_scoped_release>())
         .def("wait_mirror_completion", &FRCheckNative::wait_mirror_completion);
 }

@@ -257,118 +257,6 @@ def _prep_layer_phase1(
     )
 
 
-def _submit_stripe_chunk(
-    manager,
-    native,
-    state: _LayerEncodeSubmitState,
-    layer_bufs: LayerStripeBufs,
-    my_node: int,
-    stripe_id: int,
-    encoder_active_mask: Optional[List[int]] = None,
-    _dbg: bool = False,
-) -> None:
-    """Submit one segment x stripe chunk via stripe-FIFO API."""
-    stripe_plans = manager.stripe_plans
-    plan = stripe_plans[stripe_id]
-    block_size = state.block_size
-    layer_name = state.layer_name
-    recv_bufs = layer_bufs.recv_bufs
-    p1_bufs = layer_bufs.parity1_bufs
-    p2_bufs = layer_bufs.parity2_bufs
-
-    source_data = 0
-    source_mirror = 0
-    recv_buf = 0
-    p1 = 0
-    p2_out = 0
-    p2_in = 0
-    src_active = []
-
-    if plan.role == StripeRole.SOURCE:
-        if state.data_addrs[stripe_id] == 0:
-            return
-        source_data = state.data_addrs[stripe_id]
-        source_mirror = state.mirror_addrs[stripe_id]
-    elif plan.role == StripeRole.ENCODER:
-        rb = recv_bufs[stripe_id]
-        p1b = p1_bufs[stripe_id]
-        p2b = p2_bufs[stripe_id]
-        if rb is None or p1b is None or p2b is None:
-            return
-        recv_buf = rb.data_ptr()
-        p1 = p1b.data_ptr()
-        p2_out = p2b.data_ptr()
-        # Convert bool list to uint8 list for C++
-        if encoder_active_mask is not None:
-            src_active = [1 if v else 0 for v in encoder_active_mask]
-    elif plan.role == StripeRole.PARITY_TARGET:
-        p2b = p2_bufs[stripe_id]
-        if p2b is None:
-            return
-        p2_in = p2b.data_ptr()
-
-    native.submit_stripe_chunk(
-        stripe_id,
-        source_data,
-        source_mirror,
-        recv_buf,
-        p1,
-        p2_out,
-        p2_in,
-        block_size,
-        src_active,
-    )
-    if _dbg:
-        logger.info(
-            "[FRCHECK-DEBUG] %s chunk stripe sid=%d role=%s",
-            layer_name, stripe_id, plan.role.name,
-        )
-
-
-def _submit_encoding_network(
-    manager,
-    native,
-    submit_states: List[Tuple[_LayerEncodeSubmitState, LayerStripeBufs]],
-    my_node: int,
-    num_stripes: int,
-    _dbg: bool = False,
-) -> None:
-    """Segment x stripe submit loop (stripe-FIFO); caller waits separately."""
-    native.reset_encoding_batch()
-    stripe_plans = manager.stripe_plans
-    n = manager.frcheck_n
-
-    for state, layer_bufs in submit_states:
-        lidx = state.layer_idx
-
-        # Pre-compute per-source-node block indices across all stripes
-        # so we can determine which source ranks have data for each encoder stripe.
-        src_blk_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
-        encoder_active_masks: Dict[int, List[int]] = {}  # stripe_id → list of 0/1 per source
-
-        for sid in range(num_stripes):
-            plan = stripe_plans[sid]
-            if plan.role == StripeRole.ENCODER:
-                mask = []
-                for src_node in plan.source_node_ids:
-                    b = src_blk_per_node.get(src_node, 0)
-                    nf = manager.get_n_filled_for_node(lidx, src_node)
-                    mask.append(1 if b < nf else 0)
-                encoder_active_masks[sid] = mask
-            # Advance block index for each source in this stripe.
-            # All ranks see the same POA table, so blk_idx matches the source rank's own tracking.
-            for src_node in plan.source_node_ids:
-                src_blk_per_node[src_node] = src_blk_per_node.get(src_node, 0) + 1
-
-        for stripe_id in range(num_stripes):
-            active_mask = encoder_active_masks.get(stripe_id)
-            _submit_stripe_chunk(
-                manager, native, state, layer_bufs, my_node, stripe_id,
-                encoder_active_mask=active_mask, _dbg=_dbg,
-            )
-    native.submit_encoding_sentinel()
-
-
 def _source_blk_idx_for_stripe(
     stripe_plans,
     stripe_id: int,
@@ -578,7 +466,6 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     local_layer_order: List[str] = []
     local_layer_metadata: Dict[str, Dict[str, Any]] = {}
     encode_results: List[_LayerEncodeResult] = []
-    submit_states: List[Tuple[_LayerEncodeSubmitState, LayerStripeBufs]] = []
     prep_stream = torch.cuda.Stream()
 
     for group in layer_groups:
@@ -615,7 +502,48 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             group.total_bytes, n, num_stripes, layer_block_size, my_node,
             layer_name, layer_idx, _dbg,
         )
-        submit_states.append((state, layer_bufs))
+
+        # Pre-compute encoder active masks for this layer
+        src_blk_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
+        enc_active_masks: Dict[int, List[int]] = {}
+        for sid in range(num_stripes):
+            plan = stripe_plans[sid]
+            if plan.role == StripeRole.ENCODER:
+                mask = []
+                for src_node in plan.source_node_ids:
+                    b = src_blk_per_node.get(src_node, 0)
+                    nf = manager.get_n_filled_for_node(layer_idx, src_node)
+                    mask.append(1 if b < nf else 0)
+                enc_active_masks[sid] = mask
+            for src_node in plan.source_node_ids:
+                src_blk_per_node[src_node] = src_blk_per_node.get(src_node, 0) + 1
+
+        # Submit per-stripe tasks (non-blocking)
+        native.reset_layer()
+        for sid in range(num_stripes):
+            plan = stripe_plans[sid]
+            if plan.role == StripeRole.SOURCE:
+                addr = state.data_addrs[sid]
+                if addr == 0:
+                    continue
+                native.submit_source(sid, addr, state.mirror_addrs[sid], layer_block_size)
+            elif plan.role == StripeRole.ENCODER:
+                rb = layer_bufs.recv_bufs[sid]
+                p1b = layer_bufs.parity1_bufs[sid]
+                p2b = layer_bufs.parity2_bufs[sid]
+                if rb is None or p1b is None or p2b is None:
+                    continue
+                native.submit_encoder(sid, rb.data_ptr(), p1b.data_ptr(),
+                                     p2b.data_ptr(), layer_block_size,
+                                     enc_active_masks.get(sid, []))
+            elif plan.role == StripeRole.PARITY_TARGET:
+                p2b = layer_bufs.parity2_bufs[sid]
+                if p2b is None:
+                    continue
+                native.submit_parity(sid, p2b.data_ptr(), layer_block_size)
+
+        # Wait for all stripes in this layer to complete
+        native.wait_layer()
 
         if _dbg:
             n_src_my = sum(1 for p in stripe_plans if p.role == StripeRole.SOURCE)
@@ -636,19 +564,9 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         ))
 
     t_prep_elapsed = time.time() - t_prep
-    logger.info("FRCHECK save timing: prep %0.3fs", t_prep_elapsed)
+    logger.info("FRCHECK save timing: prep+encode %0.3fs", t_prep_elapsed)
 
-    t_batch = time.time()
-    _submit_encoding_network(
-        manager, native, submit_states, my_node, num_stripes, _dbg,
-    )
-    t_batch_elapsed = time.time() - t_batch
-    logger.info("FRCHECK save timing: batch_submit %0.3fs", t_batch_elapsed)
-
-    t_network = time.time()
-    native.wait_encoding_batch()
-    t_network_elapsed = time.time() - t_network
-    logger.info("FRCHECK save timing: network_wait %0.3fs", t_network_elapsed)
+    native.wait_mirror_completion()
 
     if world_size > 1:
         torch.distributed.barrier()
@@ -660,10 +578,8 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     t_disk_elapsed = time.time() - t_disk
     logger.info("FRCHECK save timing: disk_write %0.3fs", t_disk_elapsed)
     logger.info(
-        "FRCHECK save timing summary: prep=%.3fs batch_submit=%.3fs network_wait=%.3fs "
-        "disk_write=%.3fs encode_total=%.3fs",
-        t_prep_elapsed, t_batch_elapsed, t_network_elapsed, t_disk_elapsed,
-        t_prep_elapsed + t_batch_elapsed + t_network_elapsed,
+        "FRCHECK save timing summary: encode=%.3fs disk_write=%.3fs total=%.3fs",
+        t_prep_elapsed, t_disk_elapsed, t_prep_elapsed + t_disk_elapsed,
     )
 
     for result in encode_results:

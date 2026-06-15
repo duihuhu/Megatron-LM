@@ -72,7 +72,36 @@ CHECKPOINT_PATH="/dev/shm/models/opt-7b-0-frcheck"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
+MODE=save
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
+    MODE="$1"
+    shift
+fi
 ARGS_TO_PASS=("$@")
+RECOVERY_MODE_ARGS=()
+case "$MODE" in
+    save)
+        ;;
+    software)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+        )
+        ;;
+    hardware)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-frcheck-hardware-failure
+            --frcheck-failed-ranks "0"
+        )
+        ;;
+    hardware2)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-frcheck-hardware-failure
+            --frcheck-failed-ranks "0,1"
+        )
+        ;;
+esac
 
 # Model configuration
 HIDDEN_SIZE=4096
@@ -146,7 +175,7 @@ EVAL_AND_LOGGING_ARGS=(
     --use-frcheck
     --frcheck-n 4
     --frcheck-table-dir $FRCHECK_TABLE_DIR
-    --frcheck-failed-ranks 0,1
+    #--frcheck-failed-ranks 0,1
     --use-frcheck-hardware-failure
     --ckpt-format torch
     --save-embeddings-separately
@@ -176,6 +205,7 @@ PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     ${GPT_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
+    ${RECOVERY_MODE_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
     --distributed-backend nccl \
     ${ARGS_TO_PASS[@]}

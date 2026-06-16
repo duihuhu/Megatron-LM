@@ -2378,6 +2378,10 @@ def _add_checkpointing_args(parser):
                             'Used with --use-frcheck-hardware-failure for testing.')
     group.add_argument('--frcheck-debug', action='store_true',
                        help='Enable detailed size/encoding debug logging for FRCheck operations.')
+    group.add_argument('--frcheck-distribute-common', action='store_true',
+                       help='FRCheck: distribute layer_common (embedding, optimizer states, etc.) '
+                            'tensors to transformer layers instead of a separate group. '
+                            'Reduces block_size inflation from heterogeneous common data across PP ranks.')
 
     # use gemini checkpointing arguments
     group.add_argument('--use-gemini', action='store_true',

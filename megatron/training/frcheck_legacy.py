@@ -92,7 +92,7 @@ class _LayerEncodeSubmitState:
     n_filled_blocks: int = 0
 
 
-def _group_by_layer(decomposed) -> List[_LayerGroup]:
+def _group_by_layer(decomposed, distribute_common: bool = False) -> List[_LayerGroup]:
     """Split decomposed state_dict into per-layer groups based on FQN key."""
     groups: Dict[int, _LayerGroup] = {}
     for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
@@ -103,6 +103,21 @@ def _group_by_layer(decomposed) -> List[_LayerGroup]:
         g.tensor_infos.append(info)
         g.tensor_data.append(tensor)
         g.total_bytes += info.size_bytes
+
+    # Optionally distribute common tensors to transformer layers to reduce padding
+    if distribute_common and -1 in groups and len(groups) > 1:
+        common = groups.pop(-1)
+        others = [g for g in groups.values() if g.layer_idx >= 0]
+        if others:
+            for i, (info, tensor) in enumerate(zip(common.tensor_infos, common.tensor_data)):
+                target = others[i % len(others)]
+                target.tensor_infos.append(info)
+                target.tensor_data.append(tensor)
+                target.total_bytes += info.size_bytes
+            logger.info(
+                "FRCheck: distributed %d common tensors (%d bytes) across %d layers",
+                len(common.tensor_infos), common.total_bytes, len(others),
+            )
 
     # Sort: non-layer (-1) first, then by layer index
     result = sorted(groups.values(), key=lambda g: (0 if g.layer_idx < 0 else 1, g.layer_idx))
@@ -404,7 +419,8 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     # 4. Group tensors by layer index
     t0 = time.time()
-    layer_groups = _group_by_layer(decomposed)
+    layer_groups = _group_by_layer(decomposed,
+                                    distribute_common=getattr(args, "frcheck_distribute_common", False))
     n_tensors = len(decomposed.tensor_data)
     del decomposed.tensor_data  # GPU refs now held by per-layer groups
     num_layers = len(layer_groups)
@@ -533,9 +549,9 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
                 p2b = layer_bufs.parity2_bufs[sid]
                 if rb is None or p1b is None or p2b is None:
                     continue
-                native.submit_encoder(sid, rb.data_ptr(), p1b.data_ptr(),
-                                     p2b.data_ptr(), layer_block_size,
-                                     enc_active_masks.get(sid, []))
+                native.submit_enc_recv(sid, rb.data_ptr(), p1b.data_ptr(),
+                                      p2b.data_ptr(), layer_block_size,
+                                      enc_active_masks.get(sid, []))
             elif plan.role == StripeRole.PARITY_TARGET:
                 p2b = layer_bufs.parity2_bufs[sid]
                 if p2b is None:
@@ -563,23 +579,17 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             n_filled_blocks=state.n_filled_blocks,
         ))
 
-    t_prep_elapsed = time.time() - t_prep
-    logger.info("FRCHECK save timing: prep+encode %0.3fs", t_prep_elapsed)
+    t_enc = time.time() - t_prep
 
     native.wait_mirror_completion()
 
     if world_size > 1:
         torch.distributed.barrier()
 
-    t_disk = time.time()
+    logger.info("FRCHECK save timing: encode %0.3fs", time.time() - t_prep)
+
     _save_frcheck_stripe_files(
         manager, str(checkpoint_dir), rank, num_stripes, encode_results,
-    )
-    t_disk_elapsed = time.time() - t_disk
-    logger.info("FRCHECK save timing: disk_write %0.3fs", t_disk_elapsed)
-    logger.info(
-        "FRCHECK save timing summary: encode=%.3fs disk_write=%.3fs total=%.3fs",
-        t_prep_elapsed, t_disk_elapsed, t_prep_elapsed + t_disk_elapsed,
     )
 
     for result in encode_results:
@@ -608,7 +618,6 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         )
 
     torch.distributed.barrier()
-    logger.info(f"FRCHECK legacy save: done in {time.time() - start_time:.2f}s")
 
     # 6. Write metadata-only main file (data_len=0; tensor payload lives in layer FRBK shards).
     main_file = checkpoint_dir / f"frcheck_main_rank{rank}.pt"

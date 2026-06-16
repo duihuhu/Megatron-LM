@@ -309,7 +309,9 @@ def save_gemini_replicas_legacy_checkpoint(
         f"(send to {len(target_ranks) - 1} targets, recv from {len(source_ranks)} sources)..."
     )
     native.wait_for_exchange_completion()
-    logger.info(f"Gemini Replicas legacy save rank {rank}: C++ exchange done ({time.time()-t0:.3f}s)")
+    torch.distributed.barrier()
+    _exchange_elapsed = time.time() - t0
+    logger.info(f"Gemini Replicas legacy save rank {rank}: C++ exchange done ({_exchange_elapsed:.3f}s)")
     logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
 
     # Build rank_meta from pre-exchanged data (meta exchange already done before C++ transfer).

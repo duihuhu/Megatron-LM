@@ -80,9 +80,21 @@ else
     BOOST_FLAG=""
 fi
 
+# CUDA include and lib paths (for GDR mirror worker)
+if [ -d "/usr/local/cuda-12.3" ]; then
+    CUDA_INCLUDE="-I/usr/local/cuda-12.3/targets/x86_64-linux/include"
+    CUDA_LIB="-L/usr/local/cuda-12.3/targets/x86_64-linux/lib -lcudart"
+elif [ -d "/usr/local/cuda/include" ]; then
+    CUDA_INCLUDE="-I/usr/local/cuda/include"
+    CUDA_LIB="-L/usr/local/cuda/lib64 -lcudart"
+else
+    CUDA_INCLUDE=""
+    CUDA_LIB=""
+fi
+
 # Boost library linking (ASIO is header-only, but we need system libraries)
-# Also link InfiniBand verbs library for RDMA support
-BOOST_LIBS="-lboost_system -lpthread -libverbs"
+# Also link InfiniBand verbs library for RDMA support.  Link cudart for GDR mirror worker.
+BOOST_LIBS="-lboost_system -lpthread -libverbs $CUDA_LIB"
 
 # Output file
 OUTPUT_FILE="gemini_replicas_native${PYTHON_EXT_SUFFIX}"
@@ -97,6 +109,9 @@ echo "  -I$PYBIND11_INCLUDE \\"
 if [ -n "$BOOST_FLAG" ]; then
     echo "  $BOOST_FLAG \\"
 fi
+if [ -n "$CUDA_INCLUDE" ]; then
+    echo "  $CUDA_INCLUDE \\"
+fi
 echo "  gemini_replicas_native.cpp \\"
 echo "  -o $OUTPUT_FILE \\"
 echo "  $BOOST_LIBS"
@@ -106,6 +121,7 @@ $CXX $CXX_FLAGS \
     -I"$PYTHON_INCLUDE" \
     -I"$PYBIND11_INCLUDE" \
     $BOOST_FLAG \
+    $CUDA_INCLUDE \
     gemini_replicas_native.cpp \
     -o "$OUTPUT_FILE" \
     $BOOST_LIBS

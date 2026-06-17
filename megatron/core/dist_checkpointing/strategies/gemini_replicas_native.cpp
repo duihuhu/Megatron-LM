@@ -32,15 +32,19 @@
 #include <deque>
 #include <map>
 #include <unordered_map>
+#include <sys/socket.h>
 
 // RDMA headers
 #include <infiniband/verbs.h>
 
 #include "rdma_device_utils.h"
+#include <cuda_runtime.h>
+#include <fstream>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <queue>
 
 namespace py = pybind11;
 
@@ -108,6 +112,8 @@ public:
     // RDMA-specific methods (no-op for ASIO)
     virtual void register_buffer(uintptr_t addr, size_t size) {}
     virtual void unregister_buffer(uintptr_t addr) {}
+    virtual void set_require_registered_mr(bool v) {}
+    virtual bool get_require_registered_mr() const { return false; }
     
     // Receive from a specific source rank (for RDMA to avoid unnecessary memcpy)
     virtual std::pair<int, size_t> receive_data_from_source(int source_rank, uint8_t* buffer, size_t buffer_size) {
@@ -153,7 +159,8 @@ struct RdmaBuffer {
 class GeminiReplicasAsioConnectionManager : public IGeminiReplicasConnectionManager {
 private:
     boost::asio::io_context io_context_;
-    
+    std::unique_ptr<std::thread> io_thread_;  // joined (not detached) for clean shutdown
+
     // Send sockets for each target rank
     std::vector<std::unique_ptr<boost::asio::ip::tcp::socket>> send_sockets_;
     
@@ -168,11 +175,12 @@ private:
     
     // Mutex for recv_sockets_ access
     std::mutex recv_sockets_mutex_;
-    
+
     // Synchronization
     std::mutex connection_mutex_;
     std::condition_variable connection_cv_;
-    
+    std::string accept_error_msg_;  // stores async accept error for propagation
+
     // Rank information
     int rank_;
     int world_size_;
@@ -461,7 +469,22 @@ private:
             
             recv_acceptor_->open(endpoint.protocol());
             recv_acceptor_->set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
-            recv_acceptor_->bind(endpoint);
+#ifdef SO_REUSEPORT
+            {
+                int reuse_port = 1;
+                setsockopt(recv_acceptor_->native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                           &reuse_port, sizeof(reuse_port));
+            }
+#endif
+            for (int attempt = 0; ; ++attempt) {
+                boost::system::error_code ec;
+                recv_acceptor_->bind(endpoint, ec);
+                if (!ec) break;
+                if (attempt >= 30)
+                    throw std::runtime_error("Failed to bind to " + my_ip_ + ":" + std::to_string(my_port_)
+                        + " after 30 attempts: " + ec.message());
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
             recv_acceptor_->listen();
             
             std::cout << "[Rank " << rank_ << "] Acceptor started on " 
@@ -471,10 +494,11 @@ private:
             // Start accepting multiple connections
             accept_next_connection();
             
-            // Run io_context in a separate thread
-            std::thread([this]() {
+            // Run io_context in a joinable thread (aligned with EC-NAIVE pattern).
+            // Joined in cleanup(), not detached — ensures port is released before rebind.
+            io_thread_ = std::make_unique<std::thread>([this]() {
                 io_context_.run();
-            }).detach();
+            });
             
         } catch (const std::exception& e) {
             throw std::runtime_error(
@@ -510,9 +534,10 @@ private:
                     if (count < expected_recv_connections_) {
                         accept_next_connection();
                     }
-                } else {
-                    std::cerr << "[Rank " << rank_ << "] Accept failed: " 
-                              << ec.message() << std::endl;
+                } else if (ec != boost::asio::error::operation_aborted) {
+                    // Store error for later propagation (io_context::stop aborts pending ops)
+                    accept_error_msg_ = "[Rank " + std::to_string(rank_) + "] Accept failed: " + ec.message();
+                    std::cerr << accept_error_msg_ << std::endl;
                 }
             });
     }
@@ -580,6 +605,11 @@ private:
             }
             
             io_context_.stop();
+            // Join the io_context thread (was detached before; now joined for clean shutdown
+            // and to ensure the port is fully released before any rebind).
+            if (io_thread_ && io_thread_->joinable()) {
+                io_thread_->join();
+            }
         } catch (...) {
             // Ignore errors during cleanup
         }
@@ -644,7 +674,8 @@ private:
     
     // Registered buffers
     std::map<uintptr_t, RdmaBuffer> registered_buffers_;
-    
+    bool require_registered_mr_{false};
+
     // Temporary work request buffers (for unregistered data)
     std::vector<uint8_t> temp_send_buffer_;
     std::vector<uint8_t> temp_recv_buffer_;
@@ -806,6 +837,10 @@ public:
         registered_buffers_.erase(it);
         std::cout << "[Rank " << rank_ << "] Unregistered buffer at 0x" << std::hex << addr << std::dec << std::endl;
     }
+
+    void set_require_registered_mr(bool v) override { require_registered_mr_ = v; }
+    bool get_require_registered_mr() const override { return require_registered_mr_; }
+    ibv_pd* get_pd() const { return pd_; }
 
 private:
     void send_data_chunked(const uint8_t* data, size_t total_size, ibv_mr* mr, ibv_qp* qp) {
@@ -1018,15 +1053,17 @@ public:
 
         // Step 2: RDMA data transfer on the single QP
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(data), size);
-        bool use_temp = (mr == nullptr);
-        if (use_temp) {
-            if (size > temp_send_buffer_.size()) {
+        if (mr == nullptr) {
+            if (require_registered_mr_)
+                throw std::runtime_error("GDR mode: buffer at 0x"
+                    + std::to_string(reinterpret_cast<uintptr_t>(data))
+                    + " not registered for RDMA");
+            if (size > temp_send_buffer_.size())
                 throw std::runtime_error("Data size exceeds temporary send buffer size");
-            }
             std::memcpy(temp_send_buffer_.data(), data, size);
             mr = temp_send_mr_;
         }
-        const uint8_t* send_data = use_temp ? temp_send_buffer_.data() : data;
+        const uint8_t* send_data = (mr == temp_send_mr_) ? temp_send_buffer_.data() : data;
         send_data_chunked(send_data, size, mr, send_qps_[target_idx]);
 
         std::cout << "[Rank " << rank_ << "] Sent " << size
@@ -1100,13 +1137,15 @@ public:
 
         // Find or use temp buffer for MR
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(buffer), recv_size);
-        bool use_temp = (mr == nullptr);
 
-        if (use_temp) {
+        if (mr == nullptr) {
+            if (require_registered_mr_)
+                throw std::runtime_error("GDR mode: recv buffer at 0x"
+                    + std::to_string(reinterpret_cast<uintptr_t>(buffer))
+                    + " not registered for RDMA");
             std::lock_guard<std::mutex> lock(recv_mutex_);
-            if (recv_size > temp_recv_buffer_.size()) {
+            if (recv_size > temp_recv_buffer_.size())
                 throw std::runtime_error("Receive size exceeds temporary buffer size");
-            }
             mr = temp_recv_mr_;
             receive_data_chunked(temp_recv_buffer_.data(), recv_size, mr, recv_qps_[found_idx]);
             std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
@@ -1173,15 +1212,15 @@ public:
 
         // Find or use temp buffer for MR
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(buffer), recv_size);
-        bool use_temp = (mr == nullptr);
 
-        if (use_temp) {
-            // Temp buffer is shared — must hold mutex.
-            // In practice buffers are always pre-registered so this path is rare.
+        if (mr == nullptr) {
+            if (require_registered_mr_)
+                throw std::runtime_error("GDR mode: recv buffer at 0x"
+                    + std::to_string(reinterpret_cast<uintptr_t>(buffer))
+                    + " not registered for RDMA");
             std::lock_guard<std::mutex> lock(recv_mutex_);
-            if (recv_size > temp_recv_buffer_.size()) {
+            if (recv_size > temp_recv_buffer_.size())
                 throw std::runtime_error("Receive size exceeds temporary buffer size");
-            }
             mr = temp_recv_mr_;
             receive_data_chunked(temp_recv_buffer_.data(), recv_size, mr, recv_qps_[qp_idx]);
             std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
@@ -1400,7 +1439,22 @@ private:
         recv_acceptor_ = std::make_unique<boost::asio::ip::tcp::acceptor>(io_context_);
         recv_acceptor_->open(endpoint.protocol());
         recv_acceptor_->set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
-        recv_acceptor_->bind(endpoint);
+#ifdef SO_REUSEPORT
+        {
+            int reuse_port = 1;
+            setsockopt(recv_acceptor_->native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                       &reuse_port, sizeof(reuse_port));
+        }
+#endif
+        for (int attempt = 0; ; ++attempt) {
+            boost::system::error_code ec;
+            recv_acceptor_->bind(endpoint, ec);
+            if (!ec) break;
+            if (attempt >= 30)
+                throw std::runtime_error("Failed to bind to " + my_ip_ + ":" + std::to_string(my_port_)
+                    + " after 30 attempts: " + ec.message());
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
         recv_acceptor_->listen(expected_recv_connections_);
         std::cout << "[Rank " << rank_ << "] ASIO acceptor listening on " << my_ip_ << ":" << my_port_ << std::endl;
     }
@@ -1733,6 +1787,30 @@ private:
     
     void cleanup() {
         try {
+            // 1. Close ASIO acceptor FIRST to cancel any pending async_accept.
+            //    This ensures the io_context event loop can drain cleanly.
+            if (recv_acceptor_ && recv_acceptor_->is_open()) {
+                recv_acceptor_->close();
+            }
+            recv_acceptor_.reset();
+
+            // 2. Close control / exchange sockets so the io_context has no
+            //    remaining work.
+            send_socks_.clear();
+            recv_socks_.clear();
+            control_socks_send_.clear();
+            control_socks_recv_.clear();
+
+            // 3. Stop the ASIO event loop and join the background thread.
+            //    At this point there are no pending async ops, so run()
+            //    will return promptly.
+            io_context_.stop();
+            if (io_thread_ && io_thread_->joinable()) {
+                io_thread_->join();
+            }
+
+            // 4. Tear down RDMA resources (safe now that no TCP exchanges
+            //    reference them).
             // Unregister all buffers
             {
                 std::lock_guard<std::mutex> lock(buffer_mutex_);
@@ -1741,7 +1819,7 @@ private:
                 }
                 registered_buffers_.clear();
             }
-            
+
             // Cleanup temporary buffers
             if (temp_send_mr_) {
                 ibv_dereg_mr(temp_send_mr_);
@@ -1751,7 +1829,7 @@ private:
                 ibv_dereg_mr(temp_recv_mr_);
                 temp_recv_mr_ = nullptr;
             }
-            
+
             // Destroy queue pairs
             for (auto qp : send_qps_) {
                 if (qp) ibv_destroy_qp(qp);
@@ -1761,7 +1839,7 @@ private:
             }
             send_qps_.clear();
             recv_qps_.clear();
-            
+
             // Destroy completion queues
             if (send_cq_) {
                 ibv_destroy_cq(send_cq_);
@@ -1771,35 +1849,31 @@ private:
                 ibv_destroy_cq(recv_cq_);
                 recv_cq_ = nullptr;
             }
-            
+
             // Deallocate protection domain
             if (pd_) {
                 ibv_dealloc_pd(pd_);
                 pd_ = nullptr;
             }
-            
+
             // Close device
             if (context_) {
                 ibv_close_device(context_);
                 context_ = nullptr;
             }
-            
-            // Stop ASIO io_context and background thread
-            io_context_.stop();
-            if (io_thread_ && io_thread_->joinable()) {
-                io_thread_->join();
-            }
-            // Destroy ASIO socket objects (closes fds automatically)
-            send_socks_.clear();
-            recv_socks_.clear();
-            recv_acceptor_.reset();
-
-            control_socks_send_.clear();
-            control_socks_recv_.clear();
         } catch (...) {
             // Ignore errors during cleanup
         }
     }
+};
+
+/**
+ * Mirror task for GDR: GPU→CPU D2H copy to run in background while RDMA sends from GPU.
+ */
+struct MirrorTask {
+    uintptr_t gpu_addr;
+    uintptr_t cpu_addr;
+    size_t size;
 };
 
 /**
@@ -1859,6 +1933,15 @@ private:
     std::deque<std::atomic<bool>> recv_error_;
     std::vector<std::string> recv_error_msgs_;
     std::mutex recv_error_mutex_;
+
+    // ---- GDR mirror worker (D2H copy in background, overlaps with RDMA) ----
+    bool require_registered_mr_{false};
+    std::thread mirror_thread_;
+    std::mutex mirror_mutex_;
+    std::condition_variable mirror_cv_;
+    std::queue<MirrorTask> mirror_queue_;
+    std::atomic<bool> mirror_done_{false};
+    void* d2h_stream_{nullptr};  // cudaStream_t (opaque, avoid header dependency)
 
     std::mutex exchange_wait_mutex_;
     std::condition_variable exchange_wait_cv_;
@@ -2091,6 +2174,18 @@ public:
         for (auto& t : recv_worker_threads_)
             if (t.joinable()) t.join();
 
+        // Stop mirror worker (GDR D2H thread) — must join before member
+        // destructors destroy mirror_cv_ / mirror_mutex_ (UB if the thread
+        // is still waiting on them).
+        if (mirror_thread_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mirror_mutex_);
+                mirror_queue_.push({0, 0, 0});  // sentinel
+            }
+            mirror_cv_.notify_one();
+            mirror_thread_.join();
+        }
+
         workers_started_ = false;
         std::cout << "[Rank " << rank_ << "] Workers stopped" << std::endl;
     }
@@ -2276,7 +2371,102 @@ public:
     std::vector<int> get_target_ranks() const {
         return target_ranks_;
     }
-    
+
+    // --------------- GDR / mirror worker ---------------
+
+    static bool gdr_available() {
+        // Check /proc/modules for loadable peermem module
+        std::ifstream f("/proc/modules");
+        if (f) {
+            std::string line;
+            while (std::getline(f, line)) {
+                if (line.rfind("nvidia_peermem", 0) == 0) return true;
+                if (line.rfind("nvidia-peermem", 0) == 0) return true;
+            }
+        }
+        if (access("/sys/module/nvidia_peermem", F_OK) == 0) return true;
+        if (access("/sys/module/nvidia-peermem", F_OK) == 0) return true;
+        return false;
+    }
+
+    // Probe GDR by actually trying to register a small GPU allocation.
+    // Called after RDMA resources are initialized.  This catches peermem
+    // that is built into the driver rather than loaded as a module.
+    bool probe_gdr() {
+        if (!use_rdma_ || !initialized_) return false;
+        void* gpu_ptr = nullptr;
+        if (cudaMalloc(&gpu_ptr, 4096) != cudaSuccess) return false;
+        struct ibv_mr* mr = ibv_reg_mr(
+            static_cast<GeminiReplicasRdmaConnectionManager*>(connection_manager_.get())->get_pd(),
+            gpu_ptr, 4096,
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        cudaFree(gpu_ptr);
+        if (mr) {
+            ibv_dereg_mr(mr);
+            return true;
+        }
+        return false;
+    }
+
+    void set_require_registered_mr(bool v) {
+        require_registered_mr_ = v;
+        if (connection_manager_)
+            connection_manager_->set_require_registered_mr(v);
+    }
+
+    void start_mirror_worker() {
+        mirror_done_ = false;
+        cudaStreamCreate(reinterpret_cast<cudaStream_t*>(&d2h_stream_));
+        mirror_thread_ = std::thread(&GeminiReplicasNative::mirror_worker_func, this);
+    }
+
+    void push_mirror_task(uintptr_t gpu_addr, uintptr_t cpu_addr, size_t size) {
+        {
+            std::lock_guard<std::mutex> lk(mirror_mutex_);
+            mirror_queue_.push({gpu_addr, cpu_addr, size});
+        }
+        mirror_cv_.notify_one();
+    }
+
+    void wait_mirror_completion() {
+        // Push sentinel then wait for the worker to finish all tasks.
+        {
+            std::lock_guard<std::mutex> lk(mirror_mutex_);
+            mirror_queue_.push({0, 0, 0});  // sentinel
+        }
+        mirror_cv_.notify_one();
+        while (!mirror_done_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(d2h_stream_));
+        cudaStreamDestroy(reinterpret_cast<cudaStream_t>(d2h_stream_));
+        if (mirror_thread_.joinable()) mirror_thread_.join();
+    }
+
+private:
+    void mirror_worker_func() {
+        while (true) {
+            MirrorTask task;
+            {
+                std::unique_lock<std::mutex> lk(mirror_mutex_);
+                mirror_cv_.wait(lk, [this] { return !mirror_queue_.empty(); });
+                task = mirror_queue_.front();
+                mirror_queue_.pop();
+            }
+            if (task.gpu_addr == 0 && task.cpu_addr == 0) {
+                mirror_done_ = true;
+                break;  // sentinel
+            }
+            cudaMemcpyAsync(
+                reinterpret_cast<void*>(task.cpu_addr),
+                reinterpret_cast<const void*>(task.gpu_addr),
+                task.size,
+                cudaMemcpyDeviceToHost,
+                reinterpret_cast<cudaStream_t>(d2h_stream_));
+        }
+    }
+
+public:
     void register_buffer(uintptr_t buffer_addr, size_t buffer_size) {
         /**
          * Register buffer for RDMA operations.
@@ -2383,6 +2573,20 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
              "Directed P2P send to a single target rank for hardware recovery (synchronous, blocking)")
         .def("recv_from_rank", &GeminiReplicasNative::recv_from_rank,
              py::arg("source_rank"), py::arg("buffer_addr"), py::arg("expected_size"),
-             "Directed P2P recv from a specific source rank for hardware recovery (synchronous, blocking)");
+             "Directed P2P recv from a specific source rank for hardware recovery (synchronous, blocking)")
+        .def_static("gdr_available", &GeminiReplicasNative::gdr_available,
+             "Check if nvidia-peermem (GPU Direct RDMA) is available")
+        .def("probe_gdr", &GeminiReplicasNative::probe_gdr,
+             "Probe GDR by actually registering a small GPU MR (definitive)")
+        .def("set_require_registered_mr", &GeminiReplicasNative::set_require_registered_mr,
+             py::arg("v"),
+             "Require all buffers to be registered for RDMA (no temp buffer fallback)")
+        .def("push_mirror_task", &GeminiReplicasNative::push_mirror_task,
+             py::arg("gpu_addr"), py::arg("cpu_addr"), py::arg("size"),
+             "Push a GPU→CPU D2H copy task to the mirror worker (non-blocking)")
+        .def("start_mirror_worker", &GeminiReplicasNative::start_mirror_worker,
+             "Start the mirror worker thread for async D2H copies")
+        .def("wait_mirror_completion", &GeminiReplicasNative::wait_mirror_completion,
+             "Wait for all mirror tasks to complete and stop the mirror worker");
 }
 

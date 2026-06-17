@@ -183,6 +183,11 @@ def save_gemini_replicas_legacy_checkpoint(
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
 
+    # GDR path: allocate GPU buffer for RDMA send; D2H runs async via mirror worker.
+    gpu_tensor_buffer = None
+    if manager.use_gdr:
+        gpu_tensor_buffer = torch.zeros(total_tensor_size, dtype=torch.uint8, device="cuda")
+
     t0 = time.time()
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
@@ -196,6 +201,10 @@ def save_gemini_replicas_legacy_checkpoint(
                     f"Gemini Replicas legacy save: tensor bytes mismatch for {info.key}, "
                     f"expected={tensor_bytes}, got={tensor_view.numel()}"
                 )
+            if manager.use_gdr:
+                # Copy to GPU buffer (GPU→GPU contiguous)
+                gpu_tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
+            # Always copy to CPU buffer (async on d2h_stream; with GDR this is overlapped)
             tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
             info.offset = offset
             local_tensor_metadata.append(
@@ -224,6 +233,8 @@ def save_gemini_replicas_legacy_checkpoint(
     t0 = time.time()
     if manager.use_rdma:
         manager.register_buffer(tensor_buffer)
+        if manager.use_gdr and gpu_tensor_buffer is not None:
+            manager.register_buffer(gpu_tensor_buffer)
     logger.info(f"GEMINI save timing: RDMA reg tensor {time.time()-t0:.3f}s")
 
     start_time = time.time()
@@ -292,13 +303,21 @@ def save_gemini_replicas_legacy_checkpoint(
     logger.info(f"GEMINI save timing: recv buf alloc + barrier {time.time()-t0:.3f}s")
 
     t0 = time.time()
-    # Submit to C++ native workers (non-blocking, like ecnaive).
-    # Workers were started by manager._init_gemini_replicas_native() right
-    # after finalize_connections, so they are already waiting on CVs.
     native = manager._gemini_replicas_native
     native.reset_exchange_state()
 
-    send_addr = tensor_buffer.data_ptr()
+    if manager.use_gdr and gpu_tensor_buffer is not None:
+        send_addr = gpu_tensor_buffer.data_ptr()
+        # Push mirror task: async D2H GPU→CPU (runs in background while RDMA sends from GPU)
+        native.push_mirror_task(
+            gpu_tensor_buffer.data_ptr(),
+            tensor_buffer.data_ptr(),
+            total_tensor_size,
+        )
+        logger.info(f"GEMINI save timing: mirror task pushed {time.time()-t0:.3f}s")
+    else:
+        send_addr = tensor_buffer.data_ptr()
+
     native.submit_send_buffer(send_addr, send_buffer_size)
 
     for src_r, recv_buf in receive_buffers.items():
@@ -312,6 +331,13 @@ def save_gemini_replicas_legacy_checkpoint(
     torch.distributed.barrier()
     _exchange_elapsed = time.time() - t0
     logger.info(f"Gemini Replicas legacy save rank {rank}: C++ exchange done ({_exchange_elapsed:.3f}s)")
+
+    # With GDR: wait for async D2H to finish before writing files
+    if manager.use_gdr and gpu_tensor_buffer is not None:
+        native.wait_mirror_completion()
+        native.start_mirror_worker()  # restart for next iteration
+        logger.info(f"GEMINI save timing: mirror done {time.time()-start_time:.3f}s")
+
     logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
 
     # Build rank_meta from pre-exchanged data (meta exchange already done before C++ transfer).

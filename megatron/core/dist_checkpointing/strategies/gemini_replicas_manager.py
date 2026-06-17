@@ -52,6 +52,7 @@ class GeminiReplicasManager:
         self.use_gemini_replicas = False
         self.use_gemini_replicas_optimized = False
         self.use_rdma = False
+        self.use_gdr = False
         
         # Replica configuration
         self.num_replicas = 3  # Default: 3 replicas (including local)
@@ -509,6 +510,23 @@ class GeminiReplicasManager:
 
             logger.info(f"Gemini Replicas: C++ native module fully initialized (rank={rank}, targets={net_config['target_ranks']}, mode={mode_str})")
             print(f"Gemini Replicas: [Rank {rank}] C++ native module fully initialized - {mode_str} connections ready")
+
+            # GDR setup: check availability and start mirror worker for async D2H
+            if self.use_rdma:
+                try:
+                    self.use_gdr = gemini_replicas_native.GeminiReplicasNative.gdr_available()
+                    if not self.use_gdr:
+                        # Module not found in /proc/modules — try actual GPU MR registration
+                        self.use_gdr = self._gemini_replicas_native.probe_gdr()
+                except AttributeError:
+                    self.use_gdr = False  # old .so without GDR support
+                if self.use_gdr:
+                    logger.info(f"Gemini Replicas: [Rank {rank}] GDR (GPU Direct RDMA) available, starting mirror worker")
+                    self._gemini_replicas_native.set_require_registered_mr(True)
+                    self._gemini_replicas_native.start_mirror_worker()
+                    print(f"Gemini Replicas: [Rank {rank}] GDR mirror worker started")
+                else:
+                    logger.warning(f"Gemini Replicas: [Rank {rank}] GDR not available (nvidia-peermem missing)")
             
         except Exception as e:
             logger.error(f"Gemini Replicas: Failed to initialize C++ native module: {e}")
@@ -1015,9 +1033,9 @@ class GeminiReplicasManager:
                     logger.warning(f"Gemini Replicas: [Rank {rank}] Failed to unregister buffer during cleanup: {e}")
             self.registered_buffers.clear()
 
-        if self._gemini_replicas_native is not None:
-            logger.info("Gemini Replicas: Cleaning up native module")
-            self._gemini_replicas_native = None
+        # Delegate to the thorough shutdown path that stops workers before
+        # dropping the C++ instance — ordering matters for port release.
+        self._stop_native_gracefully()
 
         self.preallocated_cpu_buffer = None
         self.decomposed_state_dict = None

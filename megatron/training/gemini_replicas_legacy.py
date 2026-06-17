@@ -202,10 +202,12 @@ def save_gemini_replicas_legacy_checkpoint(
                     f"expected={tensor_bytes}, got={tensor_view.numel()}"
                 )
             if manager.use_gdr:
-                # Copy to GPU buffer (GPU→GPU contiguous)
+                # Copy to GPU buffer only — the mirror worker handles GPU→CPU
+                # D2H in the background, overlapped with RDMA.
                 gpu_tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
-            # Always copy to CPU buffer (async on d2h_stream; with GDR this is overlapped)
-            tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
+            else:
+                # Non-GDR: copy directly to CPU buffer (RDMA sends from CPU).
+                tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
             info.offset = offset
             local_tensor_metadata.append(
                 TensorMetadata(
@@ -225,8 +227,9 @@ def save_gemini_replicas_legacy_checkpoint(
             )
             offset += tensor_bytes
             decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
+    # GDR path: stream only has GPU→GPU copies (fast sync).
+    # Non-GDR path: stream has GPU→CPU copies (PCIe drain, now avoided with GDR).
     d2h_stream.synchronize()
-
     del decomposed.tensor_data  # drop remaining refs
     logger.info(f"GEMINI save timing: D2H+copy {time.time()-t0:.3f}s")
 
@@ -308,15 +311,16 @@ def save_gemini_replicas_legacy_checkpoint(
 
     if manager.use_gdr and gpu_tensor_buffer is not None:
         send_addr = gpu_tensor_buffer.data_ptr()
-        # Push mirror task: async D2H GPU→CPU (runs in background while RDMA sends from GPU)
-        native.push_mirror_task(
+        # Per-chunk D2H: C++ send_data_chunked pushes a mirror task after each
+        # 64 MB chunk′s RDMA completes, so chunk N′s D2H overlaps chunk N+1′s RDMA.
+        native.set_mirror_bases(
             gpu_tensor_buffer.data_ptr(),
             tensor_buffer.data_ptr(),
-            total_tensor_size,
         )
-        logger.info(f"GEMINI save timing: mirror task pushed {time.time()-t0:.3f}s")
+        logger.info(f"GEMINI save timing: mirror bases set (per-chunk overlap) {time.time()-t0:.3f}s")
     else:
         send_addr = tensor_buffer.data_ptr()
+        native.set_mirror_bases(0, 0)  # disable per-chunk mirror
 
     native.submit_send_buffer(send_addr, send_buffer_size)
 

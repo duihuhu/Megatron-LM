@@ -41,6 +41,12 @@ logger = getLogger(__name__)
 
 _LAYER_KEY_RE = re.compile(r"\.layers\.(\d+)\b")
 
+# Cached metadata exchange (identical across iterations for fixed model)
+_cached_all_tensor_infos = None
+_cached_all_layer_order = None
+_cached_all_layer_metadata = None
+_cached_all_actual_tensor_sizes = None
+
 
 def _extract_layer_idx(key: str) -> int:
     """Extract transformer layer index from a tensor FQN, or -1 if not a layer."""
@@ -627,17 +633,33 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         info.offset = _global_offsets[id(info)]
 
     t_meta = time.time()
-    all_tensor_infos, all_layer_order, all_layer_metadata = _exchange_frcheck_group_metadata(
-        decomposed.tensor_infos, local_layer_order, local_layer_metadata,
-    )
-    all_actual_tensor_sizes = {
-        r: sum(getattr(info, "size_bytes", 0) for info in infos)
-        for r, infos in all_tensor_infos.items()
-    }
-    logger.info(
-        "FRCheck save: group metadata exchange %.3fs (ranks=%d)",
-        time.time() - t_meta, len(all_tensor_infos),
-    )
+    global _cached_all_tensor_infos, _cached_all_layer_order
+    global _cached_all_layer_metadata, _cached_all_actual_tensor_sizes
+    if _cached_all_tensor_infos is None:
+        all_tensor_infos, all_layer_order, all_layer_metadata = _exchange_frcheck_group_metadata(
+            decomposed.tensor_infos, local_layer_order, local_layer_metadata,
+        )
+        all_actual_tensor_sizes = {
+            r: sum(getattr(info, "size_bytes", 0) for info in infos)
+            for r, infos in all_tensor_infos.items()
+        }
+        _cached_all_tensor_infos = all_tensor_infos
+        _cached_all_layer_order = all_layer_order
+        _cached_all_layer_metadata = all_layer_metadata
+        _cached_all_actual_tensor_sizes = all_actual_tensor_sizes
+        logger.info(
+            "FRCheck save: group metadata exchange %.3fs (ranks=%d)",
+            time.time() - t_meta, len(all_tensor_infos),
+        )
+    else:
+        all_tensor_infos = _cached_all_tensor_infos
+        all_layer_order = _cached_all_layer_order
+        all_layer_metadata = _cached_all_layer_metadata
+        all_actual_tensor_sizes = _cached_all_actual_tensor_sizes
+        logger.info(
+            "FRCheck save: group metadata exchange (cached) %.3fs",
+            time.time() - t_meta,
+        )
 
     meta1 = pickle.dumps(decomposed.non_tensor_data)
     meta2 = pickle.dumps(decomposed.tensor_infos)

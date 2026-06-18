@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -170,11 +171,14 @@ public:
     }
 
     // RDMA SEND data to peer (blocking)
-    void send_data(const uint8_t* data, size_t size) {
+    void send_data(const uint8_t* data, size_t size,
+                   const std::function<void()>& wait_cb = nullptr,
+                   const std::function<void()>& done_cb = nullptr) {
         std::lock_guard<std::mutex> lock(send_mtx_);
         if (!connected_)
             throw std::runtime_error("FRCheck RDMA: channel not connected");
 
+        if (wait_cb) wait_cb();
         // Send size over TCP
         uint64_t net_sz = htobe64(size);
         if (send(tcp_sock_, &net_sz, sizeof(net_sz), 0) != sizeof(net_sz))
@@ -182,6 +186,7 @@ public:
         uint8_t ack;
         if (recv(tcp_sock_, &ack, 1, MSG_WAITALL) != 1)
             throw std::runtime_error("FRCheck RDMA: failed to recv ack");
+        if (done_cb) done_cb();
 
         ibv_mr* mr = find_mr((uintptr_t)data, size);
         if (!mr) {
@@ -189,15 +194,18 @@ public:
                 "FRCheck RDMA: unregistered send buffer (addr=0x" +
                 std::to_string((uintptr_t)data) + " size=" + std::to_string(size) + ")");
         }
-        send_chunked(data, size, mr);
+        send_chunked(data, size, mr, wait_cb, done_cb);
     }
 
     // RDMA RECEIVE data from peer (blocking)
-    size_t recv_data(uint8_t* buf, size_t buf_size) {
+    size_t recv_data(uint8_t* buf, size_t buf_size,
+                     const std::function<void()>& wait_cb = nullptr,
+                     const std::function<void()>& done_cb = nullptr) {
         std::lock_guard<std::mutex> lock(recv_mtx_);
         if (!connected_)
             throw std::runtime_error("FRCheck RDMA: channel not connected");
 
+        if (wait_cb) wait_cb();
         uint64_t net_sz;
         if (recv(tcp_sock_, &net_sz, sizeof(net_sz), MSG_WAITALL) != sizeof(net_sz))
             throw std::runtime_error("FRCheck RDMA: failed to recv size");
@@ -210,6 +218,7 @@ public:
         uint8_t ack = 1;
         if (send(tcp_sock_, &ack, 1, 0) != 1)
             throw std::runtime_error("FRCheck RDMA: failed to send ack");
+        if (done_cb) done_cb();
 
         ibv_mr* mr = find_mr((uintptr_t)buf, size);
         if (!mr) {
@@ -217,7 +226,7 @@ public:
                 "FRCheck RDMA: unregistered recv buffer (addr=0x" +
                 std::to_string((uintptr_t)buf) + " size=" + std::to_string(size) + ")");
         }
-        recv_chunked(buf, size, mr);
+        recv_chunked(buf, size, mr, wait_cb, done_cb);
         return size;
     }
 
@@ -292,17 +301,24 @@ private:
         connected_ = true;
     }
 
-    void send_chunked(const uint8_t* data, size_t total, ibv_mr* mr) {
-        _send_chunked(data, total, mr);
+    void send_chunked(const uint8_t* data, size_t total, ibv_mr* mr,
+                      const std::function<void()>& wait_cb = nullptr,
+                      const std::function<void()>& done_cb = nullptr) {
+        _send_chunked(data, total, mr, wait_cb, done_cb);
     }
 
-    void recv_chunked(uint8_t* buf, size_t total, ibv_mr* mr) {
-        _recv_chunked(buf, total, mr);
+    void recv_chunked(uint8_t* buf, size_t total, ibv_mr* mr,
+                      const std::function<void()>& wait_cb = nullptr,
+                      const std::function<void()>& done_cb = nullptr) {
+        _recv_chunked(buf, total, mr, wait_cb, done_cb);
     }
 
-    void _send_chunked(const uint8_t* data, size_t total, ibv_mr* mr) {
+    void _send_chunked(const uint8_t* data, size_t total, ibv_mr* mr,
+                       const std::function<void()>& wait_cb,
+                       const std::function<void()>& done_cb) {
         size_t remaining = total, offset = 0;
         while (remaining > 0) {
+            if (wait_cb) wait_cb();
             size_t nchunks = (std::min(remaining, FRCHECK_RDMA_CHUNK) + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK;
             std::vector<ibv_sge> sge(nchunks);
             std::vector<ibv_send_wr> wr(nchunks);
@@ -324,12 +340,16 @@ private:
             if (ibv_post_send(qp_, &wr[0], &bad))
                 throw std::runtime_error("FRCheck RDMA: post_send failed");
             poll_cq(send_cq_, (int)nchunks);
+            if (done_cb) done_cb();
         }
     }
 
-    void _recv_chunked(uint8_t* buf, size_t total, ibv_mr* mr) {
+    void _recv_chunked(uint8_t* buf, size_t total, ibv_mr* mr,
+                       const std::function<void()>& wait_cb,
+                       const std::function<void()>& done_cb) {
         size_t remaining = total, offset = 0;
         while (remaining > 0) {
+            if (wait_cb) wait_cb();
             size_t nchunks = (std::min(remaining, FRCHECK_RDMA_CHUNK) + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK;
             std::vector<ibv_sge> sge(nchunks);
             std::vector<ibv_recv_wr> wr(nchunks);
@@ -349,6 +369,7 @@ private:
             if (ibv_post_recv(qp_, &wr[0], &bad))
                 throw std::runtime_error("FRCheck RDMA: post_recv failed");
             poll_cq(recv_cq_, (int)nchunks);
+            if (done_cb) done_cb();
         }
     }
 
@@ -1416,8 +1437,8 @@ private:
 
     struct SourceTask   { int sid; uintptr_t data, mirror; size_t bs; };
     struct EncRecvTask  { int sid; uintptr_t recv, p1, p2; size_t bs; std::vector<uint8_t> mask; };
-    struct EncSendTask  { int sid; uintptr_t recv, p1, p2; size_t bs; int n_src; std::vector<int> src_peer_rigs; int par_peer_rig; };
-    struct ParityTask   { int sid; uintptr_t p2_in; size_t bs; };
+    struct EncSendTask  { int sid; uintptr_t recv, p1, p2; size_t bs; int n_src; std::vector<int> src_peer_rigs; int par_peer_rig; bool parity_send_only = false; };
+    struct ParityTask   { int sid; uintptr_t parity_in; size_t bs; };
 
     std::queue<SourceTask>   source_q_;   std::mutex source_mtx_;   std::condition_variable source_cv_;
     std::queue<EncRecvTask>  enc_recv_q_; std::mutex enc_recv_mtx_; std::condition_variable enc_recv_cv_;
@@ -1427,9 +1448,20 @@ private:
     std::vector<std::thread> source_workers_, enc_recv_workers_, enc_send_workers_, parity_workers_;
     std::atomic<bool> all_stop_{false};
     std::atomic<int> task_total_{0}, task_done_{0};
+    std::atomic<int> task_encode_total_{0}, task_encode_done_{0};
+    std::atomic<int> task_async_total_{0}, task_async_done_{0};
+    std::mutex encode_done_mtx_;
+    std::condition_variable encode_done_cv_;
+    std::atomic<int> async_p2p_pause_count_{0};
+    std::mutex async_parity_send_order_mtx_;
     std::mutex layer_done_mtx_;
     std::condition_variable layer_done_cv_;
+    std::mutex async_done_mtx_;
+    std::condition_variable async_done_cv_;
     std::mutex encoder_encode_mtx_;
+    std::atomic<int> async_p2p_inflight_{0};
+    std::mutex async_p2p_inflight_mtx_;
+    std::condition_variable async_p2p_inflight_cv_;
     bool debug_ = false;
 
     void check_done_() {
@@ -1437,6 +1469,63 @@ private:
             std::lock_guard<std::mutex> lk(layer_done_mtx_);
             layer_done_cv_.notify_all();
         }
+    }
+
+    void check_encode_done_() {
+        if (task_encode_done_.fetch_add(1, std::memory_order_acq_rel) + 1
+            == task_encode_total_.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lk(encode_done_mtx_);
+            encode_done_cv_.notify_all();
+        }
+    }
+
+    void check_async_done_() {
+        int done = task_async_done_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        int total = task_async_total_.load(std::memory_order_acquire);
+        if (done >= total) {
+            std::lock_guard<std::mutex> lk(async_done_mtx_);
+            async_done_cv_.notify_all();
+        }
+    }
+
+    void _wait_if_paused() {
+        while (async_p2p_pause_count_.load(std::memory_order_acquire) > 0) {
+            if (debug_) {
+                static int log_counter = 0;
+                if (++log_counter % 1000 == 1)
+                    std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
+                              << " async P2 paused (refcount="
+                              << async_p2p_pause_count_.load() << ")" << std::endl;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+
+    void _async_rdma_begin() {
+        while (true) {
+            async_p2p_inflight_.fetch_add(1, std::memory_order_acq_rel);
+            if (async_p2p_pause_count_.load(std::memory_order_acquire) == 0) {
+                return;
+            }
+            _async_rdma_end();
+            _wait_if_paused();
+        }
+    }
+
+    void _async_rdma_end() {
+        int prev = async_p2p_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+        if (prev <= 1) {
+            std::lock_guard<std::mutex> lk(async_p2p_inflight_mtx_);
+            async_p2p_inflight_cv_.notify_all();
+        }
+    }
+
+    void _wait_async_rdma_idle() {
+        if (async_p2p_inflight_.load(std::memory_order_acquire) == 0) return;
+        std::unique_lock<std::mutex> lk(async_p2p_inflight_mtx_);
+        async_p2p_inflight_cv_.wait(lk, [&] {
+            return async_p2p_inflight_.load(std::memory_order_acquire) == 0;
+        });
     }
 
     void source_worker_() {
@@ -1449,6 +1538,7 @@ private:
             if (!ch) { std::cerr << "FRCheck source " << t.sid << ": no channel\n"; continue; }
             ch->send_data((const uint8_t*)t.data, t.bs);
             if (t.mirror) push_mirror_task_(t.data, t.mirror, t.bs);
+            check_encode_done_();
             check_done_();
         }
     }
@@ -1481,18 +1571,41 @@ private:
     void enc_send_worker_() {
         while (!all_stop_) {
             EncSendTask t;
-            { std::unique_lock<std::mutex> lk(enc_send_mtx_); enc_send_cv_.wait(lk, [&]{ return all_stop_ || !enc_send_q_.empty(); });
-              if (all_stop_ && enc_send_q_.empty()) break; t = std::move(enc_send_q_.front()); enc_send_q_.pop(); }
-            int n_src = t.n_src;
-            std::vector<unsigned char*> data_ptrs((size_t)n_src);
-            for (int i = 0; i < n_src; ++i)
-                data_ptrs[(size_t)i] = (unsigned char*)(t.recv + (uintptr_t)i * t.bs);
-            unsigned char* parity_ptrs[2] = { (unsigned char*)t.p1, (unsigned char*)t.p2 };
-            RsEncodeJob rs{(int)t.bs, n_src, 2, g_tbls_, data_ptrs.data(), parity_ptrs};
-            { std::lock_guard<std::mutex> lk(encoder_encode_mtx_); rs_pool_run_parallel_encode(rs); }
-            auto* ch = get_channel_(t.par_peer_rig, t.sid);
-            if (ch) ch->send_data((const uint8_t*)t.p2, t.bs);
-            check_done_();
+            bool need_order_lock = false;
+            {
+                std::unique_lock<std::mutex> lk(enc_send_mtx_);
+                enc_send_cv_.wait(lk, [&]{ return all_stop_ || !enc_send_q_.empty(); });
+                if (all_stop_ && enc_send_q_.empty()) break;
+                t = std::move(enc_send_q_.front()); enc_send_q_.pop();
+                if (t.parity_send_only) {
+                    async_parity_send_order_mtx_.lock();
+                    need_order_lock = true;
+                }
+            }
+            if (t.parity_send_only) {
+                std::unique_lock<std::mutex> send_lk(async_parity_send_order_mtx_, std::adopt_lock);
+                need_order_lock = false;
+                _wait_if_paused();
+                auto wait_cb = [this]() { this->_async_rdma_begin(); };
+                auto done_cb = [this]() { this->_async_rdma_end(); };
+                {
+                    auto* ch = get_channel_(t.par_peer_rig, t.sid);
+                    if (ch) ch->send_data((const uint8_t*)t.p1, t.bs, wait_cb, done_cb);
+                }
+                check_async_done_();
+            } else {
+                if (need_order_lock) async_parity_send_order_mtx_.unlock(); // shouldn't happen
+                // ---- sync phase: RS encode ----
+                int n_src = t.n_src;
+                std::vector<unsigned char*> data_ptrs((size_t)n_src);
+                for (int i = 0; i < n_src; ++i)
+                    data_ptrs[(size_t)i] = (unsigned char*)(t.recv + (uintptr_t)i * t.bs);
+                unsigned char* parity_ptrs[2] = { (unsigned char*)t.p1, (unsigned char*)t.p2 };
+                RsEncodeJob rs{(int)t.bs, n_src, 2, g_tbls_, data_ptrs.data(), parity_ptrs};
+                { std::lock_guard<std::mutex> lk(encoder_encode_mtx_); rs_pool_run_parallel_encode(rs); }
+                check_encode_done_();
+                check_done_();
+            }
         }
     }
 
@@ -1503,7 +1616,11 @@ private:
               if (all_stop_ && parity_q_.empty()) break; t = parity_q_.front(); parity_q_.pop(); }
             auto& si = stripe_info_[(size_t)t.sid];
             auto* ch = get_channel_(si.enc_peer_rig, t.sid);
-            if (ch) ch->recv_data((uint8_t*)t.p2_in, t.bs);
+            _wait_if_paused();
+            auto wait_cb = [this]() { this->_async_rdma_begin(); };
+            auto done_cb = [this]() { this->_async_rdma_end(); };
+            if (ch) ch->recv_data((uint8_t*)t.parity_in, t.bs, wait_cb, done_cb);
+            check_async_done_();
             check_done_();
         }
     }
@@ -1599,6 +1716,9 @@ public:
             enc_send_workers_.emplace_back(&FRCheckNative::enc_send_worker_, this);
             parity_workers_.emplace_back(&FRCheckNative::parity_worker_, this);
         }
+        // Reuse enc_send workers for deferred P2 sends (n parallel workers,
+        // same as sync path).  P2 send tasks are pushed to enc_send_q_ so
+        // the existing n workers pick them up in FIFO order.
         if (debug_)
             std::cout << "FRCheck: " << nw << " workers/role for " << ns << " stripes" << std::endl;
     }
@@ -1615,6 +1735,7 @@ public:
 
     void submit_source(int sid, uintptr_t data, uintptr_t mirror, size_t bs) {
         task_total_.fetch_add(1, std::memory_order_acq_rel);
+        task_encode_total_.fetch_add(1, std::memory_order_acq_rel);
         { std::lock_guard<std::mutex> lk(source_mtx_); source_q_.push({sid, data, mirror, bs}); }
         source_cv_.notify_one();
     }
@@ -1622,19 +1743,61 @@ public:
     void submit_enc_recv(int sid, uintptr_t recv, uintptr_t p1, uintptr_t p2, size_t bs,
                          const std::vector<uint8_t>& mask) {
         task_total_.fetch_add(1, std::memory_order_acq_rel);
+        task_encode_total_.fetch_add(1, std::memory_order_acq_rel);
         { std::lock_guard<std::mutex> lk(enc_recv_mtx_); enc_recv_q_.push({sid, recv, p1, p2, bs, mask}); }
         enc_recv_cv_.notify_one();
     }
 
-    void submit_parity(int sid, uintptr_t p2_in, size_t bs) {
+    void submit_parity(int sid, uintptr_t parity_in, size_t bs) {
         task_total_.fetch_add(1, std::memory_order_acq_rel);
-        { std::lock_guard<std::mutex> lk(parity_mtx_); parity_q_.push({sid, p2_in, bs}); }
+        task_async_total_.fetch_add(1, std::memory_order_acq_rel);
+        { std::lock_guard<std::mutex> lk(parity_mtx_); parity_q_.push({sid, parity_in, bs}); }
         parity_cv_.notify_one();
+    }
+
+    void submit_p2_send(int sid, uintptr_t p2_addr, size_t bs) {
+        submit_p1_send(sid, p2_addr, bs);
+    }
+
+    void submit_p1_send(int sid, uintptr_t p1_addr, size_t bs) {
+        auto& si = stripe_info_[(size_t)sid];
+        EncSendTask t;
+        t.sid = sid;
+        t.p1 = p1_addr;
+        t.bs = bs;
+        t.par_peer_rig = si.par_peer_rig;
+        t.parity_send_only = true;
+        task_async_total_.fetch_add(1, std::memory_order_acq_rel);
+        { std::lock_guard<std::mutex> lk(enc_send_mtx_); enc_send_q_.push(std::move(t)); }
+        enc_send_cv_.notify_one();
+    }
+
+    void reset_async_parity() {
+        task_async_done_.store(0, std::memory_order_release);
+        task_async_total_.store(0, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(parity_mtx_);
+            while (!parity_q_.empty()) parity_q_.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(enc_send_mtx_);
+            std::queue<EncSendTask> keep;
+            while (!enc_send_q_.empty()) {
+                EncSendTask t = std::move(enc_send_q_.front());
+                enc_send_q_.pop();
+                if (!t.parity_send_only) keep.push(std::move(t));
+            }
+            enc_send_q_.swap(keep);
+        }
     }
 
     void reset_layer() {
         task_done_.store(0, std::memory_order_release);
         task_total_.store(0, std::memory_order_release);
+        task_encode_done_.store(0, std::memory_order_release);
+        task_encode_total_.store(0, std::memory_order_release);
+        task_async_done_.store(0, std::memory_order_release);
+        task_async_total_.store(0, std::memory_order_release);
         { std::lock_guard<std::mutex> lk(source_mtx_);   while (!source_q_.empty()) source_q_.pop(); }
         { std::lock_guard<std::mutex> lk(enc_recv_mtx_); while (!enc_recv_q_.empty()) enc_recv_q_.pop(); }
         { std::lock_guard<std::mutex> lk(enc_send_mtx_); while (!enc_send_q_.empty()) enc_send_q_.pop(); }
@@ -1650,6 +1813,59 @@ public:
             std::cerr << "[FRCHECK-DIAG] rank " << rank_in_group_ << " stuck: done="
                       << task_done_.load() << "/" << total << std::endl;
         layer_done_cv_.wait(lk, [&]{ return task_done_.load() >= total; });
+    }
+
+    void wait_encode_only() {
+        int total = task_encode_total_.load(std::memory_order_acquire);
+        if (total == 0) return;
+        if (debug_)
+            std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
+                      << " wait_encode_only begin (total=" << total
+                      << " done=" << task_encode_done_.load() << ")" << std::endl;
+        std::unique_lock<std::mutex> lk(encode_done_mtx_);
+        encode_done_cv_.wait(lk, [&]{
+            return task_encode_done_.load(std::memory_order_acquire) >= total;
+        });
+        if (debug_)
+            std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
+                      << " wait_encode_only done" << std::endl;
+    }
+
+    void wait_parity_flush() {
+        int total = task_async_total_.load(std::memory_order_acquire);
+        if (total > 0 && debug_)
+            std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
+                      << " wait_parity_flush begin (total=" << total
+                      << " done=" << task_async_done_.load() << ")"
+                      << std::endl;
+        if (total == 0) return;
+        std::unique_lock<std::mutex> lk(async_done_mtx_);
+        async_done_cv_.wait(lk, [&]{
+            return task_async_done_.load(std::memory_order_acquire) >=
+                   task_async_total_.load(std::memory_order_acquire);
+        });
+        if (total > 0 && debug_)
+            std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
+                      << " wait_parity_flush done" << std::endl;
+    }
+
+    void inc_pause_async_p2p() {
+        int newval = async_p2p_pause_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        _wait_async_rdma_idle();
+        if (debug_)
+            std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
+                      << " inc_pause_async_p2p → refcount=" << newval << std::endl;
+    }
+
+    void dec_pause_async_p2p() {
+        int prev = async_p2p_pause_count_.fetch_sub(1, std::memory_order_acq_rel);
+        if (prev <= 1) {
+            async_p2p_pause_count_.store(0, std::memory_order_release);
+        }
+        if (debug_)
+            std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
+                      << " dec_pause_async_p2p → refcount="
+                      << (prev > 0 ? prev - 1 : 0) << std::endl;
     }
 
     void wait_mirror_completion() {
@@ -2457,8 +2673,19 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("p2_addr"), py::arg("block_size"),
              py::arg("source_active_mask") = std::vector<uint8_t>())
         .def("submit_parity", &FRCheckNative::submit_parity,
-             py::arg("stripe_id"), py::arg("p2_in_addr"), py::arg("block_size"))
+             py::arg("stripe_id"), py::arg("parity_in_addr"), py::arg("block_size"))
+        .def("submit_p1_send", &FRCheckNative::submit_p1_send,
+             py::arg("stripe_id"), py::arg("p1_addr"), py::arg("block_size"))
+        .def("submit_p2_send", &FRCheckNative::submit_p2_send,
+             py::arg("stripe_id"), py::arg("p2_addr"), py::arg("block_size"))
+        .def("reset_async_parity", &FRCheckNative::reset_async_parity)
         .def("wait_layer", &FRCheckNative::wait_layer,
              py::call_guard<py::gil_scoped_release>())
+        .def("wait_encode_only", &FRCheckNative::wait_encode_only,
+             py::call_guard<py::gil_scoped_release>())
+        .def("wait_parity_flush", &FRCheckNative::wait_parity_flush,
+             py::call_guard<py::gil_scoped_release>())
+        .def("inc_pause_async_p2p", &FRCheckNative::inc_pause_async_p2p)
+        .def("dec_pause_async_p2p", &FRCheckNative::dec_pause_async_p2p)
         .def("wait_mirror_completion", &FRCheckNative::wait_mirror_completion);
 }

@@ -2372,10 +2372,20 @@ def _add_checkpointing_args(parser):
                             'Use --frcheck-failed-ranks to specify which ranks to treat as failed.')
     group.add_argument('--frcheck-failed-ranks', type=str, default=None,
                        help='Comma-separated list of global ranks to treat as failed '
-                            'for FRCheck hardware recovery (e.g. "1" or "1,2"). '
-                            'When set, these ranks force recovery from surviving stripe blocks '
-                            'even if their main files exist. '
+                            'for FRCheck hardware recovery (e.g. "1" or "0,1,2,3,4,5,6,7" '
+                            'for a full 8-GPU node). '
+                            'In node-aware mode each POA group gets ≤1 rank per node, '
+                            'so an entire node\'s ranks are legal as long as no single group '
+                            'exceeds 2 failed ranks. '
                             'Used with --use-frcheck-hardware-failure for testing.')
+    group.add_argument('--frcheck-async-parity', action='store_true',
+                       help='Enable async P2 parity delivery in FRCheck save. '
+                            'When set, save blocks only until RS encode completes '
+                            '(P1 = 1-fault tolerant), and P2 is sent in background '
+                            'during subsequent training steps. '
+                            'Async P2 is paused during PP forward/backward to avoid '
+                            'network contention. '
+                            'When unset (default), save is fully synchronous as before.')
     group.add_argument('--frcheck-debug', action='store_true',
                        help='Enable detailed size/encoding debug logging for FRCheck operations.')
     group.add_argument('--frcheck-distribute-common', action='store_true',

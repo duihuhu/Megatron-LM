@@ -616,11 +616,16 @@ class FRCheckManager:
                 native.register_buffer(parity2_bufs[sid].data_ptr(), parity2_bufs[sid].numel())
 
         if par_indices:
+            p1_slices = allocate_hugepage_slices(
+                block_sz, len(par_indices), fallback_pin_memory=True
+            )
             p2_slices = allocate_hugepage_slices(
                 block_sz, len(par_indices), fallback_pin_memory=True
             )
             for slot, sid in enumerate(par_indices):
+                parity1_bufs[sid] = p1_slices[slot]
                 parity2_bufs[sid] = p2_slices[slot]
+                native.register_buffer(parity1_bufs[sid].data_ptr(), parity1_bufs[sid].numel())
                 native.register_buffer(parity2_bufs[sid].data_ptr(), parity2_bufs[sid].numel())
 
         layer_bufs = LayerStripeBufs(
@@ -837,6 +842,11 @@ class FRCheckManager:
     def init_frcheck_hardware_recovery(self, failed_global_ranks: List[int]) -> Dict[int, Dict]:
         """Initialize hardware recovery mode for up to 2 failed ranks per POA group.
 
+        In node-aware mode (mode 1), each POA group contains one rank from each of
+        n physical nodes.  A full-node failure manifests as one failed rank per
+        group, so ``--frcheck-failed-ranks`` can list all GPU ranks on the failed
+        node(s) — the per-group RS(2) recovery handles up to 2 node failures.
+
         Single failure: per-failed-rank cyclic decoder/helper plan (HW1).
         Dual failure: one plan per stripe; helpers send once, decoder recovers both
         erasures and sends to both failed ranks (HW2).
@@ -849,18 +859,13 @@ class FRCheckManager:
         world_size = torch.distributed.get_world_size()
         my_rank = torch.distributed.get_rank()
 
-        if len(failed_global_ranks) > 2:
-            raise RuntimeError(
-                f"FRCheck hardware recovery supports at most 2 failed ranks, "
-                f"got {failed_global_ranks}"
-            )
-
         self.is_recovery_mode = True
         self.failed_global_ranks = list(failed_global_ranks)
         self.recovery_dual_failure = False
 
         recovery_contexts: Dict[int, Dict] = {}
         failed_in_my_group: List[int] = []
+        all_groups_failed: Dict[int, List[int]] = {}  # group_id → failed ranks in that group
 
         for failed_rank in failed_global_ranks:
             group_id = self._get_group_id(failed_rank, world_size, self.frcheck_n)
@@ -874,6 +879,10 @@ class FRCheckManager:
             }
             recovery_contexts[failed_rank] = ctx
 
+            if group_id not in all_groups_failed:
+                all_groups_failed[group_id] = []
+            all_groups_failed[group_id].append(failed_rank)
+
             if group_id == self.group_id:
                 failed_in_my_group.append(failed_rank)
 
@@ -886,11 +895,24 @@ class FRCheckManager:
                     "FRCheck hardware recovery: I am in group %d with failed rank %d (rig %d)",
                     group_id, failed_rank, failed_rig)
 
-        if len(failed_in_my_group) > 2:
-            raise RuntimeError(
-                f"FRCheck: at most 2 failed ranks per POA group, "
-                f"got {failed_in_my_group} in group {self.group_id}"
-            )
+        # Validate per-group limits across all groups (not just my group).
+        # RS(2) can recover at most 2 erasures per stripe → at most 2 failed
+        # node-slots per POA group.  In node-aware mode a full-node failure
+        # produces one failed rank per group, so many global ranks are legal
+        # as long as no single group exceeds 2.
+        for gid, ranks in all_groups_failed.items():
+            if len(ranks) > 2:
+                raise RuntimeError(
+                    f"FRCheck: at most 2 failed ranks per POA group, "
+                    f"group {gid} has {len(ranks)} failed ranks: {ranks}"
+                )
+            rigs = [recovery_contexts[r]['failed_rig'] for r in ranks]
+            if len(rigs) != len(set(rigs)):
+                raise RuntimeError(
+                    f"FRCheck: duplicate node slots in group {gid}: "
+                    f"failed ranks {ranks} map to rigs {rigs} — "
+                    f"two ranks from the same node in one group"
+                )
 
         if failed_in_my_group:
             if len(failed_in_my_group) == 2:

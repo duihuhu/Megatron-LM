@@ -18,6 +18,81 @@ from megatron.core.utils import nvtx_decorator
 Shape = Union[List[int], torch.Size]
 
 
+# ---- FRCheck async parity hooks (no-op when flag not set) ----
+
+def _frcheck_inc_net_busy():
+    """Increment the FRCheck async-pause refcount.
+
+    Called right before issuing NCCL P2P operations so that background P2
+    parity sends do not contend for IB bandwidth with PP communication.
+
+    No-op when --frcheck-async-parity is not set.
+    """
+    try:
+        from megatron.training import get_args
+        args = get_args()
+        if not getattr(args, 'frcheck_async_parity', False):
+            return
+        from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
+        mgr = FRCheckManager()
+        native = mgr.get_native()
+        if native is not None:
+            native.inc_pause_async_p2p()
+    except Exception:
+        pass
+
+
+def _frcheck_dec_net_busy():
+    """Decrement the FRCheck async-pause refcount.
+
+    Called after NCCL P2P operations complete (req.wait() returns).
+    When the refcount reaches zero, background P2 parity sends resume.
+    """
+    try:
+        from megatron.training import get_args
+        args = get_args()
+        if not getattr(args, 'frcheck_async_parity', False):
+            return
+        from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
+        mgr = FRCheckManager()
+        native = mgr.get_native()
+        if native is not None:
+            native.dec_pause_async_p2p()
+    except Exception:
+        pass
+
+
+def _make_frcheck_req_wrapper(num_reqs):
+    """Return a function that wraps a single NCCL req so its .wait()
+    calls _frcheck_dec_net_busy after all wrapped reqs complete.
+
+    Used for the overlap / deferred-wait path (wait_on_reqs=False).
+    """
+    remaining = [num_reqs]
+    released = [False]
+
+    def _wrap(req):
+        _real_wait = req.wait
+        waited = [False]
+
+        def _wait():
+            if waited[0]:
+                return _real_wait()
+            _real_wait()
+            waited[0] = True
+            remaining[0] -= 1
+            if remaining[0] <= 0 and not released[0]:
+                released[0] = True
+                _frcheck_dec_net_busy()
+
+        req.wait = _wait
+        return req
+    return _wrap
+
+
+# ----------------------------------------------------------------
+
+
 def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next, config):
     """Communicate tensor shapes between stages. Used to communicate
     tensor shapes before the actual tensor communication happens.
@@ -356,6 +431,7 @@ def _communicate(
     if tensor_recv_next_func is not None:
         tensor_recv_next = tensor_recv_next_func()
 
+    _frcheck_inc_net_busy()
     p2p_reqs = p2p_func(
         tensor_send_prev=tensor_send_prev,
         tensor_recv_prev=tensor_recv_prev,
@@ -370,10 +446,25 @@ def _communicate(
     else:
         reqs.update(p2p_reqs)
 
-    if wait_on_reqs and len(reqs) > 0:
+    # Batched and ring-exchange paths do blocking wait inside p2p_func
+    # and return an empty list — NCCL is already complete.
+    if config.use_ring_exchange_p2p or config.batch_p2p_comm:
+        _frcheck_dec_net_busy()
+    elif wait_on_reqs and len(reqs) > 0:
         for req in reqs if isinstance(reqs, list) else reqs.values():
             req.wait()
+        _frcheck_dec_net_busy()
         reqs = None
+    elif len(reqs) > 0:
+        # Overlap / deferred-wait mode: keep P2 paused until all reqs finish.
+        _wrap = _make_frcheck_req_wrapper(len(reqs))
+        if isinstance(reqs, dict):
+            reqs = {k: _wrap(v) for k, v in reqs.items()}
+        else:
+            reqs = [_wrap(r) for r in reqs]
+    else:
+        # No ops issued (edge case), dec to avoid refcount leak
+        _frcheck_dec_net_busy()
 
     if config.batch_p2p_comm and config.batch_p2p_sync:
         # To protect against race condition when using batch_isend_irecv().

@@ -1446,6 +1446,49 @@ def create_layer_groups_by_param_count(optimizer, num_groups=None):
     return layer_groups
 
 
+def _frcheck_inc_net_busy():
+    """Mark the network as busy (PP NCCL communication in flight).
+
+    Increments a refcount in the FRCheck C++ native module; background P2
+    workers will pause while the count is > 0.  Call _frcheck_dec_net_busy()
+    after the NCCL operation completes.
+
+    No-op when --frcheck-async-parity is not set or FRCheck is not in use.
+    """
+    try:
+        from megatron.training import get_args
+        args = get_args()
+        if not getattr(args, 'frcheck_async_parity', False):
+            return
+        from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
+        mgr = FRCheckManager()
+        native = mgr.get_native()
+        if native is not None:
+            native.inc_pause_async_p2p()
+    except Exception:
+        pass
+
+
+def _frcheck_dec_net_busy():
+    """Mark the network as free (NCCL operation complete).
+
+    Decrements the refcount.  When the count reaches zero, background P2
+    workers are free to send parity blocks.
+    """
+    try:
+        from megatron.training import get_args
+        args = get_args()
+        if not getattr(args, 'frcheck_async_parity', False):
+            return
+        from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
+        mgr = FRCheckManager()
+        native = mgr.get_native()
+        if native is not None:
+            native.dec_pause_async_p2p()
+    except Exception:
+        pass
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
     """Single training step."""
     args = get_args()

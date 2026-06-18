@@ -10,6 +10,7 @@ import pickle
 import os
 import re
 import struct
+import threading
 import time
 from logging import getLogger
 from pathlib import Path
@@ -38,6 +39,9 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
 )
 
 logger = getLogger(__name__)
+
+_async_p1_writer_thread: Optional[threading.Thread] = None
+_async_p2_writer_thread: Optional[threading.Thread] = None
 
 _LAYER_KEY_RE = re.compile(r"\.layers\.(\d+)\b")
 
@@ -298,8 +302,11 @@ def _save_frcheck_stripe_files(
     rank: int,
     num_stripes: int,
     encode_results: List[_LayerEncodeResult],
+    include_encoder_p1: bool = True,
+    include_source: bool = True,
+    include_p2: bool = True,
 ) -> None:
-    """Write all layer stripe files after encode completes (aligned with ecnaive)."""
+    """Write all layer stripe files after encode completes."""
     import concurrent.futures
 
     _FRBK_MAGIC = b"FRBK"
@@ -328,7 +335,8 @@ def _save_frcheck_stripe_files(
             if ncopy > 0:
                 f.write(memoryview(data.numpy()))
 
-    jobs: List[Tuple[str, int, int, int, int, Any, str]] = []
+    # Job tuple: (layer_name, block_size, sid, role, ncopy, buf, suffix)
+    jobs: List[Tuple] = []
     for result in encode_results:
         layer_bufs = manager.get_layer_stripe_bufs(result.layer_idx)
         block_size = result.block_size
@@ -337,9 +345,11 @@ def _save_frcheck_stripe_files(
         for sid in range(num_stripes):
             plan = stripe_plans[sid]
             if plan.role == StripeRole.SOURCE:
+                if not include_source:
+                    continue
                 blk_idx = _source_blk_idx_for_stripe(stripe_plans, sid)
                 if blk_idx < 0 or blk_idx >= result.n_filled_blocks:
-                    continue  # skip zero-padded block
+                    continue
                 src_buf = layer_mirror[
                     blk_idx * block_size : (blk_idx + 1) * block_size
                 ]
@@ -348,12 +358,15 @@ def _save_frcheck_stripe_files(
                     src_buf, "",
                 ))
             elif plan.role == StripeRole.ENCODER:
+                if not include_encoder_p1:
+                    continue
                 jobs.append((
                     layer_name, block_size, sid, 1, block_size,
                     layer_bufs.parity1_bufs[sid], "_p1",
                 ))
-                # P2 is written by PARITY_TARGET (not duplicated here)
             elif plan.role == StripeRole.PARITY_TARGET:
+                if not include_p2:
+                    continue
                 jobs.append((
                     layer_name, block_size, sid, 2, block_size,
                     layer_bufs.parity2_bufs[sid], "",
@@ -371,6 +384,105 @@ def _save_frcheck_stripe_files(
         ]
         for fut in futures:
             fut.result()
+
+
+def _async_write_frcheck_encoder_p1_files(
+    manager,
+    output_dir: str,
+    rank: int,
+    num_stripes: int,
+    encode_results: List[_LayerEncodeResult],
+) -> None:
+    """Wait for async P1 delivery, then write encoder-owned P1 shards."""
+    native = manager.get_native()
+    if native is None:
+        return
+    native.wait_parity_flush()
+    _save_frcheck_stripe_files(
+        manager,
+        output_dir,
+        rank,
+        num_stripes,
+        encode_results,
+        include_encoder_p1=True,
+        include_source=False,
+        include_p2=False,
+    )
+
+
+def _async_write_frcheck_p2_files(
+    manager,
+    output_dir: str,
+    rank: int,
+    num_stripes: int,
+    encode_results: List[_LayerEncodeResult],
+) -> None:
+    """Wait for async P2 delivery, then write P2 shards."""
+    native = manager.get_native()
+    if native is None:
+        return
+    try:
+        native.wait_parity_flush()
+        _save_frcheck_stripe_files(
+            manager,
+            output_dir,
+            rank,
+            num_stripes,
+            encode_results,
+            include_encoder_p1=False,
+            include_source=False,
+            include_p2=True,
+        )
+    except Exception:
+        logger.exception("FRCheck async P2 writer failed")
+        raise
+
+
+def _wait_previous_async_writers() -> None:
+    global _async_p1_writer_thread, _async_p2_writer_thread
+    for attr in ("_async_p1_writer_thread", "_async_p2_writer_thread"):
+        th = globals()[attr]
+        if th is not None:
+            th.join()
+            globals()[attr] = None
+
+
+def _start_async_p1_writer(
+    manager,
+    output_dir: str,
+    rank: int,
+    num_stripes: int,
+    encode_results: List[_LayerEncodeResult],
+) -> None:
+    global _async_p1_writer_thread
+    _wait_previous_async_writers()
+    _async_p1_writer_thread = threading.Thread(
+        target=_async_write_frcheck_encoder_p1_files,
+        args=(manager, output_dir, rank, num_stripes, list(encode_results)),
+        name="frcheck-async-p1-writer",
+        daemon=False,
+    )
+    _async_p1_writer_thread.start()
+
+
+def _start_async_p2_writer(
+    manager,
+    output_dir: str,
+    rank: int,
+    num_stripes: int,
+    encode_results: List[_LayerEncodeResult],
+) -> None:
+    global _async_p2_writer_thread
+    if _async_p2_writer_thread is not None:
+        _async_p2_writer_thread.join()
+        _async_p2_writer_thread = None
+    _async_p2_writer_thread = threading.Thread(
+        target=_async_write_frcheck_p2_files,
+        args=(manager, output_dir, rank, num_stripes, list(encode_results)),
+        name="frcheck-async-p2-writer",
+        daemon=False,
+    )
+    _async_p2_writer_thread.start()
 
 
 def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
@@ -406,6 +518,16 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     if native is None:
         raise RuntimeError("FRCheck legacy save: native module not available")
     native.set_debug(_dbg)
+
+    # Async parity path: drain any pending P2 operations from a previous save.
+    _use_async_parity = getattr(args, 'frcheck_async_parity', False)
+    if _use_async_parity:
+        if _dbg:
+            logger.info("FRCHECK save: async parity enabled, waiting previous async writers")
+        _wait_previous_async_writers()
+        if _dbg:
+            logger.info("FRCHECK save: previous async writers completed")
+
     if native.group_size() != native.n():
         raise RuntimeError(
             f"FRCheck legacy save: group_size={native.group_size()} != n={native.n()}"
@@ -559,13 +681,16 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
                                       p2b.data_ptr(), layer_block_size,
                                       enc_active_masks.get(sid, []))
             elif plan.role == StripeRole.PARITY_TARGET:
-                p2b = layer_bufs.parity2_bufs[sid]
-                if p2b is None:
-                    continue
-                native.submit_parity(sid, p2b.data_ptr(), layer_block_size)
+                # Deferred to async phase (after all layers' encoding)
+                pass
 
         # Wait for all stripes in this layer to complete
-        native.wait_layer()
+        if _use_async_parity:
+            if _dbg:
+                logger.info("FRCHECK layer %s: wait_encode_only (async)", layer_name)
+            native.wait_encode_only()
+        else:
+            native.wait_layer()
 
         if _dbg:
             n_src_my = sum(1 for p in stripe_plans if p.role == StripeRole.SOURCE)
@@ -587,6 +712,35 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     t_enc = time.time() - t_prep
 
+    # ---- async parity phase: submit P2 sends + parity receives ----
+    # P2 delivery is one independent async batch. Do not call reset_layer()
+    # per layer here: sync encode uses per-layer counters, but async P2 is
+    # allowed to span layers and continue into the next training iteration.
+    if _use_async_parity:
+        if _dbg:
+            logger.info("FRCHECK save: submitting async P2 tasks for %d layers",
+                        len(encode_results))
+        native.reset_async_parity()
+        for result in encode_results:
+            layer_bufs = manager.get_layer_stripe_bufs(result.layer_idx)
+            for sid in range(num_stripes):
+                plan = stripe_plans[sid]
+                if plan.role == StripeRole.PARITY_TARGET:
+                    p2b = layer_bufs.parity2_bufs[sid]
+                    if p2b is not None:
+                        native.submit_parity(sid, p2b.data_ptr(),
+                                            result.block_size)
+            for sid in range(num_stripes):
+                plan = stripe_plans[sid]
+                if plan.role == StripeRole.ENCODER:
+                    p2b = layer_bufs.parity2_bufs[sid]
+                    if p2b is not None:
+                        native.submit_p2_send(sid, p2b.data_ptr(),
+                                             result.block_size)
+        if _dbg:
+            logger.info("FRCHECK save: async P2 tasks submitted — "
+                        "will drain in background")
+
     native.wait_mirror_completion()
 
     if world_size > 1:
@@ -594,9 +748,20 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     logger.info("FRCHECK save timing: encode %0.3fs", time.time() - t_prep)
 
-    _save_frcheck_stripe_files(
-        manager, str(checkpoint_dir), rank, num_stripes, encode_results,
-    )
+    if _use_async_parity:
+        _save_frcheck_stripe_files(
+            manager, str(checkpoint_dir), rank, num_stripes, encode_results,
+            include_encoder_p1=True,
+            include_source=True,
+            include_p2=False,
+        )
+        _start_async_p2_writer(
+            manager, str(checkpoint_dir), rank, num_stripes, encode_results,
+        )
+    else:
+        _save_frcheck_stripe_files(
+            manager, str(checkpoint_dir), rank, num_stripes, encode_results,
+        )
 
     for result in encode_results:
         local_layer_order.append(result.layer_name)
@@ -1415,6 +1580,8 @@ def _teardown_frcheck_after_training() -> None:
         return
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     logger.info("FRCheck: tearing down native module after training (rank %d)", rank)
+    if getattr(args, 'frcheck_async_parity', False):
+        _wait_previous_async_writers()
     manager.cleanup(teardown=True)
 
 

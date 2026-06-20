@@ -869,9 +869,7 @@ private:
             wrs[i].sg_list = &sges[i];
             wrs[i].num_sge = 1;
             wrs[i].opcode = IBV_WR_SEND;
-            // Signal EVERY chunk so we can interleave D2H mirror tasks
-            // per-chunk: chunk N′s D2H overlaps with chunk N+1′s RDMA.
-            wrs[i].send_flags = IBV_SEND_SIGNALED;
+            wrs[i].send_flags = 0;
             wrs[i].next = (i < chunk_count - 1) ? &wrs[i + 1] : nullptr;
         }
 
@@ -882,24 +880,16 @@ private:
             // Detach this batch's tail from the next batch
             if (batch_end < chunk_count)
                 wrs[batch_end - 1].next = nullptr;
+            wrs[batch_end - 1].send_flags = IBV_SEND_SIGNALED;
 
             ibv_send_wr* bad_wr = nullptr;
             if (ibv_post_send(qp, &wrs[batch_start], &bad_wr) != 0) {
                 throw std::runtime_error("Failed to post send work request");
             }
 
-            // Poll each signaled completion and fire the per-chunk callback.
-            // This lets D2H for chunk N start while chunk N+1 is still in-flight.
-            for (size_t i = batch_start; i < batch_end; ++i) {
-                {
-                    std::lock_guard<std::mutex> cq_lock(send_cq_poll_mutex_);
-                    poll_completion(send_cq_, 1);
-                }
-                if (on_chunk_done_) {
-                    size_t chunk_off = i * CHUNK_SIZE;
-                    size_t chunk_sz = std::min(CHUNK_SIZE, total_size - chunk_off);
-                    on_chunk_done_(reinterpret_cast<uintptr_t>(data), chunk_off, chunk_sz);
-                }
+            {
+                std::lock_guard<std::mutex> cq_lock(send_cq_poll_mutex_);
+                poll_completion(send_cq_, 1);
             }
         }
     }
@@ -2240,48 +2230,10 @@ private:
                 uintptr_t gpu_base = mirror_gpu_base_;
                 uintptr_t cpu_base = mirror_cpu_base_;
 
-                // Install per-chunk mirror callback so D2H for chunk N
-                // starts as soon as chunk N′s RDMA send completes,
-                // overlapping with chunk N+1′s RDMA.
-                // Use a shared bitmap to deduplicate: when sending to
-                // multiple targets, each chunk′s D2H is pushed only once.
-                auto mirror_pushed = std::make_shared<std::atomic<uint64_t>>(0);
-                if (cpu_base != 0) {
-                    auto* rdma_mgr = dynamic_cast<GeminiReplicasRdmaConnectionManager*>(
-                        connection_manager_.get());
-                    if (rdma_mgr) {
-                        rdma_mgr->set_chunk_done_callback(
-                            [this, gpu_base, cpu_base, mirror_pushed](
-                                uintptr_t, size_t offset, size_t sz) {
-                                static constexpr size_t kChunk = 64ULL * 1024 * 1024;
-                                uint64_t idx = offset / kChunk;
-                                if (idx < 64) {
-                                    uint64_t bit = 1ULL << idx;
-                                    uint64_t old = mirror_pushed->fetch_or(bit);
-                                    if ((old & bit) == 0) {
-                                        push_mirror_task(gpu_base + offset,
-                                                         cpu_base + offset, sz);
-                                    }
-                                } else {
-                                    // Fallback for buffers >4 GB: push anyway
-                                    // (rare in practice; the duplicate cost is
-                                    // bounded).
-                                    push_mirror_task(gpu_base + offset,
-                                                     cpu_base + offset, sz);
-                                }
-                            });
-                    }
-                }
-
                 connection_manager_->broadcast_to_targets(data, send_task_size_);
 
-                // Clear the callback so it doesn't fire for unrelated sends.
                 if (cpu_base != 0) {
-                    auto* rdma_mgr = dynamic_cast<GeminiReplicasRdmaConnectionManager*>(
-                        connection_manager_.get());
-                    if (rdma_mgr) {
-                        rdma_mgr->set_chunk_done_callback(nullptr);
-                    }
+                    push_mirror_task(gpu_base, cpu_base, send_task_size_);
                 }
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(send_error_mutex_);

@@ -716,37 +716,64 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     # P2 delivery is one independent async batch. Do not call reset_layer()
     # per layer here: sync encode uses per-layer counters, but async P2 is
     # allowed to span layers and continue into the next training iteration.
+    _async_p2_submit_elapsed = 0.0
     if _use_async_parity:
+        _async_p2_submit_t0 = time.time()
+        _async_p2_reset_elapsed = 0.0
+        _async_p2_build_elapsed = 0.0
+        _async_p2_native_elapsed = 0.0
+        _async_p2_parity_tasks = 0
+        _async_p2_send_tasks = 0
         if _dbg:
             logger.info("FRCHECK save: submitting async P2 tasks for %d layers",
                         len(encode_results))
+        _reset_t0 = time.time()
         native.reset_async_parity()
+        _async_p2_reset_elapsed = time.time() - _reset_t0
         for result in encode_results:
             layer_bufs = manager.get_layer_stripe_bufs(result.layer_idx)
-            for sid in range(num_stripes):
-                plan = stripe_plans[sid]
-                if plan.role == StripeRole.PARITY_TARGET:
-                    p2b = layer_bufs.parity2_bufs[sid]
-                    if p2b is not None:
-                        native.submit_parity(sid, p2b.data_ptr(),
-                                            result.block_size)
-            for sid in range(num_stripes):
-                plan = stripe_plans[sid]
-                if plan.role == StripeRole.ENCODER:
-                    p2b = layer_bufs.parity2_bufs[sid]
-                    if p2b is not None:
-                        native.submit_p2_send(sid, p2b.data_ptr(),
-                                             result.block_size)
+            _build_t0 = time.time()
+            p2_addrs = [
+                0 if p2b is None else p2b.data_ptr()
+                for p2b in layer_bufs.parity2_bufs
+            ]
+            _async_p2_build_elapsed += time.time() - _build_t0
+            _native_t0 = time.time()
+            counts = native.submit_async_p2_layer(p2_addrs, result.block_size)
+            _async_p2_native_elapsed += time.time() - _native_t0
+            if counts is not None and len(counts) >= 2:
+                _async_p2_parity_tasks += int(counts[0])
+                _async_p2_send_tasks += int(counts[1])
         if _dbg:
             logger.info("FRCHECK save: async P2 tasks submitted — "
                         "will drain in background")
+            logger.info(
+                "[FRCHECK-DEBUG] async P2 submit detail v2(layer_addr_api): reset=%.3fs "
+                "build_tasks=%.3fs native_batch=%.3fs parity_tasks=%d "
+                "send_tasks=%d",
+                _async_p2_reset_elapsed, _async_p2_build_elapsed,
+                _async_p2_native_elapsed, _async_p2_parity_tasks,
+                _async_p2_send_tasks,
+            )
+        _async_p2_submit_elapsed = time.time() - _async_p2_submit_t0
 
+    _mirror_t0 = time.time()
     native.wait_mirror_completion()
+    _mirror_elapsed = time.time() - _mirror_t0
 
+    _post_barrier_elapsed = 0.0
     if world_size > 1:
+        _post_barrier_t0 = time.time()
         torch.distributed.barrier()
+        _post_barrier_elapsed = time.time() - _post_barrier_t0
 
-    logger.info("FRCHECK save timing: encode %0.3fs", time.time() - t_prep)
+    logger.info(
+        "FRCheck legacy save rank %d: sync path done "
+        "(encode=%.3fs async_p2_submit=%.3fs mirror=%.3fs "
+        "post_barrier=%.3fs total=%.3fs)",
+        rank, t_enc, _async_p2_submit_elapsed, _mirror_elapsed,
+        _post_barrier_elapsed, time.time() - t_prep,
+    )
 
     if _use_async_parity:
         _save_frcheck_stripe_files(

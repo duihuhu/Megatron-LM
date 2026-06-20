@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 from typing import List, Optional, Tuple, Union
+import threading
 
 import torch
 
@@ -62,28 +63,53 @@ def _frcheck_dec_net_busy():
         pass
 
 
-def _make_frcheck_req_wrapper(num_reqs):
-    """Return a function that wraps a single NCCL req so its .wait()
-    calls _frcheck_dec_net_busy after all wrapped reqs complete.
+def _make_frcheck_deferred_req_wrapper(reqs):
+    """Release FRCheck pause as soon as deferred NCCL Work objects finish.
 
-    Used for the overlap / deferred-wait path (wait_on_reqs=False).
+    The normal overlap path may call req.wait() much later than the actual
+    PP communication completion.  A background waiter keeps FRCheck paused
+    only for the real NCCL window, while wrapped waits keep user semantics.
     """
-    remaining = [num_reqs]
+    req_list = list(reqs)
+    if not req_list:
+        _frcheck_dec_net_busy()
+        return lambda req: req
+
     released = [False]
+    release_lock = threading.Lock()
+    real_waits = {id(req): req.wait for req in req_list}
+
+    def _release_once():
+        with release_lock:
+            if released[0]:
+                return
+            released[0] = True
+        _frcheck_dec_net_busy()
+
+    def _wait_all():
+        try:
+            for req in req_list:
+                real_waits[id(req)]()
+        finally:
+            _release_once()
+
+    threading.Thread(
+        target=_wait_all,
+        name="frcheck-pp-p2p-waiter",
+        daemon=True,
+    ).start()
 
     def _wrap(req):
-        _real_wait = req.wait
+        _real_wait = real_waits[id(req)]
         waited = [False]
 
         def _wait():
             if waited[0]:
                 return _real_wait()
-            _real_wait()
-            waited[0] = True
-            remaining[0] -= 1
-            if remaining[0] <= 0 and not released[0]:
-                released[0] = True
-                _frcheck_dec_net_busy()
+            try:
+                return _real_wait()
+            finally:
+                waited[0] = True
 
         req.wait = _wait
         return req
@@ -457,7 +483,8 @@ def _communicate(
         reqs = None
     elif len(reqs) > 0:
         # Overlap / deferred-wait mode: keep P2 paused until all reqs finish.
-        _wrap = _make_frcheck_req_wrapper(len(reqs))
+        _req_values = list(reqs.values()) if isinstance(reqs, dict) else list(reqs)
+        _wrap = _make_frcheck_deferred_req_wrapper(_req_values)
         if isinstance(reqs, dict):
             reqs = {k: _wrap(v) for k, v in reqs.items()}
         else:

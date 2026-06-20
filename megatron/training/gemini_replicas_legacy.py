@@ -322,19 +322,29 @@ def save_gemini_replicas_legacy_checkpoint(
         send_addr = tensor_buffer.data_ptr()
         native.set_mirror_bases(0, 0)  # disable per-chunk mirror
 
+    _submit_t0 = time.time()
     native.submit_send_buffer(send_addr, send_buffer_size)
 
     for src_r, recv_buf in receive_buffers.items():
         native.submit_recv_buffer(src_r, recv_buf.data_ptr(), recv_buf.numel())
+    _submit_elapsed = time.time() - _submit_t0
 
     logger.info(
         f"Gemini Replicas legacy save rank {rank}: executing C++ exchange "
         f"(send to {len(target_ranks) - 1} targets, recv from {len(source_ranks)} sources)..."
     )
+    _exchange_t0 = time.time()
     native.wait_for_exchange_completion()
+    _exchange_elapsed = time.time() - _exchange_t0
+
+    _barrier_t0 = time.time()
     torch.distributed.barrier()
-    _exchange_elapsed = time.time() - t0
-    logger.info(f"Gemini Replicas legacy save rank {rank}: C++ exchange done ({_exchange_elapsed:.3f}s)")
+    _barrier_elapsed = time.time() - _barrier_t0
+    logger.info(
+        "Gemini Replicas legacy save rank %d: C++ exchange done "
+        "(submit=%.3fs wait=%.3fs post_barrier=%.3fs total=%.3fs)",
+        rank, _submit_elapsed, _exchange_elapsed, _barrier_elapsed, time.time() - t0,
+    )
 
     # With GDR: wait for async D2H to finish before writing files
     if manager.use_gdr and gpu_tensor_buffer is not None:

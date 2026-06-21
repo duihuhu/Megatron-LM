@@ -1888,6 +1888,7 @@ private:
     int world_size_;
     std::vector<int> target_ranks_;
     bool use_rdma_;
+    bool debug_ = false;
 
     // Rank→connection-index maps for directed P2P (hardware recovery).
     // Built in finalize_connections() after connect_and_wait().
@@ -1996,8 +1997,13 @@ public:
     }
     
     ~GeminiReplicasNative() {
-        std::cout << "[Rank " << rank_ << "] Destroying GeminiReplicasNative" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Destroying GeminiReplicasNative" << std::endl;
         stop_workers();
+    }
+
+    void set_debug(bool debug) {
+        debug_ = debug;
     }
     
     void finalize_connections() {
@@ -2165,8 +2171,9 @@ public:
             recv_worker_threads_.emplace_back(
                 &GeminiReplicasNative::recv_worker_func, this, i);
         }
-        std::cout << "[Rank " << rank_ << "] Workers started: 1 send + "
-                  << n_recv << " recv threads" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Workers started: 1 send + "
+                      << n_recv << " recv threads" << std::endl;
     }
 
     void stop_workers() {
@@ -2194,7 +2201,8 @@ public:
         }
 
         workers_started_ = false;
-        std::cout << "[Rank " << rank_ << "] Workers stopped" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Workers stopped" << std::endl;
     }
 
 private:
@@ -2317,8 +2325,9 @@ public:
             send_cv_.notify_one();
         }
 
-        std::cout << "[Rank " << rank_ << "] Submitted send buffer: "
-                  << buffer_size << " bytes" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Submitted send buffer: "
+                      << buffer_size << " bytes" << std::endl;
     }
 
     void submit_recv_buffer(int source_rank, uintptr_t buffer_addr, size_t buffer_size) {
@@ -2346,8 +2355,9 @@ public:
             recv_cvs_[idx]->notify_one();
         }
 
-        std::cout << "[Rank " << rank_ << "] Submitted recv buffer for source rank "
-                  << source_rank << ": " << buffer_size << " bytes" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Submitted recv buffer for source rank "
+                      << source_rank << ": " << buffer_size << " bytes" << std::endl;
     }
 
     void wait_for_exchange_completion() {
@@ -2371,7 +2381,8 @@ public:
             }
         }
 
-        std::cout << "[Rank " << rank_ << "] Exchange completed successfully" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Exchange completed successfully" << std::endl;
     }
     
     bool is_initialized() const {
@@ -2583,6 +2594,9 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
              "Get current rank")
         .def("get_target_ranks", &GeminiReplicasNative::get_target_ranks,
              "Get list of target ranks")
+        .def("set_debug", &GeminiReplicasNative::set_debug,
+             py::arg("debug"),
+             "Enable detailed Gemini Replicas native logging")
         .def("register_buffer", &GeminiReplicasNative::register_buffer,
              py::arg("buffer_addr"),
              py::arg("buffer_size"),

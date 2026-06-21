@@ -163,6 +163,7 @@ EVAL_AND_LOGGING_ARGS=(
     --use-gemini-replicas
     # 启用优化路径：使用连续 CPU buffer + C++ ASIO/RDMA 网络传输，跳过 torch.save 序列化开销
     --use-gemini-replicas-optimized
+    #--gemini-replicas-debug
 
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）

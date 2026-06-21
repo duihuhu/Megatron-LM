@@ -17,6 +17,14 @@ from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 logger = getLogger(__name__)
 
 
+def _gemini_replicas_debug_enabled() -> bool:
+    try:
+        from megatron.training import get_args
+        return bool(getattr(get_args(), "gemini_replicas_debug", False))
+    except Exception:
+        return False
+
+
 class GeminiReplicasManager:
     """Shared manager for Gemini Replicas multi-replica data transfer.
     
@@ -487,6 +495,8 @@ class GeminiReplicasManager:
                 num_source_ranks,  # Number of expected incoming connections
                 self.use_rdma  # Use RDMA or ASIO
             )
+            if hasattr(self._gemini_replicas_native, "set_debug"):
+                self._gemini_replicas_native.set_debug(_gemini_replicas_debug_enabled())
             
             logger.info(f"Gemini Replicas: C++ native module created (acceptor ready) for rank {rank}")
             print(f"Gemini Replicas: [Rank {rank}] Acceptor ready, waiting for all ranks...")
@@ -634,17 +644,20 @@ class GeminiReplicasManager:
         
         if self.preallocated_cpu_buffer is not None:
             if self.preallocated_cpu_buffer.numel() >= size_bytes:
-                logger.info(f"Gemini Replicas: [Rank {rank}] Reusing existing preallocated buffer")
+                if _gemini_replicas_debug_enabled():
+                    logger.info(f"Gemini Replicas: [Rank {rank}] Reusing existing preallocated buffer")
                 return
         
-        logger.info(f"Gemini Replicas: [Rank {rank}] Allocating preallocated buffer: {size_bytes / (1024**3):.2f} GB")
+        if _gemini_replicas_debug_enabled():
+            logger.info(f"Gemini Replicas: [Rank {rank}] Allocating preallocated buffer: {size_bytes / (1024**3):.2f} GB")
         
         pin = self.gemini_replicas_pin_memory and torch.cuda.is_available()
         self.preallocated_cpu_buffer = allocate_hugepage_tensor(
             size_bytes, fallback_pin_memory=pin, touch_pages=False,
         )
-        logger.info(f"Gemini Replicas: [Rank {rank}] Allocated preallocated buffer: "
-                     f"{size_bytes / (1024**3):.2f} GB (hugepage, pin={pin})")
+        if _gemini_replicas_debug_enabled():
+            logger.info(f"Gemini Replicas: [Rank {rank}] Allocated preallocated buffer: "
+                        f"{size_bytes / (1024**3):.2f} GB (hugepage, pin={pin})")
 
     _cached_recv_buffers: Dict[int, torch.Tensor] = {}
 
@@ -680,17 +693,21 @@ class GeminiReplicasManager:
         
         # Check if already registered
         if buffer_addr in self.registered_buffers:
-            logger.debug(f"Gemini Replicas: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} (size: {buffer_size / (1024**2):.2f} MB)")
+            if _gemini_replicas_debug_enabled():
+                logger.info(f"Gemini Replicas: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} (size: {buffer_size / (1024**2):.2f} MB)")
             return
         
         try:
-            logger.info(f"Gemini Replicas: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
+            if _gemini_replicas_debug_enabled():
+                logger.info(f"Gemini Replicas: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
             self._gemini_replicas_native.register_buffer(buffer_addr, buffer_size)
             self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
-            logger.info(f"Gemini Replicas: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
+            if _gemini_replicas_debug_enabled():
+                logger.info(f"Gemini Replicas: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
             
             # Print all registered buffers
-            logger.info(f"Gemini Replicas: [Rank {rank}] All registered buffers:")
+            if _gemini_replicas_debug_enabled():
+                logger.info(f"Gemini Replicas: [Rank {rank}] All registered buffers:")
             # for addr, (size, iteration) in self.registered_buffers.items():
             #     logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
         except Exception as e:

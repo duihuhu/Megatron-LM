@@ -161,6 +161,10 @@ def save_gemini_replicas_legacy_checkpoint(
     global _cached_rank_metadata, _cached_rank_non_tensor
     global _cached_rank_flat_key_roots, _cached_rank_tensor_infos
 
+    from megatron.training import get_args
+    args = get_args()
+    _dbg = getattr(args, "gemini_replicas_debug", False)
+
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = (
         torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -177,7 +181,8 @@ def save_gemini_replicas_legacy_checkpoint(
     t0 = time.time()
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
-    logger.info(f"GEMINI save timing: decompose {time.time()-t0:.3f}s")
+    if _dbg:
+        logger.info(f"GEMINI save timing: decompose {time.time()-t0:.3f}s")
 
     safety_margin = max(int(total_tensor_size * 0.01), 1024 * 1024)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
@@ -231,14 +236,16 @@ def save_gemini_replicas_legacy_checkpoint(
     # Non-GDR path: stream has GPU→CPU copies (PCIe drain, now avoided with GDR).
     d2h_stream.synchronize()
     del decomposed.tensor_data  # drop remaining refs
-    logger.info(f"GEMINI save timing: D2H+copy {time.time()-t0:.3f}s")
+    if _dbg:
+        logger.info(f"GEMINI save timing: D2H+copy {time.time()-t0:.3f}s")
 
     t0 = time.time()
     if manager.use_rdma:
         manager.register_buffer(tensor_buffer)
         if manager.use_gdr and gpu_tensor_buffer is not None:
             manager.register_buffer(gpu_tensor_buffer)
-    logger.info(f"GEMINI save timing: RDMA reg tensor {time.time()-t0:.3f}s")
+    if _dbg:
+        logger.info(f"GEMINI save timing: RDMA reg tensor {time.time()-t0:.3f}s")
 
     start_time = time.time()
     # ===== Metadata exchange via all_gather_object on NCCL (aligned with ecnaive/eccheck) =====
@@ -260,13 +267,15 @@ def save_gemini_replicas_legacy_checkpoint(
         _cached_rank_non_tensor = rank_non_tensor
         _cached_rank_flat_key_roots = rank_flat_key_roots
         _cached_rank_tensor_infos = rank_tensor_infos
-        logger.info(f"GEMINI save timing: meta exchange (first) {time.time()-start_time:.3f}s")
+        if _dbg:
+            logger.info(f"GEMINI save timing: meta exchange (first) {time.time()-start_time:.3f}s")
     else:
         rank_metadata = _cached_rank_metadata
         rank_non_tensor = _cached_rank_non_tensor
         rank_flat_key_roots = _cached_rank_flat_key_roots
         rank_tensor_infos = _cached_rank_tensor_infos
-        logger.info(f"GEMINI save timing: meta exchange (cached) {time.time()-start_time:.3f}s")
+        if _dbg:
+            logger.info(f"GEMINI save timing: meta exchange (cached) {time.time()-start_time:.3f}s")
 
     # Compute buffer sizes from metadata (replaces separate gloo size exchange)
     rank_sizes = {
@@ -286,11 +295,12 @@ def save_gemini_replicas_legacy_checkpoint(
         if rank in src_targets:
             source_ranks.append(src_r)
 
-    logger.info(
-        f"Gemini Replicas legacy save rank {rank}: "
-        f"targets={target_ranks}, sources={source_ranks}, "
-        f"buffer={send_buffer_size / (1024**2):.2f} MB"
-    )
+    if _dbg:
+        logger.info(
+            f"Gemini Replicas legacy save rank {rank}: "
+            f"targets={target_ranks}, sources={source_ranks}, "
+            f"buffer={send_buffer_size / (1024**2):.2f} MB"
+        )
 
     t0 = time.time()
     # Allocate or reuse cached receive buffers
@@ -317,7 +327,10 @@ def save_gemini_replicas_legacy_checkpoint(
             gpu_tensor_buffer.data_ptr(),
             tensor_buffer.data_ptr(),
         )
-        logger.info(f"GEMINI save timing: mirror bases set (per-chunk overlap) {time.time()-t0:.3f}s")
+        if _dbg:
+            logger.info(
+                f"GEMINI save timing: mirror bases set (per-chunk overlap) {time.time()-t0:.3f}s"
+            )
     else:
         send_addr = tensor_buffer.data_ptr()
         native.set_mirror_bases(0, 0)  # disable per-chunk mirror
@@ -329,10 +342,11 @@ def save_gemini_replicas_legacy_checkpoint(
         native.submit_recv_buffer(src_r, recv_buf.data_ptr(), recv_buf.numel())
     _submit_elapsed = time.time() - _submit_t0
 
-    logger.info(
-        f"Gemini Replicas legacy save rank {rank}: executing C++ exchange "
-        f"(send to {len(target_ranks) - 1} targets, recv from {len(source_ranks)} sources)..."
-    )
+    if _dbg:
+        logger.info(
+            f"Gemini Replicas legacy save rank {rank}: executing C++ exchange "
+            f"(send to {len(target_ranks) - 1} targets, recv from {len(source_ranks)} sources)..."
+        )
     _exchange_t0 = time.time()
     native.wait_for_exchange_completion()
     _exchange_elapsed = time.time() - _exchange_t0
@@ -348,9 +362,12 @@ def save_gemini_replicas_legacy_checkpoint(
 
     # With GDR: wait for async D2H to finish before writing files
     if manager.use_gdr and gpu_tensor_buffer is not None:
+        _mirror_t0 = time.time()
         native.wait_mirror_completion()
+        _mirror_elapsed = time.time() - _mirror_t0
         native.start_mirror_worker()  # restart for next iteration
-        logger.info(f"GEMINI save timing: mirror done {time.time()-start_time:.3f}s")
+        if _dbg:
+            logger.info(f"GEMINI save timing: mirror wait {_mirror_elapsed:.3f}s")
 
     logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
 

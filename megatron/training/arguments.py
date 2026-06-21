@@ -2439,6 +2439,8 @@ def _add_checkpointing_args(parser):
                             'Default: None (global round-robin across all ranks). '
                             'Must evenly divide world_size when set. '
                             'Similar to --frcheck-n for FRCheck.')
+    group.add_argument('--gemini-replicas-debug', action='store_true',
+                       help='Enable detailed debug logging for Gemini Replicas operations.')
     group.add_argument('--use-gemini-replicas-hardware-failure', action='store_true',
                        help='Enable Gemini Replicas checkpointing for hardware failure recovery. '
                             'When a rank fails (e.g., rank2), the failed rank recovers its data from other ranks '

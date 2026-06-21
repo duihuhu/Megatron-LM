@@ -146,7 +146,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00005
-    --train-iters 20
+    --train-iters 4
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -185,8 +185,9 @@ EVAL_AND_LOGGING_ARGS=(
     --use-frcheck
     --frcheck-n 8
     --frcheck-table-dir $FRCHECK_TABLE_DIR
+    --frcheck-async-parity
     #--frcheck-failed-ranks 0,1
-    --use-frcheck-hardware-failure
+    #--use-frcheck-hardware-failure
     --ckpt-format torch
     --save-embeddings-separately
     # --timing-log-level 2

@@ -99,6 +99,8 @@ void asio_tcp_connect_with_retry(
 // Forward declaration for interface
 class IGeminiReplicasConnectionManager {
 public:
+    using ChunkDoneCb = std::function<void(size_t, size_t, size_t)>;
+
     virtual ~IGeminiReplicasConnectionManager() = default;
     
     virtual void initialize_connections() = 0;
@@ -115,6 +117,7 @@ public:
     virtual void unregister_buffer(uintptr_t addr) {}
     virtual void set_require_registered_mr(bool v) {}
     virtual bool get_require_registered_mr() const { return false; }
+    virtual void set_chunk_done_callback(ChunkDoneCb cb) {}
     
     // Receive from a specific source rank (for RDMA to avoid unnecessary memcpy)
     virtual std::pair<int, size_t> receive_data_from_source(int source_rank, uint8_t* buffer, size_t buffer_size) {
@@ -689,13 +692,11 @@ private:
     static const size_t CHUNK_SIZE = 64 * 1024 * 1024;  // 64 MB per RDMA operation
     static const int MAX_BATCH_WR = 32;
 
-    // Per-chunk callback: invoked after each 64MB chunk's RDMA send completes.
-    using ChunkDoneCb = std::function<void(uintptr_t, size_t, size_t)>;
-
+    // Invoked after each RDMA send batch completes: (batch_idx, offset, bytes).
     ChunkDoneCb on_chunk_done_;
 
 public:
-    void set_chunk_done_callback(ChunkDoneCb cb) { on_chunk_done_ = std::move(cb); }
+    void set_chunk_done_callback(ChunkDoneCb cb) override { on_chunk_done_ = std::move(cb); }
 
     GeminiReplicasRdmaConnectionManager(
         int rank, int world_size,
@@ -890,6 +891,14 @@ private:
             {
                 std::lock_guard<std::mutex> cq_lock(send_cq_poll_mutex_);
                 poll_completion(send_cq_, 1);
+            }
+
+            if (on_chunk_done_) {
+                size_t offset = batch_start * CHUNK_SIZE;
+                size_t batch_bytes = std::min(
+                    total_size - offset,
+                    (batch_end - batch_start) * CHUNK_SIZE);
+                on_chunk_done_(batch_start / MAX_BATCH_WR, offset, batch_bytes);
             }
         }
     }
@@ -1944,10 +1953,11 @@ private:
     std::queue<MirrorTask> mirror_queue_;
     std::atomic<bool> mirror_done_{false};
     void* d2h_stream_{nullptr};  // cudaStream_t (opaque, avoid header dependency)
+    std::atomic<size_t> mirror_tasks_submitted_{0};
+    std::atomic<size_t> mirror_bytes_submitted_{0};
 
-    // Per-chunk mirror bases: when set, send_data_chunked pushes a mirror
-    // task after each 64 MB chunk completes (D2H for chunk N overlaps with
-    // RDMA for chunk N+1).
+    // Per-batch mirror bases: completed RDMA send batches push mirror tasks
+    // so GPU ranges can D2H while later RDMA batches continue.
     uintptr_t mirror_gpu_base_{0};
     uintptr_t mirror_cpu_base_{0};
 
@@ -2004,6 +2014,46 @@ public:
 
     void set_debug(bool debug) {
         debug_ = debug;
+    }
+
+    void configure_exchange_mirror(uintptr_t gpu_base, uintptr_t cpu_base, size_t total_size) {
+        connection_manager_->set_chunk_done_callback(nullptr);
+        mirror_tasks_submitted_ = 0;
+        mirror_bytes_submitted_ = 0;
+        if (gpu_base == 0 || cpu_base == 0 || total_size == 0) {
+            return;
+        }
+        if (target_ranks_.empty()) {
+            push_mirror_task(gpu_base, cpu_base, total_size);
+            mirror_tasks_submitted_.fetch_add(1);
+            mirror_bytes_submitted_.fetch_add(total_size);
+            return;
+        }
+
+        constexpr size_t kChunkSize = 64ULL * 1024 * 1024;
+        constexpr size_t kMaxBatchWr = 32;
+        const size_t batch_bytes = kChunkSize * kMaxBatchWr;
+        const size_t batch_count = (total_size + batch_bytes - 1) / batch_bytes;
+        const size_t fanout = target_ranks_.size();
+        auto batch_done_counts = std::make_shared<std::vector<std::atomic<size_t>>>(batch_count);
+        for (auto& count : *batch_done_counts) {
+            count = 0;
+        }
+
+        connection_manager_->set_chunk_done_callback(
+            [this, gpu_base, cpu_base, total_size, fanout, batch_done_counts](
+                size_t batch_idx, size_t offset, size_t bytes) {
+                if (batch_idx >= batch_done_counts->size() || offset >= total_size || bytes == 0) {
+                    return;
+                }
+                size_t done = (*batch_done_counts)[batch_idx].fetch_add(1) + 1;
+                if (done == fanout) {
+                    size_t bounded_bytes = std::min(bytes, total_size - offset);
+                    push_mirror_task(gpu_base + offset, cpu_base + offset, bounded_bytes);
+                    mirror_tasks_submitted_.fetch_add(1);
+                    mirror_bytes_submitted_.fetch_add(bounded_bytes);
+                }
+            });
     }
     
     void finalize_connections() {
@@ -2238,16 +2288,16 @@ private:
                 uintptr_t gpu_base = mirror_gpu_base_;
                 uintptr_t cpu_base = mirror_cpu_base_;
 
+                configure_exchange_mirror(gpu_base, cpu_base, send_task_size_);
                 connection_manager_->broadcast_to_targets(data, send_task_size_);
-
-                if (cpu_base != 0) {
-                    push_mirror_task(gpu_base, cpu_base, send_task_size_);
-                }
+                connection_manager_->set_chunk_done_callback(nullptr);
             } catch (const std::exception& e) {
+                connection_manager_->set_chunk_done_callback(nullptr);
                 std::lock_guard<std::mutex> lk(send_error_mutex_);
                 send_error_msg_ = e.what();
                 send_error_ = true;
             } catch (...) {
+                connection_manager_->set_chunk_done_callback(nullptr);
                 std::lock_guard<std::mutex> lk(send_error_mutex_);
                 send_error_msg_ = "unknown send error";
                 send_error_ = true;
@@ -2439,9 +2489,8 @@ public:
             connection_manager_->set_require_registered_mr(v);
     }
 
-    /// Set GPU/CPU base addresses for per-chunk mirroring.
-    /// When non-zero, send_data_chunked pushes a D2H mirror task after
-    /// each 64 MB chunk completes, so chunk N′s D2H overlaps chunk N+1′s RDMA.
+    /// Set GPU/CPU base addresses for per-batch mirroring.
+    /// When non-zero, RDMA send batch completions push D2H mirror tasks.
     void set_mirror_bases(uintptr_t gpu_base, uintptr_t cpu_base) {
         mirror_gpu_base_ = gpu_base;
         mirror_cpu_base_ = cpu_base;
@@ -2474,6 +2523,11 @@ public:
         cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(d2h_stream_));
         cudaStreamDestroy(reinterpret_cast<cudaStream_t>(d2h_stream_));
         if (mirror_thread_.joinable()) mirror_thread_.join();
+        if (debug_ && mirror_tasks_submitted_.load() > 0) {
+            std::cout << "[Rank " << rank_ << "] Mirror submitted "
+                      << mirror_tasks_submitted_.load() << " tasks, "
+                      << mirror_bytes_submitted_.load() << " bytes" << std::endl;
+        }
     }
 
 private:
@@ -2619,8 +2673,7 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
              "Require all buffers to be registered for RDMA (no temp buffer fallback)")
         .def("set_mirror_bases", &GeminiReplicasNative::set_mirror_bases,
              py::arg("gpu_base"), py::arg("cpu_base"),
-             "Set GPU/CPU base addresses so send_data_chunked pushes a D2H mirror "
-             "task after each 64 MB chunk completes (overlaps chunk N D2H with chunk N+1 RDMA)")
+             "Set GPU/CPU base addresses so RDMA batch completions push D2H mirror tasks")
         .def("push_mirror_task", &GeminiReplicasNative::push_mirror_task,
              py::arg("gpu_addr"), py::arg("cpu_addr"), py::arg("size"),
              "Push a GPU→CPU D2H copy task to the mirror worker (non-blocking)")

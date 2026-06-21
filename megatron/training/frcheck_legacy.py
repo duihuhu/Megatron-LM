@@ -724,7 +724,8 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
         # Wait for all stripes in this layer to complete
         if _use_async_parity:
-            logger.info("FRCHECK layer %s: wait_encode_only (async)", layer_name)
+            if _dbg:
+                logger.info("FRCHECK layer %s: wait_encode_only (async)", layer_name)
             native.wait_encode_only()
         else:
             native.wait_layer()

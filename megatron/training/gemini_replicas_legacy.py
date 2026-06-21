@@ -321,19 +321,19 @@ def save_gemini_replicas_legacy_checkpoint(
 
     if manager.use_gdr and gpu_tensor_buffer is not None:
         send_addr = gpu_tensor_buffer.data_ptr()
-        # Per-chunk D2H: C++ send_data_chunked pushes a mirror task after each
-        # 64 MB chunk′s RDMA completes, so chunk N′s D2H overlaps chunk N+1′s RDMA.
+        # Per-batch D2H: C++ pushes mirror tasks after completed RDMA send
+        # batches, so finished GPU ranges D2H while later RDMA batches continue.
         native.set_mirror_bases(
             gpu_tensor_buffer.data_ptr(),
             tensor_buffer.data_ptr(),
         )
         if _dbg:
             logger.info(
-                f"GEMINI save timing: mirror bases set (per-chunk overlap) {time.time()-t0:.3f}s"
+                f"GEMINI save timing: mirror bases set (per-batch overlap) {time.time()-t0:.3f}s"
             )
     else:
         send_addr = tensor_buffer.data_ptr()
-        native.set_mirror_bases(0, 0)  # disable per-chunk mirror
+        native.set_mirror_bases(0, 0)  # disable per-batch mirror
 
     _submit_t0 = time.time()
     native.submit_send_buffer(send_addr, send_buffer_size)

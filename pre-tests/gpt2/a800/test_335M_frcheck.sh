@@ -162,7 +162,7 @@ EVAL_AND_LOGGING_ARGS=(
 
     --use-frcheck
     #--frcheck-distribute-common
-    --frcheck-debug
+    #--frcheck-debug
     --frcheck-n 8
     #--use-frcheck-software-failure 
     #--frcheck-failed-ranks 0

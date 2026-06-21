@@ -23,6 +23,14 @@ from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 logger = getLogger(__name__)
 
 
+def _frcheck_debug_enabled() -> bool:
+    try:
+        from megatron.training import get_args
+        return bool(getattr(get_args(), "frcheck_debug", False))
+    except Exception:
+        return False
+
+
 class StripeRole(IntEnum):
     """Role of this rank within a single POA stripe."""
     SOURCE = 0
@@ -219,11 +227,12 @@ class FRCheckManager:
             if native is not None:
                 self._allocate_layer_stripe_bufs(native, lidx, bs)
 
-        logger.info(
-            "FRCheck: computed per-layer block sizes (max=%dMB): %s",
-            max_blk // (1024*1024),
-            [(f"layer_{k}", f"{v//(1024*1024)}MB") for k, v
-             in sorted(self._layer_block_sizes.items())])
+        if _frcheck_debug_enabled():
+            logger.info(
+                "FRCheck: computed per-layer block sizes (max=%dMB): %s",
+                max_blk // (1024*1024),
+                [(f"layer_{k}", f"{v//(1024*1024)}MB") for k, v
+                 in sorted(self._layer_block_sizes.items())])
 
     def get_layer_stripe_bufs(self, layer_idx: int) -> LayerStripeBufs:
         bufs = self.layer_stripe_bufs.get(layer_idx)
@@ -258,10 +267,11 @@ class FRCheckManager:
                 )
             native.set_require_registered_mr(True)
             self.num_stripes = native.num_stripes()
-        logger.info(
-            "FRCheck: GDR required (enabled), n=%d num_stripes=%d",
-            self.frcheck_n, self.num_stripes,
-        )
+        if _frcheck_debug_enabled():
+            logger.info(
+                "FRCheck: GDR required (enabled), n=%d num_stripes=%d",
+                self.frcheck_n, self.num_stripes,
+            )
 
         # Init RDMA connections within group (allocates buffers using num_stripes)
         self._init_rdma(args)
@@ -458,14 +468,16 @@ class FRCheckManager:
             mod = _importlib_util.module_from_spec(spec)
             assert spec.loader is not None
             spec.loader.exec_module(mod)
-            logger.info("FRCheck: loaded native module from %s", so_path)
+            if _frcheck_debug_enabled():
+                logger.info("FRCheck: loaded native module from %s", so_path)
             self._frcheck_native = mod.FRCheckNative(poa_path)
             self.frcheck_table_path = poa_path
-            logger.info(
-                "FRCheck: native initialized n=%s num_stripes=%s",
-                self._frcheck_native.n(),
-                self._frcheck_native.num_stripes(),
-            )
+            if _frcheck_debug_enabled():
+                logger.info(
+                    "FRCheck: native initialized n=%s num_stripes=%s",
+                    self._frcheck_native.n(),
+                    self._frcheck_native.num_stripes(),
+                )
         except Exception as e:
             logger.warning("FRCheck: failed to initialize native module: %s", e)
             self._frcheck_native = None
@@ -513,10 +525,11 @@ class FRCheckManager:
 
         rg = self.rank_in_group
 
-        logger.info(
-            "FRCheck RDMA: rank_in_group=%d/%d base_port=%d my_ip=%s peers=%s",
-            rg, n, base_port, my_ip, peer_ips,
-        )
+        if _frcheck_debug_enabled():
+            logger.info(
+                "FRCheck RDMA: rank_in_group=%d/%d base_port=%d my_ip=%s peers=%s",
+                rg, n, base_port, my_ip, peer_ips,
+            )
 
         native.init_rdma(
             group_size=n,
@@ -532,7 +545,8 @@ class FRCheckManager:
 
         # Barrier after RDMA init
         torch.distributed.barrier()
-        logger.info("FRCheck RDMA: group initialized (rank_in_group=%d/%d)", rg, n)
+        if _frcheck_debug_enabled():
+            logger.info("FRCheck RDMA: group initialized (rank_in_group=%d/%d)", rg, n)
 
     def _resolve_my_ip(self) -> str:
         """Determine my IP for listen socket, with multi-NIC per-rank support."""
@@ -559,10 +573,11 @@ class FRCheckManager:
         self.parity1_buffer = allocate_hugepage_tensor(default_block_size, fallback_pin_memory=True)
         self.parity2_buffer = allocate_hugepage_tensor(default_block_size, fallback_pin_memory=True)
 
-        logger.info(
-            "FRCheck: allocated GPU default buffer block_size=%s recv_total=%s",
-            default_block_size, recv_total,
-        )
+        if _frcheck_debug_enabled():
+            logger.info(
+                "FRCheck: allocated GPU default buffer block_size=%s recv_total=%s",
+                default_block_size, recv_total,
+            )
 
     def _allocate_layer_stripe_bufs(self, native, layer_idx: int, block_sz: int) -> None:
         """Allocate per-stripe buffers for one layer (grows-only per layer_idx)."""
@@ -642,13 +657,15 @@ class FRCheckManager:
             self.parity1_bufs = parity1_bufs
             self.parity2_bufs = parity2_bufs
 
-        lname = f"layer_{layer_idx}" if layer_idx >= 0 else "layer_common"
-        logger.info(
-            "FRCheck: allocated layer bufs blk=%dMB cap=%dMB: %d enc, %d par",
-            block_sz // (1024 * 1024),
-            layer_capacity // (1024 * 1024),
-            len(enc_indices), len(par_indices),
-        )
+        if _frcheck_debug_enabled():
+            lname = f"layer_{layer_idx}" if layer_idx >= 0 else "layer_common"
+            logger.info(
+                "FRCheck: allocated %s bufs blk=%dMB cap=%dMB: %d enc, %d par",
+                lname,
+                block_sz // (1024 * 1024),
+                layer_capacity // (1024 * 1024),
+                len(enc_indices), len(par_indices),
+            )
 
     def _compile_stripe_plans(self) -> None:
         """Pre-compile StripePlan for each POA row."""
@@ -668,12 +685,13 @@ class FRCheckManager:
                 parity_target_node_id=native.get_parity_target_node_id(sid),
             )
             self.stripe_plans.append(plan)
-        logger.info(
-            "FRCheck: compiled %d stripe plans, role_counts=%s",
-            ns,
-            {r.name: sum(1 for p in self.stripe_plans if p.role == r)
-             for r in StripeRole},
-        )
+        if _frcheck_debug_enabled():
+            logger.info(
+                "FRCheck: compiled %d stripe plans, role_counts=%s",
+                ns,
+                {r.name: sum(1 for p in self.stripe_plans if p.role == r)
+                 for r in StripeRole},
+            )
 
     def get_native(self) -> Any:
         return self._frcheck_native

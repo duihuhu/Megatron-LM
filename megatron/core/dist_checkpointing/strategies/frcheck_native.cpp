@@ -1651,7 +1651,6 @@ private:
             }
             if (t.parity_send_only) {
                 wait_async_p2_send_turn_(t.sid, t.async_order);
-                std::unique_lock<std::mutex> send_lk(async_parity_send_order_mtx_);
                 _wait_if_paused();
                 auto wait_cb = [this]() { this->_async_rdma_begin(); };
                 auto done_cb = [this]() { this->_async_rdma_end(); };
@@ -1704,9 +1703,6 @@ private:
             auto& si = stripe_info_[(size_t)t.sid];
             auto* ch = get_channel_(si.enc_peer_rig, t.sid);
             if (t.async_p2_only) wait_async_p2_recv_turn_(t.sid, t.async_order);
-            _wait_if_paused();
-            auto wait_cb = [this]() { this->_async_rdma_begin(); };
-            auto done_cb = [this]() { this->_async_rdma_end(); };
             if (debug_ && t.async_p2_only) {
                 std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
                           << " async_p2_recv begin sid=" << t.sid
@@ -1717,7 +1713,9 @@ private:
                           << "/" << task_async_total_.load(std::memory_order_acquire)
                           << " ch=" << (ch ? 1 : 0) << std::endl;
             }
-            if (ch) ch->recv_data((uint8_t*)t.parity_in, t.bs, wait_cb, done_cb);
+            // Do not pause receive-side posts: a sender that already entered RDMA
+            // needs the matching recv to make progress and drain before PP starts.
+            if (ch) ch->recv_data((uint8_t*)t.parity_in, t.bs);
             if (t.async_p2_only) advance_async_p2_recv_turn_(t.sid);
             check_async_done_();
             if (debug_ && t.async_p2_only) {
@@ -2086,11 +2084,14 @@ public:
     }
 
     void inc_pause_async_p2p() {
-        int newval = async_p2p_pause_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        // Block new async P2 RDMA before PP communication starts, then wait for
+        // already-started async RDMA chunks to drain.
+        int prev = async_p2p_pause_count_.fetch_add(1, std::memory_order_acq_rel);
         _wait_async_rdma_idle();
         if (debug_)
             std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
-                      << " inc_pause_async_p2p → refcount=" << newval << std::endl;
+                      << " inc_pause_async_p2p prev=" << prev
+                      << " -> async RDMA idle" << std::endl;
     }
 
     void dec_pause_async_p2p() {
@@ -2100,8 +2101,7 @@ public:
         }
         if (debug_)
             std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
-                      << " dec_pause_async_p2p → refcount="
-                      << (prev > 0 ? prev - 1 : 0) << std::endl;
+                      << " dec_pause_async_p2p prev=" << prev << std::endl;
     }
 
     void wait_mirror_completion() {

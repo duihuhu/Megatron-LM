@@ -102,7 +102,9 @@ class _LayerEncodeSubmitState:
     n_filled_blocks: int = 0
 
 
-def _group_by_layer(decomposed, distribute_common: bool = False) -> List[_LayerGroup]:
+def _group_by_layer(
+    decomposed, distribute_common: bool = False, debug: bool = False,
+) -> List[_LayerGroup]:
     """Split decomposed state_dict into per-layer groups based on FQN key."""
     groups: Dict[int, _LayerGroup] = {}
     for info, tensor in zip(decomposed.tensor_infos, decomposed.tensor_data):
@@ -124,10 +126,11 @@ def _group_by_layer(decomposed, distribute_common: bool = False) -> List[_LayerG
                 target.tensor_infos.append(info)
                 target.tensor_data.append(tensor)
                 target.total_bytes += info.size_bytes
-            logger.info(
-                "FRCheck: distributed %d common tensors (%d bytes) across %d layers",
-                len(common.tensor_infos), common.total_bytes, len(others),
-            )
+            if debug:
+                logger.info(
+                    "FRCheck: distributed %d common tensors (%d bytes) across %d layers",
+                    len(common.tensor_infos), common.total_bytes, len(others),
+                )
 
     # Sort: non-layer (-1) first, then by layer index
     result = sorted(groups.values(), key=lambda g: (0 if g.layer_idx < 0 else 1, g.layer_idx))
@@ -416,13 +419,25 @@ def _async_write_frcheck_p2_files(
     rank: int,
     num_stripes: int,
     encode_results: List[_LayerEncodeResult],
+    debug: bool = False,
 ) -> None:
     """Wait for async P2 delivery, then write P2 shards."""
     native = manager.get_native()
     if native is None:
         return
     try:
+        t0 = time.time()
+        logger.info(
+            "FRCHECK async P2 writer rank %d: wait_parity_flush begin (layers=%d)",
+            rank, len(encode_results),
+        )
         native.wait_parity_flush()
+        flush_elapsed = time.time() - t0
+        logger.info(
+            "FRCHECK async P2 writer rank %d: wait_parity_flush done %.3fs",
+            rank, flush_elapsed,
+        )
+        write_t0 = time.time()
         _save_frcheck_stripe_files(
             manager,
             output_dir,
@@ -433,17 +448,30 @@ def _async_write_frcheck_p2_files(
             include_source=False,
             include_p2=True,
         )
+        logger.info(
+            "FRCHECK async P2 writer rank %d: P2 shard write done %.3fs",
+            rank, time.time() - write_t0,
+        )
     except Exception:
         logger.exception("FRCheck async P2 writer failed")
         raise
 
 
-def _wait_previous_async_writers() -> None:
+def _wait_previous_async_writers(debug: bool = False, rank: int = -1) -> None:
     global _async_p1_writer_thread, _async_p2_writer_thread
     for attr in ("_async_p1_writer_thread", "_async_p2_writer_thread"):
         th = globals()[attr]
         if th is not None:
+            t0 = time.time()
+            logger.info(
+                "FRCHECK async writer rank %d: joining previous %s",
+                rank, th.name,
+            )
             th.join()
+            logger.info(
+                "FRCHECK async writer rank %d: joined previous %s in %.3fs",
+                rank, th.name, time.time() - t0,
+            )
             globals()[attr] = None
 
 
@@ -471,18 +499,32 @@ def _start_async_p2_writer(
     rank: int,
     num_stripes: int,
     encode_results: List[_LayerEncodeResult],
+    debug: bool = False,
 ) -> None:
     global _async_p2_writer_thread
     if _async_p2_writer_thread is not None:
+        t0 = time.time()
+        logger.info(
+            "FRCHECK async P2 writer rank %d: joining in-flight writer before restart",
+            rank,
+        )
         _async_p2_writer_thread.join()
+        logger.info(
+            "FRCHECK async P2 writer rank %d: in-flight writer joined in %.3fs",
+            rank, time.time() - t0,
+        )
         _async_p2_writer_thread = None
     _async_p2_writer_thread = threading.Thread(
         target=_async_write_frcheck_p2_files,
-        args=(manager, output_dir, rank, num_stripes, list(encode_results)),
+        args=(manager, output_dir, rank, num_stripes, list(encode_results), debug),
         name="frcheck-async-p2-writer",
         daemon=False,
     )
     _async_p2_writer_thread.start()
+    logger.info(
+        "FRCHECK async P2 writer rank %d: started thread for %d layers",
+        rank, len(encode_results),
+    )
 
 
 def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
@@ -499,10 +541,11 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     flatten_optimizer_fp32_params(state_dict)
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
-    logger.info(
-        "FRCheck save: rank=%d total_tensor_size=%d n_tensors=%d",
-        rank, total_tensor_size, len(decomposed.tensor_data),
-    )
+    if _dbg:
+        logger.info(
+            "FRCheck save: rank=%d total_tensor_size=%d n_tensors=%d",
+            rank, total_tensor_size, len(decomposed.tensor_data),
+        )
 
     logger.info(f"FRCHECK save timing: decompose+group {time.time()-t0:.3f}s")
 
@@ -522,11 +565,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     # Async parity path: drain any pending P2 operations from a previous save.
     _use_async_parity = getattr(args, 'frcheck_async_parity', False)
     if _use_async_parity:
-        if _dbg:
-            logger.info("FRCHECK save: async parity enabled, waiting previous async writers")
-        _wait_previous_async_writers()
-        if _dbg:
-            logger.info("FRCHECK save: previous async writers completed")
+        _wait_previous_async_writers(debug=_dbg, rank=rank)
 
     if native.group_size() != native.n():
         raise RuntimeError(
@@ -547,16 +586,20 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     # 4. Group tensors by layer index
     t0 = time.time()
-    layer_groups = _group_by_layer(decomposed,
-                                    distribute_common=getattr(args, "frcheck_distribute_common", False))
+    layer_groups = _group_by_layer(
+        decomposed,
+        distribute_common=getattr(args, "frcheck_distribute_common", False),
+        debug=_dbg,
+    )
     n_tensors = len(decomposed.tensor_data)
     del decomposed.tensor_data  # GPU refs now held by per-layer groups
     num_layers = len(layer_groups)
-    logger.info(
-        "FRCheck save: grouped %d layers from %d tensors (layers: %s)",
-        num_layers, n_tensors,
-        [(g.layer_idx, g.total_bytes) for g in layer_groups],
-    )
+    if _dbg:
+        logger.info(
+            "FRCheck save: grouped %d layers from %d tensors (layers: %s)",
+            num_layers, n_tensors,
+            [(g.layer_idx, g.total_bytes) for g in layer_groups],
+        )
 
     flat_key_roots = decomposed.flat_key_roots
 
@@ -636,11 +679,6 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
         group.tensor_data = []
 
-        logger.info(
-            "FRCheck save: %s layer_buf_gpu size=%d layer_blk=%d",
-            layer_name, layer_buf_gpu.numel(), layer_block_size,
-        )
-
         state = _prep_layer_phase1(
             manager, layer_buf_gpu, layer_bufs.layer_mirror_cpu,
             group.total_bytes, n, num_stripes, layer_block_size, my_node,
@@ -686,19 +724,10 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
         # Wait for all stripes in this layer to complete
         if _use_async_parity:
-            if _dbg:
-                logger.info("FRCHECK layer %s: wait_encode_only (async)", layer_name)
+            logger.info("FRCHECK layer %s: wait_encode_only (async)", layer_name)
             native.wait_encode_only()
         else:
             native.wait_layer()
-
-        if _dbg:
-            n_src_my = sum(1 for p in stripe_plans if p.role == StripeRole.SOURCE)
-            logger.info(
-                "[FRCHECK-DEBUG] %s prep: copy=%d bytes → buf=%d bytes (%d src stripes)",
-                layer_name, group.total_bytes,
-                layer_buf_gpu.numel(), n_src_my,
-            )
 
         encode_results.append(_LayerEncodeResult(
             layer_name=layer_name,
@@ -724,9 +753,6 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         _async_p2_native_elapsed = 0.0
         _async_p2_parity_tasks = 0
         _async_p2_send_tasks = 0
-        if _dbg:
-            logger.info("FRCHECK save: submitting async P2 tasks for %d layers",
-                        len(encode_results))
         _reset_t0 = time.time()
         native.reset_async_parity()
         _async_p2_reset_elapsed = time.time() - _reset_t0
@@ -744,18 +770,14 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             if counts is not None and len(counts) >= 2:
                 _async_p2_parity_tasks += int(counts[0])
                 _async_p2_send_tasks += int(counts[1])
-        if _dbg:
-            logger.info("FRCHECK save: async P2 tasks submitted — "
-                        "will drain in background")
-            logger.info(
-                "[FRCHECK-DEBUG] async P2 submit detail v2(layer_addr_api): reset=%.3fs "
-                "build_tasks=%.3fs native_batch=%.3fs parity_tasks=%d "
-                "send_tasks=%d",
-                _async_p2_reset_elapsed, _async_p2_build_elapsed,
-                _async_p2_native_elapsed, _async_p2_parity_tasks,
-                _async_p2_send_tasks,
-            )
         _async_p2_submit_elapsed = time.time() - _async_p2_submit_t0
+        logger.info(
+            "FRCHECK async P2 submit rank %d: layers=%d parity_tasks=%d send_tasks=%d "
+            "reset=%.3fs build=%.3fs native=%.3fs total=%.3fs",
+            rank, len(encode_results), _async_p2_parity_tasks, _async_p2_send_tasks,
+            _async_p2_reset_elapsed, _async_p2_build_elapsed,
+            _async_p2_native_elapsed, _async_p2_submit_elapsed,
+        )
 
     _mirror_t0 = time.time()
     native.wait_mirror_completion()
@@ -767,13 +789,21 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         torch.distributed.barrier()
         _post_barrier_elapsed = time.time() - _post_barrier_t0
 
-    logger.info(
-        "FRCheck legacy save rank %d: sync path done "
-        "(encode=%.3fs async_p2_submit=%.3fs mirror=%.3fs "
-        "post_barrier=%.3fs total=%.3fs)",
-        rank, t_enc, _async_p2_submit_elapsed, _mirror_elapsed,
-        _post_barrier_elapsed, time.time() - t_prep,
-    )
+    if _use_async_parity:
+        logger.info(
+            "FRCheck legacy save rank %d: async path submitted "
+            "(encode=%.3fs async_p2_submit=%.3fs mirror=%.3fs "
+            "post_barrier=%.3fs total=%.3fs)",
+            rank, t_enc, _async_p2_submit_elapsed, _mirror_elapsed,
+            _post_barrier_elapsed, time.time() - t_prep,
+        )
+    else:
+        logger.info(
+            "FRCheck legacy save rank %d: sync path done "
+            "(encode=%.3fs mirror=%.3fs post_barrier=%.3fs total=%.3fs)",
+            rank, t_enc, _mirror_elapsed,
+            _post_barrier_elapsed, time.time() - t_prep,
+        )
 
     if _use_async_parity:
         _save_frcheck_stripe_files(
@@ -784,6 +814,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         )
         _start_async_p2_writer(
             manager, str(checkpoint_dir), rank, num_stripes, encode_results,
+            debug=_dbg,
         )
     else:
         _save_frcheck_stripe_files(
@@ -839,19 +870,21 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         _cached_all_layer_order = all_layer_order
         _cached_all_layer_metadata = all_layer_metadata
         _cached_all_actual_tensor_sizes = all_actual_tensor_sizes
-        logger.info(
-            "FRCheck save: group metadata exchange %.3fs (ranks=%d)",
-            time.time() - t_meta, len(all_tensor_infos),
-        )
+        if _dbg:
+            logger.info(
+                "FRCheck save: group metadata exchange %.3fs (ranks=%d)",
+                time.time() - t_meta, len(all_tensor_infos),
+            )
     else:
         all_tensor_infos = _cached_all_tensor_infos
         all_layer_order = _cached_all_layer_order
         all_layer_metadata = _cached_all_layer_metadata
         all_actual_tensor_sizes = _cached_all_actual_tensor_sizes
-        logger.info(
-            "FRCheck save: group metadata exchange (cached) %.3fs",
-            time.time() - t_meta,
-        )
+        if _dbg:
+            logger.info(
+                "FRCheck save: group metadata exchange (cached) %.3fs",
+                time.time() - t_meta,
+            )
 
     meta1 = pickle.dumps(decomposed.non_tensor_data)
     meta2 = pickle.dumps(decomposed.tensor_infos)
@@ -876,20 +909,22 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         str(main_file), MAGIC_FRCHECK, meta1, meta2, extra, memoryview(b""), 0,
     )
 
-    logger.info(
-        "FRCheck save: done rank=%d node=%d gdr=True layers=%d file=%s (metadata-only)",
-        rank, my_node, num_layers, main_file,
-    )
+    if _dbg:
+        logger.info(
+            "FRCheck save: done rank=%d node=%d gdr=True layers=%d file=%s (metadata-only)",
+            rank, my_node, num_layers, main_file,
+        )
 
     del _global_offsets
 
     if world_size > 1:
         torch.distributed.barrier()
 
-    logger.info(
-        "FRCheck save: native module kept alive for reuse (no shutdown, rank=%d)",
-        rank,
-    )
+    if _dbg:
+        logger.info(
+            "FRCheck save: native module kept alive for reuse (no shutdown, rank=%d)",
+            rank,
+        )
 
 
 # ---------------------------------------------------------------------------

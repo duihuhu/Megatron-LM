@@ -10,7 +10,9 @@
 
 #include <arpa/inet.h>
 #include <cuda_runtime.h>
+#include <ifaddrs.h>
 #include <infiniband/verbs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -57,6 +59,63 @@ void check_cuda(cudaError_t err, const char* what) {
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
     }
+}
+
+std::string get_interface_ipv4(const std::string& iface_name) {
+    ifaddrs* ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) != 0) {
+        throw std::runtime_error(errno_message("getifaddrs failed"));
+    }
+
+    std::string ip;
+    for (ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || iface_name != ifa->ifa_name ||
+            ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+
+        char buf[INET_ADDRSTRLEN] = {};
+        auto* addr = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
+        if (inet_ntop(AF_INET, &addr->sin_addr, buf, sizeof(buf))) {
+            ip = buf;
+            break;
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    if (ip.empty()) {
+        throw std::runtime_error("No IPv4 address found for interface " + iface_name);
+    }
+    return ip;
+}
+
+ibv_device* find_rdma_device_by_ip(
+    const std::string& ip,
+    ibv_device** dev_list,
+    int num_devices,
+    int gid_index) {
+    in_addr target{};
+    if (inet_pton(AF_INET, ip.c_str(), &target) != 1) {
+        throw std::runtime_error("Invalid IPv4 address for RDMA device lookup: " + ip);
+    }
+
+    for (int i = 0; i < num_devices; ++i) {
+        ibv_context* ctx = ibv_open_device(dev_list[i]);
+        if (!ctx) continue;
+
+        ibv_gid gid{};
+        bool matched = false;
+        if (ibv_query_gid(ctx, kIbPort, gid_index, &gid) == 0) {
+            matched = std::memcmp(&gid.raw[12], &target.s_addr, 4) == 0;
+        }
+        ibv_close_device(ctx);
+
+        if (matched) {
+            return dev_list[i];
+        }
+    }
+
+    return nullptr;
 }
 
 size_t parse_size_arg(std::string value) {
@@ -171,6 +230,40 @@ Config parse_args(int argc, char** argv) {
         throw std::runtime_error("Transfer size and chunk size must be non-zero");
     }
     return cfg;
+}
+
+ibv_device* select_rdma_device(
+    const Config& cfg,
+    ibv_device** dev_list,
+    int num_devices,
+    std::string* selected_iface,
+    std::string* selected_ip) {
+    std::string env_name = "GEMINI_REPLICAS_LOCAL_RANK_NIC_" + std::to_string(cfg.local_rank);
+    const char* iface = std::getenv(env_name.c_str());
+    if (!iface || std::strlen(iface) == 0) {
+        iface = std::getenv("GEMINI_REPLICAS_INTERFACE");
+    }
+    if (!iface || std::strlen(iface) == 0) {
+        iface = std::getenv("NETIFACES_INTERFACE");
+    }
+
+    if (!iface || std::strlen(iface) == 0) {
+        *selected_iface = "";
+        *selected_ip = "";
+        return dev_list[0];
+    }
+
+    *selected_iface = iface;
+    *selected_ip = get_interface_ipv4(*selected_iface);
+    ibv_device* matched = find_rdma_device_by_ip(*selected_ip, dev_list, num_devices, cfg.gid_index);
+    if (!matched) {
+        std::cerr << "WARNING: IP " << *selected_ip << " from interface " << *selected_iface
+                  << " not found in RDMA GID table at gid_index=" << cfg.gid_index
+                  << ", falling back to first device " << ibv_get_device_name(dev_list[0])
+                  << std::endl;
+        return dev_list[0];
+    }
+    return matched;
 }
 
 int tcp_listen(int port) {
@@ -526,9 +619,20 @@ int main(int argc, char** argv) {
         int num_devices = 0;
         ibv_device** dev_list = ibv_get_device_list(&num_devices);
         if (!dev_list || num_devices == 0) throw std::runtime_error("No IB devices found");
-        ibv_device* dev = dev_list[0];
+        std::string selected_iface;
+        std::string selected_ip;
+        ibv_device* dev = select_rdma_device(cfg, dev_list, num_devices, &selected_iface, &selected_ip);
+        std::string rdma_device_name = ibv_get_device_name(dev);
+        std::cout << "RDMA_BIND,"
+                  << "rank=" << cfg.rank
+                  << ",local_rank=" << cfg.local_rank
+                  << ",nic=" << (selected_iface.empty() ? "default" : selected_iface)
+                  << ",nic_ip=" << (selected_ip.empty() ? "default" : selected_ip)
+                  << ",rdma_device=" << rdma_device_name
+                  << ",gid_index=" << cfg.gid_index
+                  << std::endl;
         ibv_context* ctx = ibv_open_device(dev);
-        if (!ctx) throw std::runtime_error("ibv_open_device failed");
+        if (!ctx) throw std::runtime_error("ibv_open_device failed for " + rdma_device_name);
         ibv_pd* pd = ibv_alloc_pd(ctx);
         if (!pd) throw std::runtime_error("ibv_alloc_pd failed");
 
@@ -604,9 +708,38 @@ int main(int argc, char** argv) {
 
             tcp_barrier(tcp_fd, lower_rank);
             if (timed) {
-                sendrecv_ms.push_back((t_sendrecv - t0) * 1000.0);
-                mirror_wait_ms.push_back(mirror_wait * 1000.0);
-                total_ms.push_back((t_done - t0) * 1000.0);
+                double iter_sendrecv_ms = (t_sendrecv - t0) * 1000.0;
+                double iter_mirror_wait_ms = mirror_wait * 1000.0;
+                double iter_total_ms = (t_done - t0) * 1000.0;
+                double iter_gbps = (static_cast<double>(cfg.bytes) * 2.0 * 8.0) /
+                                   (iter_total_ms / 1000.0) / 1e9;
+                int timed_iter = iter - cfg.warmup;
+                sendrecv_ms.push_back(iter_sendrecv_ms);
+                mirror_wait_ms.push_back(iter_mirror_wait_ms);
+                total_ms.push_back(iter_total_ms);
+
+                std::cout << std::fixed << std::setprecision(3)
+                          << "ITER_RESULT,"
+                          << "rank=" << cfg.rank
+                          << ",node_rank=" << cfg.node_rank
+                          << ",local_rank=" << cfg.local_rank
+                          << ",cuda_device=" << cfg.cuda_device
+                          << ",peer_rank=" << cfg.peer_rank
+                          << ",gid_index=" << cfg.gid_index
+                          << ",nic=" << (selected_iface.empty() ? "default" : selected_iface)
+                          << ",nic_ip=" << (selected_ip.empty() ? "default" : selected_ip)
+                          << ",rdma_device=" << rdma_device_name
+                          << ",iter=" << iter
+                          << ",timed_iter=" << timed_iter
+                          << ",size_mb=" << (cfg.bytes / 1024.0 / 1024.0)
+                          << ",chunk_mb=" << (cfg.chunk_bytes / 1024.0 / 1024.0)
+                          << ",batch_wr=" << cfg.batch_wr
+                          << ",sendrecv_ms=" << iter_sendrecv_ms
+                          << ",mirror_wait_ms=" << iter_mirror_wait_ms
+                          << ",total_ms=" << iter_total_ms
+                          << ",gbps=" << iter_gbps
+                          << ",mirror_tasks=" << last_mirror_tasks
+                          << std::endl;
             }
         }
 
@@ -630,6 +763,9 @@ int main(int argc, char** argv) {
                   << ",cuda_device=" << cfg.cuda_device
                   << ",peer_rank=" << cfg.peer_rank
                   << ",gid_index=" << cfg.gid_index
+                  << ",nic=" << (selected_iface.empty() ? "default" : selected_iface)
+                  << ",nic_ip=" << (selected_ip.empty() ? "default" : selected_ip)
+                  << ",rdma_device=" << rdma_device_name
                   << ",size_mb=" << (cfg.bytes / 1024.0 / 1024.0)
                   << ",iters=" << cfg.iters
                   << ",chunk_mb=" << (cfg.chunk_bytes / 1024.0 / 1024.0)

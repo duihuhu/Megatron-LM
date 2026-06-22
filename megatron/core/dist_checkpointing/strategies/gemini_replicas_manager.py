@@ -542,7 +542,7 @@ class GeminiReplicasManager:
             logger.error(f"Gemini Replicas: Failed to initialize C++ native module: {e}")
             import traceback
             traceback.print_exc()
-            self._gemini_replicas_native = None
+            self._stop_native_gracefully()
             raise
 
     def prepare_decomposed_state_dict(self, plan, planner):

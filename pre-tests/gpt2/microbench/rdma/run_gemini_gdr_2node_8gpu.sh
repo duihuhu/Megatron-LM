@@ -54,9 +54,9 @@ DEFAULT_ARGS=(
     --node-rank "$NODE_RANK"
     --master-addr "$MASTER_ADDR"
     --base-port "$BASE_PORT"
-    --size-mb 5120
-    --iters 10
-    --warmup 2
+    --size-mb 2560
+    --iters 20
+    --warmup 10
     --chunk-mb 64
     --batch-wr 4
 )
@@ -102,7 +102,7 @@ for ((local_rank = 0; local_rank < GPUS_PER_NODE; ++local_rank)); do
     rank=$((NODE_RANK * GPUS_PER_NODE + local_rank))
     log_file="gemini_gdr_bench_node${NODE_RANK}_rank${rank}.log"
     if [ -f "$log_file" ]; then
-        awk '/^RESULT,/ { print }' "$log_file" || true
+        awk '/^(ITER_RESULT|RESULT),/ { print }' "$log_file" || true
         if [ "$status" -ne 0 ]; then
             awk '/ERROR:/ { print }' "$log_file" || true
         fi

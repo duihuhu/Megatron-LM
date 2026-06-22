@@ -1469,6 +1469,13 @@ def _prep_survivor_hw_disk(
 # Per-layer recovery pipeline (C++ batch network)
 # ---------------------------------------------------------------------------
 
+def _is_data_recovery_plan(plan: Dict[str, Any], n: int) -> bool:
+    """Return True if this recovery plan restores training data, not parity."""
+    if plan.get('dual_failure'):
+        return True
+    return int(plan.get('failed_pos', n)) < n - 2
+
+
 def _submit_recovery_network(
     native,
     manager,
@@ -1487,16 +1494,35 @@ def _submit_recovery_network(
     if not manager.recovery_stripe_plans:
         return None, layer_timing
 
-    decoder_stripes = [p for p in manager.recovery_stripe_plans if my_node == p['decoder_node']]
-    helper_stripes = [p for p in manager.recovery_stripe_plans if my_node in p['helper_nodes']]
+    data_plans = [
+        p for p in manager.recovery_stripe_plans
+        if _is_data_recovery_plan(p, n)
+    ]
+    parity_plans = [
+        p for p in manager.recovery_stripe_plans
+        if not _is_data_recovery_plan(p, n)
+    ]
+
+    if not data_plans:
+        logger.info(
+            "FRCheck recovery layer %s: rank %d has no data recovery stripes "
+            "(skipped parity stripes=%d)",
+            layer_name, rank, len(parity_plans),
+        )
+        return None, layer_timing
+
+    decoder_stripes = [p for p in data_plans if my_node == p['decoder_node']]
+    helper_stripes = [p for p in data_plans if my_node in p['helper_nodes']]
     failed_stripes = [
-        p for p in manager.recovery_stripe_plans if _is_failed_in_recovery_plan(p, my_node)
+        p for p in data_plans if _is_failed_in_recovery_plan(p, my_node)
     ]
     is_failed = len(failed_stripes) > 0
 
     logger.info(
-        "FRCheck recovery layer %s: rank %d — %d decoder, %d helper, %d failed stripes",
-        layer_name, rank, len(decoder_stripes), len(helper_stripes), len(failed_stripes),
+        "FRCheck recovery layer %s: rank %d — data=%d parity_skipped=%d "
+        "decoder=%d helper=%d failed=%d stripes",
+        layer_name, rank, len(data_plans), len(parity_plans),
+        len(decoder_stripes), len(helper_stripes), len(failed_stripes),
     )
 
     my_blocks: Dict[int, torch.Tensor] = {}
@@ -1523,7 +1549,7 @@ def _submit_recovery_network(
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
 
     native.reset_recovery_batch()
-    for stri_plan in manager.recovery_stripe_plans:
+    for stri_plan in data_plans:
         sid = stri_plan['stripe_id']
         helper_block_addr = 0
         decoder_self_block_addr = 0
@@ -1602,10 +1628,19 @@ def _submit_recovery_network(
 
     if is_failed:
         n_stored = src_block_per_node.get(my_node, 0)
+        expected_stored = sum(
+            1 for plan in failed_stripes
+            if int(plan.get('original_role', -1)) == int(StripeRole.SOURCE)
+        )
         logger.info(
             "FRCheck recovery: %s — stored %d SOURCE blocks (expected %d)",
-            layer_name, n_stored, (n - 1) * (n - 2),
+            layer_name, n_stored, expected_stored,
         )
+        if n_stored != expected_stored:
+            raise RuntimeError(
+                f"FRCheck recovery: layer {layer_name} stored {n_stored} "
+                f"SOURCE blocks, expected {expected_stored}"
+            )
 
     return layer_buf, layer_timing
 
@@ -1758,6 +1793,20 @@ def recover_frcheck_legacy_hardware(
     all_frcheck_dirs = _gather_all_frcheck_dirs(checkpoint_dir, world_size)
     involved = is_failed or bool(manager.recovery_stripe_plans)
     my_node = manager.rank_in_group + 1
+    data_recovery_plans = [
+        p for p in manager.recovery_stripe_plans
+        if _is_data_recovery_plan(p, n)
+    ]
+    parity_recovery_plans = [
+        p for p in manager.recovery_stripe_plans
+        if not _is_data_recovery_plan(p, n)
+    ]
+    if manager.recovery_stripe_plans:
+        logger.info(
+            "FRCheck recovery: phase1 data-only mode data_stripes=%d "
+            "parity_stripes_skipped=%d",
+            len(data_recovery_plans), len(parity_recovery_plans),
+        )
 
     t_disk = time.time()
     preloaded: Dict[int, Dict[int, torch.Tensor]] = {
@@ -1773,11 +1822,11 @@ def recover_frcheck_legacy_hardware(
             n_encode_iters,
             all_layer_order,
             all_layer_metadata,
-            manager.recovery_stripe_plans,
+            data_recovery_plans,
             saved_block_size,
             my_node,
             all_frcheck_dirs,
-            preload_recovery=bool(manager.recovery_stripe_plans),
+            preload_recovery=bool(data_recovery_plans),
         )
         for blocks in preloaded.values():
             for blk in blocks.values():
@@ -1805,10 +1854,10 @@ def recover_frcheck_legacy_hardware(
         rank, all_layer_order, all_layer_metadata, saved_block_size,
     )
     is_decoder = any(
-        my_node == p['decoder_node'] for p in manager.recovery_stripe_plans
+        my_node == p['decoder_node'] for p in data_recovery_plans
     )
     is_helper = any(
-        my_node in p['helper_nodes'] for p in manager.recovery_stripe_plans
+        my_node in p['helper_nodes'] for p in data_recovery_plans
     )
     buf_pool = _allocate_recovery_buf_pool(
         native, n, max_block_size, is_failed, is_decoder, is_helper,

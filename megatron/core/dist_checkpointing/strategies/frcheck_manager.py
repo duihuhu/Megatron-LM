@@ -752,6 +752,8 @@ class FRCheckManager:
                 'dual_failure': False,
                 'failed_node': failed_rank_node,
                 'failed_pos': failed_pos,
+                'recovery_kind': 'data' if failed_pos < n - 2 else 'parity',
+                'round_id': failed_pos,
                 'decoder_node': decoder_node,
                 'decoder_pos': decoder_pos,
                 'helper_nodes': helper_nodes,

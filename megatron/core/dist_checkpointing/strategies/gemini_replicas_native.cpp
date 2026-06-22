@@ -51,8 +51,9 @@ namespace py = pybind11;
 
 namespace {
 
-// Match gemini_native.cpp TCP connect retry (100 x 100ms).
-constexpr int kGeminiReplicasTcpConnectMaxRetries = 100;
+// Large runs can reach Phase 2 at slightly different times across nodes.
+// Keep retrying long enough for slower acceptors to finish binding/listening.
+constexpr int kGeminiReplicasTcpConnectMaxRetries = 600;
 constexpr int kGeminiReplicasTcpConnectRetryDelayMs = 100;
 
 // Connect TCP socket with retry (aligned with gemini_native / FRCheck patterns).
@@ -876,7 +877,32 @@ public:
     ibv_pd* get_pd() const { return pd_; }
 
 private:
-    void send_data_chunked(const uint8_t* data, size_t total_size, ibv_mr* mr, ibv_qp* qp) {
+    size_t chunk_count_for_size(size_t total_size) const {
+        return (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    }
+
+    size_t batch_bytes(size_t total_size, size_t batch_start, size_t batch_end) const {
+        size_t offset = batch_start * CHUNK_SIZE;
+        return std::min(total_size - offset, (batch_end - batch_start) * CHUNK_SIZE);
+    }
+
+    void wait_ready_ack(int sock, int target_rank) {
+        char ack;
+        if (recv(sock, &ack, 1, MSG_WAITALL) != 1 || ack != 'A') {
+            throw std::runtime_error("Failed to receive ready ACK from target rank "
+                + std::to_string(target_rank));
+        }
+    }
+
+    void send_ready_ack(int sock) {
+        char ack = 'A';
+        if (send(sock, &ack, 1, 0) != 1) {
+            throw std::runtime_error("Failed to send ready ACK");
+        }
+    }
+
+    void send_data_chunked(
+        const uint8_t* data, size_t total_size, ibv_mr* mr, ibv_qp* qp) {
         size_t chunk_count = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
         std::vector<ibv_sge> sges(chunk_count);
@@ -901,7 +927,6 @@ private:
         // Post send work requests in batches
         for (size_t batch_start = 0; batch_start < chunk_count; batch_start += MAX_BATCH_WR) {
             size_t batch_end = std::min(batch_start + MAX_BATCH_WR, chunk_count);
-
             // Detach this batch's tail from the next batch
             if (batch_end < chunk_count)
                 wrs[batch_end - 1].next = nullptr;
@@ -962,6 +987,44 @@ private:
         return chunk_count;
     }
 
+    size_t post_receive_batch(
+        uint8_t* buffer, size_t total_size, ibv_mr* mr, ibv_qp* qp, size_t batch_start) {
+        size_t chunk_count = chunk_count_for_size(total_size);
+        size_t batch_end = std::min(batch_start + MAX_BATCH_WR, chunk_count);
+        size_t batch_chunk_count = batch_end - batch_start;
+
+        std::vector<ibv_sge> sges(batch_chunk_count);
+        std::vector<ibv_recv_wr> wrs(batch_chunk_count);
+
+        for (size_t j = 0; j < batch_chunk_count; ++j) {
+            size_t chunk_idx = batch_start + j;
+            size_t offset = chunk_idx * CHUNK_SIZE;
+            size_t chunk_size = std::min(CHUNK_SIZE, total_size - offset);
+
+            sges[j].addr = reinterpret_cast<uint64_t>(buffer + offset);
+            sges[j].length = chunk_size;
+            sges[j].lkey = mr->lkey;
+
+            wrs[j].wr_id = chunk_idx;
+            wrs[j].sg_list = &sges[j];
+            wrs[j].num_sge = 1;
+            wrs[j].next = (j + 1 < batch_chunk_count) ? &wrs[j + 1] : nullptr;
+        }
+
+        ibv_recv_wr* bad_wr = nullptr;
+        if (ibv_post_recv(qp, &wrs[0], &bad_wr) != 0) {
+            throw std::runtime_error("Failed to post receive work request");
+        }
+        return batch_chunk_count;
+    }
+
+    void receive_data_chunked_ready_ack(
+        uint8_t* buffer, size_t total_size, ibv_mr* mr, ibv_qp* qp, int control_sock) {
+        size_t chunk_count = post_receive_chunked(buffer, total_size, mr, qp);
+        send_ready_ack(control_sock);
+        poll_completion(recv_cq_, chunk_count);
+    }
+
     void receive_data_chunked(uint8_t* buffer, size_t total_size, ibv_mr* mr, ibv_qp* qp) {
         size_t chunk_count = post_receive_chunked(buffer, total_size, mr, qp);
         poll_completion(recv_cq_, chunk_count);
@@ -973,48 +1036,16 @@ public:
             throw std::runtime_error("Not connected");
         }
         
-        // Send size to all targets via control channel, then wait for ACK
-        // (receiver posts recv WRs and ACKs — matches ecnaive ordering).
+        // Send total size once, then wait for a single ready ACK after the
+        // receiver has posted all matching recv WRs.
         uint64_t size_net = htobe64(size);
         for (size_t i = 0; i < target_ranks_.size(); ++i) {
             if (send(control_socks_send_[i], &size_net, sizeof(size_net), 0) != sizeof(size_net)) {
                 throw std::runtime_error("Failed to send size to target " + std::to_string(target_ranks_[i]));
             }
         }
-        // Wait for ACKs from all targets (accept in any order).
-        // Using sequential recv() on each socket can cause distributed deadlock
-        // when combined with recv_mutex_ on the receiver side: if the first
-        // target's ACK is delayed (its recv worker is blocked behind another
-        // recv worker holding recv_mutex_ during RDMA), the sender hangs even
-        // though other targets already sent their ACKs.
-        std::vector<bool> acked(target_ranks_.size(), false);
-        size_t acked_count = 0;
-        while (acked_count < target_ranks_.size()) {
-            fd_set read_fds;
-            FD_ZERO(&read_fds);
-            int max_fd = 0;
-            for (size_t i = 0; i < target_ranks_.size(); ++i) {
-                if (acked[i]) continue;
-                FD_SET(control_socks_send_[i], &read_fds);
-                if (control_socks_send_[i] > max_fd) {
-                    max_fd = control_socks_send_[i];
-                }
-            }
-            struct timeval tv = {0, 500};
-            int ret = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
-            if (ret > 0) {
-                for (size_t i = 0; i < target_ranks_.size(); ++i) {
-                    if (acked[i]) continue;
-                    if (!FD_ISSET(control_socks_send_[i], &read_fds)) continue;
-                    char ack;
-                    if (recv(control_socks_send_[i], &ack, 1, MSG_WAITALL) != 1 || ack != 'A') {
-                        throw std::runtime_error("Failed to receive ACK from target "
-                            + std::to_string(target_ranks_[i]));
-                    }
-                    acked[i] = true;
-                    acked_count++;
-                }
-            }
+        for (size_t i = 0; i < target_ranks_.size(); ++i) {
+            wait_ready_ack(control_socks_send_[i], target_ranks_[i]);
         }
 
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(data), size);
@@ -1075,18 +1106,15 @@ public:
         if (!connected_) {
             throw std::runtime_error("Not connected");
         }
-        // Step 1: TCP control — send size, wait for ACK
+        // Step 1: TCP control — send total size and wait until the receiver
+        // has posted all matching recv WRs.
         uint64_t sz = htobe64(size);
         if (send(control_socks_send_[target_idx], &sz, sizeof(sz), MSG_NOSIGNAL)
             != static_cast<ssize_t>(sizeof(sz))) {
             throw std::runtime_error("Failed to send size to target rank "
                 + std::to_string(target_ranks_[target_idx]));
         }
-        char ack;
-        if (recv(control_socks_send_[target_idx], &ack, 1, MSG_WAITALL) != 1 || ack != 'A') {
-            throw std::runtime_error("Failed to receive ACK from target rank "
-                + std::to_string(target_ranks_[target_idx]));
-        }
+        wait_ready_ack(control_socks_send_[target_idx], target_ranks_[target_idx]);
 
         // Step 2: RDMA data transfer on the single QP
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(data), size);
@@ -1182,20 +1210,14 @@ public:
                 throw std::runtime_error("Receive size exceeds temporary buffer size");
             mr = temp_recv_mr_;
             uint8_t* recv_buffer = temp_recv_buffer_.data();
-            size_t chunk_count = post_receive_chunked(recv_buffer, recv_size, mr, recv_qps_[found_idx]);
-            char ack = 'A';
-            if (send(control_socks_recv_[found_idx], &ack, 1, 0) != 1) {
-                throw std::runtime_error("Failed to send ACK");
-            }
-            poll_completion(recv_cq_, chunk_count);
+            receive_data_chunked_ready_ack(
+                recv_buffer, recv_size, mr, recv_qps_[found_idx],
+                control_socks_recv_[found_idx]);
             std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
         } else {
-            size_t chunk_count = post_receive_chunked(buffer, recv_size, mr, recv_qps_[found_idx]);
-            char ack = 'A';
-            if (send(control_socks_recv_[found_idx], &ack, 1, 0) != 1) {
-                throw std::runtime_error("Failed to send ACK");
-            }
-            poll_completion(recv_cq_, chunk_count);
+            receive_data_chunked_ready_ack(
+                buffer, recv_size, mr, recv_qps_[found_idx],
+                control_socks_recv_[found_idx]);
         }
 
         return {recv_source_ranks_[found_idx], recv_size};
@@ -1263,20 +1285,14 @@ public:
                 throw std::runtime_error("Receive size exceeds temporary buffer size");
             mr = temp_recv_mr_;
             uint8_t* recv_buffer = temp_recv_buffer_.data();
-            size_t chunk_count = post_receive_chunked(recv_buffer, recv_size, mr, recv_qps_[qp_idx]);
-            char ack = 'A';
-            if (send(control_socks_recv_[qp_idx], &ack, 1, 0) != 1) {
-                throw std::runtime_error("Failed to send ACK");
-            }
-            poll_completion(recv_cq_, chunk_count);
+            receive_data_chunked_ready_ack(
+                recv_buffer, recv_size, mr, recv_qps_[qp_idx],
+                control_socks_recv_[qp_idx]);
             std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
         } else {
-            size_t chunk_count = post_receive_chunked(buffer, recv_size, mr, recv_qps_[qp_idx]);
-            char ack = 'A';
-            if (send(control_socks_recv_[qp_idx], &ack, 1, 0) != 1) {
-                throw std::runtime_error("Failed to send ACK");
-            }
-            poll_completion(recv_cq_, chunk_count);
+            receive_data_chunked_ready_ack(
+                buffer, recv_size, mr, recv_qps_[qp_idx],
+                control_socks_recv_[qp_idx]);
         }
 
         return {recv_source_ranks_[qp_idx], recv_size};
@@ -1308,15 +1324,9 @@ private:
         
         uint8_t* recv_buffer = use_temp ? temp_recv_buffer_.data() : buffer;
 
-        size_t chunk_count = post_receive_chunked(recv_buffer, recv_size, mr, recv_qps_[qp_idx]);
-
-        // Send ACK after posting recv WRs. Sender treats ACK as receiver-ready.
-        char ack = 'A';
-        if (send(control_socks_recv_[qp_idx], &ack, 1, 0) != 1) {
-            throw std::runtime_error("Failed to send ACK");
-        }
-
-        poll_completion(recv_cq_, chunk_count);
+        receive_data_chunked_ready_ack(
+            recv_buffer, recv_size, mr, recv_qps_[qp_idx],
+            control_socks_recv_[qp_idx]);
 
         if (use_temp) {
             std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
@@ -2086,13 +2096,20 @@ public:
     ~GeminiReplicasNative() {
         if (debug_)
             std::cout << "[Rank " << rank_ << "] Destroying GeminiReplicasNative" << std::endl;
-        stop_workers();
+        stop();
     }
 
     void set_debug(bool debug) {
         debug_ = debug;
         if (connection_manager_) {
             connection_manager_->set_debug(debug);
+        }
+    }
+
+    void stop() {
+        stop_workers();
+        if (connection_manager_) {
+            connection_manager_.reset();
         }
     }
 
@@ -2729,6 +2746,8 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
              "Start persistent send+recv worker threads (call after finalize_connections)")
         .def("stop_workers", &GeminiReplicasNative::stop_workers,
              "Stop all worker threads gracefully (for reinit during recovery)")
+        .def("stop", &GeminiReplicasNative::stop,
+             "Stop workers and release connection resources")
         .def("wait_for_exchange_completion", &GeminiReplicasNative::wait_for_exchange_completion,
              "Block until all send/recv workers finish the current exchange (polls atomics, 5ms sleep)")
         .def("reset_exchange_state", &GeminiReplicasNative::reset_exchange_state,

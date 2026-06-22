@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <deque>
 #include <iomanip>
@@ -40,6 +41,10 @@ constexpr int kIbPort = 1;
 constexpr int kGidIndex = 1;
 constexpr int kMaxWr = 256;
 constexpr int kMaxSge = 1;
+
+std::string errno_message(const std::string& what) {
+    return what + ": errno=" + std::to_string(errno) + " (" + std::strerror(errno) + ")";
+}
 
 double now_sec() {
     static auto t0 = std::chrono::steady_clock::now();
@@ -82,9 +87,11 @@ struct Config {
     int rank = 0;
     int world_size = 16;
     int local_rank = 0;
+    int cuda_device = 0;
     int node_rank = 0;
     int peer_rank = -1;
     int base_port = 36000;
+    int gid_index = kGidIndex;
     std::string master_addr = "127.0.0.1";
     size_t bytes = 512ULL * 1024ULL * 1024ULL;
     int iters = 10;
@@ -108,10 +115,12 @@ Config parse_args(int argc, char** argv) {
         if (arg == "--rank") cfg.rank = std::stoi(need_value("--rank"));
         else if (arg == "--world-size") cfg.world_size = std::stoi(need_value("--world-size"));
         else if (arg == "--local-rank") cfg.local_rank = std::stoi(need_value("--local-rank"));
+        else if (arg == "--cuda-device") cfg.cuda_device = std::stoi(need_value("--cuda-device"));
         else if (arg == "--node-rank") cfg.node_rank = std::stoi(need_value("--node-rank"));
         else if (arg == "--peer-rank") cfg.peer_rank = std::stoi(need_value("--peer-rank"));
         else if (arg == "--master-addr") cfg.master_addr = need_value("--master-addr");
         else if (arg == "--base-port") cfg.base_port = std::stoi(need_value("--base-port"));
+        else if (arg == "--gid-index") cfg.gid_index = std::stoi(need_value("--gid-index"));
         else if (arg == "--bytes") cfg.bytes = parse_size_arg(need_value("--bytes"));
         else if (arg == "--size-mb") cfg.bytes = static_cast<size_t>(std::stoull(need_value("--size-mb"))) * 1024ULL * 1024ULL;
         else if (arg == "--iters") cfg.iters = std::stoi(need_value("--iters"));
@@ -125,8 +134,10 @@ Config parse_args(int argc, char** argv) {
                 << "Usage: gemini_gdr_sendrecv_bench --rank R --world-size W --local-rank L\n"
                 << "       --node-rank N --master-addr IP [options]\n"
                 << "Options:\n"
+                << "  --cuda-device N   CUDA device ordinal after CUDA_VISIBLE_DEVICES (default: 0)\n"
                 << "  --peer-rank R     Override peer rank (default: rank +/- world_size/2)\n"
                 << "  --base-port P     Base TCP port (default: 36000)\n"
+                << "  --gid-index N     GID index for RoCE global routing (default: 1)\n"
                 << "  --bytes N|512M    Transfer bytes per iteration\n"
                 << "  --size-mb MB      Transfer size in MiB\n"
                 << "  --iters N         Timed iterations (default: 10)\n"
@@ -147,8 +158,14 @@ Config parse_args(int argc, char** argv) {
         int half = cfg.world_size / 2;
         cfg.peer_rank = (cfg.rank < half) ? cfg.rank + half : cfg.rank - half;
     }
+    if (cfg.cuda_device < 0) {
+        throw std::runtime_error("--cuda-device must be >= 0");
+    }
     if (cfg.batch_wr <= 0 || cfg.batch_wr > kMaxWr) {
         throw std::runtime_error("--batch-wr must be in [1, 256]");
+    }
+    if (cfg.gid_index < 0) {
+        throw std::runtime_error("--gid-index must be >= 0");
     }
     if (cfg.chunk_bytes == 0 || cfg.bytes == 0) {
         throw std::runtime_error("Transfer size and chunk size must be non-zero");
@@ -317,7 +334,7 @@ public:
         if (tcp_fd >= 0) close(tcp_fd);
     }
 
-    void connect_qp(int fd) {
+    void connect_qp(int fd, int gid_index) {
         tcp_fd = fd;
         send_cq = ibv_create_cq(ctx, kMaxWr, nullptr, nullptr, 0);
         recv_cq = ibv_create_cq(ctx, kMaxWr, nullptr, nullptr, 0);
@@ -340,7 +357,7 @@ public:
         attr.port_num = kIbPort;
         attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
         int flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
-        if (ibv_modify_qp(qp, &attr, flags)) throw std::runtime_error("modify QP INIT failed");
+        if (ibv_modify_qp(qp, &attr, flags)) throw std::runtime_error(errno_message("modify QP INIT failed"));
 
         ibv_port_attr port_attr{};
         if (ibv_query_port(ctx, kIbPort, &port_attr)) throw std::runtime_error("ibv_query_port failed");
@@ -349,8 +366,10 @@ public:
         local.qp_num = qp->qp_num;
         local.lid = port_attr.lid;
         ibv_gid gid{};
-        if (ibv_query_gid(ctx, kIbPort, kGidIndex, &gid) == 0) {
+        if (ibv_query_gid(ctx, kIbPort, gid_index, &gid) == 0) {
             std::memcpy(local.gid, &gid, sizeof(local.gid));
+        } else {
+            throw std::runtime_error(errno_message("ibv_query_gid failed"));
         }
         QPInfo remote{};
         if (send(tcp_fd, &local, sizeof(local), 0) != sizeof(local)) {
@@ -377,12 +396,12 @@ public:
                 reinterpret_cast<uint64_t*>(remote.gid)[0];
             attr.ah_attr.grh.dgid.global.interface_id =
                 reinterpret_cast<uint64_t*>(remote.gid)[1];
-            attr.ah_attr.grh.sgid_index = 0;
+            attr.ah_attr.grh.sgid_index = gid_index;
             attr.ah_attr.grh.hop_limit = 255;
         }
         flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                 IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-        if (ibv_modify_qp(qp, &attr, flags)) throw std::runtime_error("modify QP RTR failed");
+        if (ibv_modify_qp(qp, &attr, flags)) throw std::runtime_error(errno_message("modify QP RTR failed"));
 
         std::memset(&attr, 0, sizeof(attr));
         attr.qp_state = IBV_QPS_RTS;
@@ -393,7 +412,7 @@ public:
         attr.max_rd_atomic = 1;
         flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                 IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
-        if (ibv_modify_qp(qp, &attr, flags)) throw std::runtime_error("modify QP RTS failed");
+        if (ibv_modify_qp(qp, &attr, flags)) throw std::runtime_error(errno_message("modify QP RTS failed"));
     }
 
     void poll_cq(ibv_cq* cq, int count) {
@@ -493,7 +512,7 @@ int main(int argc, char** argv) {
         bool lower_rank = cfg.rank < cfg.peer_rank;
         int port = cfg.base_port + std::min(cfg.rank, cfg.peer_rank);
 
-        check_cuda(cudaSetDevice(cfg.local_rank), "cudaSetDevice");
+        check_cuda(cudaSetDevice(cfg.cuda_device), "cudaSetDevice");
 
         int tcp_fd = -1;
         if (lower_rank) {
@@ -516,7 +535,7 @@ int main(int argc, char** argv) {
         Lane lane;
         lane.ctx = ctx;
         lane.pd = pd;
-        lane.connect_qp(tcp_fd);
+        lane.connect_qp(tcp_fd, cfg.gid_index);
 
         uint8_t* gpu_send = nullptr;
         check_cuda(cudaMalloc(&gpu_send, cfg.bytes), "cudaMalloc gpu_send");
@@ -608,7 +627,9 @@ int main(int argc, char** argv) {
                   << "rank=" << cfg.rank
                   << ",node_rank=" << cfg.node_rank
                   << ",local_rank=" << cfg.local_rank
+                  << ",cuda_device=" << cfg.cuda_device
                   << ",peer_rank=" << cfg.peer_rank
+                  << ",gid_index=" << cfg.gid_index
                   << ",size_mb=" << (cfg.bytes / 1024.0 / 1024.0)
                   << ",iters=" << cfg.iters
                   << ",chunk_mb=" << (cfg.chunk_bytes / 1024.0 / 1024.0)

@@ -71,11 +71,6 @@ void asio_tcp_connect_with_retry(
         boost::system::error_code ec;
         boost::asio::connect(socket, endpoints, ec);
         if (!ec) {
-            if (attempt > 0) {
-                std::cout << "[Rank " << rank << "] TCP connected to target rank "
-                          << target_rank << " after " << (attempt + 1) << " attempts"
-                          << std::endl;
-            }
             return;
         }
         if (attempt < kGeminiReplicasTcpConnectMaxRetries - 1) {
@@ -118,6 +113,7 @@ public:
     virtual void set_require_registered_mr(bool v) {}
     virtual bool get_require_registered_mr() const { return false; }
     virtual void set_chunk_done_callback(ChunkDoneCb cb) {}
+    virtual void set_debug(bool debug) {}
     
     // Receive from a specific source rank (for RDMA to avoid unnecessary memcpy)
     virtual std::pair<int, size_t> receive_data_from_source(int source_rank, uint8_t* buffer, size_t buffer_size) {
@@ -195,6 +191,7 @@ private:
     std::vector<int> target_ports_;
     std::string my_ip_;
     int my_port_;
+    bool debug_{false};
 
 public:
     GeminiReplicasAsioConnectionManager(
@@ -222,9 +219,10 @@ public:
         
         recv_acceptor_ = std::make_unique<boost::asio::ip::tcp::acceptor>(io_context_);
         
-        std::cout << "[Rank " << rank_ << "] GeminiReplicasAsioConnectionManager created with " 
-                  << target_ranks_.size() << " targets and expecting " 
-                  << expected_recv_connections << " incoming connections" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] GeminiReplicasAsioConnectionManager created with " 
+                      << target_ranks_.size() << " targets and expecting " 
+                      << expected_recv_connections << " incoming connections" << std::endl;
     }
     
     ~GeminiReplicasAsioConnectionManager() {
@@ -235,6 +233,8 @@ public:
         // Phase 1: Start acceptor (non-blocking)
         start_acceptor();
     }
+
+    void set_debug(bool debug) override { debug_ = debug; }
     
     void connect_and_wait() {
         // Phase 2: Connect to all targets and wait for all connections
@@ -276,8 +276,9 @@ public:
                     boost::asio::write(*send_sockets_[i], 
                         boost::asio::buffer(data, size));
                     
-                    std::cout << "[Rank " << rank_ << "] Sent " << size 
-                              << " bytes to target rank " << target_ranks_[i] << std::endl;
+                    if (debug_)
+                        std::cout << "[Rank " << rank_ << "] Sent " << size 
+                                  << " bytes to target rank " << target_ranks_[i] << std::endl;
                 } catch (...) {
                     exceptions[i] = std::current_exception();
                 }
@@ -325,9 +326,10 @@ public:
             boost::asio::buffer(&sz, sizeof(sz)));
         boost::asio::write(*send_sockets_[target_idx],
             boost::asio::buffer(data, size));
-        std::cout << "[Rank " << rank_ << "] Sent " << size
-                  << " bytes to target rank " << target_ranks_[target_idx]
-                  << " (directed P2P)" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Sent " << size
+                      << " bytes to target rank " << target_ranks_[target_idx]
+                      << " (directed P2P)" << std::endl;
     }
 
     std::vector<int> get_recv_source_ranks() const override {
@@ -379,8 +381,9 @@ public:
         
         size_t size = size_network;
         
-        std::cout << "[Rank " << rank_ << "] Incoming data: " << size 
-                  << " bytes from source rank " << source_rank << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Incoming data: " << size 
+                      << " bytes from source rank " << source_rank << std::endl;
         
         // Return socket so caller can read the data
         return {source_rank, size, std::move(socket)};
@@ -439,8 +442,9 @@ public:
         boost::asio::read(*socket, 
             boost::asio::buffer(buffer, size));
         
-        std::cout << "[Rank " << rank_ << "] Received " << size 
-                  << " bytes from source rank " << source_rank << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Received " << size 
+                      << " bytes from source rank " << source_rank << std::endl;
         
         // Return socket to the pool for reuse (DO NOT CLOSE)
         {
@@ -491,9 +495,10 @@ private:
             }
             recv_acceptor_->listen();
             
-            std::cout << "[Rank " << rank_ << "] Acceptor started on " 
-                      << my_ip_ << ":" << my_port_ 
-                      << " (expecting " << expected_recv_connections_ << " connections)" << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Acceptor started on " 
+                          << my_ip_ << ":" << my_port_ 
+                          << " (expecting " << expected_recv_connections_ << " connections)" << std::endl;
             
             // Start accepting multiple connections
             accept_next_connection();
@@ -526,8 +531,9 @@ private:
                     }
                     
                     int count = ++recv_connected_count_;
-                    std::cout << "[Rank " << rank_ << "] Accepted connection " << count 
-                              << "/" << expected_recv_connections_ << std::endl;
+                    if (debug_)
+                        std::cout << "[Rank " << rank_ << "] Accepted connection " << count 
+                                  << "/" << expected_recv_connections_ << std::endl;
                     
                     {
                         std::lock_guard<std::mutex> lock(connection_mutex_);
@@ -552,9 +558,10 @@ private:
         }
         
         try {
-            std::cout << "[Rank " << rank_ << "] Connecting to target rank " 
-                      << target_ranks_[target_idx] << " at " 
-                      << target_ips_[target_idx] << ":" << target_ports_[target_idx] << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Connecting to target rank " 
+                          << target_ranks_[target_idx] << " at " 
+                          << target_ips_[target_idx] << ":" << target_ports_[target_idx] << std::endl;
 
             send_sockets_[target_idx] =
                 std::make_unique<boost::asio::ip::tcp::socket>(io_context_);
@@ -567,8 +574,9 @@ private:
             *send_connected_[target_idx] = true;
             connection_cv_.notify_all();
 
-            std::cout << "[Rank " << rank_ << "] Connected to target rank "
-                      << target_ranks_[target_idx] << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Connected to target rank "
+                          << target_ranks_[target_idx] << std::endl;
         } catch (const std::exception& e) {
             throw std::runtime_error(
                 "Failed to connect to target rank " + std::to_string(target_ranks_[target_idx]) + 
@@ -583,7 +591,8 @@ private:
             return is_connected();
         });
         
-        std::cout << "[Rank " << rank_ << "] All connections established" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] All connections established" << std::endl;
     }
     
     void cleanup() {
@@ -675,6 +684,7 @@ private:
     std::vector<int> target_ports_;
     std::string my_ip_;
     int my_port_;
+    bool debug_{false};
     
     // Registered buffers
     std::map<uintptr_t, RdmaBuffer> registered_buffers_;
@@ -690,7 +700,7 @@ private:
     static const int MAX_WR = 256;
     static const int MAX_SGE = 1;
     static const size_t CHUNK_SIZE = 64 * 1024 * 1024;  // 64 MB per RDMA operation
-    static const int MAX_BATCH_WR = 32;
+    static const int MAX_BATCH_WR = 8;
 
     // Invoked after each RDMA send batch completes: (batch_idx, offset, bytes).
     ChunkDoneCb on_chunk_done_;
@@ -721,22 +731,27 @@ public:
           temp_send_mr_(nullptr),
           temp_recv_mr_(nullptr)
     {
-        std::cout << "[Rank " << rank_ << "] Creating GeminiReplicasRdmaConnectionManager with " 
-                  << target_ranks_.size() << " targets and expecting " 
-                  << expected_recv_connections_ << " sources (RDMA)" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Creating GeminiReplicasRdmaConnectionManager with " 
+                      << target_ranks_.size() << " targets and expecting " 
+                      << expected_recv_connections_ << " sources (RDMA)" << std::endl;
         
         // Initialize send control sockets
         control_socks_send_.resize(target_ranks_.size(), -1);
         
-        std::cout << "[Rank " << rank_ << "] GeminiReplicasRdmaConnectionManager created" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] GeminiReplicasRdmaConnectionManager created" << std::endl;
     }
     
     ~GeminiReplicasRdmaConnectionManager() {
         cleanup();
     }
+
+    void set_debug(bool debug) override { debug_ = debug; }
     
     void initialize_connections() override {
-        std::cout << "[Rank " << rank_ << "] Initializing RDMA connections..." << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Initializing RDMA connections..." << std::endl;
 
         // Start ASIO io_context in background thread.
         // The open acceptor keeps io_context busy; when all connections are
@@ -751,19 +766,22 @@ public:
         // Start TCP listener via ASIO (matching eccheck pattern)
         start_tcp_listener();
 
-        std::cout << "[Rank " << rank_ << "] RDMA initialization complete (Phase 1)" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] RDMA initialization complete (Phase 1)" << std::endl;
     }
     
     void connect_and_wait() override {
-        std::cout << "[Rank " << rank_ << "] Connecting to targets and waiting for connections..." << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Connecting to targets and waiting for connections..." << std::endl;
 
         // Accept control connections from source ranks
         std::exception_ptr accept_exception = nullptr;
         std::thread accept_thread([this, &accept_exception]() {
             try {
                 for (int i = 0; i < expected_recv_connections_; ++i) {
-                    std::cout << "[Rank " << rank_ << "] Accepting connection " << (i+1)
-                              << "/" << expected_recv_connections_ << "..." << std::endl;
+                    if (debug_)
+                        std::cout << "[Rank " << rank_ << "] Accepting connection " << (i+1)
+                                  << "/" << expected_recv_connections_ << "..." << std::endl;
                     accept_tcp_connection();
                 }
             } catch (...) {
@@ -781,8 +799,9 @@ public:
         std::exception_ptr connect_exception = nullptr;
         try {
             for (size_t i = 0; i < target_ranks_.size(); ++i) {
-                std::cout << "[Rank " << rank_ << "] Connecting to target " << (i+1)
-                          << "/" << target_ranks_.size() << " (rank " << target_ranks_[i] << ")..." << std::endl;
+                if (debug_)
+                    std::cout << "[Rank " << rank_ << "] Connecting to target " << (i+1)
+                              << "/" << target_ranks_.size() << " (rank " << target_ranks_[i] << ")..." << std::endl;
                 connect_to_target(i);
             }
         } catch (...) {
@@ -807,19 +826,22 @@ public:
         }
 
         // Wait for all connections
-        std::cout << "[Rank " << rank_ << "] Waiting for all connections to be ready..." << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Waiting for all connections to be ready..." << std::endl;
         wait_for_connections();
 
         // No warmup — matching eccheck. QPs are connected during
         // exchange_and_connect and the first real data transfer validates them.
-        std::cout << "[Rank " << rank_ << "] All RDMA connections established (no warmup)" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] All RDMA connections established (no warmup)" << std::endl;
     }
     
     void register_buffer(uintptr_t addr, size_t size) override {
         std::lock_guard<std::mutex> lock(buffer_mutex_);
         
         if (registered_buffers_.find(addr) != registered_buffers_.end()) {
-            std::cout << "[Rank " << rank_ << "] Buffer already registered at 0x" << std::hex << addr << std::dec << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Buffer already registered at 0x" << std::hex << addr << std::dec << std::endl;
             return;
         }
         
@@ -830,8 +852,9 @@ public:
         }
         
         registered_buffers_[addr] = {mr, addr, size};
-        std::cout << "[Rank " << rank_ << "] Registered buffer at 0x" << std::hex << addr << std::dec 
-                  << ", size: " << (size / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Registered buffer at 0x" << std::hex << addr << std::dec 
+                      << ", size: " << (size / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
     }
     
     void unregister_buffer(uintptr_t addr) override {
@@ -844,7 +867,8 @@ public:
         
         ibv_dereg_mr(it->second.mr);
         registered_buffers_.erase(it);
-        std::cout << "[Rank " << rank_ << "] Unregistered buffer at 0x" << std::hex << addr << std::dec << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Unregistered buffer at 0x" << std::hex << addr << std::dec << std::endl;
     }
 
     void set_require_registered_mr(bool v) override { require_registered_mr_ = v; }
@@ -903,7 +927,7 @@ private:
         }
     }
     
-    void receive_data_chunked(uint8_t* buffer, size_t total_size, ibv_mr* mr, ibv_qp* qp) {
+    size_t post_receive_chunked(uint8_t* buffer, size_t total_size, ibv_mr* mr, ibv_qp* qp) {
         size_t chunk_count = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
         
         std::vector<ibv_sge> sges(chunk_count);
@@ -935,8 +959,11 @@ private:
                 throw std::runtime_error("Failed to post receive work request");
             }
         }
+        return chunk_count;
+    }
 
-        // Poll completions
+    void receive_data_chunked(uint8_t* buffer, size_t total_size, ibv_mr* mr, ibv_qp* qp) {
+        size_t chunk_count = post_receive_chunked(buffer, total_size, mr, qp);
         poll_completion(recv_cq_, chunk_count);
     }
 
@@ -1076,9 +1103,10 @@ public:
         const uint8_t* send_data = (mr == temp_send_mr_) ? temp_send_buffer_.data() : data;
         send_data_chunked(send_data, size, mr, send_qps_[target_idx]);
 
-        std::cout << "[Rank " << rank_ << "] Sent " << size
-                  << " bytes to target rank " << target_ranks_[target_idx]
-                  << " via RDMA (directed P2P)" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Sent " << size
+                      << " bytes to target rank " << target_ranks_[target_idx]
+                      << " via RDMA (directed P2P)" << std::endl;
     }
 
     std::vector<int> get_recv_source_ranks() const override {
@@ -1101,7 +1129,9 @@ public:
             throw std::runtime_error("Not connected");
         }
 
-        // TCP handshake: find an available source, receive size, send ACK.
+        // TCP handshake: find an available source and receive size.
+        // ACK is sent only after receive WRs are posted, so it is a real
+        // receiver-ready signal for IBV_WR_SEND.
         int found_idx = -1;
         uint64_t size_net;
         {
@@ -1130,12 +1160,6 @@ public:
             if (recv(control_socks_recv_[found_idx], &size_net, sizeof(size_net), MSG_WAITALL) != sizeof(size_net)) {
                 throw std::runtime_error("Failed to receive size from source");
             }
-
-            // Send ACK
-            char ack = 'A';
-            if (send(control_socks_recv_[found_idx], &ack, 1, 0) != 1) {
-                throw std::runtime_error("Failed to send ACK");
-            }
         }
         // Mutex released — RDMA transfer without blocking other recv workers.
 
@@ -1157,10 +1181,21 @@ public:
             if (recv_size > temp_recv_buffer_.size())
                 throw std::runtime_error("Receive size exceeds temporary buffer size");
             mr = temp_recv_mr_;
-            receive_data_chunked(temp_recv_buffer_.data(), recv_size, mr, recv_qps_[found_idx]);
+            uint8_t* recv_buffer = temp_recv_buffer_.data();
+            size_t chunk_count = post_receive_chunked(recv_buffer, recv_size, mr, recv_qps_[found_idx]);
+            char ack = 'A';
+            if (send(control_socks_recv_[found_idx], &ack, 1, 0) != 1) {
+                throw std::runtime_error("Failed to send ACK");
+            }
+            poll_completion(recv_cq_, chunk_count);
             std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
         } else {
-            receive_data_chunked(buffer, recv_size, mr, recv_qps_[found_idx]);
+            size_t chunk_count = post_receive_chunked(buffer, recv_size, mr, recv_qps_[found_idx]);
+            char ack = 'A';
+            if (send(control_socks_recv_[found_idx], &ack, 1, 0) != 1) {
+                throw std::runtime_error("Failed to send ACK");
+            }
+            poll_completion(recv_cq_, chunk_count);
         }
 
         return {recv_source_ranks_[found_idx], recv_size};
@@ -1179,7 +1214,9 @@ public:
 
         size_t qp_idx = std::distance(recv_source_ranks_.begin(), it);
 
-        // TCP handshake: receive size, send ACK.
+        // TCP handshake: receive size.
+        // ACK is sent only after receive WRs are posted, so senders do not
+        // race into IBV_WR_SEND before the receiver is ready.
         // Only hold recv_mutex_ for the short TCP portion — not for the
         // RDMA transfer which can take seconds.  This prevents recv workers
         // from serializing on the mutex and creating a distributed deadlock
@@ -1204,13 +1241,6 @@ public:
             if (recv(control_socks_recv_[qp_idx], &size_net, sizeof(size_net), MSG_WAITALL) != sizeof(size_net)) {
                 throw std::runtime_error("Failed to receive size from source");
             }
-
-            // Send ACK BEFORE releasing mutex — sender is blocked on recv() for this ACK.
-            // We must send it while holding the mutex so the sender can proceed with RDMA write.
-            char ack = 'A';
-            if (send(control_socks_recv_[qp_idx], &ack, 1, 0) != 1) {
-                throw std::runtime_error("Failed to send ACK");
-            }
         }
         // Mutex released — RDMA transfer runs without blocking other recv workers.
 
@@ -1232,10 +1262,21 @@ public:
             if (recv_size > temp_recv_buffer_.size())
                 throw std::runtime_error("Receive size exceeds temporary buffer size");
             mr = temp_recv_mr_;
-            receive_data_chunked(temp_recv_buffer_.data(), recv_size, mr, recv_qps_[qp_idx]);
+            uint8_t* recv_buffer = temp_recv_buffer_.data();
+            size_t chunk_count = post_receive_chunked(recv_buffer, recv_size, mr, recv_qps_[qp_idx]);
+            char ack = 'A';
+            if (send(control_socks_recv_[qp_idx], &ack, 1, 0) != 1) {
+                throw std::runtime_error("Failed to send ACK");
+            }
+            poll_completion(recv_cq_, chunk_count);
             std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
         } else {
-            receive_data_chunked(buffer, recv_size, mr, recv_qps_[qp_idx]);
+            size_t chunk_count = post_receive_chunked(buffer, recv_size, mr, recv_qps_[qp_idx]);
+            char ack = 'A';
+            if (send(control_socks_recv_[qp_idx], &ack, 1, 0) != 1) {
+                throw std::runtime_error("Failed to send ACK");
+            }
+            poll_completion(recv_cq_, chunk_count);
         }
 
         return {recv_source_ranks_[qp_idx], recv_size};
@@ -1267,16 +1308,15 @@ private:
         
         uint8_t* recv_buffer = use_temp ? temp_recv_buffer_.data() : buffer;
 
-        // Send ACK BEFORE posting recv WRs (matches ecnaive ordering).
-        // Sender waits for this ACK before starting RDMA send, so
-        // the recv QP is guaranteed ready.
+        size_t chunk_count = post_receive_chunked(recv_buffer, recv_size, mr, recv_qps_[qp_idx]);
+
+        // Send ACK after posting recv WRs. Sender treats ACK as receiver-ready.
         char ack = 'A';
         if (send(control_socks_recv_[qp_idx], &ack, 1, 0) != 1) {
             throw std::runtime_error("Failed to send ACK");
         }
 
-        // Receive data via RDMA
-        receive_data_chunked(recv_buffer, recv_size, mr, recv_qps_[qp_idx]);
+        poll_completion(recv_cq_, chunk_count);
 
         if (use_temp) {
             std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
@@ -1293,13 +1333,15 @@ public:
 
 private:
     void warmup_rdma_connections() {
-        std::cout << "[Rank " << rank_ << "] Warming up RDMA connections..." << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Warming up RDMA connections..." << std::endl;
         
         const size_t warmup_size = 1024;
         std::vector<uint8_t> warmup_data(warmup_size, 0xAB);
         
         // Step 1: Post all receives first (to avoid deadlock)
-        std::cout << "[Rank " << rank_ << "] Posting " << recv_qps_.size() << " warmup receives..." << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Posting " << recv_qps_.size() << " warmup receives..." << std::endl;
         for (size_t i = 0; i < recv_qps_.size(); ++i) {
             try {
                 // Post receive for warmup data
@@ -1317,7 +1359,8 @@ private:
                 if (ibv_post_recv(recv_qps_[i], &wr, &bad_wr) != 0) {
                     throw std::runtime_error("Failed to post warmup receive for source " + std::to_string(recv_source_ranks_[i]));
                 }
-                std::cout << "[Rank " << rank_ << "] Posted warmup receive for source " << recv_source_ranks_[i] << std::endl;
+                if (debug_)
+                    std::cout << "[Rank " << rank_ << "] Posted warmup receive for source " << recv_source_ranks_[i] << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "[Rank " << rank_ << "] Failed to post warmup receive: " << e.what() << std::endl;
                 throw;
@@ -1325,7 +1368,8 @@ private:
         }
         
         // Step 2: Send warmup data to all targets
-        std::cout << "[Rank " << rank_ << "] Sending " << send_qps_.size() << " warmup messages..." << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Sending " << send_qps_.size() << " warmup messages..." << std::endl;
         for (size_t i = 0; i < send_qps_.size(); ++i) {
             try {
                 std::memcpy(temp_send_buffer_.data() + i * warmup_size, warmup_data.data(), warmup_size);
@@ -1347,7 +1391,8 @@ private:
                 if (ibv_post_send(send_qps_[i], &wr, &bad_wr) != 0) {
                     throw std::runtime_error("Failed to post warmup send to target " + std::to_string(target_ranks_[i]));
                 }
-                std::cout << "[Rank " << rank_ << "] Posted warmup send to target " << target_ranks_[i] << std::endl;
+                if (debug_)
+                    std::cout << "[Rank " << rank_ << "] Posted warmup send to target " << target_ranks_[i] << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "[Rank " << rank_ << "] Failed to post warmup send: " << e.what() << std::endl;
                 throw;
@@ -1356,20 +1401,25 @@ private:
         
         // Step 3: Wait for all sends to complete (with timeout, matching
         // eccheck which has no warmup — failures here are non-fatal)
-        std::cout << "[Rank " << rank_ << "] Waiting for " << send_qps_.size() << " send completions..." << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Waiting for " << send_qps_.size() << " send completions..." << std::endl;
         try {
             for (size_t i = 0; i < send_qps_.size(); ++i) {
                 poll_completion_timeout(send_cq_, 1, 5);  // 5 second timeout per completion
-                std::cout << "[Rank " << rank_ << "] Warmup send " << (i+1) << "/" << send_qps_.size() << " completed" << std::endl;
+                if (debug_)
+                    std::cout << "[Rank " << rank_ << "] Warmup send " << (i+1) << "/" << send_qps_.size() << " completed" << std::endl;
             }
 
             // Step 4: Wait for all receives to complete
-            std::cout << "[Rank " << rank_ << "] Waiting for " << recv_qps_.size() << " receive completions..." << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Waiting for " << recv_qps_.size() << " receive completions..." << std::endl;
             for (size_t i = 0; i < recv_qps_.size(); ++i) {
                 poll_completion_timeout(recv_cq_, 1, 5);
-                std::cout << "[Rank " << rank_ << "] Warmup receive " << (i+1) << "/" << recv_qps_.size() << " completed" << std::endl;
+                if (debug_)
+                    std::cout << "[Rank " << rank_ << "] Warmup receive " << (i+1) << "/" << recv_qps_.size() << " completed" << std::endl;
             }
-            std::cout << "[Rank " << rank_ << "] RDMA warmup complete" << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] RDMA warmup complete" << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "[Rank " << rank_ << "] Warmup timed out: " << e.what()
                       << " — skipping (non-fatal, matches eccheck)" << std::endl;
@@ -1438,7 +1488,8 @@ private:
             throw std::runtime_error("Failed to register temporary buffers");
         }
         
-        std::cout << "[Rank " << rank_ << "] RDMA resources initialized" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] RDMA resources initialized" << std::endl;
     }
     
     void start_tcp_listener() {
@@ -1466,21 +1517,25 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         recv_acceptor_->listen(expected_recv_connections_);
-        std::cout << "[Rank " << rank_ << "] ASIO acceptor listening on " << my_ip_ << ":" << my_port_ << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] ASIO acceptor listening on " << my_ip_ << ":" << my_port_ << std::endl;
     }
     
     void accept_tcp_connection() {
         try {
-            std::cout << "[Rank " << rank_ << "] Waiting to accept incoming connection..." << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Waiting to accept incoming connection..." << std::endl;
             // ASIO synchronous accept (matching eccheck pattern)
             auto sock = std::make_unique<boost::asio::ip::tcp::socket>(io_context_);
             recv_acceptor_->accept(*sock);
             int client_sock = sock->native_handle();
-            std::cout << "[Rank " << rank_ << "] Accepted TCP connection (ASIO)" << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Accepted TCP connection (ASIO)" << std::endl;
 
             // Exchange QP info
             // First, create a new QP for this incoming connection
-            std::cout << "[Rank " << rank_ << "] Creating recv QP..." << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Creating recv QP..." << std::endl;
             ibv_qp_init_attr qp_init_attr{};
             qp_init_attr.send_cq = send_cq_;
             qp_init_attr.recv_cq = recv_cq_;
@@ -1496,7 +1551,8 @@ private:
             }
 
             // Acceptor receives QP info first (same as eccheck's exchange(false))
-            std::cout << "[Rank " << rank_ << "] Exchanging QP info (recv-first)..." << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Exchanging QP info (recv-first)..." << std::endl;
             RdmaConnInfo local_info = get_local_conn_info(qp);
             RdmaConnInfo remote_info;
             if (!exchange_conn_info(client_sock, local_info, remote_info, false)) {
@@ -1505,14 +1561,16 @@ private:
             }
 
             // Connect QP
-            std::cout << "[Rank " << rank_ << "] Connecting recv QP..." << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Connecting recv QP..." << std::endl;
             if (!connect_qp(qp, remote_info)) {
                 ibv_destroy_qp(qp);
                 throw std::runtime_error("Failed to connect recv QP");
             }
 
             // Receive source rank from sender
-            std::cout << "[Rank " << rank_ << "] Receiving source rank ID..." << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Receiving source rank ID..." << std::endl;
             int32_t source_rank_net;
             if (recv(client_sock, &source_rank_net, sizeof(source_rank_net), MSG_WAITALL) != sizeof(source_rank_net)) {
                 ibv_destroy_qp(qp);
@@ -1526,7 +1584,8 @@ private:
             control_socks_recv_.push_back(client_sock);
             recv_socks_.push_back(std::move(sock));
 
-            std::cout << "[Rank " << rank_ << "] Successfully accepted RDMA connection from rank " << source_rank << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Successfully accepted RDMA connection from rank " << source_rank << std::endl;
 
             // If we're the last to finish (accept side), signal connected_
             if (recv_qps_.size() == static_cast<size_t>(expected_recv_connections_) &&
@@ -1535,7 +1594,8 @@ private:
                 std::lock_guard<std::mutex> lock(connection_mutex_);
                 connected_ = true;
                 connection_cv_.notify_all();
-                std::cout << "[Rank " << rank_ << "] All connections complete (from accept side), notifying waiters" << std::endl;
+                if (debug_)
+                    std::cout << "[Rank " << rank_ << "] All connections complete (from accept side), notifying waiters" << std::endl;
             }
         } catch (const std::exception& e) {
             std::cerr << "[Rank " << rank_ << "] ERROR in accept_tcp_connection: " << e.what() << std::endl;
@@ -1545,9 +1605,10 @@ private:
 
     void connect_to_target(size_t target_idx) {
         try {
-            std::cout << "[Rank " << rank_ << "] Connecting to target "
-                      << target_ranks_[target_idx] << " at "
-                      << target_ips_[target_idx] << ":" << target_ports_[target_idx] << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Connecting to target "
+                          << target_ranks_[target_idx] << " at "
+                          << target_ips_[target_idx] << ":" << target_ports_[target_idx] << std::endl;
 
             auto sock = std::make_unique<boost::asio::ip::tcp::socket>(io_context_);
             asio_tcp_connect_with_retry(
@@ -1555,12 +1616,14 @@ private:
                 target_ips_[target_idx], target_ports_[target_idx],
                 rank_, target_ranks_[target_idx]);
             int fd = sock->native_handle();
-            std::cout << "[Rank " << rank_ << "] TCP connected to target "
-                      << target_ranks_[target_idx] << " (ASIO)" << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] TCP connected to target "
+                          << target_ranks_[target_idx] << " (ASIO)" << std::endl;
 
             // Connector sends QP info first (same as eccheck's exchange(true))
-            std::cout << "[Rank " << rank_ << "] Exchanging QP info (send-first) with target "
-                      << target_ranks_[target_idx] << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Exchanging QP info (send-first) with target "
+                          << target_ranks_[target_idx] << std::endl;
             RdmaConnInfo local_info = get_local_conn_info(send_qps_[target_idx]);
             RdmaConnInfo remote_info;
             if (!exchange_conn_info(fd, local_info, remote_info, true)) {
@@ -1569,13 +1632,15 @@ private:
             }
 
             // Connect QP
-            std::cout << "[Rank " << rank_ << "] Connecting QP to target " << target_ranks_[target_idx] << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Connecting QP to target " << target_ranks_[target_idx] << std::endl;
             if (!connect_qp(send_qps_[target_idx], remote_info)) {
                 throw std::runtime_error("Failed to connect QP to target " + std::to_string(target_ranks_[target_idx]));
             }
 
             // Send my rank to receiver
-            std::cout << "[Rank " << rank_ << "] Sending rank ID to target " << target_ranks_[target_idx] << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Sending rank ID to target " << target_ranks_[target_idx] << std::endl;
             int32_t my_rank_net = htonl(rank_);
             if (send(fd, &my_rank_net, sizeof(my_rank_net), 0) != sizeof(my_rank_net)) {
                 throw std::runtime_error("Failed to send rank to target " + std::to_string(target_ranks_[target_idx]));
@@ -1584,14 +1649,16 @@ private:
             control_socks_send_[target_idx] = fd;
             send_socks_.push_back(std::move(sock));
 
-            std::cout << "[Rank " << rank_ << "] Successfully connected to target " << target_ranks_[target_idx] << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Successfully connected to target " << target_ranks_[target_idx] << std::endl;
 
             // Check if all connections established
-            std::cout << "[Rank " << rank_ << "] Connection status: recv_qps=" << recv_qps_.size()
-                      << "/" << expected_recv_connections_ << ", send_qps=" << send_qps_.size()
-                      << "/" << target_ranks_.size() << ", control_socks_send="
-                      << std::count_if(control_socks_send_.begin(), control_socks_send_.end(), [](int s) { return s >= 0; })
-                      << "/" << target_ranks_.size() << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Connection status: recv_qps=" << recv_qps_.size()
+                          << "/" << expected_recv_connections_ << ", send_qps=" << send_qps_.size()
+                          << "/" << target_ranks_.size() << ", control_socks_send="
+                          << std::count_if(control_socks_send_.begin(), control_socks_send_.end(), [](int s) { return s >= 0; })
+                          << "/" << target_ranks_.size() << std::endl;
 
             if (recv_qps_.size() == static_cast<size_t>(expected_recv_connections_) &&
                 send_qps_.size() == target_ranks_.size() &&
@@ -1599,7 +1666,8 @@ private:
                 std::lock_guard<std::mutex> lock(connection_mutex_);
                 connected_ = true;
                 connection_cv_.notify_all();
-                std::cout << "[Rank " << rank_ << "] All connections complete (from connect_to_target), notifying waiters" << std::endl;
+                if (debug_)
+                    std::cout << "[Rank " << rank_ << "] All connections complete (from connect_to_target), notifying waiters" << std::endl;
             }
         } catch (const std::exception& e) {
             std::cerr << "[Rank " << rank_ << "] ERROR connecting to target " << target_ranks_[target_idx] << ": " << e.what() << std::endl;
@@ -1649,7 +1717,8 @@ private:
     
     bool connect_qp(ibv_qp* qp, const RdmaConnInfo& remote_info) {
         // Transition to INIT
-        std::cout << "[Rank " << rank_ << "] QP transition: RESET -> INIT" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] QP transition: RESET -> INIT" << std::endl;
         ibv_qp_attr attr{};
         attr.qp_state = IBV_QPS_INIT;
         attr.pkey_index = 0;
@@ -1664,8 +1733,9 @@ private:
         }
         
         // Transition to RTR
-        std::cout << "[Rank " << rank_ << "] QP transition: INIT -> RTR (remote QP=" << remote_info.qp_num 
-                  << ", LID=" << remote_info.lid << ")" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] QP transition: INIT -> RTR (remote QP=" << remote_info.qp_num 
+                      << ", LID=" << remote_info.lid << ")" << std::endl;
         std::memset(&attr, 0, sizeof(attr));
         attr.qp_state = IBV_QPS_RTR;
         attr.path_mtu = IBV_MTU_4096;
@@ -1684,7 +1754,8 @@ private:
         }
         
         if (use_gid) {
-            std::cout << "[Rank " << rank_ << "] Using GID (RoCE mode)" << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Using GID (RoCE mode)" << std::endl;
             attr.ah_attr.is_global = 1;
             attr.ah_attr.grh.dgid = *reinterpret_cast<const ibv_gid*>(remote_info.gid);
             attr.ah_attr.grh.flow_label = 0;
@@ -1692,7 +1763,8 @@ private:
             attr.ah_attr.grh.hop_limit = 255;
             attr.ah_attr.grh.traffic_class = 0;
         } else {
-            std::cout << "[Rank " << rank_ << "] Using LID (InfiniBand mode)" << std::endl;
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Using LID (InfiniBand mode)" << std::endl;
             attr.ah_attr.is_global = 0;
             attr.ah_attr.dlid = remote_info.lid;
         }
@@ -1710,7 +1782,8 @@ private:
         }
         
         // Transition to RTS
-        std::cout << "[Rank " << rank_ << "] QP transition: RTR -> RTS" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] QP transition: RTR -> RTS" << std::endl;
         std::memset(&attr, 0, sizeof(attr));
         attr.qp_state = IBV_QPS_RTS;
         attr.sq_psn = 0;
@@ -1727,7 +1800,8 @@ private:
             return false;
         }
         
-        std::cout << "[Rank " << rank_ << "] QP successfully connected (RESET -> INIT -> RTR -> RTS)" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] QP successfully connected (RESET -> INIT -> RTR -> RTS)" << std::endl;
         return true;
     }
     
@@ -1792,7 +1866,8 @@ private:
             return connected_.load();
         });
         
-        std::cout << "[Rank " << rank_ << "] All RDMA connections established" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] All RDMA connections established" << std::endl;
     }
     
     void cleanup() {
@@ -1979,10 +2054,11 @@ public:
           target_ranks_(target_ranks),
           use_rdma_(use_rdma)
     {
-        std::cout << "[Rank " << rank_ << "] Creating GeminiReplicasNative with " 
-                  << target_ranks_.size() << " targets and " 
-                  << num_source_ranks << " sources (mode: " 
-                  << (use_rdma_ ? "RDMA" : "ASIO") << ")" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Creating GeminiReplicasNative with " 
+                      << target_ranks_.size() << " targets and " 
+                      << num_source_ranks << " sources (mode: " 
+                      << (use_rdma_ ? "RDMA" : "ASIO") << ")" << std::endl;
         
         // Phase 1: Create connection manager and start acceptor
         if (use_rdma_) {
@@ -2003,7 +2079,8 @@ public:
         
         connection_manager_->initialize_connections();
         
-        std::cout << "[Rank " << rank_ << "] GeminiReplicasNative created (Phase 1 complete)" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] GeminiReplicasNative created (Phase 1 complete)" << std::endl;
     }
     
     ~GeminiReplicasNative() {
@@ -2014,6 +2091,9 @@ public:
 
     void set_debug(bool debug) {
         debug_ = debug;
+        if (connection_manager_) {
+            connection_manager_->set_debug(debug);
+        }
     }
 
     void configure_exchange_mirror(uintptr_t gpu_base, uintptr_t cpu_base, size_t total_size) {
@@ -2031,7 +2111,7 @@ public:
         }
 
         constexpr size_t kChunkSize = 64ULL * 1024 * 1024;
-        constexpr size_t kMaxBatchWr = 32;
+        constexpr size_t kMaxBatchWr = 8;
         const size_t batch_bytes = kChunkSize * kMaxBatchWr;
         const size_t batch_count = (total_size + batch_bytes - 1) / batch_bytes;
         const size_t fanout = target_ranks_.size();
@@ -2061,7 +2141,8 @@ public:
          * Phase 2: Connect to all targets and wait for all connections.
          * Should be called after all ranks have started their acceptors.
          */
-        std::cout << "[Rank " << rank_ << "] Finalizing connections (Phase 2)..." << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Finalizing connections (Phase 2)..." << std::endl;
 
         connection_manager_->connect_and_wait();
 
@@ -2073,13 +2154,15 @@ public:
         for (size_t i = 0; i < recv_src.size(); ++i) {
             source_rank_to_idx_[recv_src[i]] = i;
         }
-        std::cout << "[Rank " << rank_ << "] Built rank→idx maps: "
-                  << target_rank_to_idx_.size() << " targets, "
-                  << source_rank_to_idx_.size() << " sources" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Built rank->idx maps: "
+                      << target_rank_to_idx_.size() << " targets, "
+                      << source_rank_to_idx_.size() << " sources" << std::endl;
 
         initialized_ = true;
 
-        std::cout << "[Rank " << rank_ << "] All connections finalized" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] All connections finalized" << std::endl;
     }
 
     // ---- Directed P2P methods (for hardware recovery) ----
@@ -2153,12 +2236,14 @@ public:
         
         const uint8_t* data = reinterpret_cast<const uint8_t*>(buffer_addr);
         
-        std::cout << "[Rank " << rank_ << "] Broadcasting " << buffer_size 
-                  << " bytes to " << target_ranks_.size() << " targets" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Broadcasting " << buffer_size 
+                      << " bytes to " << target_ranks_.size() << " targets" << std::endl;
         
         connection_manager_->broadcast_to_targets(data, buffer_size);
         
-        std::cout << "[Rank " << rank_ << "] Broadcast completed" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Broadcast completed" << std::endl;
     }
     
     std::pair<int, size_t> receive_from_source(uintptr_t buffer_addr, size_t buffer_size) {
@@ -2178,13 +2263,15 @@ public:
         
         uint8_t* buffer = reinterpret_cast<uint8_t*>(buffer_addr);
         
-        std::cout << "[Rank " << rank_ << "] Receiving data (buffer size: " 
-                  << buffer_size << " bytes)" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Receiving data (buffer size: " 
+                      << buffer_size << " bytes)" << std::endl;
         
         auto [source_rank, received_size] = connection_manager_->receive_data(buffer, buffer_size);
         
-        std::cout << "[Rank " << rank_ << "] Received " << received_size 
-                  << " bytes from source rank " << source_rank << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Received " << received_size 
+                      << " bytes from source rank " << source_rank << std::endl;
         
         return {source_rank, received_size};
     }
@@ -2568,12 +2655,14 @@ public:
             return;
         }
         
-        std::cout << "[Rank " << rank_ << "] Registering buffer at 0x" << std::hex << buffer_addr 
-                  << std::dec << ", size: " << (buffer_size / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Registering buffer at 0x" << std::hex << buffer_addr 
+                      << std::dec << ", size: " << (buffer_size / (1024.0 * 1024.0 * 1024.0)) << " GB" << std::endl;
         
         connection_manager_->register_buffer(buffer_addr, buffer_size);
         
-        std::cout << "[Rank " << rank_ << "] Buffer registered successfully" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Buffer registered successfully" << std::endl;
     }
     
     void unregister_buffer(uintptr_t buffer_addr) {
@@ -2589,11 +2678,13 @@ public:
             return;
         }
         
-        std::cout << "[Rank " << rank_ << "] Unregistering buffer at 0x" << std::hex << buffer_addr << std::dec << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Unregistering buffer at 0x" << std::hex << buffer_addr << std::dec << std::endl;
         
         connection_manager_->unregister_buffer(buffer_addr);
         
-        std::cout << "[Rank " << rank_ << "] Buffer unregistered successfully" << std::endl;
+        if (debug_)
+            std::cout << "[Rank " << rank_ << "] Buffer unregistered successfully" << std::endl;
     }
 };
 

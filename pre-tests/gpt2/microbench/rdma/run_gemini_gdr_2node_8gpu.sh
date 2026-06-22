@@ -54,7 +54,7 @@ DEFAULT_ARGS=(
     --node-rank "$NODE_RANK"
     --master-addr "$MASTER_ADDR"
     --base-port "$BASE_PORT"
-    --size-mb 512
+    --size-mb 5120
     --iters 10
     --warmup 2
     --chunk-mb 64
@@ -82,7 +82,7 @@ for ((local_rank = 0; local_rank < GPUS_PER_NODE; ++local_rank)); do
     echo "Launching rank=$rank local_rank=$local_rank gpu=$gpu_id log=$log_file"
     CUDA_VISIBLE_DEVICES="$gpu_id" "$EXE" \
         --rank "$rank" \
-        --local-rank 0 \
+        --local-rank "$local_rank" \
         "${DEFAULT_ARGS[@]}" \
         "$@" > "$log_file" 2>&1 &
     pids+=("$!")

@@ -70,11 +70,16 @@ class _LayerGroup:
 class _RecoveryBufPool:
     """Reusable RDMA buffers sized to max per-layer block_size for this rank."""
     decoder_recv_bufs: List[torch.Tensor]
+    decoder_recv_buf_slots: List[List[torch.Tensor]]
     failed_recv_buf: Optional[torch.Tensor]
+    failed_recv_bufs: List[torch.Tensor]
     decoder_recovered_buf: Optional[torch.Tensor]
+    decoder_recovered_bufs: List[torch.Tensor]
     decoder_recovered_buf2: Optional[torch.Tensor]
+    decoder_recovered_buf2s: List[torch.Tensor]
     failed_layer_buf: Optional[torch.Tensor]
     max_block_size: int
+    concurrency: int
 
 
 @dataclass
@@ -1213,25 +1218,37 @@ def _allocate_recovery_buf_pool(
     if not need_pool:
         return None
 
-    decoder_recv_bufs: List[torch.Tensor] = []
+    # Native recovery starts n workers per role.  Allocate one temporary slot per
+    # worker and submit recovery stripes in waves of at most n to avoid reusing a
+    # slot while another worker is still using it.
+    concurrency = max(n, 1)
+    decoder_recv_buf_slots: List[List[torch.Tensor]] = []
     if is_decoder and num_helper > 0:
-        decoder_recv_bufs = [
-            allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
-            for _ in range(num_helper)
+        decoder_recv_buf_slots = [
+            [
+                allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
+                for _ in range(num_helper)
+            ]
+            for _ in range(concurrency)
         ]
 
-    failed_recv_buf = (
+    failed_recv_bufs = [
         allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
-        if is_failed else None
-    )
-    decoder_recovered_buf = (
+        for _ in range(concurrency)
+    ] if is_failed else []
+    decoder_recovered_bufs = [
         allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
-        if is_decoder else None
-    )
-    decoder_recovered_buf2 = (
+        for _ in range(concurrency)
+    ] if is_decoder else []
+    decoder_recovered_buf2s = [
         allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
-        if is_decoder and dual_failure else None
-    )
+        for _ in range(concurrency)
+    ] if is_decoder and dual_failure else []
+
+    decoder_recv_bufs = decoder_recv_buf_slots[0] if decoder_recv_buf_slots else []
+    failed_recv_buf = failed_recv_bufs[0] if failed_recv_bufs else None
+    decoder_recovered_buf = decoder_recovered_bufs[0] if decoder_recovered_bufs else None
+    decoder_recovered_buf2 = decoder_recovered_buf2s[0] if decoder_recovered_buf2s else None
     failed_layer_buf = (
         allocate_hugepage_tensor(
             num_source_stripes * max_block_size, fallback_pin_memory=True,
@@ -1239,22 +1256,30 @@ def _allocate_recovery_buf_pool(
         if is_failed else None
     )
 
-    for buf in (
-        decoder_recv_bufs
-        + ([failed_recv_buf] if failed_recv_buf is not None else [])
-        + ([decoder_recovered_buf] if decoder_recovered_buf is not None else [])
-        + ([decoder_recovered_buf2] if decoder_recovered_buf2 is not None else [])
-        + ([failed_layer_buf] if failed_layer_buf is not None else [])
-    ):
+    bufs_to_register: List[torch.Tensor] = []
+    for recv_slot in decoder_recv_buf_slots:
+        bufs_to_register.extend(recv_slot)
+    bufs_to_register.extend(failed_recv_bufs)
+    bufs_to_register.extend(decoder_recovered_bufs)
+    bufs_to_register.extend(decoder_recovered_buf2s)
+    if failed_layer_buf is not None:
+        bufs_to_register.append(failed_layer_buf)
+
+    for buf in bufs_to_register:
         native.register_buffer(buf.data_ptr(), buf.numel())
 
     return _RecoveryBufPool(
         decoder_recv_bufs=decoder_recv_bufs,
+        decoder_recv_buf_slots=decoder_recv_buf_slots,
         failed_recv_buf=failed_recv_buf,
+        failed_recv_bufs=failed_recv_bufs,
         decoder_recovered_buf=decoder_recovered_buf,
+        decoder_recovered_bufs=decoder_recovered_bufs,
         decoder_recovered_buf2=decoder_recovered_buf2,
+        decoder_recovered_buf2s=decoder_recovered_buf2s,
         failed_layer_buf=failed_layer_buf,
         max_block_size=max_block_size,
+        concurrency=concurrency,
     )
 
 
@@ -1548,83 +1573,99 @@ def _submit_recovery_network(
 
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
 
-    native.reset_recovery_batch()
-    for stri_plan in data_plans:
-        sid = stri_plan['stripe_id']
-        helper_block_addr = 0
-        decoder_self_block_addr = 0
-        decoder_helper_recv_addrs: List[int] = []
-        decoder_recovered_addrs: List[int] = []
-        failed_recv_buf_addr = 0
-        failed_layer_buf_addr = 0
-        failed_layer_offset = 0
-        failed_ncopy = 0
-        store_to_layer_buf = False
+    wave_size = buf_pool.concurrency if buf_pool is not None else max(n, 1)
+    for wave_start in range(0, len(data_plans), wave_size):
+        wave_plans = data_plans[wave_start:wave_start + wave_size]
+        native.reset_recovery_batch()
+        for submit_idx, stri_plan in enumerate(wave_plans):
+            sid = stri_plan['stripe_id']
+            buf_slot = submit_idx
+            helper_block_addr = 0
+            decoder_self_block_addr = 0
+            decoder_helper_recv_addrs: List[int] = []
+            decoder_recovered_addrs: List[int] = []
+            failed_recv_buf_addr = 0
+            failed_layer_buf_addr = 0
+            failed_layer_offset = 0
+            failed_ncopy = 0
+            store_to_layer_buf = False
 
-        if my_node in stri_plan['helper_nodes']:
-            blk = my_blocks.get(sid)
-            if blk is not None:
-                helper_block_addr = blk.data_ptr()
+            if my_node in stri_plan['helper_nodes']:
+                blk = my_blocks.get(sid)
+                if blk is not None:
+                    helper_block_addr = blk.data_ptr()
 
-        if my_node == stri_plan['decoder_node']:
-            blk = my_blocks.get(sid)
-            if blk is not None:
-                decoder_self_block_addr = blk.data_ptr()
-            if buf_pool is not None:
-                for hi in range(len(stri_plan['helper_nodes'])):
-                    if hi < len(buf_pool.decoder_recv_bufs):
-                        rb = buf_pool.decoder_recv_bufs[hi][:layer_block_size]
-                        decoder_helper_recv_addrs.append(rb.data_ptr())
-                if buf_pool.decoder_recovered_buf is not None:
-                    decoder_recovered_addrs.append(
-                        buf_pool.decoder_recovered_buf[:layer_block_size].data_ptr()
+            if my_node == stri_plan['decoder_node']:
+                blk = my_blocks.get(sid)
+                if blk is not None:
+                    decoder_self_block_addr = blk.data_ptr()
+                if buf_pool is not None:
+                    recv_bufs = (
+                        buf_pool.decoder_recv_buf_slots[buf_slot]
+                        if buf_slot < len(buf_pool.decoder_recv_buf_slots)
+                        else buf_pool.decoder_recv_bufs
                     )
-                if stri_plan.get('dual_failure') and buf_pool.decoder_recovered_buf2 is not None:
-                    decoder_recovered_addrs.append(
-                        buf_pool.decoder_recovered_buf2[:layer_block_size].data_ptr()
+                    for hi in range(len(stri_plan['helper_nodes'])):
+                        if hi < len(recv_bufs):
+                            rb = recv_bufs[hi][:layer_block_size]
+                            decoder_helper_recv_addrs.append(rb.data_ptr())
+                    if buf_slot < len(buf_pool.decoder_recovered_bufs):
+                        rec_buf = buf_pool.decoder_recovered_bufs[buf_slot]
+                        decoder_recovered_addrs.append(
+                            rec_buf[:layer_block_size].data_ptr()
+                        )
+                    if (
+                        stri_plan.get('dual_failure')
+                        and buf_slot < len(buf_pool.decoder_recovered_buf2s)
+                    ):
+                        rec_buf2 = buf_pool.decoder_recovered_buf2s[buf_slot]
+                        decoder_recovered_addrs.append(
+                            rec_buf2[:layer_block_size].data_ptr()
+                        )
+
+            if _is_failed_in_recovery_plan(stri_plan, my_node):
+                if buf_pool is not None and buf_slot < len(buf_pool.failed_recv_bufs):
+                    failed_recv_buf_addr = (
+                        buf_pool.failed_recv_bufs[buf_slot][:layer_block_size].data_ptr()
+                    )
+                if layer_buf is not None:
+                    failed_layer_buf_addr = layer_buf.data_ptr()
+
+                if stri_plan.get('dual_failure'):
+                    original_role = None
+                    for target in stri_plan['failed_targets']:
+                        if target['failed_node'] == my_node:
+                            original_role = target['original_role']
+                            break
+                else:
+                    original_role = stri_plan.get('original_role')
+
+                if layer_buf is not None and original_role == int(StripeRole.SOURCE):
+                    store_to_layer_buf = True
+                    blk_idx = src_block_per_node[my_node]
+                    src_block_per_node[my_node] += 1
+                    failed_layer_offset = blk_idx * layer_block_size
+                    failed_ncopy = min(
+                        layer_block_size,
+                        max(0, layer_total_bytes - failed_layer_offset),
                     )
 
-        if _is_failed_in_recovery_plan(stri_plan, my_node):
-            if buf_pool is not None and buf_pool.failed_recv_buf is not None:
-                failed_recv_buf_addr = buf_pool.failed_recv_buf[:layer_block_size].data_ptr()
-            if layer_buf is not None:
-                failed_layer_buf_addr = layer_buf.data_ptr()
+            native.submit_recovery_stripe(
+                sid,
+                layer_block_size,
+                helper_block_addr,
+                decoder_self_block_addr,
+                decoder_helper_recv_addrs,
+                decoder_recovered_addrs,
+                failed_recv_buf_addr,
+                failed_layer_buf_addr,
+                failed_layer_offset,
+                failed_ncopy,
+                store_to_layer_buf,
+            )
 
-            if stri_plan.get('dual_failure'):
-                original_role = None
-                for target in stri_plan['failed_targets']:
-                    if target['failed_node'] == my_node:
-                        original_role = target['original_role']
-                        break
-            else:
-                original_role = stri_plan.get('original_role')
-
-            if layer_buf is not None and original_role == int(StripeRole.SOURCE):
-                store_to_layer_buf = True
-                blk_idx = src_block_per_node[my_node]
-                src_block_per_node[my_node] += 1
-                failed_layer_offset = blk_idx * layer_block_size
-                failed_ncopy = min(
-                    layer_block_size,
-                    max(0, layer_total_bytes - failed_layer_offset),
-                )
-
-        native.submit_recovery_stripe(
-            sid,
-            layer_block_size,
-            helper_block_addr,
-            decoder_self_block_addr,
-            decoder_helper_recv_addrs,
-            decoder_recovered_addrs,
-            failed_recv_buf_addr,
-            failed_layer_buf_addr,
-            failed_layer_offset,
-            failed_ncopy,
-            store_to_layer_buf,
-        )
-
-    native.submit_recovery_sentinel()
-    native.wait_recovery_batch()
+        native.submit_recovery_sentinel()
+        native.wait_recovery_batch()
 
     if is_failed:
         n_stored = src_block_per_node.get(my_node, 0)
@@ -1721,8 +1762,6 @@ def recover_frcheck_legacy_hardware(
         'disk_io': 0.0,
         'network_encode': 0.0,
         'rebuild_sd': 0.0,
-        'rdma_xfer': 0.0,
-        'decode': 0.0,
     }
     t_prep = time.time()
 
@@ -1925,8 +1964,6 @@ def recover_frcheck_legacy_hardware(
             n, rank, preloaded_blocks=preloaded.get(encode_iter, {}),
             buf_pool=buf_pool,
         )
-        timings['rdma_xfer'] += layer_timing.get('rdma_xfer_s', 0.0)
-        timings['decode'] += layer_timing.get('decode_s', 0.0)
 
         if is_failed and layer_buf is not None and full_buf is not None:
             copied = _map_layer_buf_to_full_buf(
@@ -2191,8 +2228,7 @@ def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             "FRCheck legacy load timing (HW): "
             "total=%(total).2fs prep=%(prep).2fs main_io=%(main_io).2fs "
             "disk_io=%(disk_io).2fs network_encode=%(network_encode).2fs "
-            "rebuild_sd=%(rebuild_sd).2fs rdma_xfer=%(rdma_xfer).2fs "
-            "decode=%(decode).2fs (prep excluded from total)",
+            "rebuild_sd=%(rebuild_sd).2fs (prep excluded from total)",
             _t_fr,
         )
         return result

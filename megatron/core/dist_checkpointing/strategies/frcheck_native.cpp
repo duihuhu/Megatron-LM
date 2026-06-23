@@ -725,6 +725,8 @@ public:
             return;
         }
 
+        std::lock_guard<std::mutex> lk(decode_mtx_);
+
         // Build decode tables for this stripe
         init_decode_tables_(k, survivor_positions, lost_position);
         if (!decode_tbls_) {
@@ -936,15 +938,18 @@ public:
         RecoveryFailedTask f_sentinel{};
         if (wait_helper_) {
             std::lock_guard<std::mutex> lk(helper_mtx_);
-            helper_q_.push(h_sentinel);
+            for (size_t i = 0; i < helper_threads_.size(); ++i)
+                helper_q_.push(h_sentinel);
         }
         if (wait_decoder_) {
             std::lock_guard<std::mutex> lk(decoder_mtx_);
-            decoder_q_.push(d_sentinel);
+            for (size_t i = 0; i < decoder_threads_.size(); ++i)
+                decoder_q_.push(d_sentinel);
         }
         if (wait_failed_) {
             std::lock_guard<std::mutex> lk(failed_mtx_);
-            failed_q_.push(f_sentinel);
+            for (size_t i = 0; i < failed_threads_.size(); ++i)
+                failed_q_.push(f_sentinel);
         }
         helper_cv_.notify_all();
         decoder_cv_.notify_all();
@@ -2341,7 +2346,7 @@ public:
                 helper_q_.pop();
             }
             if (is_recovery_helper_sentinel_(task)) {
-                helper_sentinel_received_ = true;
+                helper_sentinels_received_.fetch_add(1, std::memory_order_acq_rel);
                 maybe_complete_helper_after_sentinel_();
                 continue;
             }
@@ -2379,7 +2384,7 @@ public:
                 decoder_q_.pop();
             }
             if (is_recovery_decoder_sentinel_(task)) {
-                decoder_sentinel_received_ = true;
+                decoder_sentinels_received_.fetch_add(1, std::memory_order_acq_rel);
                 maybe_complete_decoder_after_sentinel_();
                 continue;
             }
@@ -2417,7 +2422,7 @@ public:
                 failed_q_.pop();
             }
             if (is_recovery_failed_sentinel_(task)) {
-                failed_sentinel_received_ = true;
+                failed_sentinels_received_.fetch_add(1, std::memory_order_acq_rel);
                 maybe_complete_failed_after_sentinel_();
                 continue;
             }
@@ -2445,18 +2450,27 @@ public:
     void ensure_recovery_workers_() {
         if (recovery_workers_inited_) return;
         recovery_workers_stop_ = false;
-        helper_thread_ = std::thread(&FRCheckNative::helper_worker_loop_, this);
-        decoder_thread_ = std::thread(&FRCheckNative::decoder_worker_loop_, this);
-        failed_thread_ = std::thread(&FRCheckNative::failed_worker_loop_, this);
+        int nw = std::max(1, n_);
+        helper_threads_.reserve((size_t)nw);
+        decoder_threads_.reserve((size_t)nw);
+        failed_threads_.reserve((size_t)nw);
+        for (int w = 0; w < nw; ++w) {
+            helper_threads_.emplace_back(&FRCheckNative::helper_worker_loop_, this);
+            decoder_threads_.emplace_back(&FRCheckNative::decoder_worker_loop_, this);
+            failed_threads_.emplace_back(&FRCheckNative::failed_worker_loop_, this);
+        }
         recovery_workers_inited_ = true;
-        std::cout << "FRCheck: recovery workers started (helper/decoder/failed x1)"
-                  << std::endl;
+        std::cout << "FRCheck: recovery workers started (helper/decoder/failed x"
+                  << nw << ")" << std::endl;
     }
 
     void recovery_workers_join_() {
-        if (helper_thread_.joinable()) helper_thread_.join();
-        if (decoder_thread_.joinable()) decoder_thread_.join();
-        if (failed_thread_.joinable()) failed_thread_.join();
+        for (auto& t : helper_threads_) if (t.joinable()) t.join();
+        for (auto& t : decoder_threads_) if (t.joinable()) t.join();
+        for (auto& t : failed_threads_) if (t.joinable()) t.join();
+        helper_threads_.clear();
+        decoder_threads_.clear();
+        failed_threads_.clear();
         recovery_workers_inited_ = false;
     }
 
@@ -2477,34 +2491,34 @@ public:
     }
 
     void maybe_complete_helper_after_sentinel_() {
-        if (!helper_sentinel_received_) return;
+        if (helper_sentinels_received_.load(std::memory_order_acquire)
+            < (int)helper_threads_.size()) return;
         if (helper_active_.load(std::memory_order_acquire) != 0) return;
         std::lock_guard<std::mutex> lk(helper_mtx_);
         if (helper_q_.empty()) {
             helper_completed_ = true;
-            helper_sentinel_received_ = false;
             maybe_complete_recovery_batch_();
         }
     }
 
     void maybe_complete_decoder_after_sentinel_() {
-        if (!decoder_sentinel_received_) return;
+        if (decoder_sentinels_received_.load(std::memory_order_acquire)
+            < (int)decoder_threads_.size()) return;
         if (decoder_active_.load(std::memory_order_acquire) != 0) return;
         std::lock_guard<std::mutex> lk(decoder_mtx_);
         if (decoder_q_.empty()) {
             decoder_completed_ = true;
-            decoder_sentinel_received_ = false;
             maybe_complete_recovery_batch_();
         }
     }
 
     void maybe_complete_failed_after_sentinel_() {
-        if (!failed_sentinel_received_) return;
+        if (failed_sentinels_received_.load(std::memory_order_acquire)
+            < (int)failed_threads_.size()) return;
         if (failed_active_.load(std::memory_order_acquire) != 0) return;
         std::lock_guard<std::mutex> lk(failed_mtx_);
         if (failed_q_.empty()) {
             failed_completed_ = true;
-            failed_sentinel_received_ = false;
             maybe_complete_recovery_batch_();
         }
     }
@@ -2521,9 +2535,9 @@ public:
         helper_completed_ = false;
         decoder_completed_ = false;
         failed_completed_ = false;
-        helper_sentinel_received_ = false;
-        decoder_sentinel_received_ = false;
-        failed_sentinel_received_ = false;
+        helper_sentinels_received_.store(0, std::memory_order_release);
+        decoder_sentinels_received_.store(0, std::memory_order_release);
+        failed_sentinels_received_.store(0, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(helper_mtx_);
             while (!helper_q_.empty()) helper_q_.pop();
@@ -2719,6 +2733,7 @@ private:
     unsigned char* a_mat_ = nullptr;  // ISA-L RS generator matrix (rows_ × k_)
     unsigned char* g_tbls_ = nullptr; // ISA-L RS encode tables (32*k_*rows_)
     unsigned char* decode_tbls_ = nullptr; // ISA-L RS decode tables (for recovery)
+    std::mutex decode_mtx_;
     std::atomic<bool> stopped_;
     std::atomic<bool> rdma_cleaned_up_{false};
 
@@ -2763,24 +2778,24 @@ private:
     std::queue<RecoveryHelperTask> helper_q_;
     std::mutex helper_mtx_;
     std::condition_variable helper_cv_;
-    bool helper_sentinel_received_ = false;
+    std::atomic<int> helper_sentinels_received_{0};
     bool helper_completed_ = false;
     bool wait_helper_ = false;
     std::queue<RecoveryDecoderTask> decoder_q_;
     std::mutex decoder_mtx_;
     std::condition_variable decoder_cv_;
-    bool decoder_sentinel_received_ = false;
+    std::atomic<int> decoder_sentinels_received_{0};
     bool decoder_completed_ = false;
     bool wait_decoder_ = false;
     std::queue<RecoveryFailedTask> failed_q_;
     std::mutex failed_mtx_;
     std::condition_variable failed_cv_;
-    bool failed_sentinel_received_ = false;
+    std::atomic<int> failed_sentinels_received_{0};
     bool failed_completed_ = false;
     bool wait_failed_ = false;
-    std::thread helper_thread_;
-    std::thread decoder_thread_;
-    std::thread failed_thread_;
+    std::vector<std::thread> helper_threads_;
+    std::vector<std::thread> decoder_threads_;
+    std::vector<std::thread> failed_threads_;
     std::atomic<int> pending_recovery_chunks_{0};
     std::atomic<int> helper_active_{0};
     std::atomic<int> decoder_active_{0};

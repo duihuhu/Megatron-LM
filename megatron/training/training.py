@@ -1358,6 +1358,9 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
+        if getattr(args, "use_frcheck", False):
+            from megatron.training.frcheck_legacy import frcheck_log_layerwise_runtime_summary
+            frcheck_log_layerwise_runtime_summary("after_load_checkpoint")
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
@@ -1558,6 +1561,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    if getattr(args, "use_frcheck", False):
+        try:
+            from megatron.training.frcheck_legacy import frcheck_wait_for_optimizer_state
+            frcheck_wait_for_optimizer_state(optimizer)
+        except ImportError:
+            pass
     # Check if layer-wise update is enabled
     use_layer_wise_update = (
         hasattr(args, 'layer_wise_optimizer_update') 

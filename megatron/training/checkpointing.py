@@ -1948,6 +1948,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
+    frcheck_runtime_summary = None
+    if ckpt_type == CheckpointType.LEGACY and getattr(args, "use_frcheck", False):
+        from .frcheck_legacy import (
+            get_frcheck_layerwise_runtime_summary,
+            install_frcheck_layerwise_runtime_from_state_dict,
+        )
+        install_frcheck_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
+        frcheck_runtime_summary = get_frcheck_layerwise_runtime_summary()
+
     # Convert to regular torch tensor to DTensor.
     if ckpt_type == CheckpointType.LEGACY and args.ckpt_format == "torch_dcp":
         dtensor_state_dict = _to_dtensor(ddp_model, state_dict["model"])
@@ -2056,6 +2065,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         f"[rank {rank}] load only model state before barrier time: "
         f"{model_sync_end - load_model_start_time:.4f}s"
     )
+    if frcheck_runtime_summary is not None:
+        logger.info(
+            f"[rank {rank}] FRCheck layerwise runtime after model load: "
+            f"{frcheck_runtime_summary}"
+        )
+        from .frcheck_legacy import frcheck_log_layerwise_runtime_summary
+        frcheck_log_layerwise_runtime_summary("after_model_load")
     torch.distributed.barrier()
     load_model_end_time = time()
     logger.info(f"load only model state time: {load_model_end_time - load_model_start_time:.4f}s")
@@ -2063,6 +2079,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
+    if (
+        frcheck_runtime_summary is not None
+        and checkpoint_version < 2.0
+    ):
+        from .frcheck_legacy import frcheck_materialize_all_layers
+        frcheck_materialize_all_layers()
     fix_query_key_value_ordering(model, checkpoint_version)
 
     def collect_tensor_stats(obj):
@@ -2096,6 +2118,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         return tensor_count, tensor_bytes, len(storage_ptrs), non_contig_count, pinned_count
 
     # Optimizer.
+    frcheck_deferred_optimizer = False
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
@@ -2114,22 +2137,32 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 #     f"non_contig={optim_non_contig_count} "
                 #     f"pinned={optim_pinned_count}"
                 )
-                optim_submit_start = time()
-                optimizer.load_state_dict(state_dict['optimizer'])
-                optim_submit_end = time()
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                optim_sync_end = time()
-                logger.info(
-                    f"[rank {rank}] optimizer load submit={optim_submit_end - optim_submit_start:.4f}s "
-                    f"cuda_sync={optim_sync_end - optim_submit_end:.4f}s "
-                    f"total={optim_sync_end - optim_submit_start:.4f}s"
-                )
+                if frcheck_runtime_summary is not None:
+                    from .frcheck_legacy import frcheck_register_pending_optimizer_state
+                    frcheck_deferred_optimizer = frcheck_register_pending_optimizer_state(
+                        state_dict
+                    )
+                if not frcheck_deferred_optimizer:
+                    optim_submit_start = time()
+                    optimizer.load_state_dict(state_dict['optimizer'])
+                    optim_submit_end = time()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    optim_sync_end = time()
+                    logger.info(
+                        f"[rank {rank}] optimizer load submit={optim_submit_end - optim_submit_start:.4f}s "
+                        f"cuda_sync={optim_sync_end - optim_submit_end:.4f}s "
+                        f"total={optim_sync_end - optim_submit_start:.4f}s"
+                    )
+                else:
+                    logger.info(
+                        f"[rank {rank}] FRCheck optimizer load deferred until optimizer step"
+                    )
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
             is_torch_dist = ckpt_format == "torch_dist"
-            if args.use_distributed_optimizer and not is_torch_dist:
+            if args.use_distributed_optimizer and not is_torch_dist and not frcheck_deferred_optimizer:
                 # NOTE: this is a manual read of the tracker file.
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_torch_dist

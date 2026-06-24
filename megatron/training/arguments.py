@@ -2386,6 +2386,10 @@ def _add_checkpointing_args(parser):
                             'Async P2 is paused during PP forward/backward to avoid '
                             'network contention. '
                             'When unset (default), save is fully synchronous as before.')
+    group.add_argument('--frcheck-async-recovery-forward', action='store_true',
+                       help='Experimental: overlap FRCheck hardware recovery with '
+                            'forward by recovering transformer layers in a '
+                            'background worker.')
     group.add_argument('--frcheck-debug', action='store_true',
                        help='Enable detailed size/encoding debug logging for FRCheck operations.')
     group.add_argument('--frcheck-distribute-common', action='store_true',

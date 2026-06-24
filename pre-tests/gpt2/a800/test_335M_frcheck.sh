@@ -84,6 +84,9 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
+            --frcheck-async-recovery-forward
+            #--no-load-optim
+            #--no-load-rng
             --frcheck-failed-ranks "0"
         )
         ;;
@@ -161,7 +164,7 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
     --use-frcheck
-    #--frcheck-distribute-common
+    --frcheck-distribute-common
     #--frcheck-debug
     --frcheck-n 8
     #--use-frcheck-software-failure 

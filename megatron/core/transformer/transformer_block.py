@@ -65,6 +65,15 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _frcheck_wait_for_layer(layer_number: int) -> None:
+    """Best-effort hook for FRCheck layerwise recovery readiness."""
+    try:
+        from megatron.training.frcheck_legacy import frcheck_wait_and_materialize_layer
+    except Exception:
+        return
+    frcheck_wait_and_materialize_layer(layer_number - 1)
+
+
 def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
     """
     Determine the number of transformer layers to build for the current pipeline stage.
@@ -382,6 +391,7 @@ class TransformerBlock(MegatronModule):
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
+                    _frcheck_wait_for_layer(layer.layer_number)
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
@@ -575,6 +585,7 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
+                    _frcheck_wait_for_layer(layer.layer_number)
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context

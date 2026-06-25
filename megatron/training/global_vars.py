@@ -5,6 +5,7 @@
 import os
 import sys
 import torch
+import time
 
 from megatron.core import Timers
 from megatron.core.config import set_experimental_flag
@@ -22,6 +23,7 @@ _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
+_GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
 
 def get_args():
     """Return arguments."""
@@ -71,6 +73,34 @@ def get_energy_monitor():
 def get_signal_handler():
     _ensure_var_is_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
     return _GLOBAL_SIGNAL_HANDLER
+
+
+def start_recovery_to_forward_timer(scheme: str, phase: str = "network_decode") -> None:
+    """Start a one-shot timer that ends after the next forward-backward call."""
+    global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    _GLOBAL_RECOVERY_TO_FORWARD_TIMER = {
+        "scheme": scheme,
+        "phase": phase,
+        "rank": rank,
+        "start": time.time(),
+    }
+
+
+def finish_recovery_to_forward_timer() -> None:
+    """Log elapsed time from recovery network/decode start to next forward end."""
+    global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
+    timer = _GLOBAL_RECOVERY_TO_FORWARD_TIMER
+    if timer is None:
+        return
+    _GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
+    elapsed = time.time() - timer["start"]
+    print(
+        f"{timer['scheme']} recovery-to-forward timing: "
+        f"rank={timer['rank']} phase={timer['phase']} "
+        f"to_next_forward_end={elapsed:.4f}s",
+        flush=True,
+    )
 
 
 def _set_signal_handler():
@@ -128,6 +158,7 @@ def unset_global_variables():
     global _GLOBAL_TIMERS
     global _GLOBAL_ENERGY_MONITOR
     global _GLOBAL_SIGNAL_HANDLER
+    global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
 
     _GLOBAL_ARGS = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
@@ -139,6 +170,7 @@ def unset_global_variables():
     _GLOBAL_TIMERS = None
     _GLOBAL_ENERGY_MONITOR = None
     _GLOBAL_SIGNAL_HANDLER = None
+    _GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
 
     unset_num_microbatches_calculator()
 

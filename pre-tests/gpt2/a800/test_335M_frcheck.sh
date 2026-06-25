@@ -64,12 +64,24 @@ DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
-
 MODE=save
 if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
     MODE="$1"
     shift
 fi
+
+LATEST_ITER=1
+if [[ "$MODE" == "hardware" || "$MODE" == "hardware2" ]]; then
+    if [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+        LATEST_ITER="$1"
+        shift
+    fi
+    # Update latest_checkpointed_iteration.txt in the checkpoint path
+    LATEST_ITER_FILE="$CHECKPOINT_PATH/latest_checkpointed_iteration.txt"
+    mkdir -p "$CHECKPOINT_PATH"
+    echo "$LATEST_ITER" > "$LATEST_ITER_FILE"
+fi
+
 ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 case "$MODE" in

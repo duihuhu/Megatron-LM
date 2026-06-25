@@ -47,7 +47,7 @@ export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
 # export GEMINI_REPLICAS_BASE_PORT=12345
 
 MASTER_PORT=6000
-NNODES=4
+NNODES=8
 
 # ---- 节点 rank 解析（第一个参数） ----
 NODE_RANK=0
@@ -94,6 +94,19 @@ if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
     MODE="$1"
     shift
 fi
+
+LATEST_ITER=1
+if [[ "$MODE" == "hardware" || "$MODE" == "hardware2" ]]; then
+    if [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+        LATEST_ITER="$1"
+        shift
+    fi
+    # Update latest_checkpointed_iteration.txt in the checkpoint path
+    LATEST_ITER_FILE="$CHECKPOINT_PATH/latest_checkpointed_iteration.txt"
+    mkdir -p "$CHECKPOINT_PATH"
+    echo "$LATEST_ITER" > "$LATEST_ITER_FILE"
+fi
+
 ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 case "$MODE" in
@@ -171,7 +184,7 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 4
+    --pipeline-model-parallel-size 8
 )
 
 # =============================================================================
@@ -191,7 +204,7 @@ EVAL_AND_LOGGING_ARGS=(
     # 必选：启用 Gemini Replicas torch legacy checkpoint
     # ---------------------------------------------------------------------------
     # 启用 Gemini Replicas（替代原有的 --use-gemini，后者是两副本 EC 风格配对）
-     --use-gemini-replicas
+    --use-gemini-replicas
     # 启用优化路径：使用连续 CPU buffer + C++ ASIO/RDMA 网络传输，跳过 torch.save 序列化开销
     --use-gemini-replicas-optimized
 
@@ -205,7 +218,7 @@ EVAL_AND_LOGGING_ARGS=(
     # ---------------------------------------------------------------------------
     # 分组大小：将 world 划分为独立组，副本仅在组内轮询
     # ---------------------------------------------------------------------------
-    --gemini-replicas-group-size 4   # 默认 None（全局轮询，不做分组）
+    --gemini-replicas-group-size 8  # 默认 None（全局轮询，不做分组）
                                         # 设 8 则每 8 个 rank 一组，每组独立
                                         # 必须能被 world_size 整除
                                         # 独立于节点数和每节点 rank 数，但数学上要求

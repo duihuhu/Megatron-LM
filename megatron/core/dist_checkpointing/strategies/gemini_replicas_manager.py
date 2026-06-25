@@ -421,6 +421,8 @@ class GeminiReplicasManager:
                 logger.warning("Gemini Replicas: Distributed environment not initialized, skipping initialization")
                 return
             
+            self._prepare_native_reinit()
+
             # Initialize Gemini Replicas C++ module
             self._init_gemini_replicas_native()
             
@@ -428,6 +430,16 @@ class GeminiReplicasManager:
             logger.error(f"Gemini Replicas: Failed to initialize: {e}")
             self._gemini_replicas_native = None
             raise
+
+    def _prepare_native_reinit(self):
+        """Clear stale native state before binding a fresh listener."""
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logger.debug(f"Gemini Replicas: [Rank {rank}] Preparing native reinit")
+        self._stop_native_gracefully()
+        self.registered_buffers.clear()
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
     
     def _init_gemini_replicas_native(self):
         """Initialize Gemini Replicas C++ native module with ASIO or RDMA."""

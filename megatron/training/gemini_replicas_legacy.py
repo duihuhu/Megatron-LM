@@ -1814,6 +1814,11 @@ def load_gemini_replicas_legacy_checkpoint(
 
         # === timing: network/encode (pure RDMA/ASIO tensor transfer only) ===
         _t0 = time.time()
+        try:
+            from megatron.training.global_vars import start_recovery_to_forward_timer
+            start_recovery_to_forward_timer("Gemini Replicas", "network_transfer")
+        except Exception:
+            pass
         recovered_buffer = _hw_recovery_transfer(
             manager, checkpoint_dir, rank, world_size, failed,
         )

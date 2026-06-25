@@ -129,6 +129,7 @@ from .global_vars import (
     get_wandb_writer,
     get_one_logger,
     get_energy_monitor,
+    finish_recovery_to_forward_timer,
 )
 from . import one_logger_utils
 
@@ -1533,9 +1534,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 if isinstance(optim_instance, DistributedOptimizer):
                     optim_instance._copy_main_params_to_param_buffer()
 
+        @functools.wraps(forward_step_func)
+        def forward_step_func_with_recovery_timing(*args, **kwargs):
+            result = forward_step_func(*args, **kwargs)
+            finish_recovery_to_forward_timer()
+            return result
+
         # Forward pass.
         losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
+            forward_step_func=forward_step_func_with_recovery_timing,
             data_iterator=data_iterator,
             model=model,
             num_microbatches=get_num_microbatches(),

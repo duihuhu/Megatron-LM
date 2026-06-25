@@ -1457,9 +1457,16 @@ private:
             throw std::runtime_error("Failed to allocate protection domain");
         }
         
-        // Create completion queues
-        send_cq_ = ibv_create_cq(context_, MAX_WR * target_ranks_.size(), nullptr, nullptr, 0);
-        recv_cq_ = ibv_create_cq(context_, MAX_WR * expected_recv_connections_, nullptr, nullptr, 0);
+        // Recovery uses sparse directed connections, so a rank may be send-only
+        // or recv-only.  libibverbs rejects CQ depth 0, so keep idle CQs valid.
+        const int send_cq_depth = static_cast<int>(
+            std::max<size_t>(1, MAX_WR * target_ranks_.size())
+        );
+        const int recv_cq_depth = static_cast<int>(
+            std::max<size_t>(1, MAX_WR * static_cast<size_t>(expected_recv_connections_))
+        );
+        send_cq_ = ibv_create_cq(context_, send_cq_depth, nullptr, nullptr, 0);
+        recv_cq_ = ibv_create_cq(context_, recv_cq_depth, nullptr, nullptr, 0);
         if (!send_cq_ || !recv_cq_) {
             throw std::runtime_error("Failed to create completion queues");
         }

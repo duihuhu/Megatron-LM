@@ -28,6 +28,7 @@ from megatron.core.fp8_utils import is_float8tensor, dequantize_fp8_tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from .async_utils import schedule_async_save, is_empty_async_queue
 from .global_vars import get_args
+from .global_vars import finish_recovery_to_forward_timer
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
@@ -1949,13 +1950,19 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
     frcheck_runtime_summary = None
+    frcheck_skipped_model_placeholders = False
     if ckpt_type == CheckpointType.LEGACY and getattr(args, "use_frcheck", False):
         from .frcheck_legacy import (
+            frcheck_filter_layerwise_model_placeholders,
             get_frcheck_layerwise_runtime_summary,
             install_frcheck_layerwise_runtime_from_state_dict,
         )
         install_frcheck_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
+        removed_placeholders, _ = frcheck_filter_layerwise_model_placeholders(state_dict)
         frcheck_runtime_summary = get_frcheck_layerwise_runtime_summary()
+        frcheck_skipped_model_placeholders = (
+            removed_placeholders > 0 or frcheck_runtime_summary is not None
+        )
 
     # Convert to regular torch tensor to DTensor.
     if ckpt_type == CheckpointType.LEGACY and args.ckpt_format == "torch_dcp":
@@ -2010,6 +2017,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     load_model_start_time = time()
     load_model_start = time()
     strict = False if args.retro_add_retriever else strict
+    if frcheck_skipped_model_placeholders:
+        strict = False
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     # model_sd_for_stats = state_dict.get('model')
     # if isinstance(model_sd_for_stats, dict):
@@ -2056,6 +2065,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     model_sync_end = time()
+    if getattr(args, "use_gemini_replicas", False):
+        finish_recovery_to_forward_timer()
     logger.info(
         f"[rank {rank}] model load submit={model_submit_end - model_submit_start:.4f}s "
         f"cuda_sync={model_sync_end - model_submit_end:.4f}s "
@@ -2143,6 +2154,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                         state_dict
                     )
                 if not frcheck_deferred_optimizer:
+                    if getattr(args, "use_frcheck", False) and 'optimizer' in state_dict:
+                        from .frcheck_legacy import frcheck_normalize_optimizer_state_param_keys
+                        frcheck_normalize_optimizer_state_param_keys(state_dict['optimizer'])
                     optim_submit_start = time()
                     optimizer.load_state_dict(state_dict['optimizer'])
                     optim_submit_end = time()

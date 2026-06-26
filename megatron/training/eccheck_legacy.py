@@ -1589,7 +1589,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         if recovered_buffer is not None:
             manager.register_buffer(recovered_buffer)
 
-    # sync all ranks before timing
+    # Sync all ranks after setup so network timing excludes setup skew.
     barrier_s = _timed_barrier()
 
     # === timing: network/encode (C++ P2P or XOR pipeline, excluding setup/copy) ===
@@ -1615,10 +1615,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             registry=registry,
         )
 
-    barrier_s += _timed_barrier()
 
     if two_failures:
-        _mode = "2F"
+        _mode = "HW2"
     elif sw_failure:
         _mode = "SW"
     else:
@@ -1638,23 +1637,28 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     )
     rebuild_sd = time.time() - t_rebuild
 
-    if world_size > 1 and torch.distributed.is_initialized():
-        barrier_s += _timed_barrier()
-
-    summary = _timing_max_dict({
-        "e2e_s": network_encode + rebuild_sd + barrier_s,
-        "network_encode_s": network_encode,
-        "rebuild_sd_s": rebuild_sd,
-        "barrier_s": barrier_s,
-    })
-    logger.info(
-        "ECCHECK load timing (%s): e2e_s=%.2fs network_encode_s=%.2fs "
+    timings = {
+        "total": network_encode + rebuild_sd,
+        "network_encode": network_encode,
+        "rebuild_sd": rebuild_sd,
+        "barrier": barrier_s,
+    }
+    from megatron.training.global_vars import set_ft_load_timing_context
+    set_ft_load_timing_context("ECCHECK", _mode, timings)
+    logger.debug(
+        "ECCHECK load timing (%s local): e2e_s=%.2fs network_encode_s=%.2fs "
         "rebuild_sd_s=%.2fs barrier_s=%.2fs",
-        _mode, summary["e2e_s"], summary["network_encode_s"],
-        summary["rebuild_sd_s"], summary["barrier_s"],
+        _mode, timings["total"], timings["network_encode"],
+        timings["rebuild_sd"], timings["barrier"],
     )
 
     # Stop C++ load workers so they don't interfere with subsequent training.
+    # Synchronize teardown so early ranks do not release RDMA resources while peers
+    # are still draining their final load P2P completions.
+    if world_size > 1 and torch.distributed.is_initialized():
+        logger.info(f"ECCHECK legacy: rank {rank} entering pre-cleanup barrier")
+        torch.distributed.barrier()
+        logger.info(f"ECCHECK legacy: rank {rank} leaving pre-cleanup barrier")
     # The singleton manager will be reinitialized on the next save.
     logger.debug(f"ECCHECK legacy: cleaning up C++ module after recovery (rank {rank})")
     manager.cleanup()

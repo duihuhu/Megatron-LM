@@ -13,7 +13,6 @@ import struct
 from logging import getLogger
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 
 logger = getLogger(__name__)
@@ -159,6 +158,18 @@ def pin_payload_tensor_buffer_if_available(payload: Dict[str, Any]) -> Dict[str,
         )
     return payload
 
+
+def _read_uint8_tensor(f: BinaryIO, size: int) -> torch.Tensor:
+    """Read exactly *size* bytes into a writable CPU uint8 tensor."""
+    tensor = torch.empty(size, dtype=torch.uint8)
+    if size == 0:
+        return tensor
+    view = memoryview(tensor.numpy())
+    n_read = f.readinto(view)
+    if n_read != size:
+        raise EOFError(f"Expected {size} bytes, read {n_read} bytes")
+    return tensor
+
 def _peek_magic(path: str) -> bytes:
     """Return the first 4 bytes of *path* without consuming the file."""
     with open(path, "rb") as f:
@@ -195,9 +206,7 @@ def read_raw_checkpoint(
         tensor_infos = pickle.loads(f.read(meta2_len))
         extra = pickle.loads(f.read(extra_len)) if extra_len else {}
 
-        # Read directly into a torch tensor (zero-copy from read buffer)
-        raw = f.read(data_len)
-        tensor = torch.from_numpy(np.frombuffer(raw, dtype=np.uint8))
+        tensor = _read_uint8_tensor(f, data_len)
         if pin_tensor_buffer:
             tensor = pin_uint8_tensor_if_available(tensor)
 
@@ -250,8 +259,7 @@ def read_raw_block(
                 f"Unexpected magic {magic!r} (expected {expected_magic!r}) in {path}"
             )
         size = struct.unpack("<Q", f.read(8))[0]
-        raw = f.read(size)
-    tensor = torch.from_numpy(np.frombuffer(raw, dtype=np.uint8))
+        tensor = _read_uint8_tensor(f, size)
     if pin_tensor:
         tensor = pin_uint8_tensor_if_available(tensor)
     return tensor

@@ -53,11 +53,20 @@ while [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; do
     shift
 done
 
+# If no GPU IDs are provided, use all GPUs available on the node by default
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
-    echo "Error: At least one GPU id must be specified."
-    echo "Usage: $0 <node_rank> <gpu_id_0> [gpu_id_1 ...] [save|software|hardware|hardware2] [additional_args...]"
-    exit 1
+    if command -v nvidia-smi > /dev/null 2>&1; then
+        # Try to get all GPU indices using nvidia-smi, fallback to 0 if nvidia-smi fails
+        mapfile -t GPU_IDS < <(nvidia-smi --query-gpu=index --format=csv,noheader)
+        if [ "${#GPU_IDS[@]}" -eq 0 ]; then
+            GPU_IDS=(0)
+        fi
+    else
+        # If nvidia-smi does not exist, fallback to single GPU 0
+        GPU_IDS=(0)
+    fi
 fi
+
 
 # ---- mode parsing (save | software | hardware, after GPU IDs) ----
 MODE=save

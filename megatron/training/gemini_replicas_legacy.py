@@ -1794,13 +1794,14 @@ def load_gemini_replicas_legacy_checkpoint(
             flat_key_roots=_infer_flat_key_roots(main_payload),
         )
         _t['rebuild_sd'] = time.time() - _t0
-        _t['barrier'] = _timed_barrier()
-        _t['total'] = _t['network_encode'] + _t['rebuild_sd'] + _t['barrier']
-        summary = _timing_max_dict(_t)
-        logger.info(
-            "GEMINI load timing (SW): e2e_s=%(total).2fs "
+        _t['barrier'] = 0.0
+        _t['total'] = _t['network_encode'] + _t['rebuild_sd']
+        from megatron.training.global_vars import set_ft_load_timing_context
+        set_ft_load_timing_context("GEMINI", "SW", _t)
+        logger.debug(
+            "GEMINI load timing (SW local): e2e_s=%(total).2fs "
             "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
-            "barrier_s=%(barrier).2fs", summary
+            "barrier_s=%(barrier).2fs", _t
         )
         return state_dict
 
@@ -1815,12 +1816,14 @@ def load_gemini_replicas_legacy_checkpoint(
             flat_key_roots=_infer_flat_key_roots(main_payload),
         )
         _t['rebuild_sd'] = time.time() - _t0
+        _t['barrier'] = 0.0
         _t['total'] = _t['network_encode'] + _t['rebuild_sd']
-        summary = _timing_max_dict({**_t, "barrier": 0.0})
-        logger.info(
-            "GEMINI load timing (normal): e2e_s=%(total).2fs "
+        from megatron.training.global_vars import set_ft_load_timing_context
+        set_ft_load_timing_context("GEMINI", "normal", _t)
+        logger.debug(
+            "GEMINI load timing (normal local): e2e_s=%(total).2fs "
             "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
-            "barrier_s=%(barrier).2fs", summary
+            "barrier_s=%(barrier).2fs", _t
         )
     else:
         # ---- Hardware recovery ----
@@ -1903,11 +1906,8 @@ def load_gemini_replicas_legacy_checkpoint(
             failed_count=len(failed), healthy_count=len(healthy),
         )
 
-        # sync all ranks before timed RDMA transfer
+        # Sync all ranks after setup so network timing excludes setup skew.
         barrier_s = _timed_barrier()
-        _gemini_recovery_profile(
-            recovery_role, "pre_network_barrier_done", elapsed_s=barrier_s
-        )
 
         # === timing: network/encode (pure RDMA/ASIO tensor transfer only) ===
         _t0 = time.time()
@@ -1936,12 +1936,7 @@ def load_gemini_replicas_legacy_checkpoint(
         except Exception:
             pass
 
-        # sync all ranks before rebuild timing
-        rebuild_barrier_s = _timed_barrier()
-        barrier_s += rebuild_barrier_s
-        _gemini_recovery_profile(
-            recovery_role, "pre_rebuild_barrier_done", elapsed_s=rebuild_barrier_s
-        )
+        # Rebuild happens after network transfer completion; no extra timing barrier needed.
         _t0_sd = time.time()
         _gemini_recovery_profile(recovery_role, "rebuild_start")
         if is_failed:
@@ -1965,13 +1960,14 @@ def load_gemini_replicas_legacy_checkpoint(
             recovery_role, "rebuild_done", elapsed_s=_t['rebuild_sd']
         )
         _t['barrier'] = barrier_s
-        _t['total'] = _t['network_encode'] + _t['rebuild_sd'] + _t['barrier']
-        summary = _timing_max_dict(_t)
+        _t['total'] = _t['network_encode'] + _t['rebuild_sd']
+        from megatron.training.global_vars import set_ft_load_timing_context
+        set_ft_load_timing_context("GEMINI", "HW", _t)
 
-        logger.info(
-            "GEMINI load timing (HW): e2e_s=%(total).2fs "
+        logger.debug(
+            "GEMINI load timing (HW local): e2e_s=%(total).2fs "
             "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
-            "barrier_s=%(barrier).2fs", summary
+            "barrier_s=%(barrier).2fs", _t
         )
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
@@ -1989,12 +1985,6 @@ def load_gemini_replicas_legacy_checkpoint(
         manager._gemini_replicas_native = None
         _gemini_recovery_profile(
             recovery_role, "cleanup_done", elapsed_s=time.time() - t_cleanup
-        )
-
-    if world_size > 1 and torch.distributed.is_initialized():
-        return_barrier_s = _timed_barrier()
-        _gemini_recovery_profile(
-            recovery_role, "load_return_barrier_done", elapsed_s=return_barrier_s
         )
 
     try:

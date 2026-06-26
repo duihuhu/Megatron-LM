@@ -24,6 +24,7 @@ _GLOBAL_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
 _GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
+_GLOBAL_FT_LOAD_TIMING_CONTEXT = None
 
 def get_args():
     """Return arguments."""
@@ -139,6 +140,27 @@ def finish_recovery_to_forward_timer(label: str = "forward_step_end") -> None:
     )
 
 
+
+def set_ft_load_timing_context(scheme: str, mode: str, timings: dict) -> None:
+    """Store local FT load/recovery timings until model/optimizer H2D finishes."""
+    global _GLOBAL_FT_LOAD_TIMING_CONTEXT
+    _GLOBAL_FT_LOAD_TIMING_CONTEXT = {
+        "scheme": scheme,
+        "mode": mode,
+        "timings": dict(timings),
+    }
+
+
+def get_ft_load_timing_context():
+    """Return the pending FT load/recovery timing context, if any."""
+    return _GLOBAL_FT_LOAD_TIMING_CONTEXT
+
+
+def clear_ft_load_timing_context() -> None:
+    """Clear the pending FT load/recovery timing context."""
+    global _GLOBAL_FT_LOAD_TIMING_CONTEXT
+    _GLOBAL_FT_LOAD_TIMING_CONTEXT = None
+
 def _set_signal_handler():
     global _GLOBAL_SIGNAL_HANDLER
     _ensure_var_is_not_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
@@ -207,6 +229,7 @@ def unset_global_variables():
     _GLOBAL_ENERGY_MONITOR = None
     _GLOBAL_SIGNAL_HANDLER = None
     _GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
+    _GLOBAL_FT_LOAD_TIMING_CONTEXT = None
 
     unset_num_microbatches_calculator()
 

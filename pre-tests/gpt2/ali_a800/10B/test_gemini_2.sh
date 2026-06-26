@@ -192,8 +192,8 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 4
-    --pipeline-model-parallel-size 8
+    --tensor-model-parallel-size 8
+    --pipeline-model-parallel-size 4
     --sequence-parallel
 )
 
@@ -227,7 +227,7 @@ EVAL_AND_LOGGING_ARGS=(
     # ---------------------------------------------------------------------------
     # 分组大小：将 world 划分为独立组，副本仅在组内轮询
     # ---------------------------------------------------------------------------
-    --gemini-replicas-group-size 8   # 默认 None（全局轮询，不做分组）
+    --gemini-replicas-group-size 4   # 默认 None（全局轮询，不做分组）
                                         # 设 8 则每 8 个 rank 一组，每组独立
                                         # 必须能被 world_size 整除
                                         # 独立于节点数和每节点 rank 数，但数学上要求

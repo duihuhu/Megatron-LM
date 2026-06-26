@@ -61,13 +61,16 @@ _CHECKPOINT_VERSION = None
 logger = getLogger(__name__)
 
 
-def _timing_max(value: float) -> float:
+def _timing_max_dict(values: dict) -> dict:
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return float(value)
+        return {key: float(value) for key, value in values.items()}
+    keys = list(values.keys())
     device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
-    tensor = torch.tensor([float(value)], dtype=torch.float64, device=device)
+    tensor = torch.tensor(
+        [float(values[key]) for key in keys], dtype=torch.float64, device=device
+    )
     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
-    return float(tensor.item())
+    return {key: float(tensor[i].item()) for i, key in enumerate(keys)}
 
 
 def _ft_legacy_timing_enabled(args) -> bool:
@@ -2247,19 +2250,49 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     if ft_timing_enabled:
         h2d_total_s = h2d_model_s + h2d_optimizer_s
-        logger.info(
-            "FT load model timing: h2d_total_s=%.2fs h2d_model_s=%.2fs "
-            "h2d_model_submit_s=%.2fs h2d_model_sync_s=%.2fs "
-            "h2d_optimizer_s=%.2fs h2d_optimizer_submit_s=%.2fs "
-            "h2d_optimizer_sync_s=%.2fs",
-            _timing_max(h2d_total_s),
-            _timing_max(h2d_model_s),
-            _timing_max(h2d_model_submit_s),
-            _timing_max(h2d_model_sync_s),
-            _timing_max(h2d_optimizer_s),
-            _timing_max(h2d_optimizer_submit_s),
-            _timing_max(h2d_optimizer_sync_s),
+        from megatron.training.global_vars import (
+            clear_ft_load_timing_context,
+            get_ft_load_timing_context,
         )
+        ft_context = get_ft_load_timing_context()
+        recovery = (ft_context or {}).get("timings", {})
+        recovery_e2e_s = float(recovery.get("total", 0.0))
+        pre_network_barrier_s = float(recovery.get("barrier", 0.0))
+        values = {
+            "e2e_s": recovery_e2e_s + h2d_total_s,
+            "pre_network_barrier_s": pre_network_barrier_s,
+            "recovery_e2e_s": recovery_e2e_s,
+            "network_encode_s": float(recovery.get("network_encode", 0.0)),
+            "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
+            "h2d_s": h2d_total_s,
+            "h2d_model_s": h2d_model_s,
+            "h2d_model_submit_s": h2d_model_submit_s,
+            "h2d_model_sync_s": h2d_model_sync_s,
+            "h2d_optimizer_s": h2d_optimizer_s,
+            "h2d_optimizer_submit_s": h2d_optimizer_submit_s,
+            "h2d_optimizer_sync_s": h2d_optimizer_sync_s,
+        }
+        summary = _timing_max_dict(values)
+        if ft_context is not None:
+            logger.info(
+                "%s load timing (%s): e2e_s=%.2fs pre_network_barrier_s=%.2fs "
+                "recovery_e2e_s=%.2fs network_encode_s=%.2fs rebuild_sd_s=%.2fs "
+                "h2d_s=%.2fs",
+                ft_context.get("scheme", "FT"),
+                ft_context.get("mode", "unknown"),
+                summary["e2e_s"],
+                summary["pre_network_barrier_s"],
+                summary["recovery_e2e_s"],
+                summary["network_encode_s"],
+                summary["rebuild_sd_s"],
+                summary["h2d_s"],
+            )
+        else:
+            logger.info(
+                "FT load model timing: h2d_s=%.2fs",
+                summary["h2d_s"],
+            )
+        clear_ft_load_timing_context()
 
     # rerun state
     if not ignore_rerun_state:

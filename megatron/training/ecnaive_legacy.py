@@ -771,7 +771,7 @@ def _load_ecnaive_legacy_software_failure(
                 manager.register_buffer(send_block)
             send_block_idx = block_idx
 
-    # sync all ranks before timing
+    # Sync all ranks after setup so network timing excludes setup skew.
     _t['barrier'] = _timed_barrier() if world_size > 1 else 0.0
 
     # === timing: network/encode (ASIO send/recv only) ===
@@ -805,9 +805,6 @@ def _load_ecnaive_legacy_software_failure(
             "EC-NAIVE legacy sw: rig=%d sent (block_idx=%d, %d bytes)",
             rank_in_group, send_block_idx, send_block.numel(),
         )
-
-    if world_size > 1:
-        _t['barrier'] = _t.get('barrier', 0.0) + _timed_barrier()
 
     t_rebuild = _time()
     if rank_in_group == failed_rig:
@@ -1081,14 +1078,14 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         _t['total'] = (
             _t.get('network_encode', 0.0)
             + _t.get('rebuild_sd', 0.0)
-            + _t.get('barrier', 0.0)
         )
-        summary = _timing_max_dict(_t)
-        logger.info(
-            "EC-NAIVE load timing (SW): e2e_s=%(total).2fs "
+        from megatron.training.global_vars import set_ft_load_timing_context
+        set_ft_load_timing_context("EC-NAIVE", "SW", _t)
+        logger.debug(
+            "EC-NAIVE load timing (SW local): e2e_s=%(total).2fs "
             "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
             "barrier_s=%(barrier).2fs",
-            summary,
+            _t,
         )
         return state_dict
 
@@ -1124,7 +1121,7 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             for _n, t in ecnaive_blocks.items():
                 manager.register_buffer(t)
 
-    # sync all ranks before timing
+    # Sync all ranks after setup so network timing excludes setup skew.
     barrier_s = _timed_barrier() if world_size > 1 and torch.distributed.is_initialized() else 0.0
 
     # === timing: network/encode (C++ pipeline) ===
@@ -1137,9 +1134,6 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         recv_buffers=recv_buffers,
     )
     network_encode = time.time() - _t0
-
-    if world_size > 1 and torch.distributed.is_initialized():
-        barrier_s += _timed_barrier()
 
     # Backward compatibility: checkpoints saved before flat_key_roots existed.
     flat_key_roots = _infer_flat_key_roots(main_payload)
@@ -1158,20 +1152,19 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         )
     rebuild_sd = time.time() - t_rebuild
 
-    if world_size > 1 and torch.distributed.is_initialized():
-        barrier_s += _timed_barrier()
-
-    summary = _timing_max_dict({
-        "e2e_s": network_encode + rebuild_sd + barrier_s,
-        "network_encode_s": network_encode,
-        "rebuild_sd_s": rebuild_sd,
-        "barrier_s": barrier_s,
-    })
-    logger.info(
-        "EC-NAIVE load timing (HW): e2e_s=%(e2e_s).2fs "
-        "network_encode_s=%(network_encode_s).2fs rebuild_sd_s=%(rebuild_sd_s).2fs "
-        "barrier_s=%(barrier_s).2fs",
-        summary,
+    timings = {
+        "total": network_encode + rebuild_sd,
+        "network_encode": network_encode,
+        "rebuild_sd": rebuild_sd,
+        "barrier": barrier_s,
+    }
+    from megatron.training.global_vars import set_ft_load_timing_context
+    set_ft_load_timing_context("EC-NAIVE", "HW", timings)
+    logger.debug(
+        "EC-NAIVE load timing (HW local): e2e_s=%(total).2fs "
+        "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
+        "barrier_s=%(barrier).2fs",
+        timings,
     )
 
     return state_dict
@@ -1334,7 +1327,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     is_source = rank in source_ranks
     source_set = set(source_ranks)
 
-    barrier_s = _timed_barrier()
+    barrier_s = 0.0
 
     # Pre-allocate recv pool for failed ranks, load blocks for source ranks (not timed)
     recv_pool_prealloc: List[torch.Tensor] = []
@@ -1393,7 +1386,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             for b in source_blocks_prealloc:
                 manager.register_buffer(b)
 
-    # sync after pre-alloc, before timing
+    # Sync after pre-alloc/load so network timing excludes setup skew.
     barrier_s += _timed_barrier()
 
     # === timing: network/encode (C++ send/recv + RS decode only) ===
@@ -1421,8 +1414,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         native.wait_for_encoding_completion()
         _t['network_encode'] = time.time() - _t0_net
 
-        if world_size > 1:
-            barrier_s += _timed_barrier()
         t_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
@@ -1437,8 +1428,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         native.wait_for_encoding_completion()
         _t['network_encode'] = time.time() - _t0_net
 
-        if world_size > 1:
-            barrier_s += _timed_barrier()
         t_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
@@ -1696,9 +1685,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         if actual_tensor_size > 0:
             tensor_buffer = tensor_buffer[:actual_tensor_size]
 
-        if world_size > 1:
-            barrier_s += _timed_barrier()
-
         t_rebuild = time.time()
         # Debug: compare RS-recovered tensor_buffer with main_payload
         if args.ecnaive_hw_debug and isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
@@ -1767,28 +1753,24 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         native.wait_for_encoding_completion()
         _t['network_encode'] = time.time() - _t0_net
 
-        if world_size > 1:
-            barrier_s += _timed_barrier()
         t_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
         _t['rebuild_sd'] = time.time() - t_rebuild
 
-    if world_size > 1:
-        barrier_s += _timed_barrier()
     _t['barrier'] = barrier_s
     _t['total'] = (
         _t.get('network_encode', 0.0)
         + _t.get('rebuild_sd', 0.0)
-        + _t.get('barrier', 0.0)
     )
-    summary = _timing_max_dict(_t)
-    logger.info(
-        "EC-NAIVE load timing (HW recovery): e2e_s=%(total).2fs "
+    from megatron.training.global_vars import set_ft_load_timing_context
+    set_ft_load_timing_context("EC-NAIVE", "HW recovery", _t)
+    logger.debug(
+        "EC-NAIVE load timing (HW recovery local): e2e_s=%(total).2fs "
         "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
         "barrier_s=%(barrier).2fs",
-        summary,
+        _t,
     )
 
     # NOTE: do not call manager.cleanup() or native.stop() here.

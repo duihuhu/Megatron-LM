@@ -50,6 +50,7 @@ _cached_all_tensor_infos = None
 _cached_all_layer_order = None
 _cached_all_layer_metadata = None
 _cached_all_actual_tensor_sizes = None
+_cached_all_optimizer_layer_maps = None
 
 
 def _frcheck_debug_enabled(default: bool = False) -> bool:
@@ -116,6 +117,32 @@ def _summarize_optimizer_keys(keys) -> Dict[str, int]:
         category = _optimizer_key_category(str(key))
         summary[category] = summary.get(category, 0) + 1
     return summary
+
+
+def _frcheck_recovery_profile(role: str, event: str, **fields) -> None:
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    parts = [f"rank={rank}", f"role={role}", f"event={event}"]
+    for key, value in fields.items():
+        if isinstance(value, float):
+            parts.append(f"{key}={value:.6f}")
+        else:
+            parts.append(f"{key}={value}")
+    logger.info("FRCheck profile: %s", " ".join(parts))
+
+
+def _frcheck_recovery_role(
+    is_failed: bool, is_decoder: bool, is_helper: bool, involved: bool
+) -> str:
+    roles: List[str] = []
+    if is_failed:
+        roles.append("failed")
+    if is_decoder:
+        roles.append("decoder")
+    if is_helper:
+        roles.append("helper")
+    if not roles:
+        roles.append("survivor" if involved else "survivor_uninvolved")
+    return "+".join(roles)
 
 
 def _classify_frcheck_tensor(
@@ -442,8 +469,8 @@ class _FRCheckLayerwiseRuntime:
                     record.layer_name, layer_idx, record.materialize_s, waited,
                 )
                 try:
-                    from megatron.training.global_vars import finish_recovery_to_forward_timer
-                    finish_recovery_to_forward_timer()
+                    from megatron.training.global_vars import mark_recovery_to_forward_timer
+                    mark_recovery_to_forward_timer(f"{record.layer_name}_forward_ready")
                 except Exception:
                     pass
             return True
@@ -480,10 +507,125 @@ class _FRCheckLayerwiseRuntime:
         }
 
 
+class _FRCheckRecoveryService:
+    """Single owner for FRCheck recovery state across load and training safe points."""
+
+    INIT = "INIT"
+    COMMON_READY = "COMMON_READY"
+    LAYERS_RUNNING = "LAYERS_RUNNING"
+    MODEL_READY = "MODEL_READY"
+    OPTIMIZER_READY = "OPTIMIZER_READY"
+    DONE = "DONE"
+    TORN_DOWN = "TORN_DOWN"
+    ERROR = "ERROR"
+
+    def __init__(self) -> None:
+        self.role: str = "unknown"
+        self.runtime: Optional[_FRCheckLayerwiseRuntime] = None
+        self.worker: Optional[threading.Thread] = None
+        self.state: str = self.INIT
+        self.error: Optional[BaseException] = None
+        self.safe_point_teardown_done: bool = False
+
+    def reset_for_load(self, role: str) -> None:
+        global _active_layerwise_runtime, _active_recovery_worker
+        self.role = role
+        self.runtime = None
+        self.worker = None
+        _active_layerwise_runtime = None
+        _active_recovery_worker = None
+        self.state = self.INIT
+        self.error = None
+        self.safe_point_teardown_done = False
+        _frcheck_recovery_profile(self.role, "service_reset", state=self.state)
+
+    def attach_runtime(self, runtime: Optional[_FRCheckLayerwiseRuntime]) -> None:
+        self.runtime = runtime
+        if runtime is not None and self.state == self.INIT:
+            self.state = self.COMMON_READY
+        _frcheck_recovery_profile(
+            self.role, "service_attach_runtime",
+            state=self.state, has_runtime=runtime is not None,
+        )
+
+    def attach_worker(self, worker: Optional[threading.Thread]) -> None:
+        self.worker = worker
+        if worker is not None:
+            self.state = self.LAYERS_RUNNING
+            self.role = getattr(worker, "_frcheck_recovery_role", self.role)
+        _frcheck_recovery_profile(
+            self.role, "service_attach_worker",
+            state=self.state, has_worker=worker is not None,
+        )
+
+    def _check_worker_error(self) -> None:
+        worker = self.worker
+        if worker is None:
+            return
+        error_holder = getattr(worker, "_frcheck_error_holder", None)
+        if isinstance(error_holder, dict) and error_holder.get("error") is not None:
+            self.error = error_holder["error"]
+            self.state = self.ERROR
+            self.worker = None
+            raise RuntimeError("FRCheck async recovery worker failed") from self.error
+
+    def wait_all(self, reason: str = "explicit") -> None:
+        worker = self.worker
+        if worker is not None and worker.is_alive():
+            role = getattr(worker, "_frcheck_recovery_role", self.role)
+            jobs = getattr(worker, "_frcheck_job_count", -1)
+            _frcheck_recovery_profile(role, "join_wait_start", jobs=jobs, reason=reason)
+            t_join = time.time()
+            if _frcheck_debug_enabled():
+                logger.info("FRCheck: waiting for async recovery worker to finish (%s)", reason)
+            worker.join()
+            _frcheck_recovery_profile(
+                role, "join_wait_done", jobs=jobs,
+                elapsed_s=time.time() - t_join, reason=reason,
+            )
+        self._check_worker_error()
+        self.worker = None
+        if self.state != self.ERROR:
+            self.state = self.DONE
+
+    def wait_layer(self, layer_idx: int) -> bool:
+        if self.runtime is None:
+            return False
+        return self.runtime.wait_and_materialize_layer(layer_idx)
+
+    def wait_optimizer(self) -> bool:
+        if self.runtime is None:
+            return False
+        self.runtime.wait_for_optimizer_layers()
+        self.wait_all(reason="optimizer")
+        self.state = self.OPTIMIZER_READY
+        return True
+
+    def summary(self) -> Dict[str, Any]:
+        runtime_summary = None if self.runtime is None else self.runtime.summary()
+        worker_alive = self.worker is not None and self.worker.is_alive()
+        return {
+            "role": self.role,
+            "state": self.state,
+            "worker_alive": worker_alive,
+            "has_runtime": self.runtime is not None,
+            "safe_point_teardown_done": self.safe_point_teardown_done,
+            "runtime": runtime_summary,
+        }
+
+
 _active_layerwise_runtime: Optional[_FRCheckLayerwiseRuntime] = None
 _active_recovery_worker: Optional[threading.Thread] = None
+_active_recovery_service: Optional[_FRCheckRecoveryService] = None
 _pending_optimizer_state: Optional[Dict[str, Any]] = None
 _pending_optimizer_container: Optional[Dict[str, Any]] = None
+
+
+def _get_active_frcheck_recovery_service() -> _FRCheckRecoveryService:
+    global _active_recovery_service
+    if _active_recovery_service is None:
+        _active_recovery_service = _FRCheckRecoveryService()
+    return _active_recovery_service
 
 
 def _set_active_frcheck_layerwise_runtime(
@@ -491,27 +633,20 @@ def _set_active_frcheck_layerwise_runtime(
 ) -> None:
     global _active_layerwise_runtime
     _active_layerwise_runtime = runtime
+    _get_active_frcheck_recovery_service().attach_runtime(runtime)
 
 
 def _set_active_frcheck_recovery_worker(worker: Optional[threading.Thread]) -> None:
     global _active_recovery_worker
     _active_recovery_worker = worker
+    _get_active_frcheck_recovery_service().attach_worker(worker)
 
 
 def frcheck_wait_for_async_recovery() -> None:
     global _active_recovery_worker
-    worker = _active_recovery_worker
-    if worker is not None and worker.is_alive():
-        if _frcheck_debug_enabled():
-            logger.info("FRCheck: waiting for async recovery worker to finish")
-        worker.join()
-    if worker is not None:
-        error_holder = getattr(worker, "_frcheck_error_holder", None)
-        if isinstance(error_holder, dict) and error_holder.get("error") is not None:
-            error = error_holder["error"]
-            _active_recovery_worker = None
-            raise RuntimeError("FRCheck async recovery worker failed") from error
-    _active_recovery_worker = None
+    service = _get_active_frcheck_recovery_service()
+    service.wait_all(reason="explicit")
+    _active_recovery_worker = service.worker
 
 
 def _layerwise_record_from_layer_buf(
@@ -648,7 +783,7 @@ def install_frcheck_layerwise_runtime_from_state_dict(
     global _active_layerwise_runtime
     metadata = state_dict.pop("__frcheck_layerwise_runtime__", None)
     if not metadata:
-        _active_layerwise_runtime = None
+        _set_active_frcheck_layerwise_runtime(None)
         return
 
     if _active_layerwise_runtime is not None and metadata.get("active_runtime", False):
@@ -695,7 +830,7 @@ def install_frcheck_layerwise_runtime_from_state_dict(
         runtime.attach_model_state_keys(model_sd.keys())
     if model is not None:
         runtime.attach_live_model(model)
-    _active_layerwise_runtime = runtime
+    _set_active_frcheck_layerwise_runtime(runtime)
     optimizer_keys = [
         key
         for record in runtime._records_by_layer.values()
@@ -764,10 +899,7 @@ def frcheck_filter_layerwise_model_placeholders(
 
 def frcheck_wait_and_materialize_layer(layer_idx: int) -> bool:
     """Wait for a recovered FRCheck layer to be ready before forward."""
-    runtime = _active_layerwise_runtime
-    if runtime is None:
-        return False
-    return runtime.wait_and_materialize_layer(layer_idx)
+    return _get_active_frcheck_recovery_service().wait_layer(layer_idx)
 
 
 def frcheck_materialize_all_layers() -> None:
@@ -812,8 +944,8 @@ def frcheck_materialize_first_layer_for_timer() -> bool:
         record.layer_name, layer_idx, waited,
     )
     try:
-        from megatron.training.global_vars import finish_recovery_to_forward_timer
-        finish_recovery_to_forward_timer()
+        from megatron.training.global_vars import mark_recovery_to_forward_timer
+        mark_recovery_to_forward_timer(f"{record.layer_name}_injected")
     except Exception:
         pass
     return True
@@ -847,34 +979,6 @@ def _frcheck_optimizer_state_dict(optim_state: Dict[str, Any]) -> Optional[Dict[
         return None
     state = torch_optim_state.get("state")
     return state if isinstance(state, dict) else None
-
-
-def _frcheck_optimizer_state_key_summary(optim_state: Dict[str, Any]) -> Dict[str, int]:
-    state = _frcheck_optimizer_state_dict(optim_state)
-    summary = {
-        "state_entries": 0,
-        "int_keys": 0,
-        "str_digit_keys": 0,
-        "other_keys": 0,
-        "exp_avg": 0,
-        "exp_avg_sq": 0,
-    }
-    if state is None:
-        return summary
-    summary["state_entries"] = len(state)
-    for key, value in state.items():
-        if isinstance(key, int):
-            summary["int_keys"] += 1
-        elif isinstance(key, str) and key.isdigit():
-            summary["str_digit_keys"] += 1
-        else:
-            summary["other_keys"] += 1
-        if isinstance(value, dict):
-            if torch.is_tensor(value.get("exp_avg")):
-                summary["exp_avg"] += 1
-            if torch.is_tensor(value.get("exp_avg_sq")):
-                summary["exp_avg_sq"] += 1
-    return summary
 
 
 def frcheck_normalize_optimizer_state_param_keys(optim_state: Dict[str, Any]) -> None:
@@ -996,24 +1100,18 @@ def _materialize_pending_optimizer_tensors(
 def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
     """Wait for layerwise optimizer tensors and load deferred optimizer state once."""
     global _pending_optimizer_container, _pending_optimizer_state
-    runtime = _active_layerwise_runtime
+    service = _get_active_frcheck_recovery_service()
+    runtime = service.runtime
     if runtime is None or _pending_optimizer_state is None:
         return False
     t0 = time.time()
-    runtime.wait_for_optimizer_layers()
-    frcheck_wait_for_async_recovery()
+    service.wait_optimizer()
     if optimizer is None:
         return False
     updated, expected, missing_keys = _materialize_pending_optimizer_tensors(
         runtime, _pending_optimizer_state,
     )
-    before_key_summary = _frcheck_optimizer_state_key_summary(_pending_optimizer_state)
     frcheck_normalize_optimizer_state_param_keys(_pending_optimizer_state)
-    after_key_summary = _frcheck_optimizer_state_key_summary(_pending_optimizer_state)
-    logger.info(
-        "FRCheck optimizer recovery: optimizer state key summary before=%s after=%s",
-        before_key_summary, after_key_summary,
-    )
     if updated != expected:
         logger.error(
             "FRCheck optimizer recovery: materialized %d/%d optimizer tensors; "
@@ -1046,8 +1144,36 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
 
 
 def get_frcheck_layerwise_runtime_summary() -> Optional[Dict[str, Any]]:
-    runtime = _active_layerwise_runtime
-    return None if runtime is None else runtime.summary()
+    service = _get_active_frcheck_recovery_service()
+    summary = service.summary()
+    return None if not summary.get("has_runtime") else summary
+
+
+def frcheck_recovery_safe_point(point: str) -> None:
+    """Optional safe point for future async recovery wait/teardown orchestration."""
+    try:
+        from megatron.training import get_args
+        args = get_args()
+    except Exception:
+        return
+    if not getattr(args, "use_frcheck", False):
+        return
+    service = _get_active_frcheck_recovery_service()
+    _frcheck_recovery_profile(service.role, "safe_point", point=point, state=service.state)
+    if service.safe_point_teardown_done:
+        return
+    mode = getattr(args, "frcheck_recovery_safe_point", "load")
+    should_wait = (
+        (mode == "after_load_checkpoint" and point == "after_load_checkpoint")
+        or (mode == "train_step_start" and point == "train_step_start")
+        or (mode == "forward_step_start" and point == "forward_step_start")
+        or (mode == "optimizer_step" and point == "before_optimizer_step")
+    )
+    if should_wait:
+        service.wait_all(reason=point)
+        _teardown_frcheck_native_after_load()
+        service.safe_point_teardown_done = True
+        service.state = service.TORN_DOWN
 
 
 def frcheck_log_layerwise_runtime_summary(context: str) -> None:
@@ -1220,12 +1346,19 @@ def _exchange_frcheck_group_metadata(
     tensor_infos: List[Any],
     layer_order: List[str],
     layer_metadata: Dict[str, Dict[str, Any]],
-) -> Tuple[Dict[int, List[Any]], Dict[int, List[str]], Dict[int, Dict[str, Dict[str, Any]]]]:
+    optimizer_layer_map: Optional[Dict[str, int]] = None,
+) -> Tuple[
+    Dict[int, List[Any]],
+    Dict[int, List[str]],
+    Dict[int, Dict[str, Dict[str, Any]]],
+    Dict[int, Dict[str, int]],
+]:
     """All-gather per-rank tensor + per-layer metadata (keys are global ranks)."""
     local_pkg = {
         "tensor_infos": tensor_infos,
         "layer_order": layer_order,
         "layer_metadata": layer_metadata,
+        "optimizer_layer_map": optimizer_layer_map or {},
     }
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
         gathered: List[Any] = [None] * torch.distributed.get_world_size()
@@ -1236,13 +1369,15 @@ def _exchange_frcheck_group_metadata(
     all_tensor_infos: Dict[int, List[Any]] = {}
     all_layer_order: Dict[int, List[str]] = {}
     all_layer_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
+    all_optimizer_layer_maps: Dict[int, Dict[str, int]] = {}
     for r, pkg in enumerate(gathered):
         if pkg is None:
             continue
         all_tensor_infos[r] = pkg.get("tensor_infos", [])
         all_layer_order[r] = pkg.get("layer_order", [])
         all_layer_metadata[r] = pkg.get("layer_metadata", {})
-    return all_tensor_infos, all_layer_order, all_layer_metadata
+        all_optimizer_layer_maps[r] = pkg.get("optimizer_layer_map", {})
+    return all_tensor_infos, all_layer_order, all_layer_metadata, all_optimizer_layer_maps
 
 
 def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
@@ -1650,10 +1785,6 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     _dbg = getattr(args, "frcheck_debug", False)
 
     optimizer_layer_map = _build_optimizer_layer_map(state_dict)
-    logger.info(
-        "FRCheck save rank %d: optimizer state key summary %s",
-        rank, _frcheck_optimizer_state_key_summary(state_dict.get("optimizer", {})),
-    )
 
     # 1. Decompose a detached copy so save-time flattening cannot mutate live optimizer state.
     t_decompose = time.time()
@@ -2064,9 +2195,16 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     t_meta = time.time()
     global _cached_all_tensor_infos, _cached_all_layer_order
     global _cached_all_layer_metadata, _cached_all_actual_tensor_sizes
+    global _cached_all_optimizer_layer_maps
     if _cached_all_tensor_infos is None:
-        all_tensor_infos, all_layer_order, all_layer_metadata = _exchange_frcheck_group_metadata(
+        (
+            all_tensor_infos,
+            all_layer_order,
+            all_layer_metadata,
+            all_optimizer_layer_maps,
+        ) = _exchange_frcheck_group_metadata(
             decomposed.tensor_infos, local_layer_order, local_layer_metadata,
+            optimizer_layer_map,
         )
         all_actual_tensor_sizes = {
             r: sum(getattr(info, "size_bytes", 0) for info in infos)
@@ -2076,6 +2214,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         _cached_all_layer_order = all_layer_order
         _cached_all_layer_metadata = all_layer_metadata
         _cached_all_actual_tensor_sizes = all_actual_tensor_sizes
+        _cached_all_optimizer_layer_maps = all_optimizer_layer_maps
         if _dbg:
             logger.info(
                 "FRCheck save: group metadata exchange %.3fs (ranks=%d)",
@@ -2086,6 +2225,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         all_layer_order = _cached_all_layer_order
         all_layer_metadata = _cached_all_layer_metadata
         all_actual_tensor_sizes = _cached_all_actual_tensor_sizes
+        all_optimizer_layer_maps = _cached_all_optimizer_layer_maps
         if _dbg:
             logger.info(
                 "FRCheck save: group metadata exchange (cached) %.3fs",
@@ -2110,6 +2250,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         "all_layer_order": all_layer_order,
         "all_layer_metadata": all_layer_metadata,
         "all_actual_tensor_sizes": all_actual_tensor_sizes,
+        "all_optimizer_layer_maps": all_optimizer_layer_maps,
         "optimizer_layer_map": optimizer_layer_map,
     })
     write_main_prepared(
@@ -2336,6 +2477,18 @@ def _load_frcheck_main_payload(
     )
 
 
+
+def _optimizer_layer_map_for_rank(main_payload: Dict[str, Any], rank: int) -> Dict[str, int]:
+    all_maps = main_payload.get("all_optimizer_layer_maps") or {}
+    rank_map = all_maps.get(rank)
+    if rank_map is None:
+        rank_map = all_maps.get(str(rank))
+    if isinstance(rank_map, dict):
+        return rank_map
+    fallback = main_payload.get("optimizer_layer_map", {})
+    return fallback if isinstance(fallback, dict) else {}
+
+
 def _frcheck_metadata_from_payload(
     main_payload: Dict[str, Any],
     failed_rank: Optional[int],
@@ -2517,8 +2670,10 @@ def _map_layer_buf_to_full_buf(
     layer_infos: List,
     global_tensor_infos: List,
     full_buf: torch.Tensor,
+    optimizer_layer_map: Optional[Dict[str, int]] = None,
+    common_only: bool = False,
 ) -> int:
-    """Copy recovered layer buffer into full_buf using key-based global offset mapping."""
+    """Copy recovered tensors into full_buf using key-based global offset mapping."""
     key_to_global_offset: Dict[str, int] = {}
     for info in global_tensor_infos:
         key = getattr(info, "key", "")
@@ -2530,6 +2685,10 @@ def _map_layer_buf_to_full_buf(
         key = getattr(info, "key", "")
         if not key or key not in key_to_global_offset:
             continue
+        if common_only:
+            ownership = _classify_frcheck_tensor(key, optimizer_layer_map)
+            if ownership.layer_idx >= 0 and ownership.kind in ("model_layer", "optimizer_layer"):
+                continue
         local_offset = getattr(info, "offset", 0)
         global_offset = key_to_global_offset[key]
         size = getattr(info, "size_bytes", 0)
@@ -2628,25 +2787,37 @@ def _run_layer_recovery_job(
     full_buf: Optional[torch.Tensor],
     global_tensor_infos: List,
     runtime: Optional[_FRCheckLayerwiseRuntime] = None,
-    map_to_full_buf: bool = True,
+    map_to_full_buf: str = "all",
     clone_runtime_tensors: bool = True,
+    recovery_role: str = "unknown",
 ) -> Tuple[Optional[_FRCheckLayerReadyRecord], Dict[str, float]]:
+    t_job = time.time()
+    _frcheck_recovery_profile(
+        recovery_role, "job_start", layer=job.layer_name, layer_idx=job.layer_idx,
+        encode_iter=job.encode_iter, map_to_full_buf=map_to_full_buf,
+        preloaded_blocks=len(preloaded.get(job.encode_iter, {})),
+    )
     layer_buf, layer_timing = _recover_one_layer_network(
         manager, native, job.layer_name,
         job.layer_idx, job.layer_block_size, job.actual_size if is_failed else 0,
         n, rank, preloaded_blocks=preloaded.get(job.encode_iter, {}),
-        buf_pool=buf_pool,
+        buf_pool=buf_pool, recovery_role=recovery_role,
     )
 
     record = None
     if is_failed and layer_buf is not None and full_buf is not None:
         t_materialize = time.time()
         copied = 0
-        if map_to_full_buf:
+        t_map = time.time()
+        map_s = 0.0
+        if map_to_full_buf != "none":
             copied = _map_layer_buf_to_full_buf(
                 layer_buf, job.layer_infos, global_tensor_infos, full_buf,
+                optimizer_layer_map=getattr(manager, "_frcheck_optimizer_layer_map", None),
+                common_only=(map_to_full_buf == "common_only"),
             )
-        materialize_s = time.time() - t_materialize
+            map_s = time.time() - t_map
+        t_extract = time.time()
         layer_tensors = (
             _extract_layer_tensors_from_buf(
                 layer_buf, job.layer_infos,
@@ -2654,14 +2825,30 @@ def _run_layer_recovery_job(
             )
             if job.layer_idx >= 0 else None
         )
+        extract_s = time.time() - t_extract
+        materialize_s = time.time() - t_materialize
+        layer_timing["materialize_s"] = materialize_s
+        layer_timing["map_to_full_buf_s"] = map_s
+        layer_timing["extract_runtime_tensors_s"] = extract_s
+        _frcheck_recovery_profile(
+            recovery_role, "materialize_done", layer=job.layer_name,
+            layer_idx=job.layer_idx, copied_bytes=copied, map_s=map_s,
+            extract_runtime_tensors_s=extract_s, materialize_s=materialize_s,
+            runtime_tensors=len(layer_tensors or {}),
+        )
         record = _layerwise_record_from_layer_buf(
             job.layer_name, job.encode_iter, job.layer_infos, copied,
             materialize_s, tensors=layer_tensors,
         )
         if runtime is not None and job.layer_idx >= 0:
+            t_mark = time.time()
             runtime.mark_layer_ready(
                 job.layer_idx, materialize_s=materialize_s,
                 nbytes=copied, tensors=layer_tensors,
+            )
+            _frcheck_recovery_profile(
+                recovery_role, "mark_layer_ready_done", layer=job.layer_name,
+                layer_idx=job.layer_idx, elapsed_s=time.time() - t_mark,
             )
         if _frcheck_debug_enabled():
             logger.info(
@@ -2669,6 +2856,13 @@ def _run_layer_recovery_job(
                 "(expected %d) in %.4fs",
                 job.layer_name, copied, job.actual_size, materialize_s,
             )
+    layer_timing["job_total_s"] = time.time() - t_job
+    _frcheck_recovery_profile(
+        recovery_role, "job_done", layer=job.layer_name, layer_idx=job.layer_idx,
+        elapsed_s=layer_timing["job_total_s"],
+        network_batch_s=layer_timing.get("network_batch_s", 0.0),
+        materialize_s=layer_timing.get("materialize_s", 0.0),
+    )
     return record, layer_timing
 
 
@@ -2685,12 +2879,18 @@ def _start_layer_recovery_worker(
     global_tensor_infos: List,
     runtime: Optional[_FRCheckLayerwiseRuntime],
     cleanup_after: bool,
-    map_to_full_buf: bool = True,
+    map_to_full_buf: str = "all",
     clone_runtime_tensors: bool = True,
+    recovery_role: str = "unknown",
 ) -> threading.Thread:
     error_holder: Dict[str, Optional[BaseException]] = {"error": None}
 
     def _worker() -> None:
+        t_worker = time.time()
+        _frcheck_recovery_profile(
+            recovery_role, "worker_start", jobs=len(jobs),
+            map_to_full_buf=map_to_full_buf, cleanup_after=cleanup_after,
+        )
         try:
             for job in jobs:
                 try:
@@ -2699,6 +2899,7 @@ def _start_layer_recovery_worker(
                         buf_pool, full_buf, global_tensor_infos, runtime=runtime,
                         map_to_full_buf=map_to_full_buf,
                         clone_runtime_tensors=clone_runtime_tensors,
+                        recovery_role=recovery_role,
                     )
                 except Exception as exc:
                     if runtime is not None and job.layer_idx >= 0:
@@ -2709,6 +2910,10 @@ def _start_layer_recovery_worker(
         finally:
             if cleanup_after:
                 _teardown_frcheck_native_after_load()
+            _frcheck_recovery_profile(
+                recovery_role, "worker_done", jobs=len(jobs),
+                elapsed_s=time.time() - t_worker, cleanup_after=cleanup_after,
+            )
 
     worker = threading.Thread(
         target=_worker,
@@ -2716,6 +2921,8 @@ def _start_layer_recovery_worker(
         daemon=False,
     )
     setattr(worker, "_frcheck_error_holder", error_holder)
+    setattr(worker, "_frcheck_recovery_role", recovery_role)
+    setattr(worker, "_frcheck_job_count", len(jobs))
     worker.start()
     return worker
 
@@ -2931,10 +3138,14 @@ def _submit_recovery_network(
     rank: int,
     preloaded_blocks: Dict[int, torch.Tensor],
     buf_pool: Optional[_RecoveryBufPool] = None,
+    recovery_role: str = "unknown",
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
     """Submit one layer of stripe recovery via C++ batch pipeline."""
     my_node = manager.rank_in_group + 1
-    layer_timing: Dict[str, float] = {'rdma_xfer_s': 0.0, 'decode_s': 0.0}
+    layer_timing: Dict[str, float] = {
+        'rdma_xfer_s': 0.0, 'decode_s': 0.0, 'network_batch_s': 0.0,
+        'submit_s': 0.0, 'wait_s': 0.0, 'waves': 0,
+    }
 
     if not manager.recovery_stripe_plans:
         return None, layer_timing
@@ -3002,9 +3213,15 @@ def _submit_recovery_network(
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
 
     wave_size = buf_pool.concurrency if buf_pool is not None else max(n, 1)
+    t_network = time.time()
     for wave_start in range(0, len(data_plans), wave_size):
         wave_plans = data_plans[wave_start:wave_start + wave_size]
+        wave_idx = int(wave_start / wave_size)
+        layer_timing['waves'] += 1
+        t_reset = time.time()
         native.reset_recovery_batch()
+        reset_s = time.time() - t_reset
+        t_submit = time.time()
         for submit_idx, stri_plan in enumerate(wave_plans):
             sid = stri_plan['stripe_id']
             buf_slot = submit_idx
@@ -3106,7 +3323,28 @@ def _submit_recovery_network(
             )
 
         native.submit_recovery_sentinel()
+        submit_s = time.time() - t_submit
+        t_wait = time.time()
         native.wait_recovery_batch()
+        wait_s = time.time() - t_wait
+        layer_timing['submit_s'] += submit_s + reset_s
+        layer_timing['wait_s'] += wait_s
+        _frcheck_recovery_profile(
+            recovery_role, "network_wave_done", layer=layer_name,
+            layer_idx=layer_idx, wave=wave_idx, stripes=len(wave_plans),
+            reset_s=reset_s, submit_s=submit_s, wait_s=wait_s,
+        )
+
+    layer_timing['network_batch_s'] = time.time() - t_network
+    layer_timing['rdma_xfer_s'] = layer_timing['network_batch_s']
+    _frcheck_recovery_profile(
+        recovery_role, "network_batch_done", layer=layer_name,
+        layer_idx=layer_idx, stripes=len(data_plans),
+        decoder_stripes=len(decoder_stripes), helper_stripes=len(helper_stripes),
+        failed_stripes=len(failed_stripes), waves=layer_timing['waves'],
+        network_batch_s=layer_timing['network_batch_s'],
+        submit_s=layer_timing['submit_s'], wait_s=layer_timing['wait_s'],
+    )
 
     if is_failed:
         n_stored = src_block_per_node.get(my_node, 0)
@@ -3139,11 +3377,12 @@ def _recover_one_layer_network(
     rank: int,
     preloaded_blocks: Dict[int, torch.Tensor],
     buf_pool: Optional[_RecoveryBufPool] = None,
+    recovery_role: str = "unknown",
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
     """Run stripe-level RS decode recovery for one layer via C++ batch pipeline."""
     return _submit_recovery_network(
         native, manager, layer_name, layer_idx, layer_block_size, layer_total_bytes,
-        n, rank, preloaded_blocks, buf_pool,
+        n, rank, preloaded_blocks, buf_pool, recovery_role=recovery_role,
     )
 
 
@@ -3179,9 +3418,38 @@ def _teardown_frcheck_native_after_load() -> None:
     if manager.get_native() is None:
         return
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    role = getattr(manager, "_frcheck_recovery_role", "unknown")
+    try:
+        from megatron.training import get_args
+        defer_teardown = bool(getattr(get_args(), "frcheck_defer_load_teardown", False))
+    except Exception:
+        defer_teardown = False
+    if defer_teardown:
+        _frcheck_recovery_profile(role, "teardown_deferred")
+        if _frcheck_debug_enabled():
+            logger.info(
+                "FRCheck legacy load: deferred native teardown after load (rank %d)",
+                rank,
+            )
+        return
+    try:
+        skip_barrier = bool(getattr(get_args(), "frcheck_skip_load_teardown_barrier", False))
+    except Exception:
+        skip_barrier = False
+    _frcheck_recovery_profile(role, "teardown_start", sync=not skip_barrier)
+    t_cleanup = time.time()
     if _frcheck_debug_enabled():
         logger.info("FRCheck legacy load: cleaning up native module (rank %d)", rank)
-    manager.cleanup(teardown=True)
+    args = get_args()
+    recovery_only = bool(getattr(args, "frcheck_recovery_only_teardown", False))
+    if recovery_only and hasattr(manager, "cleanup_recovery"):
+        manager.cleanup_recovery(teardown=True, sync=not skip_barrier)
+    else:
+        manager.cleanup(teardown=True, sync=not skip_barrier)
+    _frcheck_recovery_profile(
+        role, "teardown_done", elapsed_s=time.time() - t_cleanup,
+        sync=not skip_barrier,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3247,6 +3515,9 @@ def recover_frcheck_legacy_hardware(
     all_tensor_infos, all_layer_order, all_layer_metadata = _frcheck_metadata_from_payload(
         main_payload, primary_failed,
     )
+    optimizer_layer_map = _optimizer_layer_map_for_rank(main_payload, rank)
+    main_payload["optimizer_layer_map"] = optimizer_layer_map
+    setattr(manager, "_frcheck_optimizer_layer_map", optimizer_layer_map)
 
     if is_failed and rank in all_tensor_infos:
         global_tensor_infos = all_tensor_infos[rank]
@@ -3348,6 +3619,21 @@ def recover_frcheck_legacy_hardware(
     is_helper = any(
         my_node in p['helper_nodes'] for p in data_recovery_plans
     )
+    recovery_role = _frcheck_recovery_role(is_failed, is_decoder, is_helper, involved)
+    setattr(manager, "_frcheck_recovery_role", recovery_role)
+    _get_active_frcheck_recovery_service().reset_for_load(recovery_role)
+    _frcheck_recovery_profile(
+        recovery_role, "rank_role", is_failed=is_failed, is_decoder=is_decoder,
+        is_helper=is_helper, involved=involved, data_stripes=len(data_recovery_plans),
+        parity_stripes=len(parity_recovery_plans), encode_iters=n_encode_iters,
+        disk_io_s=timings['disk_io'],
+    )
+    try:
+        from megatron.training.global_vars import update_recovery_to_forward_timer_context
+        update_recovery_to_forward_timer_context(role=recovery_role)
+    except Exception:
+        pass
+
     buf_pool = _allocate_recovery_buf_pool(
         native, n, max_block_size, is_failed, is_decoder, is_helper,
         dual_failure=getattr(manager, 'recovery_dual_failure', False),
@@ -3423,7 +3709,7 @@ def recover_frcheck_legacy_hardware(
     t_net = time.time()
     try:
         from megatron.training.global_vars import start_recovery_to_forward_timer
-        start_recovery_to_forward_timer("FRCheck", "network_decode")
+        start_recovery_to_forward_timer("FRCheck", "network_decode", role=recovery_role)
     except Exception:
         pass
     if _dbg:
@@ -3443,8 +3729,9 @@ def recover_frcheck_legacy_hardware(
                 job, manager, native, n, rank, is_failed, preloaded,
                 buf_pool, full_buf, global_tensor_infos,
                 runtime=runtime_for_recovery,
-                map_to_full_buf=True,
+                map_to_full_buf="all",
                 clone_runtime_tensors=True,
+                recovery_role=recovery_role,
             )
             if record is not None:
                 layerwise_records.append(record)
@@ -3452,9 +3739,10 @@ def recover_frcheck_legacy_hardware(
             worker = _start_layer_recovery_worker(
                 async_jobs, manager, native, n, rank, is_failed, preloaded,
                 buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
-                cleanup_after=True,
-                map_to_full_buf=True,
+                cleanup_after=(getattr(args, "frcheck_recovery_safe_point", "load") == "load"),
+                map_to_full_buf="common_only",
                 clone_runtime_tensors=True,
+                recovery_role=recovery_role,
             )
             _set_active_frcheck_recovery_worker(worker)
             if _dbg:
@@ -3468,8 +3756,9 @@ def recover_frcheck_legacy_hardware(
             recovery_jobs, manager, native, n, rank, is_failed, preloaded,
             buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
             cleanup_after=False,
-            map_to_full_buf=True,
+            map_to_full_buf="all",
             clone_runtime_tensors=True,
+            recovery_role=recovery_role,
         )
         _set_active_frcheck_recovery_worker(worker)
         if _dbg:
@@ -3484,8 +3773,9 @@ def recover_frcheck_legacy_hardware(
                 job, manager, native, n, rank, is_failed, preloaded,
                 buf_pool, full_buf, global_tensor_infos,
                 runtime=runtime_for_recovery,
-                map_to_full_buf=True,
+                map_to_full_buf="all",
                 clone_runtime_tensors=True,
+                recovery_role=recovery_role,
             )
             if record is not None:
                 layerwise_records.append(record)
@@ -3535,8 +3825,13 @@ def recover_frcheck_legacy_hardware(
             )
     timings['rebuild_sd'] = time.time() - t_rebuild
 
-    if not detached_transformer_recovery:
+    safe_point = getattr(args, "frcheck_recovery_safe_point", "load")
+    if safe_point == "load" and not detached_transformer_recovery:
         _teardown_frcheck_native_after_load()
+    elif safe_point != "load":
+        _frcheck_recovery_profile(
+            recovery_role, "teardown_moved_to_safe_point", safe_point=safe_point
+        )
     return result, timings
 
 
@@ -3846,7 +4141,18 @@ def _assemble_state_dict_from_local_blocks(
     payload["tensor_buffer"] = full_buf[:total_tensor_size]
     result = _reconstruct_from_main_payload(payload, flat_key_roots)
     if teardown_native:
-        _teardown_frcheck_native_after_load()
+        try:
+            from megatron.training import get_args
+            safe_point = getattr(get_args(), "frcheck_recovery_safe_point", "load")
+        except Exception:
+            safe_point = "load"
+        if safe_point == "load":
+            _teardown_frcheck_native_after_load()
+        else:
+            _frcheck_recovery_profile(
+                getattr(FRCheckManager(), "_frcheck_recovery_role", "local_load"),
+                "teardown_moved_to_safe_point", safe_point=safe_point,
+            )
     return result
 
 
@@ -3886,6 +4192,11 @@ def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             "rebuild_sd=%(rebuild_sd).2fs (prep excluded from total)",
             _t_fr,
         )
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("frcheck_load_return")
+        except Exception:
+            pass
         return result
 
     t0 = time.time()

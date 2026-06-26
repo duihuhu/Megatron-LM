@@ -100,6 +100,8 @@ case "$MODE" in
             #--no-load-optim
             #--no-load-rng
             --frcheck-failed-ranks "0"
+            --frcheck-recovery-safe-point after_load_checkpoint
+            --frcheck-recovery-only-teardown
         )
         ;;
     hardware2)
@@ -170,6 +172,8 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-interval 100
     --save $CHECKPOINT_PATH
     --frcheck-async-parity
+    --frcheck-skip-load-teardown-barrier
+    #--frcheck-defer-load-teardown
     #--load $CHECKPOINT_PATH
     
     --eval-iters 1

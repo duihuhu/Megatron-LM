@@ -130,6 +130,7 @@ from .global_vars import (
     get_one_logger,
     get_energy_monitor,
     finish_recovery_to_forward_timer,
+    mark_recovery_to_forward_timer,
 )
 from . import one_logger_utils
 
@@ -147,6 +148,18 @@ def destroy_global_state():
     destroy_model_parallel()
     destroy_rerun_state_machine()
 
+
+
+
+def _log_recovery_to_forward_profile(event: str) -> None:
+    args = get_args()
+    if not (getattr(args, "use_frcheck", False) or getattr(args, "use_gemini_replicas", False)):
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    scheme = "FRCheck" if getattr(args, "use_frcheck", False) else "Gemini Replicas"
+    logging.getLogger(__name__).info(
+        "%s profile: rank=%d event=%s", scheme, rank, event
+    )
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -853,6 +866,8 @@ def pretrain(
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
+    mark_recovery_to_forward_timer("model_optimizer_setup_done")
+    _log_recovery_to_forward_profile("model_optimizer_setup_done")
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -875,6 +890,8 @@ def pretrain(
             build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
         )
     timers('train/valid/test-data-iterators-setup').stop()
+    mark_recovery_to_forward_timer("dataloader_done")
+    _log_recovery_to_forward_profile("dataloader_done")
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
@@ -1351,6 +1368,8 @@ def setup_model_and_optimizer(
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
         )
+        mark_recovery_to_forward_timer("after_load_checkpoint")
+        _log_recovery_to_forward_profile("after_load_checkpoint")
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -1360,8 +1379,12 @@ def setup_model_and_optimizer(
             }
         )
         if getattr(args, "use_frcheck", False):
-            from megatron.training.frcheck_legacy import frcheck_log_layerwise_runtime_summary
+            from megatron.training.frcheck_legacy import (
+                frcheck_log_layerwise_runtime_summary,
+                frcheck_recovery_safe_point,
+            )
             frcheck_log_layerwise_runtime_summary("after_load_checkpoint")
+            frcheck_recovery_safe_point("after_load_checkpoint")
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
@@ -1534,10 +1557,28 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 if isinstance(optim_instance, DistributedOptimizer):
                     optim_instance._copy_main_params_to_param_buffer()
 
+        mark_recovery_to_forward_timer("train_step_start")
+        _log_recovery_to_forward_profile("train_step_start")
+        if getattr(args, "use_frcheck", False):
+            try:
+                from megatron.training.frcheck_legacy import frcheck_recovery_safe_point
+                frcheck_recovery_safe_point("train_step_start")
+            except ImportError:
+                pass
+
         @functools.wraps(forward_step_func)
         def forward_step_func_with_recovery_timing(*args, **kwargs):
+            mark_recovery_to_forward_timer("forward_step_start")
+            _log_recovery_to_forward_profile("forward_step_start")
+            if getattr(args, "use_frcheck", False):
+                try:
+                    from megatron.training.frcheck_legacy import frcheck_recovery_safe_point
+                    frcheck_recovery_safe_point("forward_step_start")
+                except ImportError:
+                    pass
             result = forward_step_func(*args, **kwargs)
-            finish_recovery_to_forward_timer()
+            finish_recovery_to_forward_timer("forward_step_end")
+            _log_recovery_to_forward_profile("forward_step_end")
             return result
 
         # Forward pass.
@@ -1570,7 +1611,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if getattr(args, "use_frcheck", False):
         try:
-            from megatron.training.frcheck_legacy import frcheck_wait_for_optimizer_state
+            from megatron.training.frcheck_legacy import (
+                frcheck_recovery_safe_point,
+                frcheck_wait_for_optimizer_state,
+            )
+            frcheck_recovery_safe_point("before_optimizer_step")
             frcheck_wait_for_optimizer_state(optimizer)
         except ImportError:
             pass

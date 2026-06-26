@@ -75,30 +75,66 @@ def get_signal_handler():
     return _GLOBAL_SIGNAL_HANDLER
 
 
-def start_recovery_to_forward_timer(scheme: str, phase: str = "network_decode") -> None:
-    """Start a one-shot timer that ends after the next forward-backward call."""
+def start_recovery_to_forward_timer(
+    scheme: str, phase: str = "network_decode", **context
+) -> None:
+    """Start a one-shot timer that ends after the next forward step."""
     global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    now = time.time()
     _GLOBAL_RECOVERY_TO_FORWARD_TIMER = {
         "scheme": scheme,
         "phase": phase,
         "rank": rank,
-        "start": time.time(),
+        "start": now,
+        "marks": [(phase, now)],
+        "context": dict(context),
     }
 
 
-def finish_recovery_to_forward_timer() -> None:
-    """Log elapsed time from recovery network/decode start to next forward end."""
+def update_recovery_to_forward_timer_context(**context) -> None:
+    """Attach metadata such as recovery role to the active recovery timer."""
+    timer = _GLOBAL_RECOVERY_TO_FORWARD_TIMER
+    if timer is None:
+        return
+    timer.setdefault("context", {}).update(context)
+
+
+def mark_recovery_to_forward_timer(label: str) -> None:
+    """Record an intermediate recovery-to-forward timing mark."""
+    timer = _GLOBAL_RECOVERY_TO_FORWARD_TIMER
+    if timer is None:
+        return
+    timer.setdefault("marks", []).append((label, time.time()))
+
+
+def finish_recovery_to_forward_timer(label: str = "forward_step_end") -> None:
+    """Log elapsed time from recovery network/decode start to next forward step end."""
     global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
     timer = _GLOBAL_RECOVERY_TO_FORWARD_TIMER
     if timer is None:
         return
+    mark_recovery_to_forward_timer(label)
     _GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
-    elapsed = time.time() - timer["start"]
+    marks = timer.get("marks", [])
+    start = timer["start"]
+    elapsed = marks[-1][1] - start if marks else 0.0
+    segments = []
+    for (prev_label, prev_time), (next_label, next_time) in zip(marks, marks[1:]):
+        segments.append(f"{prev_label}->{next_label}={next_time - prev_time:.4f}s")
+    segment_text = " ".join(segments)
+    if segment_text:
+        segment_text = f" segments=[{segment_text}]"
+    context = timer.get("context", {}) or {}
+    context_text = " ".join(
+        f"{key}={value}" for key, value in sorted(context.items())
+    )
+    if context_text:
+        context_text = f" {context_text}"
     print(
         f"{timer['scheme']} recovery-to-forward timing: "
         f"rank={timer['rank']} phase={timer['phase']} "
-        f"to_next_forward_end={elapsed:.4f}s",
+        f"to_next_forward_end={elapsed:.4f}s{context_text}{segment_text}",
         flush=True,
     )
 

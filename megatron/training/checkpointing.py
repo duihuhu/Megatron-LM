@@ -28,7 +28,7 @@ from megatron.core.fp8_utils import is_float8tensor, dequantize_fp8_tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from .async_utils import schedule_async_save, is_empty_async_queue
 from .global_vars import get_args
-from .global_vars import finish_recovery_to_forward_timer
+from .global_vars import mark_recovery_to_forward_timer
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
@@ -59,6 +59,27 @@ except Exception:
 _CHECKPOINT_VERSION = None
 
 logger = getLogger(__name__)
+
+
+def _timing_max(value: float) -> float:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return float(value)
+    device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    tensor = torch.tensor([float(value)], dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def _ft_legacy_timing_enabled(args) -> bool:
+    return any(
+        getattr(args, name, False)
+        for name in (
+            "use_gemini_replicas",
+            "use_eccheck",
+            "use_ecnaive",
+            "use_frcheck",
+        )
+    )
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 
 _TORCH_DIST_STRATEGY_PREINITIALIZED = False
@@ -2050,6 +2071,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     #         f"non_contig={model_non_contig_count} "
     #         f"pinned={model_pinned_count}"
     #     )
+    ft_timing_enabled = _ft_legacy_timing_enabled(args)
     model_submit_start = time()
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
@@ -2065,13 +2087,19 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     model_sync_end = time()
-    if getattr(args, "use_gemini_replicas", False):
-        finish_recovery_to_forward_timer()
-    logger.info(
-        f"[rank {rank}] model load submit={model_submit_end - model_submit_start:.4f}s "
-        f"cuda_sync={model_sync_end - model_submit_end:.4f}s "
-        f"total={model_sync_end - model_submit_start:.4f}s"
-    )
+    if getattr(args, "use_frcheck", False) or getattr(args, "use_gemini_replicas", False):
+        mark_recovery_to_forward_timer("model_load_done")
+        scheme = "FRCheck" if getattr(args, "use_frcheck", False) else "Gemini Replicas"
+        logger.info("%s profile: rank=%d event=model_load_done", scheme, rank)
+    h2d_model_s = model_sync_end - model_submit_start
+    h2d_model_submit_s = model_submit_end - model_submit_start
+    h2d_model_sync_s = model_sync_end - model_submit_end
+    if not ft_timing_enabled:
+        logger.info(
+            f"[rank {rank}] model load submit={h2d_model_submit_s:.4f}s "
+            f"cuda_sync={h2d_model_sync_s:.4f}s "
+            f"total={h2d_model_s:.4f}s"
+        )
     logger.info(
         f"[rank {rank}] load only model state before barrier time: "
         f"{model_sync_end - load_model_start_time:.4f}s"
@@ -2128,6 +2156,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         visit(obj)
         return tensor_count, tensor_bytes, len(storage_ptrs), non_contig_count, pinned_count
 
+    h2d_optimizer_s = 0.0
+    h2d_optimizer_submit_s = 0.0
+    h2d_optimizer_sync_s = 0.0
+
     # Optimizer.
     frcheck_deferred_optimizer = False
     if not release and not args.finetune and not args.no_load_optim:
@@ -2163,11 +2195,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     optim_sync_end = time()
-                    logger.info(
-                        f"[rank {rank}] optimizer load submit={optim_submit_end - optim_submit_start:.4f}s "
-                        f"cuda_sync={optim_sync_end - optim_submit_end:.4f}s "
-                        f"total={optim_sync_end - optim_submit_start:.4f}s"
-                    )
+                    h2d_optimizer_s = optim_sync_end - optim_submit_start
+                    h2d_optimizer_submit_s = optim_submit_end - optim_submit_start
+                    h2d_optimizer_sync_s = optim_sync_end - optim_submit_end
+                    if not ft_timing_enabled:
+                        logger.info(
+                            f"[rank {rank}] optimizer load submit={h2d_optimizer_submit_s:.4f}s "
+                            f"cuda_sync={h2d_optimizer_sync_s:.4f}s "
+                            f"total={h2d_optimizer_s:.4f}s"
+                        )
                 else:
                     logger.info(
                         f"[rank {rank}] FRCheck optimizer load deferred until optimizer step"
@@ -2208,6 +2244,22 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optimizer.reload_model_params(state_dict=state_dict)
             else:
                 optimizer.reload_model_params()
+
+    if ft_timing_enabled:
+        h2d_total_s = h2d_model_s + h2d_optimizer_s
+        logger.info(
+            "FT load model timing: h2d_total_s=%.2fs h2d_model_s=%.2fs "
+            "h2d_model_submit_s=%.2fs h2d_model_sync_s=%.2fs "
+            "h2d_optimizer_s=%.2fs h2d_optimizer_submit_s=%.2fs "
+            "h2d_optimizer_sync_s=%.2fs",
+            _timing_max(h2d_total_s),
+            _timing_max(h2d_model_s),
+            _timing_max(h2d_model_submit_s),
+            _timing_max(h2d_model_sync_s),
+            _timing_max(h2d_optimizer_s),
+            _timing_max(h2d_optimizer_submit_s),
+            _timing_max(h2d_optimizer_sync_s),
+        )
 
     # rerun state
     if not ignore_rerun_state:

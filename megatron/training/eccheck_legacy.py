@@ -34,6 +34,27 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
 
 logger = getLogger(__name__)
 
+
+def _timing_max(value: float) -> float:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return float(value)
+    device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    tensor = torch.tensor([float(value)], dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def _timing_max_dict(timings: Dict[str, float]) -> Dict[str, float]:
+    return {key: _timing_max(value) for key, value in timings.items()}
+
+
+def _timed_barrier() -> float:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0.0
+    start = time.time()
+    torch.distributed.barrier()
+    return time.time() - start
+
 _FORMAT = "eccheck_torch_legacy"
 
 
@@ -433,12 +454,14 @@ def save_eccheck_legacy_checkpoint(
         raise RuntimeError("ECCHECK native module is not available in legacy save path")
 
     flatten_optimizer_fp32_params(state_dict)
+    e2e_start = time.time()
     t0 = time.time()
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
-    logger.info(f"ECCHECK save timing: decompose {time.time()-t0:.3f}s")
+    decompose_s = time.time() - t0
+    logger.debug(f"ECCHECK save timing: decompose {decompose_s:.3f}s")
 
-    start_time = t0 = time.time()
+    t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), manager.eccheck_buffer_size)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
@@ -475,18 +498,21 @@ def save_eccheck_legacy_checkpoint(
     d2h_stream.synchronize()
 
     del decomposed.tensor_data  # drop remaining refs
-    logger.info(f"ECCHECK save timing: D2H+copy {time.time()-t0:.3f}s")
+    d2h_s = time.time() - t0
+    logger.debug(f"ECCHECK save timing: d2h {d2h_s:.3f}s")
 
     t0 = time.time()
     # Only tensor metadata needed for block sizing; non_tensor_data (~250MB)
     # is exchanged by all_gather_object but never consumed here.  Pass an empty
     # dict to avoid wasting 5+ seconds on unnecessary exchange.
     rank_metadata, _ = _build_global_registry(local_tensor_metadata, {})
-    logger.info(f"ECCHECK save timing: metadata exchange {time.time()-t0:.3f}s")
+    metadata_s = time.time() - t0
+    logger.debug(f"ECCHECK save timing: metadata exchange {metadata_s:.3f}s")
 
     t0 = time.time()
     blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
-    logger.info(f"ECCHECK save timing: block alloc {time.time()-t0:.3f}s")
+    block_alloc_s = time.time() - t0
+    logger.debug(f"ECCHECK save timing: block alloc {block_alloc_s:.3f}s")
 
     # Allocate recv encoding buffers now that we know peer data sizes
     registry = GlobalMetadataRegistry(
@@ -497,20 +523,22 @@ def save_eccheck_legacy_checkpoint(
         manager.eccheck_recv_encoding_buffers = (
             manager.allocate_recv_encoding_buffers_phase2(registry)
         )
-    logger.info(f"ECCHECK save timing: recv buf alloc {time.time()-t0:.3f}s")
+    recv_alloc_s = time.time() - t0
+    logger.debug(f"ECCHECK save timing: recv buf alloc {recv_alloc_s:.3f}s")
 
     t0 = time.time()
     if manager.use_rdma:
         manager.register_buffer(tensor_buffer)
-    logger.info(f"ECCHECK save timing: RDMA reg {time.time()-t0:.3f}s")
+    rdma_reg_s = time.time() - t0
+    logger.debug(f"ECCHECK save timing: RDMA reg {rdma_reg_s:.3f}s")
 
-    logger.info(
+    logger.debug(
         f"ECCHECK legacy save: rank {rank} encoding "
         f"{blocks['pipeline_size'] / (1024**3):.2f} GB pipeline "
         f"(actual: {total_tensor_size / (1024**3):.2f} GB)"
     )
 
-    torch.distributed.barrier()
+    pre_barrier_s = _timed_barrier()
     t0 = time.time()
     _encode_eccheck_with_native(
         manager=manager,
@@ -518,9 +546,28 @@ def save_eccheck_legacy_checkpoint(
         actual_data_bytes=total_tensor_size,
         blocks=blocks,
     )
-    logger.info(f"ECCHECK save timing: encode {time.time()-t0:.3f}s")
-    torch.distributed.barrier()
-    logger.info(f"ECCHECK legacy save: done in {time.time() - start_time:.2f}s")
+    network_encode_s = time.time() - t0
+    logger.debug(f"ECCHECK save timing: encode {network_encode_s:.3f}s")
+    post_barrier_s = _timed_barrier()
+    barrier_s = pre_barrier_s + post_barrier_s
+    e2e_s = time.time() - e2e_start
+    summary = _timing_max_dict({
+        "e2e_s": e2e_s,
+        "decompose_s": decompose_s,
+        "d2h_s": d2h_s,
+        "metadata_s": metadata_s,
+        "buffer_alloc_s": block_alloc_s + recv_alloc_s,
+        "rdma_reg_s": rdma_reg_s,
+        "network_encode_s": network_encode_s,
+        "barrier_s": barrier_s,
+    })
+    logger.info(
+        "ECCHECK save timing: e2e_s=%(e2e_s).2fs decompose_s=%(decompose_s).2fs "
+        "d2h_s=%(d2h_s).2fs metadata_s=%(metadata_s).2fs "
+        "buffer_alloc_s=%(buffer_alloc_s).2fs rdma_reg_s=%(rdma_reg_s).2fs "
+        "network_encode_s=%(network_encode_s).2fs barrier_s=%(barrier_s).2fs",
+        summary,
+    )
 
     _save_eccheck_pt_files(
         checkpoint_name=checkpoint_name,
@@ -532,7 +579,7 @@ def save_eccheck_legacy_checkpoint(
         all_tensor_infos=rank_metadata,
     )
     if world_size > 1:
-        torch.distributed.barrier()
+        _timed_barrier()
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +673,7 @@ def _load_eccheck_main_payload(
             payload = dict(gathered[r])
             all_ti = payload.get("all_tensor_infos")
             if all_ti and rank in all_ti:
-                logger.info(
+                logger.debug(
                     f"ECCHECK legacy: eccheck_main_rank{rank}.pt missing locally; "
                     f"recovered tensor_infos for rank {rank} from rank {r}"
                 )
@@ -842,7 +889,7 @@ def _run_eccheck_legacy_recovery(
     # ---- hardware failure path (rank_in_group 2) ----
     failed_rank = 2
     native.set_load_mode(True, failed_rank)
-    logger.info(f"ECCHECK legacy: set load mode (failed_rank={failed_rank})")
+    logger.debug(f"ECCHECK legacy: set load mode (failed_rank={failed_rank})")
 
     # Compute pipeline size
     max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
@@ -1033,7 +1080,7 @@ def _run_eccheck_legacy_recovery(
                              recovered_dense.numel())
                 recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
 
-        logger.info(
+        logger.debug(
             f"ECCHECK legacy: hw recovery pipeline done in {t_pipeline_net:.2f}s"
         )
 
@@ -1078,7 +1125,7 @@ def _run_eccheck_two_failures_recovery(
 
     # Set C++ to two-failure mode (failed_rank=10, following ECLATIN convention)
     native.set_load_mode(True, 10)
-    logger.info(
+    logger.debug(
         f"ECCHECK legacy two-failures: load mode set (failed_rank=10), "
         f"rank={rank}, rank_in_group={rank_in_group}"
     )
@@ -1154,25 +1201,25 @@ def _run_eccheck_two_failures_recovery(
     _t0 = time()
     if rank_in_group == 0:
         native.simple_p2p_send(int(partner_buf.data_ptr()), partner_buf.numel())
-        logger.info(
+        logger.debug(
             f"ECCHECK two-failures: rig0 sent d1 to rig1 "
             f"({partner_buf.numel() / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 1:
         native.simple_p2p_recv(int(partner_buf.data_ptr()), partner_buf.numel())
-        logger.info(
+        logger.debug(
             f"ECCHECK two-failures: rig1 received d1 from rig0 "
             f"({partner_buf.numel() / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 2:
         native.simple_p2p_recv(int(own_buf.data_ptr()), own_buf.numel())
-        logger.info(
+        logger.debug(
             f"ECCHECK two-failures: rig2 received p2 from rig3 "
             f"({own_buf.numel() / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 3:
         native.simple_p2p_send(int(partner_buf.data_ptr()), partner_buf.numel())
-        logger.info(
+        logger.debug(
             f"ECCHECK two-failures: rig3 sent p2 to rig2 "
             f"({partner_buf.numel() / (1024**3):.2f} GB)"
         )
@@ -1341,7 +1388,7 @@ def _run_eccheck_two_failures_recovery(
                 recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
 
         network_encode = t_phase1_p2p + t_pipeline_net
-        logger.info(
+        logger.debug(
             f"ECCHECK legacy: two-failure recovery pipeline done in "
             f"{network_encode:.2f}s"
         )
@@ -1543,7 +1590,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             manager.register_buffer(recovered_buffer)
 
     # sync all ranks before timing
-    torch.distributed.barrier()
+    barrier_s = _timed_barrier()
 
     # === timing: network/encode (C++ P2P or XOR pipeline, excluding setup/copy) ===
     if two_failures:
@@ -1568,7 +1615,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             registry=registry,
         )
 
-    torch.distributed.barrier()
+    barrier_s += _timed_barrier()
 
     if two_failures:
         _mode = "2F"
@@ -1576,10 +1623,6 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         _mode = "SW"
     else:
         _mode = "HW"
-    logger.info(
-        "ECCHECK legacy load timing (%s): network_encode=%.2fs",
-        _mode, network_encode,
-    )
 
     if two_failures:
         use_recovered = rank_in_group in (1, 2)
@@ -1588,17 +1631,32 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         recovered_buffer = blocks["own_buffer"]
     else:
         use_recovered = rank_in_group == 2 or (sw_failure and rank_in_group == 1)
+    t_rebuild = time.time()
     state_dict = _reconstruct_state_dict_from_eccheck_buffer(
         main_payload,
         recovered_buffer=recovered_buffer if use_recovered else None,
     )
+    rebuild_sd = time.time() - t_rebuild
 
     if world_size > 1 and torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        barrier_s += _timed_barrier()
+
+    summary = _timing_max_dict({
+        "e2e_s": network_encode + rebuild_sd + barrier_s,
+        "network_encode_s": network_encode,
+        "rebuild_sd_s": rebuild_sd,
+        "barrier_s": barrier_s,
+    })
+    logger.info(
+        "ECCHECK load timing (%s): e2e_s=%.2fs network_encode_s=%.2fs "
+        "rebuild_sd_s=%.2fs barrier_s=%.2fs",
+        _mode, summary["e2e_s"], summary["network_encode_s"],
+        summary["rebuild_sd_s"], summary["barrier_s"],
+    )
 
     # Stop C++ load workers so they don't interfere with subsequent training.
     # The singleton manager will be reinitialized on the next save.
-    logger.info(f"ECCHECK legacy: cleaning up C++ module after recovery (rank {rank})")
+    logger.debug(f"ECCHECK legacy: cleaning up C++ module after recovery (rank {rank})")
     manager.cleanup()
     manager._eccheck_native = None
 

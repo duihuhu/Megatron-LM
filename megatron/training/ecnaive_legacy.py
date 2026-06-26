@@ -26,6 +26,27 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
 logger = getLogger(__name__)
 
 
+def _timing_max(value: float) -> float:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return float(value)
+    device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    tensor = torch.tensor([float(value)], dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def _timing_max_dict(timings: Dict[str, float]) -> Dict[str, float]:
+    return {key: _timing_max(value) for key, value in timings.items()}
+
+
+def _timed_barrier() -> float:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0.0
+    start = time.time()
+    torch.distributed.barrier()
+    return time.time() - start
+
+
 
 _BUILD_GLOBAL_REGISTRY_CACHE: Dict[tuple, tuple] = {}
 
@@ -412,7 +433,7 @@ def _load_ecnaive_main_payload(
             payload = dict(gathered[r])
             all_ti = payload.get("all_tensor_infos")
             if all_ti and rank in all_ti:
-                logger.info(
+                logger.debug(
                     f"EC-NAIVE legacy: ecnaive_main_rank{rank}.pt missing locally; "
                     f"recovered tensor_infos for rank {rank} from rank {r}"
                 )
@@ -751,8 +772,7 @@ def _load_ecnaive_legacy_software_failure(
             send_block_idx = block_idx
 
     # sync all ranks before timing
-    if world_size > 1:
-        torch.distributed.barrier()
+    _t['barrier'] = _timed_barrier() if world_size > 1 else 0.0
 
     # === timing: network/encode (ASIO send/recv only) ===
     _t0_net = _time()
@@ -776,19 +796,20 @@ def _load_ecnaive_legacy_software_failure(
             else:
                 n_copy = min(buf.numel(), block_data_size)
                 tensor_buffer[dst_off:dst_off + n_copy].copy_(buf[:n_copy])
-            logger.info(
-                "EC-NAIVE legacy sw: rank2 received d_2,%d (%d bytes)",
-                idx + 1, buf.numel(),
+            logger.debug(
+                "EC-NAIVE legacy sw: failed_rig=%d received data_block_idx=%d bytes=%d",
+                failed_rig, idx + 1, buf.numel(),
             )
     if send_block is not None:
-        logger.info(
+        logger.debug(
             "EC-NAIVE legacy sw: rig=%d sent (block_idx=%d, %d bytes)",
             rank_in_group, send_block_idx, send_block.numel(),
         )
 
     if world_size > 1:
-        torch.distributed.barrier()
+        _t['barrier'] = _t.get('barrier', 0.0) + _timed_barrier()
 
+    t_rebuild = _time()
     if rank_in_group == failed_rig:
         if actual_tensor_size > 0:
             tensor_buffer = tensor_buffer[:actual_tensor_size]
@@ -805,6 +826,7 @@ def _load_ecnaive_legacy_software_failure(
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
+    _t['rebuild_sd'] = _time() - t_rebuild
 
     # NOTE: the old standalone else clause for ranks 0,1 (k=2) is absorbed into
     # the generalized else branch above.
@@ -894,14 +916,14 @@ def _run_ecnaive_full_recovery(
             size=aligned_block_size,
         )
         native.submit_load_recv_sentinel()
-        logger.info(
+        logger.debug(
             "EC-NAIVE legacy load: rank_in_group 2 waiting for load completion "
             f"(aligned_block_size={aligned_block_size})"
         )
         native.wait_for_load_completion()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        logger.info(
+        logger.debug(
             f"EC-NAIVE legacy load: hw recovery done in {time() - start_time:.2f}s (rank_in_group=2)"
         )
     else:
@@ -954,7 +976,7 @@ def _run_ecnaive_full_recovery(
             raise RuntimeError(
                 f"EC-NAIVE legacy load: unexpected rank_in_group={rank_in_group}"
             )
-        logger.info(
+        logger.debug(
             f"EC-NAIVE legacy load: submitted load sends in {time() - start_time:.2f}s "
             f"(rank_in_group={rank_in_group})"
         )
@@ -1045,7 +1067,7 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     # ---- Software failure fast path ----
     if bool(getattr(args, "use_ecnaive_software_failure", False)):
-        logger.info("EC-NAIVE legacy: software failure recovery path")
+        logger.debug("EC-NAIVE legacy: software failure recovery path")
         _t: Dict[str, float] = {}
         state_dict = _load_ecnaive_legacy_software_failure(
             checkpoint_dir=checkpoint_dir,
@@ -1056,9 +1078,17 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             global_registry=global_registry,
             timings=_t,
         )
+        _t['total'] = (
+            _t.get('network_encode', 0.0)
+            + _t.get('rebuild_sd', 0.0)
+            + _t.get('barrier', 0.0)
+        )
+        summary = _timing_max_dict(_t)
         logger.info(
-            "EC-NAIVE legacy load timing (SW): network_encode=%.2fs",
-            _t.get('network_encode', 0.0),
+            "EC-NAIVE load timing (SW): e2e_s=%(total).2fs "
+            "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
+            "barrier_s=%(barrier).2fs",
+            summary,
         )
         return state_dict
 
@@ -1095,8 +1125,7 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
                 manager.register_buffer(t)
 
     # sync all ranks before timing
-    if world_size > 1 and torch.distributed.is_initialized():
-        torch.distributed.barrier()
+    barrier_s = _timed_barrier() if world_size > 1 and torch.distributed.is_initialized() else 0.0
 
     # === timing: network/encode (C++ pipeline) ===
     _t0 = time.time()
@@ -1110,16 +1139,12 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     network_encode = time.time() - _t0
 
     if world_size > 1 and torch.distributed.is_initialized():
-        torch.distributed.barrier()
-
-    logger.info(
-        "EC-NAIVE legacy load timing (HW): network_encode=%.2fs",
-        network_encode,
-    )
+        barrier_s += _timed_barrier()
 
     # Backward compatibility: checkpoints saved before flat_key_roots existed.
     flat_key_roots = _infer_flat_key_roots(main_payload)
 
+    t_rebuild = time.time()
     if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
@@ -1131,9 +1156,23 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             manager=manager,
             flat_key_roots=flat_key_roots,
         )
+    rebuild_sd = time.time() - t_rebuild
 
     if world_size > 1 and torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        barrier_s += _timed_barrier()
+
+    summary = _timing_max_dict({
+        "e2e_s": network_encode + rebuild_sd + barrier_s,
+        "network_encode_s": network_encode,
+        "rebuild_sd_s": rebuild_sd,
+        "barrier_s": barrier_s,
+    })
+    logger.info(
+        "EC-NAIVE load timing (HW): e2e_s=%(e2e_s).2fs "
+        "network_encode_s=%(network_encode_s).2fs rebuild_sd_s=%(rebuild_sd_s).2fs "
+        "barrier_s=%(barrier_s).2fs",
+        summary,
+    )
 
     return state_dict
 
@@ -1295,7 +1334,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     is_source = rank in source_ranks
     source_set = set(source_ranks)
 
-    torch.distributed.barrier()
+    barrier_s = _timed_barrier()
 
     # Pre-allocate recv pool for failed ranks, load blocks for source ranks (not timed)
     recv_pool_prealloc: List[torch.Tensor] = []
@@ -1355,7 +1394,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 manager.register_buffer(b)
 
     # sync after pre-alloc, before timing
-    torch.distributed.barrier()
+    barrier_s += _timed_barrier()
 
     # === timing: network/encode (C++ send/recv + RS decode only) ===
     _t: Dict[str, float] = {}
@@ -1372,7 +1411,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 native.submit_send_task(
                     send_ch, int(block_tensor.data_ptr()), send_size
                 )
-            logger.info(
+            logger.debug(
                 f"EC-NAIVE hw recovery: source rank {rank} sending all "
                 f"{len(source_blocks_prealloc)} blocks to failed rank {dest_fr}"
             )
@@ -1383,10 +1422,12 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         _t['network_encode'] = time.time() - _t0_net
 
         if world_size > 1:
-            torch.distributed.barrier()
+            barrier_s += _timed_barrier()
+        t_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
+        _t['rebuild_sd'] = time.time() - t_rebuild
 
     elif affected_group and not is_failed and not is_source:
         # Survivor but not selected as source: no-op on channels
@@ -1397,10 +1438,12 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         _t['network_encode'] = time.time() - _t0_net
 
         if world_size > 1:
-            torch.distributed.barrier()
+            barrier_s += _timed_barrier()
+        t_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
+        _t['rebuild_sd'] = time.time() - t_rebuild
 
     elif affected_group and is_failed:
         # ═══════════════════════════════════════════════════════════════
@@ -1427,7 +1470,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     int(recv_pool[base + bi].data_ptr()),
                     recv_block_size,
                 )
-            logger.info(
+            logger.debug(
                 f"EC-NAIVE hw recovery: failed rank {rank} recv "
                 f"{ecnaive_n} blocks from source rank {src_rank} (slot {si})"
             )
@@ -1557,7 +1600,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 d0 = recovered_data[0]
                 d1 = recovered_data[1]
                 surv_keys = list(surviving.keys())
-                logger.warning(
+                logger.debug(
                     f"EC-NAIVE hw debug: self codeword owner_rig={owner_rig} "
                     f"k={ecnaive_k} m={m_owner} lost={lost} "
                     f"surviving_keys={surv_keys}"
@@ -1570,7 +1613,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     d0_total = min(d0.numel(), orig_d0.numel())
                     if d0_match < d0_total:
                         first = (d0[:orig_d0.numel()] != orig_d0).nonzero(as_tuple=False)[0].item()
-                        logger.warning(
+                        logger.debug(
                             f"EC-NAIVE hw debug: RSd0 vs orig_d0: "
                             f"match={d0_match}/{d0_total} "
                             f"first_mismatch_at={first} "
@@ -1585,7 +1628,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                             surviving['data_1'], surviving['parity0']
                         )
                         total_match = (d0 == expected_d0).sum().item()
-                        logger.warning(
+                        logger.debug(
                             f"EC-NAIVE hw debug: XOR RSd0 vs (d1^p0) total match: "
                             f"{total_match}/{d0.numel()} ({100*total_match/d0.numel():.1f}%)"
                         )
@@ -1633,7 +1676,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         # ── Store recovered blocks ──
         if recovered:
             manager.store_recovered_blocks(rank, recovered)
-            logger.info(
+            logger.debug(
                 f"EC-NAIVE hw recovery: stored {len(recovered)} recovered "
                 f"blocks for rank {rank} via unified decode+encode"
             )
@@ -1654,8 +1697,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             tensor_buffer = tensor_buffer[:actual_tensor_size]
 
         if world_size > 1:
-            torch.distributed.barrier()
+            barrier_s += _timed_barrier()
 
+        t_rebuild = time.time()
         # Debug: compare RS-recovered tensor_buffer with main_payload
         if args.ecnaive_hw_debug and isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
             orig_tb = main_payload["tensor_buffer"]
@@ -1676,11 +1720,11 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                         f"(total mismatches: {mismatch.numel()}/{orig.numel()})"
                     )
                 else:
-                    logger.info(
+                    logger.debug(
                         f"EC-NAIVE hw debug: tensor_buffer matches main_payload "
                         f"({orig.numel()} bytes)"
                     )
-                logger.warning(
+                logger.debug(
                     f"EC-NAIVE hw debug: zero-rate orig={zero_orig}/{orig.numel()} "
                     f"({100*zero_orig/orig.numel():.1f}%) "
                     f"recv={zero_recv}/{recv.numel()} "
@@ -1692,7 +1736,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     f"orig={orig.numel()} vs recv={recv.numel()}"
                 )
             # Use main_payload to continue training
-            logger.warning(
+            logger.debug(
                 f"EC-NAIVE hw debug: rank {rank} rebuilding from main_payload "
                 f"instead of RS-recovered tensor_buffer"
             )
@@ -1707,7 +1751,8 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 flat_key_roots=flat_key_roots,
             )
 
-        logger.info(
+        _t['rebuild_sd'] = time.time() - t_rebuild
+        logger.debug(
             f"EC-NAIVE hw recovery: rank {rank} recovered via encode_ec_blocks "
             f"(k={ecnaive_k}, n={ecnaive_n})"
         )
@@ -1723,18 +1768,28 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         _t['network_encode'] = time.time() - _t0_net
 
         if world_size > 1:
-            torch.distributed.barrier()
+            barrier_s += _timed_barrier()
+        t_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
-
-    logger.info(
-        "EC-NAIVE legacy load timing (HW recovery): network_encode=%.2fs",
-        _t.get('network_encode', 0.0),
-    )
+        _t['rebuild_sd'] = time.time() - t_rebuild
 
     if world_size > 1:
-        torch.distributed.barrier()
+        barrier_s += _timed_barrier()
+    _t['barrier'] = barrier_s
+    _t['total'] = (
+        _t.get('network_encode', 0.0)
+        + _t.get('rebuild_sd', 0.0)
+        + _t.get('barrier', 0.0)
+    )
+    summary = _timing_max_dict(_t)
+    logger.info(
+        "EC-NAIVE load timing (HW recovery): e2e_s=%(total).2fs "
+        "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
+        "barrier_s=%(barrier).2fs",
+        summary,
+    )
 
     # NOTE: do not call manager.cleanup() or native.stop() here.
     # The C++ destructor double-frees RDMA resources used during RS decode.
@@ -1754,12 +1809,14 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         raise RuntimeError("EC-NAIVE native module is not available in legacy save path")
 
     flatten_optimizer_fp32_params(state_dict)
+    e2e_start = time.time()
     t0 = time.time()
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
-    logger.info(f"ECNAIVE save timing: decompose {time.time()-t0:.3f}s")
+    decompose_s = time.time() - t0
+    logger.debug(f"ECNAIVE save timing: decompose {decompose_s:.3f}s")
 
-    start_time = t0 = time.time()
+    t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), manager.ecnaive_buffer_size)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
@@ -1796,22 +1853,26 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     d2h_stream.synchronize()
 
     del decomposed.tensor_data  # drop remaining refs
-    logger.info(f"ECNAIVE save timing: D2H+copy {time.time()-t0:.3f}s")
+    d2h_s = time.time() - t0
+    logger.debug(f"ECNAIVE save timing: d2h {d2h_s:.3f}s")
 
     t0 = time.time()
     rank_metadata, _ = _build_global_registry(local_tensor_metadata, {})
-    logger.info(f"ECNAIVE save timing: metadata exchange {time.time()-t0:.3f}s")
+    metadata_s = time.time() - t0
+    logger.debug(f"ECNAIVE save timing: metadata exchange {metadata_s:.3f}s")
 
     t0 = time.time()
     blocks = _allocate_ecnaive_blocks(manager, rank_metadata)
-    logger.info(f"ECNAIVE save timing: block alloc {time.time()-t0:.3f}s")
+    buffer_alloc_s = time.time() - t0
+    logger.debug(f"ECNAIVE save timing: block alloc {buffer_alloc_s:.3f}s")
 
     t0 = time.time()
     if manager.use_rdma:
         manager.register_buffer(tensor_buffer)
-    logger.info(f"ECNAIVE save timing: RDMA reg {time.time()-t0:.3f}s")
+    rdma_reg_s = time.time() - t0
+    logger.debug(f"ECNAIVE save timing: RDMA reg {rdma_reg_s:.3f}s")
 
-    torch.distributed.barrier()
+    pre_barrier_s = _timed_barrier()
     t0 = time.time()
     _encode_with_native(
         manager=manager,
@@ -1819,9 +1880,28 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         actual_data_bytes=total_tensor_size,
         ecnaive_blocks=blocks,
     )
-    logger.info(f"ECNAIVE save timing: encode {time.time()-t0:.3f}s")
-    torch.distributed.barrier()
-    logger.info(f"EC-NAIVE legacy save: done in {time.time() - start_time:.2f}s")
+    network_encode_s = time.time() - t0
+    logger.debug(f"ECNAIVE save timing: encode {network_encode_s:.3f}s")
+    post_barrier_s = _timed_barrier()
+    barrier_s = pre_barrier_s + post_barrier_s
+    e2e_s = time.time() - e2e_start
+    summary = _timing_max_dict({
+        "e2e_s": e2e_s,
+        "decompose_s": decompose_s,
+        "d2h_s": d2h_s,
+        "metadata_s": metadata_s,
+        "buffer_alloc_s": buffer_alloc_s,
+        "rdma_reg_s": rdma_reg_s,
+        "network_encode_s": network_encode_s,
+        "barrier_s": barrier_s,
+    })
+    logger.info(
+        "EC-NAIVE save timing: e2e_s=%(e2e_s).2fs decompose_s=%(decompose_s).2fs "
+        "d2h_s=%(d2h_s).2fs metadata_s=%(metadata_s).2fs "
+        "buffer_alloc_s=%(buffer_alloc_s).2fs rdma_reg_s=%(rdma_reg_s).2fs "
+        "network_encode_s=%(network_encode_s).2fs barrier_s=%(barrier_s).2fs",
+        summary,
+    )
 
     _save_ecnaive_pt_files(
         checkpoint_name=checkpoint_name,

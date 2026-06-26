@@ -116,7 +116,9 @@ class FRCheckManager:
         self.recovery_helper_bufs: List[Optional[torch.Tensor]] = []
         self.recovery_decoder_bufs: List[Optional[torch.Tensor]] = []
         self.recovery_failed_bufs: List[Optional[torch.Tensor]] = []
+        self._retired_runtime_buffers: List[Any] = []
 
+        self._frcheck_recovery_native_cleaned: bool = False
         self._initialized = True
 
     _rdma_registered_addrs: set = set()
@@ -250,8 +252,14 @@ class FRCheckManager:
         self.use_frcheck = bool(getattr(args, "use_frcheck", False))
         if not self.use_frcheck:
             return
-        if self._frcheck_native is not None and self.stripe_plans:
+        if self._frcheck_native is not None and self.stripe_plans and not self._frcheck_recovery_native_cleaned:
             return
+        if self._frcheck_recovery_native_cleaned:
+            # Drop the cleaned native handle only when reinitializing in the main
+            # process, not at the pre-dataloader safe point where worker fork
+            # stability matters most.
+            self._frcheck_native = None
+            self._frcheck_recovery_native_cleaned = False
 
         n = self._resolve_frcheck_n(args)
         path = self._resolve_frcheck_table_path(args, n)
@@ -1009,6 +1017,74 @@ class FRCheckManager:
         except Exception as e:
             logger.warning("FRCheck: stop() failed: %s", e)
 
+    def stop_recovery_runtime(self) -> None:
+        """Stop only C++ recovery workers when supported by the native module."""
+        if self._frcheck_native is None:
+            return
+        try:
+            if hasattr(self._frcheck_native, "stop_recovery_runtime"):
+                self._frcheck_native.stop_recovery_runtime()
+                logger.info("FRCheck: C++ recovery runtime stopped")
+            else:
+                self.stop()
+        except Exception as e:
+            logger.warning("FRCheck: stop_recovery_runtime() failed: %s", e)
+
+    def cleanup_recovery_runtime(self) -> None:
+        """Release recovery RDMA/native resources before DataLoader workers fork."""
+        if self._frcheck_native is None:
+            return
+        try:
+            if hasattr(self._frcheck_native, "cleanup_recovery_runtime"):
+                self._frcheck_native.cleanup_recovery_runtime()
+                logger.info("FRCheck: C++ recovery runtime cleaned up")
+            else:
+                self.stop()
+        except Exception as e:
+            logger.warning("FRCheck: cleanup_recovery_runtime() failed: %s", e)
+
+    def _clear_runtime_buffers_after_native_cleanup(self) -> None:
+        self._frcheck_native = None
+        self._frcheck_recovery_native_cleaned = False
+        self._rdma_registered_addrs.clear()
+        self.stripe_plans.clear()
+        self.layer_stripe_bufs.clear()
+        self._layer_stripe_alloc_sizes.clear()
+        self._layer_block_sizes = None
+        self.recv_bufs = []
+        self.parity1_bufs = []
+        self.parity2_bufs = []
+        self.data_buffer = None
+        self.recv_buffer = None
+        self.parity1_buffer = None
+        self.parity2_buffer = None
+
+    def _clear_recovery_native_handle(self) -> None:
+        # Keep old tensor/native objects alive at the pre-dataloader safe point,
+        # but remove them from active maps so the next save reinitializes and
+        # re-registers all RDMA buffers with the fresh native module.
+        retired = [self._frcheck_native]
+        retired.extend(self.layer_stripe_bufs.values())
+        retired.extend([
+            self.data_buffer, self.recv_buffer,
+            self.parity1_buffer, self.parity2_buffer,
+        ])
+        self._retired_runtime_buffers.extend(x for x in retired if x is not None)
+        self._frcheck_native = None
+        self._frcheck_recovery_native_cleaned = False
+        self._rdma_registered_addrs.clear()
+        self.stripe_plans.clear()
+        self.layer_stripe_bufs.clear()
+        self._layer_stripe_alloc_sizes.clear()
+        self._layer_block_sizes = None
+        self.recv_bufs = []
+        self.parity1_bufs = []
+        self.parity2_bufs = []
+        self.data_buffer = None
+        self.recv_buffer = None
+        self.parity1_buffer = None
+        self.parity2_buffer = None
+
     def end_recovery(self) -> None:
         """Clear recovery-mode state without tearing down RDMA / RS pool."""
         self.is_recovery_mode = False
@@ -1019,7 +1095,35 @@ class FRCheckManager:
         self.recovery_decoder_bufs = []
         self.recovery_failed_bufs = []
 
-    def cleanup(self, teardown: bool = False) -> None:
+    def cleanup_recovery(self, teardown: bool = False, sync: bool = True) -> None:
+        """Cleanup recovery-only state without full native teardown when possible."""
+        if not teardown:
+            return
+        try:
+            import time
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            t_total = time.time()
+            barrier_s = 0.0
+            if sync and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                t_barrier = time.time()
+                torch.distributed.barrier()
+                barrier_s = time.time() - t_barrier
+            t_stop = time.time()
+            self.cleanup_recovery_runtime()
+            stop_s = time.time() - t_stop
+            t_metadata = time.time()
+            self._clear_recovery_native_handle()
+            self.end_recovery()
+            metadata_s = time.time() - t_metadata
+            logger.info(
+                "FRCheck recovery cleanup profile: rank=%d sync=%s barrier_s=%.4f "
+                "native_recovery_cleanup_s=%.4f metadata_s=%.4f total_s=%.4f",
+                rank, sync, barrier_s, stop_s, metadata_s, time.time() - t_total,
+            )
+        except Exception as e:
+            logger.warning("FRCheck: error during recovery cleanup: %s", e)
+
+    def cleanup(self, teardown: bool = False, sync: bool = True) -> None:
         """Cleanup FRCheck resources (ECLATIN-style).
 
         Save/train/eval: do not call — native module stays alive for reuse.
@@ -1028,17 +1132,30 @@ class FRCheckManager:
         if not teardown:
             return
         try:
+            import time
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            t_total = time.time()
+            barrier_s = 0.0
+            if sync and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                t_barrier = time.time()
                 torch.distributed.barrier()
+                barrier_s = time.time() - t_barrier
+            t_unregister = time.time()
             self._unregister_all_buffers()
+            unregister_s = time.time() - t_unregister
+            t_stop = time.time()
             self.stop()
-            self._frcheck_native = None
-            self.stripe_plans.clear()
-            self.layer_stripe_bufs.clear()
-            self._layer_stripe_alloc_sizes.clear()
-            self._layer_block_sizes = None
+            stop_s = time.time() - t_stop
+            t_metadata = time.time()
+            self._clear_runtime_buffers_after_native_cleanup()
             self.end_recovery()
+            metadata_s = time.time() - t_metadata
+            logger.info(
+                "FRCheck cleanup profile: rank=%d sync=%s barrier_s=%.4f "
+                "unregister_s=%.4f native_stop_s=%.4f metadata_s=%.4f total_s=%.4f",
+                rank, sync, barrier_s, unregister_s, stop_s, metadata_s,
+                time.time() - t_total,
+            )
             logger.info("FRCheck: native module torn down after load (rank=%d)", rank)
         except Exception as e:
             logger.warning("FRCheck: error during manager cleanup: %s", e)

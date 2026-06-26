@@ -39,6 +39,38 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
 logger = getLogger(__name__)
 
 
+def _timing_max(value: float) -> float:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return float(value)
+    device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    tensor = torch.tensor([float(value)], dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def _timing_max_dict(timings: Dict[str, float]) -> Dict[str, float]:
+    return {key: _timing_max(value) for key, value in timings.items()}
+
+
+def _timed_barrier() -> float:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0.0
+    start = time.time()
+    torch.distributed.barrier()
+    return time.time() - start
+
+
+def _gemini_recovery_profile(role: str, event: str, **fields) -> None:
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    parts = [f"rank={rank}", f"role={role}", f"event={event}"]
+    for key, value in fields.items():
+        if isinstance(value, float):
+            parts.append(f"{key}={value:.6f}")
+        else:
+            parts.append(f"{key}={value}")
+    logger.debug("Gemini profile: %s", " ".join(parts))
+
+
 
 def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
     checkpoint_path = Path(checkpoint_name)
@@ -178,11 +210,13 @@ def save_gemini_replicas_legacy_checkpoint(
         )
 
     flatten_optimizer_fp32_params(state_dict)
+    e2e_start = time.time()
     t0 = time.time()
     decomposed = decompose_state_dict(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
+    decompose_s = time.time() - t0
     if _dbg:
-        logger.info(f"GEMINI save timing: decompose {time.time()-t0:.3f}s")
+        logger.info(f"GEMINI save timing: decompose {decompose_s:.3f}s")
 
     safety_margin = max(int(total_tensor_size * 0.01), 1024 * 1024)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
@@ -236,8 +270,12 @@ def save_gemini_replicas_legacy_checkpoint(
     # Non-GDR path: stream has GPU→CPU copies (PCIe drain, now avoided with GDR).
     d2h_stream.synchronize()
     del decomposed.tensor_data  # drop remaining refs
+    pack_or_d2h_s = time.time() - t0
+    pack_s = pack_or_d2h_s if manager.use_gdr else 0.0
+    d2h_s = 0.0 if manager.use_gdr else pack_or_d2h_s
     if _dbg:
-        logger.info(f"GEMINI save timing: D2H+copy {time.time()-t0:.3f}s")
+        field = "pack" if manager.use_gdr else "d2h"
+        logger.info(f"GEMINI save timing: {field} {pack_or_d2h_s:.3f}s")
 
     t0 = time.time()
     if manager.use_rdma:
@@ -252,6 +290,7 @@ def save_gemini_replicas_legacy_checkpoint(
     # Tensor shapes, keys, and dtypes are identical across iterations for a fixed model.
     # Cache the results from the first exchange to skip expensive NCCL all_gather_object
     # on subsequent iterations (~3s → 0s for 32 ranks, 3GB models).
+    metadata_start = time.time()
     if _cached_rank_tensor_infos is None:
         rank_metadata, rank_non_tensor = _build_global_registry(
             local_tensor_metadata, decomposed.non_tensor_data
@@ -267,15 +306,17 @@ def save_gemini_replicas_legacy_checkpoint(
         _cached_rank_non_tensor = rank_non_tensor
         _cached_rank_flat_key_roots = rank_flat_key_roots
         _cached_rank_tensor_infos = rank_tensor_infos
+        metadata_s = time.time() - metadata_start
         if _dbg:
-            logger.info(f"GEMINI save timing: meta exchange (first) {time.time()-start_time:.3f}s")
+            logger.info(f"GEMINI save timing: metadata exchange (first) {metadata_s:.3f}s")
     else:
         rank_metadata = _cached_rank_metadata
         rank_non_tensor = _cached_rank_non_tensor
         rank_flat_key_roots = _cached_rank_flat_key_roots
         rank_tensor_infos = _cached_rank_tensor_infos
+        metadata_s = time.time() - metadata_start
         if _dbg:
-            logger.info(f"GEMINI save timing: meta exchange (cached) {time.time()-start_time:.3f}s")
+            logger.info(f"GEMINI save timing: metadata exchange (cached) {metadata_s:.3f}s")
 
     # Compute buffer sizes from metadata (replaces separate gloo size exchange)
     rank_sizes = {
@@ -311,9 +352,13 @@ def save_gemini_replicas_legacy_checkpoint(
         if manager.use_rdma:
             manager.register_buffer(recv_buf)
         receive_buffers[src_r] = recv_buf
-
-    torch.distributed.barrier()
-    logger.info(f"GEMINI save timing: recv buf alloc + barrier {time.time()-t0:.3f}s")
+    recv_alloc_s = time.time() - t0
+    barrier_s = _timed_barrier()
+    if _dbg:
+        logger.info(
+            "GEMINI save timing: recv_alloc=%.3fs barrier=%.3fs",
+            recv_alloc_s, barrier_s,
+        )
 
     t0 = time.time()
     native = manager._gemini_replicas_native
@@ -351,25 +396,44 @@ def save_gemini_replicas_legacy_checkpoint(
     native.wait_for_exchange_completion()
     _exchange_elapsed = time.time() - _exchange_t0
 
-    _barrier_t0 = time.time()
-    torch.distributed.barrier()
-    _barrier_elapsed = time.time() - _barrier_t0
-    logger.info(
-        "Gemini Replicas legacy save rank %d: C++ exchange done "
-        "(submit=%.3fs wait=%.3fs post_barrier=%.3fs total=%.3fs)",
-        rank, _submit_elapsed, _exchange_elapsed, _barrier_elapsed, time.time() - t0,
-    )
+    _barrier_elapsed = _timed_barrier()
+    barrier_s += _barrier_elapsed
+    if _dbg:
+        logger.info(
+            "Gemini Replicas legacy save rank %d: C++ exchange done "
+            "(submit=%.3fs wait=%.3fs post_barrier=%.3fs total=%.3fs)",
+            rank, _submit_elapsed, _exchange_elapsed, _barrier_elapsed, time.time() - t0,
+        )
 
     # With GDR: wait for async D2H to finish before writing files
+    mirror_d2h_s = 0.0
     if manager.use_gdr and gpu_tensor_buffer is not None:
         _mirror_t0 = time.time()
         native.wait_mirror_completion()
-        _mirror_elapsed = time.time() - _mirror_t0
+        mirror_d2h_s = time.time() - _mirror_t0
         native.start_mirror_worker()  # restart for next iteration
         if _dbg:
-            logger.info(f"GEMINI save timing: mirror wait {_mirror_elapsed:.3f}s")
+            logger.info(f"GEMINI save timing: mirror_d2h {mirror_d2h_s:.3f}s")
 
-    logger.info(f"GEMINI REPLICAS legacy save: done in {time.time() - start_time:.2f}s")
+    e2e_s = time.time() - e2e_start
+    summary = _timing_max_dict({
+        "e2e_s": e2e_s,
+        "decompose_s": decompose_s,
+        "pack_s": pack_s,
+        "d2h_s": d2h_s,
+        "mirror_d2h_s": mirror_d2h_s,
+        "metadata_s": metadata_s,
+        "buffer_alloc_s": recv_alloc_s,
+        "network_encode_s": _exchange_elapsed,
+        "barrier_s": barrier_s,
+    })
+    logger.info(
+        "GEMINI save timing: e2e_s=%(e2e_s).2fs decompose_s=%(decompose_s).2fs "
+        "pack_s=%(pack_s).2fs d2h_s=%(d2h_s).2fs mirror_d2h_s=%(mirror_d2h_s).2fs "
+        "metadata_s=%(metadata_s).2fs buffer_alloc_s=%(buffer_alloc_s).2fs "
+        "network_encode_s=%(network_encode_s).2fs barrier_s=%(barrier_s).2fs",
+        summary,
+    )
 
     # Build rank_meta from pre-exchanged data (meta exchange already done before C++ transfer).
     # Format is compatible with the file writing code below.
@@ -424,7 +488,7 @@ def save_gemini_replicas_legacy_checkpoint(
             b = b.contiguous()
         replica_tasks.append((str(replica_file), meta_bytes, memoryview(b.numpy())))
 
-    torch.distributed.barrier()
+    _timed_barrier()
 
     # ---- Parallel writes ----
     import concurrent.futures
@@ -1702,6 +1766,16 @@ def load_gemini_replicas_legacy_checkpoint(
     # rebuild_sd: extract + reconstruct + unflatten
     # total: network_encode + rebuild_sd
     _t: Dict[str, float] = {}
+    recovery_role = "failed" if is_failed else "survivor"
+    try:
+        from megatron.training.global_vars import update_recovery_to_forward_timer_context
+        update_recovery_to_forward_timer_context(role=recovery_role)
+    except Exception:
+        pass
+    _gemini_recovery_profile(
+        recovery_role, "rank_role", is_failed=is_failed,
+        main_file_exists=main_file_exists, recovery_rank_str=bool(recovery_rank_str),
+    )
 
     # ---- Software failure path ----
     sw_failure = bool(getattr(args, "use_gemini_replicas_software_failure", False))
@@ -1720,14 +1794,14 @@ def load_gemini_replicas_legacy_checkpoint(
             flat_key_roots=_infer_flat_key_roots(main_payload),
         )
         _t['rebuild_sd'] = time.time() - _t0
-        _t['total'] = _t['network_encode'] + _t['rebuild_sd']
+        _t['barrier'] = _timed_barrier()
+        _t['total'] = _t['network_encode'] + _t['rebuild_sd'] + _t['barrier']
+        summary = _timing_max_dict(_t)
         logger.info(
-            "GEMINI REPLICAS legacy load timing (SW): "
-            "total=%(total).2fs network_encode=%(network_encode).2fs "
-            "rebuild_sd=%(rebuild_sd).2fs", _t
+            "GEMINI load timing (SW): e2e_s=%(total).2fs "
+            "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
+            "barrier_s=%(barrier).2fs", summary
         )
-        if world_size > 1 and torch.distributed.is_initialized():
-            torch.distributed.barrier()
         return state_dict
 
     if not is_failed and all(health_list) and not recovery_rank_str:
@@ -1742,10 +1816,11 @@ def load_gemini_replicas_legacy_checkpoint(
         )
         _t['rebuild_sd'] = time.time() - _t0
         _t['total'] = _t['network_encode'] + _t['rebuild_sd']
+        summary = _timing_max_dict({**_t, "barrier": 0.0})
         logger.info(
-            "GEMINI REPLICAS legacy load timing (normal): "
-            "total=%(total).2fs network_encode=%(network_encode).2fs "
-            "rebuild_sd=%(rebuild_sd).2fs", _t
+            "GEMINI load timing (normal): e2e_s=%(total).2fs "
+            "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
+            "barrier_s=%(barrier).2fs", summary
         )
     else:
         # ---- Hardware recovery ----
@@ -1759,8 +1834,15 @@ def load_gemini_replicas_legacy_checkpoint(
         else:
             failed_override = None
 
+        t_setup = time.time()
+        _gemini_recovery_profile(recovery_role, "setup_start")
+
         # Setup (not timed): metadata collection
+        t_meta = time.time()
         meta = _collect_metadata_for_failed_rank(checkpoint_dir, rank, world_size)
+        _gemini_recovery_profile(
+            recovery_role, "metadata_collect_done", elapsed_s=time.time() - t_meta
+        )
 
         # Setup (not timed): group membership + health determination
         rank_to_group: Dict[int, List[int]] = {}
@@ -1797,28 +1879,46 @@ def load_gemini_replicas_legacy_checkpoint(
 
         # Setup (not timed): preload files + exchange metadata via NCCL
         # All disk I/O and pickle serialization happens here, before the barrier.
+        t_preload = time.time()
         _hw_recovery_preload(
             manager, checkpoint_dir, rank, world_size, failed,
         )
         _replica_recovery_preload(
             manager, checkpoint_dir, rank, world_size, failed,
         )
+        _gemini_recovery_profile(
+            recovery_role, "preload_done", elapsed_s=time.time() - t_preload
+        )
 
         # Setup (not timed): alloc recv buffers, normalize send buffers, RDMA reg
         _hw_recv_bufs.pop(rank, None)
         _replica_recv_bufs.pop(rank, None)
+        t_prealloc = time.time()
         _recovery_prealloc_buffers(manager, rank, failed, healthy)
+        _gemini_recovery_profile(
+            recovery_role, "prealloc_done", elapsed_s=time.time() - t_prealloc
+        )
+        _gemini_recovery_profile(
+            recovery_role, "setup_done", elapsed_s=time.time() - t_setup,
+            failed_count=len(failed), healthy_count=len(healthy),
+        )
 
         # sync all ranks before timed RDMA transfer
-        torch.distributed.barrier()
+        barrier_s = _timed_barrier()
+        _gemini_recovery_profile(
+            recovery_role, "pre_network_barrier_done", elapsed_s=barrier_s
+        )
 
         # === timing: network/encode (pure RDMA/ASIO tensor transfer only) ===
         _t0 = time.time()
         try:
             from megatron.training.global_vars import start_recovery_to_forward_timer
-            start_recovery_to_forward_timer("Gemini Replicas", "network_transfer")
+            start_recovery_to_forward_timer(
+                "Gemini Replicas", "network_transfer", role=recovery_role
+            )
         except Exception:
             pass
+        _gemini_recovery_profile(recovery_role, "network_transfer_start")
         recovered_buffer = _hw_recovery_transfer(
             manager, checkpoint_dir, rank, world_size, failed,
         )
@@ -1826,10 +1926,24 @@ def load_gemini_replicas_legacy_checkpoint(
             manager, checkpoint_dir, rank, world_size, failed,
         )
         _t['network_encode'] = time.time() - _t0  # RDMA tensor transfer only
+        _gemini_recovery_profile(
+            recovery_role, "network_transfer_done",
+            elapsed_s=_t['network_encode'], is_failed=is_failed,
+        )
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("gemini_network_done")
+        except Exception:
+            pass
 
         # sync all ranks before rebuild timing
-        torch.distributed.barrier()
+        rebuild_barrier_s = _timed_barrier()
+        barrier_s += rebuild_barrier_s
+        _gemini_recovery_profile(
+            recovery_role, "pre_rebuild_barrier_done", elapsed_s=rebuild_barrier_s
+        )
         _t0_sd = time.time()
+        _gemini_recovery_profile(recovery_role, "rebuild_start")
         if is_failed:
             if rank in _recovery_meta:
                 meta.update(_recovery_meta.pop(rank))
@@ -1847,22 +1961,45 @@ def load_gemini_replicas_legacy_checkpoint(
                 flat_key_roots=_infer_flat_key_roots(main_payload),
             )
         _t['rebuild_sd'] = time.time() - _t0_sd
-        _t['total'] = _t['network_encode'] + _t['rebuild_sd']
+        _gemini_recovery_profile(
+            recovery_role, "rebuild_done", elapsed_s=_t['rebuild_sd']
+        )
+        _t['barrier'] = barrier_s
+        _t['total'] = _t['network_encode'] + _t['rebuild_sd'] + _t['barrier']
+        summary = _timing_max_dict(_t)
 
         logger.info(
-            "GEMINI REPLICAS legacy load timing (HW): "
-            "total=%(total).2fs network_encode=%(network_encode).2fs "
-            "rebuild_sd=%(rebuild_sd).2fs", _t
+            "GEMINI load timing (HW): e2e_s=%(total).2fs "
+            "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
+            "barrier_s=%(barrier).2fs", summary
         )
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("gemini_load_rebuild_done")
+        except Exception:
+            pass
 
     if manager._gemini_replicas_native is not None:
         logger.info(
             f"Gemini Replicas legacy load: cleaning up native module (rank {rank})"
         )
+        _gemini_recovery_profile(recovery_role, "cleanup_start")
+        t_cleanup = time.time()
         manager.cleanup()
         manager._gemini_replicas_native = None
+        _gemini_recovery_profile(
+            recovery_role, "cleanup_done", elapsed_s=time.time() - t_cleanup
+        )
 
     if world_size > 1 and torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        return_barrier_s = _timed_barrier()
+        _gemini_recovery_profile(
+            recovery_role, "load_return_barrier_done", elapsed_s=return_barrier_s
+        )
 
+    try:
+        from megatron.training.global_vars import mark_recovery_to_forward_timer
+        mark_recovery_to_forward_timer("gemini_load_return")
+    except Exception:
+        pass
     return state_dict

@@ -65,6 +65,11 @@ struct RsPoolWorkerCtx {
 
 namespace py = pybind11;
 
+static inline uint64_t frcheck_now_us() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // ---------------------------------------------------------------------------
 // RDMA structures
 // ---------------------------------------------------------------------------
@@ -509,19 +514,28 @@ public:
             }
         }
     }
-    void stop() {
-        if (stopped_.exchange(true)) return;
-
+    void stop_recovery_runtime() {
         recovery_workers_stop_ = true;
-        mirror_cv_.notify_all();
         helper_cv_.notify_all();
         decoder_cv_.notify_all();
         failed_cv_.notify_all();
         recovery_wait_cv_.notify_all();
+        recovery_workers_join_();
+    }
+
+    void cleanup_recovery_runtime() {
+        stop_recovery_runtime();
+        cleanup_rdma_();
+    }
+
+    void stop() {
+        if (stopped_.exchange(true)) return;
+
+        stop_recovery_runtime();
+        mirror_cv_.notify_all();
 
         abort_all_channels_();
         shutdown_stripe_workers();
-        recovery_workers_join_();
         mirror_worker_shutdown();
         rs_pool_shutdown();
         cleanup_rdma_();
@@ -963,6 +977,8 @@ public:
             return stopped_.load() || recovery_batch_completed_;
         });
         recovery_batch_active_ = false;
+        lk.unlock();
+        print_recovery_batch_profile_();
     }
 
     // ---- StripePlan queries for Python ----
@@ -2261,11 +2277,15 @@ public:
     }
 
     void execute_recovery_helper_(const RecoveryHelperTask& task) {
+        uint64_t t0 = frcheck_now_us();
         send_to_peer(task.decoder_rig, task.stripe_id,
                      task.helper_block, task.block_size);
+        recovery_helper_send_us_.fetch_add(frcheck_now_us() - t0, std::memory_order_relaxed);
+        recovery_helper_tasks_.fetch_add(1, std::memory_order_relaxed);
     }
 
     void execute_recovery_decoder_(const RecoveryDecoderTask& task) {
+        uint64_t t_recv = frcheck_now_us();
         std::vector<std::thread> recv_threads;
         std::vector<std::exception_ptr> recv_errors(task.helper_rigs.size());
 
@@ -2287,6 +2307,7 @@ public:
         for (size_t hi = 0; hi < recv_errors.size(); ++hi) {
             if (recv_errors[hi]) std::rethrow_exception(recv_errors[hi]);
         }
+        recovery_decoder_recv_us_.fetch_add(frcheck_now_us() - t_recv, std::memory_order_relaxed);
 
         int k = n_ - 2;
         std::vector<uintptr_t> survivor_addrs;
@@ -2297,40 +2318,54 @@ public:
         if (!task.dual_failure) {
             if (task.recovered_bufs.empty())
                 throw std::runtime_error("FRCheck recovery: missing recovered buffer");
+            uint64_t t_decode = frcheck_now_us();
             submit_stripe_decode(
                 k, task.survivor_positions, task.failed_pos,
                 survivor_addrs, task.recovered_bufs[0], task.block_size);
+            recovery_decoder_decode_us_.fetch_add(frcheck_now_us() - t_decode, std::memory_order_relaxed);
             if (task.failed_rigs.empty())
                 throw std::runtime_error("FRCheck recovery: missing failed rig");
+            uint64_t t_send = frcheck_now_us();
             send_to_peer(task.failed_rigs[0], task.stripe_id,
                          task.recovered_bufs[0], task.block_size);
+            recovery_decoder_send_us_.fetch_add(frcheck_now_us() - t_send, std::memory_order_relaxed);
         } else {
             if (task.recovered_bufs.size() < task.failed_positions.size())
                 throw std::runtime_error("FRCheck recovery: insufficient recovered buffers");
             std::vector<std::thread> send_threads;
             for (size_t slot = 0; slot < task.failed_positions.size(); ++slot) {
+                uint64_t t_decode = frcheck_now_us();
                 submit_stripe_decode(
                     k, task.survivor_positions, task.failed_positions[slot],
                     survivor_addrs, task.recovered_bufs[slot], task.block_size);
+                recovery_decoder_decode_us_.fetch_add(frcheck_now_us() - t_decode, std::memory_order_relaxed);
                 int frig = task.failed_rigs[slot];
                 uintptr_t rec = task.recovered_bufs[slot];
                 send_threads.emplace_back([this, frig, rec, sid = task.stripe_id, bs = task.block_size]() {
+                    uint64_t t_send = frcheck_now_us();
                     send_to_peer(frig, sid, rec, bs);
+                    recovery_decoder_send_us_.fetch_add(frcheck_now_us() - t_send, std::memory_order_relaxed);
                 });
             }
             for (auto& t : send_threads) t.join();
         }
+        recovery_decoder_tasks_.fetch_add(1, std::memory_order_relaxed);
     }
 
     void execute_recovery_failed_(const RecoveryFailedTask& task) {
+        uint64_t t_recv = frcheck_now_us();
         recv_from_peer(task.decoder_rig, task.stripe_id,
                        task.recv_buf, task.block_size);
+        recovery_failed_recv_us_.fetch_add(frcheck_now_us() - t_recv, std::memory_order_relaxed);
         if (task.store_to_layer && task.layer_buf != 0 && task.ncopy > 0) {
+            uint64_t t_copy = frcheck_now_us();
             std::memcpy(
                 reinterpret_cast<void*>(task.layer_buf + task.layer_offset),
                 reinterpret_cast<const void*>(task.recv_buf),
                 task.ncopy);
+            recovery_failed_copy_us_.fetch_add(frcheck_now_us() - t_copy, std::memory_order_relaxed);
         }
+        recovery_failed_tasks_.fetch_add(1, std::memory_order_relaxed);
     }
 
     void helper_worker_loop_() {
@@ -2523,6 +2558,37 @@ public:
         }
     }
 
+    void reset_recovery_batch_profile_() {
+        recovery_helper_send_us_.store(0, std::memory_order_relaxed);
+        recovery_decoder_recv_us_.store(0, std::memory_order_relaxed);
+        recovery_decoder_decode_us_.store(0, std::memory_order_relaxed);
+        recovery_decoder_send_us_.store(0, std::memory_order_relaxed);
+        recovery_failed_recv_us_.store(0, std::memory_order_relaxed);
+        recovery_failed_copy_us_.store(0, std::memory_order_relaxed);
+        recovery_helper_tasks_.store(0, std::memory_order_relaxed);
+        recovery_decoder_tasks_.store(0, std::memory_order_relaxed);
+        recovery_failed_tasks_.store(0, std::memory_order_relaxed);
+    }
+
+    void print_recovery_batch_profile_() {
+        auto us_to_s = [](uint64_t us) { return (double)us / 1000000.0; };
+        const int helper_tasks = recovery_helper_tasks_.load(std::memory_order_relaxed);
+        const int decoder_tasks = recovery_decoder_tasks_.load(std::memory_order_relaxed);
+        const int failed_tasks = recovery_failed_tasks_.load(std::memory_order_relaxed);
+        if (helper_tasks == 0 && decoder_tasks == 0 && failed_tasks == 0) return;
+        std::cout << "FRCheck native profile: rank_in_group=" << rank_in_group_
+                  << " helper_tasks=" << helper_tasks
+                  << " decoder_tasks=" << decoder_tasks
+                  << " failed_tasks=" << failed_tasks
+                  << " helper_send_s=" << us_to_s(recovery_helper_send_us_.load(std::memory_order_relaxed))
+                  << " decoder_recv_s=" << us_to_s(recovery_decoder_recv_us_.load(std::memory_order_relaxed))
+                  << " decoder_decode_s=" << us_to_s(recovery_decoder_decode_us_.load(std::memory_order_relaxed))
+                  << " decoder_send_s=" << us_to_s(recovery_decoder_send_us_.load(std::memory_order_relaxed))
+                  << " failed_recv_s=" << us_to_s(recovery_failed_recv_us_.load(std::memory_order_relaxed))
+                  << " failed_copy_s=" << us_to_s(recovery_failed_copy_us_.load(std::memory_order_relaxed))
+                  << std::endl;
+    }
+
     void reset_recovery_completion_() {
         recovery_batch_completed_ = false;
         pending_recovery_chunks_.store(0, std::memory_order_release);
@@ -2538,6 +2604,7 @@ public:
         helper_sentinels_received_.store(0, std::memory_order_release);
         decoder_sentinels_received_.store(0, std::memory_order_release);
         failed_sentinels_received_.store(0, std::memory_order_release);
+        reset_recovery_batch_profile_();
         {
             std::lock_guard<std::mutex> lk(helper_mtx_);
             while (!helper_q_.empty()) helper_q_.pop();
@@ -2803,6 +2870,15 @@ private:
     bool recovery_batch_completed_ = false;
     std::mutex recovery_wait_mtx_;
     std::condition_variable recovery_wait_cv_;
+    std::atomic<uint64_t> recovery_helper_send_us_{0};
+    std::atomic<uint64_t> recovery_decoder_recv_us_{0};
+    std::atomic<uint64_t> recovery_decoder_decode_us_{0};
+    std::atomic<uint64_t> recovery_decoder_send_us_{0};
+    std::atomic<uint64_t> recovery_failed_recv_us_{0};
+    std::atomic<uint64_t> recovery_failed_copy_us_{0};
+    std::atomic<int> recovery_helper_tasks_{0};
+    std::atomic<int> recovery_decoder_tasks_{0};
+    std::atomic<int> recovery_failed_tasks_{0};
 
     // ---- RS encode thread pool (matches ecnaive xor_pool pattern) ----
     static constexpr int kRsPoolWorkers = 16;
@@ -2903,6 +2979,10 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("store_to_layer_buf"))
         .def("submit_recovery_sentinel", &FRCheckNative::submit_recovery_sentinel)
         .def("wait_recovery_batch", &FRCheckNative::wait_recovery_batch,
+             py::call_guard<py::gil_scoped_release>())
+        .def("stop_recovery_runtime", &FRCheckNative::stop_recovery_runtime,
+             py::call_guard<py::gil_scoped_release>())
+        .def("cleanup_recovery_runtime", &FRCheckNative::cleanup_recovery_runtime,
              py::call_guard<py::gil_scoped_release>())
 
         // StripePlan queries

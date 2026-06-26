@@ -2390,6 +2390,24 @@ def _add_checkpointing_args(parser):
                        help='Experimental: overlap FRCheck hardware recovery with '
                             'forward by recovering transformer layers in a '
                             'background worker.')
+    group.add_argument('--frcheck-defer-load-teardown', action='store_true',
+                       help='Defer FRCheck native teardown after hardware recovery load '
+                            'until the training/eval teardown path. The recovery worker '
+                            'still completes before load returns; only native resource '
+                            'release is moved out of the recovery-to-forward path.')
+    group.add_argument('--frcheck-skip-load-teardown-barrier', action='store_true',
+                       help='Use a Gemini-style FRCheck load teardown that still releases '
+                            'native/RDMA resources before returning from load, but skips '
+                            'the extra distributed barrier inside cleanup(teardown=True).')
+    group.add_argument('--frcheck-recovery-safe-point', type=str, default='load',
+                       choices=['load', 'after_load_checkpoint', 'train_step_start', 'forward_step_start', 'optimizer_step'],
+                       help='Experimental FRCheck recovery lifecycle safe point. Default load keeps '
+                            'current behavior. Other values move async recovery wait and native '
+                            'teardown to the selected training boundary. Use after_load_checkpoint '
+                            'to cleanup before DataLoader workers are created.')
+    group.add_argument('--frcheck-recovery-only-teardown', action='store_true',
+                       help='Experimental: use FRCheck native recovery-only shutdown during load '
+                            'recovery cleanup when the native module supports it.')
     group.add_argument('--frcheck-debug', action='store_true',
                        help='Enable detailed size/encoding debug logging for FRCheck operations.')
     group.add_argument('--frcheck-distribute-common', action='store_true',

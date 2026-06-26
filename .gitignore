@@ -23,3 +23,13 @@ package.json
 .claude
 CMakeFiles/
 cache/
+
+# Generated data and local build artifacts
+.DS_Store
+pre-tests/bert/bert_data/*.bin
+pre-tests/bert/bert_data/*.idx
+pre-tests/bert/bert_data/cache/
+pre-tests/bert/bert_data/wiki_text_sentence/cache/
+pre-tests/gpt2/microbench/rdma/gemini_gdr_sendrecv_bench
+ec_encode/bench/c_bench_compare
+ec_encode/cpu/ec_encode

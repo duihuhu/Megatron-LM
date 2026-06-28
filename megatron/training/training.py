@@ -1381,10 +1381,13 @@ def setup_model_and_optimizer(
         if getattr(args, "use_frcheck", False):
             from megatron.training.frcheck_legacy import (
                 frcheck_log_layerwise_runtime_summary,
+                frcheck_materialize_all_layers,
                 frcheck_recovery_safe_point,
             )
             frcheck_log_layerwise_runtime_summary("after_load_checkpoint")
             frcheck_recovery_safe_point("after_load_checkpoint")
+            frcheck_materialize_all_layers()
+            frcheck_log_layerwise_runtime_summary("after_load_checkpoint_materialized")
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
@@ -1561,8 +1564,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         _log_recovery_to_forward_profile("train_step_start")
         if getattr(args, "use_frcheck", False):
             try:
-                from megatron.training.frcheck_legacy import frcheck_recovery_safe_point
+                from megatron.training.frcheck_legacy import (
+                    frcheck_recovery_safe_point,
+                    frcheck_wait_for_optimizer_state,
+                )
                 frcheck_recovery_safe_point("train_step_start")
+                frcheck_wait_for_optimizer_state(optimizer)
             except ImportError:
                 pass
 

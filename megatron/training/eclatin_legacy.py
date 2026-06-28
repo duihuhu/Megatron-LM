@@ -17,8 +17,8 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     GlobalMetadataRegistry,
     TensorMetadata,
     decompose_state_dict,
+    decompose_state_dict_for_save,
     extract_tensors_from_continuous_buffer,
-    flatten_optimizer_fp32_params,
     reconstruct_state_dict,
     unflatten_optimizer_fp32_params,
 )
@@ -442,7 +442,9 @@ def _save_eclatin_pt_files(
             f.result()
 
 
-def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
+def save_eclatin_legacy_checkpoint(
+    state_dict: Dict[str, Any], checkpoint_name: str, write_to_disk: bool = True
+) -> None:
     t0 = time.time()
     from megatron.training import get_args
 
@@ -461,11 +463,13 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     if manager._eclatin_native is None:
         raise RuntimeError("ECLATIN native module is not available in legacy save path")
 
-    flatten_optimizer_fp32_params(state_dict)
     t0 = time.time()
-    decomposed = decompose_state_dict(state_dict)
+    decomposed, save_copy_s, save_flatten_s, decompose_s = decompose_state_dict_for_save(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
-    logger.info(f"ECLATIN save timing: decompose {time.time()-t0:.3f}s")
+    logger.info(
+        "ECLATIN save timing: copy %.3fs flatten %.3fs decompose %.3fs",
+        save_copy_s, save_flatten_s, decompose_s,
+    )
 
     start_time = t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), manager.eclatin_buffer_size)
@@ -533,15 +537,20 @@ def save_eclatin_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     torch.distributed.barrier()
     logger.info(f"ECLATIN legacy save: done in {time.time() - start_time:.2f}s")
 
-    _save_eclatin_pt_files(
-        checkpoint_name=checkpoint_name,
-        rank=rank,
-        non_tensor_data=decomposed.non_tensor_data,
-        tensor_infos=decomposed.tensor_infos,
-        blocks=blocks,
-        full_tensor_buffer=tensor_buffer[:total_tensor_size],
-        all_tensor_infos=rank_metadata,
-    )
+    if write_to_disk:
+        _save_eclatin_pt_files(
+            checkpoint_name=checkpoint_name,
+            rank=rank,
+            non_tensor_data=decomposed.non_tensor_data,
+            tensor_infos=decomposed.tensor_infos,
+            blocks=blocks,
+            full_tensor_buffer=tensor_buffer[:total_tensor_size],
+            all_tensor_infos=rank_metadata,
+        )
+    else:
+        logger.info(
+            "ECLATIN save: skipping checkpoint file writes for this iteration"
+        )
 
     if world_size > 1:
         torch.distributed.barrier()

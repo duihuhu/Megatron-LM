@@ -17,6 +17,24 @@ import torch
 
 logger = getLogger(__name__)
 
+
+def should_write_ec_checkpoint_this_iteration(args: Any, iteration: int) -> bool:
+    """Return whether EC/Gemini legacy save should write files this iteration.
+
+    When enabled, EC/Gemini still run pack/encode/network every checkpoint call,
+    but persistent files and the latest tracker are updated only for the
+    penultimate training iteration.
+    """
+    if not getattr(args, "ec_checkpoint_write_only_penultimate_iter", False):
+        return True
+    train_iters = getattr(args, "train_iters", None)
+    if train_iters is None:
+        raise RuntimeError(
+            "--ec-checkpoint-write-only-penultimate-iter requires --train-iters "
+            "so the penultimate iteration is well-defined."
+        )
+    return int(iteration) == int(train_iters) - 1
+
 # ---- file-format constants --------------------------------------------------
 
 _HEADER_MAGIC_OFFSET = 0

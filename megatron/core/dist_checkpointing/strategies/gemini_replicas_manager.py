@@ -929,9 +929,6 @@ class GeminiReplicasManager:
         failed_in_group = recovery_ranks & set(all_members)
         healthy_in_group = set(all_members) - failed_in_group
 
-        if not failed_in_group or not healthy_in_group:
-            return  # nothing to do — no failed ranks in this group
-
         target_ranks, source_ranks = self._compute_recovery_connection_ranks(
             rank,
             recovery_ranks,
@@ -941,15 +938,30 @@ class GeminiReplicasManager:
             world_size,
         )
 
-        logger.info(
-            f"Gemini Replicas: [Rank {rank}] Reinitializing for recovery: "
-            f"failed_in_group={sorted(failed_in_group)}, "
-            f"healthy_in_group={sorted(healthy_in_group)}, "
-            f"targets={target_ranks}, sources={source_ranks}"
-        )
+        # Ranks in a group with both failed and healthy members rebuild sparse P2P.
+        # Ranks in unaffected groups keep their save-time mesh but must still join
+        # the global sync below so all_gather/barriers do not deadlock.
+        participates = bool(failed_in_group and healthy_in_group)
+        has_p2p_role = participates and bool(target_ranks or source_ranks)
 
-        # ---- tear down old connections ----
-        self._stop_native_gracefully()
+        if participates:
+            logger.info(
+                f"Gemini Replicas: [Rank {rank}] Reinitializing for recovery: "
+                f"failed_in_group={sorted(failed_in_group)}, "
+                f"healthy_in_group={sorted(healthy_in_group)}, "
+                f"targets={target_ranks}, sources={source_ranks}"
+            )
+            self._stop_native_gracefully()
+        else:
+            logger.info(
+                f"Gemini Replicas: [Rank {rank}] No recovery in local group "
+                f"(failed_in_group={sorted(failed_in_group)}), "
+                f"keeping save-time connections"
+            )
+
+        # Sync teardown across all ranks before any reconnect/IP exchange.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
         # ---- build recovery topology ----
         base_ip = resolve_ip("GEMINI_REPLICAS", rank=rank)
@@ -960,7 +972,7 @@ class GeminiReplicasManager:
             master_port + 40000
         ))
 
-        # Exchange IPs
+        # Exchange IPs — all ranks in this reinit wave must participate.
         rank_ips = {}
         if torch.distributed.is_initialized():
             try:
@@ -982,16 +994,16 @@ class GeminiReplicasManager:
 
         # ---- create new native module (or skip if this rank has no P2P role) ----
         try:
-            # Barrier so everyone tore down before reconnecting
-            torch.distributed.barrier()
-
-            if not target_ranks and not source_ranks:
-                logger.info(
-                    f"Gemini Replicas recovery: [Rank {rank}] no P2P role, "
-                    f"skipping native module creation"
-                )
-                torch.distributed.barrier()
-                torch.distributed.barrier()
+            if not has_p2p_role:
+                if participates:
+                    logger.info(
+                        f"Gemini Replicas recovery: [Rank {rank}] no P2P role, "
+                        f"skipping native module creation"
+                    )
+                # Match acceptor-ready and post-finalize barriers on P2P ranks.
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                    torch.distributed.barrier()
                 return
 
             current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1023,7 +1035,9 @@ class GeminiReplicasManager:
                 self.use_rdma,
             )
 
-            torch.distributed.barrier()
+            # All acceptors must be listening before any rank connects.
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
             self._gemini_replicas_native.finalize_connections()
 
             # Post-finalize barrier (aligned with save-time init)

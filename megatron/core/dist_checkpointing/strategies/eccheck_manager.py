@@ -1090,6 +1090,17 @@ class ECCHECKManager:
     def cleanup(self):
         """Cleanup EC-CHECK resources when manager is destroyed."""
         try:
+            from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+                release_hugepage_host_registration,
+            )
+
+            def _release_host_registrations_for_buffers(buffers) -> None:
+                if not buffers:
+                    return
+                for buffer in buffers:
+                    if torch.is_tensor(buffer):
+                        release_hugepage_host_registration(buffer)
+
             # Unregister all RDMA buffers
             if self.use_rdma and self._eccheck_native is not None:
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -1101,6 +1112,15 @@ class ECCHECKManager:
                     except Exception as e:
                         logger.warning(f"EC-CHECK: [Rank {rank}] Failed to unregister buffer during cleanup: {e}")
                 self.registered_buffers.clear()
+
+            _release_host_registrations_for_buffers(self._cached_blocks)
+            if self.preallocated_cpu_buffer is not None:
+                release_hugepage_host_registration(self.preallocated_cpu_buffer)
+            _release_host_registrations_for_buffers(self.eccheck_data_buffers)
+            _release_host_registrations_for_buffers(self.eccheck_encoding_buffers)
+            _release_host_registrations_for_buffers(self.eccheck_parity_buffers)
+            if self.eccheck_recv_encoding_buffers:
+                _release_host_registrations_for_buffers(self.eccheck_recv_encoding_buffers)
             
             # Stop buffer poller thread
             self._stop_buffer_poller_thread()

@@ -838,7 +838,8 @@ public:
         uintptr_t failed_layer_buf_addr,
         size_t failed_layer_offset,
         size_t failed_ncopy,
-        bool store_to_layer_buf)
+        bool store_to_layer_buf,
+        bool active)
     {
         if (stopped_) return;
         if (!recovery_batch_active_)
@@ -848,6 +849,11 @@ public:
 
         const RecoveryStripePlan& plan = recovery_plans_[stripe_id];
         int my_node = rank_in_group_ + 1;
+
+        if (!active) {
+            recovery_skipped_stripes_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
 
         auto is_helper = [&]() {
             return std::find(plan.helper_nodes.begin(), plan.helper_nodes.end(), my_node)
@@ -2565,6 +2571,7 @@ public:
         recovery_decoder_send_us_.store(0, std::memory_order_relaxed);
         recovery_failed_recv_us_.store(0, std::memory_order_relaxed);
         recovery_failed_copy_us_.store(0, std::memory_order_relaxed);
+        recovery_skipped_stripes_.store(0, std::memory_order_relaxed);
         recovery_helper_tasks_.store(0, std::memory_order_relaxed);
         recovery_decoder_tasks_.store(0, std::memory_order_relaxed);
         recovery_failed_tasks_.store(0, std::memory_order_relaxed);
@@ -2575,11 +2582,13 @@ public:
         const int helper_tasks = recovery_helper_tasks_.load(std::memory_order_relaxed);
         const int decoder_tasks = recovery_decoder_tasks_.load(std::memory_order_relaxed);
         const int failed_tasks = recovery_failed_tasks_.load(std::memory_order_relaxed);
-        if (helper_tasks == 0 && decoder_tasks == 0 && failed_tasks == 0) return;
+        const int skipped_stripes = recovery_skipped_stripes_.load(std::memory_order_relaxed);
+        if (helper_tasks == 0 && decoder_tasks == 0 && failed_tasks == 0 && skipped_stripes == 0) return;
         std::cout << "FRCheck native profile: rank_in_group=" << rank_in_group_
                   << " helper_tasks=" << helper_tasks
                   << " decoder_tasks=" << decoder_tasks
                   << " failed_tasks=" << failed_tasks
+                  << " skipped_stripes=" << skipped_stripes
                   << " helper_send_s=" << us_to_s(recovery_helper_send_us_.load(std::memory_order_relaxed))
                   << " decoder_recv_s=" << us_to_s(recovery_decoder_recv_us_.load(std::memory_order_relaxed))
                   << " decoder_decode_s=" << us_to_s(recovery_decoder_decode_us_.load(std::memory_order_relaxed))
@@ -2876,6 +2885,7 @@ private:
     std::atomic<uint64_t> recovery_decoder_send_us_{0};
     std::atomic<uint64_t> recovery_failed_recv_us_{0};
     std::atomic<uint64_t> recovery_failed_copy_us_{0};
+    std::atomic<int> recovery_skipped_stripes_{0};
     std::atomic<int> recovery_helper_tasks_{0};
     std::atomic<int> recovery_decoder_tasks_{0};
     std::atomic<int> recovery_failed_tasks_{0};
@@ -2976,7 +2986,8 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("failed_layer_buf_addr"),
              py::arg("failed_layer_offset"),
              py::arg("failed_ncopy"),
-             py::arg("store_to_layer_buf"))
+             py::arg("store_to_layer_buf"),
+             py::arg("active") = true)
         .def("submit_recovery_sentinel", &FRCheckNative::submit_recovery_sentinel)
         .def("wait_recovery_batch", &FRCheckNative::wait_recovery_batch,
              py::call_guard<py::gil_scoped_release>())

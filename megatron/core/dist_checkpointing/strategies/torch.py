@@ -8965,6 +8965,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             total_size (int): Total size of data to recover
         """
         from time import time
+        from megatron.training.ecnaive_legacy import _submit_ecnaive_load_recovery_stripes
         
         if not self.ecnaive_manager.use_ecnaive:
             logger.warning("EC-NAIVE: Manager not enabled, skipping recovery pipeline")
@@ -9007,69 +9008,27 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 logger.error(f"EC-NAIVE: [Rank {rank}] Missing ecnaive_blocks keys: {missing_blocks}")
                 return
             
-            # Get base addresses for all 8 recv buffers
-            recv_addrs = {
-                'p20': int(recv_buffers['p20_from_rank0'].data_ptr()),  # p_{2,0} from rank0
-                'd21': int(recv_buffers['d21_from_rank3'].data_ptr()),  # d_{2,1} from rank3
-                'd00': int(recv_buffers['d00_from_rank0'].data_ptr()),  # d_{0,0} from rank0
-                'd01': int(recv_buffers['d01_from_rank1'].data_ptr()),  # d_{0,1} from rank1
-                'd10': int(recv_buffers['d10_from_rank1'].data_ptr()),  # d_{1,0} from rank1
-                'p11': int(recv_buffers['p11_from_rank1'].data_ptr()),  # p_{1,1} from rank1
-                'd30': int(recv_buffers['d30_from_rank3'].data_ptr()),  # d_{3,0} from rank3
-                'd31': int(recv_buffers['d31_from_rank0'].data_ptr()),  # d_{3,1} from rank0
-            }
-            
-            # Get base addresses for 4 output blocks (zero-copy: XOR results directly written here)
-            output_addrs = {
-                'data0': int(ecnaive_blocks['data0'].data_ptr()),           # d_{2,0} = p_{2,0} ⊕ d_{2,1}
-                'recv_parity0': int(ecnaive_blocks['recv_parity0'].data_ptr()), # p_{0,0} = d_{0,0} ⊕ d_{0,1}
-                'recv_data1': int(ecnaive_blocks['recv_data1'].data_ptr()),     # d_{1,1} = d_{1,0} ⊕ p_{1,1}
-                'recv_parity1': int(ecnaive_blocks['recv_parity1'].data_ptr()), # p_{3,1} = d_{3,0} ⊕ d_{3,1}
-            }
-            
-            # Calculate aligned block size (same as save phase)
-            # EC-NAIVE uses full block size (not half like ECLATIN)
             aligned_block_size = ecnaive_blocks['data0'].numel()
-            
+
             logger.info(
-                f"EC-NAIVE: [Rank {rank}] (rank_in_group 2) Starting full recovery pipeline\n"
+                f"EC-NAIVE: [Rank {rank}] (rank_in_group 2) Starting striped recovery pipeline\n"
                 f"  Recv buffers: 8 buffers, {aligned_block_size / (1024**3):.2f} GB each\n"
                 f"  Output blocks: 4 blocks (ecnaive_blocks), {aligned_block_size / (1024**3):.2f} GB each\n"
-                f"  Total recovery: {4 * aligned_block_size / (1024**3):.2f} GB"
+                f"  Stripe size: {self.ecnaive_manager.ecnaive_buffer_size / (1024**2):.2f} MB"
             )
-            
-            # Submit full recovery tasks to C++ pipeline
-            # The C++ pipeline will:
-            # 1. Receive 8 blocks from rank0/1/3 in parallel
-            # 2. Perform 4 XOR operations:
-            #    - d_{2,0} = p_{2,0} ⊕ d_{2,1} → ecnaive_blocks['data0']
-            #    - p_{0,0} = d_{0,0} ⊕ d_{0,1} → ecnaive_blocks['recv_parity0']
-            #    - d_{1,1} = d_{1,0} ⊕ p_{1,1} → ecnaive_blocks['recv_data1']
-            #    - p_{3,1} = d_{3,0} ⊕ d_{3,1} → ecnaive_blocks['recv_parity1']
-            # Note: All XOR results are written directly to ecnaive_blocks (zero-copy)
-            self.ecnaive_manager._ecnaive_native.submit_ecnaive_load_recovery_full(
-                # 8 recv buffer addresses
-                recv_p20_addr=recv_addrs['p20'],
-                recv_d21_addr=recv_addrs['d21'],
-                recv_d00_addr=recv_addrs['d00'],
-                recv_d01_addr=recv_addrs['d01'],
-                recv_d10_addr=recv_addrs['d10'],
-                recv_p11_addr=recv_addrs['p11'],
-                recv_d30_addr=recv_addrs['d30'],
-                recv_d31_addr=recv_addrs['d31'],
-                # 4 output addresses (directly write to ecnaive_blocks)
-                output_data0_addr=output_addrs['data0'],
-                output_recv_parity0_addr=output_addrs['recv_parity0'],
-                output_recv_data1_addr=output_addrs['recv_data1'],
-                output_recv_parity1_addr=output_addrs['recv_parity1'],
-                size=aligned_block_size
+
+            n_stripes = _submit_ecnaive_load_recovery_stripes(
+                native=self.ecnaive_manager._ecnaive_native,
+                manager=self.ecnaive_manager,
+                rank_in_group=rank_in_group,
+                aligned_block_size=aligned_block_size,
+                ecnaive_blocks=ecnaive_blocks,
+                recv_buffers=recv_buffers,
             )
-            
-            # Submit sentinel to signal pipeline completion
-            self.ecnaive_manager._ecnaive_native.submit_load_recv_sentinel()
-            
-            # Wait for recovery to complete
-            logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group 2) Waiting for full recovery pipeline to complete...")
+
+            logger.info(
+                f"EC-NAIVE: [Rank {rank}] (rank_in_group 2) Waiting for {n_stripes} recovery stripes..."
+            )
             wait_start_time = time()
             self.ecnaive_manager._ecnaive_native.wait_for_load_completion()
             wait_end_time = time()
@@ -9099,114 +9058,18 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # === Step 3: rank_in_group 0/1/3: Send blocks to receiver ===
         else:
             aligned_block_size = ecnaive_blocks['data0'].numel()
-            
-            if rank_in_group == 0:
-                # rank_in_group 0: Sends p_{2,0}, d_{0,0}, d_{3,1} to receiver
-                # These blocks are already loaded into ecnaive_blocks from files
-                send_addrs = {
-                    'p20': int(ecnaive_blocks['recv_parity0'].data_ptr()),  # p_{2,0}
-                    'd00': int(ecnaive_blocks['data0'].data_ptr()),          # d_{0,0}
-                    'd31': int(ecnaive_blocks['recv_data1'].data_ptr()),    # d_{3,1}
-                }
-                
-                logger.info(f"EC-NAIVE: [Rank {rank}] (rank_in_group 0) Sending 3 blocks to receiver: p_{{2,0}}, d_{{0,0}}, d_{{3,1}}")
-                
-                # Send p_{2,0}
-                self.ecnaive_manager._ecnaive_native.submit_load_send_rank0_parity0(
-                    send_addr=send_addrs['p20'],
-                    size=aligned_block_size
-                )
-                
-                # Send d_{0,0}
-                self.ecnaive_manager._ecnaive_native.submit_load_send_rank0_data0(
-                    send_addr=send_addrs['d00'],
-                    size=aligned_block_size
-                )
-                
-                # Send d_{3,1}
-                self.ecnaive_manager._ecnaive_native.submit_load_send_rank0_data1(
-                    send_addr=send_addrs['d31'],
-                    size=aligned_block_size
-                )
-                
-                # Submit sentinel
-                self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
-                
-                end_time = time()
-                logger.info(
-                    f"EC-NAIVE: [Rank {rank}] Submitted 3 load-send blocks in "
-                    f"{end_time - start_time:.2f} seconds"
-                )
-            
-            elif rank_in_group == 1:
-                # rank_in_group 1: Sends d_{0,1}, d_{1,0}, p_{1,1} to receiver
-                # These blocks are already loaded into ecnaive_blocks from files
-                send_addrs = {
-                    'd01': int(ecnaive_blocks['recv_data1'].data_ptr()),    # d_{0,1}
-                    'd10': int(ecnaive_blocks['data0'].data_ptr()),          # d_{1,0}
-                    'p11': int(ecnaive_blocks['recv_parity1'].data_ptr()),   # p_{1,1}
-                }
-                
-                logger.info(f"EC-NAIVE: [Rank 1] Sending 3 blocks to rank2: d_{0,1}, d_{1,0}, p_{1,1}")
-                
-                # Send d_{0,1}
-                self.ecnaive_manager._ecnaive_native.submit_load_send_rank1_data1(
-                    send_addr=send_addrs['d01'],
-                    size=aligned_block_size
-                )
-                
-                # Send d_{1,0}
-                self.ecnaive_manager._ecnaive_native.submit_load_send_rank1_data0(
-                    send_addr=send_addrs['d10'],
-                    size=aligned_block_size
-                )
-                
-                # Send p_{1,1}
-                self.ecnaive_manager._ecnaive_native.submit_load_send_rank1_parity1(
-                    send_addr=send_addrs['p11'],
-                    size=aligned_block_size
-                )
-                
-                # Submit sentinel
-                self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
-                
-                end_time = time()
-                logger.info(
-                    f"EC-NAIVE: [Rank {rank}] Submitted 3 load-send blocks in "
-                    f"{end_time - start_time:.2f} seconds"
-                )
-            
-            elif rank_in_group == 3:
-                # rank_in_group 3: Sends d_{2,1}, d_{3,0} to receiver
-                # These blocks are already loaded into ecnaive_blocks from files
-                send_addrs = {
-                    'd21': int(ecnaive_blocks['recv_data1'].data_ptr()),  # d_{2,1}
-                    'd30': int(ecnaive_blocks['data0'].data_ptr()),         # d_{3,0}
-                }
-                
-                logger.info(f"EC-NAIVE: [Rank 3] Sending 2 blocks to rank2: d_{2,1}, d_{3,0}")
-                
-                # Send d_{2,1}
-                self.ecnaive_manager._ecnaive_native.submit_load_send_rank3_data1(
-                    send_addr=send_addrs['d21'],
-                    size=aligned_block_size
-                )
-                
-                # Send d_{3,0}
-                self.ecnaive_manager._ecnaive_native.submit_load_send_rank3_data0(
-                    send_addr=send_addrs['d30'],
-                    size=aligned_block_size
-                )
-                
-                # Submit sentinel
-                self.ecnaive_manager._ecnaive_native.submit_load_send_sentinel()
-                
-                end_time = time()
-                logger.info(
-                    f"EC-NAIVE: [Rank {rank}] Submitted 2 load-send blocks in "
-                    f"{end_time - start_time:.2f} seconds"
-                )
-            
+            n_stripes = _submit_ecnaive_load_recovery_stripes(
+                native=self.ecnaive_manager._ecnaive_native,
+                manager=self.ecnaive_manager,
+                rank_in_group=rank_in_group,
+                aligned_block_size=aligned_block_size,
+                ecnaive_blocks=ecnaive_blocks,
+            )
+            end_time = time()
+            logger.info(
+                f"EC-NAIVE: [Rank {rank}] Submitted {n_stripes} load-send stripes in "
+                f"{end_time - start_time:.2f} seconds (rank_in_group={rank_in_group})"
+            )
             logger.info(f"EC-NAIVE: [Rank {rank}] Sent blocks to receiver")
         
         # Synchronize all ranks

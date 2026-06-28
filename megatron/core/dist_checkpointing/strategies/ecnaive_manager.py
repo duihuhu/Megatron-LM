@@ -1585,8 +1585,34 @@ class ECNAIVEManager:
     def cleanup(self):
         """Cleanup EC-NAIVE resources when manager is destroyed."""
         try:
+            from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+                release_hugepage_host_registration,
+            )
+
+            def _release_host_registrations_for_buffers(buffers) -> None:
+                if not buffers:
+                    return
+                for buffer in buffers:
+                    if torch.is_tensor(buffer):
+                        release_hugepage_host_registration(buffer)
+
             # Stop buffer poller thread
             self._stop_buffer_poller_thread()
+
+            if self.use_rdma and self._ecnaive_native is not None:
+                for buffer_addr in list(self.registered_buffers.keys()):
+                    try:
+                        self._ecnaive_native.unregister_buffer(buffer_addr)
+                    except Exception as e:
+                        logger.warning(
+                            f"EC-NAIVE: Failed to unregister buffer at 0x{buffer_addr:x}: {e}"
+                        )
+
+            _release_host_registrations_for_buffers(self._cached_blocks)
+            if self.preallocated_cpu_buffer is not None:
+                release_hugepage_host_registration(self.preallocated_cpu_buffer)
+            _release_host_registrations_for_buffers(self.ecnaive_data_buffers)
+            _release_host_registrations_for_buffers(self.ecnaive_parity_buffers)
 
             # Stop the C++ pipeline and null it out so re-init works
             if hasattr(self, '_ecnaive_native') and self._ecnaive_native is not None:

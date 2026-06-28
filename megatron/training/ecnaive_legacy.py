@@ -17,8 +17,8 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     GlobalMetadataRegistry,
     TensorMetadata,
     decompose_state_dict,
+    decompose_state_dict_for_save,
     extract_tensors_from_continuous_buffer,
-    flatten_optimizer_fp32_params,
     reconstruct_state_dict,
     unflatten_optimizer_fp32_params,
 )
@@ -37,6 +37,19 @@ def _timing_max(value: float) -> float:
 
 def _timing_max_dict(timings: Dict[str, float]) -> Dict[str, float]:
     return {key: _timing_max(value) for key, value in timings.items()}
+
+
+def _native_ft_timing(native) -> Dict[str, float]:
+    if native is None:
+        return {"net_s": 0.0, "encode_s": 0.0}
+    try:
+        stats = native.get_ft_timing_stats()
+        return {
+            "net_s": float(stats.get("net_s", 0.0)),
+            "encode_s": float(stats.get("encode_s", 0.0)),
+        }
+    except AttributeError:
+        return {"net_s": 0.0, "encode_s": 0.0}
 
 
 def _timed_barrier() -> float:
@@ -127,6 +140,392 @@ def _allocate_ecnaive_blocks(
     blocks["aligned_size"] = aligned_block_size
     blocks["block_data_size"] = block_data_size
     return blocks
+
+
+def _iter_ecnaive_load_stripes(total_bytes: int, stripe_bytes: int):
+    """Yield (byte_offset, stripe_size) covering [0, total_bytes)."""
+    if stripe_bytes <= 0:
+        raise ValueError(f"EC-NAIVE load stripes: invalid stripe_bytes={stripe_bytes}")
+    pos = 0
+    while pos < total_bytes:
+        take = min(stripe_bytes, total_bytes - pos)
+        yield pos, take
+        pos += take
+
+
+def _submit_ecnaive_transfer_stripes(
+    submit_fn,
+    channel_idx: int,
+    base_addr: int,
+    total_bytes: int,
+    stripe_bytes: int,
+) -> int:
+    """Submit byte-striped send/recv tasks on one channel (single buffer, block-major)."""
+    n_stripes = 0
+    for offset, take in _iter_ecnaive_load_stripes(total_bytes, stripe_bytes):
+        submit_fn(channel_idx, base_addr + offset, take)
+        n_stripes += 1
+    return n_stripes
+
+
+def _submit_hw_stripes_stripe_major(
+    submit_fn,
+    channel_idx: int,
+    block_bases: List[int],
+    total_bytes: int,
+    stripe_bytes: int,
+) -> int:
+    """Submit HW recovery stripes: for each stripe, all blocks (matches save-side ordering).
+
+    Send and recv must use the same stripe-major order:
+      stripe0/block0, stripe0/block1, ..., stripe1/block0, ...
+    Block-major per-buffer striping desyncs RDMA control-socket ACK handshakes.
+    """
+    n_tasks = 0
+    for offset, take in _iter_ecnaive_load_stripes(total_bytes, stripe_bytes):
+        for base in block_bases:
+            submit_fn(channel_idx, base + offset, take)
+            n_tasks += 1
+    return n_tasks
+
+
+def _submit_ecnaive_load_recovery_stripes(
+    native,
+    manager: ECNAIVEManager,
+    rank_in_group: int,
+    aligned_block_size: int,
+    ecnaive_blocks: Dict[str, torch.Tensor],
+    recv_buffers: Optional[Dict[str, torch.Tensor]] = None,
+) -> int:
+    """Submit chunked load recv/send tasks (mirrors save-side stripe pipeline).
+
+    Each stripe is an independent recv/xor or send task. C++ recv and XOR workers
+    drain their queues concurrently, so stripe N+1 network I/O can overlap XOR on
+    stripe N.
+    """
+    stripe_bytes = manager.ecnaive_buffer_size
+    n_stripes = sum(1 for _ in _iter_ecnaive_load_stripes(aligned_block_size, stripe_bytes))
+
+    if rank_in_group == 2:
+        if recv_buffers is None:
+            raise RuntimeError("EC-NAIVE legacy load: recv_buffers required on rank_in_group 2")
+        recv_base = {
+            "p20": int(recv_buffers["p20_from_rank0"].data_ptr()),
+            "d21": int(recv_buffers["d21_from_rank3"].data_ptr()),
+            "d00": int(recv_buffers["d00_from_rank0"].data_ptr()),
+            "d01": int(recv_buffers["d01_from_rank1"].data_ptr()),
+            "d10": int(recv_buffers["d10_from_rank1"].data_ptr()),
+            "p11": int(recv_buffers["p11_from_rank1"].data_ptr()),
+            "d30": int(recv_buffers["d30_from_rank3"].data_ptr()),
+            "d31": int(recv_buffers["d31_from_rank0"].data_ptr()),
+        }
+        output_base = {
+            "data0": int(ecnaive_blocks["data0"].data_ptr()),
+            "recv_parity0": int(ecnaive_blocks["recv_parity0"].data_ptr()),
+            "recv_data1": int(ecnaive_blocks["recv_data1"].data_ptr()),
+            "recv_parity1": int(ecnaive_blocks["recv_parity1"].data_ptr()),
+        }
+        for offset, take in _iter_ecnaive_load_stripes(aligned_block_size, stripe_bytes):
+            native.submit_ecnaive_load_recovery_full(
+                recv_p20_addr=recv_base["p20"] + offset,
+                recv_d21_addr=recv_base["d21"] + offset,
+                recv_d00_addr=recv_base["d00"] + offset,
+                recv_d01_addr=recv_base["d01"] + offset,
+                recv_d10_addr=recv_base["d10"] + offset,
+                recv_p11_addr=recv_base["p11"] + offset,
+                recv_d30_addr=recv_base["d30"] + offset,
+                recv_d31_addr=recv_base["d31"] + offset,
+                output_data0_addr=output_base["data0"] + offset,
+                output_recv_parity0_addr=output_base["recv_parity0"] + offset,
+                output_recv_data1_addr=output_base["recv_data1"] + offset,
+                output_recv_parity1_addr=output_base["recv_parity1"] + offset,
+                size=take,
+            )
+        native.submit_load_recv_sentinel()
+    elif rank_in_group == 0:
+        send_base = {
+            "p20": int(ecnaive_blocks["recv_parity0"].data_ptr()),
+            "d00": int(ecnaive_blocks["data0"].data_ptr()),
+            "d31": int(ecnaive_blocks["recv_data1"].data_ptr()),
+        }
+        for offset, take in _iter_ecnaive_load_stripes(aligned_block_size, stripe_bytes):
+            native.submit_load_send_rank0_parity0(
+                send_addr=send_base["p20"] + offset, size=take,
+            )
+            native.submit_load_send_rank0_data0(
+                send_addr=send_base["d00"] + offset, size=take,
+            )
+            native.submit_load_send_rank0_data1(
+                send_addr=send_base["d31"] + offset, size=take,
+            )
+        native.submit_load_send_sentinel()
+    elif rank_in_group == 1:
+        send_base = {
+            "d01": int(ecnaive_blocks["recv_data1"].data_ptr()),
+            "d10": int(ecnaive_blocks["data0"].data_ptr()),
+            "p11": int(ecnaive_blocks["recv_parity1"].data_ptr()),
+        }
+        for offset, take in _iter_ecnaive_load_stripes(aligned_block_size, stripe_bytes):
+            native.submit_load_send_rank1_data1(
+                send_addr=send_base["d01"] + offset, size=take,
+            )
+            native.submit_load_send_rank1_data0(
+                send_addr=send_base["d10"] + offset, size=take,
+            )
+            native.submit_load_send_rank1_parity1(
+                send_addr=send_base["p11"] + offset, size=take,
+            )
+        native.submit_load_send_sentinel()
+    elif rank_in_group == 3:
+        send_base = {
+            "d21": int(ecnaive_blocks["recv_data1"].data_ptr()),
+            "d30": int(ecnaive_blocks["data0"].data_ptr()),
+        }
+        for offset, take in _iter_ecnaive_load_stripes(aligned_block_size, stripe_bytes):
+            native.submit_load_send_rank3_data1(
+                send_addr=send_base["d21"] + offset, size=take,
+            )
+            native.submit_load_send_rank3_data0(
+                send_addr=send_base["d30"] + offset, size=take,
+            )
+        native.submit_load_send_sentinel()
+    else:
+        raise RuntimeError(
+            f"EC-NAIVE legacy load: unexpected rank_in_group={rank_in_group}"
+        )
+    return n_stripes
+
+
+def _submit_hw_failed_recv_stripe(
+    native,
+    manager: ECNAIVEManager,
+    rank: int,
+    world_size: int,
+    source_ranks: List[int],
+    ecnaive_n: int,
+    recv_pool: List[torch.Tensor],
+    byte_offset: int,
+    stripe_size: int,
+) -> None:
+    """Submit one recv stripe from all source ranks (failed rank HW recovery)."""
+    for si, src_rank in enumerate(source_ranks):
+        recv_ch = manager.get_recv_channel_from_source(rank, src_rank, world_size)
+        base = si * ecnaive_n
+        for bi in range(ecnaive_n):
+            native.submit_recv_task(
+                recv_ch,
+                int(recv_pool[base + bi].data_ptr()) + byte_offset,
+                stripe_size,
+            )
+
+
+def _build_hw_owner_codeword_plans(
+    owner_rigs: List[int],
+    my_rig: int,
+    ecnaive_k: int,
+    ecnaive_n: int,
+    rig_to_si: Dict[int, int],
+    recv_pool: List[torch.Tensor],
+    block_data_size: int,
+    store_bufs: Dict[str, torch.Tensor],
+    recovered_slot_pool: List[torch.Tensor],
+    parity_pool_0: List[torch.Tensor],
+    parity_pool_1: List[torch.Tensor],
+) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor]]:
+    """Precompute per-codeword decode/encode metadata for striped HW recovery."""
+
+    def _find_block_in_pool(owner_rig: int, role: str) -> Optional[torch.Tensor]:
+        if role == "data0":
+            si = rig_to_si.get(owner_rig)
+            return recv_pool[si * ecnaive_n] if si is not None else None
+        if role == "data1":
+            si = rig_to_si.get((owner_rig + 1) % ecnaive_n)
+            return recv_pool[si * ecnaive_n + 1] if si is not None else None
+        if role == "parity0":
+            si = rig_to_si.get((owner_rig + 2) % ecnaive_n)
+            return recv_pool[si * ecnaive_n + 2] if si is not None else None
+        if role == "parity1":
+            si = rig_to_si.get((owner_rig + 3) % ecnaive_n)
+            return recv_pool[si * ecnaive_n + 3] if si is not None else None
+        return None
+
+    owner_plans: List[Dict[str, Any]] = []
+    recovered_refs: Dict[str, torch.Tensor] = {}
+    owner_idx = 0
+
+    for owner_rig in owner_rigs:
+        raw_surviving: Dict[str, torch.Tensor] = {}
+        lost: List[int] = []
+        for role, label in [
+            ("data0", "data_0"),
+            ("data1", "data_1"),
+            ("parity0", "parity0"),
+            ("parity1", "parity1"),
+        ]:
+            block = _find_block_in_pool(owner_rig, role)
+            if block is not None:
+                raw_surviving[label] = block
+        for pos, label in enumerate(["data_0", "data_1"]):
+            if label not in raw_surviving:
+                lost.append(pos)
+        m_owner = len(lost)
+
+        surviving_continuous = {
+            label: tensor[:block_data_size] for label, tensor in raw_surviving.items()
+        }
+
+        surviving_bases: List[int] = []
+        recovered_bases: List[int] = []
+        encode_input_bases: List[int] = []
+
+        if m_owner == 0:
+            encode_input_bases = [
+                int(surviving_continuous[f"data_{j}"].data_ptr())
+                for j in range(ecnaive_k)
+            ]
+            recovered_data = [
+                surviving_continuous[f"data_{j}"] for j in range(ecnaive_k)
+            ]
+        else:
+            data_labels = sorted(
+                [label for label in surviving_continuous if label.startswith("data_")],
+                key=lambda x: int(x.split("_")[1]),
+            )
+            parity_labels = sorted(
+                label for label in surviving_continuous if label.startswith("parity")
+            )
+            surviving_addrs_ordered = data_labels + parity_labels
+            surviving_bases = [
+                int(surviving_continuous[label].data_ptr())
+                for label in surviving_addrs_ordered
+            ]
+            if owner_rig == my_rig:
+                recovered_blocks = [
+                    store_bufs["own_data0"],
+                    store_bufs["my_data1"],
+                ][:m_owner]
+            else:
+                base = owner_idx * ecnaive_k
+                recovered_blocks = recovered_slot_pool[base : base + m_owner]
+            recovered_bases = [int(block.data_ptr()) for block in recovered_blocks]
+
+            recovered_data: List[Optional[torch.Tensor]] = [None] * ecnaive_k
+            ri = 0
+            for pos in range(ecnaive_k):
+                label = f"data_{pos}"
+                if label in surviving_continuous:
+                    recovered_data[pos] = surviving_continuous[label]
+                    encode_input_bases.append(int(surviving_continuous[label].data_ptr()))
+                else:
+                    recovered_data[pos] = recovered_blocks[ri]
+                    encode_input_bases.append(recovered_bases[ri])
+                    ri += 1
+
+        need_parity0 = (owner_rig + 2) % ecnaive_n == my_rig
+        need_parity1 = (owner_rig + 3) % ecnaive_n == my_rig
+        parity0 = parity_pool_0[owner_idx]
+        parity1 = parity_pool_1[owner_idx]
+
+        if owner_rig == my_rig:
+            recovered_refs["own_data0_ref"] = recovered_data[0]
+            if ecnaive_k > 1:
+                recovered_refs["my_data1_ref"] = recovered_data[1]
+        if (owner_rig + 1) % ecnaive_n == my_rig:
+            recovered_refs["recv_0_ref"] = recovered_data[1]
+        if need_parity0:
+            recovered_refs["recv_1_ref"] = parity0
+        if need_parity1:
+            recovered_refs["recv_2_ref"] = parity1
+
+        owner_plans.append(
+            {
+                "owner_rig": owner_rig,
+                "m_owner": m_owner,
+                "lost": lost,
+                "surviving_bases": surviving_bases,
+                "recovered_bases": recovered_bases,
+                "encode_input_bases": encode_input_bases,
+                "need_parity0": need_parity0,
+                "need_parity1": need_parity1,
+                "parity0_base": int(parity0.data_ptr()),
+                "parity1_base": int(parity1.data_ptr()),
+            }
+        )
+        owner_idx += 1
+
+    return owner_plans, recovered_refs
+
+
+def _hw_decode_encode_all_owners_stripe(
+    native,
+    owner_plans: List[Dict[str, Any]],
+    ecnaive_k: int,
+    byte_offset: int,
+    stripe_size: int,
+) -> None:
+    """RS-decode and parity-encode one byte stripe for every owner codeword."""
+    for plan in owner_plans:
+        m_owner = plan["m_owner"]
+        if m_owner > 0:
+            native.submit_ecnaive_decode_recovery(
+                ecnaive_k,
+                m_owner,
+                plan["lost"],
+                [addr + byte_offset for addr in plan["surviving_bases"]],
+                [addr + byte_offset for addr in plan["recovered_bases"]],
+                stripe_size,
+            )
+        if plan["need_parity0"] or plan["need_parity1"]:
+            native.encode_ec_blocks(
+                [addr + byte_offset for addr in plan["encode_input_bases"]],
+                plan["parity0_base"] + byte_offset,
+                plan["parity1_base"] + byte_offset,
+                stripe_size,
+            )
+
+
+def _run_hw_failed_recv_decode_pipeline(
+    native,
+    manager: ECNAIVEManager,
+    rank: int,
+    world_size: int,
+    source_ranks: List[int],
+    ecnaive_k: int,
+    ecnaive_n: int,
+    recv_pool: List[torch.Tensor],
+    block_data_size: int,
+    owner_plans: List[Dict[str, Any]],
+    stripe_bytes: int,
+) -> int:
+    """Recv/decode pipeline: recv stripe N+1 overlaps decode stripe N (mirrors save)."""
+    stripes = list(_iter_ecnaive_load_stripes(block_data_size, stripe_bytes))
+    if not stripes:
+        return 0
+
+    off0, take0 = stripes[0]
+    _submit_hw_failed_recv_stripe(
+        native, manager, rank, world_size, source_ranks, ecnaive_n,
+        recv_pool, off0, take0,
+    )
+    native.wait_for_pending_network_tasks()
+
+    for i in range(1, len(stripes)):
+        off, take = stripes[i]
+        prev_off, prev_take = stripes[i - 1]
+        _submit_hw_failed_recv_stripe(
+            native, manager, rank, world_size, source_ranks, ecnaive_n,
+            recv_pool, off, take,
+        )
+        _hw_decode_encode_all_owners_stripe(
+            native, owner_plans, ecnaive_k, prev_off, prev_take,
+        )
+        native.wait_for_pending_network_tasks()
+
+    last_off, last_take = stripes[-1]
+    _hw_decode_encode_all_owners_stripe(
+        native, owner_plans, ecnaive_k, last_off, last_take,
+    )
+    return len(stripes)
 
 
 def _encode_with_native(
@@ -782,6 +1181,9 @@ def _load_ecnaive_legacy_software_failure(
     elif send_block is not None:
         native.sw_send_data(send_block_idx, int(send_block.data_ptr()), send_block.numel())
     _t['network_encode'] = _time() - _t0_net
+    native_timing = _native_ft_timing(native)
+    _t['net_s'] = native_timing['net_s']
+    _t['encode_s'] = native_timing['encode_s']
 
     # Decode recv blocks → tensor_buffer (not timed)
     if rank_in_group == failed_rig:
@@ -879,43 +1281,19 @@ def _run_ecnaive_full_recovery(
         if missing_b:
             raise RuntimeError(f"EC-NAIVE legacy load: missing output blocks {missing_b}")
 
-        recv_addrs = {
-            "p20": int(recv_buffers["p20_from_rank0"].data_ptr()),
-            "d21": int(recv_buffers["d21_from_rank3"].data_ptr()),
-            "d00": int(recv_buffers["d00_from_rank0"].data_ptr()),
-            "d01": int(recv_buffers["d01_from_rank1"].data_ptr()),
-            "d10": int(recv_buffers["d10_from_rank1"].data_ptr()),
-            "p11": int(recv_buffers["p11_from_rank1"].data_ptr()),
-            "d30": int(recv_buffers["d30_from_rank3"].data_ptr()),
-            "d31": int(recv_buffers["d31_from_rank0"].data_ptr()),
-        }
-        output_addrs = {
-            "data0": int(ecnaive_blocks["data0"].data_ptr()),
-            "recv_parity0": int(ecnaive_blocks["recv_parity0"].data_ptr()),
-            "recv_data1": int(ecnaive_blocks["recv_data1"].data_ptr()),
-            "recv_parity1": int(ecnaive_blocks["recv_parity1"].data_ptr()),
-        }
         aligned_block_size = ecnaive_blocks["data0"].numel()
-
-        native.submit_ecnaive_load_recovery_full(
-            recv_p20_addr=recv_addrs["p20"],
-            recv_d21_addr=recv_addrs["d21"],
-            recv_d00_addr=recv_addrs["d00"],
-            recv_d01_addr=recv_addrs["d01"],
-            recv_d10_addr=recv_addrs["d10"],
-            recv_p11_addr=recv_addrs["p11"],
-            recv_d30_addr=recv_addrs["d30"],
-            recv_d31_addr=recv_addrs["d31"],
-            output_data0_addr=output_addrs["data0"],
-            output_recv_parity0_addr=output_addrs["recv_parity0"],
-            output_recv_data1_addr=output_addrs["recv_data1"],
-            output_recv_parity1_addr=output_addrs["recv_parity1"],
-            size=aligned_block_size,
+        n_stripes = _submit_ecnaive_load_recovery_stripes(
+            native=native,
+            manager=manager,
+            rank_in_group=rank_in_group,
+            aligned_block_size=aligned_block_size,
+            ecnaive_blocks=ecnaive_blocks,
+            recv_buffers=recv_buffers,
         )
-        native.submit_load_recv_sentinel()
         logger.debug(
-            "EC-NAIVE legacy load: rank_in_group 2 waiting for load completion "
-            f"(aligned_block_size={aligned_block_size})"
+            "EC-NAIVE legacy load: rank_in_group 2 submitted %d stripes "
+            "(stripe_bytes=%d, block_bytes=%d), waiting for completion",
+            n_stripes, manager.ecnaive_buffer_size, aligned_block_size,
         )
         native.wait_for_load_completion()
         if torch.cuda.is_available():
@@ -925,57 +1303,16 @@ def _run_ecnaive_full_recovery(
         )
     else:
         aligned_block_size = ecnaive_blocks["data0"].numel()
-        if rank_in_group == 0:
-            send_addrs = {
-                "p20": int(ecnaive_blocks["recv_parity0"].data_ptr()),
-                "d00": int(ecnaive_blocks["data0"].data_ptr()),
-                "d31": int(ecnaive_blocks["recv_data1"].data_ptr()),
-            }
-            native.submit_load_send_rank0_parity0(
-                send_addr=send_addrs["p20"], size=aligned_block_size
-            )
-            native.submit_load_send_rank0_data0(
-                send_addr=send_addrs["d00"], size=aligned_block_size
-            )
-            native.submit_load_send_rank0_data1(
-                send_addr=send_addrs["d31"], size=aligned_block_size
-            )
-            native.submit_load_send_sentinel()
-        elif rank_in_group == 1:
-            send_addrs = {
-                "d01": int(ecnaive_blocks["recv_data1"].data_ptr()),
-                "d10": int(ecnaive_blocks["data0"].data_ptr()),
-                "p11": int(ecnaive_blocks["recv_parity1"].data_ptr()),
-            }
-            native.submit_load_send_rank1_data1(
-                send_addr=send_addrs["d01"], size=aligned_block_size
-            )
-            native.submit_load_send_rank1_data0(
-                send_addr=send_addrs["d10"], size=aligned_block_size
-            )
-            native.submit_load_send_rank1_parity1(
-                send_addr=send_addrs["p11"], size=aligned_block_size
-            )
-            native.submit_load_send_sentinel()
-        elif rank_in_group == 3:
-            send_addrs = {
-                "d21": int(ecnaive_blocks["recv_data1"].data_ptr()),
-                "d30": int(ecnaive_blocks["data0"].data_ptr()),
-            }
-            native.submit_load_send_rank3_data1(
-                send_addr=send_addrs["d21"], size=aligned_block_size
-            )
-            native.submit_load_send_rank3_data0(
-                send_addr=send_addrs["d30"], size=aligned_block_size
-            )
-            native.submit_load_send_sentinel()
-        else:
-            raise RuntimeError(
-                f"EC-NAIVE legacy load: unexpected rank_in_group={rank_in_group}"
-            )
+        n_stripes = _submit_ecnaive_load_recovery_stripes(
+            native=native,
+            manager=manager,
+            rank_in_group=rank_in_group,
+            aligned_block_size=aligned_block_size,
+            ecnaive_blocks=ecnaive_blocks,
+        )
         logger.debug(
-            f"EC-NAIVE legacy load: submitted load sends in {time() - start_time:.2f}s "
-            f"(rank_in_group={rank_in_group})"
+            f"EC-NAIVE legacy load: submitted {n_stripes} load send stripes in "
+            f"{time() - start_time:.2f}s (rank_in_group={rank_in_group})"
         )
 
 def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
@@ -1081,12 +1418,6 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         )
         from megatron.training.global_vars import set_ft_load_timing_context
         set_ft_load_timing_context("EC-NAIVE", "SW", _t)
-        logger.debug(
-            "EC-NAIVE load timing (SW local): e2e_s=%(total).2fs "
-            "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
-            "barrier_s=%(barrier).2fs",
-            _t,
-        )
         return state_dict
 
     # ---- Hardware recovery ----
@@ -1151,21 +1482,18 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             flat_key_roots=flat_key_roots,
         )
     rebuild_sd = time.time() - t_rebuild
+    native_timing = _native_ft_timing(manager._ecnaive_native)
 
     timings = {
         "total": network_encode + rebuild_sd,
         "network_encode": network_encode,
+        "net_s": native_timing["net_s"],
+        "encode_s": native_timing["encode_s"],
         "rebuild_sd": rebuild_sd,
         "barrier": barrier_s,
     }
     from megatron.training.global_vars import set_ft_load_timing_context
     set_ft_load_timing_context("EC-NAIVE", "HW", timings)
-    logger.debug(
-        "EC-NAIVE load timing (HW local): e2e_s=%(total).2fs "
-        "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
-        "barrier_s=%(barrier).2fs",
-        timings,
-    )
 
     return state_dict
 
@@ -1396,17 +1724,28 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     # ── Pipeline: SOURCE ranks send all n blocks to each failed rank ──
     if affected_group and not is_failed and is_source:
         native.reset_encoding_completion_flags()
+        stripe_bytes = manager.ecnaive_buffer_size
 
         for dest_fr in failed_in_group:
             send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
-            for block_tensor in source_blocks_prealloc:
-                send_size = min(block_tensor.numel(), recv_block_size)
-                native.submit_send_task(
-                    send_ch, int(block_tensor.data_ptr()), send_size
-                )
+            send_bases = [
+                int(block_tensor.data_ptr()) for block_tensor in source_blocks_prealloc
+            ]
+            send_size = min(
+                min(block_tensor.numel() for block_tensor in source_blocks_prealloc),
+                recv_block_size,
+            )
+            _submit_hw_stripes_stripe_major(
+                native.submit_send_task,
+                send_ch,
+                send_bases,
+                send_size,
+                stripe_bytes,
+            )
             logger.debug(
                 f"EC-NAIVE hw recovery: source rank {rank} sending all "
-                f"{len(source_blocks_prealloc)} blocks to failed rank {dest_fr}"
+                f"{len(source_blocks_prealloc)} blocks (stripe-major, {stripe_bytes} B) "
+                f"to failed rank {dest_fr}"
             )
 
         native.submit_send_sentinels(num_channels)
@@ -1447,213 +1786,174 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         my_rig = plan['rank_in_group']
 
         recv_pool = recv_pool_prealloc
-
-        # Receive all n blocks from each source rank
-        native.reset_encoding_completion_flags()
-        for si, src_rank in enumerate(source_ranks):
-            recv_ch = manager.get_recv_channel_from_source(rank, src_rank, world_size)
-            base = si * ecnaive_n
-            for bi in range(ecnaive_n):
-                native.submit_recv_task(
-                    recv_ch,
-                    int(recv_pool[base + bi].data_ptr()),
-                    recv_block_size,
-                )
-            logger.debug(
-                f"EC-NAIVE hw recovery: failed rank {rank} recv "
-                f"{ecnaive_n} blocks from source rank {src_rank} (slot {si})"
-            )
-
-        native.submit_send_sentinels(num_channels)
-        native.submit_recv_sentinels(num_channels)
-        native.wait_for_encoding_completion()
-
-        _t['network_recv'] = time.time() - _t0_net
-
-        # ── Block locator ──────────────────────────────────────────
-        # Layout per source segment: [own_data0, recv_0, recv_1, recv_2]
-        #   own_data0 of source s = d_{s,0}
-        #   recv_0    of source s = d_{(s-1)%n, 1}
-        #   recv_1    of source s = p_{(s-2)%n, 0}   (parity0)
-        #   recv_2    of source s = p_{(s-3)%n, 1}   (parity1)
-        # (metadata and buffers pre-computed in the pre-alloc section before timing)
         rig_to_si = _rig_to_si
         owner_rigs = _owner_rigs
-        num_owners = _num_owners
         recovered_slot_pool = recovered_slot_pool_pre
         parity_pool_0 = parity_pool_0_pre
         parity_pool_1 = parity_pool_1_pre
         store_bufs = store_bufs_pre
 
-        def _find_block_in_pool(owner_rig: int, role: str) -> Optional[torch.Tensor]:
-            """Locate a specific block (role ∈ {data0,data1,parity0,parity1})
-            of owner_rig in recv_pool.  Returns None if not found."""
-            if role == 'data0':
-                si = rig_to_si.get(owner_rig)
-                return recv_pool[si * ecnaive_n] if si is not None else None
-            elif role == 'data1':
-                si = rig_to_si.get((owner_rig + 1) % ecnaive_n)
-                return recv_pool[si * ecnaive_n + 1] if si is not None else None
-            elif role == 'parity0':
-                si = rig_to_si.get((owner_rig + 2) % ecnaive_n)
-                return recv_pool[si * ecnaive_n + 2] if si is not None else None
-            elif role == 'parity1':
-                si = rig_to_si.get((owner_rig + 3) % ecnaive_n)
-                return recv_pool[si * ecnaive_n + 3] if si is not None else None
-            return None
-
-        recovered: Dict[str, torch.Tensor] = {}
-        owner_idx = 0
-
+        native.reset_encoding_completion_flags()
+        stripe_bytes = manager.ecnaive_buffer_size
         _t0_decode = time.time()
 
-        for owner_rig in owner_rigs:
-            # Find which blocks of this codeword survive in recv_pool
-            raw_surviving = {}  # label → padded tensor (raw from recv_pool)
-            lost = []           # list of lost data positions [0, 1]
-            for role, label in [('data0', 'data_0'), ('data1', 'data_1'),
-                                ('parity0', 'parity0'), ('parity1', 'parity1')]:
-                t = _find_block_in_pool(owner_rig, role)
-                if t is not None:
-                    raw_surviving[label] = t
-            # Determine lost data positions
-            for pos, label in enumerate(['data_0', 'data_1']):
-                if label not in raw_surviving:
-                    lost.append(pos)
-            m_owner = len(lost)
-
-            # Use raw padded blocks directly — compute per-chunk aligned
-            # addresses for blocks from recv slots (data_1/parity0/parity1).
-            # own_data0 blocks are continuous (no gaps).
-            surviving: Dict[str, torch.Tensor] = {}
-            is_padded: Dict[str, bool] = {}
-            for label, padded in raw_surviving.items():
-                # old checkpoints: recv slots (data_1/parity0/parity1) have 64B gaps
-                # new checkpoints: all blocks are continuous
-                if has_padded_recv and label != 'data_0':
-                    surviving[label] = padded
-                    is_padded[label] = True
-                else:
-                    surviving[label] = padded[:block_data_size]
-                    is_padded[label] = False
-
-            # Recover owner's data blocks
-            if m_owner == 0:
-                recovered_data = [surviving['data_0'], surviving['data_1']]
-                is_padded_recovered = [False, is_padded.get('data_1', False)]
-            else:
-                data_labels = sorted(
-                    [l for l in surviving if l.startswith('data_')],
-                    key=lambda x: int(x.split('_')[1]),
-                )
-                parity_labels = sorted([l for l in surviving if l.startswith('parity')])
-                surviving_addrs_ordered = data_labels + parity_labels
-                surviving_block_data = [
-                    surviving[l] for l in surviving_addrs_ordered
+        if has_padded_recv:
+            # Old checkpoints: padded recv layout — batch recv then full-block decode.
+            for si, src_rank in enumerate(source_ranks):
+                recv_ch = manager.get_recv_channel_from_source(rank, src_rank, world_size)
+                base = si * ecnaive_n
+                recv_bases = [
+                    int(recv_pool[base + bi].data_ptr()) for bi in range(ecnaive_n)
                 ]
-                is_padded_list = [is_padded[l] for l in surviving_addrs_ordered]
-
-                # Blocks are continuous (save path no longer adds padding gaps).
-                # Slice to block_data_size and pass directly to RS decode.
-                continuous_surviving = [b[:block_data_size] for b in surviving_block_data]
-
-                if owner_rig == my_rig:
-                    recovered_blocks = [store_bufs['own_data0'], store_bufs['my_data1']][:m_owner]
-                else:
-                    base = owner_idx * ecnaive_k
-                    recovered_blocks = recovered_slot_pool[base : base + m_owner]
-                surviving_addrs = [int(b.data_ptr()) for b in continuous_surviving]
-                recovered_addrs = [int(b.data_ptr()) for b in recovered_blocks]
-                native.submit_ecnaive_decode_recovery(
-                    ecnaive_k, m_owner, lost,
-                    surviving_addrs, recovered_addrs, block_data_size,
+                _submit_hw_stripes_stripe_major(
+                    native.submit_recv_task,
+                    recv_ch,
+                    recv_bases,
+                    recv_block_size,
+                    stripe_bytes,
                 )
+            native.submit_send_sentinels(num_channels)
+            native.submit_recv_sentinels(num_channels)
+            native.wait_for_encoding_completion()
+            _t['network_recv'] = time.time() - _t0_net
 
-                recovered_data = [None, None]
-                ri = 0
-                for pos in range(ecnaive_k):
-                    label = f'data_{pos}'
-                    if label in surviving:
-                        recovered_data[pos] = surviving[label]
+            def _find_block_in_pool(owner_rig: int, role: str) -> Optional[torch.Tensor]:
+                if role == 'data0':
+                    si = rig_to_si.get(owner_rig)
+                    return recv_pool[si * ecnaive_n] if si is not None else None
+                if role == 'data1':
+                    si = rig_to_si.get((owner_rig + 1) % ecnaive_n)
+                    return recv_pool[si * ecnaive_n + 1] if si is not None else None
+                if role == 'parity0':
+                    si = rig_to_si.get((owner_rig + 2) % ecnaive_n)
+                    return recv_pool[si * ecnaive_n + 2] if si is not None else None
+                if role == 'parity1':
+                    si = rig_to_si.get((owner_rig + 3) % ecnaive_n)
+                    return recv_pool[si * ecnaive_n + 3] if si is not None else None
+                return None
+
+            recovered: Dict[str, torch.Tensor] = {}
+            owner_idx = 0
+            for owner_rig in owner_rigs:
+                raw_surviving = {}
+                lost = []
+                for role, label in [
+                    ('data0', 'data_0'), ('data1', 'data_1'),
+                    ('parity0', 'parity0'), ('parity1', 'parity1'),
+                ]:
+                    block = _find_block_in_pool(owner_rig, role)
+                    if block is not None:
+                        raw_surviving[label] = block
+                for pos, label in enumerate(['data_0', 'data_1']):
+                    if label not in raw_surviving:
+                        lost.append(pos)
+                m_owner = len(lost)
+                surviving: Dict[str, torch.Tensor] = {}
+                is_padded: Dict[str, bool] = {}
+                for label, padded in raw_surviving.items():
+                    if label != 'data_0':
+                        surviving[label] = padded
+                        is_padded[label] = True
                     else:
-                        recovered_data[pos] = recovered_blocks[ri]
-                        ri += 1
-                # Track which recovered blocks are padded (for encode_ec_blocks)
-                is_padded_recovered = [
-                    is_padded.get(f'data_{pos}', False) and f'data_{pos}' in surviving
-                    for pos in range(ecnaive_k)
-                ]
+                        surviving[label] = padded[:block_data_size]
+                        is_padded[label] = False
+                if m_owner == 0:
+                    recovered_data = [surviving['data_0'], surviving['data_1']]
+                else:
+                    data_labels = sorted(
+                        [l for l in surviving if l.startswith('data_')],
+                        key=lambda x: int(x.split('_')[1]),
+                    )
+                    parity_labels = sorted([l for l in surviving if l.startswith('parity')])
+                    surviving_addrs_ordered = data_labels + parity_labels
+                    continuous_surviving = [
+                        surviving[l][:block_data_size] for l in surviving_addrs_ordered
+                    ]
+                    if owner_rig == my_rig:
+                        recovered_blocks = [
+                            store_bufs['own_data0'], store_bufs['my_data1'],
+                        ][:m_owner]
+                    else:
+                        base = owner_idx * ecnaive_k
+                        recovered_blocks = recovered_slot_pool[base : base + m_owner]
+                    native.submit_ecnaive_decode_recovery(
+                        ecnaive_k, m_owner, lost,
+                        [int(b.data_ptr()) for b in continuous_surviving],
+                        [int(b.data_ptr()) for b in recovered_blocks],
+                        block_data_size,
+                    )
+                    recovered_data = [None, None]
+                    ri = 0
+                    for pos in range(ecnaive_k):
+                        label = f'data_{pos}'
+                        if label in surviving:
+                            recovered_data[pos] = surviving[label]
+                        else:
+                            recovered_data[pos] = recovered_blocks[ri]
+                            ri += 1
+                if owner_rig == my_rig:
+                    recovered['own_data0_ref'] = recovered_data[0]
+                    recovered['my_data1_ref'] = recovered_data[1]
+                if (owner_rig + 1) % ecnaive_n == my_rig:
+                    recovered['recv_0_ref'] = recovered_data[1]
+                need_parity0 = (owner_rig + 2) % ecnaive_n == my_rig
+                need_parity1 = (owner_rig + 3) % ecnaive_n == my_rig
+                if need_parity0 or need_parity1:
+                    encode_inputs = [
+                        recovered_data[j][:block_data_size] for j in range(ecnaive_k)
+                    ]
+                    parity0 = parity_pool_0[owner_idx]
+                    parity1 = parity_pool_1[owner_idx]
+                    native.encode_ec_blocks(
+                        [int(b.data_ptr()) for b in encode_inputs],
+                        int(parity0.data_ptr()),
+                        int(parity1.data_ptr()),
+                        block_data_size,
+                    )
+                    if need_parity0:
+                        recovered['recv_1_ref'] = parity0
+                    if need_parity1:
+                        recovered['recv_2_ref'] = parity1
+                owner_idx += 1
+        else:
+            # Continuous blocks: recv stripe N+1 overlaps decode/encode stripe N (mirrors save).
+            owner_plans, recovered = _build_hw_owner_codeword_plans(
+                owner_rigs=owner_rigs,
+                my_rig=my_rig,
+                ecnaive_k=ecnaive_k,
+                ecnaive_n=ecnaive_n,
+                rig_to_si=rig_to_si,
+                recv_pool=recv_pool,
+                block_data_size=block_data_size,
+                store_bufs=store_bufs,
+                recovered_slot_pool=recovered_slot_pool,
+                parity_pool_0=parity_pool_0,
+                parity_pool_1=parity_pool_1,
+            )
+            n_stripes = _run_hw_failed_recv_decode_pipeline(
+                native=native,
+                manager=manager,
+                rank=rank,
+                world_size=world_size,
+                source_ranks=source_ranks,
+                ecnaive_k=ecnaive_k,
+                ecnaive_n=ecnaive_n,
+                recv_pool=recv_pool,
+                block_data_size=block_data_size,
+                owner_plans=owner_plans,
+                stripe_bytes=stripe_bytes,
+            )
+            native.submit_send_sentinels(num_channels)
+            native.submit_recv_sentinels(num_channels)
+            native.wait_for_encoding_completion()
+            _t['network_recv'] = time.time() - _t0_net
+            logger.debug(
+                "EC-NAIVE hw recovery: rank %d pipelined %d recv/decode stripes "
+                "(stripe_bytes=%d, block_bytes=%d)",
+                rank, n_stripes, stripe_bytes, block_data_size,
+            )
 
-            # Debug: verify RS decode for self codeword
-            if args.ecnaive_hw_debug and owner_rig == my_rig and m_owner > 0:
-                d0 = recovered_data[0]
-                d1 = recovered_data[1]
-                surv_keys = list(surviving.keys())
-                logger.debug(
-                    f"EC-NAIVE hw debug: self codeword owner_rig={owner_rig} "
-                    f"k={ecnaive_k} m={m_owner} lost={lost} "
-                    f"surviving_keys={surv_keys}"
-                )
-                # Compare RS-decoded d0 with original d0 from main_payload
-                if owner_rig == my_rig and isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
-                    orig_tb = main_payload["tensor_buffer"].detach().reshape(-1).view(torch.uint8)
-                    orig_d0 = orig_tb[:block_data_size]
-                    d0_match = (d0[:orig_d0.numel()] == orig_d0).sum().item()
-                    d0_total = min(d0.numel(), orig_d0.numel())
-                    if d0_match < d0_total:
-                        first = (d0[:orig_d0.numel()] != orig_d0).nonzero(as_tuple=False)[0].item()
-                        logger.debug(
-                            f"EC-NAIVE hw debug: RSd0 vs orig_d0: "
-                            f"match={d0_match}/{d0_total} "
-                            f"first_mismatch_at={first} "
-                            f"RSd0={d0[first].item():02x} "
-                            f"orig={orig_d0[first].item():02x}"
-                        )
-
-                # p_{i,0} = d_{i,0} XOR d_{i,1} — verify via XOR for ALL bytes
-                if 'parity0' in surviving:
-                    if 0 in lost and 'data_1' in surviving and 'parity0' in surviving:
-                        expected_d0 = torch.bitwise_xor(
-                            surviving['data_1'], surviving['parity0']
-                        )
-                        total_match = (d0 == expected_d0).sum().item()
-                        logger.debug(
-                            f"EC-NAIVE hw debug: XOR RSd0 vs (d1^p0) total match: "
-                            f"{total_match}/{d0.numel()} ({100*total_match/d0.numel():.1f}%)"
-                        )
-
-            # Save data refs (always needed, no compute required)
-            if owner_rig == my_rig:
-                recovered['own_data0_ref'] = recovered_data[0]
-                recovered['my_data1_ref'] = recovered_data[1]
-            if (owner_rig + 1) % ecnaive_n == my_rig:
-                recovered['recv_0_ref'] = recovered_data[1]
-
-            # Compute parity only when the output is actually stored by this rank.
-            # For k=2, n=4: out of 4 owner_rigs, exactly 2 produce used parity
-            # (owner_rig == my_rig and owner_rig == (my_rig-1)%n never do).
-            need_parity0 = (owner_rig + 2) % ecnaive_n == my_rig
-            need_parity1 = (owner_rig + 3) % ecnaive_n == my_rig
-            if need_parity0 or need_parity1:
-                encode_inputs = [recovered_data[j][:block_data_size] for j in range(ecnaive_k)]
-                parity0 = parity_pool_0[owner_idx]
-                parity1 = parity_pool_1[owner_idx]
-                native.encode_ec_blocks(
-                    [int(b.data_ptr()) for b in encode_inputs],
-                    int(parity0.data_ptr()),
-                    int(parity1.data_ptr()),
-                    block_data_size,
-                )
-                if need_parity0:
-                    recovered['recv_1_ref'] = parity0
-                if need_parity1:
-                    recovered['recv_2_ref'] = parity1
-
-            owner_idx += 1
-
-        _t['network_encode'] = (
-            _t['network_recv'] + (time.time() - _t0_decode)
-        )
+        _t['network_encode'] = time.time() - _t0_decode
 
         # Copy recovered refs to pre-allocated store buffers (not timed)
         for _name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2'):
@@ -1760,18 +2060,15 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         _t['rebuild_sd'] = time.time() - t_rebuild
 
     _t['barrier'] = barrier_s
+    native_timing = _native_ft_timing(native)
+    _t['net_s'] = native_timing['net_s']
+    _t['encode_s'] = native_timing['encode_s']
     _t['total'] = (
         _t.get('network_encode', 0.0)
         + _t.get('rebuild_sd', 0.0)
     )
     from megatron.training.global_vars import set_ft_load_timing_context
     set_ft_load_timing_context("EC-NAIVE", "HW recovery", _t)
-    logger.debug(
-        "EC-NAIVE load timing (HW recovery local): e2e_s=%(total).2fs "
-        "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
-        "barrier_s=%(barrier).2fs",
-        _t,
-    )
 
     # NOTE: do not call manager.cleanup() or native.stop() here.
     # The C++ destructor double-frees RDMA resources used during RS decode.
@@ -1780,7 +2077,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     return state_dict
 
 
-def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
+def save_ecnaive_legacy_checkpoint(
+    state_dict: Dict[str, Any], checkpoint_name: str, write_to_disk: bool = True
+) -> None:
     t0 = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -1790,13 +2089,13 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     if manager._ecnaive_native is None:
         raise RuntimeError("EC-NAIVE native module is not available in legacy save path")
 
-    flatten_optimizer_fp32_params(state_dict)
-    e2e_start = time.time()
     t0 = time.time()
-    decomposed = decompose_state_dict(state_dict)
+    decomposed, save_copy_s, save_flatten_s, decompose_s = decompose_state_dict_for_save(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
-    decompose_s = time.time() - t0
-    logger.debug(f"ECNAIVE save timing: decompose {decompose_s:.3f}s")
+    logger.debug(
+        "ECNAIVE save timing: copy %.3fs flatten %.3fs decompose %.3fs",
+        save_copy_s, save_flatten_s, decompose_s,
+    )
 
     t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), manager.ecnaive_buffer_size)
@@ -1805,6 +2104,39 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
+    for info in decomposed.tensor_infos:
+        info.offset = offset
+        local_tensor_metadata.append(
+            TensorMetadata(
+                key=info.key,
+                shape=info.shape,
+                dtype=str(info.dtype),
+                size_bytes=info.size_bytes,
+                global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
+                shard_index=info.shard_index if info.shard_index is not None else 0,
+                chunk_type="data",
+                target_rank=rank,
+                source_rank=rank,
+            )
+        )
+        offset += info.size_bytes
+
+    t0 = time.time()
+    rank_metadata, _ = _build_global_registry(local_tensor_metadata, {})
+    metadata_s = time.time() - t0
+
+    t0 = time.time()
+    blocks = _allocate_ecnaive_blocks(manager, rank_metadata)
+    buffer_alloc_s = time.time() - t0
+
+    if manager.use_rdma:
+        manager.register_buffer(tensor_buffer)
+
+    if world_size > 1:
+        torch.distributed.barrier()
+    e2e_t0 = time.time()
+
+    d2h_t0 = time.time()
     d2h_stream = torch.cuda.Stream()
     with torch.cuda.stream(d2h_stream):
         for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
@@ -1815,87 +2147,55 @@ def save_ecnaive_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
                     f"EC-NAIVE legacy save: tensor bytes mismatch for {info.key}, "
                     f"expected={tensor_bytes}, got={tensor_view.numel()}"
                 )
-            tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
-            info.offset = offset
-            local_tensor_metadata.append(
-                TensorMetadata(
-                    key=info.key,
-                    shape=info.shape,
-                    dtype=str(info.dtype),
-                    size_bytes=info.size_bytes,
-                    global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
-                    shard_index=info.shard_index if info.shard_index is not None else 0,
-                    chunk_type="data",
-                    target_rank=rank,
-                    source_rank=rank,
-                )
+            tensor_buffer[info.offset : info.offset + tensor_bytes].copy_(
+                tensor_view, non_blocking=True
             )
-            offset += tensor_bytes
-            decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
+            decomposed.tensor_data[i] = None
     d2h_stream.synchronize()
+    del decomposed.tensor_data
+    d2h_s = time.time() - d2h_t0
 
-    del decomposed.tensor_data  # drop remaining refs
-    d2h_s = time.time() - t0
-    logger.debug(f"ECNAIVE save timing: d2h {d2h_s:.3f}s")
-
-    t0 = time.time()
-    rank_metadata, _ = _build_global_registry(local_tensor_metadata, {})
-    metadata_s = time.time() - t0
-    logger.debug(f"ECNAIVE save timing: metadata exchange {metadata_s:.3f}s")
-
-    t0 = time.time()
-    blocks = _allocate_ecnaive_blocks(manager, rank_metadata)
-    buffer_alloc_s = time.time() - t0
-    logger.debug(f"ECNAIVE save timing: block alloc {buffer_alloc_s:.3f}s")
-
-    t0 = time.time()
-    if manager.use_rdma:
-        manager.register_buffer(tensor_buffer)
-    rdma_reg_s = time.time() - t0
-    logger.debug(f"ECNAIVE save timing: RDMA reg {rdma_reg_s:.3f}s")
-
-    pre_barrier_s = _timed_barrier()
-    t0 = time.time()
+    encode_t0 = time.time()
     _encode_with_native(
         manager=manager,
         tensor_buffer=tensor_buffer,
         actual_data_bytes=total_tensor_size,
         ecnaive_blocks=blocks,
     )
-    network_encode_s = time.time() - t0
-    logger.debug(f"ECNAIVE save timing: encode {network_encode_s:.3f}s")
-    post_barrier_s = _timed_barrier()
-    barrier_s = pre_barrier_s + post_barrier_s
-    e2e_s = time.time() - e2e_start
+    network_encode_s = time.time() - encode_t0
+    native_timing = _native_ft_timing(manager._ecnaive_native)
+    e2e_s = time.time() - e2e_t0
+    if world_size > 1:
+        torch.distributed.barrier()
     summary = _timing_max_dict({
         "e2e_s": e2e_s,
-        "decompose_s": decompose_s,
         "d2h_s": d2h_s,
-        "metadata_s": metadata_s,
-        "buffer_alloc_s": buffer_alloc_s,
-        "rdma_reg_s": rdma_reg_s,
         "network_encode_s": network_encode_s,
-        "barrier_s": barrier_s,
+        "net_s": native_timing["net_s"],
+        "encode_s": native_timing["encode_s"],
     })
     logger.info(
-        "EC-NAIVE save timing: e2e_s=%(e2e_s).2fs decompose_s=%(decompose_s).2fs "
-        "d2h_s=%(d2h_s).2fs metadata_s=%(metadata_s).2fs "
-        "buffer_alloc_s=%(buffer_alloc_s).2fs rdma_reg_s=%(rdma_reg_s).2fs "
-        "network_encode_s=%(network_encode_s).2fs barrier_s=%(barrier_s).2fs",
+        "EC-NAIVE save timing: e2e_s=%(e2e_s).2fs d2h_s=%(d2h_s).2fs "
+        "network_encode_s=%(network_encode_s).2fs net_s=%(net_s).2fs encode_s=%(encode_s).2fs",
         summary,
     )
 
-    _save_ecnaive_pt_files(
-        checkpoint_name=checkpoint_name,
-        rank=rank,
-        non_tensor_data=decomposed.non_tensor_data,
-        tensor_infos=decomposed.tensor_infos,
-        blocks=blocks,
-        full_tensor_buffer=tensor_buffer[:total_tensor_size],
-        flat_key_roots=decomposed.flat_key_roots,
-        manager=manager,
-        all_tensor_infos=rank_metadata,  # store all ranks' metadata for HW recovery
-    )
+    if write_to_disk:
+        _save_ecnaive_pt_files(
+            checkpoint_name=checkpoint_name,
+            rank=rank,
+            non_tensor_data=decomposed.non_tensor_data,
+            tensor_infos=decomposed.tensor_infos,
+            blocks=blocks,
+            full_tensor_buffer=tensor_buffer[:total_tensor_size],
+            flat_key_roots=decomposed.flat_key_roots,
+            manager=manager,
+            all_tensor_infos=rank_metadata,  # store all ranks' metadata for HW recovery
+        )
+    else:
+        logger.info(
+            "EC-NAIVE save: skipping checkpoint file writes for this iteration"
+        )
 
     if world_size > 1:
         torch.distributed.barrier()

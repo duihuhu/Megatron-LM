@@ -96,7 +96,7 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
-            --frcheck-async-recovery-forward
+            #--frcheck-async-recovery-forward
             #--no-load-optim
             #--no-load-rng
             --frcheck-failed-ranks "0"

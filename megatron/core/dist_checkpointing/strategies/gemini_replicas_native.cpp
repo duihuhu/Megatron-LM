@@ -28,6 +28,7 @@
 #include <atomic>
 #include <cstring>
 #include <cerrno>
+#include <cstdlib>
 #include <algorithm>
 #include <deque>
 #include <map>
@@ -50,6 +51,14 @@
 namespace py = pybind11;
 
 namespace {
+
+// Each Megatron rank owns one GPU; LOCAL_RANK selects the device in-process.
+int resolve_cuda_device() {
+    if (const char* local_rank = std::getenv("LOCAL_RANK")) {
+        return std::max(0, std::atoi(local_rank));
+    }
+    return 0;
+}
 
 // Large runs can reach Phase 2 at slightly different times across nodes.
 // Keep retrying long enough for slower acceptors to finish binding/listening.
@@ -489,9 +498,9 @@ private:
                 boost::system::error_code ec;
                 recv_acceptor_->bind(endpoint, ec);
                 if (!ec) break;
-                if (attempt >= 30)
+                if (attempt >= 100)
                     throw std::runtime_error("Failed to bind to " + my_ip_ + ":" + std::to_string(my_port_)
-                        + " after 30 attempts: " + ec.message());
+                        + " after 100 attempts: " + ec.message());
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             recv_acceptor_->listen();
@@ -1528,12 +1537,14 @@ private:
             boost::system::error_code ec;
             recv_acceptor_->bind(endpoint, ec);
             if (!ec) break;
-            if (attempt >= 30)
+            if (attempt >= 100)
                 throw std::runtime_error("Failed to bind to " + my_ip_ + ":" + std::to_string(my_port_)
-                    + " after 30 attempts: " + ec.message());
+                    + " after 100 attempts: " + ec.message());
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        recv_acceptor_->listen(expected_recv_connections_);
+        // Use default backlog (same as ASIO path) so concurrent inbound TCP
+        // handshakes are not dropped when multiple senders connect at once.
+        recv_acceptor_->listen();
         if (debug_)
             std::cout << "[Rank " << rank_ << "] ASIO acceptor listening on " << my_ip_ << ":" << my_port_ << std::endl;
     }
@@ -2047,6 +2058,47 @@ private:
     void* d2h_stream_{nullptr};  // cudaStream_t (opaque, avoid header dependency)
     std::atomic<size_t> mirror_tasks_submitted_{0};
     std::atomic<size_t> mirror_bytes_submitted_{0};
+    std::atomic<uint64_t> mirror_d2h_busy_total_ns_{0};
+
+    struct MirrorCopyTiming {
+        cudaEvent_t start{};
+        cudaEvent_t end{};
+        bool valid{false};
+    };
+    std::vector<MirrorCopyTiming> mirror_copy_timings_;
+    std::mutex mirror_timing_mutex_;
+
+    void reset_mirror_d2h_timing_() {
+        mirror_d2h_busy_total_ns_.store(0, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
+        for (auto& timing : mirror_copy_timings_) {
+            if (!timing.valid) {
+                continue;
+            }
+            cudaEventDestroy(timing.start);
+            cudaEventDestroy(timing.end);
+        }
+        mirror_copy_timings_.clear();
+    }
+
+    void finalize_mirror_d2h_timing_() {
+        uint64_t total_ns = 0;
+        std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
+        for (auto& timing : mirror_copy_timings_) {
+            if (!timing.valid) {
+                continue;
+            }
+            float elapsed_ms = 0.0f;
+            if (cudaEventElapsedTime(&elapsed_ms, timing.start, timing.end) == cudaSuccess) {
+                total_ns += static_cast<uint64_t>(elapsed_ms * 1e6);
+            }
+            cudaEventDestroy(timing.start);
+            cudaEventDestroy(timing.end);
+            timing.valid = false;
+        }
+        mirror_copy_timings_.clear();
+        mirror_d2h_busy_total_ns_.store(total_ns, std::memory_order_relaxed);
+    }
 
     // Per-batch mirror bases: completed RDMA send batches push mirror tasks
     // so GPU ranges can D2H while later RDMA batches continue.
@@ -2124,6 +2176,7 @@ public:
         connection_manager_->set_chunk_done_callback(nullptr);
         mirror_tasks_submitted_ = 0;
         mirror_bytes_submitted_ = 0;
+        reset_mirror_d2h_timing_();
         if (gpu_base == 0 || cpu_base == 0 || total_size == 0) {
             return;
         }
@@ -2359,6 +2412,12 @@ public:
             }
             mirror_cv_.notify_one();
             mirror_thread_.join();
+        }
+        if (d2h_stream_ != nullptr) {
+            cudaSetDevice(resolve_cuda_device());
+            cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(d2h_stream_));
+            cudaStreamDestroy(reinterpret_cast<cudaStream_t>(d2h_stream_));
+            d2h_stream_ = nullptr;
         }
 
         workers_started_ = false;
@@ -2609,6 +2668,8 @@ public:
 
     void start_mirror_worker() {
         mirror_done_ = false;
+        d2h_stream_ = nullptr;
+        cudaSetDevice(resolve_cuda_device());
         cudaStreamCreate(reinterpret_cast<cudaStream_t*>(&d2h_stream_));
         mirror_thread_ = std::thread(&GeminiReplicasNative::mirror_worker_func, this);
     }
@@ -2631,9 +2692,18 @@ public:
         while (!mirror_done_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(d2h_stream_));
-        cudaStreamDestroy(reinterpret_cast<cudaStream_t>(d2h_stream_));
-        if (mirror_thread_.joinable()) mirror_thread_.join();
+        if (mirror_thread_.joinable()) {
+            mirror_thread_.join();
+        }
+        if (d2h_stream_ != nullptr) {
+            cudaSetDevice(resolve_cuda_device());
+            cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(d2h_stream_));
+            finalize_mirror_d2h_timing_();
+            cudaStreamDestroy(reinterpret_cast<cudaStream_t>(d2h_stream_));
+            d2h_stream_ = nullptr;
+        } else {
+            finalize_mirror_d2h_timing_();
+        }
         if (debug_ && mirror_tasks_submitted_.load() > 0) {
             std::cout << "[Rank " << rank_ << "] Mirror submitted "
                       << mirror_tasks_submitted_.load() << " tasks, "
@@ -2641,8 +2711,14 @@ public:
         }
     }
 
+    double get_mirror_d2h_busy_s() const {
+        return static_cast<double>(
+            mirror_d2h_busy_total_ns_.load(std::memory_order_relaxed)) / 1e9;
+    }
+
 private:
     void mirror_worker_func() {
+        cudaSetDevice(resolve_cuda_device());
         while (true) {
             MirrorTask task;
             {
@@ -2655,12 +2731,37 @@ private:
                 mirror_done_ = true;
                 break;  // sentinel
             }
-            cudaMemcpyAsync(
+            MirrorCopyTiming timing{};
+            const bool start_ok = cudaEventCreate(&timing.start) == cudaSuccess;
+            const bool end_ok = cudaEventCreate(&timing.end) == cudaSuccess;
+            if (start_ok && end_ok) {
+                cudaEventRecord(
+                    timing.start, reinterpret_cast<cudaStream_t>(d2h_stream_));
+            } else {
+                if (start_ok) {
+                    cudaEventDestroy(timing.start);
+                }
+                if (end_ok) {
+                    cudaEventDestroy(timing.end);
+                }
+            }
+            const cudaError_t copy_err = cudaMemcpyAsync(
                 reinterpret_cast<void*>(task.cpu_addr),
                 reinterpret_cast<const void*>(task.gpu_addr),
                 task.size,
                 cudaMemcpyDeviceToHost,
                 reinterpret_cast<cudaStream_t>(d2h_stream_));
+            if (copy_err != cudaSuccess && debug_) {
+                std::cerr << "[Rank " << rank_ << "] Mirror cudaMemcpyAsync failed: "
+                          << cudaGetErrorString(copy_err) << std::endl;
+            }
+            if (start_ok && end_ok) {
+                cudaEventRecord(
+                    timing.end, reinterpret_cast<cudaStream_t>(d2h_stream_));
+                timing.valid = true;
+                std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
+                mirror_copy_timings_.push_back(timing);
+            }
         }
     }
 
@@ -2797,6 +2898,8 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
         .def("start_mirror_worker", &GeminiReplicasNative::start_mirror_worker,
              "Start the mirror worker thread for async D2H copies")
         .def("wait_mirror_completion", &GeminiReplicasNative::wait_mirror_completion,
-             "Wait for all mirror tasks to complete and stop the mirror worker");
+             "Wait for all mirror tasks to complete and stop the mirror worker")
+        .def("get_mirror_d2h_busy_s", &GeminiReplicasNative::get_mirror_d2h_busy_s,
+             "Return summed GPU busy time for mirror D2H copies in seconds");
 }
 

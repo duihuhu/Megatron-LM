@@ -2286,6 +2286,10 @@ def _add_checkpointing_args(parser):
     group.add_argument('--load-model-opt-format', action='store_true',
                        help='Load a checkpoint for TensorRT model optimizer (nvidia-modelopt).'
                             'This function can also be used to load NeMo .nemo sharded checkpoints.')
+    group.add_argument('--ec-checkpoint-write-only-penultimate-iter', action='store_true',
+                       help='For EC/Gemini legacy checkpointing, run the normal save pipeline on every '
+                            'checkpoint call but write checkpoint files and update latest_checkpointed_iteration '
+                            'only on the penultimate training iteration (train_iters - 1).')
     
     # EC-CHECK (Erasure Coding Checkpoint) arguments
     group.add_argument('--use-eccheck', action='store_true',

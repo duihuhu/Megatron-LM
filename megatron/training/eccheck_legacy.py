@@ -26,8 +26,8 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     GlobalMetadataRegistry,
     TensorMetadata,
     decompose_state_dict,
+    decompose_state_dict_for_save,
     extract_tensors_from_continuous_buffer,
-    flatten_optimizer_fp32_params,
     reconstruct_state_dict,
     unflatten_optimizer_fp32_params,
 )
@@ -46,6 +46,19 @@ def _timing_max(value: float) -> float:
 
 def _timing_max_dict(timings: Dict[str, float]) -> Dict[str, float]:
     return {key: _timing_max(value) for key, value in timings.items()}
+
+
+def _native_ft_timing(native) -> Dict[str, float]:
+    if native is None:
+        return {"net_s": 0.0, "encode_s": 0.0}
+    try:
+        stats = native.get_ft_timing_stats()
+        return {
+            "net_s": float(stats.get("net_s", 0.0)),
+            "encode_s": float(stats.get("encode_s", 0.0)),
+        }
+    except AttributeError:
+        return {"net_s": 0.0, "encode_s": 0.0}
 
 
 def _timed_barrier() -> float:
@@ -442,7 +455,7 @@ def _save_eccheck_pt_files(
 # ---------------------------------------------------------------------------
 
 def save_eccheck_legacy_checkpoint(
-    state_dict: Dict[str, Any], checkpoint_name: str
+    state_dict: Dict[str, Any], checkpoint_name: str, write_to_disk: bool = True
 ) -> None:
     t0 = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -453,13 +466,13 @@ def save_eccheck_legacy_checkpoint(
     if manager._eccheck_native is None:
         raise RuntimeError("ECCHECK native module is not available in legacy save path")
 
-    flatten_optimizer_fp32_params(state_dict)
-    e2e_start = time.time()
     t0 = time.time()
-    decomposed = decompose_state_dict(state_dict)
+    decomposed, save_copy_s, save_flatten_s, decompose_s = decompose_state_dict_for_save(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
-    decompose_s = time.time() - t0
-    logger.debug(f"ECCHECK save timing: decompose {decompose_s:.3f}s")
+    logger.debug(
+        "ECCHECK save timing: copy %.3fs flatten %.3fs decompose %.3fs",
+        save_copy_s, save_flatten_s, decompose_s,
+    )
 
     t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), manager.eccheck_buffer_size)
@@ -468,38 +481,23 @@ def save_eccheck_legacy_checkpoint(
 
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
-    d2h_stream = torch.cuda.Stream()
-    with torch.cuda.stream(d2h_stream):
-        for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
-            tensor_bytes = info.size_bytes
-            tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
-            if tensor_view.numel() != tensor_bytes:
-                raise RuntimeError(
-                    f"ECCHECK legacy save: tensor bytes mismatch for {info.key}, "
-                    f"expected={tensor_bytes}, got={tensor_view.numel()}"
-                )
-            tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
-            info.offset = offset
-            local_tensor_metadata.append(
-                TensorMetadata(
-                    key=info.key,
-                    shape=info.shape,
-                    dtype=str(info.dtype),
-                    size_bytes=info.size_bytes,
-                    global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
-                    shard_index=info.shard_index if info.shard_index is not None else 0,
-                    chunk_type="data",
-                    target_rank=rank,
-                    source_rank=rank,
-                )
+    for info in decomposed.tensor_infos:
+        info.offset = offset
+        local_tensor_metadata.append(
+            TensorMetadata(
+                key=info.key,
+                shape=info.shape,
+                dtype=str(info.dtype),
+                size_bytes=info.size_bytes,
+                offset=offset,
+                global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
+                shard_index=info.shard_index if info.shard_index is not None else 0,
+                chunk_type="data",
+                target_rank=rank,
+                source_rank=rank,
             )
-            offset += tensor_bytes
-        decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
-    d2h_stream.synchronize()
-
-    del decomposed.tensor_data  # drop remaining refs
-    d2h_s = time.time() - t0
-    logger.debug(f"ECCHECK save timing: d2h {d2h_s:.3f}s")
+        )
+        offset += info.size_bytes
 
     t0 = time.time()
     # Only tensor metadata needed for block sizing; non_tensor_data (~250MB)
@@ -507,12 +505,10 @@ def save_eccheck_legacy_checkpoint(
     # dict to avoid wasting 5+ seconds on unnecessary exchange.
     rank_metadata, _ = _build_global_registry(local_tensor_metadata, {})
     metadata_s = time.time() - t0
-    logger.debug(f"ECCHECK save timing: metadata exchange {metadata_s:.3f}s")
 
     t0 = time.time()
     blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
     block_alloc_s = time.time() - t0
-    logger.debug(f"ECCHECK save timing: block alloc {block_alloc_s:.3f}s")
 
     # Allocate recv encoding buffers now that we know peer data sizes
     registry = GlobalMetadataRegistry(
@@ -524,13 +520,9 @@ def save_eccheck_legacy_checkpoint(
             manager.allocate_recv_encoding_buffers_phase2(registry)
         )
     recv_alloc_s = time.time() - t0
-    logger.debug(f"ECCHECK save timing: recv buf alloc {recv_alloc_s:.3f}s")
 
-    t0 = time.time()
     if manager.use_rdma:
         manager.register_buffer(tensor_buffer)
-    rdma_reg_s = time.time() - t0
-    logger.debug(f"ECCHECK save timing: RDMA reg {rdma_reg_s:.3f}s")
 
     logger.debug(
         f"ECCHECK legacy save: rank {rank} encoding "
@@ -538,46 +530,68 @@ def save_eccheck_legacy_checkpoint(
         f"(actual: {total_tensor_size / (1024**3):.2f} GB)"
     )
 
-    pre_barrier_s = _timed_barrier()
-    t0 = time.time()
+    if world_size > 1:
+        torch.distributed.barrier()
+    e2e_t0 = time.time()
+
+    d2h_t0 = time.time()
+    d2h_stream = torch.cuda.Stream()
+    with torch.cuda.stream(d2h_stream):
+        for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
+            tensor_bytes = info.size_bytes
+            tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+            if tensor_view.numel() != tensor_bytes:
+                raise RuntimeError(
+                    f"ECCHECK legacy save: tensor bytes mismatch for {info.key}, "
+                    f"expected={tensor_bytes}, got={tensor_view.numel()}"
+                )
+            tensor_buffer[info.offset : info.offset + tensor_bytes].copy_(
+                tensor_view, non_blocking=True
+            )
+            decomposed.tensor_data[i] = None
+    d2h_stream.synchronize()
+    del decomposed.tensor_data
+    d2h_s = time.time() - d2h_t0
+
+    encode_t0 = time.time()
     _encode_eccheck_with_native(
         manager=manager,
         tensor_buffer=tensor_buffer,
         actual_data_bytes=total_tensor_size,
         blocks=blocks,
     )
-    network_encode_s = time.time() - t0
-    logger.debug(f"ECCHECK save timing: encode {network_encode_s:.3f}s")
-    post_barrier_s = _timed_barrier()
-    barrier_s = pre_barrier_s + post_barrier_s
-    e2e_s = time.time() - e2e_start
+    network_encode_s = time.time() - encode_t0
+    native_timing = _native_ft_timing(manager._eccheck_native)
+    e2e_s = time.time() - e2e_t0
+    if world_size > 1:
+        torch.distributed.barrier()
     summary = _timing_max_dict({
         "e2e_s": e2e_s,
-        "decompose_s": decompose_s,
         "d2h_s": d2h_s,
-        "metadata_s": metadata_s,
-        "buffer_alloc_s": block_alloc_s + recv_alloc_s,
-        "rdma_reg_s": rdma_reg_s,
         "network_encode_s": network_encode_s,
-        "barrier_s": barrier_s,
+        "net_s": native_timing["net_s"],
+        "encode_s": native_timing["encode_s"],
     })
     logger.info(
-        "ECCHECK save timing: e2e_s=%(e2e_s).2fs decompose_s=%(decompose_s).2fs "
-        "d2h_s=%(d2h_s).2fs metadata_s=%(metadata_s).2fs "
-        "buffer_alloc_s=%(buffer_alloc_s).2fs rdma_reg_s=%(rdma_reg_s).2fs "
-        "network_encode_s=%(network_encode_s).2fs barrier_s=%(barrier_s).2fs",
+        "ECCHECK save timing: e2e_s=%(e2e_s).2fs d2h_s=%(d2h_s).2fs "
+        "network_encode_s=%(network_encode_s).2fs net_s=%(net_s).2fs encode_s=%(encode_s).2fs",
         summary,
     )
 
-    _save_eccheck_pt_files(
-        checkpoint_name=checkpoint_name,
-        rank=rank,
-        non_tensor_data=decomposed.non_tensor_data,
-        tensor_infos=decomposed.tensor_infos,
-        blocks=blocks,
-        full_tensor_buffer=tensor_buffer[:total_tensor_size],
-        all_tensor_infos=rank_metadata,
-    )
+    if write_to_disk:
+        _save_eccheck_pt_files(
+            checkpoint_name=checkpoint_name,
+            rank=rank,
+            non_tensor_data=decomposed.non_tensor_data,
+            tensor_infos=decomposed.tensor_infos,
+            blocks=blocks,
+            full_tensor_buffer=tensor_buffer[:total_tensor_size],
+            all_tensor_infos=rank_metadata,
+        )
+    else:
+        logger.info(
+            "ECCHECK save: skipping checkpoint file writes for this iteration"
+        )
     if world_size > 1:
         _timed_barrier()
 
@@ -1583,11 +1597,8 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             blocks, checkpoint_dir, rank, rank_in_group, software_failure=False,
         )
 
-    if manager.use_rdma:
-        for block_name in blocks.get("block_names", []):
-            manager.register_buffer(blocks[block_name])
-        if recovered_buffer is not None:
-            manager.register_buffer(recovered_buffer)
+    if manager.use_rdma and recovered_buffer is not None:
+        manager.register_buffer(recovered_buffer)
 
     # Sync all ranks after setup so network timing excludes setup skew.
     barrier_s = _timed_barrier()
@@ -1636,21 +1647,18 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         recovered_buffer=recovered_buffer if use_recovered else None,
     )
     rebuild_sd = time.time() - t_rebuild
+    native_timing = _native_ft_timing(manager._eccheck_native)
 
     timings = {
         "total": network_encode + rebuild_sd,
         "network_encode": network_encode,
+        "net_s": native_timing["net_s"],
+        "encode_s": native_timing["encode_s"],
         "rebuild_sd": rebuild_sd,
         "barrier": barrier_s,
     }
     from megatron.training.global_vars import set_ft_load_timing_context
     set_ft_load_timing_context("ECCHECK", _mode, timings)
-    logger.debug(
-        "ECCHECK load timing (%s local): e2e_s=%.2fs network_encode_s=%.2fs "
-        "rebuild_sd_s=%.2fs barrier_s=%.2fs",
-        _mode, timings["total"], timings["network_encode"],
-        timings["rebuild_sd"], timings["barrier"],
-    )
 
     # Stop C++ load workers so they don't interfere with subsequent training.
     # Synchronize teardown so early ranks do not release RDMA resources while peers
@@ -1659,9 +1667,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         logger.info(f"ECCHECK legacy: rank {rank} entering pre-cleanup barrier")
         torch.distributed.barrier()
         logger.info(f"ECCHECK legacy: rank {rank} leaving pre-cleanup barrier")
-    # The singleton manager will be reinitialized on the next save.
-    logger.debug(f"ECCHECK legacy: cleaning up C++ module after recovery (rank {rank})")
-    manager.cleanup()
-    manager._eccheck_native = None
 
+    # Defer manager.cleanup() until after load_state_dict H2D in checkpointing.py.
+    # Early cudaHostUnregister makes rebuild_sd views non-pinned and under-reports h2d_s.
     return state_dict

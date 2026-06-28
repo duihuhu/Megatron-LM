@@ -2838,6 +2838,7 @@ public:
     }
 
     void sw_send_data(int block_idx, uintptr_t send_addr, size_t size) {
+        LoadNetScopeTimer net_timer(this);
         // Forward to RANK2 (failed rank): try RDMA channel first, fall back to ASIO socket
         if (use_rdma_ && block_idx >= 0 && static_cast<size_t>(block_idx) < rdma_sw_recovery_channels_.size()
             && rdma_sw_recovery_channels_[block_idx]) {
@@ -2861,6 +2862,7 @@ public:
     }
 
     void sw_recv_data(int block_idx, uintptr_t recv_addr, size_t size) {
+        LoadRecvNetScopeTimer net_timer(this);
         if (use_rdma_ && block_idx >= 0 && static_cast<size_t>(block_idx) < rdma_sw_recovery_channels_.size()
             && rdma_sw_recovery_channels_[block_idx]) {
             rdma_sw_recovery_channels_[block_idx]->receive_data(
@@ -2889,40 +2891,34 @@ public:
     void wait_for_load_completion() {
         if (rank_ != 2 || !is_load_mode_) return;
         
-        std::cout << "EC-NAIVE: [Rank 2] Waiting for load workers to complete..." << std::endl;
-        
-        int wait_count = 0;
         while (!load_recv_worker_completed_ || !load_xor_worker_completed_) {
-            if (wait_count % 100 == 0) {
-                std::cout << "EC-NAIVE: [Rank 2] Waiting for load workers: "
-                          << "recv=" << (load_recv_worker_completed_ ? "true" : "false")
-                          << ", xor=" << (load_xor_worker_completed_ ? "true" : "false") << std::endl;
-            }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            wait_count++;
         }
-        const double recv_ms =
-            static_cast<double>(load_recv_total_ns_.load(std::memory_order_relaxed)) / 1e6;
-        const double xor_sum_ms =
-            static_cast<double>(load_xor_total_ns_.load(std::memory_order_relaxed)) / 1e6;
-        const size_t recv_tasks = load_recv_task_count_.load(std::memory_order_relaxed);
-        const size_t xor_tasks = load_xor_task_count_.load(std::memory_order_relaxed);
-        const bool xor_e2e_ok = load_xor_e2e_wall_valid_.load(std::memory_order_relaxed);
-        const double xor_e2e_ms =
-            static_cast<double>(load_xor_e2e_wall_ns_.load(std::memory_order_relaxed)) / 1e6;
-        std::cout << "EC-NAIVE: [Rank 2] Load timing summary: "
-                  << "network_recv_ms=" << recv_ms
-                  << ", network_recv_tasks=" << recv_tasks
-                  << ", xor_decode_sum_ms=" << xor_sum_ms
-                  << " (per-chunk wall time summed)"
-                  << ", xor_decode_tasks=" << xor_tasks
-                  << ", xor_decode_e2e_wall_ms=" << (xor_e2e_ok ? xor_e2e_ms : 0.0)
-                  << " (wall: first XOR start to last XOR end; 0 if no XOR)"
-                  << std::endl;
-        std::cout << "EC-NAIVE: [Rank 2] All load workers completed" << std::endl;
     }
 
     // Release helpers: Python can poll these to free buffers.
+    pybind11::dict get_ft_timing_stats() const {
+        double net_s = 0.0;
+        double encode_s = 0.0;
+        if (is_load_mode_) {
+            const uint64_t net_ns =
+                load_recv_total_ns_.load(std::memory_order_relaxed) +
+                load_send_total_ns_.load(std::memory_order_relaxed);
+            net_s = static_cast<double>(net_ns) / 1e9;
+            encode_s = static_cast<double>(
+                load_xor_total_ns_.load(std::memory_order_relaxed)) / 1e9;
+        } else {
+            net_s = static_cast<double>(
+                save_net_wall_span_ns_.load(std::memory_order_relaxed)) / 1e9;
+            encode_s = static_cast<double>(
+                save_encode_total_ns_.load(std::memory_order_relaxed)) / 1e9;
+        }
+        pybind11::dict result;
+        result["net_s"] = net_s;
+        result["encode_s"] = encode_s;
+        return result;
+    }
+
     // Data buffers (data1_addr) are released after send operations complete
     std::vector<uintptr_t> get_data_buffers_to_release() {
         std::vector<uintptr_t> buffers;
@@ -2974,6 +2970,15 @@ public:
         recv_parity1_sentinel_received_ = false;
         recv_parity0_sentinel_received_ = false;
         recv_data1_sentinel_received_ = false;
+        save_encode_total_ns_.store(0, std::memory_order_relaxed);
+        save_encode_op_count_.store(0, std::memory_order_relaxed);
+        save_net_wall_span_ns_.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(save_net_wall_mu_);
+            save_net_wall_have_any_ = false;
+        }
+        load_send_total_ns_.store(0, std::memory_order_relaxed);
+        network_tasks_inflight_.store(0, std::memory_order_relaxed);
         // Clear legacy queues
         {
             std::lock_guard<std::mutex> lock(send_data1_mutex_);
@@ -3017,13 +3022,34 @@ public:
                            recv_parity1_completed_ && recv_parity0_completed_ && recv_data1_completed_;
             }
             if (all_done) break;
-            if (wait_count % 100 == 0) {
-                std::cout << "ECNAIVE: Waiting for " << num_channels_ << " send+recv workers..." << std::endl;
-            }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             wait_count++;
         }
-        std::cout << "ECNAIVE: All workers completed" << std::endl;
+    }
+
+    // Wait until all queued/in-flight save-path send/recv tasks finish (no sentinels required).
+    void wait_for_pending_network_tasks() {
+        while (true) {
+            if (network_tasks_inflight_.load(std::memory_order_acquire) == 0) {
+                bool queues_empty = true;
+                for (int i = 0; i < num_channels_; ++i) {
+                    std::lock_guard<std::mutex> lk_send(send_mutexes_[i]);
+                    if (!send_queues_[i].empty()) {
+                        queues_empty = false;
+                        break;
+                    }
+                    std::lock_guard<std::mutex> lk_recv(recv_mutexes_[i]);
+                    if (!recv_queues_[i].empty()) {
+                        queues_empty = false;
+                        break;
+                    }
+                }
+                if (queues_empty) {
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
     }
 
     void stop() {
@@ -3113,6 +3139,7 @@ public:
             load_send_sentinel_received_ = false;
             load_recv_total_ns_.store(0, std::memory_order_relaxed);
             load_xor_total_ns_.store(0, std::memory_order_relaxed);
+            load_send_total_ns_.store(0, std::memory_order_relaxed);
             load_recv_task_count_.store(0, std::memory_order_relaxed);
             load_xor_task_count_.store(0, std::memory_order_relaxed);
             load_xor_e2e_wall_ns_.store(0, std::memory_order_relaxed);
@@ -3903,6 +3930,7 @@ private:
     std::queue<uintptr_t> data_buffers_to_release_;
     std::queue<uintptr_t> parity_buffers_to_release_;
     std::mutex release_queue_mutex_;
+    std::atomic<int> network_tasks_inflight_{0};
 
     // Completion flags
     std::deque<std::atomic<bool>> send_completed_;
@@ -4030,6 +4058,107 @@ private:
     std::atomic<uint64_t> load_xor_total_ns_{0};
     std::atomic<size_t> load_recv_task_count_{0};
     std::atomic<size_t> load_xor_task_count_{0};
+    std::atomic<uint64_t> save_encode_total_ns_{0};
+    std::atomic<size_t> save_encode_op_count_{0};
+    std::atomic<uint64_t> load_send_total_ns_{0};
+
+    // Save net: wall from earliest net op start to latest net op end (overlapping workers).
+    std::mutex save_net_wall_mu_;
+    bool save_net_wall_have_any_{false};
+    std::chrono::steady_clock::time_point save_net_wall_first_{};
+    std::chrono::steady_clock::time_point save_net_wall_last_{};
+    std::atomic<uint64_t> save_net_wall_span_ns_{0};
+
+    void record_save_encode_op_(uint64_t ns) {
+        save_encode_total_ns_.fetch_add(ns, std::memory_order_relaxed);
+        save_encode_op_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void record_load_xor_op_(uint64_t ns) {
+        load_xor_total_ns_.fetch_add(ns, std::memory_order_relaxed);
+        load_xor_task_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void touch_save_net_wall_(
+        std::chrono::steady_clock::time_point t0,
+        std::chrono::steady_clock::time_point t1) {
+        std::lock_guard<std::mutex> lk(save_net_wall_mu_);
+        if (!save_net_wall_have_any_) {
+            save_net_wall_first_ = t0;
+            save_net_wall_last_ = t1;
+            save_net_wall_have_any_ = true;
+        } else {
+            if (t0 < save_net_wall_first_) {
+                save_net_wall_first_ = t0;
+            }
+            if (t1 > save_net_wall_last_) {
+                save_net_wall_last_ = t1;
+            }
+        }
+        const uint64_t span_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                save_net_wall_last_ - save_net_wall_first_).count());
+        save_net_wall_span_ns_.store(span_ns, std::memory_order_relaxed);
+    }
+
+    struct SaveEncodeScopeTimer {
+        ECNaiveNative* owner;
+        std::chrono::steady_clock::time_point t0;
+        explicit SaveEncodeScopeTimer(ECNaiveNative* o)
+            : owner(o), t0(std::chrono::steady_clock::now()) {}
+        ~SaveEncodeScopeTimer() {
+            if (owner != nullptr && !owner->is_load_mode_) {
+                const auto t1 = std::chrono::steady_clock::now();
+                const uint64_t ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                owner->record_save_encode_op_(ns);
+            }
+        }
+    };
+
+    struct SaveNetScopeTimer {
+        ECNaiveNative* owner;
+        std::chrono::steady_clock::time_point t0;
+        explicit SaveNetScopeTimer(ECNaiveNative* o)
+            : owner(o), t0(std::chrono::steady_clock::now()) {}
+        ~SaveNetScopeTimer() {
+            if (owner != nullptr && !owner->is_load_mode_) {
+                const auto t1 = std::chrono::steady_clock::now();
+                owner->touch_save_net_wall_(t0, t1);
+            }
+        }
+    };
+
+    struct LoadNetScopeTimer {
+        ECNaiveNative* owner;
+        std::chrono::steady_clock::time_point t0;
+        explicit LoadNetScopeTimer(ECNaiveNative* o)
+            : owner(o), t0(std::chrono::steady_clock::now()) {}
+        ~LoadNetScopeTimer() {
+            if (owner != nullptr && owner->is_load_mode_) {
+                const auto t1 = std::chrono::steady_clock::now();
+                const uint64_t ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                owner->load_send_total_ns_.fetch_add(ns, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    struct LoadRecvNetScopeTimer {
+        ECNaiveNative* owner;
+        std::chrono::steady_clock::time_point t0;
+        explicit LoadRecvNetScopeTimer(ECNaiveNative* o)
+            : owner(o), t0(std::chrono::steady_clock::now()) {}
+        ~LoadRecvNetScopeTimer() {
+            if (owner != nullptr && owner->is_load_mode_) {
+                const auto t1 = std::chrono::steady_clock::now();
+                const uint64_t ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                owner->load_recv_total_ns_.fetch_add(ns, std::memory_order_relaxed);
+            }
+        }
+    };
+
     // Load XOR: wall clock from first XOR chunk start to last XOR chunk end (excludes idle between chunks)
     std::atomic<uint64_t> load_xor_e2e_wall_ns_{0};
     std::atomic<bool> load_xor_e2e_wall_valid_{false};
@@ -4077,6 +4206,7 @@ private:
     void encode_ec_blocks(const std::vector<uintptr_t>& data_addrs,
                           uintptr_t parity0_addr, uintptr_t parity1_addr,
                           size_t size) {
+        SaveEncodeScopeTimer encode_timer(this);
         if (g_tbls_ == nullptr || a_mat_ == nullptr) {
             std::cerr << "ECNAIVE: ERROR: EC encoding tables not initialized!" << std::endl;
             throw std::runtime_error("ECNAIVE: EC encoding tables not initialized");
@@ -5009,6 +5139,8 @@ private:
                 continue;
             }
             if (task.size == 0 || task.addr == 0) continue;
+            network_tasks_inflight_.fetch_add(1, std::memory_order_relaxed);
+            SaveNetScopeTimer save_net_timer(this);
             if (use_rdma_ && send_channels_[idx] && send_channels_[idx]->is_connected()) {
                 // std::cout << "[ECNAIVE RDMA] SendWorker[" << idx << "] RDMA send "
                 //           << (task.size / (1024.0*1024.0)) << " MB" << std::endl;
@@ -5017,6 +5149,7 @@ private:
             } else if (conn_.send_socket(idx).is_open()) {
                 send_with_size(conn_.send_socket(idx), task.addr, task.size);
             }
+            network_tasks_inflight_.fetch_sub(1, std::memory_order_relaxed);
             // Release buffer after send: data channels 0..k-2, parity channels k-1..k
             {
                 std::lock_guard<std::mutex> lk(release_queue_mutex_);
@@ -5054,6 +5187,8 @@ private:
                 continue;
             }
             if (task.size == 0 || task.addr == 0) continue;
+            network_tasks_inflight_.fetch_add(1, std::memory_order_relaxed);
+            SaveNetScopeTimer save_net_timer(this);
             if (use_rdma_ && recv_channels_[idx] && recv_channels_[idx]->is_connected()) {
                 // std::cout << "[ECNAIVE RDMA] RecvWorker[" << idx << "] RDMA recv "
                 //           << (task.size / (1024.0*1024.0)) << " MB" << std::endl;
@@ -5065,6 +5200,7 @@ private:
                     std::cerr << "ECNAIVE: RecvWorker[" << idx << "] recv failed" << std::endl;
                 }
             }
+            network_tasks_inflight_.fetch_sub(1, std::memory_order_relaxed);
         }
     }
 
@@ -5932,8 +6068,7 @@ private:
             xor_last_end = xor_end;
             const uint64_t xor_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(xor_end - xor_start).count());
-            load_xor_total_ns_.fetch_add(xor_ns, std::memory_order_relaxed);
-            load_xor_task_count_.fetch_add(1, std::memory_order_relaxed);
+            record_load_xor_op_(xor_ns);
 
             std::cout << "EC-NAIVE: [Rank 2] XOR chunk completed (size=" << task.size << ")" << std::endl;
             
@@ -6069,6 +6204,7 @@ private:
             }
             
             try {
+                LoadNetScopeTimer net_timer(this);
                 if (use_rdma_ && rdma_ch >= 0 && rdma_load_channels_[rdma_ch]) {
                     // std::cout << "[ECNAIVE RDMA] Load_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                     rdma_load_channels_[rdma_ch]->send_data(reinterpret_cast<const uint8_t*>(task.send_addr), task.size);
@@ -6166,7 +6302,11 @@ PYBIND11_MODULE(ecnaive_native, m) {
         .def("get_data_buffers_to_release", &ECNaiveNative::get_data_buffers_to_release)
         .def("get_parity_buffers_to_release", &ECNaiveNative::get_parity_buffers_to_release)
         .def("reset_encoding_completion_flags", &ECNaiveNative::reset_encoding_completion_flags)
+        .def("get_ft_timing_stats", &ECNaiveNative::get_ft_timing_stats,
+             "Return per-rank timing: net_s wall-span; encode_s serial-equivalent encode CPU sum")
         .def("wait_for_encoding_completion", &ECNaiveNative::wait_for_encoding_completion)
+        .def("wait_for_pending_network_tasks", &ECNaiveNative::wait_for_pending_network_tasks,
+             "Wait until all in-flight save-path send/recv tasks complete (no sentinels)")
         // Legacy save mode sentinels
         .def("submit_send_data1_sentinel", &ECNaiveNative::submit_send_data1_sentinel)
         .def("submit_send_parity0_sentinel", &ECNaiveNative::submit_send_parity0_sentinel)

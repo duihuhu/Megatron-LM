@@ -12,7 +12,6 @@ from logging import getLogger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-import numpy as np
 import torch
 
 from megatron.core.dist_checkpointing.strategies.gemini_replicas_manager import (
@@ -30,8 +29,8 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     GlobalMetadataRegistry,
     TensorMetadata,
     decompose_state_dict,
+    decompose_state_dict_for_save,
     extract_tensors_from_continuous_buffer,
-    flatten_optimizer_fp32_params,
     reconstruct_state_dict,
     unflatten_optimizer_fp32_params,
 )
@@ -188,7 +187,7 @@ _cached_rank_tensor_infos: Optional[Dict[int, list]] = None
 
 
 def save_gemini_replicas_legacy_checkpoint(
-    state_dict: Dict[str, Any], checkpoint_name: str
+    state_dict: Dict[str, Any], checkpoint_name: str, write_to_disk: bool = True
 ) -> None:
     global _cached_rank_metadata, _cached_rank_non_tensor
     global _cached_rank_flat_key_roots, _cached_rank_tensor_infos
@@ -209,14 +208,14 @@ def save_gemini_replicas_legacy_checkpoint(
             "Gemini Replicas native module is not available in legacy save path"
         )
 
-    flatten_optimizer_fp32_params(state_dict)
-    e2e_start = time.time()
     t0 = time.time()
-    decomposed = decompose_state_dict(state_dict)
+    decomposed, save_copy_s, save_flatten_s, decompose_s = decompose_state_dict_for_save(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
-    decompose_s = time.time() - t0
     if _dbg:
-        logger.info(f"GEMINI save timing: decompose {decompose_s:.3f}s")
+        logger.info(
+            "GEMINI save timing: copy %.3fs flatten %.3fs decompose %.3fs",
+            save_copy_s, save_flatten_s, decompose_s,
+        )
 
     safety_margin = max(int(total_tensor_size * 0.01), 1024 * 1024)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
@@ -227,69 +226,37 @@ def save_gemini_replicas_legacy_checkpoint(
     if manager.use_gdr:
         gpu_tensor_buffer = torch.zeros(total_tensor_size, dtype=torch.uint8, device="cuda")
 
-    t0 = time.time()
     offset = 0
     local_tensor_metadata: List[TensorMetadata] = []
-    d2h_stream = torch.cuda.Stream()
-    with torch.cuda.stream(d2h_stream):
-        for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
-            tensor_bytes = info.size_bytes
-            tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
-            if tensor_view.numel() != tensor_bytes:
-                raise RuntimeError(
-                    f"Gemini Replicas legacy save: tensor bytes mismatch for {info.key}, "
-                    f"expected={tensor_bytes}, got={tensor_view.numel()}"
-                )
-            if manager.use_gdr:
-                # Copy to GPU buffer only — the mirror worker handles GPU→CPU
-                # D2H in the background, overlapped with RDMA.
-                gpu_tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
-            else:
-                # Non-GDR: copy directly to CPU buffer (RDMA sends from CPU).
-                tensor_buffer[offset : offset + tensor_bytes].copy_(tensor_view, non_blocking=True)
-            info.offset = offset
-            local_tensor_metadata.append(
-                TensorMetadata(
-                    key=info.key,
-                    shape=info.shape,
-                    dtype=str(info.dtype),
-                    size_bytes=info.size_bytes,
-                    offset=info.offset,
-                    global_offset=tuple(info.global_offset)
-                    if info.global_offset
-                    else tuple(),
-                    shard_index=info.shard_index if info.shard_index is not None else 0,
-                    chunk_type="data",
-                    target_rank=rank,
-                    source_rank=rank,
-                )
+    for info in decomposed.tensor_infos:
+        info.offset = offset
+        local_tensor_metadata.append(
+            TensorMetadata(
+                key=info.key,
+                shape=info.shape,
+                dtype=str(info.dtype),
+                size_bytes=info.size_bytes,
+                offset=info.offset,
+                global_offset=tuple(info.global_offset)
+                if info.global_offset
+                else tuple(),
+                shard_index=info.shard_index if info.shard_index is not None else 0,
+                chunk_type="data",
+                target_rank=rank,
+                source_rank=rank,
             )
-            offset += tensor_bytes
-            decomposed.tensor_data[i] = None  # free GPU tensor ref immediately
-    # GDR path: stream only has GPU→GPU copies (fast sync).
-    # Non-GDR path: stream has GPU→CPU copies (PCIe drain, now avoided with GDR).
-    d2h_stream.synchronize()
-    del decomposed.tensor_data  # drop remaining refs
-    pack_or_d2h_s = time.time() - t0
-    pack_s = pack_or_d2h_s if manager.use_gdr else 0.0
-    d2h_s = 0.0 if manager.use_gdr else pack_or_d2h_s
-    if _dbg:
-        field = "pack" if manager.use_gdr else "d2h"
-        logger.info(f"GEMINI save timing: {field} {pack_or_d2h_s:.3f}s")
+        )
+        offset += info.size_bytes
 
     t0 = time.time()
     if manager.use_rdma:
         manager.register_buffer(tensor_buffer)
         if manager.use_gdr and gpu_tensor_buffer is not None:
             manager.register_buffer(gpu_tensor_buffer)
+    rdma_reg_s = time.time() - t0
     if _dbg:
-        logger.info(f"GEMINI save timing: RDMA reg tensor {time.time()-t0:.3f}s")
+        logger.info(f"GEMINI save timing: RDMA reg tensor {rdma_reg_s:.3f}s")
 
-    start_time = time.time()
-    # ===== Metadata exchange via all_gather_object on NCCL (aligned with ecnaive/eccheck) =====
-    # Tensor shapes, keys, and dtypes are identical across iterations for a fixed model.
-    # Cache the results from the first exchange to skip expensive NCCL all_gather_object
-    # on subsequent iterations (~3s → 0s for 32 ranks, 3GB models).
     metadata_start = time.time()
     if _cached_rank_tensor_infos is None:
         rank_metadata, rank_non_tensor = _build_global_registry(
@@ -353,14 +320,40 @@ def save_gemini_replicas_legacy_checkpoint(
             manager.register_buffer(recv_buf)
         receive_buffers[src_r] = recv_buf
     recv_alloc_s = time.time() - t0
-    barrier_s = _timed_barrier()
-    if _dbg:
-        logger.info(
-            "GEMINI save timing: recv_alloc=%.3fs barrier=%.3fs",
-            recv_alloc_s, barrier_s,
-        )
 
-    t0 = time.time()
+    if world_size > 1:
+        torch.distributed.barrier()
+    e2e_t0 = time.time()
+
+    pack_t0 = time.time()
+    d2h_stream = torch.cuda.Stream()
+    with torch.cuda.stream(d2h_stream):
+        for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
+            tensor_bytes = info.size_bytes
+            tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+            if tensor_view.numel() != tensor_bytes:
+                raise RuntimeError(
+                    f"Gemini Replicas legacy save: tensor bytes mismatch for {info.key}, "
+                    f"expected={tensor_bytes}, got={tensor_view.numel()}"
+                )
+            if manager.use_gdr:
+                gpu_tensor_buffer[info.offset : info.offset + tensor_bytes].copy_(
+                    tensor_view, non_blocking=True
+                )
+            else:
+                tensor_buffer[info.offset : info.offset + tensor_bytes].copy_(
+                    tensor_view, non_blocking=True
+                )
+            decomposed.tensor_data[i] = None
+    d2h_stream.synchronize()
+    del decomposed.tensor_data
+    pack_or_d2h_s = time.time() - pack_t0
+    pack_s = pack_or_d2h_s if manager.use_gdr else 0.0
+    d2h_s = 0.0 if manager.use_gdr else pack_or_d2h_s
+    if _dbg:
+        field = "pack" if manager.use_gdr else "d2h"
+        logger.info(f"GEMINI save timing: {field} {pack_or_d2h_s:.3f}s")
+
     native = manager._gemini_replicas_native
     native.reset_exchange_state()
 
@@ -373,9 +366,7 @@ def save_gemini_replicas_legacy_checkpoint(
             tensor_buffer.data_ptr(),
         )
         if _dbg:
-            logger.info(
-                f"GEMINI save timing: mirror bases set (per-batch overlap) {time.time()-t0:.3f}s"
-            )
+            logger.info("GEMINI save timing: mirror bases set (per-batch overlap)")
     else:
         send_addr = tensor_buffer.data_ptr()
         native.set_mirror_bases(0, 0)  # disable per-batch mirror
@@ -396,42 +387,41 @@ def save_gemini_replicas_legacy_checkpoint(
     native.wait_for_exchange_completion()
     _exchange_elapsed = time.time() - _exchange_t0
 
-    _barrier_elapsed = _timed_barrier()
-    barrier_s += _barrier_elapsed
-    if _dbg:
-        logger.info(
-            "Gemini Replicas legacy save rank %d: C++ exchange done "
-            "(submit=%.3fs wait=%.3fs post_barrier=%.3fs total=%.3fs)",
-            rank, _submit_elapsed, _exchange_elapsed, _barrier_elapsed, time.time() - t0,
-        )
-
-    # With GDR: wait for async D2H to finish before writing files
     mirror_d2h_s = 0.0
     if manager.use_gdr and gpu_tensor_buffer is not None:
         _mirror_t0 = time.time()
         native.wait_mirror_completion()
         mirror_d2h_s = time.time() - _mirror_t0
+        d2h_s = float(native.get_mirror_d2h_busy_s())
         native.start_mirror_worker()  # restart for next iteration
         if _dbg:
-            logger.info(f"GEMINI save timing: mirror_d2h {mirror_d2h_s:.3f}s")
+            logger.info(
+                "GEMINI save timing: mirror_d2h wall=%.3fs d2h_busy=%.3fs",
+                mirror_d2h_s, d2h_s,
+            )
 
-    e2e_s = time.time() - e2e_start
+    e2e_s = time.time() - e2e_t0
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    if world_size > 1:
+        torch.distributed.barrier()
+    if _dbg:
+        logger.info(
+            "Gemini Replicas legacy save rank %d: C++ exchange done "
+            "(submit=%.3fs wait=%.3fs e2e_s=%.3fs)",
+            rank, _submit_elapsed, _exchange_elapsed, e2e_s,
+        )
+
     summary = _timing_max_dict({
         "e2e_s": e2e_s,
-        "decompose_s": decompose_s,
         "pack_s": pack_s,
         "d2h_s": d2h_s,
         "mirror_d2h_s": mirror_d2h_s,
-        "metadata_s": metadata_s,
-        "buffer_alloc_s": recv_alloc_s,
         "network_encode_s": _exchange_elapsed,
-        "barrier_s": barrier_s,
     })
     logger.info(
-        "GEMINI save timing: e2e_s=%(e2e_s).2fs decompose_s=%(decompose_s).2fs "
-        "pack_s=%(pack_s).2fs d2h_s=%(d2h_s).2fs mirror_d2h_s=%(mirror_d2h_s).2fs "
-        "metadata_s=%(metadata_s).2fs buffer_alloc_s=%(buffer_alloc_s).2fs "
-        "network_encode_s=%(network_encode_s).2fs barrier_s=%(barrier_s).2fs",
+        "GEMINI save timing: e2e_s=%(e2e_s).2fs pack_s=%(pack_s).2fs d2h_s=%(d2h_s).2fs "
+        "mirror_d2h_s=%(mirror_d2h_s).2fs network_encode_s=%(network_encode_s).2fs",
         summary,
     )
 
@@ -448,7 +438,6 @@ def save_gemini_replicas_legacy_checkpoint(
 
     # Save .pt files
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     from megatron.training.legacy_io_utils import write_main_prepared, write_block_prepared, MAGIC_GEMINI, MAGIC_GEMINI_REPLICA
 
@@ -490,17 +479,23 @@ def save_gemini_replicas_legacy_checkpoint(
 
     _timed_barrier()
 
-    # ---- Parallel writes ----
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1 + len(replica_tasks)) as ex:
-        main_file = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
-        futs = [ex.submit(write_main_prepared, str(main_file), MAGIC_GEMINI,
-                          main_meta1, main_meta2, main_extra, main_mv, total_tensor_size)]
-        for rep_path, rep_meta, rep_mv in replica_tasks:
-            futs.append(ex.submit(_write_replica_file, rep_path, MAGIC_GEMINI_REPLICA,
-                                  rep_meta, rep_mv))
-        for f in futs:
-            f.result()
+    if write_to_disk:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # ---- Parallel writes ----
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1 + len(replica_tasks)) as ex:
+            main_file = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
+            futs = [ex.submit(write_main_prepared, str(main_file), MAGIC_GEMINI,
+                              main_meta1, main_meta2, main_extra, main_mv, total_tensor_size)]
+            for rep_path, rep_meta, rep_mv in replica_tasks:
+                futs.append(ex.submit(_write_replica_file, rep_path, MAGIC_GEMINI_REPLICA,
+                                      rep_meta, rep_mv))
+            for f in futs:
+                f.result()
+    else:
+        logger.info(
+            "Gemini Replicas save: skipping checkpoint file writes for this iteration"
+        )
 
 
 def _write_replica_file(path, magic, meta_bytes, mv):
@@ -661,9 +656,15 @@ def _load_replica_full(replica_path: Path) -> Dict[str, Any]:
             _f.read(4)  # skip magic
             meta_len = struct.unpack("<Q", _f.read(8))[0]
             rp = pickle.loads(_f.read(meta_len))
-            rp["tensor_buffer"] = torch.from_numpy(
-                np.frombuffer(_f.read(), dtype=np.uint8))
-            rp["tensor_buffer"] = pin_uint8_tensor_if_available(rp["tensor_buffer"])
+            tensor_size = int(rp.get("source_tensor_buffer_size", 0))
+            tensor_buffer = torch.empty(tensor_size, dtype=torch.uint8)
+            view = memoryview(tensor_buffer.numpy())
+            bytes_read = _f.readinto(view)
+            if bytes_read != tensor_size:
+                raise EOFError(
+                    f"Expected {tensor_size} bytes in {replica_path}, got {bytes_read}"
+                )
+            rp["tensor_buffer"] = pin_uint8_tensor_if_available(tensor_buffer)
             return rp
     else:
         payload = torch.load(replica_path, map_location="cpu", weights_only=False)
@@ -1986,6 +1987,11 @@ def load_gemini_replicas_legacy_checkpoint(
         _gemini_recovery_profile(
             recovery_role, "cleanup_done", elapsed_s=time.time() - t_cleanup
         )
+
+    # All ranks must participate: P2P ranks cleaned up native connections,
+    # while no-role ranks skipped native creation during sparse recovery.
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     try:
         from megatron.training.global_vars import mark_recovery_to_forward_timer

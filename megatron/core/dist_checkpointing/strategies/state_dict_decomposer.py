@@ -326,6 +326,48 @@ def decompose_state_dict(
     return decomposed
 
 
+def _copy_state_dict_shallow(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively copy dict nesting; tensor objects are shared, not cloned."""
+    copied: Dict[str, Any] = {}
+    for key, value in state_dict.items():
+        if isinstance(value, dict):
+            copied[key] = _copy_state_dict_shallow(value)
+        else:
+            copied[key] = value
+    return copied
+
+
+def decompose_state_dict_for_save(
+    state_dict: Dict[str, Any],
+    sort_by_size: bool = False,
+) -> Tuple[DecomposedStateDict, float, float, float]:
+    """Safely flatten optimizer fp32 params on a save-only copy, then decompose.
+
+    ``flatten_optimizer_fp32_params`` mutates its input. Save paths must not run
+    it on the live training state_dict, otherwise later checkpoint saves can see
+    both the original optimizer tensors and flattened aliases.
+
+    Only the dict tree is copied; GPU tensors are referenced, not deep-cloned.
+    ``copy.deepcopy`` duplicated every tensor and roughly doubled peak VRAM during
+    save, which could surface later as ``cudaErrorInvalidResourceHandle`` at NCCL
+    barriers when memory pressure corrupts async CUDA work.
+    """
+    import time
+
+    copy_t0 = time.time()
+    save_state_dict = _copy_state_dict_shallow(state_dict)
+    copy_s = time.time() - copy_t0
+
+    flatten_t0 = time.time()
+    flatten_optimizer_fp32_params(save_state_dict)
+    flatten_s = time.time() - flatten_t0
+
+    decompose_t0 = time.time()
+    decomposed = decompose_state_dict(save_state_dict, sort_by_size=sort_by_size)
+    decompose_s = time.time() - decompose_t0
+    return decomposed, copy_s, flatten_s, decompose_s
+
+
 def reconstruct_state_dict(decomposed: DecomposedStateDict) -> Dict[str, Any]:
     """Reconstruct original state_dict from decomposed structure.
     

@@ -30,15 +30,37 @@ from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
 )
 from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     decompose_state_dict,
+    decompose_state_dict_for_save,
     DecomposedStateDict,
     TensorInfo,
     TensorMetadata,
-    flatten_optimizer_fp32_params,
     reconstruct_state_dict,
     extract_tensors_from_continuous_buffer,
 )
 
 logger = getLogger(__name__)
+
+
+def _timing_max(value: float) -> float:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return float(value)
+    device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    tensor = torch.tensor([float(value)], dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def _timing_max_dict(timings: Dict[str, float]) -> Dict[str, float]:
+    return {key: _timing_max(value) for key, value in timings.items()}
+
+
+def _timed_barrier() -> float:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0.0
+    start = time.time()
+    torch.distributed.barrier()
+    return time.time() - start
+
 
 _async_p1_writer_thread: Optional[threading.Thread] = None
 _async_p2_writer_thread: Optional[threading.Thread] = None
@@ -78,6 +100,16 @@ def _normalize_model_state_key(key: str) -> str:
         key = key[len("model."):]
     if key.startswith("module."):
         key = key[len("module."):]
+    return key
+
+
+def _canonical_frcheck_model_key(key: str) -> str:
+    """Normalize model tensor keys to match decomposed FQN format (model.* prefix)."""
+    key = str(key)
+    if key.startswith("module."):
+        key = key[len("module."):]
+    if not key.startswith("model."):
+        key = f"model.{key}"
     return key
 
 
@@ -168,56 +200,232 @@ def _classify_frcheck_tensor(
     return _TensorOwnership(layer_idx=-1, kind="common_state")
 
 
-def _build_optimizer_layer_map(state_dict: Dict[str, Any]) -> Dict[str, int]:
-    """Map optimizer tensor keys to transformer layer indexes when possible."""
+_PARAM_GROUP_ID_KEYS = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
+
+
+def _model_tensor_param_group_key(
+    key: str,
+    tensor: torch.Tensor,
+    default_skip_embedding_weight_decay: bool = False,
+) -> Tuple[float, float, bool, bool]:
+    """Approximate Megatron param-group bucket for a model tensor key."""
+    no_wd = (
+        key.endswith(".bias")
+        or len(tensor.shape) == 1
+        or (default_skip_embedding_weight_decay and "embedding" in key)
+    )
+    return (0.0 if no_wd else 1.0, 1.0, False, False)
+
+
+def _resolve_optimizer_distribute_target(
+    model_key: Optional[str],
+    common_model_targets: Dict[str, "_LayerGroup"],
+    others_by_layer: Dict[int, "_LayerGroup"],
+) -> Optional["_LayerGroup"]:
+    """Route optimizer tensors to the layer group that owns their model param."""
+    if not model_key:
+        return None
+    canonical_key = _canonical_frcheck_model_key(model_key)
+    target = common_model_targets.get(canonical_key)
+    if target is not None:
+        return target
+    layer_idx = _extract_layer_idx(canonical_key)
+    if layer_idx >= 0:
+        return others_by_layer.get(layer_idx)
+    return None
+
+
+def _optimizer_keys_for_index(
+    group_idx: int, param_idx: int, state_index: int,
+) -> List[str]:
+    """Build decomposed optimizer keys using global Adam state indices."""
+    state_prefix = f"optimizer.optimizer.state.{state_index}"
+    return [
+        f"optimizer.fp32_params_flat._fp32_group{group_idx}_param{param_idx}",
+        f"{state_prefix}.exp_avg",
+        f"{state_prefix}.exp_avg_sq",
+        f"{state_prefix}.fp32_param",
+    ]
+
+
+def _get_fp32_from_fp16_groups(optim_sd: Dict[str, Any]) -> Optional[List[List[torch.Tensor]]]:
+    """Return fp32 master-weight groups aligned with optimizer param_groups."""
+    fp32 = optim_sd.get("fp32_from_fp16_params")
+    if fp32 is not None:
+        return fp32
+
+    flat = optim_sd.get("fp32_params_flat")
+    structure = optim_sd.get("_fp32_structure")
+    if not isinstance(flat, dict) or structure is None:
+        return None
+
+    groups: List[List[torch.Tensor]] = []
+    for gi, group_size in enumerate(structure):
+        group: List[torch.Tensor] = []
+        for pi in range(int(group_size)):
+            tensor = flat.get(f"_fp32_group{gi}_param{pi}")
+            if tensor is None:
+                return None
+            group.append(tensor)
+        groups.append(group)
+    return groups
+
+
+def _ordered_model_keys_for_fp32_params(
+    model_param_entries: List[Tuple[str, torch.Tensor, int]],
+    flat_fp32: List[Tuple[int, int, torch.Tensor]],
+) -> Optional[List[Tuple[str, int]]]:
+    """Align model keys to fp32 master weights via shape sequence in state_dict order."""
+    pending_shapes = [tuple(tensor.shape) for _, _, tensor in flat_fp32]
+    ordered: List[Tuple[str, int]] = []
+    for key, tensor, layer_idx in model_param_entries:
+        if not pending_shapes:
+            break
+        if tuple(tensor.shape) == pending_shapes[0]:
+            ordered.append((key, layer_idx))
+            pending_shapes.pop(0)
+    if len(ordered) == len(flat_fp32):
+        return ordered
+    return None
+
+
+def _iter_optimizer_model_param_entries(
+    state_dict: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[Tuple[str, int, List[str]]]]:
+    """Map optimizer tensors to model tensor keys via fp32 master weights."""
     model_sd = state_dict.get("model")
     optim_sd = state_dict.get("optimizer")
     if not isinstance(model_sd, dict) or not isinstance(optim_sd, dict):
-        return {}
+        return {}, []
 
     model_param_entries: List[Tuple[str, torch.Tensor, int]] = []
     for key, tensor in model_sd.items():
-        if not torch.is_tensor(tensor):
-            continue
-        model_param_entries.append((str(key), tensor, _extract_layer_idx(str(key))))
-    if not any(layer_idx >= 0 for _, _, layer_idx in model_param_entries):
-        return {}
+        if torch.is_tensor(tensor):
+            model_param_entries.append((str(key), tensor, _extract_layer_idx(str(key))))
+    if not model_param_entries:
+        return optim_sd, []
 
-    result: Dict[str, int] = {}
     torch_optim_sd = optim_sd.get("optimizer", optim_sd)
     if not isinstance(torch_optim_sd, dict):
-        return {}
+        return optim_sd, []
     param_groups = torch_optim_sd.get("param_groups", [])
+    fp32_groups = _get_fp32_from_fp16_groups(optim_sd)
+    if not param_groups:
+        return optim_sd, []
+    if fp32_groups is None:
+        logger.warning(
+            "FRCheck optimizer map: missing fp32_from_fp16_params; "
+            "optimizer-common distribution will be incomplete",
+        )
+        return optim_sd, []
+    if len(fp32_groups) != len(param_groups):
+        logger.warning(
+            "FRCheck optimizer map: fp32 group count (%d) != param_groups (%d)",
+            len(fp32_groups), len(param_groups),
+        )
+        return optim_sd, []
 
-    # Reconstruct the common Megatron optimizer grouping order from model state
-    # dict keys. This mirrors _get_param_groups() for the GPT/Adam path:
-    # regularized params first, then no-weight-decay params. Common model
-    # params stay optimizer_common because they are not consumed by layer hooks.
-    grouped_model_entries: Dict[Tuple[float, float, bool, bool], List[Tuple[str, int]]] = {}
-    group_order: List[Tuple[float, float, bool, bool]] = []
+    flat_fp32: List[Tuple[int, int, torch.Tensor]] = []
+    for group_idx, fp32_group in enumerate(fp32_groups):
+        for param_idx, fp32_tensor in enumerate(fp32_group):
+            flat_fp32.append((group_idx, param_idx, fp32_tensor))
+
+    ordered_model_keys = _ordered_model_keys_for_fp32_params(
+        model_param_entries, flat_fp32,
+    )
+
+    model_buckets: Dict[Tuple[float, float, bool, bool], List[Tuple[str, int, torch.Tensor]]] = {}
     for key, tensor, layer_idx in model_param_entries:
-        no_wd = key.endswith(".bias") or len(tensor.shape) == 1
-        group_key = (0.0 if no_wd else 1.0, 1.0, False, False)
-        if group_key not in grouped_model_entries:
-            grouped_model_entries[group_key] = []
-            group_order.append(group_key)
-        grouped_model_entries[group_key].append((key, layer_idx))
+        bucket_key = _model_tensor_param_group_key(key, tensor)
+        model_buckets.setdefault(bucket_key, []).append((key, layer_idx, tensor))
 
-    ordered_model_groups = [grouped_model_entries[key] for key in group_order]
+    bucket_cursor: Dict[Tuple[float, float, bool, bool], int] = {
+        key: 0 for key in model_buckets
+    }
+    entries: List[Tuple[str, int, List[str]]] = []
+    state_index = 0
+    ordered_cursor = 0
+
     for group_idx, group in enumerate(param_groups):
-        params = list(group.get("params", [])) if isinstance(group, dict) else []
-        model_group = ordered_model_groups[group_idx] if group_idx < len(ordered_model_groups) else []
-        for param_idx, param_ref in enumerate(params):
+        if not isinstance(group, dict):
+            continue
+        pg_key = tuple(
+            group.get(key, False if key.startswith("is_") else 1.0)
+            for key in _PARAM_GROUP_ID_KEYS
+        )
+        fp32_group = fp32_groups[group_idx]
+        if len(fp32_group) != len(group.get("params", [])):
+            logger.warning(
+                "FRCheck optimizer map: group %d fp32 params (%d) != param_groups params (%d)",
+                group_idx, len(fp32_group), len(group.get("params", [])),
+            )
+
+        for param_idx, fp32_tensor in enumerate(fp32_group):
+            model_key: Optional[str] = None
             layer_idx = -1
-            if param_idx < len(model_group):
-                _model_key, layer_idx = model_group[param_idx]
-            if layer_idx >= 0:
-                result[f"optimizer.fp32_params_flat._fp32_group{group_idx}_param{param_idx}"] = layer_idx
-                for state_name in ("exp_avg", "exp_avg_sq", "fp32_param"):
-                    if "optimizer" in optim_sd:
-                        result[f"optimizer.optimizer.state.{param_ref}.{state_name}"] = layer_idx
-                    else:
-                        result[f"optimizer.state.{param_ref}.{state_name}"] = layer_idx
+            target_shape = tuple(fp32_tensor.shape)
+
+            if ordered_model_keys is not None and ordered_cursor < len(ordered_model_keys):
+                cand_key, cand_layer = ordered_model_keys[ordered_cursor]
+                model_key = cand_key
+                layer_idx = cand_layer
+                ordered_cursor += 1
+
+            if model_key is None:
+                bucket = model_buckets.get(pg_key, [])
+                cursor = bucket_cursor.get(pg_key, 0)
+                for mi in range(cursor, len(bucket)):
+                    cand_key, cand_layer, cand_tensor = bucket[mi]
+                    if tuple(cand_tensor.shape) == target_shape:
+                        model_key = cand_key
+                        layer_idx = cand_layer
+                        bucket_cursor[pg_key] = mi + 1
+                        break
+
+            if model_key is None:
+                for bucket_key, candidates in model_buckets.items():
+                    cur = bucket_cursor.get(bucket_key, 0)
+                    for mi in range(cur, len(candidates)):
+                        cand_key, cand_layer, cand_tensor = candidates[mi]
+                        if tuple(cand_tensor.shape) == target_shape:
+                            model_key = cand_key
+                            layer_idx = cand_layer
+                            bucket_cursor[bucket_key] = mi + 1
+                            break
+                    if model_key is not None:
+                        break
+
+            if model_key is not None:
+                entries.append((
+                    model_key,
+                    layer_idx,
+                    _optimizer_keys_for_index(group_idx, param_idx, state_index),
+                ))
+            state_index += 1
+
+    return optim_sd, entries
+
+
+def _build_optimizer_layer_map(state_dict: Dict[str, Any]) -> Dict[str, int]:
+    """Map optimizer tensor keys to transformer layer indexes when possible."""
+    _optim_sd, entries = _iter_optimizer_model_param_entries(state_dict)
+    result: Dict[str, int] = {}
+    for _model_key, layer_idx, optimizer_keys in entries:
+        if layer_idx < 0:
+            continue
+        for opt_key in optimizer_keys:
+            result[opt_key] = layer_idx
+    return result
+
+
+def _build_optimizer_model_key_map(state_dict: Dict[str, Any]) -> Dict[str, str]:
+    """Map optimizer tensor keys back to their source model tensor key."""
+    _optim_sd, entries = _iter_optimizer_model_param_entries(state_dict)
+    result: Dict[str, str] = {}
+    for model_key, _layer_idx, optimizer_keys in entries:
+        canonical_model_key = _canonical_frcheck_model_key(model_key)
+        for opt_key in optimizer_keys:
+            result[opt_key] = canonical_model_key
     return result
 
 
@@ -284,8 +492,12 @@ class _FRCheckLayerReadyRecord:
     contains_optimizer_state: bool = False
     materialize_s: float = 0.0
     ready: bool = True
+    model_ready: bool = True
+    optimizer_ready: bool = True
     error: str = ""
     tensors: Optional[Dict[str, torch.Tensor]] = None
+    model_tensors: Optional[Dict[str, torch.Tensor]] = None
+    optimizer_tensors: Optional[Dict[str, torch.Tensor]] = None
 
 
 @dataclass
@@ -296,6 +508,45 @@ class _FRCheckLayerRecoveryJob:
     layer_block_size: int
     actual_size: int
     layer_infos: List
+
+
+def _split_recovered_tensors(
+    tensors: Optional[Dict[str, torch.Tensor]],
+    model_keys: List[str],
+    optimizer_keys: List[str],
+    optimizer_layer_map: Optional[Dict[str, int]] = None,
+) -> Tuple[Optional[Dict[str, torch.Tensor]], Optional[Dict[str, torch.Tensor]]]:
+    if not tensors:
+        return None, None
+    model_key_set = set(model_keys)
+    opt_key_set = set(optimizer_keys)
+    model_tensors: Dict[str, torch.Tensor] = {}
+    optimizer_tensors: Dict[str, torch.Tensor] = {}
+    for key, tensor in tensors.items():
+        if key in model_key_set:
+            model_tensors[key] = tensor
+        elif key in opt_key_set:
+            optimizer_tensors[key] = tensor
+        else:
+            ownership = _classify_frcheck_tensor(key, optimizer_layer_map)
+            if ownership.kind == "model_layer":
+                model_tensors[key] = tensor
+            elif ownership.kind == "optimizer_layer":
+                optimizer_tensors[key] = tensor
+    return (model_tensors or None), (optimizer_tensors or None)
+
+
+def _sort_recovery_jobs_by_forward_priority(
+    jobs: List[_FRCheckLayerRecoveryJob],
+) -> List[_FRCheckLayerRecoveryJob]:
+    return sorted(
+        jobs,
+        key=lambda job: (
+            0 if job.layer_idx < 0 else 1,
+            job.layer_idx,
+            job.encode_iter,
+        ),
+    )
 
 
 class _FRCheckLayerwiseRuntime:
@@ -310,14 +561,21 @@ class _FRCheckLayerwiseRuntime:
         }
         self._model_keys_by_layer: Dict[int, Set[str]] = {}
         self._live_tensors: Dict[str, torch.Tensor] = {}
-        self._events_by_layer: Dict[int, threading.Event] = {}
+        self._model_events_by_layer: Dict[int, threading.Event] = {}
+        self._optimizer_events_by_layer: Dict[int, threading.Event] = {}
         self._injected_layers: Set[int] = set()
         for layer_idx, record in self._records_by_layer.items():
-            event = threading.Event()
-            if record.ready:
-                event.set()
-            self._events_by_layer[layer_idx] = event
+            model_event = threading.Event()
+            optimizer_event = threading.Event()
+            if record.model_ready:
+                model_event.set()
+            if record.optimizer_ready or not record.contains_optimizer_state:
+                optimizer_event.set()
+            self._model_events_by_layer[layer_idx] = model_event
+            self._optimizer_events_by_layer[layer_idx] = optimizer_event
         self.wait_s: float = 0.0
+        self.forward_wait_model_s: float = 0.0
+        self.optimizer_wait_s: float = 0.0
         self.materialized_layers: Set[int] = set()
         self.optimizer_materialized: bool = False
         self.missing_layers: Set[int] = set()
@@ -380,7 +638,14 @@ class _FRCheckLayerwiseRuntime:
         if layer_idx in self._injected_layers:
             return
         record = self._records_by_layer.get(layer_idx)
-        if record is None or not record.tensors:
+        if record is None:
+            return
+        tensors = record.model_tensors
+        if not tensors and record.tensors:
+            tensors, _ = _split_recovered_tensors(
+                record.tensors, record.model_tensor_keys, record.optimizer_tensor_keys,
+            )
+        if not tensors:
             return
         t0 = time.time()
         copied = 0
@@ -388,7 +653,7 @@ class _FRCheckLayerwiseRuntime:
         missing = 0
         with torch.no_grad():
             for key in record.model_tensor_keys:
-                tensor = record.tensors.get(key)
+                tensor = tensors.get(key)
                 if tensor is None:
                     continue
                 dst = self._lookup_live_tensor(key)
@@ -404,18 +669,74 @@ class _FRCheckLayerwiseRuntime:
         logger.info(
             "FRCheck layerwise inject: layer=%s idx=%d tensors=%d bytes=%d "
             "matched=%d missing=%d time=%.4fs total_inject=%.4fs",
-            record.layer_name, layer_idx, len(record.tensors), copied,
+            record.layer_name, layer_idx, len(tensors), copied,
             matched, missing, inject_s, self.inject_s,
         )
-        if record.contains_optimizer_state:
-            optimizer_key_set = set(record.optimizer_tensor_keys)
-            record.tensors = {
-                key: tensor
-                for key, tensor in record.tensors.items()
-                if key in optimizer_key_set
-            }
-        else:
-            record.tensors = None
+        record.model_tensors = None
+        if record.optimizer_tensors is None and record.tensors is not None:
+            _, optimizer_tensors = _split_recovered_tensors(
+                record.tensors,
+                record.model_tensor_keys,
+                record.optimizer_tensor_keys,
+            )
+            record.optimizer_tensors = optimizer_tensors
+        record.tensors = record.optimizer_tensors if record.contains_optimizer_state else None
+
+    def mark_model_ready(
+        self,
+        layer_idx: int,
+        materialize_s: float = 0.0,
+        nbytes: int = 0,
+        model_tensors: Optional[Dict[str, torch.Tensor]] = None,
+        error: str = "",
+    ) -> None:
+        record = self._records_by_layer.get(layer_idx)
+        if record is None:
+            return
+        record.materialize_s = materialize_s
+        record.nbytes = nbytes
+        if model_tensors is not None:
+            record.model_tensors = model_tensors
+        record.error = error
+        record.model_ready = not error
+        record.ready = record.model_ready and (
+            record.optimizer_ready or not record.contains_optimizer_state
+        )
+        if self.first_layer_ready_s is None:
+            self.first_layer_ready_s = time.time()
+        self.last_layer_ready_s = time.time()
+        event = self._model_events_by_layer.setdefault(layer_idx, threading.Event())
+        event.set()
+        _frcheck_recovery_profile(
+            "runtime", "model_ready_done", layer=record.layer_name,
+            layer_idx=layer_idx, model_tensors=len(model_tensors or {}),
+            error=error or "none",
+        )
+
+    def mark_optimizer_ready(
+        self,
+        layer_idx: int,
+        optimizer_tensors: Optional[Dict[str, torch.Tensor]] = None,
+        error: str = "",
+    ) -> None:
+        record = self._records_by_layer.get(layer_idx)
+        if record is None:
+            return
+        if optimizer_tensors is not None:
+            record.optimizer_tensors = optimizer_tensors
+        record.error = error or record.error
+        record.optimizer_ready = not error
+        record.ready = record.model_ready and (
+            record.optimizer_ready or not record.contains_optimizer_state
+        )
+        event = self._optimizer_events_by_layer.setdefault(layer_idx, threading.Event())
+        event.set()
+        _frcheck_recovery_profile(
+            "runtime", "optimizer_ready_done", layer=record.layer_name,
+            layer_idx=layer_idx,
+            optimizer_tensors=len(optimizer_tensors or {}),
+            error=error or "none",
+        )
 
     def mark_layer_ready(
         self,
@@ -428,20 +749,24 @@ class _FRCheckLayerwiseRuntime:
         record = self._records_by_layer.get(layer_idx)
         if record is None:
             return
-        record.materialize_s = materialize_s
-        record.nbytes = nbytes
-        if tensors is not None:
-            record.tensors = tensors
-        record.error = error
-        record.ready = not error
-        if self.first_layer_ready_s is None:
-            self.first_layer_ready_s = time.time()
-        self.last_layer_ready_s = time.time()
-        event = self._events_by_layer.setdefault(layer_idx, threading.Event())
-        event.set()
+        model_tensors, optimizer_tensors = _split_recovered_tensors(
+            tensors, record.model_tensor_keys, record.optimizer_tensor_keys,
+        )
+        self.mark_model_ready(
+            layer_idx,
+            materialize_s=materialize_s,
+            nbytes=nbytes,
+            model_tensors=model_tensors,
+            error=error,
+        )
+        if record.contains_optimizer_state:
+            self.mark_optimizer_ready(layer_idx, optimizer_tensors=optimizer_tensors, error=error)
+        else:
+            self.mark_optimizer_ready(layer_idx, error=error)
 
     def mark_layer_error(self, layer_idx: int, error: str) -> None:
-        self.mark_layer_ready(layer_idx, error=error)
+        self.mark_model_ready(layer_idx, error=error)
+        self.mark_optimizer_ready(layer_idx, error=error)
 
     def wait_and_materialize_layer(self, layer_idx: int) -> bool:
         t0 = time.time()
@@ -450,16 +775,17 @@ class _FRCheckLayerwiseRuntime:
             if record is None:
                 self.missing_layers.add(layer_idx)
                 return False
-            event = self._events_by_layer.setdefault(layer_idx, threading.Event())
+            event = self._model_events_by_layer.setdefault(layer_idx, threading.Event())
             event.wait()
-            if not record.ready:
+            if not record.model_ready:
                 raise RuntimeError(
-                    f"FRCheck layer {record.layer_name} is not ready: {record.error}"
+                    f"FRCheck layer {record.layer_name} model is not ready: {record.error}"
                 )
             self._inject_layer_tensors(layer_idx)
             first_touch = layer_idx not in self.materialized_layers
             self.materialized_layers.add(layer_idx)
             waited = time.time() - t0
+            self.forward_wait_model_s += waited
             if self.first_wait_s is None:
                 self.first_wait_s = waited
             if first_touch:
@@ -478,25 +804,35 @@ class _FRCheckLayerwiseRuntime:
             self.wait_s += time.time() - t0
 
     def wait_for_optimizer_layers(self) -> None:
-        for layer_idx, record in sorted(self._records_by_layer.items()):
-            if not record.contains_optimizer_state:
-                continue
-            event = self._events_by_layer.setdefault(layer_idx, threading.Event())
-            event.wait()
-            if not record.ready:
-                raise RuntimeError(
-                    f"FRCheck optimizer layer {record.layer_name} is not ready: {record.error}"
-                )
+        t0 = time.time()
+        try:
+            for layer_idx, record in sorted(self._records_by_layer.items()):
+                if not record.contains_optimizer_state:
+                    continue
+                event = self._optimizer_events_by_layer.setdefault(layer_idx, threading.Event())
+                event.wait()
+                if not record.optimizer_ready:
+                    raise RuntimeError(
+                        f"FRCheck optimizer layer {record.layer_name} is not ready: "
+                        f"{record.error}"
+                    )
+        finally:
+            self.optimizer_wait_s += time.time() - t0
 
     def summary(self) -> Dict[str, Any]:
         pending_runtime_tensors = sum(
-            len(record.tensors or {}) for record in self._records_by_layer.values()
+            len(record.model_tensors or {})
+            + len(record.optimizer_tensors or {})
+            + len(record.tensors or {})
+            for record in self._records_by_layer.values()
         )
         return {
             "ready_layers": len(self._records_by_layer),
             "materialized_layers": len(self.materialized_layers),
             "missing_layers": sorted(self.missing_layers),
             "wait_s": self.wait_s,
+            "forward_wait_model_s": self.forward_wait_model_s,
+            "optimizer_wait_s": self.optimizer_wait_s,
             "first_wait_s": self.first_wait_s,
             "first_layer_ready_s": self.first_layer_ready_s,
             "last_layer_ready_s": self.last_layer_ready_s,
@@ -656,6 +992,9 @@ def _layerwise_record_from_layer_buf(
     nbytes: int,
     materialize_s: float,
     tensors: Optional[Dict[str, torch.Tensor]] = None,
+    optimizer_layer_map: Optional[Dict[str, int]] = None,
+    model_tensor_keys: Optional[List[str]] = None,
+    optimizer_tensor_keys: Optional[List[str]] = None,
 ) -> _FRCheckLayerReadyRecord:
     layer_idx = -1
     if layer_name.startswith("layer_"):
@@ -668,14 +1007,18 @@ def _layerwise_record_from_layer_buf(
         for info in layer_infos
         if getattr(info, "key", "")
     ]
-    model_tensor_keys = [
-        key for key in tensor_keys
-        if _classify_frcheck_tensor(key).kind == "model_layer"
-    ]
-    optimizer_tensor_keys = [
-        key for key in tensor_keys
-        if _classify_frcheck_tensor(key).kind == "optimizer_layer"
-    ]
+    model_tensor_keys = list(model_tensor_keys or [])
+    optimizer_tensor_keys = list(optimizer_tensor_keys or [])
+    if not model_tensor_keys or not optimizer_tensor_keys:
+        for key in tensor_keys:
+            ownership = _classify_frcheck_tensor(key, optimizer_layer_map)
+            if ownership.kind == "model_layer" and key not in model_tensor_keys:
+                model_tensor_keys.append(key)
+            elif ownership.kind == "optimizer_layer" and key not in optimizer_tensor_keys:
+                optimizer_tensor_keys.append(key)
+    model_tensors, optimizer_tensors = _split_recovered_tensors(
+        tensors, model_tensor_keys, optimizer_tensor_keys, optimizer_layer_map,
+    )
     return _FRCheckLayerReadyRecord(
         layer_name=layer_name,
         layer_idx=layer_idx,
@@ -687,6 +1030,10 @@ def _layerwise_record_from_layer_buf(
         contains_optimizer_state=bool(optimizer_tensor_keys),
         materialize_s=materialize_s,
         tensors=tensors,
+        model_tensors=model_tensors,
+        optimizer_tensors=optimizer_tensors,
+        model_ready=bool(model_tensors) or not model_tensor_keys,
+        optimizer_ready=bool(optimizer_tensors) or not optimizer_tensor_keys,
     )
 
 
@@ -706,6 +1053,7 @@ def _make_pending_layerwise_records(
         job = _make_layer_recovery_job(
             encode_iter, rank, is_failed, main_payload, all_layer_order,
             all_layer_metadata, all_frcheck_dirs, checkpoint_dir, saved_block_size,
+            recovery_rank=primary_failed,
         )
         if job is None or job.layer_idx < 0:
             continue
@@ -740,6 +1088,10 @@ def _make_pending_layerwise_records(
                     layer_meta.get("contains_optimizer_state", bool(optimizer_tensor_keys))
                 ),
                 ready=False,
+                model_ready=False,
+                optimizer_ready=not bool(
+                    layer_meta.get("contains_optimizer_state", bool(optimizer_tensor_keys))
+                ),
             )
         )
     return records
@@ -819,8 +1171,17 @@ def install_frcheck_layerwise_runtime_from_state_dict(
             contains_optimizer_state=bool(item.get("contains_optimizer_state", False)),
             materialize_s=float(item.get("materialize_s", 0.0)),
             ready=bool(item.get("ready", True)),
+            model_ready=bool(item.get("model_ready", item.get("ready", True))),
+            optimizer_ready=bool(
+                item.get(
+                    "optimizer_ready",
+                    item.get("ready", True) or not item.get("contains_optimizer_state", False),
+                )
+            ),
             error=str(item.get("error", "")),
             tensors=item.get("tensors"),
+            model_tensors=item.get("model_tensors"),
+            optimizer_tensors=item.get("optimizer_tensors"),
         )
         for item in metadata.get("records", [])
     ]
@@ -927,11 +1288,11 @@ def frcheck_materialize_first_layer_for_timer() -> bool:
     record = runtime._records_by_layer.get(layer_idx)
     if record is None:
         return False
-    event = runtime._events_by_layer.setdefault(layer_idx, threading.Event())
+    event = runtime._model_events_by_layer.setdefault(layer_idx, threading.Event())
     event.wait()
-    if not record.ready:
+    if not record.model_ready:
         raise RuntimeError(
-            f"FRCheck layer {record.layer_name} is not ready: {record.error}"
+            f"FRCheck layer {record.layer_name} model is not ready: {record.error}"
         )
     runtime._inject_layer_tensors(layer_idx)
     runtime.materialized_layers.add(layer_idx)
@@ -1074,6 +1435,25 @@ def _assign_nested_state_tensor(root: Dict[str, Any], flat_key: str, tensor: tor
     return False
 
 
+def _sync_frcheck_model_params_to_optimizer_main_params(optimizer) -> bool:
+    """Copy layerwise-injected model params into optimizer fp32 master params once."""
+    if optimizer is None:
+        return False
+    optimizers = getattr(optimizer, "chained_optimizers", None)
+    if optimizers is None:
+        optimizers = [optimizer]
+    synced = False
+    for optim_instance in optimizers:
+        copy_fn = getattr(optim_instance, "_copy_model_params_to_main_params", None)
+        if copy_fn is None:
+            continue
+        copy_fn()
+        synced = True
+    if synced and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return synced
+
+
 def _materialize_pending_optimizer_tensors(
     runtime: _FRCheckLayerwiseRuntime,
     optim_state: Dict[str, Any],
@@ -1082,11 +1462,21 @@ def _materialize_pending_optimizer_tensors(
     updated = 0
     missing_keys: List[str] = []
     for record in runtime._records_by_layer.values():
-        if not record.contains_optimizer_state or not record.tensors:
+        if not record.contains_optimizer_state:
+            continue
+        tensor_source = record.optimizer_tensors
+        if not tensor_source and record.tensors:
+            _, tensor_source = _split_recovered_tensors(
+                record.tensors,
+                record.model_tensor_keys,
+                record.optimizer_tensor_keys,
+                None,
+            )
+        if not tensor_source:
             continue
         for key in record.optimizer_tensor_keys:
             expected += 1
-            tensor = record.tensors.get(key)
+            tensor = tensor_source.get(key)
             if tensor is None:
                 missing_keys.append(key)
                 continue
@@ -1102,9 +1492,17 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
     global _pending_optimizer_container, _pending_optimizer_state
     service = _get_active_frcheck_recovery_service()
     runtime = service.runtime
-    if runtime is None or _pending_optimizer_state is None:
+    if runtime is None:
         return False
     t0 = time.time()
+    if not runtime.optimizer_materialized and optimizer is not None:
+        if _sync_frcheck_model_params_to_optimizer_main_params(optimizer):
+            logger.info(
+                "FRCheck optimizer recovery: synced injected model params to optimizer main params"
+            )
+    if _pending_optimizer_state is None:
+        runtime.optimizer_materialized = True
+        return False
     service.wait_optimizer()
     if optimizer is None:
         return False
@@ -1129,6 +1527,7 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
     optimizer.load_state_dict(_pending_optimizer_state)
     for record in runtime._records_by_layer.values():
         if record.contains_optimizer_state:
+            record.optimizer_tensors = None
             record.tensors = None
     _pending_optimizer_container = None
     _pending_optimizer_state = None
@@ -1187,6 +1586,7 @@ def _group_by_layer(
     distribute_common: bool = False,
     debug: bool = False,
     optimizer_layer_map: Optional[Dict[str, int]] = None,
+    optimizer_model_key_map: Optional[Dict[str, str]] = None,
 ) -> List[_LayerGroup]:
     """Split decomposed state_dict into per-layer groups based on FQN key."""
     groups: Dict[int, _LayerGroup] = {}
@@ -1209,22 +1609,61 @@ def _group_by_layer(
         moved_data = []
         kept_infos = []
         kept_data = []
-        for info, tensor in zip(common.tensor_infos, common.tensor_data):
-            ownership = _classify_frcheck_tensor(info.key, optimizer_layer_map)
-            if ownership.kind == "model_common":
-                moved_infos.append(info)
-                moved_data.append(tensor)
-            else:
-                kept_infos.append(info)
-                kept_data.append(tensor)
-        if others and moved_infos:
-            for i, (info, tensor) in enumerate(zip(moved_infos, moved_data)):
-                target = others[i % len(others)]
-                target.tensor_infos.append(info)
-                target.tensor_data.append(tensor)
-                target.total_bytes += info.size_bytes
-            moved_model_common_tensors = len(moved_infos)
-            moved_model_common_bytes = sum(getattr(info, "size_bytes", 0) for info in moved_infos)
+        common_model_targets: Dict[str, _LayerGroup] = {}
+        moved_optimizer_common_tensors = 0
+        moved_optimizer_common_bytes = 0
+
+        if others:
+            common_model_idx = 0
+            for info, tensor in zip(common.tensor_infos, common.tensor_data):
+                ownership = _classify_frcheck_tensor(info.key, optimizer_layer_map)
+                if ownership.kind == "model_common":
+                    target = others[common_model_idx % len(others)]
+                    common_model_idx += 1
+                    target.tensor_infos.append(info)
+                    target.tensor_data.append(tensor)
+                    target.total_bytes += info.size_bytes
+                    common_model_targets[info.key] = target
+                    moved_infos.append(info)
+                    moved_data.append(tensor)
+                else:
+                    kept_infos.append(info)
+                    kept_data.append(tensor)
+        else:
+            kept_infos = list(common.tensor_infos)
+            kept_data = list(common.tensor_data)
+
+        if common_model_targets:
+            if not optimizer_model_key_map:
+                logger.warning(
+                    "FRCheck distribute_common: optimizer_model_key_map is empty; "
+                    "optimizer-common tensors will remain in layer_common",
+                )
+            others_by_layer = {group.layer_idx: group for group in others}
+            next_kept_infos = []
+            next_kept_data = []
+            for info, tensor in zip(kept_infos, kept_data):
+                model_key = (
+                    optimizer_model_key_map.get(info.key)
+                    if optimizer_model_key_map else None
+                )
+                target = _resolve_optimizer_distribute_target(
+                    model_key, common_model_targets, others_by_layer,
+                )
+                if target is not None:
+                    target.tensor_infos.append(info)
+                    target.tensor_data.append(tensor)
+                    target.total_bytes += info.size_bytes
+                    moved_optimizer_common_tensors += 1
+                    moved_optimizer_common_bytes += int(getattr(info, "size_bytes", 0))
+                else:
+                    next_kept_infos.append(info)
+                    next_kept_data.append(tensor)
+            kept_infos = next_kept_infos
+            kept_data = next_kept_data
+
+        moved_model_common_tensors = len(moved_infos)
+        moved_model_common_bytes = sum(getattr(info, "size_bytes", 0) for info in moved_infos)
         kept_bytes = sum(getattr(info, "size_bytes", 0) for info in kept_infos)
         if kept_infos:
             common.tensor_infos = kept_infos
@@ -1242,10 +1681,20 @@ def _group_by_layer(
             moved_bytes = sum(getattr(info, "size_bytes", 0) for info in moved_infos)
             logger.info(
                 "FRCheck: semantic common distribution moved model_common=%d "
-                "tensors (%d bytes), grouped optimizer_layer=%d, kept common=%d "
-                "tensors (%d bytes)",
-                len(moved_infos), moved_bytes, mapped_optimizer,
-                len(kept_infos), kept_bytes,
+                "tensors (%d bytes), moved optimizer_common=%d tensors (%d bytes), "
+                "grouped optimizer_layer=%d, kept common=%d tensors (%d bytes)",
+                len(moved_infos), moved_bytes,
+                moved_optimizer_common_tensors, moved_optimizer_common_bytes,
+                mapped_optimizer, len(kept_infos), kept_bytes,
+            )
+        elif distribute_common and kept_bytes > 1_000_000:
+            logger.warning(
+                "FRCheck distribute_common: kept layer_common=%.1fMB (%d tensors) "
+                "after moving model_common=%d optimizer_common=%d; "
+                "optimizer_model_key_map entries=%d",
+                kept_bytes / 1e6, len(kept_infos),
+                moved_model_common_tensors, moved_optimizer_common_tensors,
+                len(optimizer_model_key_map or {}),
             )
 
     # Sort: non-layer (-1) first, then by layer index
@@ -1773,7 +2222,9 @@ def _start_async_p2_writer(
         )
 
 
-def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: str) -> None:
+def save_frcheck_legacy_checkpoint(
+    state_dict: Dict[str, Any], checkpoint_name: str, write_to_disk: bool = True
+) -> None:
     """Write frcheck_main_rank*.pt + layer-wise source/parity shards."""
     t0 = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -1786,17 +2237,10 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
 
     optimizer_layer_map = _build_optimizer_layer_map(state_dict)
 
-    # 1. Decompose a detached copy so save-time flattening cannot mutate live optimizer state.
+    # 1. Flatten on a shallow save copy only — mutating live optimizer layout would
+    #    duplicate fp32 tensors on iter>=2 and break layer routing below.
     t_decompose = time.time()
-    t_copy = time.time()
-    save_state_dict = copy.deepcopy(state_dict)
-    save_copy_s = time.time() - t_copy
-    t_flatten = time.time()
-    flatten_optimizer_fp32_params(save_state_dict)
-    save_flatten_s = time.time() - t_flatten
-    t_decomp_only = time.time()
-    decomposed = decompose_state_dict(save_state_dict)
-    save_decompose_s = time.time() - t_decomp_only
+    decomposed, save_copy_s, save_flatten_s, save_decompose_s = decompose_state_dict_for_save(state_dict)
     save_pre_group_s = time.time() - t_decompose
     total_tensor_size = decomposed.total_tensor_size_bytes
     if _dbg:
@@ -1841,7 +2285,8 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     # 3. Setup output directory (same layout as ecnaive: files live in mp_rank_* dir)
     checkpoint_path = Path(checkpoint_name)
     checkpoint_dir = checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if write_to_disk:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # 4. Group tensors by layer index
     t0 = time.time()
@@ -1850,6 +2295,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         distribute_common=getattr(args, "frcheck_distribute_common", False),
         debug=_dbg,
         optimizer_layer_map=optimizer_layer_map,
+        optimizer_model_key_map=_build_optimizer_model_key_map(state_dict),
     )
     layer_groups = _synchronize_layer_groups(layer_groups)
     save_group_s = time.time() - t0
@@ -1911,8 +2357,16 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             total_pad / 1e6, total_pct,
         )
 
-    # 5. Phase A: prep all layers (copy + register), then Phase B: batch network encode
-    t_prep = time.time()
+    # 5. Prep: allocate/register layer buffers (no pack/encode)
+    for group in layer_groups:
+        layer_bufs = manager.get_layer_stripe_bufs(group.layer_idx)
+        _register_layer_stripe_bufs(manager, native, layer_bufs)
+
+    if world_size > 1:
+        torch.distributed.barrier()
+    e2e_t0 = time.time()
+
+    # Pipeline: pack + encode per layer
     local_layer_order: List[str] = []
     local_layer_metadata: Dict[str, Dict[str, Any]] = {}
     encode_results: List[_LayerEncodeResult] = []
@@ -1931,7 +2385,6 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         layer_idx = group.layer_idx
         layer_block_size = manager._layer_block_sizes[layer_idx]
         layer_bufs = manager.get_layer_stripe_bufs(layer_idx)
-        _register_layer_stripe_bufs(manager, native, layer_bufs)
 
         layer_buf_gpu = layer_bufs.layer_buf_gpu
         pack_t0 = time.time()
@@ -2051,7 +2504,7 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             n_filled_blocks=state.n_filled_blocks,
         ))
 
-    t_enc = time.time() - t_prep
+    network_encode_s = submit_total_s + wait_total_s
     logger.info(
         "FRCheck legacy save rank %d: profile pre_group=%.3fs "
         "(deepcopy=%.3fs flatten=%.3fs decompose=%.3fs) group=%.3fs "
@@ -2108,42 +2561,55 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
     native.wait_mirror_completion()
     _mirror_elapsed = time.time() - _mirror_t0
 
-    _post_barrier_elapsed = 0.0
+    if _use_async_parity:
+        network_encode_s += _async_p2_submit_elapsed
+    e2e_s = time.time() - e2e_t0
     if world_size > 1:
-        _post_barrier_t0 = time.time()
         torch.distributed.barrier()
-        _post_barrier_elapsed = time.time() - _post_barrier_t0
+    summary = _timing_max_dict({
+        "e2e_s": e2e_s,
+        "pack_s": pack_total_s,
+        "network_encode_s": network_encode_s,
+        "mirror_d2h_s": _mirror_elapsed,
+    })
+    logger.info(
+        "FRCHECK save timing: e2e_s=%(e2e_s).2fs pack_s=%(pack_s).2fs "
+        "network_encode_s=%(network_encode_s).2fs mirror_d2h_s=%(mirror_d2h_s).2fs",
+        summary,
+    )
 
     if _use_async_parity:
         logger.info(
             "FRCheck legacy save rank %d: async path submitted "
-            "(encode=%.3fs async_p2_submit=%.3fs mirror=%.3fs "
-            "post_barrier=%.3fs total=%.3fs)",
-            rank, t_enc, _async_p2_submit_elapsed, _mirror_elapsed,
-            _post_barrier_elapsed, time.time() - t_prep,
+            "(network_encode=%.3fs async_p2_submit=%.3fs mirror=%.3fs e2e_s=%.3fs)",
+            rank, network_encode_s, _async_p2_submit_elapsed, _mirror_elapsed, e2e_s,
         )
     else:
         logger.info(
             "FRCheck legacy save rank %d: sync path done "
-            "(encode=%.3fs mirror=%.3fs post_barrier=%.3fs total=%.3fs)",
-            rank, t_enc, _mirror_elapsed,
-            _post_barrier_elapsed, time.time() - t_prep,
+            "(network_encode=%.3fs mirror=%.3fs e2e_s=%.3fs)",
+            rank, network_encode_s, _mirror_elapsed, e2e_s,
         )
 
-    if _use_async_parity:
-        _save_frcheck_stripe_files(
-            manager, str(checkpoint_dir), rank, num_stripes, encode_results,
-            include_encoder_p1=True,
-            include_source=True,
-            include_p2=False,
-        )
-        _start_async_p2_writer(
-            manager, str(checkpoint_dir), rank, num_stripes, encode_results,
-            debug=_dbg,
-        )
+    if write_to_disk:
+        if _use_async_parity:
+            _save_frcheck_stripe_files(
+                manager, str(checkpoint_dir), rank, num_stripes, encode_results,
+                include_encoder_p1=True,
+                include_source=True,
+                include_p2=False,
+            )
+            _start_async_p2_writer(
+                manager, str(checkpoint_dir), rank, num_stripes, encode_results,
+                debug=_dbg,
+            )
+        else:
+            _save_frcheck_stripe_files(
+                manager, str(checkpoint_dir), rank, num_stripes, encode_results,
+            )
     else:
-        _save_frcheck_stripe_files(
-            manager, str(checkpoint_dir), rank, num_stripes, encode_results,
+        logger.info(
+            "FRCheck save: skipping checkpoint file writes for this iteration"
         )
 
     for result in encode_results:
@@ -2165,23 +2631,24 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
             "optimizer_tensor_keys": optimizer_tensor_keys,
             "contains_optimizer_state": bool(optimizer_tensor_keys),
         }
-        layer_main = checkpoint_dir / result.layer_name / f"frcheck_layer_main_rank{rank}.pt"
-        torch.save(
-            {
-                "version": 2,
-                "format": "frcheck_torch_legacy",
-                "rank": rank,
-                "layer_name": result.layer_name,
-                "n": n,
-                "num_stripes": num_stripes,
-                "block_size": result.block_size,
-                "rank_in_group": rg,
-                "gdr": True,
-                "tensor_infos": result.tensor_infos,
-                "actual_tensor_size": result.total_bytes,
-            },
-            layer_main,
-        )
+        if write_to_disk:
+            layer_main = checkpoint_dir / result.layer_name / f"frcheck_layer_main_rank{rank}.pt"
+            torch.save(
+                {
+                    "version": 2,
+                    "format": "frcheck_torch_legacy",
+                    "rank": rank,
+                    "layer_name": result.layer_name,
+                    "n": n,
+                    "num_stripes": num_stripes,
+                    "block_size": result.block_size,
+                    "rank_in_group": rg,
+                    "gdr": True,
+                    "tensor_infos": result.tensor_infos,
+                    "actual_tensor_size": result.total_bytes,
+                },
+                layer_main,
+            )
 
     torch.distributed.barrier()
 
@@ -2253,14 +2720,15 @@ def save_frcheck_legacy_checkpoint(state_dict: Dict[str, Any], checkpoint_name: 
         "all_optimizer_layer_maps": all_optimizer_layer_maps,
         "optimizer_layer_map": optimizer_layer_map,
     })
-    write_main_prepared(
-        str(main_file), MAGIC_FRCHECK, meta1, meta2, extra, memoryview(b""), 0,
-    )
+    if write_to_disk:
+        write_main_prepared(
+            str(main_file), MAGIC_FRCHECK, meta1, meta2, extra, memoryview(b""), 0,
+        )
 
     if _dbg:
         logger.info(
-            "FRCheck save: done rank=%d node=%d gdr=True layers=%d file=%s (metadata-only)",
-            rank, my_node, num_layers, main_file,
+            "FRCheck save: done rank=%d node=%d gdr=True layers=%d file=%s (metadata-only, write_to_disk=%s)",
+            rank, my_node, num_layers, main_file, write_to_disk,
         )
 
     del _global_offsets
@@ -2573,10 +3041,15 @@ def _allocate_recovery_buf_pool(
     if not need_pool:
         return None
 
-    # Native recovery starts n workers per role.  Allocate one temporary slot per
-    # worker and submit recovery stripes in waves of at most n to avoid reusing a
-    # slot while another worker is still using it.
-    concurrency = max(n, 1)
+    # Match save-side batching: submit all data recovery stripes for a layer in
+    # one native batch.  Each stripe needs a distinct temporary slot until the
+    # batch completes, so default to the number of data/source stripes.
+    max_concurrency = max(num_source_stripes, 1)
+    env_concurrency = os.environ.get("FRCHECK_RECOVERY_CONCURRENCY")
+    if env_concurrency:
+        concurrency = max(1, min(int(env_concurrency), max_concurrency))
+    else:
+        concurrency = max_concurrency
     decoder_recv_buf_slots: List[List[torch.Tensor]] = []
     if is_decoder and num_helper > 0:
         decoder_recv_buf_slots = [
@@ -2714,46 +3187,30 @@ def _make_layer_recovery_job(
     all_frcheck_dirs: List[Optional[Path]],
     checkpoint_dir: Path,
     saved_block_size: int,
+    recovery_rank: Optional[int] = None,
 ) -> Optional[_FRCheckLayerRecoveryJob]:
-    my_order = all_layer_order.get(rank, main_payload.get("layer_names", []))
+    metadata_rank = recovery_rank if recovery_rank is not None else rank
+    my_order = all_layer_order.get(metadata_rank, main_payload.get("layer_names", []))
     if encode_iter >= len(my_order):
-        if is_failed:
-            return None
-        return _FRCheckLayerRecoveryJob(
-            encode_iter=encode_iter,
-            layer_name=f"encode_iter_{encode_iter}",
-            layer_idx=-1,
-            layer_block_size=saved_block_size,
-            actual_size=0,
-            layer_infos=[],
-        )
+        return None
 
     layer_name = my_order[encode_iter]
     layer_block_size = _resolve_layer_block_size(
-        rank, layer_name, all_layer_metadata, saved_block_size,
+        metadata_rank, layer_name, all_layer_metadata, saved_block_size,
     )
-    if not is_failed:
-        return _FRCheckLayerRecoveryJob(
-            encode_iter=encode_iter,
-            layer_name=layer_name,
-            layer_idx=-1,
-            layer_block_size=layer_block_size,
-            actual_size=0,
-            layer_infos=[],
-        )
 
-    meta = all_layer_metadata.get(rank, {}).get(layer_name)
+    meta = all_layer_metadata.get(metadata_rank, {}).get(layer_name)
     if meta is None:
         failed_dir = (
-            all_frcheck_dirs[rank]
-            if rank < len(all_frcheck_dirs)
+            all_frcheck_dirs[metadata_rank]
+            if metadata_rank < len(all_frcheck_dirs)
             else checkpoint_dir
         )
-        meta = _read_local_layer_metadata(failed_dir, layer_name, rank)
+        meta = _read_local_layer_metadata(failed_dir, layer_name, metadata_rank)
     if meta is None:
         logger.warning(
             "FRCheck recovery: no metadata for rank %d layer %s (iter %d)",
-            rank, layer_name, encode_iter,
+            metadata_rank, layer_name, encode_iter,
         )
         return None
     actual_size = int(meta.get("actual_tensor_size", 0))
@@ -2799,7 +3256,7 @@ def _run_layer_recovery_job(
     )
     layer_buf, layer_timing = _recover_one_layer_network(
         manager, native, job.layer_name,
-        job.layer_idx, job.layer_block_size, job.actual_size if is_failed else 0,
+        job.layer_idx, job.layer_block_size, job.actual_size,
         n, rank, preloaded_blocks=preloaded.get(job.encode_iter, {}),
         buf_pool=buf_pool, recovery_role=recovery_role,
     )
@@ -2839,16 +3296,51 @@ def _run_layer_recovery_job(
         record = _layerwise_record_from_layer_buf(
             job.layer_name, job.encode_iter, job.layer_infos, copied,
             materialize_s, tensors=layer_tensors,
+            optimizer_layer_map=getattr(manager, "_frcheck_optimizer_layer_map", None),
+            model_tensor_keys=(
+                runtime._records_by_layer[job.layer_idx].model_tensor_keys
+                if runtime is not None and job.layer_idx in runtime._records_by_layer
+                else None
+            ),
+            optimizer_tensor_keys=(
+                runtime._records_by_layer[job.layer_idx].optimizer_tensor_keys
+                if runtime is not None and job.layer_idx in runtime._records_by_layer
+                else None
+            ),
         )
         if runtime is not None and job.layer_idx >= 0:
             t_mark = time.time()
-            runtime.mark_layer_ready(
-                job.layer_idx, materialize_s=materialize_s,
-                nbytes=copied, tensors=layer_tensors,
+            pending_record = runtime._records_by_layer.get(job.layer_idx)
+            opt_map = getattr(manager, "_frcheck_optimizer_layer_map", None)
+            split_model_keys = (
+                pending_record.model_tensor_keys if pending_record is not None else []
             )
+            split_optimizer_keys = (
+                pending_record.optimizer_tensor_keys if pending_record is not None else []
+            )
+            model_tensors, optimizer_tensors = _split_recovered_tensors(
+                layer_tensors,
+                split_model_keys,
+                split_optimizer_keys,
+                opt_map,
+            )
+            runtime.mark_model_ready(
+                job.layer_idx,
+                materialize_s=materialize_s,
+                nbytes=copied,
+                model_tensors=model_tensors,
+            )
+            if pending_record is not None and pending_record.contains_optimizer_state:
+                runtime.mark_optimizer_ready(
+                    job.layer_idx, optimizer_tensors=optimizer_tensors,
+                )
+            else:
+                runtime.mark_optimizer_ready(job.layer_idx)
             _frcheck_recovery_profile(
                 recovery_role, "mark_layer_ready_done", layer=job.layer_name,
                 layer_idx=job.layer_idx, elapsed_s=time.time() - t_mark,
+                model_tensors=len(model_tensors or {}),
+                optimizer_tensors=len(optimizer_tensors or {}),
             )
         if _frcheck_debug_enabled():
             logger.info(
@@ -3150,7 +3642,7 @@ def _submit_recovery_network(
     if not manager.recovery_stripe_plans:
         return None, layer_timing
 
-    data_plans = [
+    raw_data_plans = [
         p for p in manager.recovery_stripe_plans
         if _is_data_recovery_plan(p, n)
     ]
@@ -3160,12 +3652,34 @@ def _submit_recovery_network(
     ]
 
     _dbg = _frcheck_debug_enabled()
+    num_source_stripes = (n - 1) * (n - 2)
+    n_filled_blocks = _n_filled_blocks_for_layer(
+        layer_total_bytes, layer_block_size, num_source_stripes,
+    )
+    data_plans: List[Dict[str, Any]] = []
+    skipped_padding_stripes = 0
+    failed_source_seen = 0
+    active_by_stripe: Dict[int, bool] = {}
+    enable_padding_skip = os.environ.get("FRCHECK_RECOVERY_SKIP_PADDING", "0") == "1"
+    for plan in raw_data_plans:
+        active = True
+        if not plan.get('dual_failure'):
+            original_role = int(plan.get('original_role', -1))
+            if original_role == int(StripeRole.SOURCE):
+                blk_idx = failed_source_seen
+                failed_source_seen += 1
+                if blk_idx >= n_filled_blocks:
+                    skipped_padding_stripes += 1
+                    active = not enable_padding_skip
+        active_by_stripe[int(plan['stripe_id'])] = active
+        data_plans.append(plan)
+
     if not data_plans:
         if _dbg:
             logger.info(
                 "FRCheck recovery layer %s: rank %d has no data recovery stripes "
-                "(skipped parity stripes=%d)",
-                layer_name, rank, len(parity_plans),
+                "(skipped parity stripes=%d padding stripes=%d)",
+                layer_name, rank, len(parity_plans), skipped_padding_stripes,
             )
         return None, layer_timing
 
@@ -3178,9 +3692,12 @@ def _submit_recovery_network(
 
     if _dbg:
         logger.info(
-            "FRCheck recovery layer %s: rank %d — data=%d parity_skipped=%d "
+            "FRCheck recovery layer %s: rank %d — data=%d raw_data=%d "
+            "parity_skipped=%d padding_skipped=%d filled=%d/%d "
             "decoder=%d helper=%d failed=%d stripes",
-            layer_name, rank, len(data_plans), len(parity_plans),
+            layer_name, rank, len(data_plans), len(raw_data_plans),
+            len(parity_plans), skipped_padding_stripes,
+            n_filled_blocks, num_source_stripes,
             len(decoder_stripes), len(helper_stripes), len(failed_stripes),
         )
 
@@ -3193,7 +3710,6 @@ def _submit_recovery_network(
             native.register_buffer(blk.data_ptr(), blk.numel())
         my_blocks[sid] = blk
 
-    num_source_stripes = (n - 1) * (n - 2)
     layer_buf = None
     if is_failed:
         stable_buf = None
@@ -3222,8 +3738,12 @@ def _submit_recovery_network(
         native.reset_recovery_batch()
         reset_s = time.time() - t_reset
         t_submit = time.time()
+        wave_active_stripes = 0
         for submit_idx, stri_plan in enumerate(wave_plans):
             sid = stri_plan['stripe_id']
+            active = active_by_stripe.get(int(sid), True)
+            if active:
+                wave_active_stripes += 1
             buf_slot = submit_idx
             helper_block_addr = 0
             decoder_self_block_addr = 0
@@ -3281,7 +3801,11 @@ def _submit_recovery_network(
                 else:
                     original_role = stri_plan.get('original_role')
 
-                if layer_buf is not None and original_role == int(StripeRole.SOURCE):
+                if (
+                    active
+                    and layer_buf is not None
+                    and original_role == int(StripeRole.SOURCE)
+                ):
                     store_to_layer_buf = True
                     blk_idx = src_block_per_node[my_node]
                     src_block_per_node[my_node] += 1
@@ -3320,6 +3844,7 @@ def _submit_recovery_network(
                 failed_layer_offset,
                 failed_ncopy,
                 store_to_layer_buf,
+                active,
             )
 
         native.submit_recovery_sentinel()
@@ -3332,6 +3857,9 @@ def _submit_recovery_network(
         _frcheck_recovery_profile(
             recovery_role, "network_wave_done", layer=layer_name,
             layer_idx=layer_idx, wave=wave_idx, stripes=len(wave_plans),
+            wave_size=wave_size, pool_concurrency=(buf_pool.concurrency if buf_pool is not None else 0),
+            active_stripes=wave_active_stripes,
+            skipped_padding_stripes=len(wave_plans) - wave_active_stripes,
             reset_s=reset_s, submit_s=submit_s, wait_s=wait_s,
         )
 
@@ -3340,8 +3868,17 @@ def _submit_recovery_network(
     _frcheck_recovery_profile(
         recovery_role, "network_batch_done", layer=layer_name,
         layer_idx=layer_idx, stripes=len(data_plans),
+        raw_stripes=len(raw_data_plans),
+        active_stripes=sum(1 for plan in data_plans if active_by_stripe.get(int(plan['stripe_id']), True)),
+        skipped_padding_stripes=(
+            sum(1 for plan in data_plans if not active_by_stripe.get(int(plan['stripe_id']), True))
+        ),
+        padding_candidate_stripes=skipped_padding_stripes,
+        padding_skip_enabled=enable_padding_skip,
+        n_filled_blocks=n_filled_blocks,
         decoder_stripes=len(decoder_stripes), helper_stripes=len(helper_stripes),
         failed_stripes=len(failed_stripes), waves=layer_timing['waves'],
+        wave_size=wave_size, pool_concurrency=(buf_pool.concurrency if buf_pool is not None else 0),
         network_batch_s=layer_timing['network_batch_s'],
         submit_s=layer_timing['submit_s'], wait_s=layer_timing['wait_s'],
     )
@@ -3351,6 +3888,7 @@ def _submit_recovery_network(
         expected_stored = sum(
             1 for plan in failed_stripes
             if int(plan.get('original_role', -1)) == int(StripeRole.SOURCE)
+            and active_by_stripe.get(int(plan['stripe_id']), True)
         )
         if _dbg:
             logger.info(
@@ -3683,6 +4221,7 @@ def recover_frcheck_legacy_hardware(
         job = _make_layer_recovery_job(
             encode_iter, rank, is_failed, main_payload, all_layer_order,
             all_layer_metadata, all_frcheck_dirs, checkpoint_dir, saved_block_size,
+            recovery_rank=primary_failed,
         )
         if job is None:
             continue
@@ -3695,10 +4234,9 @@ def recover_frcheck_legacy_hardware(
         and runtime_for_recovery is not None
     )
     if detached_transformer_recovery:
-        _preallocate_stable_failed_layer_bufs(
-            native, buf_pool,
-            [job for job in recovery_jobs if job.layer_idx >= 0],
-            n,
+        _frcheck_recovery_profile(
+            recovery_role, "stable_failed_layer_bufs_disabled",
+            jobs=sum(1 for job in recovery_jobs if job.layer_idx >= 0),
         )
 
     timings['prep'] = time.time() - t_prep
@@ -3740,7 +4278,7 @@ def recover_frcheck_legacy_hardware(
                 async_jobs, manager, native, n, rank, is_failed, preloaded,
                 buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
                 cleanup_after=(getattr(args, "frcheck_recovery_safe_point", "load") == "load"),
-                map_to_full_buf="common_only",
+                map_to_full_buf="all",
                 clone_runtime_tensors=True,
                 recovery_role=recovery_role,
             )
@@ -3751,6 +4289,7 @@ def recover_frcheck_legacy_hardware(
                     "started rank=%d sync_jobs=%d async_jobs=%d",
                     rank, len(sync_jobs), len(async_jobs),
                 )
+            frcheck_wait_for_async_recovery()
     elif async_forward and involved and recovery_jobs:
         worker = _start_layer_recovery_worker(
             recovery_jobs, manager, native, n, rank, is_failed, preloaded,
@@ -3766,7 +4305,14 @@ def recover_frcheck_legacy_hardware(
                 "FRCheck recovery: async-forward worker started rank=%d jobs=%d",
                 rank, len(recovery_jobs),
             )
-        frcheck_wait_for_async_recovery()
+        safe_point = getattr(args, "frcheck_recovery_safe_point", "load")
+        if safe_point == "load":
+            frcheck_wait_for_async_recovery()
+        elif _dbg:
+            logger.info(
+                "FRCheck recovery: deferring async worker join to safe_point=%s rank=%d",
+                safe_point, rank,
+            )
     else:
         for job in recovery_jobs:
             record, _layer_timing = _run_layer_recovery_job(
@@ -3810,8 +4356,12 @@ def recover_frcheck_legacy_hardware(
                     "nbytes": r.nbytes,
                     "materialize_s": r.materialize_s,
                     "ready": r.ready,
+                    "model_ready": r.model_ready,
+                    "optimizer_ready": r.optimizer_ready,
                     "error": r.error,
                     "tensors": r.tensors,
+                    "model_tensors": r.model_tensors,
+                    "optimizer_tensors": r.optimizer_tensors,
                 }
                 for r in records_to_export
             ],

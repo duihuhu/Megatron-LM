@@ -588,8 +588,25 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             "Gemini Replicas legacy only supports torch checkpoint format. "
             "Please use --ckpt-format torch without distributed checkpoint save."
         )
+    ec_legacy_checkpointing = any((
+        getattr(args, "use_eclatin", False),
+        getattr(args, "use_ecnaive", False),
+        getattr(args, "use_frcheck", False),
+        getattr(args, "use_gemini_replicas", False),
+        getattr(args, "use_eccheck", False),
+    ))
+    ec_write_to_disk = True
+    if ec_legacy_checkpointing:
+        from megatron.training.legacy_io_utils import should_write_ec_checkpoint_this_iteration
+        ec_write_to_disk = should_write_ec_checkpoint_this_iteration(args, iteration)
+
     print_rank_0('saving checkpoint at iteration {:7d} to {} in {} format'.format(
         iteration, save_dir, ckpt_format))
+    if ec_legacy_checkpointing and not ec_write_to_disk:
+        print_rank_0(
+            '  EC/Gemini checkpoint file writes disabled for this iteration; '
+            'running save pipeline without updating latest_checkpointed_iteration'
+        )
 
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state(args.ckpt_format)
@@ -734,23 +751,23 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 assert ckpt_type == CheckpointType.LEGACY
                 if getattr(args, "use_eclatin", False):
                     from .eclatin_legacy import save_eclatin_legacy_checkpoint
-                    save_eclatin_legacy_checkpoint(state_dict, checkpoint_name)
+                    save_eclatin_legacy_checkpoint(state_dict, checkpoint_name, write_to_disk=ec_write_to_disk)
                     checkpoint_name = str(Path(checkpoint_name).parent)
                 elif args.use_ecnaive:
                     from .ecnaive_legacy import save_ecnaive_legacy_checkpoint
-                    save_ecnaive_legacy_checkpoint(state_dict, checkpoint_name)
+                    save_ecnaive_legacy_checkpoint(state_dict, checkpoint_name, write_to_disk=ec_write_to_disk)
                     checkpoint_name = str(Path(checkpoint_name).parent)
                 elif getattr(args, "use_frcheck", False):
                     from .frcheck_legacy import save_frcheck_legacy_checkpoint
-                    save_frcheck_legacy_checkpoint(state_dict, checkpoint_name)
+                    save_frcheck_legacy_checkpoint(state_dict, checkpoint_name, write_to_disk=ec_write_to_disk)
                     checkpoint_name = str(Path(checkpoint_name).parent)
                 elif getattr(args, "use_gemini_replicas", False):
                     from .gemini_replicas_legacy import save_gemini_replicas_legacy_checkpoint
-                    save_gemini_replicas_legacy_checkpoint(state_dict, checkpoint_name)
+                    save_gemini_replicas_legacy_checkpoint(state_dict, checkpoint_name, write_to_disk=ec_write_to_disk)
                     checkpoint_name = str(Path(checkpoint_name).parent)
                 elif getattr(args, "use_eccheck", False):
                     from .eccheck_legacy import save_eccheck_legacy_checkpoint
-                    save_eccheck_legacy_checkpoint(state_dict, checkpoint_name)
+                    save_eccheck_legacy_checkpoint(state_dict, checkpoint_name, write_to_disk=ec_write_to_disk)
                     checkpoint_name = str(Path(checkpoint_name).parent)
                 else:
                     # Save.
@@ -768,8 +785,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Write from the first GPU on every node (not just global rank 0) so the
     # tracker file survives single-node failures.
     is_local_rank0 = torch.cuda.is_available() and torch.cuda.current_device() == 0
-    if not torch.distributed.is_initialized() \
-            or (torch.distributed.get_rank() == 0 or is_local_rank0):
+    should_update_latest = not (ec_legacy_checkpointing and not ec_write_to_disk)
+    if should_update_latest and (not torch.distributed.is_initialized() \
+            or (torch.distributed.get_rank() == 0 or is_local_rank0)):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
 
         if ckpt_type == CheckpointType.LOCAL:
@@ -1981,8 +1999,22 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             get_frcheck_layerwise_runtime_summary,
             install_frcheck_layerwise_runtime_from_state_dict,
         )
+        frcheck_rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized() else 0
+        )
         install_frcheck_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
+        mark_recovery_to_forward_timer("frcheck_runtime_install_done")
+        logger.info(
+            "FRCheck profile: rank=%d event=frcheck_runtime_install_done", frcheck_rank,
+        )
         removed_placeholders, _ = frcheck_filter_layerwise_model_placeholders(state_dict)
+        mark_recovery_to_forward_timer("frcheck_filter_placeholders_done")
+        logger.info(
+            "FRCheck profile: rank=%d event=frcheck_filter_placeholders_done "
+            "removed=%d",
+            frcheck_rank, removed_placeholders,
+        )
         frcheck_runtime_summary = get_frcheck_layerwise_runtime_summary()
         frcheck_skipped_model_placeholders = (
             removed_placeholders > 0 or frcheck_runtime_summary is not None
@@ -2076,6 +2108,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     #     )
     ft_timing_enabled = _ft_legacy_timing_enabled(args)
     model_submit_start = time()
+    if getattr(args, "use_frcheck", False):
+        mark_recovery_to_forward_timer("frcheck_load_state_dict_start")
+        logger.info("FRCheck profile: rank=%d event=frcheck_load_state_dict_start", rank)
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
             load_model_state_dict(ddp_model[0], state_dict['model'], strict)
@@ -2087,9 +2122,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     continue
                 load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
     model_submit_end = time()
+    if getattr(args, "use_frcheck", False):
+        mark_recovery_to_forward_timer("frcheck_load_state_dict_done")
+        logger.info("FRCheck profile: rank=%d event=frcheck_load_state_dict_done", rank)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     model_sync_end = time()
+    if getattr(args, "use_frcheck", False):
+        mark_recovery_to_forward_timer("frcheck_cuda_sync_done")
+        logger.info("FRCheck profile: rank=%d event=frcheck_cuda_sync_done", rank)
     if getattr(args, "use_frcheck", False) or getattr(args, "use_gemini_replicas", False):
         mark_recovery_to_forward_timer("model_load_done")
         scheme = "FRCheck" if getattr(args, "use_frcheck", False) else "Gemini Replicas"
@@ -2115,6 +2156,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         from .frcheck_legacy import frcheck_log_layerwise_runtime_summary
         frcheck_log_layerwise_runtime_summary("after_model_load")
     torch.distributed.barrier()
+    if getattr(args, "use_frcheck", False):
+        mark_recovery_to_forward_timer("frcheck_model_load_barrier_done")
+        logger.info("FRCheck profile: rank=%d event=frcheck_model_load_barrier_done", rank)
     load_model_end_time = time()
     logger.info(f"load only model state time: {load_model_end_time - load_model_start_time:.4f}s")
     load_model_start_time = time()
@@ -2263,6 +2307,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             "pre_network_barrier_s": pre_network_barrier_s,
             "recovery_e2e_s": recovery_e2e_s,
             "network_encode_s": float(recovery.get("network_encode", 0.0)),
+            "net_s": float(recovery.get("net_s", 0.0)),
+            "encode_s": float(recovery.get("encode_s", 0.0)),
             "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
             "h2d_s": h2d_total_s,
             "h2d_model_s": h2d_model_s,
@@ -2276,14 +2322,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         if ft_context is not None:
             logger.info(
                 "%s load timing (%s): e2e_s=%.2fs pre_network_barrier_s=%.2fs "
-                "recovery_e2e_s=%.2fs network_encode_s=%.2fs rebuild_sd_s=%.2fs "
-                "h2d_s=%.2fs",
+                "recovery_e2e_s=%.2fs network_encode_s=%.2fs net_s=%.2fs encode_s=%.2fs "
+                "rebuild_sd_s=%.2fs h2d_s=%.2fs",
                 ft_context.get("scheme", "FT"),
                 ft_context.get("mode", "unknown"),
                 summary["e2e_s"],
                 summary["pre_network_barrier_s"],
                 summary["recovery_e2e_s"],
                 summary["network_encode_s"],
+                summary["net_s"],
+                summary["encode_s"],
                 summary["rebuild_sd_s"],
                 summary["h2d_s"],
             )
@@ -2293,6 +2341,20 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 summary["h2d_s"],
             )
         clear_ft_load_timing_context()
+        if (
+            ft_context is not None
+            and ft_context.get("scheme") == "ECCHECK"
+            and getattr(args, "use_eccheck", False)
+        ):
+            from megatron.core.dist_checkpointing.strategies.eccheck_manager import (
+                ECCHECKManager,
+            )
+            _eccheck_mgr = ECCHECKManager()
+            logger.debug(
+                "ECCHECK: deferred post-H2D cleanup on rank %d", rank
+            )
+            _eccheck_mgr.cleanup()
+            _eccheck_mgr._eccheck_native = None
 
     # rerun state
     if not ignore_rerun_state:

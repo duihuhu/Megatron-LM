@@ -46,8 +46,14 @@ export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
 # 基础端口号，每个 rank 占用 100 个端口范围以避免冲突
 # export GEMINI_REPLICAS_BASE_PORT=12345
 
-MASTER_PORT=6000
-NNODES=8
+MASTER_PORT=${MASTER_PORT:-6000}
+NNODES=${NNODES:-8}
+
+# Gemini uses one shared port namespace per distributed job.
+# Keep the same base ports on all simulated nodes; change these env vars only
+# when running another independent job on the same machine.
+export GEMINI_REPLICAS_BASE_PORT=${GEMINI_REPLICAS_BASE_PORT:-$((MASTER_PORT + 30000))}
+export GEMINI_REPLICAS_RECOVERY_BASE_PORT=${GEMINI_REPLICAS_RECOVERY_BASE_PORT:-$((MASTER_PORT + 40000))}
 
 # ---- 节点 rank 解析（第一个参数） ----
 NODE_RANK=0
@@ -78,6 +84,23 @@ GPUS_PER_NODE=${#GPU_IDS[@]}
 export CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_IDS[*]}")
 export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+
+check_gemini_port_free() {
+    local port=$1
+    local label=$2
+    if ss -ltn "sport = :${port}" | grep -q ":${port} "; then
+        echo "Error: ${label} port ${port} is already in use." >&2
+        echo "Another Gemini job or stale process is probably still listening." >&2
+        echo "Use a different MASTER_PORT/GEMINI_REPLICAS_BASE_PORT, or stop the old job." >&2
+        exit 1
+    fi
+}
+
+for ((local_idx=0; local_idx<GPUS_PER_NODE; local_idx++)); do
+    global_rank=$((NODE_RANK * GPUS_PER_NODE + local_idx))
+    check_gemini_port_free $((GEMINI_REPLICAS_BASE_PORT + global_rank * 100)) "Gemini save"
+    check_gemini_port_free $((GEMINI_REPLICAS_RECOVERY_BASE_PORT + global_rank * 100)) "Gemini recovery"
+done
 
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
@@ -260,6 +283,7 @@ fi
 
 echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (Gemini Replicas Legacy)"
 echo "WORLD_SIZE=$WORLD_SIZE  GPUS_PER_NODE=$GPUS_PER_NODE  NNODES=$NNODES"
+echo "GEMINI_REPLICAS_BASE_PORT=$GEMINI_REPLICAS_BASE_PORT  GEMINI_REPLICAS_RECOVERY_BASE_PORT=$GEMINI_REPLICAS_RECOVERY_BASE_PORT"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 
 export USE_FLASH_ATTN=1 && \

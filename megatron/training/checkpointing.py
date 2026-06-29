@@ -2294,6 +2294,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     if ft_timing_enabled:
         h2d_total_s = h2d_model_s + h2d_optimizer_s
+        logger.info(
+            "[rank %d] FT load h2d local: model=%.4fs optimizer=%.4fs total=%.4fs",
+            rank, h2d_model_s, h2d_optimizer_s, h2d_total_s,
+        )
         from megatron.training.global_vars import (
             clear_ft_load_timing_context,
             get_ft_load_timing_context,

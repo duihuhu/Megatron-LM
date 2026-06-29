@@ -518,8 +518,9 @@ public:
         recovery_workers_stop_ = true;
         helper_cv_.notify_all();
         decoder_cv_.notify_all();
+        decoder_send_cv_.notify_all();
         failed_cv_.notify_all();
-        recovery_wait_cv_.notify_all();
+        recovery_batch_cv_.notify_all();
         recovery_workers_join_();
     }
 
@@ -816,18 +817,28 @@ public:
         }
     }
 
-    void reset_recovery_batch() {
-        if (recovery_batch_active_)
-            throw std::runtime_error("FRCheck: recovery batch already active");
+    uint64_t begin_recovery_batch() {
         if (encoding_batch_active_)
             throw std::runtime_error("FRCheck: encode batch active, cannot start recovery batch");
-
         ensure_recovery_workers_();
-        reset_recovery_completion_();
-        recovery_batch_active_ = true;
+        reset_recovery_batch_profile_();
+        uint64_t batch_id = next_recovery_batch_id_.fetch_add(1, std::memory_order_acq_rel);
+        {
+            std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+            recovery_batches_[batch_id] = RecoveryBatchState{};
+        }
+        return batch_id;
     }
 
-    void submit_recovery_stripe(
+    void reset_recovery_batch() {
+        if (legacy_recovery_batch_active_)
+            throw std::runtime_error("FRCheck: recovery batch already active");
+        legacy_recovery_batch_id_ = begin_recovery_batch();
+        legacy_recovery_batch_active_ = true;
+    }
+
+    void submit_recovery_stripe_to_batch(
+        uint64_t batch_id,
         int stripe_id,
         size_t block_size,
         uintptr_t helper_block_addr,
@@ -842,8 +853,7 @@ public:
         bool active)
     {
         if (stopped_) return;
-        if (!recovery_batch_active_)
-            throw std::runtime_error("FRCheck: submit_recovery_stripe without reset_recovery_batch");
+        ensure_recovery_batch_exists_(batch_id);
         if (stripe_id < 0 || stripe_id >= (int)recovery_plans_.size())
             throw std::runtime_error("FRCheck: invalid recovery stripe_id");
 
@@ -862,22 +872,23 @@ public:
 
         if (is_helper() && helper_block_addr != 0) {
             RecoveryHelperTask task;
+            task.batch_id = batch_id;
             task.stripe_id = stripe_id;
             task.block_size = block_size;
             task.helper_block = helper_block_addr;
             task.decoder_rig = plan.decoder_node - 1;
+            recovery_batch_add_expected_(batch_id, 1);
             pending_recovery_chunks_.fetch_add(1, std::memory_order_acq_rel);
             {
                 std::lock_guard<std::mutex> lk(helper_mtx_);
                 helper_q_.push(std::move(task));
-                wait_helper_ = true;
-                helper_completed_ = false;
             }
             helper_cv_.notify_all();
         }
 
         if (my_node == plan.decoder_node && decoder_self_block_addr != 0) {
             RecoveryDecoderTask task;
+            task.batch_id = batch_id;
             task.stripe_id = stripe_id;
             task.block_size = block_size;
             task.self_block = decoder_self_block_addr;
@@ -896,12 +907,12 @@ public:
                     task.failed_rigs.push_back(ft.failed_node - 1);
                 }
             }
-            pending_recovery_chunks_.fetch_add(1, std::memory_order_acq_rel);
+            int decoder_outputs = plan.dual_failure ? (int)plan.failed_targets.size() : 1;
+            recovery_batch_add_expected_(batch_id, decoder_outputs);
+            pending_recovery_chunks_.fetch_add(decoder_outputs, std::memory_order_acq_rel);
             {
                 std::lock_guard<std::mutex> lk(decoder_mtx_);
                 decoder_q_.push(std::move(task));
-                wait_decoder_ = true;
-                decoder_completed_ = false;
             }
             decoder_cv_.notify_all();
         }
@@ -909,6 +920,7 @@ public:
         if (!plan.dual_failure) {
             if (my_node == plan.failed_node && failed_recv_buf_addr != 0) {
                 RecoveryFailedTask task;
+                task.batch_id = batch_id;
                 task.stripe_id = stripe_id;
                 task.block_size = block_size;
                 task.recv_buf = failed_recv_buf_addr;
@@ -917,12 +929,11 @@ public:
                 task.layer_offset = failed_layer_offset;
                 task.ncopy = failed_ncopy;
                 task.store_to_layer = store_to_layer_buf;
+                recovery_batch_add_expected_(batch_id, 1);
                 pending_recovery_chunks_.fetch_add(1, std::memory_order_acq_rel);
                 {
                     std::lock_guard<std::mutex> lk(failed_mtx_);
                     failed_q_.push(std::move(task));
-                    wait_failed_ = true;
-                    failed_completed_ = false;
                 }
                 failed_cv_.notify_all();
             }
@@ -931,6 +942,7 @@ public:
                 if (my_node != ft.failed_node || failed_recv_buf_addr == 0)
                     continue;
                 RecoveryFailedTask task;
+                task.batch_id = batch_id;
                 task.stripe_id = stripe_id;
                 task.block_size = block_size;
                 task.recv_buf = failed_recv_buf_addr;
@@ -939,12 +951,11 @@ public:
                 task.layer_offset = failed_layer_offset;
                 task.ncopy = failed_ncopy;
                 task.store_to_layer = store_to_layer_buf;
+                recovery_batch_add_expected_(batch_id, 1);
                 pending_recovery_chunks_.fetch_add(1, std::memory_order_acq_rel);
                 {
                     std::lock_guard<std::mutex> lk(failed_mtx_);
                     failed_q_.push(std::move(task));
-                    wait_failed_ = true;
-                    failed_completed_ = false;
                 }
                 failed_cv_.notify_all();
                 break;
@@ -952,40 +963,66 @@ public:
         }
     }
 
-    void submit_recovery_sentinel() {
-        RecoveryHelperTask h_sentinel{};
-        RecoveryDecoderTask d_sentinel{};
-        RecoveryFailedTask f_sentinel{};
-        if (wait_helper_) {
-            std::lock_guard<std::mutex> lk(helper_mtx_);
-            for (size_t i = 0; i < helper_threads_.size(); ++i)
-                helper_q_.push(h_sentinel);
-        }
-        if (wait_decoder_) {
-            std::lock_guard<std::mutex> lk(decoder_mtx_);
-            for (size_t i = 0; i < decoder_threads_.size(); ++i)
-                decoder_q_.push(d_sentinel);
-        }
-        if (wait_failed_) {
-            std::lock_guard<std::mutex> lk(failed_mtx_);
-            for (size_t i = 0; i < failed_threads_.size(); ++i)
-                failed_q_.push(f_sentinel);
-        }
-        helper_cv_.notify_all();
-        decoder_cv_.notify_all();
-        failed_cv_.notify_all();
-        maybe_complete_recovery_batch_();
+    void submit_recovery_stripe(
+        int stripe_id,
+        size_t block_size,
+        uintptr_t helper_block_addr,
+        uintptr_t decoder_self_block_addr,
+        const std::vector<uintptr_t>& decoder_helper_recv_addrs,
+        const std::vector<uintptr_t>& decoder_recovered_addrs,
+        uintptr_t failed_recv_buf_addr,
+        uintptr_t failed_layer_buf_addr,
+        size_t failed_layer_offset,
+        size_t failed_ncopy,
+        bool store_to_layer_buf,
+        bool active)
+    {
+        if (!legacy_recovery_batch_active_)
+            throw std::runtime_error("FRCheck: submit_recovery_stripe without reset_recovery_batch");
+        submit_recovery_stripe_to_batch(
+            legacy_recovery_batch_id_, stripe_id, block_size, helper_block_addr,
+            decoder_self_block_addr, decoder_helper_recv_addrs, decoder_recovered_addrs,
+            failed_recv_buf_addr, failed_layer_buf_addr, failed_layer_offset,
+            failed_ncopy, store_to_layer_buf, active);
     }
 
-    void wait_recovery_batch() {
-        std::unique_lock<std::mutex> lk(recovery_wait_mtx_);
-        recovery_wait_cv_.wait(lk, [this] {
-            return stopped_.load() || recovery_batch_completed_;
+    void end_recovery_batch(uint64_t batch_id) {
+        {
+            std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+            auto it = recovery_batches_.find(batch_id);
+            if (it == recovery_batches_.end())
+                throw std::runtime_error("FRCheck: unknown recovery batch id");
+            it->second.closed = true;
+        }
+        recovery_batch_cv_.notify_all();
+    }
+
+    void wait_recovery_batch_id(uint64_t batch_id) {
+        std::unique_lock<std::mutex> lk(recovery_batch_mtx_);
+        recovery_batch_cv_.wait(lk, [&] {
+            if (stopped_.load()) return true;
+            auto it = recovery_batches_.find(batch_id);
+            return it != recovery_batches_.end() && it->second.closed &&
+                   it->second.done >= it->second.expected;
         });
-        recovery_batch_active_ = false;
+        recovery_batches_.erase(batch_id);
         lk.unlock();
         print_recovery_batch_profile_();
     }
+
+    void submit_recovery_sentinel() {
+        if (!legacy_recovery_batch_active_)
+            throw std::runtime_error("FRCheck: submit_recovery_sentinel without reset_recovery_batch");
+        end_recovery_batch(legacy_recovery_batch_id_);
+    }
+
+    void wait_recovery_batch() {
+        if (!legacy_recovery_batch_active_)
+            throw std::runtime_error("FRCheck: wait_recovery_batch without reset_recovery_batch");
+        wait_recovery_batch_id(legacy_recovery_batch_id_);
+        legacy_recovery_batch_active_ = false;
+    }
+
 
     // ---- StripePlan queries for Python ----
     int get_role_for_stripe(int stripe_id) const {
@@ -2147,7 +2184,14 @@ public:
     }
 
     // ---- Recovery worker tasks ----
+    struct RecoveryBatchState {
+        int expected = 0;
+        int done = 0;
+        bool closed = false;
+    };
+
     struct RecoveryHelperTask {
+        uint64_t batch_id = 0;
         int stripe_id = 0;
         size_t block_size = 0;
         uintptr_t helper_block = 0;
@@ -2155,6 +2199,7 @@ public:
     };
 
     struct RecoveryDecoderTask {
+        uint64_t batch_id = 0;
         int stripe_id = 0;
         size_t block_size = 0;
         uintptr_t self_block = 0;
@@ -2168,7 +2213,16 @@ public:
         std::vector<int> failed_rigs;
     };
 
+    struct RecoveryDecoderSendTask {
+        uint64_t batch_id = 0;
+        int stripe_id = 0;
+        size_t block_size = 0;
+        uintptr_t recovered_buf = 0;
+        int failed_rig = -1;
+    };
+
     struct RecoveryFailedTask {
+        uint64_t batch_id = 0;
         int stripe_id = 0;
         size_t block_size = 0;
         uintptr_t recv_buf = 0;
@@ -2331,31 +2385,50 @@ public:
             recovery_decoder_decode_us_.fetch_add(frcheck_now_us() - t_decode, std::memory_order_relaxed);
             if (task.failed_rigs.empty())
                 throw std::runtime_error("FRCheck recovery: missing failed rig");
-            uint64_t t_send = frcheck_now_us();
-            send_to_peer(task.failed_rigs[0], task.stripe_id,
-                         task.recovered_bufs[0], task.block_size);
-            recovery_decoder_send_us_.fetch_add(frcheck_now_us() - t_send, std::memory_order_relaxed);
+            enqueue_recovery_decoder_send_(
+                task.batch_id, task.stripe_id, task.block_size,
+                task.recovered_bufs[0], task.failed_rigs[0]);
         } else {
             if (task.recovered_bufs.size() < task.failed_positions.size())
                 throw std::runtime_error("FRCheck recovery: insufficient recovered buffers");
-            std::vector<std::thread> send_threads;
             for (size_t slot = 0; slot < task.failed_positions.size(); ++slot) {
                 uint64_t t_decode = frcheck_now_us();
                 submit_stripe_decode(
                     k, task.survivor_positions, task.failed_positions[slot],
                     survivor_addrs, task.recovered_bufs[slot], task.block_size);
                 recovery_decoder_decode_us_.fetch_add(frcheck_now_us() - t_decode, std::memory_order_relaxed);
-                int frig = task.failed_rigs[slot];
-                uintptr_t rec = task.recovered_bufs[slot];
-                send_threads.emplace_back([this, frig, rec, sid = task.stripe_id, bs = task.block_size]() {
-                    uint64_t t_send = frcheck_now_us();
-                    send_to_peer(frig, sid, rec, bs);
-                    recovery_decoder_send_us_.fetch_add(frcheck_now_us() - t_send, std::memory_order_relaxed);
-                });
+                enqueue_recovery_decoder_send_(
+                    task.batch_id, task.stripe_id, task.block_size,
+                    task.recovered_bufs[slot], task.failed_rigs[slot]);
             }
-            for (auto& t : send_threads) t.join();
         }
         recovery_decoder_tasks_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void enqueue_recovery_decoder_send_(
+        uint64_t batch_id,
+        int stripe_id,
+        size_t block_size,
+        uintptr_t recovered_buf,
+        int failed_rig) {
+        RecoveryDecoderSendTask task;
+        task.batch_id = batch_id;
+        task.stripe_id = stripe_id;
+        task.block_size = block_size;
+        task.recovered_buf = recovered_buf;
+        task.failed_rig = failed_rig;
+        {
+            std::lock_guard<std::mutex> lk(decoder_send_mtx_);
+            decoder_send_q_.push(std::move(task));
+        }
+        decoder_send_cv_.notify_one();
+    }
+
+    void execute_recovery_decoder_send_(const RecoveryDecoderSendTask& task) {
+        uint64_t t_send = frcheck_now_us();
+        send_to_peer(task.failed_rig, task.stripe_id,
+                     task.recovered_buf, task.block_size);
+        recovery_decoder_send_us_.fetch_add(frcheck_now_us() - t_send, std::memory_order_relaxed);
     }
 
     void execute_recovery_failed_(const RecoveryFailedTask& task) {
@@ -2386,11 +2459,6 @@ public:
                 task = helper_q_.front();
                 helper_q_.pop();
             }
-            if (is_recovery_helper_sentinel_(task)) {
-                helper_sentinels_received_.fetch_add(1, std::memory_order_acq_rel);
-                maybe_complete_helper_after_sentinel_();
-                continue;
-            }
             helper_active_.fetch_add(1, std::memory_order_acq_rel);
             try {
                 execute_recovery_helper_(task);
@@ -2399,6 +2467,7 @@ public:
                 pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
                 if (recovery_workers_stop_) return;
                 std::cerr << "FRCheck helper_worker: " << e.what() << std::endl;
+                recovery_batch_mark_done_(task.batch_id);
                 return;
             } catch (...) {
                 helper_active_.fetch_sub(1, std::memory_order_acq_rel);
@@ -2408,7 +2477,7 @@ public:
             }
             helper_active_.fetch_sub(1, std::memory_order_acq_rel);
             pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-            maybe_complete_helper_after_sentinel_();
+            recovery_batch_mark_done_(task.batch_id);
         }
     }
 
@@ -2424,11 +2493,6 @@ public:
                 task = decoder_q_.front();
                 decoder_q_.pop();
             }
-            if (is_recovery_decoder_sentinel_(task)) {
-                decoder_sentinels_received_.fetch_add(1, std::memory_order_acq_rel);
-                maybe_complete_decoder_after_sentinel_();
-                continue;
-            }
             decoder_active_.fetch_add(1, std::memory_order_acq_rel);
             try {
                 execute_recovery_decoder_(task);
@@ -2437,6 +2501,7 @@ public:
                 pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
                 if (recovery_workers_stop_) return;
                 std::cerr << "FRCheck decoder_worker: " << e.what() << std::endl;
+                recovery_batch_mark_done_(task.batch_id);
                 return;
             } catch (...) {
                 decoder_active_.fetch_sub(1, std::memory_order_acq_rel);
@@ -2445,8 +2510,40 @@ public:
                 throw;
             }
             decoder_active_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+
+    void decoder_send_worker_loop_() {
+        while (!recovery_workers_stop_) {
+            RecoveryDecoderSendTask task;
+            {
+                std::unique_lock<std::mutex> lk(decoder_send_mtx_);
+                decoder_send_cv_.wait(lk, [this] {
+                    return recovery_workers_stop_ || !decoder_send_q_.empty();
+                });
+                if (recovery_workers_stop_) break;
+                task = decoder_send_q_.front();
+                decoder_send_q_.pop();
+            }
+            decoder_send_active_.fetch_add(1, std::memory_order_acq_rel);
+            try {
+                execute_recovery_decoder_send_(task);
+            } catch (const std::exception& e) {
+                decoder_send_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (recovery_workers_stop_) return;
+                std::cerr << "FRCheck decoder_send_worker: " << e.what() << std::endl;
+                recovery_batch_mark_done_(task.batch_id);
+                return;
+            } catch (...) {
+                decoder_send_active_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (recovery_workers_stop_) return;
+                throw;
+            }
+            decoder_send_active_.fetch_sub(1, std::memory_order_acq_rel);
             pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-            maybe_complete_decoder_after_sentinel_();
+            recovery_batch_mark_done_(task.batch_id);
         }
     }
 
@@ -2462,11 +2559,6 @@ public:
                 task = failed_q_.front();
                 failed_q_.pop();
             }
-            if (is_recovery_failed_sentinel_(task)) {
-                failed_sentinels_received_.fetch_add(1, std::memory_order_acq_rel);
-                maybe_complete_failed_after_sentinel_();
-                continue;
-            }
             failed_active_.fetch_add(1, std::memory_order_acq_rel);
             try {
                 execute_recovery_failed_(task);
@@ -2475,6 +2567,7 @@ public:
                 pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
                 if (recovery_workers_stop_) return;
                 std::cerr << "FRCheck failed_worker: " << e.what() << std::endl;
+                recovery_batch_mark_done_(task.batch_id);
                 return;
             } catch (...) {
                 failed_active_.fetch_sub(1, std::memory_order_acq_rel);
@@ -2484,7 +2577,7 @@ public:
             }
             failed_active_.fetch_sub(1, std::memory_order_acq_rel);
             pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
-            maybe_complete_failed_after_sentinel_();
+            recovery_batch_mark_done_(task.batch_id);
         }
     }
 
@@ -2498,6 +2591,7 @@ public:
         for (int w = 0; w < nw; ++w) {
             helper_threads_.emplace_back(&FRCheckNative::helper_worker_loop_, this);
             decoder_threads_.emplace_back(&FRCheckNative::decoder_worker_loop_, this);
+            decoder_send_threads_.emplace_back(&FRCheckNative::decoder_send_worker_loop_, this);
             failed_threads_.emplace_back(&FRCheckNative::failed_worker_loop_, this);
         }
         recovery_workers_inited_ = true;
@@ -2508,60 +2602,13 @@ public:
     void recovery_workers_join_() {
         for (auto& t : helper_threads_) if (t.joinable()) t.join();
         for (auto& t : decoder_threads_) if (t.joinable()) t.join();
+        for (auto& t : decoder_send_threads_) if (t.joinable()) t.join();
         for (auto& t : failed_threads_) if (t.joinable()) t.join();
         helper_threads_.clear();
         decoder_threads_.clear();
+        decoder_send_threads_.clear();
         failed_threads_.clear();
         recovery_workers_inited_ = false;
-    }
-
-    void notify_recovery_wait_() { recovery_wait_cv_.notify_all(); }
-
-    void maybe_complete_recovery_batch_() {
-        if (pending_recovery_chunks_.load(std::memory_order_acquire) != 0) return;
-        if (helper_active_.load(std::memory_order_acquire) != 0) return;
-        if (decoder_active_.load(std::memory_order_acquire) != 0) return;
-        if (failed_active_.load(std::memory_order_acquire) != 0) return;
-        if (wait_helper_ && !helper_completed_) return;
-        if (wait_decoder_ && !decoder_completed_) return;
-        if (wait_failed_ && !failed_completed_) return;
-        std::lock_guard<std::mutex> lk(recovery_wait_mtx_);
-        if (recovery_batch_completed_) return;
-        recovery_batch_completed_ = true;
-        notify_recovery_wait_();
-    }
-
-    void maybe_complete_helper_after_sentinel_() {
-        if (helper_sentinels_received_.load(std::memory_order_acquire)
-            < (int)helper_threads_.size()) return;
-        if (helper_active_.load(std::memory_order_acquire) != 0) return;
-        std::lock_guard<std::mutex> lk(helper_mtx_);
-        if (helper_q_.empty()) {
-            helper_completed_ = true;
-            maybe_complete_recovery_batch_();
-        }
-    }
-
-    void maybe_complete_decoder_after_sentinel_() {
-        if (decoder_sentinels_received_.load(std::memory_order_acquire)
-            < (int)decoder_threads_.size()) return;
-        if (decoder_active_.load(std::memory_order_acquire) != 0) return;
-        std::lock_guard<std::mutex> lk(decoder_mtx_);
-        if (decoder_q_.empty()) {
-            decoder_completed_ = true;
-            maybe_complete_recovery_batch_();
-        }
-    }
-
-    void maybe_complete_failed_after_sentinel_() {
-        if (failed_sentinels_received_.load(std::memory_order_acquire)
-            < (int)failed_threads_.size()) return;
-        if (failed_active_.load(std::memory_order_acquire) != 0) return;
-        std::lock_guard<std::mutex> lk(failed_mtx_);
-        if (failed_q_.empty()) {
-            failed_completed_ = true;
-            maybe_complete_recovery_batch_();
-        }
     }
 
     void reset_recovery_batch_profile_() {
@@ -2598,22 +2645,39 @@ public:
                   << std::endl;
     }
 
+    void ensure_recovery_batch_exists_(uint64_t batch_id) {
+        std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+        if (recovery_batches_.find(batch_id) == recovery_batches_.end())
+            throw std::runtime_error("FRCheck: unknown recovery batch id");
+    }
+
+    void recovery_batch_add_expected_(uint64_t batch_id, int count) {
+        if (count <= 0) return;
+        {
+            std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+            auto it = recovery_batches_.find(batch_id);
+            if (it == recovery_batches_.end())
+                throw std::runtime_error("FRCheck: unknown recovery batch id");
+            it->second.expected += count;
+        }
+        recovery_batch_cv_.notify_all();
+    }
+
+    void recovery_batch_mark_done_(uint64_t batch_id) {
+        {
+            std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+            auto it = recovery_batches_.find(batch_id);
+            if (it != recovery_batches_.end())
+                it->second.done += 1;
+        }
+        recovery_batch_cv_.notify_all();
+    }
+
     void reset_recovery_completion_() {
-        recovery_batch_completed_ = false;
         pending_recovery_chunks_.store(0, std::memory_order_release);
         helper_active_.store(0, std::memory_order_release);
         decoder_active_.store(0, std::memory_order_release);
         failed_active_.store(0, std::memory_order_release);
-        wait_helper_ = false;
-        wait_decoder_ = false;
-        wait_failed_ = false;
-        helper_completed_ = false;
-        decoder_completed_ = false;
-        failed_completed_ = false;
-        helper_sentinels_received_.store(0, std::memory_order_release);
-        decoder_sentinels_received_.store(0, std::memory_order_release);
-        failed_sentinels_received_.store(0, std::memory_order_release);
-        reset_recovery_batch_profile_();
         {
             std::lock_guard<std::mutex> lk(helper_mtx_);
             while (!helper_q_.empty()) helper_q_.pop();
@@ -2621,6 +2685,10 @@ public:
         {
             std::lock_guard<std::mutex> lk(decoder_mtx_);
             while (!decoder_q_.empty()) decoder_q_.pop();
+        }
+        {
+            std::lock_guard<std::mutex> lk(decoder_send_mtx_);
+            while (!decoder_send_q_.empty()) decoder_send_q_.pop();
         }
         {
             std::lock_guard<std::mutex> lk(failed_mtx_);
@@ -2847,38 +2915,36 @@ private:
     // Hardware recovery
     std::vector<RecoveryStripePlan> recovery_plans_;
     bool recovery_dual_failure_ = false;
-    bool recovery_batch_active_ = false;
+    bool legacy_recovery_batch_active_ = false;
+    uint64_t legacy_recovery_batch_id_ = 0;
+    std::atomic<uint64_t> next_recovery_batch_id_{1};
+    std::unordered_map<uint64_t, RecoveryBatchState> recovery_batches_;
+    std::mutex recovery_batch_mtx_;
+    std::condition_variable recovery_batch_cv_;
     bool encoding_batch_active_ = false;
     bool recovery_workers_inited_ = false;
     std::atomic<bool> recovery_workers_stop_{false};
     std::queue<RecoveryHelperTask> helper_q_;
     std::mutex helper_mtx_;
     std::condition_variable helper_cv_;
-    std::atomic<int> helper_sentinels_received_{0};
-    bool helper_completed_ = false;
-    bool wait_helper_ = false;
     std::queue<RecoveryDecoderTask> decoder_q_;
     std::mutex decoder_mtx_;
     std::condition_variable decoder_cv_;
-    std::atomic<int> decoder_sentinels_received_{0};
-    bool decoder_completed_ = false;
-    bool wait_decoder_ = false;
+    std::queue<RecoveryDecoderSendTask> decoder_send_q_;
+    std::mutex decoder_send_mtx_;
+    std::condition_variable decoder_send_cv_;
     std::queue<RecoveryFailedTask> failed_q_;
     std::mutex failed_mtx_;
     std::condition_variable failed_cv_;
-    std::atomic<int> failed_sentinels_received_{0};
-    bool failed_completed_ = false;
-    bool wait_failed_ = false;
     std::vector<std::thread> helper_threads_;
     std::vector<std::thread> decoder_threads_;
+    std::vector<std::thread> decoder_send_threads_;
     std::vector<std::thread> failed_threads_;
     std::atomic<int> pending_recovery_chunks_{0};
     std::atomic<int> helper_active_{0};
     std::atomic<int> decoder_active_{0};
+    std::atomic<int> decoder_send_active_{0};
     std::atomic<int> failed_active_{0};
-    bool recovery_batch_completed_ = false;
-    std::mutex recovery_wait_mtx_;
-    std::condition_variable recovery_wait_cv_;
     std::atomic<uint64_t> recovery_helper_send_us_{0};
     std::atomic<uint64_t> recovery_decoder_recv_us_{0};
     std::atomic<uint64_t> recovery_decoder_decode_us_{0};
@@ -2974,8 +3040,27 @@ PYBIND11_MODULE(frcheck_native, m) {
         // Hardware recovery batch pipeline
         .def("init_recovery_plans", &FRCheckNative::init_recovery_plans,
              py::arg("failed_nodes_1based"))
+        .def("begin_recovery_batch", &FRCheckNative::begin_recovery_batch)
+        .def("end_recovery_batch", &FRCheckNative::end_recovery_batch,
+             py::arg("batch_id"))
+        .def("wait_recovery_batch_id", &FRCheckNative::wait_recovery_batch_id,
+             py::arg("batch_id"), py::call_guard<py::gil_scoped_release>())
         .def("reset_recovery_batch", &FRCheckNative::reset_recovery_batch)
         .def("submit_recovery_stripe", &FRCheckNative::submit_recovery_stripe,
+             py::arg("stripe_id"),
+             py::arg("block_size"),
+             py::arg("helper_block_addr"),
+             py::arg("decoder_self_block_addr"),
+             py::arg("decoder_helper_recv_addrs"),
+             py::arg("decoder_recovered_addrs"),
+             py::arg("failed_recv_buf_addr"),
+             py::arg("failed_layer_buf_addr"),
+             py::arg("failed_layer_offset"),
+             py::arg("failed_ncopy"),
+             py::arg("store_to_layer_buf"),
+             py::arg("active") = true)
+        .def("submit_recovery_stripe_to_batch", &FRCheckNative::submit_recovery_stripe_to_batch,
+             py::arg("batch_id"),
              py::arg("stripe_id"),
              py::arg("block_size"),
              py::arg("helper_block_addr"),

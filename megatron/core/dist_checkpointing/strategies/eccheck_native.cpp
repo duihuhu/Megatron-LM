@@ -646,6 +646,13 @@ private:
     std::atomic<uint64_t> load_rank2_rdma_poll_step2_p2p_recv_ns_{0};
     std::atomic<uint64_t> load_rank2_rdma_poll_step6_p2p_recv_ns_{0};
 
+    // Load net: wall from earliest load network op start to latest op end.
+    std::mutex load_net_wall_mu_;
+    bool load_net_wall_have_any_{false};
+    std::chrono::steady_clock::time_point load_net_wall_first_{};
+    std::chrono::steady_clock::time_point load_net_wall_last_{};
+    std::atomic<uint64_t> load_net_wall_span_ns_{0};
+
     std::atomic<uint64_t> save_encode_total_ns_{0};
     std::atomic<size_t> save_encode_op_count_{0};
 
@@ -693,13 +700,36 @@ private:
         save_net_wall_span_ns_.store(span_ns, std::memory_order_relaxed);
     }
 
+    void touch_load_net_wall_(
+        std::chrono::steady_clock::time_point t0,
+        std::chrono::steady_clock::time_point t1) {
+        std::lock_guard<std::mutex> lk(load_net_wall_mu_);
+        if (!load_net_wall_have_any_) {
+            load_net_wall_first_ = t0;
+            load_net_wall_last_ = t1;
+            load_net_wall_have_any_ = true;
+        } else {
+            if (t0 < load_net_wall_first_) {
+                load_net_wall_first_ = t0;
+            }
+            if (t1 > load_net_wall_last_) {
+                load_net_wall_last_ = t1;
+            }
+        }
+        const uint64_t span_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                load_net_wall_last_ - load_net_wall_first_).count());
+        load_net_wall_span_ns_.store(span_ns, std::memory_order_relaxed);
+    }
+
     struct SaveEncodeScopeTimer {
         ECCHECKNative* owner;
         std::chrono::steady_clock::time_point t0;
-        explicit SaveEncodeScopeTimer(ECCHECKNative* o)
-            : owner(o), t0(std::chrono::steady_clock::now()) {}
+        bool record;
+        explicit SaveEncodeScopeTimer(ECCHECKNative* o, bool should_record = true)
+            : owner(o), t0(std::chrono::steady_clock::now()), record(should_record) {}
         ~SaveEncodeScopeTimer() {
-            if (owner != nullptr && !owner->is_load_mode_) {
+            if (record && owner != nullptr && !owner->is_load_mode_) {
                 const auto t1 = std::chrono::steady_clock::now();
                 const uint64_t ns = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
@@ -1610,11 +1640,11 @@ private:
         // Load mode: optional 16-thread striped pool (ECCHECK_ENCODE_CPU_LIST).
 
         if (ec_rs_encode_pool_inited_.load(std::memory_order_acquire)) {
-            // Save path: count only actual pool execution, not time waiting for the serialized dispatch mutex.
+            // Save path: report one parity lane only, not both overlapped/serialized lanes.
             std::lock_guard<std::mutex> work_lk(ec_rs_encode_pool_work_mutex_);
-            SaveEncodeScopeTimer encode_timer(this);
             int parity_idx = coefficient;
             if (parity_idx < 0 || parity_idx >= rows_) parity_idx = 0;
+            SaveEncodeScopeTimer encode_timer(this, parity_idx == 0);
             if (data_block_index_ >= 0 && data_block_index_ < k_) {
                 size_t tbl_off = (static_cast<size_t>(parity_idx * k_ + data_block_index_)) * 32u;
                 ec_rs_encode_pool_run_parallel(data_addr, encoding_addr, size, g_tbls_ + tbl_off);
@@ -3564,6 +3594,11 @@ public:
         load_rank2_rdma_poll_enc_xor_recv_ns_.store(0, std::memory_order_relaxed);
         load_rank2_rdma_poll_step2_p2p_recv_ns_.store(0, std::memory_order_relaxed);
         load_rank2_rdma_poll_step6_p2p_recv_ns_.store(0, std::memory_order_relaxed);
+        load_net_wall_span_ns_.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(load_net_wall_mu_);
+            load_net_wall_have_any_ = false;
+        }
         save_encode_total_ns_.store(0, std::memory_order_relaxed);
         save_encode_op_count_.store(0, std::memory_order_relaxed);
         save_net_wall_span_ns_.store(0, std::memory_order_relaxed);
@@ -3918,17 +3953,8 @@ public:
         double net_s = 0.0;
         double encode_s = 0.0;
         if (is_load_mode_) {
-            const uint64_t net_ns =
-                load_enc_xor_send_total_ns_.load(std::memory_order_relaxed) +
-                load_enc_xor_recv_total_ns_.load(std::memory_order_relaxed) +
-                load_step2_p2p_send_total_ns_.load(std::memory_order_relaxed) +
-                load_step2_p2p_recv_total_ns_.load(std::memory_order_relaxed) +
-                load_step6_p2p_send_total_ns_.load(std::memory_order_relaxed) +
-                load_step6_p2p_recv_total_ns_.load(std::memory_order_relaxed) +
-                load_rank2_rdma_poll_enc_xor_recv_ns_.load(std::memory_order_relaxed) +
-                load_rank2_rdma_poll_step2_p2p_recv_ns_.load(std::memory_order_relaxed) +
-                load_rank2_rdma_poll_step6_p2p_recv_ns_.load(std::memory_order_relaxed);
-            net_s = static_cast<double>(net_ns) / 1e9;
+            net_s = static_cast<double>(
+                load_net_wall_span_ns_.load(std::memory_order_relaxed)) / 1e9;
             const uint64_t enc_total_ns =
                 load_encode_total_ns_.load(std::memory_order_relaxed) +
                 load_xor_total_ns_.load(std::memory_order_relaxed);
@@ -4088,6 +4114,11 @@ public:
             load_rank2_rdma_poll_enc_xor_recv_ns_.store(0, std::memory_order_relaxed);
             load_rank2_rdma_poll_step2_p2p_recv_ns_.store(0, std::memory_order_relaxed);
             load_rank2_rdma_poll_step6_p2p_recv_ns_.store(0, std::memory_order_relaxed);
+            load_net_wall_span_ns_.store(0, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(load_net_wall_mu_);
+                load_net_wall_have_any_ = false;
+            }
             {
                 std::lock_guard<std::mutex> lk(load_recv_pipeline_e2e_mu_);
                 load_recv_pipeline_e2e_have_any_ = false;
@@ -4599,6 +4630,7 @@ public:
         const char* trace_label = nullptr,
         size_t trace_bytes = 0) {
         const auto t1 = std::chrono::steady_clock::now();
+        touch_load_net_wall_(t0, t1);
         if (update_recv_pipeline_e2e_wall) {
             touch_load_recv_pipeline_e2e_wall_(t0, t1);
         }

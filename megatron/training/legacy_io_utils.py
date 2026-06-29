@@ -146,18 +146,27 @@ def write_block_prepared(path: str, magic: bytes, mv: memoryview, size: int) -> 
 # ---- read helpers -----------------------------------------------------------
 
 def pin_uint8_tensor_if_available(tensor: torch.Tensor) -> torch.Tensor:
-    """Copy a CPU uint8 tensor into pinned memory when CUDA is available."""
+    """Copy a CPU uint8 tensor into H2D-friendly host memory when CUDA is available."""
     if (
         not torch.is_tensor(tensor)
         or tensor.device.type != "cpu"
         or tensor.numel() == 0
         or not torch.cuda.is_available()
-        or tensor.is_pinned()
     ):
         return tensor
+    from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+        allocate_hugepage_tensor,
+        is_hugepage_cuda_registered,
+    )
+
+    if tensor.is_pinned() or is_hugepage_cuda_registered(tensor):
+        return tensor
     try:
-        pinned = torch.empty(tensor.numel(), dtype=torch.uint8, pin_memory=True)
-        pinned.copy_(tensor.contiguous().view(torch.uint8).reshape(-1))
+        flat = tensor.contiguous().view(torch.uint8).reshape(-1)
+        pinned = allocate_hugepage_tensor(
+            flat.numel(), fallback_pin_memory=True, touch_pages=False,
+        )
+        pinned.copy_(flat)
         return pinned
     except Exception as exc:
         logger.warning(

@@ -92,6 +92,13 @@ def _try_cuda_host_unregister_ptr(ptr: int) -> bool:
     return True
 
 
+def is_hugepage_cuda_registered(buffer: torch.Tensor) -> bool:
+    """Return True when *buffer* storage is tracked by cudaHostRegister."""
+    if not torch.is_tensor(buffer):
+        return False
+    return int(buffer.data_ptr()) in _REGISTERED_HOST
+
+
 def release_hugepage_host_registration(buffer: torch.Tensor) -> bool:
     """Release CUDA host registration for a hugetlb-backed allocation."""
     if not torch.is_tensor(buffer):

@@ -7,6 +7,7 @@ independently so per-layer data fits within SOURCE stripe capacity.
 
 import copy
 import pickle
+import queue
 import os
 import re
 import struct
@@ -508,6 +509,28 @@ class _FRCheckLayerRecoveryJob:
     layer_block_size: int
     actual_size: int
     layer_infos: List
+
+
+@dataclass
+class _FRCheckRecoveryWindow:
+    job: _FRCheckLayerRecoveryJob
+    plans: List[Dict[str, Any]]
+    active_by_stripe: Dict[int, bool]
+    wave_idx: int
+    layer_buf: Optional[torch.Tensor]
+    src_block_start: int
+    slot_start: int
+    source_block_indices: Dict[Tuple[int, int], int]
+    decoder_stripes: int
+    helper_stripes: int
+    failed_stripes: int
+    skipped_padding_stripes: int
+
+
+@dataclass
+class _FRCheckRecoveredWindow:
+    window: _FRCheckRecoveryWindow
+    timing: Dict[str, float]
 
 
 def _split_recovered_tensors(
@@ -3033,6 +3056,7 @@ def _allocate_recovery_buf_pool(
     is_decoder: bool,
     is_helper: bool,
     dual_failure: bool = False,
+    concurrency_override: Optional[int] = None,
 ) -> Optional[_RecoveryBufPool]:
     """Pre-allocate stripe recovery buffers once before the per-layer network loop."""
     num_helper = max(n - 3, 0)
@@ -3041,15 +3065,18 @@ def _allocate_recovery_buf_pool(
     if not need_pool:
         return None
 
-    # Match save-side batching: submit all data recovery stripes for a layer in
-    # one native batch.  Each stripe needs a distinct temporary slot until the
-    # batch completes, so default to the number of data/source stripes.
+    # Global recovery submit can keep windows from multiple layers in flight.
+    # Allocate and register all temporary slots once up front; do not allocate
+    # per-window in the network path.
     max_concurrency = max(num_source_stripes, 1)
-    env_concurrency = os.environ.get("FRCHECK_RECOVERY_CONCURRENCY")
-    if env_concurrency:
-        concurrency = max(1, min(int(env_concurrency), max_concurrency))
+    if concurrency_override is not None:
+        concurrency = max(1, int(concurrency_override))
     else:
-        concurrency = max_concurrency
+        env_concurrency = os.environ.get("FRCHECK_RECOVERY_CONCURRENCY")
+        if env_concurrency:
+            concurrency = max(1, min(int(env_concurrency), max_concurrency))
+        else:
+            concurrency = max_concurrency
     decoder_recv_buf_slots: List[List[torch.Tensor]] = []
     if is_decoder and num_helper > 0:
         decoder_recv_buf_slots = [
@@ -3123,7 +3150,7 @@ def _preallocate_stable_failed_layer_bufs(
     num_source_stripes = (n - 1) * (n - 2)
     stable: Dict[int, torch.Tensor] = {}
     for job in jobs:
-        if job.layer_idx < 0 or job.layer_idx in stable:
+        if job.layer_idx in stable:
             continue
         size = num_source_stripes * job.layer_block_size
         buf = allocate_hugepage_tensor(size, fallback_pin_memory=True)
@@ -3232,35 +3259,20 @@ def _make_layer_recovery_job(
     )
 
 
-def _run_layer_recovery_job(
+def _materialize_recovered_layer(
     job: _FRCheckLayerRecoveryJob,
     manager,
-    native,
-    n: int,
-    rank: int,
     is_failed: bool,
-    preloaded: Dict[int, Dict[int, torch.Tensor]],
-    buf_pool: Optional[_RecoveryBufPool],
+    layer_buf: Optional[torch.Tensor],
     full_buf: Optional[torch.Tensor],
     global_tensor_infos: List,
     runtime: Optional[_FRCheckLayerwiseRuntime] = None,
     map_to_full_buf: str = "all",
     clone_runtime_tensors: bool = True,
     recovery_role: str = "unknown",
+    tensor_views_by_key: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Tuple[Optional[_FRCheckLayerReadyRecord], Dict[str, float]]:
-    t_job = time.time()
-    _frcheck_recovery_profile(
-        recovery_role, "job_start", layer=job.layer_name, layer_idx=job.layer_idx,
-        encode_iter=job.encode_iter, map_to_full_buf=map_to_full_buf,
-        preloaded_blocks=len(preloaded.get(job.encode_iter, {})),
-    )
-    layer_buf, layer_timing = _recover_one_layer_network(
-        manager, native, job.layer_name,
-        job.layer_idx, job.layer_block_size, job.actual_size,
-        n, rank, preloaded_blocks=preloaded.get(job.encode_iter, {}),
-        buf_pool=buf_pool, recovery_role=recovery_role,
-    )
-
+    layer_timing: Dict[str, float] = {}
     record = None
     if is_failed and layer_buf is not None and full_buf is not None:
         t_materialize = time.time()
@@ -3275,13 +3287,18 @@ def _run_layer_recovery_job(
             )
             map_s = time.time() - t_map
         t_extract = time.time()
+        need_layer_tensors = (
+            tensor_views_by_key is not None or (runtime is not None and job.layer_idx >= 0)
+        )
         layer_tensors = (
             _extract_layer_tensors_from_buf(
                 layer_buf, job.layer_infos,
                 clone_storage=clone_runtime_tensors,
             )
-            if job.layer_idx >= 0 else None
+            if need_layer_tensors else None
         )
+        if tensor_views_by_key is not None and layer_tensors:
+            tensor_views_by_key.update(layer_tensors)
         extract_s = time.time() - t_extract
         materialize_s = time.time() - t_materialize
         layer_timing["materialize_s"] = materialize_s
@@ -3348,6 +3365,46 @@ def _run_layer_recovery_job(
                 "(expected %d) in %.4fs",
                 job.layer_name, copied, job.actual_size, materialize_s,
             )
+    return record, layer_timing
+
+
+def _run_layer_recovery_job(
+    job: _FRCheckLayerRecoveryJob,
+    manager,
+    native,
+    n: int,
+    rank: int,
+    is_failed: bool,
+    preloaded: Dict[int, Dict[int, torch.Tensor]],
+    buf_pool: Optional[_RecoveryBufPool],
+    full_buf: Optional[torch.Tensor],
+    global_tensor_infos: List,
+    runtime: Optional[_FRCheckLayerwiseRuntime] = None,
+    map_to_full_buf: str = "all",
+    clone_runtime_tensors: bool = True,
+    recovery_role: str = "unknown",
+    tensor_views_by_key: Optional[Dict[str, torch.Tensor]] = None,
+) -> Tuple[Optional[_FRCheckLayerReadyRecord], Dict[str, float]]:
+    t_job = time.time()
+    _frcheck_recovery_profile(
+        recovery_role, "job_start", layer=job.layer_name, layer_idx=job.layer_idx,
+        encode_iter=job.encode_iter, map_to_full_buf=map_to_full_buf,
+        preloaded_blocks=len(preloaded.get(job.encode_iter, {})),
+    )
+    layer_buf, layer_timing = _recover_one_layer_network(
+        manager, native, job.layer_name,
+        job.layer_idx, job.layer_block_size, job.actual_size,
+        n, rank, preloaded_blocks=preloaded.get(job.encode_iter, {}),
+        buf_pool=buf_pool, recovery_role=recovery_role,
+    )
+
+    record, materialize_timing = _materialize_recovered_layer(
+        job, manager, is_failed, layer_buf, full_buf, global_tensor_infos,
+        runtime=runtime, map_to_full_buf=map_to_full_buf,
+        clone_runtime_tensors=clone_runtime_tensors,
+        recovery_role=recovery_role, tensor_views_by_key=tensor_views_by_key,
+    )
+    layer_timing.update(materialize_timing)
     layer_timing["job_total_s"] = time.time() - t_job
     _frcheck_recovery_profile(
         recovery_role, "job_done", layer=job.layer_name, layer_idx=job.layer_idx,
@@ -3356,6 +3413,364 @@ def _run_layer_recovery_job(
         materialize_s=layer_timing.get("materialize_s", 0.0),
     )
     return record, layer_timing
+def _recovery_data_failed_pos(plan: Dict[str, Any], n: int, my_node: int) -> Optional[int]:
+    if plan.get('dual_failure'):
+        positions = [
+            int(target.get('failed_pos', n))
+            for target in plan.get('failed_targets', [])
+            if target.get('failed_node') == my_node
+        ]
+        data_positions = [pos for pos in positions if pos < n - 2]
+        return min(data_positions) if data_positions else None
+    pos = int(plan.get('failed_pos', n))
+    return pos if pos < n - 2 else None
+
+
+def _build_failed_source_block_indices(
+    plans: List[Dict[str, Any]],
+    active_by_stripe: Dict[int, bool],
+    n: int,
+) -> Dict[Tuple[int, int], int]:
+    source_counts: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
+    source_indices: Dict[Tuple[int, int], int] = {}
+    for plan in plans:
+        sid = int(plan['stripe_id'])
+        if not active_by_stripe.get(sid, True):
+            continue
+        if plan.get('dual_failure'):
+            for target in plan.get('failed_targets', []):
+                failed_node = int(target.get('failed_node', -1))
+                original_role = int(target.get('original_role', -1))
+                if original_role != int(StripeRole.SOURCE):
+                    continue
+                source_indices[(sid, failed_node)] = source_counts[failed_node]
+                source_counts[failed_node] += 1
+        else:
+            failed_node = int(plan.get('failed_node', -1))
+            original_role = int(plan.get('original_role', -1))
+            if original_role != int(StripeRole.SOURCE):
+                continue
+            source_indices[(sid, failed_node)] = source_counts[failed_node]
+            source_counts[failed_node] += 1
+    return source_indices
+
+
+def _group_recovery_data_windows_by_column(
+    data_plans: List[Dict[str, Any]],
+    n: int,
+    my_node: int,
+) -> List[List[Dict[str, Any]]]:
+    windows: List[List[Dict[str, Any]]] = []
+    for failed_pos in range(max(n - 2, 0)):
+        column_plans = [
+            plan for plan in data_plans
+            if _recovery_data_failed_pos(plan, n, my_node) == failed_pos
+        ]
+        column_plans.sort(key=lambda plan: int(plan['stripe_id']))
+        for start in range(0, len(column_plans), max(n - 1, 1)):
+            windows.append(column_plans[start:start + max(n - 1, 1)])
+    return windows
+
+
+
+
+def _iter_recovery_windows_for_job(
+    job: _FRCheckLayerRecoveryJob,
+    manager,
+    native,
+    n: int,
+    rank: int,
+    preloaded_blocks: Dict[int, torch.Tensor],
+    buf_pool: Optional[_RecoveryBufPool],
+    recovery_role: str,
+) -> Tuple[List[_FRCheckRecoveryWindow], Dict[int, torch.Tensor], Dict[str, float]]:
+    layer_timing: Dict[str, float] = {
+        'rdma_xfer_s': 0.0, 'decode_s': 0.0, 'network_batch_s': 0.0,
+        'network_submit_s': 0.0, 'network_wait_s': 0.0,
+        'submit_s': 0.0, 'wait_s': 0.0, 'waves': 0,
+        'pipeline_overlap_s': 0.0,
+    }
+    if not manager.recovery_stripe_plans:
+        return [], {}, layer_timing
+
+    raw_data_plans, parity_plans, active_by_stripe, skipped_padding_stripes, n_filled_blocks = (
+        _build_recovery_layer_context(manager, n, job.actual_size, job.layer_block_size)
+    )
+    data_plans = list(raw_data_plans)
+    if not data_plans:
+        if _frcheck_debug_enabled():
+            logger.info(
+                "FRCheck recovery layer %s: rank %d has no data recovery stripes "
+                "(skipped parity stripes=%d padding stripes=%d)",
+                job.layer_name, rank, len(parity_plans), skipped_padding_stripes,
+            )
+        return [], {}, layer_timing
+
+    my_blocks, layer_buf, decoder_count, helper_count, failed_count = (
+        _prepare_recovery_layer_buffers(
+            native, manager, n, job.layer_idx, job.layer_block_size, data_plans,
+            preloaded_blocks, buf_pool,
+        )
+    )
+    num_source_stripes = (n - 1) * (n - 2)
+    my_node = manager.rank_in_group + 1
+    source_block_indices = _build_failed_source_block_indices(
+        data_plans, active_by_stripe, n,
+    )
+    column_windows = _group_recovery_data_windows_by_column(data_plans, n, my_node)
+    windows: List[_FRCheckRecoveryWindow] = []
+    for wave_plans in column_windows:
+        windows.append(_FRCheckRecoveryWindow(
+            job=job,
+            plans=wave_plans,
+            active_by_stripe=active_by_stripe,
+            wave_idx=len(windows),
+            layer_buf=layer_buf,
+            src_block_start=0,
+            slot_start=0,
+            source_block_indices=source_block_indices,
+            decoder_stripes=decoder_count,
+            helper_stripes=helper_count,
+            failed_stripes=failed_count,
+            skipped_padding_stripes=skipped_padding_stripes,
+        ))
+
+    max_window_size = max((len(window.plans) for window in windows), default=0)
+
+    if _frcheck_debug_enabled():
+        logger.info(
+            "FRCheck recovery layer %s: rank %d — data=%d raw_data=%d "
+            "parity_skipped=%d padding_skipped=%d filled=%d/%d "
+            "decoder=%d helper=%d failed=%d stripes windows=%d max_window_size=%d",
+            job.layer_name, rank, len(data_plans), len(raw_data_plans),
+            len(parity_plans), skipped_padding_stripes,
+            n_filled_blocks, num_source_stripes,
+            decoder_count, helper_count, failed_count, len(windows), max_window_size,
+        )
+    layer_timing['waves'] = len(windows)
+    return windows, my_blocks, layer_timing
+
+
+def _run_recovery_pipeline(
+    jobs: List[_FRCheckLayerRecoveryJob],
+    manager,
+    native,
+    n: int,
+    rank: int,
+    is_failed: bool,
+    preloaded: Dict[int, Dict[int, torch.Tensor]],
+    buf_pool: Optional[_RecoveryBufPool],
+    full_buf: Optional[torch.Tensor],
+    global_tensor_infos: List,
+    runtime: Optional[_FRCheckLayerwiseRuntime] = None,
+    map_to_full_buf: str = "all",
+    clone_runtime_tensors: bool = True,
+    recovery_role: str = "unknown",
+    tensor_views_by_key: Optional[Dict[str, torch.Tensor]] = None,
+) -> List[Tuple[Optional[_FRCheckLayerReadyRecord], Dict[str, float]]]:
+    t_pipeline = time.time()
+    completed: "queue.Queue[Optional[_FRCheckRecoveredWindow]]" = queue.Queue(maxsize=2)
+    results: List[Tuple[Optional[_FRCheckLayerReadyRecord], Dict[str, float]]] = []
+    aggregate_timing: Dict[int, Dict[str, float]] = {}
+    first_network_done = {"time": 0.0}
+    last_materialize_done = {"time": 0.0}
+    error_holder: Dict[str, Optional[BaseException]] = {"error": None}
+
+    def _network_worker() -> None:
+        def _alloc_slots(
+            free_ranges: List[Tuple[int, int]], required: int
+        ) -> Optional[int]:
+            for idx, (start_slot, length) in enumerate(free_ranges):
+                if length < required:
+                    continue
+                alloc_start = start_slot
+                if length == required:
+                    free_ranges.pop(idx)
+                else:
+                    free_ranges[idx] = (start_slot + required, length - required)
+                return alloc_start
+            return None
+
+        def _free_slots(
+            free_ranges: List[Tuple[int, int]], start_slot: int, length: int
+        ) -> None:
+            free_ranges.append((start_slot, length))
+            free_ranges.sort()
+            merged: List[Tuple[int, int]] = []
+            for cur_start, cur_len in free_ranges:
+                if not merged:
+                    merged.append((cur_start, cur_len))
+                    continue
+                prev_start, prev_len = merged[-1]
+                prev_end = prev_start + prev_len
+                if cur_start <= prev_end:
+                    merged[-1] = (prev_start, max(prev_end, cur_start + cur_len) - prev_start)
+                else:
+                    merged.append((cur_start, cur_len))
+            free_ranges[:] = merged
+
+        def _mark_window_done(recovered: _FRCheckRecoveredWindow) -> None:
+            job = recovered.window.job
+            layer_timing = aggregate_timing.get(id(job), {})
+            t_wait = time.time()
+            native.wait_recovery_batch_id(int(recovered.timing.get('batch_id', 0)))
+            wait_s = time.time() - t_wait
+            recovered.timing['wait_s'] = wait_s
+            layer_timing['network_wait_s'] += wait_s
+            layer_timing['wait_s'] = layer_timing['network_wait_s']
+            _frcheck_recovery_profile(
+                recovery_role, "network_window_done", layer=job.layer_name,
+                layer_idx=job.layer_idx, wave=recovered.window.wave_idx,
+                batch_id=recovered.timing.get('batch_id', 0),
+                wait_s=wait_s,
+            )
+            first_network_done["time"] = first_network_done["time"] or time.time()
+            if recovered.window.wave_idx + 1 == len(job_windows.get(id(job), [])):
+                started = job_network_start.get(id(job), time.time())
+                layer_timing['network_batch_s'] = time.time() - started
+                layer_timing['rdma_xfer_s'] = layer_timing['network_batch_s']
+            completed.put(recovered)
+
+        try:
+            pending_windows: List[Tuple[_FRCheckRecoveryWindow, Dict[int, torch.Tensor]]] = []
+            job_windows: Dict[int, List[_FRCheckRecoveryWindow]] = {}
+            job_network_start: Dict[int, float] = {}
+            for job in jobs:
+                windows, my_blocks, layer_timing = _iter_recovery_windows_for_job(
+                    job, manager, native, n, rank,
+                    preloaded.get(job.encode_iter, {}), buf_pool, recovery_role,
+                )
+                aggregate_timing[id(job)] = layer_timing
+                job_windows[id(job)] = windows
+                for window in windows:
+                    pending_windows.append((window, my_blocks))
+
+            max_inflight_stripes = (
+                buf_pool.concurrency if buf_pool is not None else max((n - 1) * (n - 2), 1)
+            )
+            free_ranges: List[Tuple[int, int]] = [(0, max_inflight_stripes)]
+            active_windows: List[Tuple[_FRCheckRecoveredWindow, int, int]] = []
+            idx = 0
+            while idx < len(pending_windows):
+                window, my_blocks = pending_windows[idx]
+                required_slots = max(len(window.plans), 1)
+                if required_slots > max_inflight_stripes:
+                    raise RuntimeError(
+                        "FRCheck recovery: one POA recovery window requires "
+                        f"{required_slots} slots but buffer pool has {max_inflight_stripes}"
+                    )
+                slot_start = _alloc_slots(free_ranges, required_slots)
+                if slot_start is None:
+                    recovered, old_start, old_len = active_windows.pop(0)
+                    _mark_window_done(recovered)
+                    _free_slots(free_ranges, old_start, old_len)
+                    continue
+
+                window.slot_start = slot_start
+                job = window.job
+                layer_timing = aggregate_timing.get(id(job), {})
+                if id(job) not in job_network_start:
+                    job_network_start[id(job)] = time.time()
+                timing = _submit_recovery_window(
+                    native, manager, window, my_blocks, buf_pool, n,
+                )
+                layer_timing['network_submit_s'] += timing.get('reset_s', 0.0) + timing.get('submit_s', 0.0)
+                layer_timing['submit_s'] = layer_timing['network_submit_s']
+                recovered = _FRCheckRecoveredWindow(window=window, timing=timing)
+                active_windows.append((recovered, slot_start, required_slots))
+                idx += 1
+                _frcheck_recovery_profile(
+                    recovery_role, "network_window_submitted", layer=job.layer_name,
+                    layer_idx=job.layer_idx, wave=window.wave_idx,
+                    batch_id=timing.get('batch_id', 0), stripes=len(window.plans),
+                    active_stripes=int(timing.get('active_stripes', 0.0)),
+                    skipped_padding_stripes=(
+                        len(window.plans) - int(timing.get('active_stripes', 0.0))
+                    ),
+                    reset_s=timing.get('reset_s', 0.0),
+                    submit_s=timing.get('submit_s', 0.0),
+                    slot_start=window.slot_start,
+                    inflight_windows=len(active_windows),
+                )
+
+            while active_windows:
+                recovered, old_start, old_len = active_windows.pop(0)
+                _mark_window_done(recovered)
+                _free_slots(free_ranges, old_start, old_len)
+        except BaseException as exc:
+            error_holder["error"] = exc
+        finally:
+            completed.put(None)
+
+    network_thread = threading.Thread(
+        target=_network_worker,
+        name=f"frcheck-recovery-network-rank{rank}",
+        daemon=False,
+    )
+    network_thread.start()
+    materialized_jobs: Set[int] = set()
+    while True:
+        item = completed.get()
+        if item is None:
+            break
+        job = item.window.job
+        if id(job) in materialized_jobs:
+            continue
+        layer_timing = aggregate_timing.get(id(job), {})
+        if error_holder["error"] is not None:
+            break
+        # A job can be materialized after its final window arrives.  Since windows
+        # are submitted in job order, the last window has the highest wave index.
+        if item.window.wave_idx + 1 < int(layer_timing.get('waves', 0)):
+            continue
+        record, materialize_timing = _materialize_recovered_layer(
+            job, manager, is_failed, item.window.layer_buf, full_buf,
+            global_tensor_infos, runtime=runtime, map_to_full_buf=map_to_full_buf,
+            clone_runtime_tensors=clone_runtime_tensors,
+            recovery_role=recovery_role, tensor_views_by_key=tensor_views_by_key,
+        )
+        layer_timing.update(materialize_timing)
+        layer_timing['job_total_s'] = (
+            layer_timing.get('network_batch_s', 0.0)
+            + layer_timing.get('materialize_s', 0.0)
+        )
+        results.append((record, layer_timing))
+        materialized_jobs.add(id(job))
+        last_materialize_done["time"] = time.time()
+        _frcheck_recovery_profile(
+            recovery_role, "pipeline_job_done", layer=job.layer_name,
+            layer_idx=job.layer_idx,
+            network_batch_s=layer_timing.get('network_batch_s', 0.0),
+            network_submit_s=layer_timing.get('network_submit_s', 0.0),
+            network_wait_s=layer_timing.get('network_wait_s', 0.0),
+            materialize_s=layer_timing.get('materialize_s', 0.0),
+            waves=layer_timing.get('waves', 0),
+        )
+    network_thread.join()
+    if error_holder["error"] is not None:
+        raise error_holder["error"]
+    elapsed = time.time() - t_pipeline
+    serial_work_s = sum(
+        timing.get('network_batch_s', 0.0) + timing.get('materialize_s', 0.0)
+        for _record, timing in results
+    )
+    overlap_s = max(0.0, serial_work_s - elapsed)
+    total_submit_s = sum(timing.get('network_submit_s', 0.0) for _record, timing in results)
+    total_wait_s = sum(timing.get('network_wait_s', 0.0) for _record, timing in results)
+    total_materialize_s = sum(timing.get('materialize_s', 0.0) for _record, timing in results)
+    for _record, timing in results:
+        timing['pipeline_overlap_s'] = overlap_s
+        timing['pipeline_critical_s'] = elapsed
+    _frcheck_recovery_profile(
+        recovery_role, "pipeline_done", jobs=len(jobs), elapsed_s=elapsed,
+        network_submit_s=total_submit_s, network_wait_s=total_wait_s,
+        materialize_s=total_materialize_s,
+        serial_work_s=serial_work_s, pipeline_overlap_s=overlap_s,
+        first_network_done_s=(first_network_done["time"] - t_pipeline if first_network_done["time"] else 0.0),
+        last_materialize_done_s=(last_materialize_done["time"] - t_pipeline if last_materialize_done["time"] else 0.0),
+    )
+    return results
+
 
 
 def _start_layer_recovery_worker(
@@ -3374,6 +3789,7 @@ def _start_layer_recovery_worker(
     map_to_full_buf: str = "all",
     clone_runtime_tensors: bool = True,
     recovery_role: str = "unknown",
+    tensor_views_by_key: Optional[Dict[str, torch.Tensor]] = None,
 ) -> threading.Thread:
     error_holder: Dict[str, Optional[BaseException]] = {"error": None}
 
@@ -3384,19 +3800,23 @@ def _start_layer_recovery_worker(
             map_to_full_buf=map_to_full_buf, cleanup_after=cleanup_after,
         )
         try:
-            for job in jobs:
-                try:
-                    _run_layer_recovery_job(
-                        job, manager, native, n, rank, is_failed, preloaded,
-                        buf_pool, full_buf, global_tensor_infos, runtime=runtime,
-                        map_to_full_buf=map_to_full_buf,
-                        clone_runtime_tensors=clone_runtime_tensors,
-                        recovery_role=recovery_role,
-                    )
-                except Exception as exc:
-                    if runtime is not None and job.layer_idx >= 0:
-                        runtime.mark_layer_error(job.layer_idx, f"{type(exc).__name__}: {exc}")
-                    raise
+            try:
+                _run_recovery_pipeline(
+                    jobs, manager, native, n, rank, is_failed, preloaded,
+                    buf_pool, full_buf, global_tensor_infos, runtime=runtime,
+                    map_to_full_buf=map_to_full_buf,
+                    clone_runtime_tensors=clone_runtime_tensors,
+                    recovery_role=recovery_role,
+                    tensor_views_by_key=tensor_views_by_key,
+                )
+            except Exception as exc:
+                if runtime is not None:
+                    for job in jobs:
+                        if job.layer_idx >= 0:
+                            runtime.mark_layer_error(
+                                job.layer_idx, f"{type(exc).__name__}: {exc}"
+                            )
+                raise
         except BaseException as exc:
             error_holder["error"] = exc
         finally:
@@ -3619,6 +4039,223 @@ def _is_data_recovery_plan(plan: Dict[str, Any], n: int) -> bool:
     return int(plan.get('failed_pos', n)) < n - 2
 
 
+def _recovery_window_rows(n: int) -> int:
+    return max(1, n)
+
+
+def _build_recovery_layer_context(
+    manager,
+    n: int,
+    layer_total_bytes: int,
+    layer_block_size: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[int, bool], int, int]:
+    raw_data_plans = [
+        p for p in manager.recovery_stripe_plans
+        if _is_data_recovery_plan(p, n)
+    ]
+    parity_plans = [
+        p for p in manager.recovery_stripe_plans
+        if not _is_data_recovery_plan(p, n)
+    ]
+    num_source_stripes = (n - 1) * (n - 2)
+    n_filled_blocks = _n_filled_blocks_for_layer(
+        layer_total_bytes, layer_block_size, num_source_stripes,
+    )
+    active_by_stripe: Dict[int, bool] = {}
+    skipped_padding_stripes = 0
+    failed_source_seen = 0
+    enable_padding_skip = os.environ.get("FRCHECK_RECOVERY_SKIP_PADDING", "0") == "1"
+    for plan in raw_data_plans:
+        active = True
+        if not plan.get('dual_failure'):
+            original_role = int(plan.get('original_role', -1))
+            if original_role == int(StripeRole.SOURCE):
+                blk_idx = failed_source_seen
+                failed_source_seen += 1
+                if blk_idx >= n_filled_blocks:
+                    skipped_padding_stripes += 1
+                    active = not enable_padding_skip
+        active_by_stripe[int(plan['stripe_id'])] = active
+    return raw_data_plans, parity_plans, active_by_stripe, skipped_padding_stripes, n_filled_blocks
+
+
+def _prepare_recovery_layer_buffers(
+    native,
+    manager,
+    n: int,
+    layer_idx: int,
+    layer_block_size: int,
+    data_plans: List[Dict[str, Any]],
+    preloaded_blocks: Dict[int, torch.Tensor],
+    buf_pool: Optional[_RecoveryBufPool],
+) -> Tuple[Dict[int, torch.Tensor], Optional[torch.Tensor], int, int, int]:
+    my_node = manager.rank_in_group + 1
+    num_source_stripes = (n - 1) * (n - 2)
+    decoder_stripes = [p for p in data_plans if my_node == p['decoder_node']]
+    helper_stripes = [p for p in data_plans if my_node in p['helper_nodes']]
+    failed_stripes = [p for p in data_plans if _is_failed_in_recovery_plan(p, my_node)]
+
+    my_blocks: Dict[int, torch.Tensor] = {}
+    for plan in decoder_stripes + helper_stripes:
+        sid = plan['stripe_id']
+        blk = preloaded_blocks.get(sid)
+        if blk is None:
+            blk = torch.zeros(layer_block_size, dtype=torch.uint8)
+            native.register_buffer(blk.data_ptr(), blk.numel())
+        my_blocks[sid] = blk
+
+    layer_buf = None
+    if failed_stripes:
+        stable_buf = None
+        if buf_pool is not None and buf_pool.stable_failed_layer_bufs is not None:
+            stable_buf = buf_pool.stable_failed_layer_bufs.get(layer_idx)
+        if stable_buf is not None:
+            layer_buf = stable_buf[: num_source_stripes * layer_block_size]
+        elif buf_pool is not None and buf_pool.failed_layer_buf is not None:
+            layer_buf = buf_pool.failed_layer_buf[: num_source_stripes * layer_block_size]
+        else:
+            layer_buf = allocate_hugepage_tensor(
+                num_source_stripes * layer_block_size, fallback_pin_memory=True,
+            )
+            native.register_buffer(layer_buf.data_ptr(), layer_buf.numel())
+
+    return my_blocks, layer_buf, len(decoder_stripes), len(helper_stripes), len(failed_stripes)
+
+
+def _recovery_original_role_for_node(plan: Dict[str, Any], my_node: int) -> Optional[int]:
+    if plan.get('dual_failure'):
+        for target in plan.get('failed_targets', []):
+            if target.get('failed_node') == my_node:
+                return target.get('original_role')
+        return None
+    return plan.get('original_role')
+
+
+def _submit_recovery_window(
+    native,
+    manager,
+    window: _FRCheckRecoveryWindow,
+    my_blocks: Dict[int, torch.Tensor],
+    buf_pool: Optional[_RecoveryBufPool],
+    n: int,
+) -> Dict[str, float]:
+    my_node = manager.rank_in_group + 1
+    job = window.job
+    t_reset = time.time()
+    batch_id = native.begin_recovery_batch()
+    reset_s = time.time() - t_reset
+    t_submit = time.time()
+    wave_active_stripes = 0
+    for submit_idx, stri_plan in enumerate(window.plans):
+        sid = stri_plan['stripe_id']
+        active = window.active_by_stripe.get(int(sid), True)
+        if active:
+            wave_active_stripes += 1
+        buf_slot = window.slot_start + submit_idx
+        helper_block_addr = 0
+        decoder_self_block_addr = 0
+        decoder_helper_recv_addrs: List[int] = []
+        decoder_recovered_addrs: List[int] = []
+        failed_recv_buf_addr = 0
+        failed_layer_buf_addr = 0
+        failed_layer_offset = 0
+        failed_ncopy = 0
+        store_to_layer_buf = False
+
+        if my_node in stri_plan['helper_nodes']:
+            blk = my_blocks.get(sid)
+            if blk is not None:
+                helper_block_addr = blk.data_ptr()
+
+        if my_node == stri_plan['decoder_node']:
+            blk = my_blocks.get(sid)
+            if blk is not None:
+                decoder_self_block_addr = blk.data_ptr()
+            if buf_pool is not None:
+                recv_bufs = (
+                    buf_pool.decoder_recv_buf_slots[buf_slot]
+                    if buf_slot < len(buf_pool.decoder_recv_buf_slots)
+                    else buf_pool.decoder_recv_bufs
+                )
+                for hi in range(len(stri_plan['helper_nodes'])):
+                    if hi < len(recv_bufs):
+                        rb = recv_bufs[hi][:job.layer_block_size]
+                        decoder_helper_recv_addrs.append(rb.data_ptr())
+                if buf_slot < len(buf_pool.decoder_recovered_bufs):
+                    rec_buf = buf_pool.decoder_recovered_bufs[buf_slot]
+                    decoder_recovered_addrs.append(
+                        rec_buf[:job.layer_block_size].data_ptr()
+                    )
+                if (
+                    stri_plan.get('dual_failure')
+                    and buf_slot < len(buf_pool.decoder_recovered_buf2s)
+                ):
+                    rec_buf2 = buf_pool.decoder_recovered_buf2s[buf_slot]
+                    decoder_recovered_addrs.append(
+                        rec_buf2[:job.layer_block_size].data_ptr()
+                    )
+
+        if _is_failed_in_recovery_plan(stri_plan, my_node):
+            if window.layer_buf is not None:
+                failed_layer_buf_addr = window.layer_buf.data_ptr()
+            original_role = _recovery_original_role_for_node(stri_plan, my_node)
+            if active and window.layer_buf is not None and original_role == int(StripeRole.SOURCE):
+                store_to_layer_buf = True
+                blk_idx = window.source_block_indices.get((int(sid), my_node))
+                if blk_idx is None:
+                    raise RuntimeError(
+                        "FRCheck recovery: missing source block index for "
+                        f"stripe={sid} failed_node={my_node}"
+                    )
+                failed_layer_offset = blk_idx * job.layer_block_size
+                failed_ncopy = min(
+                    job.layer_block_size,
+                    max(0, job.actual_size - failed_layer_offset),
+                )
+                if failed_ncopy == job.layer_block_size:
+                    failed_recv_buf_addr = (
+                        window.layer_buf[
+                            failed_layer_offset:
+                            failed_layer_offset + job.layer_block_size
+                        ].data_ptr()
+                    )
+                    store_to_layer_buf = False
+            if (
+                failed_recv_buf_addr == 0
+                and buf_pool is not None
+                and buf_slot < len(buf_pool.failed_recv_bufs)
+            ):
+                failed_recv_buf_addr = (
+                    buf_pool.failed_recv_bufs[buf_slot][:job.layer_block_size].data_ptr()
+                )
+
+        native.submit_recovery_stripe_to_batch(
+            batch_id,
+            sid,
+            job.layer_block_size,
+            helper_block_addr,
+            decoder_self_block_addr,
+            decoder_helper_recv_addrs,
+            decoder_recovered_addrs,
+            failed_recv_buf_addr,
+            failed_layer_buf_addr,
+            failed_layer_offset,
+            failed_ncopy,
+            store_to_layer_buf,
+            active,
+        )
+
+    native.end_recovery_batch(batch_id)
+    submit_s = time.time() - t_submit
+    return {
+        "batch_id": int(batch_id),
+        "reset_s": reset_s,
+        "submit_s": submit_s,
+        "wait_s": 0.0,
+        "active_stripes": float(wave_active_stripes),
+    }
+
+
 def _submit_recovery_network(
     native,
     manager,
@@ -3724,7 +4361,6 @@ def _submit_recovery_network(
                 num_source_stripes * layer_block_size, fallback_pin_memory=True,
             )
             native.register_buffer(layer_buf.data_ptr(), layer_buf.numel())
-        layer_buf.zero_()
 
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
 
@@ -4014,6 +4650,11 @@ def recover_frcheck_legacy_hardware(
         'main_io': 0.0,
         'disk_io': 0.0,
         'network_encode': 0.0,
+        'network_submit': 0.0,
+        'network_wait': 0.0,
+        'materialize': 0.0,
+        'pipeline_overlap': 0.0,
+        'pipeline_critical': 0.0,
         'rebuild_sd': 0.0,
     }
     t_prep = time.time()
@@ -4172,10 +4813,7 @@ def recover_frcheck_legacy_hardware(
     except Exception:
         pass
 
-    buf_pool = _allocate_recovery_buf_pool(
-        native, n, max_block_size, is_failed, is_decoder, is_helper,
-        dual_failure=getattr(manager, 'recovery_dual_failure', False),
-    )
+    buf_pool: Optional[_RecoveryBufPool] = None
 
     if is_failed:
         safety_margin = max(int(total_tensor_size * 0.01), 4096)
@@ -4188,6 +4826,7 @@ def recover_frcheck_legacy_hardware(
             )
 
     layerwise_records: List[_FRCheckLayerReadyRecord] = []
+    direct_tensor_views_by_key: Optional[Dict[str, torch.Tensor]] = {} if is_failed else None
     async_forward = False
     async_detach_safe = False
     try:
@@ -4227,17 +4866,39 @@ def recover_frcheck_legacy_hardware(
             continue
         recovery_jobs.append(job)
 
+    buf_pool = _allocate_recovery_buf_pool(
+        native, n, max_block_size, is_failed, is_decoder, is_helper,
+        dual_failure=getattr(manager, 'recovery_dual_failure', False),
+    )
+
     detached_transformer_recovery = bool(
         async_forward
         and async_detach_safe
         and is_failed
         and runtime_for_recovery is not None
     )
-    if detached_transformer_recovery:
+    if direct_tensor_views_by_key is not None:
+        _preallocate_stable_failed_layer_bufs(native, buf_pool, recovery_jobs, n)
         _frcheck_recovery_profile(
-            recovery_role, "stable_failed_layer_bufs_disabled",
-            jobs=sum(1 for job in recovery_jobs if job.layer_idx >= 0),
+            recovery_role, "stable_failed_layer_bufs_enabled",
+            jobs=len(recovery_jobs), direct_reconstruct=True,
         )
+    elif detached_transformer_recovery:
+        async_jobs_for_buffers = [job for job in recovery_jobs if job.layer_idx >= 0]
+        _preallocate_stable_failed_layer_bufs(native, buf_pool, async_jobs_for_buffers, n)
+        _frcheck_recovery_profile(
+            recovery_role, "stable_failed_layer_bufs_enabled",
+            jobs=len(async_jobs_for_buffers), direct_reconstruct=False,
+        )
+
+    # Keep the recovery job shared while letting async use its intended fast path:
+    # sync reconstructs the complete state_dict from full_buf, while detached async
+    # keeps layer-owned tensors in stable per-layer views and reconstructs only
+    # common tensors from full_buf.
+    sync_map_to_full_buf = "none" if direct_tensor_views_by_key is not None else "all"
+    sync_clone_runtime_tensors = False
+    async_map_to_full_buf = "none"
+    async_clone_runtime_tensors = False
 
     timings['prep'] = time.time() - t_prep
 
@@ -4250,6 +4911,31 @@ def recover_frcheck_legacy_hardware(
         start_recovery_to_forward_timer("FRCheck", "network_decode", role=recovery_role)
     except Exception:
         pass
+    def _accumulate_layer_timings(
+        layer_results: List[Tuple[Optional[_FRCheckLayerReadyRecord], Dict[str, float]]]
+    ) -> None:
+        if not layer_results:
+            return
+        timings['network_submit'] += sum(
+            item.get('network_submit_s', item.get('submit_s', 0.0))
+            for _record, item in layer_results
+        )
+        timings['network_wait'] += sum(
+            item.get('network_wait_s', item.get('wait_s', 0.0))
+            for _record, item in layer_results
+        )
+        timings['materialize'] += sum(
+            item.get('materialize_s', 0.0) for _record, item in layer_results
+        )
+        timings['pipeline_overlap'] = max(
+            timings['pipeline_overlap'],
+            max((item.get('pipeline_overlap_s', 0.0) for _record, item in layer_results), default=0.0),
+        )
+        timings['pipeline_critical'] += max(
+            (item.get('pipeline_critical_s', 0.0) for _record, item in layer_results),
+            default=0.0,
+        )
+
     if _dbg:
         logger.info(
             "FRCheck recovery async decision: rank=%d async_forward=%s "
@@ -4262,25 +4948,29 @@ def recover_frcheck_legacy_hardware(
     if detached_transformer_recovery:
         sync_jobs = [job for job in recovery_jobs if job.layer_idx < 0]
         async_jobs = [job for job in recovery_jobs if job.layer_idx >= 0]
-        for job in sync_jobs:
-            record, _layer_timing = _run_layer_recovery_job(
-                job, manager, native, n, rank, is_failed, preloaded,
+        if sync_jobs:
+            sync_results = _run_recovery_pipeline(
+                sync_jobs, manager, native, n, rank, is_failed, preloaded,
                 buf_pool, full_buf, global_tensor_infos,
                 runtime=runtime_for_recovery,
-                map_to_full_buf="all",
-                clone_runtime_tensors=True,
+                map_to_full_buf=sync_map_to_full_buf,
+                clone_runtime_tensors=sync_clone_runtime_tensors,
                 recovery_role=recovery_role,
+                tensor_views_by_key=direct_tensor_views_by_key,
             )
-            if record is not None:
-                layerwise_records.append(record)
+            _accumulate_layer_timings(sync_results)
+            for record, _layer_timing in sync_results:
+                if record is not None:
+                    layerwise_records.append(record)
         if async_jobs:
             worker = _start_layer_recovery_worker(
                 async_jobs, manager, native, n, rank, is_failed, preloaded,
                 buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
                 cleanup_after=(getattr(args, "frcheck_recovery_safe_point", "load") == "load"),
-                map_to_full_buf="all",
-                clone_runtime_tensors=True,
+                map_to_full_buf=async_map_to_full_buf,
+                clone_runtime_tensors=async_clone_runtime_tensors,
                 recovery_role=recovery_role,
+                tensor_views_by_key=None,
             )
             _set_active_frcheck_recovery_worker(worker)
             if _dbg:
@@ -4289,15 +4979,24 @@ def recover_frcheck_legacy_hardware(
                     "started rank=%d sync_jobs=%d async_jobs=%d",
                     rank, len(sync_jobs), len(async_jobs),
                 )
-            frcheck_wait_for_async_recovery()
+            safe_point = getattr(args, "frcheck_recovery_safe_point", "load")
+            if safe_point == "load":
+                frcheck_wait_for_async_recovery()
+            elif _dbg:
+                logger.info(
+                    "FRCheck recovery: deferring detached transformer worker join "
+                    "to safe_point=%s rank=%d",
+                    safe_point, rank,
+                )
     elif async_forward and involved and recovery_jobs:
         worker = _start_layer_recovery_worker(
             recovery_jobs, manager, native, n, rank, is_failed, preloaded,
             buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
             cleanup_after=False,
-            map_to_full_buf="all",
-            clone_runtime_tensors=True,
+            map_to_full_buf=sync_map_to_full_buf,
+            clone_runtime_tensors=sync_clone_runtime_tensors,
             recovery_role=recovery_role,
+            tensor_views_by_key=direct_tensor_views_by_key,
         )
         _set_active_frcheck_recovery_worker(worker)
         if _dbg:
@@ -4314,17 +5013,20 @@ def recover_frcheck_legacy_hardware(
                 safe_point, rank,
             )
     else:
-        for job in recovery_jobs:
-            record, _layer_timing = _run_layer_recovery_job(
-                job, manager, native, n, rank, is_failed, preloaded,
-                buf_pool, full_buf, global_tensor_infos,
-                runtime=runtime_for_recovery,
-                map_to_full_buf="all",
-                clone_runtime_tensors=True,
-                recovery_role=recovery_role,
-            )
+        sync_results = _run_recovery_pipeline(
+            recovery_jobs, manager, native, n, rank, is_failed, preloaded,
+            buf_pool, full_buf, global_tensor_infos,
+            runtime=runtime_for_recovery,
+            map_to_full_buf=sync_map_to_full_buf,
+            clone_runtime_tensors=sync_clone_runtime_tensors,
+            recovery_role=recovery_role,
+            tensor_views_by_key=direct_tensor_views_by_key,
+        )
+        _accumulate_layer_timings(sync_results)
+        for record, _layer_timing in sync_results:
             if record is not None:
                 layerwise_records.append(record)
+
 
     timings['network_encode'] = time.time() - t_net
 
@@ -4333,6 +5035,10 @@ def recover_frcheck_legacy_hardware(
     if detached_transformer_recovery:
         result = _reconstruct_without_layer_owned_tensors(
             main_payload, full_buf[:total_tensor_size], flat_key_roots,
+        )
+    elif direct_tensor_views_by_key is not None:
+        result = _reconstruct_from_tensor_views(
+            main_payload, direct_tensor_views_by_key, flat_key_roots,
         )
     else:
         result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
@@ -4399,6 +5105,45 @@ def _reconstruct_from_main_payload(main_payload: Dict, flat_key_roots: list = No
         )
     buf = tensor_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
     tensor_data = extract_tensors_from_continuous_buffer(buf, tensor_infos)
+
+    decomposed = DecomposedStateDict(
+        non_tensor_data=non_tensor_data,
+        tensor_infos=tensor_infos,
+        tensor_data=tensor_data,
+        flat_key_roots=set(flat_key_roots) if flat_key_roots else set(),
+    )
+    result = reconstruct_state_dict(decomposed)
+    from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
+        unflatten_optimizer_fp32_params,
+    )
+    unflatten_optimizer_fp32_params(result)
+    return result
+
+
+def _reconstruct_from_tensor_views(
+    main_payload: Dict,
+    tensor_views_by_key: Dict[str, torch.Tensor],
+    flat_key_roots: list = None,
+) -> Dict[str, Any]:
+    """Reconstruct state_dict directly from per-layer tensor views."""
+    tensor_infos = main_payload.get("tensor_infos", [])
+    non_tensor_data = main_payload.get("non_tensor_data", {})
+    flat_key_roots = flat_key_roots or main_payload.get("flat_key_roots", [])
+
+    tensor_data: List[torch.Tensor] = []
+    missing_keys: List[str] = []
+    for info in tensor_infos:
+        key = getattr(info, "key", "")
+        tensor = tensor_views_by_key.get(key)
+        if tensor is None:
+            missing_keys.append(key)
+            continue
+        tensor_data.append(tensor)
+    if missing_keys:
+        raise RuntimeError(
+            "FRCheck load: missing tensor views for direct reconstruct: "
+            f"{missing_keys[:8]} (total {len(missing_keys)})"
+        )
 
     decomposed = DecomposedStateDict(
         non_tensor_data=non_tensor_data,

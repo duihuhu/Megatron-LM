@@ -200,6 +200,15 @@ def _allocate_eccheck_blocks_legacy(
     return blocks
 
 
+def _allocate_recovered_buffer(size_bytes: int, pin: bool) -> torch.Tensor:
+    """Hugetlb-backed buffer for HW recovery (matches ECNaive/Gemini load paths)."""
+    return allocate_hugepage_tensor(
+        size_bytes,
+        fallback_pin_memory=pin,
+        touch_pages=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Encoding pipeline (save)
 # ---------------------------------------------------------------------------
@@ -1421,6 +1430,18 @@ def _run_eccheck_two_failures_recovery(
 # State dict reconstruction
 # ---------------------------------------------------------------------------
 
+def _tensor_buffer_as_uint8_view(buffer: torch.Tensor) -> torch.Tensor:
+    """View checkpoint buffer as contiguous uint8 without copying pinned storage."""
+    buf = buffer.detach()
+    if buf.dtype == torch.uint8:
+        buf = buf.reshape(-1)
+    else:
+        buf = buf.reshape(-1).view(torch.uint8)
+    if not buf.is_contiguous():
+        buf = buf.contiguous()
+    return buf
+
+
 def _reconstruct_state_dict_from_eccheck_buffer(
     main_payload: Dict[str, Any],
     recovered_buffer: Optional[torch.Tensor],
@@ -1428,10 +1449,9 @@ def _reconstruct_state_dict_from_eccheck_buffer(
     flat_key_roots = _infer_flat_key_roots(main_payload)
 
     if recovered_buffer is not None:
-        buf = recovered_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
+        buf = _tensor_buffer_as_uint8_view(recovered_buffer)
     else:
-        tb = main_payload["tensor_buffer"]
-        buf = tb.detach().contiguous().reshape(-1).view(torch.uint8)
+        buf = _tensor_buffer_as_uint8_view(main_payload["tensor_buffer"])
     tensor_infos = main_payload["tensor_infos"]
     tensor_data = extract_tensors_from_continuous_buffer(buf, tensor_infos)
     decomposed = DecomposedStateDict(
@@ -1570,9 +1590,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
                 software_failure=False, two_failures=True,
             )
         elif rank_in_group in (1, 2):
-            recovered_buffer = torch.empty(
-                actual_tensor_bytes, dtype=torch.uint8, pin_memory=pin
-            )
+            recovered_buffer = _allocate_recovered_buffer(actual_tensor_bytes, pin)
             total_size = actual_tensor_bytes
     elif sw_failure:
         if rank_in_group == 0:
@@ -1585,12 +1603,12 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         elif rank_in_group == 1:
             actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
             pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
-            recovered_buffer = torch.empty(actual_tensor_bytes, dtype=torch.uint8, pin_memory=pin)
+            recovered_buffer = _allocate_recovered_buffer(actual_tensor_bytes, pin)
             total_size = actual_tensor_bytes
     elif rank_in_group == 2:
         blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
         pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
-        recovered_buffer = torch.empty(total_size, dtype=torch.uint8, pin_memory=pin)
+        recovered_buffer = _allocate_recovered_buffer(total_size, pin)
     else:
         blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
         _load_eccheck_blocks_from_disk_into(

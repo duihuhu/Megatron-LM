@@ -18,6 +18,9 @@ MASTER_ADDR=10.0.0.62
 export ECCHECK_USE_ASIO=false
 export FRCHECK_INTERFACE=$NETIFACES_INTERFACE
 export FRCHECK_BASE_IP=$MASTER_ADDR
+# FRCheck RDMA listens on FRCHECK_BASE_PORT + rank_in_group.
+# Keep this separate from torchrun MASTER_PORT and move it if a port is busy.
+export FRCHECK_BASE_PORT=${FRCHECK_BASE_PORT:-26100}
 MASTER_PORT=6000
 NNODES=8
 
@@ -96,12 +99,14 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
-            #--frcheck-async-recovery-forward
+            --frcheck-async-recovery-forward
             #--no-load-optim
             #--no-load-rng
             --frcheck-failed-ranks "0"
-            --frcheck-recovery-safe-point after_load_checkpoint
+            --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
+            # Native RDMA stays alive until optimizer_step; forked DataLoader workers segfault.
+            --num-workers 0
         )
         ;;
     hardware2)

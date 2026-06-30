@@ -81,16 +81,9 @@ while [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; do
 done
 
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
-    if command -v nvidia-smi > /dev/null 2>&1; then
-        # Try to get all GPU indices using nvidia-smi, fallback to 0 if nvidia-smi fails
-        mapfile -t GPU_IDS < <(nvidia-smi --query-gpu=index --format=csv,noheader)
-        if [ "${#GPU_IDS[@]}" -eq 0 ]; then
-            GPU_IDS=(0)
-        fi
-    else
-        # If nvidia-smi does not exist, fallback to single GPU 0
-        GPU_IDS=(0)
-    fi
+    echo "Error: At least one GPU id must be specified."
+    echo "Usage: $0 <node_rank> <gpu_id_0> [gpu_id_1 ...] [save|software|hardware] [additional_args...]"
+    exit 1
 fi
 
 # ---- mode 解析（save | software | hardware，位于 GPU ID 之后） ----
@@ -126,22 +119,22 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-gemini-replicas-software-failure
-            --gemini-replicas-recovery-rank "0,1,2,3,4,5,6,7"
+            --gemini-replicas-recovery-rank "8,9,10,11,12,13,14,15"
         )
         ;;
     hardware)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-gemini-replicas-hardware-failure
-            --gemini-replicas-recovery-rank "0,1,2,3,4,5,6,7"
+            --gemini-replicas-recovery-rank "8,9,10,11,12,13,14,15"
         )
         ;;
 esac
 
 # 模型固定参数
-HIDDEN_SIZE=4800
-NUM_ATTENTION_HEADS=40
-NUM_LAYERS=40
+HIDDEN_SIZE=2560
+NUM_ATTENTION_HEADS=32
+NUM_LAYERS=32 
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
@@ -206,7 +199,6 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    --ec-checkpoint-write-only-penultimate-iter
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 

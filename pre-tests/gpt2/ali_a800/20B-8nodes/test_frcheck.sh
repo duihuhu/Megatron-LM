@@ -100,7 +100,12 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
-            --frcheck-failed-ranks "0"
+            #--frcheck-async-recovery-forward
+            #--no-load-optim
+            #--no-load-rng
+            --frcheck-failed-ranks "0,1,2,3,4,5,6,7"
+            --frcheck-recovery-safe-point after_load_checkpoint
+            --frcheck-recovery-only-teardown
         )
         ;;
     hardware2)
@@ -183,9 +188,12 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
     --use-frcheck
+    --ec-checkpoint-write-only-penultimate-iter
     --frcheck-n 8
+    --frcheck-distribute-common
     --frcheck-table-dir $FRCHECK_TABLE_DIR
     --frcheck-async-parity
+    --frcheck-skip-load-teardown-barrier
     #--frcheck-failed-ranks 0,1
     #--use-frcheck-hardware-failure
     --ckpt-format torch

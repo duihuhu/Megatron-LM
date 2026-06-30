@@ -60,7 +60,7 @@ export GEMINI_REPLICAS_LOCAL_RANK_NIC_5=eth1
 export GEMINI_REPLICAS_LOCAL_RANK_NIC_6=eth1
 export GEMINI_REPLICAS_LOCAL_RANK_NIC_7=eth1
 MASTER_PORT=6000
-NNODES=4
+NNODES=8
 
 # ---- 节点 rank 解析（第一个参数） ----
 NODE_RANK=0
@@ -139,14 +139,15 @@ case "$MODE" in
 esac
 
 # 模型固定参数
-HIDDEN_SIZE=4800
+HIDDEN_SIZE=5120
 NUM_ATTENTION_HEADS=40
-NUM_LAYERS=40
+NUM_LAYERS=64 
 
-SEQ_LENGTH=1024
+
+SEQ_LENGTH=2048
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
 MICRO_BATCH_SIZE=4
-GLOBAL_BATCH_SIZE=16
+GLOBAL_BATCH_SIZE=32
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -178,7 +179,7 @@ GPT_ARGS=(
     --weight-decay 1e-2
     --lr-warmup-fraction .05
     --clip-grad 1.0
-    --fp16
+    #--fp16
     --tokenizer-type GPT2BPETokenizer
     --use-mcore-models
     --transformer-impl transformer_engine
@@ -193,7 +194,7 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 8
-    --pipeline-model-parallel-size 4
+    --pipeline-model-parallel-size 8
     --sequence-parallel
 )
 
@@ -205,8 +206,7 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    --save $CHECKPOINT_PATH
-    --ec-checkpoint-write-only-penultimate-iter
+    #--save $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
@@ -214,21 +214,21 @@ EVAL_AND_LOGGING_ARGS=(
     # 必选：启用 Gemini Replicas torch legacy checkpoint
     # ---------------------------------------------------------------------------
     # 启用 Gemini Replicas（替代原有的 --use-gemini，后者是两副本 EC 风格配对）
-    --use-gemini-replicas
+    #--use-gemini-replicas
     # 启用优化路径：使用连续 CPU buffer + C++ ASIO/RDMA 网络传输，跳过 torch.save 序列化开销
-    --use-gemini-replicas-optimized
+    #--use-gemini-replicas-optimized
 
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）
     # ---------------------------------------------------------------------------
-    --gemini-replicas-num 2          # 默认 3。设为 2 即两副本，设为 N 即 N 副本
+    #--gemini-replicas-num 2          # 默认 3。设为 2 即两副本，设为 N 即 N 副本
                                         # 在组内 round-robin 轮询放置副本
                                         # 容错能力 = num_replicas - 1 个 rank 同时故障
 
     # ---------------------------------------------------------------------------
     # 分组大小：将 world 划分为独立组，副本仅在组内轮询
     # ---------------------------------------------------------------------------
-    --gemini-replicas-group-size 4   # 默认 None（全局轮询，不做分组）
+    #--gemini-replicas-group-size 8   # 默认 None（全局轮询，不做分组）
                                         # 设 8 则每 8 个 rank 一组，每组独立
                                         # 必须能被 world_size 整除
                                         # 独立于节点数和每节点 rank 数，但数学上要求
@@ -274,6 +274,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-embeddings-separately
     # --no-save-optim                 # 取消注释以跳过 optimizer 保存
     # --no-load-optim                 # 取消注释以跳过 optimizer 加载
+    --timing-log-level 2
 )
 
 # =============================================================================

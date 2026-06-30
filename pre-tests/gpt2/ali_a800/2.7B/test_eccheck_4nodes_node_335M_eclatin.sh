@@ -1,16 +1,16 @@
 #!/bin/bash
 
 # Script to run a single node in 4-node simulation (default 1 GPU per node)
-# Usage: ./test_eccheck_4nodes_node_335M_ecnaive.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [mode] [additional_args...]
+# Usage: ./test_eccheck_4nodes_node_335M_eclatin.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [mode] [additional_args...]
 #
 # mode (optional, default: save):
 #   save      - checkpoint save only (no load / recovery flags)
 #   software  - load checkpoint + software failure recovery
-#   hardware  - load checkpoint + hardware failure recovery (failed ranks only)
+#   hardware  - load checkpoint + hardware failure recovery
 #
-# Example: ./test_eccheck_4nodes_node_335M_ecnaive.sh 0 0
-# Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_ecnaive.sh 0 2 3 software
-# Example (8 GPUs, hardware recovery): ./test_eccheck_4nodes_node_335M_ecnaive.sh 0 0 1 2 3 4 5 6 7 hardware
+# Example: ./test_eccheck_4nodes_node_335M_eclatin.sh 0 0
+# Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_eclatin.sh 0 2 3 software
+# Example (8 GPUs, hardware recovery): ./test_eccheck_4nodes_node_335M_eclatin.sh 0 0 1 2 3 4 5 6 7 hardware
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
@@ -28,33 +28,15 @@ NNODES=4
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
-export ECNAIVE_INTERFACE=$NETIFACES_INTERFACE
 export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
-export MEGATRON_ECNAIVE_LOAD_NET_TRACE=1
-export ECNAIVE_LOCAL_RANK_NIC_0=eth0
-export ECNAIVE_LOCAL_RANK_NIC_1=eth0
-export ECNAIVE_LOCAL_RANK_NIC_2=eth0
-export ECNAIVE_LOCAL_RANK_NIC_3=eth0
-export ECNAIVE_LOCAL_RANK_NIC_4=eth1
-export ECNAIVE_LOCAL_RANK_NIC_5=eth1
-export ECNAIVE_LOCAL_RANK_NIC_6=eth1
-export ECNAIVE_LOCAL_RANK_NIC_7=eth1
-#  priority from
-#  ┌──────────────────────────────────────────┬──────────────────────────┐
-#  │                 环境变量                 │           用途           │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ ECNAIVE_RANK_IP_0=10.0.0.1               │ 每个 rank 显式指定 IP    │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ ECNAIVE_LOCAL_RANK_NIC_0=mlx5_0          │ 每个 local_rank 绑定 NIC │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ ECNAIVE_NIC_LIST + ECNAIVE_RANKS_PER_NIC │ 批量 NIC 分配            │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ ECNAIVE_BASE_IP=10.0.0.1                 │ 所有 rank 同一 IP        │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ ECNAIVE_INTERFACE=bond0                  │ 从指定接口自动检测 IP    │
-#  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ MASTER_ADDR                              │ 最终 fallback            │
-#  └──────────────────────────────────────────┴──────────────────────────┘
+export ECLATIN_LOCAL_RANK_NIC_0=eth0
+export ECLATIN_LOCAL_RANK_NIC_1=eth0
+export ECLATIN_LOCAL_RANK_NIC_2=eth0
+export ECLATIN_LOCAL_RANK_NIC_3=eth0
+export ECLATIN_LOCAL_RANK_NIC_4=eth1
+export ECLATIN_LOCAL_RANK_NIC_5=eth1
+export ECLATIN_LOCAL_RANK_NIC_6=eth1
+export ECLATIN_LOCAL_RANK_NIC_7=eth1
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -71,18 +53,10 @@ while [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; do
     shift
 done
 
-# If no GPU IDs are provided, use all GPUs available on the node by default
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
-    if command -v nvidia-smi > /dev/null 2>&1; then
-        # Try to get all GPU indices using nvidia-smi, fallback to 0 if nvidia-smi fails
-        mapfile -t GPU_IDS < <(nvidia-smi --query-gpu=index --format=csv,noheader)
-        if [ "${#GPU_IDS[@]}" -eq 0 ]; then
-            GPU_IDS=(0)
-        fi
-    else
-        # If nvidia-smi does not exist, fallback to single GPU 0
-        GPU_IDS=(0)
-    fi
+    echo "Error: At least one GPU id must be specified."
+    echo "Usage: $0 <node_rank> <gpu_id_0> [gpu_id_1 ...] [save|software|hardware|hardware2] [additional_args...]"
+    exit 1
 fi
 
 # ---- mode parsing (save | software | hardware, after GPU IDs) ----
@@ -105,7 +79,7 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/opt/7B/opt-7b-0/logs"
-CHECKPOINT_PATH="/dev/shm/models/opt-7b-0-ecnaive"
+CHECKPOINT_PATH="/dev/shm/models/opt-7b-0-eclatin"
 # DATA_PATH="/workspace/Megatron-LM/pre-tests/opt/opt_data/wiki_text_sentence"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -121,27 +95,26 @@ case "$MODE" in
     software)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            --use-ecnaive-software-failure
+            --use-eclatin-software-failure
         )
         ;;
     hardware)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            --ecnaive-failed-ranks "8,9,10,11,12,13,14,15"
         )
         ;;
     hardware2)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            --ecnaive-failed-ranks "8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+            --use-eclatin-two-failures
         )
         ;;
 esac
 
 # Model related configuration here, please do not overlap with json config
-HIDDEN_SIZE=4800
-NUM_ATTENTION_HEADS=40
-NUM_LAYERS=40
+HIDDEN_SIZE=2560
+NUM_ATTENTION_HEADS=32
+NUM_LAYERS=32
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
@@ -171,8 +144,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
     --lr 0.00005
-    --train-iters 20
-    --ec-checkpoint-write-only-penultimate-iter
+    --train-iters 1
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -203,7 +175,8 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH 
-    --eval-iters 10
+    #--load $CHECKPOINT_PATH
+    --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     # --use-eccheck
 
@@ -213,20 +186,13 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-gemini-hardware-failure
     # --use-distributed-optimizer
     # --use-ecnaive-software-failure
-    --use-ecnaive
+    --use-eclatin
     --ckpt-format torch
     # --no-save-optim
     # --no-load-optim
     --save-embeddings-separately
     --use-rdma
     # --timing-log-level 2
-
-    # --- EC-NAIVE generalized parameters ---
-     --ecnaive-rs-k 2             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
-    #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
-    # --ecnaive-failed-ranks "0,1,2,3,4,5,6,7"
-    #                                Uses ISA-L RS decoding (GF(2^8)) to recover 1-2 lost blocks
-    # --no-load-optim
 )
 
 mkdir -p logs

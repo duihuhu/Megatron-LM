@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # FRCheck (POA-driven stripe encode with RDMA) — single-node script.
-# Usage: ./test_eccheck_4nodes_node_335M_frcheck.sh <node_rank> [<gpu_id_0> [gpu_id_1 ...]] [additional_args...]
-# Example: ./test_eccheck_4nodes_node_335M_frcheck.sh 0
+# Usage: ./test_eccheck_4nodes_node_335M_frcheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]
+# Example: ./test_eccheck_4nodes_node_335M_frcheck.sh 0 0
 # Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_frcheck.sh 0 2 3
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -27,7 +27,8 @@ export ECCHECK_USE_ASIO=false
 export FRCHECK_INTERFACE=$NETIFACES_INTERFACE
 export FRCHECK_BASE_IP=$MASTER_ADDR
 MASTER_PORT=6000
-NNODES=4
+NNODES=8
+
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 
@@ -51,17 +52,9 @@ while [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; do
 done
 
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
-    # No GPU IDs provided: use all GPUs in the system
-    if ! command -v nvidia-smi >/dev/null 2>&1; then
-        echo "Error: nvidia-smi not found and no GPU IDs specified."
-        exit 1
-    fi
-    mapfile -t ALL_IDS < <(nvidia-smi --query-gpu=index --format=csv,noheader)
-    if [ "${#ALL_IDS[@]}" -eq 0 ]; then
-        echo "Error: No GPUs found on this node."
-        exit 1
-    fi
-    GPU_IDS=("${ALL_IDS[@]}")
+    echo "Error: At least one GPU id must be specified."
+    echo "Usage: ./test_eccheck_4nodes_node_335M_frcheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]"
+    exit 1
 fi
 
 GPUS_PER_NODE=${#GPU_IDS[@]}
@@ -79,42 +72,12 @@ CHECKPOINT_PATH="/dev/shm/models/opt-7b-0-frcheck"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
-
-MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
-    MODE="$1"
-    shift
-fi
 ARGS_TO_PASS=("$@")
-RECOVERY_MODE_ARGS=()
-case "$MODE" in
-    save)
-        ;;
-    software)
-        RECOVERY_MODE_ARGS=(
-            --load $CHECKPOINT_PATH
-        )
-        ;;
-    hardware)
-        RECOVERY_MODE_ARGS=(
-            --load $CHECKPOINT_PATH
-            --use-frcheck-hardware-failure
-            --frcheck-failed-ranks "0"
-        )
-        ;;
-    hardware2)
-        RECOVERY_MODE_ARGS=(
-            --load $CHECKPOINT_PATH
-            --use-frcheck-hardware-failure
-            --frcheck-failed-ranks "0,1"
-        )
-        ;;
-esac
 
 # Model configuration
-HIDDEN_SIZE=4800
-NUM_ATTENTION_HEADS=40
-NUM_LAYERS=40
+HIDDEN_SIZE=4096
+NUM_ATTENTION_HEADS=32
+NUM_LAYERS=32
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
@@ -166,7 +129,7 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 8
-    --pipeline-model-parallel-size 4
+    --pipeline-model-parallel-size 8
     --sequence-parallel
 )
 
@@ -175,7 +138,6 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     --save $CHECKPOINT_PATH
-    --ec-checkpoint-write-only-penultimate-iter
     #--load $CHECKPOINT_PATH
     
     --eval-iters 1
@@ -184,8 +146,9 @@ EVAL_AND_LOGGING_ARGS=(
     --use-frcheck
     --frcheck-n 4
     --frcheck-table-dir $FRCHECK_TABLE_DIR
-    #--frcheck-failed-ranks 0,1
+    --frcheck-failed-ranks 0,1
     --use-frcheck-hardware-failure
+    --use-rdma
     --ckpt-format torch
     --save-embeddings-separately
     # --timing-log-level 2
@@ -214,7 +177,6 @@ PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     ${GPT_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
-    ${RECOVERY_MODE_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
     --distributed-backend nccl \
     ${ARGS_TO_PASS[@]}

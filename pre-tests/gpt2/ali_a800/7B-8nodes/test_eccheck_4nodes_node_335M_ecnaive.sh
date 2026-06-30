@@ -24,7 +24,7 @@ MASTER_ADDR=172.16.0.224
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
-NNODES=4
+NNODES=8
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
@@ -71,18 +71,10 @@ while [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; do
     shift
 done
 
-# If no GPU IDs are provided, use all GPUs available on the node by default
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
-    if command -v nvidia-smi > /dev/null 2>&1; then
-        # Try to get all GPU indices using nvidia-smi, fallback to 0 if nvidia-smi fails
-        mapfile -t GPU_IDS < <(nvidia-smi --query-gpu=index --format=csv,noheader)
-        if [ "${#GPU_IDS[@]}" -eq 0 ]; then
-            GPU_IDS=(0)
-        fi
-    else
-        # If nvidia-smi does not exist, fallback to single GPU 0
-        GPU_IDS=(0)
-    fi
+    echo "Error: At least one GPU id must be specified."
+    echo "Usage: $0 <node_rank> <gpu_id_0> [gpu_id_1 ...] [save|software|hardware|hardware2] [additional_args...]"
+    exit 1
 fi
 
 # ---- mode parsing (save | software | hardware, after GPU IDs) ----
@@ -139,9 +131,9 @@ case "$MODE" in
 esac
 
 # Model related configuration here, please do not overlap with json config
-HIDDEN_SIZE=4800
-NUM_ATTENTION_HEADS=40
-NUM_LAYERS=40
+HIDDEN_SIZE=4096
+NUM_ATTENTION_HEADS=32
+NUM_LAYERS=32
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
@@ -172,7 +164,6 @@ GPT_ARGS=(
     --global-batch-size $GLOBAL_BATCH_SIZE 
     --lr 0.00005
     --train-iters 20
-    --ec-checkpoint-write-only-penultimate-iter
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -194,7 +185,7 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 8
-    --pipeline-model-parallel-size 4
+    --pipeline-model-parallel-size 8
     --sequence-parallel
 )
 

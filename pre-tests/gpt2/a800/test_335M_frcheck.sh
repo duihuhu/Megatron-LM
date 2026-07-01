@@ -89,6 +89,10 @@ ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 case "$MODE" in
     save)
+        RECOVERY_MODE_ARGS=(
+            --save $CHECKPOINT_PATH
+            --ec-checkpoint-write-only-penultimate-iter
+        )
         ;;
     software)
         RECOVERY_MODE_ARGS=(
@@ -175,7 +179,7 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    --save $CHECKPOINT_PATH
+    #--save $CHECKPOINT_PATH
     --frcheck-async-parity
     --frcheck-skip-load-teardown-barrier
     #--frcheck-defer-load-teardown

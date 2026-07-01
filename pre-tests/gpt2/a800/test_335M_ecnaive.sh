@@ -17,7 +17,7 @@ MASTER_ADDR=10.0.0.62
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
-NNODES=8
+NNODES=4
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
@@ -93,6 +93,10 @@ ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 case "$MODE" in
     save)
+        RECOVERY_MODE_ARGS=(
+            --ec-checkpoint-write-only-penultimate-iter
+            --save $CHECKPOINT_PATH
+        )
         ;;
     software)
         RECOVERY_MODE_ARGS=(
@@ -166,14 +170,14 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 8
+    --pipeline-model-parallel-size 4
 )
 
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    --save $CHECKPOINT_PATH 
+    #--save $CHECKPOINT_PATH 
     
     #--load $CHECKPOINT_PATH
     --eval-iters 1
@@ -188,7 +192,7 @@ EVAL_AND_LOGGING_ARGS=(
     --timing-log-level 1
 
     # --- EC-NAIVE generalized parameters ---
-     --ecnaive-rs-k 6             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
+     --ecnaive-rs-k 2             # Number of data blocks for RS encoding (default 2 → 2+2 scheme)
     #                                Group size n = k + 2 (e.g. k=6 → 6+2=8 ranks/group)
     #--use-ecnaive-software-failure
     #--ecnaive-failed-ranks 0   # Comma-separated failed global ranks for hardware recovery only; software recovery is set to 2

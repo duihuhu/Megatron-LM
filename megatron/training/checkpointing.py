@@ -2005,16 +2005,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         )
         install_frcheck_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
         mark_recovery_to_forward_timer("frcheck_runtime_install_done")
-        logger.info(
-            "FRCheck profile: rank=%d event=frcheck_runtime_install_done", frcheck_rank,
-        )
         removed_placeholders, _ = frcheck_filter_layerwise_model_placeholders(state_dict)
         mark_recovery_to_forward_timer("frcheck_filter_placeholders_done")
-        logger.info(
-            "FRCheck profile: rank=%d event=frcheck_filter_placeholders_done "
-            "removed=%d",
-            frcheck_rank, removed_placeholders,
-        )
         frcheck_runtime_summary = get_frcheck_layerwise_runtime_summary()
         frcheck_skipped_model_placeholders = (
             removed_placeholders > 0 or frcheck_runtime_summary is not None
@@ -2110,7 +2102,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     model_submit_start = time()
     if getattr(args, "use_frcheck", False):
         mark_recovery_to_forward_timer("frcheck_load_state_dict_start")
-        logger.info("FRCheck profile: rank=%d event=frcheck_load_state_dict_start", rank)
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
             load_model_state_dict(ddp_model[0], state_dict['model'], strict)
@@ -2124,17 +2115,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     model_submit_end = time()
     if getattr(args, "use_frcheck", False):
         mark_recovery_to_forward_timer("frcheck_load_state_dict_done")
-        logger.info("FRCheck profile: rank=%d event=frcheck_load_state_dict_done", rank)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     model_sync_end = time()
     if getattr(args, "use_frcheck", False):
         mark_recovery_to_forward_timer("frcheck_cuda_sync_done")
-        logger.info("FRCheck profile: rank=%d event=frcheck_cuda_sync_done", rank)
     if getattr(args, "use_frcheck", False) or getattr(args, "use_gemini_replicas", False):
         mark_recovery_to_forward_timer("model_load_done")
-        scheme = "FRCheck" if getattr(args, "use_frcheck", False) else "Gemini Replicas"
-        logger.info("%s profile: rank=%d event=model_load_done", scheme, rank)
     h2d_model_s = model_sync_end - model_submit_start
     h2d_model_submit_s = model_submit_end - model_submit_start
     h2d_model_sync_s = model_sync_end - model_submit_end
@@ -2144,21 +2131,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             f"cuda_sync={h2d_model_sync_s:.4f}s "
             f"total={h2d_model_s:.4f}s"
         )
-    logger.info(
-        f"[rank {rank}] load only model state before barrier time: "
-        f"{model_sync_end - load_model_start_time:.4f}s"
-    )
     if frcheck_runtime_summary is not None:
-        logger.info(
-            f"[rank {rank}] FRCheck layerwise runtime after model load: "
-            f"{frcheck_runtime_summary}"
-        )
         from .frcheck_legacy import frcheck_log_layerwise_runtime_summary
         frcheck_log_layerwise_runtime_summary("after_model_load")
     torch.distributed.barrier()
     if getattr(args, "use_frcheck", False):
         mark_recovery_to_forward_timer("frcheck_model_load_barrier_done")
-        logger.info("FRCheck profile: rank=%d event=frcheck_model_load_barrier_done", rank)
     load_model_end_time = time()
     logger.info(f"load only model state time: {load_model_end_time - load_model_start_time:.4f}s")
     load_model_start_time = time()

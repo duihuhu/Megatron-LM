@@ -8,8 +8,10 @@ import functools
 import gc
 import logging
 import math
+import multiprocessing
 import os
 import sys
+import threading
 from typing import List, Optional
 
 import torch.distributed
@@ -152,14 +154,24 @@ def destroy_global_state():
 
 
 def _log_recovery_to_forward_profile(event: str) -> None:
+    return
+
+def _force_exit_after_frcheck_load() -> None:
+    """Terminate leftover worker resources and bypass Python exit hooks for FRCheck load-only runs."""
     args = get_args()
-    if not (getattr(args, "use_frcheck", False) or getattr(args, "use_gemini_replicas", False)):
+    if not getattr(args, "use_frcheck_hardware_failure", False):
         return
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    scheme = "FRCheck" if getattr(args, "use_frcheck", False) else "Gemini Replicas"
+    for child in multiprocessing.active_children():
+        if child.is_alive():
+            child.terminate()
+    for child in multiprocessing.active_children():
+        child.join(timeout=1.0)
     logging.getLogger(__name__).info(
-        "%s profile: rank=%d event=%s", scheme, rank, event
+        "FRCheck: rank=%d force exiting after hardware recovery cleanup", rank
     )
+    logging.shutdown()
+    os._exit(0)
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -1009,6 +1021,7 @@ def pretrain(
     if getattr(_get_args(), "use_frcheck", False):
         from megatron.training.frcheck_legacy import _teardown_frcheck_after_training
         _teardown_frcheck_after_training()
+        _force_exit_after_frcheck_load()
 
 
 def update_train_iters(args):

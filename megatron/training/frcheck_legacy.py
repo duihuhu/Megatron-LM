@@ -152,6 +152,18 @@ def _summarize_optimizer_keys(keys) -> Dict[str, int]:
     return summary
 
 
+_FRCHECK_QUIET_PROFILE_EVENTS = {
+    "model_ready_done",
+    "optimizer_ready_done",
+    "network_window_submitted",
+    "network_window_done",
+    "safe_point",
+    "safe_point_deferred_for_layerwise",
+    "service_attach_worker",
+    "service_attach_runtime",
+}
+
+
 def _frcheck_recovery_profile(role: str, event: str, **fields) -> None:
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     parts = [f"rank={rank}", f"role={role}", f"event={event}"]
@@ -160,7 +172,8 @@ def _frcheck_recovery_profile(role: str, event: str, **fields) -> None:
             parts.append(f"{key}={value:.6f}")
         else:
             parts.append(f"{key}={value}")
-    logger.info("FRCheck profile: %s", " ".join(parts))
+    log_fn = logger.debug if event in _FRCHECK_QUIET_PROFILE_EVENTS else logger.info
+    log_fn("FRCheck profile: %s", " ".join(parts))
 
 
 def _frcheck_recovery_role(
@@ -690,12 +703,6 @@ class _FRCheckLayerwiseRuntime:
         self._injected_layers.add(layer_idx)
         inject_s = time.time() - t0
         self.inject_s += inject_s
-        logger.info(
-            "FRCheck layerwise inject: layer=%s idx=%d tensors=%d bytes=%d "
-            "matched=%d missing=%d time=%.4fs total_inject=%.4fs",
-            record.layer_name, layer_idx, len(tensors), copied,
-            matched, missing, inject_s, self.inject_s,
-        )
         record.model_tensors = None
         if record.optimizer_tensors is None and record.tensors is not None:
             _, optimizer_tensors = _split_recovered_tensors(
@@ -958,7 +965,8 @@ class _FRCheckRecoveryService:
             return False
         self.runtime.wait_for_optimizer_layers()
         self.wait_all(reason="optimizer")
-        self.state = self.OPTIMIZER_READY
+        if not self.safe_point_teardown_done:
+            self.state = self.OPTIMIZER_READY
         return True
 
     def summary(self) -> Dict[str, Any]:
@@ -1610,7 +1618,7 @@ def frcheck_recovery_safe_point(point: str) -> None:
 
 def frcheck_log_layerwise_runtime_summary(context: str) -> None:
     summary = get_frcheck_layerwise_runtime_summary()
-    if summary is not None:
+    if summary is not None and _frcheck_debug_enabled():
         logger.info("FRCheck layerwise runtime summary (%s): %s", context, summary)
 
 
@@ -4602,6 +4610,9 @@ def _teardown_frcheck_after_training() -> None:
     from megatron.training import get_args
     args = get_args()
     if not getattr(args, "use_frcheck", False):
+        return
+    service = _get_active_frcheck_recovery_service()
+    if service.safe_point_teardown_done:
         return
     frcheck_wait_for_async_recovery()
     manager = FRCheckManager()

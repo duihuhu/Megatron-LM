@@ -392,6 +392,9 @@ def maybe_setup_simulated_fault() -> None:
         else:
             os.kill(target_pid, signal.SIGKILL)
 
-    fault_sim_thread = threading.Thread(target=__fault_thread)
-    fault_sim_thread.daemon = True
+    fault_sim_thread = threading.Thread(
+        target=__fault_thread,
+        name="ft-fault-sim-thread",
+        daemon=True,
+    )
     fault_sim_thread.start()

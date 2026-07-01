@@ -189,113 +189,6 @@ def _submit_hw_stripes_stripe_major(
     return n_tasks
 
 
-def _submit_ecnaive_load_recovery_stripes(
-    native,
-    manager: ECNAIVEManager,
-    rank_in_group: int,
-    aligned_block_size: int,
-    ecnaive_blocks: Dict[str, torch.Tensor],
-    recv_buffers: Optional[Dict[str, torch.Tensor]] = None,
-) -> int:
-    """Submit chunked load recv/send tasks (mirrors save-side stripe pipeline).
-
-    Each stripe is an independent recv/xor or send task. C++ recv and XOR workers
-    drain their queues concurrently, so stripe N+1 network I/O can overlap XOR on
-    stripe N.
-    """
-    stripe_bytes = manager.ecnaive_buffer_size
-    n_stripes = sum(1 for _ in _iter_ecnaive_load_stripes(aligned_block_size, stripe_bytes))
-
-    if rank_in_group == 2:
-        if recv_buffers is None:
-            raise RuntimeError("EC-NAIVE legacy load: recv_buffers required on rank_in_group 2")
-        recv_base = {
-            "p20": int(recv_buffers["p20_from_rank0"].data_ptr()),
-            "d21": int(recv_buffers["d21_from_rank3"].data_ptr()),
-            "d00": int(recv_buffers["d00_from_rank0"].data_ptr()),
-            "d01": int(recv_buffers["d01_from_rank1"].data_ptr()),
-            "d10": int(recv_buffers["d10_from_rank1"].data_ptr()),
-            "p11": int(recv_buffers["p11_from_rank1"].data_ptr()),
-            "d30": int(recv_buffers["d30_from_rank3"].data_ptr()),
-            "d31": int(recv_buffers["d31_from_rank0"].data_ptr()),
-        }
-        output_base = {
-            "data0": int(ecnaive_blocks["data0"].data_ptr()),
-            "recv_parity0": int(ecnaive_blocks["recv_parity0"].data_ptr()),
-            "recv_data1": int(ecnaive_blocks["recv_data1"].data_ptr()),
-            "recv_parity1": int(ecnaive_blocks["recv_parity1"].data_ptr()),
-        }
-        for offset, take in _iter_ecnaive_load_stripes(aligned_block_size, stripe_bytes):
-            native.submit_ecnaive_load_recovery_full(
-                recv_p20_addr=recv_base["p20"] + offset,
-                recv_d21_addr=recv_base["d21"] + offset,
-                recv_d00_addr=recv_base["d00"] + offset,
-                recv_d01_addr=recv_base["d01"] + offset,
-                recv_d10_addr=recv_base["d10"] + offset,
-                recv_p11_addr=recv_base["p11"] + offset,
-                recv_d30_addr=recv_base["d30"] + offset,
-                recv_d31_addr=recv_base["d31"] + offset,
-                output_data0_addr=output_base["data0"] + offset,
-                output_recv_parity0_addr=output_base["recv_parity0"] + offset,
-                output_recv_data1_addr=output_base["recv_data1"] + offset,
-                output_recv_parity1_addr=output_base["recv_parity1"] + offset,
-                size=take,
-            )
-        native.submit_load_recv_sentinel()
-    elif rank_in_group == 0:
-        send_base = {
-            "p20": int(ecnaive_blocks["recv_parity0"].data_ptr()),
-            "d00": int(ecnaive_blocks["data0"].data_ptr()),
-            "d31": int(ecnaive_blocks["recv_data1"].data_ptr()),
-        }
-        for offset, take in _iter_ecnaive_load_stripes(aligned_block_size, stripe_bytes):
-            native.submit_load_send_rank0_parity0(
-                send_addr=send_base["p20"] + offset, size=take,
-            )
-            native.submit_load_send_rank0_data0(
-                send_addr=send_base["d00"] + offset, size=take,
-            )
-            native.submit_load_send_rank0_data1(
-                send_addr=send_base["d31"] + offset, size=take,
-            )
-        native.submit_load_send_sentinel()
-    elif rank_in_group == 1:
-        send_base = {
-            "d01": int(ecnaive_blocks["recv_data1"].data_ptr()),
-            "d10": int(ecnaive_blocks["data0"].data_ptr()),
-            "p11": int(ecnaive_blocks["recv_parity1"].data_ptr()),
-        }
-        for offset, take in _iter_ecnaive_load_stripes(aligned_block_size, stripe_bytes):
-            native.submit_load_send_rank1_data1(
-                send_addr=send_base["d01"] + offset, size=take,
-            )
-            native.submit_load_send_rank1_data0(
-                send_addr=send_base["d10"] + offset, size=take,
-            )
-            native.submit_load_send_rank1_parity1(
-                send_addr=send_base["p11"] + offset, size=take,
-            )
-        native.submit_load_send_sentinel()
-    elif rank_in_group == 3:
-        send_base = {
-            "d21": int(ecnaive_blocks["recv_data1"].data_ptr()),
-            "d30": int(ecnaive_blocks["data0"].data_ptr()),
-        }
-        for offset, take in _iter_ecnaive_load_stripes(aligned_block_size, stripe_bytes):
-            native.submit_load_send_rank3_data1(
-                send_addr=send_base["d21"] + offset, size=take,
-            )
-            native.submit_load_send_rank3_data0(
-                send_addr=send_base["d30"] + offset, size=take,
-            )
-        native.submit_load_send_sentinel()
-    else:
-        raise RuntimeError(
-            f"EC-NAIVE legacy load: unexpected rank_in_group={rank_in_group}"
-        )
-    return n_stripes
-
-
 def _submit_hw_failed_recv_stripe(
     native,
     manager: ECNAIVEManager,
@@ -462,6 +355,7 @@ def _hw_decode_encode_all_owners_stripe(
     ecnaive_k: int,
     byte_offset: int,
     stripe_size: int,
+    owner_encode_s: Optional[Dict[int, float]] = None,
 ) -> None:
     """RS-decode and parity-encode one byte stripe for every owner codeword."""
     for plan in owner_plans:
@@ -476,12 +370,15 @@ def _hw_decode_encode_all_owners_stripe(
                 stripe_size,
             )
         if plan["need_parity0"] or plan["need_parity1"]:
+            t0 = time.time()
             native.encode_ec_blocks(
                 [addr + byte_offset for addr in plan["encode_input_bases"]],
                 plan["parity0_base"] + byte_offset,
                 plan["parity1_base"] + byte_offset,
                 stripe_size,
             )
+            if owner_encode_s is not None:
+                owner_encode_s[plan["owner_rig"]] = owner_encode_s.get(plan["owner_rig"], 0.0) + (time.time() - t0)
 
 
 def _run_hw_failed_recv_decode_pipeline(
@@ -496,6 +393,7 @@ def _run_hw_failed_recv_decode_pipeline(
     block_data_size: int,
     owner_plans: List[Dict[str, Any]],
     stripe_bytes: int,
+    owner_encode_s: Optional[Dict[int, float]] = None,
 ) -> int:
     """Recv/decode pipeline: recv stripe N+1 overlaps decode stripe N (mirrors save)."""
     stripes = list(_iter_ecnaive_load_stripes(block_data_size, stripe_bytes))
@@ -517,13 +415,13 @@ def _run_hw_failed_recv_decode_pipeline(
             recv_pool, off, take,
         )
         _hw_decode_encode_all_owners_stripe(
-            native, owner_plans, ecnaive_k, prev_off, prev_take,
+            native, owner_plans, ecnaive_k, prev_off, prev_take, owner_encode_s,
         )
         native.wait_for_pending_network_tasks()
 
     last_off, last_take = stripes[-1]
     _hw_decode_encode_all_owners_stripe(
-        native, owner_plans, ecnaive_k, last_off, last_take,
+        native, owner_plans, ecnaive_k, last_off, last_take, owner_encode_s,
     )
     return len(stripes)
 
@@ -1183,7 +1081,7 @@ def _load_ecnaive_legacy_software_failure(
     _t['network_encode'] = _time() - _t0_net
     native_timing = _native_ft_timing(native)
     _t['net_s'] = native_timing['net_s']
-    _t['encode_s'] = native_timing['encode_s']
+    _t.setdefault('encode_s', native_timing['encode_s'])
 
     # Decode recv blocks → tensor_buffer (not timed)
     if rank_in_group == failed_rig:
@@ -1240,81 +1138,6 @@ def _load_ecnaive_legacy_software_failure(
     return state_dict
 
 
-def _run_ecnaive_full_recovery(
-    manager: ECNAIVEManager,
-    rank: int,
-    world_size: int,
-    ecnaive_blocks: Dict[str, torch.Tensor],
-    recv_buffers: Optional[Dict[str, torch.Tensor]],
-) -> None:
-    """Mirror megatron.core.dist_checkpointing.strategies.torch recovery send/recv layout."""
-    native = manager._ecnaive_native
-    if native is None:
-        raise RuntimeError("EC-NAIVE native module is not initialized")
-
-    net_config = manager._get_ecnaive_load_network_config(rank, world_size)
-    rank_in_group = net_config["rank_in_group"]
-
-    from time import time
-
-    start_time = time()
-
-    if rank_in_group == 2:
-        if recv_buffers is None:
-            raise RuntimeError("EC-NAIVE legacy load: recv_buffers required on rank_in_group 2")
-        required_keys = [
-            "p20_from_rank0",
-            "d21_from_rank3",
-            "d00_from_rank0",
-            "d01_from_rank1",
-            "d10_from_rank1",
-            "p11_from_rank1",
-            "d30_from_rank3",
-            "d31_from_rank0",
-        ]
-        missing = [k for k in required_keys if k not in recv_buffers]
-        if missing:
-            raise RuntimeError(f"EC-NAIVE legacy load: missing recv buffers {missing}")
-
-        required_blocks = ["data0", "recv_parity0", "recv_data1", "recv_parity1"]
-        missing_b = [k for k in required_blocks if k not in ecnaive_blocks]
-        if missing_b:
-            raise RuntimeError(f"EC-NAIVE legacy load: missing output blocks {missing_b}")
-
-        aligned_block_size = ecnaive_blocks["data0"].numel()
-        n_stripes = _submit_ecnaive_load_recovery_stripes(
-            native=native,
-            manager=manager,
-            rank_in_group=rank_in_group,
-            aligned_block_size=aligned_block_size,
-            ecnaive_blocks=ecnaive_blocks,
-            recv_buffers=recv_buffers,
-        )
-        logger.debug(
-            "EC-NAIVE legacy load: rank_in_group 2 submitted %d stripes "
-            "(stripe_bytes=%d, block_bytes=%d), waiting for completion",
-            n_stripes, manager.ecnaive_buffer_size, aligned_block_size,
-        )
-        native.wait_for_load_completion()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        logger.debug(
-            f"EC-NAIVE legacy load: hw recovery done in {time() - start_time:.2f}s (rank_in_group=2)"
-        )
-    else:
-        aligned_block_size = ecnaive_blocks["data0"].numel()
-        n_stripes = _submit_ecnaive_load_recovery_stripes(
-            native=native,
-            manager=manager,
-            rank_in_group=rank_in_group,
-            aligned_block_size=aligned_block_size,
-            ecnaive_blocks=ecnaive_blocks,
-        )
-        logger.debug(
-            f"EC-NAIVE legacy load: submitted {n_stripes} load send stripes in "
-            f"{time() - start_time:.2f}s (rank_in_group={rank_in_group})"
-        )
-
 def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
     """Infer flat key roots from checkpoint payload (for backward compatibility)."""
     if "flat_key_roots" in main_payload:
@@ -1358,13 +1181,8 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     """
     Load EC-NAIVE torch legacy checkpoint.
 
-    Normal load: always run 8-port recovery (aligned with torch_dist), then
-    reconstruct state_dict from main tensor_buffer when present, else from
-    decoded data0.
-
-    Software failure (use_ecnaive_software_failure=True): rank_in_group=2
-    reads d_{2,0} locally + receives d_{2,1} from rank_in_group=3 via C++
-    (1 port), concatenates, and reconstructs.  No XOR decode or parity needed.
+    Normal load rebuilds from the local main tensor buffer. Hardware recovery is
+    handled only by load_ecnaive_legacy_checkpoint_hardware_recovery().
     """
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -1387,11 +1205,9 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         raise RuntimeError("EC-NAIVE native module is not available in legacy load path")
 
     tensor_infos = main_payload["tensor_infos"]
-
     local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
-    gathered_meta: List[Any]
     if world_size > 1 and torch.distributed.is_initialized():
-        gathered_meta = [None for _ in range(world_size)]
+        gathered_meta: List[Any] = [None for _ in range(world_size)]
         torch.distributed.all_gather_object(gathered_meta, local_metadata)
         rank_metadata = {i: gathered_meta[i] for i in range(world_size)}
     else:
@@ -1420,83 +1236,33 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         set_ft_load_timing_context("EC-NAIVE", "SW", _t)
         return state_dict
 
-    # ---- Hardware recovery ----
-    # Setup (not timed): init + buffer_alloc
-    manager.init_ecnaive_load(rank, world_size)
-
-    rank_in_group = manager._get_rank_in_group(rank, world_size)
-    recv_buffers: Optional[Dict[str, torch.Tensor]] = None
-    ecnaive_blocks: Dict[str, torch.Tensor]
-
-    aligned_block_size = int(main_payload["aligned_block_size"])
-
-    if rank_in_group == 2:
-        recv_buffers = manager.allocate_ecnaive_load_recv_buffers(global_registry)
-        data0, recv_parity1, recv_parity0, recv_data1 = allocate_hugepage_slices(
-            aligned_block_size,
-            4,
-            touch_pages=True,
+    if not isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
+        raise RuntimeError(
+            "EC-NAIVE legacy load: local tensor_buffer is missing. "
+            "Use --ecnaive-failed-ranks to run generalized hardware recovery."
         )
-        ecnaive_blocks = {
-            "data0": data0,
-            "recv_parity1": recv_parity1,
-            "recv_parity0": recv_parity0,
-            "recv_data1": recv_data1,
-        }
-        if manager.use_rdma:
-            for _n, t in ecnaive_blocks.items():
-                manager.register_buffer(t)
-    else:
-        ecnaive_blocks = _load_blocks_from_disk(checkpoint_dir, rank)
-        if manager.use_rdma:
-            for _n, t in ecnaive_blocks.items():
-                manager.register_buffer(t)
 
-    # Sync all ranks after setup so network timing excludes setup skew.
-    barrier_s = _timed_barrier() if world_size > 1 and torch.distributed.is_initialized() else 0.0
-
-    # === timing: network/encode (C++ pipeline) ===
-    _t0 = time.time()
-    _run_ecnaive_full_recovery(
-        manager=manager,
-        rank=rank,
-        world_size=world_size,
-        ecnaive_blocks=ecnaive_blocks,
-        recv_buffers=recv_buffers,
-    )
-    network_encode = time.time() - _t0
-
-    # Backward compatibility: checkpoints saved before flat_key_roots existed.
     flat_key_roots = _infer_flat_key_roots(main_payload)
-
     t_rebuild = time.time()
-    if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
-        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
-            main_payload, flat_key_roots=flat_key_roots,
-        )
-    else:
-        state_dict = _reconstruct_state_dict_from_main_and_data0(
-            main_payload=main_payload,
-            data0_uint8=ecnaive_blocks["data0"],
-            manager=manager,
-            flat_key_roots=flat_key_roots,
-        )
+    state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+        main_payload, flat_key_roots=flat_key_roots,
+    )
     rebuild_sd = time.time() - t_rebuild
-    native_timing = _native_ft_timing(manager._ecnaive_native)
 
-    timings = {
-        "total": network_encode + rebuild_sd,
-        "network_encode": network_encode,
-        "net_s": native_timing["net_s"],
-        "encode_s": native_timing["encode_s"],
-        "rebuild_sd": rebuild_sd,
-        "barrier": barrier_s,
-    }
     from megatron.training.global_vars import set_ft_load_timing_context
-    set_ft_load_timing_context("EC-NAIVE", "HW", timings)
-
+    set_ft_load_timing_context(
+        "EC-NAIVE",
+        "normal",
+        {
+            "total": rebuild_sd,
+            "network_encode": 0.0,
+            "net_s": 0.0,
+            "encode_s": 0.0,
+            "rebuild_sd": rebuild_sd,
+            "barrier": 0.0,
+        },
+    )
     return state_dict
-
 
 def _load_all_blocks_from_disk(
     checkpoint_dir: Path,
@@ -1904,12 +1670,14 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     ]
                     parity0 = parity_pool_0[owner_idx]
                     parity1 = parity_pool_1[owner_idx]
+                    t0_encode = time.time()
                     native.encode_ec_blocks(
                         [int(b.data_ptr()) for b in encode_inputs],
                         int(parity0.data_ptr()),
                         int(parity1.data_ptr()),
                         block_data_size,
                     )
+                    _t['encode_s'] = max(_t.get('encode_s', 0.0), time.time() - t0_encode)
                     if need_parity0:
                         recovered['recv_1_ref'] = parity0
                     if need_parity1:
@@ -1930,6 +1698,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 parity_pool_0=parity_pool_0,
                 parity_pool_1=parity_pool_1,
             )
+            owner_encode_s: Dict[int, float] = {}
             n_stripes = _run_hw_failed_recv_decode_pipeline(
                 native=native,
                 manager=manager,
@@ -1942,7 +1711,10 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 block_data_size=block_data_size,
                 owner_plans=owner_plans,
                 stripe_bytes=stripe_bytes,
+                owner_encode_s=owner_encode_s,
             )
+            if owner_encode_s:
+                _t['encode_s'] = max(owner_encode_s.values())
             native.submit_send_sentinels(num_channels)
             native.submit_recv_sentinels(num_channels)
             native.wait_for_encoding_completion()
@@ -2062,7 +1834,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     _t['barrier'] = barrier_s
     native_timing = _native_ft_timing(native)
     _t['net_s'] = native_timing['net_s']
-    _t['encode_s'] = native_timing['encode_s']
+    _t.setdefault('encode_s', native_timing['encode_s'])
     _t['total'] = (
         _t.get('network_encode', 0.0)
         + _t.get('rebuild_sd', 0.0)

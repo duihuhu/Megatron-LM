@@ -90,6 +90,10 @@ ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 case "$MODE" in
     save)
+        RECOVERY_MODE_ARGS=(
+            --save $CHECKPOINT_PATH
+            --ec-checkpoint-write-only-penultimate-iter
+        )
         ;;
     software)
         RECOVERY_MODE_ARGS=(
@@ -100,12 +104,14 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
-            #--frcheck-async-recovery-forward
+            --frcheck-async-recovery-forward
             #--no-load-optim
             #--no-load-rng
             --frcheck-failed-ranks "0,1,2,3,4,5,6,7"
-            --frcheck-recovery-safe-point after_load_checkpoint
+            --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
+            # Native RDMA stays alive until optimizer_step; forked DataLoader workers segfault.
+            --num-workers 0
         )
         ;;
     hardware2)
@@ -151,7 +157,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00005
-    --train-iters 4
+    --train-iters 20
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -181,7 +187,7 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    --save $CHECKPOINT_PATH
+    #--save $CHECKPOINT_PATH
     #--load $CHECKPOINT_PATH
     
     --eval-iters 1

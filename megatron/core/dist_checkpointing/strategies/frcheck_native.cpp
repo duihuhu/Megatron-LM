@@ -2148,14 +2148,14 @@ public:
     }
 
     void inc_pause_async_p2p() {
-        // Block new async P2 RDMA before PP communication starts, then wait for
-        // already-started async RDMA chunks to drain.
+        // Block new async P2 RDMA before PP communication starts.
+        // Already-started RDMA is allowed to drain in the background so PP does
+        // not wait at the communication boundary.
         int prev = async_p2p_pause_count_.fetch_add(1, std::memory_order_acq_rel);
-        _wait_async_rdma_idle();
         if (debug_)
             std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
                       << " inc_pause_async_p2p prev=" << prev
-                      << " -> async RDMA idle" << std::endl;
+                      << " -> paused new async RDMA" << std::endl;
     }
 
     void dec_pause_async_p2p() {

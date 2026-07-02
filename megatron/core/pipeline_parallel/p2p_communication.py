@@ -2,6 +2,9 @@
 
 from typing import List, Optional, Tuple, Union
 
+import logging
+import time
+
 import torch
 
 from megatron.core import ModelParallelConfig
@@ -17,8 +20,23 @@ from megatron.core.utils import nvtx_decorator
 # Types
 Shape = Union[List[int], torch.Size]
 
+logger = logging.getLogger(__name__)
+
 
 # ---- FRCheck async parity hooks (no-op when flag not set) ----
+
+def _frcheck_async_parity_debug_enabled(args=None):
+    if args is None:
+        try:
+            from megatron.training import get_args
+            args = get_args()
+        except Exception:
+            return False
+    return (
+        bool(getattr(args, 'use_frcheck', False))
+        and bool(getattr(args, 'frcheck_debug', False))
+    )
+
 
 def _frcheck_inc_net_busy():
     """Increment the FRCheck async-pause refcount.
@@ -403,6 +421,22 @@ def _communicate(
     if tensor_recv_next_func is not None:
         tensor_recv_next = tensor_recv_next_func()
 
+    frcheck_async_debug = _frcheck_async_parity_debug_enabled()
+    frcheck_trace_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    frcheck_async_parity = False
+    if frcheck_async_debug:
+        try:
+            from megatron.training import get_args
+            frcheck_async_parity = bool(getattr(get_args(), 'frcheck_async_parity', False))
+        except Exception:
+            frcheck_async_parity = False
+    frcheck_p2p_total_t0 = time.time()
+    frcheck_p2p_call_t0 = frcheck_p2p_total_t0
+    if frcheck_async_debug:
+        logger.info(
+            "FRCHECK async parity trace rank %d async_parity=%s: pp_p2p_pause_begin",
+            frcheck_trace_rank, frcheck_async_parity,
+        )
     _frcheck_inc_net_busy()
     p2p_reqs = p2p_func(
         tensor_send_prev=tensor_send_prev,
@@ -413,18 +447,22 @@ def _communicate(
         prev_pipeline_rank=prev_rank,
         next_pipeline_rank=next_rank,
     )
+    frcheck_p2p_call_elapsed = time.time() - frcheck_p2p_call_t0
     if isinstance(p2p_reqs, list):
         reqs.extend(p2p_reqs)
     else:
         reqs.update(p2p_reqs)
 
+    frcheck_p2p_wait_elapsed = 0.0
     # Batched and ring-exchange paths do blocking wait inside p2p_func
     # and return an empty list — NCCL is already complete.
     if config.use_ring_exchange_p2p or config.batch_p2p_comm:
         _frcheck_dec_net_busy()
     elif wait_on_reqs and len(reqs) > 0:
+        frcheck_p2p_wait_t0 = time.time()
         for req in reqs if isinstance(reqs, list) else reqs.values():
             req.wait()
+        frcheck_p2p_wait_elapsed = time.time() - frcheck_p2p_wait_t0
         _frcheck_dec_net_busy()
         reqs = None
     elif len(reqs) > 0:
@@ -435,6 +473,12 @@ def _communicate(
     else:
         # No ops issued (edge case), dec to avoid refcount leak
         _frcheck_dec_net_busy()
+    if frcheck_async_debug:
+        logger.info(
+            "FRCHECK async parity trace rank %d async_parity=%s: pp_p2p_pause_end total=%.6fs call=%.6fs wait=%.6fs reqs=%d",
+            frcheck_trace_rank, frcheck_async_parity, time.time() - frcheck_p2p_total_t0,
+            frcheck_p2p_call_elapsed, frcheck_p2p_wait_elapsed, len(reqs) if reqs is not None else 0,
+        )
 
     if config.batch_p2p_comm and config.batch_p2p_sync:
         # To protect against race condition when using batch_isend_irecv().

@@ -5,6 +5,7 @@
 import contextlib
 import os
 import random
+import re
 import shutil
 import sys
 import threading
@@ -2058,6 +2059,33 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
                 load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
+
+    def state_dict_has_model_keys(state_dict):
+        """Return True when checkpoint carries any model shard key."""
+        if 'model' in state_dict or 'model0' in state_dict:
+            return True
+        return any(
+            isinstance(key, str) and re.fullmatch(r'model\d+', key)
+            for key in state_dict.keys()
+        )
+
+    def get_single_model_state_dict(state_dict):
+        """Return the model state for runs that only build one local model chunk."""
+        if 'model' in state_dict:
+            return state_dict['model']
+        if 'model0' in state_dict:
+            return state_dict['model0']
+        model_keys = sorted(
+            key for key in state_dict.keys()
+            if isinstance(key, str) and re.fullmatch(r'model\d+', key)
+        )
+        if len(model_keys) == 1:
+            return state_dict[model_keys[0]]
+        raise KeyError(
+            "checkpoint state_dict does not contain a single model state; "
+            f"available model keys={model_keys}, all keys={list(state_dict.keys())}"
+        )
+
     # Model.
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -2103,8 +2131,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if getattr(args, "use_frcheck", False):
         mark_recovery_to_forward_timer("frcheck_load_state_dict_start")
     if not skip_load_to_model_and_opt:
-        if len(ddp_model) == 1:
-            load_model_state_dict(ddp_model[0], state_dict['model'], strict)
+        if not state_dict_has_model_keys(state_dict):
+            if frcheck_skipped_model_placeholders:
+                print_rank_0(
+                    'FRCheck layerwise recovery: checkpoint has no model state; '
+                    'layers will be injected before forward'
+                )
+            else:
+                get_single_model_state_dict(state_dict)
+        elif len(ddp_model) == 1:
+            load_model_state_dict(ddp_model[0], get_single_model_state_dict(state_dict), strict)
         else:
             for i in range(len(ddp_model)):
                 # If there is no corresponding model in the state_dict, it will be ignored.

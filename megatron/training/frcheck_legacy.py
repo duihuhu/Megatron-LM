@@ -2170,6 +2170,11 @@ def _async_write_frcheck_p2_files(
         flush_elapsed = time.time() - t0
         if debug:
             logger.info(
+                "FRCHECK async parity trace rank %d: async_p2_flush_done elapsed=%.6fs layers=%d",
+                rank, flush_elapsed, len(encode_results),
+            )
+        if debug:
+            logger.info(
                 "FRCHECK async P2 writer rank %d: wait_parity_flush done %.3fs",
                 rank, flush_elapsed,
             )
@@ -2603,6 +2608,12 @@ def save_frcheck_legacy_checkpoint(
                 rank, len(encode_results), _async_p2_parity_tasks, _async_p2_send_tasks,
                 _async_p2_reset_elapsed, _async_p2_build_elapsed,
                 _async_p2_native_elapsed, _async_p2_submit_elapsed,
+            )
+        if _dbg:
+            logger.info(
+                "FRCHECK async parity trace rank %d: async_p2_submit_done elapsed=%.6fs layers=%d parity_tasks=%d send_tasks=%d",
+                rank, _async_p2_submit_elapsed, len(encode_results),
+                _async_p2_parity_tasks, _async_p2_send_tasks,
             )
 
     _mirror_t0 = time.time()

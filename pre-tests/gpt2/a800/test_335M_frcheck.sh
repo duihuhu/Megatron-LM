@@ -73,17 +73,7 @@ if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
     shift
 fi
 
-LATEST_ITER=1
-if [[ "$MODE" == "hardware" || "$MODE" == "hardware2" ]]; then
-    if [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; then
-        LATEST_ITER="$1"
-        shift
-    fi
-    # Update latest_checkpointed_iteration.txt in the checkpoint path
-    LATEST_ITER_FILE="$CHECKPOINT_PATH/latest_checkpointed_iteration.txt"
-    mkdir -p "$CHECKPOINT_PATH"
-    echo "$LATEST_ITER" > "$LATEST_ITER_FILE"
-fi
+
 
 ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
@@ -180,7 +170,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     #--save $CHECKPOINT_PATH
-    --frcheck-async-parity
+    #--frcheck-async-parity
     --frcheck-skip-load-teardown-barrier
     #--frcheck-defer-load-teardown
     #--load $CHECKPOINT_PATH
@@ -190,7 +180,7 @@ EVAL_AND_LOGGING_ARGS=(
 
     --use-frcheck
     --frcheck-distribute-common
-    #--frcheck-debug
+    --frcheck-debug
     --frcheck-n 8
     #--use-frcheck-software-failure 
     #--frcheck-failed-ranks 0

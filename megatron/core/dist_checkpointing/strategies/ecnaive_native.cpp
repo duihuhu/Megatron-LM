@@ -1476,7 +1476,7 @@ public:
             net_s = static_cast<double>(
                 save_net_wall_span_ns_.load(std::memory_order_relaxed)) / 1e9;
             encode_s = static_cast<double>(
-                save_encode_max_ns_.load(std::memory_order_relaxed)) / 1e9;
+                save_encode_total_ns_.load(std::memory_order_relaxed)) / 1e9;
         }
         pybind11::dict result;
         result["net_s"] = net_s;
@@ -1535,7 +1535,7 @@ public:
         recv_parity1_sentinel_received_ = false;
         recv_parity0_sentinel_received_ = false;
         recv_data1_sentinel_received_ = false;
-        save_encode_max_ns_.store(0, std::memory_order_relaxed);
+        save_encode_total_ns_.store(0, std::memory_order_relaxed);
         save_encode_op_count_.store(0, std::memory_order_relaxed);
         save_net_wall_span_ns_.store(0, std::memory_order_relaxed);
         {
@@ -1977,7 +1977,7 @@ private:
     int ec_decode_tbls_m_{0};
     std::vector<unsigned char> ec_decode_tbls_;  // stable storage for decode tables
 
-    std::atomic<uint64_t> save_encode_max_ns_{0};
+    std::atomic<uint64_t> save_encode_total_ns_{0};
     std::atomic<size_t> save_encode_op_count_{0};
     std::atomic<uint64_t> load_recv_total_ns_{0};
     std::atomic<uint64_t> load_send_total_ns_{0};
@@ -1990,10 +1990,7 @@ private:
     std::atomic<uint64_t> save_net_wall_span_ns_{0};
 
     void record_save_encode_op_(uint64_t ns) {
-        uint64_t cur = save_encode_max_ns_.load(std::memory_order_relaxed);
-        while (cur < ns && !save_encode_max_ns_.compare_exchange_weak(
-                   cur, ns, std::memory_order_relaxed, std::memory_order_relaxed)) {
-        }
+        save_encode_total_ns_.fetch_add(ns, std::memory_order_relaxed);
         save_encode_op_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -3327,7 +3324,7 @@ PYBIND11_MODULE(ecnaive_native, m) {
         .def("get_parity_buffers_to_release", &ECNaiveNative::get_parity_buffers_to_release)
         .def("reset_encoding_completion_flags", &ECNaiveNative::reset_encoding_completion_flags)
         .def("get_ft_timing_stats", &ECNaiveNative::get_ft_timing_stats,
-             "Return per-rank timing: net_s wall-span; encode_s max single encode op")
+             "Return per-rank timing: net_s wall-span; encode_s serial-equivalent encode CPU sum")
         .def("wait_for_encoding_completion", &ECNaiveNative::wait_for_encoding_completion)
         .def("wait_for_pending_network_tasks", &ECNaiveNative::wait_for_pending_network_tasks,
              "Wait until all in-flight save-path send/recv tasks complete (no sentinels)")

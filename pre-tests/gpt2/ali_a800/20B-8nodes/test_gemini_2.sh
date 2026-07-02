@@ -126,14 +126,14 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-gemini-replicas-software-failure
-            --gemini-replicas-recovery-rank "0,1,2,3,4,5,6,7"
+            --gemini-replicas-recovery-rank "16,17,18,19,20,21,22,23"
         )
         ;;
     hardware)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-gemini-replicas-hardware-failure
-            --gemini-replicas-recovery-rank "0,1,2,3,4,5,6,7"
+            --gemini-replicas-recovery-rank "16,17,18,19,20,21,22,23"
         )
         ;;
 esac

@@ -28,6 +28,21 @@ import time
 _TRAIN_START_TIME = time.time()
 import torch
 
+logger = logging.getLogger(__name__)
+
+
+def _frcheck_async_parity_debug_enabled(args=None):
+    if args is None:
+        try:
+            args = get_args()
+        except Exception:
+            return False
+    return (
+        bool(getattr(args, "use_frcheck", False))
+        and bool(getattr(args, "frcheck_debug", False))
+    )
+
+
 try:
     from megatron.post_training.algos.distillation import (
         get_tensor_shapes_adjust_fn_for_distillation,
@@ -1540,6 +1555,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     """Single training step."""
     args = get_args()
     timers = get_timers()
+    frcheck_async_debug = _frcheck_async_parity_debug_enabled(args)
+    frcheck_trace_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    frcheck_train_step_t0 = time.time()
+    if frcheck_async_debug:
+        logger.info(
+            "FRCHECK async parity trace rank %d iter %d async_parity=%s: train_step_start",
+            frcheck_trace_rank, getattr(args, "curr_iteration", -1),
+            bool(getattr(args, "frcheck_async_parity", False)),
+        )
 
     # CUDA Graph capturing only executes once, when it's the first training iteration.
     if args.curr_iteration == args.iteration and args.external_cuda_graph:
@@ -1608,6 +1632,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             return result
 
         # Forward pass.
+        if frcheck_async_debug:
+            logger.info(
+                "FRCHECK async parity trace rank %d iter %d async_parity=%s: forward_backward_start",
+                frcheck_trace_rank, getattr(args, "curr_iteration", -1),
+                bool(getattr(args, "frcheck_async_parity", False)),
+            )
+        frcheck_forward_backward_t0 = time.time()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func_with_recovery_timing,
             data_iterator=data_iterator,
@@ -1619,6 +1650,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
+        if frcheck_async_debug:
+            logger.info(
+                "FRCHECK async parity trace rank %d iter %d async_parity=%s: forward_backward_end elapsed=%.6fs",
+                frcheck_trace_rank, getattr(args, "curr_iteration", -1),
+                bool(getattr(args, "frcheck_async_parity", False)),
+                time.time() - frcheck_forward_backward_t0,
+            )
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
@@ -1634,6 +1672,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
+    if frcheck_async_debug:
+        logger.info(
+            "FRCHECK async parity trace rank %d iter %d async_parity=%s: before_optimizer_step",
+            frcheck_trace_rank, getattr(args, "curr_iteration", -1),
+            bool(getattr(args, "frcheck_async_parity", False)),
+        )
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if getattr(args, "use_frcheck", False):
         try:
@@ -1713,6 +1757,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.curr_iteration == args.iteration and args.external_cuda_graph:
         if args.use_distributed_optimizer and args.overlap_param_gather:
             cuda_graph_set_manual_hooks(model)
+
+    if frcheck_async_debug:
+        logger.info(
+            "FRCHECK async parity trace rank %d iter %d async_parity=%s: train_step_end elapsed=%.6fs",
+            frcheck_trace_rank, getattr(args, "curr_iteration", -1),
+            bool(getattr(args, "frcheck_async_parity", False)),
+            time.time() - frcheck_train_step_t0,
+        )
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
@@ -2109,6 +2161,8 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
+    frcheck_async_debug = _frcheck_async_parity_debug_enabled(args)
+    frcheck_save_t0 = time.time()
     save_checkpoint(
         iteration,
         model,
@@ -2120,6 +2174,13 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
+    if frcheck_async_debug:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logger.info(
+            "FRCHECK async parity trace rank %d iter %d async_parity=%s: save_return elapsed=%.6fs",
+            rank, iteration, bool(getattr(args, "frcheck_async_parity", False)),
+            time.time() - frcheck_save_t0,
+        )
     if args.fp8:
         # Run garbage collection after checkpoint saving to free memory from
         # dequantized bf16 tensors that were temporarily created during fp8

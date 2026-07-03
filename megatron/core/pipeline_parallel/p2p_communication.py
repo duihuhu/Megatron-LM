@@ -38,18 +38,25 @@ def _frcheck_async_parity_debug_enabled(args=None):
     )
 
 
+def _frcheck_any_async_parity_enabled(args) -> bool:
+    return (
+        bool(getattr(args, 'frcheck_async_parity', False))
+        or bool(getattr(args, 'frcheck_recovery_async_parity', False))
+    )
+
+
 def _frcheck_inc_net_busy():
     """Increment the FRCheck async-pause refcount.
 
     Called right before issuing NCCL P2P operations so that background P2
     parity sends do not contend for IB bandwidth with PP communication.
 
-    No-op when --frcheck-async-parity is not set.
+    No-op when neither save nor recovery async parity is enabled.
     """
     try:
         from megatron.training import get_args
         args = get_args()
-        if not getattr(args, 'frcheck_async_parity', False):
+        if not _frcheck_any_async_parity_enabled(args):
             return
         from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
         mgr = FRCheckManager()
@@ -69,7 +76,7 @@ def _frcheck_dec_net_busy():
     try:
         from megatron.training import get_args
         args = get_args()
-        if not getattr(args, 'frcheck_async_parity', False):
+        if not _frcheck_any_async_parity_enabled(args):
             return
         from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
         mgr = FRCheckManager()
@@ -423,19 +430,23 @@ def _communicate(
 
     frcheck_async_debug = _frcheck_async_parity_debug_enabled()
     frcheck_trace_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    frcheck_async_parity = False
+    frcheck_save_async_parity = False
+    frcheck_recovery_async_parity = False
     if frcheck_async_debug:
         try:
             from megatron.training import get_args
-            frcheck_async_parity = bool(getattr(get_args(), 'frcheck_async_parity', False))
+            _frcheck_args = get_args()
+            frcheck_save_async_parity = bool(getattr(_frcheck_args, 'frcheck_async_parity', False))
+            frcheck_recovery_async_parity = bool(getattr(_frcheck_args, 'frcheck_recovery_async_parity', False))
         except Exception:
-            frcheck_async_parity = False
+            frcheck_save_async_parity = False
+            frcheck_recovery_async_parity = False
     frcheck_p2p_total_t0 = time.time()
     frcheck_p2p_call_t0 = frcheck_p2p_total_t0
     if frcheck_async_debug:
         logger.info(
-            "FRCHECK async parity trace rank %d async_parity=%s: pp_p2p_pause_begin",
-            frcheck_trace_rank, frcheck_async_parity,
+            "FRCHECK async parity trace rank %d save_async_parity=%s recovery_async_parity=%s: pp_p2p_pause_begin",
+            frcheck_trace_rank, frcheck_save_async_parity, frcheck_recovery_async_parity,
         )
     _frcheck_inc_net_busy()
     p2p_reqs = p2p_func(
@@ -475,8 +486,9 @@ def _communicate(
         _frcheck_dec_net_busy()
     if frcheck_async_debug:
         logger.info(
-            "FRCHECK async parity trace rank %d async_parity=%s: pp_p2p_pause_end total=%.6fs call=%.6fs wait=%.6fs reqs=%d",
-            frcheck_trace_rank, frcheck_async_parity, time.time() - frcheck_p2p_total_t0,
+            "FRCHECK async parity trace rank %d save_async_parity=%s recovery_async_parity=%s: pp_p2p_pause_end total=%.6fs call=%.6fs wait=%.6fs reqs=%d",
+            frcheck_trace_rank, frcheck_save_async_parity, frcheck_recovery_async_parity,
+            time.time() - frcheck_p2p_total_t0,
             frcheck_p2p_call_elapsed, frcheck_p2p_wait_elapsed, len(reqs) if reqs is not None else 0,
         )
 

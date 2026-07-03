@@ -1508,6 +1508,13 @@ def create_layer_groups_by_param_count(optimizer, num_groups=None):
     return layer_groups
 
 
+def _frcheck_any_async_parity_enabled(args) -> bool:
+    return (
+        bool(getattr(args, 'frcheck_async_parity', False))
+        or bool(getattr(args, 'frcheck_recovery_async_parity', False))
+    )
+
+
 def _frcheck_inc_net_busy():
     """Mark the network as busy (PP NCCL communication in flight).
 
@@ -1515,12 +1522,12 @@ def _frcheck_inc_net_busy():
     workers will pause while the count is > 0.  Call _frcheck_dec_net_busy()
     after the NCCL operation completes.
 
-    No-op when --frcheck-async-parity is not set or FRCheck is not in use.
+    No-op when neither save nor recovery async parity is enabled.
     """
     try:
         from megatron.training import get_args
         args = get_args()
-        if not getattr(args, 'frcheck_async_parity', False):
+        if not _frcheck_any_async_parity_enabled(args):
             return
         from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
         mgr = FRCheckManager()
@@ -1540,7 +1547,7 @@ def _frcheck_dec_net_busy():
     try:
         from megatron.training import get_args
         args = get_args()
-        if not getattr(args, 'frcheck_async_parity', False):
+        if not _frcheck_any_async_parity_enabled(args):
             return
         from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
         mgr = FRCheckManager()
@@ -1560,9 +1567,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     frcheck_train_step_t0 = time.time()
     if frcheck_async_debug:
         logger.info(
-            "FRCHECK async parity trace rank %d iter %d async_parity=%s: train_step_start",
+            "FRCHECK async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: train_step_start",
             frcheck_trace_rank, getattr(args, "curr_iteration", -1),
             bool(getattr(args, "frcheck_async_parity", False)),
+            bool(getattr(args, "frcheck_recovery_async_parity", False)),
         )
 
     # CUDA Graph capturing only executes once, when it's the first training iteration.
@@ -1634,9 +1642,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Forward pass.
         if frcheck_async_debug:
             logger.info(
-                "FRCHECK async parity trace rank %d iter %d async_parity=%s: forward_backward_start",
+                "FRCHECK async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: forward_backward_start",
                 frcheck_trace_rank, getattr(args, "curr_iteration", -1),
                 bool(getattr(args, "frcheck_async_parity", False)),
+                bool(getattr(args, "frcheck_recovery_async_parity", False)),
             )
         frcheck_forward_backward_t0 = time.time()
         losses_reduced = forward_backward_func(
@@ -1652,9 +1661,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         )
         if frcheck_async_debug:
             logger.info(
-                "FRCHECK async parity trace rank %d iter %d async_parity=%s: forward_backward_end elapsed=%.6fs",
+                "FRCHECK async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: forward_backward_end elapsed=%.6fs",
                 frcheck_trace_rank, getattr(args, "curr_iteration", -1),
                 bool(getattr(args, "frcheck_async_parity", False)),
+                bool(getattr(args, "frcheck_recovery_async_parity", False)),
                 time.time() - frcheck_forward_backward_t0,
             )
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
@@ -1674,9 +1684,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     if frcheck_async_debug:
         logger.info(
-            "FRCHECK async parity trace rank %d iter %d async_parity=%s: before_optimizer_step",
+            "FRCHECK async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: before_optimizer_step",
             frcheck_trace_rank, getattr(args, "curr_iteration", -1),
             bool(getattr(args, "frcheck_async_parity", False)),
+            bool(getattr(args, "frcheck_recovery_async_parity", False)),
         )
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if getattr(args, "use_frcheck", False):
@@ -1760,9 +1771,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     if frcheck_async_debug:
         logger.info(
-            "FRCHECK async parity trace rank %d iter %d async_parity=%s: train_step_end elapsed=%.6fs",
+            "FRCHECK async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: train_step_end elapsed=%.6fs",
             frcheck_trace_rank, getattr(args, "curr_iteration", -1),
             bool(getattr(args, "frcheck_async_parity", False)),
+            bool(getattr(args, "frcheck_recovery_async_parity", False)),
             time.time() - frcheck_train_step_t0,
         )
 

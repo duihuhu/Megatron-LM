@@ -55,12 +55,13 @@ class StripePlan:
 
 @dataclass
 class LayerStripeBufs:
-    """Per-layer encode buffers: one GPU source region + CPU mirror + stripe role bufs."""
+    """Per-layer encode buffers: source region + CPU mirror + stripe role bufs."""
     layer_buf_gpu: torch.Tensor
     layer_mirror_cpu: torch.Tensor
     recv_bufs: List[Optional[torch.Tensor]]
     parity1_bufs: List[Optional[torch.Tensor]]
     parity2_bufs: List[Optional[torch.Tensor]]
+    source_on_cpu: bool = False
 
 
 class FRCheckManager:
@@ -587,10 +588,17 @@ class FRCheckManager:
                 default_block_size, recv_total,
             )
 
-    def _allocate_layer_stripe_bufs(self, native, layer_idx: int, block_sz: int) -> None:
+    def _allocate_layer_stripe_bufs(
+        self, native, layer_idx: int, block_sz: int, source_on_cpu: bool = False
+    ) -> None:
         """Allocate per-stripe buffers for one layer (grows-only per layer_idx)."""
         prev = self._layer_stripe_alloc_sizes.get(layer_idx, 0)
-        if prev >= block_sz and layer_idx in self.layer_stripe_bufs:
+        prev_bufs = self.layer_stripe_bufs.get(layer_idx)
+        if (
+            prev >= block_sz
+            and prev_bufs is not None
+            and bool(getattr(prev_bufs, "source_on_cpu", False)) == bool(source_on_cpu)
+        ):
             return
 
         n_src = (self.frcheck_n - 1) * (self.frcheck_n - 2)
@@ -605,11 +613,14 @@ class FRCheckManager:
         par_indices = [sid for sid in range(self.num_stripes)
                        if self.stripe_plans[sid].role == StripeRole.PARITY_TARGET]
 
-        layer_buf_gpu = torch.zeros(layer_capacity, dtype=torch.uint8, device="cuda")
         layer_mirror_cpu = allocate_hugepage_tensor(
             layer_capacity, fallback_pin_memory=True,
         )
         layer_mirror_cpu.zero_()
+        if source_on_cpu:
+            layer_buf_gpu = layer_mirror_cpu
+        else:
+            layer_buf_gpu = torch.zeros(layer_capacity, dtype=torch.uint8, device="cuda")
 
         buf_addr = layer_buf_gpu.data_ptr()
         if buf_addr not in self._rdma_registered_addrs:
@@ -657,6 +668,7 @@ class FRCheckManager:
             recv_bufs=recv_bufs,
             parity1_bufs=parity1_bufs,
             parity2_bufs=parity2_bufs,
+            source_on_cpu=source_on_cpu,
         )
         self.layer_stripe_bufs[layer_idx] = layer_bufs
 

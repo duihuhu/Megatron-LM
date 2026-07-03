@@ -4,7 +4,7 @@
 # Usage: ./test_eccheck_4nodes_node_335M_frcheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]
 # Example: ./test_eccheck_4nodes_node_335M_frcheck.sh 0 0
 # Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_frcheck.sh 0 2 3
-
+export FRCHECK_ENABLE_RECOVERY_PARITY_REPAIR=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
@@ -20,7 +20,7 @@ export FRCHECK_INTERFACE=$NETIFACES_INTERFACE
 export FRCHECK_BASE_IP=$MASTER_ADDR
 # FRCheck RDMA listens on FRCHECK_BASE_PORT + rank_in_group.
 # Keep this separate from torchrun MASTER_PORT and move it if a port is busy.
-export FRCHECK_BASE_PORT=${FRCHECK_BASE_PORT:-26100}
+export FRCHECK_BASE_PORT=${FRCHECK_BASE_PORT:-27200}
 MASTER_PORT=6000
 NNODES=8
 
@@ -81,6 +81,7 @@ case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
+            --frcheck-async-parity
             --ec-checkpoint-write-only-penultimate-iter
         )
         ;;
@@ -94,8 +95,7 @@ case "$MODE" in
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
             --frcheck-async-recovery-forward
-            #--no-load-optim
-            #--no-load-rng
+            --frcheck-recovery-async-parity
             --frcheck-failed-ranks "0"
             --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
@@ -170,7 +170,6 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     #--save $CHECKPOINT_PATH
-    #--frcheck-async-parity
     --frcheck-skip-load-teardown-barrier
     #--frcheck-defer-load-teardown
     #--load $CHECKPOINT_PATH
@@ -180,7 +179,7 @@ EVAL_AND_LOGGING_ARGS=(
 
     --use-frcheck
     --frcheck-distribute-common
-    --frcheck-debug
+    #--frcheck-debug
     --frcheck-n 8
     #--use-frcheck-software-failure 
     #--frcheck-failed-ranks 0

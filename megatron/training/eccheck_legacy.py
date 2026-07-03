@@ -213,12 +213,132 @@ def _allocate_recovered_buffer(size_bytes: int, pin: bool) -> torch.Tensor:
 # Encoding pipeline (save)
 # ---------------------------------------------------------------------------
 
+def _eccheck_chunk_take(
+    src_pos: int,
+    pipeline_total_bytes: int,
+    buffer_size: int,
+    recv_offset_1: int,
+    recv_offset_2: int,
+    own_offset: int,
+    partner_offset: int,
+    recv_buffer_thread1: torch.Tensor,
+    recv_buffer_thread2: torch.Tensor,
+    own_buffer: torch.Tensor,
+    partner_buffer: torch.Tensor,
+) -> int:
+    """Return the byte count for one ECCHECK encode stripe at src_pos."""
+    remaining = pipeline_total_bytes - src_pos
+    take = min(buffer_size, remaining)
+
+    recv_offset_1_aligned = ((recv_offset_1 + 63) // 64) * 64
+    recv_offset_2_aligned = ((recv_offset_2 + 63) // 64) * 64
+    recv_rem_1 = recv_buffer_thread1.numel() - recv_offset_1_aligned
+    recv_rem_2 = recv_buffer_thread2.numel() - recv_offset_2_aligned
+    max_recv_space = min(recv_rem_1, recv_rem_2)
+    if take > max_recv_space:
+        if max_recv_space < 64:
+            return 0
+        take = max_recv_space
+
+    own_offset_aligned = ((own_offset + 63) // 64) * 64
+    partner_offset_aligned = ((partner_offset + 63) // 64) * 64
+    p2p_rem_own = own_buffer.numel() - own_offset_aligned
+    p2p_rem_partner = partner_buffer.numel() - partner_offset_aligned
+    max_p2p_space = min(p2p_rem_own, p2p_rem_partner)
+    if take > max_p2p_space:
+        if max_p2p_space < 64:
+            return 0
+        take = max_p2p_space
+    return take
+
+
+def _copy_buffer_range_from_tensors(
+    tensor_buffer: torch.Tensor,
+    range_start: int,
+    range_end: int,
+    tensor_infos: List[Any],
+    tensor_data: List[Optional[torch.Tensor]],
+    non_blocking: bool = True,
+) -> None:
+    """Copy bytes [range_start, range_end) from source tensors into tensor_buffer."""
+    if range_end <= range_start:
+        return
+    for info, tensor in zip(tensor_infos, tensor_data):
+        if tensor is None:
+            continue
+        tensor_start = info.offset
+        tensor_end = tensor_start + info.size_bytes
+        if tensor_end <= range_start:
+            continue
+        if tensor_start >= range_end:
+            break
+        copy_start = max(range_start, tensor_start)
+        copy_end = min(range_end, tensor_end)
+        local_off = copy_start - tensor_start
+        nbytes = copy_end - copy_start
+        dst_off = copy_start
+        tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+        if tensor_view.numel() != info.size_bytes:
+            raise RuntimeError(
+                f"ECCHECK legacy save: tensor bytes mismatch for {info.key}, "
+                f"expected={info.size_bytes}, got={tensor_view.numel()}"
+            )
+        use_non_blocking = non_blocking and tensor.is_cuda
+        tensor_buffer[dst_off : dst_off + nbytes].copy_(
+            tensor_view[local_off : local_off + nbytes],
+            non_blocking=use_non_blocking,
+        )
+
+
+def _submit_eccheck_d2h_chunk(
+    tensor_buffer: torch.Tensor,
+    range_start: int,
+    range_end: int,
+    actual_data_bytes: int,
+    tensor_infos: List[Any],
+    tensor_data: List[Optional[torch.Tensor]],
+    d2h_stream: Optional[torch.cuda.Stream],
+) -> Optional[Tuple[torch.cuda.Event, torch.cuda.Event]]:
+    """Launch async D2H for one encode stripe; returns (start, end) CUDA events."""
+    if range_start >= actual_data_bytes:
+        return None
+    d2h_end = min(range_end, actual_data_bytes)
+    if d2h_end <= range_start:
+        return None
+    if d2h_stream is not None:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(d2h_stream):
+            start_event.record(d2h_stream)
+            _copy_buffer_range_from_tensors(
+                tensor_buffer,
+                range_start,
+                d2h_end,
+                tensor_infos,
+                tensor_data,
+                non_blocking=True,
+            )
+            end_event.record(d2h_stream)
+        return start_event, end_event
+    _copy_buffer_range_from_tensors(
+        tensor_buffer,
+        range_start,
+        d2h_end,
+        tensor_infos,
+        tensor_data,
+        non_blocking=False,
+    )
+    return None
+
+
 def _encode_eccheck_with_native(
     manager: ECCHECKManager,
     tensor_buffer: torch.Tensor,
     actual_data_bytes: int,
     blocks: Dict[str, Any],
-) -> None:
+    tensor_infos: List[Any],
+    tensor_data: List[Optional[torch.Tensor]],
+) -> float:
     native = manager._eccheck_native
     if native is None:
         raise RuntimeError("ECCHECK native module is not initialized")
@@ -287,11 +407,80 @@ def _encode_eccheck_with_native(
     own_offset = 0
     partner_offset = 0
     src_base_ptr = tensor_buffer.data_ptr()
+    d2h_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+    d2h_s = 0.0
+    pending_d2h: Optional[Tuple[torch.cuda.Event, torch.cuda.Event]] = None
 
     try:
         while src_pos < pipeline_total_bytes:
-            remaining = pipeline_total_bytes - src_pos
-            take = min(buffer_size, remaining)
+            take = _eccheck_chunk_take(
+                src_pos,
+                pipeline_total_bytes,
+                buffer_size,
+                recv_offset_1,
+                recv_offset_2,
+                own_offset,
+                partner_offset,
+                recv_buffer_thread1,
+                recv_buffer_thread2,
+                own_buffer,
+                partner_buffer,
+            )
+            if take <= 0:
+                logger.warning(
+                    f"ECCHECK legacy: recv/P2P buffers exhausted, stopping at "
+                    f"{src_pos / (1024**3):.2f} GB / {pipeline_total_bytes / (1024**3):.2f} GB"
+                )
+                break
+
+            if pending_d2h is None:
+                pending_d2h = _submit_eccheck_d2h_chunk(
+                    tensor_buffer,
+                    src_pos,
+                    src_pos + take,
+                    actual_data_bytes,
+                    tensor_infos,
+                    tensor_data,
+                    d2h_stream,
+                )
+
+            if pending_d2h is not None:
+                start_event, end_event = pending_d2h
+                end_event.synchronize()
+                d2h_s += start_event.elapsed_time(end_event) / 1000.0
+                pending_d2h = None
+
+            next_src = src_pos + take
+            if next_src < pipeline_total_bytes:
+                recv_offset_1_aligned = ((recv_offset_1 + 63) // 64) * 64
+                recv_offset_2_aligned = ((recv_offset_2 + 63) // 64) * 64
+                next_recv_offset_1 = recv_offset_1_aligned + take
+                next_recv_offset_2 = recv_offset_2_aligned + take
+                next_own_offset = ((own_offset + 63) // 64) * 64 + take
+                next_partner_offset = ((partner_offset + 63) // 64) * 64 + take
+                next_take = _eccheck_chunk_take(
+                    next_src,
+                    pipeline_total_bytes,
+                    buffer_size,
+                    next_recv_offset_1,
+                    next_recv_offset_2,
+                    next_own_offset,
+                    next_partner_offset,
+                    recv_buffer_thread1,
+                    recv_buffer_thread2,
+                    own_buffer,
+                    partner_buffer,
+                )
+                if next_take > 0:
+                    pending_d2h = _submit_eccheck_d2h_chunk(
+                        tensor_buffer,
+                        next_src,
+                        next_src + next_take,
+                        actual_data_bytes,
+                        tensor_infos,
+                        tensor_data,
+                        d2h_stream,
+                    )
 
             cur_buffer_addr = _get_free_data_buffer()
 
@@ -318,45 +507,15 @@ def _encode_eccheck_with_native(
 
             recv_chunk_size = take
 
-            # Bounds check: recv buffers (prevent alignment-padding overflow)
             recv_offset_1_aligned = ((recv_offset_1 + 63) // 64) * 64
             recv_offset_2_aligned = ((recv_offset_2 + 63) // 64) * 64
-            recv_rem_1 = recv_buffer_thread1.numel() - recv_offset_1_aligned
-            recv_rem_2 = recv_buffer_thread2.numel() - recv_offset_2_aligned
-            max_recv_space = min(recv_rem_1, recv_rem_2)
-            if take > max_recv_space:
-                if max_recv_space < 64:
-                    logger.warning(
-                        f"ECCHECK legacy: recv buffers exhausted "
-                        f"(rem1={recv_rem_1}, rem2={recv_rem_2}), stopping at "
-                        f"{src_pos / (1024**3):.2f} GB / {pipeline_total_bytes / (1024**3):.2f} GB"
-                    )
-                    break
-                take = max_recv_space
-                recv_chunk_size = take
-
-            # Bounds check: P2P buffers
-            own_offset_aligned = ((own_offset + 63) // 64) * 64
-            partner_offset_aligned = ((partner_offset + 63) // 64) * 64
-            p2p_rem_own = own_buffer.numel() - own_offset_aligned
-            p2p_rem_partner = partner_buffer.numel() - partner_offset_aligned
-            max_p2p_space = min(p2p_rem_own, p2p_rem_partner)
-            if take > max_p2p_space:
-                if max_p2p_space < 64:
-                    logger.warning(
-                        f"ECCHECK legacy: P2P buffers exhausted "
-                        f"(rem_own={p2p_rem_own}, rem_partner={p2p_rem_partner}), stopping at "
-                        f"{src_pos / (1024**3):.2f} GB / {pipeline_total_bytes / (1024**3):.2f} GB"
-                    )
-                    break
-                take = max_p2p_space
-                recv_chunk_size = take
-
             recv_addr_1 = recv_base_1 + recv_offset_1_aligned
             recv_addr_2 = recv_base_2 + recv_offset_2_aligned
             recv_offset_1 = recv_offset_1_aligned + recv_chunk_size
             recv_offset_2 = recv_offset_2_aligned + recv_chunk_size
 
+            own_offset_aligned = ((own_offset + 63) // 64) * 64
+            partner_offset_aligned = ((partner_offset + 63) // 64) * 64
             own_write_addr = own_base + own_offset_aligned
             partner_write_addr = partner_base + partner_offset_aligned
             own_offset = own_offset_aligned + take
@@ -373,6 +532,12 @@ def _encode_eccheck_with_native(
 
             src_pos += take
 
+        if pending_d2h is not None:
+            start_event, end_event = pending_d2h
+            end_event.synchronize()
+            d2h_s += start_event.elapsed_time(end_event) / 1000.0
+            pending_d2h = None
+
         # Sentinels
         native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0, 0, 0)
         native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0, 0, 0)
@@ -383,6 +548,7 @@ def _encode_eccheck_with_native(
     finally:
         if active_event is not None:
             active_event.clear()
+    return d2h_s
 
 
 # ---------------------------------------------------------------------------
@@ -543,32 +709,16 @@ def save_eccheck_legacy_checkpoint(
         torch.distributed.barrier()
     e2e_t0 = time.time()
 
-    d2h_t0 = time.time()
-    d2h_stream = torch.cuda.Stream()
-    with torch.cuda.stream(d2h_stream):
-        for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
-            tensor_bytes = info.size_bytes
-            tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
-            if tensor_view.numel() != tensor_bytes:
-                raise RuntimeError(
-                    f"ECCHECK legacy save: tensor bytes mismatch for {info.key}, "
-                    f"expected={tensor_bytes}, got={tensor_view.numel()}"
-                )
-            tensor_buffer[info.offset : info.offset + tensor_bytes].copy_(
-                tensor_view, non_blocking=True
-            )
-            decomposed.tensor_data[i] = None
-    d2h_stream.synchronize()
-    del decomposed.tensor_data
-    d2h_s = time.time() - d2h_t0
-
     encode_t0 = time.time()
-    _encode_eccheck_with_native(
+    d2h_s = _encode_eccheck_with_native(
         manager=manager,
         tensor_buffer=tensor_buffer,
         actual_data_bytes=total_tensor_size,
         blocks=blocks,
+        tensor_infos=decomposed.tensor_infos,
+        tensor_data=decomposed.tensor_data,
     )
+    del decomposed.tensor_data
     network_encode_s = time.time() - encode_t0
     native_timing = _native_ft_timing(manager._eccheck_native)
     e2e_s = time.time() - e2e_t0

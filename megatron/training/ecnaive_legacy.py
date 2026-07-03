@@ -426,12 +426,112 @@ def _run_hw_failed_recv_decode_pipeline(
     return len(stripes)
 
 
+def _copy_buffer_range_from_tensors(
+    tensor_buffer: torch.Tensor,
+    range_start: int,
+    range_end: int,
+    tensor_infos: List[Any],
+    tensor_data: List[Optional[torch.Tensor]],
+    non_blocking: bool = True,
+) -> None:
+    """Copy bytes [range_start, range_end) from source tensors into tensor_buffer."""
+    if range_end <= range_start:
+        return
+    for info, tensor in zip(tensor_infos, tensor_data):
+        if tensor is None:
+            continue
+        tensor_start = info.offset
+        tensor_end = tensor_start + info.size_bytes
+        if tensor_end <= range_start:
+            continue
+        if tensor_start >= range_end:
+            break
+        copy_start = max(range_start, tensor_start)
+        copy_end = min(range_end, tensor_end)
+        local_off = copy_start - tensor_start
+        nbytes = copy_end - copy_start
+        dst_off = copy_start
+        tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+        if tensor_view.numel() != info.size_bytes:
+            raise RuntimeError(
+                f"EC-NAIVE legacy save: tensor bytes mismatch for {info.key}, "
+                f"expected={info.size_bytes}, got={tensor_view.numel()}"
+            )
+        use_non_blocking = non_blocking and tensor.is_cuda
+        tensor_buffer[dst_off : dst_off + nbytes].copy_(
+            tensor_view[local_off : local_off + nbytes],
+            non_blocking=use_non_blocking,
+        )
+
+
+def _submit_ecnaive_d2h_stripe(
+    tensor_buffer: torch.Tensor,
+    src_pos: int,
+    take: int,
+    block_data_size: int,
+    k: int,
+    actual_data_bytes: int,
+    tensor_infos: List[Any],
+    tensor_data: List[Optional[torch.Tensor]],
+    d2h_stream: Optional[torch.cuda.Stream],
+) -> Optional[Tuple[torch.cuda.Event, torch.cuda.Event]]:
+    """D2H all k RS block slices for one encode stripe; returns (start, end) events."""
+    has_data = False
+    for j in range(k):
+        range_start = j * block_data_size + src_pos
+        if range_start < actual_data_bytes:
+            has_data = True
+            break
+    if not has_data:
+        return None
+
+    if d2h_stream is not None:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(d2h_stream):
+            start_event.record(d2h_stream)
+            for j in range(k):
+                range_start = j * block_data_size + src_pos
+                range_end = range_start + take
+                if range_start >= actual_data_bytes:
+                    continue
+                d2h_end = min(range_end, actual_data_bytes)
+                _copy_buffer_range_from_tensors(
+                    tensor_buffer,
+                    range_start,
+                    d2h_end,
+                    tensor_infos,
+                    tensor_data,
+                    non_blocking=True,
+                )
+            end_event.record(d2h_stream)
+        return start_event, end_event
+
+    for j in range(k):
+        range_start = j * block_data_size + src_pos
+        range_end = range_start + take
+        if range_start >= actual_data_bytes:
+            continue
+        d2h_end = min(range_end, actual_data_bytes)
+        _copy_buffer_range_from_tensors(
+            tensor_buffer,
+            range_start,
+            d2h_end,
+            tensor_infos,
+            tensor_data,
+            non_blocking=False,
+        )
+    return None
+
+
 def _encode_with_native(
     manager: ECNAIVEManager,
     tensor_buffer: torch.Tensor,
     actual_data_bytes: int,
     ecnaive_blocks: Dict[str, Any],
-) -> None:
+    tensor_infos: List[Any],
+    tensor_data: List[Optional[torch.Tensor]],
+) -> float:
     """Encode tensor data with ISA-L Reed-Solomon and distribute via C++ engine.
 
     Generalized for k+2 scheme: splits tensor_buffer into k data blocks,
@@ -492,11 +592,48 @@ def _encode_with_native(
 
     src_pos = 0
     src_base_ptr = tensor_buffer.data_ptr()
+    d2h_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+    d2h_s = 0.0
+    pending_d2h: Optional[Tuple[torch.cuda.Event, torch.cuda.Event]] = None
 
     try:
         while src_pos < block_data_size:
             remaining_in_block = block_data_size - src_pos
             take = min(ecnaive_buffer_size, remaining_in_block)
+
+            if pending_d2h is None:
+                pending_d2h = _submit_ecnaive_d2h_stripe(
+                    tensor_buffer,
+                    src_pos,
+                    take,
+                    block_data_size,
+                    k,
+                    actual_data_bytes,
+                    tensor_infos,
+                    tensor_data,
+                    d2h_stream,
+                )
+
+            if pending_d2h is not None:
+                start_event, end_event = pending_d2h
+                end_event.synchronize()
+                d2h_s += start_event.elapsed_time(end_event) / 1000.0
+                pending_d2h = None
+
+            next_src = src_pos + take
+            if next_src < block_data_size:
+                next_take = min(ecnaive_buffer_size, block_data_size - next_src)
+                pending_d2h = _submit_ecnaive_d2h_stripe(
+                    tensor_buffer,
+                    next_src,
+                    next_take,
+                    block_data_size,
+                    k,
+                    actual_data_bytes,
+                    tensor_infos,
+                    tensor_data,
+                    d2h_stream,
+                )
 
             # Stage k data blocks into temporary buffers
             data_block_addrs = []  # data addrs for C++ encoder
@@ -550,6 +687,12 @@ def _encode_with_native(
             own_data0_offset += take
             src_pos += take
 
+        if pending_d2h is not None:
+            start_event, end_event = pending_d2h
+            end_event.synchronize()
+            d2h_s += start_event.elapsed_time(end_event) / 1000.0
+            pending_d2h = None
+
         # Sentinels: n-1 send + n-1 recv
         native.submit_send_sentinels(num_sends=num_recv)
         native.submit_recv_sentinels(num_recvs=num_recv)
@@ -559,6 +702,7 @@ def _encode_with_native(
     finally:
         if active_event is not None:
             active_event.clear()
+    return d2h_s
 
 
 def _save_ecnaive_pt_files(
@@ -1908,32 +2052,16 @@ def save_ecnaive_legacy_checkpoint(
         torch.distributed.barrier()
     e2e_t0 = time.time()
 
-    d2h_t0 = time.time()
-    d2h_stream = torch.cuda.Stream()
-    with torch.cuda.stream(d2h_stream):
-        for i, (info, tensor) in enumerate(zip(decomposed.tensor_infos, decomposed.tensor_data)):
-            tensor_bytes = info.size_bytes
-            tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
-            if tensor_view.numel() != tensor_bytes:
-                raise RuntimeError(
-                    f"EC-NAIVE legacy save: tensor bytes mismatch for {info.key}, "
-                    f"expected={tensor_bytes}, got={tensor_view.numel()}"
-                )
-            tensor_buffer[info.offset : info.offset + tensor_bytes].copy_(
-                tensor_view, non_blocking=True
-            )
-            decomposed.tensor_data[i] = None
-    d2h_stream.synchronize()
-    del decomposed.tensor_data
-    d2h_s = time.time() - d2h_t0
-
     encode_t0 = time.time()
-    _encode_with_native(
+    d2h_s = _encode_with_native(
         manager=manager,
         tensor_buffer=tensor_buffer,
         actual_data_bytes=total_tensor_size,
         ecnaive_blocks=blocks,
+        tensor_infos=decomposed.tensor_infos,
+        tensor_data=decomposed.tensor_data,
     )
+    del decomposed.tensor_data
     network_encode_s = time.time() - encode_t0
     native_timing = _native_ft_timing(manager._ecnaive_native)
     e2e_s = time.time() - e2e_t0

@@ -176,15 +176,11 @@ def _force_exit_after_frcheck_load() -> None:
     args = get_args()
     if not getattr(args, "use_frcheck_hardware_failure", False):
         return
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     for child in multiprocessing.active_children():
         if child.is_alive():
             child.terminate()
     for child in multiprocessing.active_children():
         child.join(timeout=1.0)
-    logging.getLogger(__name__).info(
-        "FRCheck: rank=%d force exiting after hardware recovery cleanup", rank
-    )
     logging.shutdown()
     os._exit(0)
 

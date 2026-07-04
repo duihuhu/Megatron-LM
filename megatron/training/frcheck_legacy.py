@@ -156,15 +156,12 @@ def _summarize_optimizer_keys(keys) -> Dict[str, int]:
     return summary
 
 
-_FRCHECK_QUIET_PROFILE_EVENTS = {
-    "model_ready_done",
-    "optimizer_ready_done",
-    "network_window_submitted",
-    "network_window_done",
-    "safe_point",
-    "safe_point_deferred_for_layerwise",
-    "service_attach_worker",
-    "service_attach_runtime",
+_FRCHECK_INFO_PROFILE_EVENTS = {
+    "pipeline_job_done",
+    "pipeline_done",
+    "recovery_async_parity_submit_thread_start",
+    "recovery_async_parity_submit",
+    "recovery_async_parity_all_layers_submitted",
 }
 
 
@@ -176,7 +173,12 @@ def _frcheck_recovery_profile(role: str, event: str, **fields) -> None:
             parts.append(f"{key}={value:.6f}")
         else:
             parts.append(f"{key}={value}")
-    log_fn = logger.debug if event in _FRCHECK_QUIET_PROFILE_EVENTS else logger.info
+    if event.endswith("_error"):
+        log_fn = logger.warning
+    elif event in _FRCHECK_INFO_PROFILE_EVENTS:
+        log_fn = logger.info
+    else:
+        log_fn = logger.debug
     log_fn("FRCheck profile: %s", " ".join(parts))
 
 
@@ -823,8 +825,8 @@ class _FRCheckLayerwiseRuntime:
             self.forward_wait_model_s += waited
             if self.first_wait_s is None:
                 self.first_wait_s = waited
-            if first_touch:
-                logger.info(
+            if first_touch and _frcheck_debug_enabled():
+                logger.debug(
                     "FRCheck layerwise forward: layer=%s idx=%d ready "
                     "recovery_materialize=%.4fs wait=%.4fs",
                     record.layer_name, layer_idx, record.materialize_s, waited,
@@ -1303,8 +1305,8 @@ def frcheck_filter_layerwise_model_placeholders(
             if torch.is_tensor(tensor):
                 removed_bytes += tensor.numel() * tensor.element_size()
 
-    if removed:
-        logger.info(
+    if removed and _frcheck_debug_enabled():
+        logger.debug(
             "FRCheck layerwise model load: skipped %d placeholder tensors "
             "(%.2f MiB); runtime will inject them before layer forward",
             removed, removed_bytes / (1024 ** 2),
@@ -1361,10 +1363,11 @@ def frcheck_materialize_first_layer_for_timer() -> bool:
     runtime.wait_s += waited
     if runtime.first_wait_s is None:
         runtime.first_wait_s = waited
-    logger.info(
-        "FRCheck layerwise timing: first layer=%s idx=%d injected wait=%.4fs",
-        record.layer_name, layer_idx, waited,
-    )
+    if _frcheck_debug_enabled():
+        logger.debug(
+            "FRCheck layerwise timing: first layer=%s idx=%d injected wait=%.4fs",
+            record.layer_name, layer_idx, waited,
+        )
     try:
         from megatron.training.global_vars import mark_recovery_to_forward_timer
         mark_recovery_to_forward_timer(f"{record.layer_name}_injected")
@@ -1386,10 +1389,11 @@ def frcheck_register_pending_optimizer_state(state_dict: Dict[str, Any]) -> bool
         return False
     _pending_optimizer_container = {"optimizer": optim_state}
     _pending_optimizer_state = optim_state
-    logger.info(
-        "FRCheck optimizer recovery: deferred optimizer load for %d layers",
-        sum(1 for r in runtime._records_by_layer.values() if r.contains_optimizer_state),
-    )
+    if _frcheck_debug_enabled():
+        logger.debug(
+            "FRCheck optimizer recovery: deferred optimizer load for %d layers",
+            sum(1 for r in runtime._records_by_layer.values() if r.contains_optimizer_state),
+        )
     return True
 
 
@@ -1545,9 +1549,10 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
     t0 = time.time()
     if not runtime.optimizer_materialized and optimizer is not None:
         if _sync_frcheck_model_params_to_optimizer_main_params(optimizer):
-            logger.info(
-                "FRCheck optimizer recovery: synced injected model params to optimizer main params"
-            )
+            if _frcheck_debug_enabled():
+                logger.debug(
+                    "FRCheck optimizer recovery: synced injected model params to optimizer main params"
+                )
     if _pending_optimizer_state is None:
         runtime.optimizer_materialized = True
         _finish_recovery_parity_repair_submissions("after_optimizer_state", service.role)
@@ -1593,11 +1598,12 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
         service.state = service.TORN_DOWN
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    logger.info(
-        "FRCheck optimizer recovery: loaded deferred optimizer state in %.4fs "
-        "(updated_tensors=%d)",
-        time.time() - t0, updated,
-    )
+    if _frcheck_debug_enabled():
+        logger.debug(
+            "FRCheck optimizer recovery: loaded deferred optimizer state in %.4fs "
+            "(updated_tensors=%d)",
+            time.time() - t0, updated,
+        )
     return True
 
 
@@ -3896,15 +3902,6 @@ def _flush_recovery_async_parity(reason: str, role: str = "unknown") -> None:
         return
     if not _frcheck_recovery_async_parity_enabled():
         return
-    t0 = time.time()
-    _frcheck_recovery_profile(role, "recovery_async_parity_flush_start", reason=reason)
-    _frcheck_recovery_profile(
-        role,
-        "recovery_async_parity_flush_done",
-        reason=reason,
-        elapsed_s=time.time() - t0,
-        mode="recovery_decode",
-    )
     _recovery_async_parity_submitted = False
 
 
@@ -4088,16 +4085,6 @@ def _submit_recovery_parity_repair(
         )
         batch_timings.append(batch_timing)
         timing["submit_s"] += batch_timing.get("reset_s", 0.0) + batch_timing.get("submit_s", 0.0)
-        _frcheck_recovery_profile(
-            recovery_role,
-            "recovery_parity_window_submitted",
-            layer=job.layer_name,
-            layer_idx=job.layer_idx,
-            wave=len(batch_timings) - 1,
-            batch_id=batch_timing.get("batch_id", 0),
-            stripes=len(wave_plans),
-            active_stripes=int(batch_timing.get("active_stripes", 0.0)),
-        )
     for batch_timing in batch_timings:
         wait_t0 = time.time()
         native.wait_recovery_batch_id(int(batch_timing.get("batch_id", 0)))
@@ -4209,7 +4196,6 @@ def _start_recovery_parity_repair_submissions(reason: str, role: str = "unknown"
         daemon=False,
     )
     _recovery_async_parity_thread = worker
-    _frcheck_recovery_profile(recovery_role, "recovery_async_parity_thread_started", reason=reason)
     worker.start()
 
 
@@ -4219,15 +4205,7 @@ def _finish_recovery_parity_repair_submissions(reason: str, role: str = "unknown
     _start_recovery_parity_repair_submissions(reason, role)
     worker = _recovery_async_parity_thread
     if worker is not None:
-        t0 = time.time()
-        _frcheck_recovery_profile(role, "recovery_async_parity_thread_join_start", reason=reason)
         worker.join()
-        _frcheck_recovery_profile(
-            role,
-            "recovery_async_parity_thread_join_done",
-            reason=reason,
-            elapsed_s=time.time() - t0,
-        )
         _recovery_async_parity_thread = None
     if _recovery_async_parity_error is not None:
         exc = _recovery_async_parity_error
@@ -6225,16 +6203,20 @@ def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         failed_ranks = [int(x.strip()) for x in failed_ranks_str.split(",")]
 
     if hw_failure and failed_ranks:
-        logger.info("FRCheck: hardware recovery mode — failed ranks %s", failed_ranks)
+        if _frcheck_debug_enabled():
+            logger.debug(
+                "FRCheck: hardware recovery mode — failed ranks %s", failed_ranks
+            )
         result, _t_fr = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
         _t_fr['total'] = _t_fr['network_encode'] + _t_fr['rebuild_sd']
-        logger.info(
-            "FRCheck legacy load timing (HW): "
-            "total=%(total).2fs prep=%(prep).2fs main_io=%(main_io).2fs "
-            "disk_io=%(disk_io).2fs network_encode=%(network_encode).2fs "
-            "rebuild_sd=%(rebuild_sd).2fs (prep excluded from total)",
-            _t_fr,
-        )
+        if _frcheck_debug_enabled():
+            logger.debug(
+                "FRCheck legacy load timing (HW): "
+                "total=%(total).2fs prep=%(prep).2fs main_io=%(main_io).2fs "
+                "disk_io=%(disk_io).2fs network_encode=%(network_encode).2fs "
+                "rebuild_sd=%(rebuild_sd).2fs (prep excluded from total)",
+                _t_fr,
+            )
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
             mark_recovery_to_forward_timer("frcheck_load_return")
@@ -6242,10 +6224,4 @@ def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             pass
         return result
 
-    t0 = time.time()
-    result = _assemble_state_dict_from_local_blocks(checkpoint_name)
-    logger.info(
-        "FRCheck legacy load timing: assemble_from_blocks %.2fs",
-        time.time() - t0,
-    )
-    return result
+    return _assemble_state_dict_from_local_blocks(checkpoint_name)

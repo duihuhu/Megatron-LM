@@ -2464,7 +2464,6 @@ public:
 
     void execute_recovery_helper_(const RecoveryHelperTask& task) {
         uint64_t t0 = frcheck_now_us();
-        _wait_if_paused();
         send_to_peer(task.decoder_rig, task.stripe_id,
                      task.helper_block, task.block_size);
         recovery_helper_send_us_.fetch_add(frcheck_now_us() - t0, std::memory_order_relaxed);
@@ -2553,7 +2552,6 @@ public:
 
     void execute_recovery_decoder_send_(const RecoveryDecoderSendTask& task) {
         uint64_t t_send = frcheck_now_us();
-        _wait_if_paused();
         send_to_peer(task.failed_rig, task.stripe_id,
                      task.recovered_buf, task.block_size);
         recovery_decoder_send_us_.fetch_add(frcheck_now_us() - t_send, std::memory_order_relaxed);
@@ -2723,8 +2721,6 @@ public:
             failed_threads_.emplace_back(&FRCheckNative::failed_worker_loop_, this);
         }
         recovery_workers_inited_ = true;
-        std::cout << "FRCheck: recovery workers started (helper/decoder/failed x"
-                  << nw << ")" << std::endl;
     }
 
     void recovery_workers_join_() {
@@ -2752,26 +2748,7 @@ public:
         recovery_failed_tasks_.store(0, std::memory_order_relaxed);
     }
 
-    void print_recovery_batch_profile_() {
-        auto us_to_s = [](uint64_t us) { return (double)us / 1000000.0; };
-        const int helper_tasks = recovery_helper_tasks_.load(std::memory_order_relaxed);
-        const int decoder_tasks = recovery_decoder_tasks_.load(std::memory_order_relaxed);
-        const int failed_tasks = recovery_failed_tasks_.load(std::memory_order_relaxed);
-        const int skipped_stripes = recovery_skipped_stripes_.load(std::memory_order_relaxed);
-        if (helper_tasks == 0 && decoder_tasks == 0 && failed_tasks == 0 && skipped_stripes == 0) return;
-        std::cout << "FRCheck native profile: rank_in_group=" << rank_in_group_
-                  << " helper_tasks=" << helper_tasks
-                  << " decoder_tasks=" << decoder_tasks
-                  << " failed_tasks=" << failed_tasks
-                  << " skipped_stripes=" << skipped_stripes
-                  << " helper_send_s=" << us_to_s(recovery_helper_send_us_.load(std::memory_order_relaxed))
-                  << " decoder_recv_s=" << us_to_s(recovery_decoder_recv_us_.load(std::memory_order_relaxed))
-                  << " decoder_decode_s=" << us_to_s(recovery_decoder_decode_us_.load(std::memory_order_relaxed))
-                  << " decoder_send_s=" << us_to_s(recovery_decoder_send_us_.load(std::memory_order_relaxed))
-                  << " failed_recv_s=" << us_to_s(recovery_failed_recv_us_.load(std::memory_order_relaxed))
-                  << " failed_copy_s=" << us_to_s(recovery_failed_copy_us_.load(std::memory_order_relaxed))
-                  << std::endl;
-    }
+    void print_recovery_batch_profile_() {}
 
     void ensure_recovery_batch_exists_(uint64_t batch_id) {
         std::lock_guard<std::mutex> lk(recovery_batch_mtx_);

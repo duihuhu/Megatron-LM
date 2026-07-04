@@ -2161,20 +2161,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     h2d_model_s = model_sync_end - model_submit_start
     h2d_model_submit_s = model_submit_end - model_submit_start
     h2d_model_sync_s = model_sync_end - model_submit_end
-    if not ft_timing_enabled:
-        logger.info(
-            f"[rank {rank}] model load submit={h2d_model_submit_s:.4f}s "
-            f"cuda_sync={h2d_model_sync_s:.4f}s "
-            f"total={h2d_model_s:.4f}s"
-        )
     if frcheck_runtime_summary is not None:
         from .frcheck_legacy import frcheck_log_layerwise_runtime_summary
         frcheck_log_layerwise_runtime_summary("after_model_load")
     torch.distributed.barrier()
     if getattr(args, "use_frcheck", False):
         mark_recovery_to_forward_timer("frcheck_model_load_barrier_done")
-    load_model_end_time = time()
-    logger.info(f"load only model state time: {load_model_end_time - load_model_start_time:.4f}s")
     load_model_start_time = time()
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
@@ -2259,16 +2251,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     h2d_optimizer_s = optim_sync_end - optim_submit_start
                     h2d_optimizer_submit_s = optim_submit_end - optim_submit_start
                     h2d_optimizer_sync_s = optim_sync_end - optim_submit_end
-                    if not ft_timing_enabled:
-                        logger.info(
-                            f"[rank {rank}] optimizer load submit={h2d_optimizer_submit_s:.4f}s "
-                            f"cuda_sync={h2d_optimizer_sync_s:.4f}s "
-                            f"total={h2d_optimizer_s:.4f}s"
-                        )
-                else:
-                    logger.info(
-                        f"[rank {rank}] FRCheck optimizer load deferred until optimizer step"
-                    )
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
@@ -2308,54 +2290,34 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     if ft_timing_enabled:
         h2d_total_s = h2d_model_s + h2d_optimizer_s
-        logger.info(
-            "[rank %d] FT load h2d local: model=%.4fs optimizer=%.4fs total=%.4fs",
-            rank, h2d_model_s, h2d_optimizer_s, h2d_total_s,
-        )
         from megatron.training.global_vars import (
             clear_ft_load_timing_context,
             get_ft_load_timing_context,
         )
         ft_context = get_ft_load_timing_context()
-        recovery = (ft_context or {}).get("timings", {})
-        recovery_e2e_s = float(recovery.get("total", 0.0))
-        pre_network_barrier_s = float(recovery.get("barrier", 0.0))
-        values = {
-            "e2e_s": recovery_e2e_s + h2d_total_s,
-            "pre_network_barrier_s": pre_network_barrier_s,
-            "recovery_e2e_s": recovery_e2e_s,
-            "network_encode_s": float(recovery.get("network_encode", 0.0)),
-            "net_s": float(recovery.get("net_s", 0.0)),
-            "encode_s": float(recovery.get("encode_s", 0.0)),
-            "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
-            "h2d_s": h2d_total_s,
-            "h2d_model_s": h2d_model_s,
-            "h2d_model_submit_s": h2d_model_submit_s,
-            "h2d_model_sync_s": h2d_model_sync_s,
-            "h2d_optimizer_s": h2d_optimizer_s,
-            "h2d_optimizer_submit_s": h2d_optimizer_submit_s,
-            "h2d_optimizer_sync_s": h2d_optimizer_sync_s,
-        }
-        summary = _timing_max_dict(values)
-        if ft_context is not None:
+        if getattr(args, "use_frcheck", False):
+            summary = _timing_max_dict({"h2d_s": h2d_total_s})
+            logger.info("FRCheck load timing: h2d_s=%.2fs", summary["h2d_s"])
+        elif ft_context is not None:
+            recovery = ft_context.get("timings", {})
+            recovery_e2e_s = float(recovery.get("total", 0.0))
+            values = {
+                "e2e_s": recovery_e2e_s + h2d_total_s,
+                "recovery_e2e_s": recovery_e2e_s,
+                "network_encode_s": float(recovery.get("network_encode", 0.0)),
+                "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
+                "h2d_s": h2d_total_s,
+            }
+            summary = _timing_max_dict(values)
             logger.info(
-                "%s load timing (%s): e2e_s=%.2fs pre_network_barrier_s=%.2fs "
-                "recovery_e2e_s=%.2fs network_encode_s=%.2fs net_s=%.2fs encode_s=%.2fs "
-                "rebuild_sd_s=%.2fs h2d_s=%.2fs",
+                "%s load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
+                "network_encode_s=%.2fs rebuild_sd_s=%.2fs h2d_s=%.2fs",
                 ft_context.get("scheme", "FT"),
                 ft_context.get("mode", "unknown"),
                 summary["e2e_s"],
-                summary["pre_network_barrier_s"],
                 summary["recovery_e2e_s"],
                 summary["network_encode_s"],
-                summary["net_s"],
-                summary["encode_s"],
                 summary["rebuild_sd_s"],
-                summary["h2d_s"],
-            )
-        else:
-            logger.info(
-                "FT load model timing: h2d_s=%.2fs",
                 summary["h2d_s"],
             )
         clear_ft_load_timing_context()
@@ -2420,15 +2382,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    logger.info(
-        f"[rank {rank}] load optimizer+rng before barrier time: "
-        f"{time() - load_model_start_time:.4f}s"
-    )
     torch.distributed.barrier()
     load_model_end_time = time()
-    logger.info(f"load model+optimizer+rng time: {load_model_end_time - load_model_start_time:.4f}s")
-    load_model_start_time = time()
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
@@ -2446,9 +2401,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
     torch.distributed.barrier()
     load_model_end_time = time()
-    logger.info(f"load model time: {load_model_end_time - load_model_start_time:.4f}s")
-
-    logger.info(f"load model total time: {load_model_end_time - load_model_start:.4f}s")
 
     torch.cuda.empty_cache()
 

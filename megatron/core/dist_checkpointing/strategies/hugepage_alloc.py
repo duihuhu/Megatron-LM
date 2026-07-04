@@ -11,9 +11,6 @@ _HUGEPAGE_SIZE = 2 * 1024 * 1024
 
 logger = getLogger(__name__)
 
-_success_logged = 0
-_fail_logged = 0
-_log_limit = int(__import__("os").environ.get("MEGATRON_HUGEPAGE_LOG_LIMIT", "5"))
 _cuda_host_register = int(__import__("os").environ.get("MEGATRON_HUGEPAGE_CUDA_REGISTER", "1"))
 
 _CUDA_SUCCESS = 0
@@ -22,17 +19,11 @@ _REGISTERED_HOST: Dict[int, int] = {}
 
 
 def _maybe_log_success(msg: str) -> None:
-    global _success_logged
-    if _success_logged < _log_limit:
-        logger.info(msg)
-        _success_logged += 1
+    del msg
 
 
 def _maybe_log_fail(msg: str) -> None:
-    global _fail_logged
-    if _fail_logged < _log_limit:
-        logger.warning(msg)
-        _fail_logged += 1
+    del msg
 
 
 def _touch_tensor_pages(buffer: torch.Tensor, stride: int = _HUGEPAGE_SIZE) -> None:

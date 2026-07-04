@@ -120,22 +120,12 @@ def finish_recovery_to_forward_timer(label: str = "forward_step_end") -> None:
     marks = timer.get("marks", [])
     start = timer["start"]
     elapsed = marks[-1][1] - start if marks else 0.0
-    segments = []
-    for (prev_label, prev_time), (next_label, next_time) in zip(marks, marks[1:]):
-        segments.append(f"{prev_label}->{next_label}={next_time - prev_time:.4f}s")
-    segment_text = " ".join(segments)
-    if segment_text:
-        segment_text = f" segments=[{segment_text}]"
     context = timer.get("context", {}) or {}
-    context_text = " ".join(
-        f"{key}={value}" for key, value in sorted(context.items())
-    )
-    if context_text:
-        context_text = f" {context_text}"
+    role = context.get("role", "")
+    role_text = f" role={role}" if role else ""
     print(
-        f"{timer['scheme']} recovery-to-forward timing: "
-        f"rank={timer['rank']} phase={timer['phase']} "
-        f"to_next_forward_end={elapsed:.4f}s{context_text}{segment_text}",
+        f"{timer['scheme']} recovery-to-forward: "
+        f"rank={timer['rank']}{role_text} elapsed={elapsed:.4f}s",
         flush=True,
     )
 

@@ -926,15 +926,6 @@ class FRCheckManager:
             if group_id == self.group_id:
                 failed_in_my_group.append(failed_rank)
 
-            if my_rank == failed_rank:
-                logger.info(
-                    "FRCheck hardware recovery: I am the failed rank %d (group %d, rig %d)",
-                    failed_rank, group_id, failed_rig)
-            elif group_id == self.group_id:
-                logger.info(
-                    "FRCheck hardware recovery: I am in group %d with failed rank %d (rig %d)",
-                    group_id, failed_rank, failed_rig)
-
         # Validate per-group limits across all groups (not just my group).
         # RS(2) can recover at most 2 erasures per stripe → at most 2 failed
         # node-slots per POA group.  In node-aware mode a full-node failure
@@ -965,34 +956,11 @@ class FRCheckManager:
                 self.recovery_dual_failure = True
                 for fr in failed_in_my_group:
                     recovery_contexts[fr]['recovery_plans'] = self.recovery_stripe_plans
-                logger.info(
-                    "FRCheck recovery: dual-failure mode failed_nodes=%s (%d stripes)",
-                    failed_nodes, len(self.recovery_stripe_plans),
-                )
             else:
                 fr = failed_in_my_group[0]
                 failed_node = recovery_contexts[fr]['failed_node']
                 self.recovery_stripe_plans = self._compile_recovery_plans(failed_node)
                 recovery_contexts[fr]['recovery_plans'] = self.recovery_stripe_plans
-
-            my_node = self.rank_in_group + 1
-            n_decoder = n_helper = n_failed = 0
-            for plan in self.recovery_stripe_plans:
-                if my_node == plan['decoder_node']:
-                    n_decoder += 1
-                elif my_node in plan['helper_nodes']:
-                    n_helper += 1
-                elif plan.get('dual_failure'):
-                    if my_node in plan['failed_nodes']:
-                        n_failed += 1
-                elif my_node == plan.get('failed_node'):
-                    n_failed += 1
-            logger.info(
-                "FRCheck recovery: my roles — %d decoder, %d helper, %d failed "
-                "(total %d stripes, dual=%s)",
-                n_decoder, n_helper, n_failed, len(self.recovery_stripe_plans),
-                self.recovery_dual_failure,
-            )
 
             native = self._frcheck_native
             if native is not None:
@@ -1025,7 +993,6 @@ class FRCheckManager:
             return
         try:
             self._frcheck_native.stop()
-            logger.info("FRCheck: C++ native module stopped")
         except Exception as e:
             logger.warning("FRCheck: stop() failed: %s", e)
 
@@ -1036,7 +1003,6 @@ class FRCheckManager:
         try:
             if hasattr(self._frcheck_native, "stop_recovery_runtime"):
                 self._frcheck_native.stop_recovery_runtime()
-                logger.info("FRCheck: C++ recovery runtime stopped")
             else:
                 self.stop()
         except Exception as e:
@@ -1049,7 +1015,6 @@ class FRCheckManager:
         try:
             if hasattr(self._frcheck_native, "cleanup_recovery_runtime"):
                 self._frcheck_native.cleanup_recovery_runtime()
-                logger.info("FRCheck: C++ recovery runtime cleaned up")
             else:
                 self.stop()
         except Exception as e:
@@ -1112,26 +1077,11 @@ class FRCheckManager:
         if not teardown:
             return
         try:
-            import time
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            t_total = time.time()
-            barrier_s = 0.0
             if sync and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-                t_barrier = time.time()
                 torch.distributed.barrier()
-                barrier_s = time.time() - t_barrier
-            t_stop = time.time()
             self.cleanup_recovery_runtime()
-            stop_s = time.time() - t_stop
-            t_metadata = time.time()
             self._clear_recovery_native_handle()
             self.end_recovery()
-            metadata_s = time.time() - t_metadata
-            logger.info(
-                "FRCheck recovery cleanup profile: rank=%d sync=%s barrier_s=%.4f "
-                "native_recovery_cleanup_s=%.4f metadata_s=%.4f total_s=%.4f",
-                rank, sync, barrier_s, stop_s, metadata_s, time.time() - t_total,
-            )
         except Exception as e:
             logger.warning("FRCheck: error during recovery cleanup: %s", e)
 
@@ -1144,31 +1094,12 @@ class FRCheckManager:
         if not teardown:
             return
         try:
-            import time
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            t_total = time.time()
-            barrier_s = 0.0
             if sync and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-                t_barrier = time.time()
                 torch.distributed.barrier()
-                barrier_s = time.time() - t_barrier
-            t_unregister = time.time()
             self._unregister_all_buffers()
-            unregister_s = time.time() - t_unregister
-            t_stop = time.time()
             self.stop()
-            stop_s = time.time() - t_stop
-            t_metadata = time.time()
             self._clear_runtime_buffers_after_native_cleanup()
             self.end_recovery()
-            metadata_s = time.time() - t_metadata
-            logger.info(
-                "FRCheck cleanup profile: rank=%d sync=%s barrier_s=%.4f "
-                "unregister_s=%.4f native_stop_s=%.4f metadata_s=%.4f total_s=%.4f",
-                rank, sync, barrier_s, unregister_s, stop_s, metadata_s,
-                time.time() - t_total,
-            )
-            logger.info("FRCheck: native module torn down after load (rank=%d)", rank)
         except Exception as e:
             logger.warning("FRCheck: error during manager cleanup: %s", e)
 

@@ -2050,15 +2050,64 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 
+    def _model_load_key_stats(module, checkpoint_state_dict):
+        """Return key match stats between checkpoint model state and live module."""
+        module_state_dict = module.state_dict()
+        module_keys = set(module_state_dict.keys())
+        checkpoint_keys = set(checkpoint_state_dict.keys())
+        matched_keys = module_keys & checkpoint_keys
+        missing_keys = module_keys - checkpoint_keys
+        unexpected_keys = checkpoint_keys - module_keys
+        return {
+            "module_key_count": len(module_keys),
+            "checkpoint_key_count": len(checkpoint_keys),
+            "matched_key_count": len(matched_keys),
+            "missing_key_count": len(missing_keys),
+            "unexpected_key_count": len(unexpected_keys),
+            "missing_examples": sorted(missing_keys)[:5],
+            "unexpected_examples": sorted(unexpected_keys)[:5],
+        }
+
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
         try:
-            module.load_state_dict(state_dict, strict=strict)
+            load_return = module.load_state_dict(state_dict, strict=strict)
+            if ft_timing_enabled:
+                stats = _model_load_key_stats(module, state_dict)
+                logger.info(
+                    "model load key match: strict=%s matched=%d/%d checkpoint_keys=%d "
+                    "missing=%d unexpected=%d missing_examples=%s unexpected_examples=%s",
+                    strict,
+                    stats["matched_key_count"],
+                    stats["module_key_count"],
+                    stats["checkpoint_key_count"],
+                    stats["missing_key_count"],
+                    stats["unexpected_key_count"],
+                    stats["missing_examples"],
+                    stats["unexpected_examples"],
+                )
+            return load_return
         except Exception as e:
             if strict:
-                # Fallback support for backward compatibility breaking changes in TransformerEngine
+                stats = _model_load_key_stats(module, state_dict)
+                logger.warning(
+                    "model load strict=True failed; retrying strict=False. "
+                    "matched=%d/%d checkpoint_keys=%d missing=%d unexpected=%d "
+                    "missing_examples=%s unexpected_examples=%s error=%s",
+                    stats["matched_key_count"],
+                    stats["module_key_count"],
+                    stats["checkpoint_key_count"],
+                    stats["missing_key_count"],
+                    stats["unexpected_key_count"],
+                    stats["missing_examples"],
+                    stats["unexpected_examples"],
+                    e,
+                )
+                # Fallback support for backward compatibility breaking changes in TransformerEngine.
                 load_return = module.load_state_dict(state_dict, strict=False)
-                print(f"load_return: {load_return}")
+                logger.warning("model load strict=False return: %s", load_return)
+                return load_return
+            raise
 
     def state_dict_has_model_keys(state_dict):
         """Return True when checkpoint carries any model shard key."""
@@ -2086,6 +2135,45 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             f"available model keys={model_keys}, all keys={list(state_dict.keys())}"
         )
 
+    def collect_tensor_stats(obj):
+        tensor_count = 0
+        tensor_bytes = 0
+        non_contig_count = 0
+        pinned_count = 0
+        storage_ptrs = set()
+        try:
+            from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+                is_hugepage_cuda_registered,
+            )
+        except Exception:
+            is_hugepage_cuda_registered = None
+
+        def visit(value):
+            nonlocal tensor_count, tensor_bytes, non_contig_count, pinned_count
+            if torch.is_tensor(value):
+                tensor_count += 1
+                tensor_bytes += value.numel() * value.element_size()
+                if not value.is_contiguous():
+                    non_contig_count += 1
+                if value.device.type == 'cpu' and (
+                    value.is_pinned()
+                    or (is_hugepage_cuda_registered is not None and is_hugepage_cuda_registered(value))
+                ):
+                    pinned_count += 1
+                try:
+                    storage_ptrs.add(value.untyped_storage().data_ptr())
+                except Exception:
+                    storage_ptrs.add(value.storage().data_ptr())
+            elif isinstance(value, dict):
+                for item in value.values():
+                    visit(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    visit(item)
+
+        visit(obj)
+        return tensor_count, tensor_bytes, len(storage_ptrs), non_contig_count, pinned_count
+
     # Model.
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -2096,37 +2184,33 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if frcheck_skipped_model_placeholders:
         strict = False
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    # model_sd_for_stats = state_dict.get('model')
-    # if isinstance(model_sd_for_stats, dict):
-    #     model_tensor_count = 0
-    #     model_non_tensor_count = 0
-    #     model_tensor_bytes = 0
-    #     model_non_contig_count = 0
-    #     model_pinned_count = 0
-    #     model_storage_ptrs = set()
-    #     for value in model_sd_for_stats.values():
-    #         if torch.is_tensor(value):
-    #             model_tensor_count += 1
-    #             model_tensor_bytes += value.numel() * value.element_size()
-    #             if not value.is_contiguous():
-    #                 model_non_contig_count += 1
-    #             if value.device.type == 'cpu' and value.is_pinned():
-    #                 model_pinned_count += 1
-    #             try:
-    #                 model_storage_ptrs.add(value.untyped_storage().data_ptr())
-    #             except Exception:
-    #                 model_storage_ptrs.add(value.storage().data_ptr())
-    #         else:
-    #             model_non_tensor_count += 1
-    #     logger.info(
-    #         f"[rank {rank}] model sd stats: tensors={model_tensor_count} "
-    #         f"non_tensors={model_non_tensor_count} "
-    #         f"bytes={model_tensor_bytes / (1024 ** 2):.2f} MiB "
-    #         f"storages={len(model_storage_ptrs)} "
-    #         f"non_contig={model_non_contig_count} "
-    #         f"pinned={model_pinned_count}"
-    #     )
     ft_timing_enabled = _ft_legacy_timing_enabled(args)
+    model_tensor_count = 0
+    model_tensor_bytes = 0
+    model_pinned_count = 0
+    try:
+        model_sd_for_stats = get_single_model_state_dict(state_dict)
+    except KeyError:
+        model_sd_for_stats = None
+    if isinstance(model_sd_for_stats, dict):
+        (
+            model_tensor_count,
+            model_tensor_bytes,
+            _model_storage_count,
+            _model_non_contig_count,
+            model_pinned_count,
+        ) = collect_tensor_stats(model_sd_for_stats)
+    if (
+        ft_timing_enabled
+        and model_tensor_count == 0
+        and state_dict_has_model_keys(state_dict)
+        and not frcheck_skipped_model_placeholders
+    ):
+        logger.warning(
+            "FT load timing: rank %d checkpoint has model keys but 0 model tensors "
+            "in rebuilt state_dict before H2D",
+            rank,
+        )
     model_submit_start = time()
     if getattr(args, "use_frcheck", False):
         mark_recovery_to_forward_timer("frcheck_load_state_dict_start")
@@ -2179,39 +2263,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         frcheck_materialize_all_layers()
     fix_query_key_value_ordering(model, checkpoint_version)
 
-    def collect_tensor_stats(obj):
-        tensor_count = 0
-        tensor_bytes = 0
-        non_contig_count = 0
-        pinned_count = 0
-        storage_ptrs = set()
-
-        def visit(value):
-            nonlocal tensor_count, tensor_bytes, non_contig_count, pinned_count
-            if torch.is_tensor(value):
-                tensor_count += 1
-                tensor_bytes += value.numel() * value.element_size()
-                if not value.is_contiguous():
-                    non_contig_count += 1
-                if value.device.type == 'cpu' and value.is_pinned():
-                    pinned_count += 1
-                try:
-                    storage_ptrs.add(value.untyped_storage().data_ptr())
-                except Exception:
-                    storage_ptrs.add(value.storage().data_ptr())
-            elif isinstance(value, dict):
-                for item in value.values():
-                    visit(item)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    visit(item)
-
-        visit(obj)
-        return tensor_count, tensor_bytes, len(storage_ptrs), non_contig_count, pinned_count
-
     h2d_optimizer_s = 0.0
     h2d_optimizer_submit_s = 0.0
     h2d_optimizer_sync_s = 0.0
+    optim_tensor_count = 0
+    optim_tensor_bytes = 0
+    optim_storage_count = 0
+    optim_non_contig_count = 0
+    optim_pinned_count = 0
 
     # Optimizer.
     frcheck_deferred_optimizer = False
@@ -2220,28 +2279,30 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             # Load state dict.
             if not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
                 (
-                #     optim_tensor_count,
-                #     optim_tensor_bytes,
-                #     optim_storage_count,
-                #     optim_non_contig_count,
-                #     optim_pinned_count,
-                # ) = collect_tensor_stats(state_dict.get('optimizer'))
-                # logger.info(
-                #     f"[rank {rank}] optimizer sd stats: tensors={optim_tensor_count} "
-                #     f"bytes={optim_tensor_bytes / (1024 ** 2):.2f} MiB "
-                #     f"storages={optim_storage_count} "
-                #     f"non_contig={optim_non_contig_count} "
-                #     f"pinned={optim_pinned_count}"
-                )
+                    optim_tensor_count,
+                    optim_tensor_bytes,
+                    optim_storage_count,
+                    optim_non_contig_count,
+                    optim_pinned_count,
+                ) = collect_tensor_stats(state_dict.get('optimizer'))
                 if frcheck_runtime_summary is not None:
                     from .frcheck_legacy import frcheck_register_pending_optimizer_state
                     frcheck_deferred_optimizer = frcheck_register_pending_optimizer_state(
                         state_dict
                     )
                 if not frcheck_deferred_optimizer:
-                    if getattr(args, "use_frcheck", False) and 'optimizer' in state_dict:
-                        from .frcheck_legacy import frcheck_normalize_optimizer_state_param_keys
-                        frcheck_normalize_optimizer_state_param_keys(state_dict['optimizer'])
+                    if rank == 0:
+                        base_optimizer = getattr(optimizer, "optimizer", None)
+                        chained = getattr(optimizer, "chained_optimizers", None)
+                        chained_types = []
+                        if chained is not None:
+                            chained_types = [type(item).__name__ for item in chained]
+                        logger.info(
+                            "optimizer load type: wrapper=%s base=%s chained=%s",
+                            type(optimizer).__name__,
+                            type(base_optimizer).__name__ if base_optimizer is not None else "None",
+                            chained_types,
+                        )
                     optim_submit_start = time()
                     optimizer.load_state_dict(state_dict['optimizer'])
                     optim_submit_end = time()
@@ -2296,8 +2357,58 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         )
         ft_context = get_ft_load_timing_context()
         if getattr(args, "use_frcheck", False):
-            summary = _timing_max_dict({"h2d_s": h2d_total_s})
-            logger.info("FRCheck load timing: h2d_s=%.2fs", summary["h2d_s"])
+            summary = _timing_max_dict({
+                "h2d_model_s": h2d_model_s,
+                "h2d_optimizer_s": h2d_optimizer_s,
+                "h2d_total_s": h2d_total_s,
+                "h2d_model_submit_s": h2d_model_submit_s,
+                "h2d_model_sync_s": h2d_model_sync_s,
+                "h2d_optimizer_submit_s": h2d_optimizer_submit_s,
+                "h2d_optimizer_sync_s": h2d_optimizer_sync_s,
+                "optim_tensor_count": float(optim_tensor_count),
+                "optim_tensor_mib": optim_tensor_bytes / (1024 ** 2),
+                "optim_storage_count": float(optim_storage_count),
+                "optim_non_contig_count": float(optim_non_contig_count),
+                "optim_pinned_count": float(optim_pinned_count),
+            })
+            if rank == 0:
+                recovery = (ft_context or {}).get("timings", {})
+                recovery_e2e_s = float(recovery.get("total", 0.0))
+                rebuild_sd_s = float(recovery.get("rebuild_sd", 0.0))
+                network_encode_s = float(recovery.get("network_encode", 0.0))
+                mode = (ft_context or {}).get("mode", "SW")
+                if ft_context is not None:
+                    e2e_s = recovery_e2e_s + summary["h2d_total_s"]
+                    logger.info(
+                        "FRCheck load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
+                        "network_encode_s=%.2fs rebuild_sd_s=%.2fs h2d_model_s=%.2fs "
+                        "h2d_optimizer_s=%.2fs h2d_total_s=%.2fs "
+                        "h2d_optimizer_submit_s=%.2fs h2d_optimizer_sync_s=%.2fs "
+                        "optim_tensors=%.0f optim_mib=%.1f optim_pinned=%.0f/%.0f optim_storages=%.0f",
+                        mode,
+                        e2e_s,
+                        recovery_e2e_s,
+                        network_encode_s,
+                        rebuild_sd_s,
+                        summary["h2d_model_s"],
+                        summary["h2d_optimizer_s"],
+                        summary["h2d_total_s"],
+                        summary["h2d_optimizer_submit_s"],
+                        summary["h2d_optimizer_sync_s"],
+                        summary["optim_tensor_count"],
+                        summary["optim_tensor_mib"],
+                        summary["optim_pinned_count"],
+                        summary["optim_tensor_count"],
+                        summary["optim_storage_count"],
+                    )
+                else:
+                    logger.info(
+                        "FRCheck load timing: h2d_model_s=%.2fs "
+                        "h2d_optimizer_s=%.2fs h2d_total_s=%.2fs",
+                        summary["h2d_model_s"],
+                        summary["h2d_optimizer_s"],
+                        summary["h2d_total_s"],
+                    )
         elif ft_context is not None:
             recovery = ft_context.get("timings", {})
             recovery_e2e_s = float(recovery.get("total", 0.0))
@@ -2305,20 +2416,62 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 "e2e_s": recovery_e2e_s + h2d_total_s,
                 "recovery_e2e_s": recovery_e2e_s,
                 "network_encode_s": float(recovery.get("network_encode", 0.0)),
+                "net_s": float(recovery.get("net_s", 0.0)),
+                "decode_s": float(
+                    recovery.get("decode_s", recovery.get("encode_s", 0.0))
+                ),
                 "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
                 "h2d_s": h2d_total_s,
+                "h2d_model_s": h2d_model_s,
+                "h2d_optimizer_s": h2d_optimizer_s,
+                "model_tensor_count": float(model_tensor_count),
+                "model_tensor_mib": model_tensor_bytes / (1024 ** 2),
+                "model_pinned_count": float(model_pinned_count),
+                "optim_tensor_count": float(optim_tensor_count),
+                "optim_tensor_mib": optim_tensor_bytes / (1024 ** 2),
+                "optim_pinned_count": float(optim_pinned_count),
+                "optim_storage_count": float(optim_storage_count),
+                "h2d_model_submit_s": h2d_model_submit_s,
+                "h2d_model_sync_s": h2d_model_sync_s,
+                "h2d_optimizer_submit_s": h2d_optimizer_submit_s,
+                "h2d_optimizer_sync_s": h2d_optimizer_sync_s,
+                "rebuild_from_recovered": float(recovery.get("rebuild_from_recovered", 0.0)),
             }
             summary = _timing_max_dict(values)
             logger.info(
-                "%s load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
-                "network_encode_s=%.2fs rebuild_sd_s=%.2fs h2d_s=%.2fs",
+                "%s load timing (%s): e2e_s=%.4fs recovery_e2e_s=%.4fs "
+                "network_encode_s=%.4fs net_s=%.4fs decode_s=%.4fs rebuild_sd_s=%.4fs "
+                "h2d_model_s=%.4fs h2d_optimizer_s=%.4fs h2d_total_s=%.4fs "
+                "h2d_model_submit_s=%.4fs h2d_model_sync_s=%.4fs "
+                "h2d_optimizer_submit_s=%.4fs h2d_optimizer_sync_s=%.4fs "
+                "rebuild_from_recovered=%.0f "
+                "model_tensors=%.0f model_mib=%.1f model_pinned=%.0f/%.0f "
+                "optim_tensors=%.0f optim_mib=%.1f optim_pinned=%.0f/%.0f optim_storages=%.0f",
                 ft_context.get("scheme", "FT"),
                 ft_context.get("mode", "unknown"),
                 summary["e2e_s"],
                 summary["recovery_e2e_s"],
                 summary["network_encode_s"],
+                summary["net_s"],
+                summary["decode_s"],
                 summary["rebuild_sd_s"],
+                summary["h2d_model_s"],
+                summary["h2d_optimizer_s"],
                 summary["h2d_s"],
+                summary["h2d_model_submit_s"],
+                summary["h2d_model_sync_s"],
+                summary["h2d_optimizer_submit_s"],
+                summary["h2d_optimizer_sync_s"],
+                summary["rebuild_from_recovered"],
+                summary["model_tensor_count"],
+                summary["model_tensor_mib"],
+                summary["model_pinned_count"],
+                summary["model_tensor_count"],
+                summary["optim_tensor_count"],
+                summary["optim_tensor_mib"],
+                summary["optim_pinned_count"],
+                summary["optim_tensor_count"],
+                summary["optim_storage_count"],
             )
         clear_ft_load_timing_context()
         if (

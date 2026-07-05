@@ -580,11 +580,14 @@ def _collect_metadata_for_failed_rank(
 
     my_all_meta: Optional[Dict[str, Any]] = None
     if main_path.is_file():
-        from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
-        own = (read_raw_checkpoint(str(main_path), MAGIC_GEMINI, pin_tensor_buffer=True)
-               if is_raw_format(str(main_path), MAGIC_GEMINI)
-               else torch.load(main_path, map_location="cpu", weights_only=False))
-        pin_payload_tensor_buffer_if_available(own)
+        from megatron.training.legacy_io_utils import (
+            is_raw_format, read_raw_checkpoint_metadata, MAGIC_GEMINI,
+        )
+        own = (
+            read_raw_checkpoint_metadata(str(main_path), MAGIC_GEMINI)
+            if is_raw_format(str(main_path), MAGIC_GEMINI)
+            else torch.load(main_path, map_location="cpu", weights_only=False)
+        )
         my_all_meta = {
             "all_tensor_infos": own.get("all_tensor_infos", {}),
             "all_non_tensor_data": own.get("all_non_tensor_data", {}),
@@ -657,14 +660,15 @@ def _load_replica_full(replica_path: Path) -> Dict[str, Any]:
             meta_len = struct.unpack("<Q", _f.read(8))[0]
             rp = pickle.loads(_f.read(meta_len))
             tensor_size = int(rp.get("source_tensor_buffer_size", 0))
-            tensor_buffer = torch.empty(tensor_size, dtype=torch.uint8)
+            from megatron.training.legacy_io_utils import _allocate_read_buffer
+            tensor_buffer = _allocate_read_buffer(tensor_size, pin=True)
             view = memoryview(tensor_buffer.numpy())
             bytes_read = _f.readinto(view)
             if bytes_read != tensor_size:
                 raise EOFError(
                     f"Expected {tensor_size} bytes in {replica_path}, got {bytes_read}"
                 )
-            rp["tensor_buffer"] = pin_uint8_tensor_if_available(tensor_buffer)
+            rp["tensor_buffer"] = tensor_buffer
             return rp
     else:
         payload = torch.load(replica_path, map_location="cpu", weights_only=False)
@@ -1331,7 +1335,9 @@ def _replica_recovery_preload(
             if src == rank:
                 mp = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
                 from megatron.training.legacy_io_utils import read_raw_checkpoint, MAGIC_GEMINI
-                payload = read_raw_checkpoint(str(mp), MAGIC_GEMINI)
+                payload = read_raw_checkpoint(
+                    str(mp), MAGIC_GEMINI, pin_tensor_buffer=True,
+                )
                 meta = {
                     "tensor_infos": payload["tensor_infos"],
                     "non_tensor_data": payload["non_tensor_data"],
@@ -1755,18 +1761,33 @@ def load_gemini_replicas_legacy_checkpoint(
         is_failed = not main_file_exists
 
     main_payload: Optional[Dict[str, Any]] = None
-    if main_file_exists:
-        from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
-        main_payload = (read_raw_checkpoint(str(main_path), MAGIC_GEMINI, pin_tensor_buffer=True)
-                        if is_raw_format(str(main_path), MAGIC_GEMINI)
-                        else torch.load(main_path, map_location="cpu", weights_only=False))
-        pin_payload_tensor_buffer_if_available(main_payload)
 
-    # ---- Timing collection (excl disk IO) ----
+    def _load_local_main_payload(load_tensor_buffer: bool) -> Dict[str, Any]:
+        if not main_file_exists:
+            raise FileNotFoundError(f"Gemini Replicas load: missing main file {main_path}")
+        from megatron.training.legacy_io_utils import (
+            is_raw_format, read_raw_checkpoint, read_raw_checkpoint_metadata, MAGIC_GEMINI,
+        )
+        if is_raw_format(str(main_path), MAGIC_GEMINI):
+            payload = (
+                read_raw_checkpoint(str(main_path), MAGIC_GEMINI, pin_tensor_buffer=True)
+                if load_tensor_buffer
+                else read_raw_checkpoint_metadata(str(main_path), MAGIC_GEMINI)
+            )
+        else:
+            payload = torch.load(main_path, map_location="cpu", weights_only=False)
+            if not load_tensor_buffer:
+                payload["tensor_buffer"] = None
+        if load_tensor_buffer:
+            pin_payload_tensor_buffer_if_available(payload)
+        return payload
+
+    # ---- Timing collection ----
+    # prep_copy: disk read / CPU buffer copy / pin (excluded from total)
     # network_encode: C++ ASIO/RDMA send/recv + block assembly (HW only; SW=0)
-    # rebuild_sd: extract + reconstruct + unflatten
+    # rebuild_sd: extract + reconstruct + unflatten only
     # total: network_encode + rebuild_sd
-    _t: Dict[str, float] = {}
+    _t: Dict[str, float] = {'prep_copy': 0.0}
     recovery_role = "failed" if is_failed else "survivor"
     try:
         from megatron.training.global_vars import update_recovery_to_forward_timer_context
@@ -1781,11 +1802,12 @@ def load_gemini_replicas_legacy_checkpoint(
     # ---- Software failure path ----
     sw_failure = bool(getattr(args, "use_gemini_replicas_software_failure", False))
     if sw_failure:
+        prep_copy_s = 0.0
         if main_payload is None:
-            raise FileNotFoundError(
-                f"Gemini Replicas software failure: rank {rank} main file not found "
-                f"at {main_path}. In software failure mode, main.pt must exist on disk."
-            )
+            t_prep = time.time()
+            main_payload = _load_local_main_payload(load_tensor_buffer=True)
+            prep_copy_s = time.time() - t_prep
+        _t['prep_copy'] = prep_copy_s
         _t['network_encode'] = 0.0
         _t0 = time.time()
         state_dict = _reconstruct_from_payload(
@@ -1808,6 +1830,12 @@ def load_gemini_replicas_legacy_checkpoint(
 
     if not is_failed and all(health_list) and not recovery_rank_str:
         # ---- Normal load (no recovery ranks specified, all files present) ----
+        prep_copy_s = 0.0
+        if main_payload is None:
+            t_prep = time.time()
+            main_payload = _load_local_main_payload(load_tensor_buffer=True)
+            prep_copy_s = time.time() - t_prep
+        _t['prep_copy'] = prep_copy_s
         _t['network_encode'] = 0.0
         _t0 = time.time()
         state_dict = _reconstruct_from_payload(
@@ -1843,6 +1871,8 @@ def load_gemini_replicas_legacy_checkpoint(
 
         # Setup (not timed): metadata collection
         t_meta = time.time()
+        if main_payload is None and main_file_exists:
+            main_payload = _load_local_main_payload(load_tensor_buffer=False)
         meta = _collect_metadata_for_failed_rank(checkpoint_dir, rank, world_size)
         _gemini_recovery_profile(
             recovery_role, "metadata_collect_done", elapsed_s=time.time() - t_meta
@@ -1938,6 +1968,14 @@ def load_gemini_replicas_legacy_checkpoint(
             pass
 
         # Rebuild happens after network transfer completion; no extra timing barrier needed.
+        prep_copy_s = 0.0
+        if not is_failed and (
+            main_payload is None or main_payload.get("tensor_buffer") is None
+        ):
+            t_prep = time.time()
+            main_payload = _load_local_main_payload(load_tensor_buffer=True)
+            prep_copy_s = time.time() - t_prep
+        _t['prep_copy'] = prep_copy_s
         _t0_sd = time.time()
         _gemini_recovery_profile(recovery_role, "rebuild_start")
         if is_failed:

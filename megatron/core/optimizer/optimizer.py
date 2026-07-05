@@ -4,6 +4,7 @@
 
 import copy
 import math
+import time
 import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
@@ -65,6 +66,94 @@ def _optimizer_state_tensor_bytes_for_params(
             if torch.is_tensor(value):
                 total += value.numel() * value.element_size()
     return total
+
+
+def normalize_optimizer_state_param_keys(optim_state: Dict[str, Any]) -> None:
+    """Convert digit string keys in torch optimizer ``state`` to integers."""
+    state = optim_state.get("state")
+    if not isinstance(state, dict):
+        return
+    normalized: Dict[Any, Any] = {}
+    for key, value in list(state.items()):
+        normalized_key = int(key) if isinstance(key, str) and key.isdigit() else key
+        if (
+            normalized_key in normalized
+            and isinstance(normalized[normalized_key], dict)
+            and isinstance(value, dict)
+        ):
+            normalized[normalized_key].update(value)
+        else:
+            normalized[normalized_key] = value
+    state.clear()
+    state.update(normalized)
+
+
+def _optimizer_state_dict_has_cpu_tensors(optim_state: Dict[str, Any]) -> bool:
+    state = optim_state.get("state")
+    if not isinstance(state, dict):
+        return False
+    for value in state.values():
+        if not isinstance(value, dict):
+            continue
+        for tensor in value.values():
+            if torch.is_tensor(tensor) and tensor.device.type == "cpu":
+                return True
+    return False
+
+
+def _load_fused_optimizer_state_dict_fast(
+    optimizer: torch.optim.Optimizer, optim_state: Dict[str, Any]
+) -> None:
+    """Load CPU checkpoint optimizer state without Apex/PyTorch per-tensor deep copies."""
+    normalize_optimizer_state_param_keys(optim_state)
+
+    groups = optimizer.param_groups
+    saved_groups = optim_state["param_groups"]
+    if len(groups) != len(saved_groups):
+        raise ValueError("loaded state dict has a different number of parameter groups")
+    param_lens = (len(g["params"]) for g in groups)
+    saved_lens = (len(g["params"]) for g in saved_groups)
+    if any(p_len != s_len for p_len, s_len in zip(param_lens, saved_lens)):
+        raise ValueError(
+            "loaded state dict contains a parameter group that doesn't match "
+            "the size of optimizer's group"
+        )
+
+    id_map = dict(
+        zip(
+            chain.from_iterable(g["params"] for g in saved_groups),
+            chain.from_iterable(g["params"] for g in groups),
+        )
+    )
+
+    new_state: Dict[torch.Tensor, Dict[Any, Any]] = {}
+    for key, value in optim_state["state"].items():
+        if key not in id_map or not isinstance(value, dict):
+            continue
+        param = id_map[key]
+        param_state: Dict[Any, Any] = {}
+        for state_key, state_value in value.items():
+            if torch.is_tensor(state_value):
+                if param.device.type != state_value.device.type:
+                    dst = torch.empty_like(state_value, device=param.device)
+                    dst.copy_(state_value, non_blocking=True)
+                    param_state[state_key] = dst
+                else:
+                    param_state[state_key] = state_value
+            else:
+                param_state[state_key] = state_value
+        new_state[param] = param_state
+
+    param_groups = []
+    for group, saved_group in zip(groups, saved_groups):
+        updated = dict(saved_group)
+        updated["params"] = group["params"]
+        param_groups.append(updated)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    optimizer.__setstate__({"state": new_state, "param_groups": param_groups})
 
 
 def _zero_grad_group_helper(
@@ -1320,6 +1409,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
+        profile_ft_load = False
+        try:
+            from megatron.training.global_vars import get_ft_load_timing_context
+            profile_ft_load = get_ft_load_timing_context() is not None
+        except Exception:
+            profile_ft_load = False
+        profile_t0 = time.time() if profile_ft_load else 0.0
+
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
@@ -1330,12 +1427,23 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
 
         # Filter and reorder param groups to match current optimizer
+        filter_t0 = time.time() if profile_ft_load else 0.0
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
             self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
         )
-        self.optimizer.load_state_dict(state_dict[optimizer_key])
+        filter_s = time.time() - filter_t0 if profile_ft_load else 0.0
+
+        optim_sd = state_dict[optimizer_key]
+        inner_t0 = time.time() if profile_ft_load else 0.0
+        if _optimizer_state_dict_has_cpu_tensors(optim_sd):
+            _load_fused_optimizer_state_dict_fast(self.optimizer, optim_sd)
+        else:
+            normalize_optimizer_state_param_keys(optim_sd)
+            self.optimizer.load_state_dict(optim_sd)
+        inner_s = time.time() - inner_t0 if profile_ft_load else 0.0
 
         # Grad scaler.
+        scaler_t0 = time.time() if profile_ft_load else 0.0
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
                 logger.info('***WARNING*** found an old checkpoint, will not load grad scaler ...')
@@ -1348,16 +1456,37 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     'checkpoint but it is None in the class. '
                     'Skipping loading grad scaler ...'
                 )
+        scaler_s = time.time() - scaler_t0 if profile_ft_load else 0.0
 
         # Copy data for the main params.
+        fp32_t0 = time.time() if profile_ft_load else 0.0
         fp32_from_float16_params_key = 'fp32_from_fp16_params'
         if fp32_from_float16_params_key not in state_dict:
             fp32_from_float16_params_key = 'fp32_from_fp16'
+        fp32_tensors = 0
+        fp32_bytes = 0
         for current_group, saved_group in zip(
             self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key]
         ):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
+                if profile_ft_load:
+                    fp32_tensors += 1
+                    fp32_bytes += saved_param.numel() * saved_param.element_size()
+        fp32_s = time.time() - fp32_t0 if profile_ft_load else 0.0
+        if profile_ft_load:
+            logger.info(
+                "optimizer load profile: total_s=%.2fs filter_s=%.2fs "
+                "inner_optimizer_s=%.2fs grad_scaler_s=%.2fs "
+                "fp32_master_copy_s=%.2fs fp32_tensors=%d fp32_mib=%.1f",
+                time.time() - profile_t0,
+                filter_s,
+                inner_s,
+                scaler_s,
+                fp32_s,
+                fp32_tensors,
+                fp32_bytes / (1024 ** 2),
+            )
 
 
 class FP32Optimizer(MegatronOptimizer):
@@ -1568,15 +1697,36 @@ class FP32Optimizer(MegatronOptimizer):
         return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict):
+        profile_ft_load = False
+        try:
+            from megatron.training.global_vars import get_ft_load_timing_context
+            profile_ft_load = get_ft_load_timing_context() is not None
+        except Exception:
+            profile_ft_load = False
+        profile_t0 = time.time() if profile_ft_load else 0.0
+
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
 
         # Filter and reorder param groups to match current optimizer
+        filter_t0 = time.time() if profile_ft_load else 0.0
         state_dict['param_groups'] = self._filter_and_reorder_param_groups(
             self.optimizer.param_groups, state_dict['param_groups']
         )
+        filter_s = time.time() - filter_t0 if profile_ft_load else 0.0
+
+        inner_t0 = time.time() if profile_ft_load else 0.0
         self.optimizer.load_state_dict(state_dict)
+        inner_s = time.time() - inner_t0 if profile_ft_load else 0.0
+        if profile_ft_load:
+            logger.info(
+                "optimizer load profile: total_s=%.2fs filter_s=%.2fs "
+                "inner_optimizer_s=%.2fs wrapper=FP32Optimizer",
+                time.time() - profile_t0,
+                filter_s,
+                inner_s,
+            )
 
     def sharded_state_dict(
         self,

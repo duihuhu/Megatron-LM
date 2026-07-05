@@ -1,4 +1,4 @@
-#!/bin/bash
+zj#!/bin/bash
 
 # FRCheck (POA-driven stripe encode with RDMA) — single-node script.
 # Usage: ./test_eccheck_4nodes_node_335M_frcheck.sh <node_rank> [<gpu_id_0> [gpu_id_1 ...]] [additional_args...]
@@ -89,6 +89,11 @@ ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 case "$MODE" in
     save)
+        RECOVERY_MODE_ARGS=(
+            --save $CHECKPOINT_PATH
+            --ec-checkpoint-write-only-penultimate-iter
+            --frcheck-async-parity
+        )
         ;;
     software)
         RECOVERY_MODE_ARGS=(
@@ -99,7 +104,13 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
-            --frcheck-failed-ranks "0"
+            --frcheck-async-recovery-forward
+            --frcheck-recovery-async-parity
+            --frcheck-failed-ranks "0,1,2,3,4,5,6,7"
+            --frcheck-recovery-safe-point optimizer_step
+            --frcheck-recovery-only-teardown
+            # Native RDMA stays alive until optimizer_step; forked DataLoader workers segfault.
+            --num-workers 0
         )
         ;;
     hardware2)
@@ -116,10 +127,10 @@ HIDDEN_SIZE=4800
 NUM_ATTENTION_HEADS=40
 NUM_LAYERS=40
 
-SEQ_LENGTH=1024
+SEQ_LENGTH=4096
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
 MICRO_BATCH_SIZE=4
-GLOBAL_BATCH_SIZE=16
+GLOBAL_BATCH_SIZE=32
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -144,7 +155,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00005
-    --train-iters 20
+    --train-iters 10
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -174,7 +185,7 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    --save $CHECKPOINT_PATH
+    #--save $CHECKPOINT_PATH
     --ec-checkpoint-write-only-penultimate-iter
     #--load $CHECKPOINT_PATH
     
@@ -184,8 +195,6 @@ EVAL_AND_LOGGING_ARGS=(
     --use-frcheck
     --frcheck-n 4
     --frcheck-table-dir $FRCHECK_TABLE_DIR
-    #--frcheck-failed-ranks 0,1
-    --use-frcheck-hardware-failure
     --ckpt-format torch
     --save-embeddings-separately
     # --timing-log-level 2

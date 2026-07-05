@@ -93,6 +93,7 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
             --ec-checkpoint-write-only-penultimate-iter
+            --frcheck-async-parity
         )
         ;;
     software)

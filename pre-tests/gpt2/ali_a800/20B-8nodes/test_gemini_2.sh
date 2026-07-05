@@ -121,6 +121,9 @@ ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 case "$MODE" in
     save)
+        RECOVERY_MODE_ARGS=(
+            --save $CHECKPOINT_PATH
+        )
         ;;
     software)
         RECOVERY_MODE_ARGS=(
@@ -206,7 +209,7 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    --save $CHECKPOINT_PATH
+    #--save $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 

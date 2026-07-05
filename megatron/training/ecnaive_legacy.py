@@ -25,6 +25,15 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
 
 logger = getLogger(__name__)
 
+def _allocate_pinned_uint8_buffer(size_bytes: int) -> torch.Tensor:
+    """Allocate a final CPU tensor buffer with torch-visible pinned memory."""
+    if torch.cuda.is_available() and size_bytes > 0:
+        try:
+            return torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
+        except Exception:
+            pass
+    return allocate_hugepage_tensor(size_bytes, fallback_pin_memory=torch.cuda.is_available())
+
 
 def _timing_max(value: float) -> float:
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -426,6 +435,228 @@ def _run_hw_failed_recv_decode_pipeline(
     return len(stripes)
 
 
+def _resolve_ecnaive_block_paths(
+    checkpoint_dir: Path,
+    rank: int,
+    ecnaive_k: int,
+    ecnaive_n: int,
+    block_files: Optional[Dict[str, str]] = None,
+) -> List[Path]:
+    """Resolve on-disk paths for all n EC-NAIVE checkpoint blocks."""
+    legacy_map: Dict[int, str] = {}
+    if ecnaive_k == 2:
+        legacy_map = {
+            0: "data0",
+            1: "recv_parity1",
+            2: "recv_parity0",
+            3: "recv_data1",
+        }
+
+    paths: List[Path] = []
+    for i in range(ecnaive_n):
+        canon_name = "own_data0" if i == 0 else f"recv_{i - 1}"
+        candidates: List[Path] = []
+        if block_files and canon_name in block_files:
+            candidates.append(checkpoint_dir / block_files[canon_name])
+        candidates.append(checkpoint_dir / f"ecnaive_block_rank{rank}_{canon_name}.pt")
+        if i in legacy_map:
+            candidates.append(
+                checkpoint_dir / f"ecnaive_block_rank{rank}_{legacy_map[i]}.pt"
+            )
+
+        block_path = None
+        for path in candidates:
+            if path.is_file():
+                block_path = path
+                break
+        if block_path is None:
+            raise FileNotFoundError(
+                f"EC-NAIVE hw recovery: survivor rank {rank} missing block "
+                f"{i} ({canon_name}) — tried: {[str(p) for p in candidates]}"
+            )
+        paths.append(block_path)
+    return paths
+
+
+def _copy_ecnaive_block_range_into_tensor(
+    block_path: Path,
+    dest: torch.Tensor,
+    byte_offset: int,
+    nbytes: int,
+) -> None:
+    """Copy a byte range from one EC-NAIVE block file into ``dest[:nbytes]``."""
+    from megatron.training.legacy_io_utils import (
+        is_raw_format,
+        read_raw_block_range,
+        MAGIC_BLOCK,
+        pin_uint8_tensor_if_available,
+    )
+
+    if is_raw_format(str(block_path), MAGIC_BLOCK):
+        read_raw_block_range(
+            str(block_path), MAGIC_BLOCK, dest, byte_offset, nbytes,
+        )
+        return
+
+    payload = torch.load(block_path, map_location="cpu", weights_only=False)
+    src = pin_uint8_tensor_if_available(
+        payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
+    )
+    end = byte_offset + nbytes
+    if end > src.numel():
+        raise ValueError(
+            f"EC-NAIVE block range [{byte_offset}, {end}) exceeds file size "
+            f"{src.numel()} for {block_path}"
+        )
+    dest[:nbytes].copy_(src[byte_offset:end])
+
+
+def _run_hw_source_streaming_send(
+    native,
+    manager: ECNAIVEManager,
+    rank: int,
+    world_size: int,
+    failed_in_group: List[int],
+    block_paths: List[Path],
+    send_size: int,
+    stripe_bytes: int,
+) -> int:
+    """Send all checkpoint blocks stripe-by-stripe without full-block resident memory."""
+    ecnaive_n = len(block_paths)
+    scratch = list(
+        allocate_hugepage_slices(
+            stripe_bytes,
+            ecnaive_n,
+            fallback_pin_memory=True,
+            touch_pages=True,
+        )
+    )
+    if manager.use_rdma:
+        for buf in scratch:
+            manager.register_buffer(buf)
+
+    stripes = list(_iter_ecnaive_load_stripes(send_size, stripe_bytes))
+    for byte_offset, take in stripes:
+        for bi, block_path in enumerate(block_paths):
+            _copy_ecnaive_block_range_into_tensor(
+                block_path, scratch[bi], byte_offset, take,
+            )
+        for dest_fr in failed_in_group:
+            send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
+            for buf in scratch:
+                native.submit_send_task(send_ch, int(buf.data_ptr()), take)
+        native.wait_for_pending_network_tasks()
+    return len(stripes)
+
+
+def _run_hw_failed_own_tensor_streaming_recovery(
+    native,
+    manager: ECNAIVEManager,
+    rank: int,
+    world_size: int,
+    source_ranks: List[int],
+    ecnaive_k: int,
+    ecnaive_n: int,
+    recv_pool: List[torch.Tensor],
+    rig_to_si: Dict[int, int],
+    my_rig: int,
+    tensor_buffer: torch.Tensor,
+    block_data_size: int,
+    actual_tensor_size: int,
+    stripe_bytes: int,
+    decode_scratch: List[torch.Tensor],
+) -> Tuple[int, float]:
+    """Recover only this failed rank's tensor buffer with stripe-sized scratch memory.
+
+    Hardware recovery used to materialize every recovered checkpoint block for
+    cascading-failure tolerance. For multi-GB checkpoints and many failed ranks
+    per node, that creates an OOM-scale CPU memory spike. This path keeps the
+    network protocol unchanged but decodes only the two data blocks needed to
+    rebuild this rank's state_dict, copying each stripe directly into the final
+    tensor buffer.
+    """
+
+    def _find_block(owner_rig: int, role: str) -> Optional[torch.Tensor]:
+        if role == "data0":
+            si = rig_to_si.get(owner_rig)
+            return recv_pool[si * ecnaive_n] if si is not None else None
+        if role == "data1":
+            si = rig_to_si.get((owner_rig + 1) % ecnaive_n)
+            return recv_pool[si * ecnaive_n + 1] if si is not None else None
+        if role == "parity0":
+            si = rig_to_si.get((owner_rig + 2) % ecnaive_n)
+            return recv_pool[si * ecnaive_n + 2] if si is not None else None
+        if role == "parity1":
+            si = rig_to_si.get((owner_rig + 3) % ecnaive_n)
+            return recv_pool[si * ecnaive_n + 3] if si is not None else None
+        return None
+
+    def _copy_data_stripe(data_pos: int, src: torch.Tensor, byte_offset: int, size: int) -> None:
+        dst = data_pos * block_data_size + byte_offset
+        total = actual_tensor_size if actual_tensor_size > 0 else block_data_size * ecnaive_k
+        nbytes = min(size, max(0, total - dst))
+        if nbytes > 0:
+            tensor_buffer[dst : dst + nbytes].copy_(src[:nbytes])
+
+    stripes = list(_iter_ecnaive_load_stripes(block_data_size, stripe_bytes))
+    decode_s = 0.0
+    for byte_offset, take in stripes:
+        _submit_hw_failed_recv_stripe(
+            native, manager, rank, world_size, source_ranks, ecnaive_n,
+            recv_pool, 0, take,
+        )
+        native.wait_for_pending_network_tasks()
+
+        decode_t0 = time.time()
+        raw_surviving: Dict[str, torch.Tensor] = {}
+        for role, label in [
+            ("data0", "data_0"),
+            ("data1", "data_1"),
+            ("parity0", "parity0"),
+            ("parity1", "parity1"),
+        ]:
+            block = _find_block(my_rig, role)
+            if block is not None:
+                raw_surviving[label] = block
+
+        lost = [pos for pos, label in enumerate(["data_0", "data_1"]) if label not in raw_surviving]
+        m_owner = len(lost)
+        if m_owner == 0:
+            recovered_data = [raw_surviving["data_0"], raw_surviving["data_1"]]
+        else:
+            data_labels = sorted(
+                [label for label in raw_surviving if label.startswith("data_")],
+                key=lambda x: int(x.split("_")[1]),
+            )
+            parity_labels = sorted(label for label in raw_surviving if label.startswith("parity"))
+            surviving_order = data_labels + parity_labels
+            recovered_blocks = decode_scratch[:m_owner]
+            native.submit_ecnaive_decode_recovery(
+                ecnaive_k,
+                m_owner,
+                lost,
+                [int(raw_surviving[label].data_ptr()) for label in surviving_order],
+                [int(block.data_ptr()) for block in recovered_blocks],
+                take,
+            )
+            recovered_data: List[Optional[torch.Tensor]] = [None] * ecnaive_k
+            ri = 0
+            for pos in range(ecnaive_k):
+                label = f"data_{pos}"
+                if label in raw_surviving:
+                    recovered_data[pos] = raw_surviving[label]
+                else:
+                    recovered_data[pos] = recovered_blocks[ri]
+                    ri += 1
+
+        _copy_data_stripe(0, recovered_data[0], byte_offset, take)
+        if ecnaive_k > 1:
+            _copy_data_stripe(1, recovered_data[1], byte_offset, take)
+        decode_s += time.time() - decode_t0
+
+    return len(stripes), decode_s
+
+
 def _copy_buffer_range_from_tensors(
     tensor_buffer: torch.Tensor,
     range_start: int,
@@ -820,27 +1051,44 @@ def _tensor_infos_to_local_metadata(
     return out
 
 
+def _load_ecnaive_main_payload_local(
+    checkpoint_dir: Path, rank: int, load_tensor_buffer: bool = True
+) -> Optional[Dict[str, Any]]:
+    """Load this rank's EC-NAIVE main payload without distributed collectives."""
+    main_path = checkpoint_dir / f"ecnaive_main_rank{rank}.pt"
+    if not main_path.is_file():
+        return None
+
+    from megatron.training.legacy_io_utils import (
+        is_raw_format, read_raw_checkpoint, read_raw_checkpoint_metadata, MAGIC_ECNAIVE,
+        pin_payload_tensor_buffer_if_available,
+    )
+    if is_raw_format(str(main_path), MAGIC_ECNAIVE):
+        return (
+            read_raw_checkpoint(str(main_path), MAGIC_ECNAIVE, pin_tensor_buffer=True)
+            if load_tensor_buffer
+            else read_raw_checkpoint_metadata(str(main_path), MAGIC_ECNAIVE)
+        )
+
+    local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+    if load_tensor_buffer:
+        pin_payload_tensor_buffer_if_available(local_payload)
+    else:
+        local_payload["tensor_buffer"] = None
+    return local_payload
+
+
 def _load_ecnaive_main_payload(
-    checkpoint_dir: Path, rank: int, world_size: int
+    checkpoint_dir: Path, rank: int, world_size: int, load_tensor_buffer: bool = True
 ) -> Dict[str, Any]:
     """
     Load ecnaive_main_rank{rank}.pt. If missing on this rank, recover payload via all_gather_object
     using other ranks' copies (rank r uses gathered[r] when present).
     """
     main_path = checkpoint_dir / f"ecnaive_main_rank{rank}.pt"
-    local_payload: Optional[Dict[str, Any]] = None
-    if main_path.is_file():
-        from megatron.training.legacy_io_utils import (
-            is_raw_format, read_raw_checkpoint, MAGIC_ECNAIVE,
-            pin_payload_tensor_buffer_if_available,
-        )
-        if is_raw_format(str(main_path), MAGIC_ECNAIVE):
-            local_payload = read_raw_checkpoint(
-                str(main_path), MAGIC_ECNAIVE, pin_tensor_buffer=True,
-            )
-        else:
-            local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
-            pin_payload_tensor_buffer_if_available(local_payload)
+    local_payload = _load_ecnaive_main_payload_local(
+        checkpoint_dir, rank, load_tensor_buffer=load_tensor_buffer
+    )
 
     if world_size <= 1 or not torch.distributed.is_initialized():
         if local_payload is None:
@@ -1125,7 +1373,7 @@ def _load_ecnaive_legacy_software_failure(
     Non-participating ranks just reconstruct from their own main.pt.
 
     If *timings* dict is provided, it will be populated with:
-      init, xfer, rebuild_sd (all in seconds).
+      prep_copy, network_encode, rebuild_sd (all in seconds; total excludes prep_copy).
     """
     from time import time as _time
     _t = timings if timings is not None else {}
@@ -1167,7 +1415,7 @@ def _load_ecnaive_legacy_software_failure(
     if rank_in_group == failed_rig:
         # Pre-allocate final tensor_buffer once (pinned for fast CPU→GPU copy)
         buf_len = max(actual_tensor_size, pipeline_total_bytes)
-        tensor_buffer = allocate_hugepage_tensor(buf_len, fallback_pin_memory=True)
+        tensor_buffer = _allocate_pinned_uint8_buffer(buf_len)
         # Load local d_{f,0} into tensor_buffer
         own_data0 = _load_ecnaive_block_file(
             checkpoint_dir, rank,
@@ -1249,6 +1497,21 @@ def _load_ecnaive_legacy_software_failure(
             "EC-NAIVE legacy sw: rig=%d sent (block_idx=%d, %d bytes)",
             rank_in_group, send_block_idx, send_block.numel(),
         )
+
+    prep_copy_s = 0.0
+    if rank_in_group != failed_rig and not isinstance(
+        main_payload.get("tensor_buffer"), torch.Tensor
+    ):
+        t_prep = _time()
+        main_payload = _load_ecnaive_main_payload_local(
+            checkpoint_dir, rank, load_tensor_buffer=True
+        )
+        if main_payload is None:
+            raise FileNotFoundError(
+                f"EC-NAIVE legacy sw: missing main payload for rank {rank} under {checkpoint_dir}"
+            )
+        prep_copy_s = _time() - t_prep
+    _t['prep_copy'] = prep_copy_s
 
     t_rebuild = _time()
     if rank_in_group == failed_rig:
@@ -1332,11 +1595,13 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
-    main_payload = _load_ecnaive_main_payload(checkpoint_dir, rank, world_size)
-
     from megatron.training import get_args
 
     args = get_args()
+    sw_failure_requested = bool(getattr(args, "use_ecnaive_software_failure", False))
+    main_payload = _load_ecnaive_main_payload(
+        checkpoint_dir, rank, world_size, load_tensor_buffer=not sw_failure_requested
+    )
     if not getattr(args, "use_ecnaive", False):
         logger.warning(
             "EC-NAIVE legacy load: args.use_ecnaive is False; enabling for native module init"
@@ -1360,9 +1625,9 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     global_registry = GlobalMetadataRegistry(rank_metadata=rank_metadata, rank_non_tensor_data={})
 
     # ---- Software failure fast path ----
-    if bool(getattr(args, "use_ecnaive_software_failure", False)):
+    if sw_failure_requested:
         logger.debug("EC-NAIVE legacy: software failure recovery path")
-        _t: Dict[str, float] = {}
+        _t: Dict[str, float] = {'prep_copy': 0.0}
         state_dict = _load_ecnaive_legacy_software_failure(
             checkpoint_dir=checkpoint_dir,
             rank=rank,
@@ -1478,12 +1743,13 @@ def _load_all_blocks_from_disk(
 def load_ecnaive_legacy_checkpoint_hardware_recovery(
     checkpoint_name: str, failed_global_ranks: List[int]
 ) -> Dict[str, Any]:
-    """Hardware recovery for 1-2 failed ranks using C++ ASIO send/recv + RS decode.
+    """Hardware recovery using C++ ASIO/RDMA send/recv plus RS decode.
 
-    Each surviving rank sends ALL its n checkpoint blocks to each failed rank
-    in the same group. The failed rank receives from all survivors and recovers:
-      1. Its own k data blocks → tensor_buffer → state_dict (RS decode)
-      2. Its (n-1) recv blocks (for cascading failure tolerance)
+    Source ranks send all n checkpoint blocks to each failed rank in the same
+    group. Current continuous checkpoints stream block data from disk in
+    stripe-sized chunks on both source and failed ranks, avoiding full-block
+    resident memory when many ranks are colocated on one node. Legacy padded
+    checkpoints keep the older full-block compatibility path.
     """
     start_time = time.time()
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
@@ -1570,6 +1836,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     # Pre-allocate recv pool for failed ranks, load blocks for source ranks (not timed)
     recv_pool_prealloc: List[torch.Tensor] = []
     source_blocks_prealloc: List[torch.Tensor] = []
+    source_block_paths: List[Path] = []
     # Pre-computed decode layout and buffers for failed ranks (moved here to keep outside timing)
     _rig_to_si: Dict[int, int] = {}
     _owner_rigs: List[int] = []
@@ -1581,13 +1848,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     tensor_buffer_pre: Optional[torch.Tensor] = None
     if affected_group and is_failed:
         total_pool_blocks = len(source_ranks) * ecnaive_n
-        recv_pool_prealloc = list(allocate_hugepage_slices(
-            recv_block_size, total_pool_blocks,
-            fallback_pin_memory=True, touch_pages=True,
-        ))
-        if manager.use_rdma:
-            for buf in recv_pool_prealloc:
-                manager.register_buffer(buf)
         # Pre-compute block locator metadata
         _source_rig_map = {r: manager._get_rank_in_group(r, world_size) for r in source_ranks}
         _rig_to_si = {rig: si for si, (_, rig) in enumerate(
@@ -1599,36 +1859,60 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             if _ow not in _owner_rigs:
                 _owner_rigs.append(_ow)
         _num_owners = len(_owner_rigs)
-        # Pre-allocate decode/encode/store/tensor buffers
-        recovered_slot_pool_pre = [
-            torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners * ecnaive_k)
-        ]
-        parity_pool_0_pre = [
-            torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners)
-        ]
-        parity_pool_1_pre = [
-            torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners)
-        ]
-        store_bufs_pre = {
-            _name: torch.empty(block_data_size, dtype=torch.uint8)
-            for _name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2')
-        }
-        tensor_buffer_pre = allocate_hugepage_tensor(
-            max(block_data_size * ecnaive_k, actual_tensor_size), fallback_pin_memory=True,
+
+        if has_padded_recv:
+            recv_pool_prealloc = list(allocate_hugepage_slices(
+                recv_block_size, total_pool_blocks,
+                fallback_pin_memory=True, touch_pages=True,
+            ))
+            # Pre-allocate decode/encode/store/tensor buffers for legacy padded checkpoints.
+            recovered_slot_pool_pre = [
+                torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners * ecnaive_k)
+            ]
+            parity_pool_0_pre = [
+                torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners)
+            ]
+            parity_pool_1_pre = [
+                torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners)
+            ]
+            store_bufs_pre = {
+                _name: torch.empty(block_data_size, dtype=torch.uint8)
+                for _name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2')
+            }
+        else:
+            recv_pool_prealloc = list(allocate_hugepage_slices(
+                stripe_bytes := manager.ecnaive_buffer_size, total_pool_blocks,
+                fallback_pin_memory=True, touch_pages=True,
+            ))
+            store_bufs_pre = {
+                'own_data0': torch.empty(stripe_bytes, dtype=torch.uint8),
+                'my_data1': torch.empty(stripe_bytes, dtype=torch.uint8),
+            }
+
+        if manager.use_rdma:
+            for buf in recv_pool_prealloc:
+                manager.register_buffer(buf)
+        tensor_buffer_pre = _allocate_pinned_uint8_buffer(
+            max(block_data_size * ecnaive_k, actual_tensor_size)
         )
     elif affected_group and not is_failed and is_source:
-        source_blocks_prealloc = _load_all_blocks_from_disk(
-            checkpoint_dir, rank, ecnaive_k, ecnaive_n, block_files,
-        )
-        if manager.use_rdma:
-            for b in source_blocks_prealloc:
-                manager.register_buffer(b)
+        if has_padded_recv:
+            source_blocks_prealloc = _load_all_blocks_from_disk(
+                checkpoint_dir, rank, ecnaive_k, ecnaive_n, block_files,
+            )
+            if manager.use_rdma:
+                for b in source_blocks_prealloc:
+                    manager.register_buffer(b)
+        else:
+            source_block_paths = _resolve_ecnaive_block_paths(
+                checkpoint_dir, rank, ecnaive_k, ecnaive_n, block_files,
+            )
 
     # Sync after pre-alloc/load so network timing excludes setup skew.
     barrier_s += _timed_barrier()
 
     # === timing: network/encode (C++ send/recv + RS decode only) ===
-    _t: Dict[str, float] = {}
+    _t: Dict[str, float] = {'prep_copy': 0.0}
     _t0_net = time.time()
 
     # ── Pipeline: SOURCE ranks send all n blocks to each failed rank ──
@@ -1636,26 +1920,44 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         native.reset_encoding_completion_flags()
         stripe_bytes = manager.ecnaive_buffer_size
 
-        for dest_fr in failed_in_group:
-            send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
-            send_bases = [
-                int(block_tensor.data_ptr()) for block_tensor in source_blocks_prealloc
-            ]
-            send_size = min(
-                min(block_tensor.numel() for block_tensor in source_blocks_prealloc),
-                recv_block_size,
-            )
-            _submit_hw_stripes_stripe_major(
-                native.submit_send_task,
-                send_ch,
-                send_bases,
+        if has_padded_recv:
+            for dest_fr in failed_in_group:
+                send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
+                send_bases = [
+                    int(block_tensor.data_ptr()) for block_tensor in source_blocks_prealloc
+                ]
+                send_size = min(
+                    min(block_tensor.numel() for block_tensor in source_blocks_prealloc),
+                    recv_block_size,
+                )
+                _submit_hw_stripes_stripe_major(
+                    native.submit_send_task,
+                    send_ch,
+                    send_bases,
+                    send_size,
+                    stripe_bytes,
+                )
+                logger.debug(
+                    f"EC-NAIVE hw recovery: source rank {rank} sending all "
+                    f"{len(source_blocks_prealloc)} blocks (stripe-major, {stripe_bytes} B) "
+                    f"to failed rank {dest_fr}"
+                )
+        else:
+            send_size = block_data_size
+            n_stripes = _run_hw_source_streaming_send(
+                native,
+                manager,
+                rank,
+                world_size,
+                failed_in_group,
+                source_block_paths,
                 send_size,
                 stripe_bytes,
             )
             logger.debug(
-                f"EC-NAIVE hw recovery: source rank {rank} sending all "
-                f"{len(source_blocks_prealloc)} blocks (stripe-major, {stripe_bytes} B) "
-                f"to failed rank {dest_fr}"
+                f"EC-NAIVE hw recovery: source rank {rank} streamed "
+                f"{len(source_block_paths)} blocks in {n_stripes} stripes "
+                f"({stripe_bytes} B) to failed ranks {failed_in_group}"
             )
 
         native.submit_send_sentinels(num_channels)
@@ -1742,6 +2044,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     return recv_pool[si * ecnaive_n + 3] if si is not None else None
                 return None
 
+            decode_t0 = time.time()
             recovered: Dict[str, torch.Tensor] = {}
             owner_idx = 0
             for owner_rig in owner_rigs:
@@ -1827,23 +2130,12 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     if need_parity1:
                         recovered['recv_2_ref'] = parity1
                 owner_idx += 1
+            _t['decode_s'] = time.time() - decode_t0
         else:
-            # Continuous blocks: recv stripe N+1 overlaps decode/encode stripe N (mirrors save).
-            owner_plans, recovered = _build_hw_owner_codeword_plans(
-                owner_rigs=owner_rigs,
-                my_rig=my_rig,
-                ecnaive_k=ecnaive_k,
-                ecnaive_n=ecnaive_n,
-                rig_to_si=rig_to_si,
-                recv_pool=recv_pool,
-                block_data_size=block_data_size,
-                store_bufs=store_bufs,
-                recovered_slot_pool=recovered_slot_pool,
-                parity_pool_0=parity_pool_0,
-                parity_pool_1=parity_pool_1,
-            )
-            owner_encode_s: Dict[int, float] = {}
-            n_stripes = _run_hw_failed_recv_decode_pipeline(
+            # Continuous checkpoints use stripe-sized scratch buffers and copy directly
+            # into the final tensor buffer. This avoids full-block recovered/parity pools.
+            tensor_buffer = tensor_buffer_pre
+            n_stripes, decode_s = _run_hw_failed_own_tensor_streaming_recovery(
                 native=native,
                 manager=manager,
                 rank=rank,
@@ -1852,19 +2144,22 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 ecnaive_k=ecnaive_k,
                 ecnaive_n=ecnaive_n,
                 recv_pool=recv_pool,
+                rig_to_si=rig_to_si,
+                my_rig=my_rig,
+                tensor_buffer=tensor_buffer,
                 block_data_size=block_data_size,
-                owner_plans=owner_plans,
+                actual_tensor_size=actual_tensor_size,
                 stripe_bytes=stripe_bytes,
-                owner_encode_s=owner_encode_s,
+                decode_scratch=[store_bufs['own_data0'], store_bufs['my_data1']],
             )
-            if owner_encode_s:
-                _t['encode_s'] = max(owner_encode_s.values())
             native.submit_send_sentinels(num_channels)
             native.submit_recv_sentinels(num_channels)
             native.wait_for_encoding_completion()
             _t['network_recv'] = time.time() - _t0_net
+            _t['decode_s'] = decode_s
+            recovered = {}
             logger.debug(
-                "EC-NAIVE hw recovery: rank %d pipelined %d recv/decode stripes "
+                "EC-NAIVE hw recovery: rank %d streamed %d recv/decode stripes "
                 "(stripe_bytes=%d, block_bytes=%d)",
                 rank, n_stripes, stripe_bytes, block_data_size,
             )
@@ -1886,20 +2181,23 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 f"blocks for rank {rank} via unified decode+encode"
             )
 
-        # ── Assemble tensor_buffer from own k data blocks ──
-        d0 = recovered.get('own_data0')
-        d1 = recovered.get('my_data1')
-        if d0 is None or d1 is None:
-            raise RuntimeError(
-                f"EC-NAIVE hw recovery: missing own data blocks for rank {rank}"
-            )
-        tensor_buffer = tensor_buffer_pre
-        tensor_buffer[:d0.numel()].copy_(d0)
-        if actual_tensor_size > 0:
-            end = min(d1.numel(), max(0, actual_tensor_size - d0.numel()))
-            tensor_buffer[d0.numel():d0.numel() + end].copy_(d1[:end])
+        # ── Assemble tensor_buffer from own k data blocks (excluded from e2e) ──
+        t_prep = time.time()
+        if has_padded_recv:
+            d0 = recovered.get('own_data0')
+            d1 = recovered.get('my_data1')
+            if d0 is None or d1 is None:
+                raise RuntimeError(
+                    f"EC-NAIVE hw recovery: missing own data blocks for rank {rank}"
+                )
+            tensor_buffer = tensor_buffer_pre
+            tensor_buffer[:d0.numel()].copy_(d0)
+            if actual_tensor_size > 0:
+                end = min(d1.numel(), max(0, actual_tensor_size - d0.numel()))
+                tensor_buffer[d0.numel():d0.numel() + end].copy_(d1[:end])
         if actual_tensor_size > 0:
             tensor_buffer = tensor_buffer[:actual_tensor_size]
+        _t['prep_copy'] = _t.get('prep_copy', 0.0) + (time.time() - t_prep)
 
         t_rebuild = time.time()
         # Debug: compare RS-recovered tensor_buffer with main_payload

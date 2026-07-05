@@ -186,9 +186,33 @@ def pin_payload_tensor_buffer_if_available(payload: Dict[str, Any]) -> Dict[str,
     return payload
 
 
-def _read_uint8_tensor(f: BinaryIO, size: int) -> torch.Tensor:
+def _allocate_read_buffer(size: int, pin: bool = False) -> torch.Tensor:
+    """Allocate a writable uint8 CPU tensor for raw checkpoint reads."""
+    if pin and size > 0 and torch.cuda.is_available():
+        try:
+            return torch.empty(size, dtype=torch.uint8, pin_memory=True)
+        except Exception as pin_exc:
+            try:
+                from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+                    allocate_hugepage_tensor,
+                )
+
+                return allocate_hugepage_tensor(
+                    size, fallback_pin_memory=True, touch_pages=False,
+                )
+            except Exception as hugepage_exc:
+                logger.warning(
+                    "Unable to allocate pinned raw checkpoint read buffer; "
+                    "using pageable CPU memory: pin=%s hugepage=%s",
+                    pin_exc,
+                    hugepage_exc,
+                )
+    return torch.empty(size, dtype=torch.uint8)
+
+
+def _read_uint8_tensor(f: BinaryIO, size: int, pin: bool = False) -> torch.Tensor:
     """Read exactly *size* bytes into a writable CPU uint8 tensor."""
-    tensor = torch.empty(size, dtype=torch.uint8)
+    tensor = _allocate_read_buffer(size, pin=pin)
     if size == 0:
         return tensor
     view = memoryview(tensor.numpy())
@@ -233,7 +257,7 @@ def read_raw_checkpoint(
         tensor_infos = pickle.loads(f.read(meta2_len))
         extra = pickle.loads(f.read(extra_len)) if extra_len else {}
 
-        tensor = _read_uint8_tensor(f, data_len)
+        tensor = _read_uint8_tensor(f, data_len, pin=pin_tensor_buffer)
         if pin_tensor_buffer:
             tensor = pin_uint8_tensor_if_available(tensor)
 
@@ -286,10 +310,52 @@ def read_raw_block(
                 f"Unexpected magic {magic!r} (expected {expected_magic!r}) in {path}"
             )
         size = struct.unpack("<Q", f.read(8))[0]
-        tensor = _read_uint8_tensor(f, size)
+        tensor = _read_uint8_tensor(f, size, pin=pin_tensor)
     if pin_tensor:
         tensor = pin_uint8_tensor_if_available(tensor)
     return tensor
+
+
+def read_raw_block_range(
+    path: str,
+    expected_magic: bytes,
+    dest: torch.Tensor,
+    byte_offset: int,
+    nbytes: int,
+) -> None:
+    """Read ``nbytes`` starting at ``byte_offset`` from a raw block file into ``dest``.
+
+    ``dest`` must hold at least ``nbytes`` elements.  The file payload begins
+    immediately after the ``[magic:4][data_len:8]`` header.
+    """
+    if nbytes <= 0:
+        return
+    if dest.numel() < nbytes:
+        raise ValueError(
+            f"Destination buffer too small for raw block range read: "
+            f"need {nbytes}, have {dest.numel()}"
+        )
+    header_size = _HEADER_MAGIC_LEN + 8
+    with open(path, "rb") as f:
+        magic = f.read(_HEADER_MAGIC_LEN)
+        if magic != expected_magic:
+            raise ValueError(
+                f"Unexpected magic {magic!r} (expected {expected_magic!r}) in {path}"
+            )
+        data_len = struct.unpack("<Q", f.read(8))[0]
+        if byte_offset < 0 or byte_offset + nbytes > data_len:
+            raise ValueError(
+                f"Raw block range [{byte_offset}, {byte_offset + nbytes}) exceeds "
+                f"payload size {data_len} in {path}"
+            )
+        f.seek(header_size + byte_offset)
+        view = memoryview(dest.numpy())[:nbytes]
+        n_read = f.readinto(view)
+        if n_read != nbytes:
+            raise EOFError(
+                f"Expected {nbytes} bytes at offset {byte_offset} in {path}, "
+                f"read {n_read} bytes"
+            )
 
 
 def is_raw_format(path: str, expected_magic: bytes) -> bool:

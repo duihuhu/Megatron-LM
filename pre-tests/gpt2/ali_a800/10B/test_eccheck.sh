@@ -100,6 +100,9 @@ ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 case "$MODE" in
     save)
+        RECOVERY_MODE_ARGS=(
+            --save $CHECKPOINT_PATH
+        )
         ;;
     software)
         RECOVERY_MODE_ARGS=(
@@ -125,10 +128,10 @@ HIDDEN_SIZE=4800
 NUM_ATTENTION_HEADS=40
 NUM_LAYERS=40
 
-SEQ_LENGTH=1024
+SEQ_LENGTH=4096
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
 MICRO_BATCH_SIZE=4
-GLOBAL_BATCH_SIZE=16
+GLOBAL_BATCH_SIZE=32
 
 
 DISTRIBUTED_ARGS=(
@@ -154,7 +157,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00005
-    --train-iters 20
+    --train-iters 10
     --ec-checkpoint-write-only-penultimate-iter
     --lr-decay-iters 320000
     --lr-decay-style cosine
@@ -185,7 +188,7 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    --save $CHECKPOINT_PATH
+    #--save $CHECKPOINT_PATH
     #--load $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH

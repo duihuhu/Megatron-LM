@@ -145,7 +145,7 @@ def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
         return set(main_payload["flat_key_roots"])
     flat_key_roots: Set[str] = set()
     for info in main_payload.get("tensor_infos", []):
-        key = info.key if isinstance(info, dict) else getattr(info, "key", "")
+        key = info.get("key", "") if isinstance(info, dict) else getattr(info, "key", "")
         first_seg = key.split(".")[0]
         if first_seg == "model" or (
             first_seg.startswith("model")
@@ -200,11 +200,16 @@ def _allocate_eccheck_blocks_legacy(
     return blocks
 
 
-def _allocate_recovered_buffer(size_bytes: int, pin: bool) -> torch.Tensor:
-    """Hugetlb-backed buffer for HW recovery (matches ECNaive/Gemini load paths)."""
+def _allocate_recovered_buffer(size_bytes: int, pin: bool = True) -> torch.Tensor:
+    """Pinned buffer for recovery output and fast H2D."""
+    if torch.cuda.is_available() and pin:
+        try:
+            return torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
+        except Exception:
+            pass
     return allocate_hugepage_tensor(
         size_bytes,
-        fallback_pin_memory=pin,
+        fallback_pin_memory=torch.cuda.is_available() and pin,
         touch_pages=True,
     )
 
@@ -745,6 +750,7 @@ def save_eccheck_legacy_checkpoint(
             tensor_infos=decomposed.tensor_infos,
             blocks=blocks,
             full_tensor_buffer=tensor_buffer[:total_tensor_size],
+            flat_key_roots=decomposed.flat_key_roots,
             all_tensor_infos=rank_metadata,
         )
     else:
@@ -759,12 +765,11 @@ def save_eccheck_legacy_checkpoint(
 # Load helpers
 # ---------------------------------------------------------------------------
 
-def _load_eccheck_main_payload(
+def _load_eccheck_main_payload_local(
     checkpoint_dir: Path,
     rank: int,
-    world_size: int,
     load_tensor_buffer: bool = True,
-) -> Dict[str, Any]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     main_path = checkpoint_dir / f"eccheck_main_rank{rank}.pt"
     local_payload: Optional[Dict[str, Any]] = None
     local_error: Optional[str] = None
@@ -795,6 +800,19 @@ def _load_eccheck_main_payload(
                     local_payload["tensor_buffer"] = None
         except Exception as exc:
             local_error = f"{type(exc).__name__}: {exc}"
+    return local_payload, local_error
+
+
+def _load_eccheck_main_payload(
+    checkpoint_dir: Path,
+    rank: int,
+    world_size: int,
+    load_tensor_buffer: bool = True,
+) -> Dict[str, Any]:
+    main_path = checkpoint_dir / f"eccheck_main_rank{rank}.pt"
+    local_payload, local_error = _load_eccheck_main_payload_local(
+        checkpoint_dir, rank, load_tensor_buffer=load_tensor_buffer,
+    )
 
     if world_size <= 1 or not torch.distributed.is_initialized():
         if local_error is not None:
@@ -1021,8 +1039,11 @@ def _run_eccheck_legacy_recovery(
     recovered_buffer: Optional[torch.Tensor],
     total_size: int,
     registry: GlobalMetadataRegistry,
-) -> float:
+) -> Tuple[float, float]:
     """Drive C++ recovery for ECCHECK legacy load using submit_load_pipeline_chunk.
+
+    Returns (network_encode_s, prep_copy_s).  Post-network dense extract/copy is
+    tracked in prep_copy_s and excluded from recovery e2e total.
 
     Uses the same chunked pipeline API as the modern path but sources data
     from pre-loaded .pt block buffers instead of mmap files.
@@ -1057,7 +1078,7 @@ def _run_eccheck_legacy_recovery(
                 int(recovered_buffer.data_ptr()), recovered_buffer.numel()
             )
         # rig=2/3: no-op
-        return time() - start_t
+        return time() - start_t, 0.0
 
     # ---- hardware failure path (rank_in_group 2) ----
     failed_rank = 2
@@ -1067,7 +1088,7 @@ def _run_eccheck_legacy_recovery(
     # Compute pipeline size
     max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
     if max_total_bytes == 0:
-        return 0.0
+        return 0.0, 0.0
     buffer_size = manager.eccheck_buffer_size
 
     # Get buffer pools (reuse save-time pools via manager)
@@ -1130,6 +1151,7 @@ def _run_eccheck_legacy_recovery(
 
     t_pipeline_net_start: Optional[float] = None
     t_pipeline_net = 0.0
+    prep_copy_s = 0.0
     try:
         while processed < max_total_bytes:
             remaining = max_total_bytes - processed
@@ -1239,11 +1261,12 @@ def _run_eccheck_legacy_recovery(
             torch.cuda.synchronize()
         t_pipeline_net = time() - t_pipeline_net_start
 
-        # Extract recovered data from own_buffer for rank2 (not timed).
+        # Extract recovered data from own_buffer for rank2 (prep_copy, not e2e).
         # own_buf was written by C++ at 64B-aligned offsets with gaps between
         # chunks.  We iterate over the same chunk layout used during encoding
         # to reconstruct a dense buffer.
         if rank_in_group == 2 and recovered_buffer is not None:
+            t_prep = time()
             recovered_dense = _extract_dense_from_gapped_buffer(
                 own_buf, buffer_size, max_total_bytes,
             )
@@ -1252,6 +1275,7 @@ def _run_eccheck_legacy_recovery(
                 n_copy = min(actual_tensor_bytes, total_size,
                              recovered_dense.numel())
                 recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
+            prep_copy_s = time() - t_prep
 
         logger.debug(
             f"ECCHECK legacy: hw recovery pipeline done in {t_pipeline_net:.2f}s"
@@ -1261,7 +1285,7 @@ def _run_eccheck_legacy_recovery(
         if active_event is not None:
             active_event.clear()
 
-    return t_pipeline_net
+    return t_pipeline_net, prep_copy_s
 
 
 # ---------------------------------------------------------------------------
@@ -1276,8 +1300,10 @@ def _run_eccheck_two_failures_recovery(
     recovered_buffer: Optional[torch.Tensor],
     total_size: int,
     registry: GlobalMetadataRegistry,
-) -> float:
+) -> Tuple[float, float]:
     """Drive C++ two-failure recovery for ECCHECK legacy load.
+
+    Returns (network_encode_s, prep_copy_s).
 
     Two physical nodes lost → rig1 and rig2 in each 4-rank group are failed.
     Survivors rig0 and rig3 use bidirectional XOR exchange to recover
@@ -1306,7 +1332,7 @@ def _run_eccheck_two_failures_recovery(
     # Compute pipeline size
     max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
     if max_total_bytes == 0:
-        return 0.0
+        return 0.0, 0.0
     buffer_size = manager.eccheck_buffer_size
 
     # Get buffer pools
@@ -1318,6 +1344,8 @@ def _run_eccheck_two_failures_recovery(
     free_parity_queue = buffers["free_parity_buffer_queue"]
     poll_and_release = buffers.get("poll_and_release_buffers")
     active_event = buffers.get("buffer_poller_active_event")
+
+    prep_copy_s = 0.0
 
     def _get_free_data():
         if poll_and_release is not None:
@@ -1537,7 +1565,8 @@ def _run_eccheck_two_failures_recovery(
             torch.cuda.synchronize()
         t_pipeline_net = time() - t_pipeline_net_start
 
-        # ---- Phase 4: Extract recovered data (not timed) ----
+        # ---- Phase 4: Extract recovered data (prep_copy, not e2e) ----
+        t_prep = time()
         # rig2: own_buffer was written by C++ via XOR as d2 (gapped)
         if rank_in_group == 2 and recovered_buffer is not None:
             recovered_dense = _extract_dense_from_gapped_buffer(
@@ -1559,6 +1588,7 @@ def _run_eccheck_two_failures_recovery(
                 n_copy = min(actual_tensor_bytes, total_size,
                              recovered_dense.numel())
                 recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
+        prep_copy_s = time() - t_prep
 
         network_encode = t_phase1_p2p + t_pipeline_net
         logger.debug(
@@ -1573,7 +1603,7 @@ def _run_eccheck_two_failures_recovery(
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    return network_encode
+    return network_encode, prep_copy_s
 
 
 # ---------------------------------------------------------------------------
@@ -1592,6 +1622,46 @@ def _tensor_buffer_as_uint8_view(buffer: torch.Tensor) -> torch.Tensor:
     return buf
 
 
+def _dict_to_tensor_info(info: Dict[str, Any]) -> Any:
+    """Convert serialized tensor info dict to extract-compatible objects."""
+    from types import SimpleNamespace
+
+    dtype_str = info.get("dtype", "torch.float32")
+    dtype = (
+        getattr(torch, dtype_str.split(".")[-1])
+        if isinstance(dtype_str, str) and "." in dtype_str
+        else dtype_str
+    )
+    return SimpleNamespace(
+        key=info.get("key", ""),
+        offset=info["offset"],
+        size_bytes=info["size_bytes"],
+        dtype=dtype,
+        shape=tuple(info["shape"]),
+    )
+
+
+def _coerce_tensor_infos_for_extract(tensor_infos: List[Any]) -> List[Any]:
+    """Normalize tensor_infos to objects with torch.dtype for buffer extract."""
+    if not tensor_infos:
+        return tensor_infos
+    if isinstance(tensor_infos[0], dict):
+        return [_dict_to_tensor_info(info) for info in tensor_infos]
+    if hasattr(tensor_infos[0], "dtype") and isinstance(tensor_infos[0].dtype, str):
+        coerced = []
+        for info in tensor_infos:
+            dtype_str = info.dtype
+            dt = (
+                getattr(torch, dtype_str.split(".")[-1])
+                if "." in dtype_str
+                else torch.float32
+            )
+            info.dtype = dt
+            coerced.append(info)
+        return coerced
+    return tensor_infos
+
+
 def _reconstruct_state_dict_from_eccheck_buffer(
     main_payload: Dict[str, Any],
     recovered_buffer: Optional[torch.Tensor],
@@ -1601,8 +1671,13 @@ def _reconstruct_state_dict_from_eccheck_buffer(
     if recovered_buffer is not None:
         buf = _tensor_buffer_as_uint8_view(recovered_buffer)
     else:
-        buf = _tensor_buffer_as_uint8_view(main_payload["tensor_buffer"])
-    tensor_infos = main_payload["tensor_infos"]
+        tensor_buffer = main_payload.get("tensor_buffer")
+        if tensor_buffer is None:
+            raise RuntimeError(
+                "ECCHECK legacy: tensor_buffer missing and no recovered_buffer provided"
+            )
+        buf = _tensor_buffer_as_uint8_view(tensor_buffer)
+    tensor_infos = _coerce_tensor_infos_for_extract(main_payload["tensor_infos"])
     tensor_data = extract_tensors_from_continuous_buffer(buf, tensor_infos)
     decomposed = DecomposedStateDict(
         non_tensor_data=main_payload["non_tensor_data"],
@@ -1621,7 +1696,7 @@ def _reconstruct_state_dict_from_main_tensor_buffer(
     flat_key_roots = _infer_flat_key_roots(main_payload)
     tb = main_payload["tensor_buffer"]
     buf = tb.detach().contiguous().reshape(-1).view(torch.uint8)
-    tensor_infos = main_payload["tensor_infos"]
+    tensor_infos = _coerce_tensor_infos_for_extract(main_payload["tensor_infos"])
     tensor_data = extract_tensors_from_continuous_buffer(buf, tensor_infos)
     decomposed = DecomposedStateDict(
         non_tensor_data=main_payload["non_tensor_data"],
@@ -1687,9 +1762,11 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         else:
             load_tensor_buffer = rank_in_group != 2
 
+    t_prep = time.time()
     main_payload = _load_eccheck_main_payload(
         checkpoint_dir, rank, world_size, load_tensor_buffer=load_tensor_buffer,
     )
+    prep_copy_s = time.time() - t_prep
 
     if not getattr(args, "use_eccheck", False):
         logger.warning(
@@ -1729,8 +1806,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     recovered_buffer: Optional[torch.Tensor] = None
 
+    t_disk = time.time()
     if two_failures:
-        pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
+        pin = True
         actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
         blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
 
@@ -1752,18 +1830,19 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             )
         elif rank_in_group == 1:
             actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
-            pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
+            pin = True
             recovered_buffer = _allocate_recovered_buffer(actual_tensor_bytes, pin)
             total_size = actual_tensor_bytes
     elif rank_in_group == 2:
         blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
-        pin = torch.cuda.is_available() and getattr(manager, "eccheck_pin_memory", False)
+        pin = True
         recovered_buffer = _allocate_recovered_buffer(total_size, pin)
     else:
         blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
         _load_eccheck_blocks_from_disk_into(
             blocks, checkpoint_dir, rank, rank_in_group, software_failure=False,
         )
+    prep_copy_s += time.time() - t_disk
 
     if manager.use_rdma and recovered_buffer is not None:
         manager.register_buffer(recovered_buffer)
@@ -1772,8 +1851,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     barrier_s = _timed_barrier()
 
     # === timing: network/encode (C++ P2P or XOR pipeline, excluding setup/copy) ===
+    recovery_prep_copy_s = 0.0
     if two_failures:
-        network_encode = _run_eccheck_two_failures_recovery(
+        network_encode, recovery_prep_copy_s = _run_eccheck_two_failures_recovery(
             manager=manager,
             rank=rank,
             world_size=world_size,
@@ -1783,7 +1863,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             registry=registry,
         )
     else:
-        network_encode = _run_eccheck_legacy_recovery(
+        network_encode, recovery_prep_copy_s = _run_eccheck_legacy_recovery(
             manager=manager,
             rank=rank,
             world_size=world_size,
@@ -1793,7 +1873,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             total_size=total_size,
             registry=registry,
         )
-
+    prep_copy_s += recovery_prep_copy_s
 
     if two_failures:
         _mode = "HW2"
@@ -1802,17 +1882,33 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     else:
         _mode = "HW"
 
-    if two_failures:
-        use_recovered = rank_in_group in (1, 2)
-    elif sw_failure and rank_in_group == 0:
-        use_recovered = True
-        recovered_buffer = blocks["own_buffer"]
+    # SW rig0 rebuilds from the same data it sends; rig1 rebuilds from the
+    # recovered P2P buffer. rig2/3 keep using their local main tensor buffers.
+    if sw_failure and rank_in_group == 0:
+        t_pin = time.time()
+        final_buffer = _allocate_recovered_buffer(total_size, pin=True)
+        n_copy = min(total_size, blocks["own_buffer"].numel())
+        final_buffer[:n_copy].copy_(blocks["own_buffer"][:n_copy])
+        recovered_buffer = final_buffer
+        prep_copy_s += time.time() - t_pin
+
+    if sw_failure:
+        rebuild_recovered_buffer = (
+            recovered_buffer if rank_in_group in (0, 1) else None
+        )
+    elif two_failures:
+        rebuild_recovered_buffer = (
+            recovered_buffer if rank_in_group in (1, 2) else None
+        )
     else:
-        use_recovered = rank_in_group == 2 or (sw_failure and rank_in_group == 1)
+        rebuild_recovered_buffer = (
+            recovered_buffer if rank_in_group == 2 else None
+        )
+
     t_rebuild = time.time()
     state_dict = _reconstruct_state_dict_from_eccheck_buffer(
         main_payload,
-        recovered_buffer=recovered_buffer if use_recovered else None,
+        recovered_buffer=rebuild_recovered_buffer,
     )
     rebuild_sd = time.time() - t_rebuild
     native_timing = _native_ft_timing(manager._eccheck_native)
@@ -1822,11 +1918,29 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         "network_encode": network_encode,
         "net_s": native_timing["net_s"],
         "encode_s": native_timing["encode_s"],
+        "decode_s": native_timing["encode_s"],
+        "prep_copy": prep_copy_s,
         "rebuild_sd": rebuild_sd,
         "barrier": barrier_s,
+        "rebuild_from_recovered": float(rebuild_recovered_buffer is not None),
     }
     from megatron.training.global_vars import set_ft_load_timing_context
     set_ft_load_timing_context("ECCHECK", _mode, timings)
+
+    load_summary = (
+        _timing_max_dict(timings)
+        if world_size > 1 and torch.distributed.is_initialized()
+        else dict(timings)
+    )
+    load_log = dict(load_summary)
+    load_log["mode"] = _mode
+    logger.info(
+        "ECCHECK load recovery timing (%(mode)s): recovery_e2e_s=%(total).4fs "
+        "network_encode_s=%(network_encode).4fs net_s=%(net_s).4fs "
+        "decode_s=%(decode_s).4fs rebuild_sd_s=%(rebuild_sd).4fs "
+        "prep_copy_s=%(prep_copy).4fs rebuild_from_recovered=%(rebuild_from_recovered).0f",
+        load_log,
+    )
 
     # Stop C++ load workers so they don't interfere with subsequent training.
     # Synchronize teardown so early ranks do not release RDMA resources while peers

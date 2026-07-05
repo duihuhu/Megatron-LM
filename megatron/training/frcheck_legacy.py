@@ -1408,22 +1408,13 @@ def _frcheck_optimizer_state_dict(optim_state: Dict[str, Any]) -> Optional[Dict[
 
 
 def frcheck_normalize_optimizer_state_param_keys(optim_state: Dict[str, Any]) -> None:
-    state = _frcheck_optimizer_state_dict(optim_state)
-    if state is None:
+    from megatron.core.optimizer.optimizer import normalize_optimizer_state_param_keys
+
+    torch_optim = optim_state.get("optimizer")
+    if isinstance(torch_optim, dict):
+        normalize_optimizer_state_param_keys(torch_optim)
         return
-    normalized: Dict[Any, Any] = {}
-    for key, value in list(state.items()):
-        normalized_key = int(key) if isinstance(key, str) and key.isdigit() else key
-        if (
-            normalized_key in normalized
-            and isinstance(normalized[normalized_key], dict)
-            and isinstance(value, dict)
-        ):
-            normalized[normalized_key].update(value)
-        else:
-            normalized[normalized_key] = value
-    state.clear()
-    state.update(normalized)
+    normalize_optimizer_state_param_keys(optim_state)
 
 
 def _assign_deferred_optimizer_tensor(root: Dict[str, Any], flat_key: str, tensor: torch.Tensor) -> bool:
@@ -2894,6 +2885,34 @@ def _read_frbk_block_into(dst: torch.Tensor, filepath: str) -> int:
             return 0
         ncopy = min(int(data_size), dst.numel())
         if ncopy > 0:
+            f.readinto(dst[:ncopy].numpy())
+        return ncopy
+
+
+def _read_frbk_range_into(
+    dst: torch.Tensor,
+    filepath: str,
+    payload_offset: int,
+    size: int,
+) -> int:
+    """Read a byte range from an FRBK payload directly into dst."""
+    if size <= 0:
+        return 0
+    path = Path(filepath)
+    if not path.is_file():
+        return 0
+    with open(path, "rb") as f:
+        hdr = f.read(28)
+        if len(hdr) < 28:
+            return 0
+        magic, _stripe_id, _role, data_size, _block_sz = struct.unpack("<4sIIQQ", hdr)
+        if magic != b"FRBK":
+            return 0
+        if payload_offset >= int(data_size):
+            return 0
+        ncopy = min(int(size), int(data_size) - int(payload_offset), dst.numel())
+        if ncopy > 0:
+            f.seek(int(payload_offset), os.SEEK_CUR)
             f.readinto(dst[:ncopy].numpy())
         return ncopy
 
@@ -5455,18 +5474,7 @@ def recover_frcheck_legacy_hardware(
             for blk in blocks.values():
                 if blk.numel() > 1:
                     native.register_buffer(blk.data_ptr(), blk.numel())
-        if _dbg:
-            logger.info(
-                "FRCheck recovery: survivor disk prep rank=%d preload_blocks=%d",
-                rank, sum(len(blocks) for blocks in preloaded.values()),
-            )
-    n_disk_blocks = sum(len(blocks) for blocks in preloaded.values())
     timings['disk_io'] = time.time() - t_disk
-    if (is_survivor or involved) and _dbg:
-        logger.info(
-            "FRCheck recovery: disk prep rank=%d blocks=%d time=%.2fs",
-            rank, n_disk_blocks, timings['disk_io'],
-        )
 
     if is_survivor and not involved and _dbg:
         logger.info(
@@ -6032,6 +6040,7 @@ def _build_full_buf_from_local_blocks(
     out_buf: Optional[torch.Tensor] = None,
     source_block_cache: Optional[Dict[Tuple[str, int, int], torch.Tensor]] = None,
     cache_source_keys: Optional[Set[Tuple[str, int, int]]] = None,
+    timings: Optional[Dict[str, float]] = None,
 ) -> torch.Tensor:
     """Assemble rank-local tensor bytes into full_buf from SOURCE FRBK shards."""
     poa_path = main_payload.get("poa_path", "")
@@ -6056,7 +6065,20 @@ def _build_full_buf_from_local_blocks(
             rank, num_source, len(layer_names),
         )
 
+    if timings is not None:
+        timings.setdefault("alloc", 0.0)
+        timings.setdefault("layer_meta", 0.0)
+        timings.setdefault("read_blocks", 0.0)
+        timings.setdefault("copy_to_full", 0.0)
+        timings.setdefault("layers", float(len(layer_names)))
+        timings.setdefault("source_blocks", 0.0)
+        timings.setdefault("bytes_read", 0.0)
+        timings.setdefault("bytes_copied", 0.0)
+        timings.setdefault("direct_reads", 0.0)
+        timings.setdefault("staged_blocks", 0.0)
+
     safety_margin = max(int(total_tensor_size * 0.01), 4096)
+    t_alloc = time.time()
     if out_buf is not None:
         if out_buf.numel() < total_tensor_size + safety_margin:
             raise RuntimeError(
@@ -6065,11 +6087,24 @@ def _build_full_buf_from_local_blocks(
             )
         full_buf = out_buf
     else:
-        full_buf = torch.zeros(total_tensor_size + safety_margin, dtype=torch.uint8)
+        # Match Gemini SW load: a regular CPU tensor is enough here. Hardware
+        # recovery passes an RDMA-registered out_buf from the manager.
+        full_buf = torch.empty(
+            total_tensor_size + safety_margin,
+            dtype=torch.uint8,
+            pin_memory=torch.cuda.is_available(),
+        )
+    if timings is not None:
+        timings["alloc"] += time.time() - t_alloc
 
     cache = source_block_cache if source_block_cache is not None else {}
     cache_keys = cache_source_keys if cache_source_keys is not None else set()
-    key_to_local: Dict[str, Tuple[torch.Tensor, int]] = {}
+    use_staged_blocks = bool(cache_keys)
+    global_info_by_key = {
+        getattr(info, "key", ""): info
+        for info in global_tensor_infos
+        if getattr(info, "key", "")
+    }
 
     for layer_name in layer_names:
         layer_dir = checkpoint_dir / layer_name
@@ -6080,7 +6115,10 @@ def _build_full_buf_from_local_blocks(
             )
             continue
 
+        t_meta = time.time()
         layer_meta = torch.load(layer_main_path, map_location="cpu", weights_only=False)
+        if timings is not None:
+            timings["layer_meta"] += time.time() - t_meta
         layer_block_size = int(layer_meta.get("block_size", 0))
         if layer_block_size <= 0:
             raise RuntimeError(
@@ -6093,42 +6131,102 @@ def _build_full_buf_from_local_blocks(
             layer_block_size,
             num_source,
         )
-        layer_buf = torch.zeros(num_source * layer_block_size, dtype=torch.uint8)
 
-        for stripe_id, blk_idx in source_stripes:
-            if blk_idx >= n_filled_blocks:
-                continue
-            block_path = (
-                layer_dir / f"stripe_{stripe_id}" / f"frcheck_shard_rank{rank}.pt"
-            )
-            src_offset = blk_idx * layer_block_size
-            dst_slice = layer_buf[src_offset:src_offset + layer_block_size]
-            copy_len = _read_frbk_block_into(dst_slice, str(block_path))
-            if copy_len == 0:
-                logger.warning(
-                    "FRCheck load: missing block %s, skipping stripe", block_path,
+        if use_staged_blocks:
+            layer_buf = torch.empty(num_source * layer_block_size, dtype=torch.uint8)
+            for stripe_id, blk_idx in source_stripes:
+                if blk_idx >= n_filled_blocks:
+                    continue
+                block_path = (
+                    layer_dir / f"stripe_{stripe_id}" / f"frcheck_shard_rank{rank}.pt"
                 )
-                continue
-            cache_key = (layer_name, stripe_id, int(StripeRole.SOURCE))
-            if cache_key in cache_keys:
-                cache[cache_key] = dst_slice[:layer_block_size].clone()
+                src_offset = blk_idx * layer_block_size
+                dst_slice = layer_buf[src_offset:src_offset + layer_block_size]
+                t_read = time.time()
+                copy_len = _read_frbk_block_into(dst_slice, str(block_path))
+                if timings is not None:
+                    timings["read_blocks"] += time.time() - t_read
+                if copy_len == 0:
+                    logger.warning(
+                        "FRCheck load: missing block %s, skipping stripe", block_path,
+                    )
+                    continue
+                if timings is not None:
+                    timings["source_blocks"] += 1.0
+                    timings["staged_blocks"] += 1.0
+                    timings["bytes_read"] += float(copy_len)
+                cache_key = (layer_name, stripe_id, int(StripeRole.SOURCE))
+                if cache_key in cache_keys:
+                    cache[cache_key] = dst_slice[:layer_block_size].clone()
 
+            t_copy = time.time()
+            for info in layer_infos:
+                key = getattr(info, "key", "")
+                global_info = global_info_by_key.get(key)
+                if global_info is None:
+                    continue
+                local_offset = int(getattr(info, "offset", 0))
+                global_offset = int(getattr(global_info, "offset", 0))
+                size = int(getattr(global_info, "size_bytes", 0))
+                if size > 0 and global_offset + size <= full_buf.numel():
+                    full_buf[global_offset:global_offset + size].copy_(
+                        layer_buf[local_offset:local_offset + size]
+                    )
+                    if timings is not None:
+                        timings["bytes_copied"] += float(size)
+            if timings is not None:
+                timings["copy_to_full"] += time.time() - t_copy
+            continue
+
+        # Normal SW load does not need whole layer staging. Read only tensor ranges
+        # directly into their final global offsets in full_buf.
         for info in layer_infos:
             key = getattr(info, "key", "")
-            if key:
-                key_to_local[key] = (layer_buf, getattr(info, "offset", 0))
-
-    for global_info in global_tensor_infos:
-        key = getattr(global_info, "key", "")
-        if key not in key_to_local:
-            continue
-        layer_buf, local_offset = key_to_local[key]
-        global_offset = getattr(global_info, "offset", 0)
-        size = getattr(global_info, "size_bytes", 0)
-        if size > 0 and global_offset + size <= full_buf.numel():
-            full_buf[global_offset:global_offset + size].copy_(
-                layer_buf[local_offset:local_offset + size]
-            )
+            global_info = global_info_by_key.get(key)
+            if global_info is None:
+                continue
+            local_offset = int(getattr(info, "offset", 0))
+            global_offset = int(getattr(global_info, "offset", 0))
+            remaining = int(getattr(global_info, "size_bytes", 0))
+            if remaining <= 0 or global_offset + remaining > full_buf.numel():
+                continue
+            while remaining > 0:
+                blk_idx = local_offset // layer_block_size
+                within_block = local_offset - blk_idx * layer_block_size
+                if blk_idx >= n_filled_blocks:
+                    break
+                source = None
+                for stripe_id, source_blk_idx in source_stripes:
+                    if source_blk_idx == blk_idx:
+                        source = (stripe_id, source_blk_idx)
+                        break
+                if source is None:
+                    break
+                stripe_id, _source_blk_idx = source
+                chunk = min(remaining, layer_block_size - within_block)
+                block_path = (
+                    layer_dir / f"stripe_{stripe_id}" / f"frcheck_shard_rank{rank}.pt"
+                )
+                dst = full_buf[global_offset:global_offset + chunk]
+                t_read = time.time()
+                copy_len = _read_frbk_range_into(
+                    dst, str(block_path), within_block, chunk,
+                )
+                if timings is not None:
+                    timings["read_blocks"] += time.time() - t_read
+                if copy_len <= 0:
+                    logger.warning(
+                        "FRCheck load: missing range %s offset=%d size=%d",
+                        block_path, within_block, chunk,
+                    )
+                    break
+                if timings is not None:
+                    timings["source_blocks"] += 1.0
+                    timings["direct_reads"] += 1.0
+                    timings["bytes_read"] += float(copy_len)
+                local_offset += copy_len
+                global_offset += copy_len
+                remaining -= copy_len
 
     return full_buf
 
@@ -6156,11 +6254,40 @@ def _assemble_state_dict_from_local_blocks(
 
     flat_key_roots = main_payload.get("flat_key_roots", [])
     total_tensor_size = int(main_payload.get("actual_tensor_size", 0))
-    full_buf = _build_full_buf_from_local_blocks(checkpoint_dir, rank, main_payload)
+    assemble_timings: Dict[str, float] = {}
+    t_assemble = time.time()
+    full_buf = _build_full_buf_from_local_blocks(
+        checkpoint_dir, rank, main_payload, timings=assemble_timings,
+    )
+    assemble_s = time.time() - t_assemble
 
     payload = dict(main_payload)
     payload["tensor_buffer"] = full_buf[:total_tensor_size]
+    t_rebuild = time.time()
     result = _reconstruct_from_main_payload(payload, flat_key_roots)
+    rebuild_sd_s = time.time() - t_rebuild
+    try:
+        from megatron.training import get_args
+        args = get_args()
+        if getattr(args, "use_frcheck", False):
+            from megatron.training.global_vars import set_ft_load_timing_context
+            timings = {
+                "network_encode": 0.0,
+                "assemble": assemble_s,
+                "assemble_alloc": assemble_timings.get("alloc", 0.0),
+                "assemble_layer_meta": assemble_timings.get("layer_meta", 0.0),
+                "assemble_read": assemble_timings.get("read_blocks", 0.0),
+                "assemble_copy": assemble_timings.get("copy_to_full", 0.0),
+                "assemble_source_blocks": assemble_timings.get("source_blocks", 0.0),
+                "assemble_bytes_read": assemble_timings.get("bytes_read", 0.0),
+                "assemble_bytes_copied": assemble_timings.get("bytes_copied", 0.0),
+                "prep_copy": assemble_s,
+                "rebuild_sd": rebuild_sd_s,
+                "total": rebuild_sd_s,
+            }
+            set_ft_load_timing_context("FRCHECK", "SW", timings)
+    except Exception:
+        pass
     if teardown_native:
         try:
             from megatron.training import get_args
@@ -6209,12 +6336,16 @@ def load_frcheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             )
         result, _t_fr = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
         _t_fr['total'] = _t_fr['network_encode'] + _t_fr['rebuild_sd']
+        try:
+            from megatron.training.global_vars import set_ft_load_timing_context
+            set_ft_load_timing_context("FRCHECK", "HW", _t_fr)
+        except Exception:
+            pass
         if _frcheck_debug_enabled():
             logger.debug(
                 "FRCheck legacy load timing (HW): "
-                "total=%(total).2fs prep=%(prep).2fs main_io=%(main_io).2fs "
-                "disk_io=%(disk_io).2fs network_encode=%(network_encode).2fs "
-                "rebuild_sd=%(rebuild_sd).2fs (prep excluded from total)",
+                "total=%(total).2fs network_encode=%(network_encode).2fs "
+                "rebuild_sd=%(rebuild_sd).2fs",
                 _t_fr,
             )
         try:

@@ -187,7 +187,7 @@ EVAL_AND_LOGGING_ARGS=(
     #--use-frcheck-hardware-failure
     --ckpt-format torch
     --save-embeddings-separately
-    --timing-log-level 1
+    #--timing-log-level 1
 )
 
 mkdir -p logs

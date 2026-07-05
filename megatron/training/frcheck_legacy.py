@@ -2351,6 +2351,8 @@ def save_frcheck_legacy_checkpoint(
     if native is None:
         raise RuntimeError("FRCheck legacy save: native module not available")
     native.set_debug(_dbg)
+    if hasattr(native, "reset_ft_timing_stats"):
+        native.reset_ft_timing_stats()
 
     # Async parity path: drain any pending P2 operations from a previous save.
     _use_async_parity = getattr(args, 'frcheck_async_parity', False)
@@ -2593,18 +2595,6 @@ def save_frcheck_legacy_checkpoint(
         ))
 
     network_encode_s = submit_total_s + wait_total_s
-    logger.info(
-        "FRCheck legacy save rank %d: profile pre_group=%.3fs "
-        "(deepcopy=%.3fs flatten=%.3fs decompose=%.3fs) group=%.3fs "
-        "pack=%.3fs phase1=%.3fs submit=%.3fs wait=%.3fs "
-        "bytes=%.2fMB model_layer=%.2fMB optimizer_layer=%.2fMB common=%.2fMB "
-        "noncontig=%d tensors=%d",
-        rank, save_pre_group_s, save_copy_s, save_flatten_s, save_decompose_s,
-        save_group_s, pack_total_s, phase1_total_s, submit_total_s, wait_total_s,
-        total_tensor_size / 1e6, model_layer_bytes_total / 1e6,
-        optimizer_layer_bytes_total / 1e6, common_bytes_total / 1e6,
-        noncontig_total, n_tensors,
-    )
 
     # ---- async parity phase: submit P2 sends + parity receives ----
     # P2 delivery is one independent async batch. Do not call reset_layer()
@@ -2660,30 +2650,35 @@ def save_frcheck_legacy_checkpoint(
     e2e_s = time.time() - e2e_t0
     if world_size > 1:
         torch.distributed.barrier()
-    summary = _timing_max_dict({
+    has_native_timing = hasattr(native, "get_ft_timing_stats")
+    native_timing = native.get_ft_timing_stats() if has_native_timing else {}
+    summary_fields = {
         "e2e_s": e2e_s,
-        "pack_s": pack_total_s,
         "network_encode_s": network_encode_s,
-        "mirror_d2h_s": _mirror_elapsed,
-    })
-    logger.info(
-        "FRCHECK save timing: e2e_s=%(e2e_s).2fs pack_s=%(pack_s).2fs "
-        "network_encode_s=%(network_encode_s).2fs mirror_d2h_s=%(mirror_d2h_s).2fs",
-        summary,
-    )
-
-    if _use_async_parity:
-        logger.info(
-            "FRCheck legacy save rank %d: async path submitted "
-            "(network_encode=%.3fs async_p2_submit=%.3fs mirror=%.3fs e2e_s=%.3fs)",
-            rank, network_encode_s, _async_p2_submit_elapsed, _mirror_elapsed, e2e_s,
-        )
-    else:
-        logger.info(
-            "FRCheck legacy save rank %d: sync path done "
-            "(network_encode=%.3fs mirror=%.3fs e2e_s=%.3fs)",
-            rank, network_encode_s, _mirror_elapsed, e2e_s,
-        )
+    }
+    if has_native_timing:
+        summary_fields.update({
+            "d2h_s": native_timing.get("d2h_s", 0.0),
+            "net_s": native_timing.get("net_s", 0.0),
+            "encode_s": native_timing.get("encode_s", 0.0),
+        })
+    summary = _timing_max_dict(summary_fields)
+    if rank == 0:
+        summary["mode"] = "async" if _use_async_parity else "sync"
+        if has_native_timing:
+            logger.info(
+                "FRCHECK save timing (%(mode)s): e2e_s=%(e2e_s).2fs "
+                "d2h_s=%(d2h_s).2fs network_encode_s=%(network_encode_s).2fs "
+                "net_s=%(net_s).2fs encode_s=%(encode_s).2fs",
+                summary,
+            )
+        else:
+            logger.info(
+                "FRCHECK save timing (%(mode)s): e2e_s=%(e2e_s).2fs "
+                "network_encode_s=%(network_encode_s).2fs "
+                "native_breakdown=unavailable",
+                summary,
+            )
 
     if write_to_disk:
         if _use_async_parity:

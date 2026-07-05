@@ -1483,6 +1483,12 @@ private:
         size_t block_size = 0;
     };
 
+    struct MirrorCopyTiming {
+        cudaEvent_t start = nullptr;
+        cudaEvent_t end = nullptr;
+        bool valid = false;
+    };
+
     std::thread mirror_thread_;
     std::mutex mirror_mtx_;
     std::condition_variable mirror_cv_;
@@ -1490,6 +1496,12 @@ private:
     std::atomic<bool> mirror_stop_{false};
     std::atomic<bool> mirror_idle_{true};
     cudaStream_t d2h_stream_ = nullptr;
+    std::atomic<uint64_t> mirror_d2h_busy_total_us_{0};
+    std::atomic<uint64_t> save_net_start_us_{0};
+    std::atomic<uint64_t> save_net_end_us_{0};
+    std::atomic<uint64_t> save_encode_total_us_{0};
+    std::vector<MirrorCopyTiming> mirror_copy_timings_;
+    std::mutex mirror_timing_mtx_;
 
     // ---- Role-based queues: n workers each, encoder split into RECV→encode+SEND ----
     struct StripeInfo {
@@ -1724,6 +1736,22 @@ private:
         async_p2_order_cv_.notify_all();
     }
 
+    void record_save_net_start_(uint64_t t) {
+        uint64_t old = save_net_start_us_.load(std::memory_order_relaxed);
+        while ((old == 0 || t < old) &&
+               !save_net_start_us_.compare_exchange_weak(
+                   old, t, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+
+    void record_save_net_end_(uint64_t t) {
+        uint64_t old = save_net_end_us_.load(std::memory_order_relaxed);
+        while (t > old &&
+               !save_net_end_us_.compare_exchange_weak(
+                   old, t, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+
     void source_worker_() {
         while (!all_stop_) {
             SourceTask t;
@@ -1733,7 +1761,10 @@ private:
             wait_encode_source_turn_(t.sid, t.encode_batch);
             auto* ch = get_channel_(si.enc_peer_rig, t.sid);
             if (!ch) { std::cerr << "FRCheck source " << t.sid << ": no channel\n"; continue; }
+            uint64_t net_t0 = frcheck_now_us();
+            record_save_net_start_(net_t0);
             ch->send_data((const uint8_t*)t.data, t.bs);
+            record_save_net_end_(frcheck_now_us());
             advance_encode_source_turn_(t.sid, t.encode_batch);
             if (t.mirror) push_mirror_task_(t.data, t.mirror, t.bs);
             check_encode_done_();
@@ -1756,7 +1787,12 @@ private:
                     if (si.src_peer_rigs[(size_t)i] == rank_in_group_) return;
                     uintptr_t dst = t.recv + (uintptr_t)i * t.bs;
                     auto* ch = get_channel_(si.src_peer_rigs[(size_t)i], t.sid);
-                    if (ch) ch->recv_data((uint8_t*)dst, t.bs);
+                    if (ch) {
+                        uint64_t net_t0 = frcheck_now_us();
+                        record_save_net_start_(net_t0);
+                        ch->recv_data((uint8_t*)dst, t.bs);
+                        record_save_net_end_(frcheck_now_us());
+                    }
                 });
             }
             for (auto& th : recv_threads) th.join();
@@ -1795,7 +1831,12 @@ private:
                                   << "/" << task_async_total_.load(std::memory_order_acquire)
                                   << " ch=" << (ch ? 1 : 0) << std::endl;
                     }
-                    if (ch) ch->send_data((const uint8_t*)t.p1, t.bs, wait_cb, done_cb);
+                    if (ch) {
+                        uint64_t net_t0 = frcheck_now_us();
+                        record_save_net_start_(net_t0);
+                        ch->send_data((const uint8_t*)t.p1, t.bs, wait_cb, done_cb);
+                        record_save_net_end_(frcheck_now_us());
+                    }
                 }
                 advance_async_p2_send_turn_(t.sid, t.async_batch);
                 check_async_done_();
@@ -1817,7 +1858,10 @@ private:
                     data_ptrs[(size_t)i] = (unsigned char*)(t.recv + (uintptr_t)i * t.bs);
                 unsigned char* parity_ptrs[2] = { (unsigned char*)t.p1, (unsigned char*)t.p2 };
                 RsEncodeJob rs{(int)t.bs, n_src, 2, g_tbls_, data_ptrs.data(), parity_ptrs};
+                uint64_t encode_t0 = frcheck_now_us();
                 { std::lock_guard<std::mutex> lk(encoder_encode_mtx_); rs_pool_run_parallel_encode(rs); }
+                save_encode_total_us_.fetch_add(
+                    frcheck_now_us() - encode_t0, std::memory_order_relaxed);
                 check_encode_done_();
                 check_done_();
             }
@@ -1845,7 +1889,12 @@ private:
             }
             // Do not pause receive-side posts: a sender that already entered RDMA
             // needs the matching recv to make progress and drain before PP starts.
-            if (ch) ch->recv_data((uint8_t*)t.parity_in, t.bs);
+            if (ch) {
+                uint64_t net_t0 = frcheck_now_us();
+                record_save_net_start_(net_t0);
+                ch->recv_data((uint8_t*)t.parity_in, t.bs);
+                record_save_net_end_(frcheck_now_us());
+            }
             if (t.async_p2_only) advance_async_p2_recv_turn_(t.sid, t.async_batch);
             check_async_done_();
             if (debug_ && t.async_p2_only) {
@@ -1886,6 +1935,17 @@ private:
                 mirror_q_.pop();
                 mirror_idle_ = false;
             }
+            MirrorCopyTiming timing;
+            const bool start_ok = cudaEventCreate(&timing.start) == cudaSuccess;
+            const bool end_ok = cudaEventCreate(&timing.end) == cudaSuccess;
+            if (start_ok && end_ok) {
+                cudaEventRecord(timing.start, d2h_stream_);
+            } else {
+                if (start_ok) cudaEventDestroy(timing.start);
+                if (end_ok) cudaEventDestroy(timing.end);
+                timing.start = nullptr;
+                timing.end = nullptr;
+            }
             cudaError_t err = cudaMemcpyAsync(
                 reinterpret_cast<void*>(task.cpu_addr),
                 reinterpret_cast<const void*>(task.gpu_addr),
@@ -1896,6 +1956,12 @@ private:
                 std::cerr << "FRCheck mirror_worker: async D2H failed: "
                           << cudaGetErrorString(err) << std::endl;
             }
+            if (timing.start != nullptr && timing.end != nullptr) {
+                cudaEventRecord(timing.end, d2h_stream_);
+                timing.valid = true;
+                std::lock_guard<std::mutex> timing_lk(mirror_timing_mtx_);
+                mirror_copy_timings_.push_back(timing);
+            }
             {
                 std::lock_guard<std::mutex> lk(mirror_mtx_);
                 if (mirror_q_.empty()) mirror_idle_ = true;
@@ -1904,9 +1970,63 @@ private:
         }
     }
 
+public:
+    void reset_ft_timing_stats() {
+        mirror_d2h_busy_total_us_.store(0, std::memory_order_relaxed);
+        save_net_start_us_.store(0, std::memory_order_relaxed);
+        save_net_end_us_.store(0, std::memory_order_relaxed);
+        save_encode_total_us_.store(0, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(mirror_timing_mtx_);
+        for (auto& timing : mirror_copy_timings_) {
+            if (timing.start != nullptr) cudaEventDestroy(timing.start);
+            if (timing.end != nullptr) cudaEventDestroy(timing.end);
+        }
+        mirror_copy_timings_.clear();
+    }
+
+private:
+    void finalize_mirror_d2h_timing_() {
+        std::vector<MirrorCopyTiming> timings;
+        {
+            std::lock_guard<std::mutex> lk(mirror_timing_mtx_);
+            timings.swap(mirror_copy_timings_);
+        }
+        double total_ms = 0.0;
+        for (auto& timing : timings) {
+            if (timing.valid && timing.start != nullptr && timing.end != nullptr) {
+                float elapsed_ms = 0.0f;
+                if (cudaEventElapsedTime(&elapsed_ms, timing.start, timing.end) == cudaSuccess) {
+                    total_ms += static_cast<double>(elapsed_ms);
+                }
+            }
+            if (timing.start != nullptr) cudaEventDestroy(timing.start);
+            if (timing.end != nullptr) cudaEventDestroy(timing.end);
+        }
+        const uint64_t total_us = static_cast<uint64_t>(total_ms * 1000.0);
+        mirror_d2h_busy_total_us_.fetch_add(total_us, std::memory_order_relaxed);
+    }
+
+public:
+    py::dict get_ft_timing_stats() const {
+        const uint64_t net_start = save_net_start_us_.load(std::memory_order_relaxed);
+        const uint64_t net_end = save_net_end_us_.load(std::memory_order_relaxed);
+        const double net_s = (net_start > 0 && net_end > net_start)
+            ? static_cast<double>(net_end - net_start) / 1e6
+            : 0.0;
+        py::dict result;
+        result["net_s"] = net_s;
+        result["encode_s"] = static_cast<double>(
+            save_encode_total_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["d2h_s"] = static_cast<double>(
+            mirror_d2h_busy_total_us_.load(std::memory_order_relaxed)) / 1e6;
+        return result;
+    }
+
+private:
     void mirror_worker_init() {
         mirror_stop_ = false;
         mirror_idle_ = true;
+        reset_ft_timing_stats();
         if (d2h_stream_ == nullptr) {
             cudaError_t err = cudaStreamCreate(&d2h_stream_);
             if (err != cudaSuccess) {
@@ -1924,6 +2044,7 @@ private:
         if (mirror_thread_.joinable()) mirror_thread_.join();
         if (d2h_stream_ != nullptr) {
             cudaStreamSynchronize(d2h_stream_);
+            finalize_mirror_d2h_timing_();
             cudaStreamDestroy(d2h_stream_);
             d2h_stream_ = nullptr;
         }
@@ -2306,6 +2427,7 @@ public:
                 std::cerr << "FRCheck wait_mirror: d2h_stream sync failed: "
                           << cudaGetErrorString(err) << std::endl;
             }
+            finalize_mirror_d2h_timing_();
         }
     }
 
@@ -3141,6 +3263,9 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("require"))
         .def("set_debug", &FRCheckNative::set_debug,
              py::arg("debug"))
+        .def("reset_ft_timing_stats", &FRCheckNative::reset_ft_timing_stats)
+        .def("get_ft_timing_stats", &FRCheckNative::get_ft_timing_stats,
+             "Return per-rank FRCheck timing counters including mirror D2H busy time")
 
         // Hardware recovery batch pipeline
         .def("init_recovery_plans", &FRCheckNative::init_recovery_plans,

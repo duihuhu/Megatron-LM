@@ -419,11 +419,12 @@ def save_gemini_replicas_legacy_checkpoint(
         "mirror_d2h_s": mirror_d2h_s,
         "network_encode_s": _exchange_elapsed,
     })
-    logger.info(
-        "GEMINI save timing: e2e_s=%(e2e_s).2fs pack_s=%(pack_s).2fs d2h_s=%(d2h_s).2fs "
-        "mirror_d2h_s=%(mirror_d2h_s).2fs network_encode_s=%(network_encode_s).2fs",
-        summary,
-    )
+    if rank == 0:
+        logger.info(
+            "GEMINI save timing: e2e_s=%(e2e_s).2fs pack_s=%(pack_s).2fs d2h_s=%(d2h_s).2fs "
+            "mirror_d2h_s=%(mirror_d2h_s).2fs network_encode_s=%(network_encode_s).2fs",
+            summary,
+        )
 
     # Build rank_meta from pre-exchanged data (meta exchange already done before C++ transfer).
     # Format is compatible with the file writing code below.
@@ -717,7 +718,7 @@ def _hw_recovery_prepare(
                 sender = min(candidates, key=lambda c: sender_load.get(c, 0))
                 sender_load[sender] = sender_load.get(sender, 0) + 1
                 assignments[f] = sender
-                logger.info(
+                logger.debug(
                     f"Gemini Replicas recovery: failed rank {f} → sender {sender}"
                 )
             else:
@@ -826,7 +827,7 @@ def _hw_recovery_preload(
             replica_path = (
                 checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{f}.pt"
             )
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas recovery rank {rank}: preloading replica for rank {f}"
             )
             rp = _load_replica_full(replica_path)
@@ -838,7 +839,7 @@ def _hw_recovery_preload(
             }
             my_meta_by_failed[f] = meta
             _hw_preloaded.setdefault(rank, {})[f] = rp["tensor_buffer"]
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas recovery rank {rank}: preloaded "
                 f"{rp['tensor_buffer'].numel() / (1024**2):.2f} MB for rank {f}"
             )
@@ -944,12 +945,12 @@ def _hw_recovery_transfer(
                     f"Gemini Replicas recovery rank {rank}: "
                     f"send buffer for failed rank {f} not preloaded"
                 )
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas recovery rank {rank}: RDMA sending "
                 f"{buf.numel() / (1024**2):.2f} MB to rank {f}"
             )
             manager.send_to_rank(f, buf, register=False)
-            logger.info(f"Gemini Replicas recovery rank {rank}: RDMA sent to rank {f}")
+            logger.debug(f"Gemini Replicas recovery rank {rank}: RDMA sent to rank {f}")
         return torch.zeros(0, dtype=torch.uint8)
     else:
         sender = info["sender"]
@@ -962,14 +963,14 @@ def _hw_recovery_transfer(
                 f"Gemini Replicas recovery rank {rank}: "
                 f"main recv buffer not pre-allocated (size={tensor_size})"
             )
-        logger.info(
+        logger.debug(
             f"Gemini Replicas recovery rank {rank}: RDMA receiving "
             f"{tensor_size / (1024**2):.2f} MB from sender rank {sender}"
         )
         recovered_buffer = manager.recv_from_rank(
             sender, tensor_size, buffer=recv_buf,
         )
-        logger.info(
+        logger.debug(
             f"Gemini Replicas recovery rank {rank}: RDMA received "
             f"{recovered_buffer.numel() / (1024**2):.2f} MB from sender {sender}"
         )
@@ -1021,7 +1022,7 @@ def _run_hardware_recovery(
         healthy = {r for r, ok in enumerate(health_list) if ok}
         failed = {r for r in range(world_size) if r not in healthy}
 
-    logger.info(
+    logger.debug(
         f"Gemini Replicas recovery rank {rank}: group={my_group}, "
         f"healthy={sorted(healthy)}, failed={sorted(failed)}"
     )
@@ -1046,7 +1047,7 @@ def _run_hardware_recovery(
                 break
             if sender is not None:
                 assignments[f] = sender
-                logger.info(
+                logger.debug(
                     f"Gemini Replicas recovery: failed rank {f} → sender {sender}"
                 )
             else:
@@ -1104,7 +1105,7 @@ def _run_hardware_recovery(
             replica_path = (
                 checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{f}.pt"
             )
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas recovery rank {rank}: loading replica for rank {f} "
                 f"from {replica_path}"
             )
@@ -1128,13 +1129,13 @@ def _run_hardware_recovery(
                 buf,
             ])
 
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas recovery rank {rank}: sending combined buffer "
                 f"({combined.numel() / (1024**2):.2f} MB) to rank {f} via "
                 f"{'RDMA' if manager.use_rdma else 'ASIO'}"
             )
             manager.send_to_rank(f, combined)
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas recovery rank {rank}: sent to rank {f}"
             )
 
@@ -1175,7 +1176,7 @@ def _run_hardware_recovery(
             )
 
         # ---- Phase 3: receive via C++ ASIO/RDMA ----
-        logger.info(
+        logger.debug(
             f"Gemini Replicas recovery rank {rank}: receiving "
             f"{combined_size / (1024**2):.2f} MB from sender rank {sender} via "
             f"{'RDMA' if manager.use_rdma else 'ASIO'}"
@@ -1192,7 +1193,7 @@ def _run_hardware_recovery(
         _recovery_meta[rank] = meta
 
         recovered_buffer = combined[8 + meta_size:combined_size].clone()
-        logger.info(
+        logger.debug(
             f"Gemini Replicas recovery rank {rank}: received metadata "
             f"({meta_size} B) + tensor data "
             f"({recovered_buffer.numel() / (1024**2):.2f} MB) from sender {sender}"
@@ -1241,7 +1242,7 @@ def _replica_recovery_prepare(
         return
 
     if rank in failed:
-        logger.info(
+        logger.debug(
             f"Gemini Replicas replica recovery rank {rank}: "
             f"need replicas from sources {failed_sources.get(rank, [])}"
         )
@@ -1359,7 +1360,7 @@ def _replica_recovery_preload(
 
             my_meta_by_source[src] = meta
             _replica_preloaded.setdefault(rank, {})[src] = buf
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas replica recovery rank {rank}: "
                 f"preloaded source {src} ({buf.numel() / (1024**2):.2f} MB)"
             )
@@ -1413,7 +1414,7 @@ def _recover_missing_replicas_transfer(
                     continue
                 targets = manager._calculate_target_ranks(src, world_size)
                 if f in targets:
-                    logger.info(
+                    logger.debug(
                         f"Gemini Replicas replica recovery rank {rank}: "
                         f"RDMA sending source {src} to rank {f} "
                         f"({buf.numel() / (1024**2):.2f} MB)"
@@ -1433,12 +1434,12 @@ def _recover_missing_replicas_transfer(
                     f"Gemini Replicas replica recovery rank {rank}: "
                     f"recv buffer for source {src} not pre-allocated"
                 )
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas replica recovery rank {rank}: "
                 f"RDMA receiving source {src} ({tensor_size / (1024**2):.2f} MB)"
             )
             combined = manager.recv_from_rank(snd, tensor_size, buffer=recv_buf)
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas replica recovery rank {rank}: "
                 f"RDMA received source {src} "
                 f"({combined.numel() / (1024**2):.2f} MB)"
@@ -1520,7 +1521,7 @@ def _recover_missing_replicas(
         return
 
     if rank in failed:
-        logger.info(
+        logger.debug(
             f"Gemini Replicas replica recovery rank {rank}: "
             f"need replicas from sources {failed_sources.get(rank, [])}"
         )
@@ -1667,7 +1668,7 @@ def _recover_missing_replicas(
                     continue
                 targets = manager._calculate_target_ranks(src, world_size)
                 if f in targets:
-                    logger.info(
+                    logger.debug(
                         f"Gemini Replicas replica recovery rank {rank}: "
                         f"sending replica for source {src} to failed rank {f} "
                         f"({combined.numel() / (1024**2):.2f} MB)"
@@ -1683,7 +1684,7 @@ def _recover_missing_replicas(
             combined_size = global_sizes.get(src)
             if combined_size is None:
                 continue
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas replica recovery rank {rank}: "
                 f"receiving replica for source {src} "
                 f"({combined_size / (1024**2):.2f} MB)"
@@ -1693,7 +1694,7 @@ def _recover_missing_replicas(
             header = combined[:8].numpy().tobytes()
             meta_size = struct.unpack("<Q", header)[0]
             # replica data = combined[8 + meta_size:combined_size] — in CPU memory
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas replica recovery rank {rank}: "
                 f"received replica for source {src} "
                 f"({(combined_size - 8 - meta_size) / (1024**2):.2f} MB in memory)"
@@ -1752,7 +1753,7 @@ def load_gemini_replicas_legacy_checkpoint(
         # Explicit ranks treated as failed (for testing)
         recovery_ranks = {int(x.strip()) for x in recovery_rank_str.split(",")}
         is_failed = rank in recovery_ranks
-        logger.info(
+        logger.debug(
             f"Gemini Replicas load rank {rank}: "
             f"recovery_ranks={recovery_ranks}, is_failed={is_failed}"
         )
@@ -1856,7 +1857,7 @@ def load_gemini_replicas_legacy_checkpoint(
         )
     else:
         # ---- Hardware recovery ----
-        logger.info(
+        logger.debug(
             f"Gemini Replicas legacy load rank {rank}: "
             f"{sum(health_list)}/{world_size} healthy, entering recovery"
         )
@@ -1945,7 +1946,8 @@ def load_gemini_replicas_legacy_checkpoint(
         try:
             from megatron.training.global_vars import start_recovery_to_forward_timer
             start_recovery_to_forward_timer(
-                "Gemini Replicas", "network_transfer", role=recovery_role
+                "Gemini Replicas", "network_transfer",
+                role=recovery_role, rank0_only_max=True,
             )
         except Exception:
             pass
@@ -2015,7 +2017,7 @@ def load_gemini_replicas_legacy_checkpoint(
             pass
 
     if manager._gemini_replicas_native is not None:
-        logger.info(
+        logger.debug(
             f"Gemini Replicas legacy load: cleaning up native module (rank {rank})"
         )
         _gemini_recovery_profile(recovery_role, "cleanup_start")

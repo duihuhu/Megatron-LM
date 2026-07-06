@@ -2392,67 +2392,80 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         elif ft_context is not None:
             recovery = ft_context.get("timings", {})
             recovery_e2e_s = float(recovery.get("total", 0.0))
-            values = {
-                "e2e_s": recovery_e2e_s + h2d_total_s,
-                "recovery_e2e_s": recovery_e2e_s,
-                "network_encode_s": float(recovery.get("network_encode", 0.0)),
-                "net_s": float(recovery.get("net_s", 0.0)),
-                "decode_s": float(
-                    recovery.get("decode_s", recovery.get("encode_s", 0.0))
-                ),
-                "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
-                "h2d_s": h2d_total_s,
-                "h2d_model_s": h2d_model_s,
-                "h2d_optimizer_s": h2d_optimizer_s,
-                "model_tensor_count": float(model_tensor_count),
-                "model_tensor_mib": model_tensor_bytes / (1024 ** 2),
-                "model_pinned_count": float(model_pinned_count),
-                "optim_tensor_count": float(optim_tensor_count),
-                "optim_tensor_mib": optim_tensor_bytes / (1024 ** 2),
-                "optim_pinned_count": float(optim_pinned_count),
-                "optim_storage_count": float(optim_storage_count),
-                "h2d_model_submit_s": h2d_model_submit_s,
-                "h2d_model_sync_s": h2d_model_sync_s,
-                "h2d_optimizer_submit_s": h2d_optimizer_submit_s,
-                "h2d_optimizer_sync_s": h2d_optimizer_sync_s,
-                "rebuild_from_recovered": float(recovery.get("rebuild_from_recovered", 0.0)),
-            }
-            summary = _timing_max_dict(values)
-            logger.info(
-                "%s load timing (%s): e2e_s=%.4fs recovery_e2e_s=%.4fs "
-                "network_encode_s=%.4fs net_s=%.4fs decode_s=%.4fs rebuild_sd_s=%.4fs "
-                "h2d_model_s=%.4fs h2d_optimizer_s=%.4fs h2d_total_s=%.4fs "
-                "h2d_model_submit_s=%.4fs h2d_model_sync_s=%.4fs "
-                "h2d_optimizer_submit_s=%.4fs h2d_optimizer_sync_s=%.4fs "
-                "rebuild_from_recovered=%.0f "
-                "model_tensors=%.0f model_mib=%.1f model_pinned=%.0f/%.0f "
-                "optim_tensors=%.0f optim_mib=%.1f optim_pinned=%.0f/%.0f optim_storages=%.0f",
-                ft_context.get("scheme", "FT"),
-                ft_context.get("mode", "unknown"),
-                summary["e2e_s"],
-                summary["recovery_e2e_s"],
-                summary["network_encode_s"],
-                summary["net_s"],
-                summary["decode_s"],
-                summary["rebuild_sd_s"],
-                summary["h2d_model_s"],
-                summary["h2d_optimizer_s"],
-                summary["h2d_s"],
-                summary["h2d_model_submit_s"],
-                summary["h2d_model_sync_s"],
-                summary["h2d_optimizer_submit_s"],
-                summary["h2d_optimizer_sync_s"],
-                summary["rebuild_from_recovered"],
-                summary["model_tensor_count"],
-                summary["model_tensor_mib"],
-                summary["model_pinned_count"],
-                summary["model_tensor_count"],
-                summary["optim_tensor_count"],
-                summary["optim_tensor_mib"],
-                summary["optim_pinned_count"],
-                summary["optim_tensor_count"],
-                summary["optim_storage_count"],
-            )
+            if ft_context.get("scheme") == "GEMINI" and getattr(args, "use_gemini_replicas", False):
+                summary = _timing_max_dict({
+                    "e2e_s": recovery_e2e_s + h2d_total_s,
+                    "h2d_s": h2d_total_s,
+                })
+                if rank == 0:
+                    logger.info(
+                        "Gemini Replicas load timing (%s): e2e_s=%.2fs h2d_s=%.2fs",
+                        ft_context.get("mode", "unknown"),
+                        summary["e2e_s"],
+                        summary["h2d_s"],
+                    )
+            else:
+                values = {
+                    "e2e_s": recovery_e2e_s + h2d_total_s,
+                    "recovery_e2e_s": recovery_e2e_s,
+                    "network_encode_s": float(recovery.get("network_encode", 0.0)),
+                    "net_s": float(recovery.get("net_s", 0.0)),
+                    "decode_s": float(
+                        recovery.get("decode_s", recovery.get("encode_s", 0.0))
+                    ),
+                    "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
+                    "h2d_s": h2d_total_s,
+                    "h2d_model_s": h2d_model_s,
+                    "h2d_optimizer_s": h2d_optimizer_s,
+                    "model_tensor_count": float(model_tensor_count),
+                    "model_tensor_mib": model_tensor_bytes / (1024 ** 2),
+                    "model_pinned_count": float(model_pinned_count),
+                    "optim_tensor_count": float(optim_tensor_count),
+                    "optim_tensor_mib": optim_tensor_bytes / (1024 ** 2),
+                    "optim_pinned_count": float(optim_pinned_count),
+                    "optim_storage_count": float(optim_storage_count),
+                    "h2d_model_submit_s": h2d_model_submit_s,
+                    "h2d_model_sync_s": h2d_model_sync_s,
+                    "h2d_optimizer_submit_s": h2d_optimizer_submit_s,
+                    "h2d_optimizer_sync_s": h2d_optimizer_sync_s,
+                    "rebuild_from_recovered": float(recovery.get("rebuild_from_recovered", 0.0)),
+                }
+                summary = _timing_max_dict(values)
+                logger.info(
+                    "%s load timing (%s): e2e_s=%.4fs recovery_e2e_s=%.4fs "
+                    "network_encode_s=%.4fs net_s=%.4fs decode_s=%.4fs rebuild_sd_s=%.4fs "
+                    "h2d_model_s=%.4fs h2d_optimizer_s=%.4fs h2d_total_s=%.4fs "
+                    "h2d_model_submit_s=%.4fs h2d_model_sync_s=%.4fs "
+                    "h2d_optimizer_submit_s=%.4fs h2d_optimizer_sync_s=%.4fs "
+                    "rebuild_from_recovered=%.0f "
+                    "model_tensors=%.0f model_mib=%.1f model_pinned=%.0f/%.0f "
+                    "optim_tensors=%.0f optim_mib=%.1f optim_pinned=%.0f/%.0f optim_storages=%.0f",
+                    ft_context.get("scheme", "FT"),
+                    ft_context.get("mode", "unknown"),
+                    summary["e2e_s"],
+                    summary["recovery_e2e_s"],
+                    summary["network_encode_s"],
+                    summary["net_s"],
+                    summary["decode_s"],
+                    summary["rebuild_sd_s"],
+                    summary["h2d_model_s"],
+                    summary["h2d_optimizer_s"],
+                    summary["h2d_s"],
+                    summary["h2d_model_submit_s"],
+                    summary["h2d_model_sync_s"],
+                    summary["h2d_optimizer_submit_s"],
+                    summary["h2d_optimizer_sync_s"],
+                    summary["rebuild_from_recovered"],
+                    summary["model_tensor_count"],
+                    summary["model_tensor_mib"],
+                    summary["model_pinned_count"],
+                    summary["model_tensor_count"],
+                    summary["optim_tensor_count"],
+                    summary["optim_tensor_mib"],
+                    summary["optim_pinned_count"],
+                    summary["optim_tensor_count"],
+                    summary["optim_storage_count"],
+                )
         clear_ft_load_timing_context()
         if (
             ft_context is not None

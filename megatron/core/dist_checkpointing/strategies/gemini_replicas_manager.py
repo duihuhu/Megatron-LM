@@ -154,7 +154,7 @@ class GeminiReplicasManager:
             targets = []
             for i in range(self.num_replicas):
                 targets.append((my_rank + i) % world_size)
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas: [Rank {my_rank}] Calculated target ranks: {targets} "
                 f"({self.num_replicas} replicas, global)"
             )
@@ -228,7 +228,7 @@ class GeminiReplicasManager:
             target_local = (local_rank + i) % group_world
             targets.append(group_start + target_local)
 
-        logger.info(
+        logger.debug(
             f"Gemini Replicas: [Rank {my_rank}] consecutive-group targets: {targets} "
             f"({self.num_replicas} replicas, group=[{group_start}, {group_end}))"
         )
@@ -339,7 +339,7 @@ class GeminiReplicasManager:
             port = base_port + target * 100
             target_ports.append(port)
         
-        logger.info(
+        logger.debug(
             f"Gemini Replicas: [Rank {rank}] Port allocation:\n"
             f"  My port range: {my_port_base} - {my_port_base + 99}\n"
             f"  My recv port: {recv_port}\n"
@@ -357,7 +357,7 @@ class GeminiReplicasManager:
                 for r, ip in enumerate(ip_list):
                     rank_ips[r] = ip
                 
-                logger.info(
+                logger.debug(
                     f"Gemini Replicas: [Rank {rank}] IP exchange completed - "
                     f"All rank IPs: {rank_ips}"
                 )
@@ -368,7 +368,7 @@ class GeminiReplicasManager:
                 for r in range(world_size):
                     rank_ips[r] = base_ip
         else:
-            logger.info("Gemini Replicas: Distributed not initialized, using local IP for all ranks")
+            logger.debug("Gemini Replicas: Distributed not initialized, using local IP for all ranks")
             rank_ips[rank] = base_ip
         
         # Prepare target IPs for C++ module
@@ -385,7 +385,7 @@ class GeminiReplicasManager:
             'recv_ports': recv_ports,
         }
         
-        logger.info(
+        logger.debug(
             f"Gemini Replicas: [Rank {rank}] Network config:\n"
             f"  My IP: {config['my_ip']}\n"
             f"  Base port: {config['base_port']}\n"
@@ -474,9 +474,9 @@ class GeminiReplicasManager:
             
             # Synchronize all ranks before creating C++ instances
             mode_str = "RDMA" if self.use_rdma else "ASIO"
-            logger.info(f"Gemini Replicas: [Rank {rank}] Synchronizing all ranks before creating C++ native module...")
+            logger.debug(f"Gemini Replicas: [Rank {rank}] Synchronizing all ranks before creating C++ native module...")
             torch.distributed.barrier()
-            logger.info(f"Gemini Replicas: [Rank {rank}] All ranks synchronized, creating C++ native module with {mode_str}...")
+            logger.debug(f"Gemini Replicas: [Rank {rank}] All ranks synchronized, creating C++ native module with {mode_str}...")
             
             # Use the prepared target_ips and target_ports from config
             target_ips = net_config['target_ips']
@@ -490,12 +490,7 @@ class GeminiReplicasManager:
             num_source_ranks = len(net_config['source_ranks'])
             
             # Create C++ instance (Phase 1: start acceptor only)
-            logger.info(f"Gemini Replicas: Creating C++ native module with {mode_str} (Phase 1: acceptor)...")
-            print(f"Gemini Replicas: [Rank {rank}] Creating C++ native module (Phase 1: starting acceptor, mode: {mode_str})...")
-            print(f"Gemini Replicas: [Rank {rank}] Target ranks: {net_config['target_ranks']}")
-            print(f"Gemini Replicas: [Rank {rank}] Target IPs: {target_ips}")
-            print(f"Gemini Replicas: [Rank {rank}] Target ports for sending: {target_ports}")
-            print(f"Gemini Replicas: [Rank {rank}] My recv port: {my_recv_port} (accepting from {num_source_ranks} sources: {net_config['source_ranks']})")
+            logger.debug(f"Gemini Replicas: Creating C++ native module with {mode_str} (Phase 1: acceptor)...")
             
             self._gemini_replicas_native = gemini_replicas_native.GeminiReplicasNative(
                 rank, world_size,
@@ -510,28 +505,25 @@ class GeminiReplicasManager:
             if hasattr(self._gemini_replicas_native, "set_debug"):
                 self._gemini_replicas_native.set_debug(_gemini_replicas_debug_enabled())
             
-            logger.info(f"Gemini Replicas: C++ native module created (acceptor ready) for rank {rank}")
-            print(f"Gemini Replicas: [Rank {rank}] Acceptor ready, waiting for all ranks...")
+            logger.debug(f"Gemini Replicas: C++ native module created (acceptor ready) for rank {rank}")
             
             # Synchronize all ranks before connecting (Phase 2)
             torch.distributed.barrier()
-            logger.info(f"Gemini Replicas: [Rank {rank}] All ranks ready, starting Phase 2 (connecting)...")
-            print(f"Gemini Replicas: [Rank {rank}] Phase 2: Connecting to target ranks {net_config['target_ranks']}...")
+            logger.debug(f"Gemini Replicas: [Rank {rank}] All ranks ready, starting Phase 2 (connecting)...")
             
             # Phase 2: Connect to all targets
             self._gemini_replicas_native.finalize_connections()
 
             # Post-finalize barrier (aligned with EC-NAIVE load: all TCP+RDMA ready)
             torch.distributed.barrier()
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas: [Rank {rank}] All ranks finished Phase 2 connections"
             )
 
             # Start persistent send/recv worker threads (like ecnaive)
             self._gemini_replicas_native.start_workers(net_config['source_ranks'])
 
-            logger.info(f"Gemini Replicas: C++ native module fully initialized (rank={rank}, targets={net_config['target_ranks']}, mode={mode_str})")
-            print(f"Gemini Replicas: [Rank {rank}] C++ native module fully initialized - {mode_str} connections ready")
+            logger.debug(f"Gemini Replicas: C++ native module fully initialized (rank={rank}, targets={net_config['target_ranks']}, mode={mode_str})")
 
             # GDR setup: check availability and start mirror worker for async D2H
             if self.use_rdma:
@@ -543,10 +535,9 @@ class GeminiReplicasManager:
                 except AttributeError:
                     self.use_gdr = False  # old .so without GDR support
                 if self.use_gdr:
-                    logger.info(f"Gemini Replicas: [Rank {rank}] GDR (GPU Direct RDMA) available, starting mirror worker")
+                    logger.debug(f"Gemini Replicas: [Rank {rank}] GDR (GPU Direct RDMA) available, starting mirror worker")
                     self._gemini_replicas_native.set_require_registered_mr(True)
                     self._gemini_replicas_native.start_mirror_worker()
-                    print(f"Gemini Replicas: [Rank {rank}] GDR mirror worker started")
                 else:
                     logger.warning(f"Gemini Replicas: [Rank {rank}] GDR not available (nvidia-peermem missing)")
             

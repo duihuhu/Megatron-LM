@@ -754,10 +754,6 @@ def save_eccheck_legacy_checkpoint(
             flat_key_roots=decomposed.flat_key_roots,
             all_tensor_infos=rank_metadata,
         )
-    else:
-        logger.debug(
-            "ECCHECK save: skipping checkpoint file writes for this iteration"
-        )
     if world_size > 1:
         _timed_barrier()
 

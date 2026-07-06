@@ -1,4 +1,4 @@
-zj#!/bin/bash
+#!/bin/bash
 
 # FRCheck (POA-driven stripe encode with RDMA) — single-node script.
 # Usage: ./test_eccheck_4nodes_node_335M_frcheck.sh <node_rank> [<gpu_id_0> [gpu_id_1 ...]] [additional_args...]
@@ -93,6 +93,7 @@ case "$MODE" in
             --save $CHECKPOINT_PATH
             --ec-checkpoint-write-only-penultimate-iter
             --frcheck-async-parity
+            #--frcheck-debug
         )
         ;;
     software)
@@ -186,7 +187,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     #--save $CHECKPOINT_PATH
-    --ec-checkpoint-write-only-penultimate-iter
+    #--ec-checkpoint-write-only-penultimate-iter
     #--load $CHECKPOINT_PATH
     
     --eval-iters 1

@@ -603,11 +603,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     print_rank_0('saving checkpoint at iteration {:7d} to {} in {} format'.format(
         iteration, save_dir, ckpt_format))
-    if ec_legacy_checkpointing and not ec_write_to_disk:
-        print_rank_0(
-            '  EC/Gemini checkpoint file writes disabled for this iteration; '
-            'running save pipeline without updating latest_checkpointed_iteration'
-        )
 
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state(args.ckpt_format)

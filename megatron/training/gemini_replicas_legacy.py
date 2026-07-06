@@ -493,10 +493,6 @@ def save_gemini_replicas_legacy_checkpoint(
                                       rep_meta, rep_mv))
             for f in futs:
                 f.result()
-    else:
-        logger.info(
-            "Gemini Replicas save: skipping checkpoint file writes for this iteration"
-        )
 
 
 def _write_replica_file(path, magic, meta_bytes, mv):

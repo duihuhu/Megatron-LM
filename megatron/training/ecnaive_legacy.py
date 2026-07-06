@@ -2417,10 +2417,6 @@ def save_ecnaive_legacy_checkpoint(
             manager=manager,
             all_tensor_infos=rank_metadata,  # store all ranks' metadata for HW recovery
         )
-    else:
-        logger.debug(
-            "EC-NAIVE save: skipping checkpoint file writes for this iteration"
-        )
 
     if world_size > 1:
         torch.distributed.barrier()

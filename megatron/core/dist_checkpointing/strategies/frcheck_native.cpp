@@ -70,6 +70,14 @@ static inline uint64_t frcheck_now_us() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Each Megatron rank owns one GPU; LOCAL_RANK selects the device in-process.
+static int resolve_cuda_device() {
+    if (const char* local_rank = std::getenv("LOCAL_RANK")) {
+        return std::max(0, std::atoi(local_rank));
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // RDMA structures
 // ---------------------------------------------------------------------------
@@ -1483,25 +1491,25 @@ private:
         size_t block_size = 0;
     };
 
-    struct MirrorCopyTiming {
-        cudaEvent_t start = nullptr;
-        cudaEvent_t end = nullptr;
-        bool valid = false;
-    };
-
     std::thread mirror_thread_;
     std::mutex mirror_mtx_;
     std::condition_variable mirror_cv_;
     std::queue<MirrorTask> mirror_q_;
-    std::atomic<bool> mirror_stop_{false};
+    std::atomic<bool> mirror_done_{false};
     std::atomic<bool> mirror_idle_{true};
     cudaStream_t d2h_stream_ = nullptr;
     std::atomic<uint64_t> mirror_d2h_busy_total_us_{0};
+
+    struct MirrorCopyTiming {
+        cudaEvent_t start{};
+        cudaEvent_t end{};
+        bool valid{false};
+    };
+    std::vector<MirrorCopyTiming> mirror_copy_timings_;
+    std::mutex mirror_timing_mutex_;
     std::atomic<uint64_t> save_net_start_us_{0};
     std::atomic<uint64_t> save_net_end_us_{0};
     std::atomic<uint64_t> save_encode_total_us_{0};
-    std::vector<MirrorCopyTiming> mirror_copy_timings_;
-    std::mutex mirror_timing_mtx_;
 
     // ---- Role-based queues: n workers each, encoder split into RECV→encode+SEND ----
     struct StripeInfo {
@@ -1912,6 +1920,38 @@ private:
         }
     }
 
+    void reset_mirror_d2h_timing_() {
+        mirror_d2h_busy_total_us_.store(0, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
+        for (auto& timing : mirror_copy_timings_) {
+            if (!timing.valid) {
+                continue;
+            }
+            cudaEventDestroy(timing.start);
+            cudaEventDestroy(timing.end);
+        }
+        mirror_copy_timings_.clear();
+    }
+
+    void finalize_mirror_d2h_timing_() {
+        uint64_t total_us = 0;
+        std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
+        for (auto& timing : mirror_copy_timings_) {
+            if (!timing.valid) {
+                continue;
+            }
+            float elapsed_ms = 0.0f;
+            if (cudaEventElapsedTime(&elapsed_ms, timing.start, timing.end) == cudaSuccess) {
+                total_us += static_cast<uint64_t>(elapsed_ms * 1000.0);
+            }
+            cudaEventDestroy(timing.start);
+            cudaEventDestroy(timing.end);
+            timing.valid = false;
+        }
+        mirror_copy_timings_.clear();
+        mirror_d2h_busy_total_us_.store(total_us, std::memory_order_relaxed);
+    }
+
     void push_mirror_task_(uintptr_t gpu_addr, uintptr_t cpu_addr, size_t block_size) {
         MirrorTask mt{gpu_addr, cpu_addr, block_size};
         {
@@ -1922,29 +1962,32 @@ private:
         mirror_cv_.notify_one();
     }
 
-    void mirror_worker_() {
-        while (!mirror_stop_.load()) {
+    void mirror_worker_func() {
+        cudaSetDevice(resolve_cuda_device());
+        while (true) {
             MirrorTask task;
             {
                 std::unique_lock<std::mutex> lk(mirror_mtx_);
-                mirror_cv_.wait(lk, [this] {
-                    return mirror_stop_.load() || !mirror_q_.empty();
-                });
-                if (mirror_stop_.load() && mirror_q_.empty()) break;
+                mirror_cv_.wait(lk, [this] { return !mirror_q_.empty(); });
                 task = mirror_q_.front();
                 mirror_q_.pop();
-                mirror_idle_ = false;
             }
-            MirrorCopyTiming timing;
+            if (task.gpu_addr == 0 && task.cpu_addr == 0) {
+                mirror_done_ = true;
+                break;
+            }
+            MirrorCopyTiming timing{};
             const bool start_ok = cudaEventCreate(&timing.start) == cudaSuccess;
             const bool end_ok = cudaEventCreate(&timing.end) == cudaSuccess;
             if (start_ok && end_ok) {
                 cudaEventRecord(timing.start, d2h_stream_);
             } else {
-                if (start_ok) cudaEventDestroy(timing.start);
-                if (end_ok) cudaEventDestroy(timing.end);
-                timing.start = nullptr;
-                timing.end = nullptr;
+                if (start_ok) {
+                    cudaEventDestroy(timing.start);
+                }
+                if (end_ok) {
+                    cudaEventDestroy(timing.end);
+                }
             }
             cudaError_t err = cudaMemcpyAsync(
                 reinterpret_cast<void*>(task.cpu_addr),
@@ -1956,54 +1999,21 @@ private:
                 std::cerr << "FRCheck mirror_worker: async D2H failed: "
                           << cudaGetErrorString(err) << std::endl;
             }
-            if (timing.start != nullptr && timing.end != nullptr) {
+            if (start_ok && end_ok) {
                 cudaEventRecord(timing.end, d2h_stream_);
                 timing.valid = true;
-                std::lock_guard<std::mutex> timing_lk(mirror_timing_mtx_);
+                std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
                 mirror_copy_timings_.push_back(timing);
             }
-            {
-                std::lock_guard<std::mutex> lk(mirror_mtx_);
-                if (mirror_q_.empty()) mirror_idle_ = true;
-            }
-            mirror_cv_.notify_all();
         }
     }
 
 public:
     void reset_ft_timing_stats() {
-        mirror_d2h_busy_total_us_.store(0, std::memory_order_relaxed);
         save_net_start_us_.store(0, std::memory_order_relaxed);
         save_net_end_us_.store(0, std::memory_order_relaxed);
         save_encode_total_us_.store(0, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lk(mirror_timing_mtx_);
-        for (auto& timing : mirror_copy_timings_) {
-            if (timing.start != nullptr) cudaEventDestroy(timing.start);
-            if (timing.end != nullptr) cudaEventDestroy(timing.end);
-        }
-        mirror_copy_timings_.clear();
-    }
-
-private:
-    void finalize_mirror_d2h_timing_() {
-        std::vector<MirrorCopyTiming> timings;
-        {
-            std::lock_guard<std::mutex> lk(mirror_timing_mtx_);
-            timings.swap(mirror_copy_timings_);
-        }
-        double total_ms = 0.0;
-        for (auto& timing : timings) {
-            if (timing.valid && timing.start != nullptr && timing.end != nullptr) {
-                float elapsed_ms = 0.0f;
-                if (cudaEventElapsedTime(&elapsed_ms, timing.start, timing.end) == cudaSuccess) {
-                    total_ms += static_cast<double>(elapsed_ms);
-                }
-            }
-            if (timing.start != nullptr) cudaEventDestroy(timing.start);
-            if (timing.end != nullptr) cudaEventDestroy(timing.end);
-        }
-        const uint64_t total_us = static_cast<uint64_t>(total_ms * 1000.0);
-        mirror_d2h_busy_total_us_.fetch_add(total_us, std::memory_order_relaxed);
+        mirror_d2h_busy_total_us_.store(0, std::memory_order_relaxed);
     }
 
 public:
@@ -2023,39 +2033,85 @@ public:
     }
 
 private:
-    void mirror_worker_init() {
-        mirror_stop_ = false;
-        mirror_idle_ = true;
-        reset_ft_timing_stats();
-        if (d2h_stream_ == nullptr) {
-            cudaError_t err = cudaStreamCreate(&d2h_stream_);
-            if (err != cudaSuccess) {
-                throw std::runtime_error(
-                    std::string("FRCheck: cudaStreamCreate(d2h_stream) failed: ") +
-                    cudaGetErrorString(err));
-            }
-        }
-        mirror_thread_ = std::thread([this]() { mirror_worker_(); });
-    }
-
-    void mirror_worker_shutdown() {
-        mirror_stop_ = true;
-        mirror_cv_.notify_all();
-        if (mirror_thread_.joinable()) mirror_thread_.join();
+    void finalize_mirror_stream_() {
         if (d2h_stream_ != nullptr) {
-            cudaStreamSynchronize(d2h_stream_);
+            cudaSetDevice(resolve_cuda_device());
+            cudaError_t err = cudaStreamSynchronize(d2h_stream_);
+            if (err != cudaSuccess) {
+                std::cerr << "FRCheck mirror: d2h_stream sync failed: "
+                          << cudaGetErrorString(err) << std::endl;
+            }
             finalize_mirror_d2h_timing_();
             cudaStreamDestroy(d2h_stream_);
             d2h_stream_ = nullptr;
         }
-        {
+    }
+
+    void stop_mirror_worker_() {
+        if (mirror_thread_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mirror_mtx_);
+                mirror_q_.push({0, 0, 0});
+            }
+            mirror_cv_.notify_one();
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(300);
+            while (!mirror_done_.load()) {
+                if (std::chrono::steady_clock::now() > deadline) {
+                    std::cerr << "FRCheck mirror: worker drain timed out on rank "
+                              << rank_in_group_ << std::endl;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (mirror_thread_.joinable()) {
+                mirror_thread_.join();
+            }
+        } else {
             std::lock_guard<std::mutex> lk(mirror_mtx_);
-            while (!mirror_q_.empty()) mirror_q_.pop();
-            mirror_idle_ = true;
+            while (!mirror_q_.empty()) {
+                mirror_q_.pop();
+            }
         }
+        finalize_mirror_stream_();
+        mirror_done_ = false;
+    }
+
+    void mirror_worker_init() {
+        start_mirror_worker();
+    }
+
+    void mirror_worker_shutdown() {
+        stop_mirror_worker_();
+        reset_mirror_d2h_timing_();
+        mirror_idle_ = true;
     }
 
 public:
+    void start_mirror_worker() {
+        if (mirror_thread_.joinable()) {
+            stop_mirror_worker_();
+        } else {
+            finalize_mirror_stream_();
+            {
+                std::lock_guard<std::mutex> lk(mirror_mtx_);
+                while (!mirror_q_.empty()) {
+                    mirror_q_.pop();
+                }
+            }
+            mirror_done_ = false;
+        }
+        cudaSetDevice(resolve_cuda_device());
+        cudaError_t err = cudaStreamCreate(&d2h_stream_);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("FRCheck: cudaStreamCreate(d2h_stream) failed: ") +
+                cudaGetErrorString(err));
+        }
+        mirror_thread_ = std::thread(&FRCheckNative::mirror_worker_func, this);
+    }
+
+private:
     void init_stripe_workers() {
         int ns = (int)stripe_plans_.size();
         stripe_info_.resize((size_t)ns);
@@ -2101,6 +2157,7 @@ public:
         enc_send_workers_.clear(); parity_workers_.clear();
     }
 
+public:
     void skip_source_batch(int sid, uint64_t batch) {
         advance_encode_source_turn_(sid, batch);
     }
@@ -2416,19 +2473,8 @@ public:
     }
 
     void wait_mirror_completion() {
-        std::unique_lock<std::mutex> lk(mirror_mtx_);
-        mirror_cv_.wait(lk, [this] {
-            return (mirror_idle_.load() && mirror_q_.empty()) ||
-                   stopped_.load() || mirror_stop_.load();
-        });
-        if (d2h_stream_ != nullptr) {
-            cudaError_t err = cudaStreamSynchronize(d2h_stream_);
-            if (err != cudaSuccess) {
-                std::cerr << "FRCheck wait_mirror: d2h_stream sync failed: "
-                          << cudaGetErrorString(err) << std::endl;
-            }
-            finalize_mirror_d2h_timing_();
-        }
+        stop_mirror_worker_();
+        mirror_idle_ = true;
     }
 
     // ---- Recovery worker tasks ----
@@ -3360,5 +3406,6 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("inc_pause_async_p2p", &FRCheckNative::inc_pause_async_p2p)
         .def("dec_pause_async_p2p", &FRCheckNative::dec_pause_async_p2p)
+        .def("start_mirror_worker", &FRCheckNative::start_mirror_worker)
         .def("wait_mirror_completion", &FRCheckNative::wait_mirror_completion);
 }

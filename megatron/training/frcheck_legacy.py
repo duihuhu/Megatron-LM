@@ -2347,6 +2347,8 @@ def save_frcheck_legacy_checkpoint(
     native.set_debug(_dbg)
     if hasattr(native, "reset_ft_timing_stats"):
         native.reset_ft_timing_stats()
+    if hasattr(native, "start_mirror_worker"):
+        native.start_mirror_worker()
 
     # Async parity path: drain any pending P2 operations from a previous save.
     _use_async_parity = getattr(args, 'frcheck_async_parity', False)
@@ -2638,10 +2640,14 @@ def save_frcheck_legacy_checkpoint(
     _mirror_t0 = time.time()
     native.wait_mirror_completion()
     _mirror_elapsed = time.time() - _mirror_t0
+    if hasattr(native, "start_mirror_worker"):
+        native.start_mirror_worker()
 
     if _use_async_parity:
         network_encode_s += _async_p2_submit_elapsed
     e2e_s = time.time() - e2e_t0
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     if world_size > 1:
         torch.distributed.barrier()
     has_native_timing = hasattr(native, "get_ft_timing_stats")
@@ -2690,10 +2696,6 @@ def save_frcheck_legacy_checkpoint(
             _save_frcheck_stripe_files(
                 manager, str(checkpoint_dir), rank, num_stripes, encode_results,
             )
-    else:
-        logger.info(
-            "FRCheck save: skipping checkpoint file writes for this iteration"
-        )
 
     groups_by_name = {
         (f"layer_{group.layer_idx}" if group.layer_idx >= 0 else "layer_common"): group

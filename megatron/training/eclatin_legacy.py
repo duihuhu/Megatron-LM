@@ -547,10 +547,6 @@ def save_eclatin_legacy_checkpoint(
             full_tensor_buffer=tensor_buffer[:total_tensor_size],
             all_tensor_infos=rank_metadata,
         )
-    else:
-        logger.info(
-            "ECLATIN save: skipping checkpoint file writes for this iteration"
-        )
 
     if world_size > 1:
         torch.distributed.barrier()

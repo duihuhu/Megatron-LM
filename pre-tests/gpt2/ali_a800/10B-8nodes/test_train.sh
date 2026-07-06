@@ -24,7 +24,7 @@ MASTER_ADDR=172.16.0.224
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=6000
-NNODES=4
+NNODES=8
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
@@ -153,7 +153,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE 
     --global-batch-size $GLOBAL_BATCH_SIZE 
     --lr 0.00005
-    --train-iters 20
+    --train-iters 10
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -175,7 +175,7 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 8
-    --pipeline-model-parallel-size 4
+    --pipeline-model-parallel-size 8
     --sequence-parallel
 )
 

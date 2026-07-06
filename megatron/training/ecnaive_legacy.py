@@ -2372,11 +2372,12 @@ def save_ecnaive_legacy_checkpoint(
         "net_s": native_timing["net_s"],
         "encode_s": native_timing["encode_s"],
     })
-    logger.info(
-        "EC-NAIVE save timing: e2e_s=%(e2e_s).2fs d2h_s=%(d2h_s).2fs "
-        "network_encode_s=%(network_encode_s).2fs net_s=%(net_s).2fs encode_s=%(encode_s).2fs",
-        summary,
-    )
+    if rank == 0:
+        logger.info(
+            "EC-NAIVE save timing: e2e_s=%(e2e_s).2fs d2h_s=%(d2h_s).2fs "
+            "network_encode_s=%(network_encode_s).2fs net_s=%(net_s).2fs encode_s=%(encode_s).2fs",
+            summary,
+        )
 
     if write_to_disk:
         _save_ecnaive_pt_files(
@@ -2391,7 +2392,7 @@ def save_ecnaive_legacy_checkpoint(
             all_tensor_infos=rank_metadata,  # store all ranks' metadata for HW recovery
         )
     else:
-        logger.info(
+        logger.debug(
             "EC-NAIVE save: skipping checkpoint file writes for this iteration"
         )
 

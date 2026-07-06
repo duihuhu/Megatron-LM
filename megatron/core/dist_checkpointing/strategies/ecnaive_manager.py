@@ -104,7 +104,7 @@ class ECNAIVEManager:
             if self.preallocated_cpu_buffer.numel() >= size_bytes:
                 return
         pin = self.ecnaive_pin_memory and torch.cuda.is_available()
-        logger.info(
+        logger.debug(
             f"ECNAIVE: Allocating preallocated buffer: {size_bytes / (1024**3):.2f} GB (pin={pin})"
         )
         self.preallocated_cpu_buffer = allocate_hugepage_tensor(
@@ -130,7 +130,7 @@ class ECNAIVEManager:
             return self._cached_blocks
         if pin is None:
             pin = self.ecnaive_pin_memory and torch.cuda.is_available()
-        logger.info(
+        logger.debug(
             f"ECNAIVE: Allocating {count} blocks: {aligned_size / (1024**3):.2f} GB each "
             f"({count * aligned_size / (1024**3):.2f} GB total, pin={pin})"
         )
@@ -470,7 +470,7 @@ class ECNAIVEManager:
                     ip_bytes = bytes(ip_tensor.cpu().tolist())
                     rank_ips[r] = socket.inet_ntoa(ip_bytes)
                 
-                logger.info(
+                logger.debug(
                     f"EC-NAIVE: [Rank {rank}] IP exchange completed - "
                     f"All rank IPs: {rank_ips}"
                 )
@@ -483,7 +483,7 @@ class ECNAIVEManager:
                     rank_ips[r] = base_ip
         else:
             # Single rank mode - use local IP
-            logger.info("EC-NAIVE: Distributed not initialized, using local IP for all ranks")
+            logger.debug("EC-NAIVE: Distributed not initialized, using local IP for all ranks")
             rank_ips[0] = base_ip
         
         config = {
@@ -493,7 +493,7 @@ class ECNAIVEManager:
             'ports': ports,
         }
         
-        logger.info(
+        logger.debug(
             f"EC-NAIVE: [Rank {rank}] Network config:\n"
             f"  My IP: {config['my_ip']}\n"
             f"  Base port: {config['base_port']}\n"
@@ -580,7 +580,7 @@ class ECNAIVEManager:
                     ip_bytes = bytes(ip_tensor.cpu().tolist())
                     rank_ips[r] = socket.inet_ntoa(ip_bytes)
                 
-                logger.info(
+                logger.debug(
                     f"EC-NAIVE: [Rank {rank}] Load mode IP exchange completed - "
                     f"All rank IPs: {rank_ips}"
                 )
@@ -591,7 +591,7 @@ class ECNAIVEManager:
                 for r in range(world_size):
                     rank_ips[r] = base_ip
         else:
-            logger.info("EC-NAIVE: Distributed not initialized, using local IP for all ranks")
+            logger.debug("EC-NAIVE: Distributed not initialized, using local IP for all ranks")
             rank_ips[0] = base_ip
         
         config = {
@@ -604,7 +604,7 @@ class ECNAIVEManager:
             'load_receiver_rank': load_receiver_rank,
         }
         
-        logger.info(
+        logger.debug(
             f"EC-NAIVE: [Rank {rank}] Load mode network config:\n"
             f"  My IP: {config['my_ip']}\n"
             f"  Base port: {config['base_port']}\n"
@@ -631,7 +631,7 @@ class ECNAIVEManager:
             return
         failed_rank = 2
         self._ecnaive_native.set_load_mode(True, failed_rank, rank, is_software_only=True)
-        logger.info(f"EC-NAIVE: [Rank {rank}] Set load mode (failed_rank={failed_rank}) for software-only")
+        logger.debug(f"EC-NAIVE: [Rank {rank}] Set load mode (failed_rank={failed_rank}) for software-only")
         if net_config is None:
             net_config = self._get_ecnaive_load_network_config(rank, world_size)
         rank_in_group = net_config['rank_in_group']
@@ -642,7 +642,7 @@ class ECNAIVEManager:
         self._ecnaive_native.init_ecnaive_load_connections_software_only(
             rank_in_group, rank2_ip, port
         )
-        logger.info(f"EC-NAIVE: [Rank {rank}] Software-only load connection initialized (1 port)")
+        logger.debug(f"EC-NAIVE: [Rank {rank}] Software-only load connection initialized (1 port)")
 
     # ---- Generalized SW recovery (k-1 ports, any k >= 2) ----
 
@@ -689,7 +689,7 @@ class ECNAIVEManager:
         receiver_ip = rank_ips.get(load_receiver_rank, base_ip)
 
         # Phase 1: bind/listen (receiver) + RDMA CQs (all ranks)
-        logger.info(f"EC-NAIVE: [Rank {rank}] SW recovery phase 1: {num_blocks} ports")
+        logger.debug(f"EC-NAIVE: [Rank {rank}] SW recovery phase 1: {num_blocks} ports")
         native.init_ecnaive_load_sw_bind_listen(
             rank_in_group, receiver_ip, num_blocks, sw_ports)
         torch.distributed.barrier()
@@ -697,22 +697,22 @@ class ECNAIVEManager:
         # Phase 2: receiver accepts (blocking), senders each connect to exactly one port.
         # Non-participating ranks skip entirely — they have no data block for the failed rank.
         if rank_in_group == failed_rank_in_group:
-            logger.info("EC-NAIVE: [Rank %d] SW recovery phase 2: accepting %d connections",
+            logger.debug("EC-NAIVE: [Rank %d] SW recovery phase 2: accepting %d connections",
                         rank, num_blocks)
             native.init_ecnaive_load_sw_accept(rank_in_group, num_blocks)
         else:
             block_idx = self.get_sw_recovery_block_idx_for_sender(
                 rank_in_group, failed_rank_in_group=failed_rank_in_group)
             if block_idx >= 0:
-                logger.info("EC-NAIVE: [Rank %d] SW recovery phase 2: connecting block_idx=%d "
+                logger.debug("EC-NAIVE: [Rank %d] SW recovery phase 2: connecting block_idx=%d "
                             "port=%d", rank, block_idx, sw_ports[block_idx])
                 native.init_ecnaive_load_sw_connect_one(
                     rank_in_group, receiver_ip, block_idx, sw_ports[block_idx])
             else:
-                logger.info("EC-NAIVE: [Rank %d] SW recovery phase 2: no block, skipping",
+                logger.debug("EC-NAIVE: [Rank %d] SW recovery phase 2: no block, skipping",
                             rank)
         torch.distributed.barrier()
-        logger.info("EC-NAIVE: [Rank %d] SW recovery connections ready (%d blocks)",
+        logger.debug("EC-NAIVE: [Rank %d] SW recovery connections ready (%d blocks)",
                     rank, num_blocks)
 
     def get_sw_recovery_block_idx_for_sender(
@@ -969,14 +969,14 @@ class ECNAIVEManager:
             # Ports per rank: (n-1) ASIO send + (n-1) ASIO recv + (n-1) RDMA recv
             self.ecnaive_ports_per_rank = 3 * (self.ecnaive_n - 1)
 
-            logger.info(
+            logger.debug(
                 f"EC-NAIVE: RS scheme {self.ecnaive_k}+2 → {self.ecnaive_n} ranks/group, "
                 f"{self.ecnaive_ports_per_rank} ports/rank"
             )
 
             # Check RDMA flag
             self.use_rdma = getattr(args, 'use_rdma', False)
-            logger.info(f"EC-NAIVE: RDMA support {'enabled' if self.use_rdma else 'disabled'}")
+            logger.debug(f"EC-NAIVE: RDMA support {'enabled' if self.use_rdma else 'disabled'}")
                 
             # Check if distributed environment is initialized
             if not torch.distributed.is_initialized():
@@ -1023,19 +1023,18 @@ class ECNAIVEManager:
             # Create instance with error handling
             try:
                 # ===== ASIO Initialization Path =====
-                logger.info(f"EC-NAIVE: [Rank {rank}] Using ASIO for communication")
+                logger.debug(f"EC-NAIVE: [Rank {rank}] Using ASIO for communication")
                 
                 # Get network configuration
                 net_config = self._get_ecnaive_network_config(rank, world_size)
                 
                 # Synchronize all ranks before creating C++ instances
-                logger.info(f"EC-NAIVE: [Rank {rank}] Synchronizing all ranks before creating C++ native module (ASIO)...")
+                logger.debug(f"EC-NAIVE: [Rank {rank}] Synchronizing all ranks before creating C++ native module (ASIO)...")
                 torch.distributed.barrier()
-                logger.info(f"EC-NAIVE: [Rank {rank}] All ranks synchronized, creating C++ native module with ASIO...")
+                logger.debug(f"EC-NAIVE: [Rank {rank}] All ranks synchronized, creating C++ native module with ASIO...")
                 
                 # Create C++ instance with ASIO parameters
-                logger.info(f"EC-NAIVE: Creating C++ native module with ASIO (this will block until ASIO connections are established)...")
-                print(f"EC-NAIVE: [Rank {rank}] Creating C++ native module with ASIO (blocking until ASIO initialization completes)...")
+                logger.debug(f"EC-NAIVE: Creating C++ native module with ASIO (this will block until ASIO connections are established)...")
                 
                 # EC-NAIVE requires 12 parameters (6 pairs of ip:port):
                 # send_data1_ip, send_data1_port, send_parity0_ip, send_parity0_port, 
@@ -1103,17 +1102,16 @@ class ECNAIVEManager:
                 )
                 
                 # If we reach here, ASIO connections are ready and threads are running
-                logger.info(f"EC-NAIVE: C++ native module initialized successfully with ASIO (rank={rank}, world_size={world_size})")
-                print(f"EC-NAIVE: [Rank {rank}] C++ native module initialized - ASIO connections ready for data exchange")
+                logger.debug(f"EC-NAIVE: C++ native module initialized successfully with ASIO (rank={rank}, world_size={world_size})")
                 
                 # Initialize EC-NAIVE buffers
                 # EC-NAIVE does not use layerwise mode
                 self._init_ecnaive_buffers()
                 
                 # Synchronize all ranks after RDMA/ASIO and buffers are ready
-                logger.info(f"EC-NAIVE: [Rank {rank}] Synchronizing all ranks after native module init...")
+                logger.debug(f"EC-NAIVE: [Rank {rank}] Synchronizing all ranks after native module init...")
                 torch.distributed.barrier()
-                logger.info(f"EC-NAIVE: [Rank {rank}] All ranks synchronized after EC-NAIVE init")
+                logger.debug(f"EC-NAIVE: [Rank {rank}] All ranks synchronized after EC-NAIVE init")
         
             except Exception as e:
                 logger.warning(f"EC-NAIVE: Failed to create C++ native module instance: {e}")
@@ -1141,8 +1139,7 @@ class ECNAIVEManager:
         in strategy after metadata exchange.
         """
         rank = torch.distributed.get_rank()
-        logger.info("EC-NAIVE: Initializing buffers for EC-NAIVE (data and parity pools only)")
-        print(f"EC-NAIVE: Initializing buffers for EC-NAIVE (rank={rank}, data and parity pools only)")
+        logger.debug("EC-NAIVE: Initializing buffers for EC-NAIVE (data and parity pools only)")
         
         # Allocate data buffers for storing original tensor data
         self.ecnaive_data_buffers = self._allocate_data_buffers()
@@ -1152,12 +1149,12 @@ class ECNAIVEManager:
         
         # Register buffers for RDMA if enabled
         if self.use_rdma and self._ecnaive_native is not None:
-            logger.info(f"EC-NAIVE: [Rank {rank}] Registering data and parity buffers for RDMA...")
+            logger.debug(f"EC-NAIVE: [Rank {rank}] Registering data and parity buffers for RDMA...")
             for buffer in self.ecnaive_data_buffers:
                 self.register_buffer(buffer)
             for buffer in self.ecnaive_parity_buffers:
                 self.register_buffer(buffer)
-            logger.info(f"EC-NAIVE: [Rank {rank}] All pooled buffers registered for RDMA")
+            logger.debug(f"EC-NAIVE: [Rank {rank}] All pooled buffers registered for RDMA")
         
         # Initialize free buffer queues
         self._free_data_buffer_queue = queue.Queue()
@@ -1168,16 +1165,13 @@ class ECNAIVEManager:
         for buffer in self.ecnaive_parity_buffers:
             self._free_parity_buffer_queue.put(int(buffer.data_ptr()))
 
-        logger.info(f"EC-NAIVE: Buffer initialization completed - "
+        logger.debug(f"EC-NAIVE: Buffer initialization completed - "
                    f"Data buffers: {len(self.ecnaive_data_buffers)}, "
                    f"Parity buffers: {len(self.ecnaive_parity_buffers)}")
-        print(f"EC-NAIVE: Buffer initialization completed (rank={rank}) - "
-              f"Data buffers: {len(self.ecnaive_data_buffers)}, "
-              f"Parity buffers: {len(self.ecnaive_parity_buffers)}")
     
     def _allocate_data_buffers(self):
         """Allocate data buffers for storing original tensor data."""
-        logger.info(f"EC-NAIVE: Allocating data buffers ({self.ecnaive_data_buffers_count} buffers, {self.ecnaive_buffer_size // (1024*1024)}MB each)")
+        logger.debug(f"EC-NAIVE: Allocating data buffers ({self.ecnaive_data_buffers_count} buffers, {self.ecnaive_buffer_size // (1024*1024)}MB each)")
         
         data_buffers = []
         for i in range(self.ecnaive_data_buffers_count):
@@ -1189,12 +1183,12 @@ class ECNAIVEManager:
             data_buffers.append(buffer)
             logger.debug(f"EC-NAIVE: Allocated data buffer {i}: {self.ecnaive_buffer_size} bytes")
         
-        logger.info(f"EC-NAIVE: Allocated {len(data_buffers)} data buffers")
+        logger.debug(f"EC-NAIVE: Allocated {len(data_buffers)} data buffers")
         return data_buffers
     
     def _allocate_parity_buffers(self):
         """Allocate parity buffers (pooled) for parity blocks."""
-        logger.info(f"EC-NAIVE: Allocating parity buffers ({self.ecnaive_parity_buffers_count} buffers, {self.ecnaive_buffer_size // (1024*1024)}MB each)")
+        logger.debug(f"EC-NAIVE: Allocating parity buffers ({self.ecnaive_parity_buffers_count} buffers, {self.ecnaive_buffer_size // (1024*1024)}MB each)")
         
         parity_buffers = []
         for i in range(self.ecnaive_parity_buffers_count):
@@ -1206,7 +1200,7 @@ class ECNAIVEManager:
             parity_buffers.append(buffer)
             logger.debug(f"EC-NAIVE: Allocated parity buffer {i}: {self.ecnaive_buffer_size} bytes")
         
-        logger.info(f"EC-NAIVE: Allocated {len(parity_buffers)} parity buffers")
+        logger.debug(f"EC-NAIVE: Allocated {len(parity_buffers)} parity buffers")
         return parity_buffers
     
     
@@ -1245,7 +1239,7 @@ class ECNAIVEManager:
         
         def buffer_poller_worker():
             """Persistent background thread that polls for buffer releases."""
-            logger.info("EC-NAIVE: Buffer poller thread started")
+            logger.debug("EC-NAIVE: Buffer poller thread started")
             poll_count = 0
             
             while not self._buffer_poller_stop_event.is_set():
@@ -1260,19 +1254,19 @@ class ECNAIVEManager:
                 from time import sleep
                 sleep(0.001)  # 1ms
             
-            logger.info("EC-NAIVE: Buffer poller thread stopping")
+            logger.debug("EC-NAIVE: Buffer poller thread stopping")
         
         # Start the daemon thread
         self._buffer_poller_thread = threading.Thread(target=buffer_poller_worker, daemon=True)
         self._buffer_poller_thread.start()
-        logger.info("EC-NAIVE: Buffer poller thread created and started")
+        logger.debug("EC-NAIVE: Buffer poller thread created and started")
     
     def _stop_buffer_poller_thread(self):
         """Stop the persistent buffer poller thread."""
         if not hasattr(self, '_buffer_poller_thread') or self._buffer_poller_thread is None:
             return
         
-        logger.info("EC-NAIVE: Stopping buffer poller thread...")
+        logger.debug("EC-NAIVE: Stopping buffer poller thread...")
         
         # Signal the thread to stop
         if self._buffer_poller_stop_event:
@@ -1284,7 +1278,7 @@ class ECNAIVEManager:
             if self._buffer_poller_thread.is_alive():
                 logger.warning("EC-NAIVE: Buffer poller thread did not stop in time")
             else:
-                logger.info("EC-NAIVE: Buffer poller thread stopped successfully")
+                logger.debug("EC-NAIVE: Buffer poller thread stopped successfully")
         
         self._buffer_poller_thread = None
         self._buffer_poller_stop_event = None
@@ -1334,15 +1328,15 @@ class ECNAIVEManager:
             return
         
         try:
-            logger.info(f"EC-NAIVE: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
+            logger.debug(f"EC-NAIVE: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
             self._ecnaive_native.register_buffer(buffer_addr, buffer_size)
             self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
-            logger.info(f"EC-NAIVE: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
+            logger.debug(f"EC-NAIVE: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
             
             # Print all registered buffers
-            logger.info(f"EC-NAIVE: [Rank {rank}] All registered buffers:")
+            logger.debug(f"EC-NAIVE: [Rank {rank}] All registered buffers:")
             # for addr, (size, iteration) in self.registered_buffers.items():
-            #     logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
+            #     logger.debug(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
         except Exception as e:
             logger.error(f"EC-NAIVE: [Rank {rank}] Failed to register buffer: {e}")
             raise
@@ -1363,10 +1357,10 @@ class ECNAIVEManager:
             return
         
         try:
-            logger.info(f"EC-NAIVE: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
+            logger.debug(f"EC-NAIVE: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
             self._ecnaive_native.unregister_buffer(buffer_addr)
             del self.registered_buffers[buffer_addr]
-            logger.info(f"EC-NAIVE: [Rank {rank}] Buffer unregistered successfully (remaining: {len(self.registered_buffers)})")
+            logger.debug(f"EC-NAIVE: [Rank {rank}] Buffer unregistered successfully (remaining: {len(self.registered_buffers)})")
         except Exception as e:
             logger.error(f"EC-NAIVE: [Rank {rank}] Failed to unregister buffer: {e}")
             raise
@@ -1386,7 +1380,7 @@ class ECNAIVEManager:
                 'own_data0', 'recv_0', ..., 'recv_{n-2}'.
         """
         self._recovered_blocks[rank] = blocks
-        logger.info(
+        logger.debug(
             f"EC-NAIVE: Stored {len(blocks)} recovered blocks for rank {rank}"
         )
 
@@ -1449,7 +1443,7 @@ class ECNAIVEManager:
             if hasattr(self, '_ecnaive_native') and self._ecnaive_native is not None:
                 self._ecnaive_native.stop()
                 self._ecnaive_native = None
-                logger.info("EC-NAIVE: C++ native module stopped in manager cleanup")
+                logger.debug("EC-NAIVE: C++ native module stopped in manager cleanup")
 
             # Clear registered buffers and cached allocations
             self.registered_buffers.clear()

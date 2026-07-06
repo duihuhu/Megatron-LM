@@ -759,7 +759,6 @@ void AsioConnectionManager::init_send_channels(
             auto endpoints = resolver.resolve(ips[i], std::to_string(ports[i]));
             boost::asio::connect(send_sockets_[i], endpoints);
             send_connected_[i] = true;
-            std::cout << "ASIO: send channel " << i << " connected to " << ips[i] << ":" << ports[i] << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "ASIO: send channel " << i << " init error: " << e.what() << std::endl;
             send_connected_[i] = false;
@@ -797,7 +796,6 @@ void AsioConnectionManager::init_recv_channels(
                 recv_acceptors_[i].listen();
                 recv_acceptors_[i].accept(recv_sockets_[i]);
                 recv_connected_[i] = true;
-                std::cout << "ASIO: recv channel " << i << " accepted on " << ips[i] << ":" << ports[i] << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "ASIO: recv channel " << i << " init error: " << e.what() << std::endl;
                 recv_connected_[i] = false;
@@ -841,8 +839,6 @@ void AsioConnectionManager::bind_listen_ecnaive_load_recv_rank3_data1(const std:
         ecnaive_load_recv_rank3_data1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
         ecnaive_load_recv_rank3_data1_acceptor_.bind(endpoint);
         ecnaive_load_recv_rank3_data1_acceptor_.listen();
-        std::cout << "EC-NAIVE: [Rank 2] Bound and listening on ecnaive_load_recv_rank3_data1 port " 
-                  << port << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "EC-NAIVE: bind_listen_ecnaive_load_recv_rank3_data1 error: " << e.what() << std::endl;
         throw;
@@ -854,7 +850,6 @@ void AsioConnectionManager::accept_ecnaive_load_recv_rank3_data1() {
     try {
         ecnaive_load_recv_rank3_data1_acceptor_.accept(ecnaive_load_recv_rank3_data1_socket_);
         ecnaive_load_recv_rank3_data1_connected_ = true;
-        std::cout << "EC-NAIVE: [Rank 2] Accepted ecnaive_load_recv_rank3_data1 connection" << std::endl;
         connection_cv_.notify_all();
     } catch (const std::exception& e) {
         std::cerr << "EC-NAIVE: accept_ecnaive_load_recv_rank3_data1 error: " << e.what() << std::endl;
@@ -870,7 +865,6 @@ void AsioConnectionManager::init_ecnaive_load_send_rank3_data1(const std::string
         auto endpoints = resolver.resolve(rank2_ip, std::to_string(port));
         boost::asio::connect(ecnaive_load_send_rank3_data1_socket_, endpoints);
         ecnaive_load_send_rank3_data1_connected_ = true;
-        std::cout << "EC-NAIVE: [Rank 3] Connected ecnaive_load_send_rank3_data1 to rank2" << std::endl;
         connection_cv_.notify_all();
     } catch (const std::exception& e) {
         std::cerr << "EC-NAIVE: init_ecnaive_load_send_rank3_data1 error: " << e.what() << std::endl;
@@ -1037,8 +1031,6 @@ public:
             rdma_recv_cqs_.emplace_back(nullptr);
         }
 
-        std::cout << "ECNAIVE: Initializing connections (RDMA: " << (use_rdma_ ? "enabled" : "disabled")
-                  << ", k=" << k_ << ", n=" << n_ << ", channels=" << num_channels_ << ")..." << std::endl;
 
         // Initialize RDMA resources if enabled
         if (use_rdma_) {
@@ -1059,7 +1051,6 @@ public:
             init_rdma_save_channels();
         }
         start_threads();
-        std::cout << "ECNAIVE: Pipeline started successfully" << std::endl;
     }
 
     ~ECNaiveNative() {
@@ -1221,7 +1212,6 @@ public:
 
     // Submit sentinels to signal pipeline completion
     void submit_send_data1_sentinel() {
-        std::cout << "ECNAIVE: Submitting sentinel to send_data1 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(send_data1_mutex_);
             send_data1_q_.push({0, 0});
@@ -1392,11 +1382,6 @@ public:
         job.decode_tbls = ec_decode_tbls_.data();
         ec_rs_pool_run_parallel(job);
 
-        std::cout << "ECNAIVE: RS decode recovery done (pool): k_orig=" << k_orig
-                  << " surviving=" << surviving_count << " m=" << m
-                  << " lost_pos=[" << lost_positions[0];
-        if (m > 1) std::cout << "," << lost_positions[1];
-        std::cout << "] size=" << size << std::endl;
     }
 
     // Software failure mode interfaces (direct send/recv without pipeline)
@@ -1425,7 +1410,6 @@ public:
         if (use_rdma_ && rdma_software_load_channel_) {
             // std::cout << "[ECNAIVE RDMA] Load: Sending " << size << " bytes via RDMA" << std::endl;
             rdma_software_load_channel_->send_data(reinterpret_cast<const uint8_t*>(send_addr), size);
-            std::cout << "EC-NAIVE: [Rank 3] Software sent d21 (RDMA, size=" << size << ")" << std::endl;
             return;
         }
         // Legacy k=2 path: dedicated named socket
@@ -1448,7 +1432,6 @@ public:
         if (use_rdma_ && rdma_software_load_channel_) {
             // std::cout << "[ECNAIVE RDMA] Load: Receiving " << size << " bytes via RDMA" << std::endl;
             rdma_software_load_channel_->receive_data(reinterpret_cast<uint8_t*>(recv_addr), size);
-            std::cout << "EC-NAIVE: [Rank 2] Software received d21 (RDMA, size=" << size << ")" << std::endl;
             return;
         }
         // Legacy k=2 path
@@ -1570,7 +1553,6 @@ public:
             while (!recv_data1_q_.empty()) recv_data1_q_.pop();
         }
 
-        std::cout << "ECNAIVE: Reset encoding completion flags and cleared all queues" << std::endl;
     }
 
     void wait_for_encoding_completion() {
@@ -1664,10 +1646,6 @@ public:
         if (rank >= 0) {
             rank_ = rank;
         }
-        std::cout << "EC-NAIVE: Set load mode: "
-                  << (is_load ? "true" : "false") << ", failed_rank=" << failed_rank
-                  << ", failed_rank_in_group=" << failed_rank_in_group_ << ", rank=" << rank_
-                  << ", is_software_only=" << (is_software_only ? "true" : "false") << std::endl;
         
         if (is_load) {
             load_recv_total_ns_.store(0, std::memory_order_relaxed);
@@ -1687,14 +1665,11 @@ public:
             return;
         }
         rank_ = rank_in_group;
-        std::cout << "EC-NAIVE: [Rank_in_group " << rank_in_group << "] Software-only load: 1 port (rank3_data1)" << std::endl;
         if (rank_in_group == 2) {
             conn_.bind_listen_ecnaive_load_recv_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
             conn_.accept_ecnaive_load_recv_rank3_data1();
-            std::cout << "EC-NAIVE: [Rank_in_group 2] Software-only accept done" << std::endl;
         } else if (rank_in_group == 3) {
             conn_.init_ecnaive_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
-            std::cout << "EC-NAIVE: [Rank_in_group 3] Software-only connect done" << std::endl;
         }
         if (use_rdma_ && (rank_ == 2 || rank_ == 3)) {
             try {
@@ -1730,8 +1705,6 @@ public:
                     boost::asio::ip::address::from_string(receiver_ip), ports[i]));
             sw_asio_acceptors_[i]->listen();
         }
-        std::cout << "EC-NAIVE: [Rig 2] SW recovery bind/listen on " << num_blocks
-                  << " ports" << std::endl;
     }
 
     // Phase 2a: receiver (rig=2) accepts on all k-1 ports, sets up RDMA channels
@@ -1748,8 +1721,6 @@ public:
                 sw_recovery_io_);
             sw_asio_acceptors_[i]->accept(*sw_asio_recv_sockets_[i]);
         }
-        std::cout << "EC-NAIVE: [Rig 2] SW recovery accepted " << num_blocks
-                  << " connections" << std::endl;
 
         // RDMA channels on accepted sockets
         if (use_rdma_) {
@@ -1764,8 +1735,6 @@ public:
                     rank_in_group, 2);
                 rdma_sw_recovery_channels_[i]->exchange_and_connect(true);
             }
-            std::cout << "EC-NAIVE: SW recovery RDMA channels initialized (rig=2, "
-                      << num_blocks << " blocks)" << std::endl;
         }
     }
 
@@ -1793,8 +1762,6 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
-        std::cout << "EC-NAIVE: [Rig " << rank_in_group << "] SW recovery connected block_idx="
-                  << block_idx << " port=" << port << std::endl;
 
         // RDMA channel for this single connection
         if (use_rdma_) {
@@ -2106,7 +2073,6 @@ private:
         // not the full Vandermonde matrix (which includes data rows at positions 0..k-1).
         // ec_init_tables expects a k×rows matrix; a_mat_ is k×(k+rows), so offset by k*k.
         ec_init_tables(k_, rows_, a_mat_ + k_ * k_, g_tbls_);
-        std::cout << "ECNAIVE: EC encoding tables initialized (k=" << k_ << ", rows=" << rows_ << ")" << std::endl;
     }
     
     // EC encoding function: encode k_ data blocks to rows_ (2) parity blocks
@@ -2142,7 +2108,6 @@ private:
     
     // RDMA initialization
     void init_rdma_resources() {
-        std::cout << "[ECNAIVE RDMA] Initializing RDMA resources..." << std::endl;
 
         // Must be called before any RDMA memory registration when the process may fork (e.g. multiprocessing
         // write workers). Without this, child processes get EFAULT (Bad address) when accessing RDMA-registered
@@ -2191,15 +2156,12 @@ private:
             }
         }
 
-        std::cout << "[ECNAIVE RDMA] RDMA resources initialized successfully ("
-                  << total_cqs << " CQ pairs for save channels, k=" << k_ << ")" << std::endl;
     }
 
     // Software-only load RDMA: 1 CQ pair and 1 channel (rank3_data1). Call after init_ecnaive_load_connections_software_only.
     void init_rdma_software_load_resources() {
         if (!use_rdma_) return;
         if (rdma_software_load_send_cq_ || rdma_software_load_recv_cq_) return;  // already inited
-        std::cout << "[ECNAIVE RDMA] Initializing software-only load RDMA resources (1 CQ pair)..." << std::endl;
         if (!rdma_context_) {
             if (ibv_fork_init() != 0) {
                 std::cerr << "[ECNAIVE RDMA] WARNING: ibv_fork_init() failed." << std::endl;
@@ -2236,7 +2198,6 @@ private:
             }
             throw std::runtime_error("Failed to create software-only load completion queues");
         }
-        std::cout << "[ECNAIVE RDMA] Software-only load RDMA resources initialized (1 CQ pair)" << std::endl;
     }
 
     void init_rdma_software_load_channel() {
@@ -2245,21 +2206,17 @@ private:
         int rank_for_log = (rank_ >= 0) ? rank_ : 0;
         try {
             if (rank_ == 2) {
-                std::cout << "[ECNAIVE RDMA] Creating software-only load channel (rank2 recv)..." << std::endl;
                 int sock = conn_.get_ecnaive_load_recv_rank3_data1_socket().native_handle();
                 rdma_software_load_channel_ = std::make_unique<RdmaConnectionChannel>(
                     rdma_context_, rdma_pd_, rdma_software_load_send_cq_, rdma_software_load_recv_cq_,
                     sock, sock, &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 3);
                 rdma_software_load_channel_->exchange_and_connect(false);
-                std::cout << "[ECNAIVE RDMA] Software-only load channel connected (rank2)" << std::endl;
             } else if (rank_ == 3) {
-                std::cout << "[ECNAIVE RDMA] Creating software-only load channel (rank3 send)..." << std::endl;
                 int sock = conn_.get_ecnaive_load_send_rank3_data1_socket().native_handle();
                 rdma_software_load_channel_ = std::make_unique<RdmaConnectionChannel>(
                     rdma_context_, rdma_pd_, rdma_software_load_send_cq_, rdma_software_load_recv_cq_,
                     sock, sock, &rdma_registered_buffers_, &rdma_buffer_mutex_, rank_for_log, 2);
                 rdma_software_load_channel_->exchange_and_connect(true);
-                std::cout << "[ECNAIVE RDMA] Software-only load channel connected (rank3)" << std::endl;
             }
         } catch (const std::exception& e) {
             std::cerr << "[ECNAIVE RDMA] Failed to init software-only load channel: " << e.what() << std::endl;
@@ -2273,7 +2230,6 @@ private:
             return;
         }
         
-        std::cout << "[ECNAIVE RDMA] Cleaning up RDMA resources..." << std::endl;
         
         // Destroy RDMA channels first (each channel destroys its QP)
         send_data1_channel_.reset();
@@ -2326,21 +2282,17 @@ private:
             rdma_context_ = nullptr;
         }
         
-        std::cout << "[ECNAIVE RDMA] RDMA resources cleaned up" << std::endl;
     }
 
     void start_threads() {
         ec_rs_pool_init();
-        std::cout << "ECNAIVE: Starting " << (2 * num_channels_) << " worker threads..." << std::endl;
         for (int i = 0; i < num_channels_; ++i) {
             send_threads_[i] = std::thread(&ECNaiveNative::send_worker, this, i);
             recv_threads_[i] = std::thread(&ECNaiveNative::recv_worker, this, i);
         }
-        std::cout << "ECNAIVE: All worker threads started" << std::endl;
     }
 
     void init_connections() {
-        std::cout << "ECNAIVE: Initializing connections for " << num_channels_ << " channels..." << std::endl;
 
         // Start acceptors in separate thread (parallel listen/accept for all recv channels)
         std::thread recv_init_thread([this]() {
@@ -2354,9 +2306,7 @@ private:
         conn_.init_send_channels(send_ips_, send_ports_);
 
         recv_init_thread.join();
-        std::cout << "ECNAIVE: Waiting for all connections..." << std::endl;
         conn_.wait_for_connections();
-        std::cout << "ECNAIVE: All " << num_channels_ << " connections established" << std::endl;
     }
 
     // Establish 6 dedicated raw TCP sockets for RDMA RdmaConnInfo exchange only (like Gemini).
@@ -2365,7 +2315,6 @@ private:
         if (!use_rdma_) {
             return;
         }
-        std::cout << "[ECNAIVE RDMA] Establishing dedicated TCP sockets for RdmaConnInfo exchange..." << std::endl;
         // Accept side: same order as ASIO recv roles (recv_parity1, recv_parity0, recv_data1).
         std::thread accept_thread([this]() {
             auto do_listen_accept = [this](const std::string& ip, uint16_t port, int& out_fd, const std::string& name) {
@@ -2397,7 +2346,6 @@ private:
                 if (out_fd < 0) {
                     throw std::runtime_error(std::string("[ECNAIVE RDMA] accept failed for ") + name + ": " + std::strerror(errno));
                 }
-                std::cout << "[ECNAIVE RDMA] " << name << " accepted" << std::endl;
             };
             for (int i = 0; i < num_channels_; ++i) {
                 do_listen_accept(recv_ips_[i], rdma_recv_ports_[i], rdma_recv_fds_[i],
@@ -2429,7 +2377,6 @@ private:
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
-            std::cout << "[ECNAIVE RDMA] " << name << " connected" << std::endl;
         };
         try {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -2447,14 +2394,12 @@ private:
         if (accept_thread.joinable()) {
             accept_thread.join();
         }
-        std::cout << "[ECNAIVE RDMA] All 6 dedicated TCP sockets for RdmaConnInfo exchange established" << std::endl;
     }
 
     void close_rdma_exchange_sockets() {
         auto close_fd = [](int& fd, const std::string& name) {
             if (fd >= 0) {
                 close(fd);
-                std::cout << "[ECNAIVE RDMA] Closed " << name << " fd=" << fd << std::endl;
                 fd = -1;
             }
         };
@@ -2474,8 +2419,6 @@ private:
         if (!use_rdma_ || !rdma_pd_) return;
 
         try {
-            std::cout << "[ECNAIVE RDMA] Creating " << (2 * num_channels_)
-                      << " RDMA save channels (k=" << k_ << ")..." << std::endl;
 
             // Create all channels first (no exchange yet).
             // Send channels: rdma_send_fds_[i] is the "connect" side.
@@ -2514,8 +2457,6 @@ private:
                 for (auto& t : ex_threads) t.join();
             }
 
-            std::cout << "[ECNAIVE RDMA] All " << (2 * num_channels_)
-                      << " RDMA save channels connected" << std::endl;
 
         } catch (const std::exception& e) {
             std::cerr << "[ECNAIVE RDMA] Save channel init failed: " << e.what()
@@ -2530,7 +2471,6 @@ private:
 
     // Save mode workers: 3 sends + 3 receives
     void recv_parity1_worker() {
-        std::cout << "ECNAIVE: RecvParity1 worker started" << std::endl;
         while (!stop_) {
             RecvTask task;
             {
@@ -2547,7 +2487,6 @@ private:
                     std::lock_guard<std::mutex> lock(recv_parity1_mutex_);
                     if (recv_parity1_q_.empty()) {
                         recv_parity1_completed_ = true;
-                        std::cout << "ECNAIVE: RecvParity1 worker completed" << std::endl;
                         recv_parity1_sentinel_received_ = false;
                     }
                 }
@@ -2581,7 +2520,6 @@ private:
                 std::lock_guard<std::mutex> lock(recv_parity1_mutex_);
                 if (recv_parity1_q_.empty()) {
                     recv_parity1_completed_ = true;
-                    std::cout << "ECNAIVE: RecvParity1 worker completed" << std::endl;
                     recv_parity1_sentinel_received_ = false;
                 }
             }
@@ -2589,7 +2527,6 @@ private:
     }
 
     void recv_parity0_worker() {
-        std::cout << "ECNAIVE: RecvParity0 worker started" << std::endl;
         while (!stop_) {
             RecvTask task;
             {
@@ -2606,7 +2543,6 @@ private:
                     std::lock_guard<std::mutex> lock(recv_parity0_mutex_);
                     if (recv_parity0_q_.empty()) {
                         recv_parity0_completed_ = true;
-                        std::cout << "ECNAIVE: RecvParity0 worker completed" << std::endl;
                         recv_parity0_sentinel_received_ = false;
                     }
                 }
@@ -2626,7 +2562,6 @@ private:
                 // std::cout << "[ECNAIVE RDMA] Recv_Parity0: Receiving " << task.size << " bytes via RDMA" << std::endl;
                 recv_parity0_channel_->receive_data(reinterpret_cast<uint8_t*>(task.addr), task.size);
             } else {
-                std::cout << "[ECNAIVE ASIO] Recv_Parity0: Receiving " << task.size << " bytes via ASIO" << std::endl;
                 if (!recv_with_size_bool(
                         conn_.get_recv_parity0_socket(),
                         reinterpret_cast<void*>(task.addr),
@@ -2640,7 +2575,6 @@ private:
                 std::lock_guard<std::mutex> lock(recv_parity0_mutex_);
                 if (recv_parity0_q_.empty()) {
                     recv_parity0_completed_ = true;
-                    std::cout << "ECNAIVE: RecvParity0 worker completed" << std::endl;
                     recv_parity0_sentinel_received_ = false;
                 }
             }
@@ -2648,7 +2582,6 @@ private:
     }
 
     void recv_data1_worker() {
-        std::cout << "ECNAIVE: RecvData1 worker started" << std::endl;
         while (!stop_) {
             RecvTask task;
             {
@@ -2665,7 +2598,6 @@ private:
                     std::lock_guard<std::mutex> lock(recv_data1_mutex_);
                     if (recv_data1_q_.empty()) {
                         recv_data1_completed_ = true;
-                        std::cout << "ECNAIVE: RecvData1 worker completed" << std::endl;
                         recv_data1_sentinel_received_ = false;
                     }
                 }
@@ -2682,10 +2614,8 @@ private:
             }
 
             if (use_rdma_ && recv_data1_channel_) {
-                std::cout << "[ECNAIVE RDMA] Recv_Data1: Receiving " << task.size << " bytes via RDMA" << std::endl;
                 recv_data1_channel_->receive_data(reinterpret_cast<uint8_t*>(task.addr), task.size);
             } else {
-                std::cout << "[ECNAIVE ASIO] Recv_Data1: Receiving " << task.size << " bytes via ASIO" << std::endl;
                 if (!recv_with_size_bool(
                         conn_.get_recv_data1_socket(),
                         reinterpret_cast<void*>(task.addr),
@@ -2699,7 +2629,6 @@ private:
                 std::lock_guard<std::mutex> lock(recv_data1_mutex_);
                 if (recv_data1_q_.empty()) {
                     recv_data1_completed_ = true;
-                    std::cout << "ECNAIVE: RecvData1 worker completed" << std::endl;
                     recv_data1_sentinel_received_ = false;
                 }
             }
@@ -2707,7 +2636,6 @@ private:
     }
 
     void send_data1_worker() {
-        std::cout << "ECNAIVE: SendData1 worker started" << std::endl;
         while (!stop_) {
             SendTask task;
             {
@@ -2724,7 +2652,6 @@ private:
                     std::lock_guard<std::mutex> lock(send_data1_mutex_);
                     if (send_data1_q_.empty()) {
                         send_data1_completed_ = true;
-                        std::cout << "ECNAIVE: SendData1 worker completed" << std::endl;
                         send_data1_sentinel_received_ = false;
                     }
                 }
@@ -2738,7 +2665,6 @@ private:
                     // std::cout << "[ECNAIVE RDMA] Send_Data1: Sending " << task.size << " bytes via RDMA" << std::endl;
                     send_data1_channel_->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else {
-                    std::cout << "[ECNAIVE ASIO] Send_Data1: Sending " << task.size << " bytes via ASIO" << std::endl;
                     send_with_size(conn_.get_send_data1_socket(), task.addr, task.size);
                 }
             }
@@ -2752,7 +2678,6 @@ private:
                 std::lock_guard<std::mutex> lock(send_data1_mutex_);
                 if (send_data1_q_.empty()) {
                     send_data1_completed_ = true;
-                    std::cout << "ECNAIVE: SendData1 worker completed" << std::endl;
                     send_data1_sentinel_received_ = false;
                 }
             }
@@ -2760,7 +2685,6 @@ private:
     }
 
     void send_parity0_worker() {
-        std::cout << "ECNAIVE: SendParity0 worker started" << std::endl;
         while (!stop_) {
             SendTask task;
             {
@@ -2777,7 +2701,6 @@ private:
                     std::lock_guard<std::mutex> lock(send_parity0_mutex_);
                     if (send_parity0_q_.empty()) {
                         send_parity0_completed_ = true;
-                        std::cout << "ECNAIVE: SendParity0 worker completed" << std::endl;
                         send_parity0_sentinel_received_ = false;
                     }
                 }
@@ -2791,7 +2714,6 @@ private:
                     // std::cout << "[ECNAIVE RDMA] Send_Parity0: Sending " << task.size << " bytes via RDMA" << std::endl;
                     send_parity0_channel_->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else {
-                    std::cout << "[ECNAIVE ASIO] Send_Parity0: Sending " << task.size << " bytes via ASIO" << std::endl;
                     send_with_size(conn_.get_send_parity0_socket(), task.addr, task.size);
                 }
             }
@@ -2805,7 +2727,6 @@ private:
                 std::lock_guard<std::mutex> lock(send_parity0_mutex_);
                 if (send_parity0_q_.empty()) {
                     send_parity0_completed_ = true;
-                    std::cout << "ECNAIVE: SendParity0 worker completed" << std::endl;
                     send_parity0_sentinel_received_ = false;
                 }
             }
@@ -2813,7 +2734,6 @@ private:
     }
 
     void send_parity1_worker() {
-        std::cout << "ECNAIVE: SendParity1 worker started" << std::endl;
         while (!stop_) {
             SendTask task;
             {
@@ -2830,7 +2750,6 @@ private:
                     std::lock_guard<std::mutex> lock(send_parity1_mutex_);
                     if (send_parity1_q_.empty()) {
                         send_parity1_completed_ = true;
-                        std::cout << "ECNAIVE: SendParity1 worker completed" << std::endl;
                         send_parity1_sentinel_received_ = false;
                     }
                 }
@@ -2844,7 +2763,6 @@ private:
                     // std::cout << "[ECNAIVE RDMA] Send_Parity1: Sending " << task.size << " bytes via RDMA" << std::endl;
                     send_parity1_channel_->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else {
-                    std::cout << "[ECNAIVE ASIO] Send_Parity1: Sending " << task.size << " bytes via ASIO" << std::endl;
                     send_with_size(conn_.get_send_parity1_socket(), task.addr, task.size);
                 }
             }
@@ -2858,7 +2776,6 @@ private:
                 std::lock_guard<std::mutex> lock(send_parity1_mutex_);
                 if (send_parity1_q_.empty()) {
                     send_parity1_completed_ = true;
-                    std::cout << "ECNAIVE: SendParity1 worker completed" << std::endl;
                     send_parity1_sentinel_received_ = false;
                 }
             }
@@ -2868,7 +2785,6 @@ private:
     // ========== Generalized save workers (for k+2 scheme) ==========
 
     void send_worker(int idx) {
-        std::cout << "ECNAIVE: SendWorker[" << idx << "] started" << std::endl;
         while (!stop_) {
             SendTask task;
             {
@@ -2916,7 +2832,6 @@ private:
     }
 
     void recv_worker(int idx) {
-        std::cout << "ECNAIVE: RecvWorker[" << idx << "] started" << std::endl;
         while (!stop_) {
             RecvTask task;
             {
@@ -3066,8 +2981,6 @@ private:
             for (int i = 0; i < kEcRsPoolSize; ++i) {
                 cpus[static_cast<size_t>(i)] = i;
             }
-            std::cout << "ECNAIVE: ECNAIVE_XOR_CPU_LIST not set; EC RS pool binds workers to CPUs 0.."
-                      << (kEcRsPoolSize - 1) << std::endl;
             return cpus;
         }
         std::vector<int> parsed;
@@ -3128,8 +3041,6 @@ private:
             }
         }
         ec_rs_pool_inited_.store(true, std::memory_order_release);
-        std::cout << "ECNAIVE: EC RS pthread pool (" << kEcRsPoolSize
-                  << " workers) initialized" << std::endl;
     }
 
     void ec_rs_pool_shutdown() {
@@ -3141,7 +3052,6 @@ private:
         }
         ec_rs_pool_stop_.store(false, std::memory_order_release);
         ec_rs_pool_inited_.store(false, std::memory_order_release);
-        std::cout << "ECNAIVE: EC RS pthread pool shut down" << std::endl;
     }
 
     static void* ec_rs_pool_pthread_entry(void* arg) {

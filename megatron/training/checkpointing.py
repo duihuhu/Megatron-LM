@@ -1399,10 +1399,11 @@ def _load_base_checkpoint(
                                 ([int(x.strip()) for x in failed_ranks_str.split(",")]
                                  if failed_ranks_str else None))
                 if failed_ranks is not None and torch.distributed.is_initialized():
-                    logger.info(
-                        f"EC-NAIVE: hardware recovery mode — "
-                        f"failed ranks {failed_ranks}"
-                    )
+                    if torch.distributed.get_rank() == 0:
+                        logger.info(
+                            f"EC-NAIVE: hardware recovery mode — "
+                            f"failed ranks {failed_ranks}"
+                        )
                     state_dict = load_ecnaive_legacy_checkpoint_hardware_recovery(
                         checkpoint_name, failed_ranks,
                     )
@@ -2412,6 +2413,18 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if rank == 0:
                     logger.info(
                         "ECCHECK load timing (%s): e2e_s=%.2fs h2d_s=%.2fs",
+                        ft_context.get("mode", "unknown"),
+                        summary["e2e_s"],
+                        summary["h2d_s"],
+                    )
+            elif ft_context.get("scheme") == "EC-NAIVE" and getattr(args, "use_ecnaive", False):
+                summary = _timing_max_dict({
+                    "e2e_s": recovery_e2e_s + h2d_total_s,
+                    "h2d_s": h2d_total_s,
+                })
+                if rank == 0:
+                    logger.info(
+                        "EC-NAIVE load timing (%s): e2e_s=%.2fs h2d_s=%.2fs",
                         ft_context.get("mode", "unknown"),
                         summary["e2e_s"],
                         summary["h2d_s"],

@@ -162,6 +162,67 @@ def _iter_ecnaive_load_stripes(total_bytes: int, stripe_bytes: int):
         pos += take
 
 
+def _find_owner_codeword_block_in_recv_pool(
+    owner_rig: int,
+    block_label: str,
+    ecnaive_k: int,
+    ecnaive_n: int,
+    rig_to_si: Dict[int, int],
+    recv_pool: List[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Locate one codeword block (data_j / parity0 / parity1) inside the HW recv pool."""
+    if block_label.startswith("data_"):
+        j = int(block_label.split("_", 1)[1])
+        if j == 0:
+            holder_rig = owner_rig
+            block_idx = 0
+        else:
+            holder_rig = (owner_rig + j) % ecnaive_n
+            block_idx = j
+    elif block_label == "parity0":
+        holder_rig = (owner_rig + ecnaive_k) % ecnaive_n
+        block_idx = ecnaive_k
+    elif block_label == "parity1":
+        holder_rig = (owner_rig + ecnaive_k + 1) % ecnaive_n
+        block_idx = ecnaive_k + 1
+    else:
+        return None
+
+    si = rig_to_si.get(holder_rig)
+    if si is None:
+        return None
+    pool_idx = si * ecnaive_n + block_idx
+    if pool_idx < 0 or pool_idx >= len(recv_pool):
+        return None
+    return recv_pool[pool_idx]
+
+
+def _collect_owner_codeword_survivors(
+    owner_rig: int,
+    ecnaive_k: int,
+    ecnaive_n: int,
+    rig_to_si: Dict[int, int],
+    recv_pool: List[torch.Tensor],
+) -> Tuple[Dict[str, torch.Tensor], List[int]]:
+    """Return surviving data/parity blocks and lost data indices for one owner codeword."""
+    raw_surviving: Dict[str, torch.Tensor] = {}
+    for j in range(ecnaive_k):
+        label = f"data_{j}"
+        block = _find_owner_codeword_block_in_recv_pool(
+            owner_rig, label, ecnaive_k, ecnaive_n, rig_to_si, recv_pool,
+        )
+        if block is not None:
+            raw_surviving[label] = block
+    for pname in ("parity0", "parity1"):
+        block = _find_owner_codeword_block_in_recv_pool(
+            owner_rig, pname, ecnaive_k, ecnaive_n, rig_to_si, recv_pool,
+        )
+        if block is not None:
+            raw_surviving[pname] = block
+    lost = [j for j in range(ecnaive_k) if f"data_{j}" not in raw_surviving]
+    return raw_surviving, lost
+
+
 def _submit_ecnaive_transfer_stripes(
     submit_fn,
     channel_idx: int,
@@ -235,41 +296,14 @@ def _build_hw_owner_codeword_plans(
     parity_pool_1: List[torch.Tensor],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor]]:
     """Precompute per-codeword decode/encode metadata for striped HW recovery."""
-
-    def _find_block_in_pool(owner_rig: int, role: str) -> Optional[torch.Tensor]:
-        if role == "data0":
-            si = rig_to_si.get(owner_rig)
-            return recv_pool[si * ecnaive_n] if si is not None else None
-        if role == "data1":
-            si = rig_to_si.get((owner_rig + 1) % ecnaive_n)
-            return recv_pool[si * ecnaive_n + 1] if si is not None else None
-        if role == "parity0":
-            si = rig_to_si.get((owner_rig + 2) % ecnaive_n)
-            return recv_pool[si * ecnaive_n + 2] if si is not None else None
-        if role == "parity1":
-            si = rig_to_si.get((owner_rig + 3) % ecnaive_n)
-            return recv_pool[si * ecnaive_n + 3] if si is not None else None
-        return None
-
     owner_plans: List[Dict[str, Any]] = []
     recovered_refs: Dict[str, torch.Tensor] = {}
     owner_idx = 0
 
     for owner_rig in owner_rigs:
-        raw_surviving: Dict[str, torch.Tensor] = {}
-        lost: List[int] = []
-        for role, label in [
-            ("data0", "data_0"),
-            ("data1", "data_1"),
-            ("parity0", "parity0"),
-            ("parity1", "parity1"),
-        ]:
-            block = _find_block_in_pool(owner_rig, role)
-            if block is not None:
-                raw_surviving[label] = block
-        for pos, label in enumerate(["data_0", "data_1"]):
-            if label not in raw_surviving:
-                lost.append(pos)
+        raw_surviving, lost = _collect_owner_codeword_survivors(
+            owner_rig, ecnaive_k, ecnaive_n, rig_to_si, recv_pool,
+        )
         m_owner = len(lost)
 
         surviving_continuous = {
@@ -323,8 +357,8 @@ def _build_hw_owner_codeword_plans(
                     encode_input_bases.append(recovered_bases[ri])
                     ri += 1
 
-        need_parity0 = (owner_rig + 2) % ecnaive_n == my_rig
-        need_parity1 = (owner_rig + 3) % ecnaive_n == my_rig
+        need_parity0 = (owner_rig + ecnaive_k) % ecnaive_n == my_rig
+        need_parity1 = (owner_rig + ecnaive_k + 1) % ecnaive_n == my_rig
         parity0 = parity_pool_0[owner_idx]
         parity1 = parity_pool_1[owner_idx]
 
@@ -332,12 +366,13 @@ def _build_hw_owner_codeword_plans(
             recovered_refs["own_data0_ref"] = recovered_data[0]
             if ecnaive_k > 1:
                 recovered_refs["my_data1_ref"] = recovered_data[1]
-        if (owner_rig + 1) % ecnaive_n == my_rig:
-            recovered_refs["recv_0_ref"] = recovered_data[1]
+        for j in range(1, ecnaive_k):
+            if (owner_rig + j) % ecnaive_n == my_rig:
+                recovered_refs[f"recv_{j - 1}_ref"] = recovered_data[j]
         if need_parity0:
-            recovered_refs["recv_1_ref"] = parity0
+            recovered_refs[f"recv_{ecnaive_k - 1}_ref"] = parity0
         if need_parity1:
-            recovered_refs["recv_2_ref"] = parity1
+            recovered_refs[f"recv_{ecnaive_k}_ref"] = parity1
 
         owner_plans.append(
             {
@@ -571,25 +606,10 @@ def _run_hw_failed_own_tensor_streaming_recovery(
     Hardware recovery used to materialize every recovered checkpoint block for
     cascading-failure tolerance. For multi-GB checkpoints and many failed ranks
     per node, that creates an OOM-scale CPU memory spike. This path keeps the
-    network protocol unchanged but decodes only the two data blocks needed to
+    network protocol unchanged but decodes only the k data blocks needed to
     rebuild this rank's state_dict, copying each stripe directly into the final
     tensor buffer.
     """
-
-    def _find_block(owner_rig: int, role: str) -> Optional[torch.Tensor]:
-        if role == "data0":
-            si = rig_to_si.get(owner_rig)
-            return recv_pool[si * ecnaive_n] if si is not None else None
-        if role == "data1":
-            si = rig_to_si.get((owner_rig + 1) % ecnaive_n)
-            return recv_pool[si * ecnaive_n + 1] if si is not None else None
-        if role == "parity0":
-            si = rig_to_si.get((owner_rig + 2) % ecnaive_n)
-            return recv_pool[si * ecnaive_n + 2] if si is not None else None
-        if role == "parity1":
-            si = rig_to_si.get((owner_rig + 3) % ecnaive_n)
-            return recv_pool[si * ecnaive_n + 3] if si is not None else None
-        return None
 
     def _copy_data_stripe(data_pos: int, src: torch.Tensor, byte_offset: int, size: int) -> None:
         dst = data_pos * block_data_size + byte_offset
@@ -608,21 +628,14 @@ def _run_hw_failed_own_tensor_streaming_recovery(
         native.wait_for_pending_network_tasks()
 
         decode_t0 = time.time()
-        raw_surviving: Dict[str, torch.Tensor] = {}
-        for role, label in [
-            ("data0", "data_0"),
-            ("data1", "data_1"),
-            ("parity0", "parity0"),
-            ("parity1", "parity1"),
-        ]:
-            block = _find_block(my_rig, role)
-            if block is not None:
-                raw_surviving[label] = block
-
-        lost = [pos for pos, label in enumerate(["data_0", "data_1"]) if label not in raw_surviving]
+        raw_surviving, lost = _collect_owner_codeword_survivors(
+            my_rig, ecnaive_k, ecnaive_n, rig_to_si, recv_pool,
+        )
         m_owner = len(lost)
         if m_owner == 0:
-            recovered_data = [raw_surviving["data_0"], raw_surviving["data_1"]]
+            recovered_data = [
+                raw_surviving[f"data_{j}"] for j in range(ecnaive_k)
+            ]
         else:
             data_labels = sorted(
                 [label for label in raw_surviving if label.startswith("data_")],
@@ -649,9 +662,8 @@ def _run_hw_failed_own_tensor_streaming_recovery(
                     recovered_data[pos] = recovered_blocks[ri]
                     ri += 1
 
-        _copy_data_stripe(0, recovered_data[0], byte_offset, take)
-        if ecnaive_k > 1:
-            _copy_data_stripe(1, recovered_data[1], byte_offset, take)
+        for j in range(ecnaive_k):
+            _copy_data_stripe(j, recovered_data[j], byte_offset, take)
         decode_s += time.time() - decode_t0
 
     return len(stripes), decode_s
@@ -1646,6 +1658,14 @@ def load_ecnaive_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         )
         from megatron.training.global_vars import set_ft_load_timing_context
         set_ft_load_timing_context("EC-NAIVE", "SW", _t)
+        load_log = dict(_t)
+        load_log["mode"] = "SW"
+        logger.debug(
+            "EC-NAIVE load timing (%(mode)s local): e2e_s=%(total).2fs "
+            "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
+            "barrier_s=%(barrier).2fs",
+            load_log,
+        )
         return state_dict
 
     if not isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
@@ -1754,7 +1774,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     resident memory when many ranks are colocated on one node. Legacy padded
     checkpoints keep the older full-block compatibility path.
     """
-    start_time = time.time()
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -1779,6 +1798,14 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     native = manager._ecnaive_native
     if native is None:
         raise RuntimeError("EC-NAIVE native module unavailable for hardware recovery")
+
+    try:
+        from megatron.training.global_vars import start_recovery_to_forward_timer
+        start_recovery_to_forward_timer(
+            "EC-NAIVE", "network_recovery", role="HW", rank0_only_max=True,
+        )
+    except Exception:
+        pass
 
     # Step 1: Load main payload + exchange metadata
     main_payload = _load_ecnaive_main_payload(checkpoint_dir, rank, world_size)
@@ -2032,37 +2059,13 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
             native.wait_for_encoding_completion()
             _t['network_recv'] = time.time() - _t0_net
 
-            def _find_block_in_pool(owner_rig: int, role: str) -> Optional[torch.Tensor]:
-                if role == 'data0':
-                    si = rig_to_si.get(owner_rig)
-                    return recv_pool[si * ecnaive_n] if si is not None else None
-                if role == 'data1':
-                    si = rig_to_si.get((owner_rig + 1) % ecnaive_n)
-                    return recv_pool[si * ecnaive_n + 1] if si is not None else None
-                if role == 'parity0':
-                    si = rig_to_si.get((owner_rig + 2) % ecnaive_n)
-                    return recv_pool[si * ecnaive_n + 2] if si is not None else None
-                if role == 'parity1':
-                    si = rig_to_si.get((owner_rig + 3) % ecnaive_n)
-                    return recv_pool[si * ecnaive_n + 3] if si is not None else None
-                return None
-
             decode_t0 = time.time()
             recovered: Dict[str, torch.Tensor] = {}
             owner_idx = 0
             for owner_rig in owner_rigs:
-                raw_surviving = {}
-                lost = []
-                for role, label in [
-                    ('data0', 'data_0'), ('data1', 'data_1'),
-                    ('parity0', 'parity0'), ('parity1', 'parity1'),
-                ]:
-                    block = _find_block_in_pool(owner_rig, role)
-                    if block is not None:
-                        raw_surviving[label] = block
-                for pos, label in enumerate(['data_0', 'data_1']):
-                    if label not in raw_surviving:
-                        lost.append(pos)
+                raw_surviving, lost = _collect_owner_codeword_survivors(
+                    owner_rig, ecnaive_k, ecnaive_n, rig_to_si, recv_pool,
+                )
                 m_owner = len(lost)
                 surviving: Dict[str, torch.Tensor] = {}
                 is_padded: Dict[str, bool] = {}
@@ -2074,7 +2077,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                         surviving[label] = padded[:block_data_size]
                         is_padded[label] = False
                 if m_owner == 0:
-                    recovered_data = [surviving['data_0'], surviving['data_1']]
+                    recovered_data = [
+                        surviving[f'data_{j}'] for j in range(ecnaive_k)
+                    ]
                 else:
                     data_labels = sorted(
                         [l for l in surviving if l.startswith('data_')],
@@ -2098,7 +2103,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                         [int(b.data_ptr()) for b in recovered_blocks],
                         block_data_size,
                     )
-                    recovered_data = [None, None]
+                    recovered_data = [None] * ecnaive_k
                     ri = 0
                     for pos in range(ecnaive_k):
                         label = f'data_{pos}'
@@ -2109,11 +2114,13 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                             ri += 1
                 if owner_rig == my_rig:
                     recovered['own_data0_ref'] = recovered_data[0]
-                    recovered['my_data1_ref'] = recovered_data[1]
-                if (owner_rig + 1) % ecnaive_n == my_rig:
-                    recovered['recv_0_ref'] = recovered_data[1]
-                need_parity0 = (owner_rig + 2) % ecnaive_n == my_rig
-                need_parity1 = (owner_rig + 3) % ecnaive_n == my_rig
+                    if ecnaive_k > 1:
+                        recovered['my_data1_ref'] = recovered_data[1]
+                for j in range(1, ecnaive_k):
+                    if (owner_rig + j) % ecnaive_n == my_rig:
+                        recovered[f'recv_{j - 1}_ref'] = recovered_data[j]
+                need_parity0 = (owner_rig + ecnaive_k) % ecnaive_n == my_rig
+                need_parity1 = (owner_rig + ecnaive_k + 1) % ecnaive_n == my_rig
                 if need_parity0 or need_parity1:
                     encode_inputs = [
                         recovered_data[j][:block_data_size] for j in range(ecnaive_k)
@@ -2129,9 +2136,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     )
                     _t['encode_s'] = max(_t.get('encode_s', 0.0), time.time() - t0_encode)
                     if need_parity0:
-                        recovered['recv_1_ref'] = parity0
+                        recovered[f'recv_{ecnaive_k - 1}_ref'] = parity0
                     if need_parity1:
-                        recovered['recv_2_ref'] = parity1
+                        recovered[f'recv_{ecnaive_k}_ref'] = parity1
                 owner_idx += 1
             _t['decode_s'] = time.time() - decode_t0
         else:
@@ -2280,12 +2287,28 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     native_timing = _native_ft_timing(native)
     _t['net_s'] = native_timing['net_s']
     _t.setdefault('encode_s', native_timing['encode_s'])
+    _t.setdefault('decode_s', _t.get('decode_s', _t['encode_s']))
     _t['total'] = (
         _t.get('network_encode', 0.0)
         + _t.get('rebuild_sd', 0.0)
     )
     from megatron.training.global_vars import set_ft_load_timing_context
-    set_ft_load_timing_context("EC-NAIVE", "HW recovery", _t)
+    set_ft_load_timing_context("EC-NAIVE", "HW", _t)
+
+    load_log = dict(_t)
+    load_log["mode"] = "HW"
+    logger.debug(
+        "EC-NAIVE load timing (%(mode)s local): e2e_s=%(total).2fs "
+        "network_encode_s=%(network_encode).2fs decode_s=%(decode_s).2fs "
+        "rebuild_sd_s=%(rebuild_sd).2fs barrier_s=%(barrier).2fs",
+        load_log,
+    )
+
+    try:
+        from megatron.training.global_vars import mark_recovery_to_forward_timer
+        mark_recovery_to_forward_timer("ecnaive_load_return")
+    except Exception:
+        pass
 
     # NOTE: do not call manager.cleanup() or native.stop() here.
     # The C++ destructor double-frees RDMA resources used during RS decode.

@@ -1413,8 +1413,11 @@ def _load_ecnaive_legacy_software_failure(
     has_padded_sw = ckpt_ver < 3
 
     if rank_in_group == failed_rig:
-        # Pre-allocate final tensor_buffer once (pinned for fast CPU→GPU copy)
-        buf_len = max(actual_tensor_size, pipeline_total_bytes)
+        # Pre-allocate final tensor_buffer once (pinned for fast CPU→GPU copy).
+        # Layout uses k stripes of block_data_size; k * block_data_size can exceed
+        # pipeline_total_bytes by up to (k - 1) bytes due to ceil division.
+        layout_bytes = k * block_data_size
+        buf_len = max(actual_tensor_size, layout_bytes)
         tensor_buffer = _allocate_pinned_uint8_buffer(buf_len)
         # Load local d_{f,0} into tensor_buffer
         own_data0 = _load_ecnaive_block_file(

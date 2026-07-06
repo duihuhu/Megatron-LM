@@ -114,6 +114,10 @@ ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 case "$MODE" in
     save)
+        RECOVERY_MODE_ARGS=(
+            --save $CHECKPOINT_PATH
+            --ec-checkpoint-write-only-penultimate-iter
+        )
         ;;
     software)
         RECOVERY_MODE_ARGS=(
@@ -134,13 +138,12 @@ esac
 # 模型固定参数
 HIDDEN_SIZE=5120
 NUM_ATTENTION_HEADS=40
-NUM_LAYERS=64 
+NUM_LAYERS=64
 
-
-SEQ_LENGTH=1024
+SEQ_LENGTH=4096
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
 MICRO_BATCH_SIZE=4
-GLOBAL_BATCH_SIZE=16
+GLOBAL_BATCH_SIZE=32
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -199,7 +202,7 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    --save $CHECKPOINT_PATH
+    #--save $CHECKPOINT_PATH
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
@@ -221,7 +224,7 @@ EVAL_AND_LOGGING_ARGS=(
     # ---------------------------------------------------------------------------
     # 分组大小：将 world 划分为独立组，副本仅在组内轮询
     # ---------------------------------------------------------------------------
-    --gemini-replicas-group-size 4   # 默认 None（全局轮询，不做分组）
+    --gemini-replicas-group-size 8   # 默认 None（全局轮询，不做分组）
                                         # 设 8 则每 8 个 rank 一组，每组独立
                                         # 必须能被 world_size 整除
                                         # 独立于节点数和每节点 rank 数，但数学上要求

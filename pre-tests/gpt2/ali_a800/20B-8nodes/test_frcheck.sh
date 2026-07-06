@@ -1,4 +1,4 @@
-#!/bin/bash
+zj#!/bin/bash
 
 # FRCheck (POA-driven stripe encode with RDMA) — single-node script.
 # Usage: ./test_eccheck_4nodes_node_335M_frcheck.sh <node_rank> [<gpu_id_0> [gpu_id_1 ...]] [additional_args...]
@@ -28,7 +28,6 @@ export FRCHECK_INTERFACE=$NETIFACES_INTERFACE
 export FRCHECK_BASE_IP=$MASTER_ADDR
 MASTER_PORT=6000
 NNODES=8
-
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 
@@ -106,8 +105,7 @@ case "$MODE" in
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
             --frcheck-async-recovery-forward
-            #--no-load-optim
-            #--no-load-rng
+            --frcheck-recovery-async-parity
             --frcheck-failed-ranks "0,1,2,3,4,5,6,7"
             --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
@@ -127,10 +125,9 @@ esac
 # Model configuration
 HIDDEN_SIZE=5120
 NUM_ATTENTION_HEADS=40
-NUM_LAYERS=64 
+NUM_LAYERS=64
 
-
-SEQ_LENGTH=2048
+SEQ_LENGTH=4096
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
 MICRO_BATCH_SIZE=4
 GLOBAL_BATCH_SIZE=32
@@ -158,7 +155,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00005
-    --train-iters 20
+    --train-iters 10
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -189,20 +186,15 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     #--save $CHECKPOINT_PATH
+    --ec-checkpoint-write-only-penultimate-iter
     #--load $CHECKPOINT_PATH
     
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
     --use-frcheck
-    --ec-checkpoint-write-only-penultimate-iter
     --frcheck-n 8
-    --frcheck-distribute-common
     --frcheck-table-dir $FRCHECK_TABLE_DIR
-    --frcheck-async-parity
-    --frcheck-skip-load-teardown-barrier
-    #--frcheck-failed-ranks 0,1
-    #--use-frcheck-hardware-failure
     --ckpt-format torch
     --save-embeddings-separately
     # --timing-log-level 2

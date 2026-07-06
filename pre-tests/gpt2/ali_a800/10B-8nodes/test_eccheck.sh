@@ -124,9 +124,9 @@ case "$MODE" in
 esac
 
 # Model related configuration here, please do not overlap with json config
-HIDDEN_SIZE=5120
+HIDDEN_SIZE=4800
 NUM_ATTENTION_HEADS=40
-NUM_LAYERS=64
+NUM_LAYERS=40
 
 SEQ_LENGTH=4096
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH

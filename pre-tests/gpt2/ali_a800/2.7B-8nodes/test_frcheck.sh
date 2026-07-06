@@ -1,43 +1,38 @@
-#!/bin/bash
+zj#!/bin/bash
 
-# Script to run a single node in 4-node simulation (default 1 GPU per node)
-# Usage: ./test_eccheck_4nodes_node_335M_eccheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [mode] [additional_args...]
-#
-# mode (optional, default: save):
-#   save      - checkpoint save only (no load / recovery flags)
-#   software  - load checkpoint + software failure recovery
-#   hardware  - load checkpoint + hardware failure recovery
-#
-# Example: ./test_eccheck_4nodes_node_335M_eccheck.sh 0 0
-# Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_eccheck.sh 0 2 3 software
-# Example (8 GPUs, hardware recovery): ./test_eccheck_4nodes_node_335M_eccheck.sh 0 0 1 2 3 4 5 6 7 hardware
+# FRCheck (POA-driven stripe encode with RDMA) — single-node script.
+# Usage: ./test_eccheck_4nodes_node_335M_frcheck.sh <node_rank> [<gpu_id_0> [gpu_id_1 ...]] [additional_args...]
+# Example: ./test_eccheck_4nodes_node_335M_frcheck.sh 0
+# Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_frcheck.sh 0 2 3
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
 export NETIFACES_INTERFACE=eth0
+export FRCHECK_LOCAL_RANK_NIC_0=eth0
+export FRCHECK_LOCAL_RANK_NIC_1=eth0
+export FRCHECK_LOCAL_RANK_NIC_2=eth0
+export FRCHECK_LOCAL_RANK_NIC_3=eth0
+export FRCHECK_LOCAL_RANK_NIC_4=eth1
+export FRCHECK_LOCAL_RANK_NIC_5=eth1
+export FRCHECK_LOCAL_RANK_NIC_6=eth1
+export FRCHECK_LOCAL_RANK_NIC_7=eth1
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
 MASTER_ADDR=172.16.0.224
 
-export ECCHECK_USE_ASIO=true
+export ECCHECK_USE_ASIO=false
+export FRCHECK_INTERFACE=$NETIFACES_INTERFACE
+export FRCHECK_BASE_IP=$MASTER_ADDR
 MASTER_PORT=6000
 NNODES=8
-
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
-export ECCHECK_INTERFACE=$NETIFACES_INTERFACE
-export ECCHECK_LOCAL_RANK_NIC_0=eth0
-export ECCHECK_LOCAL_RANK_NIC_1=eth0
-export ECCHECK_LOCAL_RANK_NIC_2=eth0
-export ECCHECK_LOCAL_RANK_NIC_3=eth0  
-export ECCHECK_LOCAL_RANK_NIC_4=eth1
-export ECCHECK_LOCAL_RANK_NIC_5=eth1
-export ECCHECK_LOCAL_RANK_NIC_6=eth1
-export ECCHECK_LOCAL_RANK_NIC_7=eth1
-export MEGATRON_ECCHECK_LOAD_NET_TRACE=1
+
+# POA table directory (auto-generates if file not found)
+FRCHECK_TABLE_DIR="/workspace/Megatron-LM/megatron/core/dist_checkpointing/strategies"
 
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
@@ -48,7 +43,7 @@ if [ -n "$1" ]; then
     fi
 fi
 
-# Next arguments are GPU IDs, collect them until we hit a non-numeric (additional args start with non-numeric or --)
+# Next arguments are GPU IDs, collect them until we hit a non-numeric
 GPU_IDS=()
 while [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; do
     GPU_IDS+=("$1")
@@ -56,31 +51,22 @@ while [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; do
 done
 
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
-    if command -v nvidia-smi > /dev/null 2>&1; then
-        # Try to get all GPU indices using nvidia-smi, fallback to 0 if nvidia-smi fails
-        mapfile -t GPU_IDS < <(nvidia-smi --query-gpu=index --format=csv,noheader)
-        if [ "${#GPU_IDS[@]}" -eq 0 ]; then
-            GPU_IDS=(0)
-        fi
-    else
-        # If nvidia-smi does not exist, fallback to single GPU 0
-        GPU_IDS=(0)
+    # No GPU IDs provided: use all GPUs in the system
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "Error: nvidia-smi not found and no GPU IDs specified."
+        exit 1
     fi
-fi
-
-# ---- mode parsing (save | software | hardware, after GPU IDs) ----
-MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
-    MODE="$1"
-    shift
+    mapfile -t ALL_IDS < <(nvidia-smi --query-gpu=index --format=csv,noheader)
+    if [ "${#ALL_IDS[@]}" -eq 0 ]; then
+        echo "Error: No GPUs found on this node."
+        exit 1
+    fi
+    GPU_IDS=("${ALL_IDS[@]}")
 fi
 
 GPUS_PER_NODE=${#GPU_IDS[@]}
 
-# Set CUDA_VISIBLE_DEVICES by explicitly listing all provided GPU IDs (as comma-separated values)
 export CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_IDS[*]}")
-
-# Set NCCL_DEBUG_FILE after NODE_RANK is determined
 export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
@@ -88,51 +74,63 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/opt/7B/opt-7b-0/logs"
-CHECKPOINT_PATH="/dev/shm/models/opt-7b-0-eccheck"
+CHECKPOINT_PATH="/dev/shm/models/opt-7b-0-frcheck"
 # DATA_PATH="/workspace/Megatron-LM/pre-tests/opt/opt_data/wiki_text_sentence"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
-# Remaining args after node-rank and GPU ids are passed to the training script
-ARGS_TO_PASS=("$@")
 
-# Recovery mode args: enabled only for software / hardware load tests
+MODE=save
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
+    MODE="$1"
+    shift
+fi
+ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
+            --ec-checkpoint-write-only-penultimate-iter
+            --frcheck-async-parity
         )
         ;;
     software)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            --use-eccheck-software-failure
         )
         ;;
     hardware)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
+            --use-frcheck-hardware-failure
+            --frcheck-async-recovery-forward
+            --frcheck-recovery-async-parity
+            --frcheck-failed-ranks "0,1,2,3,4,5,6,7"
+            --frcheck-recovery-safe-point optimizer_step
+            --frcheck-recovery-only-teardown
+            # Native RDMA stays alive until optimizer_step; forked DataLoader workers segfault.
+            --num-workers 0
         )
         ;;
     hardware2)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            --use-eccheck-two-failures
+            --use-frcheck-hardware-failure
+            --frcheck-failed-ranks "0,1"
         )
         ;;
 esac
 
-# Model related configuration here, please do not overlap with json config
-HIDDEN_SIZE=5120
-NUM_ATTENTION_HEADS=40
-NUM_LAYERS=64
+# Model configuration
+HIDDEN_SIZE=2560
+NUM_ATTENTION_HEADS=32
+NUM_LAYERS=32
 
 SEQ_LENGTH=4096
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
 MICRO_BATCH_SIZE=4
 GLOBAL_BATCH_SIZE=32
-
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -158,7 +156,6 @@ GPT_ARGS=(
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00005
     --train-iters 10
-    --ec-checkpoint-write-only-penultimate-iter
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -189,31 +186,34 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     #--save $CHECKPOINT_PATH
+    --ec-checkpoint-write-only-penultimate-iter
     #--load $CHECKPOINT_PATH
+    
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
-    --use-eccheck
+
+    --use-frcheck
+    --frcheck-n 8
+    --frcheck-table-dir $FRCHECK_TABLE_DIR
     --ckpt-format torch
     --save-embeddings-separately
     # --timing-log-level 2
-    # --timing-log-option all
-    --use-rdma
 )
 
 mkdir -p logs
 mkdir -p logs/csv
 
 # -------------------------------------------------------------------------
-# Print command if PRINT_CMD is set
-# -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK, mode=$MODE): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} ${RECOVERY_MODE_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
 
-echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (mode=$MODE)"
+echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (FRCheck)"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
+echo "FRCHECK_TABLE_DIR: $FRCHECK_TABLE_DIR"
+echo "FRCHECK_BASE_IP: $FRCHECK_BASE_IP"
 
 export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \
@@ -223,7 +223,7 @@ PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     ${GPT_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
-    ${EVAL_AND_LOGGING_ARGS[@]} \
     ${RECOVERY_MODE_ARGS[@]} \
+    ${EVAL_AND_LOGGING_ARGS[@]} \
     --distributed-backend nccl \
     ${ARGS_TO_PASS[@]}

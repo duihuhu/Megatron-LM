@@ -736,11 +736,12 @@ def save_eccheck_legacy_checkpoint(
         "net_s": native_timing["net_s"],
         "encode_s": native_timing["encode_s"],
     })
-    logger.info(
-        "ECCHECK save timing: e2e_s=%(e2e_s).2fs d2h_s=%(d2h_s).2fs "
-        "network_encode_s=%(network_encode_s).2fs net_s=%(net_s).2fs encode_s=%(encode_s).2fs",
-        summary,
-    )
+    if rank == 0:
+        logger.info(
+            "ECCHECK save timing: e2e_s=%(e2e_s).2fs d2h_s=%(d2h_s).2fs "
+            "network_encode_s=%(network_encode_s).2fs net_s=%(net_s).2fs encode_s=%(encode_s).2fs",
+            summary,
+        )
 
     if write_to_disk:
         _save_eccheck_pt_files(
@@ -754,7 +755,7 @@ def save_eccheck_legacy_checkpoint(
             all_tensor_infos=rank_metadata,
         )
     else:
-        logger.info(
+        logger.debug(
             "ECCHECK save: skipping checkpoint file writes for this iteration"
         )
     if world_size > 1:
@@ -1850,6 +1851,22 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     # Sync all ranks after setup so network timing excludes setup skew.
     barrier_s = _timed_barrier()
 
+    if two_failures:
+        _mode = "HW2"
+    elif sw_failure:
+        _mode = "SW"
+    else:
+        _mode = "HW"
+
+    if _mode in ("HW", "HW2"):
+        try:
+            from megatron.training.global_vars import start_recovery_to_forward_timer
+            start_recovery_to_forward_timer(
+                "ECCHECK", "network_recovery", role=_mode, rank0_only_max=True,
+            )
+        except Exception:
+            pass
+
     # === timing: network/encode (C++ P2P or XOR pipeline, excluding setup/copy) ===
     recovery_prep_copy_s = 0.0
     if two_failures:
@@ -1875,12 +1892,12 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         )
     prep_copy_s += recovery_prep_copy_s
 
-    if two_failures:
-        _mode = "HW2"
-    elif sw_failure:
-        _mode = "SW"
-    else:
-        _mode = "HW"
+    if _mode in ("HW", "HW2"):
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("eccheck_network_done")
+        except Exception:
+            pass
 
     # SW rig0 rebuilds from the same data it sends; rig1 rebuilds from the
     # recovered P2P buffer. rig2/3 keep using their local main tensor buffers.
@@ -1927,18 +1944,12 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     from megatron.training.global_vars import set_ft_load_timing_context
     set_ft_load_timing_context("ECCHECK", _mode, timings)
 
-    load_summary = (
-        _timing_max_dict(timings)
-        if world_size > 1 and torch.distributed.is_initialized()
-        else dict(timings)
-    )
-    load_log = dict(load_summary)
+    load_log = dict(timings)
     load_log["mode"] = _mode
-    logger.info(
-        "ECCHECK load recovery timing (%(mode)s): recovery_e2e_s=%(total).4fs "
-        "network_encode_s=%(network_encode).4fs net_s=%(net_s).4fs "
-        "decode_s=%(decode_s).4fs rebuild_sd_s=%(rebuild_sd).4fs "
-        "prep_copy_s=%(prep_copy).4fs rebuild_from_recovered=%(rebuild_from_recovered).0f",
+    logger.debug(
+        "ECCHECK load timing (%(mode)s local): e2e_s=%(total).2fs "
+        "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
+        "barrier_s=%(barrier).2fs",
         load_log,
     )
 
@@ -1946,9 +1957,14 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     # Synchronize teardown so early ranks do not release RDMA resources while peers
     # are still draining their final load P2P completions.
     if world_size > 1 and torch.distributed.is_initialized():
-        logger.info(f"ECCHECK legacy: rank {rank} entering pre-cleanup barrier")
         torch.distributed.barrier()
-        logger.info(f"ECCHECK legacy: rank {rank} leaving pre-cleanup barrier")
+
+    if _mode in ("HW", "HW2"):
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("eccheck_load_return")
+        except Exception:
+            pass
 
     # Defer manager.cleanup() until after load_state_dict H2D in checkpointing.py.
     # Early cudaHostUnregister makes rebuild_sd views non-pinned and under-reports h2d_s.

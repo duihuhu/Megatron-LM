@@ -100,7 +100,7 @@ class ECCHECKManager:
             if self.preallocated_cpu_buffer.numel() >= size_bytes:
                 return
         pin = self.eccheck_pin_memory and torch.cuda.is_available()
-        logger.info(
+        logger.debug(
             f"ECCHECK: Allocating preallocated buffer: {size_bytes / (1024**3):.2f} GB (pin={pin})"
         )
         self.preallocated_cpu_buffer = allocate_hugepage_tensor(
@@ -118,7 +118,7 @@ class ECCHECKManager:
                 and self._cached_block_size >= aligned_size):
             return self._cached_blocks
         pin = self.eccheck_pin_memory and torch.cuda.is_available()
-        logger.info(
+        logger.debug(
             f"ECCHECK: Allocating {count} blocks: {aligned_size / (1024**3):.2f} GB each "
             f"({count * aligned_size / (1024**3):.2f} GB total, pin={pin})"
         )
@@ -354,13 +354,13 @@ class ECCHECKManager:
                     ip_bytes = bytes(ip_tensor.cpu().tolist())
                     rank_ips[r] = socket.inet_ntoa(ip_bytes)
                 
-                logger.info(f"EC-CHECK: [Rank {rank}] All ranks IPs: {rank_ips}")
+                logger.debug(f"EC-CHECK: [Rank {rank}] All ranks IPs: {rank_ips}")
 
                 # Get partner IPs from gathered results
                 xor_partner_ip = rank_ips.get(xor_partner, base_ip)
                 p2p_partner_ip = rank_ips.get(p2p_partner, base_ip)
 
-                logger.info(
+                logger.debug(
                     f"EC-CHECK: [Rank {rank}] IP exchange completed - "
                     f"XOR partner ({xor_partner}): {xor_partner_ip}, "
                     f"P2P partner ({p2p_partner}): {p2p_partner_ip}"
@@ -375,7 +375,7 @@ class ECCHECKManager:
                 rank_ips = {r: base_ip for r in range(world_size)}
         else:
             # Single rank mode - use local IP
-            logger.info("EC-CHECK: Distributed not initialized, using local IP for all partners")
+            logger.debug("EC-CHECK: Distributed not initialized, using local IP for all partners")
             rank_ips = {r: base_ip for r in range(world_size)}
 
         group_id = self._get_group_id(rank, world_size)
@@ -392,7 +392,7 @@ class ECCHECKManager:
             'group_id': group_id,
         }
 
-        logger.info(
+        logger.debug(
             f"EC-CHECK: [Rank {rank}] Network config:\n"
             f"  My IP: {config['my_ip']}\n"
             f"  Base port: {config['base_port']}\n"
@@ -468,7 +468,7 @@ class ECCHECKManager:
                 if use_asio or self.use_rdma:
                     # ===== ASIO/RDMA Initialization Path =====
                     transport_mode = "RDMA" if self.use_rdma else "ASIO"
-                    logger.info(f"EC-CHECK: [Rank {rank}] Using {transport_mode} for communication")
+                    logger.debug(f"EC-CHECK: [Rank {rank}] Using {transport_mode} for communication")
                     
                     # Check RDMA availability if RDMA mode is requested
                     if self.use_rdma:
@@ -495,13 +495,12 @@ class ECCHECKManager:
                     net_config = self._get_eccheck_network_config(rank, world_size)
                     
                     # Synchronize all ranks before creating C++ instances
-                    logger.info(f"EC-CHECK: [Rank {rank}] Synchronizing all ranks before creating C++ native module ({transport_mode})...")
+                    logger.debug(f"EC-CHECK: [Rank {rank}] Synchronizing all ranks before creating C++ native module ({transport_mode})...")
                     torch.distributed.barrier()
-                    logger.info(f"EC-CHECK: [Rank {rank}] All ranks synchronized, creating C++ native module with {transport_mode}...")
+                    logger.debug(f"EC-CHECK: [Rank {rank}] All ranks synchronized, creating C++ native module with {transport_mode}...")
                     
                     # Create C++ instance with ASIO/RDMA parameters
-                    logger.info(f"EC-CHECK: Creating C++ native module with {transport_mode} (this will block until connections are established)...")
-                    print(f"EC-CHECK: [Rank {rank}] Creating C++ native module with {transport_mode} (blocking until initialization completes)...")
+                    logger.debug(f"EC-CHECK: Creating C++ native module with {transport_mode} (this will block until connections are established)...")
                     
                     # Calculate partner ports (send connects to partner's recv port)
                     # For XOR: rank 0 sends to rank 2's recv port, rank 2 sends to rank 0's recv port
@@ -575,15 +574,14 @@ class ECCHECKManager:
                     )
                     
                     # If we reach here, ASIO/RDMA connections are ready and threads are running
-                    logger.info(f"EC-CHECK: C++ native module initialized successfully with {transport_mode} (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
-                    print(f"EC-CHECK: [Rank {rank}] C++ native module initialized - {transport_mode} connections ready for data exchange")
+                    logger.debug(f"EC-CHECK: C++ native module initialized successfully with {transport_mode} (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
                     
                     # Initialize EC-CHECK buffers (same for both ASIO and NCCL)
                     self._init_eccheck_buffers()
                     
                 else:
                     # ===== NCCL Initialization Path (original) =====
-                    logger.info(f"EC-CHECK: [Rank {rank}] Using NCCL for communication")
+                    logger.debug(f"EC-CHECK: [Rank {rank}] Using NCCL for communication")
                     
                     # ===== Step 1: Rank 0 generates four NCCL IDs =====
                     # thread1: for rank0↔rank2 XOR communication
@@ -596,7 +594,7 @@ class ECCHECKManager:
                         nccl_id_thread2 = eccheck_native.generate_nccl_id()  # rank1↔rank3
                         nccl_id_p2p_0_1 = eccheck_native.generate_nccl_id()  # rank0↔rank1
                         nccl_id_p2p_2_3 = eccheck_native.generate_nccl_id()  # rank2↔rank3
-                        logger.info(f"EC-CHECK: [Rank 0] Generated four NCCL IDs (size: {len(nccl_id_thread1)} bytes each)")
+                        logger.debug(f"EC-CHECK: [Rank 0] Generated four NCCL IDs (size: {len(nccl_id_thread1)} bytes each)")
                     else:
                         # Other ranks prepare empty lists (will be filled by broadcast)
                         nccl_id_thread1 = [0] * 128  # NCCL ID is typically 128 bytes
@@ -634,14 +632,14 @@ class ECCHECKManager:
                     nccl_id_p2p_0_1 = id_p2p_0_1_tensor.cpu().tolist()
                     nccl_id_p2p_2_3 = id_p2p_2_3_tensor.cpu().tolist()
                     
-                    logger.info(f"EC-CHECK: [Rank {rank}] Received four NCCL IDs via broadcast")
+                    logger.debug(f"EC-CHECK: [Rank {rank}] Received four NCCL IDs via broadcast")
                     
                     # ===== Step 3: Synchronize all ranks before creating C++ instances =====
                     # This barrier ensures all ranks start creating C++ instances at roughly the same time,
                     # which helps synchronize the NCCL communicator initialization calls.
-                    logger.info(f"EC-CHECK: [Rank {rank}] Synchronizing all ranks before creating C++ native module...")
+                    logger.debug(f"EC-CHECK: [Rank {rank}] Synchronizing all ranks before creating C++ native module...")
                     torch.distributed.barrier()
-                    logger.info(f"EC-CHECK: [Rank {rank}] All ranks synchronized, creating C++ native module...")
+                    logger.debug(f"EC-CHECK: [Rank {rank}] All ranks synchronized, creating C++ native module...")
                     
                     # ===== Step 4: Create C++ instance with broadcasted IDs =====
                     # IMPORTANT: This constructor call will BLOCK until:
@@ -649,8 +647,7 @@ class ECCHECKManager:
                     # 2. All NCCL communicators are fully initialized using the broadcasted IDs
                     # 3. All threads are ready for data exchange
                     # Only after all initialization is complete will this call return.
-                    logger.info(f"EC-CHECK: Creating C++ native module (this will block until NCCL is initialized)...")
-                    print(f"EC-CHECK: [Rank {rank}] Creating C++ native module (blocking until NCCL initialization completes)...")
+                    logger.debug(f"EC-CHECK: Creating C++ native module (this will block until NCCL is initialized)...")
                     
                     rank_in_group = self._get_rank_in_group(rank, world_size)
                     p2p_partner_rank = self.get_p2p_partner_rank(rank, world_size)
@@ -665,8 +662,7 @@ class ECCHECKManager:
                     )
                     
                     # If we reach here, NCCL communicators are ready and threads are running
-                    logger.info(f"EC-CHECK: C++ native module initialized successfully (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
-                    print(f"EC-CHECK: [Rank {rank}] C++ native module initialized - NCCL communicators ready for data exchange")
+                    logger.debug(f"EC-CHECK: C++ native module initialized successfully (rank={rank}, world_size={world_size}, paired_rank={paired_rank})")
                     
                     # Initialize EC-CHECK buffers
                     self._init_eccheck_buffers()
@@ -697,8 +693,7 @@ class ECCHECKManager:
         when peer data sizes are known.
         """
         rank = torch.distributed.get_rank()
-        logger.info("EC-CHECK: Initializing buffers for EC-CHECK (data and encoding only)")
-        print(f"EC-CHECK: Initializing buffers for EC-CHECK (rank={rank}, data and encoding only)")
+        logger.debug("EC-CHECK: Initializing buffers for EC-CHECK (data and encoding only)")
         
         # Allocate data buffers for storing original tensor data
         self.eccheck_data_buffers = self._allocate_data_buffers()
@@ -728,14 +723,10 @@ class ECCHECKManager:
         for buffer in self.eccheck_parity_buffers:
             self._free_parity_buffer_queue.put(int(buffer.data_ptr()))
 
-        logger.info(f"EC-CHECK: Buffer initialization completed - "
+        logger.debug(f"EC-CHECK: Buffer initialization completed - "
                    f"Data buffers: {len(self.eccheck_data_buffers)}, "
                    f"Encoding buffers: {len(self.eccheck_encoding_buffers)}, "
                    f"Parity buffers: {len(self.eccheck_parity_buffers)}")
-        print(f"EC-CHECK: Buffer initialization completed (rank={rank}) - "
-              f"Data buffers: {len(self.eccheck_data_buffers)}, "
-              f"Encoding buffers: {len(self.eccheck_encoding_buffers)}, "
-              f"Parity buffers: {len(self.eccheck_parity_buffers)}")
         
         # Register all buffers for RDMA if RDMA is enabled
         if self.use_rdma:
@@ -743,7 +734,7 @@ class ECCHECKManager:
     
     def _allocate_data_buffers(self):
         """Allocate data buffers for storing original tensor data."""
-        logger.info(f"EC-CHECK: Allocating data buffers ({self.eccheck_data_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
+        logger.debug(f"EC-CHECK: Allocating data buffers ({self.eccheck_data_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
         
         data_buffers = []
         for i in range(self.eccheck_data_buffers_count):
@@ -755,12 +746,12 @@ class ECCHECKManager:
             data_buffers.append(buffer)
             logger.debug(f"EC-CHECK: Allocated data buffer {i}: {self.eccheck_buffer_size} bytes")
         
-        logger.info(f"EC-CHECK: Allocated {len(data_buffers)} data buffers")
+        logger.debug(f"EC-CHECK: Allocated {len(data_buffers)} data buffers")
         return data_buffers
     
     def _allocate_encoding_buffers(self):
         """Allocate encoding buffers for encoded packets."""
-        logger.info(f"EC-CHECK: Allocating encoding buffers ({self.eccheck_encoding_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
+        logger.debug(f"EC-CHECK: Allocating encoding buffers ({self.eccheck_encoding_buffers_count} buffers, {self.eccheck_buffer_size // (1024*1024)}MB each)")
         
         encoding_buffers = []
         for i in range(self.eccheck_encoding_buffers_count):
@@ -772,7 +763,7 @@ class ECCHECKManager:
             encoding_buffers.append(buffer)
             logger.debug(f"EC-CHECK: Allocated encoding buffer {i}: {self.eccheck_buffer_size} bytes")
         
-        logger.info(f"EC-CHECK: Allocated {len(encoding_buffers)} encoding buffers")
+        logger.debug(f"EC-CHECK: Allocated {len(encoding_buffers)} encoding buffers")
         return encoding_buffers
     
     def _allocate_parity_buffers(self):
@@ -784,7 +775,7 @@ class ECCHECKManager:
         # Use encoding buffer count instead of data buffer count
         # Each data chunk needs 2 parity buffers (thread1 and thread2)
         parity_buffer_count = self.eccheck_encoding_buffers_count
-        logger.info(f"EC-CHECK: Allocating parity buffers ({parity_buffer_count} buffers)")
+        logger.debug(f"EC-CHECK: Allocating parity buffers ({parity_buffer_count} buffers)")
         
         parity_buffers = []
         for i in range(parity_buffer_count):
@@ -796,7 +787,7 @@ class ECCHECKManager:
             parity_buffers.append(buffer)
             logger.debug(f"EC-CHECK: Allocated parity buffer {i}: {self.eccheck_buffer_size} bytes")
         
-        logger.info(f"EC-CHECK: Allocated {len(parity_buffers)} parity buffers")
+        logger.debug(f"EC-CHECK: Allocated {len(parity_buffers)} parity buffers")
         return parity_buffers
     
     def _poll_and_release_buffers(self):
@@ -843,7 +834,7 @@ class ECCHECKManager:
         
         def buffer_poller_worker():
             """Persistent background thread that polls for buffer releases."""
-            logger.info("EC-CHECK: Buffer poller thread started")
+            logger.debug("EC-CHECK: Buffer poller thread started")
             poll_count = 0
             
             while not self._buffer_poller_stop_event.is_set():
@@ -858,19 +849,19 @@ class ECCHECKManager:
                 from time import sleep
                 sleep(0.001)  # 1ms
             
-            logger.info("EC-CHECK: Buffer poller thread stopping")
+            logger.debug("EC-CHECK: Buffer poller thread stopping")
         
         # Start the daemon thread
         self._buffer_poller_thread = threading.Thread(target=buffer_poller_worker, daemon=True)
         self._buffer_poller_thread.start()
-        logger.info("EC-CHECK: Buffer poller thread created and started")
+        logger.debug("EC-CHECK: Buffer poller thread created and started")
     
     def _stop_buffer_poller_thread(self):
         """Stop the persistent buffer poller thread."""
         if not hasattr(self, '_buffer_poller_thread') or self._buffer_poller_thread is None:
             return
         
-        logger.info("EC-CHECK: Stopping buffer poller thread...")
+        logger.debug("EC-CHECK: Stopping buffer poller thread...")
         
         # Signal the thread to stop
         if self._buffer_poller_stop_event:
@@ -882,7 +873,7 @@ class ECCHECKManager:
             if self._buffer_poller_thread.is_alive():
                 logger.warning("EC-CHECK: Buffer poller thread did not stop in time")
             else:
-                logger.info("EC-CHECK: Buffer poller thread stopped successfully")
+                logger.debug("EC-CHECK: Buffer poller thread stopped successfully")
         
         self._buffer_poller_thread = None
         self._buffer_poller_stop_event = None
@@ -946,7 +937,7 @@ class ECCHECKManager:
         # Align maximum size to buffer_size (64MB) so recv buffers match pipeline iterations
         aligned_size = ((max_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size + 1) * self.eccheck_buffer_size
         
-        logger.info(
+        logger.debug(
             f"EC-CHECK: Allocating TWO receive buffers using global maximum size\n"
             f"  Paired rank: {paired_rank}\n"
             f"  Peer data size: {peer_total_size / (1024**3):.2f} GB\n"
@@ -963,7 +954,7 @@ class ECCHECKManager:
             touch_pages=True,
         )
         
-        logger.info(
+        logger.debug(
             f"EC-CHECK: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "
             f"({aligned_size / (1024**2):.0f} MB each)"
         )
@@ -972,7 +963,7 @@ class ECCHECKManager:
         
         # Register receive buffers for RDMA if RDMA is enabled
         if self.use_rdma:
-            logger.info(f"EC-CHECK: [Rank {rank}] Registering receive buffers for RDMA...")
+            logger.debug(f"EC-CHECK: [Rank {rank}] Registering receive buffers for RDMA...")
             self.register_buffer(recv_buffer_thread1)
             self.register_buffer(recv_buffer_thread2)
         
@@ -1000,7 +991,7 @@ class ECCHECKManager:
                     f"(registered={registered_size / (1024**2):.2f} MB, requested={buffer_size / (1024**2):.2f} MB)"
                 )
                 return
-            logger.info(
+            logger.debug(
                 f"EC-CHECK: [Rank {rank}] Re-registering buffer at 0x{buffer_addr:x} "
                 f"to expand coverage from {registered_size / (1024**2):.2f} MB "
                 f"to {buffer_size / (1024**2):.2f} MB"
@@ -1015,13 +1006,13 @@ class ECCHECKManager:
             self.registered_buffers.pop(buffer_addr, None)
         
         try:
-            logger.info(f"EC-CHECK: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
+            logger.debug(f"EC-CHECK: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
             self._eccheck_native.register_buffer(buffer_addr, buffer_size)
             self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
-            logger.info(f"EC-CHECK: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
+            logger.debug(f"EC-CHECK: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
             
             # Print all registered buffers
-            logger.info(f"EC-CHECK: [Rank {rank}] All registered buffers:")
+            logger.debug(f"EC-CHECK: [Rank {rank}] All registered buffers:")
             # for addr, (size, iteration) in self.registered_buffers.items():
             #     logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
         except Exception as e:
@@ -1061,7 +1052,7 @@ class ECCHECKManager:
             return
         
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        logger.info(f"EC-CHECK: [Rank {rank}] Registering all buffers for RDMA...")
+        logger.debug(f"EC-CHECK: [Rank {rank}] Registering all buffers for RDMA...")
         
         # Register data buffers
         if self.eccheck_data_buffers:
@@ -1084,7 +1075,7 @@ class ECCHECKManager:
             self.register_buffer(recv_buffer_thread1)
             self.register_buffer(recv_buffer_thread2)
         
-        logger.info(f"EC-CHECK: [Rank {rank}] All buffers registered for RDMA (total: {len(self.registered_buffers)})")
+        logger.debug(f"EC-CHECK: [Rank {rank}] All buffers registered for RDMA (total: {len(self.registered_buffers)})")
     
     
     def cleanup(self):
@@ -1104,7 +1095,7 @@ class ECCHECKManager:
             # Unregister all RDMA buffers
             if self.use_rdma and self._eccheck_native is not None:
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                logger.info(f"EC-CHECK: [Rank {rank}] Unregistering all RDMA buffers...")
+                logger.debug(f"EC-CHECK: [Rank {rank}] Unregistering all RDMA buffers...")
                 for buffer_addr in list(self.registered_buffers.keys()):
                     try:
                         # logger.info(f"EC-CHECK: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x} during cleanup")
@@ -1128,7 +1119,7 @@ class ECCHECKManager:
             # Stop the C++ pipeline
             if hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
                 self._eccheck_native.stop_pipeline()
-                logger.info("EC-CHECK: C++ native module stopped in manager cleanup")
+                logger.debug("EC-CHECK: C++ native module stopped in manager cleanup")
 
             # Release cached allocations
             self.preallocated_cpu_buffer = None

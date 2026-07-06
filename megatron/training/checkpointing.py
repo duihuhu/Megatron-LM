@@ -2404,6 +2404,18 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                         summary["e2e_s"],
                         summary["h2d_s"],
                     )
+            elif ft_context.get("scheme") == "ECCHECK" and getattr(args, "use_eccheck", False):
+                summary = _timing_max_dict({
+                    "e2e_s": recovery_e2e_s + h2d_total_s,
+                    "h2d_s": h2d_total_s,
+                })
+                if rank == 0:
+                    logger.info(
+                        "ECCHECK load timing (%s): e2e_s=%.2fs h2d_s=%.2fs",
+                        ft_context.get("mode", "unknown"),
+                        summary["e2e_s"],
+                        summary["h2d_s"],
+                    )
             else:
                 values = {
                     "e2e_s": recovery_e2e_s + h2d_total_s,

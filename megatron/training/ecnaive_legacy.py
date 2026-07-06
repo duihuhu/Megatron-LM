@@ -1009,7 +1009,8 @@ def _save_ecnaive_pt_files(
         buf = buf.to("cpu")
     main_mv = memoryview(buf.numpy())
 
-    # Pre-prepare block memoryviews
+    # Version 3 blocks are continuous; only block_data_size bytes are meaningful.
+    block_write_size = int(blocks.get("block_data_size", blocks["aligned_size"]))
     block_mvs = {}
     for name in block_names:
         b = blocks[name][: blocks[name].numel()]
@@ -1029,7 +1030,7 @@ def _save_ecnaive_pt_files(
             block_file = checkpoint_dir / f"ecnaive_block_rank{rank}_{name}.pt"
             futs.append(ex.submit(write_block_prepared,
                                   str(block_file), MAGIC_BLOCK,
-                                  block_mvs[name], blocks[name].numel()))
+                                  block_mvs[name], block_write_size))
         for f in futs:
             f.result()
 

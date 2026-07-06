@@ -550,6 +550,10 @@ def _encode_eccheck_with_native(
         native.wait_for_encoding_completion()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        blocks["block_write_sizes"] = {
+            "own_buffer": min(own_offset, own_buffer.numel()),
+            "partner_buffer": min(partner_offset, partner_buffer.numel()),
+        }
     finally:
         if active_event is not None:
             active_event.clear()
@@ -591,6 +595,7 @@ def _save_eccheck_pt_files(
         "actual_tensor_size": blocks["actual_size"],
         "pipeline_total_bytes": blocks["pipeline_size"],
         "aligned_block_size": blocks["aligned_size"],
+        "block_write_sizes": blocks.get("block_write_sizes", {}),
         "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
         "block_files": block_files,
         "all_tensor_infos": all_tensor_infos if all_tensor_infos is not None else {},
@@ -602,8 +607,9 @@ def _save_eccheck_pt_files(
         buf = buf.to("cpu")
     main_mv = memoryview(buf.numpy())
 
-    # Pre-prepare block memoryviews
+    # ECCHECK blocks keep the internal 64B gapped layout, but trim unused tail bytes.
     block_names = ("own_buffer", "partner_buffer")
+    block_write_sizes = blocks.get("block_write_sizes", {})
     block_mvs = {}
     for name in block_names:
         b = blocks[name][: blocks[name].numel()]
@@ -621,9 +627,10 @@ def _save_eccheck_pt_files(
                           meta1, meta2, extra, main_mv, blocks["actual_size"])]
         for name in block_names:
             block_file = checkpoint_dir / f"eccheck_block_rank{rank}_{name}.pt"
+            block_write_size = int(block_write_sizes.get(name, blocks[name].numel()))
             futs.append(ex.submit(write_block_prepared,
                                   str(block_file), MAGIC_BLOCK,
-                                  block_mvs[name], blocks[name].numel()))
+                                  block_mvs[name], block_write_size))
         for f in futs:
             f.result()
 

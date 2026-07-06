@@ -138,9 +138,13 @@ def write_main_prepared(
 
 def write_block_prepared(path: str, magic: bytes, mv: memoryview, size: int) -> None:
     """Write a block file from a pre-prepared memoryview."""
+    if size < 0 or size > len(mv):
+        raise ValueError(
+            f"Invalid raw block size {size}; prepared buffer has {len(mv)} bytes"
+        )
     with open(path, "wb") as f:
         f.write(struct.pack("<4sQ", magic, size))
-        f.write(mv)
+        f.write(mv[:size])
 
 
 # ---- read helpers -----------------------------------------------------------

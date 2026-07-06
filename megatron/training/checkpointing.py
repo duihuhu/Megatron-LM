@@ -1994,6 +1994,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     frcheck_runtime_summary = None
     frcheck_skipped_model_placeholders = False
+    frcheck_deferred_model_keys = set()
     if ckpt_type == CheckpointType.LEGACY and getattr(args, "use_frcheck", False):
         from .frcheck_legacy import (
             frcheck_filter_layerwise_model_placeholders,
@@ -2006,7 +2007,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         )
         install_frcheck_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
         mark_recovery_to_forward_timer("frcheck_runtime_install_done")
-        removed_placeholders, _ = frcheck_filter_layerwise_model_placeholders(state_dict)
+        (
+            removed_placeholders,
+            _,
+            frcheck_deferred_model_keys,
+        ) = frcheck_filter_layerwise_model_placeholders(state_dict)
         mark_recovery_to_forward_timer("frcheck_filter_placeholders_done")
         frcheck_runtime_summary = get_frcheck_layerwise_runtime_summary()
         frcheck_skipped_model_placeholders = (
@@ -2050,13 +2055,21 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 
-    def _model_load_key_stats(module, checkpoint_state_dict):
+    def _model_load_key_stats(module, checkpoint_state_dict, ignored_missing_keys=None):
         """Return key match stats between checkpoint model state and live module."""
         module_state_dict = module.state_dict()
         module_keys = set(module_state_dict.keys())
         checkpoint_keys = set(checkpoint_state_dict.keys())
         matched_keys = module_keys & checkpoint_keys
         missing_keys = module_keys - checkpoint_keys
+        if ignored_missing_keys:
+            ignored = set(ignored_missing_keys)
+            missing_keys = {
+                key for key in missing_keys
+                if key not in ignored
+                and key.removeprefix("module.") not in ignored
+                and key.removeprefix("model.") not in ignored
+            }
         unexpected_keys = checkpoint_keys - module_keys
         return {
             "module_key_count": len(module_keys),
@@ -2073,23 +2086,28 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         try:
             load_return = module.load_state_dict(state_dict, strict=strict)
             if ft_timing_enabled:
-                stats = _model_load_key_stats(module, state_dict)
-                logger.info(
-                    "model load key match: strict=%s matched=%d/%d checkpoint_keys=%d "
-                    "missing=%d unexpected=%d missing_examples=%s unexpected_examples=%s",
-                    strict,
-                    stats["matched_key_count"],
-                    stats["module_key_count"],
-                    stats["checkpoint_key_count"],
-                    stats["missing_key_count"],
-                    stats["unexpected_key_count"],
-                    stats["missing_examples"],
-                    stats["unexpected_examples"],
+                stats = _model_load_key_stats(
+                    module, state_dict, frcheck_deferred_model_keys,
                 )
+                if stats["missing_key_count"] or stats["unexpected_key_count"]:
+                    logger.info(
+                        "model load key match: strict=%s matched=%d/%d checkpoint_keys=%d "
+                        "missing=%d unexpected=%d missing_examples=%s unexpected_examples=%s",
+                        strict,
+                        stats["matched_key_count"],
+                        stats["module_key_count"],
+                        stats["checkpoint_key_count"],
+                        stats["missing_key_count"],
+                        stats["unexpected_key_count"],
+                        stats["missing_examples"],
+                        stats["unexpected_examples"],
+                    )
             return load_return
         except Exception as e:
             if strict:
-                stats = _model_load_key_stats(module, state_dict)
+                stats = _model_load_key_stats(
+                    module, state_dict, frcheck_deferred_model_keys,
+                )
                 logger.warning(
                     "model load strict=True failed; retrying strict=False. "
                     "matched=%d/%d checkpoint_keys=%d missing=%d unexpected=%d "
@@ -2357,58 +2375,20 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         )
         ft_context = get_ft_load_timing_context()
         if getattr(args, "use_frcheck", False):
+            recovery = (ft_context or {}).get("timings", {})
+            recovery_e2e_s = float(recovery.get("total", 0.0))
+            mode = (ft_context or {}).get("mode", "SW")
             summary = _timing_max_dict({
-                "h2d_model_s": h2d_model_s,
-                "h2d_optimizer_s": h2d_optimizer_s,
-                "h2d_total_s": h2d_total_s,
-                "h2d_model_submit_s": h2d_model_submit_s,
-                "h2d_model_sync_s": h2d_model_sync_s,
-                "h2d_optimizer_submit_s": h2d_optimizer_submit_s,
-                "h2d_optimizer_sync_s": h2d_optimizer_sync_s,
-                "optim_tensor_count": float(optim_tensor_count),
-                "optim_tensor_mib": optim_tensor_bytes / (1024 ** 2),
-                "optim_storage_count": float(optim_storage_count),
-                "optim_non_contig_count": float(optim_non_contig_count),
-                "optim_pinned_count": float(optim_pinned_count),
+                "e2e_s": recovery_e2e_s + h2d_total_s,
+                "h2d_s": h2d_total_s,
             })
             if rank == 0:
-                recovery = (ft_context or {}).get("timings", {})
-                recovery_e2e_s = float(recovery.get("total", 0.0))
-                rebuild_sd_s = float(recovery.get("rebuild_sd", 0.0))
-                network_encode_s = float(recovery.get("network_encode", 0.0))
-                mode = (ft_context or {}).get("mode", "SW")
-                if ft_context is not None:
-                    e2e_s = recovery_e2e_s + summary["h2d_total_s"]
-                    logger.info(
-                        "FRCheck load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
-                        "network_encode_s=%.2fs rebuild_sd_s=%.2fs h2d_model_s=%.2fs "
-                        "h2d_optimizer_s=%.2fs h2d_total_s=%.2fs "
-                        "h2d_optimizer_submit_s=%.2fs h2d_optimizer_sync_s=%.2fs "
-                        "optim_tensors=%.0f optim_mib=%.1f optim_pinned=%.0f/%.0f optim_storages=%.0f",
-                        mode,
-                        e2e_s,
-                        recovery_e2e_s,
-                        network_encode_s,
-                        rebuild_sd_s,
-                        summary["h2d_model_s"],
-                        summary["h2d_optimizer_s"],
-                        summary["h2d_total_s"],
-                        summary["h2d_optimizer_submit_s"],
-                        summary["h2d_optimizer_sync_s"],
-                        summary["optim_tensor_count"],
-                        summary["optim_tensor_mib"],
-                        summary["optim_pinned_count"],
-                        summary["optim_tensor_count"],
-                        summary["optim_storage_count"],
-                    )
-                else:
-                    logger.info(
-                        "FRCheck load timing: h2d_model_s=%.2fs "
-                        "h2d_optimizer_s=%.2fs h2d_total_s=%.2fs",
-                        summary["h2d_model_s"],
-                        summary["h2d_optimizer_s"],
-                        summary["h2d_total_s"],
-                    )
+                logger.info(
+                    "FRCheck load timing (%s): e2e_s=%.2fs h2d_s=%.2fs",
+                    mode,
+                    summary["e2e_s"],
+                    summary["h2d_s"],
+                )
         elif ft_context is not None:
             recovery = ft_context.get("timings", {})
             recovery_e2e_s = float(recovery.get("total", 0.0))

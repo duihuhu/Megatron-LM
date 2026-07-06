@@ -24,6 +24,7 @@ _GLOBAL_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
 _GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
+_GLOBAL_RECOVERY_TIMING_SUMMARIES = {}
 _GLOBAL_FT_LOAD_TIMING_CONTEXT = None
 
 def get_args():
@@ -109,8 +110,14 @@ def mark_recovery_to_forward_timer(label: str) -> None:
     timer.setdefault("marks", []).append((label, time.time()))
 
 
+def stash_recovery_timing_summary(name: str, values: dict) -> None:
+    """Store local recovery timing values for a later safe collective logging point."""
+    _GLOBAL_RECOVERY_TIMING_SUMMARIES[name] = dict(values)
+
+
+
 def finish_recovery_to_forward_timer(label: str = "forward_step_end") -> None:
-    """Log elapsed time from recovery network/decode start to next forward step end."""
+    """Record elapsed time from recovery start to the next forward step end."""
     global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
     timer = _GLOBAL_RECOVERY_TO_FORWARD_TIMER
     if timer is None:
@@ -121,6 +128,12 @@ def finish_recovery_to_forward_timer(label: str = "forward_step_end") -> None:
     start = timer["start"]
     elapsed = marks[-1][1] - start if marks else 0.0
     context = timer.get("context", {}) or {}
+    if context.get("rank0_only_max"):
+        stash_recovery_timing_summary(
+            "recovery_to_forward",
+            {"elapsed_s": elapsed, "scheme": timer["scheme"]},
+        )
+        return
     role = context.get("role", "")
     role_text = f" role={role}" if role else ""
     print(
@@ -128,6 +141,73 @@ def finish_recovery_to_forward_timer(label: str = "forward_step_end") -> None:
         f"rank={timer['rank']}{role_text} elapsed={elapsed:.4f}s",
         flush=True,
     )
+
+
+
+def flush_recovery_timing_summaries() -> None:
+    """All-reduce and log pending recovery timings at a common train-step boundary."""
+    global _GLOBAL_RECOVERY_TIMING_SUMMARIES
+    pipeline_keys = [
+        "pipeline_s",
+        "network_submit_s",
+        "network_wait_s",
+        "materialize_s",
+        "serial_work_s",
+        "pipeline_overlap_s",
+        "first_network_done_s",
+        "last_materialize_done_s",
+    ]
+    pipeline = _GLOBAL_RECOVERY_TIMING_SUMMARIES.get("frcheck_hw_pipeline")
+    rtf = _GLOBAL_RECOVERY_TIMING_SUMMARIES.get("recovery_to_forward")
+
+    rtf_elapsed_s = float((rtf or {}).get("elapsed_s", 0.0))
+    values = [1.0 if pipeline is not None else 0.0]
+    values.extend(float((pipeline or {}).get(key, 0.0)) for key in pipeline_keys)
+    values.append(1.0 if rtf is not None else 0.0)
+    values.append(rtf_elapsed_s)
+    # Keep one collective at the safe train-step boundary. The negated elapsed
+    # gives the cross-rank minimum via MAX while missing ranks stay inactive.
+    values.append(-rtf_elapsed_s if rtf is not None else -1.0e30)
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+        tensor = torch.tensor(values, dtype=torch.float64, device=device)
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+        values = [float(item) for item in tensor.cpu().tolist()]
+        rank = torch.distributed.get_rank()
+    else:
+        rank = 0
+
+    if rank == 0:
+        import logging
+        logger = logging.getLogger("megatron.training.frcheck_legacy")
+        if values[0] > 0.0:
+            summary = dict(zip(pipeline_keys, values[1:1 + len(pipeline_keys)]))
+            logger.info(
+                "FRCheck HW pipeline breakdown: pipeline_s=%.2fs "
+                "network_submit_s=%.2fs network_wait_s=%.2fs materialize_s=%.2fs "
+                "serial_work_s=%.2fs overlap_s=%.2fs first_network_done_s=%.2fs "
+                "last_materialize_done_s=%.2fs",
+                summary["pipeline_s"],
+                summary["network_submit_s"],
+                summary["network_wait_s"],
+                summary["materialize_s"],
+                summary["serial_work_s"],
+                summary["pipeline_overlap_s"],
+                summary["first_network_done_s"],
+                summary["last_materialize_done_s"],
+            )
+        if values[1 + len(pipeline_keys)] > 0.0:
+            scheme = str((rtf or {}).get("scheme", "FRCheck"))
+            elapsed_max_s = values[2 + len(pipeline_keys)]
+            elapsed_min_s = -values[3 + len(pipeline_keys)]
+            print(
+                f"{scheme} recovery-to-forward: "
+                f"elapsed_min={elapsed_min_s:.4f}s elapsed_max={elapsed_max_s:.4f}s",
+                flush=True,
+            )
+
+    _GLOBAL_RECOVERY_TIMING_SUMMARIES = {}
 
 
 
@@ -207,6 +287,7 @@ def unset_global_variables():
     global _GLOBAL_ENERGY_MONITOR
     global _GLOBAL_SIGNAL_HANDLER
     global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
+    global _GLOBAL_RECOVERY_TIMING_SUMMARIES
 
     _GLOBAL_ARGS = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
@@ -219,6 +300,7 @@ def unset_global_variables():
     _GLOBAL_ENERGY_MONITOR = None
     _GLOBAL_SIGNAL_HANDLER = None
     _GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
+    _GLOBAL_RECOVERY_TIMING_SUMMARIES = {}
     _GLOBAL_FT_LOAD_TIMING_CONTEXT = None
 
     unset_num_microbatches_calculator()

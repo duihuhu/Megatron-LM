@@ -156,13 +156,7 @@ def _summarize_optimizer_keys(keys) -> Dict[str, int]:
     return summary
 
 
-_FRCHECK_INFO_PROFILE_EVENTS = {
-    "pipeline_job_done",
-    "pipeline_done",
-    "recovery_async_parity_submit_thread_start",
-    "recovery_async_parity_submit",
-    "recovery_async_parity_all_layers_submitted",
-}
+_FRCHECK_INFO_PROFILE_EVENTS = set()
 
 
 def _frcheck_recovery_profile(role: str, event: str, **fields) -> None:
@@ -1266,11 +1260,11 @@ def install_frcheck_layerwise_runtime_from_state_dict(
 
 def frcheck_filter_layerwise_model_placeholders(
     state_dict: Dict[str, Any],
-) -> Tuple[int, int]:
+) -> Tuple[int, int, Set[str]]:
     """Drop layer-owned model placeholders that will be injected by runtime."""
     runtime = _active_layerwise_runtime
     if runtime is None:
-        return 0, 0
+        return 0, 0, set()
 
     skip_keys: Set[str] = set()
     for record in runtime._records_by_layer.values():
@@ -1279,7 +1273,7 @@ def frcheck_filter_layerwise_model_placeholders(
             if canonical_key:
                 skip_keys.add(canonical_key)
     if not skip_keys:
-        return 0, 0
+        return 0, 0, set()
 
     def should_skip(key: str) -> bool:
         canonical_key = _canonical_live_model_key(key)
@@ -1311,7 +1305,7 @@ def frcheck_filter_layerwise_model_placeholders(
             "(%.2f MiB); runtime will inject them before layer forward",
             removed, removed_bytes / (1024 ** 2),
         )
-    return removed, removed_bytes
+    return removed, removed_bytes, skip_keys
 
 
 def frcheck_wait_and_materialize_layer(layer_idx: int) -> bool:
@@ -4437,14 +4431,27 @@ def _run_recovery_pipeline(
     for _record, timing in results:
         timing['pipeline_overlap_s'] = overlap_s
         timing['pipeline_critical_s'] = elapsed
-    _frcheck_recovery_profile(
-        recovery_role, "pipeline_done", jobs=len(jobs), elapsed_s=elapsed,
-        network_submit_s=total_submit_s, network_wait_s=total_wait_s,
-        materialize_s=total_materialize_s,
-        serial_work_s=serial_work_s, pipeline_overlap_s=overlap_s,
-        first_network_done_s=(first_network_done["time"] - t_pipeline if first_network_done["time"] else 0.0),
-        last_materialize_done_s=(last_materialize_done["time"] - t_pipeline if last_materialize_done["time"] else 0.0),
+    first_network_done_s = (
+        first_network_done["time"] - t_pipeline if first_network_done["time"] else 0.0
     )
+    last_materialize_done_s = (
+        last_materialize_done["time"] - t_pipeline if last_materialize_done["time"] else 0.0
+    )
+    summary = {
+        "pipeline_s": elapsed,
+        "network_submit_s": total_submit_s,
+        "network_wait_s": total_wait_s,
+        "materialize_s": total_materialize_s,
+        "serial_work_s": serial_work_s,
+        "pipeline_overlap_s": overlap_s,
+        "first_network_done_s": first_network_done_s,
+        "last_materialize_done_s": last_materialize_done_s,
+    }
+    try:
+        from megatron.training.global_vars import stash_recovery_timing_summary
+        stash_recovery_timing_summary("frcheck_hw_pipeline", summary)
+    except Exception:
+        pass
     return results
 
 
@@ -5617,7 +5624,9 @@ def recover_frcheck_legacy_hardware(
     t_net = time.time()
     try:
         from megatron.training.global_vars import start_recovery_to_forward_timer
-        start_recovery_to_forward_timer("FRCheck", "network_decode", role=recovery_role)
+        start_recovery_to_forward_timer(
+            "FRCheck", "network_decode", role=recovery_role, rank0_only_max=True,
+        )
     except Exception:
         pass
     def _accumulate_layer_timings(

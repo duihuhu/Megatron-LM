@@ -147,6 +147,7 @@ from .global_vars import (
     get_one_logger,
     get_energy_monitor,
     finish_recovery_to_forward_timer,
+    flush_recovery_timing_summaries,
     mark_recovery_to_forward_timer,
 )
 from . import one_logger_utils
@@ -1655,6 +1656,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
+        flush_recovery_timing_summaries()
         if frcheck_async_debug:
             logger.info(
                 "FRCHECK async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: forward_backward_end elapsed=%.6fs",

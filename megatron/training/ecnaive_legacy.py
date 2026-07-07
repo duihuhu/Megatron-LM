@@ -92,6 +92,73 @@ def _build_global_registry(local_metadata: List[TensorMetadata], local_non_tenso
     return rank_metadata, rank_non_tensor
 
 
+def _rank_tensor_sizes_from_metadata(
+    rank_metadata: Dict[int, List[TensorMetadata]], world_size: int
+) -> List[int]:
+    return [sum(meta.size_bytes for meta in rank_metadata.get(r, [])) for r in range(world_size)]
+
+
+def _rank_block_sizes_from_actual_sizes(actual_sizes: List[int], k: int) -> List[int]:
+    return [(int(size) + k - 1) // k if int(size) > 0 else 0 for size in actual_sizes]
+
+
+def _ecnaive_group_global_ranks(
+    manager: ECNAIVEManager, rank: int, world_size: int
+) -> List[int]:
+    n = manager.ecnaive_n
+    if world_size >= n and world_size % n == 0:
+        group_id = manager._get_group_id(rank, world_size)
+        return [
+            manager._get_rank_by_group_position(group_id, rig, world_size)
+            for rig in range(n)
+        ]
+    return list(range(world_size))
+
+
+def _ecnaive_group_block_sizes(
+    manager: ECNAIVEManager,
+    rank: int,
+    world_size: int,
+    rank_block_sizes: List[int],
+) -> List[int]:
+    group_ranks = _ecnaive_group_global_ranks(manager, rank, world_size)
+    return [int(rank_block_sizes[r]) for r in group_ranks]
+
+
+def _ecnaive_block_owner_rig(holder_rig: int, block_idx: int, ecnaive_n: int) -> int:
+    return holder_rig if block_idx == 0 else (holder_rig - block_idx) % ecnaive_n
+
+
+def _ecnaive_block_write_sizes_for_rank(
+    manager: ECNAIVEManager,
+    rank: int,
+    world_size: int,
+    rank_block_sizes: List[int],
+) -> List[int]:
+    n = manager.ecnaive_n
+    holder_rig = manager._get_rank_in_group(rank, world_size)
+    group_block_sizes = _ecnaive_group_block_sizes(manager, rank, world_size, rank_block_sizes)
+    return [
+        int(group_block_sizes[_ecnaive_block_owner_rig(holder_rig, i, n)])
+        for i in range(n)
+    ]
+
+
+def _ecnaive_payload_rank_block_sizes(
+    payload: Dict[str, Any], k: int, world_size: int
+) -> List[int]:
+    sizes = payload.get("rank_block_data_sizes")
+    if isinstance(sizes, dict):
+        return [int(sizes.get(r, sizes.get(str(r), 0))) for r in range(world_size)]
+    if isinstance(sizes, (list, tuple)) and len(sizes) >= world_size:
+        return [int(sizes[r]) for r in range(world_size)]
+    block_data_size = int(payload.get("block_data_size", 0))
+    if block_data_size <= 0:
+        total = int(payload.get("pipeline_total_bytes", 0))
+        block_data_size = (total + k - 1) // k if total > 0 else 0
+    return [block_data_size for _ in range(world_size)]
+
+
 def _allocate_ecnaive_blocks(
     manager: ECNAIVEManager,
     rank_metadata: Dict[int, List[TensorMetadata]],
@@ -112,18 +179,14 @@ def _allocate_ecnaive_blocks(
     k = manager.ecnaive_k
     n = manager.ecnaive_n
 
-    if world_size > 1:
-        all_sizes = [
-            sum(meta.size_bytes for meta in rank_metadata.get(r, []))
-            for r in range(world_size)
-        ]
-        max_total_bytes = max(all_sizes)
-    else:
-        max_total_bytes = own_total_size
-
-    block_data_size = (max_total_bytes + k - 1) // k  # ceil division
+    rank_actual_sizes = _rank_tensor_sizes_from_metadata(rank_metadata, world_size)
+    rank_block_sizes = _rank_block_sizes_from_actual_sizes(rank_actual_sizes, k)
+    group_block_sizes = _ecnaive_group_block_sizes(manager, rank, world_size, rank_block_sizes)
+    max_total_bytes = max(rank_actual_sizes) if rank_actual_sizes else own_total_size
+    block_data_size = int(rank_block_sizes[rank]) if rank < len(rank_block_sizes) else 0
+    max_group_block_size = max(group_block_sizes) if group_block_sizes else block_data_size
     aligned_block_size = (
-        (block_data_size + manager.ecnaive_buffer_size - 1)
+        (max_group_block_size + manager.ecnaive_buffer_size - 1)
         // manager.ecnaive_buffer_size
     ) * manager.ecnaive_buffer_size
 
@@ -148,6 +211,11 @@ def _allocate_ecnaive_blocks(
     blocks["pipeline_size"] = max_total_bytes
     blocks["aligned_size"] = aligned_block_size
     blocks["block_data_size"] = block_data_size
+    blocks["rank_actual_sizes"] = rank_actual_sizes
+    blocks["rank_block_data_sizes"] = rank_block_sizes
+    blocks["block_write_sizes"] = _ecnaive_block_write_sizes_for_rank(
+        manager, rank, world_size, rank_block_sizes
+    )
     return blocks
 
 
@@ -269,16 +337,25 @@ def _submit_hw_failed_recv_stripe(
     recv_pool: List[torch.Tensor],
     byte_offset: int,
     stripe_size: int,
+    source_block_sizes: Optional[List[List[int]]] = None,
+    buffer_offset: Optional[int] = None,
 ) -> None:
     """Submit one recv stripe from all source ranks (failed rank HW recovery)."""
+    write_offset = byte_offset if buffer_offset is None else buffer_offset
     for si, src_rank in enumerate(source_ranks):
         recv_ch = manager.get_recv_channel_from_source(rank, src_rank, world_size)
         base = si * ecnaive_n
         for bi in range(ecnaive_n):
+            take = stripe_size
+            if source_block_sizes is not None:
+                valid = max(0, int(source_block_sizes[si][bi]) - byte_offset)
+                take = min(stripe_size, valid)
+            if take <= 0:
+                continue
             native.submit_recv_task(
                 recv_ch,
-                int(recv_pool[base + bi].data_ptr()) + byte_offset,
-                stripe_size,
+                int(recv_pool[base + bi].data_ptr()) + write_offset,
+                take,
             )
 
 
@@ -553,7 +630,7 @@ def _run_hw_source_streaming_send(
     world_size: int,
     failed_in_group: List[int],
     block_paths: List[Path],
-    send_size: int,
+    block_sizes: List[int],
     stripe_bytes: int,
 ) -> int:
     """Send all checkpoint blocks stripe-by-stripe without full-block resident memory."""
@@ -570,16 +647,23 @@ def _run_hw_source_streaming_send(
         for buf in scratch:
             manager.register_buffer(buf)
 
-    stripes = list(_iter_ecnaive_load_stripes(send_size, stripe_bytes))
+    max_size = max(block_sizes) if block_sizes else 0
+    stripes = list(_iter_ecnaive_load_stripes(max_size, stripe_bytes))
     for byte_offset, take in stripes:
         for bi, block_path in enumerate(block_paths):
-            _copy_ecnaive_block_range_into_tensor(
-                block_path, scratch[bi], byte_offset, take,
-            )
+            valid = max(0, int(block_sizes[bi]) - byte_offset)
+            send_take = min(take, valid)
+            if send_take > 0:
+                _copy_ecnaive_block_range_into_tensor(
+                    block_path, scratch[bi], byte_offset, send_take,
+                )
         for dest_fr in failed_in_group:
             send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
-            for buf in scratch:
-                native.submit_send_task(send_ch, int(buf.data_ptr()), take)
+            for bi, buf in enumerate(scratch):
+                valid = max(0, int(block_sizes[bi]) - byte_offset)
+                send_take = min(take, valid)
+                if send_take > 0:
+                    native.submit_send_task(send_ch, int(buf.data_ptr()), send_take)
         native.wait_for_pending_network_tasks()
     return len(stripes)
 
@@ -600,6 +684,7 @@ def _run_hw_failed_own_tensor_streaming_recovery(
     actual_tensor_size: int,
     stripe_bytes: int,
     decode_scratch: List[torch.Tensor],
+    source_block_sizes: Optional[List[List[int]]] = None,
 ) -> Tuple[int, float]:
     """Recover only this failed rank's tensor buffer with stripe-sized scratch memory.
 
@@ -623,7 +708,7 @@ def _run_hw_failed_own_tensor_streaming_recovery(
     for byte_offset, take in stripes:
         _submit_hw_failed_recv_stripe(
             native, manager, rank, world_size, source_ranks, ecnaive_n,
-            recv_pool, 0, take,
+            recv_pool, byte_offset, take, source_block_sizes, buffer_offset=0,
         )
         native.wait_for_pending_network_tasks()
 
@@ -815,6 +900,9 @@ def _encode_with_native(
     pipeline_total_bytes = ecnaive_blocks["pipeline_size"]
     aligned_block_size = ecnaive_blocks["aligned_size"]
     block_data_size = ecnaive_blocks.get("block_data_size", (pipeline_total_bytes + k - 1) // k)
+    block_write_sizes = [int(x) for x in ecnaive_blocks.get("block_write_sizes", [])]
+    if len(block_write_sizes) != n:
+        block_write_sizes = [int(block_data_size)] * n
 
     # Persistent block base addresses
     own_data0 = ecnaive_blocks["own_data0"]
@@ -836,19 +924,23 @@ def _encode_with_native(
     src_pos = 0
     src_base_ptr = tensor_buffer.data_ptr()
     d2h_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+    if d2h_stream is not None:
+        d2h_stream.wait_stream(torch.cuda.current_stream())
     d2h_s = 0.0
     pending_d2h: Optional[Tuple[torch.cuda.Event, torch.cuda.Event]] = None
+    max_stream_block_size = max(block_write_sizes) if block_write_sizes else int(block_data_size)
 
     try:
-        while src_pos < block_data_size:
-            remaining_in_block = block_data_size - src_pos
-            take = min(ecnaive_buffer_size, remaining_in_block)
+        while src_pos < max_stream_block_size:
+            remaining_in_stream = max_stream_block_size - src_pos
+            take = min(ecnaive_buffer_size, remaining_in_stream)
+            own_take = min(take, max(0, int(block_data_size) - src_pos))
 
-            if pending_d2h is None:
+            if own_take > 0 and pending_d2h is None:
                 pending_d2h = _submit_ecnaive_d2h_stripe(
                     tensor_buffer,
                     src_pos,
-                    take,
+                    own_take,
                     block_data_size,
                     k,
                     actual_data_bytes,
@@ -864,12 +956,12 @@ def _encode_with_native(
                 pending_d2h = None
 
             next_src = src_pos + take
-            if next_src < block_data_size:
-                next_take = min(ecnaive_buffer_size, block_data_size - next_src)
+            next_own_take = min(ecnaive_buffer_size, max(0, int(block_data_size) - next_src))
+            if next_own_take > 0:
                 pending_d2h = _submit_ecnaive_d2h_stripe(
                     tensor_buffer,
                     next_src,
-                    next_take,
+                    next_own_take,
                     block_data_size,
                     k,
                     actual_data_bytes,
@@ -878,56 +970,70 @@ def _encode_with_native(
                     d2h_stream,
                 )
 
-            # Stage k data blocks into temporary buffers
-            data_block_addrs = []  # data addrs for C++ encoder
-            own_data0_write_addr = own_data0_base + own_data0_offset
+            # Stage this rank's owner codeword only while it still has bytes.
+            data_block_addrs = []
+            parity0_addr = 0
+            parity1_addr = 0
+            if own_take > 0:
+                own_data0_write_addr = own_data0_base + own_data0_offset
 
-            # d_{i,0}: write directly to persistent own_data0 block
-            data_block_addrs.append(own_data0_write_addr)
-            src_offset_0 = 0 * block_data_size + src_pos
-            if src_offset_0 < actual_data_bytes:
-                bytes_to_copy = min(take, actual_data_bytes - src_offset_0)
-                ctypes.memmove(own_data0_write_addr, src_base_ptr + src_offset_0, bytes_to_copy)
-                if take > bytes_to_copy:
-                    ctypes.memset(own_data0_write_addr + bytes_to_copy, 0, take - bytes_to_copy)
-            else:
-                ctypes.memset(own_data0_write_addr, 0, take)
-
-            # d_{i,1}..d_{i,k-1}: copy to temp pool buffers (will be sent)
-            temp_data_bufs = []
-            for j in range(1, k):
-                data_addr = get_free_data_buffer()
-                temp_data_bufs.append(data_addr)
-                data_block_addrs.append(data_addr)
-                src_offset_j = j * block_data_size + src_pos
-                if src_offset_j < actual_data_bytes:
-                    bytes_to_copy = min(take, actual_data_bytes - src_offset_j)
-                    ctypes.memmove(data_addr, src_base_ptr + src_offset_j, bytes_to_copy)
-                    if take > bytes_to_copy:
-                        ctypes.memset(data_addr + bytes_to_copy, 0, take - bytes_to_copy)
+                # d_{i,0}: write directly to persistent own_data0 block
+                data_block_addrs.append(own_data0_write_addr)
+                src_offset_0 = 0 * block_data_size + src_pos
+                if src_offset_0 < actual_data_bytes:
+                    bytes_to_copy = min(own_take, actual_data_bytes - src_offset_0)
+                    ctypes.memmove(own_data0_write_addr, src_base_ptr + src_offset_0, bytes_to_copy)
+                    if own_take > bytes_to_copy:
+                        ctypes.memset(own_data0_write_addr + bytes_to_copy, 0, own_take - bytes_to_copy)
                 else:
-                    ctypes.memset(data_addr, 0, take)
+                    ctypes.memset(own_data0_write_addr, 0, own_take)
 
-            # Parity buffers from pool
-            parity0_addr = get_free_parity_buffer()
-            parity1_addr = get_free_parity_buffer()
+                # d_{i,1}..d_{i,k-1}: copy to temp pool buffers (will be sent)
+                for j in range(1, k):
+                    data_addr = get_free_data_buffer()
+                    data_block_addrs.append(data_addr)
+                    src_offset_j = j * block_data_size + src_pos
+                    if src_offset_j < actual_data_bytes:
+                        bytes_to_copy = min(own_take, actual_data_bytes - src_offset_j)
+                        ctypes.memmove(data_addr, src_base_ptr + src_offset_j, bytes_to_copy)
+                        if own_take > bytes_to_copy:
+                            ctypes.memset(data_addr + bytes_to_copy, 0, own_take - bytes_to_copy)
+                    else:
+                        ctypes.memset(data_addr, 0, own_take)
 
-            # Continuous recv block write addresses (no padding, aligned with ECLATIN)
+                # Parity buffers from pool
+                parity0_addr = get_free_parity_buffer()
+                parity1_addr = get_free_parity_buffer()
+                native.encode_ec_blocks(data_block_addrs, parity0_addr, parity1_addr, own_take)
+
+            # Continuous recv block write addresses (no padding, aligned with ECLATIN).
             recv_write_addrs = []
+            recv_takes = []
             for i in range(num_recv):
-                if recv_offsets[i] + take > aligned_block_size:
-                    logger.warning("EC-NAIVE legacy: recv block %d exhausted", i)
-                    recv_offsets[i] = 0
-                recv_write_addrs.append(recv_bases[i] + recv_offsets[i])
-                recv_offsets[i] += take
+                block_idx = i + 1
+                valid = max(0, block_write_sizes[block_idx] - src_pos)
+                recv_take = min(take, valid)
+                recv_takes.append(recv_take)
+                if recv_take > 0:
+                    if recv_offsets[i] + recv_take > aligned_block_size:
+                        logger.warning("EC-NAIVE legacy: recv block %d exhausted", i)
+                        recv_offsets[i] = 0
+                    recv_write_addrs.append(recv_bases[i] + recv_offsets[i])
+                    recv_offsets[i] += recv_take
+                else:
+                    recv_write_addrs.append(0)
 
-            # Submit to C++ native: encode k data → 2 parity, send/recv over network
-            native.submit_ecnaive_save_general(
-                data_block_addrs, parity0_addr, parity1_addr,
-                recv_write_addrs, take,
-            )
+            # Submit receives/sends per channel so each owner codeword can use its own block size.
+            for i, recv_take in enumerate(recv_takes):
+                if recv_take > 0:
+                    native.submit_recv_task(i, recv_write_addrs[i], recv_take)
+            if own_take > 0:
+                for j in range(1, k):
+                    native.submit_send_task(j - 1, data_block_addrs[j], own_take)
+                native.submit_send_task(k - 1, parity0_addr, own_take)
+                native.submit_send_task(k, parity1_addr, own_take)
 
-            own_data0_offset += take
+            own_data0_offset += own_take
             src_pos += take
 
         if pending_d2h is not None:
@@ -991,12 +1097,15 @@ def _save_ecnaive_pt_files(
     meta1 = _pickle.dumps(non_tensor_data)
     meta2 = _pickle.dumps(tensor_infos)
     extra = _pickle.dumps({
-        "version": 3, "format": "ecnaive_torch_legacy", "rank": rank,
+        "version": 4, "format": "ecnaive_torch_legacy", "rank": rank,
         "ecnaive_k": k, "ecnaive_n": n,
         "actual_tensor_size": blocks["actual_size"],
         "pipeline_total_bytes": blocks["pipeline_size"],
         "aligned_block_size": blocks["aligned_size"],
         "block_data_size": blocks.get("block_data_size", blocks["pipeline_size"] // k),
+        "rank_actual_sizes": blocks.get("rank_actual_sizes", []),
+        "rank_block_data_sizes": blocks.get("rank_block_data_sizes", []),
+        "block_write_sizes": blocks.get("block_write_sizes", []),
         "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
         "block_files": block_files,
         "_block_files_legacy": block_files_legacy,
@@ -1009,8 +1118,10 @@ def _save_ecnaive_pt_files(
         buf = buf.to("cpu")
     main_mv = memoryview(buf.numpy())
 
-    # Version 3 blocks are continuous; only block_data_size bytes are meaningful.
-    block_write_size = int(blocks.get("block_data_size", blocks["aligned_size"]))
+    # Version 4 blocks are continuous and each block is sized by its owner rank.
+    block_write_sizes = [int(x) for x in blocks.get("block_write_sizes", [])]
+    if len(block_write_sizes) != len(block_names):
+        block_write_sizes = [int(blocks.get("block_data_size", blocks["aligned_size"]))] * len(block_names)
     block_mvs = {}
     for name in block_names:
         b = blocks[name][: blocks[name].numel()]
@@ -1026,11 +1137,11 @@ def _save_ecnaive_pt_files(
         from megatron.training.legacy_io_utils import write_main_prepared, write_block_prepared
         futs = [ex.submit(write_main_prepared, str(main_file), MAGIC_ECNAIVE,
                           meta1, meta2, extra, main_mv, blocks["actual_size"])]
-        for name in block_names:
+        for idx, name in enumerate(block_names):
             block_file = checkpoint_dir / f"ecnaive_block_rank{rank}_{name}.pt"
             futs.append(ex.submit(write_block_prepared,
                                   str(block_file), MAGIC_BLOCK,
-                                  block_mvs[name], block_write_size))
+                                  block_mvs[name], block_write_sizes[idx]))
         for f in futs:
             f.result()
 
@@ -1140,6 +1251,12 @@ def _load_ecnaive_main_payload(
                     f"recovered tensor_infos for rank {rank} from rank {r}"
                 )
                 payload["tensor_infos"] = all_ti[rank]
+                rank_sizes = payload.get("rank_actual_sizes")
+                if isinstance(rank_sizes, (list, tuple)) and rank < len(rank_sizes):
+                    payload["actual_tensor_size"] = int(rank_sizes[rank])
+                rank_block_sizes = payload.get("rank_block_data_sizes")
+                if isinstance(rank_block_sizes, (list, tuple)) and rank < len(rank_block_sizes):
+                    payload["block_data_size"] = int(rank_block_sizes[rank])
                 payload["tensor_buffer"] = None  # to be recovered via RS decode
                 return payload
             # Backward compat: old checkpoints without all_tensor_infos
@@ -1410,6 +1527,12 @@ def _load_ecnaive_legacy_software_failure(
                          (pipeline_total_bytes + k - 1) // k))
     tensor_infos = main_payload["tensor_infos"]
     non_tensor_data = main_payload["non_tensor_data"]
+    rank_block_sizes = _ecnaive_payload_rank_block_sizes(main_payload, k, world_size)
+    failed_global_rank = manager._get_rank_by_group_position(group_id, failed_rig, world_size)
+    failed_block_data_size = int(rank_block_sizes[failed_global_rank])
+    if int(main_payload.get("version", 2)) >= 4:
+        block_data_size = failed_block_data_size
+        aligned_block_size = max(aligned_block_size, block_data_size)
 
     block_files_legacy = main_payload.get("_block_files_legacy", None)
 
@@ -1449,8 +1572,9 @@ def _load_ecnaive_legacy_software_failure(
             n_copy = min(own_data0.numel(), block_data_size)
             tensor_buffer[:n_copy].copy_(own_data0[:n_copy])
         own_data0 = None  # free ref
+        recv_alloc_size = aligned_block_size if has_padded_sw else block_data_size
         for _j in range(1, k):
-            buf = torch.zeros(aligned_block_size, dtype=torch.uint8)
+            buf = torch.zeros(recv_alloc_size, dtype=torch.uint8)
             if manager.use_rdma:
                 manager.register_buffer(buf)
             recv_blocks.append(buf)
@@ -1472,6 +1596,8 @@ def _load_ecnaive_legacy_software_failure(
                 legacy_name=legacy_name,
                 block_files_legacy=block_files_legacy,
             )
+            if not has_padded_sw and send_block.numel() > block_data_size:
+                send_block = send_block[:block_data_size].contiguous()
             if manager.use_rdma:
                 manager.register_buffer(send_block)
             send_block_idx = block_idx
@@ -1835,6 +1961,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                              ((block_data_size + manager.ecnaive_buffer_size - 1)
                               // manager.ecnaive_buffer_size) * manager.ecnaive_buffer_size))
     recv_block_size = aligned_block_size if has_padded_recv else block_data_size
+    rank_block_sizes = _ecnaive_payload_rank_block_sizes(main_payload, ecnaive_k, world_size)
 
     flat_key_roots = _infer_flat_key_roots(main_payload)
     actual_tensor_size = int(main_payload.get("actual_tensor_size", 0))
@@ -1861,6 +1988,19 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     source_ranks = survivors_in_group[:ecnaive_k] if len(survivors_in_group) >= ecnaive_k else survivors_in_group
     is_source = rank in source_ranks
     source_set = set(source_ranks)
+
+    def _block_sizes_for_holder(holder_rank: int) -> List[int]:
+        holder_rig = manager._get_rank_in_group(holder_rank, world_size)
+        group_block_sizes = _ecnaive_group_block_sizes(
+            manager, holder_rank, world_size, rank_block_sizes,
+        )
+        return [
+            int(group_block_sizes[_ecnaive_block_owner_rig(holder_rig, bi, ecnaive_n)])
+            for bi in range(ecnaive_n)
+        ]
+
+    source_block_sizes_all = [_block_sizes_for_holder(src) for src in source_ranks]
+    local_block_sizes = _block_sizes_for_holder(rank)
 
     barrier_s = 0.0
 
@@ -1974,7 +2114,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     f"to failed rank {dest_fr}"
                 )
         else:
-            send_size = block_data_size
             n_stripes = _run_hw_source_streaming_send(
                 native,
                 manager,
@@ -1982,7 +2121,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 world_size,
                 failed_in_group,
                 source_block_paths,
-                send_size,
+                local_block_sizes,
                 stripe_bytes,
             )
             logger.debug(
@@ -2162,6 +2301,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 actual_tensor_size=actual_tensor_size,
                 stripe_bytes=stripe_bytes,
                 decode_scratch=[store_bufs['own_data0'], store_bufs['my_data1']],
+                source_block_sizes=source_block_sizes_all,
             )
             native.submit_send_sentinels(num_channels)
             native.submit_recv_sentinels(num_channels)

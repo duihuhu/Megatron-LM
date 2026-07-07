@@ -667,6 +667,13 @@ class ECNAIVEManager:
         n = self.ecnaive_n
         group_id = self._get_group_id(rank, world_size)
         rank_in_group = self._get_rank_in_group(rank, world_size)
+        failed_global_rank = (
+            self._get_rank_by_group_position(group_id, failed_rank_in_group, world_size)
+            if world_size >= n else failed_rank_in_group
+        )
+        native.set_load_mode(
+            True, failed_global_rank, rank_in_group, is_software_only=True,
+        )
         load_receiver_rank = (
             self._get_rank_by_group_position(group_id, failed_rank_in_group, world_size)
             if world_size >= n else failed_rank_in_group

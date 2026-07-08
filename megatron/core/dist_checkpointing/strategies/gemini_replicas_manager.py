@@ -61,6 +61,7 @@ class GeminiReplicasManager:
         self.use_gemini_replicas_optimized = False
         self.use_rdma = False
         self.use_gdr = False
+        self.channels_per_peer = 1
         
         # Replica configuration
         self.num_replicas = 3  # Default: 3 replicas (including local)
@@ -302,9 +303,15 @@ class GeminiReplicasManager:
         # Step 1: Get base IP address (with multi-NIC per-rank support)
         base_ip = resolve_ip("GEMINI_REPLICAS", rank=rank)
 
-        # Step 2: Get base port
+        # Step 2: Get base port.
+        # IMPORTANT: keep the whole listener range below the kernel ephemeral
+        # port range (net.ipv4.ip_local_port_range, default 32768-60999).
+        # Each rank owns 100 ports (base + rank*100); with 64 ranks the save
+        # range is base .. base+6407, so master_port+12000 (=18000) keeps it at
+        # 18000-24407, well clear of ephemeral ports that NCCL/gloo/torch grab
+        # at random and would otherwise steal a rank's fixed listener port.
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
-        base_port = int(os.environ.get('GEMINI_REPLICAS_BASE_PORT', master_port + 30000))
+        base_port = int(os.environ.get('GEMINI_REPLICAS_BASE_PORT', master_port + 12000))
         
         # Step 3: Calculate target and source ranks
         target_ranks_all = self._calculate_target_ranks(rank, world_size)
@@ -327,6 +334,16 @@ class GeminiReplicasManager:
         
         # My port range starts at: base_port + rank * 100
         my_port_base = base_port + rank * 100
+        channels_per_peer = self.channels_per_peer if self.use_rdma else 1
+        if channels_per_peer < 1:
+            raise ValueError(
+                f"Gemini Replicas: channels_per_peer must be >= 1, got {channels_per_peer}"
+            )
+        if channels_per_peer > 100:
+            raise ValueError(
+                f"Gemini Replicas: channels_per_peer ({channels_per_peer}) exceeds "
+                "the per-rank port range size (100)"
+            )
         
         # Receive port: my_port_base (only one recv port for now, accepts connections sequentially)
         recv_port = my_port_base
@@ -383,6 +400,7 @@ class GeminiReplicasManager:
             'target_ips': target_ips,
             'target_ports': target_ports,
             'recv_ports': recv_ports,
+            'channels_per_peer': channels_per_peer,
         }
         
         logger.debug(
@@ -393,6 +411,7 @@ class GeminiReplicasManager:
             f"  Source ranks (recv from): {config['source_ranks']}\n"
             f"  Target ports (send): {config['target_ports']}\n"
             f"  Recv ports (from sources): {config['recv_ports']}\n"
+            f"  Channels per peer: {config['channels_per_peer']}\n"
             f"  All rank IPs: {config['rank_ips']}"
         )
         
@@ -412,6 +431,17 @@ class GeminiReplicasManager:
             self.num_replicas = getattr(args, 'gemini_replicas_num', 3)
             self.group_size = getattr(args, 'gemini_replicas_group_size', None)
             self.use_rdma = getattr(args, 'use_rdma', False)
+            self.channels_per_peer = int(getattr(args, 'gemini_replicas_channels_per_peer', 1))
+            if self.channels_per_peer < 1:
+                raise ValueError(
+                    f"Gemini Replicas: channels_per_peer must be >= 1, got {self.channels_per_peer}"
+                )
+            if not self.use_rdma and self.channels_per_peer != 1:
+                logger.warning(
+                    "Gemini Replicas: --gemini-replicas-channels-per-peer only applies "
+                    "to RDMA save; ASIO will use one channel per peer"
+                )
+                self.channels_per_peer = 1
             
             if not self.use_gemini_replicas or not self.use_gemini_replicas_optimized:
                 return
@@ -500,7 +530,8 @@ class GeminiReplicasManager:
                 net_config['my_ip'],  # My IP for acceptor
                 my_recv_port,  # My recv port
                 num_source_ranks,  # Number of expected incoming connections
-                self.use_rdma  # Use RDMA or ASIO
+                self.use_rdma,  # Use RDMA or ASIO
+                net_config['channels_per_peer']  # RDMA channels per peer
             )
             if hasattr(self._gemini_replicas_native, "set_debug"):
                 self._gemini_replicas_native.set_debug(_gemini_replicas_debug_enabled())
@@ -957,10 +988,14 @@ class GeminiReplicasManager:
         # ---- build recovery topology ----
         base_ip = resolve_ip("GEMINI_REPLICAS", rank=rank)
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
-        # Use a different base port to avoid conflicts with the save connections
+        # Use a different base port to avoid conflicts with the save connections,
+        # but still keep it below the kernel ephemeral range (32768-60999) so
+        # random NCCL/gloo/torch sockets never steal a fixed listener port.
+        # master_port+18500 (=24500) gives a 24500-30907 range for 64 ranks,
+        # non-overlapping with the save range (18000-24407).
         reco_base_port = int(os.environ.get(
             'GEMINI_REPLICAS_RECOVERY_BASE_PORT',
-            master_port + 40000
+            master_port + 18500
         ))
 
         # Exchange IPs — all ranks in this reinit wave must participate.

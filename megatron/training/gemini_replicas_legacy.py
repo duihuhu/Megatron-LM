@@ -386,6 +386,7 @@ def save_gemini_replicas_legacy_checkpoint(
     _exchange_t0 = time.time()
     native.wait_for_exchange_completion()
     _exchange_elapsed = time.time() - _exchange_t0
+    exchange_stats = native.get_exchange_stats() if hasattr(native, "get_exchange_stats") else {}
 
     mirror_d2h_s = 0.0
     if manager.use_gdr and gpu_tensor_buffer is not None:
@@ -419,11 +420,22 @@ def save_gemini_replicas_legacy_checkpoint(
         "mirror_d2h_s": mirror_d2h_s,
         "network_encode_s": _exchange_elapsed,
     })
+    byte_summary = _timing_max_dict({
+        "send_bytes": float(exchange_stats.get("send_bytes", 0.0)),
+        "recv_bytes": float(exchange_stats.get("recv_bytes", 0.0)),
+        "send_tasks": float(exchange_stats.get("send_tasks", 0.0)),
+        "recv_tasks": float(exchange_stats.get("recv_tasks", 0.0)),
+    })
     if rank == 0:
         logger.info(
             "GEMINI save timing: e2e_s=%(e2e_s).2fs pack_s=%(pack_s).2fs d2h_s=%(d2h_s).2fs "
             "mirror_d2h_s=%(mirror_d2h_s).2fs network_encode_s=%(network_encode_s).2fs",
             summary,
+        )
+        logger.debug(
+            "GEMINI save network bytes: send_bytes=%(send_bytes).0f recv_bytes=%(recv_bytes).0f "
+            "send_tasks=%(send_tasks).0f recv_tasks=%(recv_tasks).0f",
+            byte_summary,
         )
 
     # Build rank_meta from pre-exchanged data (meta exchange already done before C++ transfer).

@@ -33,6 +33,7 @@
 #include <deque>
 #include <map>
 #include <unordered_map>
+#include <atomic>
 #include <sys/socket.h>
 
 // RDMA headers
@@ -123,6 +124,7 @@ public:
     virtual void set_require_registered_mr(bool v) {}
     virtual bool get_require_registered_mr() const { return false; }
     virtual void set_chunk_done_callback(ChunkDoneCb cb) {}
+    virtual size_t send_channel_count() const { return 1; }
     virtual void set_debug(bool debug) {}
     
     // Receive from a specific source rank (for RDMA to avoid unnecessary memcpy)
@@ -486,14 +488,11 @@ private:
             );
             
             recv_acceptor_->open(endpoint.protocol());
+            // reuse_address (SO_REUSEADDR) lets us rebind a port still in
+            // TIME_WAIT. SO_REUSEPORT is intentionally NOT set: each rank owns
+            // a unique recv port, so multiple live listeners on the same port
+            // would only mask duplicate-bind bugs.
             recv_acceptor_->set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
-#ifdef SO_REUSEPORT
-            {
-                int reuse_port = 1;
-                setsockopt(recv_acceptor_->native_handle(), SOL_SOCKET, SO_REUSEPORT,
-                           &reuse_port, sizeof(reuse_port));
-            }
-#endif
             for (int attempt = 0; ; ++attempt) {
                 boost::system::error_code ec;
                 recv_acceptor_->bind(endpoint, ec);
@@ -520,6 +519,11 @@ private:
             });
             
         } catch (const std::exception& e) {
+            // Release the acceptor so its port is freed before any retry.
+            if (recv_acceptor_ && recv_acceptor_->is_open()) {
+                boost::system::error_code ignored;
+                recv_acceptor_->close(ignored);
+            }
             throw std::runtime_error(
                 "Failed to start acceptor: " + std::string(e.what())
             );
@@ -653,16 +657,20 @@ private:
     ibv_cq* send_cq_;
     ibv_cq* recv_cq_;
 
-    // Queue pairs for each target rank
+    // Queue pairs for each target rank/channel.
     std::vector<ibv_qp*> send_qps_;
+    std::vector<int> send_target_ranks_;
+    std::vector<int> send_channel_indices_;
 
-    // Queue pairs for receiving (one per expected source)
+    // Queue pairs for receiving (one per expected source/channel).
     std::vector<ibv_qp*> recv_qps_;
     std::vector<int> recv_source_ranks_;  // Track which rank each recv QP is for
+    std::vector<int> recv_channel_indices_;
 
     // ASIO resources (connection setup, matching eccheck pattern)
     boost::asio::io_context io_context_;
     std::unique_ptr<boost::asio::ip::tcp::acceptor> recv_acceptor_;
+    std::vector<std::unique_ptr<boost::asio::ip::tcp::acceptor>> recv_acceptors_;
     std::unique_ptr<std::thread> io_thread_;  // runs io_context
 
     // TCP control sockets (raw fds from ASIO sockets' native_handle)
@@ -682,12 +690,19 @@ private:
     std::mutex buffer_mutex_;
     std::mutex recv_mutex_;
     std::mutex send_cq_poll_mutex_;
+    // Guards concurrent libibverbs QP setup (ibv_create_qp / connect_qp) while
+    // multiple per-channel accept threads and the connect thread run in
+    // parallel during connect_and_wait(). Held only around the (fast) verbs
+    // calls, never around blocking socket I/O, so it does not reintroduce the
+    // channel-ordering deadlock.
+    std::mutex qp_setup_mutex_;
     
     // Rank information
     int rank_;
     int world_size_;
     std::vector<int> target_ranks_;
     int expected_recv_connections_;
+    int channels_per_peer_;
     
     // Network configuration
     std::vector<std::string> target_ips_;
@@ -724,7 +739,8 @@ public:
         const std::vector<std::string>& target_ips,
         const std::vector<int>& target_ports,
         const std::string& my_ip, int my_port,
-        int expected_recv_connections
+        int expected_recv_connections,
+        int channels_per_peer = 1
     )
         : context_(nullptr),
           pd_(nullptr),
@@ -733,7 +749,8 @@ public:
           rank_(rank),
           world_size_(world_size),
           target_ranks_(target_ranks),
-          expected_recv_connections_(expected_recv_connections),
+          expected_recv_connections_(expected_recv_connections * std::max(1, channels_per_peer)),
+          channels_per_peer_(std::max(1, channels_per_peer)),
           target_ips_(target_ips),
           target_ports_(target_ports),
           my_ip_(my_ip),
@@ -743,11 +760,19 @@ public:
     {
         if (debug_)
             std::cout << "[Rank " << rank_ << "] Creating GeminiReplicasRdmaConnectionManager with " 
-                      << target_ranks_.size() << " targets and expecting " 
-                      << expected_recv_connections_ << " sources (RDMA)" << std::endl;
+                      << target_ranks_.size() << " targets, "
+                      << channels_per_peer_ << " channels/peer and expecting "
+                      << expected_recv_connections_ << " incoming channels (RDMA)" << std::endl;
         
+        for (size_t peer_idx = 0; peer_idx < target_ranks_.size(); ++peer_idx) {
+            for (int ch = 0; ch < channels_per_peer_; ++ch) {
+                send_target_ranks_.push_back(target_ranks_[peer_idx]);
+                send_channel_indices_.push_back(ch);
+            }
+        }
+
         // Initialize send control sockets
-        control_socks_send_.resize(target_ranks_.size(), -1);
+        control_socks_send_.resize(send_target_ranks_.size(), -1);
         
         if (debug_)
             std::cout << "[Rank " << rank_ << "] GeminiReplicasRdmaConnectionManager created" << std::endl;
@@ -763,18 +788,26 @@ public:
         if (debug_)
             std::cout << "[Rank " << rank_ << "] Initializing RDMA connections..." << std::endl;
 
-        // Start ASIO io_context in background thread.
-        // The open acceptor keeps io_context busy; when all connections are
-        // accepted and acceptor is closed, io_context::run() exits naturally.
-        io_thread_ = std::make_unique<std::thread>([this]() {
-            io_context_.run();
-        });
+        // Any failure here (RDMA resource alloc or port bind) must release
+        // everything that was already set up. Otherwise the caller's retry
+        // hits "Address already in use" on our own half-bound listener ports.
+        try {
+            // Start ASIO io_context in background thread.
+            // The open acceptor keeps io_context busy; when all connections are
+            // accepted and acceptor is closed, io_context::run() exits naturally.
+            io_thread_ = std::make_unique<std::thread>([this]() {
+                io_context_.run();
+            });
 
-        // Initialize RDMA resources
-        init_rdma_resources();
+            // Initialize RDMA resources
+            init_rdma_resources();
 
-        // Start TCP listener via ASIO (matching eccheck pattern)
-        start_tcp_listener();
+            // Start TCP listener via ASIO (matching eccheck pattern)
+            start_tcp_listener();
+        } catch (...) {
+            cleanup();
+            throw;
+        }
 
         if (debug_)
             std::cout << "[Rank " << rank_ << "] RDMA initialization complete (Phase 1)" << std::endl;
@@ -784,20 +817,36 @@ public:
         if (debug_)
             std::cout << "[Rank " << rank_ << "] Connecting to targets and waiting for connections..." << std::endl;
 
-        // Accept control connections from source ranks
-        std::exception_ptr accept_exception = nullptr;
-        std::thread accept_thread([this, &accept_exception]() {
-            try {
-                for (int i = 0; i < expected_recv_connections_; ++i) {
-                    if (debug_)
-                        std::cout << "[Rank " << rank_ << "] Accepting connection " << (i+1)
-                                  << "/" << expected_recv_connections_ << "..." << std::endl;
-                    accept_tcp_connection();
+        // Accept control connections from source ranks.
+        // One accept thread PER CHANNEL so all channels are accepted
+        // concurrently. A single channel-ordered thread would require channel
+        // ch to fully finish before ch+1; combined with the peer-major connect
+        // order this forms a circular wait that deadlocks the 3-replica ring
+        // topology for any channels_per_peer >= 2. With per-channel threads
+        // every rank is ready to accept on all channels from the start, so a
+        // connector's sequential (peer-major) connects always find a waiting
+        // acceptor and never block on another connector's progress.
+        const int sources_per_channel =
+            channels_per_peer_ > 0 ? expected_recv_connections_ / channels_per_peer_ : 0;
+        std::vector<std::thread> accept_threads;
+        std::vector<std::exception_ptr> accept_exceptions(
+            static_cast<size_t>(channels_per_peer_));
+        accept_threads.reserve(static_cast<size_t>(channels_per_peer_));
+        for (int ch = 0; ch < channels_per_peer_; ++ch) {
+            accept_threads.emplace_back([this, ch, sources_per_channel, &accept_exceptions]() {
+                try {
+                    for (int i = 0; i < sources_per_channel; ++i) {
+                        if (debug_)
+                            std::cout << "[Rank " << rank_ << "] Accepting channel " << ch
+                                      << " connection " << (i+1) << "/"
+                                      << sources_per_channel << "..." << std::endl;
+                        accept_tcp_connection(ch);
+                    }
+                } catch (...) {
+                    accept_exceptions[static_cast<size_t>(ch)] = std::current_exception();
                 }
-            } catch (...) {
-                accept_exception = std::current_exception();
-            }
-        });
+            });
+        }
 
         // Small delay to let receivers start accepting
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -808,23 +857,29 @@ public:
         // std::terminate (same pattern as the old execute_exchange bug).
         std::exception_ptr connect_exception = nullptr;
         try {
-            for (size_t i = 0; i < target_ranks_.size(); ++i) {
+            for (size_t i = 0; i < send_target_ranks_.size(); ++i) {
                 if (debug_)
-                    std::cout << "[Rank " << rank_ << "] Connecting to target " << (i+1)
-                              << "/" << target_ranks_.size() << " (rank " << target_ranks_[i] << ")..." << std::endl;
+                    std::cout << "[Rank " << rank_ << "] Connecting to target channel " << (i+1)
+                              << "/" << send_target_ranks_.size() << " (rank "
+                              << send_target_ranks_[i] << ", channel "
+                              << send_channel_indices_[i] << ")..." << std::endl;
                 connect_to_target(i);
             }
         } catch (...) {
             connect_exception = std::current_exception();
         }
 
-        accept_thread.join();
+        for (auto& t : accept_threads) {
+            if (t.joinable()) t.join();
+        }
 
-        if (accept_exception) {
-            try { std::rethrow_exception(accept_exception); }
-            catch (const std::exception& e) {
-                std::cerr << "[Rank " << rank_ << "] ERROR in accept thread: " << e.what() << std::endl;
-                throw;
+        for (auto& ep : accept_exceptions) {
+            if (ep) {
+                try { std::rethrow_exception(ep); }
+                catch (const std::exception& e) {
+                    std::cerr << "[Rank " << rank_ << "] ERROR in accept thread: " << e.what() << std::endl;
+                    throw;
+                }
             }
         }
         if (connect_exception) {
@@ -911,7 +966,8 @@ private:
     }
 
     void send_data_chunked(
-        const uint8_t* data, size_t total_size, ibv_mr* mr, ibv_qp* qp) {
+        const uint8_t* data, size_t total_size, ibv_mr* mr, ibv_qp* qp,
+        size_t global_base_offset = 0) {
         size_t chunk_count = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
         std::vector<ibv_sge> sges(chunk_count);
@@ -956,7 +1012,9 @@ private:
                 size_t batch_bytes = std::min(
                     total_size - offset,
                     (batch_end - batch_start) * CHUNK_SIZE);
-                on_chunk_done_(batch_start / MAX_BATCH_WR, offset, batch_bytes);
+                size_t global_offset = global_base_offset + offset;
+                size_t global_batch_idx = global_offset / (CHUNK_SIZE * MAX_BATCH_WR);
+                on_chunk_done_(global_batch_idx, global_offset, batch_bytes);
             }
         }
     }
@@ -1039,22 +1097,38 @@ private:
         poll_completion(recv_cq_, chunk_count);
     }
 
+private:
+    size_t peer_channel_index(size_t peer_idx, int channel_idx) const {
+        return peer_idx * static_cast<size_t>(channels_per_peer_) + static_cast<size_t>(channel_idx);
+    }
+
+    static size_t shard_offset(size_t total_size, int channel_idx, int channels) {
+        return (total_size * static_cast<size_t>(channel_idx)) / static_cast<size_t>(channels);
+    }
+
+    static size_t shard_size(size_t total_size, int channel_idx, int channels) {
+        size_t start = shard_offset(total_size, channel_idx, channels);
+        size_t end = shard_offset(total_size, channel_idx + 1, channels);
+        return end - start;
+    }
+
+    void send_size_and_wait_ack(size_t send_idx, size_t size, int target_rank) {
+        uint64_t size_net = htobe64(size);
+        if (send(control_socks_send_[send_idx], &size_net, sizeof(size_net), MSG_NOSIGNAL)
+            != static_cast<ssize_t>(sizeof(size_net))) {
+            throw std::runtime_error("Failed to send size to target " + std::to_string(target_rank));
+        }
+        wait_ready_ack(control_socks_send_[send_idx], target_rank);
+    }
+
 public:
+    size_t send_channel_count() const override {
+        return static_cast<size_t>(std::max(1, channels_per_peer_));
+    }
+
     void broadcast_to_targets(const uint8_t* data, size_t size) override {
         if (!connected_) {
             throw std::runtime_error("Not connected");
-        }
-        
-        // Send total size once, then wait for a single ready ACK after the
-        // receiver has posted all matching recv WRs.
-        uint64_t size_net = htobe64(size);
-        for (size_t i = 0; i < target_ranks_.size(); ++i) {
-            if (send(control_socks_send_[i], &size_net, sizeof(size_net), 0) != sizeof(size_net)) {
-                throw std::runtime_error("Failed to send size to target " + std::to_string(target_ranks_[i]));
-            }
-        }
-        for (size_t i = 0; i < target_ranks_.size(); ++i) {
-            wait_ready_ack(control_socks_send_[i], target_ranks_[i]);
         }
 
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(data), size);
@@ -1066,26 +1140,30 @@ public:
         }
 
         const uint8_t* send_data = data;
-
-        if (target_ranks_.size() <= 1) {
-            if (!target_ranks_.empty()) {
-                send_data_chunked(send_data, size, mr, send_qps_[0]);
-            }
+        const size_t total_channels = target_ranks_.size() * static_cast<size_t>(channels_per_peer_);
+        if (total_channels == 0) {
             return;
         }
 
-        // Parallel RDMA send to all targets (wall time ~ max, not sum).
-        std::vector<std::exception_ptr> send_exceptions(target_ranks_.size());
+        std::vector<std::exception_ptr> send_exceptions(total_channels);
         std::vector<std::thread> send_threads;
-        send_threads.reserve(target_ranks_.size());
-        for (size_t i = 0; i < target_ranks_.size(); ++i) {
-            send_threads.emplace_back([this, i, send_data, size, mr, &send_exceptions]() {
-                try {
-                    send_data_chunked(send_data, size, mr, send_qps_[i]);
-                } catch (...) {
-                    send_exceptions[i] = std::current_exception();
-                }
-            });
+        send_threads.reserve(total_channels);
+        for (size_t peer_idx = 0; peer_idx < target_ranks_.size(); ++peer_idx) {
+            for (int ch = 0; ch < channels_per_peer_; ++ch) {
+                size_t send_idx = peer_channel_index(peer_idx, ch);
+                size_t offset = shard_offset(size, ch, channels_per_peer_);
+                size_t part_size = shard_size(size, ch, channels_per_peer_);
+                send_threads.emplace_back(
+                    [this, send_idx, peer_idx, ch, offset, part_size, send_data, mr, &send_exceptions]() {
+                        try {
+                            int target_rank = target_ranks_[peer_idx];
+                            send_size_and_wait_ack(send_idx, part_size, target_rank);
+                            send_data_chunked(send_data + offset, part_size, mr, send_qps_[send_idx], offset);
+                        } catch (...) {
+                            send_exceptions[send_idx] = std::current_exception();
+                        }
+                    });
+            }
         }
         for (auto& t : send_threads) {
             t.join();
@@ -1096,7 +1174,8 @@ public:
                     std::rethrow_exception(send_exceptions[i]);
                 } catch (const std::exception& e) {
                     throw std::runtime_error(
-                        "Failed RDMA send to target rank " + std::to_string(target_ranks_[i])
+                        "Failed RDMA send to target rank " + std::to_string(send_target_ranks_[i])
+                        + " channel " + std::to_string(send_channel_indices_[i])
                         + ": " + e.what());
                 }
             }
@@ -1237,74 +1316,58 @@ public:
             throw std::runtime_error("Not connected");
         }
 
-        // Find the QP index for this source rank
-        auto it = std::find(recv_source_ranks_.begin(), recv_source_ranks_.end(), source_rank);
-        if (it == recv_source_ranks_.end()) {
-            throw std::runtime_error("Source rank " + std::to_string(source_rank) + " not found");
-        }
-
-        size_t qp_idx = std::distance(recv_source_ranks_.begin(), it);
-
-        // TCP handshake: receive size.
-        // ACK is sent only after receive WRs are posted, so senders do not
-        // race into IBV_WR_SEND before the receiver is ready.
-        // Only hold recv_mutex_ for the short TCP portion — not for the
-        // RDMA transfer which can take seconds.  This prevents recv workers
-        // from serializing on the mutex and creating a distributed deadlock
-        // with the sender's ACK-wait loop.
-        uint64_t size_net;
-        {
-            std::lock_guard<std::mutex> lock(recv_mutex_);
-
-            // Wait for data from this specific source (with timeout)
-            fd_set read_fds;
-            FD_ZERO(&read_fds);
-            FD_SET(control_socks_recv_[qp_idx], &read_fds);
-
-            struct timeval tv = {30, 0}; // 30 second timeout
-            int ret = select(control_socks_recv_[qp_idx] + 1, &read_fds, nullptr, nullptr, &tv);
-
-            if (ret <= 0) {
-                throw std::runtime_error("Timeout waiting for data from source rank " + std::to_string(source_rank));
-            }
-
-            // Receive size
-            if (recv(control_socks_recv_[qp_idx], &size_net, sizeof(size_net), MSG_WAITALL) != sizeof(size_net)) {
-                throw std::runtime_error("Failed to receive size from source");
+        std::vector<size_t> qp_indices(static_cast<size_t>(channels_per_peer_), static_cast<size_t>(-1));
+        for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
+            if (recv_source_ranks_[i] == source_rank) {
+                int ch = recv_channel_indices_[i];
+                if (ch >= 0 && ch < channels_per_peer_) {
+                    qp_indices[static_cast<size_t>(ch)] = i;
+                }
             }
         }
-        // Mutex released — RDMA transfer runs without blocking other recv workers.
-
-        size_t recv_size = be64toh(size_net);
-
-        if (recv_size > buffer_size) {
-            throw std::runtime_error("Received size exceeds buffer size");
+        for (int ch = 0; ch < channels_per_peer_; ++ch) {
+            if (qp_indices[static_cast<size_t>(ch)] == static_cast<size_t>(-1)) {
+                throw std::runtime_error(
+                    "Source rank " + std::to_string(source_rank)
+                    + " channel " + std::to_string(ch) + " not found");
+            }
         }
 
-        // Find or use temp buffer for MR
-        ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(buffer), recv_size);
-
-        if (mr == nullptr) {
-            if (require_registered_mr_)
-                throw std::runtime_error("GDR mode: recv buffer at 0x"
-                    + std::to_string(reinterpret_cast<uintptr_t>(buffer))
-                    + " not registered for RDMA");
-            std::lock_guard<std::mutex> lock(recv_mutex_);
-            if (recv_size > temp_recv_buffer_.size())
-                throw std::runtime_error("Receive size exceeds temporary buffer size");
-            mr = temp_recv_mr_;
-            uint8_t* recv_buffer = temp_recv_buffer_.data();
-            receive_data_chunked_ready_ack(
-                recv_buffer, recv_size, mr, recv_qps_[qp_idx],
-                control_socks_recv_[qp_idx]);
-            std::memcpy(buffer, temp_recv_buffer_.data(), recv_size);
-        } else {
-            receive_data_chunked_ready_ack(
-                buffer, recv_size, mr, recv_qps_[qp_idx],
-                control_socks_recv_[qp_idx]);
+        std::vector<std::exception_ptr> recv_exceptions(static_cast<size_t>(channels_per_peer_));
+        std::vector<size_t> recv_sizes(static_cast<size_t>(channels_per_peer_), 0);
+        std::vector<std::thread> recv_threads;
+        recv_threads.reserve(static_cast<size_t>(channels_per_peer_));
+        for (int ch = 0; ch < channels_per_peer_; ++ch) {
+            size_t qp_idx = qp_indices[static_cast<size_t>(ch)];
+            size_t offset = shard_offset(buffer_size, ch, channels_per_peer_);
+            size_t part_capacity = shard_size(buffer_size, ch, channels_per_peer_);
+            recv_threads.emplace_back([this, qp_idx, ch, buffer, offset, part_capacity, &recv_sizes, &recv_exceptions]() {
+                try {
+                    auto result = receive_data_from_qp(qp_idx, buffer + offset, part_capacity);
+                    recv_sizes[static_cast<size_t>(ch)] = result.second;
+                } catch (...) {
+                    recv_exceptions[static_cast<size_t>(ch)] = std::current_exception();
+                }
+            });
+        }
+        for (auto& t : recv_threads) {
+            t.join();
+        }
+        size_t total_recv = 0;
+        for (int ch = 0; ch < channels_per_peer_; ++ch) {
+            if (recv_exceptions[static_cast<size_t>(ch)]) {
+                try {
+                    std::rethrow_exception(recv_exceptions[static_cast<size_t>(ch)]);
+                } catch (const std::exception& e) {
+                    throw std::runtime_error(
+                        "Failed RDMA receive from source rank " + std::to_string(source_rank)
+                        + " channel " + std::to_string(ch) + ": " + e.what());
+                }
+            }
+            total_recv += recv_sizes[static_cast<size_t>(ch)];
         }
 
-        return {recv_source_ranks_[qp_idx], recv_size};
+        return {source_rank, total_recv};
     }
 
 private:
@@ -1469,7 +1532,7 @@ private:
         // Recovery uses sparse directed connections, so a rank may be send-only
         // or recv-only.  libibverbs rejects CQ depth 0, so keep idle CQs valid.
         const int send_cq_depth = static_cast<int>(
-            std::max<size_t>(1, MAX_WR * target_ranks_.size())
+            std::max<size_t>(1, MAX_WR * send_target_ranks_.size())
         );
         const int recv_cq_depth = static_cast<int>(
             std::max<size_t>(1, MAX_WR * static_cast<size_t>(expected_recv_connections_))
@@ -1481,7 +1544,7 @@ private:
         }
         
         // Create queue pairs for sending
-        for (size_t i = 0; i < target_ranks_.size(); ++i) {
+        for (size_t i = 0; i < send_target_ranks_.size(); ++i) {
             ibv_qp_init_attr qp_init_attr{};
             qp_init_attr.send_cq = send_cq_;
             qp_init_attr.recv_cq = recv_cq_;
@@ -1493,7 +1556,7 @@ private:
             
             ibv_qp* qp = ibv_create_qp(pd_, &qp_init_attr);
             if (!qp) {
-                throw std::runtime_error("Failed to create send QP for target " + std::to_string(target_ranks_[i]));
+                throw std::runtime_error("Failed to create send QP for target " + std::to_string(send_target_ranks_[i]));
             }
             send_qps_.push_back(qp);
         }
@@ -1519,43 +1582,58 @@ private:
     }
     
     void start_tcp_listener() {
-        // Use ASIO acceptor instead of raw socket/bind/listen (matching eccheck pattern).
-        // ASIO's reuse_address handles TIME_WAIT automatically — no retry loop needed.
-        boost::asio::ip::tcp::endpoint endpoint(
-            boost::asio::ip::address::from_string(my_ip_), my_port_);
-        recv_acceptor_ = std::make_unique<boost::asio::ip::tcp::acceptor>(io_context_);
-        recv_acceptor_->open(endpoint.protocol());
-        recv_acceptor_->set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
-#ifdef SO_REUSEPORT
-        {
-            int reuse_port = 1;
-            setsockopt(recv_acceptor_->native_handle(), SOL_SOCKET, SO_REUSEPORT,
-                       &reuse_port, sizeof(reuse_port));
+        // One listener per RDMA channel so channel ports are base + channel_idx.
+        recv_acceptors_.clear();
+        recv_acceptors_.reserve(static_cast<size_t>(channels_per_peer_));
+        // If any channel fails to bind, close the acceptors that already bound
+        // so their ports are released immediately; otherwise a retry of the
+        // whole init would collide with these half-open listeners.
+        try {
+            for (int ch = 0; ch < channels_per_peer_; ++ch) {
+                const int listen_port = my_port_ + ch;
+                boost::asio::ip::tcp::endpoint endpoint(
+                    boost::asio::ip::address::from_string(my_ip_), listen_port);
+                auto acceptor = std::make_unique<boost::asio::ip::tcp::acceptor>(io_context_);
+                acceptor->open(endpoint.protocol());
+                // reuse_address (SO_REUSEADDR) lets us rebind a port still in
+                // TIME_WAIT. SO_REUSEPORT is intentionally NOT set: each rank
+                // owns a unique port, and allowing multiple live listeners on
+                // the same port only hides duplicate-bind bugs.
+                acceptor->set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+                for (int attempt = 0; ; ++attempt) {
+                    boost::system::error_code ec;
+                    acceptor->bind(endpoint, ec);
+                    if (!ec) break;
+                    if (attempt >= 100)
+                        throw std::runtime_error("Failed to bind to " + my_ip_ + ":" + std::to_string(listen_port)
+                            + " after 100 attempts: " + ec.message());
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                acceptor->listen();
+                if (debug_)
+                    std::cout << "[Rank " << rank_ << "] ASIO acceptor listening on "
+                              << my_ip_ << ":" << listen_port << " channel " << ch << std::endl;
+                recv_acceptors_.push_back(std::move(acceptor));
+            }
+        } catch (...) {
+            for (auto& acceptor : recv_acceptors_) {
+                if (acceptor && acceptor->is_open()) {
+                    boost::system::error_code ignored;
+                    acceptor->close(ignored);
+                }
+            }
+            recv_acceptors_.clear();
+            throw;
         }
-#endif
-        for (int attempt = 0; ; ++attempt) {
-            boost::system::error_code ec;
-            recv_acceptor_->bind(endpoint, ec);
-            if (!ec) break;
-            if (attempt >= 100)
-                throw std::runtime_error("Failed to bind to " + my_ip_ + ":" + std::to_string(my_port_)
-                    + " after 100 attempts: " + ec.message());
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        // Use default backlog (same as ASIO path) so concurrent inbound TCP
-        // handshakes are not dropped when multiple senders connect at once.
-        recv_acceptor_->listen();
-        if (debug_)
-            std::cout << "[Rank " << rank_ << "] ASIO acceptor listening on " << my_ip_ << ":" << my_port_ << std::endl;
     }
     
-    void accept_tcp_connection() {
+    void accept_tcp_connection(int expected_channel_idx) {
         try {
             if (debug_)
                 std::cout << "[Rank " << rank_ << "] Waiting to accept incoming connection..." << std::endl;
             // ASIO synchronous accept (matching eccheck pattern)
             auto sock = std::make_unique<boost::asio::ip::tcp::socket>(io_context_);
-            recv_acceptor_->accept(*sock);
+            recv_acceptors_[static_cast<size_t>(expected_channel_idx)]->accept(*sock);
             int client_sock = sock->native_handle();
             if (debug_)
                 std::cout << "[Rank " << rank_ << "] Accepted TCP connection (ASIO)" << std::endl;
@@ -1573,7 +1651,12 @@ private:
             qp_init_attr.cap.max_send_sge = MAX_SGE;
             qp_init_attr.cap.max_recv_sge = MAX_SGE;
 
-            ibv_qp* qp = ibv_create_qp(pd_, &qp_init_attr);
+            ibv_qp* qp = nullptr;
+            {
+                // Serialize verbs QP creation across concurrent accept threads.
+                std::lock_guard<std::mutex> vlock(qp_setup_mutex_);
+                qp = ibv_create_qp(pd_, &qp_init_attr);
+            }
             if (!qp) {
                 throw std::runtime_error("Failed to create recv QP: " + std::string(strerror(errno)));
             }
@@ -1591,36 +1674,66 @@ private:
             // Connect QP
             if (debug_)
                 std::cout << "[Rank " << rank_ << "] Connecting recv QP..." << std::endl;
-            if (!connect_qp(qp, remote_info)) {
+            bool qp_ok = false;
+            {
+                std::lock_guard<std::mutex> vlock(qp_setup_mutex_);
+                qp_ok = connect_qp(qp, remote_info);
+            }
+            if (!qp_ok) {
                 ibv_destroy_qp(qp);
                 throw std::runtime_error("Failed to connect recv QP");
             }
 
-            // Receive source rank from sender
+            // Receive source rank and channel from sender.
             if (debug_)
-                std::cout << "[Rank " << rank_ << "] Receiving source rank ID..." << std::endl;
+                std::cout << "[Rank " << rank_ << "] Receiving source rank/channel ID..." << std::endl;
             int32_t source_rank_net;
+            int32_t channel_idx_net;
             if (recv(client_sock, &source_rank_net, sizeof(source_rank_net), MSG_WAITALL) != sizeof(source_rank_net)) {
                 ibv_destroy_qp(qp);
                 throw std::runtime_error("Failed to receive source rank: " + std::string(strerror(errno)));
             }
+            if (recv(client_sock, &channel_idx_net, sizeof(channel_idx_net), MSG_WAITALL) != sizeof(channel_idx_net)) {
+                ibv_destroy_qp(qp);
+                throw std::runtime_error("Failed to receive channel index: " + std::string(strerror(errno)));
+            }
             int source_rank = ntohl(source_rank_net);
+            int channel_idx = ntohl(channel_idx_net);
+            if (channel_idx != expected_channel_idx) {
+                ibv_destroy_qp(qp);
+                throw std::runtime_error("Accepted channel mismatch: expected "
+                    + std::to_string(expected_channel_idx) + " got " + std::to_string(channel_idx));
+            }
 
-            // Store the QP, source rank, raw fd, and keep ASIO socket alive
-            recv_qps_.push_back(qp);
-            recv_source_ranks_.push_back(source_rank);
-            control_socks_recv_.push_back(client_sock);
-            recv_socks_.push_back(std::move(sock));
+            // Store the QP, source rank/channel, raw fd, and keep ASIO socket
+            // alive. Multiple per-channel accept threads mutate these vectors
+            // concurrently, so guard them (and the completion check) with the
+            // connection mutex.
+            bool all_done = false;
+            {
+                std::lock_guard<std::mutex> lock(connection_mutex_);
+                recv_qps_.push_back(qp);
+                recv_source_ranks_.push_back(source_rank);
+                recv_channel_indices_.push_back(channel_idx);
+                control_socks_recv_.push_back(client_sock);
+                recv_socks_.push_back(std::move(sock));
+
+                all_done =
+                    recv_qps_.size() == static_cast<size_t>(expected_recv_connections_) &&
+                    send_qps_.size() == send_target_ranks_.size() &&
+                    std::all_of(control_socks_send_.begin(), control_socks_send_.end(),
+                                [](int s) { return s >= 0; });
+                if (all_done) {
+                    connected_ = true;
+                }
+            }
 
             if (debug_)
-                std::cout << "[Rank " << rank_ << "] Successfully accepted RDMA connection from rank " << source_rank << std::endl;
+                std::cout << "[Rank " << rank_ << "] Successfully accepted RDMA connection from rank "
+                          << source_rank << " channel " << channel_idx << std::endl;
 
             // If we're the last to finish (accept side), signal connected_
-            if (recv_qps_.size() == static_cast<size_t>(expected_recv_connections_) &&
-                send_qps_.size() == target_ranks_.size() &&
-                std::all_of(control_socks_send_.begin(), control_socks_send_.end(), [](int s) { return s >= 0; })) {
-                std::lock_guard<std::mutex> lock(connection_mutex_);
-                connected_ = true;
+            if (all_done) {
                 connection_cv_.notify_all();
                 if (debug_)
                     std::cout << "[Rank " << rank_ << "] All connections complete (from accept side), notifying waiters" << std::endl;
@@ -1633,72 +1746,95 @@ private:
 
     void connect_to_target(size_t target_idx) {
         try {
+            const int target_rank = send_target_ranks_[target_idx];
+            const int channel_idx = send_channel_indices_[target_idx];
+            const size_t peer_idx = target_idx / static_cast<size_t>(channels_per_peer_);
+            const int target_port = target_ports_[peer_idx] + channel_idx;
             if (debug_)
                 std::cout << "[Rank " << rank_ << "] Connecting to target "
-                          << target_ranks_[target_idx] << " at "
-                          << target_ips_[target_idx] << ":" << target_ports_[target_idx] << std::endl;
+                          << target_rank << " channel " << channel_idx << " at "
+                          << target_ips_[peer_idx] << ":" << target_port << std::endl;
 
             auto sock = std::make_unique<boost::asio::ip::tcp::socket>(io_context_);
             asio_tcp_connect_with_retry(
                 io_context_, *sock,
-                target_ips_[target_idx], target_ports_[target_idx],
-                rank_, target_ranks_[target_idx]);
+                target_ips_[peer_idx], target_port,
+                rank_, target_rank);
             int fd = sock->native_handle();
             if (debug_)
                 std::cout << "[Rank " << rank_ << "] TCP connected to target "
-                          << target_ranks_[target_idx] << " (ASIO)" << std::endl;
+                          << target_rank << " channel " << channel_idx << " (ASIO)" << std::endl;
 
             // Connector sends QP info first (same as eccheck's exchange(true))
             if (debug_)
                 std::cout << "[Rank " << rank_ << "] Exchanging QP info (send-first) with target "
-                          << target_ranks_[target_idx] << std::endl;
+                          << target_rank << " channel " << channel_idx << std::endl;
             RdmaConnInfo local_info = get_local_conn_info(send_qps_[target_idx]);
             RdmaConnInfo remote_info;
             if (!exchange_conn_info(fd, local_info, remote_info, true)) {
                 throw std::runtime_error("Failed to exchange connection info with target "
-                    + std::to_string(target_ranks_[target_idx]));
+                    + std::to_string(target_rank) + " channel " + std::to_string(channel_idx));
             }
 
             // Connect QP
             if (debug_)
-                std::cout << "[Rank " << rank_ << "] Connecting QP to target " << target_ranks_[target_idx] << std::endl;
-            if (!connect_qp(send_qps_[target_idx], remote_info)) {
-                throw std::runtime_error("Failed to connect QP to target " + std::to_string(target_ranks_[target_idx]));
+                std::cout << "[Rank " << rank_ << "] Connecting QP to target "
+                          << target_rank << " channel " << channel_idx << std::endl;
+            bool send_qp_ok = false;
+            {
+                // Serialize verbs setup against the concurrent accept threads.
+                std::lock_guard<std::mutex> vlock(qp_setup_mutex_);
+                send_qp_ok = connect_qp(send_qps_[target_idx], remote_info);
+            }
+            if (!send_qp_ok) {
+                throw std::runtime_error("Failed to connect QP to target " + std::to_string(target_rank)
+                    + " channel " + std::to_string(channel_idx));
             }
 
-            // Send my rank to receiver
+            // Send my rank and channel to receiver.
             if (debug_)
-                std::cout << "[Rank " << rank_ << "] Sending rank ID to target " << target_ranks_[target_idx] << std::endl;
+                std::cout << "[Rank " << rank_ << "] Sending rank/channel ID to target "
+                          << target_rank << " channel " << channel_idx << std::endl;
             int32_t my_rank_net = htonl(rank_);
+            int32_t channel_idx_net = htonl(channel_idx);
             if (send(fd, &my_rank_net, sizeof(my_rank_net), 0) != sizeof(my_rank_net)) {
-                throw std::runtime_error("Failed to send rank to target " + std::to_string(target_ranks_[target_idx]));
+                throw std::runtime_error("Failed to send rank to target " + std::to_string(target_rank));
+            }
+            if (send(fd, &channel_idx_net, sizeof(channel_idx_net), 0) != sizeof(channel_idx_net)) {
+                throw std::runtime_error("Failed to send channel index to target " + std::to_string(target_rank));
             }
 
-            control_socks_send_[target_idx] = fd;
-            send_socks_.push_back(std::move(sock));
-
-            if (debug_)
-                std::cout << "[Rank " << rank_ << "] Successfully connected to target " << target_ranks_[target_idx] << std::endl;
-
-            // Check if all connections established
-            if (debug_)
-                std::cout << "[Rank " << rank_ << "] Connection status: recv_qps=" << recv_qps_.size()
-                          << "/" << expected_recv_connections_ << ", send_qps=" << send_qps_.size()
-                          << "/" << target_ranks_.size() << ", control_socks_send="
-                          << std::count_if(control_socks_send_.begin(), control_socks_send_.end(), [](int s) { return s >= 0; })
-                          << "/" << target_ranks_.size() << std::endl;
-
-            if (recv_qps_.size() == static_cast<size_t>(expected_recv_connections_) &&
-                send_qps_.size() == target_ranks_.size() &&
-                std::all_of(control_socks_send_.begin(), control_socks_send_.end(), [](int s) { return s >= 0; })) {
+            // control_socks_send_ is written at a fixed index by this single
+            // connect thread, but the completion check reads recv_qps_ which
+            // the accept threads mutate — so do the check under the lock.
+            bool all_done = false;
+            {
                 std::lock_guard<std::mutex> lock(connection_mutex_);
-                connected_ = true;
+                control_socks_send_[target_idx] = fd;
+                send_socks_.push_back(std::move(sock));
+
+                all_done =
+                    recv_qps_.size() == static_cast<size_t>(expected_recv_connections_) &&
+                    send_qps_.size() == send_target_ranks_.size() &&
+                    std::all_of(control_socks_send_.begin(), control_socks_send_.end(),
+                                [](int s) { return s >= 0; });
+                if (all_done) {
+                    connected_ = true;
+                }
+            }
+
+            if (debug_)
+                std::cout << "[Rank " << rank_ << "] Successfully connected to target "
+                          << target_rank << " channel " << channel_idx << std::endl;
+
+            if (all_done) {
                 connection_cv_.notify_all();
                 if (debug_)
                     std::cout << "[Rank " << rank_ << "] All connections complete (from connect_to_target), notifying waiters" << std::endl;
             }
         } catch (const std::exception& e) {
-            std::cerr << "[Rank " << rank_ << "] ERROR connecting to target " << target_ranks_[target_idx] << ": " << e.what() << std::endl;
+            std::cerr << "[Rank " << rank_ << "] ERROR connecting to target channel "
+                      << target_idx << ": " << e.what() << std::endl;
             throw;
         }
     }
@@ -1906,6 +2042,12 @@ private:
                 recv_acceptor_->close();
             }
             recv_acceptor_.reset();
+            for (auto& acceptor : recv_acceptors_) {
+                if (acceptor && acceptor->is_open()) {
+                    acceptor->close();
+                }
+            }
+            recv_acceptors_.clear();
 
             // 2. Close control / exchange sockets so the io_context has no
             //    remaining work.
@@ -2000,6 +2142,7 @@ private:
     int world_size_;
     std::vector<int> target_ranks_;
     bool use_rdma_;
+    int channels_per_peer_;
     bool debug_ = false;
 
     // Rank→connection-index maps for directed P2P (hardware recovery).
@@ -2047,6 +2190,11 @@ private:
     std::deque<std::atomic<bool>> recv_error_;
     std::vector<std::string> recv_error_msgs_;
     std::mutex recv_error_mutex_;
+
+    std::atomic<uint64_t> exchange_send_bytes_{0};
+    std::atomic<uint64_t> exchange_recv_bytes_{0};
+    std::atomic<uint64_t> exchange_send_tasks_{0};
+    std::atomic<uint64_t> exchange_recv_tasks_{0};
 
     // ---- GDR mirror worker (D2H copy in background, overlaps with RDMA) ----
     bool require_registered_mr_{false};
@@ -2116,12 +2264,14 @@ public:
         const std::vector<int>& target_ports,
         const std::string& my_ip, int my_port,
         int num_source_ranks,
-        bool use_rdma = false
+        bool use_rdma = false,
+        int channels_per_peer = 1
     )
         : rank_(rank),
           world_size_(world_size),
           target_ranks_(target_ranks),
-          use_rdma_(use_rdma)
+          use_rdma_(use_rdma),
+          channels_per_peer_(std::max(1, channels_per_peer))
     {
         if (debug_)
             std::cout << "[Rank " << rank_ << "] Creating GeminiReplicasNative with " 
@@ -2135,7 +2285,8 @@ public:
                 rank_, world_size_,
                 target_ranks, target_ips, target_ports,
                 my_ip, my_port,
-                num_source_ranks  // Pass number of expected incoming connections
+                num_source_ranks,  // Number of source peers
+                channels_per_peer_
             );
         } else {
             connection_manager_ = std::make_unique<GeminiReplicasAsioConnectionManager>(
@@ -2191,7 +2342,7 @@ public:
         constexpr size_t kMaxBatchWr = 8;
         const size_t batch_bytes = kChunkSize * kMaxBatchWr;
         const size_t batch_count = (total_size + batch_bytes - 1) / batch_bytes;
-        const size_t fanout = target_ranks_.size();
+        const size_t fanout = target_ranks_.size() * connection_manager_->send_channel_count();
         auto batch_done_counts = std::make_shared<std::vector<std::atomic<size_t>>>(batch_count);
         for (auto& count : *batch_done_counts) {
             count = 0;
@@ -2460,6 +2611,11 @@ private:
 
                 configure_exchange_mirror(gpu_base, cpu_base, send_task_size_);
                 connection_manager_->broadcast_to_targets(data, send_task_size_);
+                exchange_send_bytes_.fetch_add(
+                    send_task_size_ * target_ranks_.size(), std::memory_order_relaxed);
+                exchange_send_tasks_.fetch_add(
+                    target_ranks_.size() * connection_manager_->send_channel_count(),
+                    std::memory_order_relaxed);
                 connection_manager_->set_chunk_done_callback(nullptr);
             } catch (const std::exception& e) {
                 connection_manager_->set_chunk_done_callback(nullptr);
@@ -2493,8 +2649,10 @@ private:
 
             try {
                 uint8_t* buf = reinterpret_cast<uint8_t*>(recv_task_addrs_[idx]);
-                connection_manager_->receive_data_from_source(
+                auto result = connection_manager_->receive_data_from_source(
                     source_rank, buf, recv_task_sizes_[idx]);
+                exchange_recv_bytes_.fetch_add(result.second, std::memory_order_relaxed);
+                exchange_recv_tasks_.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(recv_error_mutex_);
                 recv_error_msgs_[idx] = e.what();
@@ -2519,6 +2677,10 @@ public:
         send_error_ = false;
         send_task_addr_ = 0;
         send_task_size_ = 0;
+        exchange_send_bytes_.store(0, std::memory_order_relaxed);
+        exchange_recv_bytes_.store(0, std::memory_order_relaxed);
+        exchange_send_tasks_.store(0, std::memory_order_relaxed);
+        exchange_recv_tasks_.store(0, std::memory_order_relaxed);
         for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
             recv_ready_[i] = false;
             recv_done_[i] = false;
@@ -2607,6 +2769,15 @@ public:
     
     bool is_initialized() const {
         return initialized_;
+    }
+
+    pybind11::dict get_exchange_stats() const {
+        pybind11::dict result;
+        result["send_bytes"] = static_cast<double>(exchange_send_bytes_.load(std::memory_order_relaxed));
+        result["recv_bytes"] = static_cast<double>(exchange_recv_bytes_.load(std::memory_order_relaxed));
+        result["send_tasks"] = static_cast<double>(exchange_send_tasks_.load(std::memory_order_relaxed));
+        result["recv_tasks"] = static_cast<double>(exchange_recv_tasks_.load(std::memory_order_relaxed));
+        return result;
     }
     
     int get_rank() const {
@@ -2819,7 +2990,7 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
     
     py::class_<GeminiReplicasNative>(m, "GeminiReplicasNative")
         .def(py::init<int, int, const std::vector<int>&, const std::vector<std::string>&, 
-                      const std::vector<int>&, const std::string&, int, int, bool>(),
+                      const std::vector<int>&, const std::string&, int, int, bool, int>(),
              py::arg("rank"),
              py::arg("world_size"),
              py::arg("target_ranks"),
@@ -2829,6 +3000,7 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
              py::arg("my_port"),
              py::arg("num_source_ranks"),
              py::arg("use_rdma") = false,
+             py::arg("channels_per_peer") = 1,
              "Create GeminiReplicasNative instance (Phase 1: start acceptor)")
         .def("finalize_connections", &GeminiReplicasNative::finalize_connections,
              "Finalize connections (Phase 2: connect to all targets)")
@@ -2862,6 +3034,8 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
              "Reset per-exchange flags for the next exchange")
         .def("is_initialized", &GeminiReplicasNative::is_initialized,
              "Check if fully initialized")
+        .def("get_exchange_stats", &GeminiReplicasNative::get_exchange_stats,
+             "Return temporary per-exchange send/recv payload byte counters")
         .def("get_rank", &GeminiReplicasNative::get_rank,
              "Get current rank")
         .def("get_target_ranks", &GeminiReplicasNative::get_target_ranks,

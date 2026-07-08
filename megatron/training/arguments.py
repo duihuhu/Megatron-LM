@@ -2475,6 +2475,10 @@ def _add_checkpointing_args(parser):
                             'Default: None (global round-robin across all ranks). '
                             'Must evenly divide world_size when set. '
                             'Similar to --frcheck-n for FRCheck.')
+    group.add_argument('--gemini-replicas-channels-per-peer', type=int, default=1,
+                       help='Number of RDMA channels to open per Gemini Replicas peer during save. '
+                            'Default: 1 preserves the existing one-QP-per-peer behavior. '
+                            'Only affects optimized RDMA save path.')
     group.add_argument('--gemini-replicas-debug', action='store_true',
                        help='Enable detailed debug logging for Gemini Replicas operations.')
     group.add_argument('--use-gemini-replicas-hardware-failure', action='store_true',

@@ -123,6 +123,7 @@ case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
+            --gemini-replicas-channels-per-peer 8
             --ec-checkpoint-write-only-penultimate-iter
         )
         ;;

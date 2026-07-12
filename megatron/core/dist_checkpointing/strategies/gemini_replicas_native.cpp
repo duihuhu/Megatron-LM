@@ -2333,33 +2333,47 @@ public:
         }
         if (target_ranks_.empty()) {
             push_mirror_task(gpu_base, cpu_base, total_size);
-            mirror_tasks_submitted_.fetch_add(1);
-            mirror_bytes_submitted_.fetch_add(total_size);
             return;
         }
 
-        constexpr size_t kChunkSize = 64ULL * 1024 * 1024;
-        constexpr size_t kMaxBatchWr = 8;
-        const size_t batch_bytes = kChunkSize * kMaxBatchWr;
-        const size_t batch_count = (total_size + batch_bytes - 1) / batch_bytes;
-        const size_t fanout = target_ranks_.size() * connection_manager_->send_channel_count();
-        auto batch_done_counts = std::make_shared<std::vector<std::atomic<size_t>>>(batch_count);
-        for (auto& count : *batch_done_counts) {
-            count = 0;
+        // Channels carry disjoint shards. The callback's exact byte range can
+        // repeat only across targets, so count completion by (offset, bytes),
+        // rather than by the coarser RDMA batch index shared by nearby shards.
+        const size_t target_fanout = target_ranks_.size();
+        auto range_done_counts = std::make_shared<std::map<std::pair<size_t, size_t>, size_t>>();
+        auto range_done_mutex = std::make_shared<std::mutex>();
+
+        // Split each completed range into smaller D2H sub-tasks so a single large
+        // mirror copy does not monopolize the copy engine / PCIe and starve the
+        // concurrent GDR sends. Controlled by GEMINI_MIRROR_CHUNK_MB (default 64).
+        size_t mirror_chunk_bytes = 64ULL * 1024 * 1024;
+        if (const char* env = std::getenv("GEMINI_MIRROR_CHUNK_MB")) {
+            const long mb = std::atol(env);
+            if (mb > 0) {
+                mirror_chunk_bytes = static_cast<size_t>(mb) * 1024 * 1024;
+            }
         }
 
         connection_manager_->set_chunk_done_callback(
-            [this, gpu_base, cpu_base, total_size, fanout, batch_done_counts](
-                size_t batch_idx, size_t offset, size_t bytes) {
-                if (batch_idx >= batch_done_counts->size() || offset >= total_size || bytes == 0) {
+            [this, gpu_base, cpu_base, total_size, target_fanout,
+             range_done_counts, range_done_mutex, mirror_chunk_bytes](
+                size_t, size_t offset, size_t bytes) {
+                if (offset >= total_size || bytes == 0) {
                     return;
                 }
-                size_t done = (*batch_done_counts)[batch_idx].fetch_add(1) + 1;
-                if (done == fanout) {
-                    size_t bounded_bytes = std::min(bytes, total_size - offset);
-                    push_mirror_task(gpu_base + offset, cpu_base + offset, bounded_bytes);
-                    mirror_tasks_submitted_.fetch_add(1);
-                    mirror_bytes_submitted_.fetch_add(bounded_bytes);
+                const size_t bounded_bytes = std::min(bytes, total_size - offset);
+                bool range_complete = false;
+                {
+                    std::lock_guard<std::mutex> lk(*range_done_mutex);
+                    auto& done = (*range_done_counts)[{offset, bounded_bytes}];
+                    ++done;
+                    range_complete = (done == target_fanout);
+                }
+                if (range_complete) {
+                    for (size_t sub = 0; sub < bounded_bytes; sub += mirror_chunk_bytes) {
+                        const size_t chunk = std::min(mirror_chunk_bytes, bounded_bytes - sub);
+                        push_mirror_task(gpu_base + offset + sub, cpu_base + offset + sub, chunk);
+                    }
                 }
             });
     }
@@ -2777,6 +2791,9 @@ public:
         result["recv_bytes"] = static_cast<double>(exchange_recv_bytes_.load(std::memory_order_relaxed));
         result["send_tasks"] = static_cast<double>(exchange_send_tasks_.load(std::memory_order_relaxed));
         result["recv_tasks"] = static_cast<double>(exchange_recv_tasks_.load(std::memory_order_relaxed));
+        result["mirror_tasks"] = static_cast<double>(mirror_tasks_submitted_.load(std::memory_order_relaxed));
+        result["mirror_bytes"] = static_cast<double>(mirror_bytes_submitted_.load(std::memory_order_relaxed));
+        result["mirror_d2h_busy_s"] = get_mirror_d2h_busy_s();
         return result;
     }
     
@@ -2846,10 +2863,13 @@ public:
     }
 
     void push_mirror_task(uintptr_t gpu_addr, uintptr_t cpu_addr, size_t size) {
+        if (gpu_addr == 0 || cpu_addr == 0 || size == 0) return;
         {
             std::lock_guard<std::mutex> lk(mirror_mutex_);
             mirror_queue_.push({gpu_addr, cpu_addr, size});
         }
+        mirror_tasks_submitted_.fetch_add(1, std::memory_order_relaxed);
+        mirror_bytes_submitted_.fetch_add(size, std::memory_order_relaxed);
         mirror_cv_.notify_one();
     }
 

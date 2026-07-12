@@ -5,6 +5,7 @@ Mirrors ecnaive_legacy.py: decompose state dict, exchange via C++ native,
 save/load .pt files with torch.save / torch.load.
 """
 
+import os
 import pickle
 import struct
 import time
@@ -357,50 +358,108 @@ def save_gemini_replicas_legacy_checkpoint(
     native = manager._gemini_replicas_native
     native.reset_exchange_state()
 
-    if manager.use_gdr and gpu_tensor_buffer is not None:
-        send_addr = gpu_tensor_buffer.data_ptr()
-        # Per-batch D2H: C++ pushes mirror tasks after completed RDMA send
-        # batches, so finished GPU ranges D2H while later RDMA batches continue.
-        native.set_mirror_bases(
-            gpu_tensor_buffer.data_ptr(),
-            tensor_buffer.data_ptr(),
+    mirror_mode = os.environ.get("GEMINI_MIRROR_MODE", "batch").strip().lower()
+    if mirror_mode not in {"batch", "after_network", "off", "cpu_pipeline"}:
+        raise RuntimeError(
+            f"Invalid GEMINI_MIRROR_MODE={mirror_mode!r}; expected "
+            "batch, after_network, off, or cpu_pipeline"
         )
-        if _dbg:
-            logger.info("GEMINI save timing: mirror bases set (per-batch overlap)")
-    else:
-        send_addr = tensor_buffer.data_ptr()
-        native.set_mirror_bases(0, 0)  # disable per-batch mirror
-
-    _submit_t0 = time.time()
-    native.submit_send_buffer(send_addr, send_buffer_size)
-
-    for src_r, recv_buf in receive_buffers.items():
-        native.submit_recv_buffer(src_r, recv_buf.data_ptr(), recv_buf.numel())
-    _submit_elapsed = time.time() - _submit_t0
-
-    if _dbg:
-        logger.info(
-            f"Gemini Replicas legacy save rank {rank}: executing C++ exchange "
-            f"(send to {len(target_ranks) - 1} targets, recv from {len(source_ranks)} sources)..."
-        )
-    _exchange_t0 = time.time()
-    native.wait_for_exchange_completion()
-    _exchange_elapsed = time.time() - _exchange_t0
-    exchange_stats = native.get_exchange_stats() if hasattr(native, "get_exchange_stats") else {}
 
     mirror_d2h_s = 0.0
-    if manager.use_gdr and gpu_tensor_buffer is not None:
-        _mirror_t0 = time.time()
-        native.wait_mirror_completion()
-        mirror_d2h_s = time.time() - _mirror_t0
-        d2h_s = float(native.get_mirror_d2h_busy_s())
-        native.start_mirror_worker()  # restart for next iteration
+    if mirror_mode == "cpu_pipeline" and manager.use_gdr and gpu_tensor_buffer is not None:
+        # FRCheck-style pipeline: the GPU buffer is already packed above. Send from
+        # the CPU buffer (NIC reads host memory, no GPU-read contention with the
+        # concurrent D2H), and overlap each segment's D2H (GPU->CPU) with the
+        # network send of earlier segments. Segment count via GEMINI_PIPELINE_SEGMENTS.
+        manager.register_buffer(tensor_buffer)
+        native.set_mirror_bases(0, 0)
+        num_seg = max(1, int(os.environ.get("GEMINI_PIPELINE_SEGMENTS", "4")))
+
+        d2h_stream = torch.cuda.Stream()
+        seg_ranges: List[Tuple[int, int]] = []
+        seg_events: List[torch.cuda.Event] = []
+        d2h_start_ev = torch.cuda.Event(enable_timing=True)
+        d2h_end_ev = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(d2h_stream):
+            d2h_start_ev.record(d2h_stream)
+            for k in range(num_seg):
+                s0 = (send_buffer_size * k) // num_seg
+                s1 = (send_buffer_size * (k + 1)) // num_seg
+                if s1 <= s0:
+                    continue
+                tensor_buffer[s0:s1].copy_(gpu_tensor_buffer[s0:s1], non_blocking=True)
+                ev = torch.cuda.Event()
+                ev.record(d2h_stream)
+                seg_ranges.append((s0, s1))
+                seg_events.append(ev)
+            d2h_end_ev.record(d2h_stream)
+
+        send_base = tensor_buffer.data_ptr()
+        _exchange_t0 = time.time()
+        for seg_idx, ((s0, s1), ev) in enumerate(zip(seg_ranges, seg_events)):
+            ev.synchronize()  # later segments keep copying on d2h_stream
+            native.reset_exchange_state()
+            native.submit_send_buffer(send_base + s0, s1 - s0)
+            for src_r, recv_buf in receive_buffers.items():
+                src_total = recv_buf.numel()
+                r0 = (src_total * seg_idx) // num_seg
+                r1 = (src_total * (seg_idx + 1)) // num_seg
+                if r1 > r0:
+                    native.submit_recv_buffer(src_r, recv_buf.data_ptr() + r0, r1 - r0)
+            native.wait_for_exchange_completion()
+        _exchange_elapsed = time.time() - _exchange_t0
+        d2h_end_ev.synchronize()
+        d2h_s = d2h_start_ev.elapsed_time(d2h_end_ev) / 1000.0
+        exchange_stats = native.get_exchange_stats() if hasattr(native, "get_exchange_stats") else {}
+    else:
+        if manager.use_gdr and gpu_tensor_buffer is not None:
+            send_addr = gpu_tensor_buffer.data_ptr()
+            if mirror_mode == "batch":
+                # Mirror each exact GPU range after all target sends for that range finish.
+                native.set_mirror_bases(
+                    gpu_tensor_buffer.data_ptr(),
+                    tensor_buffer.data_ptr(),
+                )
+            else:
+                native.set_mirror_bases(0, 0)
+            if _dbg:
+                logger.info("GEMINI save timing: mirror mode=%s", mirror_mode)
+        else:
+            send_addr = tensor_buffer.data_ptr()
+            native.set_mirror_bases(0, 0)
+            mirror_mode = "cpu_send"
+
+        _submit_t0 = time.time()
+        native.submit_send_buffer(send_addr, send_buffer_size)
+
+        for src_r, recv_buf in receive_buffers.items():
+            native.submit_recv_buffer(src_r, recv_buf.data_ptr(), recv_buf.numel())
+        _submit_elapsed = time.time() - _submit_t0
+
         if _dbg:
             logger.info(
-                "GEMINI save timing: mirror_d2h wall=%.3fs d2h_busy=%.3fs",
-                mirror_d2h_s, d2h_s,
+                f"Gemini Replicas legacy save rank {rank}: executing C++ exchange "
+                f"(send to {len(target_ranks) - 1} targets, recv from {len(source_ranks)} sources)..."
             )
-
+        _exchange_t0 = time.time()
+        native.wait_for_exchange_completion()
+        _exchange_elapsed = time.time() - _exchange_t0
+        if manager.use_gdr and gpu_tensor_buffer is not None:
+            _mirror_t0 = time.time()
+            if mirror_mode == "after_network":
+                native.push_mirror_task(
+                    gpu_tensor_buffer.data_ptr(), tensor_buffer.data_ptr(), send_buffer_size
+                )
+            native.wait_mirror_completion()
+            mirror_d2h_s = time.time() - _mirror_t0
+            d2h_s = float(native.get_mirror_d2h_busy_s())
+            native.start_mirror_worker()  # restart for next iteration
+            if _dbg:
+                logger.info(
+                    "GEMINI save timing: mirror_d2h wall=%.3fs d2h_busy=%.3fs",
+                    mirror_d2h_s, d2h_s,
+                )
+        exchange_stats = native.get_exchange_stats() if hasattr(native, "get_exchange_stats") else {}
     e2e_s = time.time() - e2e_t0
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -425,16 +484,23 @@ def save_gemini_replicas_legacy_checkpoint(
         "recv_bytes": float(exchange_stats.get("recv_bytes", 0.0)),
         "send_tasks": float(exchange_stats.get("send_tasks", 0.0)),
         "recv_tasks": float(exchange_stats.get("recv_tasks", 0.0)),
+        "mirror_tasks": float(exchange_stats.get("mirror_tasks", 0.0)),
+        "mirror_bytes": float(exchange_stats.get("mirror_bytes", 0.0)),
+        "mirror_d2h_busy_s": float(exchange_stats.get("mirror_d2h_busy_s", 0.0)),
     })
     if rank == 0:
+        summary["mirror_mode"] = mirror_mode
         logger.info(
-            "GEMINI save timing: e2e_s=%(e2e_s).2fs pack_s=%(pack_s).2fs d2h_s=%(d2h_s).2fs "
+            "GEMINI save timing: mirror_mode=%(mirror_mode)s e2e_s=%(e2e_s).2fs "
+            "pack_s=%(pack_s).2fs d2h_s=%(d2h_s).2fs "
             "mirror_d2h_s=%(mirror_d2h_s).2fs network_encode_s=%(network_encode_s).2fs",
             summary,
         )
         logger.debug(
             "GEMINI save network bytes: send_bytes=%(send_bytes).0f recv_bytes=%(recv_bytes).0f "
-            "send_tasks=%(send_tasks).0f recv_tasks=%(recv_tasks).0f",
+            "send_tasks=%(send_tasks).0f recv_tasks=%(recv_tasks).0f "
+            "mirror_tasks=%(mirror_tasks).0f mirror_bytes=%(mirror_bytes).0f "
+            "mirror_d2h_busy_s=%(mirror_d2h_busy_s).4f",
             byte_summary,
         )
 

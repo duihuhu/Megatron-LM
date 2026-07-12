@@ -140,6 +140,7 @@ public:
     }
 
     ~FRCheckRdmaChannel() {
+        stop_tag_receiver();
         if (qp_) ibv_destroy_qp(qp_);
         if (recv_cq_) { ibv_destroy_cq(recv_cq_); recv_cq_ = nullptr; }
         if (send_cq_) { ibv_destroy_cq(send_cq_); send_cq_ = nullptr; }
@@ -152,6 +153,8 @@ public:
     // Break blocking send/recv during shutdown (ECLATIN-style conn cleanup).
     void abort_connection() {
         connected_ = false;
+        tag_stop_.store(true, std::memory_order_release);
+        tag_cv_.notify_all();
         if (tcp_sock_ >= 0) {
             shutdown(tcp_sock_, SHUT_RDWR);
         }
@@ -414,6 +417,174 @@ private:
     bool connected_;
     std::mutex send_mtx_;
     std::mutex recv_mtx_;
+
+    // ---- Tagged multiplexing (shared-lane mode) ----
+    // A shared lane is bidirectional and carries interleaved messages for many
+    // stripes.  A single dedicated reader thread owns ALL TCP control bytes and
+    // demultiplexes two control record types:
+    //   DATA: cache the incoming payload size for `tag`; recv_tagged() sends the
+    //         ACK only after its RDMA receive buffer is ready.
+    //   ACK : the peer accepted our earlier DATA for `tag`; wake the sender so
+    //         it can RDMA send the payload.
+    // Senders never read the socket directly (that would steal ACK/DATA bytes);
+    // they wait for the reader thread to deliver the ACK.
+    struct TaggedCtl { uint32_t type; uint32_t pad; uint64_t tag; uint64_t size; };
+    static constexpr uint32_t kTagData = 0;
+    static constexpr uint32_t kTagAck  = 1;
+
+    std::mutex tag_mtx_;
+    std::condition_variable tag_cv_;
+    std::map<uint64_t, size_t> pending_data_sizes_;
+    std::map<uint64_t, bool> ack_ready_;
+    std::mutex sock_write_mtx_;
+    std::thread tag_receiver_thread_;
+    std::atomic<bool> tag_stop_{false};
+    bool tag_mode_ = false;
+
+    bool read_full_(void* p, size_t n) {
+        uint8_t* c = (uint8_t*)p;
+        size_t got = 0;
+        while (got < n) {
+            ssize_t r = ::recv(tcp_sock_, c + got, n - got, MSG_WAITALL);
+            if (r <= 0) return false;
+            got += (size_t)r;
+        }
+        return true;
+    }
+
+    bool write_full_locked_(const void* p, size_t n) {
+        std::lock_guard<std::mutex> lk(sock_write_mtx_);
+        const uint8_t* c = (const uint8_t*)p;
+        size_t sent = 0;
+        while (sent < n) {
+            ssize_t w = ::send(tcp_sock_, c + sent, n - sent, 0);
+            if (w <= 0) return false;
+            sent += (size_t)w;
+        }
+        return true;
+    }
+
+    void tag_receiver_loop_() {
+        while (!tag_stop_.load(std::memory_order_acquire)) {
+            TaggedCtl c;
+            if (!read_full_(&c, sizeof(c))) break;
+            uint32_t type = be32toh(c.type);
+            uint64_t tag = be64toh(c.tag);
+            size_t size = (size_t)be64toh(c.size);
+
+            if (type == kTagAck) {
+                std::lock_guard<std::mutex> lk(tag_mtx_);
+                ack_ready_[tag] = true;
+                tag_cv_.notify_all();
+                continue;
+            }
+
+            // DATA: cache the header and keep draining control records.  Do
+            // not wait for recv_tagged() here; otherwise one early DATA for an
+            // unregistered tag can block ACK/DATA handling for the whole lane.
+            {
+                std::lock_guard<std::mutex> lk(tag_mtx_);
+                pending_data_sizes_[tag] = size;
+            }
+            tag_cv_.notify_all();
+        }
+        tag_stop_.store(true, std::memory_order_release);
+        tag_cv_.notify_all();
+    }
+
+public:
+    void start_tag_receiver() {
+        if (tag_mode_) return;
+        tag_mode_ = true;
+        tag_stop_.store(false, std::memory_order_release);
+        tag_receiver_thread_ = std::thread(&FRCheckRdmaChannel::tag_receiver_loop_, this);
+    }
+
+    void stop_tag_receiver() {
+        if (!tag_mode_) return;
+        tag_stop_.store(true, std::memory_order_release);
+        tag_cv_.notify_all();
+        if (tcp_sock_ >= 0) shutdown(tcp_sock_, SHUT_RDWR);
+        if (tag_receiver_thread_.joinable()) tag_receiver_thread_.join();
+        tag_mode_ = false;
+    }
+
+    // Serialized tagged send: one message in flight per channel.  Writes a DATA
+    // control record, waits (via the reader thread) for the peer ACK, then
+    // RDMA sends the payload.
+    void send_tagged(uint64_t tag, const uint8_t* data, size_t size,
+                     const std::function<void()>& wait_cb = nullptr,
+                     const std::function<void()>& done_cb = nullptr) {
+        std::lock_guard<std::mutex> lock(send_mtx_);
+        if (!connected_)
+            throw std::runtime_error("FRCheck RDMA: channel not connected");
+        if (wait_cb) wait_cb();
+        {
+            std::lock_guard<std::mutex> lk(tag_mtx_);
+            ack_ready_[tag] = false;
+        }
+        TaggedCtl c{htobe32(kTagData), 0, htobe64(tag), htobe64(size)};
+        if (!write_full_locked_(&c, sizeof(c)))
+            throw std::runtime_error("FRCheck RDMA: failed to send tagged header");
+        {
+            std::unique_lock<std::mutex> lk(tag_mtx_);
+            tag_cv_.wait(lk, [&]{
+                auto it = ack_ready_.find(tag);
+                return (it != ack_ready_.end() && it->second) ||
+                       tag_stop_.load(std::memory_order_acquire);
+            });
+            ack_ready_.erase(tag);
+            if (tag_stop_.load(std::memory_order_acquire)) {
+                if (done_cb) done_cb();
+                return;
+            }
+        }
+        if (done_cb) done_cb();
+        ibv_mr* mr = find_mr((uintptr_t)data, size);
+        if (!mr)
+            throw std::runtime_error("FRCheck RDMA: unregistered tagged send buffer");
+        send_chunked(data, size, mr, wait_cb, done_cb);
+    }
+
+    // Register a tagged recv target and block until its DATA header arrives.
+    // The ACK is sent from this thread after the buffer/MR is known, then the
+    // matching RDMA recv is posted.  The TCP reader remains free to process
+    // unrelated tags on the same shared lane.
+    size_t recv_tagged(uint64_t tag, uint8_t* buf, size_t buf_size,
+                       const std::function<void()>& wait_cb = nullptr,
+                       const std::function<void()>& done_cb = nullptr) {
+        if (wait_cb) wait_cb();
+        size_t size = 0;
+        {
+            std::unique_lock<std::mutex> lk(tag_mtx_);
+            tag_cv_.wait(lk, [&]{
+                return pending_data_sizes_.count(tag) ||
+                       tag_stop_.load(std::memory_order_acquire);
+            });
+            if (tag_stop_.load(std::memory_order_acquire)) {
+                if (done_cb) done_cb();
+                return 0;
+            }
+            size = pending_data_sizes_[tag];
+            pending_data_sizes_.erase(tag);
+        }
+        if (size > buf_size) {
+            throw std::runtime_error("FRCheck tagged recv: size " + std::to_string(size) +
+                                     " exceeds buffer " + std::to_string(buf_size) +
+                                     " (tag=" + std::to_string(tag) + ")");
+        }
+        ibv_mr* mr = find_mr((uintptr_t)buf, size);
+        if (!mr) {
+            throw std::runtime_error("FRCheck RDMA: unregistered tagged recv buffer");
+        }
+        std::lock_guard<std::mutex> lock(recv_mtx_);
+        TaggedCtl ack{htobe32(kTagAck), 0, htobe64(tag), 0};
+        if (!write_full_locked_(&ack, sizeof(ack))) {
+            throw std::runtime_error("FRCheck RDMA: failed to send tagged ack");
+        }
+        recv_chunked(buf, size, mr, wait_cb, done_cb);
+        return size;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -497,8 +668,28 @@ public:
           group_size_(0), rank_in_group_(-1),
           acceptor_fd_(-1), acceptor_thread_stop_(false)
     {
-        generate_poa_(n);
-        init_encode_tables_();
+        if (n == 2) {
+            // Simple two-rank microbench mode only needs RDMA channels, not POA/RS coding.
+            n_ = n;
+            poa_path_ = "(generated n=2 simple)";
+            int lanes = 1;
+            const char* send_lanes_env = std::getenv("FRCHECK_SEND_LANES_PER_PEER");
+            const char* recv_lanes_env = std::getenv("FRCHECK_RECV_LANES_PER_PEER");
+            if (send_lanes_env && send_lanes_env[0] != '\0' &&
+                recv_lanes_env && recv_lanes_env[0] != '\0') {
+                lanes = std::max(1, std::atoi(send_lanes_env)) +
+                        std::max(1, std::atoi(recv_lanes_env));
+            } else {
+                const char* lanes_env = std::getenv("FRCHECK_RDMA_LANES_PER_PEER");
+                if (lanes_env && lanes_env[0] != '\0') {
+                    lanes = std::max(1, std::atoi(lanes_env));
+                }
+            }
+            table_.assign((size_t)lanes, std::vector<int>{1, 2});
+        } else {
+            generate_poa_(n);
+            init_encode_tables_();
+        }
     }
 
     ~FRCheckNative() {
@@ -596,19 +787,62 @@ public:
         if (listen(acceptor_fd_, std::max(group_size * 16, 128)) < 0)
             throw std::runtime_error("FRCheck RDMA: listen failed");
 
-        num_lanes_ = (int)table_.size();
-        if (num_lanes_ <= 0)
+        num_stripes_ = (int)table_.size();
+        if (num_stripes_ <= 0)
             throw std::runtime_error("FRCheck RDMA: POA table has no stripes");
+        lane_direction_split_ = false;
+        save_forward_lanes_ = 0;
+        save_reverse_lanes_ = 0;
+        const char* send_lanes_env = std::getenv("FRCHECK_SEND_LANES_PER_PEER");
+        const char* recv_lanes_env = std::getenv("FRCHECK_RECV_LANES_PER_PEER");
+        if (send_lanes_env && send_lanes_env[0] != '\0' &&
+            recv_lanes_env && recv_lanes_env[0] != '\0') {
+            save_forward_lanes_ = std::max(1, std::atoi(send_lanes_env));
+            save_reverse_lanes_ = std::max(1, std::atoi(recv_lanes_env));
+            num_lanes_ = save_forward_lanes_ + save_reverse_lanes_;
+            lane_direction_split_ = true;
+        } else {
+            num_lanes_ = num_stripes_;
+            const char* lanes_env = std::getenv("FRCHECK_RDMA_LANES_PER_PEER");
+            if (lanes_env && lanes_env[0] != '\0') {
+                int requested_lanes = std::atoi(lanes_env);
+                if (requested_lanes > 0) {
+                    int bounded_lanes = std::min(num_stripes_, requested_lanes);
+                    if (bounded_lanes < num_stripes_) {
+                        // Shared lanes are bidirectional and carry interleaved stripe
+                        // messages; correctness relies on the tagged multiplexing
+                        // protocol (per-channel reader thread + DATA/ACK records).
+                        // Keep it opt-in while the path is experimental.
+                        const char* unsafe_env = std::getenv("FRCHECK_ALLOW_UNSAFE_LANE_SHARING");
+                        if (!unsafe_env || std::atoi(unsafe_env) == 0) {
+                            throw std::runtime_error(
+                                "FRCheck RDMA: FRCHECK_RDMA_LANES_PER_PEER < num_stripes uses the "
+                                "experimental tagged shared-lane path; set "
+                                "FRCHECK_ALLOW_UNSAFE_LANE_SHARING=1 to enable it");
+                        }
+                    }
+                    num_lanes_ = bounded_lanes;
+                }
+            }
+        }
+        // n=2 simple microbench can issue multiple concurrent layer tasks per peer.
+        // Use the tagged control path so parallel recv/send threads cannot steal FIFO headers.
+        shared_lane_ = (num_lanes_ < num_stripes_) || (n_ == 2) || lane_direction_split_;
         if (debug_)
             std::cout << "[FRCheck RDMA] rank=" << rank_in_group
+                      << " num_stripes=" << num_stripes_
                       << " num_lanes=" << num_lanes_
+                      << " shared_lane=" << (shared_lane_ ? 1 : 0)
+                      << " split_lanes=" << (lane_direction_split_ ? 1 : 0)
+                      << " forward_lanes=" << save_forward_lanes_
+                      << " reverse_lanes=" << save_reverse_lanes_
                       << " (connections per peer=" << num_lanes_ << ")" << std::endl;
 
         // Launch accept thread
         acceptor_thread_stop_ = false;
         accept_thread_ = std::thread([this]() { accept_loop_(); });
 
-        // channels_[peer_rg][lane_id] = channel (lane_id == stripe_id)
+        // channels_[peer_rg][lane_id], where lane_id is stripe_id % num_lanes_.
         channels_.assign(group_size, std::vector<FRCheckRdmaChannel*>(num_lanes_, nullptr));
 
         auto connect_outbound = [&](int peer, int lane) {
@@ -631,7 +865,7 @@ public:
                 std::unique_ptr<FRCheckRdmaChannel>(channels_[peer][lane]));
         };
 
-        // Connect to lower ranks: one TCP+QP per (peer, stripe lane)
+        // Connect to lower ranks: one TCP+QP per (peer, lane).
         for (int peer = 0; peer < rank_in_group; ++peer) {
             for (int lane = 0; lane < num_lanes_; ++lane) {
                 connect_outbound(peer, lane);
@@ -667,6 +901,18 @@ public:
         }
 
         n_connected_ = group_size_;
+
+        // Shared-lane mode: start a per-channel tagged receiver thread so that
+        // out-of-order stripe messages on a shared channel are dispatched to
+        // the correct destination buffer by tag instead of by FIFO position.
+        if (shared_lane_) {
+            for (auto& peer_row : channels_) {
+                for (auto* ch : peer_row) {
+                    if (ch) ch->start_tag_receiver();
+                }
+            }
+        }
+
         if (debug_)
             std::cout << "[FRCheck RDMA] rank=" << rank_in_group
                       << " all " << group_size_ << " peers x " << num_lanes_
@@ -676,8 +922,10 @@ public:
         // Init RS encode thread pool
         rs_pool_init();
 
-        // Pre-compile stripe plans
-        compile_stripe_plans_();
+        // Pre-compile stripe plans only for real FRCheck POA mode.
+        if (n_ >= 3) {
+            compile_stripe_plans_();
+        }
 
         // Start per-stripe workers (needs stripe_plans_ populated)
         mirror_worker_init();
@@ -801,6 +1049,105 @@ public:
                 " lane " + std::to_string(stripe_id));
         }
         ch->recv_data((uint8_t*)addr, size);
+    }
+
+    void send_layer_to_peer(int peer_rig, uintptr_t addr, size_t size, uint64_t batch_id, int lane_id = 0) {
+        int mapped_lane_id = map_save_send_lane_(peer_rig, lane_id);
+        FRCheckRdmaChannel* ch = get_channel_by_lane_(peer_rig, mapped_lane_id);
+        if (!ch) {
+            throw std::runtime_error(
+                "FRCheck layer send: no channel to rig " + std::to_string(peer_rig) +
+                " lane " + std::to_string(mapped_lane_id));
+        }
+        uint64_t net_t0 = frcheck_now_us();
+        record_save_net_start_(net_t0);
+        if (shared_lane_) {
+            ch->send_tagged(make_channel_tag_(2, mapped_lane_id, batch_id), (const uint8_t*)addr, size);
+        } else {
+            ch->send_data((const uint8_t*)addr, size);
+        }
+        uint64_t net_t1 = frcheck_now_us();
+        record_save_net_end_(net_t1);
+        uint64_t elapsed = net_t1 - net_t0;
+        save_source_send_total_us_.fetch_add(elapsed, std::memory_order_relaxed);
+        save_source_send_tasks_.fetch_add(1, std::memory_order_relaxed);
+        save_source_send_bytes_.fetch_add(size, std::memory_order_relaxed);
+        record_atomic_max_(save_source_send_max_us_, elapsed);
+    }
+
+    size_t recv_layer_from_peer(int peer_rig, uintptr_t addr, size_t capacity, uint64_t batch_id, int lane_id = 0) {
+        int mapped_lane_id = map_save_recv_lane_(peer_rig, lane_id);
+        FRCheckRdmaChannel* ch = get_channel_by_lane_(peer_rig, mapped_lane_id);
+        if (!ch) {
+            throw std::runtime_error(
+                "FRCheck layer recv: no channel from rig " + std::to_string(peer_rig) +
+                " lane " + std::to_string(mapped_lane_id));
+        }
+        uint64_t net_t0 = frcheck_now_us();
+        record_save_net_start_(net_t0);
+        size_t got = 0;
+        if (shared_lane_) {
+            got = ch->recv_tagged(make_channel_tag_(2, mapped_lane_id, batch_id), (uint8_t*)addr, capacity);
+        } else {
+            got = ch->recv_data((uint8_t*)addr, capacity);
+        }
+        uint64_t net_t1 = frcheck_now_us();
+        record_save_net_end_(net_t1);
+        uint64_t elapsed = net_t1 - net_t0;
+        save_enc_recv_total_us_.fetch_add(elapsed, std::memory_order_relaxed);
+        save_enc_recv_tasks_.fetch_add(1, std::memory_order_relaxed);
+        save_enc_recv_bytes_.fetch_add(got, std::memory_order_relaxed);
+        record_atomic_max_(save_enc_recv_max_us_, elapsed);
+        return got;
+    }
+
+    double simple_exchange_with_peer(
+        int peer_rig,
+        uintptr_t send_addr,
+        uintptr_t recv_addr,
+        size_t total_size,
+        int lanes,
+        uint64_t send_batch_id,
+        uint64_t recv_batch_id) {
+        lanes = std::max(1, lanes);
+        std::vector<std::thread> threads;
+        std::vector<std::exception_ptr> errors((size_t)lanes * 2);
+        threads.reserve((size_t)lanes * 2);
+        auto t0 = std::chrono::steady_clock::now();
+
+        for (int lane = 0; lane < lanes; ++lane) {
+            size_t start = (total_size * (size_t)lane) / (size_t)lanes;
+            size_t end = (total_size * (size_t)(lane + 1)) / (size_t)lanes;
+            size_t part = end - start;
+            if (part == 0) continue;
+            uint64_t recv_tag = recv_batch_id + (uint64_t)lane * 104729ULL;
+            uint64_t send_tag = send_batch_id + (uint64_t)lane * 104729ULL;
+            size_t recv_err_idx = (size_t)lane * 2;
+            size_t send_err_idx = recv_err_idx + 1;
+            threads.emplace_back([this, peer_rig, recv_addr, start, part, recv_tag, lane, recv_err_idx, &errors]() {
+                try {
+                    this->recv_layer_from_peer(peer_rig, recv_addr + start, part, recv_tag, lane);
+                } catch (...) {
+                    errors[recv_err_idx] = std::current_exception();
+                }
+            });
+            threads.emplace_back([this, peer_rig, send_addr, start, part, send_tag, lane, send_err_idx, &errors]() {
+                try {
+                    this->send_layer_to_peer(peer_rig, send_addr + start, part, send_tag, lane);
+                } catch (...) {
+                    errors[send_err_idx] = std::current_exception();
+                }
+            });
+        }
+
+        for (auto& th : threads) {
+            if (th.joinable()) th.join();
+        }
+        for (auto& ep : errors) {
+            if (ep) std::rethrow_exception(ep);
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(t1 - t0).count();
     }
 
     void set_require_registered_mr(bool require) { require_registered_mr_ = require; }
@@ -1415,9 +1762,15 @@ private:
             if (rs_pool_stop_.load(std::memory_order_acquire)) break;
             uint64_t e = rs_pool_epoch_.load(std::memory_order_acquire);
             RsEncodeJob job = rs_pool_shared_job_;
+            const std::vector<RsEncodeJob>* jobs = rs_pool_shared_jobs_;
             lk.unlock();
 
-            rs_pool_execute_slice(job, wid);
+            if (jobs != nullptr) {
+                for (const auto& j : *jobs)
+                    rs_pool_execute_slice(j, wid);
+            } else {
+                rs_pool_execute_slice(job, wid);
+            }
 
             {
                 std::lock_guard<std::mutex> guard(rs_pool_mutex_);
@@ -1456,6 +1809,7 @@ private:
             std::lock_guard<std::mutex> publish(rs_pool_mutex_);
             if (stopped_) return;
             rs_pool_shared_job_ = job;
+            rs_pool_shared_jobs_ = nullptr;
             rs_pool_epoch_.fetch_add(1, std::memory_order_acq_rel);
             rs_pool_remaining_.store(kRsPoolSize, std::memory_order_release);
         }
@@ -1465,6 +1819,30 @@ private:
             return rs_pool_remaining_.load(std::memory_order_acquire) == 0 ||
                    stopped_.load() || rs_pool_stop_.load(std::memory_order_acquire);
         });
+    }
+
+    // Encode multiple stripes in a single pool dispatch: each worker processes
+    // its byte-slice across ALL jobs, so a whole layer's encoder stripes share
+    // one barrier instead of one barrier per stripe. `jobs` must stay alive
+    // until this call returns.
+    void rs_pool_run_parallel_encode_batch(const std::vector<RsEncodeJob>& jobs) {
+        if (jobs.empty()) return;
+        {
+            std::lock_guard<std::mutex> publish(rs_pool_mutex_);
+            if (stopped_) return;
+            rs_pool_shared_jobs_ = &jobs;
+            rs_pool_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            rs_pool_remaining_.store(kRsPoolSize, std::memory_order_release);
+        }
+        rs_pool_worker_cv_.notify_all();
+        {
+            std::unique_lock<std::mutex> lk(rs_pool_mutex_);
+            rs_pool_coordinator_cv_.wait(lk, [&] {
+                return rs_pool_remaining_.load(std::memory_order_acquire) == 0 ||
+                       stopped_.load() || rs_pool_stop_.load(std::memory_order_acquire);
+            });
+            rs_pool_shared_jobs_ = nullptr;
+        }
     }
 
     // ---- EC-aligned role encoding workers (1 thread per role) ----
@@ -1499,6 +1877,12 @@ private:
     std::atomic<bool> mirror_idle_{true};
     cudaStream_t d2h_stream_ = nullptr;
     std::atomic<uint64_t> mirror_d2h_busy_total_us_{0};
+    std::atomic<uint64_t> mirror_tasks_submitted_{0};
+    std::atomic<uint64_t> mirror_bytes_submitted_{0};
+    std::atomic<uint64_t> mirror_tasks_completed_{0};
+    std::atomic<uint64_t> mirror_bytes_completed_{0};
+    std::atomic<uint64_t> mirror_tasks_failed_{0};
+    std::atomic<uint64_t> mirror_bytes_failed_{0};
 
     struct MirrorCopyTiming {
         cudaEvent_t start{};
@@ -1510,6 +1894,15 @@ private:
     std::atomic<uint64_t> save_net_start_us_{0};
     std::atomic<uint64_t> save_net_end_us_{0};
     std::atomic<uint64_t> save_encode_total_us_{0};
+    std::atomic<uint64_t> save_encode_wait_total_us_{0};
+    std::atomic<uint64_t> save_source_send_total_us_{0};
+    std::atomic<uint64_t> save_source_send_max_us_{0};
+    std::atomic<uint64_t> save_enc_recv_total_us_{0};
+    std::atomic<uint64_t> save_enc_recv_max_us_{0};
+    std::atomic<uint64_t> save_source_send_tasks_{0};
+    std::atomic<uint64_t> save_enc_recv_tasks_{0};
+    std::atomic<uint64_t> save_source_send_bytes_{0};
+    std::atomic<uint64_t> save_enc_recv_bytes_{0};
 
     // ---- Role-based queues: n workers each, encoder split into RECV→encode+SEND ----
     struct StripeInfo {
@@ -1519,17 +1912,19 @@ private:
     };
     std::vector<StripeInfo> stripe_info_;
 
-    struct SourceTask   { int sid; uintptr_t data, mirror; size_t bs; uint64_t encode_batch = 0; };
+    struct SourceTask   { int sid; uintptr_t data, mirror; size_t bs; uint64_t encode_batch = 0; bool skip = false; };
     struct EncRecvTask  { int sid; uintptr_t recv, p1, p2; size_t bs; std::vector<uint8_t> mask; uint64_t encode_batch = 0; };
+    struct EncRecvSubTask { int sid; int src_idx; uintptr_t dst; size_t bs; uint64_t batch; std::shared_ptr<std::atomic<int>> remaining; std::shared_ptr<std::mutex> done_mtx; std::shared_ptr<std::condition_variable> done_cv; };
     struct EncSendTask  { int sid; uintptr_t recv, p1, p2; size_t bs; int n_src; std::vector<int> src_peer_rigs; int par_peer_rig; bool parity_send_only = false; uint64_t async_order = 0; uint64_t async_batch = 0; };
     struct ParityTask   { int sid; uintptr_t parity_in; size_t bs; bool async_p2_only = false; uint64_t async_order = 0; uint64_t async_batch = 0; };
 
     std::queue<SourceTask>   source_q_;   std::mutex source_mtx_;   std::condition_variable source_cv_;
     std::queue<EncRecvTask>  enc_recv_q_; std::mutex enc_recv_mtx_; std::condition_variable enc_recv_cv_;
+    std::queue<EncRecvSubTask> enc_recv_part_q_; std::mutex enc_recv_part_mtx_; std::condition_variable enc_recv_part_cv_;
     std::queue<EncSendTask>  enc_send_q_; std::mutex enc_send_mtx_; std::condition_variable enc_send_cv_;
     std::queue<ParityTask>   parity_q_;   std::mutex parity_mtx_;   std::condition_variable parity_cv_;
 
-    std::vector<std::thread> source_workers_, enc_recv_workers_, enc_send_workers_, parity_workers_;
+    std::vector<std::thread> source_workers_, enc_recv_workers_, enc_recv_part_workers_, enc_send_workers_, parity_workers_;
     std::atomic<bool> all_stop_{false};
     std::atomic<int> task_total_{0}, task_done_{0};
     std::atomic<int> task_encode_total_{0}, task_encode_done_{0};
@@ -1760,6 +2155,14 @@ private:
         }
     }
 
+    void record_atomic_max_(std::atomic<uint64_t>& target, uint64_t value) {
+        uint64_t old = target.load(std::memory_order_relaxed);
+        while (value > old &&
+               !target.compare_exchange_weak(
+                   old, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+
     void source_worker_() {
         while (!all_stop_) {
             SourceTask t;
@@ -1767,16 +2170,68 @@ private:
               if (all_stop_ && source_q_.empty()) break; t = source_q_.front(); source_q_.pop(); }
             auto& si = stripe_info_[(size_t)t.sid];
             wait_encode_source_turn_(t.sid, t.encode_batch);
-            auto* ch = get_channel_(si.enc_peer_rig, t.sid);
-            if (!ch) { std::cerr << "FRCheck source " << t.sid << ": no channel\n"; continue; }
-            uint64_t net_t0 = frcheck_now_us();
-            record_save_net_start_(net_t0);
-            ch->send_data((const uint8_t*)t.data, t.bs);
-            record_save_net_end_(frcheck_now_us());
+            if (!t.skip) {
+                auto* ch = get_save_send_channel_(si.enc_peer_rig, t.sid);
+                if (!ch) { std::cerr << "FRCheck source " << t.sid << ": no channel\n"; continue; }
+                uint64_t net_t0 = frcheck_now_us();
+                record_save_net_start_(net_t0);
+                if (shared_lane_) {
+                    ch->send_tagged(make_channel_tag_(0, t.sid, t.encode_batch),
+                                    (const uint8_t*)t.data, t.bs);
+                } else {
+                    ch->send_data((const uint8_t*)t.data, t.bs);
+                }
+                uint64_t net_t1 = frcheck_now_us();
+                record_save_net_end_(net_t1);
+                uint64_t elapsed = net_t1 - net_t0;
+                save_source_send_total_us_.fetch_add(elapsed, std::memory_order_relaxed);
+                save_source_send_tasks_.fetch_add(1, std::memory_order_relaxed);
+                save_source_send_bytes_.fetch_add(t.bs, std::memory_order_relaxed);
+                record_atomic_max_(save_source_send_max_us_, elapsed);
+                if (t.mirror) push_mirror_task_(t.data, t.mirror, t.bs);
+            }
             advance_encode_source_turn_(t.sid, t.encode_batch);
-            if (t.mirror) push_mirror_task_(t.data, t.mirror, t.bs);
             check_encode_done_();
             check_done_();
+        }
+    }
+
+    void enc_recv_part_worker_() {
+        while (!all_stop_) {
+            EncRecvSubTask t;
+            {
+                std::unique_lock<std::mutex> lk(enc_recv_part_mtx_);
+                enc_recv_part_cv_.wait(lk, [&]{ return all_stop_ || !enc_recv_part_q_.empty(); });
+                if (all_stop_ && enc_recv_part_q_.empty()) break;
+                t = enc_recv_part_q_.front();
+                enc_recv_part_q_.pop();
+            }
+            auto& si = stripe_info_[(size_t)t.sid];
+            if (t.src_idx >= 0 && t.src_idx < (int)si.src_peer_rigs.size() &&
+                si.src_peer_rigs[(size_t)t.src_idx] != rank_in_group_) {
+                auto* ch = get_save_recv_channel_(si.src_peer_rigs[(size_t)t.src_idx], t.sid);
+                if (ch) {
+                    uint64_t net_t0 = frcheck_now_us();
+                    record_save_net_start_(net_t0);
+                    if (shared_lane_) {
+                        ch->recv_tagged(make_channel_tag_(0, t.sid, t.batch),
+                                        (uint8_t*)t.dst, t.bs);
+                    } else {
+                        ch->recv_data((uint8_t*)t.dst, t.bs);
+                    }
+                    uint64_t net_t1 = frcheck_now_us();
+                    record_save_net_end_(net_t1);
+                    uint64_t elapsed = net_t1 - net_t0;
+                    save_enc_recv_total_us_.fetch_add(elapsed, std::memory_order_relaxed);
+                    save_enc_recv_tasks_.fetch_add(1, std::memory_order_relaxed);
+                    save_enc_recv_bytes_.fetch_add(t.bs, std::memory_order_relaxed);
+                    record_atomic_max_(save_enc_recv_max_us_, elapsed);
+                }
+            }
+            if (t.remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                std::lock_guard<std::mutex> lk(*t.done_mtx);
+                t.done_cv->notify_one();
+            }
         }
     }
 
@@ -1788,22 +2243,31 @@ private:
             auto& si = stripe_info_[(size_t)t.sid];
             wait_encode_recv_turn_(t.sid, t.encode_batch);
             int n_src = (int)si.src_peer_rigs.size();
-            std::vector<std::thread> recv_threads;
+            int active_remote = 0;
+            auto remaining = std::make_shared<std::atomic<int>>(0);
+            auto done_mtx = std::make_shared<std::mutex>();
+            auto done_cv = std::make_shared<std::condition_variable>();
+
             for (int i = 0; i < n_src; ++i) {
                 if (!t.mask.empty() && i < (int)t.mask.size() && t.mask[(size_t)i] == 0) continue;
-                recv_threads.emplace_back([&, i]() {
-                    if (si.src_peer_rigs[(size_t)i] == rank_in_group_) return;
-                    uintptr_t dst = t.recv + (uintptr_t)i * t.bs;
-                    auto* ch = get_channel_(si.src_peer_rigs[(size_t)i], t.sid);
-                    if (ch) {
-                        uint64_t net_t0 = frcheck_now_us();
-                        record_save_net_start_(net_t0);
-                        ch->recv_data((uint8_t*)dst, t.bs);
-                        record_save_net_end_(frcheck_now_us());
-                    }
-                });
+                if (si.src_peer_rigs[(size_t)i] == rank_in_group_) continue;
+                ++active_remote;
             }
-            for (auto& th : recv_threads) th.join();
+            remaining->store(active_remote, std::memory_order_release);
+            if (active_remote > 0) {
+                {
+                    std::lock_guard<std::mutex> lk(enc_recv_part_mtx_);
+                    for (int i = 0; i < n_src; ++i) {
+                        if (!t.mask.empty() && i < (int)t.mask.size() && t.mask[(size_t)i] == 0) continue;
+                        if (si.src_peer_rigs[(size_t)i] == rank_in_group_) continue;
+                        uintptr_t dst = t.recv + (uintptr_t)i * t.bs;
+                        enc_recv_part_q_.push({t.sid, i, dst, t.bs, t.encode_batch, remaining, done_mtx, done_cv});
+                    }
+                }
+                enc_recv_part_cv_.notify_all();
+                std::unique_lock<std::mutex> lk(*done_mtx);
+                done_cv->wait(lk, [&]{ return remaining->load(std::memory_order_acquire) == 0 || all_stop_.load(std::memory_order_acquire); });
+            }
             advance_encode_recv_turn_(t.sid, t.encode_batch);
             // Push to enc_send_q_
             EncSendTask es{t.sid, t.recv, t.p1, t.p2, t.bs, n_src, si.src_peer_rigs, si.par_peer_rig};
@@ -1827,7 +2291,7 @@ private:
                 auto wait_cb = [this]() { this->_async_rdma_begin(); };
                 auto done_cb = [this]() { this->_async_rdma_end(); };
                 {
-                    auto* ch = get_channel_(t.par_peer_rig, t.sid);
+                    auto* ch = get_save_send_channel_(t.par_peer_rig, t.sid);
                     if (debug_) {
                         std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
                                   << " async_p2_send begin sid=" << t.sid
@@ -1842,7 +2306,12 @@ private:
                     if (ch) {
                         uint64_t net_t0 = frcheck_now_us();
                         record_save_net_start_(net_t0);
-                        ch->send_data((const uint8_t*)t.p1, t.bs, wait_cb, done_cb);
+                        if (shared_lane_) {
+                            ch->send_tagged(make_channel_tag_(1, t.sid, t.async_batch),
+                                            (const uint8_t*)t.p1, t.bs, wait_cb, done_cb);
+                        } else {
+                            ch->send_data((const uint8_t*)t.p1, t.bs, wait_cb, done_cb);
+                        }
                         record_save_net_end_(frcheck_now_us());
                     }
                 }
@@ -1882,7 +2351,7 @@ private:
             { std::unique_lock<std::mutex> lk(parity_mtx_); parity_cv_.wait(lk, [&]{ return all_stop_ || !parity_q_.empty(); });
               if (all_stop_ && parity_q_.empty()) break; t = parity_q_.front(); parity_q_.pop(); }
             auto& si = stripe_info_[(size_t)t.sid];
-            auto* ch = get_channel_(si.enc_peer_rig, t.sid);
+            auto* ch = get_save_recv_channel_(si.enc_peer_rig, t.sid);
             if (t.async_p2_only) wait_async_p2_recv_turn_(t.sid, t.async_order, t.async_batch);
             if (debug_ && t.async_p2_only) {
                 std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
@@ -1900,7 +2369,12 @@ private:
             if (ch) {
                 uint64_t net_t0 = frcheck_now_us();
                 record_save_net_start_(net_t0);
-                ch->recv_data((uint8_t*)t.parity_in, t.bs);
+                if (shared_lane_ && t.async_p2_only) {
+                    ch->recv_tagged(make_channel_tag_(1, t.sid, t.async_batch),
+                                    (uint8_t*)t.parity_in, t.bs);
+                } else {
+                    ch->recv_data((uint8_t*)t.parity_in, t.bs);
+                }
                 record_save_net_end_(frcheck_now_us());
             }
             if (t.async_p2_only) advance_async_p2_recv_turn_(t.sid, t.async_batch);
@@ -1959,6 +2433,8 @@ private:
             mirror_q_.push(mt);
             mirror_idle_ = false;
         }
+        mirror_tasks_submitted_.fetch_add(1, std::memory_order_relaxed);
+        mirror_bytes_submitted_.fetch_add(block_size, std::memory_order_relaxed);
         mirror_cv_.notify_one();
     }
 
@@ -1996,10 +2472,15 @@ private:
                 cudaMemcpyDeviceToHost,
                 d2h_stream_);
             if (err != cudaSuccess) {
+                mirror_tasks_failed_.fetch_add(1, std::memory_order_relaxed);
+                mirror_bytes_failed_.fetch_add(task.block_size, std::memory_order_relaxed);
                 std::cerr << "FRCheck mirror_worker: async D2H failed: "
                           << cudaGetErrorString(err) << std::endl;
+            } else {
+                mirror_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
+                mirror_bytes_completed_.fetch_add(task.block_size, std::memory_order_relaxed);
             }
-            if (start_ok && end_ok) {
+            if (start_ok && end_ok && err == cudaSuccess) {
                 cudaEventRecord(timing.end, d2h_stream_);
                 timing.valid = true;
                 std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
@@ -2009,11 +2490,82 @@ private:
     }
 
 public:
+    void mirror_layer(uintptr_t gpu_addr, uintptr_t cpu_addr, size_t size) {
+        if (gpu_addr == 0 || cpu_addr == 0 || size == 0) return;
+        push_mirror_task_(gpu_addr, cpu_addr, size);
+    }
+
+    void encode_layer_stripes(
+        const std::vector<int>& stripe_ids,
+        const std::vector<uintptr_t>& data_addrs,
+        const std::vector<uintptr_t>& p1_addrs,
+        const std::vector<uintptr_t>& p2_addrs,
+        size_t block_size)
+    {
+        const int n_src = n_ - 2;
+        if (n_src <= 0 || block_size == 0 || stripe_ids.empty()) return;
+        if (data_addrs.size() != stripe_ids.size() * (size_t)n_src ||
+            p1_addrs.size() != stripe_ids.size() ||
+            p2_addrs.size() != stripe_ids.size()) {
+            throw std::runtime_error("FRCheck layer encode: invalid argument sizes");
+        }
+        // Build persistent per-stripe pointer arrays so all encoder stripes of
+        // this layer can be encoded in a single RS pool dispatch (one barrier)
+        // instead of one barrier per stripe.
+        const size_t n_stripes = stripe_ids.size();
+        std::vector<std::vector<unsigned char*>> src_ptrs(n_stripes);
+        std::vector<std::array<unsigned char*, 2>> par_ptrs(n_stripes);
+        std::vector<RsEncodeJob> jobs(n_stripes);
+        for (size_t si = 0; si < n_stripes; ++si) {
+            if (p1_addrs[si] == 0 || p2_addrs[si] == 0) {
+                throw std::runtime_error("FRCheck layer encode: missing parity output buffer");
+            }
+            src_ptrs[si].resize((size_t)n_src);
+            for (int i = 0; i < n_src; ++i) {
+                uintptr_t addr = data_addrs[si * (size_t)n_src + (size_t)i];
+                if (addr == 0) {
+                    throw std::runtime_error("FRCheck layer encode: missing source block buffer");
+                }
+                src_ptrs[si][(size_t)i] = (unsigned char*)addr;
+            }
+            par_ptrs[si][0] = (unsigned char*)p1_addrs[si];
+            par_ptrs[si][1] = (unsigned char*)p2_addrs[si];
+            jobs[si] = RsEncodeJob{
+                (int)block_size, n_src, 2, g_tbls_,
+                src_ptrs[si].data(), par_ptrs[si].data(),
+            };
+        }
+
+        uint64_t wait_t0 = frcheck_now_us();
+        std::lock_guard<std::mutex> lk(encoder_encode_mtx_);
+        uint64_t encode_t0 = frcheck_now_us();
+        save_encode_wait_total_us_.fetch_add(
+            encode_t0 - wait_t0, std::memory_order_relaxed);
+        rs_pool_run_parallel_encode_batch(jobs);
+        save_encode_total_us_.fetch_add(
+            frcheck_now_us() - encode_t0, std::memory_order_relaxed);
+    }
+
     void reset_ft_timing_stats() {
         save_net_start_us_.store(0, std::memory_order_relaxed);
         save_net_end_us_.store(0, std::memory_order_relaxed);
         save_encode_total_us_.store(0, std::memory_order_relaxed);
+        save_encode_wait_total_us_.store(0, std::memory_order_relaxed);
+        save_source_send_total_us_.store(0, std::memory_order_relaxed);
+        save_source_send_max_us_.store(0, std::memory_order_relaxed);
+        save_enc_recv_total_us_.store(0, std::memory_order_relaxed);
+        save_enc_recv_max_us_.store(0, std::memory_order_relaxed);
+        save_source_send_tasks_.store(0, std::memory_order_relaxed);
+        save_enc_recv_tasks_.store(0, std::memory_order_relaxed);
+        save_source_send_bytes_.store(0, std::memory_order_relaxed);
+        save_enc_recv_bytes_.store(0, std::memory_order_relaxed);
         mirror_d2h_busy_total_us_.store(0, std::memory_order_relaxed);
+        mirror_tasks_submitted_.store(0, std::memory_order_relaxed);
+        mirror_bytes_submitted_.store(0, std::memory_order_relaxed);
+        mirror_tasks_completed_.store(0, std::memory_order_relaxed);
+        mirror_bytes_completed_.store(0, std::memory_order_relaxed);
+        mirror_tasks_failed_.store(0, std::memory_order_relaxed);
+        mirror_bytes_failed_.store(0, std::memory_order_relaxed);
     }
 
 public:
@@ -2027,8 +2579,38 @@ public:
         result["net_s"] = net_s;
         result["encode_s"] = static_cast<double>(
             save_encode_total_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["encode_wait_s"] = static_cast<double>(
+            save_encode_wait_total_us_.load(std::memory_order_relaxed)) / 1e6;
         result["d2h_s"] = static_cast<double>(
             mirror_d2h_busy_total_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["mirror_tasks_submitted"] = static_cast<double>(
+            mirror_tasks_submitted_.load(std::memory_order_relaxed));
+        result["mirror_bytes_submitted"] = static_cast<double>(
+            mirror_bytes_submitted_.load(std::memory_order_relaxed));
+        result["mirror_tasks_completed"] = static_cast<double>(
+            mirror_tasks_completed_.load(std::memory_order_relaxed));
+        result["mirror_bytes_completed"] = static_cast<double>(
+            mirror_bytes_completed_.load(std::memory_order_relaxed));
+        result["mirror_tasks_failed"] = static_cast<double>(
+            mirror_tasks_failed_.load(std::memory_order_relaxed));
+        result["mirror_bytes_failed"] = static_cast<double>(
+            mirror_bytes_failed_.load(std::memory_order_relaxed));
+        result["source_send_sum_s"] = static_cast<double>(
+            save_source_send_total_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["source_send_max_s"] = static_cast<double>(
+            save_source_send_max_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["enc_recv_sum_s"] = static_cast<double>(
+            save_enc_recv_total_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["enc_recv_max_s"] = static_cast<double>(
+            save_enc_recv_max_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["source_send_tasks"] = static_cast<double>(
+            save_source_send_tasks_.load(std::memory_order_relaxed));
+        result["enc_recv_tasks"] = static_cast<double>(
+            save_enc_recv_tasks_.load(std::memory_order_relaxed));
+        result["source_send_bytes"] = static_cast<double>(
+            save_source_send_bytes_.load(std::memory_order_relaxed));
+        result["enc_recv_bytes"] = static_cast<double>(
+            save_enc_recv_bytes_.load(std::memory_order_relaxed));
         return result;
     }
 
@@ -2133,39 +2715,55 @@ private:
         }
         all_stop_.store(false, std::memory_order_release);
         int nw = n_;
+        // Each encoder stripe may recv from (n-2) remote sources in parallel.
+        // Use a dedicated pool large enough for concurrent stripes * sources.
+        int enc_recv_part_nw = nw * std::max(1, nw - 2);
+        const char* part_env = std::getenv("FRCHECK_ENC_RECV_PART_WORKERS");
+        if (part_env && part_env[0] != '\0') {
+            int env_nw = std::atoi(part_env);
+            if (env_nw > 0) enc_recv_part_nw = env_nw;
+        }
         for (int w = 0; w < nw; ++w) {
             source_workers_.emplace_back(&FRCheckNative::source_worker_, this);
             enc_recv_workers_.emplace_back(&FRCheckNative::enc_recv_worker_, this);
             enc_send_workers_.emplace_back(&FRCheckNative::enc_send_worker_, this);
             parity_workers_.emplace_back(&FRCheckNative::parity_worker_, this);
         }
+        for (int w = 0; w < enc_recv_part_nw; ++w) {
+            enc_recv_part_workers_.emplace_back(&FRCheckNative::enc_recv_part_worker_, this);
+        }
         // Reuse enc_send workers for deferred P2 sends (n parallel workers,
         // same as sync path).  P2 send tasks are pushed to enc_send_q_ so
         // the existing n workers pick them up in FIFO order.
         if (debug_)
-            std::cout << "FRCheck: " << nw << " workers/role for " << ns << " stripes" << std::endl;
+            std::cout << "FRCheck: " << nw << " workers/role, "
+                      << enc_recv_part_nw << " enc_recv_part workers for "
+                      << ns << " stripes" << std::endl;
     }
 
     void shutdown_stripe_workers() {
         all_stop_.store(true, std::memory_order_release);
         source_cv_.notify_all(); enc_recv_cv_.notify_all();
-        enc_send_cv_.notify_all(); parity_cv_.notify_all();
+        enc_recv_part_cv_.notify_all(); enc_send_cv_.notify_all(); parity_cv_.notify_all();
         async_p2_order_cv_.notify_all();
-        for (auto* v : {&source_workers_, &enc_recv_workers_, &enc_send_workers_, &parity_workers_})
+        for (auto* v : {&source_workers_, &enc_recv_workers_, &enc_recv_part_workers_, &enc_send_workers_, &parity_workers_})
             for (auto& t : *v) if (t.joinable()) t.join();
-        source_workers_.clear(); enc_recv_workers_.clear();
+        source_workers_.clear(); enc_recv_workers_.clear(); enc_recv_part_workers_.clear();
         enc_send_workers_.clear(); parity_workers_.clear();
     }
 
 public:
     void skip_source_batch(int sid, uint64_t batch) {
-        advance_encode_source_turn_(sid, batch);
+        task_total_.fetch_add(1, std::memory_order_acq_rel);
+        task_encode_total_.fetch_add(1, std::memory_order_acq_rel);
+        { std::lock_guard<std::mutex> lk(source_mtx_); source_q_.push({sid, 0, 0, 0, batch, true}); }
+        source_cv_.notify_one();
     }
 
     void submit_source_with_batch(int sid, uintptr_t data, uintptr_t mirror, size_t bs, uint64_t batch) {
         task_total_.fetch_add(1, std::memory_order_acq_rel);
         task_encode_total_.fetch_add(1, std::memory_order_acq_rel);
-        { std::lock_guard<std::mutex> lk(source_mtx_); source_q_.push({sid, data, mirror, bs, batch}); }
+        { std::lock_guard<std::mutex> lk(source_mtx_); source_q_.push({sid, data, mirror, bs, batch, false}); }
         source_cv_.notify_one();
     }
 
@@ -2381,6 +2979,7 @@ public:
         encode_recv_batch_run_order_.assign(encode_recv_batch_run_order_.size(), 1);
         { std::lock_guard<std::mutex> lk(source_mtx_);   while (!source_q_.empty()) source_q_.pop(); }
         { std::lock_guard<std::mutex> lk(enc_recv_mtx_); while (!enc_recv_q_.empty()) enc_recv_q_.pop(); }
+        { std::lock_guard<std::mutex> lk(enc_recv_part_mtx_); while (!enc_recv_part_q_.empty()) enc_recv_part_q_.pop(); }
         { std::lock_guard<std::mutex> lk(enc_send_mtx_); while (!enc_send_q_.empty()) enc_send_q_.pop(); }
         { std::lock_guard<std::mutex> lk(parity_mtx_);   while (!parity_q_.empty()) parity_q_.pop(); }
     }
@@ -3095,12 +3694,44 @@ public:
     }
 
     // ---- Channel access ----
-    FRCheckRdmaChannel* get_channel_(int peer_rg, int stripe_id) {
+    FRCheckRdmaChannel* get_channel_by_lane_(int peer_rg, int lane_id) {
         if (peer_rg < 0 || peer_rg >= group_size_ || peer_rg == rank_in_group_)
             return nullptr;
-        if (stripe_id < 0 || stripe_id >= num_lanes_)
+        if (lane_id < 0 || lane_id >= num_lanes_ || num_lanes_ <= 0)
             return nullptr;
-        return channels_[peer_rg][stripe_id];
+        return channels_[peer_rg][lane_id];
+    }
+
+    FRCheckRdmaChannel* get_channel_(int peer_rg, int stripe_id) {
+        if (stripe_id < 0 || stripe_id >= num_stripes_ || num_lanes_ <= 0)
+            return nullptr;
+        return get_channel_by_lane_(peer_rg, stripe_id % num_lanes_);
+    }
+
+    int map_save_direction_lane_(bool forward, int logical_lane_id) const {
+        if (num_lanes_ <= 0 || logical_lane_id < 0)
+            return -1;
+        if (!lane_direction_split_)
+            return logical_lane_id % num_lanes_;
+        if (forward)
+            return logical_lane_id % std::max(1, save_forward_lanes_);
+        return save_forward_lanes_ + (logical_lane_id % std::max(1, save_reverse_lanes_));
+    }
+
+    int map_save_send_lane_(int peer_rg, int logical_lane_id) const {
+        return map_save_direction_lane_(rank_in_group_ < peer_rg, logical_lane_id);
+    }
+
+    int map_save_recv_lane_(int peer_rg, int logical_lane_id) const {
+        return map_save_direction_lane_(peer_rg < rank_in_group_, logical_lane_id);
+    }
+
+    FRCheckRdmaChannel* get_save_send_channel_(int peer_rg, int logical_lane_id) {
+        return get_channel_by_lane_(peer_rg, map_save_send_lane_(peer_rg, logical_lane_id));
+    }
+
+    FRCheckRdmaChannel* get_save_recv_channel_(int peer_rg, int logical_lane_id) {
+        return get_channel_by_lane_(peer_rg, map_save_recv_lane_(peer_rg, logical_lane_id));
     }
 
 public:
@@ -3164,8 +3795,22 @@ private:
     int n_connected_ = 0;
     std::string my_ip_;
 
-    // Channels: index by peer rank_in_group and stripe lane (lane_id == stripe_id)
+    // Channels: index by peer rank_in_group and lane (lane_id = stripe_id % num_lanes_).
+    int num_stripes_ = 0;
     int num_lanes_ = 0;
+    int save_forward_lanes_ = 0;
+    int save_reverse_lanes_ = 0;
+    bool shared_lane_ = false;
+    bool lane_direction_split_ = false;
+
+    // Tag layout for shared-lane multiplexing: kind|sid|batch.
+    //   kind: 0 = sync source->encoder, 1 = async P2 encoder->parity target,
+    //         2 = layer-level source payload.
+    static uint64_t make_channel_tag_(int kind, int sid, uint64_t batch) {
+        return ((uint64_t)(kind & 0xF) << 60)
+             | ((uint64_t)(uint32_t)sid << 32)
+             | (uint64_t)(uint32_t)batch;
+    }
     std::vector<std::vector<FRCheckRdmaChannel*>> channels_;
     std::vector<std::unique_ptr<FRCheckRdmaChannel>> channel_owners_;
     bool require_registered_mr_ = true;
@@ -3243,6 +3888,7 @@ private:
     std::array<uint64_t, kRsPoolWorkers> rs_pool_last_epoch_{};
     std::atomic<int> rs_pool_remaining_{0};
     RsEncodeJob rs_pool_shared_job_{};
+    const std::vector<RsEncodeJob>* rs_pool_shared_jobs_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -3305,10 +3951,29 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("peer_rig"), py::arg("stripe_id"),
              py::arg("addr"), py::arg("size"),
              py::call_guard<py::gil_scoped_release>())
+        .def("send_layer_to_peer", &FRCheckNative::send_layer_to_peer,
+             py::arg("peer_rig"), py::arg("addr"), py::arg("size"), py::arg("batch_id"),
+             py::arg("lane_id") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("recv_layer_from_peer", &FRCheckNative::recv_layer_from_peer,
+             py::arg("peer_rig"), py::arg("addr"), py::arg("capacity"), py::arg("batch_id"),
+             py::arg("lane_id") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("simple_exchange_with_peer", &FRCheckNative::simple_exchange_with_peer,
+             py::arg("peer_rig"), py::arg("send_addr"), py::arg("recv_addr"),
+             py::arg("total_size"), py::arg("lanes"), py::arg("send_batch_id"),
+             py::arg("recv_batch_id"),
+             py::call_guard<py::gil_scoped_release>())
         .def("set_require_registered_mr", &FRCheckNative::set_require_registered_mr,
              py::arg("require"))
         .def("set_debug", &FRCheckNative::set_debug,
              py::arg("debug"))
+        .def("mirror_layer", &FRCheckNative::mirror_layer,
+             py::arg("gpu_addr"), py::arg("cpu_addr"), py::arg("size"))
+        .def("encode_layer_stripes", &FRCheckNative::encode_layer_stripes,
+             py::arg("stripe_ids"), py::arg("data_addrs"), py::arg("p1_addrs"),
+             py::arg("p2_addrs"), py::arg("block_size"),
+             py::call_guard<py::gil_scoped_release>())
         .def("reset_ft_timing_stats", &FRCheckNative::reset_ft_timing_stats)
         .def("get_ft_timing_stats", &FRCheckNative::get_ft_timing_stats,
              "Return per-rank FRCheck timing counters including mirror D2H busy time")

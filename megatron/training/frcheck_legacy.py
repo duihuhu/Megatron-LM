@@ -22,7 +22,6 @@ from dataclasses import dataclass
 
 from megatron.core.dist_checkpointing.strategies.frcheck_manager import (
     FRCheckManager,
-    LayerStripeBufs,
     StripePlan,
     StripeRole,
 )
@@ -1949,22 +1948,6 @@ def _primary_failed_rank_in_group(
 
 
 
-def _register_layer_stripe_bufs(manager, native, layer_bufs: LayerStripeBufs) -> None:
-    """Register per-stripe recv/parity buffers for RDMA."""
-    for buf_list in (
-        layer_bufs.recv_bufs,
-        layer_bufs.parity1_bufs,
-        layer_bufs.parity2_bufs,
-    ):
-        for buf in buf_list:
-            if buf is None:
-                continue
-            addr = buf.data_ptr()
-            if addr in manager._rdma_registered_addrs:
-                continue
-            native.register_buffer(addr, buf.numel())
-            manager._rdma_registered_addrs.add(addr)
-
 
 def _prep_layer_phase1(
     manager,
@@ -2060,6 +2043,301 @@ def _n_filled_blocks_for_layer(total_bytes: int, block_size: int, n_source: int)
     if total_bytes <= 0 or block_size <= 0:
         return 0
     return min((int(total_bytes) + int(block_size) - 1) // int(block_size), n_source)
+
+
+def _build_layer_exchange_plan(
+    manager,
+    layer_idx: int,
+) -> Tuple[Dict[int, List[Tuple[int, int]]], Dict[int, List[Tuple[int, int]]], List[int]]:
+    """Return packed send/recv block plans and local encoder stripes."""
+    my_node = int(manager.rank_in_group) + 1
+    send_blocks: Dict[int, List[Tuple[int, int]]] = {}
+    recv_blocks: Dict[int, List[Tuple[int, int]]] = {}
+    encoder_sids: List[int] = []
+    src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, manager.frcheck_n + 1)}
+    for sid, plan in enumerate(manager.stripe_plans):
+        block_indices = {
+            src_node: src_block_per_node.get(src_node, 0)
+            for src_node in plan.source_node_ids
+        }
+        if my_node in plan.source_node_ids and plan.encoder_node_id != my_node:
+            blk_idx = block_indices[my_node]
+            if blk_idx < manager.get_n_filled_for_node(layer_idx, my_node):
+                send_blocks.setdefault(plan.encoder_node_id, []).append((sid, blk_idx))
+        if plan.role == StripeRole.ENCODER:
+            encoder_sids.append(sid)
+            for src_node in plan.source_node_ids:
+                if src_node == my_node:
+                    continue
+                blk_idx = block_indices[src_node]
+                if blk_idx < manager.get_n_filled_for_node(layer_idx, src_node):
+                    recv_blocks.setdefault(src_node, []).append((sid, blk_idx))
+        for src_node in plan.source_node_ids:
+            src_block_per_node[src_node] = src_block_per_node.get(src_node, 0) + 1
+    return send_blocks, recv_blocks, encoder_sids
+
+
+def _prepare_layer_exchange_network(
+    manager,
+    native,
+    prepared: Dict[str, Any],
+    n: int,
+    pack_stream,
+) -> Dict[str, Any]:
+    """Pack one layer's source blocks and create non-started RDMA threads."""
+    result = prepared["result"]
+    state = prepared["state"]
+    layer_bufs = prepared["layer_bufs"]
+    layer_idx = int(result.layer_idx)
+    block_size = int(result.block_size)
+    my_node = int(manager.rank_in_group) + 1
+    send_blocks, recv_blocks, encoder_sids = _build_layer_exchange_plan(manager, layer_idx)
+    batch_base = int(prepared["batch_id"]) * 1000003
+    lane_id = (int(prepared["batch_id"]) - 1) % max(1, int(getattr(manager, "num_stripes", 1)))
+
+    payload_bytes = int(result.n_filled_blocks) * block_size
+    if payload_bytes > 0:
+        native.mirror_layer(state.layer_buf_base, int(layer_bufs.layer_mirror_cpu.data_ptr()), payload_bytes)
+
+    # Gather each layer's scattered source blocks into a contiguous per-peer CPU
+    # staging buffer so the exchange can issue a few large RDMA sends instead of
+    # one send per block. The gather D2H copies are queued on `pack_stream` and
+    # overlapped; the caller performs a single pack_stream.synchronize() before
+    # any send is issued.
+    layer_gpu = layer_bufs.layer_buf_gpu
+    send_offsets: Dict[int, Dict[int, int]] = {}
+    stage_pack_s = 0.0
+    stage_pack_bytes = 0
+    stage_pack_blocks = 0
+    stage_pack_t0 = time.time()
+    with torch.cuda.stream(pack_stream):
+        for dst_node, blocks in send_blocks.items():
+            pack_buf = layer_bufs.send_layer_bufs.get(dst_node)
+            if pack_buf is None:
+                raise RuntimeError(f"FRCheck layer exchange: missing send buffer for node {dst_node}")
+            if int(pack_buf.numel()) < len(blocks) * block_size:
+                raise RuntimeError(
+                    f"FRCheck layer exchange: send buffer too small for node {dst_node}"
+                )
+            offsets: Dict[int, int] = {}
+            for slot, (sid, blk_idx) in enumerate(blocks):
+                dst_start = slot * block_size
+                src_start = int(blk_idx) * block_size
+                pack_buf[dst_start:dst_start + block_size].copy_(
+                    layer_gpu[src_start:src_start + block_size], non_blocking=True
+                )
+                offsets[sid] = dst_start
+                stage_pack_bytes += block_size
+                stage_pack_blocks += 1
+            send_offsets[dst_node] = offsets
+        stage_event = torch.cuda.Event()
+        stage_event.record(pack_stream)
+    stage_pack_s = time.time() - stage_pack_t0
+
+    recv_offsets: Dict[int, Dict[int, int]] = {}
+    for src_node, blocks in recv_blocks.items():
+        recv_buf = layer_bufs.remote_layer_bufs.get(src_node)
+        if recv_buf is None:
+            raise RuntimeError(f"FRCheck layer exchange: missing recv buffer for node {src_node}")
+        required_bytes = len(blocks) * block_size
+        if int(recv_buf.numel()) < required_bytes:
+            raise RuntimeError(
+                f"FRCheck layer exchange: recv buffer too small for node {src_node}"
+            )
+        recv_offsets[src_node] = {
+            sid: slot * block_size for slot, (sid, _blk_idx) in enumerate(blocks)
+        }
+
+    num_stripes_local = max(1, int(getattr(manager, "num_stripes", 1)))
+    # Segments per peer for the aggregated exchange. Staging makes each peer's
+    # payload contiguous, so a small segment count yields few large transfers.
+    # Keep it symmetric on send/recv so tagged transfers match across the pair.
+    send_seg = max(1, int(os.environ.get("FRCHECK_LAYER_EXCHANGE_SEG", "1")))
+
+    def _iter_staged_segments(block_count: int):
+        if block_count <= 0:
+            return
+        nseg = min(send_seg, block_count)
+        base = block_count // nseg
+        rem = block_count % nseg
+        start = 0
+        for seg_idx in range(nseg):
+            take = base + (1 if seg_idx < rem else 0)
+            if take <= 0:
+                continue
+            yield seg_idx, start, take
+            start += take
+
+    send_tasks: List[Dict[str, Any]] = []
+    recv_tasks: List[Dict[str, Any]] = []
+    for src_node, blocks in sorted(recv_blocks.items()):
+        if not blocks:
+            continue
+        recv_buf = layer_bufs.remote_layer_bufs[src_node]
+        for seg_idx, start, take in _iter_staged_segments(len(blocks)):
+            seg_lane = (lane_id + seg_idx) % num_stripes_local
+            segment_blocks = list(blocks[start:start + take])
+            recv_tasks.append({
+                "peer_node": src_node,
+                "peer_rig": src_node - 1,
+                "addr": int(recv_buf.data_ptr()) + start * block_size,
+                "size": take * block_size,
+                "batch_id": batch_base + src_node * 1009 + my_node + seg_idx * 104729,
+                "lane_id": seg_lane,
+                "ready_sids": [int(sid) for sid, _blk_idx in segment_blocks],
+            })
+    for dst_node, blocks in sorted(send_blocks.items()):
+        if not blocks:
+            continue
+        pack_buf = layer_bufs.send_layer_bufs[dst_node]
+        for seg_idx, start, take in _iter_staged_segments(len(blocks)):
+            seg_lane = (lane_id + seg_idx) % num_stripes_local
+            send_tasks.append({
+                "peer_node": dst_node,
+                "peer_rig": dst_node - 1,
+                "addr": int(pack_buf.data_ptr()) + start * block_size,
+                "size": take * block_size,
+                "batch_id": batch_base + my_node * 1009 + dst_node + seg_idx * 104729,
+                "lane_id": seg_lane,
+            })
+
+    remaining = len(send_tasks) + len(recv_tasks)
+    done_event = threading.Event()
+    if remaining == 0:
+        done_event.set()
+
+    ctx = {
+        "prepared": prepared,
+        "send_blocks": send_blocks,
+        "recv_blocks": recv_blocks,
+        "encoder_sids": encoder_sids,
+        "recv_offsets": recv_offsets,
+        "send_tasks": send_tasks,
+        "recv_tasks": recv_tasks,
+        "remaining": remaining,
+        "remaining_lock": threading.Lock(),
+        "done_event": done_event,
+        "errors": [],
+        "start_time": time.time(),
+        "stage_event": stage_event,
+        "stage_pack_s": stage_pack_s,
+        "stage_pack_bytes": stage_pack_bytes,
+        "stage_pack_blocks": stage_pack_blocks,
+    }
+    encode_specs = _build_layer_exchange_encode_specs(manager, ctx, n)
+    ready_queue: queue.Queue = queue.Queue()
+    ready_pending_remote = {
+        int(sid): set(spec["remote_deps"]) for sid, spec in encode_specs.items()
+    }
+    ready_queued_sids: Set[int] = set()
+    for sid, pending in ready_pending_remote.items():
+        if not pending:
+            ready_queue.put(int(sid))
+            ready_queued_sids.add(int(sid))
+    ctx.update({
+        "encode_specs": encode_specs,
+        "ready_queue": ready_queue,
+        "ready_lock": threading.Lock(),
+        "ready_pending_remote": ready_pending_remote,
+        "ready_queued_sids": ready_queued_sids,
+        "encoded_sids": set(),
+        "encode_done_event": threading.Event(),
+        "ready_encode_batches": 0,
+        "ready_first_s": 0.0,
+        "ready_last_s": 0.0,
+        "stream_encode_active_s": 0.0,
+        "encode_batch_size": max(1, int(os.environ.get("FRCHECK_LAYER_ENCODE_BATCH", "1"))),
+    })
+    return ctx
+
+
+def _build_layer_exchange_encode_specs(
+    manager, ctx: Dict[str, Any], n: int
+) -> Dict[int, Dict[str, Any]]:
+    """Build per-stripe encode inputs and remote dependencies for layer exchange."""
+    prepared = ctx["prepared"]
+    result = prepared["result"]
+    state = prepared["state"]
+    layer_bufs = prepared["layer_bufs"]
+    layer_idx = int(result.layer_idx)
+    block_size = int(result.block_size)
+    my_node = int(manager.rank_in_group) + 1
+    encoder_sids = set(ctx["encoder_sids"])
+    recv_offsets = ctx["recv_offsets"]
+
+    specs: Dict[int, Dict[str, Any]] = {}
+    src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
+    for sid, plan in enumerate(manager.stripe_plans):
+        source_block_indices: List[int] = []
+        for src_node in plan.source_node_ids:
+            source_block_indices.append(src_block_per_node.get(src_node, 0))
+        for src_node in plan.source_node_ids:
+            src_block_per_node[src_node] = src_block_per_node.get(src_node, 0) + 1
+        if sid not in encoder_sids:
+            continue
+        p1b = layer_bufs.parity1_bufs[sid]
+        p2b = layer_bufs.parity2_bufs[sid]
+        if p1b is None or p2b is None:
+            continue
+
+        data_addrs: List[int] = []
+        remote_deps: Set[int] = set()
+        for src_node, blk_idx in zip(plan.source_node_ids, source_block_indices):
+            nf = manager.get_n_filled_for_node(layer_idx, src_node)
+            if blk_idx >= nf:
+                data_addrs.append(int(layer_bufs.zero_block.data_ptr()))
+            elif src_node == my_node:
+                data_addrs.append(state.layer_buf_base + blk_idx * block_size)
+            else:
+                remote_buf = layer_bufs.remote_layer_bufs.get(src_node)
+                off = recv_offsets.get(src_node, {}).get(sid)
+                if remote_buf is None or off is None:
+                    raise RuntimeError(
+                        f"FRCheck layer exchange: missing packed data for node {src_node} stripe {sid}"
+                    )
+                data_addrs.append(int(remote_buf.data_ptr()) + off)
+                remote_deps.add(int(src_node))
+        specs[sid] = {
+            "data_addrs": data_addrs,
+            "p1_addr": int(p1b.data_ptr()),
+            "p2_addr": int(p2b.data_ptr()),
+            "remote_deps": remote_deps,
+            "block_size": block_size,
+        }
+    return specs
+
+
+def _encode_layer_exchange_stripes(
+    native, ctx: Dict[str, Any], stripe_ids: List[int]
+) -> None:
+    """Encode a ready subset of local encoder stripes."""
+    if not stripe_ids:
+        return
+    specs = ctx["encode_specs"]
+    data_addrs: List[int] = []
+    p1_addrs: List[int] = []
+    p2_addrs: List[int] = []
+    for sid in stripe_ids:
+        spec = specs[int(sid)]
+        data_addrs.extend(spec["data_addrs"])
+        p1_addrs.append(int(spec["p1_addr"]))
+        p2_addrs.append(int(spec["p2_addr"]))
+    native.encode_layer_stripes(
+        [int(sid) for sid in stripe_ids],
+        data_addrs,
+        p1_addrs,
+        p2_addrs,
+        int(ctx["prepared"]["result"].block_size),
+    )
+
+
+def _encode_layer_exchange_context(manager, native, ctx: Dict[str, Any], n: int) -> float:
+    """Encode local encoder stripes after all layer-exchange network tasks finish."""
+    if "encode_specs" not in ctx:
+        ctx["encode_specs"] = _build_layer_exchange_encode_specs(manager, ctx, n)
+    stripe_ids = sorted(int(sid) for sid in ctx["encode_specs"].keys())
+    _encode_layer_exchange_stripes(native, ctx, stripe_ids)
+    return time.time() - float(ctx["start_time"])
 
 
 def _save_frcheck_stripe_files(
@@ -2442,13 +2720,18 @@ def save_frcheck_legacy_checkpoint(
             total_pad / 1e6, total_pct,
         )
 
-    # 5. Prep: allocate/register layer buffers (no pack/encode)
-    for group in layer_groups:
-        layer_bufs = manager.get_layer_stripe_bufs(group.layer_idx)
-        _register_layer_stripe_bufs(manager, native, layer_bufs)
+    # 5. Per-layer buffers were allocated and registered by the manager when
+    # adaptive block sizes were computed. Avoid a second ibv_reg_mr pass here.
+    trace_save = _dbg or os.environ.get("FRCHECK_TRACE_INIT", "0") == "1"
+    if trace_save:
+        logger.info("FRCHECK save trace rank=%d: layer buffers already registered", rank)
 
     if world_size > 1:
+        if trace_save:
+            logger.info("FRCHECK save trace rank=%d: before pre-encode barrier", rank)
         torch.distributed.barrier()
+        if trace_save:
+            logger.info("FRCHECK save trace rank=%d: after pre-encode barrier", rank)
     e2e_t0 = time.time()
 
     # Pipeline: pack + encode per layer
@@ -2465,8 +2748,27 @@ def save_frcheck_legacy_checkpoint(
     model_layer_bytes_total = 0
     optimizer_layer_bytes_total = 0
     common_bytes_total = 0
+    has_encode_batch = (
+        hasattr(native, "submit_source_with_batch")
+        and hasattr(native, "submit_enc_recv_with_batch")
+        and hasattr(native, "skip_source_batch")
+    )
+    use_layer_exchange_encode = bool(
+        getattr(args, "frcheck_layer_exchange_encode", False)
+        and hasattr(native, "send_layer_to_peer")
+        and hasattr(native, "recv_layer_from_peer")
+        and hasattr(native, "encode_layer_stripes")
+        and hasattr(native, "mirror_layer")
+    )
+    use_cross_layer_encode = (
+        has_encode_batch and hasattr(native, "reset_encode_layer")
+        and not use_layer_exchange_encode
+    )
 
-    for group in layer_groups:
+    prepared_layers: List[Dict[str, Any]] = []
+
+    # Stage A: pack and prepare all layers before launching network/encode.
+    for encode_batch_id, group in enumerate(layer_groups, start=1):
         layer_name = f"layer_{group.layer_idx}" if group.layer_idx >= 0 else "layer_common"
         layer_idx = group.layer_idx
         layer_block_size = manager._layer_block_sizes[layer_idx]
@@ -2474,7 +2776,12 @@ def save_frcheck_legacy_checkpoint(
 
         layer_buf_gpu = layer_bufs.layer_buf_gpu
         pack_t0 = time.time()
-        layer_buf_gpu.zero_()
+        if trace_save:
+            logger.info(
+                "FRCHECK save trace rank=%d: pack begin batch=%d %s bytes=%.2fMB block=%.2fMB",
+                rank, encode_batch_id, layer_name, group.total_bytes / 1e6,
+                layer_block_size / 1e6,
+            )
 
         offset = 0
         layer_noncontig = 0
@@ -2500,6 +2807,13 @@ def save_frcheck_legacy_checkpoint(
                 )
                 info.offset = offset
                 offset += nbytes
+
+            # Only clear padding that can be transmitted in the final used block.
+            if offset > 0 and layer_block_size > 0:
+                tail_end = ((offset + layer_block_size - 1) // layer_block_size) * layer_block_size
+                tail_end = min(tail_end, int(layer_buf_gpu.numel()))
+                if tail_end > offset:
+                    layer_buf_gpu[offset:tail_end].zero_()
         prep_stream.synchronize()
         layer_pack_s = time.time() - pack_t0
         pack_total_s += layer_pack_s
@@ -2519,7 +2833,7 @@ def save_frcheck_legacy_checkpoint(
         layer_phase1_s = time.time() - phase1_t0
         phase1_total_s += layer_phase1_s
 
-        # Pre-compute encoder active masks for this layer
+        # Pre-compute encoder active masks for this layer.
         src_blk_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
         enc_active_masks: Dict[int, List[int]] = {}
         for sid in range(num_stripes):
@@ -2534,53 +2848,7 @@ def save_frcheck_legacy_checkpoint(
             for src_node in plan.source_node_ids:
                 src_blk_per_node[src_node] = src_blk_per_node.get(src_node, 0) + 1
 
-        # Submit per-stripe tasks (non-blocking)
-        submit_t0 = time.time()
-        native.reset_layer()
-        for sid in range(num_stripes):
-            plan = stripe_plans[sid]
-            if plan.role == StripeRole.SOURCE:
-                addr = state.data_addrs[sid]
-                if addr == 0:
-                    continue
-                native.submit_source(sid, addr, state.mirror_addrs[sid], layer_block_size)
-            elif plan.role == StripeRole.ENCODER:
-                rb = layer_bufs.recv_bufs[sid]
-                p1b = layer_bufs.parity1_bufs[sid]
-                p2b = layer_bufs.parity2_bufs[sid]
-                if rb is None or p1b is None or p2b is None:
-                    continue
-                native.submit_enc_recv(sid, rb.data_ptr(), p1b.data_ptr(),
-                                      p2b.data_ptr(), layer_block_size,
-                                      enc_active_masks.get(sid, []))
-            elif plan.role == StripeRole.PARITY_TARGET:
-                # Deferred to async phase (after all layers' encoding)
-                pass
-        layer_submit_s = time.time() - submit_t0
-        submit_total_s += layer_submit_s
-
-        # Wait for all stripes in this layer to complete
-        wait_t0 = time.time()
-        if _use_async_parity:
-            if _dbg:
-                logger.info("FRCHECK layer %s: wait_encode_only (async)", layer_name)
-            native.wait_encode_only()
-        else:
-            native.wait_layer()
-        layer_wait_s = time.time() - wait_t0
-        wait_total_s += layer_wait_s
-        if _dbg:
-            logger.info(
-                "FRCHECK save layer profile rank=%d %s: bytes=%.2fMB pack=%.4fs "
-                "phase1=%.4fs submit=%.4fs wait=%.4fs noncontig=%d "
-                "model_layer=%.2fMB optimizer_layer=%.2fMB common=%.2fMB",
-                rank, layer_name, group.total_bytes / 1e6, layer_pack_s,
-                layer_phase1_s, layer_submit_s, layer_wait_s, layer_noncontig,
-                layer_model_bytes / 1e6, layer_optimizer_bytes / 1e6,
-                layer_common_bytes / 1e6,
-            )
-
-        encode_results.append(_LayerEncodeResult(
+        result = _LayerEncodeResult(
             layer_name=layer_name,
             layer_idx=layer_idx,
             block_size=layer_block_size,
@@ -2588,9 +2856,467 @@ def save_frcheck_legacy_checkpoint(
             tensor_infos=group.tensor_infos,
             total_bytes=group.total_bytes,
             n_filled_blocks=state.n_filled_blocks,
-        ))
+        )
+        encode_results.append(result)
+        prepared_layers.append({
+            "batch_id": int(encode_batch_id),
+            "group": group,
+            "result": result,
+            "state": state,
+            "layer_bufs": layer_bufs,
+            "enc_active_masks": enc_active_masks,
+            "pack_s": layer_pack_s,
+            "phase1_s": layer_phase1_s,
+            "noncontig": layer_noncontig,
+            "model_bytes": layer_model_bytes,
+            "optimizer_bytes": layer_optimizer_bytes,
+            "common_bytes": layer_common_bytes,
+        })
+        if trace_save:
+            logger.info(
+                "FRCHECK save trace rank=%d: pack done batch=%d %s pack=%.4fs phase1=%.4fs",
+                rank, encode_batch_id, layer_name, layer_pack_s, layer_phase1_s,
+            )
+
+    # Stage B: submit prepared layers to native workers.
+    if use_cross_layer_encode:
+        native.reset_encode_layer()
+
+    layer_submit_times: Dict[int, float] = {
+        int(prepared["batch_id"]): 0.0 for prepared in prepared_layers
+    }
+
+    def _submit_prepared_sid(prepared: Dict[str, Any], sid: int) -> None:
+        encode_batch_id = int(prepared["batch_id"])
+        state = prepared["state"]
+        layer_bufs = prepared["layer_bufs"]
+        enc_active_masks = prepared["enc_active_masks"]
+        layer_block_size = int(prepared["result"].block_size)
+        plan = stripe_plans[sid]
+
+        if plan.role == StripeRole.SOURCE:
+            addr = state.data_addrs[sid]
+            if addr == 0:
+                if use_cross_layer_encode:
+                    native.skip_source_batch(sid, encode_batch_id)
+                return
+            if use_cross_layer_encode:
+                native.submit_source_with_batch(
+                    sid, addr, state.mirror_addrs[sid],
+                    layer_block_size, encode_batch_id,
+                )
+            else:
+                native.submit_source(sid, addr, state.mirror_addrs[sid], layer_block_size)
+        elif plan.role == StripeRole.ENCODER:
+            rb = layer_bufs.recv_bufs[sid]
+            p1b = layer_bufs.parity1_bufs[sid]
+            p2b = layer_bufs.parity2_bufs[sid]
+            if rb is None or p1b is None or p2b is None:
+                return
+            if use_cross_layer_encode:
+                native.submit_enc_recv_with_batch(
+                    sid, rb.data_ptr(), p1b.data_ptr(), p2b.data_ptr(),
+                    layer_block_size, enc_active_masks.get(sid, []),
+                    encode_batch_id,
+                )
+            else:
+                native.submit_enc_recv(
+                    sid, rb.data_ptr(), p1b.data_ptr(), p2b.data_ptr(),
+                    layer_block_size, enc_active_masks.get(sid, []),
+                )
+        elif plan.role == StripeRole.PARITY_TARGET:
+            # Deferred to async phase (after all layers' encoding).
+            return
+
+    if use_layer_exchange_encode:
+        pack_stream = torch.cuda.Stream()
+        layer_exchange_contexts: List[Dict[str, Any]] = []
+        for prepared in prepared_layers:
+            layer_exchange_contexts.append(
+                _prepare_layer_exchange_network(manager, native, prepared, n, pack_stream)
+            )
+        # No global stage sync: each layer's send waits on its own CUDA event so
+        # gather D2H overlaps with network of already-staged layers.
+        lx_stage_sync_s = 0.0
+
+        worker_errors: List[BaseException] = []
+        worker_errors_lock = threading.Lock()
+        send_queues: Dict[Tuple[int, int], queue.Queue] = {}
+        recv_queues: Dict[Tuple[int, int], queue.Queue] = {}
+
+        def _mark_task_done(ctx: Dict[str, Any]) -> None:
+            with ctx["remaining_lock"]:
+                ctx["remaining"] -= 1
+                if ctx["remaining"] == 0:
+                    ctx["done_event"].set()
+
+        def _record_worker_error(ctx: Dict[str, Any], exc: BaseException) -> None:
+            ctx["errors"].append(exc)
+            ctx["done_event"].set()
+            with worker_errors_lock:
+                worker_errors.append(exc)
+
+        def _mark_ready_stripes(ctx: Dict[str, Any], src_node: int, sids: List[int]) -> None:
+            if not sids:
+                return
+            now_s = time.time() - float(ctx["start_time"])
+            with ctx["ready_lock"]:
+                for sid in sids:
+                    sid = int(sid)
+                    pending = ctx["ready_pending_remote"].get(sid)
+                    if pending is None:
+                        continue
+                    pending.discard(int(src_node))
+                    if pending or sid in ctx["ready_queued_sids"] or sid in ctx["encoded_sids"]:
+                        continue
+                    ctx["ready_queue"].put(sid)
+                    ctx["ready_queued_sids"].add(sid)
+                    if float(ctx.get("ready_first_s", 0.0)) == 0.0:
+                        ctx["ready_first_s"] = now_s
+                    ctx["ready_last_s"] = now_s
+
+        def _send_worker(peer_key: Tuple[int, int], q: queue.Queue) -> None:
+            while True:
+                item = q.get()
+                if item is None:
+                    return
+                ctx, task = item
+                try:
+                    # Send from the CPU staging buffer only once this layer's
+                    # gather D2H has completed; this overlaps later layers' D2H
+                    # with earlier layers' network transfers.
+                    stage_event = ctx.get("stage_event")
+                    if stage_event is not None:
+                        stage_event.synchronize()
+                    native.send_layer_to_peer(
+                        int(task["peer_rig"]), int(task["addr"]),
+                        int(task["size"]), int(task["batch_id"]), int(task["lane_id"]),
+                    )
+                    _mark_task_done(ctx)
+                except BaseException as exc:
+                    _record_worker_error(ctx, exc)
+
+        def _recv_worker(peer_key: Tuple[int, int], q: queue.Queue) -> None:
+            while True:
+                item = q.get()
+                if item is None:
+                    return
+                ctx, task = item
+                try:
+                    native.recv_layer_from_peer(
+                        int(task["peer_rig"]), int(task["addr"]),
+                        int(task["size"]), int(task["batch_id"]), int(task["lane_id"]),
+                    )
+                    _mark_ready_stripes(ctx, int(task["peer_node"]), task.get("ready_sids", []))
+                    _mark_task_done(ctx)
+                except BaseException as exc:
+                    _record_worker_error(ctx, exc)
+
+        lx_queue_setup_t0 = time.time()
+        for ctx in layer_exchange_contexts:
+            for task in ctx["send_tasks"]:
+                key = (int(task["peer_node"]), int(task["lane_id"]))
+                send_queues.setdefault(key, queue.Queue())
+            for task in ctx["recv_tasks"]:
+                key = (int(task["peer_node"]), int(task["lane_id"]))
+                recv_queues.setdefault(key, queue.Queue())
+        lx_queue_setup_s = time.time() - lx_queue_setup_t0
+
+        exchange_workers: List[threading.Thread] = []
+        lx_exchange_thread_start_t0 = time.time()
+        for peer_key, q in sorted(send_queues.items()):
+            th = threading.Thread(target=_send_worker, args=(peer_key, q), name=f"frcheck-layer-send-peer{peer_key[0]}-lane{peer_key[1]}")
+            th.start()
+            exchange_workers.append(th)
+        for peer_key, q in sorted(recv_queues.items()):
+            th = threading.Thread(target=_recv_worker, args=(peer_key, q), name=f"frcheck-layer-recv-peer{peer_key[0]}-lane{peer_key[1]}")
+            th.start()
+            exchange_workers.append(th)
+        lx_exchange_thread_start_s = time.time() - lx_exchange_thread_start_t0
+
+        encode_errors: List[BaseException] = []
+        encode_threads: List[threading.Thread] = []
+
+        def _wait_and_encode(ctx: Dict[str, Any]) -> None:
+            try:
+                wait_t0 = time.time()
+                encode_t0 = time.time()
+                if os.environ.get("FRCHECK_LAYER_STREAM_ENCODE", "1") == "0":
+                    ctx["done_event"].wait()
+                    ctx["exchange_wait_s"] = time.time() - wait_t0
+                    if ctx["errors"]:
+                        raise RuntimeError("FRCheck layer exchange failed") from ctx["errors"][0]
+                    ctx["layer_elapsed"] = _encode_layer_exchange_context(manager, native, ctx, n)
+                else:
+                    total_stripes = len(ctx.get("encode_specs", {}))
+                    batch_size = int(ctx.get("encode_batch_size", 1))
+                    while len(ctx["encoded_sids"]) < total_stripes:
+                        if ctx["errors"]:
+                            raise RuntimeError("FRCheck layer exchange failed") from ctx["errors"][0]
+                        batch: List[int] = []
+                        try:
+                            sid = ctx["ready_queue"].get(timeout=0.01)
+                        except queue.Empty:
+                            if ctx["done_event"].is_set() and ctx["ready_queue"].empty():
+                                if ctx["errors"]:
+                                    raise RuntimeError("FRCheck layer exchange failed") from ctx["errors"][0]
+                                pending = sorted(
+                                    int(sid) for sid in ctx["encode_specs"].keys()
+                                    if int(sid) not in ctx["encoded_sids"]
+                                )
+                                if pending:
+                                    raise RuntimeError(
+                                        f"FRCheck layer exchange encode incomplete: pending stripes {pending[:8]}"
+                                    )
+                                break
+                            continue
+                        batch.append(int(sid))
+                        while len(batch) < batch_size:
+                            try:
+                                batch.append(int(ctx["ready_queue"].get_nowait()))
+                            except queue.Empty:
+                                break
+                        with ctx["ready_lock"]:
+                            batch = [
+                                int(sid) for sid in batch
+                                if int(sid) not in ctx["encoded_sids"]
+                            ]
+                        if not batch:
+                            continue
+                        batch_encode_t0 = time.time()
+                        _encode_layer_exchange_stripes(native, ctx, batch)
+                        batch_encode_s = time.time() - batch_encode_t0
+                        with ctx["ready_lock"]:
+                            ctx["stream_encode_active_s"] += batch_encode_s
+                            ctx["encoded_sids"].update(batch)
+                            ctx["ready_encode_batches"] += 1
+                            if len(ctx["encoded_sids"]) >= total_stripes:
+                                ctx["encode_done_event"].set()
+                    ctx["done_event"].wait()
+                    ctx["exchange_wait_s"] = time.time() - wait_t0
+                    if ctx["errors"]:
+                        raise RuntimeError("FRCheck layer exchange failed") from ctx["errors"][0]
+                    ctx["layer_elapsed"] = time.time() - float(ctx["start_time"])
+                ctx["encode_wall_s"] = float(ctx.get("stream_encode_active_s", time.time() - encode_t0))
+                ctx["encode_end_s"] = time.time() - float(ctx["start_time"])
+            except BaseException as exc:
+                encode_errors.append(exc)
+
+        lx_encode_thread_start_t0 = time.time()
+        for ctx in layer_exchange_contexts:
+            th = threading.Thread(
+                target=_wait_and_encode,
+                args=(ctx,),
+                name=f"frcheck-layer-encode-{ctx['prepared']['result'].layer_name}",
+            )
+            th.start()
+            encode_threads.append(th)
+        lx_encode_thread_start_s = time.time() - lx_encode_thread_start_t0
+
+        lx_queue_put_t0 = time.time()
+        for ctx in layer_exchange_contexts:
+            for task in ctx["recv_tasks"]:
+                recv_queues[(int(task["peer_node"]), int(task["lane_id"]))].put((ctx, task))
+            for task in ctx["send_tasks"]:
+                send_queues[(int(task["peer_node"]), int(task["lane_id"]))].put((ctx, task))
+        for q in send_queues.values():
+            q.put(None)
+        for q in recv_queues.values():
+            q.put(None)
+        lx_queue_put_s = time.time() - lx_queue_put_t0
+
+        lx_join_t0 = time.time()
+        for th in exchange_workers:
+            th.join()
+        lx_exchange_join_s = time.time() - lx_join_t0
+        lx_encode_join_t0 = time.time()
+        for th in encode_threads:
+            th.join()
+        lx_encode_join_s = time.time() - lx_encode_join_t0
+        if worker_errors:
+            raise RuntimeError("FRCheck layer exchange worker failed") from worker_errors[0]
+        if encode_errors:
+            raise RuntimeError("FRCheck layer exchange encode failed") from encode_errors[0]
+
+        layer_exchange_send_tasks = sum(len(ctx["send_tasks"]) for ctx in layer_exchange_contexts)
+        layer_exchange_recv_tasks = sum(len(ctx["recv_tasks"]) for ctx in layer_exchange_contexts)
+        layer_exchange_send_bytes = sum(
+            int(task["size"]) for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+        )
+        layer_exchange_recv_bytes = sum(
+            int(task["size"]) for ctx in layer_exchange_contexts for task in ctx["recv_tasks"]
+        )
+        lx_stage_pack_s = sum(float(ctx.get("stage_pack_s", 0.0)) for ctx in layer_exchange_contexts)
+        lx_stage_pack_bytes = sum(int(ctx.get("stage_pack_bytes", 0)) for ctx in layer_exchange_contexts)
+        lx_stage_pack_blocks = sum(int(ctx.get("stage_pack_blocks", 0)) for ctx in layer_exchange_contexts)
+        lx_exchange_wait_sum_s = sum(float(ctx.get("exchange_wait_s", 0.0)) for ctx in layer_exchange_contexts)
+        lx_exchange_wait_max_s = max(
+            (float(ctx.get("exchange_wait_s", 0.0)) for ctx in layer_exchange_contexts),
+            default=0.0,
+        )
+        lx_encode_wall_sum_s = sum(float(ctx.get("encode_wall_s", 0.0)) for ctx in layer_exchange_contexts)
+        lx_encode_wall_max_s = max(
+            (float(ctx.get("encode_wall_s", 0.0)) for ctx in layer_exchange_contexts),
+            default=0.0,
+        )
+        lx_ready_encode_batches = sum(
+            int(ctx.get("ready_encode_batches", 0)) for ctx in layer_exchange_contexts
+        )
+        lx_ready_first_s = min(
+            (float(ctx.get("ready_first_s", 0.0)) for ctx in layer_exchange_contexts
+             if float(ctx.get("ready_first_s", 0.0)) > 0.0),
+            default=0.0,
+        )
+        lx_ready_last_s = max(
+            (float(ctx.get("ready_last_s", 0.0)) for ctx in layer_exchange_contexts),
+            default=0.0,
+        )
+        lx_layer_elapsed_max = max(
+            (float(ctx.get("layer_elapsed", 0.0)) for ctx in layer_exchange_contexts),
+            default=0.0,
+        )
+        slow_layers = sorted(
+            (
+                (
+                    float(ctx.get("layer_elapsed", 0.0)),
+                    ctx["prepared"]["result"].layer_name,
+                    float(ctx.get("exchange_wait_s", 0.0)),
+                    float(ctx.get("encode_wall_s", 0.0)),
+                    float(ctx.get("stage_pack_s", 0.0)),
+                    len(ctx["send_tasks"]),
+                    len(ctx["recv_tasks"]),
+                )
+                for ctx in layer_exchange_contexts
+            ),
+            reverse=True,
+        )[:3]
+        lx_slow_layers = ";".join(
+            f"{name}:total={total:.3f},wait={wait:.3f},encode={enc:.3f},stage={stage:.3f},send={send_n},recv={recv_n}"
+            for total, name, wait, enc, stage, send_n, recv_n in slow_layers
+        )
+
+        for ctx in layer_exchange_contexts:
+            prepared = ctx["prepared"]
+            batch_id = int(prepared["batch_id"])
+            result = prepared["result"]
+            layer_elapsed = float(ctx.get("layer_elapsed", 0.0))
+            layer_submit_times[batch_id] += layer_elapsed
+            submit_total_s = max(submit_total_s, layer_elapsed)
+            if _dbg or trace_save:
+                group = prepared["group"]
+                send_bytes = sum(len(v) for v in ctx["send_blocks"].values()) * int(result.block_size)
+                recv_bytes = sum(len(v) for v in ctx["recv_blocks"].values()) * int(result.block_size)
+                logger.info(
+                    "FRCHECK save layer-exchange profile rank=%d %s: bytes=%.2fMB pack=%.4fs "
+                    "phase1=%.4fs exchange_encode=%.4fs send=%.2fMB recv=%.2fMB noncontig=%d "
+                    "model_layer=%.2fMB optimizer_layer=%.2fMB common=%.2fMB",
+                    rank, result.layer_name, group.total_bytes / 1e6, prepared["pack_s"],
+                    prepared["phase1_s"], layer_elapsed, send_bytes / 1e6, recv_bytes / 1e6,
+                    prepared["noncontig"], prepared["model_bytes"] / 1e6,
+                    prepared["optimizer_bytes"] / 1e6, prepared["common_bytes"] / 1e6,
+                )
+    elif use_cross_layer_encode:
+        stripe_wave_size = max(1, int(n))
+        for stripe_wave_id, stripe_start in enumerate(range(0, num_stripes, stripe_wave_size)):
+            stripe_end = min(stripe_start + stripe_wave_size, num_stripes)
+            if trace_save:
+                logger.info(
+                    "FRCHECK save trace rank=%d: submit stripe_wave=%d stripes=[%d,%d) layers=%d",
+                    rank, stripe_wave_id, stripe_start, stripe_end, len(prepared_layers),
+                )
+            for prepared in prepared_layers:
+                batch_id = int(prepared["batch_id"])
+                submit_t0 = time.time()
+                for sid in range(stripe_start, stripe_end):
+                    _submit_prepared_sid(prepared, sid)
+                layer_submit_times[batch_id] += time.time() - submit_t0
+    else:
+        for prepared in prepared_layers:
+            batch_id = int(prepared["batch_id"])
+            result = prepared["result"]
+            submit_t0 = time.time()
+            native.reset_layer()
+            for sid in range(num_stripes):
+                _submit_prepared_sid(prepared, sid)
+            layer_submit_s = time.time() - submit_t0
+            layer_submit_times[batch_id] += layer_submit_s
+            submit_total_s += layer_submit_s
+
+            layer_wait_s = 0.0
+            wait_t0 = time.time()
+            if _use_async_parity:
+                if _dbg:
+                    logger.info("FRCHECK layer %s: wait_encode_only (async)", result.layer_name)
+                native.wait_encode_only()
+            else:
+                native.wait_layer()
+            layer_wait_s = time.time() - wait_t0
+            wait_total_s += layer_wait_s
+
+            if _dbg or trace_save:
+                group = prepared["group"]
+                logger.info(
+                    "FRCHECK save layer profile rank=%d %s: bytes=%.2fMB pack=%.4fs "
+                    "phase1=%.4fs submit=%.4fs wait=%.4fs noncontig=%d "
+                    "model_layer=%.2fMB optimizer_layer=%.2fMB common=%.2fMB",
+                    rank, result.layer_name, group.total_bytes / 1e6, prepared["pack_s"],
+                    prepared["phase1_s"], layer_submit_s, layer_wait_s, prepared["noncontig"],
+                    prepared["model_bytes"] / 1e6, prepared["optimizer_bytes"] / 1e6,
+                    prepared["common_bytes"] / 1e6,
+                )
+
+    if use_cross_layer_encode:
+        submit_total_s = sum(layer_submit_times.values())
+        if _dbg or trace_save:
+            for prepared in prepared_layers:
+                batch_id = int(prepared["batch_id"])
+                result = prepared["result"]
+                group = prepared["group"]
+                logger.info(
+                    "FRCHECK save layer profile rank=%d %s: bytes=%.2fMB pack=%.4fs "
+                    "phase1=%.4fs submit=%.4fs wait=%.4fs noncontig=%d "
+                    "model_layer=%.2fMB optimizer_layer=%.2fMB common=%.2fMB",
+                    rank, result.layer_name, group.total_bytes / 1e6, prepared["pack_s"],
+                    prepared["phase1_s"], layer_submit_times.get(batch_id, 0.0), 0.0,
+                    prepared["noncontig"], prepared["model_bytes"] / 1e6,
+                    prepared["optimizer_bytes"] / 1e6, prepared["common_bytes"] / 1e6,
+                )
+
+    if use_cross_layer_encode:
+        wait_t0 = time.time()
+        if _dbg or trace_save:
+            logger.info(
+                "FRCHECK save: wait_encode_only for cross-layer batch layers=%d",
+                len(encode_results),
+            )
+        native.wait_encode_only()
+        wait_total_s += time.time() - wait_t0
 
     network_encode_s = submit_total_s + wait_total_s
+
+    layer_exchange_send_tasks = locals().get("layer_exchange_send_tasks", 0)
+    layer_exchange_recv_tasks = locals().get("layer_exchange_recv_tasks", 0)
+    layer_exchange_send_bytes = locals().get("layer_exchange_send_bytes", 0)
+    layer_exchange_recv_bytes = locals().get("layer_exchange_recv_bytes", 0)
+    lx_stage_sync_s = locals().get("lx_stage_sync_s", 0.0)
+    lx_stage_pack_s = locals().get("lx_stage_pack_s", 0.0)
+    lx_stage_pack_bytes = locals().get("lx_stage_pack_bytes", 0)
+    lx_stage_pack_blocks = locals().get("lx_stage_pack_blocks", 0)
+    lx_exchange_wait_sum_s = locals().get("lx_exchange_wait_sum_s", 0.0)
+    lx_exchange_wait_max_s = locals().get("lx_exchange_wait_max_s", 0.0)
+    lx_encode_wall_sum_s = locals().get("lx_encode_wall_sum_s", 0.0)
+    lx_encode_wall_max_s = locals().get("lx_encode_wall_max_s", 0.0)
+    lx_slow_layers = locals().get("lx_slow_layers", "")
+    lx_queue_setup_s = locals().get("lx_queue_setup_s", 0.0)
+    lx_exchange_thread_start_s = locals().get("lx_exchange_thread_start_s", 0.0)
+    lx_encode_thread_start_s = locals().get("lx_encode_thread_start_s", 0.0)
+    lx_queue_put_s = locals().get("lx_queue_put_s", 0.0)
+    lx_exchange_join_s = locals().get("lx_exchange_join_s", 0.0)
+    lx_encode_join_s = locals().get("lx_encode_join_s", 0.0)
+    lx_ready_encode_batches = locals().get("lx_ready_encode_batches", 0)
+    lx_ready_first_s = locals().get("lx_ready_first_s", 0.0)
+    lx_ready_last_s = locals().get("lx_ready_last_s", 0.0)
+    lx_layer_elapsed_max = locals().get("lx_layer_elapsed_max", 0.0)
 
     # ---- async parity phase: submit P2 sends + parity receives ----
     # P2 delivery is one independent async batch. Do not call reset_layer()
@@ -2607,7 +3333,8 @@ def save_frcheck_legacy_checkpoint(
         _reset_t0 = time.time()
         native.reset_async_parity()
         _async_p2_reset_elapsed = time.time() - _reset_t0
-        for result in encode_results:
+        has_async_p2_batch = hasattr(native, "submit_async_p2_layer_with_batch")
+        for async_batch_id, result in enumerate(encode_results, start=1):
             layer_bufs = manager.get_layer_stripe_bufs(result.layer_idx)
             _build_t0 = time.time()
             p2_addrs = [
@@ -2616,7 +3343,12 @@ def save_frcheck_legacy_checkpoint(
             ]
             _async_p2_build_elapsed += time.time() - _build_t0
             _native_t0 = time.time()
-            counts = native.submit_async_p2_layer(p2_addrs, result.block_size)
+            if has_async_p2_batch:
+                counts = native.submit_async_p2_layer_with_batch(
+                    p2_addrs, result.block_size, int(async_batch_id),
+                )
+            else:
+                counts = native.submit_async_p2_layer(p2_addrs, result.block_size)
             _async_p2_native_elapsed += time.time() - _native_t0
             if counts is not None and len(counts) >= 2:
                 _async_p2_parity_tasks += int(counts[0])
@@ -2655,12 +3387,54 @@ def save_frcheck_legacy_checkpoint(
     summary_fields = {
         "e2e_s": e2e_s,
         "network_encode_s": network_encode_s,
+        "pack_total_s": pack_total_s,
+        "phase1_total_s": phase1_total_s,
+        "submit_total_s": submit_total_s,
+        "wait_total_s": wait_total_s,
+        "mirror_elapsed_s": _mirror_elapsed,
+        "layer_exchange_send_tasks": layer_exchange_send_tasks,
+        "layer_exchange_recv_tasks": layer_exchange_recv_tasks,
+        "layer_exchange_send_bytes": layer_exchange_send_bytes,
+        "layer_exchange_recv_bytes": layer_exchange_recv_bytes,
+        "lx_stage_sync_s": lx_stage_sync_s,
+        "lx_stage_pack_s": lx_stage_pack_s,
+        "lx_stage_pack_bytes": lx_stage_pack_bytes,
+        "lx_stage_pack_blocks": lx_stage_pack_blocks,
+        "lx_exchange_wait_sum_s": lx_exchange_wait_sum_s,
+        "lx_exchange_wait_max_s": lx_exchange_wait_max_s,
+        "lx_encode_wall_sum_s": lx_encode_wall_sum_s,
+        "lx_encode_wall_max_s": lx_encode_wall_max_s,
+        "lx_queue_setup_s": lx_queue_setup_s,
+        "lx_exchange_thread_start_s": lx_exchange_thread_start_s,
+        "lx_encode_thread_start_s": lx_encode_thread_start_s,
+        "lx_queue_put_s": lx_queue_put_s,
+        "lx_exchange_join_s": lx_exchange_join_s,
+        "lx_encode_join_s": lx_encode_join_s,
+        "lx_ready_encode_batches": lx_ready_encode_batches,
+        "lx_ready_first_s": lx_ready_first_s,
+        "lx_ready_last_s": lx_ready_last_s,
+        "lx_layer_elapsed_max": lx_layer_elapsed_max,
     }
     if has_native_timing:
         summary_fields.update({
             "d2h_s": native_timing.get("d2h_s", 0.0),
             "net_s": native_timing.get("net_s", 0.0),
             "encode_s": native_timing.get("encode_s", 0.0),
+            "encode_wait_s": native_timing.get("encode_wait_s", 0.0),
+            "source_send_sum_s": native_timing.get("source_send_sum_s", 0.0),
+            "source_send_max_s": native_timing.get("source_send_max_s", 0.0),
+            "enc_recv_sum_s": native_timing.get("enc_recv_sum_s", 0.0),
+            "enc_recv_max_s": native_timing.get("enc_recv_max_s", 0.0),
+            "source_send_tasks": native_timing.get("source_send_tasks", 0.0),
+            "enc_recv_tasks": native_timing.get("enc_recv_tasks", 0.0),
+            "source_send_bytes": native_timing.get("source_send_bytes", 0.0),
+            "enc_recv_bytes": native_timing.get("enc_recv_bytes", 0.0),
+            "mirror_tasks_submitted": native_timing.get("mirror_tasks_submitted", 0.0),
+            "mirror_bytes_submitted": native_timing.get("mirror_bytes_submitted", 0.0),
+            "mirror_tasks_completed": native_timing.get("mirror_tasks_completed", 0.0),
+            "mirror_bytes_completed": native_timing.get("mirror_bytes_completed", 0.0),
+            "mirror_tasks_failed": native_timing.get("mirror_tasks_failed", 0.0),
+            "mirror_bytes_failed": native_timing.get("mirror_bytes_failed", 0.0),
         })
     summary = _timing_max_dict(summary_fields)
     if rank == 0:
@@ -2669,9 +3443,55 @@ def save_frcheck_legacy_checkpoint(
             logger.info(
                 "FRCHECK save timing (%(mode)s): e2e_s=%(e2e_s).2fs "
                 "d2h_s=%(d2h_s).2fs network_encode_s=%(network_encode_s).2fs "
-                "net_s=%(net_s).2fs encode_s=%(encode_s).2fs",
+                "net_s=%(net_s).2fs encode_s=%(encode_s).2fs encode_wait_s=%(encode_wait_s).2fs "
+                "source_send_sum_s=%(source_send_sum_s).2fs source_send_max_s=%(source_send_max_s).2fs "
+                "enc_recv_sum_s=%(enc_recv_sum_s).2fs enc_recv_max_s=%(enc_recv_max_s).2fs",
                 summary,
             )
+            logger.info(
+                "FRCHECK save detail (%(mode)s): pack_s=%(pack_total_s).2fs "
+                "phase1_s=%(phase1_total_s).2fs submit_s=%(submit_total_s).2fs "
+                "wait_s=%(wait_total_s).2fs mirror_wait_s=%(mirror_elapsed_s).2fs "
+                "layer_exchange_send_tasks=%(layer_exchange_send_tasks).0f "
+                "layer_exchange_recv_tasks=%(layer_exchange_recv_tasks).0f "
+                "layer_exchange_send_bytes=%(layer_exchange_send_bytes).0f "
+                "layer_exchange_recv_bytes=%(layer_exchange_recv_bytes).0f "
+                "lx_stage_pack_bytes=%(lx_stage_pack_bytes).0f mirror_tasks=%(mirror_tasks_completed).0f/%(mirror_tasks_submitted).0f "
+                "mirror_bytes=%(mirror_bytes_completed).0f/%(mirror_bytes_submitted).0f "
+                "mirror_failed_tasks=%(mirror_tasks_failed).0f mirror_failed_bytes=%(mirror_bytes_failed).0f",
+                summary,
+            )
+            if _dbg:
+                logger.info(
+                    "FRCHECK save native tasks (%(mode)s): source_send_tasks=%(source_send_tasks).0f "
+                    "enc_recv_tasks=%(enc_recv_tasks).0f source_send_bytes=%(source_send_bytes).0f "
+                    "enc_recv_bytes=%(enc_recv_bytes).0f",
+                    summary,
+                )
+                logger.info(
+                    "FRCHECK save submit detail (%(mode)s): queue_setup_s=%(lx_queue_setup_s).4fs "
+                    "exchange_thread_start_s=%(lx_exchange_thread_start_s).4fs "
+                    "encode_thread_start_s=%(lx_encode_thread_start_s).4fs "
+                    "queue_put_s=%(lx_queue_put_s).4fs exchange_join_s=%(lx_exchange_join_s).4fs "
+                    "encode_join_s=%(lx_encode_join_s).4fs ready_batches=%(lx_ready_encode_batches).0f "
+                    "ready_first_s=%(lx_ready_first_s).4fs ready_last_s=%(lx_ready_last_s).4fs "
+                    "layer_elapsed_max_s=%(lx_layer_elapsed_max).4fs",
+                    summary,
+                )
+                logger.info(
+                    "FRCHECK save stage detail (%(mode)s): stage_pack_s=%(lx_stage_pack_s).4fs "
+                    "stage_sync_s=%(lx_stage_sync_s).4fs "
+                    "stage_pack_bytes=%(lx_stage_pack_bytes).0f stage_pack_blocks=%(lx_stage_pack_blocks).0f "
+                    "exchange_wait_sum_s=%(lx_exchange_wait_sum_s).4fs "
+                    "exchange_wait_max_s=%(lx_exchange_wait_max_s).4fs "
+                    "encode_wall_sum_s=%(lx_encode_wall_sum_s).4fs "
+                    "encode_wall_max_s=%(lx_encode_wall_max_s).4fs",
+                    summary,
+                )
+                logger.info(
+                    "FRCHECK save slow layers (%s): %s",
+                    summary["mode"], lx_slow_layers,
+                )
         else:
             logger.info(
                 "FRCHECK save timing (%(mode)s): e2e_s=%(e2e_s).2fs "
@@ -2832,10 +3652,16 @@ def save_frcheck_legacy_checkpoint(
     if world_size > 1:
         torch.distributed.barrier()
 
+    release_save_buffers = bool(
+        getattr(args, "frcheck_layer_exchange_encode", False) and not _use_async_parity
+    )
+    if release_save_buffers:
+        manager.release_save_layer_buffers(empty_cuda_cache=True)
+
     if _dbg:
         logger.info(
-            "FRCheck save: native module kept alive for reuse (no shutdown, rank=%d)",
-            rank,
+            "FRCheck save: native module kept alive for reuse (no shutdown, rank=%d, released_save_buffers=%s)",
+            rank, release_save_buffers,
         )
 
 

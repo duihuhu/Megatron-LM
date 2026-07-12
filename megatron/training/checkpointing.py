@@ -136,7 +136,22 @@ def maybe_preinitialize_legacy_ec_modules():
             getattr(mgr, init_method)()
             logger.info(f'EC legacy preinit: {cls_name} initialized')
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(f'EC legacy preinit: {cls_name} init failed: {exc}')
+            # Fail fast: a half-initialized native module (e.g. some ranks
+            # could not bind their listener ports) leaves the job in a state
+            # that deadlocks later at the connect/exchange phase ("Connection
+            # refused" retried hundreds of times). Aborting here — on every
+            # rank — lets the launcher tear the job down cleanly so the
+            # operator can clean up stale processes and restart, instead of
+            # hanging silently.
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            logger.error(
+                f'EC legacy preinit: {cls_name} init failed on rank {rank}: {exc}. '
+                f'Aborting to avoid a half-initialized deadlock. '
+                f'Check for stale processes holding the listener ports and retry.'
+            )
+            raise RuntimeError(
+                f'EC legacy preinit failed for {cls_name} on rank {rank}: {exc}'
+            ) from exc
 
     _LEGACY_EC_PREINITIALIZED = True
 

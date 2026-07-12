@@ -5,6 +5,13 @@
 # Example: ./test_eccheck_4nodes_node_335M_frcheck.sh 0 0
 # Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_frcheck.sh 0 2 3
 export FRCHECK_ENABLE_RECOVERY_PARITY_REPAIR=1
+#export FRCHECK_TRACE_INIT=1
+# Experimental: shared-lane RDMA multiplexing (tagged DATA/ACK protocol).
+# Reduces channels/rank from peers*num_stripes to peers*lanes. Opt-in for now.
+export FRCHECK_RDMA_LANES_PER_PEER=8
+export FRCHECK_ALLOW_UNSAFE_LANE_SHARING=1
+export FRCHECK_LAYER_EXCHANGE_SEG=4
+export FRCHECK_LAYER_ENCODE_BATCH=2
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
@@ -83,6 +90,7 @@ case "$MODE" in
             --save $CHECKPOINT_PATH
             --frcheck-async-parity
             --ec-checkpoint-write-only-penultimate-iter
+            --frcheck-layer-exchange-encode
         )
         ;;
     software)

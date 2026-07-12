@@ -24,6 +24,8 @@ logger = getLogger(__name__)
 
 
 def _frcheck_debug_enabled() -> bool:
+    if os.environ.get("FRCHECK_TRACE_INIT", "0") == "1":
+        return True
     try:
         from megatron.training import get_args
         return bool(getattr(get_args(), "frcheck_debug", False))
@@ -61,6 +63,9 @@ class LayerStripeBufs:
     recv_bufs: List[Optional[torch.Tensor]]
     parity1_bufs: List[Optional[torch.Tensor]]
     parity2_bufs: List[Optional[torch.Tensor]]
+    remote_layer_bufs: Dict[int, torch.Tensor] = field(default_factory=dict)
+    send_layer_bufs: Dict[int, torch.Tensor] = field(default_factory=dict)
+    zero_block: Optional[torch.Tensor] = None
     source_on_cpu: bool = False
 
 
@@ -262,10 +267,22 @@ class FRCheckManager:
             self._frcheck_native = None
             self._frcheck_recovery_native_cleaned = False
 
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: begin init_frcheck_if_enabled", rank)
         n = self._resolve_frcheck_n(args)
         path = self._resolve_frcheck_table_path(args, n)
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: resolved n=%d table=%s", rank, n, path)
         self._validate_and_build_grouping(n)
+        if _frcheck_debug_enabled():
+            logger.info(
+                "FRCHECK init trace rank=%d: grouping group_id=%s rank_in_group=%s members=%s",
+                rank, self.group_id, self.rank_in_group, self.group_member_ranks,
+            )
         self._init_frcheck_native(path)
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: native module loaded", rank)
 
         native = self._frcheck_native
         if native is not None:
@@ -276,6 +293,8 @@ class FRCheckManager:
                 )
             native.set_require_registered_mr(True)
             self.num_stripes = native.num_stripes()
+            if _frcheck_debug_enabled():
+                native.set_debug(True)
         if _frcheck_debug_enabled():
             logger.info(
                 "FRCheck: GDR required (enabled), n=%d num_stripes=%d",
@@ -283,10 +302,16 @@ class FRCheckManager:
             )
 
         # Init RDMA connections within group (allocates buffers using num_stripes)
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: before _init_rdma", rank)
         self._init_rdma(args)
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: after _init_rdma", rank)
 
         # Pre-compile stripe plans (reads from native after init_rdma)
         self._compile_stripe_plans()
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: compiled stripe plans", rank)
 
         # Per-stripe buffers allocated lazily on first save (after adaptive block_size)
 
@@ -508,12 +533,18 @@ class FRCheckManager:
 
         # Determine my IP
         my_ip = self._resolve_my_ip()
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: resolved my_ip=%s", rank, my_ip)
 
         # Exchange IPs across all ranks (GPU tensors required for NCCL backend)
         ip_bytes = my_ip.encode("utf-8").ljust(64, b"\x00")[:64]
         ip_tensor = torch.tensor([b for b in ip_bytes], dtype=torch.uint8, device="cuda")
         ip_list_tensors = [torch.zeros(64, dtype=torch.uint8, device="cuda") for _ in range(world_size)]
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: before ip all_gather world_size=%d", rank, world_size)
         torch.distributed.all_gather(ip_list_tensors, ip_tensor)
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: after ip all_gather", rank)
         ip_list = []
         for t in ip_list_tensors:
             raw = bytes(t.cpu().tolist()).rstrip(b"\x00")
@@ -536,6 +567,10 @@ class FRCheckManager:
 
         if _frcheck_debug_enabled():
             logger.info(
+                "FRCHECK init trace rank=%d: before native.init_rdma rg=%d/%d base_port=%d peers=%s",
+                rank, rg, n, base_port, peer_ips,
+            )
+            logger.info(
                 "FRCheck RDMA: rank_in_group=%d/%d base_port=%d my_ip=%s peers=%s",
                 rg, n, base_port, my_ip, peer_ips,
             )
@@ -548,12 +583,22 @@ class FRCheckManager:
             peer_ips=peer_ips,
             use_rdma=True,
         )
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: after native.init_rdma", rank)
 
         # Register default buffers
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: before default buffers", rank)
         self._allocate_default_buffers(native, n)
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: after default buffers", rank)
 
         # Barrier after RDMA init
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: before RDMA barrier", rank)
         torch.distributed.barrier()
+        if _frcheck_debug_enabled():
+            logger.info("FRCHECK init trace rank=%d: after RDMA barrier", rank)
         if _frcheck_debug_enabled():
             logger.info("FRCheck RDMA: group initialized (rank_in_group=%d/%d)", rg, n)
 
@@ -567,15 +612,31 @@ class FRCheckManager:
         return resolve_ip("FRCHECK", rank=rank, fallback_prefixes=["ECLATIN"])
 
     def _allocate_default_buffers(self, native, n: int) -> None:
-        """Allocate back-compat data/recv/parity buffers."""
+        """Keep legacy default sizes; per-layer save/recovery allocates real buffers."""
         default_block_size = 64 * 1024 * 1024  # 64 MiB fallback (per-layer block_size overrides)
 
         self.block_size = default_block_size
-        recv_total = (n - 2) * default_block_size
-
         native.set_require_registered_mr(True)
 
-        self.data_buffer = torch.cuda.ByteTensor(default_block_size)
+        # The current FRCheck paths allocate and register per-layer buffers after
+        # layer sizes are known. Eagerly registering this legacy GPU fallback can
+        # stall RDMA/GDR init before the save path starts, so leave it disabled
+        # unless an old path explicitly opts in for debugging.
+        alloc_default = os.environ.get("FRCHECK_ALLOC_DEFAULT_BUFFERS", "0") == "1"
+        if not alloc_default:
+            self.data_buffer = None
+            self.recv_buffer = None
+            self.parity1_buffer = None
+            self.parity2_buffer = None
+            if _frcheck_debug_enabled():
+                logger.info(
+                    "FRCheck: skipped legacy default buffers block_size=%s",
+                    default_block_size,
+                )
+            return
+
+        recv_total = (n - 2) * default_block_size
+        self.data_buffer = torch.empty(default_block_size, dtype=torch.uint8, device="cuda")
         native.register_buffer(self.data_buffer.data_ptr(), self.data_buffer.numel())
 
         self.recv_buffer = allocate_hugepage_tensor(recv_total, fallback_pin_memory=True)
@@ -584,7 +645,7 @@ class FRCheckManager:
 
         if _frcheck_debug_enabled():
             logger.info(
-                "FRCheck: allocated GPU default buffer block_size=%s recv_total=%s",
+                "FRCheck: allocated legacy default buffer block_size=%s recv_total=%s",
                 default_block_size, recv_total,
             )
 
@@ -630,6 +691,47 @@ class FRCheckManager:
         recv_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
         parity1_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
         parity2_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
+        remote_layer_bufs: Dict[int, torch.Tensor] = {}
+        send_layer_bufs: Dict[int, torch.Tensor] = {}
+        my_node = self.rank_in_group + 1 if self.rank_in_group is not None else None
+        recv_counts: Dict[int, int] = {}
+        send_counts: Dict[int, int] = {}
+        if my_node is not None:
+            for plan in self.stripe_plans:
+                if plan.role == StripeRole.ENCODER:
+                    for src_node in plan.source_node_ids:
+                        if src_node != my_node:
+                            recv_counts[src_node] = recv_counts.get(src_node, 0) + 1
+                if my_node in plan.source_node_ids and plan.encoder_node_id != my_node:
+                    peer = plan.encoder_node_id
+                    send_counts[peer] = send_counts.get(peer, 0) + 1
+        for node, count in recv_counts.items():
+            if count <= 0:
+                continue
+            buf = allocate_hugepage_tensor(count * block_sz, fallback_pin_memory=True)
+            buf.zero_()
+            remote_layer_bufs[node] = buf
+            addr = buf.data_ptr()
+            if addr not in self._rdma_registered_addrs:
+                native.register_buffer(addr, buf.numel())
+                self._rdma_registered_addrs.add(addr)
+        # CPU staging buffers to gather a layer's scattered source blocks into a
+        # contiguous per-peer region, enabling few large aggregated RDMA sends.
+        for node, count in send_counts.items():
+            if count <= 0:
+                continue
+            buf = allocate_hugepage_tensor(count * block_sz, fallback_pin_memory=True)
+            send_layer_bufs[node] = buf
+            addr = buf.data_ptr()
+            if addr not in self._rdma_registered_addrs:
+                native.register_buffer(addr, buf.numel())
+                self._rdma_registered_addrs.add(addr)
+        zero_block = allocate_hugepage_tensor(block_sz, fallback_pin_memory=True)
+        zero_block.zero_()
+        zero_addr = zero_block.data_ptr()
+        if zero_addr not in self._rdma_registered_addrs:
+            native.register_buffer(zero_addr, zero_block.numel())
+            self._rdma_registered_addrs.add(zero_addr)
 
         if enc_indices:
             r_slices = allocate_hugepage_slices(
@@ -645,9 +747,11 @@ class FRCheckManager:
                 recv_bufs[sid] = r_slices[slot]
                 parity1_bufs[sid] = p1_slices[slot]
                 parity2_bufs[sid] = p2_slices[slot]
-                native.register_buffer(recv_bufs[sid].data_ptr(), recv_bufs[sid].numel())
-                native.register_buffer(parity1_bufs[sid].data_ptr(), parity1_bufs[sid].numel())
-                native.register_buffer(parity2_bufs[sid].data_ptr(), parity2_bufs[sid].numel())
+                for buf in (recv_bufs[sid], parity1_bufs[sid], parity2_bufs[sid]):
+                    addr = buf.data_ptr()
+                    if addr not in self._rdma_registered_addrs:
+                        native.register_buffer(addr, buf.numel())
+                        self._rdma_registered_addrs.add(addr)
 
         if par_indices:
             p1_slices = allocate_hugepage_slices(
@@ -659,8 +763,11 @@ class FRCheckManager:
             for slot, sid in enumerate(par_indices):
                 parity1_bufs[sid] = p1_slices[slot]
                 parity2_bufs[sid] = p2_slices[slot]
-                native.register_buffer(parity1_bufs[sid].data_ptr(), parity1_bufs[sid].numel())
-                native.register_buffer(parity2_bufs[sid].data_ptr(), parity2_bufs[sid].numel())
+                for buf in (parity1_bufs[sid], parity2_bufs[sid]):
+                    addr = buf.data_ptr()
+                    if addr not in self._rdma_registered_addrs:
+                        native.register_buffer(addr, buf.numel())
+                        self._rdma_registered_addrs.add(addr)
 
         layer_bufs = LayerStripeBufs(
             layer_buf_gpu=layer_buf_gpu,
@@ -668,6 +775,9 @@ class FRCheckManager:
             recv_bufs=recv_bufs,
             parity1_bufs=parity1_bufs,
             parity2_bufs=parity2_bufs,
+            remote_layer_bufs=remote_layer_bufs,
+            send_layer_bufs=send_layer_bufs,
+            zero_block=zero_block,
             source_on_cpu=source_on_cpu,
         )
         self.layer_stripe_bufs[layer_idx] = layer_bufs
@@ -986,6 +1096,21 @@ class FRCheckManager:
                     rank, addr, e,
                 )
         self._rdma_registered_addrs.clear()
+
+    def release_save_layer_buffers(self, empty_cuda_cache: bool = True) -> None:
+        """Release per-layer save buffers that can be rebuilt at the next checkpoint."""
+        if not self.layer_stripe_bufs:
+            return
+        self._unregister_all_buffers()
+        self.layer_stripe_bufs.clear()
+        self._layer_stripe_alloc_sizes.clear()
+        self._layer_block_sizes = None
+        self._layer_per_rank_bytes = None
+        self.recv_bufs = []
+        self.parity1_bufs = []
+        self.parity2_bufs = []
+        if empty_cuda_cache and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def stop(self) -> None:
         """Stop C++ encode workers and RS pool (synchronous, ECLATIN-style)."""

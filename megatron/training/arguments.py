@@ -2396,6 +2396,12 @@ def _add_checkpointing_args(parser):
                             'Async P2 is paused during PP forward/backward to avoid '
                             'network contention. '
                             'When unset (default), save is fully synchronous as before.')
+    group.add_argument('--frcheck-layer-exchange-encode', action='store_true',
+                       help='Use FRCheck layer-level source exchange for the synchronous '
+                            'save encode phase. This reduces per-stripe RDMA tasks by '
+                            'sending one layer payload per encoder peer, then locally '
+                            'splitting blocks and running RS encode. Async P2 behavior '
+                            'and shard format are unchanged.')
     group.add_argument('--frcheck-recovery-async-parity', action='store_true',
                        help='Enable async parity repair after FRCheck hardware recovery. '
                             'This is a load/recovery-side option and is independent '

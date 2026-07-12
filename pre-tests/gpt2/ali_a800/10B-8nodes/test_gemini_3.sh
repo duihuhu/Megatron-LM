@@ -46,6 +46,11 @@ export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 # ---------------------------------------------------------------------------
 # 数据传输走的高速网络接口名
 export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
+export GEMINI_MIRROR_MODE=${GEMINI_MIRROR_MODE:-cpu_pipeline}
+export GEMINI_PIPELINE_SEGMENTS=16
+# ---------------------------------------------------------------------------
+# 数据传输走的高速网络接口名
+export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
 # 各 rank 监听的基础 IP（通常设为 MASTER_ADDR，各 rank 用 GEMINI_REPLICAS_BASE_PORT + rank*100 派生端口）
 # export GEMINI_REPLICAS_BASE_IP=$MASTER_ADDR
 # 基础端口号，每个 rank 占用 100 个端口范围以避免冲突
@@ -124,7 +129,7 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
             --ec-checkpoint-write-only-penultimate-iter
-            --gemini-replicas-channels-per-peer 4
+            --gemini-replicas-channels-per-peer 16
         )
         ;;
     software)
@@ -176,7 +181,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00005
-    --train-iters 20
+    --train-iters 10
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5

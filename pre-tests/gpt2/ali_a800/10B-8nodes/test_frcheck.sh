@@ -1,14 +1,18 @@
-zj#!/bin/bash
+#!/bin/bash
 
 # FRCheck (POA-driven stripe encode with RDMA) — single-node script.
 # Usage: ./test_eccheck_4nodes_node_335M_frcheck.sh <node_rank> [<gpu_id_0> [gpu_id_1 ...]] [additional_args...]
 # Example: ./test_eccheck_4nodes_node_335M_frcheck.sh 0
 # Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_frcheck.sh 0 2 3
 
+cd /workspace/Megatron-LM || exit 1
+
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
 export NETIFACES_INTERFACE=eth0
+export FRCHECK_LAYER_EXCHANGE_SEG=64
+export FRCHECK_LAYER_ENCODE_BATCH=32
 export FRCHECK_LOCAL_RANK_NIC_0=eth0
 export FRCHECK_LOCAL_RANK_NIC_1=eth0
 export FRCHECK_LOCAL_RANK_NIC_2=eth0
@@ -26,6 +30,15 @@ MASTER_ADDR=172.16.0.224
 export ECCHECK_USE_ASIO=false
 export FRCHECK_INTERFACE=$NETIFACES_INTERFACE
 export FRCHECK_BASE_IP=$MASTER_ADDR
+
+# FRCheck native split-lane configuration.  The native layer maps logical
+# lane ids to separate forward/reverse RDMA lane pools, so A->B and B->A do
+# not contend on the same underlying channel set.
+export FRCHECK_SEND_LANES_PER_PEER=${FRCHECK_SEND_LANES_PER_PEER:-8}
+export FRCHECK_RECV_LANES_PER_PEER=${FRCHECK_RECV_LANES_PER_PEER:-8}
+export FRCHECK_RDMA_LANES_PER_PEER=$((FRCHECK_SEND_LANES_PER_PEER + FRCHECK_RECV_LANES_PER_PEER))
+export FRCHECK_LAYER_EXCHANGE_SEG=${FRCHECK_LAYER_EXCHANGE_SEG:-8}
+export FRCHECK_ALLOW_UNSAFE_LANE_SHARING=${FRCHECK_ALLOW_UNSAFE_LANE_SHARING:-1}
 MASTER_PORT=6000
 NNODES=8
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
@@ -92,7 +105,8 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
             --ec-checkpoint-write-only-penultimate-iter
-            --frcheck-async-parity
+            #--frcheck-async-parity
+            --frcheck-layer-exchange-encode
         )
         ;;
     software)

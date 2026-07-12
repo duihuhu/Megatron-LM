@@ -1464,6 +1464,10 @@ public:
         pybind11::dict result;
         result["net_s"] = net_s;
         result["encode_s"] = encode_s;
+        result["send_bytes"] = static_cast<double>(save_send_bytes_.load(std::memory_order_relaxed));
+        result["recv_bytes"] = static_cast<double>(save_recv_bytes_.load(std::memory_order_relaxed));
+        result["send_tasks"] = static_cast<double>(save_send_tasks_.load(std::memory_order_relaxed));
+        result["recv_tasks"] = static_cast<double>(save_recv_tasks_.load(std::memory_order_relaxed));
         return result;
     }
 
@@ -1526,6 +1530,10 @@ public:
             save_net_wall_have_any_ = false;
         }
         load_send_total_ns_.store(0, std::memory_order_relaxed);
+        save_send_bytes_.store(0, std::memory_order_relaxed);
+        save_recv_bytes_.store(0, std::memory_order_relaxed);
+        save_send_tasks_.store(0, std::memory_order_relaxed);
+        save_recv_tasks_.store(0, std::memory_order_relaxed);
         network_tasks_inflight_.store(0, std::memory_order_relaxed);
         // Clear legacy queues
         {
@@ -1859,6 +1867,10 @@ private:
     std::queue<uintptr_t> parity_buffers_to_release_;
     std::mutex release_queue_mutex_;
     std::atomic<int> network_tasks_inflight_{0};
+    std::atomic<uint64_t> save_send_bytes_{0};
+    std::atomic<uint64_t> save_recv_bytes_{0};
+    std::atomic<uint64_t> save_send_tasks_{0};
+    std::atomic<uint64_t> save_recv_tasks_{0};
 
     // Completion flags
     std::deque<std::atomic<bool>> send_completed_;
@@ -2818,6 +2830,8 @@ private:
             } else if (conn_.send_socket(idx).is_open()) {
                 send_with_size(conn_.send_socket(idx), task.addr, task.size);
             }
+            save_send_bytes_.fetch_add(task.size, std::memory_order_relaxed);
+            save_send_tasks_.fetch_add(1, std::memory_order_relaxed);
             network_tasks_inflight_.fetch_sub(1, std::memory_order_relaxed);
             // Release buffer after send: data channels 0..k-2, parity channels k-1..k
             {
@@ -2868,6 +2882,8 @@ private:
                     std::cerr << "ECNAIVE: RecvWorker[" << idx << "] recv failed" << std::endl;
                 }
             }
+            save_recv_bytes_.fetch_add(task.size, std::memory_order_relaxed);
+            save_recv_tasks_.fetch_add(1, std::memory_order_relaxed);
             network_tasks_inflight_.fetch_sub(1, std::memory_order_relaxed);
         }
     }

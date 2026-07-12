@@ -56,9 +56,17 @@ def _native_ft_timing(native) -> Dict[str, float]:
         return {
             "net_s": float(stats.get("net_s", 0.0)),
             "encode_s": float(stats.get("encode_s", 0.0)),
+            "send_bytes": float(stats.get("send_bytes", 0.0)),
+            "recv_bytes": float(stats.get("recv_bytes", 0.0)),
+            "send_tasks": float(stats.get("send_tasks", 0.0)),
+            "recv_tasks": float(stats.get("recv_tasks", 0.0)),
         }
     except AttributeError:
-        return {"net_s": 0.0, "encode_s": 0.0}
+        return {
+            "net_s": 0.0, "encode_s": 0.0,
+            "send_bytes": 0.0, "recv_bytes": 0.0,
+            "send_tasks": 0.0, "recv_tasks": 0.0,
+        }
 
 
 def _timed_barrier() -> float:
@@ -2539,11 +2547,22 @@ def save_ecnaive_legacy_checkpoint(
         "net_s": native_timing["net_s"],
         "encode_s": native_timing["encode_s"],
     })
+    byte_summary = _timing_max_dict({
+        "send_bytes": native_timing.get("send_bytes", 0.0),
+        "recv_bytes": native_timing.get("recv_bytes", 0.0),
+        "send_tasks": native_timing.get("send_tasks", 0.0),
+        "recv_tasks": native_timing.get("recv_tasks", 0.0),
+    })
     if rank == 0:
         logger.info(
             "EC-NAIVE save timing: e2e_s=%(e2e_s).2fs d2h_s=%(d2h_s).2fs "
             "network_encode_s=%(network_encode_s).2fs net_s=%(net_s).2fs encode_s=%(encode_s).2fs",
             summary,
+        )
+        logger.debug(
+            "EC-NAIVE save network bytes: send_bytes=%(send_bytes).0f recv_bytes=%(recv_bytes).0f "
+            "send_tasks=%(send_tasks).0f recv_tasks=%(recv_tasks).0f",
+            byte_summary,
         )
 
     if write_to_disk:

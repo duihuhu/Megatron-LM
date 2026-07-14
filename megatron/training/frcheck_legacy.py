@@ -5591,19 +5591,35 @@ def _build_recovery_layer_context(
     )
     active_by_stripe: Dict[int, bool] = {}
     skipped_padding_stripes = 0
-    failed_source_seen = 0
     enable_padding_skip = os.environ.get("FRCHECK_RECOVERY_SKIP_PADDING", "0") == "1"
     for plan in raw_data_plans:
         active = True
-        if not plan.get('dual_failure'):
-            original_role = int(plan.get('original_role', -1))
-            if original_role == int(StripeRole.SOURCE):
-                blk_idx = failed_source_seen
-                failed_source_seen += 1
+        sid = int(plan['stripe_id'])
+        if plan.get('dual_failure'):
+            # Match save's source-block indexing exactly instead of relying on
+            # recovery-plan order, which can differ from POA stripe order.
+            for target in plan.get('failed_targets', []):
+                if int(target.get('original_role', -1)) != int(StripeRole.SOURCE):
+                    continue
+                failed_node = int(target.get('failed_node', -1))
+                blk_idx = _source_blk_idx_for_node_stripe(
+                    manager.stripe_plans, sid, failed_node,
+                )
                 if blk_idx >= n_filled_blocks:
                     skipped_padding_stripes += 1
                     active = not enable_padding_skip
-        active_by_stripe[int(plan['stripe_id'])] = active
+                    break
+        else:
+            original_role = int(plan.get('original_role', -1))
+            if original_role == int(StripeRole.SOURCE):
+                failed_node = int(plan.get('failed_node', -1))
+                blk_idx = _source_blk_idx_for_node_stripe(
+                    manager.stripe_plans, sid, failed_node,
+                )
+                if blk_idx >= n_filled_blocks:
+                    skipped_padding_stripes += 1
+                    active = not enable_padding_skip
+        active_by_stripe[sid] = active
     return raw_data_plans, parity_plans, active_by_stripe, skipped_padding_stripes, n_filled_blocks
 
 
@@ -5823,20 +5839,34 @@ def _submit_recovery_network(
     )
     data_plans: List[Dict[str, Any]] = []
     skipped_padding_stripes = 0
-    failed_source_seen = 0
     active_by_stripe: Dict[int, bool] = {}
     enable_padding_skip = os.environ.get("FRCHECK_RECOVERY_SKIP_PADDING", "0") == "1"
     for plan in raw_data_plans:
         active = True
-        if not plan.get('dual_failure'):
-            original_role = int(plan.get('original_role', -1))
-            if original_role == int(StripeRole.SOURCE):
-                blk_idx = failed_source_seen
-                failed_source_seen += 1
+        sid = int(plan['stripe_id'])
+        if plan.get('dual_failure'):
+            for target in plan.get('failed_targets', []):
+                if int(target.get('original_role', -1)) != int(StripeRole.SOURCE):
+                    continue
+                failed_node = int(target.get('failed_node', -1))
+                blk_idx = _source_blk_idx_for_node_stripe(
+                    manager.stripe_plans, sid, failed_node,
+                )
                 if blk_idx >= n_filled_blocks:
                     skipped_padding_stripes += 1
                     active = not enable_padding_skip
-        active_by_stripe[int(plan['stripe_id'])] = active
+                    break
+        else:
+            original_role = int(plan.get('original_role', -1))
+            if original_role == int(StripeRole.SOURCE):
+                failed_node = int(plan.get('failed_node', -1))
+                blk_idx = _source_blk_idx_for_node_stripe(
+                    manager.stripe_plans, sid, failed_node,
+                )
+                if blk_idx >= n_filled_blocks:
+                    skipped_padding_stripes += 1
+                    active = not enable_padding_skip
+        active_by_stripe[sid] = active
         data_plans.append(plan)
 
     if not data_plans:

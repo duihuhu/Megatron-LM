@@ -5,6 +5,7 @@
 # Example: ./test_eccheck_4nodes_node_335M_frcheck.sh 0 0
 # Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_frcheck.sh 0 2 3
 export FRCHECK_ENABLE_RECOVERY_PARITY_REPAIR=1
+export FRCHECK_RECOVERY_SKIP_PADDING=0
 #export FRCHECK_TRACE_INIT=1
 # Experimental: shared-lane RDMA multiplexing (tagged DATA/ACK protocol).
 # Reduces channels/rank from peers*num_stripes to peers*lanes. Opt-in for now.

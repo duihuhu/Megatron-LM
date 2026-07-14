@@ -1031,24 +1031,38 @@ public:
     }
 
     // ---- Point-to-point RDMA (for recovery) ----
-    void send_to_peer(int peer_rig, int stripe_id, uintptr_t addr, size_t size) {
-        FRCheckRdmaChannel* ch = get_channel_(peer_rig, stripe_id);
+    void send_to_peer(int peer_rig, int stripe_id, uintptr_t addr, size_t size,
+                      uint64_t batch_id = 0, int tag_kind = 3) {
+        int lane_id = (num_lanes_ > 0) ? (stripe_id % num_lanes_) : stripe_id;
+        FRCheckRdmaChannel* ch = get_channel_by_lane_(peer_rig, lane_id);
         if (!ch) {
             throw std::runtime_error(
                 "FRCheck send_to_peer: no channel to rig " + std::to_string(peer_rig) +
-                " lane " + std::to_string(stripe_id));
+                " lane " + std::to_string(lane_id));
         }
-        ch->send_data((const uint8_t*)addr, size);
+        if (shared_lane_) {
+            ch->send_tagged(make_channel_tag_(tag_kind, stripe_id, batch_id),
+                            (const uint8_t*)addr, size);
+        } else {
+            ch->send_data((const uint8_t*)addr, size);
+        }
     }
 
-    void recv_from_peer(int peer_rig, int stripe_id, uintptr_t addr, size_t size) {
-        FRCheckRdmaChannel* ch = get_channel_(peer_rig, stripe_id);
+    void recv_from_peer(int peer_rig, int stripe_id, uintptr_t addr, size_t size,
+                        uint64_t batch_id = 0, int tag_kind = 3) {
+        int lane_id = (num_lanes_ > 0) ? (stripe_id % num_lanes_) : stripe_id;
+        FRCheckRdmaChannel* ch = get_channel_by_lane_(peer_rig, lane_id);
         if (!ch) {
             throw std::runtime_error(
                 "FRCheck recv_from_peer: no channel from rig " + std::to_string(peer_rig) +
-                " lane " + std::to_string(stripe_id));
+                " lane " + std::to_string(lane_id));
         }
-        ch->recv_data((uint8_t*)addr, size);
+        if (shared_lane_) {
+            ch->recv_tagged(make_channel_tag_(tag_kind, stripe_id, batch_id),
+                            (uint8_t*)addr, size);
+        } else {
+            ch->recv_data((uint8_t*)addr, size);
+        }
     }
 
     void send_layer_to_peer(int peer_rig, uintptr_t addr, size_t size, uint64_t batch_id, int lane_id = 0) {
@@ -3232,7 +3246,7 @@ public:
     void execute_recovery_helper_(const RecoveryHelperTask& task) {
         uint64_t t0 = frcheck_now_us();
         send_to_peer(task.decoder_rig, task.stripe_id,
-                     task.helper_block, task.block_size);
+                     task.helper_block, task.block_size, 0, 3);
         recovery_helper_send_us_.fetch_add(frcheck_now_us() - t0, std::memory_order_relaxed);
         recovery_helper_tasks_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -3250,7 +3264,7 @@ public:
                         throw std::runtime_error("FRCheck recovery: missing helper recv buf");
                     recv_from_peer(
                         task.helper_rigs[hi], task.stripe_id,
-                        task.helper_recv_bufs[hi], task.block_size);
+                        task.helper_recv_bufs[hi], task.block_size, 0, 3);
                 } catch (...) {
                     recv_errors[hi] = std::current_exception();
                 }
@@ -3320,14 +3334,14 @@ public:
     void execute_recovery_decoder_send_(const RecoveryDecoderSendTask& task) {
         uint64_t t_send = frcheck_now_us();
         send_to_peer(task.failed_rig, task.stripe_id,
-                     task.recovered_buf, task.block_size);
+                     task.recovered_buf, task.block_size, 0, 4);
         recovery_decoder_send_us_.fetch_add(frcheck_now_us() - t_send, std::memory_order_relaxed);
     }
 
     void execute_recovery_failed_(const RecoveryFailedTask& task) {
         uint64_t t_recv = frcheck_now_us();
         recv_from_peer(task.decoder_rig, task.stripe_id,
-                       task.recv_buf, task.block_size);
+                       task.recv_buf, task.block_size, 0, 4);
         recovery_failed_recv_us_.fetch_add(frcheck_now_us() - t_recv, std::memory_order_relaxed);
         if (task.store_to_layer && task.layer_buf != 0 && task.ncopy > 0) {
             uint64_t t_copy = frcheck_now_us();
@@ -3946,10 +3960,12 @@ PYBIND11_MODULE(frcheck_native, m) {
         .def("send_to_peer", &FRCheckNative::send_to_peer,
              py::arg("peer_rig"), py::arg("stripe_id"),
              py::arg("addr"), py::arg("size"),
+             py::arg("batch_id") = 0, py::arg("tag_kind") = 3,
              py::call_guard<py::gil_scoped_release>())
         .def("recv_from_peer", &FRCheckNative::recv_from_peer,
              py::arg("peer_rig"), py::arg("stripe_id"),
              py::arg("addr"), py::arg("size"),
+             py::arg("batch_id") = 0, py::arg("tag_kind") = 3,
              py::call_guard<py::gil_scoped_release>())
         .def("send_layer_to_peer", &FRCheckNative::send_layer_to_peer,
              py::arg("peer_rig"), py::arg("addr"), py::arg("size"), py::arg("batch_id"),

@@ -157,6 +157,40 @@ def _summarize_optimizer_keys(keys) -> Dict[str, int]:
 
 _FRCHECK_INFO_PROFILE_EVENTS = set()
 
+_frcheck_first_layer_recovery_start_s: Optional[float] = None
+_frcheck_first_layer_recovery_reported: bool = False
+_frcheck_first_layer_recovery_target_idx: Optional[int] = None
+
+
+_frcheck_async_runtime_timing_reported: bool = False
+
+
+def _start_frcheck_first_layer_recovery_timer(target_layer_idx: Optional[int] = None) -> None:
+    global _frcheck_first_layer_recovery_start_s, _frcheck_first_layer_recovery_reported
+    global _frcheck_first_layer_recovery_target_idx
+    _frcheck_first_layer_recovery_start_s = time.time()
+    _frcheck_first_layer_recovery_reported = False
+    _frcheck_first_layer_recovery_target_idx = target_layer_idx
+
+
+def _maybe_report_frcheck_first_layer_recovered(layer_name: str, layer_idx: int) -> None:
+    global _frcheck_first_layer_recovery_reported
+    if _frcheck_first_layer_recovery_reported:
+        return
+    if _frcheck_first_layer_recovery_start_s is None:
+        return
+    target_idx = _frcheck_first_layer_recovery_target_idx
+    if target_idx is not None and layer_idx != target_idx:
+        return
+    _frcheck_first_layer_recovery_reported = True
+    elapsed_s = time.time() - _frcheck_first_layer_recovery_start_s
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if rank == 0:
+        logger.info(
+            "FRCheck first model layer recovered: layer=%s layer_idx=%s elapsed_s=%.6f",
+            layer_name, layer_idx, elapsed_s,
+        )
+
 
 def _frcheck_recovery_profile(role: str, event: str, **fields) -> None:
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -612,6 +646,9 @@ class _FRCheckLayerwiseRuntime:
         self.wait_s: float = 0.0
         self.forward_wait_model_s: float = 0.0
         self.optimizer_wait_s: float = 0.0
+        self.optimizer_materialize_s: float = 0.0
+        self.optimizer_load_s: float = 0.0
+        self.optimizer_sync_s: float = 0.0
         self.materialized_layers: Set[int] = set()
         self.optimizer_materialized: bool = False
         self.missing_layers: Set[int] = set()
@@ -863,6 +900,10 @@ class _FRCheckLayerwiseRuntime:
             "wait_s": self.wait_s,
             "forward_wait_model_s": self.forward_wait_model_s,
             "optimizer_wait_s": self.optimizer_wait_s,
+            "optimizer_materialize_s": self.optimizer_materialize_s,
+            "optimizer_load_s": self.optimizer_load_s,
+            "optimizer_sync_s": self.optimizer_sync_s,
+            "optimizer_h2d_s": self.optimizer_materialize_s + self.optimizer_load_s + self.optimizer_sync_s,
             "first_wait_s": self.first_wait_s,
             "first_layer_ready_s": self.first_layer_ready_s,
             "last_layer_ready_s": self.last_layer_ready_s,
@@ -1549,9 +1590,11 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
     service.wait_optimizer()
     if optimizer is None:
         return False
+    t_materialize = time.time()
     updated, expected, missing_keys = _materialize_pending_optimizer_tensors(
         runtime, _pending_optimizer_state,
     )
+    runtime.optimizer_materialize_s += time.time() - t_materialize
     frcheck_normalize_optimizer_state_param_keys(_pending_optimizer_state)
     if updated != expected:
         logger.error(
@@ -1564,7 +1607,9 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
             f"materialization ({updated}/{expected})"
         )
     _install_current_fp32_params_for_optimizer_load(optimizer, _pending_optimizer_state)
+    t_load = time.time()
     optimizer.load_state_dict(_pending_optimizer_state)
+    runtime.optimizer_load_s += time.time() - t_load
     for record in runtime._records_by_layer.values():
         if record.contains_optimizer_state:
             record.optimizer_tensors = None
@@ -1573,7 +1618,9 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
     _pending_optimizer_state = None
     runtime.optimizer_materialized = True
     if torch.cuda.is_available():
+        t_sync = time.time()
         torch.cuda.synchronize()
+        runtime.optimizer_sync_s += time.time() - t_sync
     _finish_recovery_parity_repair_submissions("after_optimizer_state", service.role)
     if _pending_recovery_parity_repair is None and not service.safe_point_teardown_done:
         _flush_recovery_async_parity("after_optimizer_state", service.role)
@@ -1581,7 +1628,9 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
         service.safe_point_teardown_done = True
         service.state = service.TORN_DOWN
     if torch.cuda.is_available():
+        t_sync = time.time()
         torch.cuda.synchronize()
+        runtime.optimizer_sync_s += time.time() - t_sync
     if _frcheck_debug_enabled():
         logger.debug(
             "FRCheck optimizer recovery: loaded deferred optimizer state in %.4fs "
@@ -1595,6 +1644,58 @@ def get_frcheck_layerwise_runtime_summary() -> Optional[Dict[str, Any]]:
     service = _get_active_frcheck_recovery_service()
     summary = service.summary()
     return None if not summary.get("has_runtime") else summary
+
+
+def _log_frcheck_async_runtime_timing_once(context: str) -> None:
+    global _frcheck_async_runtime_timing_reported
+    if _frcheck_async_runtime_timing_reported:
+        return
+    summary = get_frcheck_layerwise_runtime_summary()
+    runtime = (summary or {}).get("runtime", {}) or {}
+    layer_inject_s = float(runtime.get("inject_s", 0.0) or 0.0)
+    forward_wait_model_s = float(runtime.get("forward_wait_model_s", 0.0) or 0.0)
+    optimizer_wait_s = float(runtime.get("optimizer_wait_s", 0.0) or 0.0)
+    optimizer_materialize_s = float(runtime.get("optimizer_materialize_s", 0.0) or 0.0)
+    optimizer_load_s = float(runtime.get("optimizer_load_s", 0.0) or 0.0)
+    optimizer_sync_s = float(runtime.get("optimizer_sync_s", 0.0) or 0.0)
+    optimizer_h2d_s = float(runtime.get("optimizer_h2d_s", 0.0) or 0.0)
+    h2d_s = layer_inject_s + optimizer_h2d_s
+    wait_s = float(runtime.get("wait_s", 0.0) or 0.0)
+    materialized_layers = float(runtime.get("materialized_layers", 0.0) or 0.0)
+    injected_layers = float(runtime.get("injected_layers", 0.0) or 0.0)
+    values = _timing_max_dict({
+        "layer_inject_s": layer_inject_s,
+        "forward_wait_model_s": forward_wait_model_s,
+        "optimizer_wait_s": optimizer_wait_s,
+        "optimizer_materialize_s": optimizer_materialize_s,
+        "optimizer_load_s": optimizer_load_s,
+        "optimizer_sync_s": optimizer_sync_s,
+        "optimizer_h2d_s": optimizer_h2d_s,
+        "h2d_s": h2d_s,
+        "wait_s": wait_s,
+        "materialized_layers": materialized_layers,
+        "injected_layers": injected_layers,
+    })
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    _frcheck_async_runtime_timing_reported = True
+    if rank == 0:
+        logger.info(
+            "FRCheck async runtime timing (%s): layer_inject_s=%.6fs "
+            "optimizer_materialize_s=%.6fs optimizer_load_s=%.6fs "
+            "optimizer_sync_s=%.6fs h2d_s=%.6fs forward_wait_model_s=%.6fs "
+            "optimizer_wait_s=%.6fs wait_s=%.6fs materialized_layers=%d injected_layers=%d",
+            context,
+            values["layer_inject_s"],
+            values["optimizer_materialize_s"],
+            values["optimizer_load_s"],
+            values["optimizer_sync_s"],
+            values["h2d_s"],
+            values["forward_wait_model_s"],
+            values["optimizer_wait_s"],
+            values["wait_s"],
+            int(values["materialized_layers"]),
+            int(values["injected_layers"]),
+        )
 
 
 def frcheck_recovery_safe_point(point: str) -> None:
@@ -1634,6 +1735,7 @@ def frcheck_recovery_safe_point(point: str) -> None:
     )
     if should_wait:
         service.wait_all(reason=point)
+        _log_frcheck_async_runtime_timing_once(point)
         _finish_recovery_parity_repair_submissions(point, service.role)
         if _pending_recovery_parity_repair is None:
             _flush_recovery_async_parity(point, service.role)
@@ -5114,6 +5216,21 @@ def _run_recovery_pipeline(
             native.wait_recovery_batch_id(int(recovered.timing.get('batch_id', 0)))
             wait_s = time.time() - t_wait
             recovered.timing['wait_s'] = wait_s
+            batch_timing = {}
+            if hasattr(native, 'get_recovery_batch_timing_stats'):
+                batch_timing = dict(native.get_recovery_batch_timing_stats())
+            for start_key, end_key in (
+                ('net_start_us', 'net_end_us'),
+                ('decode_start_us', 'decode_end_us'),
+            ):
+                start_us = float(batch_timing.get(start_key, 0.0) or 0.0)
+                end_us = float(batch_timing.get(end_key, 0.0) or 0.0)
+                if start_us > 0.0:
+                    old_start = float(layer_timing.get(start_key, 0.0) or 0.0)
+                    layer_timing[start_key] = start_us if old_start == 0.0 else min(old_start, start_us)
+                if end_us > 0.0:
+                    layer_timing[end_key] = max(float(layer_timing.get(end_key, 0.0) or 0.0), end_us)
+            layer_timing['failed_copy_s'] = layer_timing.get('failed_copy_s', 0.0) + float(batch_timing.get('copy_s', 0.0) or 0.0)
             layer_timing['network_wait_s'] += wait_s
             layer_timing['wait_s'] = layer_timing['network_wait_s']
             _frcheck_recovery_profile(
@@ -5121,6 +5238,8 @@ def _run_recovery_pipeline(
                 layer_idx=job.layer_idx, wave=recovered.window.wave_idx,
                 batch_id=recovered.timing.get('batch_id', 0),
                 wait_s=wait_s,
+                net_s=batch_timing.get('net_s', 0.0),
+                decode_s=batch_timing.get('decode_s', 0.0),
             )
             first_network_done["time"] = first_network_done["time"] or time.time()
             if recovered.window.wave_idx + 1 == len(job_windows.get(id(job), [])):
@@ -5235,6 +5354,7 @@ def _run_recovery_pipeline(
         results.append((record, layer_timing))
         materialized_jobs.add(id(job))
         last_materialize_done["time"] = time.time()
+        _maybe_report_frcheck_first_layer_recovered(job.layer_name, job.layer_idx)
         _frcheck_recovery_profile(
             recovery_role, "pipeline_job_done", layer=job.layer_name,
             layer_idx=job.layer_idx,
@@ -5256,6 +5376,17 @@ def _run_recovery_pipeline(
     total_submit_s = sum(timing.get('network_submit_s', 0.0) for _record, timing in results)
     total_wait_s = sum(timing.get('network_wait_s', 0.0) for _record, timing in results)
     total_materialize_s = sum(timing.get('materialize_s', 0.0) for _record, timing in results)
+    net_starts = [float(timing.get('net_start_us', 0.0) or 0.0) for _record, timing in results]
+    net_ends = [float(timing.get('net_end_us', 0.0) or 0.0) for _record, timing in results]
+    decode_starts = [float(timing.get('decode_start_us', 0.0) or 0.0) for _record, timing in results]
+    decode_ends = [float(timing.get('decode_end_us', 0.0) or 0.0) for _record, timing in results]
+    net_start_us = min((value for value in net_starts if value > 0.0), default=0.0)
+    net_end_us = max(net_ends, default=0.0)
+    decode_start_us = min((value for value in decode_starts if value > 0.0), default=0.0)
+    decode_end_us = max(decode_ends, default=0.0)
+    total_recovery_net_s = ((net_end_us - net_start_us) / 1.0e6) if net_start_us > 0.0 and net_end_us > net_start_us else 0.0
+    total_recovery_decode_s = ((decode_end_us - decode_start_us) / 1.0e6) if decode_start_us > 0.0 and decode_end_us > decode_start_us else 0.0
+    total_failed_copy_s = sum(timing.get('failed_copy_s', 0.0) for _record, timing in results)
     for _record, timing in results:
         timing['pipeline_overlap_s'] = overlap_s
         timing['pipeline_critical_s'] = elapsed
@@ -5270,6 +5401,9 @@ def _run_recovery_pipeline(
         "network_submit_s": total_submit_s,
         "network_wait_s": total_wait_s,
         "materialize_s": total_materialize_s,
+        "recovery_net_s": total_recovery_net_s,
+        "recovery_decode_s": total_recovery_decode_s,
+        "h2d_s": total_failed_copy_s,
         "serial_work_s": serial_work_s,
         "pipeline_overlap_s": overlap_s,
         "first_network_done_s": first_network_done_s,
@@ -6184,8 +6318,14 @@ def _teardown_frcheck_native_after_load() -> None:
         manager.cleanup_recovery(teardown=True, sync=not skip_barrier)
     else:
         manager.cleanup(teardown=True, sync=not skip_barrier)
+    teardown_s = time.time() - t_cleanup
+    try:
+        from megatron.training.global_vars import add_recovery_teardown_time
+        add_recovery_teardown_time(teardown_s)
+    except Exception:
+        pass
     _frcheck_recovery_profile(
-        role, "teardown_done", elapsed_s=time.time() - t_cleanup,
+        role, "teardown_done", elapsed_s=teardown_s,
         sync=not skip_barrier,
     )
 
@@ -6479,7 +6619,12 @@ def recover_frcheck_legacy_hardware(
     if world_size > 1 and torch.distributed.is_initialized():
         torch.distributed.barrier()
 
+    first_recovery_layer_idx = min(
+        (job.layer_idx for job in recovery_jobs if job.layer_idx >= 0),
+        default=None,
+    )
     t_net = time.time()
+    _start_frcheck_first_layer_recovery_timer(first_recovery_layer_idx)
     try:
         from megatron.training.global_vars import start_recovery_to_forward_timer
         start_recovery_to_forward_timer(

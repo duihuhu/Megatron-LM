@@ -2177,6 +2177,30 @@ private:
         }
     }
 
+    void record_atomic_min_nonzero_(std::atomic<uint64_t>& target, uint64_t value) {
+        uint64_t old = target.load(std::memory_order_relaxed);
+        while ((old == 0 || value < old) &&
+               !target.compare_exchange_weak(
+                   old, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+
+    void record_recovery_net_start_(uint64_t t) {
+        record_atomic_min_nonzero_(recovery_net_start_us_, t);
+    }
+
+    void record_recovery_net_end_(uint64_t t) {
+        record_atomic_max_(recovery_net_end_us_, t);
+    }
+
+    void record_recovery_decode_start_(uint64_t t) {
+        record_atomic_min_nonzero_(recovery_decode_start_us_, t);
+    }
+
+    void record_recovery_decode_end_(uint64_t t) {
+        record_atomic_max_(recovery_decode_end_us_, t);
+    }
+
     void source_worker_() {
         while (!all_stop_) {
             SourceTask t;
@@ -3245,14 +3269,18 @@ public:
 
     void execute_recovery_helper_(const RecoveryHelperTask& task) {
         uint64_t t0 = frcheck_now_us();
+        record_recovery_net_start_(t0);
         send_to_peer(task.decoder_rig, task.stripe_id,
                      task.helper_block, task.block_size, 0, 3);
-        recovery_helper_send_us_.fetch_add(frcheck_now_us() - t0, std::memory_order_relaxed);
+        uint64_t t1 = frcheck_now_us();
+        record_recovery_net_end_(t1);
+        recovery_helper_send_us_.fetch_add(t1 - t0, std::memory_order_relaxed);
         recovery_helper_tasks_.fetch_add(1, std::memory_order_relaxed);
     }
 
     void execute_recovery_decoder_(const RecoveryDecoderTask& task) {
         uint64_t t_recv = frcheck_now_us();
+        record_recovery_net_start_(t_recv);
         std::vector<std::thread> recv_threads;
         std::vector<std::exception_ptr> recv_errors(task.helper_rigs.size());
 
@@ -3274,7 +3302,9 @@ public:
         for (size_t hi = 0; hi < recv_errors.size(); ++hi) {
             if (recv_errors[hi]) std::rethrow_exception(recv_errors[hi]);
         }
-        recovery_decoder_recv_us_.fetch_add(frcheck_now_us() - t_recv, std::memory_order_relaxed);
+        uint64_t t_recv_done = frcheck_now_us();
+        record_recovery_net_end_(t_recv_done);
+        recovery_decoder_recv_us_.fetch_add(t_recv_done - t_recv, std::memory_order_relaxed);
 
         int k = n_ - 2;
         std::vector<uintptr_t> survivor_addrs;
@@ -3286,10 +3316,13 @@ public:
             if (task.recovered_bufs.empty())
                 throw std::runtime_error("FRCheck recovery: missing recovered buffer");
             uint64_t t_decode = frcheck_now_us();
+            record_recovery_decode_start_(t_decode);
             submit_stripe_decode(
                 k, task.survivor_positions, task.failed_pos,
                 survivor_addrs, task.recovered_bufs[0], task.block_size);
-            recovery_decoder_decode_us_.fetch_add(frcheck_now_us() - t_decode, std::memory_order_relaxed);
+            uint64_t t_decode_done = frcheck_now_us();
+            record_recovery_decode_end_(t_decode_done);
+            recovery_decoder_decode_us_.fetch_add(t_decode_done - t_decode, std::memory_order_relaxed);
             if (task.failed_rigs.empty())
                 throw std::runtime_error("FRCheck recovery: missing failed rig");
             enqueue_recovery_decoder_send_(
@@ -3300,10 +3333,13 @@ public:
                 throw std::runtime_error("FRCheck recovery: insufficient recovered buffers");
             for (size_t slot = 0; slot < task.failed_positions.size(); ++slot) {
                 uint64_t t_decode = frcheck_now_us();
+                record_recovery_decode_start_(t_decode);
                 submit_stripe_decode(
                     k, task.survivor_positions, task.failed_positions[slot],
                     survivor_addrs, task.recovered_bufs[slot], task.block_size);
-                recovery_decoder_decode_us_.fetch_add(frcheck_now_us() - t_decode, std::memory_order_relaxed);
+                uint64_t t_decode_done = frcheck_now_us();
+                record_recovery_decode_end_(t_decode_done);
+                recovery_decoder_decode_us_.fetch_add(t_decode_done - t_decode, std::memory_order_relaxed);
                 enqueue_recovery_decoder_send_(
                     task.batch_id, task.stripe_id, task.block_size,
                     task.recovered_bufs[slot], task.failed_rigs[slot]);
@@ -3333,16 +3369,22 @@ public:
 
     void execute_recovery_decoder_send_(const RecoveryDecoderSendTask& task) {
         uint64_t t_send = frcheck_now_us();
+        record_recovery_net_start_(t_send);
         send_to_peer(task.failed_rig, task.stripe_id,
                      task.recovered_buf, task.block_size, 0, 4);
-        recovery_decoder_send_us_.fetch_add(frcheck_now_us() - t_send, std::memory_order_relaxed);
+        uint64_t t_send_done = frcheck_now_us();
+        record_recovery_net_end_(t_send_done);
+        recovery_decoder_send_us_.fetch_add(t_send_done - t_send, std::memory_order_relaxed);
     }
 
     void execute_recovery_failed_(const RecoveryFailedTask& task) {
         uint64_t t_recv = frcheck_now_us();
+        record_recovery_net_start_(t_recv);
         recv_from_peer(task.decoder_rig, task.stripe_id,
                        task.recv_buf, task.block_size, 0, 4);
-        recovery_failed_recv_us_.fetch_add(frcheck_now_us() - t_recv, std::memory_order_relaxed);
+        uint64_t t_recv_done = frcheck_now_us();
+        record_recovery_net_end_(t_recv_done);
+        recovery_failed_recv_us_.fetch_add(t_recv_done - t_recv, std::memory_order_relaxed);
         if (task.store_to_layer && task.layer_buf != 0 && task.ncopy > 0) {
             uint64_t t_copy = frcheck_now_us();
             std::memcpy(
@@ -3523,12 +3565,63 @@ public:
         recovery_decoder_send_us_.store(0, std::memory_order_relaxed);
         recovery_failed_recv_us_.store(0, std::memory_order_relaxed);
         recovery_failed_copy_us_.store(0, std::memory_order_relaxed);
+        recovery_net_start_us_.store(0, std::memory_order_relaxed);
+        recovery_net_end_us_.store(0, std::memory_order_relaxed);
+        recovery_decode_start_us_.store(0, std::memory_order_relaxed);
+        recovery_decode_end_us_.store(0, std::memory_order_relaxed);
         recovery_skipped_stripes_.store(0, std::memory_order_relaxed);
         recovery_helper_tasks_.store(0, std::memory_order_relaxed);
         recovery_decoder_tasks_.store(0, std::memory_order_relaxed);
         recovery_failed_tasks_.store(0, std::memory_order_relaxed);
     }
 
+public:
+    py::dict get_recovery_batch_timing_stats() const {
+        py::dict result;
+        const double helper_send_s = static_cast<double>(
+            recovery_helper_send_us_.load(std::memory_order_relaxed)) / 1e6;
+        const double decoder_recv_s = static_cast<double>(
+            recovery_decoder_recv_us_.load(std::memory_order_relaxed)) / 1e6;
+        const double decoder_send_s = static_cast<double>(
+            recovery_decoder_send_us_.load(std::memory_order_relaxed)) / 1e6;
+        const double failed_recv_s = static_cast<double>(
+            recovery_failed_recv_us_.load(std::memory_order_relaxed)) / 1e6;
+        const double failed_copy_s = static_cast<double>(
+            recovery_failed_copy_us_.load(std::memory_order_relaxed)) / 1e6;
+        const uint64_t net_start = recovery_net_start_us_.load(std::memory_order_relaxed);
+        const uint64_t net_end = recovery_net_end_us_.load(std::memory_order_relaxed);
+        const uint64_t decode_start = recovery_decode_start_us_.load(std::memory_order_relaxed);
+        const uint64_t decode_end = recovery_decode_end_us_.load(std::memory_order_relaxed);
+        result["helper_send_s"] = helper_send_s;
+        result["decoder_recv_s"] = decoder_recv_s;
+        result["decoder_decode_sum_s"] = static_cast<double>(
+            recovery_decoder_decode_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["decoder_send_s"] = decoder_send_s;
+        result["failed_recv_s"] = failed_recv_s;
+        result["failed_copy_s"] = failed_copy_s;
+        result["net_s"] = (net_start > 0 && net_end > net_start)
+            ? static_cast<double>(net_end - net_start) / 1e6
+            : 0.0;
+        result["decode_s"] = (decode_start > 0 && decode_end > decode_start)
+            ? static_cast<double>(decode_end - decode_start) / 1e6
+            : 0.0;
+        result["net_start_us"] = static_cast<double>(net_start);
+        result["net_end_us"] = static_cast<double>(net_end);
+        result["decode_start_us"] = static_cast<double>(decode_start);
+        result["decode_end_us"] = static_cast<double>(decode_end);
+        result["copy_s"] = failed_copy_s;
+        result["helper_tasks"] = static_cast<double>(
+            recovery_helper_tasks_.load(std::memory_order_relaxed));
+        result["decoder_tasks"] = static_cast<double>(
+            recovery_decoder_tasks_.load(std::memory_order_relaxed));
+        result["failed_tasks"] = static_cast<double>(
+            recovery_failed_tasks_.load(std::memory_order_relaxed));
+        result["skipped_stripes"] = static_cast<double>(
+            recovery_skipped_stripes_.load(std::memory_order_relaxed));
+        return result;
+    }
+
+private:
     void print_recovery_batch_profile_() {}
 
     void ensure_recovery_batch_exists_(uint64_t batch_id) {
@@ -3883,6 +3976,10 @@ private:
     std::atomic<uint64_t> recovery_decoder_send_us_{0};
     std::atomic<uint64_t> recovery_failed_recv_us_{0};
     std::atomic<uint64_t> recovery_failed_copy_us_{0};
+    std::atomic<uint64_t> recovery_net_start_us_{0};
+    std::atomic<uint64_t> recovery_net_end_us_{0};
+    std::atomic<uint64_t> recovery_decode_start_us_{0};
+    std::atomic<uint64_t> recovery_decode_end_us_{0};
     std::atomic<int> recovery_skipped_stripes_{0};
     std::atomic<int> recovery_helper_tasks_{0};
     std::atomic<int> recovery_decoder_tasks_{0};
@@ -4002,6 +4099,8 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("batch_id"))
         .def("wait_recovery_batch_id", &FRCheckNative::wait_recovery_batch_id,
              py::arg("batch_id"), py::call_guard<py::gil_scoped_release>())
+        .def("get_recovery_batch_timing_stats", &FRCheckNative::get_recovery_batch_timing_stats,
+             "Return timing counters for the most recently completed recovery batch")
         .def("reset_recovery_batch", &FRCheckNative::reset_recovery_batch)
         .def("submit_recovery_stripe", &FRCheckNative::submit_recovery_stripe,
              py::arg("stripe_id"),

@@ -116,6 +116,13 @@ def stash_recovery_timing_summary(name: str, values: dict) -> None:
 
 
 
+def add_recovery_teardown_time(elapsed_s: float) -> None:
+    """Accumulate local teardown time to exclude from recovery-to-forward."""
+    summary = _GLOBAL_RECOVERY_TIMING_SUMMARIES.setdefault("teardown", {})
+    summary["elapsed_s"] = float(summary.get("elapsed_s", 0.0)) + float(elapsed_s)
+
+
+
 def finish_recovery_to_forward_timer(label: str = "forward_step_end") -> None:
     """Record elapsed time from recovery start to the next forward step end."""
     global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
@@ -129,9 +136,11 @@ def finish_recovery_to_forward_timer(label: str = "forward_step_end") -> None:
     elapsed = marks[-1][1] - start if marks else 0.0
     context = timer.get("context", {}) or {}
     if context.get("rank0_only_max"):
+        teardown = _GLOBAL_RECOVERY_TIMING_SUMMARIES.get("teardown", {})
+        teardown_s = float((teardown or {}).get("elapsed_s", 0.0))
         stash_recovery_timing_summary(
             "recovery_to_forward",
-            {"elapsed_s": elapsed, "scheme": timer["scheme"]},
+            {"elapsed_s": elapsed, "teardown_s": teardown_s, "scheme": timer["scheme"]},
         )
         return
     role = context.get("role", "")
@@ -152,6 +161,9 @@ def flush_recovery_timing_summaries() -> None:
         "network_submit_s",
         "network_wait_s",
         "materialize_s",
+        "recovery_net_s",
+        "recovery_decode_s",
+        "h2d_s",
         "serial_work_s",
         "pipeline_overlap_s",
         "first_network_done_s",
@@ -161,13 +173,15 @@ def flush_recovery_timing_summaries() -> None:
     rtf = _GLOBAL_RECOVERY_TIMING_SUMMARIES.get("recovery_to_forward")
 
     rtf_elapsed_s = float((rtf or {}).get("elapsed_s", 0.0))
+    rtf_teardown_s = float((rtf or {}).get("teardown_s", 0.0))
+    rtf_adjusted_elapsed_s = max(0.0, rtf_elapsed_s - rtf_teardown_s)
     values = [1.0 if pipeline is not None else 0.0]
     values.extend(float((pipeline or {}).get(key, 0.0)) for key in pipeline_keys)
     values.append(1.0 if rtf is not None else 0.0)
+    values.append(rtf_adjusted_elapsed_s)
+    values.append(-rtf_adjusted_elapsed_s if rtf is not None else -1.0e30)
     values.append(rtf_elapsed_s)
-    # Keep one collective at the safe train-step boundary. The negated elapsed
-    # gives the cross-rank minimum via MAX while missing ranks stay inactive.
-    values.append(-rtf_elapsed_s if rtf is not None else -1.0e30)
+    values.append(rtf_teardown_s)
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
@@ -186,12 +200,16 @@ def flush_recovery_timing_summaries() -> None:
             logger.info(
                 "FRCheck HW pipeline breakdown: pipeline_s=%.2fs "
                 "network_submit_s=%.2fs network_wait_s=%.2fs materialize_s=%.2fs "
+                "net_s=%.2fs decode_s=%.2fs h2d_s=%.2fs "
                 "serial_work_s=%.2fs overlap_s=%.2fs first_network_done_s=%.2fs "
                 "last_materialize_done_s=%.2fs",
                 summary["pipeline_s"],
                 summary["network_submit_s"],
                 summary["network_wait_s"],
                 summary["materialize_s"],
+                summary["recovery_net_s"],
+                summary["recovery_decode_s"],
+                summary["h2d_s"],
                 summary["serial_work_s"],
                 summary["pipeline_overlap_s"],
                 summary["first_network_done_s"],
@@ -201,9 +219,12 @@ def flush_recovery_timing_summaries() -> None:
             scheme = str((rtf or {}).get("scheme", "FRCheck"))
             elapsed_max_s = values[2 + len(pipeline_keys)]
             elapsed_min_s = -values[3 + len(pipeline_keys)]
+            raw_elapsed_max_s = values[4 + len(pipeline_keys)]
+            teardown_max_s = values[5 + len(pipeline_keys)]
             print(
                 f"{scheme} recovery-to-forward: "
-                f"elapsed_min={elapsed_min_s:.4f}s elapsed_max={elapsed_max_s:.4f}s",
+                f"elapsed_min={elapsed_min_s:.4f}s elapsed_max={elapsed_max_s:.4f}s "
+                f"raw_elapsed_max={raw_elapsed_max_s:.4f}s teardown_max={teardown_max_s:.4f}s",
                 flush=True,
             )
 

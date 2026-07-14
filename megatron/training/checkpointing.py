@@ -29,7 +29,7 @@ from megatron.core.fp8_utils import is_float8tensor, dequantize_fp8_tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from .async_utils import schedule_async_save, is_empty_async_queue
 from .global_vars import get_args
-from .global_vars import mark_recovery_to_forward_timer
+from .global_vars import mark_recovery_to_forward_timer, start_recovery_to_forward_timer
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
@@ -2134,7 +2134,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 )
                 # Fallback support for backward compatibility breaking changes in TransformerEngine.
                 load_return = module.load_state_dict(state_dict, strict=False)
-                logger.warning("model load strict=False return: %s", load_return)
+                missing_after = len(getattr(load_return, "missing_keys", []) or [])
+                unexpected_after = len(getattr(load_return, "unexpected_keys", []) or [])
+                logger.warning(
+                    "model load strict=False completed: missing=%d unexpected=%d",
+                    missing_after,
+                    unexpected_after,
+                )
                 return load_return
             raise
 
@@ -2202,6 +2208,24 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
         visit(obj)
         return tensor_count, tensor_bytes, len(storage_ptrs), non_contig_count, pinned_count
+
+    if (
+        ckpt_type == CheckpointType.LEGACY
+        and not any(
+            bool(getattr(args, flag, False))
+            for flag in (
+                "use_frcheck",
+                "use_eccheck",
+                "use_ecnaive",
+                "use_gemini",
+                "use_gemini_replicas",
+                "use_eclatin",
+            )
+        )
+    ):
+        start_recovery_to_forward_timer(
+            "Megatron legacy load-to-forward", "load_model_start", rank0_only_max=True,
+        )
 
     # Model.
     if torch.cuda.is_available():
@@ -2389,42 +2413,78 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             recovery = (ft_context or {}).get("timings", {})
             recovery_e2e_s = float(recovery.get("total", 0.0))
             mode = (ft_context or {}).get("mode", "SW")
+            layer_inject_s = 0.0
+            try:
+                from .frcheck_legacy import get_frcheck_layerwise_runtime_summary
+                runtime_summary = get_frcheck_layerwise_runtime_summary()
+                runtime = (runtime_summary or {}).get("runtime", {})
+                layer_inject_s = float(runtime.get("inject_s", 0.0))
+            except Exception:
+                layer_inject_s = 0.0
             summary = _timing_max_dict({
-                "e2e_s": recovery_e2e_s + h2d_total_s,
+                "e2e_s": recovery_e2e_s + h2d_total_s + layer_inject_s,
                 "h2d_s": h2d_total_s,
+                "layer_inject_s": layer_inject_s,
             })
             if rank == 0:
                 logger.info(
-                    "FRCheck load timing (%s): e2e_s=%.2fs h2d_s=%.2fs",
+                    "FRCheck load timing (%s): e2e_s=%.2fs h2d_s=%.2fs "
+                    "layer_inject_s=%.2fs",
                     mode,
                     summary["e2e_s"],
                     summary["h2d_s"],
+                    summary["layer_inject_s"],
                 )
         elif ft_context is not None:
             recovery = ft_context.get("timings", {})
             recovery_e2e_s = float(recovery.get("total", 0.0))
             if ft_context.get("scheme") == "GEMINI" and getattr(args, "use_gemini_replicas", False):
+                network_encode_s = float(recovery.get("network_encode", 0.0))
                 summary = _timing_max_dict({
                     "e2e_s": recovery_e2e_s + h2d_total_s,
+                    "recovery_e2e_s": recovery_e2e_s,
+                    "network_encode_s": network_encode_s,
+                    "net_s": float(recovery.get("net_s", network_encode_s)),
+                    "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
                     "h2d_s": h2d_total_s,
                 })
                 if rank == 0:
                     logger.info(
-                        "Gemini Replicas load timing (%s): e2e_s=%.2fs h2d_s=%.2fs",
+                        "Gemini Replicas load timing (%s): e2e_s=%.2fs "
+                        "recovery_e2e_s=%.2fs network_encode_s=%.2fs "
+                        "net_s=%.2fs rebuild_sd_s=%.2fs h2d_s=%.2fs",
                         ft_context.get("mode", "unknown"),
                         summary["e2e_s"],
+                        summary["recovery_e2e_s"],
+                        summary["network_encode_s"],
+                        summary["net_s"],
+                        summary["rebuild_sd_s"],
                         summary["h2d_s"],
                     )
             elif ft_context.get("scheme") == "ECCHECK" and getattr(args, "use_eccheck", False):
                 summary = _timing_max_dict({
                     "e2e_s": recovery_e2e_s + h2d_total_s,
+                    "recovery_e2e_s": recovery_e2e_s,
+                    "network_encode_s": float(recovery.get("network_encode", 0.0)),
+                    "net_s": float(recovery.get("net_s", 0.0)),
+                    "encode_s": float(recovery.get("encode_s", 0.0)),
+                    "decode_s": float(recovery.get("decode_s", recovery.get("encode_s", 0.0))),
+                    "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
                     "h2d_s": h2d_total_s,
                 })
                 if rank == 0:
                     logger.info(
-                        "ECCHECK load timing (%s): e2e_s=%.2fs h2d_s=%.2fs",
+                        "ECCHECK load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
+                        "network_encode_s=%.2fs net_s=%.2fs encode_s=%.2fs "
+                        "decode_s=%.2fs rebuild_sd_s=%.2fs h2d_s=%.2fs",
                         ft_context.get("mode", "unknown"),
                         summary["e2e_s"],
+                        summary["recovery_e2e_s"],
+                        summary["network_encode_s"],
+                        summary["net_s"],
+                        summary["encode_s"],
+                        summary["decode_s"],
+                        summary["rebuild_sd_s"],
                         summary["h2d_s"],
                     )
             elif ft_context.get("scheme") == "EC-NAIVE" and getattr(args, "use_ecnaive", False):
@@ -2528,7 +2588,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             logger.debug(
                 "ECCHECK: deferred post-H2D cleanup on rank %d", rank
             )
+            t_cleanup = time()
             _eccheck_mgr.cleanup()
+            cleanup_s = time() - t_cleanup
+            try:
+                from megatron.training.global_vars import add_recovery_teardown_time
+                add_recovery_teardown_time(cleanup_s)
+            except Exception:
+                pass
             _eccheck_mgr._eccheck_native = None
 
     # rerun state

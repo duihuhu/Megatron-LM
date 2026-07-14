@@ -2098,8 +2098,14 @@ def load_gemini_replicas_legacy_checkpoint(
         t_cleanup = time.time()
         manager.cleanup()
         manager._gemini_replicas_native = None
+        cleanup_s = time.time() - t_cleanup
+        try:
+            from megatron.training.global_vars import add_recovery_teardown_time
+            add_recovery_teardown_time(cleanup_s)
+        except Exception:
+            pass
         _gemini_recovery_profile(
-            recovery_role, "cleanup_done", elapsed_s=time.time() - t_cleanup
+            recovery_role, "cleanup_done", elapsed_s=cleanup_s
         )
 
     # All ranks must participate: P2P ranks cleaned up native connections,

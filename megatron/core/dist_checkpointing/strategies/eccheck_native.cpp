@@ -376,10 +376,17 @@ private:
         uintptr_t parity_addr;      // XOR结果地址（parity buffer）
         uintptr_t p2p_own_write_addr;    // P2P: 写入own_buffer的地址
         uintptr_t p2p_partner_write_addr; // P2P: 写入partner_buffer的地址（接收到的数据）
+        bool local_is_zero_tail;          // Save path: local data chunk is implicit zero
+        bool remote_is_zero_tail;         // Save path: XOR peer data chunk is implicit zero
+        bool p2p_data_is_zero_tail;       // Save path: P2P data sender chunk is implicit zero
+        size_t p2p_data_size;             // Save path: valid P2P data bytes in this chunk
+        size_t sequence_id;               // Save path chunk order for P2P transfers
     };
     
     std::queue<EncodingTask> encoding_tasks_1_;  // Thread1的编码任务
     std::queue<EncodingTask> encoding_tasks_2_;  // Thread2的编码任务
+    std::atomic<size_t> save_sequence_id_thread1_{0};
+    std::atomic<size_t> save_sequence_id_thread2_{0};
     
     std::mutex encoding_tasks_1_mutex_;
     std::mutex encoding_tasks_2_mutex_;
@@ -399,7 +406,12 @@ private:
     struct RecvTask {
         uintptr_t recv_addr;
         size_t size;
-        uintptr_t parity_addr;      // XOR结果地址（从EncodingTask传递）
+        uintptr_t parity_addr;      // XOR result address from EncodingTask
+        bool local_is_zero_tail;    // Save path: local data chunk is implicit zero
+        bool remote_is_zero_tail;   // Save path: remote XOR chunk is implicit zero
+        bool p2p_data_is_zero_tail; // Save path: P2P data sender chunk is implicit zero
+        size_t p2p_data_size;       // Save path: valid P2P data bytes in this chunk
+        size_t sequence_id;         // Save path chunk order for downstream P2P tasks
     };
     std::queue<RecvTask> recv_queue_;
     std::mutex recv_queue_mutex_;
@@ -457,6 +469,11 @@ private:
         uintptr_t p2p_own_write_addr;    // P2P: 写入own_buffer的地址
         uintptr_t p2p_partner_write_addr; // P2P: 写入partner_buffer的地址
         uintptr_t data_addr;             // 原始data地址（用于奇数rank发送data）
+        bool local_is_zero_tail;
+        bool remote_is_zero_tail;
+        bool p2p_data_is_zero_tail;
+        size_t p2p_data_size;
+        size_t sequence_id;
     };
     
     // Unified XOR task queue
@@ -514,6 +531,8 @@ private:
         bool is_load_mode_transfer;      // true=load mode transfer (Step2 or Step6), false=save stage
         bool is_step6_transfer;         // true=Step6 transfer (rank3->rank2), false=Step2 transfer
         uintptr_t load_mode_data_addr;  // load mode Step2: corresponding data_addr (for finding encoding task)
+        size_t zero_fill_tail_size;     // save path: zero-fill remaining bytes after valid data
+        size_t sequence_id;             // save path chunk order for network transfer
     };
     
     struct P2PRecvTask {
@@ -523,6 +542,9 @@ private:
         bool is_load_mode_transfer;      // true=load mode transfer, false=save stage
         bool is_step6_transfer;         // true=Step6 transfer (rank3->rank2), false=Step2 transfer
         uintptr_t data_buffer_addr;      // load mode: receive后写入的data_buffer地址（如果与recv_buffer_addr不同）
+        bool skip_network;              // save path: fill zeros without receiving data
+        size_t zero_fill_tail_size;      // save path: zero-fill remaining bytes after valid data
+        size_t sequence_id;              // save path chunk order for network transfer
     };
     
     // P2P task queues (two independent workers)
@@ -812,6 +834,25 @@ private:
     EcRsEncodeJob ec_rs_encode_pool_shared_job_{};
     std::mutex ec_rs_encode_pool_work_mutex_;  // serialize encoder_1/encoder_2 dispatch
 
+    bool release_data_buffer_once(uintptr_t data_addr) {
+        if (data_addr == 0) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> state_lock(data_buffer_state_mutex_);
+            auto it = data_buffer_states_.find(data_addr);
+            if (it == data_buffer_states_.end()) {
+                return false;
+            }
+            data_buffer_states_.erase(it);
+        }
+        {
+            std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
+            data_buffers_to_release_.push(data_addr);
+        }
+        return true;
+    }
+
     // ── Save-path XOR pool (16 pthread, xor_gen) ──────────────────
     static constexpr int kEcXorPoolSize = 16;
     struct EcXorJob {
@@ -887,6 +928,12 @@ private:
     bool nccl_p2p_recv_initialized_;
 #ifdef __GNUC__
 #endif
+#else
+    bool nccl_xor_send_initialized_;
+    bool nccl_xor_recv_initialized_;
+    bool nccl_p2p_send_initialized_;
+    bool nccl_p2p_recv_initialized_;
+#endif
 
     // EC parameters (k, rows=2) and tables
     int k_;
@@ -894,14 +941,8 @@ private:
     int data_block_index_;
     unsigned char *a_mat_;    // RS matrix (k * m)
     unsigned char *g_tbls_;   // tables produced by ec_init_tables (32 * k * rows)
-    unsigned char decode_coefficient_0_;  // Decoding coefficient for rank 0/1 in load mode (temporarily set to 1)
-    unsigned char decode_coefficient_1_;  // Decoding coefficient for rank 2/3 in load mode (temporarily set to 1)
-#else
-    bool nccl_xor_send_initialized_;
-    bool nccl_xor_recv_initialized_;
-    bool nccl_p2p_send_initialized_;
-    bool nccl_p2p_recv_initialized_;
-#endif
+    unsigned char decode_coefficient_0_;
+    unsigned char decode_coefficient_1_;
 
     // NCCL IDs stored as member variables (passed from Python via point-to-point exchange)
     std::vector<uint8_t> nccl_id_xor_send_;   // XOR send ID
@@ -940,8 +981,12 @@ private:
     ibv_cq* rdma_xor_recv_cq_;
     ibv_cq* rdma_p2p_send_cq_;
     ibv_cq* rdma_p2p_recv_cq_;
-    ibv_qp* rdma_xor_qp_;
-    ibv_qp* rdma_p2p_qp_;
+    ibv_qp* rdma_xor_send_qp_;
+    ibv_qp* rdma_xor_recv_qp_;
+    ibv_qp* rdma_xor_qp_;  // Compatibility alias for older/simple paths
+    ibv_qp* rdma_p2p_send_qp_;
+    ibv_qp* rdma_p2p_recv_qp_;
+    ibv_qp* rdma_p2p_qp_;  // Compatibility alias for simple/load paths
     
     // RDMA registered buffers
     std::map<uintptr_t, RdmaBufferInfo> rdma_registered_buffers_;
@@ -1057,10 +1102,9 @@ private:
 
     }
 
-    // Helper: lower-ranked partner in a P2P pair sends parity, higher sends data.
-    // This works for both adjacent pairing (0↔1) and group-based pairing (0↔2).
+    // Helper: even rank_in_group in each P2P pair sends parity; odd sends data.
     bool is_p2p_parity_sender() const {
-        return rank_ < p2p_partner_rank_;
+        return (rank_in_group_ % 2) == 0;
     }
 
     // ========== NCCL初始化函数 ==========
@@ -1701,12 +1745,12 @@ private:
                         send_queue_cv_.notify_one();
                         {
                             std::lock_guard<std::mutex> recv_lock(recv_queue_mutex_);
-                            recv_queue_.push({0, 0, 0});
+                            recv_queue_.push({0, 0, 0, false, false, false, 0, 0});
                         }
                         recv_queue_cv_.notify_one();
                         {
                             std::lock_guard<std::mutex> xor_lock(xor_queue_mutex_);
-                            xor_queue_.push({0, 0, 0, 0, 0, 0, 0});
+                            xor_queue_.push({0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0});
                         }
                         xor_queue_cv_.notify_one();
                         // Reset sentinel flag and continue (don't exit)
@@ -1719,12 +1763,18 @@ private:
             
             // Check if we need to encode/send data
             bool need_encode = (task.data_addr != 0 && task.encoding_addr != 0);
+            if (need_encode && task.local_is_zero_tail) {
+                std::memset(reinterpret_cast<void*>(task.encoding_addr), 0, task.size);
+            }
             
             if (need_encode) {
                 // Step 1: Perform encoding (parity index 0 for thread1)
-                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 0);
+                if (!task.local_is_zero_tail) {
+                    encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 0);
+                }
                 
                 // Mark data buffer as copied by thread 1
+                bool release_data_after_state_update = false;
                 {
                     std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
                     auto& state = data_buffer_states_[task.data_addr];
@@ -1735,29 +1785,25 @@ private:
                     if (state.thread2_copied) {
                         // In load mode, rank 1 and rank 2 don't send data, so data buffer should be released immediately
                         // In save mode, even ranks release immediately, odd ranks release in P2P worker
-                        bool should_release = false;
                         if (is_load_mode_ && failed_rank_in_group_ == 2 && (rank_in_group_ == 1 || rank_in_group_ == 2)) {
-                            // Load mode: rank 1 and rank 2 release data buffer immediately
-                            should_release = true;
+                            release_data_after_state_update = true;
                         } else if (is_p2p_parity_sender()) {
                             // Save mode: parity senders release data buffer immediately
                             // (P2P worker uses parity buffer instead)
-                            should_release = true;
+                            release_data_after_state_update = true;
                         }
                         // For data senders, data buffer will be released by P2P worker
-                        
-                        if (should_release) {
-                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                        data_buffers_to_release_.push(task.data_addr);
-                        data_buffer_states_.erase(task.data_addr);
                     }
-                    }
+                }
+                if (release_data_after_state_update) {
+                    release_data_buffer_once(task.data_addr);
                 }
                 
                 // Step 2: Handle based on XOR configuration
                 if (xor_config_.thread0_is_receiver && task.parity_addr != 0 && task.recv_addr != 0) {
                     // This thread is receiver: save encoding buffer to pending, wait for recv
                     // The recv_worker will trigger XOR when recv completes
+                    if (!task.remote_is_zero_tail) {
                     {
                         std::lock_guard<std::mutex> lock(pending_xor_mutex_);
                         pending_xor_encoding_[task.recv_addr] = task.encoding_addr;
@@ -1779,12 +1825,15 @@ private:
                     //           << ", encoding_addr=" << task.encoding_addr 
                     //           << ", p2p_own=" << task.p2p_own_write_addr
                     //           << ", p2p_partner=" << task.p2p_partner_write_addr << std::endl;
+                    }
                     // Note: encoding buffer will be released by XOR worker after XOR completes
                 } else {
                     // This thread is sender: send encoding result immediately
                 {
                     std::lock_guard<std::mutex> lock(send_queue_mutex_);
-                    send_queue_.push({task.encoding_addr, task.size});
+                    if (!task.local_is_zero_tail) {
+                        send_queue_.push({task.encoding_addr, task.size});
+                    }
                     // std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 (sender): Pushed task to send_queue, "
                     //           << "encoding_addr=" << task.encoding_addr << ", size=" << task.size 
                     //           << ", queue_size=" << send_queue_.size() << std::endl;
@@ -1793,9 +1842,14 @@ private:
                 // std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 1 (sender): Notified send_queue_cv" << std::endl;
                     
                     // Sender doesn't need parity buffer, release it immediately
-                    if (task.parity_addr != 0) {
+                    {
                         std::lock_guard<std::mutex> lock(release_queue_mutex_);
-                        parity_buffers_to_release_.push(task.parity_addr);
+                        if (task.parity_addr != 0) {
+                            parity_buffers_to_release_.push(task.parity_addr);
+                        }
+                        if (task.local_is_zero_tail && task.encoding_addr != 0) {
+                            encoding_buffers_to_release_.push(task.encoding_addr);
+                        }
                     }
                 }
             }
@@ -1803,11 +1857,23 @@ private:
             // Check if we need to receive data
             bool need_recv = (task.recv_addr != 0 && task.recv_chunk_size != 0);
             
+            if (need_recv && xor_config_.thread0_is_receiver && task.remote_is_zero_tail) {
+                std::lock_guard<std::mutex> lock(xor_queue_mutex_);
+                xor_queue_.push({
+                    task.encoding_addr, 0, task.parity_addr, task.size,
+                    task.p2p_own_write_addr, task.p2p_partner_write_addr, task.data_addr,
+                    task.local_is_zero_tail, true, task.p2p_data_is_zero_tail,
+                    task.p2p_data_size, task.sequence_id
+                });
+                xor_queue_cv_.notify_one();
+                need_recv = false;
+            }
+
             if (need_recv && xor_config_.thread0_is_receiver) {
                 // Submit recv task to recv_worker with parity_addr
                 {
                     std::lock_guard<std::mutex> lock(recv_queue_mutex_);
-                    recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr});
+                    recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr, task.local_is_zero_tail, task.remote_is_zero_tail, task.p2p_data_is_zero_tail, task.p2p_data_size, task.sequence_id});
                 }
                 recv_queue_cv_.notify_one();
             }
@@ -1825,12 +1891,12 @@ private:
                     send_queue_cv_.notify_one();
                     {
                         std::lock_guard<std::mutex> recv_lock(recv_queue_mutex_);
-                        recv_queue_.push({0, 0, 0});
+                        recv_queue_.push({0, 0, 0, false, false, false, 0, 0});
                     }
                     recv_queue_cv_.notify_one();
                     {
                         std::lock_guard<std::mutex> xor_lock(xor_queue_mutex_);
-                        xor_queue_.push({0, 0, 0, 0, 0, 0, 0});
+                        xor_queue_.push({0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0});
                     }
                     xor_queue_cv_.notify_one();
                     // Reset sentinel flag and continue (don't exit)
@@ -1881,12 +1947,12 @@ private:
                         send_queue_cv_.notify_one();
                         {
                             std::lock_guard<std::mutex> recv_lock(recv_queue_mutex_);
-                            recv_queue_.push({0, 0, 0});
+                            recv_queue_.push({0, 0, 0, false, false, false, 0, 0});
                         }
                         recv_queue_cv_.notify_one();
                         {
                             std::lock_guard<std::mutex> xor_lock(xor_queue_mutex_);
-                            xor_queue_.push({0, 0, 0, 0, 0, 0, 0});
+                            xor_queue_.push({0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0});
                         }
                         xor_queue_cv_.notify_one();
                         // Reset sentinel flag and continue (don't exit)
@@ -1899,12 +1965,18 @@ private:
             
             // Check if we need to encode/send data
             bool need_encode = (task.data_addr != 0 && task.encoding_addr != 0);
+            if (need_encode && task.local_is_zero_tail) {
+                std::memset(reinterpret_cast<void*>(task.encoding_addr), 0, task.size);
+            }
             
             if (need_encode) {
                 // Step 1: Perform encoding (parity index 1 for thread2)
-                encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 1);
+                if (!task.local_is_zero_tail) {
+                    encode_with_coefficient(task.data_addr, task.size, task.encoding_addr, 1);
+                }
                 
                 // Mark data buffer as copied by thread 2
+                bool release_data_after_state_update = false;
                 {
                     std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
                     auto& state = data_buffer_states_[task.data_addr];
@@ -1915,28 +1987,24 @@ private:
                     if (state.thread1_copied) {
                         // In load mode, rank 1 and rank 2 don't send data, so data buffer should be released immediately
                         // In save mode, even ranks release immediately, odd ranks release in P2P worker
-                        bool should_release = false;
                         if (is_load_mode_ && failed_rank_in_group_ == 2 && (rank_in_group_ == 1 || rank_in_group_ == 2)) {
-                            // Load mode: rank 1 and rank 2 release data buffer immediately
-                            should_release = true;
+                            release_data_after_state_update = true;
                         } else if (is_p2p_parity_sender()) {
                             // Save mode: parity senders release data buffer immediately
                             // (P2P worker uses parity buffer instead)
-                            should_release = true;
+                            release_data_after_state_update = true;
                         }
                         // For data senders, data buffer will be released by P2P worker
-                        
-                        if (should_release) {
-                        std::lock_guard<std::mutex> release_lock(release_queue_mutex_);
-                        data_buffers_to_release_.push(task.data_addr);
-                        data_buffer_states_.erase(task.data_addr);
                     }
-                    }
+                }
+                if (release_data_after_state_update) {
+                    release_data_buffer_once(task.data_addr);
                 }
                 
                 // Step 2: Handle based on XOR configuration
                 if (xor_config_.thread1_is_receiver && task.parity_addr != 0 && task.recv_addr != 0) {
                     // This thread is receiver: save encoding buffer to pending, wait for recv
+                    if (!task.remote_is_zero_tail) {
                     {
                         std::lock_guard<std::mutex> lock(pending_xor_mutex_);
                         pending_xor_encoding_[task.recv_addr] = task.encoding_addr;
@@ -1953,6 +2021,7 @@ private:
                         std::lock_guard<std::mutex> lock(recv_to_p2p_mutex_);
                         recv_to_p2p_[task.recv_addr] = {task.p2p_own_write_addr, task.p2p_partner_write_addr};
                     }
+                    }
                     // std::cout << "EC-CHECK: [Rank " << rank_ << "] Thread2 encoding completed, "
                     //           << "pending XOR for recv_addr=" << task.recv_addr 
                     //           << ", encoding_addr=" << task.encoding_addr
@@ -1962,7 +2031,9 @@ private:
                     // This thread is sender: send encoding result immediately
                 {
                     std::lock_guard<std::mutex> lock(send_queue_mutex_);
-                    send_queue_.push({task.encoding_addr, task.size});
+                    if (!task.local_is_zero_tail) {
+                        send_queue_.push({task.encoding_addr, task.size});
+                    }
                     // std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 (sender): Pushed task to send_queue, "
                     //           << "encoding_addr=" << task.encoding_addr << ", size=" << task.size 
                     //           << ", queue_size=" << send_queue_.size() << std::endl;
@@ -1971,9 +2042,14 @@ private:
                 // std::cout << "EC-CHECK: [Rank " << rank_ << "] Encoder thread 2 (sender): Notified send_queue_cv" << std::endl;
                     
                     // Sender doesn't need parity buffer, release it immediately
-                    if (task.parity_addr != 0) {
+                    {
                         std::lock_guard<std::mutex> lock(release_queue_mutex_);
-                        parity_buffers_to_release_.push(task.parity_addr);
+                        if (task.parity_addr != 0) {
+                            parity_buffers_to_release_.push(task.parity_addr);
+                        }
+                        if (task.local_is_zero_tail && task.encoding_addr != 0) {
+                            encoding_buffers_to_release_.push(task.encoding_addr);
+                        }
                     }
                 }
             }
@@ -1981,11 +2057,23 @@ private:
             // Check if we need to receive data
             bool need_recv = (task.recv_addr != 0 && task.recv_chunk_size != 0);
             
+            if (need_recv && xor_config_.thread1_is_receiver && task.remote_is_zero_tail) {
+                std::lock_guard<std::mutex> lock(xor_queue_mutex_);
+                xor_queue_.push({
+                    task.encoding_addr, 0, task.parity_addr, task.size,
+                    task.p2p_own_write_addr, task.p2p_partner_write_addr, task.data_addr,
+                    task.local_is_zero_tail, true, task.p2p_data_is_zero_tail,
+                    task.p2p_data_size, task.sequence_id
+                });
+                xor_queue_cv_.notify_one();
+                need_recv = false;
+            }
+
             if (need_recv && xor_config_.thread1_is_receiver) {
                 // Submit recv task to recv_worker with parity_addr
                 {
                     std::lock_guard<std::mutex> lock(recv_queue_mutex_);
-                    recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr});
+                    recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr, task.local_is_zero_tail, task.remote_is_zero_tail, task.p2p_data_is_zero_tail, task.p2p_data_size, task.sequence_id});
                 }
                 recv_queue_cv_.notify_one();
             }
@@ -2004,12 +2092,12 @@ private:
                     send_queue_cv_.notify_one();
                     {
                         std::lock_guard<std::mutex> recv_lock(recv_queue_mutex_);
-                        recv_queue_.push({0, 0, 0});
+                        recv_queue_.push({0, 0, 0, false, false, false, 0, 0});
                     }
                     recv_queue_cv_.notify_one();
                     {
                         std::lock_guard<std::mutex> xor_lock(xor_queue_mutex_);
-                        xor_queue_.push({0, 0, 0, 0, 0, 0, 0});
+                        xor_queue_.push({0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0});
                     }
                     xor_queue_cv_.notify_one();
                     // Reset sentinel flag and continue (don't exit)
@@ -2058,9 +2146,9 @@ private:
             {
             SaveNetScopeTimer save_net_timer(this);
 #ifdef __linux__
-            if (use_rdma_ && rdma_xor_qp_) {
+            if (use_rdma_ && rdma_xor_send_qp_) {
                 try {
-                    rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_send_control_sock(),
+                    rdma_send_data_via_qp(rdma_xor_send_qp_, rdma_xor_send_cq_, get_rdma_xor_send_control_sock(),
                         rdma_xor_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
@@ -2213,9 +2301,9 @@ private:
             {
             SaveNetScopeTimer save_net_timer(this);
 #ifdef __linux__
-            if (use_rdma_ && rdma_xor_qp_) {
+            if (use_rdma_ && rdma_xor_recv_qp_) {
                 try {
-                    size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
+                    size_t recv_size = rdma_receive_data_via_qp(rdma_xor_recv_qp_, rdma_xor_recv_cq_,
                         get_rdma_xor_recv_control_sock(), rdma_xor_recv_control_mutex_,
                         reinterpret_cast<uint8_t*>(task.recv_addr), task.size,
                         RdmaLoadRecvPollLane::None);
@@ -2344,7 +2432,12 @@ private:
                         task.size,
                         p2p_own_write_addr,
                         p2p_partner_write_addr,
-                        data_addr
+                        data_addr,
+                        task.local_is_zero_tail,
+                        task.remote_is_zero_tail,
+                        task.p2p_data_is_zero_tail,
+                        task.p2p_data_size,
+                        task.sequence_id
                     });
                 }
                 xor_queue_cv_.notify_one();
@@ -2366,12 +2459,12 @@ private:
         auto submit_p2p_sentinel = [this]() {
             {
                 std::lock_guard<std::mutex> send_lock(p2p_send_queue_mutex_);
-                p2p_send_queue_.push({0, 0, 0, 0, 0, false, false, 0});
+                p2p_send_queue_.push({0, 0, 0, 0, 0, false, false, 0, 0, 0});
             }
             p2p_send_queue_cv_.notify_one();
             {
                 std::lock_guard<std::mutex> recv_lock(p2p_recv_queue_mutex_);
-                p2p_recv_queue_.push({0, 0, false, false, 0});
+                p2p_recv_queue_.push({0, 0, false, false, 0, false, 0, 0});
             }
             p2p_recv_queue_cv_.notify_one();
             // std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker: Sent sentinel to P2P workers" << std::endl;
@@ -2418,25 +2511,32 @@ private:
                 continue;
             }
             
-            unsigned char* srcs[2];
-            srcs[0] = reinterpret_cast<unsigned char*>(task.local_encoding_addr);
-            srcs[1] = reinterpret_cast<unsigned char*>(task.remote_encoding_addr);
             unsigned char* dest = reinterpret_cast<unsigned char*>(task.parity_addr);
-            
-            // XOR via 16-pthread save pool when available (serialized dispatch).
-            // Save encode_s tracks RS encode only; XOR is part of parity assembly.
-            if (ec_xor_pool_inited_.load(std::memory_order_acquire)) {
-                std::lock_guard<std::mutex> work_lk(ec_xor_pool_work_mutex_);
-                ec_xor_pool_run_parallel(task.parity_addr,
-                                         task.local_encoding_addr,
-                                         task.remote_encoding_addr,
-                                         task.size);
+            if (task.local_is_zero_tail && task.remote_is_zero_tail) {
+                std::memset(dest, 0, task.size);
+            } else if (task.remote_is_zero_tail) {
+                std::memcpy(dest, reinterpret_cast<void*>(task.local_encoding_addr), task.size);
+            } else if (task.local_is_zero_tail) {
+                std::memcpy(dest, reinterpret_cast<void*>(task.remote_encoding_addr), task.size);
             } else {
-                void* xor_array[3];
-                xor_array[0] = srcs[0];
-                xor_array[1] = srcs[1];
-                xor_array[2] = dest;
-                xor_gen(3, static_cast<int>(task.size), xor_array);
+                unsigned char* srcs[2];
+                srcs[0] = reinterpret_cast<unsigned char*>(task.local_encoding_addr);
+                srcs[1] = reinterpret_cast<unsigned char*>(task.remote_encoding_addr);
+                // XOR via 16-pthread save pool when available (serialized dispatch).
+                // Save encode_s tracks RS encode only; XOR is part of parity assembly.
+                if (ec_xor_pool_inited_.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> work_lk(ec_xor_pool_work_mutex_);
+                    ec_xor_pool_run_parallel(task.parity_addr,
+                                             task.local_encoding_addr,
+                                             task.remote_encoding_addr,
+                                             task.size);
+                } else {
+                    void* xor_array[3];
+                    xor_array[0] = srcs[0];
+                    xor_array[1] = srcs[1];
+                    xor_array[2] = dest;
+                    xor_gen(3, static_cast<int>(task.size), xor_array);
+                }
             }
             
             if (task.p2p_own_write_addr != 0 && task.p2p_partner_write_addr != 0 && task.parity_addr != 0) {
@@ -2446,18 +2546,27 @@ private:
                     parity_buffers_to_release_.push(task.parity_addr);
                 }
                 uintptr_t send_buffer = is_p2p_parity_sender() ? task.parity_addr : task.data_addr;
+                size_t p2p_send_size = is_p2p_parity_sender() ? task.size : task.p2p_data_size;
+                size_t p2p_send_zero_tail = is_p2p_parity_sender() ? 0 : task.size - p2p_send_size;
+                bool skip_p2p_send = (!is_p2p_parity_sender() && p2p_send_size == 0);
+
+                size_t p2p_recv_size = is_p2p_parity_sender() ? task.p2p_data_size : task.size;
+                size_t p2p_recv_zero_tail = is_p2p_parity_sender() ? task.size - p2p_recv_size : 0;
+                bool skip_p2p_recv = (is_p2p_parity_sender() && p2p_recv_size == 0);
 
                 {
                     std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
                     p2p_send_queue_.push({
-                        send_buffer,
+                        skip_p2p_send ? 0 : send_buffer,
                         task.p2p_own_write_addr,
-                        task.size,
+                        p2p_send_size,
                         task.parity_addr,
                         task.data_addr,
                         false,  // is_load_mode_transfer
                         false,  // is_step6_transfer
-                        0      // load_mode_data_addr (not needed for save mode)
+                        0,      // load_mode_data_addr (not needed for save mode)
+                        p2p_send_zero_tail,
+                        task.sequence_id
                     });
                 }
                 p2p_send_queue_cv_.notify_one();
@@ -2466,10 +2575,13 @@ private:
                     std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
                     p2p_recv_queue_.push({
                         task.p2p_partner_write_addr,
-                        task.size,
+                        p2p_recv_size,
                         false,  // is_load_mode_transfer
                         false,  // is_step6_transfer
-                        0       // data_buffer_addr
+                        0,      // data_buffer_addr
+                        skip_p2p_recv,
+                        p2p_recv_zero_tail,
+                        task.sequence_id
                     });
                 }
                 p2p_recv_queue_cv_.notify_one();
@@ -2512,22 +2624,50 @@ private:
         // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker started" << std::endl;
         
         // NCCL is already initialized in main thread, no need to initialize here
+        size_t next_save_sequence_id = 0;
+        std::map<size_t, P2PSendTask> pending_save_tasks;
         
         while (!should_stop_threads_) {
-            P2PSendTask task;
+            P2PSendTask task{};
+            bool has_task = false;
             
             {
                 std::unique_lock<std::mutex> lock(p2p_send_queue_mutex_);
-                p2p_send_queue_cv_.wait(lock, [this] {
-                    return !p2p_send_queue_.empty() || should_stop_threads_;
+                auto ready_pending = [&]() {
+                    return pending_save_tasks.find(next_save_sequence_id) != pending_save_tasks.end();
+                };
+                p2p_send_queue_cv_.wait(lock, [this, &ready_pending] {
+                    return !p2p_send_queue_.empty() || should_stop_threads_ || ready_pending();
                 });
                 
-                if (should_stop_threads_ && p2p_send_queue_.empty()) {
+                if (should_stop_threads_ && p2p_send_queue_.empty() && !ready_pending()) {
                     break;
                 }
-                
-                task = p2p_send_queue_.front();
-                p2p_send_queue_.pop();
+
+                while (!ready_pending() && !p2p_send_queue_.empty()) {
+                    P2PSendTask candidate = p2p_send_queue_.front();
+                    p2p_send_queue_.pop();
+                    bool is_sentinel = (candidate.send_buffer_addr == 0 &&
+                                        candidate.p2p_own_write_addr == 0 && candidate.size == 0);
+                    if (is_sentinel || candidate.is_load_mode_transfer ||
+                        candidate.sequence_id == next_save_sequence_id) {
+                        task = candidate;
+                        has_task = true;
+                        break;
+                    }
+                    pending_save_tasks[candidate.sequence_id] = candidate;
+                }
+
+                if (task.send_buffer_addr == 0 && task.p2p_own_write_addr == 0 &&
+                    task.size == 0 && !pending_save_tasks.empty() && ready_pending()) {
+                    auto it = pending_save_tasks.find(next_save_sequence_id);
+                    task = it->second;
+                    pending_save_tasks.erase(it);
+                    has_task = true;
+                }
+                if (!has_task) {
+                    continue;
+                }
                 // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Popped task, "
                 //           << "send_buffer_addr=" << task.send_buffer_addr
                 //           << ", p2p_own_write_addr=" << task.p2p_own_write_addr
@@ -2554,7 +2694,16 @@ private:
             }
             
             // Step 1: Copy own data/parity to own_buffer (save path only)
-            if (task.p2p_own_write_addr != 0 && task.send_buffer_addr != 0 && task.size > 0) {
+            if (task.p2p_own_write_addr != 0 && task.send_buffer_addr == 0 &&
+                (task.size > 0 || task.zero_fill_tail_size > 0)) {
+                std::memset(reinterpret_cast<void*>(task.p2p_own_write_addr), 0,
+                            task.size + task.zero_fill_tail_size);
+                if (!task.is_load_mode_transfer && !is_p2p_parity_sender() && task.data_addr != 0) {
+                    if (release_data_buffer_once(task.data_addr)) {
+                        task.data_addr = 0;
+                    }
+                }
+            } else if (task.p2p_own_write_addr != 0 && task.send_buffer_addr != 0 && task.size > 0) {
 #ifdef __linux__
                 if (use_rdma_ && (!rdma_range_registered(task.p2p_own_write_addr, task.size) ||
                                   !rdma_range_registered(task.send_buffer_addr, task.size))) {
@@ -2568,6 +2717,15 @@ private:
                 std::memcpy(reinterpret_cast<void*>(task.p2p_own_write_addr),
                            reinterpret_cast<void*>(task.send_buffer_addr),
                            task.size);
+                if (task.zero_fill_tail_size > 0) {
+                    std::memset(reinterpret_cast<void*>(task.p2p_own_write_addr + task.size),
+                                0, task.zero_fill_tail_size);
+                }
+                if (!task.is_load_mode_transfer && !is_p2p_parity_sender() && task.data_addr != 0) {
+                    if (release_data_buffer_once(task.data_addr)) {
+                        task.data_addr = 0;
+                    }
+                }
                 // if (rank_ % 2 == 0) {
                 //     std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send: Copied own parity to own_buffer at "
                 //               << task.p2p_own_write_addr << std::endl;
@@ -2582,14 +2740,20 @@ private:
                 continue;
             }
             
-            // Step 2: Send data using RDMA, ASIO, or NCCL
-            if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
+            // Step 2: Send data using RDMA, ASIO, or NCCL.  In save mode we send
+            // from own_buffer after the local copy above, so the reusable data/parity
+            // pools can be released without racing the network operation.
+            uintptr_t network_send_addr = task.send_buffer_addr;
+            if (!task.is_load_mode_transfer && task.p2p_own_write_addr != 0) {
+                network_send_addr = task.p2p_own_write_addr;
+            }
+            if (p2p_partner_rank_ >= 0 && task.size > 0 && network_send_addr != 0) {
             SaveNetScopeTimer save_net_timer(this);
 #ifdef __linux__
-            if (use_rdma_ && rdma_p2p_qp_) {
+            if (use_rdma_ && rdma_p2p_send_qp_) {
                     try {
-                        rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
-                            rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
+                        rdma_send_data_via_qp(rdma_p2p_send_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
+                            rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(network_send_addr), task.size);
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA P2P send failed: " << e.what() << std::endl;
                     }
@@ -2597,9 +2761,8 @@ private:
 #endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_send_connected()) {
                     // ASIO send path (synchronous)
-                    const char* send_label = is_p2p_parity_sender() ? "parity" : "data";
                     // std::cout << "[EC-CHECK ASIO] P2P_Send: Sending " << task.size << " bytes (" << send_label << ") via ASIO" << std::endl;
-                    uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.send_buffer_addr);
+                    uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(network_send_addr);
                     uint32_t size_net = htonl(static_cast<uint32_t>(task.size));  // Network byte order
                     
                     try {
@@ -2655,7 +2818,6 @@ private:
                                 // std::cerr << "EC-CHECK: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
                                 std::cerr.flush();
                             } else {
-                                const char* send_label = is_p2p_parity_sender() ? "parity" : "data";
                                 // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Starting NCCL send ("
                                 //           << send_label << "), size=" << task.size
                                 //           << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
@@ -2753,16 +2915,16 @@ private:
                     }
                     // For data senders (higher rank in P2P pair), release data buffer
                     if (!is_p2p_parity_sender() && task.data_addr != 0) {
-                        data_buffers_to_release_.push(task.data_addr);
-                        // Also remove from data_buffer_states_ if it exists
-                        {
-                            std::lock_guard<std::mutex> state_lock(data_buffer_state_mutex_);
-                            data_buffer_states_.erase(task.data_addr);
-                        }
+                        release_data_buffer_once(task.data_addr);
                     }
                 }
             }
             
+            if (!task.is_load_mode_transfer) {
+                ++next_save_sequence_id;
+                p2p_send_queue_cv_.notify_one();
+            }
+
             // After processing task, check if sentinel was received and queue is empty
             if (p2p_send_worker_sentinel_received_.load()) {
                 std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
@@ -2782,22 +2944,49 @@ private:
         // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker started" << std::endl;
         
         // NCCL is already initialized in main thread, no need to initialize here
+        size_t next_save_sequence_id = 0;
+        std::map<size_t, P2PRecvTask> pending_save_tasks;
         
         while (!should_stop_threads_) {
-            P2PRecvTask task;
+            P2PRecvTask task{};
+            bool has_task = false;
             
             {
                 std::unique_lock<std::mutex> lock(p2p_recv_queue_mutex_);
-                p2p_recv_queue_cv_.wait(lock, [this] {
-                    return !p2p_recv_queue_.empty() || should_stop_threads_;
+                auto ready_pending = [&]() {
+                    return pending_save_tasks.find(next_save_sequence_id) != pending_save_tasks.end();
+                };
+                p2p_recv_queue_cv_.wait(lock, [this, &ready_pending] {
+                    return !p2p_recv_queue_.empty() || should_stop_threads_ || ready_pending();
                 });
                 
-                if (should_stop_threads_ && p2p_recv_queue_.empty()) {
+                if (should_stop_threads_ && p2p_recv_queue_.empty() && !ready_pending()) {
                     break;
                 }
-                
-                task = p2p_recv_queue_.front();
-                p2p_recv_queue_.pop();
+
+                while (!ready_pending() && !p2p_recv_queue_.empty()) {
+                    P2PRecvTask candidate = p2p_recv_queue_.front();
+                    p2p_recv_queue_.pop();
+                    bool is_sentinel = (candidate.recv_buffer_addr == 0 && candidate.size == 0);
+                    if (is_sentinel || candidate.is_load_mode_transfer ||
+                        candidate.sequence_id == next_save_sequence_id) {
+                        task = candidate;
+                        has_task = true;
+                        break;
+                    }
+                    pending_save_tasks[candidate.sequence_id] = candidate;
+                }
+
+                if (task.recv_buffer_addr == 0 && task.size == 0 &&
+                    !pending_save_tasks.empty() && ready_pending()) {
+                    auto it = pending_save_tasks.find(next_save_sequence_id);
+                    task = it->second;
+                    pending_save_tasks.erase(it);
+                    has_task = true;
+                }
+                if (!has_task) {
+                    continue;
+                }
                 // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Popped task, "
                 //           << "recv_buffer_addr=" << task.recv_buffer_addr
                 //           << ", size=" << task.size
@@ -2824,20 +3013,29 @@ private:
             
             // Receive data using RDMA, ASIO, or NCCL
             bool task_processed = false;  // Track whether task was successfully processed
-            
-            if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
+            if (task.skip_network && task.recv_buffer_addr != 0 &&
+                (task.size > 0 || task.zero_fill_tail_size > 0)) {
+                std::memset(reinterpret_cast<void*>(task.recv_buffer_addr), 0,
+                            task.size + task.zero_fill_tail_size);
+                task_processed = true;
+            } else if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
 #ifdef __linux__
-                if (use_rdma_ && rdma_p2p_qp_) {
+                if (use_rdma_ && rdma_p2p_recv_qp_) {
                     // std::cout << "[EC-CHECK RDMA] Save_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                     try {
-                        size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
+                        size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_recv_qp_, rdma_p2p_recv_cq_,
                             get_rdma_p2p_recv_control_sock(), rdma_p2p_recv_control_mutex_,
                             reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size,
                             RdmaLoadRecvPollLane::None);
                         if (recv_size == task.size) task_processed = true;
                         else {
                             std::cerr << "EC-CHECK: [Rank " << rank_ << "] P2P RDMA recv size mismatch: expected "
-                                      << task.size << ", got " << recv_size << std::endl;
+                                      << task.size << ", got " << recv_size
+                                      << ", rank_in_group=" << rank_in_group_
+                                      << ", partner=" << p2p_partner_rank_
+                                      << ", seq=" << task.sequence_id
+                                      << ", expect_role=" << (is_p2p_parity_sender() ? "data" : "parity")
+                                      << std::endl;
                         }
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA P2P recv failed: " << e.what() << std::endl;
@@ -2847,7 +3045,6 @@ private:
 #endif
                 if (use_asio_ && asio_initialized_ && asio_conn_mgr_.is_p2p_recv_connected()) {
                     // ASIO recv path (synchronous)
-                    const char* recv_label = is_p2p_parity_sender() ? "data" : "parity";
                     // std::cout << "[EC-CHECK ASIO] P2P_Recv: Receiving " << task.size << " bytes (" << recv_label << ") via ASIO" << std::endl;
                     uint8_t* buffer_ptr = reinterpret_cast<uint8_t*>(task.recv_buffer_addr);
                     uint32_t size_net;
@@ -2908,7 +3105,6 @@ private:
                                 std::cerr << "EC-CHECK: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
                                 std::cerr.flush();
                             } else {
-                                const char* recv_label = is_p2p_parity_sender() ? "data" : "parity";
                                 // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Starting NCCL recv ("
                                 //           << recv_label << "), size=" << task.size
                                 //           << ", partner_rank_in_comm=" << partner_rank_in_comm << std::endl;
@@ -3019,6 +3215,11 @@ private:
             
             // Note: No buffer release needed here - recv buffer (p2p_partner_write_addr) is managed by Python
             
+            if (!task.is_load_mode_transfer) {
+                ++next_save_sequence_id;
+                p2p_recv_queue_cv_.notify_one();
+            }
+
             // After processing task, check if sentinel was received and queue is empty
             if (p2p_recv_worker_sentinel_received_.load()) {
                 std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
@@ -3204,7 +3405,9 @@ public:
           rdma_context_(nullptr), rdma_pd_(nullptr),
           rdma_xor_send_cq_(nullptr), rdma_xor_recv_cq_(nullptr),
           rdma_p2p_send_cq_(nullptr), rdma_p2p_recv_cq_(nullptr),
-          rdma_xor_qp_(nullptr), rdma_p2p_qp_(nullptr),
+          rdma_xor_send_qp_(nullptr), rdma_xor_recv_qp_(nullptr),
+          rdma_xor_qp_(nullptr), rdma_p2p_send_qp_(nullptr),
+          rdma_p2p_recv_qp_(nullptr), rdma_p2p_qp_(nullptr),
           rdma_step6_p2p_send_cq_(nullptr), rdma_step6_p2p_recv_cq_(nullptr), rdma_step6_p2p_qp_(nullptr),
           rdma_temp_send_mr_(nullptr), rdma_temp_recv_mr_(nullptr),
           rdma_listen_sock_(-1), rdma_xor_control_sock_(-1), rdma_p2p_control_sock_(-1)
@@ -3312,16 +3515,67 @@ public:
 #ifdef __linux__
             if (use_rdma_) {
                 init_rdma_resources();
-                int sock_xor = (rank_in_group_ == 0 || rank_in_group_ == 1)
-                    ? asio_conn_mgr_.get_xor_send_socket().native_handle()
-                    : asio_conn_mgr_.get_xor_recv_socket().native_handle();
-                bool xor_first = (rank_in_group_ == 0 || rank_in_group_ == 1);
-                exchange_and_connect_qp(sock_xor, rdma_xor_qp_, xor_first);
-                int sock_p2p = (rank_ < p2p_partner_rank_)
-                    ? asio_conn_mgr_.get_p2p_send_socket().native_handle()
-                    : asio_conn_mgr_.get_p2p_recv_socket().native_handle();
-                bool p2p_first = (rank_ < p2p_partner_rank_);
-                exchange_and_connect_qp(sock_p2p, rdma_p2p_qp_, p2p_first);
+                std::exception_ptr xor_send_exchange_error = nullptr;
+                std::exception_ptr xor_recv_exchange_error = nullptr;
+                std::thread xor_send_exchange_thread([this, &xor_send_exchange_error]() {
+                    try {
+                        exchange_and_connect_qp(
+                            asio_conn_mgr_.get_xor_send_socket().native_handle(),
+                            rdma_xor_send_qp_,
+                            true);
+                    } catch (...) {
+                        xor_send_exchange_error = std::current_exception();
+                    }
+                });
+                std::thread xor_recv_exchange_thread([this, &xor_recv_exchange_error]() {
+                    try {
+                        exchange_and_connect_qp(
+                            asio_conn_mgr_.get_xor_recv_socket().native_handle(),
+                            rdma_xor_recv_qp_,
+                            false);
+                    } catch (...) {
+                        xor_recv_exchange_error = std::current_exception();
+                    }
+                });
+                xor_send_exchange_thread.join();
+                xor_recv_exchange_thread.join();
+                if (xor_send_exchange_error) {
+                    std::rethrow_exception(xor_send_exchange_error);
+                }
+                if (xor_recv_exchange_error) {
+                    std::rethrow_exception(xor_recv_exchange_error);
+                }
+                std::exception_ptr p2p_send_exchange_error = nullptr;
+                std::exception_ptr p2p_recv_exchange_error = nullptr;
+                std::thread p2p_send_exchange_thread([this, &p2p_send_exchange_error]() {
+                    try {
+                        exchange_and_connect_qp(
+                            asio_conn_mgr_.get_p2p_send_socket().native_handle(),
+                            rdma_p2p_send_qp_,
+                            true);
+                    } catch (...) {
+                        p2p_send_exchange_error = std::current_exception();
+                    }
+                });
+                std::thread p2p_recv_exchange_thread([this, &p2p_recv_exchange_error]() {
+                    try {
+                        exchange_and_connect_qp(
+                            asio_conn_mgr_.get_p2p_recv_socket().native_handle(),
+                            rdma_p2p_recv_qp_,
+                            false);
+                    } catch (...) {
+                        p2p_recv_exchange_error = std::current_exception();
+                    }
+                });
+                p2p_send_exchange_thread.join();
+                p2p_recv_exchange_thread.join();
+                if (p2p_send_exchange_error) {
+                    std::rethrow_exception(p2p_send_exchange_error);
+                }
+                if (p2p_recv_exchange_error) {
+                    std::rethrow_exception(p2p_recv_exchange_error);
+                }
+                rdma_p2p_qp_ = rdma_p2p_send_qp_;
                 if (rank_in_group_ == 2 || rank_in_group_ == 3) {
                     int sock_step6 = (rank_in_group_ == 3)
                         ? asio_conn_mgr_.get_step6_p2p_send_socket().native_handle()
@@ -3803,11 +4057,21 @@ public:
     void submit_data_for_encoding_thread1(uintptr_t data_addr, size_t size, 
                                           uintptr_t encoding_addr, uintptr_t recv_addr, 
                                           size_t recv_chunk_size, uintptr_t parity_addr,
-                                          uintptr_t p2p_own_write_addr, uintptr_t p2p_partner_write_addr) {
+                                          uintptr_t p2p_own_write_addr, uintptr_t p2p_partner_write_addr,
+                                          bool local_is_zero_tail = false,
+                                          bool remote_is_zero_tail = false,
+                                          bool p2p_data_is_zero_tail = false,
+                                          size_t p2p_data_size = 0) {
+        size_t sequence_id = 0;
+        if (data_addr != 0 || size != 0) {
+            sequence_id = save_sequence_id_thread1_.fetch_add(1, std::memory_order_relaxed);
+        }
         {
             std::lock_guard<std::mutex> lock(encoding_tasks_1_mutex_);
             encoding_tasks_1_.push({data_addr, size, encoding_addr, recv_addr, recv_chunk_size, 
-                                    parity_addr, p2p_own_write_addr, p2p_partner_write_addr});
+                                    parity_addr, p2p_own_write_addr, p2p_partner_write_addr,
+                                    local_is_zero_tail, remote_is_zero_tail, p2p_data_is_zero_tail,
+                                    p2p_data_size, sequence_id});
         }
         encoding_tasks_1_cv_.notify_one();
         
@@ -3822,13 +4086,30 @@ public:
     void submit_data_for_encoding_thread2(uintptr_t data_addr, size_t size,
                                           uintptr_t encoding_addr, uintptr_t recv_addr,
                                           size_t recv_chunk_size, uintptr_t parity_addr,
-                                          uintptr_t p2p_own_write_addr, uintptr_t p2p_partner_write_addr) {
+                                          uintptr_t p2p_own_write_addr, uintptr_t p2p_partner_write_addr,
+                                          bool local_is_zero_tail = false,
+                                          bool remote_is_zero_tail = false,
+                                          bool p2p_data_is_zero_tail = false,
+                                          size_t p2p_data_size = 0) {
+        size_t sequence_id = 0;
+        if (data_addr != 0 || size != 0) {
+            sequence_id = save_sequence_id_thread2_.fetch_add(1, std::memory_order_relaxed);
+        }
         {
             std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_);
             encoding_tasks_2_.push({data_addr, size, encoding_addr, recv_addr, recv_chunk_size,
-                                    parity_addr, p2p_own_write_addr, p2p_partner_write_addr});
+                                    parity_addr, p2p_own_write_addr, p2p_partner_write_addr,
+                                    local_is_zero_tail, remote_is_zero_tail, p2p_data_is_zero_tail,
+                                    p2p_data_size, sequence_id});
         }
         encoding_tasks_2_cv_.notify_one();
+
+        if (data_addr != 0 && size != 0) {
+            std::lock_guard<std::mutex> lock(data_buffer_state_mutex_);
+            if (data_buffer_states_.find(data_addr) == data_buffer_states_.end()) {
+                data_buffer_states_[data_addr] = {false, false};
+            }
+        }
     }
     
     std::vector<uintptr_t> get_data_buffers_to_release() {
@@ -3895,7 +4176,7 @@ public:
             {
                 std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
                 // Load-time P2P transfer doesn't need a local copy, so p2p_own_write_addr/parity/data are 0
-                p2p_send_queue_.push({data_addr, 0, size, 0, 0, false, false, 0});
+                p2p_send_queue_.push({data_addr, 0, size, 0, 0, false, false, 0, 0, 0});
             }
             p2p_send_queue_cv_.notify_one();
             // std::cout << "EC-CHECK: [Rank " << rank_
@@ -3904,7 +4185,7 @@ public:
         } else if (ops == "recv") {
             {
                 std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
-                p2p_recv_queue_.push({data_addr, size, false, false, 0});
+                p2p_recv_queue_.push({data_addr, size, false, false, 0, false, 0, 0});
             }
             p2p_recv_queue_cv_.notify_one();
             // std::cout << "EC-CHECK: [Rank " << rank_
@@ -3948,7 +4229,9 @@ public:
                     0,                   // data_addr (Step2不需要)
                     true,                // is_load_mode_transfer
                     false,               // is_step6_transfer (Step2, not Step6)
-                    load_mode_data_addr  // load_mode_data_addr (for finding encoding task after Step2 send)
+                    load_mode_data_addr, // load_mode_data_addr (for finding encoding task after Step2 send)
+                    0,
+                    0
                 });
             }
             load_p2p_send_queue_cv_.notify_one();
@@ -3969,7 +4252,10 @@ public:
                     size,                  // size
                     true,                  // is_load_mode_transfer
                     false,                 // is_step6_transfer (Step2, not Step6)
-                    recv_data_buffer_addr  // data_buffer_addr (接收后数据就在这个地址，无需复制)
+                    recv_data_buffer_addr, // data_buffer_addr (接收后数据就在这个地址，无需复制)
+                    false,
+                    0,
+                    0
                 });
             }
             load_p2p_recv_queue_cv_.notify_one();
@@ -4169,6 +4455,9 @@ public:
             return;
         }
 
+        const size_t sequence_id_1 = save_sequence_id_thread1_.fetch_add(1, std::memory_order_relaxed);
+        const size_t sequence_id_2 = save_sequence_id_thread2_.fetch_add(1, std::memory_order_relaxed);
+
         // Submit TWO encoding tasks to save-path encoder threads.
         // Encoder thread 1 (parity row 0): rig0→rig2, rig1→rig3
         //   receivers: rig2, rig3 → parity_addr = own_write_addr for XOR output
@@ -4179,7 +4468,8 @@ public:
                 data_addr, size, enc_addr_0,
                 recv_addr_1, recv_chunk_size,
                 own_write_addr,  // parity_addr: XOR destination (= own_buffer write offset)
-                own_write_addr, partner_write_addr
+                own_write_addr, partner_write_addr,
+                false, false, false, size, sequence_id_1
             });
         }
         encoding_tasks_1_cv_.notify_one();
@@ -4193,7 +4483,8 @@ public:
                 data_addr, size, enc_addr_1,
                 recv_addr_2, recv_chunk_size,
                 own_write_addr,  // parity_addr: XOR destination (= own_buffer write offset)
-                own_write_addr, partner_write_addr
+                own_write_addr, partner_write_addr,
+                false, false, false, size, sequence_id_2
             });
         }
         encoding_tasks_2_cv_.notify_one();
@@ -4218,13 +4509,13 @@ public:
         // Send sentinels to both encoder threads
         {
             std::lock_guard<std::mutex> lock(encoding_tasks_1_mutex_);
-            encoding_tasks_1_.push({0, 0, 0, 0, 0, 0, 0, 0});
+            encoding_tasks_1_.push({0, 0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0});
         }
         encoding_tasks_1_cv_.notify_one();
 
         {
             std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_);
-            encoding_tasks_2_.push({0, 0, 0, 0, 0, 0, 0, 0});
+            encoding_tasks_2_.push({0, 0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0});
         }
         encoding_tasks_2_cv_.notify_one();
     }
@@ -4411,7 +4702,7 @@ public:
                     if (rank_in_group_ == 0 || rank_in_group_ == 3) {
                         {
                             std::lock_guard<std::mutex> p2p_send_lock(load_p2p_send_queue_mutex_);
-                            load_p2p_send_queue_.push({0, 0, 0, 0, 0, true, false, 0});
+                            load_p2p_send_queue_.push({0, 0, 0, 0, 0, true, false, 0, 0, 0});
                         }
                         load_p2p_send_queue_cv_.notify_one();
                     }
@@ -4420,7 +4711,7 @@ public:
                     if (rank_in_group_ == 1 || rank_in_group_ == 2) {
                         {
                             std::lock_guard<std::mutex> p2p_recv_lock(load_p2p_recv_queue_mutex_);
-                            load_p2p_recv_queue_.push({0, 0, true, false, 0});
+                            load_p2p_recv_queue_.push({0, 0, true, false, 0, false, 0, 0});
                         }
                         load_p2p_recv_queue_cv_.notify_one();
                     }
@@ -4467,7 +4758,9 @@ public:
                 0,                        // data_addr (Step6 不需要)
                 true,                     // is_load_mode_transfer
                 true,                     // is_step6_transfer
-                0                         // load_mode_data_addr (Step6 不需要)
+                0,                        // load_mode_data_addr (Step6 不需要)
+                0,
+                0
             });
         }
         load_step6_p2p_send_queue_cv_.notify_one();
@@ -4488,7 +4781,10 @@ public:
                 size,
                 true,                     // is_load_mode_transfer
                 true,                     // is_step6_transfer
-                0                         // data_buffer_addr (Step6 不需要)
+                0,                        // data_buffer_addr (Step6 不需要)
+                false,
+                0,
+                0
             });
         }
         load_step6_p2p_recv_queue_cv_.notify_one();
@@ -4581,7 +4877,7 @@ public:
                 // std::cout << "[EC-CHECK RDMA] Load_XOR_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                 const auto t_net = std::chrono::steady_clock::now();
                 try {
-                    rdma_send_data_via_qp(rdma_xor_qp_, rdma_xor_send_cq_, get_rdma_xor_send_control_sock(),
+                    rdma_send_data_via_qp(rdma_xor_send_qp_, rdma_xor_send_cq_, get_rdma_xor_send_control_sock(),
                         rdma_xor_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
                     record_load_net_ns_(load_enc_xor_send_total_ns_, load_enc_xor_send_task_count_, t_net, false,
                                         "enc_xor_send", task.size);
@@ -4700,7 +4996,7 @@ public:
                 // std::cout << "[EC-CHECK RDMA] Load_XOR_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                 const auto t_net = std::chrono::steady_clock::now();
                 try {
-                    size_t recv_size = rdma_receive_data_via_qp(rdma_xor_qp_, rdma_xor_recv_cq_,
+                    size_t recv_size = rdma_receive_data_via_qp(rdma_xor_recv_qp_, rdma_xor_recv_cq_,
                         get_rdma_xor_recv_control_sock(), rdma_xor_recv_control_mutex_,
                         reinterpret_cast<uint8_t*>(task.recv_addr), task.size,
                         RdmaLoadRecvPollLane::EncXor);
@@ -5400,11 +5696,11 @@ public:
             // Send data using RDMA or ASIO (load mode)
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
 #ifdef __linux__
-                if (use_rdma_ && rdma_p2p_qp_) {
+                if (use_rdma_ && rdma_p2p_send_qp_) {
                     // std::cout << "[EC-CHECK RDMA] Load_P2P_Send: Sending " << task.size << " bytes via RDMA" << std::endl;
                     const auto t_net = std::chrono::steady_clock::now();
                     try {
-                        rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
+                        rdma_send_data_via_qp(rdma_p2p_send_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
                             rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
                         record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net, false,
                                             "step2_p2p_send", task.size);
@@ -5522,11 +5818,11 @@ public:
             bool task_processed = false;
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
 #ifdef __linux__
-                if (use_rdma_ && rdma_p2p_qp_) {
+                if (use_rdma_ && rdma_p2p_recv_qp_) {
                     // std::cout << "[EC-CHECK RDMA] Load_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
                     const auto t_net = std::chrono::steady_clock::now();
                     try {
-                        size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_,
+                        size_t recv_size = rdma_receive_data_via_qp(rdma_p2p_recv_qp_, rdma_p2p_recv_cq_,
                             get_rdma_p2p_recv_control_sock(), rdma_p2p_recv_control_mutex_,
                             reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size,
                             RdmaLoadRecvPollLane::Step2P2p);
@@ -5891,14 +6187,14 @@ public:
         if (rank_in_group_ == 3) {
             {
                 std::lock_guard<std::mutex> step6_send_lock(load_step6_p2p_send_queue_mutex_);
-                load_step6_p2p_send_queue_.push({0, 0, 0, 0, 0, true, true, 0});
+                load_step6_p2p_send_queue_.push({0, 0, 0, 0, 0, true, true, 0, 0, 0});
             }
             load_step6_p2p_send_queue_cv_.notify_one();
         }
         if (rank_in_group_ == 2) {
             {
                 std::lock_guard<std::mutex> step6_recv_lock(load_step6_p2p_recv_queue_mutex_);
-                load_step6_p2p_recv_queue_.push({0, 0, true, true, 0});
+                load_step6_p2p_recv_queue_.push({0, 0, true, true, 0, false, 0, 0});
             }
             load_step6_p2p_recv_queue_cv_.notify_one();
         }
@@ -5910,7 +6206,7 @@ public:
             throw std::runtime_error("ASIO P2P send not initialized");
         }
 #ifdef __linux__
-        if (use_rdma_ && rdma_p2p_qp_) {
+        if (use_rdma_ && rdma_p2p_send_qp_) {
             bool temp_reg = false;
             if (!rdma_find_mr(buffer_addr, size) && size > rdma_temp_send_buffer_.size()) {
                 register_buffer(buffer_addr, size);
@@ -5918,7 +6214,7 @@ public:
             }
             // std::cout << "[EC-CHECK RDMA] Simple_P2P_Send: Sending " << size << " bytes via RDMA" << std::endl;
             try {
-                rdma_send_data_via_qp(rdma_p2p_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
+                rdma_send_data_via_qp(rdma_p2p_send_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
                     rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(buffer_addr), size);
             } catch (...) {
                 if (temp_reg) unregister_buffer(buffer_addr);
@@ -5957,7 +6253,7 @@ public:
             throw std::runtime_error("ASIO P2P recv not initialized");
         }
 #ifdef __linux__
-        if (use_rdma_ && rdma_p2p_qp_) {
+        if (use_rdma_ && rdma_p2p_recv_qp_) {
             bool temp_reg = false;
             if (!rdma_find_mr(buffer_addr, size) && size > rdma_temp_recv_buffer_.size()) {
                 register_buffer(buffer_addr, size);
@@ -5965,7 +6261,7 @@ public:
             }
             // std::cout << "[EC-CHECK RDMA] Simple_P2P_Recv: Receiving " << size << " bytes via RDMA" << std::endl;
             try {
-                rdma_receive_data_via_qp(rdma_p2p_qp_, rdma_p2p_recv_cq_, get_rdma_p2p_recv_control_sock(),
+                rdma_receive_data_via_qp(rdma_p2p_recv_qp_, rdma_p2p_recv_cq_, get_rdma_p2p_recv_control_sock(),
                     rdma_p2p_recv_control_mutex_, reinterpret_cast<uint8_t*>(buffer_addr), size,
                     RdmaLoadRecvPollLane::None);
             } catch (...) {
@@ -6061,35 +6357,49 @@ public:
         const int MAX_WR = 64;
         ibv_qp_init_attr qp_attr{};
         qp_attr.send_cq = rdma_xor_send_cq_;
-        qp_attr.recv_cq = rdma_xor_recv_cq_;
+        qp_attr.recv_cq = rdma_xor_send_cq_;
         qp_attr.qp_type = IBV_QPT_RC;
         qp_attr.cap.max_send_wr = MAX_WR;
         qp_attr.cap.max_recv_wr = MAX_WR;
         qp_attr.cap.max_send_sge = 1;
         qp_attr.cap.max_recv_sge = 1;
-        rdma_xor_qp_ = ibv_create_qp(rdma_pd_, &qp_attr);
-        if (!rdma_xor_qp_) {
+        rdma_xor_send_qp_ = ibv_create_qp(rdma_pd_, &qp_attr);
+        qp_attr.send_cq = rdma_xor_recv_cq_;
+        qp_attr.recv_cq = rdma_xor_recv_cq_;
+        rdma_xor_recv_qp_ = ibv_create_qp(rdma_pd_, &qp_attr);
+        rdma_xor_qp_ = rdma_xor_send_qp_;
+        if (!rdma_xor_send_qp_ || !rdma_xor_recv_qp_) {
+            if (rdma_xor_send_qp_) { ibv_destroy_qp(rdma_xor_send_qp_); rdma_xor_send_qp_ = nullptr; }
+            if (rdma_xor_recv_qp_) { ibv_destroy_qp(rdma_xor_recv_qp_); rdma_xor_recv_qp_ = nullptr; }
+            rdma_xor_qp_ = nullptr;
             ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr;
             ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr;
             ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr;
             ibv_destroy_cq(rdma_p2p_recv_cq_); rdma_p2p_recv_cq_ = nullptr;
             ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr;
             ibv_close_device(rdma_context_); rdma_context_ = nullptr;
-            throw std::runtime_error("Failed to create XOR QP");
+            throw std::runtime_error("Failed to create XOR QPs");
         }
 
         qp_attr.send_cq = rdma_p2p_send_cq_;
         qp_attr.recv_cq = rdma_p2p_recv_cq_;
-        rdma_p2p_qp_ = ibv_create_qp(rdma_pd_, &qp_attr);
-        if (!rdma_p2p_qp_) {
-            ibv_destroy_qp(rdma_xor_qp_); rdma_xor_qp_ = nullptr;
+        rdma_p2p_send_qp_ = ibv_create_qp(rdma_pd_, &qp_attr);
+        rdma_p2p_recv_qp_ = ibv_create_qp(rdma_pd_, &qp_attr);
+        rdma_p2p_qp_ = rdma_p2p_send_qp_;
+        if (!rdma_p2p_send_qp_ || !rdma_p2p_recv_qp_) {
+            if (rdma_p2p_send_qp_) { ibv_destroy_qp(rdma_p2p_send_qp_); rdma_p2p_send_qp_ = nullptr; }
+            if (rdma_p2p_recv_qp_) { ibv_destroy_qp(rdma_p2p_recv_qp_); rdma_p2p_recv_qp_ = nullptr; }
+            rdma_p2p_qp_ = nullptr;
+            if (rdma_xor_send_qp_) { ibv_destroy_qp(rdma_xor_send_qp_); rdma_xor_send_qp_ = nullptr; }
+                if (rdma_xor_recv_qp_) { ibv_destroy_qp(rdma_xor_recv_qp_); rdma_xor_recv_qp_ = nullptr; }
+                rdma_xor_qp_ = nullptr;
             ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr;
             ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr;
             ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr;
             ibv_destroy_cq(rdma_p2p_recv_cq_); rdma_p2p_recv_cq_ = nullptr;
             ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr;
             ibv_close_device(rdma_context_); rdma_context_ = nullptr;
-            throw std::runtime_error("Failed to create P2P QP");
+            throw std::runtime_error("Failed to create P2P QPs");
         }
 
         if (rank_in_group_ == 2 || rank_in_group_ == 3) {
@@ -6098,8 +6408,12 @@ public:
             if (!rdma_step6_p2p_send_cq_ || !rdma_step6_p2p_recv_cq_) {
                 if (rdma_step6_p2p_send_cq_) { ibv_destroy_cq(rdma_step6_p2p_send_cq_); rdma_step6_p2p_send_cq_ = nullptr; }
                 if (rdma_step6_p2p_recv_cq_) { ibv_destroy_cq(rdma_step6_p2p_recv_cq_); rdma_step6_p2p_recv_cq_ = nullptr; }
-                ibv_destroy_qp(rdma_xor_qp_); rdma_xor_qp_ = nullptr;
-                ibv_destroy_qp(rdma_p2p_qp_); rdma_p2p_qp_ = nullptr;
+                if (rdma_xor_send_qp_) { ibv_destroy_qp(rdma_xor_send_qp_); rdma_xor_send_qp_ = nullptr; }
+                if (rdma_xor_recv_qp_) { ibv_destroy_qp(rdma_xor_recv_qp_); rdma_xor_recv_qp_ = nullptr; }
+                rdma_xor_qp_ = nullptr;
+                if (rdma_p2p_send_qp_) { ibv_destroy_qp(rdma_p2p_send_qp_); rdma_p2p_send_qp_ = nullptr; }
+                if (rdma_p2p_recv_qp_) { ibv_destroy_qp(rdma_p2p_recv_qp_); rdma_p2p_recv_qp_ = nullptr; }
+                rdma_p2p_qp_ = nullptr;
                 ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr;
                 ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr;
                 ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr;
@@ -6114,8 +6428,12 @@ public:
             if (!rdma_step6_p2p_qp_) {
                 ibv_destroy_cq(rdma_step6_p2p_send_cq_); rdma_step6_p2p_send_cq_ = nullptr;
                 ibv_destroy_cq(rdma_step6_p2p_recv_cq_); rdma_step6_p2p_recv_cq_ = nullptr;
-                ibv_destroy_qp(rdma_xor_qp_); rdma_xor_qp_ = nullptr;
-                ibv_destroy_qp(rdma_p2p_qp_); rdma_p2p_qp_ = nullptr;
+                if (rdma_xor_send_qp_) { ibv_destroy_qp(rdma_xor_send_qp_); rdma_xor_send_qp_ = nullptr; }
+                if (rdma_xor_recv_qp_) { ibv_destroy_qp(rdma_xor_recv_qp_); rdma_xor_recv_qp_ = nullptr; }
+                rdma_xor_qp_ = nullptr;
+                if (rdma_p2p_send_qp_) { ibv_destroy_qp(rdma_p2p_send_qp_); rdma_p2p_send_qp_ = nullptr; }
+                if (rdma_p2p_recv_qp_) { ibv_destroy_qp(rdma_p2p_recv_qp_); rdma_p2p_recv_qp_ = nullptr; }
+                rdma_p2p_qp_ = nullptr;
                 ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr;
                 ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr;
                 ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr;
@@ -6136,8 +6454,12 @@ public:
         if (!rdma_temp_send_mr_ || !rdma_temp_recv_mr_) {
             if (rdma_temp_send_mr_) { ibv_dereg_mr(rdma_temp_send_mr_); rdma_temp_send_mr_ = nullptr; }
             if (rdma_temp_recv_mr_) { ibv_dereg_mr(rdma_temp_recv_mr_); rdma_temp_recv_mr_ = nullptr; }
-            ibv_destroy_qp(rdma_xor_qp_); rdma_xor_qp_ = nullptr;
-            ibv_destroy_qp(rdma_p2p_qp_); rdma_p2p_qp_ = nullptr;
+            if (rdma_xor_send_qp_) { ibv_destroy_qp(rdma_xor_send_qp_); rdma_xor_send_qp_ = nullptr; }
+                if (rdma_xor_recv_qp_) { ibv_destroy_qp(rdma_xor_recv_qp_); rdma_xor_recv_qp_ = nullptr; }
+                rdma_xor_qp_ = nullptr;
+            if (rdma_p2p_send_qp_) { ibv_destroy_qp(rdma_p2p_send_qp_); rdma_p2p_send_qp_ = nullptr; }
+            if (rdma_p2p_recv_qp_) { ibv_destroy_qp(rdma_p2p_recv_qp_); rdma_p2p_recv_qp_ = nullptr; }
+            rdma_p2p_qp_ = nullptr;
             ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr;
             ibv_destroy_cq(rdma_xor_recv_cq_); rdma_xor_recv_cq_ = nullptr;
             ibv_destroy_cq(rdma_p2p_send_cq_); rdma_p2p_send_cq_ = nullptr;
@@ -6452,8 +6774,12 @@ public:
             rdma_registered_buffers_.clear();
         }
 
-        if (rdma_xor_qp_) { ibv_destroy_qp(rdma_xor_qp_); rdma_xor_qp_ = nullptr; }
-        if (rdma_p2p_qp_) { ibv_destroy_qp(rdma_p2p_qp_); rdma_p2p_qp_ = nullptr; }
+        if (rdma_xor_qp_) { if (rdma_xor_send_qp_) { ibv_destroy_qp(rdma_xor_send_qp_); rdma_xor_send_qp_ = nullptr; }
+                if (rdma_xor_recv_qp_) { ibv_destroy_qp(rdma_xor_recv_qp_); rdma_xor_recv_qp_ = nullptr; }
+                rdma_xor_qp_ = nullptr; }
+        if (rdma_p2p_send_qp_) { ibv_destroy_qp(rdma_p2p_send_qp_); rdma_p2p_send_qp_ = nullptr; }
+        if (rdma_p2p_recv_qp_) { ibv_destroy_qp(rdma_p2p_recv_qp_); rdma_p2p_recv_qp_ = nullptr; }
+        rdma_p2p_qp_ = nullptr;
         if (rdma_step6_p2p_qp_) { ibv_destroy_qp(rdma_step6_p2p_qp_); rdma_step6_p2p_qp_ = nullptr; }
 
         if (rdma_xor_send_cq_) { ibv_destroy_cq(rdma_xor_send_cq_); rdma_xor_send_cq_ = nullptr; }
@@ -6567,8 +6893,32 @@ PYBIND11_MODULE(eccheck_native, m) {
         .def("reset_encoding_completion_flags", &ECCHECKNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECCHECKNative::wait_for_encoding_completion)
         .def("stop_pipeline", &ECCHECKNative::stop_pipeline)
-        .def("submit_data_for_encoding_thread1", &ECCHECKNative::submit_data_for_encoding_thread1)
-        .def("submit_data_for_encoding_thread2", &ECCHECKNative::submit_data_for_encoding_thread2)
+        .def("submit_data_for_encoding_thread1", &ECCHECKNative::submit_data_for_encoding_thread1,
+             pybind11::arg("data_addr") = 0,
+             pybind11::arg("size") = 0,
+             pybind11::arg("encoding_addr") = 0,
+             pybind11::arg("recv_addr") = 0,
+             pybind11::arg("recv_chunk_size") = 0,
+             pybind11::arg("parity_addr") = 0,
+             pybind11::arg("p2p_own_write_addr") = 0,
+             pybind11::arg("p2p_partner_write_addr") = 0,
+             pybind11::arg("local_is_zero_tail") = false,
+             pybind11::arg("remote_is_zero_tail") = false,
+             pybind11::arg("p2p_data_is_zero_tail") = false,
+             pybind11::arg("p2p_data_size") = 0)
+        .def("submit_data_for_encoding_thread2", &ECCHECKNative::submit_data_for_encoding_thread2,
+             pybind11::arg("data_addr") = 0,
+             pybind11::arg("size") = 0,
+             pybind11::arg("encoding_addr") = 0,
+             pybind11::arg("recv_addr") = 0,
+             pybind11::arg("recv_chunk_size") = 0,
+             pybind11::arg("parity_addr") = 0,
+             pybind11::arg("p2p_own_write_addr") = 0,
+             pybind11::arg("p2p_partner_write_addr") = 0,
+             pybind11::arg("local_is_zero_tail") = false,
+             pybind11::arg("remote_is_zero_tail") = false,
+             pybind11::arg("p2p_data_is_zero_tail") = false,
+             pybind11::arg("p2p_data_size") = 0)
         .def("get_data_buffers_to_release", &ECCHECKNative::get_data_buffers_to_release)
         .def("get_encoding_buffers_to_release", &ECCHECKNative::get_encoding_buffers_to_release)
         .def("get_parity_buffers_to_release", &ECCHECKNative::get_parity_buffers_to_release)

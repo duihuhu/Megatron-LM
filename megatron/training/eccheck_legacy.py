@@ -140,6 +140,55 @@ def _max_tensor_bytes_from_registry(registry: GlobalMetadataRegistry, world_size
     return max_bytes
 
 
+def _eccheck_pipeline_transfer_bytes(registry: GlobalMetadataRegistry, world_size: int) -> int:
+    """Return the logical EC pipeline length used by recovery transfers."""
+    return _max_tensor_bytes_from_registry(registry, world_size)
+
+
+def _rank_total_bytes(rank_metadata: Dict[int, List[TensorMetadata]], rank: int) -> int:
+    return sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
+
+
+def _rank_data_transfer_bytes(
+    registry: GlobalMetadataRegistry, rank: int, world_size: int
+) -> int:
+    """Return actual data bytes for one rank, without EC padding."""
+    if rank < 0 or rank >= world_size:
+        return 0
+    return _rank_total_bytes(registry.rank_metadata, rank)
+
+
+def _block_payload_sizes_for_save(
+    rank: int,
+    world_size: int,
+    rank_metadata: Dict[int, List[TensorMetadata]],
+    blocks: Dict[str, Any],
+) -> Dict[str, int]:
+    """Return logical bytes to persist for each ECCHECK side block."""
+    pipeline_bytes = int(blocks["pipeline_size"])
+    own_actual = _rank_total_bytes(rank_metadata, rank)
+    if world_size > 1:
+        partner_rank = ECCHECKManager().get_p2p_partner_rank(rank, world_size)
+        partner_actual = _rank_total_bytes(rank_metadata, partner_rank)
+        rank_in_group = ECCHECKManager._get_rank_in_group(rank, world_size)
+    else:
+        partner_actual = own_actual
+        rank_in_group = 0
+
+    # Even positions store parity locally and partner data remotely; odd positions
+    # store data locally and partner parity remotely. Parity must keep pipeline size.
+    if rank_in_group % 2 == 0:
+        sizes = {"own_buffer": pipeline_bytes, "partner_buffer": partner_actual}
+    else:
+        sizes = {"own_buffer": own_actual, "partner_buffer": pipeline_bytes}
+
+    block_write_sizes = blocks.get("block_write_sizes", {})
+    return {
+        name: min(int(size), int(block_write_sizes.get(name, blocks[name].numel())))
+        for name, size in sizes.items()
+    }
+
+
 def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
     if "flat_key_roots" in main_payload:
         return set(main_payload["flat_key_roots"])
@@ -343,6 +392,7 @@ def _encode_eccheck_with_native(
     blocks: Dict[str, Any],
     tensor_infos: List[Any],
     tensor_data: List[Optional[torch.Tensor]],
+    rank_metadata: Dict[int, List[TensorMetadata]],
 ) -> float:
     native = manager._eccheck_native
     if native is None:
@@ -358,32 +408,32 @@ def _encode_eccheck_with_native(
     active_event = buffers.get("buffer_poller_active_event")
     poll_and_release = buffers.get("poll_and_release_buffers")
 
+    def _get_free_buffer_with_poll(free_queue, label: str):
+        # Keep polling native release queues while waiting; a blocking Queue.get()
+        # can otherwise miss releases when the background poller is delayed.
+        waited_s = 0.0
+        while True:
+            if poll_and_release is not None:
+                poll_and_release()
+            try:
+                return free_queue.get(timeout=0.1)
+            except queue.Empty:
+                waited_s += 0.1
+                if waited_s >= 5.0:
+                    logger.warning(
+                        f"ECCHECK legacy: still waiting for free {label} buffer "
+                        f"after {waited_s:.1f}s"
+                    )
+                    waited_s = 0.0
+
     def _get_free_data_buffer():
-        if poll_and_release is not None:
-            poll_and_release()
-        try:
-            return free_data_queue.get(timeout=5.0)
-        except queue.Empty:
-            logger.error("ECCHECK legacy: timeout waiting for free data buffer")
-            return free_data_queue.get()
+        return _get_free_buffer_with_poll(free_data_queue, "data")
 
     def _get_free_encoding_buffer():
-        if poll_and_release is not None:
-            poll_and_release()
-        try:
-            return free_encoding_queue.get(timeout=5.0)
-        except queue.Empty:
-            logger.error("ECCHECK legacy: timeout waiting for free encoding buffer")
-            return free_encoding_queue.get()
+        return _get_free_buffer_with_poll(free_encoding_queue, "encoding")
 
     def _get_free_parity_buffer():
-        if poll_and_release is not None:
-            poll_and_release()
-        try:
-            return free_parity_queue.get(timeout=5.0)
-        except queue.Empty:
-            logger.error("ECCHECK legacy: timeout waiting for free parity buffer")
-            return free_parity_queue.get()
+        return _get_free_buffer_with_poll(free_parity_queue, "parity")
 
     own_buffer = blocks["own_buffer"]
     partner_buffer = blocks["partner_buffer"]
@@ -399,6 +449,19 @@ def _encode_eccheck_with_native(
 
     pipeline_total_bytes = blocks["pipeline_size"]
     buffer_size = manager.eccheck_buffer_size
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    xor_peer_rank = manager._get_xor_paired_rank(rank, world_size) if world_size > 1 else rank
+    xor_peer_actual_bytes = _rank_total_bytes(rank_metadata, xor_peer_rank)
+    if world_size > 1:
+        rank_in_group = manager._get_rank_in_group(rank, world_size)
+        if rank_in_group % 2 == 0:
+            p2p_data_rank = manager.get_p2p_partner_rank(rank, world_size)
+        else:
+            p2p_data_rank = rank
+    else:
+        p2p_data_rank = rank
+    p2p_data_actual_bytes = _rank_total_bytes(rank_metadata, p2p_data_rank)
 
     native.reset_encoding_completion_flags()
     native.set_load_mode(False, -1)
@@ -526,13 +589,21 @@ def _encode_eccheck_with_native(
             own_offset = own_offset_aligned + take
             partner_offset = partner_offset_aligned + take
 
+            local_is_zero_tail = src_pos >= actual_data_bytes
+            remote_is_zero_tail = src_pos >= xor_peer_actual_bytes
+            p2p_data_size = min(take, max(0, p2p_data_actual_bytes - src_pos))
+            p2p_data_is_zero_tail = p2p_data_size == 0
             native.submit_data_for_encoding_thread1(
                 cur_buffer_addr, take, enc_addr1, recv_addr_1,
                 recv_chunk_size, parity_addr1, own_write_addr, partner_write_addr,
+                local_is_zero_tail, remote_is_zero_tail, p2p_data_is_zero_tail,
+                p2p_data_size,
             )
             native.submit_data_for_encoding_thread2(
                 cur_buffer_addr, take, enc_addr2, recv_addr_2,
                 recv_chunk_size, parity_addr2, own_write_addr, partner_write_addr,
+                local_is_zero_tail, remote_is_zero_tail, p2p_data_is_zero_tail,
+                p2p_data_size,
             )
 
             src_pos += take
@@ -567,6 +638,7 @@ def _encode_eccheck_with_native(
 def _save_eccheck_pt_files(
     checkpoint_name: str,
     rank: int,
+    world_size: int,
     non_tensor_data: Dict[str, Any],
     tensor_infos: List[Any],
     blocks: Dict[str, Any],
@@ -590,12 +662,16 @@ def _save_eccheck_pt_files(
     import pickle as _pickle
     meta1 = _pickle.dumps(non_tensor_data)
     meta2 = _pickle.dumps(tensor_infos)
+    block_payload_sizes = _block_payload_sizes_for_save(
+        rank, world_size, all_tensor_infos or {}, blocks,
+    )
     extra = _pickle.dumps({
         "version": 1, "format": _FORMAT, "rank": rank,
         "actual_tensor_size": blocks["actual_size"],
         "pipeline_total_bytes": blocks["pipeline_size"],
         "aligned_block_size": blocks["aligned_size"],
         "block_write_sizes": blocks.get("block_write_sizes", {}),
+        "block_payload_sizes": block_payload_sizes,
         "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
         "block_files": block_files,
         "all_tensor_infos": all_tensor_infos if all_tensor_infos is not None else {},
@@ -609,7 +685,7 @@ def _save_eccheck_pt_files(
 
     # ECCHECK blocks keep the internal 64B gapped layout, but trim unused tail bytes.
     block_names = ("own_buffer", "partner_buffer")
-    block_write_sizes = blocks.get("block_write_sizes", {})
+    block_write_sizes = block_payload_sizes
     block_mvs = {}
     for name in block_names:
         b = blocks[name][: blocks[name].numel()]
@@ -729,6 +805,7 @@ def save_eccheck_legacy_checkpoint(
         blocks=blocks,
         tensor_infos=decomposed.tensor_infos,
         tensor_data=decomposed.tensor_data,
+        rank_metadata=rank_metadata,
     )
     del decomposed.tensor_data
     network_encode_s = time.time() - encode_t0
@@ -754,6 +831,7 @@ def save_eccheck_legacy_checkpoint(
         _save_eccheck_pt_files(
             checkpoint_name=checkpoint_name,
             rank=rank,
+            world_size=world_size,
             non_tensor_data=decomposed.non_tensor_data,
             tensor_infos=decomposed.tensor_infos,
             blocks=blocks,
@@ -908,6 +986,8 @@ def _copy_block_file_into_tensor(
     dst = dest.contiguous().view(-1)
     n = min(src.numel(), dst.numel())
     dst[:n].copy_(src[:n])
+    if n < dst.numel():
+        dst[n:].zero_()
 
 
 def _load_eccheck_blocks_from_disk_into(
@@ -927,7 +1007,7 @@ def _load_eccheck_blocks_from_disk_into(
     - rank_in_group 3: loads own_buffer + partner_buffer (its own data + received)
 
     Software failure layout (use_eccheck_software_failure=True):
-    - rank_in_group 0: loads own_buffer (to send to rig=1 via C++ P2P)
+    - rank_in_group 0: loads partner_buffer (d1, to send to rig=1 via C++ P2P)
     - rank_in_group 1: loads nothing (receives from rig=0 via C++ P2P)
     - rank_in_group 2/3: not participating in software failure
 
@@ -940,7 +1020,7 @@ def _load_eccheck_blocks_from_disk_into(
     if software_failure:
         if rank_in_group == 0:
             _copy_block_file_into_tensor(
-                checkpoint_dir, rank, "own_buffer", blocks["own_buffer"]
+                checkpoint_dir, rank, "partner_buffer", blocks["partner_buffer"]
             )
         # rig=1: will receive via C++ P2P, no local disk load
         # rig=2/3: not participating
@@ -1065,22 +1145,25 @@ def _run_eccheck_legacy_recovery(
     rank_in_group = manager._get_rank_in_group(rank, world_size)
 
     # ---- software failure path ----
-    # rank_in_group 0 sends own_buffer to rank_in_group 1 via C++ P2P.
+    # rank_in_group 0 sends partner_buffer (d1) to rank_in_group 1 via C++ P2P.
     # rank_in_group 1 receives into recovered_buffer.
     # This exercises the network path for worst-case recovery time measurement.
     if software_failure:
         start_t = time()
         if rank_in_group == 0:
-            own_buf = blocks["own_buffer"].contiguous().view(torch.uint8).reshape(-1)
-            actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
-            send_size = min(actual_tensor_bytes, own_buf.numel())
-            native.simple_p2p_send(int(own_buf.data_ptr()), send_size)
+            partner_rank = manager.get_p2p_partner_rank(rank, world_size)
+            transfer_bytes = _rank_data_transfer_bytes(registry, partner_rank, world_size)
+            partner_buf = blocks["partner_buffer"].contiguous().view(torch.uint8).reshape(-1)
+            send_size = min(transfer_bytes, partner_buf.numel())
+            native.simple_p2p_send(int(partner_buf.data_ptr()), send_size)
         elif rank_in_group == 1:
             if recovered_buffer is None:
                 raise RuntimeError("ECCHECK legacy: software failure needs recovered_buffer")
-            native.simple_p2p_recv(
-                int(recovered_buffer.data_ptr()), recovered_buffer.numel()
-            )
+            transfer_bytes = _rank_data_transfer_bytes(registry, rank, world_size)
+            recv_size = min(transfer_bytes, recovered_buffer.numel())
+            native.simple_p2p_recv(int(recovered_buffer.data_ptr()), recv_size)
+            if recv_size < recovered_buffer.numel():
+                recovered_buffer[recv_size:].zero_()
         # rig=2/3: no-op
         return time() - start_t, 0.0
 
@@ -1403,30 +1486,46 @@ def _run_eccheck_two_failures_recovery(
     # ---- Phase 1: P2P data distribution (timed as network) ----
     # Rig0 → Rig1: send d1 (partner_buffer)
     # Rig3 → Rig2: send p2 = d0⊕d2 (partner_buffer)
+    phase1_parity_bytes = _eccheck_pipeline_transfer_bytes(registry, world_size)
     _t0 = time()
     if rank_in_group == 0:
-        native.simple_p2p_send(int(partner_buf.data_ptr()), partner_buf.numel())
+        rig1_rank = manager._get_rank_by_group_position(
+            manager._get_group_id(rank, world_size), 1, world_size,
+        )
+        send_size = min(
+            _rank_data_transfer_bytes(registry, rig1_rank, world_size),
+            partner_buf.numel(),
+        )
+        native.simple_p2p_send(int(partner_buf.data_ptr()), send_size)
         logger.debug(
             f"ECCHECK two-failures: rig0 sent d1 to rig1 "
-            f"({partner_buf.numel() / (1024**3):.2f} GB)"
+            f"({send_size / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 1:
-        native.simple_p2p_recv(int(partner_buf.data_ptr()), partner_buf.numel())
+        recv_size = min(
+            _rank_data_transfer_bytes(registry, rank, world_size),
+            partner_buf.numel(),
+        )
+        native.simple_p2p_recv(int(partner_buf.data_ptr()), recv_size)
+        if recv_size < partner_buf.numel():
+            partner_buf[recv_size:].zero_()
         logger.debug(
             f"ECCHECK two-failures: rig1 received d1 from rig0 "
-            f"({partner_buf.numel() / (1024**3):.2f} GB)"
+            f"({recv_size / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 2:
-        native.simple_p2p_recv(int(own_buf.data_ptr()), own_buf.numel())
+        recv_size = min(phase1_parity_bytes, own_buf.numel())
+        native.simple_p2p_recv(int(own_buf.data_ptr()), recv_size)
         logger.debug(
             f"ECCHECK two-failures: rig2 received p2 from rig3 "
-            f"({own_buf.numel() / (1024**3):.2f} GB)"
+            f"({recv_size / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 3:
-        native.simple_p2p_send(int(partner_buf.data_ptr()), partner_buf.numel())
+        send_size = min(phase1_parity_bytes, partner_buf.numel())
+        native.simple_p2p_send(int(partner_buf.data_ptr()), send_size)
         logger.debug(
             f"ECCHECK two-failures: rig3 sent p2 to rig2 "
-            f"({partner_buf.numel() / (1024**3):.2f} GB)"
+            f"({send_size / (1024**3):.2f} GB)"
         )
     t_phase1_p2p = time() - _t0
 
@@ -1757,12 +1856,12 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     load_tensor_buffer = True
     if world_size > 1:
         # Ranks rebuilt from EC/P2P data do not need the multi-GB main tensor
-        # buffer.  In SW mode, rig0 can rebuild from the same own_buffer it
-        # sends, and rig1 rebuilds from recovered_buffer.
+        # buffer. In SW mode only rig1 is rebuilt from recovered_buffer;
+        # rig0 still needs its local main tensor and sends d1 from partner_buffer.
         if two_failures:
             load_tensor_buffer = rank_in_group not in (1, 2)
         elif sw_failure:
-            load_tensor_buffer = rank_in_group not in (0, 1)
+            load_tensor_buffer = rank_in_group != 1
         else:
             load_tensor_buffer = rank_in_group != 2
 
@@ -1801,7 +1900,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
 
     if sw_failure:
-        required_block_names = ["own_buffer"] if rank_in_group == 0 else []
+        required_block_names = ["partner_buffer"] if rank_in_group == 0 else []
     else:
         required_block_names = ["own_buffer", "partner_buffer"]
     blocks = _allocate_eccheck_blocks_legacy(
@@ -1827,7 +1926,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     elif sw_failure:
         if rank_in_group == 0:
             blocks = _allocate_eccheck_blocks_legacy(
-                manager, rank_metadata, block_names=["own_buffer"],
+                manager, rank_metadata, block_names=["partner_buffer"],
             )
             _load_eccheck_blocks_from_disk_into(
                 blocks, checkpoint_dir, rank, rank_in_group, software_failure=True,
@@ -1902,19 +2001,11 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # SW rig0 rebuilds from the same data it sends; rig1 rebuilds from the
-    # recovered P2P buffer. rig2/3 keep using their local main tensor buffers.
-    if sw_failure and rank_in_group == 0:
-        t_pin = time.time()
-        final_buffer = _allocate_recovered_buffer(total_size, pin=True)
-        n_copy = min(total_size, blocks["own_buffer"].numel())
-        final_buffer[:n_copy].copy_(blocks["own_buffer"][:n_copy])
-        recovered_buffer = final_buffer
-        prep_copy_s += time.time() - t_pin
+    # SW rig1 rebuilds from recovered_buffer; rig0/2/3 use their local main tensor.
 
     if sw_failure:
         rebuild_recovered_buffer = (
-            recovered_buffer if rank_in_group in (0, 1) else None
+            recovered_buffer if rank_in_group == 1 else None
         )
     elif two_failures:
         rebuild_recovered_buffer = (

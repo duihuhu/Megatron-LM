@@ -76,7 +76,7 @@ DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 SHM_PKT="/dev/shm/shm_pkt"
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -85,6 +85,7 @@ fi
 
 ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
+FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-3}
 case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
@@ -117,6 +118,22 @@ case "$MODE" in
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
             --frcheck-failed-ranks "0,1"
+        )
+        ;;
+    inprocess)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --ft-inprocess-recovery-benchmark
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-failed-ranks "0"
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
+            --frcheck-async-recovery-forward
+            --frcheck-recovery-async-parity
+            --frcheck-recovery-safe-point optimizer_step
+            --frcheck-recovery-only-teardown
+            --num-workers 0
         )
         ;;
 esac

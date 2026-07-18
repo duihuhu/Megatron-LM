@@ -65,13 +65,41 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def _frcheck_wait_for_layer(layer_number: int) -> None:
-    """Best-effort hook for FRCheck layerwise recovery readiness."""
+_frcheck_wait_layer_hook = None
+_frcheck_forward_done_hook = None
+_frcheck_hooks_loaded = False
+
+
+def _load_frcheck_layer_hooks() -> None:
+    global _frcheck_wait_layer_hook, _frcheck_forward_done_hook, _frcheck_hooks_loaded
+    if _frcheck_hooks_loaded:
+        return
+    _frcheck_hooks_loaded = True
     try:
-        from megatron.training.frcheck_legacy import frcheck_wait_and_materialize_layer
+        from megatron.training.frcheck_legacy import (
+            frcheck_wait_and_materialize_layer,
+            record_frcheck_first_layer_forward_done,
+        )
     except Exception:
         return
-    frcheck_wait_and_materialize_layer(layer_number - 1)
+    _frcheck_wait_layer_hook = frcheck_wait_and_materialize_layer
+    _frcheck_forward_done_hook = record_frcheck_first_layer_forward_done
+
+
+def _frcheck_wait_for_layer(layer_idx: int) -> None:
+    """Best-effort hook for FRCheck layerwise recovery readiness."""
+    if not _frcheck_hooks_loaded:
+        _load_frcheck_layer_hooks()
+    if _frcheck_wait_layer_hook is not None:
+        _frcheck_wait_layer_hook(layer_idx)
+
+
+def _frcheck_record_layer_forward_done(layer_idx: int) -> None:
+    """Best-effort hook for FRCheck first-layer forward completion."""
+    if not _frcheck_hooks_loaded:
+        _load_frcheck_layer_hooks()
+    if _frcheck_forward_done_hook is not None:
+        _frcheck_forward_done_hook(layer_idx)
 
 
 def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
@@ -391,7 +419,7 @@ class TransformerBlock(MegatronModule):
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
-                    _frcheck_wait_for_layer(layer.layer_number)
+                    _frcheck_wait_for_layer(index)
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
@@ -408,6 +436,7 @@ class TransformerBlock(MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                         )
+                    _frcheck_record_layer_forward_done(index)
                 return hidden_states, context
 
             return custom_forward
@@ -585,7 +614,7 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
-                    _frcheck_wait_for_layer(layer.layer_number)
+                    _frcheck_wait_for_layer(l_no)
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
@@ -605,6 +634,7 @@ class TransformerBlock(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
+                    _frcheck_record_layer_forward_done(l_no)
 
                     if (
                         torch.is_grad_enabled()

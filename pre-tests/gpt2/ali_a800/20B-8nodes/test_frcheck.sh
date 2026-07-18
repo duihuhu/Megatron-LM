@@ -97,19 +97,20 @@ SHM_PKT="/dev/shm/shm_pkt"
 
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess)$ ]]; then
     MODE="$1"
     shift
 fi
 ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
+FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-6}
 case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
             --frcheck-layer-exchange-encode
             --ec-checkpoint-write-only-penultimate-iter
-            #--frcheck-async-parity
+            --frcheck-async-parity
         )
         ;;
     software)
@@ -122,7 +123,7 @@ case "$MODE" in
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
             --frcheck-async-recovery-forward
-            --frcheck-recovery-async-parity
+            #--frcheck-recovery-async-parity
             --frcheck-failed-ranks "0,1,2,3,4,5,6,7"
             --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
@@ -135,6 +136,22 @@ case "$MODE" in
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
             --frcheck-failed-ranks "0,1"
+        )
+        ;;
+    inprocess)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --ft-inprocess-recovery-benchmark
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-failed-ranks "0,1,2,3,4,5,6,7"
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
+            --frcheck-async-recovery-forward
+            --frcheck-recovery-async-parity
+            --frcheck-recovery-safe-point optimizer_step
+            --frcheck-recovery-only-teardown
+            --num-workers 0
         )
         ;;
 esac
@@ -164,6 +181,7 @@ DATA_ARGS=(
 )
 
 GPT_ARGS=(
+    --no-barrier-with-level-1-timing
     --no-async-tensor-model-parallel-allreduce
     --hidden-size $HIDDEN_SIZE
     --num-attention-heads $NUM_ATTENTION_HEADS
@@ -223,12 +241,12 @@ mkdir -p logs/csv
 
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${RECOVERY_MODE_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
 
-echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (FRCheck)"
+echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (FRCheck mode=$MODE)"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 echo "FRCHECK_TABLE_DIR: $FRCHECK_TABLE_DIR"
 echo "FRCHECK_BASE_IP: $FRCHECK_BASE_IP"

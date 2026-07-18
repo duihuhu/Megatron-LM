@@ -937,24 +937,11 @@ public:
 
     // ---- Buffer registration ----
     void register_buffer(uintptr_t addr, size_t size) {
-        if (!rdma_pd_) return;
-        ibv_mr* mr = ibv_reg_mr(rdma_pd_, (void*)addr, size,
-                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                                 IBV_ACCESS_REMOTE_READ);
-        if (!mr) {
-            if (require_registered_mr_) {
-                throw std::runtime_error(
-                    "FRCheck RDMA: ibv_reg_mr failed for save pipeline (addr=0x" +
-                    std::to_string(addr) + " size=" + std::to_string(size) +
-                    ", GPU pointers need nvidia-peermem for GDR)");
-            }
-            std::cerr << "[FRCheck RDMA] WARNING: ibv_reg_mr failed for addr=0x"
-                      << std::hex << addr << " size=" << std::dec << size
-                      << " (GPU pointers need nvidia-peermem for GDR)" << std::endl;
-            return;
-        }
-        std::lock_guard<std::mutex> lk(buf_mtx_);
-        registered_bufs_[addr] = {mr, addr, size};
+        register_buffer_(addr, size, false);
+    }
+
+    void register_recovery_buffer(uintptr_t addr, size_t size) {
+        register_buffer_(addr, size, true);
     }
 
     void unregister_buffer(uintptr_t addr) {
@@ -964,6 +951,24 @@ public:
             if (it->second.mr) ibv_dereg_mr(it->second.mr);
             registered_bufs_.erase(it);
         }
+        recovery_buffer_addrs_.erase(addr);
+    }
+
+    void clear_recovery_buffers() {
+        const int pending_chunks = pending_recovery_chunks_.load(std::memory_order_acquire);
+        if (pending_chunks != 0) {
+            throw std::runtime_error(
+                "FRCheck: clear_recovery_buffers called with pending recovery chunks: " +
+                std::to_string(pending_chunks));
+        }
+        std::lock_guard<std::mutex> lk(buf_mtx_);
+        for (uintptr_t addr : recovery_buffer_addrs_) {
+            auto it = registered_bufs_.find(addr);
+            if (it == registered_bufs_.end()) continue;
+            if (it->second.mr) ibv_dereg_mr(it->second.mr);
+            registered_bufs_.erase(it);
+        }
+        recovery_buffer_addrs_.clear();
     }
 
     // ---- GDR capability detection ----
@@ -1169,6 +1174,24 @@ public:
 
     // ---- Hardware recovery batch pipeline ----
     void init_recovery_plans(const std::vector<int>& failed_nodes_1based) {
+        const int pending_chunks = pending_recovery_chunks_.load(std::memory_order_acquire);
+        if (pending_chunks != 0)
+            throw std::runtime_error(
+                "FRCheck: init_recovery_plans called with pending recovery chunks: " +
+                std::to_string(pending_chunks));
+        clear_recovery_buffers();
+        {
+            std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+            recovery_batches_.clear();
+            if (recovery_generation_ >= kRecoveryGenerationMax)
+                throw std::runtime_error("FRCheck: recovery generation exhausted");
+            ++recovery_generation_;
+            next_recovery_batch_id_ =
+                (recovery_generation_ << kRecoveryBatchCycleBits) + 1;
+            legacy_recovery_batch_active_ = false;
+            legacy_recovery_batch_id_ = 0;
+        }
+
         if (failed_nodes_1based.empty())
             throw std::runtime_error("FRCheck: init_recovery_plans requires failed nodes");
         if (failed_nodes_1based.size() > 2)
@@ -1191,10 +1214,17 @@ public:
             throw std::runtime_error("FRCheck: encode batch active, cannot start recovery batch");
         ensure_recovery_workers_();
         reset_recovery_batch_profile_();
-        uint64_t batch_id = next_recovery_batch_id_.fetch_add(1, std::memory_order_acq_rel);
+        uint64_t batch_id;
         {
             std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
-            recovery_batches_[batch_id] = RecoveryBatchState{};
+            const uint64_t generation_end =
+                (recovery_generation_ + 1) << kRecoveryBatchCycleBits;
+            if (recovery_generation_ == 0 || next_recovery_batch_id_ >= generation_end)
+                throw std::runtime_error("FRCheck: recovery batch ID exhausted for generation");
+            batch_id = next_recovery_batch_id_++;
+            RecoveryBatchState state;
+            state.batch_start_us = frcheck_now_us();
+            recovery_batches_[batch_id] = state;
         }
         return batch_id;
     }
@@ -1374,7 +1404,6 @@ public:
             return it != recovery_batches_.end() && it->second.closed &&
                    it->second.done >= it->second.expected;
         });
-        recovery_batches_.erase(batch_id);
         lk.unlock();
         print_recovery_batch_profile_();
     }
@@ -1389,6 +1418,7 @@ public:
         if (!legacy_recovery_batch_active_)
             throw std::runtime_error("FRCheck: wait_recovery_batch without reset_recovery_batch");
         wait_recovery_batch_id(legacy_recovery_batch_id_);
+        discard_recovery_batch_milestones_(legacy_recovery_batch_id_);
         legacy_recovery_batch_active_ = false;
     }
 
@@ -1419,6 +1449,37 @@ public:
     }
 
 private:
+    void register_buffer_(uintptr_t addr, size_t size, bool recovery_buffer) {
+        if (!rdma_pd_) return;
+        ibv_mr* mr = ibv_reg_mr(rdma_pd_, (void*)addr, size,
+                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                                 IBV_ACCESS_REMOTE_READ);
+        if (!mr) {
+            if (require_registered_mr_) {
+                throw std::runtime_error(
+                    "FRCheck RDMA: ibv_reg_mr failed for save pipeline (addr=0x" +
+                    std::to_string(addr) + " size=" + std::to_string(size) +
+                    ", GPU pointers need nvidia-peermem for GDR)");
+            }
+            std::cerr << "[FRCheck RDMA] WARNING: ibv_reg_mr failed for addr=0x"
+                      << std::hex << addr << " size=" << std::dec << size
+                      << " (GPU pointers need nvidia-peermem for GDR)" << std::endl;
+            return;
+        }
+
+        std::lock_guard<std::mutex> lk(buf_mtx_);
+        auto existing = registered_bufs_.find(addr);
+        if (existing != registered_bufs_.end()) {
+            if (existing->second.mr) ibv_dereg_mr(existing->second.mr);
+            registered_bufs_.erase(existing);
+        }
+        registered_bufs_.emplace(addr, RdmaBuffer{mr, addr, size});
+        if (recovery_buffer)
+            recovery_buffer_addrs_.insert(addr);
+        else
+            recovery_buffer_addrs_.erase(addr);
+    }
+
     // ---- POA loading ----
     void load_poa_(std::istream& in) {
         table_.clear();
@@ -1796,6 +1857,16 @@ private:
     }
 
     void rs_pool_execute_slice(const RsEncodeJob& job, int wid) {
+        if (job.k <= 0 || job.m <= 0 || job.g_tbls == nullptr ||
+            job.data_ptrs == nullptr || job.parity_ptrs == nullptr)
+            return;
+        for (int i = 0; i < job.k; ++i) {
+            if (job.data_ptrs[i] == nullptr) return;
+        }
+        for (int i = 0; i < job.m; ++i) {
+            if (job.parity_ptrs[i] == nullptr) return;
+        }
+
         int total = job.len;
         int base = total / kRsPoolSize;
         int rem = total % kRsPoolSize;
@@ -1813,9 +1884,11 @@ private:
         std::vector<unsigned char*> src((size_t)job.k);
         for (int i = 0; i < job.k; ++i)
             src[i] = job.data_ptrs[i] + off;
-        unsigned char* dest[2] = { job.parity_ptrs[0] + off, job.parity_ptrs[1] + off };
+        std::vector<unsigned char*> dest((size_t)job.m);
+        for (int i = 0; i < job.m; ++i)
+            dest[i] = job.parity_ptrs[i] + off;
 
-        ec_encode_data(len, job.k, job.m, job.g_tbls, src.data(), dest);
+        ec_encode_data(len, job.k, job.m, job.g_tbls, src.data(), dest.data());
     }
 
     void rs_pool_run_parallel_encode(const RsEncodeJob& job) {
@@ -3119,6 +3192,10 @@ public:
         int expected = 0;
         int done = 0;
         bool closed = false;
+        uint64_t batch_start_us = 0;
+        uint64_t decoder_decode_done_us = 0;
+        uint64_t decoder_send_done_us = 0;
+        uint64_t failed_delivered_us = 0;
     };
 
     struct RecoveryHelperTask {
@@ -3271,7 +3348,7 @@ public:
         uint64_t t0 = frcheck_now_us();
         record_recovery_net_start_(t0);
         send_to_peer(task.decoder_rig, task.stripe_id,
-                     task.helper_block, task.block_size, 0, 3);
+                     task.helper_block, task.block_size, task.batch_id, 3);
         uint64_t t1 = frcheck_now_us();
         record_recovery_net_end_(t1);
         recovery_helper_send_us_.fetch_add(t1 - t0, std::memory_order_relaxed);
@@ -3292,7 +3369,7 @@ public:
                         throw std::runtime_error("FRCheck recovery: missing helper recv buf");
                     recv_from_peer(
                         task.helper_rigs[hi], task.stripe_id,
-                        task.helper_recv_bufs[hi], task.block_size, 0, 3);
+                        task.helper_recv_bufs[hi], task.block_size, task.batch_id, 3);
                 } catch (...) {
                     recv_errors[hi] = std::current_exception();
                 }
@@ -3321,6 +3398,7 @@ public:
                 k, task.survivor_positions, task.failed_pos,
                 survivor_addrs, task.recovered_bufs[0], task.block_size);
             uint64_t t_decode_done = frcheck_now_us();
+            recovery_batch_record_event_(task.batch_id, RecoveryBatchEvent::DECODER_DECODE, t_decode_done);
             record_recovery_decode_end_(t_decode_done);
             recovery_decoder_decode_us_.fetch_add(t_decode_done - t_decode, std::memory_order_relaxed);
             if (task.failed_rigs.empty())
@@ -3338,6 +3416,8 @@ public:
                     k, task.survivor_positions, task.failed_positions[slot],
                     survivor_addrs, task.recovered_bufs[slot], task.block_size);
                 uint64_t t_decode_done = frcheck_now_us();
+                recovery_batch_record_event_(
+                    task.batch_id, RecoveryBatchEvent::DECODER_DECODE, t_decode_done);
                 record_recovery_decode_end_(t_decode_done);
                 recovery_decoder_decode_us_.fetch_add(t_decode_done - t_decode, std::memory_order_relaxed);
                 enqueue_recovery_decoder_send_(
@@ -3371,8 +3451,9 @@ public:
         uint64_t t_send = frcheck_now_us();
         record_recovery_net_start_(t_send);
         send_to_peer(task.failed_rig, task.stripe_id,
-                     task.recovered_buf, task.block_size, 0, 4);
+                     task.recovered_buf, task.block_size, task.batch_id, 4);
         uint64_t t_send_done = frcheck_now_us();
+        recovery_batch_record_event_(task.batch_id, RecoveryBatchEvent::DECODER_SEND, t_send_done);
         record_recovery_net_end_(t_send_done);
         recovery_decoder_send_us_.fetch_add(t_send_done - t_send, std::memory_order_relaxed);
     }
@@ -3381,7 +3462,7 @@ public:
         uint64_t t_recv = frcheck_now_us();
         record_recovery_net_start_(t_recv);
         recv_from_peer(task.decoder_rig, task.stripe_id,
-                       task.recv_buf, task.block_size, 0, 4);
+                       task.recv_buf, task.block_size, task.batch_id, 4);
         uint64_t t_recv_done = frcheck_now_us();
         record_recovery_net_end_(t_recv_done);
         recovery_failed_recv_us_.fetch_add(t_recv_done - t_recv, std::memory_order_relaxed);
@@ -3393,6 +3474,8 @@ public:
                 task.ncopy);
             recovery_failed_copy_us_.fetch_add(frcheck_now_us() - t_copy, std::memory_order_relaxed);
         }
+        recovery_batch_record_event_(
+            task.batch_id, RecoveryBatchEvent::FAILED_DELIVERED, frcheck_now_us());
         recovery_failed_tasks_.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -3576,6 +3659,34 @@ public:
     }
 
 public:
+    py::dict get_recovery_batch_milestones(uint64_t batch_id) {
+        RecoveryBatchState state;
+        {
+            std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+            auto it = recovery_batches_.find(batch_id);
+            if (it == recovery_batches_.end())
+                throw std::runtime_error("FRCheck: unknown recovery batch id");
+            if (!it->second.closed || it->second.done < it->second.expected)
+                throw std::runtime_error("FRCheck: recovery batch is not complete");
+            state = it->second;
+            recovery_batches_.erase(it);
+        }
+        const uint64_t now_us = frcheck_now_us();
+        py::dict result;
+        result["batch_start_us"] = static_cast<double>(state.batch_start_us);
+        result["now_us"] = static_cast<double>(now_us);
+        result["decoder_decode_done_us"] = static_cast<double>(state.decoder_decode_done_us);
+        result["decoder_send_done_us"] = static_cast<double>(state.decoder_send_done_us);
+        result["failed_delivered_us"] = static_cast<double>(state.failed_delivered_us);
+        result["decoder_decode_offset_s"] = event_offset_s_(
+            state.batch_start_us, state.decoder_decode_done_us);
+        result["decoder_send_offset_s"] = event_offset_s_(
+            state.batch_start_us, state.decoder_send_done_us);
+        result["failed_delivered_offset_s"] = event_offset_s_(
+            state.batch_start_us, state.failed_delivered_us);
+        return result;
+    }
+
     py::dict get_recovery_batch_timing_stats() const {
         py::dict result;
         const double helper_send_s = static_cast<double>(
@@ -3622,6 +3733,38 @@ public:
     }
 
 private:
+    enum class RecoveryBatchEvent {
+        DECODER_DECODE,
+        DECODER_SEND,
+        FAILED_DELIVERED,
+    };
+
+    static double event_offset_s_(uint64_t start_us, uint64_t event_us) {
+        return (start_us > 0 && event_us >= start_us)
+            ? static_cast<double>(event_us - start_us) / 1e6
+            : 0.0;
+    }
+
+    void recovery_batch_record_event_(
+        uint64_t batch_id, RecoveryBatchEvent event, uint64_t timestamp_us) {
+        std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+        auto it = recovery_batches_.find(batch_id);
+        if (it == recovery_batches_.end()) return;
+        uint64_t* target = nullptr;
+        if (event == RecoveryBatchEvent::DECODER_DECODE)
+            target = &it->second.decoder_decode_done_us;
+        else if (event == RecoveryBatchEvent::DECODER_SEND)
+            target = &it->second.decoder_send_done_us;
+        else
+            target = &it->second.failed_delivered_us;
+        *target = std::max(*target, timestamp_us);
+    }
+
+    void discard_recovery_batch_milestones_(uint64_t batch_id) {
+        std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+        recovery_batches_.erase(batch_id);
+    }
+
     void print_recovery_batch_profile_() {}
 
     void ensure_recovery_batch_exists_(uint64_t batch_id) {
@@ -3713,10 +3856,14 @@ private:
         if (accept_thread_.joinable())
             accept_thread_.join();
 
-        for (auto& kv : registered_bufs_) {
-            if (kv.second.mr) ibv_dereg_mr(kv.second.mr);
+        {
+            std::lock_guard<std::mutex> lk(buf_mtx_);
+            for (auto& kv : registered_bufs_) {
+                if (kv.second.mr) ibv_dereg_mr(kv.second.mr);
+            }
+            registered_bufs_.clear();
+            recovery_buffer_addrs_.clear();
         }
-        registered_bufs_.clear();
 
         if (rdma_pd_) { ibv_dealloc_pd(rdma_pd_); rdma_pd_ = nullptr; }
         if (rdma_ctx_) { ibv_close_device(rdma_ctx_); rdma_ctx_ = nullptr; }
@@ -3924,6 +4071,7 @@ private:
 
     // Registered buffers (shared across channels)
     std::map<uintptr_t, RdmaBuffer> registered_bufs_;
+    std::set<uintptr_t> recovery_buffer_addrs_;
     std::mutex buf_mtx_;
 
     // TCP acceptor (raw socket)
@@ -3942,7 +4090,10 @@ private:
     bool recovery_dual_failure_ = false;
     bool legacy_recovery_batch_active_ = false;
     uint64_t legacy_recovery_batch_id_ = 0;
-    std::atomic<uint64_t> next_recovery_batch_id_{1};
+    static constexpr uint64_t kRecoveryBatchCycleBits = 20;
+    static constexpr uint64_t kRecoveryGenerationMax = (1ULL << 12) - 1;
+    uint64_t recovery_generation_ = 0;
+    uint64_t next_recovery_batch_id_ = 1;
     std::unordered_map<uint64_t, RecoveryBatchState> recovery_batches_;
     std::mutex recovery_batch_mtx_;
     std::condition_variable recovery_batch_cv_;
@@ -4038,8 +4189,11 @@ PYBIND11_MODULE(frcheck_native, m) {
         // Buffer registration
         .def("register_buffer", &FRCheckNative::register_buffer,
              py::arg("addr"), py::arg("size"))
+        .def("register_recovery_buffer", &FRCheckNative::register_recovery_buffer,
+             py::arg("addr"), py::arg("size"))
         .def("unregister_buffer", &FRCheckNative::unregister_buffer,
              py::arg("addr"))
+        .def("clear_recovery_buffers", &FRCheckNative::clear_recovery_buffers)
 
         // GDR capability
         .def_static("gdr_available", &FRCheckNative::gdr_available)
@@ -4099,6 +4253,9 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("batch_id"))
         .def("wait_recovery_batch_id", &FRCheckNative::wait_recovery_batch_id,
              py::arg("batch_id"), py::call_guard<py::gil_scoped_release>())
+        .def("get_recovery_batch_milestones", &FRCheckNative::get_recovery_batch_milestones,
+             py::arg("batch_id"),
+             "Return and release exact milestones for a completed recovery batch")
         .def("get_recovery_batch_timing_stats", &FRCheckNative::get_recovery_batch_timing_stats,
              "Return timing counters for the most recently completed recovery batch")
         .def("reset_recovery_batch", &FRCheckNative::reset_recovery_batch)

@@ -158,39 +158,232 @@ def _summarize_optimizer_keys(keys) -> Dict[str, int]:
 _FRCHECK_INFO_PROFILE_EVENTS = set()
 
 _frcheck_first_layer_recovery_start_s: Optional[float] = None
-_frcheck_first_layer_recovery_reported: bool = False
 _frcheck_first_layer_recovery_target_idx: Optional[int] = None
+_frcheck_first_layer_milestones: Dict[str, Any] = {}
+_frcheck_first_layer_milestones_lock = threading.Lock()
+_frcheck_first_layer_cuda_start_events: Dict[int, Any] = {}
+_frcheck_first_layer_pending_cuda_events: Dict[str, Dict[str, Any]] = {}
+_frcheck_first_layer_generation: int = 0
+_frcheck_first_layer_failed_rank: bool = False
 
 
 _frcheck_async_runtime_timing_reported: bool = False
 
 
+def _stash_frcheck_first_layer_milestones_locked() -> None:
+    try:
+        from megatron.training.global_vars import stash_recovery_timing_summary
+        stash_recovery_timing_summary(
+            "frcheck_first_layer_milestones", dict(_frcheck_first_layer_milestones)
+        )
+    except Exception:
+        pass
+
+
 def _start_frcheck_first_layer_recovery_timer(target_layer_idx: Optional[int] = None) -> None:
-    global _frcheck_first_layer_recovery_start_s, _frcheck_first_layer_recovery_reported
-    global _frcheck_first_layer_recovery_target_idx
-    _frcheck_first_layer_recovery_start_s = time.time()
-    _frcheck_first_layer_recovery_reported = False
-    _frcheck_first_layer_recovery_target_idx = target_layer_idx
-
-
-def _maybe_report_frcheck_first_layer_recovered(layer_name: str, layer_idx: int) -> None:
-    global _frcheck_first_layer_recovery_reported
-    if _frcheck_first_layer_recovery_reported:
-        return
-    if _frcheck_first_layer_recovery_start_s is None:
-        return
-    target_idx = _frcheck_first_layer_recovery_target_idx
-    if target_idx is not None and layer_idx != target_idx:
-        return
-    _frcheck_first_layer_recovery_reported = True
-    elapsed_s = time.time() - _frcheck_first_layer_recovery_start_s
+    global _frcheck_first_layer_recovery_start_s, _frcheck_first_layer_recovery_target_idx
+    global _frcheck_first_layer_milestones, _frcheck_first_layer_generation
+    global _frcheck_first_layer_failed_rank
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    if rank == 0:
-        logger.info(
-            "FRCheck first model layer recovered: layer=%s layer_idx=%s elapsed_s=%.6f",
-            layer_name, layer_idx, elapsed_s,
+    failed_rank = rank in _get_frcheck_failed_ranks()
+    with _frcheck_first_layer_milestones_lock:
+        _frcheck_first_layer_generation += 1
+        _frcheck_first_layer_recovery_start_s = None
+        _frcheck_first_layer_recovery_target_idx = target_layer_idx
+        _frcheck_first_layer_failed_rank = failed_rank
+        _frcheck_first_layer_cuda_start_events.clear()
+        _frcheck_first_layer_pending_cuda_events.clear()
+        _frcheck_first_layer_milestones = {
+            "layer_idx": int(target_layer_idx) if target_layer_idx is not None else -1,
+            "rank": int(rank),
+            "repair_s": 0.0,
+            "repair_valid": False,
+            "sent_to_failed_s": 0.0,
+            "sent_to_failed_valid": False,
+            "delivered_s": 0.0,
+            "delivered_valid": False,
+            "h2d_s": 0.0,
+            "h2d_valid": False,
+            "forward_done_s": 0.0,
+            "forward_done_valid": False,
+        }
+        _stash_frcheck_first_layer_milestones_locked()
+
+
+def _arm_frcheck_first_layer_cuda_timer() -> None:
+    global _frcheck_first_layer_recovery_start_s
+    try:
+        from megatron.training.global_vars import get_recovery_to_forward_timer_start
+        timer_start_s = get_recovery_to_forward_timer_start()
+    except Exception:
+        timer_start_s = 0.0
+    if timer_start_s <= 0.0:
+        return
+    start_event = None
+    device_idx = -1
+    if torch.cuda.is_available():
+        try:
+            device_idx = torch.cuda.current_device()
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(torch.cuda.current_stream(device_idx))
+        except Exception:
+            start_event = None
+            device_idx = -1
+    with _frcheck_first_layer_milestones_lock:
+        _frcheck_first_layer_recovery_start_s = timer_start_s
+        if start_event is not None:
+            _frcheck_first_layer_cuda_start_events[device_idx] = start_event
+
+
+def _record_frcheck_first_layer_milestone(
+    name: str, layer_idx: int, elapsed_s: float
+) -> None:
+    with _frcheck_first_layer_milestones_lock:
+        if layer_idx != _frcheck_first_layer_recovery_target_idx or elapsed_s < 0.0:
+            return
+        valid_key = f"{name}_valid"
+        if name not in _frcheck_first_layer_milestones:
+            return
+        if _frcheck_first_layer_milestones.get(valid_key, False):
+            elapsed_s = max(float(_frcheck_first_layer_milestones[name]), elapsed_s)
+        _frcheck_first_layer_milestones[name] = float(elapsed_s)
+        _frcheck_first_layer_milestones[valid_key] = True
+        _stash_frcheck_first_layer_milestones_locked()
+
+
+def _record_frcheck_first_layer_cuda_event(name: str, layer_idx: int) -> None:
+    if layer_idx != _frcheck_first_layer_recovery_target_idx:
+        return
+    if not _frcheck_first_layer_failed_rank:
+        return
+    if not torch.cuda.is_available():
+        timer_start_s = _frcheck_first_layer_recovery_start_s
+        if timer_start_s is not None:
+            _record_frcheck_first_layer_milestone(
+                name, layer_idx, max(0.0, time.time() - timer_start_s)
+            )
+        return
+    with _frcheck_first_layer_milestones_lock:
+        if (
+            layer_idx != _frcheck_first_layer_recovery_target_idx
+            or _frcheck_first_layer_milestones.get(f"{name}_valid", False)
+            or name in _frcheck_first_layer_pending_cuda_events
+        ):
+            return
+        generation = _frcheck_first_layer_generation
+        timer_start_s = _frcheck_first_layer_recovery_start_s
+    if timer_start_s is None:
+        return
+    try:
+        device_idx = torch.cuda.current_device()
+        stream = torch.cuda.current_stream(device_idx)
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(stream)
+    except Exception:
+        return
+    with _frcheck_first_layer_milestones_lock:
+        if generation != _frcheck_first_layer_generation:
+            return
+        _frcheck_first_layer_pending_cuda_events.setdefault(
+            name,
+            {
+                "event": event,
+                "device": device_idx,
+                "generation": generation,
+                "layer_idx": layer_idx,
+            },
         )
 
+
+def resolve_frcheck_first_layer_cuda_events() -> None:
+    if _frcheck_first_layer_recovery_start_s is None:
+        return
+    with _frcheck_first_layer_milestones_lock:
+        pending = dict(_frcheck_first_layer_pending_cuda_events)
+        start_events = dict(_frcheck_first_layer_cuda_start_events)
+        generation = _frcheck_first_layer_generation
+    resolved = {}
+    for name, item in pending.items():
+        if item.get("generation") != generation:
+            continue
+        device_idx = int(item["device"])
+        start_event = start_events.get(device_idx)
+        if start_event is None:
+            continue
+        try:
+            item["event"].synchronize()
+            elapsed_s = float(start_event.elapsed_time(item["event"])) / 1000.0
+        except Exception:
+            continue
+        resolved[name] = (int(item["layer_idx"]), elapsed_s)
+    if not resolved:
+        return
+    with _frcheck_first_layer_milestones_lock:
+        if generation != _frcheck_first_layer_generation:
+            return
+        for name, (layer_idx, elapsed_s) in resolved.items():
+            if layer_idx != _frcheck_first_layer_recovery_target_idx:
+                continue
+            valid_key = f"{name}_valid"
+            if name not in _frcheck_first_layer_milestones:
+                continue
+            _frcheck_first_layer_milestones[name] = float(elapsed_s)
+            _frcheck_first_layer_milestones[valid_key] = True
+            _frcheck_first_layer_pending_cuda_events.pop(name, None)
+        _stash_frcheck_first_layer_milestones_locked()
+
+
+def _record_frcheck_native_batch_milestones(
+    native, batch_id: int, layer_idx: int
+) -> None:
+    if layer_idx != _frcheck_first_layer_recovery_target_idx:
+        native.get_recovery_batch_milestones(batch_id)
+        return
+    milestones = dict(native.get_recovery_batch_milestones(batch_id))
+    try:
+        from megatron.training.global_vars import get_recovery_to_forward_timer_start
+        timer_start_s = get_recovery_to_forward_timer_start()
+    except Exception:
+        timer_start_s = 0.0
+    native_now_us = float(milestones.get("now_us", 0.0) or 0.0)
+    if timer_start_s <= 0.0 or native_now_us <= 0.0:
+        return
+    wall_now_s = time.time()
+    for event_key, metric_name in (
+        ("decoder_decode_done_us", "repair_s"),
+        ("decoder_send_done_us", "sent_to_failed_s"),
+        ("failed_delivered_us", "delivered_s"),
+    ):
+        event_us = float(milestones.get(event_key, 0.0) or 0.0)
+        if event_us <= 0.0:
+            continue
+        event_wall_s = wall_now_s - max(0.0, native_now_us - event_us) / 1.0e6
+        _record_frcheck_first_layer_milestone(
+            metric_name, layer_idx, max(0.0, event_wall_s - timer_start_s)
+        )
+
+
+def _get_frcheck_failed_ranks() -> Set[int]:
+    try:
+        from megatron.training import get_args
+        args = get_args()
+    except Exception:
+        return set()
+    configured = getattr(args, "frcheck_failed_ranks_parsed", None)
+    if configured is None:
+        configured = getattr(args, "frcheck_failed_ranks", None)
+    if configured is None:
+        return set()
+    if isinstance(configured, str):
+        configured = [value.strip() for value in configured.split(",") if value.strip()]
+    try:
+        return {int(value) for value in configured}
+    except (TypeError, ValueError):
+        return set()
+
+
+def record_frcheck_first_layer_forward_done(layer_idx: int) -> None:
+    _record_frcheck_first_layer_cuda_event("forward_done_s", layer_idx)
 
 def _frcheck_recovery_profile(role: str, event: str, **fields) -> None:
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -736,6 +929,8 @@ class _FRCheckLayerwiseRuntime:
                 dst.copy_(tensor.to(device=dst.device, dtype=dst.dtype), non_blocking=True)
                 copied += tensor.numel() * tensor.element_size()
                 matched += 1
+        if layer_idx == _frcheck_first_layer_recovery_target_idx and matched > 0:
+            _record_frcheck_first_layer_cuda_event("h2d_s", layer_idx)
         self._injected_layers.add(layer_idx)
         inject_s = time.time() - t0
         self.inject_s += inject_s
@@ -938,8 +1133,9 @@ class _FRCheckRecoveryService:
         global _active_layerwise_runtime, _active_recovery_worker
         global _recovery_async_parity_initialized, _recovery_async_parity_submitted
         global _recovery_async_parity_thread, _recovery_async_parity_error
-        global _pending_recovery_parity_repair
+        global _pending_recovery_parity_repair, _frcheck_async_runtime_timing_reported
         self.role = role
+        _frcheck_async_runtime_timing_reported = False
         self.runtime = None
         self.worker = None
         _active_layerwise_runtime = None
@@ -1410,13 +1606,17 @@ def frcheck_materialize_first_layer_for_timer() -> bool:
     return True
 
 
-def frcheck_register_pending_optimizer_state(state_dict: Dict[str, Any]) -> bool:
-    """Keep optimizer state_dict for loading at the first optimizer consumption point."""
+def frcheck_register_pending_optimizer_state(
+    state_dict: Dict[str, Any], allow_without_runtime: bool = False,
+) -> bool:
+    """Keep optimizer state_dict alive until its first consumption point."""
     global _pending_optimizer_container, _pending_optimizer_state
     runtime = _active_layerwise_runtime
-    if runtime is None:
+    if runtime is None and not allow_without_runtime:
         return False
-    if not any(r.contains_optimizer_state for r in runtime._records_by_layer.values()):
+    if runtime is not None and not any(
+        r.contains_optimizer_state for r in runtime._records_by_layer.values()
+    ):
         return False
     optim_state = state_dict.pop("optimizer", None)
     if optim_state is None:
@@ -1424,9 +1624,14 @@ def frcheck_register_pending_optimizer_state(state_dict: Dict[str, Any]) -> bool
     _pending_optimizer_container = {"optimizer": optim_state}
     _pending_optimizer_state = optim_state
     if _frcheck_debug_enabled():
+        deferred_layers = 0 if runtime is None else sum(
+            1 for r in runtime._records_by_layer.values() if r.contains_optimizer_state
+        )
         logger.debug(
-            "FRCheck optimizer recovery: deferred optimizer load for %d layers",
-            sum(1 for r in runtime._records_by_layer.values() if r.contains_optimizer_state),
+            "FRCheck optimizer recovery: deferred optimizer load for %d layers "
+            "(runtime=%s)",
+            deferred_layers,
+            runtime is not None,
         )
     return True
 
@@ -1452,10 +1657,16 @@ def frcheck_normalize_optimizer_state_param_keys(optim_state: Dict[str, Any]) ->
 
 
 def _assign_deferred_optimizer_tensor(root: Dict[str, Any], flat_key: str, tensor: torch.Tensor) -> bool:
-    """Materialize only optimizer tensors still needed after model->main sync."""
-    if flat_key.startswith("optimizer.fp32_params_flat."):
-        # Failed-rank fp32 master params are restored by copying injected model
-        # params into the live optimizer. Avoid reconstructing flat fp32 state.
+    """Materialize optimizer tensors without aliasing recovery buffers."""
+    fp32_prefix = "optimizer.fp32_params_flat."
+    if flat_key.startswith(fp32_prefix):
+        suffix = flat_key[len(fp32_prefix):]
+        if not suffix:
+            return False
+        flat = root.setdefault("fp32_params_flat", {})
+        if not isinstance(flat, dict):
+            return False
+        flat[suffix] = tensor.detach().clone()
         return True
 
     if not flat_key.startswith("optimizer.optimizer.state."):
@@ -1482,7 +1693,8 @@ def _assign_deferred_optimizer_tensor(root: Dict[str, Any], flat_key: str, tenso
     entry = state.setdefault(state_key, {})
     if not isinstance(entry, dict):
         return False
-    entry[leaf] = tensor
+    # Optimizer state must not alias reusable FRCheck recovery buffers.
+    entry[leaf] = tensor.detach().clone()
     return True
 
 
@@ -1506,9 +1718,7 @@ def _sync_frcheck_model_params_to_optimizer_main_params(optimizer) -> bool:
 
 
 def _install_current_fp32_params_for_optimizer_load(optimizer, optim_state: Dict[str, Any]) -> None:
-    """Use live fp32 master params already synced from recovered model params."""
-    optim_state.pop("fp32_params_flat", None)
-    optim_state.pop("_fp32_structure", None)
+    """Fallback to live fp32 master params when the checkpoint lacks them."""
     if "fp32_from_fp16_params" in optim_state:
         return
 
@@ -1564,13 +1774,44 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
     service = _get_active_frcheck_recovery_service()
     runtime = service.runtime
     if runtime is None:
+        loaded = False
+        if _pending_optimizer_state is not None and optimizer is not None:
+            # Survivor state may reference reusable recovery buffers. Preserve the
+            # original ownership guarantee, but move the clone off the first-forward
+            # critical path together with optimizer loading.
+            from megatron.training.checkpointing import _clone_inprocess_optimizer_tensors
+
+            t_clone = time.time()
+            optimizer_state = _clone_inprocess_optimizer_tensors(
+                _pending_optimizer_state
+            )
+            clone_s = time.time() - t_clone
+            t_load = time.time()
+            optimizer.load_state_dict(optimizer_state)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            load_s = time.time() - t_load
+            logger.info(
+                "FRCheck deferred survivor optimizer restore: clone_s=%.4fs "
+                "load_s=%.4fs total_s=%.4fs",
+                clone_s,
+                load_s,
+                clone_s + load_s,
+            )
+            _pending_optimizer_container = None
+            _pending_optimizer_state = None
+            loaded = True
         _finish_recovery_parity_repair_submissions("after_optimizer_state", service.role)
-        if _pending_recovery_parity_repair is None and not service.safe_point_teardown_done:
+        if (
+            _pending_recovery_parity_repair is None
+            and _pending_optimizer_state is None
+            and not service.safe_point_teardown_done
+        ):
             _flush_recovery_async_parity("after_optimizer_state", service.role)
             _teardown_frcheck_native_after_load()
             service.safe_point_teardown_done = True
             service.state = service.TORN_DOWN
-        return False
+        return loaded
     t0 = time.time()
     if not runtime.optimizer_materialized and optimizer is not None:
         if _sync_frcheck_model_params_to_optimizer_main_params(optimizer):
@@ -1606,6 +1847,10 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
             "FRCheck optimizer recovery: incomplete deferred optimizer "
             f"materialization ({updated}/{expected})"
         )
+    from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
+        unflatten_optimizer_fp32_params,
+    )
+    unflatten_optimizer_fp32_params({"optimizer": _pending_optimizer_state})
     _install_current_fp32_params_for_optimizer_load(optimizer, _pending_optimizer_state)
     t_load = time.time()
     optimizer.load_state_dict(_pending_optimizer_state)
@@ -1631,6 +1876,7 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
         t_sync = time.time()
         torch.cuda.synchronize()
         runtime.optimizer_sync_s += time.time() - t_sync
+    _log_frcheck_async_runtime_timing_once("after_optimizer_state")
     if _frcheck_debug_enabled():
         logger.debug(
             "FRCheck optimizer recovery: loaded deferred optimizer state in %.4fs "
@@ -1663,7 +1909,8 @@ def _log_frcheck_async_runtime_timing_once(context: str) -> None:
     wait_s = float(runtime.get("wait_s", 0.0) or 0.0)
     materialized_layers = float(runtime.get("materialized_layers", 0.0) or 0.0)
     injected_layers = float(runtime.get("injected_layers", 0.0) or 0.0)
-    values = _timing_max_dict({
+    first_wait_s = float(runtime.get("first_wait_s", 0.0) or 0.0)
+    local_values = {
         "layer_inject_s": layer_inject_s,
         "forward_wait_model_s": forward_wait_model_s,
         "optimizer_wait_s": optimizer_wait_s,
@@ -1675,7 +1922,20 @@ def _log_frcheck_async_runtime_timing_once(context: str) -> None:
         "wait_s": wait_s,
         "materialized_layers": materialized_layers,
         "injected_layers": injected_layers,
-    })
+        "first_wait_s": first_wait_s,
+    }
+    try:
+        from megatron.training import get_args
+        inprocess_recovery = bool(
+            getattr(get_args(), "ft_inprocess_recovery_benchmark", False)
+        )
+    except Exception:
+        inprocess_recovery = False
+    # In-process recovery reaches the common forward-backward boundary on every rank.
+    # Defer its report until then so failed-rank runtime values can be aggregated.
+    if inprocess_recovery and context != "after_forward_backward":
+        return
+    values = _timing_max_dict(local_values)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     _frcheck_async_runtime_timing_reported = True
     if rank == 0:
@@ -1683,7 +1943,8 @@ def _log_frcheck_async_runtime_timing_once(context: str) -> None:
             "FRCheck async runtime timing (%s): layer_inject_s=%.6fs "
             "optimizer_materialize_s=%.6fs optimizer_load_s=%.6fs "
             "optimizer_sync_s=%.6fs h2d_s=%.6fs forward_wait_model_s=%.6fs "
-            "optimizer_wait_s=%.6fs wait_s=%.6fs materialized_layers=%d injected_layers=%d",
+            "optimizer_wait_s=%.6fs wait_s=%.6fs first_wait_s=%.6fs "
+            "materialized_layers=%d injected_layers=%d",
             context,
             values["layer_inject_s"],
             values["optimizer_materialize_s"],
@@ -1693,10 +1954,19 @@ def _log_frcheck_async_runtime_timing_once(context: str) -> None:
             values["forward_wait_model_s"],
             values["optimizer_wait_s"],
             values["wait_s"],
+            values["first_wait_s"],
             int(values["materialized_layers"]),
             int(values["injected_layers"]),
         )
 
+
+
+def finalize_frcheck_recovery_timing() -> None:
+    """Resolve deferred CUDA milestones and log one completed recovery cycle."""
+    if _frcheck_first_layer_recovery_start_s is None:
+        return
+    resolve_frcheck_first_layer_cuda_events()
+    _log_frcheck_async_runtime_timing_once("after_forward_backward")
 
 def frcheck_recovery_safe_point(point: str) -> None:
     """Optional safe point for future async recovery wait/teardown orchestration."""
@@ -1735,9 +2005,16 @@ def frcheck_recovery_safe_point(point: str) -> None:
     )
     if should_wait:
         service.wait_all(reason=point)
-        _log_frcheck_async_runtime_timing_once(point)
+        # At before_optimizer_step the deferred optimizer state may still be loaded
+        # immediately after this safe-point check. Log after that load so optimizer
+        # materialize/load/sync time is included.
+        if not (point == "before_optimizer_step" and _pending_optimizer_state is not None):
+            _log_frcheck_async_runtime_timing_once(point)
         _finish_recovery_parity_repair_submissions(point, service.role)
-        if _pending_recovery_parity_repair is None:
+        if (
+            _pending_recovery_parity_repair is None
+            and _pending_optimizer_state is None
+        ):
             _flush_recovery_async_parity(point, service.role)
             _teardown_frcheck_native_after_load()
             service.safe_point_teardown_done = True
@@ -2530,6 +2807,14 @@ def _save_frcheck_stripe_files(
         ]
         for fut in futures:
             fut.result()
+
+
+def wait_for_frcheck_parity_flush() -> None:
+    """Drain FRCheck save-side parity work before in-process recovery."""
+    _wait_previous_async_writers(debug=_frcheck_debug_enabled())
+    native = FRCheckManager().get_native()
+    if native is not None and hasattr(native, "wait_parity_flush"):
+        native.wait_parity_flush()
 
 
 def _async_write_frcheck_encoder_p1_files(
@@ -4150,7 +4435,7 @@ def _allocate_recovery_buf_pool(
         bufs_to_register.append(failed_layer_buf)
 
     for buf in bufs_to_register:
-        native.register_buffer(buf.data_ptr(), buf.numel())
+        native.register_recovery_buffer(buf.data_ptr(), buf.numel())
 
     return _RecoveryBufPool(
         decoder_recv_bufs=decoder_recv_bufs,
@@ -4183,7 +4468,7 @@ def _preallocate_stable_failed_layer_bufs(
             continue
         size = num_source_stripes * job.layer_block_size
         buf = allocate_hugepage_tensor(size, fallback_pin_memory=True)
-        native.register_buffer(buf.data_ptr(), buf.numel())
+        native.register_recovery_buffer(buf.data_ptr(), buf.numel())
         stable[job.layer_idx] = buf
     buf_pool.stable_failed_layer_bufs = stable
 
@@ -5025,7 +5310,13 @@ def _submit_recovery_parity_repair(
         timing["submit_s"] += batch_timing.get("reset_s", 0.0) + batch_timing.get("submit_s", 0.0)
     for batch_timing in batch_timings:
         wait_t0 = time.time()
-        native.wait_recovery_batch_id(int(batch_timing.get("batch_id", 0)))
+        batch_id = int(batch_timing.get("batch_id", 0))
+        native.wait_recovery_batch_id(batch_id)
+        if hasattr(native, "get_recovery_batch_milestones"):
+            # Parity repair runs after failed training data is available and is not
+            # part of the first-layer recovery critical path. Consume the native
+            # record to release it without merging it into first-layer milestones.
+            native.get_recovery_batch_milestones(batch_id)
         wait_s = time.time() - wait_t0
         timing["wait_s"] += wait_s
     timing["waves"] = float(len(batch_timings))
@@ -5174,6 +5465,17 @@ def _run_recovery_pipeline(
     aggregate_timing: Dict[int, Dict[str, float]] = {}
     first_network_done = {"time": 0.0}
     last_materialize_done = {"time": 0.0}
+    last_model_done = {"time": 0.0}
+    last_optimizer_done = {"time": 0.0}
+    last_common_done = {"time": 0.0}
+    pipeline_start_delay_s = 0.0
+    try:
+        from megatron.training.global_vars import get_recovery_to_forward_timer_start
+        recovery_to_forward_start_s = get_recovery_to_forward_timer_start()
+        if recovery_to_forward_start_s > 0.0:
+            pipeline_start_delay_s = max(0.0, t_pipeline - recovery_to_forward_start_s)
+    except Exception:
+        pipeline_start_delay_s = 0.0
     error_holder: Dict[str, Optional[BaseException]] = {"error": None}
 
     def _network_worker() -> None:
@@ -5213,9 +5515,12 @@ def _run_recovery_pipeline(
             job = recovered.window.job
             layer_timing = aggregate_timing.get(id(job), {})
             t_wait = time.time()
-            native.wait_recovery_batch_id(int(recovered.timing.get('batch_id', 0)))
+            batch_id = int(recovered.timing.get('batch_id', 0))
+            native.wait_recovery_batch_id(batch_id)
             wait_s = time.time() - t_wait
             recovered.timing['wait_s'] = wait_s
+            if hasattr(native, 'get_recovery_batch_milestones'):
+                _record_frcheck_native_batch_milestones(native, batch_id, job.layer_idx)
             batch_timing = {}
             if hasattr(native, 'get_recovery_batch_timing_stats'):
                 batch_timing = dict(native.get_recovery_batch_timing_stats())
@@ -5231,6 +5536,10 @@ def _run_recovery_pipeline(
                 if end_us > 0.0:
                     layer_timing[end_key] = max(float(layer_timing.get(end_key, 0.0) or 0.0), end_us)
             layer_timing['failed_copy_s'] = layer_timing.get('failed_copy_s', 0.0) + float(batch_timing.get('copy_s', 0.0) or 0.0)
+            layer_timing['decoder_decode_sum_s'] = (
+                layer_timing.get('decoder_decode_sum_s', 0.0)
+                + float(batch_timing.get('decoder_decode_sum_s', 0.0) or 0.0)
+            )
             layer_timing['network_wait_s'] += wait_s
             layer_timing['wait_s'] = layer_timing['network_wait_s']
             _frcheck_recovery_profile(
@@ -5353,8 +5662,14 @@ def _run_recovery_pipeline(
         )
         results.append((record, layer_timing))
         materialized_jobs.add(id(job))
-        last_materialize_done["time"] = time.time()
-        _maybe_report_frcheck_first_layer_recovered(job.layer_name, job.layer_idx)
+        done_time = time.time()
+        last_materialize_done["time"] = done_time
+        if record is not None and record.model_tensor_keys:
+            last_model_done["time"] = done_time
+        if record is not None and record.optimizer_tensor_keys:
+            last_optimizer_done["time"] = done_time
+        if record is None or job.layer_idx < 0:
+            last_common_done["time"] = done_time
         _frcheck_recovery_profile(
             recovery_role, "pipeline_job_done", layer=job.layer_name,
             layer_idx=job.layer_idx,
@@ -5378,20 +5693,27 @@ def _run_recovery_pipeline(
     total_materialize_s = sum(timing.get('materialize_s', 0.0) for _record, timing in results)
     net_starts = [float(timing.get('net_start_us', 0.0) or 0.0) for _record, timing in results]
     net_ends = [float(timing.get('net_end_us', 0.0) or 0.0) for _record, timing in results]
-    decode_starts = [float(timing.get('decode_start_us', 0.0) or 0.0) for _record, timing in results]
-    decode_ends = [float(timing.get('decode_end_us', 0.0) or 0.0) for _record, timing in results]
     net_start_us = min((value for value in net_starts if value > 0.0), default=0.0)
     net_end_us = max(net_ends, default=0.0)
-    decode_start_us = min((value for value in decode_starts if value > 0.0), default=0.0)
-    decode_end_us = max(decode_ends, default=0.0)
     total_recovery_net_s = ((net_end_us - net_start_us) / 1.0e6) if net_start_us > 0.0 and net_end_us > net_start_us else 0.0
-    total_recovery_decode_s = ((decode_end_us - decode_start_us) / 1.0e6) if decode_start_us > 0.0 and decode_end_us > decode_start_us else 0.0
+    total_recovery_decode_s = sum(
+        timing.get('decoder_decode_sum_s', 0.0) for _record, timing in results
+    )
     total_failed_copy_s = sum(timing.get('failed_copy_s', 0.0) for _record, timing in results)
     for _record, timing in results:
         timing['pipeline_overlap_s'] = overlap_s
         timing['pipeline_critical_s'] = elapsed
     first_network_done_s = (
         first_network_done["time"] - t_pipeline if first_network_done["time"] else 0.0
+    )
+    last_model_done_s = (
+        last_model_done["time"] - t_pipeline if last_model_done["time"] else 0.0
+    )
+    last_optimizer_done_s = (
+        last_optimizer_done["time"] - t_pipeline if last_optimizer_done["time"] else 0.0
+    )
+    last_common_done_s = (
+        last_common_done["time"] - t_pipeline if last_common_done["time"] else 0.0
     )
     last_materialize_done_s = (
         last_materialize_done["time"] - t_pipeline if last_materialize_done["time"] else 0.0
@@ -5407,7 +5729,11 @@ def _run_recovery_pipeline(
         "serial_work_s": serial_work_s,
         "pipeline_overlap_s": overlap_s,
         "first_network_done_s": first_network_done_s,
+        "last_model_done_s": last_model_done_s,
+        "last_optimizer_done_s": last_optimizer_done_s,
+        "last_common_done_s": last_common_done_s,
         "last_materialize_done_s": last_materialize_done_s,
+        "pipeline_start_delay_s": pipeline_start_delay_s,
     }
     try:
         from megatron.training.global_vars import stash_recovery_timing_summary
@@ -5779,7 +6105,7 @@ def _prepare_recovery_layer_buffers(
         blk = preloaded_blocks.get(sid)
         if blk is None:
             blk = torch.zeros(layer_block_size, dtype=torch.uint8)
-            native.register_buffer(blk.data_ptr(), blk.numel())
+            native.register_recovery_buffer(blk.data_ptr(), blk.numel())
         my_blocks[sid] = blk
 
     layer_buf = None
@@ -5795,7 +6121,7 @@ def _prepare_recovery_layer_buffers(
             layer_buf = allocate_hugepage_tensor(
                 num_source_stripes * layer_block_size, fallback_pin_memory=True,
             )
-            native.register_buffer(layer_buf.data_ptr(), layer_buf.numel())
+            native.register_recovery_buffer(layer_buf.data_ptr(), layer_buf.numel())
 
     return my_blocks, layer_buf, len(decoder_stripes), len(helper_stripes), len(failed_stripes)
 
@@ -6036,7 +6362,7 @@ def _submit_recovery_network(
         blk = preloaded_blocks.get(sid)
         if blk is None:
             blk = torch.zeros(layer_block_size, dtype=torch.uint8)
-            native.register_buffer(blk.data_ptr(), blk.numel())
+            native.register_recovery_buffer(blk.data_ptr(), blk.numel())
         my_blocks[sid] = blk
 
     layer_buf = None
@@ -6052,7 +6378,7 @@ def _submit_recovery_network(
             layer_buf = allocate_hugepage_tensor(
                 num_source_stripes * layer_block_size, fallback_pin_memory=True,
             )
-            native.register_buffer(layer_buf.data_ptr(), layer_buf.numel())
+            native.register_recovery_buffer(layer_buf.data_ptr(), layer_buf.numel())
 
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
 
@@ -6292,9 +6618,29 @@ def _teardown_frcheck_native_after_load() -> None:
     role = getattr(manager, "_frcheck_recovery_role", "unknown")
     try:
         from megatron.training import get_args
-        defer_teardown = bool(getattr(get_args(), "frcheck_defer_load_teardown", False))
+        args = get_args()
     except Exception:
-        defer_teardown = False
+        args = None
+
+    inprocess_reuse = bool(
+        args is not None
+        and getattr(args, "ft_inprocess_recovery_benchmark", False)
+    )
+    if inprocess_reuse:
+        _flush_recovery_async_parity("load_teardown_inprocess_reuse", role)
+        manager.end_recovery()
+        _frcheck_recovery_profile(role, "teardown_skipped_inprocess_reuse")
+        if _frcheck_debug_enabled():
+            logger.info(
+                "FRCheck legacy load: keeping native module alive for in-process reuse (rank %d)",
+                rank,
+            )
+        return
+
+    defer_teardown = bool(
+        args is not None
+        and getattr(args, "frcheck_defer_load_teardown", False)
+    )
     if defer_teardown:
         _frcheck_recovery_profile(role, "teardown_deferred")
         if _frcheck_debug_enabled():
@@ -6303,17 +6649,19 @@ def _teardown_frcheck_native_after_load() -> None:
                 rank,
             )
         return
-    try:
-        skip_barrier = bool(getattr(get_args(), "frcheck_skip_load_teardown_barrier", False))
-    except Exception:
-        skip_barrier = False
+    skip_barrier = bool(
+        args is not None
+        and getattr(args, "frcheck_skip_load_teardown_barrier", False)
+    )
     _flush_recovery_async_parity("load_teardown", role)
     _frcheck_recovery_profile(role, "teardown_start", sync=not skip_barrier)
     t_cleanup = time.time()
     if _frcheck_debug_enabled():
         logger.info("FRCheck legacy load: cleaning up native module (rank %d)", rank)
-    args = get_args()
-    recovery_only = bool(getattr(args, "frcheck_recovery_only_teardown", False))
+    recovery_only = bool(
+        args is not None
+        and getattr(args, "frcheck_recovery_only_teardown", False)
+    )
     if recovery_only and hasattr(manager, "cleanup_recovery"):
         manager.cleanup_recovery(teardown=True, sync=not skip_barrier)
     else:
@@ -6473,7 +6821,7 @@ def recover_frcheck_legacy_hardware(
         for blocks in preloaded.values():
             for blk in blocks.values():
                 if blk.numel() > 1:
-                    native.register_buffer(blk.data_ptr(), blk.numel())
+                    native.register_recovery_buffer(blk.data_ptr(), blk.numel())
     timings['disk_io'] = time.time() - t_disk
 
     if is_survivor and not involved and _dbg:
@@ -6556,6 +6904,15 @@ def recover_frcheck_legacy_hardware(
             continue
         recovery_jobs.append(job)
 
+    recovery_jobs = _sort_recovery_jobs_by_forward_priority(recovery_jobs)
+    if _dbg:
+        logger.info(
+            "FRCheck recovery job order rank=%d role=%s: %s",
+            rank,
+            recovery_role,
+            [(job.layer_name, job.layer_idx, job.encode_iter) for job in recovery_jobs],
+        )
+
     buf_pool = _allocate_recovery_buf_pool(
         native, n, max_block_size, is_failed, is_decoder, is_helper,
         dual_failure=getattr(manager, 'recovery_dual_failure', False),
@@ -6595,7 +6952,7 @@ def recover_frcheck_legacy_hardware(
         for blocks in parity_preloaded.values():
             for blk in blocks.values():
                 if blk.numel() > 1:
-                    native.register_buffer(blk.data_ptr(), blk.numel())
+                    native.register_recovery_buffer(blk.data_ptr(), blk.numel())
         _set_pending_recovery_parity_repair(
             recovery_jobs, buf_pool, checkpoint_dir, rank,
             all_layer_metadata, recovery_role, parity_preloaded=parity_preloaded
@@ -6625,13 +6982,23 @@ def recover_frcheck_legacy_hardware(
     )
     t_net = time.time()
     _start_frcheck_first_layer_recovery_timer(first_recovery_layer_idx)
-    try:
-        from megatron.training.global_vars import start_recovery_to_forward_timer
-        start_recovery_to_forward_timer(
-            "FRCheck", "network_decode", role=recovery_role, rank0_only_max=True,
-        )
-    except Exception:
-        pass
+    recovery_to_forward_started = False
+
+    def _start_recovery_to_forward_from_pipeline_start() -> None:
+        nonlocal recovery_to_forward_started
+        if recovery_to_forward_started:
+            return
+        recovery_to_forward_started = True
+        try:
+            from megatron.training.global_vars import start_recovery_to_forward_timer
+            start_recovery_to_forward_timer(
+                "FRCheck", "recovery_pipeline_start",
+                role=recovery_role, rank0_only_max=True,
+            )
+            _arm_frcheck_first_layer_cuda_timer()
+        except Exception:
+            pass
+
     def _accumulate_layer_timings(
         layer_results: List[Tuple[Optional[_FRCheckLayerReadyRecord], Dict[str, float]]]
     ) -> None:
@@ -6670,6 +7037,7 @@ def recover_frcheck_legacy_hardware(
         sync_jobs = [job for job in recovery_jobs if job.layer_idx < 0]
         async_jobs = [job for job in recovery_jobs if job.layer_idx >= 0]
         if sync_jobs:
+            _start_recovery_to_forward_from_pipeline_start()
             sync_results = _run_recovery_pipeline(
                 sync_jobs, manager, native, n, rank, is_failed, preloaded,
                 buf_pool, full_buf, global_tensor_infos,
@@ -6684,6 +7052,7 @@ def recover_frcheck_legacy_hardware(
                 if record is not None:
                     layerwise_records.append(record)
         if async_jobs:
+            _start_recovery_to_forward_from_pipeline_start()
             worker = _start_layer_recovery_worker(
                 async_jobs, manager, native, n, rank, is_failed, preloaded,
                 buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
@@ -6710,6 +7079,7 @@ def recover_frcheck_legacy_hardware(
                     safe_point, rank,
                 )
     elif async_forward and involved and recovery_jobs:
+        _start_recovery_to_forward_from_pipeline_start()
         worker = _start_layer_recovery_worker(
             recovery_jobs, manager, native, n, rank, is_failed, preloaded,
             buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
@@ -6734,6 +7104,7 @@ def recover_frcheck_legacy_hardware(
                 safe_point, rank,
             )
     else:
+        _start_recovery_to_forward_from_pipeline_start()
         sync_results = _run_recovery_pipeline(
             recovery_jobs, manager, native, n, rank, is_failed, preloaded,
             buf_pool, full_buf, global_tensor_infos,

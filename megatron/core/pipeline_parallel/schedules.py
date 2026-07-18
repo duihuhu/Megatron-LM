@@ -28,6 +28,16 @@ from .combined_1f1b import combined_1f1b_schedule_for_no_pipelining
 Shape = Union[List[int], torch.Size]
 
 
+def _mark_recovery_to_forward_timer(label: str) -> None:
+    """Record optional FT diagnostics without coupling core schedules to training."""
+    try:
+        from megatron.training.global_vars import mark_recovery_to_forward_timer
+
+        mark_recovery_to_forward_timer(label)
+    except (ImportError, RuntimeError):
+        pass
+
+
 def get_forward_backward_func():
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
@@ -489,6 +499,7 @@ def forward_backward_no_pipelining(
     config = get_model_config(model)
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+        _mark_recovery_to_forward_timer("forward_backward_timer_start_done")
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -775,6 +786,7 @@ def forward_backward_pipelining_with_interleaving(
 
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+        _mark_recovery_to_forward_timer("forward_backward_timer_start_done")
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
@@ -1681,6 +1693,7 @@ def get_tensor_shapes(
 
 def recv_forward(tensor_shapes, config, is_first_stage):
     """Wrapper for p2p_communication.recv_forward used with non-interleaving schedule."""
+    _mark_recovery_to_forward_timer("first_forward_recv_start")
     input_tensors = []
     for tensor_shape in tensor_shapes:
         if tensor_shape is None:
@@ -1689,6 +1702,7 @@ def recv_forward(tensor_shapes, config, is_first_stage):
             input_tensors.append(
                 p2p_communication.recv_forward(tensor_shape, config, is_first_stage)
             )
+    _mark_recovery_to_forward_timer("first_forward_recv_done")
     return input_tensors
 
 
@@ -1799,6 +1813,7 @@ def forward_backward_pipelining_without_interleaving(
 
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+        _mark_recovery_to_forward_timer("forward_backward_timer_start_done")
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func

@@ -361,6 +361,37 @@ def validate_args(args, defaults={}):
             "At most one of --use-ecnaive, --use-eclatin, --use-frcheck, "
             "and --use-gemini-replicas may be enabled."
         )
+    if getattr(args, "ft_inprocess_recovery_benchmark", False):
+        if args.ckpt_format != "torch":
+            raise RuntimeError(
+                "--ft-inprocess-recovery-benchmark requires --ckpt-format torch"
+            )
+        if args.load is None:
+            raise RuntimeError(
+                "--ft-inprocess-recovery-benchmark requires --load"
+            )
+        # With no FT legacy scheme enabled, use the in-process benchmark as a
+        # native Megatron legacy load baseline.
+        train_iter = getattr(args, "ft_inprocess_recovery_after_train_iter", None)
+        save_iter = getattr(args, "ft_inprocess_recovery_after_save_iter", None)
+        if train_iter is not None and train_iter < 0:
+            raise RuntimeError(
+                "--ft-inprocess-recovery-after-train-iter must be >= 0"
+            )
+        if save_iter is not None and save_iter < 0:
+            raise RuntimeError(
+                "--ft-inprocess-recovery-after-save-iter must be >= 0"
+            )
+        if getattr(args, "ft_inprocess_recovery_warmup_steps", 1) < 0:
+            raise RuntimeError(
+                "--ft-inprocess-recovery-warmup-steps must be >= 0"
+            )
+        if getattr(args, "ft_inprocess_recovery_repeat", 1) < 1:
+            raise RuntimeError(
+                "--ft-inprocess-recovery-repeat must be >= 1"
+            )
+        if train_iter is None and save_iter is not None:
+            args.ft_inprocess_recovery_after_train_iter = save_iter
     if getattr(args, "no_shared_block", False):
         if not getattr(args, "use_eclatin", False):
             raise RuntimeError(
@@ -2296,6 +2327,27 @@ def _add_checkpointing_args(parser):
                        help='For EC/Gemini legacy checkpointing, run the normal save pipeline on every '
                             'checkpoint call but write checkpoint files and update latest_checkpointed_iteration '
                             'only on the penultimate training iteration (train_iters - 1).')
+    group.add_argument('--ft-inprocess-recovery-benchmark', action='store_true',
+                       help='After warmup training iterations in a checkpoint-loaded process, run one '
+                            'simulated hardware recovery before the next training step so recovery-to-forward '
+                            'timing excludes process restart and cold checkpoint load overhead.')
+    group.add_argument('--ft-inprocess-recovery-after-train-iter', type=int, default=None,
+                       help='Completed training iteration after which --ft-inprocess-recovery-benchmark runs. '
+                            'If unset, the first completed training iteration triggers it.')
+    group.add_argument('--ft-inprocess-recovery-after-save-iter', type=int, default=None,
+                       help='Deprecated alias kept for compatibility; use --ft-inprocess-recovery-after-train-iter.')
+    group.add_argument('--ft-inprocess-recovery-warmup-steps', type=int, default=1,
+                       help='Number of uncounted train steps to run before in-process recovery. '
+                            'These steps warm up training resources without advancing the outer iteration counter.')
+    group.add_argument('--ft-inprocess-recovery-repeat', type=int, default=1,
+                       help='Number of in-process recovery cycles to run after the warmup. '
+                            'A value greater than one alternates recovery and one counted train step.')
+    group.add_argument('--ft-inprocess-recovery-failed-ranks', type=str, default=None,
+                       help='Comma-separated global ranks to simulate as failed for in-process FT recovery. '
+                            'Falls back to the scheme-specific failed-rank argument when unset.')
+    group.add_argument('--ft-inprocess-recovery-exit-after-forward', action='store_true',
+                       help='Exit after the training iteration following in-process recovery completes. '
+                            'Useful for one-shot recovery-to-forward benchmark runs.')
     
     # EC-CHECK (Erasure Coding Checkpoint) arguments
     group.add_argument('--use-eccheck', action='store_true',
@@ -2323,6 +2375,14 @@ def _add_checkpointing_args(parser):
                             'two physical nodes lost). They recover via bidirectional XOR '
                             'exchange with surviving ranks 0 and 3, using RDMA transport '
                             'and 16-thread encode/XOR pool aligned with save path.')
+    group.add_argument('--eccheck-recovery-cluster', type=int, default=0,
+                       help='Node-aware ECCHECK cluster to fail during HW, HW2, and '
+                            'in-process recovery. Other four-node clusters load normally.')
+    group.add_argument('--eccheck-rig-remap-offset', type=int, default=0,
+                       choices=range(4),
+                       help='Rotate physical ECCHECK group positions into logical rig positions. '
+                            'Save and load must use the same value; offset 2 maps physical rig0 '
+                            'to the logical rig2 hardware-failure role.')
 
     # ECLATIN (Erasure Coding Checkpoint with different pipeline) arguments
     group.add_argument('--use-eclatin', action='store_true',
@@ -2482,9 +2542,9 @@ def _add_checkpointing_args(parser):
                             'Must evenly divide world_size when set. '
                             'Similar to --frcheck-n for FRCheck.')
     group.add_argument('--gemini-replicas-channels-per-peer', type=int, default=1,
-                       help='Number of RDMA channels to open per Gemini Replicas peer during save. '
-                            'Default: 1 preserves the existing one-QP-per-peer behavior. '
-                            'Only affects optimized RDMA save path.')
+                       help='Number of RDMA channels to open per Gemini Replicas peer during save '
+                            'and hardware recovery. Default: 1 preserves the existing one-QP-per-peer '
+                            'behavior. Only affects optimized RDMA save and hardware recovery paths.')
     group.add_argument('--gemini-replicas-debug', action='store_true',
                        help='Enable detailed debug logging for Gemini Replicas operations.')
     group.add_argument('--use-gemini-replicas-hardware-failure', action='store_true',

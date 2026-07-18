@@ -71,6 +71,7 @@ from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.training.checkpointing import maybe_preinitialize_legacy_ec_modules
 from megatron.training.checkpointing import maybe_preinitialize_torch_dist_save_strategy
+from megatron.training.checkpointing import run_inprocess_ft_recovery_benchmark
 from megatron.training.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
@@ -149,6 +150,8 @@ from .global_vars import (
     finish_recovery_to_forward_timer,
     flush_recovery_timing_summaries,
     mark_recovery_to_forward_timer,
+    restart_recovery_to_forward_timer,
+    stash_recovery_timing_summary,
 )
 from . import one_logger_utils
 
@@ -1557,6 +1560,8 @@ def _frcheck_dec_net_busy():
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
     """Single training step."""
+    mark_recovery_to_forward_timer("train_step_entry")
+    _log_recovery_to_forward_profile("train_step_entry")
     args = get_args()
     timers = get_timers()
     frcheck_async_debug = _frcheck_async_parity_debug_enabled(args)
@@ -1586,9 +1591,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
+        mark_recovery_to_forward_timer("zero_grad_start")
+        _log_recovery_to_forward_profile("zero_grad_start")
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
         optimizer.zero_grad()
+        mark_recovery_to_forward_timer("zero_grad_done")
+        _log_recovery_to_forward_profile("zero_grad_done")
 
         if has_nvidia_modelopt:
             # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
@@ -1611,13 +1620,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if getattr(args, "use_frcheck", False):
             try:
                 from megatron.training.frcheck_legacy import (
-                    frcheck_async_layerwise_active,
                     frcheck_recovery_safe_point,
                     frcheck_wait_for_optimizer_state,
                 )
+                mark_recovery_to_forward_timer("frcheck_train_prep_start")
                 frcheck_recovery_safe_point("train_step_start")
-                if not frcheck_async_layerwise_active():
+                mark_recovery_to_forward_timer("frcheck_train_safe_point_done")
+                if not getattr(args, "frcheck_async_recovery_forward", False):
                     frcheck_wait_for_optimizer_state(optimizer)
+                mark_recovery_to_forward_timer("frcheck_train_optimizer_state_done")
             except ImportError:
                 pass
 
@@ -1644,6 +1655,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 bool(getattr(args, "frcheck_async_parity", False)),
                 bool(getattr(args, "frcheck_recovery_async_parity", False)),
             )
+        if getattr(args, "use_frcheck", False):
+            mark_recovery_to_forward_timer("pipeline_start")
+            _log_recovery_to_forward_profile("pipeline_start")
+        mark_recovery_to_forward_timer("forward_backward_start")
+        _log_recovery_to_forward_profile("forward_backward_start")
         frcheck_forward_backward_t0 = time.time()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func_with_recovery_timing,
@@ -1656,6 +1672,22 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
+        if getattr(args, "use_frcheck", False):
+            frcheck_forward_backward_elapsed_s = time.time() - frcheck_forward_backward_t0
+            stash_recovery_timing_summary(
+                "frcheck_forward_backward",
+                {
+                    "elapsed_s": frcheck_forward_backward_elapsed_s,
+                    "rank": frcheck_trace_rank,
+                    "pp_rank": mpu.get_pipeline_model_parallel_rank(),
+                    "tp_rank": mpu.get_tensor_model_parallel_rank(),
+                },
+            )
+        mark_recovery_to_forward_timer("forward_backward_done")
+        _log_recovery_to_forward_profile("forward_backward_done")
+        if getattr(args, "use_frcheck", False):
+            from megatron.training.frcheck_legacy import finalize_frcheck_recovery_timing
+            finalize_frcheck_recovery_timing()
         flush_recovery_timing_summaries()
         if frcheck_async_debug:
             logger.info(
@@ -2566,8 +2598,66 @@ def train(
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
-    # Run training iterations till done.
-    while iteration < args.train_iters:
+    def ft_inprocess_needs_more_training(current_iteration: int) -> bool:
+        if not getattr(args, "ft_inprocess_recovery_benchmark", False):
+            return False
+        repeat = int(getattr(args, "ft_inprocess_recovery_repeat", 1) or 1)
+        runs_done = int(getattr(args, "_ft_inprocess_recovery_runs_done", 0) or 0)
+        if getattr(args, "_ft_inprocess_recovery_awaiting_forward", False):
+            return True
+        if runs_done >= repeat:
+            return False
+        trigger_iter = getattr(args, "ft_inprocess_recovery_after_train_iter", None)
+        if trigger_iter is None:
+            trigger_iter = start_iteration
+        return current_iteration >= trigger_iter or runs_done < repeat
+
+    if getattr(args, "ft_inprocess_recovery_benchmark", False):
+        trigger_iter = getattr(args, "ft_inprocess_recovery_after_train_iter", None)
+        if trigger_iter is None:
+            trigger_iter = start_iteration
+        if (
+            not getattr(args, "_ft_inprocess_recovery_done", False)
+            and iteration >= trigger_iter
+        ):
+            warmup_steps = int(getattr(args, "ft_inprocess_recovery_warmup_steps", 1) or 0)
+            if warmup_steps > 0:
+                print_rank_0(
+                    "FT in-process recovery benchmark: running "
+                    f"{warmup_steps} uncounted warmup train step(s) "
+                    f"before iteration {iteration + 1}."
+                )
+            for warmup_idx in range(warmup_steps):
+                args.curr_iteration = iteration
+                ft_integration.on_training_step_start()
+                train_step(
+                    forward_step_func,
+                    train_data_iterator,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    config,
+                    forward_backward_func,
+                )
+                ft_integration.on_training_step_end()
+                print_rank_0(
+                    "FT in-process recovery benchmark: completed uncounted "
+                    f"warmup train step {warmup_idx + 1}/{warmup_steps}."
+                )
+            if should_disable_forward_pre_hook(args) and not pre_hook_enabled:
+                enable_forward_pre_hook(model)
+                config.param_sync_func = param_sync_func
+                pre_hook_enabled = True
+            if run_inprocess_ft_recovery_benchmark(
+                model, optimizer, opt_param_scheduler,
+            ):
+                args._ft_inprocess_recovery_trigger_iteration = iteration - 1
+
+    # Run training iterations till done. In in-process recovery benchmark mode,
+    # continue past train_iters until the requested recovery/train cycles finish.
+    while iteration < args.train_iters or ft_inprocess_needs_more_training(iteration):
+        mark_recovery_to_forward_timer("train_loop_iteration_start")
+        _log_recovery_to_forward_profile("train_loop_iteration_start")
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
             if args.use_pytorch_profiler:
                 prof.step()
@@ -2578,6 +2668,8 @@ def train(
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
         ft_integration.on_checkpointing_end(is_async_finalization=True)
+        mark_recovery_to_forward_timer("async_save_finalize_done")
+        _log_recovery_to_forward_profile("async_save_finalize_done")
 
         # Update number of microbatches first without consistency check to decide if a
         # checkpoint should be saved. If the number of microbatches is different
@@ -2601,6 +2693,8 @@ def train(
                 )
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
+        mark_recovery_to_forward_timer("microbatch_update_done")
+        _log_recovery_to_forward_profile("microbatch_update_done")
 
         # Completely skip iteration if needed.
         if iteration in args.iterations_to_skip:
@@ -2616,7 +2710,11 @@ def train(
 
         # Run training step.
         args.curr_iteration = iteration
+        mark_recovery_to_forward_timer("ft_step_start_hook_start")
+        _log_recovery_to_forward_profile("ft_step_start_hook_start")
         ft_integration.on_training_step_start()
+        mark_recovery_to_forward_timer("ft_step_start_hook_done")
+        _log_recovery_to_forward_profile("ft_step_start_hook_done")
         (
             loss_dict,
             skipped_iter,
@@ -2749,6 +2847,42 @@ def train(
             if args.log_energy:
                 energy_monitor.resume()
 
+        ft_inprocess_should_exit = False
+        if getattr(args, "ft_inprocess_recovery_benchmark", False):
+            from megatron.training.checkpointing import flush_inprocess_load_timing_if_pending
+            flush_inprocess_load_timing_if_pending()
+
+            completed_recovery_forward = (
+                getattr(args, "_ft_inprocess_recovery_awaiting_forward", False)
+                and iteration > getattr(args, "_ft_inprocess_recovery_trigger_iteration", -1)
+            )
+            if completed_recovery_forward:
+                args._ft_inprocess_recovery_awaiting_forward = False
+                repeat = int(getattr(args, "ft_inprocess_recovery_repeat", 1) or 1)
+                runs_done = int(getattr(args, "_ft_inprocess_recovery_runs_done", 0) or 0)
+                if (
+                    getattr(args, "ft_inprocess_recovery_exit_after_forward", False)
+                    and runs_done >= repeat
+                ):
+                    ft_inprocess_should_exit = True
+
+            trigger_iter = getattr(args, "ft_inprocess_recovery_after_train_iter", None)
+            if trigger_iter is None:
+                trigger_iter = start_iteration
+            if (
+                not ft_inprocess_should_exit
+                and not getattr(args, "_ft_inprocess_recovery_done", False)
+                and not getattr(args, "_ft_inprocess_recovery_awaiting_forward", False)
+                and iteration >= trigger_iter
+            ):
+                if run_inprocess_ft_recovery_benchmark(
+                    model, optimizer, opt_param_scheduler,
+                ):
+                    args._ft_inprocess_recovery_trigger_iteration = iteration
+
+        if ft_inprocess_should_exit:
+            break
+
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations.
         post_training_step_callbacks(
@@ -2770,6 +2904,9 @@ def train(
             checkpointing_context,
             train_data_iterator,
         )
+        if ft_inprocess_should_exit:
+            should_exit = True
+            exit_code = 0
         if should_exit:
             break
 

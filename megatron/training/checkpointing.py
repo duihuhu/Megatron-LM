@@ -13,6 +13,7 @@ from argparse import Namespace
 from enum import Enum, auto
 from logging import getLogger
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from time import time
@@ -84,6 +85,503 @@ def _ft_legacy_timing_enabled(args) -> bool:
             "use_frcheck",
         )
     )
+
+
+def _parse_rank_list(value):
+    if value is None or value == "":
+        return None
+    return [int(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
+def _inprocess_recovery_failed_ranks(args):
+    explicit = _parse_rank_list(getattr(args, "ft_inprocess_recovery_failed_ranks", None))
+    if explicit is not None:
+        return explicit
+    if getattr(args, "use_gemini_replicas", False):
+        return _parse_rank_list(getattr(args, "gemini_replicas_recovery_rank", None))
+    if getattr(args, "use_frcheck", False):
+        return _parse_rank_list(getattr(args, "frcheck_failed_ranks", None))
+    if getattr(args, "use_ecnaive", False):
+        return _parse_rank_list(getattr(args, "ecnaive_failed_ranks", None))
+    if getattr(args, "use_eccheck", False):
+        if not torch.distributed.is_initialized():
+            return [0]
+        from megatron.core.dist_checkpointing.strategies.eccheck_manager import (
+            ECCHECKManager,
+        )
+
+        world_size = torch.distributed.get_world_size()
+        target_cluster = int(getattr(args, "eccheck_recovery_cluster", 0))
+        layout = ECCHECKManager._get_group_layout(world_size)
+        num_clusters = int(layout["clusters"] if layout["mode"] == 1 else layout["num_groups"])
+        if target_cluster < 0 or target_cluster >= num_clusters:
+            raise ValueError(
+                f"ECCHECK recovery cluster {target_cluster} is outside [0, {num_clusters - 1}]"
+            )
+        failed_group_positions = (
+            (1, 2) if getattr(args, "use_eccheck_two_failures", False) else (2,)
+        )
+        return [
+            rank
+            for rank in range(world_size)
+            if ECCHECKManager._get_cluster_id(rank, world_size) == target_cluster
+            and ECCHECKManager._get_rank_in_group(rank, world_size)
+            in failed_group_positions
+        ]
+    return None
+
+
+def _set_scheme_failed_ranks_for_inprocess(args, failed_ranks):
+    failed_text = ",".join(str(rank) for rank in failed_ranks)
+    if getattr(args, "use_gemini_replicas", False):
+        args.use_gemini_replicas_hardware_failure = True
+        args.gemini_replicas_recovery_rank = failed_text
+    elif getattr(args, "use_frcheck", False):
+        args.use_frcheck_hardware_failure = True
+        args.frcheck_failed_ranks = failed_text
+        args.frcheck_failed_ranks_parsed = list(failed_ranks)
+        args.frcheck_recovery_only_teardown = True
+    elif getattr(args, "use_ecnaive", False):
+        args.ecnaive_failed_ranks = failed_text
+        args.ecnaive_failed_ranks_parsed = list(failed_ranks)
+
+
+def _state_dict_has_model_keys_for_inprocess(state_dict):
+    if not isinstance(state_dict, dict):
+        return False
+    if "model" in state_dict or "model0" in state_dict:
+        return True
+    return any(isinstance(key, str) and re.fullmatch(r"model\d+", key) for key in state_dict.keys())
+
+
+def _single_model_state_dict_for_inprocess(state_dict):
+    if "model" in state_dict:
+        return state_dict["model"]
+    if "model0" in state_dict:
+        return state_dict["model0"]
+    model_keys = sorted(
+        key for key in state_dict.keys()
+        if isinstance(key, str) and re.fullmatch(r"model\d+", key)
+    )
+    if len(model_keys) == 1:
+        return state_dict[model_keys[0]]
+    raise KeyError(f"cannot infer single model state from keys={model_keys}")
+
+
+def _inject_inprocess_model_state(ddp_model, state_dict, strict=True):
+    if not isinstance(state_dict, dict) or not _state_dict_has_model_keys_for_inprocess(state_dict):
+        return
+    if len(ddp_model) == 1:
+        ddp_model[0].load_state_dict(
+            _single_model_state_dict_for_inprocess(state_dict), strict=strict
+        )
+    else:
+        for i, module in enumerate(ddp_model):
+            key = f"model{i}"
+            if key in state_dict:
+                module.load_state_dict(state_dict[key], strict=strict)
+
+
+def _inject_inprocess_scheduler_state(opt_param_scheduler, state_dict):
+    if not isinstance(state_dict, dict) or opt_param_scheduler is None:
+        return
+    if "lr_scheduler" in state_dict:
+        opt_param_scheduler.load_state_dict(state_dict["lr_scheduler"])
+    elif "opt_param_scheduler" in state_dict:
+        opt_param_scheduler.load_state_dict(state_dict["opt_param_scheduler"])
+
+
+def _clone_inprocess_optimizer_tensors(value):
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {key: _clone_inprocess_optimizer_tensors(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_inprocess_optimizer_tensors(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_inprocess_optimizer_tensors(item) for item in value)
+    return value
+
+
+def _inject_inprocess_recovered_state(
+    ddp_model,
+    optimizer,
+    opt_param_scheduler,
+    state_dict,
+    strict=True,
+    clone_optimizer_tensors=False,
+):
+    if not isinstance(state_dict, dict):
+        return
+    mark_recovery_to_forward_timer("inprocess_inject_start")
+    _inject_inprocess_model_state(ddp_model, state_dict, strict=strict)
+    mark_recovery_to_forward_timer("inprocess_model_load_done")
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    mark_recovery_to_forward_timer("inprocess_model_sync_done")
+    if optimizer is not None and not getattr(optimizer, "is_stub_optimizer", False):
+        if "optimizer" in state_dict:
+            optimizer_state = state_dict["optimizer"]
+            if clone_optimizer_tensors:
+                mark_recovery_to_forward_timer("inprocess_optimizer_clone_start")
+                optimizer_state = _clone_inprocess_optimizer_tensors(optimizer_state)
+                mark_recovery_to_forward_timer("inprocess_optimizer_clone_done")
+            optimizer.load_state_dict(optimizer_state)
+            mark_recovery_to_forward_timer("inprocess_optimizer_load_done")
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            mark_recovery_to_forward_timer("inprocess_optimizer_sync_done")
+    _inject_inprocess_scheduler_state(opt_param_scheduler, state_dict)
+    mark_recovery_to_forward_timer("inprocess_scheduler_done")
+
+
+def _format_inprocess_load_timing_summary(ft_context: dict, h2d_total_s: float) -> Optional[str]:
+    args = get_args()
+    recovery = ft_context.get("timings", {})
+    recovery_e2e_s = float(recovery.get("total", 0.0))
+    scheme = ft_context.get("scheme")
+
+    if scheme == "GEMINI" and getattr(args, "use_gemini_replicas", False):
+        network_encode_s = float(recovery.get("network_encode", 0.0))
+        summary = _timing_max_dict({
+            "e2e_s": recovery_e2e_s + h2d_total_s,
+            "recovery_e2e_s": recovery_e2e_s,
+            "network_encode_s": network_encode_s,
+            "net_s": float(recovery.get("net_s", network_encode_s)),
+            "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
+            "h2d_s": h2d_total_s,
+        })
+        return (
+            "Gemini Replicas load timing (%s): e2e_s=%.2fs "
+            "recovery_e2e_s=%.2fs network_encode_s=%.2fs "
+            "net_s=%.2fs rebuild_sd_s=%.2fs h2d_s=%.2fs"
+            % (
+                ft_context.get("mode", "unknown"),
+                summary["e2e_s"],
+                summary["recovery_e2e_s"],
+                summary["network_encode_s"],
+                summary["net_s"],
+                summary["rebuild_sd_s"],
+                summary["h2d_s"],
+            )
+        )
+    if scheme == "ECCHECK" and getattr(args, "use_eccheck", False):
+        summary = _timing_max_dict({
+            "e2e_s": recovery_e2e_s + h2d_total_s,
+            "recovery_e2e_s": recovery_e2e_s,
+            "network_encode_s": float(recovery.get("network_encode", 0.0)),
+            "net_s": float(recovery.get("net_s", 0.0)),
+            "encode_s": float(recovery.get("encode_s", 0.0)),
+            "decode_s": float(recovery.get("decode_s", recovery.get("encode_s", 0.0))),
+            "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
+            "h2d_s": h2d_total_s,
+        })
+        return (
+            "ECCHECK load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
+            "network_encode_s=%.2fs net_s=%.2fs encode_s=%.2fs "
+            "decode_s=%.2fs rebuild_sd_s=%.2fs h2d_s=%.2fs"
+            % (
+                ft_context.get("mode", "unknown"),
+                summary["e2e_s"],
+                summary["recovery_e2e_s"],
+                summary["network_encode_s"],
+                summary["net_s"],
+                summary["encode_s"],
+                summary["decode_s"],
+                summary["rebuild_sd_s"],
+                summary["h2d_s"],
+            )
+        )
+    if scheme == "EC-NAIVE" and getattr(args, "use_ecnaive", False):
+        summary = _timing_max_dict({
+            "e2e_s": recovery_e2e_s + h2d_total_s,
+            "recovery_e2e_s": recovery_e2e_s,
+            "network_encode_s": float(recovery.get("network_encode", 0.0)),
+            "net_s": float(recovery.get("net_s", 0.0)),
+            "encode_s": float(recovery.get("encode_s", 0.0)),
+            "decode_s": float(recovery.get("decode_s", recovery.get("encode_s", 0.0))),
+            "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
+            "h2d_s": h2d_total_s,
+        })
+        return (
+            "EC-NAIVE load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
+            "network_encode_s=%.2fs net_s=%.2fs encode_s=%.2fs decode_s=%.2fs "
+            "rebuild_sd_s=%.2fs h2d_s=%.2fs"
+            % (
+                ft_context.get("mode", "unknown"),
+                summary["e2e_s"],
+                summary["recovery_e2e_s"],
+                summary["network_encode_s"],
+                summary["net_s"],
+                summary["encode_s"],
+                summary["decode_s"],
+                summary["rebuild_sd_s"],
+                summary["h2d_s"],
+            )
+        )
+    return None
+
+
+def _stash_inprocess_ft_load_timing(h2d_total_s: float) -> None:
+    from megatron.training.global_vars import get_ft_load_timing_context
+
+    ft_context = get_ft_load_timing_context()
+    if ft_context is None:
+        return
+    args = get_args()
+    args._ft_inprocess_load_timing_pending = {
+        "ft_context": dict(ft_context),
+        "h2d_total_s": float(h2d_total_s),
+    }
+
+
+def flush_inprocess_load_timing_if_pending() -> None:
+    args = get_args()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    native_pending = getattr(args, "_ft_inprocess_native_load_timing_pending", None)
+    if native_pending:
+        summary = _timing_max_dict({
+            "e2e_s": float(native_pending.get("e2e_s", 0.0)),
+            "disk_s": float(native_pending.get("disk_s", 0.0)),
+            "h2d_s": float(native_pending.get("h2d_s", 0.0)),
+        })
+        if rank == 0:
+            logger.info(
+                "Megatron legacy load timing (INPROCESS): e2e_s=%.2fs "
+                "disk_s=%.2fs h2d_s=%.2fs",
+                summary["e2e_s"],
+                summary["disk_s"],
+                summary["h2d_s"],
+            )
+        args._ft_inprocess_native_load_timing_pending = None
+
+    pending = getattr(args, "_ft_inprocess_load_timing_pending", None)
+    if not pending:
+        return
+    from megatron.training.global_vars import clear_ft_load_timing_context
+
+    ft_context = pending.get("ft_context") or {}
+    h2d_total_s = float(pending.get("h2d_total_s", 0.0))
+    message = _format_inprocess_load_timing_summary(ft_context, h2d_total_s)
+    if message and rank == 0:
+        logger.info(message)
+    args._ft_inprocess_load_timing_pending = None
+    clear_ft_load_timing_context()
+
+
+def _native_legacy_inprocess_enabled(args) -> bool:
+    if not getattr(args, "ft_inprocess_recovery_benchmark", False):
+        return False
+    return not any(
+        bool(getattr(args, flag, False))
+        for flag in (
+            "use_frcheck",
+            "use_eccheck",
+            "use_ecnaive",
+            "use_gemini",
+            "use_gemini_replicas",
+            "use_eclatin",
+        )
+    )
+
+
+def _run_native_legacy_inprocess_benchmark(
+    ddp_model, optimizer, opt_param_scheduler, strict=True,
+) -> bool:
+    args = get_args()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    t_disk = time()
+    state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(args.load, args)
+    disk_s = time() - t_disk
+    if state_dict is None:
+        raise RuntimeError("native legacy in-process benchmark could not load checkpoint")
+    if ckpt_type != CheckpointType.LEGACY:
+        raise RuntimeError(
+            "native legacy in-process benchmark only supports torch legacy checkpoints"
+        )
+
+    if rank == 0:
+        logger.info(
+            "Megatron legacy in-process load benchmark: checkpoint=%s release=%s",
+            checkpoint_name, release,
+        )
+
+    start_recovery_to_forward_timer(
+        "Megatron legacy load-to-forward", "inprocess_load_model_start", rank0_only_max=True,
+    )
+    h2d_start = time()
+    _inject_inprocess_recovered_state(
+        ddp_model, optimizer, opt_param_scheduler, state_dict, strict=strict,
+    )
+    h2d_s = time() - h2d_start
+    mark_recovery_to_forward_timer("h2d_done")
+
+    args._ft_inprocess_native_load_timing_pending = {
+        "e2e_s": h2d_s,
+        "disk_s": disk_s,
+        "h2d_s": h2d_s,
+    }
+
+    return True
+
+
+def run_inprocess_ft_recovery_benchmark(
+    ddp_model, optimizer, opt_param_scheduler, strict=True,
+):
+    """Run one minimal FT recovery in the current process after warmup training."""
+    args = get_args()
+    if not getattr(args, "ft_inprocess_recovery_benchmark", False):
+        return False
+    repeat = int(getattr(args, "ft_inprocess_recovery_repeat", 1) or 1)
+    runs_done = int(getattr(args, "_ft_inprocess_recovery_runs_done", 0) or 0)
+    if runs_done >= repeat:
+        args._ft_inprocess_recovery_done = True
+        return False
+    if args.load is None:
+        raise RuntimeError("in-process FT recovery benchmark requires args.load")
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("in-process FT recovery benchmark requires torch.distributed")
+
+    def _mark_inprocess_recovery_cycle_done() -> None:
+        completed = int(getattr(args, "_ft_inprocess_recovery_runs_done", 0) or 0) + 1
+        args._ft_inprocess_recovery_runs_done = completed
+        args._ft_inprocess_recovery_done = completed >= repeat
+        args._ft_inprocess_recovery_awaiting_forward = True
+
+    if _native_legacy_inprocess_enabled(args):
+        if _run_native_legacy_inprocess_benchmark(
+            ddp_model, optimizer, opt_param_scheduler, strict=strict,
+        ):
+            mark_recovery_to_forward_timer("inprocess_post_h2d_barrier_skipped")
+            _mark_inprocess_recovery_cycle_done()
+            return True
+        return False
+
+    rank = torch.distributed.get_rank()
+    failed_ranks = _inprocess_recovery_failed_ranks(args)
+    if not failed_ranks:
+        if getattr(args, "use_eccheck", False):
+            failed_ranks = _inprocess_recovery_failed_ranks(args)
+        if not failed_ranks:
+            raise RuntimeError(
+                "in-process FT recovery benchmark needs failed ranks via "
+                "--ft-inprocess-recovery-failed-ranks or scheme-specific option"
+            )
+    world_size = torch.distributed.get_world_size()
+    for failed_rank in failed_ranks:
+        if failed_rank < 0 or failed_rank >= world_size:
+            raise RuntimeError(
+                f"in-process FT recovery failed rank {failed_rank} out of range [0, {world_size - 1}]"
+            )
+    failed_set = set(failed_ranks)
+    _set_scheme_failed_ranks_for_inprocess(args, failed_ranks)
+
+    iteration, release = read_metadata(get_checkpoint_tracker_filename(args.load))
+    checkpoint_name = get_checkpoint_name(args.load, iteration, release, return_base_dir=False)
+    if rank == 0:
+        logger.info(
+            "FT in-process recovery benchmark: run=%d/%d load=%s iteration=%s failed_ranks=%s",
+            runs_done + 1, repeat, args.load, iteration, failed_ranks,
+        )
+    torch.distributed.barrier()
+
+    state_dict = None
+    args._ft_inprocess_recovery_active = True
+    try:
+        if getattr(args, "use_gemini_replicas", False):
+            from .gemini_replicas_legacy import load_gemini_replicas_legacy_checkpoint
+            state_dict = load_gemini_replicas_legacy_checkpoint(checkpoint_name)
+        elif getattr(args, "use_frcheck", False):
+            from .frcheck_legacy import (
+                frcheck_filter_layerwise_model_placeholders,
+                frcheck_register_pending_optimizer_state,
+                get_frcheck_layerwise_runtime_summary,
+                install_frcheck_layerwise_runtime_from_state_dict,
+                recover_frcheck_legacy_hardware,
+                wait_for_frcheck_parity_flush,
+            )
+            wait_for_frcheck_parity_flush()
+            state_dict, timings = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
+            timings["total"] = timings.get("network_encode", 0.0) + timings.get("rebuild_sd", 0.0)
+            from megatron.training.global_vars import set_ft_load_timing_context
+            set_ft_load_timing_context("FRCHECK", "HW-INPROCESS", timings)
+            if rank in failed_set:
+                install_frcheck_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
+                frcheck_filter_layerwise_model_placeholders(state_dict)
+                runtime_summary = get_frcheck_layerwise_runtime_summary()
+                if runtime_summary is not None:
+                    frcheck_register_pending_optimizer_state(state_dict)
+        elif getattr(args, "use_ecnaive", False):
+            from .ecnaive_legacy import load_ecnaive_legacy_checkpoint_hardware_recovery
+            state_dict = load_ecnaive_legacy_checkpoint_hardware_recovery(checkpoint_name, failed_ranks)
+        elif getattr(args, "use_eccheck", False):
+            # ECCHECK legacy HW recovery uses its established rank_in_group failure roles.
+            from .eccheck_legacy import load_eccheck_legacy_checkpoint
+            state_dict = load_eccheck_legacy_checkpoint(checkpoint_name)
+        else:
+            raise RuntimeError("No supported FT scheme enabled for in-process recovery benchmark")
+    finally:
+        args._ft_inprocess_recovery_active = False
+
+    h2d_start = time()
+    if state_dict is not None:
+        if rank in failed_set and getattr(args, "use_frcheck", False):
+            from .frcheck_legacy import get_frcheck_layerwise_runtime_summary
+            runtime_summary = get_frcheck_layerwise_runtime_summary()
+            if runtime_summary is None:
+                _inject_inprocess_recovered_state(
+                    ddp_model, optimizer, opt_param_scheduler, state_dict, strict=strict,
+                )
+            else:
+                mark_recovery_to_forward_timer("inprocess_inject_start")
+                _inject_inprocess_model_state(ddp_model, state_dict, strict=False)
+                mark_recovery_to_forward_timer("inprocess_model_load_done")
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                mark_recovery_to_forward_timer("inprocess_model_sync_done")
+                _inject_inprocess_scheduler_state(opt_param_scheduler, state_dict)
+                mark_recovery_to_forward_timer("inprocess_scheduler_done")
+        else:
+            defer_frcheck_optimizer = bool(
+                getattr(args, "use_frcheck", False)
+                and rank not in failed_set
+                and optimizer is not None
+                and not getattr(optimizer, "is_stub_optimizer", False)
+                and isinstance(state_dict, dict)
+                and "optimizer" in state_dict
+            )
+            if defer_frcheck_optimizer:
+                from .frcheck_legacy import frcheck_register_pending_optimizer_state
+
+                frcheck_register_pending_optimizer_state(
+                    state_dict, allow_without_runtime=True,
+                )
+                mark_recovery_to_forward_timer("inprocess_inject_start")
+                _inject_inprocess_model_state(ddp_model, state_dict, strict=strict)
+                mark_recovery_to_forward_timer("inprocess_model_load_done")
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                mark_recovery_to_forward_timer("inprocess_model_sync_done")
+                _inject_inprocess_scheduler_state(opt_param_scheduler, state_dict)
+                mark_recovery_to_forward_timer("inprocess_scheduler_done")
+            else:
+                _inject_inprocess_recovered_state(
+                    ddp_model,
+                    optimizer,
+                    opt_param_scheduler,
+                    state_dict,
+                    strict=strict,
+                )
+    h2d_total_s = time() - h2d_start
+    mark_recovery_to_forward_timer("h2d_done")
+    _stash_inprocess_ft_load_timing(h2d_total_s)
+    mark_recovery_to_forward_timer("inprocess_post_h2d_barrier_skipped")
+    _mark_inprocess_recovery_cycle_done()
+    return True
+
+
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 
 _TORCH_DIST_STRATEGY_PREINITIALIZED = False
@@ -134,7 +632,7 @@ def maybe_preinitialize_legacy_ec_modules():
             mod = importlib.import_module(mod_path)
             mgr = getattr(mod, cls_name)()
             getattr(mgr, init_method)()
-            logger.info(f'EC legacy preinit: {cls_name} initialized')
+            logger.debug(f'EC legacy preinit: {cls_name} initialized')
         except Exception as exc:  # pylint: disable=broad-except
             # Fail fast: a half-initialized native module (e.g. some ranks
             # could not bind their listener ports) leaves the job in a state
@@ -2404,6 +2902,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     if ft_timing_enabled:
         h2d_total_s = h2d_model_s + h2d_optimizer_s
+        mark_recovery_to_forward_timer("h2d_done")
         from megatron.training.global_vars import (
             clear_ft_load_timing_context,
             get_ft_load_timing_context,
@@ -2445,6 +2944,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     "recovery_e2e_s": recovery_e2e_s,
                     "network_encode_s": network_encode_s,
                     "net_s": float(recovery.get("net_s", network_encode_s)),
+                    "prep_copy_s": float(recovery.get("prep_copy", 0.0)),
                     "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
                     "h2d_s": h2d_total_s,
                 })
@@ -2522,6 +3022,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     "decode_s": float(
                         recovery.get("decode_s", recovery.get("encode_s", 0.0))
                     ),
+                    "prep_copy_s": float(recovery.get("prep_copy", 0.0)),
                     "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
                     "h2d_s": h2d_total_s,
                     "h2d_model_s": h2d_model_s,
@@ -2542,7 +3043,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 summary = _timing_max_dict(values)
                 logger.info(
                     "%s load timing (%s): e2e_s=%.4fs recovery_e2e_s=%.4fs "
-                    "network_encode_s=%.4fs net_s=%.4fs decode_s=%.4fs rebuild_sd_s=%.4fs "
+                    "network_encode_s=%.4fs net_s=%.4fs decode_s=%.4fs prep_copy_s=%.4fs "
+                    "rebuild_sd_s=%.4fs "
                     "h2d_model_s=%.4fs h2d_optimizer_s=%.4fs h2d_total_s=%.4fs "
                     "h2d_model_submit_s=%.4fs h2d_model_sync_s=%.4fs "
                     "h2d_optimizer_submit_s=%.4fs h2d_optimizer_sync_s=%.4fs "
@@ -2556,6 +3058,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     summary["network_encode_s"],
                     summary["net_s"],
                     summary["decode_s"],
+                    summary["prep_copy_s"],
                     summary["rebuild_sd_s"],
                     summary["h2d_model_s"],
                     summary["h2d_optimizer_s"],
@@ -2581,22 +3084,31 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             and ft_context.get("scheme") == "ECCHECK"
             and getattr(args, "use_eccheck", False)
         ):
-            from megatron.core.dist_checkpointing.strategies.eccheck_manager import (
-                ECCHECKManager,
-            )
-            _eccheck_mgr = ECCHECKManager()
-            logger.debug(
-                "ECCHECK: deferred post-H2D cleanup on rank %d", rank
-            )
-            t_cleanup = time()
-            _eccheck_mgr.cleanup()
-            cleanup_s = time() - t_cleanup
-            try:
-                from megatron.training.global_vars import add_recovery_teardown_time
-                add_recovery_teardown_time(cleanup_s)
-            except Exception:
-                pass
-            _eccheck_mgr._eccheck_native = None
+            if (
+                getattr(args, "ft_inprocess_recovery_benchmark", False)
+                and getattr(args, "_ft_inprocess_recovery_active", False)
+            ):
+                logger.debug(
+                    "ECCHECK: keeping native resources alive for in-process recovery on rank %d",
+                    rank,
+                )
+            else:
+                from megatron.core.dist_checkpointing.strategies.eccheck_manager import (
+                    ECCHECKManager,
+                )
+                _eccheck_mgr = ECCHECKManager()
+                logger.debug(
+                    "ECCHECK: deferred post-H2D cleanup on rank %d", rank
+                )
+                t_cleanup = time()
+                _eccheck_mgr.cleanup()
+                cleanup_s = time() - t_cleanup
+                try:
+                    from megatron.training.global_vars import add_recovery_teardown_time
+                    add_recovery_teardown_time(cleanup_s)
+                except Exception:
+                    pass
+                _eccheck_mgr._eccheck_native = None
 
     # rerun state
     if not ignore_rerun_state:

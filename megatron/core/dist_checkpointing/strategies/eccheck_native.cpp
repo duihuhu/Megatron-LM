@@ -381,6 +381,7 @@ private:
         bool p2p_data_is_zero_tail;       // Save path: P2P data sender chunk is implicit zero
         size_t p2p_data_size;             // Save path: valid P2P data bytes in this chunk
         size_t sequence_id;               // Save path chunk order for P2P transfers
+        bool parity_is_pooled = true;
     };
     
     std::queue<EncodingTask> encoding_tasks_1_;  // Thread1的编码任务
@@ -412,6 +413,7 @@ private:
         bool p2p_data_is_zero_tail; // Save path: P2P data sender chunk is implicit zero
         size_t p2p_data_size;       // Save path: valid P2P data bytes in this chunk
         size_t sequence_id;         // Save path chunk order for downstream P2P tasks
+        bool parity_is_pooled = true; // Result address belongs to parity scratch pool
     };
     std::queue<RecvTask> recv_queue_;
     std::mutex recv_queue_mutex_;
@@ -464,7 +466,7 @@ private:
     struct XORTask {
         uintptr_t local_encoding_addr;   // 本地encoded数据地址
         uintptr_t remote_encoding_addr;  // 接收到的远程encoded数据地址
-        uintptr_t parity_addr;           // XOR结果地址（parity buffer）
+        uintptr_t parity_addr;           // XOR result address
         size_t size;                     // 数据大小
         uintptr_t p2p_own_write_addr;    // P2P: 写入own_buffer的地址
         uintptr_t p2p_partner_write_addr; // P2P: 写入partner_buffer的地址
@@ -474,6 +476,7 @@ private:
         bool p2p_data_is_zero_tail;
         size_t p2p_data_size;
         size_t sequence_id;
+        bool parity_is_pooled = true;
     };
     
     // Unified XOR task queue
@@ -533,6 +536,7 @@ private:
         uintptr_t load_mode_data_addr;  // load mode Step2: corresponding data_addr (for finding encoding task)
         size_t zero_fill_tail_size;     // save path: zero-fill remaining bytes after valid data
         size_t sequence_id;             // save path chunk order for network transfer
+        bool parity_is_pooled = true;
     };
     
     struct P2PRecvTask {
@@ -572,6 +576,7 @@ private:
         uintptr_t recv_addr;
         size_t recv_chunk_size;
         uintptr_t parity_addr;
+        bool parity_is_pooled;
         bool is_receiver;
         uintptr_t p2p_partner_write_addr;  // For Step6: rank2 needs this to receive d3
     };
@@ -605,6 +610,7 @@ private:
         uintptr_t recv_addr;
         size_t size;
         uintptr_t parity_addr;
+        bool parity_is_pooled;
     };
     std::queue<LoadRecvTask> load_recv_queue_;
     std::mutex load_recv_queue_mutex_;
@@ -618,6 +624,7 @@ private:
         uintptr_t local_encoding_addr;
         uintptr_t remote_encoding_addr;
         uintptr_t parity_addr;
+        bool parity_is_pooled;
         size_t size;
         uintptr_t p2p_partner_write_addr;  // For Step6: rank2 needs this to receive d3
         uintptr_t data_addr;
@@ -1844,7 +1851,7 @@ private:
                     // Sender doesn't need parity buffer, release it immediately
                     {
                         std::lock_guard<std::mutex> lock(release_queue_mutex_);
-                        if (task.parity_addr != 0) {
+                        if (task.parity_addr != 0 && task.parity_is_pooled) {
                             parity_buffers_to_release_.push(task.parity_addr);
                         }
                         if (task.local_is_zero_tail && task.encoding_addr != 0) {
@@ -1863,7 +1870,7 @@ private:
                     task.encoding_addr, 0, task.parity_addr, task.size,
                     task.p2p_own_write_addr, task.p2p_partner_write_addr, task.data_addr,
                     task.local_is_zero_tail, true, task.p2p_data_is_zero_tail,
-                    task.p2p_data_size, task.sequence_id
+                    task.p2p_data_size, task.sequence_id, task.parity_is_pooled
                 });
                 xor_queue_cv_.notify_one();
                 need_recv = false;
@@ -1873,7 +1880,8 @@ private:
                 // Submit recv task to recv_worker with parity_addr
                 {
                     std::lock_guard<std::mutex> lock(recv_queue_mutex_);
-                    recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr, task.local_is_zero_tail, task.remote_is_zero_tail, task.p2p_data_is_zero_tail, task.p2p_data_size, task.sequence_id});
+                    recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr, task.local_is_zero_tail, task.remote_is_zero_tail, task.p2p_data_is_zero_tail, task.p2p_data_size, task.sequence_id,
+                                      task.parity_is_pooled});
                 }
                 recv_queue_cv_.notify_one();
             }
@@ -2044,7 +2052,7 @@ private:
                     // Sender doesn't need parity buffer, release it immediately
                     {
                         std::lock_guard<std::mutex> lock(release_queue_mutex_);
-                        if (task.parity_addr != 0) {
+                        if (task.parity_addr != 0 && task.parity_is_pooled) {
                             parity_buffers_to_release_.push(task.parity_addr);
                         }
                         if (task.local_is_zero_tail && task.encoding_addr != 0) {
@@ -2063,7 +2071,7 @@ private:
                     task.encoding_addr, 0, task.parity_addr, task.size,
                     task.p2p_own_write_addr, task.p2p_partner_write_addr, task.data_addr,
                     task.local_is_zero_tail, true, task.p2p_data_is_zero_tail,
-                    task.p2p_data_size, task.sequence_id
+                    task.p2p_data_size, task.sequence_id, task.parity_is_pooled
                 });
                 xor_queue_cv_.notify_one();
                 need_recv = false;
@@ -2073,7 +2081,8 @@ private:
                 // Submit recv task to recv_worker with parity_addr
                 {
                     std::lock_guard<std::mutex> lock(recv_queue_mutex_);
-                    recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr, task.local_is_zero_tail, task.remote_is_zero_tail, task.p2p_data_is_zero_tail, task.p2p_data_size, task.sequence_id});
+                    recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr, task.local_is_zero_tail, task.remote_is_zero_tail, task.p2p_data_is_zero_tail, task.p2p_data_size, task.sequence_id,
+                                      task.parity_is_pooled});
                 }
                 recv_queue_cv_.notify_one();
             }
@@ -2437,7 +2446,8 @@ private:
                         task.remote_is_zero_tail,
                         task.p2p_data_is_zero_tail,
                         task.p2p_data_size,
-                        task.sequence_id
+                        task.sequence_id,
+                        task.parity_is_pooled
                     });
                 }
                 xor_queue_cv_.notify_one();
@@ -2541,7 +2551,7 @@ private:
             
             if (task.p2p_own_write_addr != 0 && task.p2p_partner_write_addr != 0 && task.parity_addr != 0) {
                 // Release parity buffer after XOR (single-node recovery loads via this path too)
-                if (task.parity_addr != 0) {
+                if (task.parity_addr != 0 && task.parity_is_pooled) {
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     parity_buffers_to_release_.push(task.parity_addr);
                 }
@@ -2566,7 +2576,8 @@ private:
                         false,  // is_step6_transfer
                         0,      // load_mode_data_addr (not needed for save mode)
                         p2p_send_zero_tail,
-                        task.sequence_id
+                        task.sequence_id,
+                        task.parity_is_pooled
                     });
                 }
                 p2p_send_queue_cv_.notify_one();
@@ -2602,7 +2613,7 @@ private:
                 // Only handle save mode here to avoid duplicate release
                 if (!(is_load_mode_ && failed_rank_in_group_ == 2)) {
                     // Save mode: original logic
-                if (!is_p2p_parity_sender() && task.parity_addr != 0) {
+                if (!is_p2p_parity_sender() && task.parity_addr != 0 && task.parity_is_pooled) {
                     parity_buffers_to_release_.push(task.parity_addr);
                     }
                 }
@@ -2910,7 +2921,7 @@ private:
                     // Save mode or Step6: original logic
                     // For even ranks, release parity buffer after send completes (parity was sent)
                     // For odd ranks, parity buffer is not sent, so it will be released in XOR worker
-                    if (is_p2p_parity_sender() && task.parity_addr != 0) {
+                    if (is_p2p_parity_sender() && task.parity_addr != 0 && task.parity_is_pooled) {
                         parity_buffers_to_release_.push(task.parity_addr);
                     }
                     // For data senders (higher rank in P2P pair), release data buffer
@@ -3790,32 +3801,32 @@ public:
         // If in load mode, mark unused workers as completed immediately
         if (is_load_mode_) {
             // send worker: only rank0/1 use it
-            if (rank_ != 0 && rank_ != 1) {
+            if (rank_in_group_ != 0 && rank_in_group_ != 1) {
                 load_send_worker_completed_ = true;
             }
             
             // recv worker: only rank2/3 use it
-            if (rank_ != 2 && rank_ != 3) {
+            if (rank_in_group_ != 2 && rank_in_group_ != 3) {
                 load_recv_worker_completed_ = true;
             }
             
             // p2p_send worker: only rank0/3 use it
-            if (rank_ != 0 && rank_ != 3) {
+            if (rank_in_group_ != 0 && rank_in_group_ != 3) {
                 load_p2p_send_worker_completed_ = true;
             }
             
             // p2p_recv worker: only rank1/2 use it
-            if (rank_ != 1 && rank_ != 2) {
+            if (rank_in_group_ != 1 && rank_in_group_ != 2) {
                 load_p2p_recv_worker_completed_ = true;
             }
             
             // step6_p2p_send worker: only rank3 uses it
-            if (rank_ != 3) {
+            if (rank_in_group_ != 3) {
                 load_step6_p2p_send_worker_completed_ = true;
             }
             
             // step6_p2p_recv worker: only rank2 uses it
-            if (rank_ != 2) {
+            if (rank_in_group_ != 2) {
                 load_step6_p2p_recv_worker_completed_ = true;
             }
         }
@@ -3874,17 +3885,17 @@ public:
                 if (all_completed) break;
 
                 if (++wait_count > 3000) {  // ~30s timeout
-                    std::cerr << "EC-CHECK: [Rank " << rank_
-                              << "] Two-failure wait_for_encoding_completion timeout:"
-                              << " enc1=" << encoding_thread_1_completed_.load()
-                              << " enc2=" << encoding_thread_2_completed_.load()
-                              << " send=" << send_worker_completed_.load()
-                              << " recv=" << recv_worker_completed_.load()
-                              << " xor=" << xor_worker_completed_.load()
-                              << " p2ps=" << p2p_send_worker_completed_.load()
-                              << " p2pr=" << p2p_recv_worker_completed_.load()
-                              << std::endl;
-                    break;
+                    std::ostringstream error;
+                    error << "EC-CHECK: [Rank " << rank_
+                          << "] Two-failure wait_for_encoding_completion timeout:"
+                          << " enc1=" << encoding_thread_1_completed_.load()
+                          << " enc2=" << encoding_thread_2_completed_.load()
+                          << " send=" << send_worker_completed_.load()
+                          << " recv=" << recv_worker_completed_.load()
+                          << " xor=" << xor_worker_completed_.load()
+                          << " p2ps=" << p2p_send_worker_completed_.load()
+                          << " p2pr=" << p2p_recv_worker_completed_.load();
+                    throw std::runtime_error(error.str());
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
@@ -4274,8 +4285,43 @@ public:
         // Rebuild XOR configuration (needs failed_rank_in_group_ for hardware recovery branches)
         build_xor_config();
         
-        // 新增：如果是 load mode，启动该 rank 实际使用的 load worker
-        if (is_load && !load_encoder_worker_.joinable()) {
+        // Load workers exit after their sentinel. Join completed workers here so
+        // repeated in-process recovery can restart them on the same native module.
+        if (is_load) {
+            if (load_encoder_worker_.joinable() && load_encoding_completed_.load()) {
+                load_encoder_worker_.join();
+            }
+            if (load_send_worker_.joinable() && load_send_worker_completed_.load()) {
+                load_send_worker_.join();
+            }
+            if (load_recv_worker_.joinable() && load_recv_worker_completed_.load()) {
+                load_recv_worker_.join();
+            }
+            if (load_xor_worker_.joinable() && load_xor_worker_completed_.load()) {
+                load_xor_worker_.join();
+            }
+            if (load_p2p_send_worker_.joinable() && load_p2p_send_worker_completed_.load()) {
+                load_p2p_send_worker_.join();
+            }
+            if (load_p2p_recv_worker_.joinable() && load_p2p_recv_worker_completed_.load()) {
+                load_p2p_recv_worker_.join();
+            }
+            if (load_step6_p2p_send_worker_.joinable() && load_step6_p2p_send_worker_completed_.load()) {
+                load_step6_p2p_send_worker_.join();
+            }
+            if (load_step6_p2p_recv_worker_.joinable() && load_step6_p2p_recv_worker_completed_.load()) {
+                load_step6_p2p_recv_worker_.join();
+            }
+        }
+
+        const bool load_workers_active =
+            load_encoder_worker_.joinable() || load_send_worker_.joinable() ||
+            load_recv_worker_.joinable() || load_xor_worker_.joinable() ||
+            load_p2p_send_worker_.joinable() || load_p2p_recv_worker_.joinable() ||
+            load_step6_p2p_send_worker_.joinable() || load_step6_p2p_recv_worker_.joinable();
+
+        // Start load workers when entering load mode and no previous load worker remains.
+        if (is_load && !load_workers_active) {
             // Reset all load worker flags
             load_encoding_completed_ = false;
             load_encoding_sentinel_received_ = false;
@@ -4395,8 +4441,9 @@ public:
         uintptr_t encoding_addr,          // 编码buffer（parity index 1）
         uintptr_t recv_addr,               // 接收地址（只有 rank2/3 需要，其他传 0）
         size_t recv_chunk_size,           // 接收chunk大小（只有 rank2/3 需要，其他传 0）
-        uintptr_t parity_addr,            // parity buffer（只有 rank2/3 需要，其他传 0）
-        uintptr_t p2p_partner_write_addr   // Step6: rank2 接收 d3 的地址（只有 rank2 需要，其他传 0）
+        uintptr_t parity_addr,            // XOR output address for rank2/3
+        uintptr_t p2p_partner_write_addr,  // Step6: rank2 receives d3 at this address
+        bool parity_is_pooled              // true only for parity scratch pool outputs
     ) {
         if (!is_load_mode_) {
             std::cerr << "EC-CHECK: [Rank " << rank_ 
@@ -4411,7 +4458,7 @@ public:
         LoadEncodingTask load_task = {
             data_addr, size, encoding_addr,
             recv_addr, recv_chunk_size, parity_addr,
-            is_receiver,
+            parity_is_pooled, is_receiver,
             p2p_partner_write_addr  // For Step6: rank2 needs this to receive d3
         };
         
@@ -4446,7 +4493,8 @@ public:
         uintptr_t enc_addr_0, uintptr_t enc_addr_1,
         uintptr_t recv_addr_1, uintptr_t recv_addr_2,
         size_t recv_chunk_size,
-        uintptr_t own_write_addr, uintptr_t partner_write_addr
+        uintptr_t own_write_addr, uintptr_t partner_write_addr,
+        uintptr_t recovered_write_addr
     ) {
         if (!is_two_failures_load_mode_) {
             std::cerr << "EC-CHECK: [Rank " << rank_
@@ -4457,19 +4505,25 @@ public:
 
         const size_t sequence_id_1 = save_sequence_id_thread1_.fetch_add(1, std::memory_order_relaxed);
         const size_t sequence_id_2 = save_sequence_id_thread2_.fetch_add(1, std::memory_order_relaxed);
+        const uintptr_t row0_xor_output_addr =
+            (rank_in_group_ == 2 && recovered_write_addr != 0) ? recovered_write_addr : own_write_addr;
+        const uintptr_t row0_p2p_own_addr =
+            (rank_in_group_ == 2 && recovered_write_addr != 0) ? recovered_write_addr : own_write_addr;
+        const uintptr_t row1_xor_output_addr = own_write_addr;
+        const uintptr_t row1_p2p_recv_addr =
+            (rank_in_group_ == 1 && recovered_write_addr != 0) ? recovered_write_addr : partner_write_addr;
 
-        // Submit TWO encoding tasks to save-path encoder threads.
-        // Encoder thread 1 (parity row 0): rig0→rig2, rig1→rig3
-        //   receivers: rig2, rig3 → parity_addr = own_write_addr for XOR output
-        //   senders:   rig0, rig1 → parity_addr = 0 (send via send_queue)
+        // Only row 0 recovers rig2 via XOR, and only row 1 recovers rig1 via
+        // the downstream P2P receive. Non-receiver encoder tasks carry ordinary
+        // addresses which they neither write nor release as pooled storage.
         {
             std::lock_guard<std::mutex> lock(encoding_tasks_1_mutex_);
             encoding_tasks_1_.push({
                 data_addr, size, enc_addr_0,
                 recv_addr_1, recv_chunk_size,
-                own_write_addr,  // parity_addr: XOR destination (= own_buffer write offset)
-                own_write_addr, partner_write_addr,
-                false, false, false, size, sequence_id_1
+                row0_xor_output_addr,
+                row0_p2p_own_addr, partner_write_addr,
+                false, false, false, size, sequence_id_1, false
             });
         }
         encoding_tasks_1_cv_.notify_one();
@@ -4482,9 +4536,9 @@ public:
             encoding_tasks_2_.push({
                 data_addr, size, enc_addr_1,
                 recv_addr_2, recv_chunk_size,
-                own_write_addr,  // parity_addr: XOR destination (= own_buffer write offset)
-                own_write_addr, partner_write_addr,
-                false, false, false, size, sequence_id_2
+                row1_xor_output_addr,
+                own_write_addr, row1_p2p_recv_addr,
+                false, false, false, size, sequence_id_2, false
             });
         }
         encoding_tasks_2_cv_.notify_one();
@@ -4566,7 +4620,7 @@ public:
                         if (can_send_sentinel) {
                             // All tasks completed, will send sentinel in the check below
                             // Create a dummy sentinel task to trigger the check
-                            task = {0, 0, 0, 0, 0, false, 0};
+                            task = {0, 0, 0, 0, 0, 0, false, false, 0};
                         } else {
                             // Still have pending tasks, continue waiting
                             continue;
@@ -4631,7 +4685,8 @@ public:
                     // Submit recv task to load recv queue
                     {
                         std::lock_guard<std::mutex> lock(load_recv_queue_mutex_);
-                        load_recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr});
+                        load_recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr,
+                                               task.parity_is_pooled});
                     }
                     load_recv_queue_cv_.notify_one();
                 } else {
@@ -4686,17 +4741,20 @@ public:
                     if (rank_in_group_ == 2 || rank_in_group_ == 3) {
                         {
                             std::lock_guard<std::mutex> recv_lock(load_recv_queue_mutex_);
-                            load_recv_queue_.push({0, 0, 0});
+                            load_recv_queue_.push({0, 0, 0, false});
                         }
                         load_recv_queue_cv_.notify_one();
                     }
                     
-                    // All ranks use load_xor_queue_ (rank2/3 do XOR for recovery)
-                    {
-                        std::lock_guard<std::mutex> xor_lock(load_xor_queue_mutex_);
-                        load_xor_queue_.push({0, 0, 0, 0, 0, 0});
+                    // Non-receiver ranks never enqueue XOR work, so the encoder is
+                    // their final upstream producer and terminates the XOR worker directly.
+                    if (rank_in_group_ == 0 || rank_in_group_ == 1) {
+                        {
+                            std::lock_guard<std::mutex> xor_lock(load_xor_queue_mutex_);
+                            load_xor_queue_.push({0, 0, 0, false, 0, 0, 0});
+                        }
+                        load_xor_queue_cv_.notify_one();
                     }
-                    load_xor_queue_cv_.notify_one();
                     
                     // rank0/3: use load_p2p_send_queue_ (Step2 and Step6 P2P send)
                     if (rank_in_group_ == 0 || rank_in_group_ == 3) {
@@ -4719,6 +4777,7 @@ public:
                     load_encoding_sentinel_received_ = false;
                     // std::cout << "EC-CHECK: [Rank " << rank_ 
                     //           << "] Load encoder: All tasks completed, sentinel sent to downstream workers" << std::endl;
+                    break;
                 }
             }
         }
@@ -4982,6 +5041,11 @@ public:
                 {
                     std::lock_guard<std::mutex> lock(load_recv_queue_mutex_);
                     if (load_recv_queue_.empty()) {
+                        {
+                            std::lock_guard<std::mutex> xor_lock(load_xor_queue_mutex_);
+                            load_xor_queue_.push({0, 0, 0, false, 0, 0, 0});
+                        }
+                        load_xor_queue_cv_.notify_one();
                         load_recv_worker_completed_ = true;
                         load_recv_worker_sentinel_received_ = false;
                         break;
@@ -5088,6 +5152,7 @@ public:
                         local_encoding_addr,
                         task.recv_addr,
                         task.parity_addr,
+                        task.parity_is_pooled,
                         task.size,
                         p2p_partner_write_addr,
                         data_addr
@@ -5100,6 +5165,11 @@ public:
             if (load_recv_worker_sentinel_received_.load()) {
                 std::lock_guard<std::mutex> lock(load_recv_queue_mutex_);
                 if (load_recv_queue_.empty()) {
+                    {
+                        std::lock_guard<std::mutex> xor_lock(load_xor_queue_mutex_);
+                        load_xor_queue_.push({0, 0, 0, false, 0, 0, 0});
+                    }
+                    load_xor_queue_cv_.notify_one();
                     load_recv_worker_completed_ = true;
                     load_recv_worker_sentinel_received_ = false;
                     break;
@@ -5553,7 +5623,7 @@ public:
                     load_xor_worker_completed_ = true;
                     load_xor_worker_sentinel_received_ = false;
                     publish_load_xor_e2e_for_batch(xor_have_chunk, xor_first_start, xor_last_end);
-                    continue;
+                    break;
                 }
                 
                 task = load_xor_queue_.front();
@@ -5561,7 +5631,7 @@ public:
             }
             
             bool is_sentinel = (task.local_encoding_addr == 0 && task.remote_encoding_addr == 0 &&
-                                task.parity_addr == 0 && task.size == 0 &&
+                                task.parity_addr == 0 && !task.parity_is_pooled && task.size == 0 &&
                                 task.p2p_partner_write_addr == 0 && task.data_addr == 0);
             if (is_sentinel) {
                 load_xor_worker_sentinel_received_ = true;
@@ -5576,6 +5646,7 @@ public:
                 }
                 if (batch_xor_done) {
                     publish_load_xor_e2e_for_batch(xor_have_chunk, xor_first_start, xor_last_end);
+                    break;
                 }
                 continue;
             }
@@ -5621,7 +5692,7 @@ public:
             
             // Release parity buffer after XOR (single-node recovery)
             // Must release here to avoid pool exhaustion with large models (>24 chunks)
-            if (task.parity_addr != 0) {
+            if (task.parity_addr != 0 && task.parity_is_pooled) {
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
                 parity_buffers_to_release_.push(task.parity_addr);
             }
@@ -5639,6 +5710,7 @@ public:
                 }
                 if (batch_xor_done) {
                     publish_load_xor_e2e_for_batch(xor_have_chunk, xor_first_start, xor_last_end);
+                    break;
                 }
             }
         }
@@ -5672,7 +5744,7 @@ public:
                 if (load_p2p_send_worker_sentinel_received_.load() && load_p2p_send_queue_.empty()) {
                     load_p2p_send_worker_completed_ = true;
                     load_p2p_send_worker_sentinel_received_ = false;
-                    continue;
+                    break;
                 }
                 
                 task = load_p2p_send_queue_.front();
@@ -5687,7 +5759,7 @@ public:
                     if (load_p2p_send_queue_.empty()) {
                         load_p2p_send_worker_completed_ = true;
                         load_p2p_send_worker_sentinel_received_ = false;
-                        continue;
+                        break;
                     }
                 }
                 continue;
@@ -5769,6 +5841,7 @@ public:
                 if (load_p2p_send_queue_.empty()) {
                     load_p2p_send_worker_completed_ = true;
                     load_p2p_send_worker_sentinel_received_ = false;
+                    break;
                 }
             }
         }
@@ -5793,7 +5866,7 @@ public:
                 if (load_p2p_recv_worker_sentinel_received_.load() && load_p2p_recv_queue_.empty()) {
                     load_p2p_recv_worker_completed_ = true;
                     load_p2p_recv_worker_sentinel_received_ = false;
-                    continue;
+                    break;
                 }
                 
                 task = load_p2p_recv_queue_.front();
@@ -5808,7 +5881,7 @@ public:
                     if (load_p2p_recv_queue_.empty()) {
                         load_p2p_recv_worker_completed_ = true;
                         load_p2p_recv_worker_sentinel_received_ = false;
-                        continue;
+                        break;
                     }
                 }
                 continue;
@@ -5933,6 +6006,7 @@ public:
                 if (load_p2p_recv_queue_.empty()) {
                     load_p2p_recv_worker_completed_ = true;
                     load_p2p_recv_worker_sentinel_received_ = false;
+                    break;
                 }
             }
         }
@@ -6025,8 +6099,8 @@ public:
                 }
             }
             
-            // Step6: Release parity buffer after send (always release, even if send failed)
-            if (task.parity_addr != 0) {
+            // Step6 uses pooled scratch only; final recovery outputs never enter this queue.
+            if (task.parity_addr != 0 && task.parity_is_pooled) {
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
                 parity_buffers_to_release_.push(task.parity_addr);
             }
@@ -6171,7 +6245,7 @@ public:
             return;
         }
         
-        LoadEncodingTask sentinel = {0, 0, 0, 0, 0, 0, false, 0};
+        LoadEncodingTask sentinel = {0, 0, 0, 0, 0, 0, false, false, 0};
         submit_load_encoding_task(sentinel);
     }
     
@@ -6947,7 +7021,8 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("recv_addr") = 0,
              pybind11::arg("recv_chunk_size") = 0,
              pybind11::arg("parity_addr") = 0,
-             pybind11::arg("p2p_partner_write_addr") = 0)
+             pybind11::arg("p2p_partner_write_addr") = 0,
+             pybind11::arg("parity_is_pooled") = true)
         .def("submit_two_failure_encoding_chunk", &ECCHECKNative::submit_two_failure_encoding_chunk,
              "Submit encoding chunk for two-failure recovery (bidirectional XOR exchange)",
              pybind11::arg("data_addr") = 0,
@@ -6958,7 +7033,8 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("recv_addr_2") = 0,
              pybind11::arg("recv_chunk_size") = 0,
              pybind11::arg("own_write_addr") = 0,
-             pybind11::arg("partner_write_addr") = 0)
+             pybind11::arg("partner_write_addr") = 0,
+             pybind11::arg("recovered_write_addr") = 0)
         .def("submit_two_failure_encoding_sentinels", &ECCHECKNative::submit_two_failure_encoding_sentinels,
              "Submit sentinels to both encoder threads for two-failure recovery")
         .def("submit_load_step6_p2p_send", &ECCHECKNative::submit_load_step6_p2p_send,

@@ -1123,11 +1123,10 @@ def _run_eccheck_legacy_recovery(
     recovered_buffer: Optional[torch.Tensor],
     total_size: int,
     registry: GlobalMetadataRegistry,
-) -> Tuple[float, float]:
+) -> float:
     """Drive C++ recovery for ECCHECK legacy load using submit_load_pipeline_chunk.
 
-    Returns (network_encode_s, prep_copy_s).  Post-network dense extract/copy is
-    tracked in prep_copy_s and excluded from recovery e2e total.
+    Returns the network and encoding time in seconds.
 
     Uses the same chunked pipeline API as the modern path but sources data
     from pre-loaded .pt block buffers instead of mmap files.
@@ -1165,7 +1164,7 @@ def _run_eccheck_legacy_recovery(
             if recv_size < recovered_buffer.numel():
                 recovered_buffer[recv_size:].zero_()
         # rig=2/3: no-op
-        return time() - start_t, 0.0
+        return time() - start_t
 
     # ---- hardware failure path (rank_in_group 2) ----
     failed_rank = 2
@@ -1175,7 +1174,7 @@ def _run_eccheck_legacy_recovery(
     # Compute pipeline size
     max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
     if max_total_bytes == 0:
-        return 0.0, 0.0
+        return 0.0
     buffer_size = manager.eccheck_buffer_size
 
     # Get buffer pools (reuse save-time pools via manager)
@@ -1228,7 +1227,6 @@ def _run_eccheck_legacy_recovery(
     own_buf = blocks["own_buffer"]
     partner_buf = blocks["partner_buffer"]
 
-    native.reset_encoding_completion_flags()
     if active_event is not None:
         active_event.set()
 
@@ -1238,7 +1236,6 @@ def _run_eccheck_legacy_recovery(
 
     t_pipeline_net_start: Optional[float] = None
     t_pipeline_net = 0.0
-    prep_copy_s = 0.0
     try:
         while processed < max_total_bytes:
             remaining = max_total_bytes - processed
@@ -1283,15 +1280,24 @@ def _run_eccheck_legacy_recovery(
 
             enc_addr2 = _get_free_encoding()
 
-            # Parity and recv: only rank2/3 need these
+            # Receivers need a network buffer. Rig2 writes XOR output directly
+            # into dense recovered storage; rig3 retains pooled parity scratch.
             if rank_in_group in (2, 3):
-                parity_addr2 = _get_free_parity()
+                if rank_in_group == 2:
+                    if recovered_buffer is None:
+                        raise RuntimeError("ECCHECK legacy: rig2 needs recovered_buffer")
+                    parity_addr2 = int(recovered_buffer.data_ptr()) + processed
+                    parity_is_pooled = False
+                else:
+                    parity_addr2 = _get_free_parity()
+                    parity_is_pooled = True
                 recv_offset2_aligned = ((recv_offset2 + 63) // 64) * 64
                 recv_addr2 = recv_base2 + recv_offset2_aligned
                 recv_chunk_size = take
                 recv_offset2 = recv_offset2_aligned + recv_chunk_size
             else:
                 parity_addr2 = 0
+                parity_is_pooled = False
                 recv_addr2 = 0
                 recv_chunk_size = 0
 
@@ -1329,6 +1335,7 @@ def _run_eccheck_legacy_recovery(
                 recv_addr=recv_addr2,
                 recv_chunk_size=recv_chunk_size,
                 parity_addr=parity_addr2,
+                parity_is_pooled=parity_is_pooled,
                 p2p_partner_write_addr=p2p_partner_write,
             )
 
@@ -1348,22 +1355,6 @@ def _run_eccheck_legacy_recovery(
             torch.cuda.synchronize()
         t_pipeline_net = time() - t_pipeline_net_start
 
-        # Extract recovered data from own_buffer for rank2 (prep_copy, not e2e).
-        # own_buf was written by C++ at 64B-aligned offsets with gaps between
-        # chunks.  We iterate over the same chunk layout used during encoding
-        # to reconstruct a dense buffer.
-        if rank_in_group == 2 and recovered_buffer is not None:
-            t_prep = time()
-            recovered_dense = _extract_dense_from_gapped_buffer(
-                own_buf, buffer_size, max_total_bytes,
-            )
-            actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
-            if recovered_buffer.numel() >= total_size:
-                n_copy = min(actual_tensor_bytes, total_size,
-                             recovered_dense.numel())
-                recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
-            prep_copy_s = time() - t_prep
-
         logger.debug(
             f"ECCHECK legacy: hw recovery pipeline done in {t_pipeline_net:.2f}s"
         )
@@ -1372,7 +1363,7 @@ def _run_eccheck_legacy_recovery(
         if active_event is not None:
             active_event.clear()
 
-    return t_pipeline_net, prep_copy_s
+    return t_pipeline_net
 
 
 # ---------------------------------------------------------------------------
@@ -1387,10 +1378,10 @@ def _run_eccheck_two_failures_recovery(
     recovered_buffer: Optional[torch.Tensor],
     total_size: int,
     registry: GlobalMetadataRegistry,
-) -> Tuple[float, float]:
+) -> float:
     """Drive C++ two-failure recovery for ECCHECK legacy load.
 
-    Returns (network_encode_s, prep_copy_s).
+    Returns the network and encoding time in seconds.
 
     Two physical nodes lost → rig1 and rig2 in each 4-rank group are failed.
     Survivors rig0 and rig3 use bidirectional XOR exchange to recover
@@ -1419,7 +1410,7 @@ def _run_eccheck_two_failures_recovery(
     # Compute pipeline size
     max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
     if max_total_bytes == 0:
-        return 0.0, 0.0
+        return 0.0
     buffer_size = manager.eccheck_buffer_size
 
     # Get buffer pools
@@ -1431,8 +1422,6 @@ def _run_eccheck_two_failures_recovery(
     free_parity_queue = buffers["free_parity_buffer_queue"]
     poll_and_release = buffers.get("poll_and_release_buffers")
     active_event = buffers.get("buffer_poller_active_event")
-
-    prep_copy_s = 0.0
 
     def _get_free_data():
         if poll_and_release is not None:
@@ -1475,7 +1464,6 @@ def _run_eccheck_two_failures_recovery(
     own_buf = blocks["own_buffer"]
     partner_buf = blocks["partner_buffer"]
 
-    native.reset_encoding_completion_flags()
     if active_event is not None:
         active_event.set()
 
@@ -1609,8 +1597,16 @@ def _run_eccheck_two_failures_recovery(
             # Bounds check
             own_offset_aligned = ((own_offset + 63) // 64) * 64
             partner_offset_aligned = ((partner_offset + 63) // 64) * 64
-            p2p_rem_own = own_buf.numel() - own_offset_aligned
-            p2p_rem_partner = partner_buf.numel() - partner_offset_aligned
+            p2p_rem_own = (
+                recovered_buffer.numel() - processed
+                if rank_in_group == 2 and recovered_buffer is not None
+                else own_buf.numel() - own_offset_aligned
+            )
+            p2p_rem_partner = (
+                recovered_buffer.numel() - processed
+                if rank_in_group == 1 and recovered_buffer is not None
+                else partner_buf.numel() - partner_offset_aligned
+            )
             max_p2p = min(p2p_rem_own, p2p_rem_partner)
 
             recv_offset_1_aligned = ((recv_offset_1 + 63) // 64) * 64
@@ -1655,6 +1651,10 @@ def _run_eccheck_two_failures_recovery(
                 recv_chunk_size=take,
                 own_write_addr=own_write_addr,
                 partner_write_addr=partner_write_addr,
+                recovered_write_addr=(
+                    int(recovered_buffer.data_ptr()) + processed
+                    if is_failed and recovered_buffer is not None else 0
+                ),
             )
 
             processed += take
@@ -1667,31 +1667,6 @@ def _run_eccheck_two_failures_recovery(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t_pipeline_net = time() - t_pipeline_net_start
-
-        # ---- Phase 4: Extract recovered data (prep_copy, not e2e) ----
-        t_prep = time()
-        # rig2: own_buffer was written by C++ via XOR as d2 (gapped)
-        if rank_in_group == 2 and recovered_buffer is not None:
-            recovered_dense = _extract_dense_from_gapped_buffer(
-                own_buf, buffer_size, max_total_bytes,
-            )
-            actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
-            if recovered_buffer.numel() >= total_size:
-                n_copy = min(actual_tensor_bytes, total_size,
-                             recovered_dense.numel())
-                recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
-
-        # rig1: partner_buffer was written by C++ via P2P as d1 (gapped)
-        if rank_in_group == 1 and recovered_buffer is not None:
-            recovered_dense = _extract_dense_from_gapped_buffer(
-                partner_buf, buffer_size, max_total_bytes,
-            )
-            actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
-            if recovered_buffer.numel() >= total_size:
-                n_copy = min(actual_tensor_bytes, total_size,
-                             recovered_dense.numel())
-                recovered_buffer[:n_copy].copy_(recovered_dense[:n_copy])
-        prep_copy_s = time() - t_prep
 
         network_encode = t_phase1_p2p + t_pipeline_net
         logger.debug(
@@ -1706,7 +1681,7 @@ def _run_eccheck_two_failures_recovery(
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    return network_encode, prep_copy_s
+    return network_encode
 
 
 # ---------------------------------------------------------------------------
@@ -1850,11 +1825,25 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     args = get_args()
     rank_in_group = ECCHECKManager._get_rank_in_group(rank, world_size) if world_size > 1 else 0
+    cluster_id = ECCHECKManager._get_cluster_id(rank, world_size) if world_size > 1 else 0
     sw_failure = bool(getattr(args, "use_eccheck_software_failure", False))
     two_failures = bool(getattr(args, "use_eccheck_two_failures", False))
+    target_cluster = int(getattr(args, "eccheck_recovery_cluster", 0))
+    layout = ECCHECKManager._get_group_layout(world_size)
+    num_clusters = int(
+        layout["clusters"] if layout["mode"] == 1 else layout["num_groups"]
+    )
+    if target_cluster < 0 or target_cluster >= num_clusters:
+        raise ValueError(
+            f"ECCHECK recovery cluster {target_cluster} is outside "
+            f"[0, {num_clusters - 1}]"
+        )
+    # Software-failure behavior remains unchanged. HW/HW2 recovery is confined
+    # to one four-node cluster; ranks in other clusters load their local state.
+    recovery_cluster_active = sw_failure or cluster_id == target_cluster
 
     load_tensor_buffer = True
-    if world_size > 1:
+    if world_size > 1 and recovery_cluster_active:
         # Ranks rebuilt from EC/P2P data do not need the multi-GB main tensor
         # buffer. In SW mode only rig1 is rebuilt from recovered_buffer;
         # rig0 still needs its local main tensor and sends d1 from partner_buffer.
@@ -1865,11 +1854,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         else:
             load_tensor_buffer = rank_in_group != 2
 
-    t_prep = time.time()
     main_payload = _load_eccheck_main_payload(
         checkpoint_dir, rank, world_size, load_tensor_buffer=load_tensor_buffer,
     )
-    prep_copy_s = time.time() - t_prep
 
     if not getattr(args, "use_eccheck", False):
         logger.warning(
@@ -1881,6 +1868,8 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     manager.init_eccheck_if_enabled()
     if manager._eccheck_native is None:
         raise RuntimeError("ECCHECK native module is not available in legacy load path")
+    if getattr(args, "ft_inprocess_recovery_benchmark", False):
+        manager.reset_free_buffer_queues_for_inprocess_recovery()
 
     tensor_infos = main_payload["tensor_infos"]
     local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
@@ -1899,18 +1888,22 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
 
-    if sw_failure:
-        required_block_names = ["partner_buffer"] if rank_in_group == 0 else []
+    if recovery_cluster_active:
+        if sw_failure:
+            required_block_names = ["partner_buffer"] if rank_in_group == 0 else []
+        else:
+            required_block_names = ["own_buffer", "partner_buffer"]
+        blocks = _allocate_eccheck_blocks_legacy(
+            manager, rank_metadata, block_names=required_block_names,
+        )
     else:
-        required_block_names = ["own_buffer", "partner_buffer"]
-    blocks = _allocate_eccheck_blocks_legacy(
-        manager, rank_metadata, block_names=required_block_names,
-    )
+        blocks = {}
 
     recovered_buffer: Optional[torch.Tensor] = None
 
-    t_disk = time.time()
-    if two_failures:
+    if not recovery_cluster_active:
+        pass
+    elif two_failures:
         pin = True
         actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
         blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
@@ -1939,14 +1932,13 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     elif rank_in_group == 2:
         blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
         pin = True
-        recovered_buffer = _allocate_recovered_buffer(total_size, pin)
+        recovered_capacity = _max_tensor_bytes_from_registry(registry, world_size)
+        recovered_buffer = _allocate_recovered_buffer(recovered_capacity, pin)
     else:
         blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
         _load_eccheck_blocks_from_disk_into(
             blocks, checkpoint_dir, rank, rank_in_group, software_failure=False,
         )
-    prep_copy_s += time.time() - t_disk
-
     if manager.use_rdma and recovered_buffer is not None:
         manager.register_buffer(recovered_buffer)
 
@@ -1960,7 +1952,14 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     else:
         _mode = "HW"
 
-    if _mode in ("HW", "HW2"):
+    should_time_recovery_to_forward = (
+        _mode in ("HW", "HW2")
+        and (
+            not getattr(args, "ft_inprocess_recovery_benchmark", False)
+            or bool(getattr(args, "_ft_inprocess_recovery_active", False))
+        )
+    )
+    if should_time_recovery_to_forward:
         try:
             from megatron.training.global_vars import start_recovery_to_forward_timer
             start_recovery_to_forward_timer(
@@ -1970,9 +1969,10 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             pass
 
     # === timing: network/encode (C++ P2P or XOR pipeline, excluding setup/copy) ===
-    recovery_prep_copy_s = 0.0
-    if two_failures:
-        network_encode, recovery_prep_copy_s = _run_eccheck_two_failures_recovery(
+    if not recovery_cluster_active:
+        network_encode = 0.0
+    elif two_failures:
+        network_encode = _run_eccheck_two_failures_recovery(
             manager=manager,
             rank=rank,
             world_size=world_size,
@@ -1982,7 +1982,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             registry=registry,
         )
     else:
-        network_encode, recovery_prep_copy_s = _run_eccheck_legacy_recovery(
+        network_encode = _run_eccheck_legacy_recovery(
             manager=manager,
             rank=rank,
             world_size=world_size,
@@ -1992,9 +1992,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             total_size=total_size,
             registry=registry,
         )
-    prep_copy_s += recovery_prep_copy_s
-
-    if _mode in ("HW", "HW2"):
+    if should_time_recovery_to_forward:
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
             mark_recovery_to_forward_timer("eccheck_network_done")
@@ -2003,7 +2001,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     # SW rig1 rebuilds from recovered_buffer; rig0/2/3 use their local main tensor.
 
-    if sw_failure:
+    if not recovery_cluster_active:
+        rebuild_recovered_buffer = None
+    elif sw_failure:
         rebuild_recovered_buffer = (
             recovered_buffer if rank_in_group == 1 else None
         )
@@ -2030,10 +2030,11 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         "net_s": native_timing["net_s"],
         "encode_s": native_timing["encode_s"],
         "decode_s": native_timing["encode_s"],
-        "prep_copy": prep_copy_s,
         "rebuild_sd": rebuild_sd,
         "barrier": barrier_s,
         "rebuild_from_recovered": float(rebuild_recovered_buffer is not None),
+        "recovery_cluster_active": float(recovery_cluster_active),
+        "recovery_cluster": float(target_cluster),
     }
     from megatron.training.global_vars import set_ft_load_timing_context
     set_ft_load_timing_context("ECCHECK", _mode, timings)
@@ -2042,18 +2043,40 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     load_log["mode"] = _mode
     logger.debug(
         "ECCHECK load timing (%(mode)s local): e2e_s=%(total).2fs "
-        "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
-        "barrier_s=%(barrier).2fs",
+        "network_encode_s=%(network_encode).2fs "
+        "rebuild_sd_s=%(rebuild_sd).2fs barrier_s=%(barrier).2fs",
         load_log,
     )
 
+    if should_time_recovery_to_forward:
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("eccheck_rebuild_done")
+            mark_recovery_to_forward_timer("eccheck_final_barrier_start")
+        except Exception:
+            pass
+
+    skip_final_barrier = bool(getattr(args, "ft_inprocess_recovery_benchmark", False))
     # Stop C++ load workers so they don't interfere with subsequent training.
     # Synchronize teardown so early ranks do not release RDMA resources while peers
-    # are still draining their final load P2P completions.
-    if world_size > 1 and torch.distributed.is_initialized():
+    # are still draining their final load P2P completions. In in-process benchmark
+    # mode cleanup is deferred, so skip this tail barrier.
+    if world_size > 1 and torch.distributed.is_initialized() and not skip_final_barrier:
         torch.distributed.barrier()
+        if should_time_recovery_to_forward:
+            try:
+                from megatron.training.global_vars import mark_recovery_to_forward_timer
+                mark_recovery_to_forward_timer("eccheck_final_barrier_done")
+            except Exception:
+                pass
+    elif skip_final_barrier and should_time_recovery_to_forward:
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("eccheck_final_barrier_skipped_inprocess")
+        except Exception:
+            pass
 
-    if _mode in ("HW", "HW2"):
+    if should_time_recovery_to_forward:
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
             mark_recovery_to_forward_timer("eccheck_load_return")

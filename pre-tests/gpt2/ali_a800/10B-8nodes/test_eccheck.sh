@@ -70,7 +70,7 @@ fi
 
 # ---- mode parsing (save | software | hardware, after GPU IDs) ----
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -98,6 +98,7 @@ ARGS_TO_PASS=("$@")
 
 # Recovery mode args: enabled only for software / hardware load tests
 RECOVERY_MODE_ARGS=()
+FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-6}
 case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
@@ -119,6 +120,17 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-eccheck-two-failures
+        )
+        ;;
+    inprocess)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --ft-inprocess-recovery-benchmark
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
+            --eccheck-recovery-cluster 0
         )
         ;;
 esac
@@ -193,6 +205,7 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
     --use-eccheck
+    --eccheck-rig-remap-offset 2
     --ckpt-format torch
     --save-embeddings-separately
     # --timing-log-level 2

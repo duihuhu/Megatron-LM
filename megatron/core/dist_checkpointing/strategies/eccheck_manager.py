@@ -168,6 +168,15 @@ class ECCHECKManager:
                 "clusters": 1}
 
     @classmethod
+    def _get_cluster_id(cls, rank: int, world_size: int) -> int:
+        """Get the four-node recovery cluster containing this rank."""
+        layout = cls._get_group_layout(world_size)
+        if layout["mode"] == 1:
+            node_id = rank // layout["ranks_per_node"]
+            return node_id % layout["clusters"]
+        return cls._get_group_id(rank, world_size)
+
+    @classmethod
     def _get_group_id(cls, rank: int, world_size: int) -> int:
         """Get group id for multi-rank (mode 0 or mode 1)."""
         layout = cls._get_group_layout(world_size)
@@ -182,32 +191,55 @@ class ECCHECKManager:
         return rank % num_groups
 
     @classmethod
-    def _get_rank_in_group(cls, rank: int, world_size: int) -> int:
-        """Get rank index within group (0..3), mode 0 or mode 1."""
+    def _get_rig_remap_offset(cls) -> int:
+        """Return the process-wide physical-to-logical rig rotation."""
+        try:
+            from megatron.training import get_args
+
+            offset = int(getattr(get_args(), "eccheck_rig_remap_offset", 0))
+        except (ImportError, RuntimeError, AssertionError):
+            offset = int(os.environ.get("ECCHECK_RIG_REMAP_OFFSET", "0"))
+        if offset < 0 or offset >= RANKS_PER_GROUP:
+            raise ValueError(
+                f"ECCHECK rig remap offset must be in [0, {RANKS_PER_GROUP - 1}], "
+                f"got {offset}"
+            )
+        return offset
+
+    @classmethod
+    def _get_physical_rank_in_group(cls, rank: int, world_size: int) -> int:
+        """Get the unrotated physical position within a four-rank group."""
         layout = cls._get_group_layout(world_size)
         num_groups = layout["num_groups"]
         if layout["mode"] == 1:
-            ranks_per_node = layout["ranks_per_node"]
-            clusters = layout["clusters"]
-            node_id = rank // ranks_per_node
-            return node_id // clusters
+            node_id = rank // layout["ranks_per_node"]
+            return node_id // layout["clusters"]
         return rank // num_groups
+
+    @classmethod
+    def _get_rank_in_group(cls, rank: int, world_size: int) -> int:
+        """Map a global rank to its rotated logical ECCHECK rig position."""
+        physical_rig = cls._get_physical_rank_in_group(rank, world_size)
+        return (physical_rig + cls._get_rig_remap_offset()) % RANKS_PER_GROUP
 
     @classmethod
     def _get_rank_by_group_position(
         cls, group_id: int, rank_in_group: int, world_size: int
     ) -> int:
-        """Map (group_id, rank_in_group) -> global rank."""
+        """Map a logical group position back to its global rank."""
         layout = cls._get_group_layout(world_size)
         num_groups = layout["num_groups"]
+        physical_rig = (
+            rank_in_group - cls._get_rig_remap_offset()
+        ) % RANKS_PER_GROUP
         if layout["mode"] == 1:
             ranks_per_node = layout["ranks_per_node"]
             clusters = layout["clusters"]
             local_rank = group_id // clusters
             cluster_id = group_id % clusters
-            node_id = rank_in_group * clusters + cluster_id
+            node_id = physical_rig * clusters + cluster_id
             return node_id * ranks_per_node + local_rank
-        return group_id + num_groups * rank_in_group
+        return group_id + num_groups * physical_rig
 
     def _get_xor_paired_rank(self, my_rank: int, world_size: int) -> int:
         """Get the paired rank for parity exchange (XOR pairing within group).
@@ -879,6 +911,32 @@ class ECCHECKManager:
         self._buffer_poller_stop_event = None
         self._buffer_poller_active_event = None
     
+    def reset_free_buffer_queues_for_inprocess_recovery(self):
+        """Reset reusable free-buffer queues between in-process recovery cycles."""
+        if self.eccheck_data_buffers is None:
+            return
+
+        # Drain stale release notifications from the previous recovery cycle.
+        if self._eccheck_native is not None:
+            try:
+                self._eccheck_native.get_data_buffers_to_release()
+                self._eccheck_native.get_encoding_buffers_to_release()
+                self._eccheck_native.get_parity_buffers_to_release()
+            except Exception as exc:
+                logger.debug("EC-CHECK: ignored stale release queue drain failure: %s", exc)
+
+        self._free_data_buffer_queue = queue.Queue()
+        for buffer in self.eccheck_data_buffers or []:
+            self._free_data_buffer_queue.put(int(buffer.data_ptr()))
+
+        self._free_encoding_buffer_queue = queue.Queue()
+        for buffer in self.eccheck_encoding_buffers or []:
+            self._free_encoding_buffer_queue.put(int(buffer.data_ptr()))
+
+        self._free_parity_buffer_queue = queue.Queue()
+        for buffer in self.eccheck_parity_buffers or []:
+            self._free_parity_buffer_queue.put(int(buffer.data_ptr()))
+
     def get_eccheck_buffers(self):
         """Get EC-CHECK buffers for FileSystemWriterAsync.
         

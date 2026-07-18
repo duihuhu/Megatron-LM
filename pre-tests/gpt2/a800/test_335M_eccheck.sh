@@ -17,7 +17,7 @@ MASTER_ADDR=10.0.0.62
 
 export ECCHECK_USE_ASIO=true
 MASTER_PORT=7000
-NNODES=4
+NNODES=8
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
@@ -67,12 +67,15 @@ DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 SHM_PKT="/dev/shm/shm_pkt"
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess)$ ]]; then
     MODE="$1"
     shift
 fi
 ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
+FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-3}
+ECCHECK_RECOVERY_CLUSTER=${ECCHECK_RECOVERY_CLUSTER:-0}
+ECCHECK_RIG_REMAP_OFFSET=${ECCHECK_RIG_REMAP_OFFSET:-2}
 case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
@@ -89,12 +92,25 @@ case "$MODE" in
     hardware)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
+            --eccheck-recovery-cluster $ECCHECK_RECOVERY_CLUSTER
         )
         ;;
     hardware2)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-eccheck-two-failures
+            --eccheck-recovery-cluster $ECCHECK_RECOVERY_CLUSTER
+        )
+        ;;
+    inprocess)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --ft-inprocess-recovery-benchmark
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
+            --eccheck-recovery-cluster $ECCHECK_RECOVERY_CLUSTER
         )
         ;;
 esac
@@ -122,6 +138,7 @@ DATA_ARGS=(
 )
 
 GPT_ARGS=(
+    --eccheck-rig-remap-offset $ECCHECK_RIG_REMAP_OFFSET
     --no-async-tensor-model-parallel-allreduce
     --hidden-size $HIDDEN_SIZE
     --num-attention-heads $NUM_ATTENTION_HEADS
@@ -149,7 +166,7 @@ GPT_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 4
+    --pipeline-model-parallel-size 8
 )
 
 EVAL_AND_LOGGING_ARGS=(

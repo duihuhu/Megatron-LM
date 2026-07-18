@@ -98,6 +98,7 @@ ARGS_TO_PASS=("$@")
 
 # Recovery mode args: enabled only for software / hardware load tests
 RECOVERY_MODE_ARGS=()
+FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-3}
 case "$MODE" in
     save)
         ;;

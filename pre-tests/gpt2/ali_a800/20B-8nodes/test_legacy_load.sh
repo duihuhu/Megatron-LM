@@ -87,6 +87,7 @@ ARGS_TO_PASS=("$@")
 
 # Native legacy checkpoint mode args
 RECOVERY_MODE_ARGS=()
+FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-3}
 case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(

@@ -1934,14 +1934,10 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     if native is None:
         raise RuntimeError("EC-NAIVE native module unavailable for hardware recovery")
 
-    try:
-        from megatron.training.global_vars import start_recovery_to_forward_timer
-        start_recovery_to_forward_timer(
-            "EC-NAIVE", "network_recovery", role="HW", rank0_only_max=True,
-        )
-    except Exception:
-        pass
-
+    should_time_recovery_to_forward = (
+        not getattr(args, "ft_inprocess_recovery_benchmark", False)
+        or bool(getattr(args, "_ft_inprocess_recovery_active", False))
+    )
     # Step 1: Load main payload + exchange metadata
     main_payload = _load_ecnaive_main_payload(checkpoint_dir, rank, world_size)
     tensor_infos = main_payload.get("tensor_infos", [])
@@ -2089,6 +2085,15 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
     # Sync after pre-alloc/load so network timing excludes setup skew.
     barrier_s += _timed_barrier()
+
+    if should_time_recovery_to_forward:
+        try:
+            from megatron.training.global_vars import start_recovery_to_forward_timer
+            start_recovery_to_forward_timer(
+                "EC-NAIVE", "network_recovery", role="HW", rank0_only_max=True,
+            )
+        except Exception:
+            pass
 
     # === timing: network/encode (C++ send/recv + RS decode only) ===
     _t: Dict[str, float] = {'prep_copy': 0.0}
@@ -2453,11 +2458,12 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         load_log,
     )
 
-    try:
-        from megatron.training.global_vars import mark_recovery_to_forward_timer
-        mark_recovery_to_forward_timer("ecnaive_load_return")
-    except Exception:
-        pass
+    if should_time_recovery_to_forward:
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("ecnaive_load_return")
+        except Exception:
+            pass
 
     # NOTE: do not call manager.cleanup() or native.stop() here.
     # The C++ destructor double-frees RDMA resources used during RS decode.

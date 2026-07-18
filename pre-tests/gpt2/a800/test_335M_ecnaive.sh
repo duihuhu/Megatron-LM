@@ -85,12 +85,13 @@ SHM_PKT="/dev/shm/shm_pkt"
 # Remaining args after node-rank and GPU ids are passed to the training script
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess)$ ]]; then
     MODE="$1"
     shift
 fi
 ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
+FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-3}
 case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
@@ -115,6 +116,17 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --ecnaive-failed-ranks "0,1"
+        )
+        ;;
+    inprocess)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --ft-inprocess-recovery-benchmark
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-failed-ranks "0"
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
         )
         ;;
 esac

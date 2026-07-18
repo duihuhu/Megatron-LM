@@ -967,7 +967,7 @@ class GeminiReplicasManager:
         has_p2p_role = participates and bool(target_ranks or source_ranks)
 
         if participates:
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas: [Rank {rank}] Reinitializing for recovery: "
                 f"failed_in_group={sorted(failed_in_group)}, "
                 f"healthy_in_group={sorted(healthy_in_group)}, "
@@ -975,7 +975,7 @@ class GeminiReplicasManager:
             )
             self._stop_native_gracefully()
         else:
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas: [Rank {rank}] No recovery in local group "
                 f"(failed_in_group={sorted(failed_in_group)}), "
                 f"keeping save-time connections"
@@ -1028,7 +1028,7 @@ class GeminiReplicasManager:
         try:
             if not has_p2p_role:
                 if participates:
-                    logger.info(
+                    logger.debug(
                         f"Gemini Replicas recovery: [Rank {rank}] no P2P role, "
                         f"skipping native module creation"
                     )
@@ -1055,7 +1055,7 @@ class GeminiReplicasManager:
             spec.loader.exec_module(gemini_replicas_native)
 
             mode_str = "RDMA" if self.use_rdma else "ASIO"
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas recovery: [Rank {rank}] creating native module: "
                 f"targets={target_ranks}, sources={source_ranks} ({mode_str}), "
                 f"channels_per_peer={recovery_channels}"
@@ -1075,7 +1075,7 @@ class GeminiReplicasManager:
 
             # Post-finalize barrier (aligned with save-time init)
             torch.distributed.barrier()
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas recovery: [Rank {rank}] "
                 f"All ranks finished recovery Phase 2 connections"
             )
@@ -1084,7 +1084,7 @@ class GeminiReplicasManager:
             # Starting persistent exchange workers here leaves recv workers alive
             # across in-process recovery cycles and can block the next reinit.
 
-            logger.info(
+            logger.debug(
                 f"Gemini Replicas recovery: [Rank {rank}] reinit complete, "
                 f"targets={target_ranks}, sources={source_ranks}"
             )

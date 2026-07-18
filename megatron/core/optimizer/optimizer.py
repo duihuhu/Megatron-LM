@@ -1475,7 +1475,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     fp32_bytes += saved_param.numel() * saved_param.element_size()
         fp32_s = time.time() - fp32_t0 if profile_ft_load else 0.0
         if profile_ft_load:
-            logger.info(
+            logger.debug(
                 "optimizer load profile: total_s=%.2fs filter_s=%.2fs "
                 "inner_optimizer_s=%.2fs grad_scaler_s=%.2fs "
                 "fp32_master_copy_s=%.2fs fp32_tensors=%d fp32_mib=%.1f",
@@ -1720,7 +1720,7 @@ class FP32Optimizer(MegatronOptimizer):
         self.optimizer.load_state_dict(state_dict)
         inner_s = time.time() - inner_t0 if profile_ft_load else 0.0
         if profile_ft_load:
-            logger.info(
+            logger.debug(
                 "optimizer load profile: total_s=%.2fs filter_s=%.2fs "
                 "inner_optimizer_s=%.2fs wrapper=FP32Optimizer",
                 time.time() - profile_t0,

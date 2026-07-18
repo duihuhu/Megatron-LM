@@ -65,9 +65,6 @@ find_rdma_device_by_ip(const std::string&     ip_str,
         ibv_close_device(ctx);
 
         if (matched) {
-            std::cout << "[RDMA] IP " << ip_str << " → device "
-                      << ibv_get_device_name(device_list[i])
-                      << " (index " << i << ")" << std::endl;
             return device_list[i];
         }
     }

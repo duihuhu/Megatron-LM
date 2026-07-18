@@ -31,7 +31,7 @@ def _try_get_ip_from_interface(interface_name: str) -> Optional[str]:
         addrs = netifaces.ifaddresses(interface_name)
         if netifaces.AF_INET in addrs:
             ip = addrs[netifaces.AF_INET][0]['addr']
-            logger.info("Resolved IP %s from interface %s", ip, interface_name)
+            logger.debug("Resolved IP %s from interface %s", ip, interface_name)
             return ip
         logger.warning("Interface %s has no IPv4 address", interface_name)
     except ImportError:
@@ -51,7 +51,7 @@ def _try_auto_detect_ip() -> Optional[str]:
         s.connect(('8.8.8.8', 80))
         ip = s.getsockname()[0]
         s.close()
-        logger.info("Auto-detected IP address: %s", ip)
+        logger.debug("Auto-detected IP address: %s", ip)
         return ip
     except Exception as e:
         logger.warning("Failed to auto-detect IP: %s", e)
@@ -126,7 +126,7 @@ def resolve_ip(
         for p in prefixes:
             rank_ip = os.environ.get(f'{p}_RANK_IP_{rank}')
             if rank_ip:
-                logger.info("[Rank %d] Using IP from %s_RANK_IP_%d: %s", rank, p, rank, rank_ip)
+                logger.debug("[Rank %d] Using IP from %s_RANK_IP_%d: %s", rank, p, rank, rank_ip)
                 return rank_ip
 
     # ==== Phase 2: per-local-rank NIC name ====
@@ -136,7 +136,7 @@ def resolve_ip(
             if nic_name:
                 ip = _try_get_ip_from_interface(nic_name)
                 if ip:
-                    logger.info(
+                    logger.debug(
                         "[Rank %d / local_rank %d] Using IP %s from %s_LOCAL_RANK_NIC_%d=%s",
                         rank, local_rank, ip, p, local_rank, nic_name,
                     )
@@ -156,7 +156,7 @@ def resolve_ip(
                     # Each entry can be "interface_name" or "interface_name:ip"
                     if ':' in entry:
                         ip = entry.split(':', 1)[1].strip()
-                        logger.info(
+                        logger.debug(
                             "[Rank %d / local_rank %d] Using IP %s "
                             "from %s_NIC_LIST (nic_idx=%d)",
                             rank, local_rank, ip, p, nic_idx,
@@ -164,7 +164,7 @@ def resolve_ip(
                     else:
                         ip = _try_get_ip_from_interface(entry)
                         if ip:
-                            logger.info(
+                            logger.debug(
                                 "[Rank %d / local_rank %d] Using IP %s "
                                 "from %s_NIC_LIST interface %s (nic_idx=%d)",
                                 rank, local_rank, ip, p, entry, nic_idx,
@@ -183,7 +183,7 @@ def resolve_ip(
     for p in prefixes:
         base_ip = os.environ.get(f'{p}_BASE_IP')
         if base_ip:
-            logger.info("Using IP from %s_BASE_IP: %s", p, base_ip)
+            logger.debug("Using IP from %s_BASE_IP: %s", p, base_ip)
             return base_ip
 
     # ==== Legacy: single INTERFACE name ====

@@ -1814,10 +1814,15 @@ def load_gemini_replicas_legacy_checkpoint(
         args.use_gemini_replicas = True
 
     manager = GeminiReplicasManager()
-    manager.init_gemini_replicas_if_enabled()
+    recovery_rank_str = getattr(args, "gemini_replicas_recovery_rank", None)
+    inprocess_recovery_active = bool(
+        getattr(args, "ft_inprocess_recovery_benchmark", False)
+        and getattr(args, "_ft_inprocess_recovery_active", False)
+    )
+    if not inprocess_recovery_active:
+        manager.init_gemini_replicas_if_enabled()
 
     # ---- Determine which ranks need recovery ----
-    recovery_rank_str = getattr(args, "gemini_replicas_recovery_rank", None)
     main_path = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
     main_file_exists = main_path.is_file()
     health_list = [None for _ in range(world_size)]
@@ -2090,7 +2095,8 @@ def load_gemini_replicas_legacy_checkpoint(
         except Exception:
             pass
 
-    if manager._gemini_replicas_native is not None:
+    skip_cleanup = bool(getattr(args, "ft_inprocess_recovery_benchmark", False))
+    if manager._gemini_replicas_native is not None and not skip_cleanup:
         logger.debug(
             f"Gemini Replicas legacy load: cleaning up native module (rank {rank})"
         )
@@ -2107,11 +2113,29 @@ def load_gemini_replicas_legacy_checkpoint(
         _gemini_recovery_profile(
             recovery_role, "cleanup_done", elapsed_s=cleanup_s
         )
+    elif skip_cleanup:
+        _gemini_recovery_profile(recovery_role, "cleanup_skipped_inprocess")
 
-    # All ranks must participate: P2P ranks cleaned up native connections,
-    # while no-role ranks skipped native creation during sparse recovery.
-    if torch.distributed.is_initialized():
+    try:
+        from megatron.training.global_vars import mark_recovery_to_forward_timer
+        mark_recovery_to_forward_timer("gemini_final_barrier_start")
+    except Exception:
+        pass
+    # All ranks must participate after cleanup in normal load. In in-process
+    # benchmark mode cleanup is skipped, so this barrier only adds skew.
+    if torch.distributed.is_initialized() and not skip_cleanup:
         torch.distributed.barrier()
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("gemini_final_barrier_done")
+        except Exception:
+            pass
+    elif skip_cleanup:
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("gemini_final_barrier_skipped_inprocess")
+        except Exception:
+            pass
 
     try:
         from megatron.training.global_vars import mark_recovery_to_forward_timer

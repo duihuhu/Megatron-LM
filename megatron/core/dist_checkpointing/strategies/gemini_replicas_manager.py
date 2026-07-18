@@ -1073,7 +1073,9 @@ class GeminiReplicasManager:
                 f"All ranks finished recovery Phase 2 connections"
             )
 
-            self._gemini_replicas_native.start_workers(source_ranks)
+            # Hardware recovery uses synchronous directed P2P calls below.
+            # Starting persistent exchange workers here leaves recv workers alive
+            # across in-process recovery cycles and can block the next reinit.
 
             logger.info(
                 f"Gemini Replicas recovery: [Rank {rank}] reinit complete, "

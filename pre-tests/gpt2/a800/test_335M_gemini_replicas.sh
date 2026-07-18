@@ -88,6 +88,9 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 check_gemini_port_free() {
     local port=$1
     local label=$2
+    if ! command -v ss >/dev/null 2>&1; then
+        return 0
+    fi
     if ss -ltn "sport = :${port}" | grep -q ":${port} "; then
         echo "Error: ${label} port ${port} is already in use." >&2
         echo "Another Gemini job or stale process is probably still listening." >&2
@@ -110,6 +113,53 @@ CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-gemini-replicas-leg
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 
 SHM_PKT="/dev/shm/shm_pkt"
+
+MODE=save
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess)$ ]]; then
+    MODE="$1"
+    shift
+fi
+ARGS_TO_PASS=("$@")
+RECOVERY_MODE_ARGS=()
+case "$MODE" in
+    save)
+        RECOVERY_MODE_ARGS=(
+            --save $CHECKPOINT_PATH
+            --ec-checkpoint-write-only-penultimate-iter
+            --gemini-replicas-channels-per-peer 8
+        )
+        ;;
+    software)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-gemini-replicas-software-failure
+            --gemini-replicas-recovery-rank "0"
+        )
+        ;;
+    hardware)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-gemini-replicas-hardware-failure
+            --gemini-replicas-recovery-rank "0"
+        )
+        ;;
+    hardware2)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-gemini-replicas-hardware-failure
+            --gemini-replicas-recovery-rank "0,1"
+        )
+        ;;
+    inprocess)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --ft-inprocess-recovery-benchmark
+            --ft-inprocess-recovery-failed-ranks "0"
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
+        )
+        ;;
+esac
 
 ARGS_TO_PASS=("$@")
 
@@ -174,7 +224,7 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    --save $CHECKPOINT_PATH
+    #--save $CHECKPOINT_PATH
     #--load $CHECKPOINT_PATH          # 取消注释以测试 load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
@@ -276,7 +326,7 @@ mkdir -p logs/csv
 
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${RECOVERY_MODE_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
@@ -294,6 +344,7 @@ PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
     ${GPT_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
+    ${RECOVERY_MODE_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
     --distributed-backend nccl \
     ${ARGS_TO_PASS[@]}

@@ -97,7 +97,7 @@ fi
 
 # ---- mode 解析（save | software | hardware，位于 GPU ID 之后） ----
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|inprocess)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -121,6 +121,7 @@ ARGS_TO_PASS=("$@")
 
 # Recovery mode args: enabled only for software / hardware load tests
 RECOVERY_MODE_ARGS=()
+FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-6}
 case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
@@ -141,6 +142,17 @@ case "$MODE" in
             --load $CHECKPOINT_PATH
             --use-gemini-replicas-hardware-failure
             --gemini-replicas-recovery-rank "0,1,2,3,4,5,6,7"
+        )
+        ;;
+    inprocess)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --ft-inprocess-recovery-benchmark
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-failed-ranks "0,1,2,3,4,5,6,7"
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
         )
         ;;
 esac

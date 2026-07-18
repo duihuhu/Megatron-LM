@@ -1187,24 +1187,17 @@ public:
     void send_to_one_target(size_t target_idx, const uint8_t* data,
                             size_t size, int source_rank) override {
         /**
-         * Send data to a single target via RDMA.
-         * Control channel handshake (size + ACK) on the specific control socket,
-         * then RDMA data transfer on the specific QP.
+         * Send data to one logical target over all of that peer's RDMA channels.
+         * Each channel uses the same shard boundaries as receive_data_from_source.
          */
         if (!connected_) {
             throw std::runtime_error("Not connected");
         }
-        // Step 1: TCP control — send total size and wait until the receiver
-        // has posted all matching recv WRs.
-        uint64_t sz = htobe64(size);
-        if (send(control_socks_send_[target_idx], &sz, sizeof(sz), MSG_NOSIGNAL)
-            != static_cast<ssize_t>(sizeof(sz))) {
-            throw std::runtime_error("Failed to send size to target rank "
-                + std::to_string(target_ranks_[target_idx]));
+        if (target_idx >= target_ranks_.size()) {
+            throw std::runtime_error("Invalid logical target index "
+                + std::to_string(target_idx));
         }
-        wait_ready_ack(control_socks_send_[target_idx], target_ranks_[target_idx]);
 
-        // Step 2: RDMA data transfer on the single QP
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(data), size);
         if (mr == nullptr) {
             if (require_registered_mr_)
@@ -1217,12 +1210,52 @@ public:
             mr = temp_send_mr_;
         }
         const uint8_t* send_data = (mr == temp_send_mr_) ? temp_send_buffer_.data() : data;
-        send_data_chunked(send_data, size, mr, send_qps_[target_idx]);
+        const int target_rank = target_ranks_[target_idx];
+
+        std::vector<std::exception_ptr> send_exceptions(
+            static_cast<size_t>(channels_per_peer_));
+        std::vector<std::thread> send_threads;
+        send_threads.reserve(static_cast<size_t>(channels_per_peer_));
+        for (int ch = 0; ch < channels_per_peer_; ++ch) {
+            const size_t send_idx = peer_channel_index(target_idx, ch);
+            const size_t offset = shard_offset(size, ch, channels_per_peer_);
+            const size_t part_size = shard_size(size, ch, channels_per_peer_);
+            send_threads.emplace_back(
+                [this, send_idx, ch, offset, part_size, send_data, mr,
+                 target_rank, &send_exceptions]() {
+                    try {
+                        send_size_and_wait_ack(send_idx, part_size, target_rank);
+                        send_data_chunked(
+                            send_data + offset, part_size, mr,
+                            send_qps_[send_idx], offset);
+                    } catch (...) {
+                        send_exceptions[static_cast<size_t>(ch)] =
+                            std::current_exception();
+                    }
+                });
+        }
+        for (auto& thread : send_threads) {
+            thread.join();
+        }
+        for (int ch = 0; ch < channels_per_peer_; ++ch) {
+            const auto& error = send_exceptions[static_cast<size_t>(ch)];
+            if (error) {
+                try {
+                    std::rethrow_exception(error);
+                } catch (const std::exception& e) {
+                    throw std::runtime_error(
+                        "Failed directed RDMA send to target rank "
+                        + std::to_string(target_rank) + " channel "
+                        + std::to_string(ch) + ": " + e.what());
+                }
+            }
+        }
 
         if (debug_)
             std::cout << "[Rank " << rank_ << "] Sent " << size
-                      << " bytes to target rank " << target_ranks_[target_idx]
-                      << " via RDMA (directed P2P)" << std::endl;
+                      << " bytes to target rank " << target_rank << " over "
+                      << channels_per_peer_ << " RDMA channel(s) (directed P2P)"
+                      << std::endl;
     }
 
     std::vector<int> get_recv_source_ranks() const override {

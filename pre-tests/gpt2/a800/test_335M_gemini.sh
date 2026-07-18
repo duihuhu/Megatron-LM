@@ -88,6 +88,9 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 check_gemini_port_free() {
     local port=$1
     local label=$2
+    if ! command -v ss >/dev/null 2>&1; then
+        return 0
+    fi
     if ss -ltn "sport = :${port}" | grep -q ":${port} "; then
         echo "Error: ${label} port ${port} is already in use." >&2
         echo "Another Gemini job or stale process is probably still listening." >&2
@@ -113,7 +116,7 @@ SHM_PKT="/dev/shm/shm_pkt"
 
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -131,34 +134,48 @@ if [[ "$MODE" == "hardware" || "$MODE" == "hardware2" ]]; then
 fi
 
 ARGS_TO_PASS=("$@")
-RECOVERY_MODE_ARGS=()
+GEMINI_REPLICAS_CHANNELS_PER_PEER=${GEMINI_REPLICAS_CHANNELS_PER_PEER:-8}
+RECOVERY_MODE_ARGS=(
+    --gemini-replicas-channels-per-peer $GEMINI_REPLICAS_CHANNELS_PER_PEER
+)
+FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-3}
 case "$MODE" in
     save)
-        RECOVERY_MODE_ARGS=(
+        RECOVERY_MODE_ARGS+=(
             --save $CHECKPOINT_PATH
             --ec-checkpoint-write-only-penultimate-iter
-            --gemini-replicas-channels-per-peer 8
         )
         ;;
     software)
-        RECOVERY_MODE_ARGS=(
+        RECOVERY_MODE_ARGS+=(
             --load $CHECKPOINT_PATH
             --use-gemini-replicas-software-failure
             --gemini-replicas-recovery-rank "0"
         )
         ;;
     hardware)
-        RECOVERY_MODE_ARGS=(
+        RECOVERY_MODE_ARGS+=(
             --load $CHECKPOINT_PATH
             --use-gemini-replicas-hardware-failure
             --gemini-replicas-recovery-rank "0"
         )
         ;;
     hardware2)
-        RECOVERY_MODE_ARGS=(
+        RECOVERY_MODE_ARGS+=(
             --load $CHECKPOINT_PATH
             --use-gemini-replicas-hardware-failure
             --gemini-replicas-recovery-rank "0,1"
+        )
+        ;;
+    inprocess)
+        RECOVERY_MODE_ARGS+=(
+            --load $CHECKPOINT_PATH
+            --ft-inprocess-recovery-benchmark
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-failed-ranks "0"
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
         )
         ;;
 esac

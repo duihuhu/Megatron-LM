@@ -1013,6 +1013,12 @@ class GeminiReplicasManager:
         # Each rank listens on its own port: reco_base_port + rank * 100
         # Senders connect to the TARGET's listen port
         PORT_STEP = 100
+        recovery_channels = self.channels_per_peer if self.use_rdma else 1
+        if recovery_channels > PORT_STEP:
+            raise ValueError(
+                f"Gemini Replicas: recovery channels_per_peer ({recovery_channels}) "
+                f"exceeds the per-rank port range size ({PORT_STEP})"
+            )
         recv_port = reco_base_port + rank * PORT_STEP
         target_ips = [rank_ips.get(t, base_ip) for t in target_ranks]
         target_ports = [reco_base_port + t * PORT_STEP for t in target_ranks]
@@ -1051,14 +1057,15 @@ class GeminiReplicasManager:
             mode_str = "RDMA" if self.use_rdma else "ASIO"
             logger.info(
                 f"Gemini Replicas recovery: [Rank {rank}] creating native module: "
-                f"targets={target_ranks}, sources={source_ranks} ({mode_str})"
+                f"targets={target_ranks}, sources={source_ranks} ({mode_str}), "
+                f"channels_per_peer={recovery_channels}"
             )
 
             self._gemini_replicas_native = gemini_replicas_native.GeminiReplicasNative(
                 rank, world_size,
                 target_ranks, target_ips, target_ports,
                 base_ip, recv_port, num_sources,
-                self.use_rdma,
+                self.use_rdma, recovery_channels,
             )
 
             # All acceptors must be listening before any rank connects.

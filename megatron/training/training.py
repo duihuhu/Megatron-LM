@@ -1021,20 +1021,31 @@ def pretrain(
     if wandb_writer:
         wandb_writer.finish()
 
+    if getattr(args, "frcheck_debug", False):
+        logger.info("FRCHECK teardown trace rank=%d: before async save finalize", args.rank)
     ft_integration.on_checkpointing_start()
     maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
+    if getattr(args, "frcheck_debug", False):
+        logger.info("FRCHECK teardown trace rank=%d: after async save finalize", args.rank)
 
     one_logger and one_logger.log_metrics(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
 
+    if getattr(args, "frcheck_debug", False):
+        logger.info("FRCHECK teardown trace rank=%d: before FT/logger shutdown", args.rank)
     ft_integration.shutdown()
     one_logger_utils.finish()
+    if getattr(args, "frcheck_debug", False):
+        logger.info("FRCHECK teardown trace rank=%d: after FT/logger shutdown", args.rank)
 
-    from megatron.training import get_args as _get_args
-    if getattr(_get_args(), "use_frcheck", False):
+    if getattr(args, "use_frcheck", False):
+        if getattr(args, "frcheck_debug", False):
+            logger.info("FRCHECK teardown trace rank=%d: before FRCheck teardown import", args.rank)
         from megatron.training.frcheck_legacy import _teardown_frcheck_after_training
+        if getattr(args, "frcheck_debug", False):
+            logger.info("FRCHECK teardown trace rank=%d: after FRCheck teardown import", args.rank)
         _teardown_frcheck_after_training()
         _force_exit_after_frcheck_load()
 

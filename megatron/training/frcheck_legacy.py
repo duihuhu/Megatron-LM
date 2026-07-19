@@ -64,6 +64,8 @@ def _timed_barrier() -> float:
 
 _async_p1_writer_thread: Optional[threading.Thread] = None
 _async_p2_writer_thread: Optional[threading.Thread] = None
+_async_writer_error: Optional[BaseException] = None
+_p2_save_generation: int = 0
 _recovery_async_parity_initialized: bool = False
 _recovery_async_parity_submitted: bool = False
 _recovery_async_parity_thread: Optional[threading.Thread] = None
@@ -155,7 +157,13 @@ def _summarize_optimizer_keys(keys) -> Dict[str, int]:
     return summary
 
 
-_FRCHECK_INFO_PROFILE_EVENTS = set()
+_FRCHECK_INFO_PROFILE_EVENTS = {
+    "recovery_parity_repair_prepared",
+    "recovery_parity_repair_start",
+    "recovery_parity_repair_done",
+    "recovery_parity_join_start",
+    "recovery_parity_join_done",
+}
 
 _frcheck_first_layer_recovery_start_s: Optional[float] = None
 _frcheck_first_layer_recovery_target_idx: Optional[int] = None
@@ -2841,76 +2849,85 @@ def _async_write_frcheck_encoder_p1_files(
     )
 
 
-def _async_write_frcheck_p2_files(
-    manager,
+def _write_frcheck_aggregate_p2_files(
     output_dir: str,
     rank: int,
-    num_stripes: int,
-    encode_results: List[_LayerEncodeResult],
-    debug: bool = False,
+    segments: List[Dict[str, Any]],
 ) -> None:
-    """Wait for async P2 delivery, then write P2 shards."""
+    """Write received aggregate P2 slices using the existing FRBK layout."""
+    import concurrent.futures
+
+    def _write(segment: Dict[str, Any]) -> None:
+        stripe_dir = Path(output_dir) / segment["layer_name"] / f"stripe_{segment['sid']}"
+        stripe_dir.mkdir(parents=True, exist_ok=True)
+        path = stripe_dir / f"frcheck_shard_rank{rank}.pt"
+        size = int(segment["size"])
+        block_size = int(segment["block_size"])
+        header = struct.pack("<4sIIQQ", b"FRBK", int(segment["sid"]), 2, size, block_size)
+        data = segment["buffer"][int(segment["offset"]):int(segment["offset"]) + size]
+        with open(path, "wb") as file:
+            file.write(header)
+            if size > 0:
+                file.write(memoryview(data.numpy()))
+
+    if not segments:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(segments))) as executor:
+        futures = [executor.submit(_write, segment) for segment in segments]
+        for future in futures:
+            future.result()
+
+
+def _finish_aggregate_p2_context(context: Dict[str, Any], debug: bool = False) -> None:
+    """Wait for aggregate P2, write received shards, and release registered buffers."""
+    manager = context["manager"]
     native = manager.get_native()
     if native is None:
-        return
+        raise RuntimeError("FRCheck aggregate P2 native module is unavailable")
     try:
-        t0 = time.time()
+        wait_start = time.time()
+        native.wait_aggregate_p2(300)
         if debug:
             logger.info(
-                "FRCHECK async P2 writer rank %d: wait_parity_flush begin (layers=%d)",
-                rank, len(encode_results),
+                "FRCHECK aggregate P2 wait rank %d: generation=%d elapsed=%.3fs",
+                context["rank"], context["generation"], time.time() - wait_start,
             )
-        native.wait_parity_flush()
-        flush_elapsed = time.time() - t0
-        if debug:
-            logger.info(
-                "FRCHECK async parity trace rank %d: async_p2_flush_done elapsed=%.6fs layers=%d",
-                rank, flush_elapsed, len(encode_results),
+        if context["write_to_disk"]:
+            _write_frcheck_aggregate_p2_files(
+                context["output_dir"], context["rank"], context["recv_segments"],
             )
-        if debug:
-            logger.info(
-                "FRCHECK async P2 writer rank %d: wait_parity_flush done %.3fs",
-                rank, flush_elapsed,
-            )
-        write_t0 = time.time()
-        _save_frcheck_stripe_files(
-            manager,
-            output_dir,
-            rank,
-            num_stripes,
-            encode_results,
-            include_encoder_p1=False,
-            include_source=False,
-            include_p2=True,
-        )
-        if debug:
-            logger.info(
-                "FRCHECK async P2 writer rank %d: P2 shard write done %.3fs",
-                rank, time.time() - write_t0,
-            )
-    except Exception:
-        logger.exception("FRCheck async P2 writer failed")
-        raise
+    finally:
+        manager.release_registered_save_buffers(context["buffers"])
+
+
+def _async_finish_aggregate_p2_context(context: Dict[str, Any], debug: bool = False) -> None:
+    global _async_writer_error
+    try:
+        _finish_aggregate_p2_context(context, debug=debug)
+    except BaseException as exc:
+        _async_writer_error = exc
+        logger.exception("FRCheck async aggregate P2 writer failed")
 
 
 def _wait_previous_async_writers(debug: bool = False, rank: int = -1) -> None:
-    global _async_p1_writer_thread, _async_p2_writer_thread
+    global _async_p1_writer_thread, _async_p2_writer_thread, _async_writer_error
     for attr in ("_async_p1_writer_thread", "_async_p2_writer_thread"):
-        th = globals()[attr]
-        if th is not None:
-            t0 = time.time()
+        thread = globals()[attr]
+        if thread is not None:
+            start = time.time()
             if debug:
-                logger.info(
-                    "FRCHECK async writer rank %d: joining previous %s",
-                    rank, th.name,
-                )
-            th.join()
+                logger.info("FRCHECK async writer rank %d: joining previous %s", rank, thread.name)
+            thread.join()
+            globals()[attr] = None
             if debug:
                 logger.info(
                     "FRCHECK async writer rank %d: joined previous %s in %.3fs",
-                    rank, th.name, time.time() - t0,
+                    rank, thread.name, time.time() - start,
                 )
-            globals()[attr] = None
+    if _async_writer_error is not None:
+        error = _async_writer_error
+        _async_writer_error = None
+        raise RuntimeError("FRCheck asynchronous writer failed") from error
 
 
 def _start_async_p1_writer(
@@ -2931,41 +2948,105 @@ def _start_async_p1_writer(
     _async_p1_writer_thread.start()
 
 
-def _start_async_p2_writer(
-    manager,
-    output_dir: str,
-    rank: int,
-    num_stripes: int,
-    encode_results: List[_LayerEncodeResult],
-    debug: bool = False,
-) -> None:
+def _start_async_p2_writer(context: Dict[str, Any], debug: bool = False) -> None:
     global _async_p2_writer_thread
-    if _async_p2_writer_thread is not None:
-        t0 = time.time()
-        if debug:
-            logger.info(
-                "FRCHECK async P2 writer rank %d: joining in-flight writer before restart",
-                rank,
-            )
-        _async_p2_writer_thread.join()
-        if debug:
-            logger.info(
-                "FRCHECK async P2 writer rank %d: in-flight writer joined in %.3fs",
-                rank, time.time() - t0,
-            )
-        _async_p2_writer_thread = None
+    _wait_previous_async_writers(debug=debug, rank=int(context["rank"]))
     _async_p2_writer_thread = threading.Thread(
-        target=_async_write_frcheck_p2_files,
-        args=(manager, output_dir, rank, num_stripes, list(encode_results), debug),
+        target=_async_finish_aggregate_p2_context,
+        args=(context, debug),
         name="frcheck-async-p2-writer",
         daemon=False,
     )
     _async_p2_writer_thread.start()
-    if debug:
-        logger.info(
-            "FRCHECK async P2 writer rank %d: started thread for %d layers",
-            rank, len(encode_results),
-        )
+
+
+def _build_and_submit_aggregate_p2(
+    manager,
+    native,
+    encode_results: List[_LayerEncodeResult],
+    output_dir: str,
+    rank: int,
+    write_to_disk: bool,
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Pack all P2 blocks into one registered buffer per physical peer/lane."""
+    global _p2_save_generation
+    _p2_save_generation += 1
+    generation = _p2_save_generation
+    send_groups: Dict[Tuple[int, int], List[Tuple[_LayerEncodeResult, int, torch.Tensor]]] = {}
+    recv_groups: Dict[Tuple[int, int], List[Tuple[_LayerEncodeResult, int]]] = {}
+    ordered_results = sorted(encode_results, key=lambda result: (result.layer_idx, result.layer_name))
+    for result in ordered_results:
+        layer_bufs = manager.get_layer_stripe_bufs(result.layer_idx)
+        for sid in range(native.num_stripes()):
+            route = native.get_p2_route(sid)
+            role, peer, lane = int(route[0]), int(route[1]), int(route[2])
+            if role == int(StripeRole.ENCODER):
+                source = layer_bufs.parity2_bufs[sid]
+                if source is None:
+                    raise RuntimeError(f"FRCheck aggregate P2 missing encoder buffer for stripe {sid}")
+                send_groups.setdefault((peer, lane), []).append((result, sid, source))
+            elif role == int(StripeRole.PARITY_TARGET):
+                recv_groups.setdefault((peer, lane), []).append((result, sid))
+
+    buffers: List[torch.Tensor] = []
+    send_tasks: List[Tuple[int, int, int, int]] = []
+    recv_tasks: List[Tuple[int, int, int, int]] = []
+    recv_segments: List[Dict[str, Any]] = []
+    total_send_bytes = 0
+    total_recv_bytes = 0
+    for (peer, lane), segments in sorted(send_groups.items()):
+        size = sum(int(result.block_size) for result, _sid, _source in segments)
+        buffer = manager.allocate_registered_save_buffer(size)
+        buffers.append(buffer)
+        offset = 0
+        for result, _sid, source in segments:
+            block_size = int(result.block_size)
+            buffer[offset:offset + block_size].copy_(source[:block_size])
+            offset += block_size
+        send_tasks.append((peer, lane, int(buffer.data_ptr()), size))
+        total_send_bytes += size
+    for (peer, lane), segments in sorted(recv_groups.items()):
+        size = sum(int(result.block_size) for result, _sid in segments)
+        buffer = manager.allocate_registered_save_buffer(size)
+        buffers.append(buffer)
+        offset = 0
+        for result, sid in segments:
+            block_size = int(result.block_size)
+            recv_segments.append({
+                "buffer": buffer,
+                "offset": offset,
+                "size": block_size,
+                "block_size": block_size,
+                "layer_name": result.layer_name,
+                "layer_idx": result.layer_idx,
+                "sid": sid,
+                "peer": peer,
+                "lane": lane,
+            })
+            offset += block_size
+        recv_tasks.append((peer, lane, int(buffer.data_ptr()), size))
+        total_recv_bytes += size
+    try:
+        counts = native.submit_aggregate_p2(send_tasks, recv_tasks, generation)
+    except BaseException:
+        manager.release_registered_save_buffers(buffers)
+        raise
+    context = {
+        "manager": manager,
+        "output_dir": output_dir,
+        "rank": rank,
+        "generation": generation,
+        "buffers": buffers,
+        "recv_segments": recv_segments,
+        "write_to_disk": write_to_disk,
+    }
+    summary = {
+        "send_tasks": int(counts[0]),
+        "recv_tasks": int(counts[1]),
+        "send_bytes": total_send_bytes,
+        "recv_bytes": total_recv_bytes,
+    }
+    return context, summary
 
 
 def save_frcheck_legacy_checkpoint(
@@ -3015,10 +3096,9 @@ def save_frcheck_legacy_checkpoint(
     if hasattr(native, "start_mirror_worker"):
         native.start_mirror_worker()
 
-    # Async parity path: drain any pending P2 operations from a previous save.
+    # Save-scoped aggregate buffers cannot be reused until the previous writer exits.
     _use_async_parity = getattr(args, 'frcheck_async_parity', False)
-    if _use_async_parity:
-        _wait_previous_async_writers(debug=_dbg, rank=rank)
+    _wait_previous_async_writers(debug=_dbg, rank=rank)
 
     if native.group_size() != native.n():
         raise RuntimeError(
@@ -3631,12 +3711,9 @@ def save_frcheck_legacy_checkpoint(
 
             layer_wait_s = 0.0
             wait_t0 = time.time()
-            if _use_async_parity:
-                if _dbg:
-                    logger.info("FRCHECK layer %s: wait_encode_only (async)", result.layer_name)
-                native.wait_encode_only()
-            else:
-                native.wait_layer()
+            if _dbg:
+                logger.info("FRCHECK layer %s: wait_encode_only (P2 deferred)", result.layer_name)
+            native.wait_encode_only()
             layer_wait_s = time.time() - wait_t0
             wait_total_s += layer_wait_s
 
@@ -3705,56 +3782,19 @@ def save_frcheck_legacy_checkpoint(
     lx_ready_last_s = locals().get("lx_ready_last_s", 0.0)
     lx_layer_elapsed_max = locals().get("lx_layer_elapsed_max", 0.0)
 
-    # ---- async parity phase: submit P2 sends + parity receives ----
-    # P2 delivery is one independent async batch. Do not call reset_layer()
-    # per layer here: sync encode uses per-layer counters, but async P2 is
-    # allowed to span layers and continue into the next training iteration.
-    _async_p2_submit_elapsed = 0.0
-    if _use_async_parity:
-        _async_p2_submit_t0 = time.time()
-        _async_p2_reset_elapsed = 0.0
-        _async_p2_build_elapsed = 0.0
-        _async_p2_native_elapsed = 0.0
-        _async_p2_parity_tasks = 0
-        _async_p2_send_tasks = 0
-        _reset_t0 = time.time()
-        native.reset_async_parity()
-        _async_p2_reset_elapsed = time.time() - _reset_t0
-        has_async_p2_batch = hasattr(native, "submit_async_p2_layer_with_batch")
-        for async_batch_id, result in enumerate(encode_results, start=1):
-            layer_bufs = manager.get_layer_stripe_bufs(result.layer_idx)
-            _build_t0 = time.time()
-            p2_addrs = [
-                0 if p2b is None else p2b.data_ptr()
-                for p2b in layer_bufs.parity2_bufs
-            ]
-            _async_p2_build_elapsed += time.time() - _build_t0
-            _native_t0 = time.time()
-            if has_async_p2_batch:
-                counts = native.submit_async_p2_layer_with_batch(
-                    p2_addrs, result.block_size, int(async_batch_id),
-                )
-            else:
-                counts = native.submit_async_p2_layer(p2_addrs, result.block_size)
-            _async_p2_native_elapsed += time.time() - _native_t0
-            if counts is not None and len(counts) >= 2:
-                _async_p2_parity_tasks += int(counts[0])
-                _async_p2_send_tasks += int(counts[1])
-        _async_p2_submit_elapsed = time.time() - _async_p2_submit_t0
-        if _dbg:
-            logger.info(
-                "FRCHECK async P2 submit rank %d: layers=%d parity_tasks=%d send_tasks=%d "
-                "reset=%.3fs build=%.3fs native=%.3fs total=%.3fs",
-                rank, len(encode_results), _async_p2_parity_tasks, _async_p2_send_tasks,
-                _async_p2_reset_elapsed, _async_p2_build_elapsed,
-                _async_p2_native_elapsed, _async_p2_submit_elapsed,
-            )
-        if _dbg:
-            logger.info(
-                "FRCHECK async parity trace rank %d: async_p2_submit_done elapsed=%.6fs layers=%d parity_tasks=%d send_tasks=%d",
-                rank, _async_p2_submit_elapsed, len(encode_results),
-                _async_p2_parity_tasks, _async_p2_send_tasks,
-            )
+    # ---- aggregate P2 phase: one transfer per physical peer/lane ----
+    _async_p2_submit_t0 = time.time()
+    p2_context, p2_summary = _build_and_submit_aggregate_p2(
+        manager, native, encode_results, str(checkpoint_dir), rank, write_to_disk,
+    )
+    _async_p2_submit_elapsed = time.time() - _async_p2_submit_t0
+    if rank == 0:
+        logger.info(
+            "FRCHECK aggregate P2: generation=%d send_tasks=%d recv_tasks=%d "
+            "send_bytes=%d recv_bytes=%d async=%s",
+            p2_context["generation"], p2_summary["send_tasks"], p2_summary["recv_tasks"],
+            p2_summary["send_bytes"], p2_summary["recv_bytes"], _use_async_parity,
+        )
 
     _mirror_t0 = time.time()
     native.wait_mirror_completion()
@@ -3762,8 +3802,7 @@ def save_frcheck_legacy_checkpoint(
     if hasattr(native, "start_mirror_worker"):
         native.start_mirror_worker()
 
-    if _use_async_parity:
-        network_encode_s += _async_p2_submit_elapsed
+    network_encode_s += _async_p2_submit_elapsed
     e2e_s = time.time() - e2e_t0
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -3771,6 +3810,15 @@ def save_frcheck_legacy_checkpoint(
         torch.distributed.barrier()
     has_native_timing = hasattr(native, "get_ft_timing_stats")
     native_timing = native.get_ft_timing_stats() if has_native_timing else {}
+    if has_native_timing:
+        mirror_submitted = int(native_timing.get("mirror_tasks_submitted", 0))
+        mirror_completed = int(native_timing.get("mirror_tasks_completed", 0))
+        mirror_failed = int(native_timing.get("mirror_tasks_failed", 0))
+        if mirror_failed or mirror_completed != mirror_submitted:
+            raise RuntimeError(
+                f"FRCheck mirror incomplete: completed={mirror_completed} "
+                f"submitted={mirror_submitted} failed={mirror_failed}"
+            )
     summary_fields = {
         "e2e_s": e2e_s,
         "network_encode_s": network_encode_s,
@@ -3888,21 +3936,14 @@ def save_frcheck_legacy_checkpoint(
             )
 
     if write_to_disk:
-        if _use_async_parity:
-            _save_frcheck_stripe_files(
-                manager, str(checkpoint_dir), rank, num_stripes, encode_results,
-                include_encoder_p1=True,
-                include_source=True,
-                include_p2=False,
-            )
-            _start_async_p2_writer(
-                manager, str(checkpoint_dir), rank, num_stripes, encode_results,
-                debug=_dbg,
-            )
-        else:
-            _save_frcheck_stripe_files(
-                manager, str(checkpoint_dir), rank, num_stripes, encode_results,
-            )
+        _save_frcheck_stripe_files(
+            manager, str(checkpoint_dir), rank, num_stripes, encode_results,
+            include_encoder_p1=True, include_source=True, include_p2=False,
+        )
+    if _use_async_parity:
+        _start_async_p2_writer(p2_context, debug=_dbg)
+    else:
+        _finish_aggregate_p2_context(p2_context, debug=_dbg)
 
     groups_by_name = {
         (f"layer_{group.layer_idx}" if group.layer_idx >= 0 else "layer_common"): group
@@ -4870,7 +4911,8 @@ def _iter_recovery_windows_for_job(
     return windows, my_blocks, layer_timing
 
 
-def _frcheck_recovery_async_parity_enabled() -> bool:
+def _frcheck_recovery_parity_repair_enabled() -> bool:
+    """Return whether the active FRCheck hardware recovery requires repair."""
     try:
         from megatron.training import get_args
         args = get_args()
@@ -4879,8 +4921,18 @@ def _frcheck_recovery_async_parity_enabled() -> bool:
     return (
         bool(getattr(args, "use_frcheck", False))
         and bool(getattr(args, "use_frcheck_hardware_failure", False))
-        and bool(getattr(args, "frcheck_recovery_async_parity", False))
     )
+
+
+def _frcheck_recovery_async_parity_enabled() -> bool:
+    """Return whether recovery parity repair runs behind the load thread."""
+    if not _frcheck_recovery_parity_repair_enabled():
+        return False
+    try:
+        from megatron.training import get_args
+        return bool(getattr(get_args(), "frcheck_recovery_async_parity", False))
+    except Exception:
+        return False
 
 
 def _ensure_recovery_parity_layer_buffers(
@@ -5123,8 +5175,7 @@ def _flush_recovery_async_parity(reason: str, role: str = "unknown") -> None:
     global _recovery_async_parity_submitted
     if not _recovery_async_parity_submitted:
         return
-    if not _frcheck_recovery_async_parity_enabled():
-        return
+    # The decode-batch repair core waits every native batch before returning.
     _recovery_async_parity_submitted = False
 
 
@@ -5283,7 +5334,7 @@ def _submit_recovery_parity_repair(
         "parity_stripes": 0.0,
         "waves": 0.0,
     }
-    if native is None or job.layer_idx < 0:
+    if native is None:
         return timing
     n = int(native.n())
     parity_plans, active_by_stripe = _build_recovery_parity_repair_context(manager, n, job)
@@ -5335,7 +5386,7 @@ def _set_pending_recovery_parity_repair(
     parity_preloaded: Optional[Dict[int, Dict[int, torch.Tensor]]] = None,
 ) -> None:
     global _pending_recovery_parity_repair
-    if not jobs or not _frcheck_recovery_async_parity_enabled():
+    if not jobs or not _frcheck_recovery_parity_repair_enabled():
         return
     _pending_recovery_parity_repair = {
         "jobs": list(jobs),
@@ -5345,6 +5396,9 @@ def _set_pending_recovery_parity_repair(
         "all_layer_metadata": all_layer_metadata,
         "recovery_role": recovery_role,
         "parity_preloaded": parity_preloaded or {},
+        "execution_mode": (
+            "background" if _frcheck_recovery_async_parity_enabled() else "sync"
+        ),
     }
 
 
@@ -5357,18 +5411,21 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
         return
     recovery_role = str(pending.get("recovery_role", "unknown"))
     buf_pool = pending.get("buf_pool")
-    jobs = [job for job in pending["jobs"] if job.layer_idx >= 0]
+    jobs = list(pending["jobs"])
     preloaded = pending.get("parity_preloaded", {})
+    execution_mode = str(pending.get("execution_mode", "background"))
     t0 = time.time()
     total_stripes = 0
     total_waves = 0
+    total_submit_s = 0.0
+    total_wait_s = 0.0
     _recovery_async_parity_submitted = True
     _frcheck_recovery_profile(
         recovery_role,
-        "recovery_async_parity_submit_thread_start",
+        "recovery_parity_repair_start",
         reason=reason,
         jobs=len(jobs),
-        mode="recovery_decode",
+        mode=execution_mode,
     )
     try:
         for job in jobs:
@@ -5378,12 +5435,14 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
             )
             total_stripes += int(timing.get("parity_stripes", 0.0))
             total_waves += int(timing.get("waves", 0.0))
+            total_submit_s += float(timing.get("submit_s", 0.0))
+            total_wait_s += float(timing.get("wait_s", 0.0))
             _frcheck_recovery_profile(
                 recovery_role,
-                "recovery_async_parity_submit",
+                "recovery_parity_repair_layer_done",
                 layer=job.layer_name,
                 layer_idx=job.layer_idx,
-                mode="recovery_decode",
+                mode=execution_mode,
                 parity_stripes=int(timing.get("parity_stripes", 0.0)),
                 decoder_stripes=int(timing.get("decoder_stripes", 0.0)),
                 helper_stripes=int(timing.get("helper_stripes", 0.0)),
@@ -5395,18 +5454,21 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
             )
         _frcheck_recovery_profile(
             recovery_role,
-            "recovery_async_parity_all_layers_submitted",
+            "recovery_parity_repair_done",
             jobs=len(jobs),
             tasks=total_stripes,
             waves=total_waves,
-            mode="recovery_decode",
+            mode=execution_mode,
+            submit_s=total_submit_s,
+            wait_s=total_wait_s,
             elapsed_s=time.time() - t0,
         )
     except BaseException as exc:
         _recovery_async_parity_error = exc
         _frcheck_recovery_profile(
             recovery_role,
-            "recovery_async_parity_submit_thread_error",
+            "recovery_parity_repair_error",
+            mode=execution_mode,
             error=f"{type(exc).__name__}: {exc}",
         )
 
@@ -5429,17 +5491,38 @@ def _start_recovery_parity_repair_submissions(reason: str, role: str = "unknown"
 
 
 def _finish_recovery_parity_repair_submissions(reason: str, role: str = "unknown") -> None:
-    """Ensure recovery parity repair submissions have finished before flushing."""
+    """Join background parity repair and propagate its error before teardown."""
     global _recovery_async_parity_thread, _recovery_async_parity_error
-    _start_recovery_parity_repair_submissions(reason, role)
+    if _frcheck_recovery_async_parity_enabled():
+        _start_recovery_parity_repair_submissions(reason, role)
     worker = _recovery_async_parity_thread
     if worker is not None:
+        t_join = time.time()
+        _frcheck_recovery_profile(role, "recovery_parity_join_start", reason=reason)
         worker.join()
         _recovery_async_parity_thread = None
+        _frcheck_recovery_profile(
+            role, "recovery_parity_join_done", reason=reason,
+            elapsed_s=time.time() - t_join, mode="background",
+        )
     if _recovery_async_parity_error is not None:
         exc = _recovery_async_parity_error
         _recovery_async_parity_error = None
-        raise exc
+        raise RuntimeError("FRCheck recovery parity repair failed") from exc
+
+
+def _run_pending_recovery_parity_repair_sync(
+    reason: str, role: str = "unknown"
+) -> None:
+    """Run the same parity repair core synchronously after data recovery."""
+    global _pending_recovery_parity_repair
+    pending = _pending_recovery_parity_repair
+    if pending is None:
+        return
+    _pending_recovery_parity_repair = None
+    pending["execution_mode"] = "sync"
+    _run_recovery_parity_repair_submissions(pending, reason)
+    _finish_recovery_parity_repair_submissions(reason, role)
 
 
 def _run_recovery_pipeline(
@@ -5793,7 +5876,10 @@ def _start_layer_recovery_worker(
         except BaseException as exc:
             error_holder["error"] = exc
         finally:
-            if error_holder["error"] is None:
+            if (
+                error_holder["error"] is None
+                and _frcheck_recovery_async_parity_enabled()
+            ):
                 _start_recovery_parity_repair_submissions(
                     "after_recovery_worker", recovery_role
                 )
@@ -5887,17 +5973,20 @@ def _preload_recovery_stripe_blocks(
         if stripe_plans else len(source_block_idx_by_sid)
     )
 
-    def _load_one(job: Tuple[int, Dict]) -> Tuple[int, int, torch.Tensor]:
+    def _load_one(job: Tuple[int, Dict]) -> Tuple[int, int, int, torch.Tensor]:
         encode_iter, plan = job
+        sid = int(plan['stripe_id'])
+        role = _stripe_role_for_node(
+            FRCheckManager(), sid, my_node, FRCheckManager().frcheck_n,
+        )
         if encode_iter >= len(my_order):
-            return encode_iter, plan['stripe_id'], torch.zeros(1, dtype=torch.uint8)
+            return encode_iter, sid, role, torch.zeros(1, dtype=torch.uint8)
         layer_name = my_order[encode_iter]
         meta = all_layer_metadata.get(rank, {}).get(layer_name, {})
         layer_block_size = int(
             meta.get("block_size", saved_block_size) or saved_block_size
         )
-        sid = plan['stripe_id']
-        role = _stripe_role_for_node(FRCheckManager(), int(sid), my_node, FRCheckManager().frcheck_n)
+        sid = int(plan['stripe_id'])
         if role == int(StripeRole.SOURCE):
             blk_idx = (
                 _source_blk_idx_for_node_stripe(stripe_plans, int(sid), my_node)
@@ -5909,7 +5998,7 @@ def _preload_recovery_stripe_blocks(
                 n_source,
             )
             if blk_idx >= n_filled:
-                return encode_iter, sid, torch.zeros(layer_block_size, dtype=torch.uint8)
+                return encode_iter, sid, role, torch.zeros(layer_block_size, dtype=torch.uint8)
         cache_key = (layer_name, sid, role)
         cached = cache.get(cache_key)
         if cached is not None and cached.numel() >= layer_block_size:
@@ -5927,7 +6016,7 @@ def _preload_recovery_stripe_blocks(
             )
             if cache_key not in cache:
                 cache[cache_key] = blk
-        return encode_iter, sid, blk
+        return encode_iter, sid, role, blk
 
     jobs = [
         (encode_iter, plan)
@@ -5935,9 +6024,25 @@ def _preload_recovery_stripe_blocks(
         for plan in participating
     ]
     n_workers = min(len(jobs), 8)
+    loaded_by_role: Dict[int, int] = {}
+    loaded_bytes_by_role: Dict[int, int] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
-        for encode_iter, sid, blk in executor.map(_load_one, jobs):
+        for encode_iter, sid, role, blk in executor.map(_load_one, jobs):
             result[encode_iter][sid] = blk
+            loaded_by_role[role] = loaded_by_role.get(role, 0) + 1
+            loaded_bytes_by_role[role] = loaded_bytes_by_role.get(role, 0) + int(blk.numel())
+    if _frcheck_debug_enabled():
+        logger.info(
+            "FRCheck recovery preload rank=%d: source=%d encoder_p1=%d parity_p2=%d "
+            "source_bytes=%d encoder_p1_bytes=%d parity_p2_bytes=%d",
+            rank,
+            loaded_by_role.get(int(StripeRole.SOURCE), 0),
+            loaded_by_role.get(int(StripeRole.ENCODER), 0),
+            loaded_by_role.get(int(StripeRole.PARITY_TARGET), 0),
+            loaded_bytes_by_role.get(int(StripeRole.SOURCE), 0),
+            loaded_bytes_by_role.get(int(StripeRole.ENCODER), 0),
+            loaded_bytes_by_role.get(int(StripeRole.PARITY_TARGET), 0),
+        )
     return result
 
 
@@ -6588,21 +6693,35 @@ def _teardown_frcheck_after_training() -> None:
     args = get_args()
     if not getattr(args, "use_frcheck", False):
         return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    debug = _frcheck_debug_enabled()
+    if debug:
+        logger.info("FRCHECK teardown trace rank=%d: enter FRCheck teardown", rank)
     service = _get_active_frcheck_recovery_service()
-    if service.safe_point_teardown_done:
-        return
-    frcheck_wait_for_async_recovery()
     manager = FRCheckManager()
+    if service.safe_point_teardown_done and manager.get_native() is None:
+        if debug:
+            logger.info("FRCHECK teardown trace rank=%d: teardown already completed", rank)
+        return
+    if debug:
+        logger.info("FRCHECK teardown trace rank=%d: before recovery worker wait", rank)
+    frcheck_wait_for_async_recovery()
+    if debug:
+        logger.info("FRCHECK teardown trace rank=%d: after recovery worker wait", rank)
     if manager.get_native() is None:
         return
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    if _frcheck_debug_enabled():
+    if debug:
         logger.info("FRCheck: tearing down native module after training (rank %d)", rank)
-    if getattr(args, 'frcheck_async_parity', False):
-        _wait_previous_async_writers(debug=_frcheck_debug_enabled(), rank=rank)
+    _wait_previous_async_writers(debug=debug, rank=rank)
+    if debug:
+        logger.info("FRCHECK teardown trace rank=%d: save writers drained", rank)
     _finish_recovery_parity_repair_submissions("after_training", service.role)
     _flush_recovery_async_parity("after_training", service.role)
+    if debug:
+        logger.info("FRCHECK teardown trace rank=%d: before manager cleanup", rank)
     manager.cleanup(teardown=True)
+    if debug:
+        logger.info("FRCHECK teardown trace rank=%d: after manager cleanup", rank)
 
 
 # ---------------------------------------------------------------------------
@@ -6611,11 +6730,16 @@ def _teardown_frcheck_after_training() -> None:
 
 def _teardown_frcheck_native_after_load() -> None:
     """Stop and release native module after load/recovery (not used on save path)."""
+    _wait_previous_async_writers(debug=_frcheck_debug_enabled())
     manager = FRCheckManager()
     if manager.get_native() is None:
         return
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     role = getattr(manager, "_frcheck_recovery_role", "unknown")
+    service = _get_active_frcheck_recovery_service()
+    if service.worker is not threading.current_thread():
+        service.wait_all(reason="load_teardown")
+    _finish_recovery_parity_repair_submissions("load_teardown", role)
     try:
         from megatron.training import get_args
         args = get_args()
@@ -6835,7 +6959,7 @@ def recover_frcheck_legacy_hardware(
     )
     role_plans_for_buffers = (
         manager.recovery_stripe_plans
-        if _frcheck_recovery_async_parity_enabled()
+        if _frcheck_recovery_parity_repair_enabled()
         else data_recovery_plans
     )
     is_decoder = any(
@@ -6938,7 +7062,7 @@ def recover_frcheck_legacy_hardware(
             jobs=len(async_jobs_for_buffers), direct_reconstruct=False,
         )
 
-    if recovery_jobs and _frcheck_recovery_async_parity_enabled():
+    if recovery_jobs and _frcheck_recovery_parity_repair_enabled():
         parity_preloaded = _preload_recovery_stripe_blocks(
             n_encode_iters,
             all_layer_order,
@@ -6957,12 +7081,13 @@ def recover_frcheck_legacy_hardware(
             recovery_jobs, buf_pool, checkpoint_dir, rank,
             all_layer_metadata, recovery_role, parity_preloaded=parity_preloaded
         )
-    elif recovery_jobs and getattr(args, "use_frcheck_hardware_failure", False):
+    if recovery_jobs and _frcheck_recovery_parity_repair_enabled():
         _frcheck_recovery_profile(
             recovery_role,
-            "recovery_async_parity_disabled",
-            reason="frcheck_recovery_async_parity_not_set",
+            "recovery_parity_repair_prepared",
+            mode=("background" if _frcheck_recovery_async_parity_enabled() else "sync"),
             jobs=len(recovery_jobs),
+            parity_stripes=len(parity_recovery_plans),
         )
 
     # Direct recovery keeps failed-rank tensors in stable per-layer views.
@@ -7119,6 +7244,20 @@ def recover_frcheck_legacy_hardware(
             if record is not None:
                 layerwise_records.append(record)
 
+    if recovery_jobs and _frcheck_recovery_parity_repair_enabled():
+        if _frcheck_recovery_async_parity_enabled():
+            if _get_active_frcheck_recovery_service().worker is None:
+                _start_recovery_parity_repair_submissions(
+                    "after_recovery_data", recovery_role
+                )
+        else:
+            # Sync mode makes parity repair part of recovery-to-forward latency.
+            _get_active_frcheck_recovery_service().wait_all(
+                reason="sync_parity_repair"
+            )
+            _run_pending_recovery_parity_repair_sync(
+                "after_recovery_data", recovery_role
+            )
 
     timings['network_encode'] = time.time() - t_net
 

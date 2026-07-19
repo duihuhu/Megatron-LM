@@ -21,7 +21,7 @@ export NETIFACES_INTERFACE=bond0
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
 export NCCL_IB_DISABLE=1
-MASTER_ADDR=10.0.0.62
+MASTER_ADDR=${MASTER_ADDR:-10.0.0.62}
 
 export ECCHECK_USE_ASIO=false
 export FRCHECK_INTERFACE=$NETIFACES_INTERFACE
@@ -29,8 +29,8 @@ export FRCHECK_BASE_IP=$MASTER_ADDR
 # FRCheck RDMA listens on FRCHECK_BASE_PORT + rank_in_group.
 # Keep this separate from torchrun MASTER_PORT and move it if a port is busy.
 export FRCHECK_BASE_PORT=${FRCHECK_BASE_PORT:-27200}
-MASTER_PORT=6000
-NNODES=8
+MASTER_PORT=${MASTER_PORT:-6000}
+NNODES=${NNODES:-8}
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
@@ -90,10 +90,12 @@ case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
-            --frcheck-async-parity
             --ec-checkpoint-write-only-penultimate-iter
             --frcheck-layer-exchange-encode
         )
+        if [ "${FRCHECK_ASYNC_PARITY:-1}" != "0" ]; then
+            RECOVERY_MODE_ARGS+=(--frcheck-async-parity)
+        fi
         ;;
     software)
         RECOVERY_MODE_ARGS=(
@@ -105,7 +107,6 @@ case "$MODE" in
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
             --frcheck-async-recovery-forward
-            --frcheck-recovery-async-parity
             --frcheck-failed-ranks "0"
             --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
@@ -130,13 +131,17 @@ case "$MODE" in
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
             --frcheck-async-recovery-forward
-            --frcheck-recovery-async-parity
             --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
             --num-workers 0
         )
         ;;
 esac
+
+if [[ "$MODE" =~ ^(hardware|hardware2|inprocess)$ ]] \
+    && [ "${FRCHECK_RECOVERY_ASYNC_PARITY:-1}" != "0" ]; then
+    RECOVERY_MODE_ARGS+=(--frcheck-recovery-async-parity)
+fi
 
 # Model configuration
 HIDDEN_SIZE=1024

@@ -2016,6 +2016,13 @@ private:
     std::atomic<int> task_total_{0}, task_done_{0};
     std::atomic<int> task_encode_total_{0}, task_encode_done_{0};
     std::atomic<int> task_async_total_{0}, task_async_done_{0};
+    std::vector<std::thread> aggregate_p2_threads_;
+    std::mutex aggregate_p2_mtx_;
+    std::condition_variable aggregate_p2_cv_;
+    std::exception_ptr aggregate_p2_error_;
+    std::atomic<int> aggregate_p2_total_{0};
+    std::atomic<int> aggregate_p2_done_{0};
+    uint64_t aggregate_p2_generation_ = 0;
     std::mutex encode_done_mtx_;
     std::condition_variable encode_done_cv_;
     std::atomic<int> async_p2p_pause_count_{0};
@@ -2731,8 +2738,13 @@ private:
             cudaSetDevice(resolve_cuda_device());
             cudaError_t err = cudaStreamSynchronize(d2h_stream_);
             if (err != cudaSuccess) {
-                std::cerr << "FRCheck mirror: d2h_stream sync failed: "
-                          << cudaGetErrorString(err) << std::endl;
+                mirror_tasks_failed_.fetch_add(1, std::memory_order_relaxed);
+                finalize_mirror_d2h_timing_();
+                cudaStreamDestroy(d2h_stream_);
+                d2h_stream_ = nullptr;
+                throw std::runtime_error(
+                    std::string("FRCheck mirror: d2h_stream sync failed: ") +
+                    cudaGetErrorString(err));
             }
             finalize_mirror_d2h_timing_();
             cudaStreamDestroy(d2h_stream_);
@@ -3048,6 +3060,125 @@ public:
         const std::vector<uintptr_t>& p2_addrs,
         size_t bs) {
         return submit_async_p2_layer_with_batch(p2_addrs, bs, 0);
+    }
+
+    std::vector<int> get_p2_route(int sid) const {
+        if (sid < 0 || sid >= (int)stripe_info_.size())
+            throw std::runtime_error("FRCheck P2 route: invalid stripe id");
+        const int role = get_role_for_stripe(sid);
+        if (role == (int)StripeRole::ENCODER) {
+            const int peer = stripe_info_[(size_t)sid].par_peer_rig;
+            return {role, peer, map_save_send_lane_(peer, sid)};
+        }
+        if (role == (int)StripeRole::PARITY_TARGET) {
+            const int peer = stripe_info_[(size_t)sid].enc_peer_rig;
+            return {role, peer, map_save_recv_lane_(peer, sid)};
+        }
+        return {role, -1, -1};
+    }
+
+    std::vector<int> submit_aggregate_p2(
+        const std::vector<std::tuple<int, int, uintptr_t, size_t>>& send_tasks,
+        const std::vector<std::tuple<int, int, uintptr_t, size_t>>& recv_tasks,
+        uint64_t generation) {
+        if (!aggregate_p2_threads_.empty() ||
+            aggregate_p2_done_.load(std::memory_order_acquire) <
+                aggregate_p2_total_.load(std::memory_order_acquire)) {
+            throw std::runtime_error("FRCheck aggregate P2: previous generation is still active");
+        }
+        if (generation == 0 || generation <= aggregate_p2_generation_)
+            throw std::runtime_error("FRCheck aggregate P2: generation must increase");
+        aggregate_p2_generation_ = generation;
+        aggregate_p2_error_ = nullptr;
+        aggregate_p2_done_.store(0, std::memory_order_release);
+        const int total = static_cast<int>(send_tasks.size() + recv_tasks.size());
+        aggregate_p2_total_.store(total, std::memory_order_release);
+
+        auto launch = [this, generation](bool is_send, int peer, int lane,
+                                         uintptr_t addr, size_t size) {
+            aggregate_p2_threads_.emplace_back([this, generation, is_send, peer, lane, addr, size]() {
+                try {
+                    FRCheckRdmaChannel* ch = get_channel_by_lane_(peer, lane);
+                    if (!ch)
+                        throw std::runtime_error(
+                            "FRCheck aggregate P2: missing channel peer=" +
+                            std::to_string(peer) + " lane=" + std::to_string(lane));
+                    const uint64_t tag = make_channel_tag_(5, lane, generation);
+                    uint64_t net_t0 = frcheck_now_us();
+                    record_save_net_start_(net_t0);
+                    if (is_send) {
+                        _wait_if_paused();
+                        auto wait_cb = [this]() { this->_async_rdma_begin(); };
+                        auto done_cb = [this]() { this->_async_rdma_end(); };
+                        if (shared_lane_)
+                            ch->send_tagged(tag, reinterpret_cast<const uint8_t*>(addr), size,
+                                            wait_cb, done_cb);
+                        else
+                            ch->send_data(reinterpret_cast<const uint8_t*>(addr), size,
+                                          wait_cb, done_cb);
+                    } else if (shared_lane_) {
+                        const size_t got = ch->recv_tagged(
+                            tag, reinterpret_cast<uint8_t*>(addr), size);
+                        if (got != size)
+                            throw std::runtime_error("FRCheck aggregate P2: short tagged receive");
+                    } else {
+                        const size_t got = ch->recv_data(reinterpret_cast<uint8_t*>(addr), size);
+                        if (got != size)
+                            throw std::runtime_error("FRCheck aggregate P2: short receive");
+                    }
+                    record_save_net_end_(frcheck_now_us());
+                } catch (...) {
+                    std::lock_guard<std::mutex> lk(aggregate_p2_mtx_);
+                    if (!aggregate_p2_error_) aggregate_p2_error_ = std::current_exception();
+                }
+                aggregate_p2_done_.fetch_add(1, std::memory_order_acq_rel);
+                aggregate_p2_cv_.notify_all();
+            });
+        };
+        for (const auto& task : recv_tasks) {
+            int peer, lane; uintptr_t addr; size_t size;
+            std::tie(peer, lane, addr, size) = task;
+            launch(false, peer, lane, addr, size);
+        }
+        for (const auto& task : send_tasks) {
+            int peer, lane; uintptr_t addr; size_t size;
+            std::tie(peer, lane, addr, size) = task;
+            launch(true, peer, lane, addr, size);
+        }
+        return {static_cast<int>(send_tasks.size()), static_cast<int>(recv_tasks.size())};
+    }
+
+    void wait_aggregate_p2(int timeout_seconds = 300) {
+        const int total = aggregate_p2_total_.load(std::memory_order_acquire);
+        if (total > 0) {
+            std::unique_lock<std::mutex> lk(aggregate_p2_mtx_);
+            if (!aggregate_p2_cv_.wait_for(
+                    lk, std::chrono::seconds(std::max(1, timeout_seconds)), [this, total] {
+                        return aggregate_p2_done_.load(std::memory_order_acquire) >= total;
+                    })) {
+                const int done = aggregate_p2_done_.load(std::memory_order_acquire);
+                lk.unlock();
+                abort_all_channels_();
+                for (auto& thread : aggregate_p2_threads_)
+                    if (thread.joinable()) thread.join();
+                aggregate_p2_threads_.clear();
+                throw std::runtime_error(
+                    "FRCheck aggregate P2 timed out: done=" +
+                    std::to_string(done) + "/" + std::to_string(total));
+            }
+        }
+        for (auto& thread : aggregate_p2_threads_)
+            if (thread.joinable()) thread.join();
+        aggregate_p2_threads_.clear();
+        std::exception_ptr error;
+        {
+            std::lock_guard<std::mutex> lk(aggregate_p2_mtx_);
+            error = aggregate_p2_error_;
+            aggregate_p2_error_ = nullptr;
+        }
+        if (error) std::rethrow_exception(error);
+        if (aggregate_p2_done_.load(std::memory_order_acquire) != total)
+            throw std::runtime_error("FRCheck aggregate P2 completion count mismatch");
     }
 
     void reset_async_parity() {
@@ -4334,6 +4465,11 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("p2_addrs"), py::arg("block_size"))
         .def("submit_async_p2_layer_with_batch", &FRCheckNative::submit_async_p2_layer_with_batch,
              py::arg("p2_addrs"), py::arg("block_size"), py::arg("batch_id"))
+        .def("get_p2_route", &FRCheckNative::get_p2_route, py::arg("stripe_id"))
+        .def("submit_aggregate_p2", &FRCheckNative::submit_aggregate_p2,
+             py::arg("send_tasks"), py::arg("recv_tasks"), py::arg("generation"))
+        .def("wait_aggregate_p2", &FRCheckNative::wait_aggregate_p2,
+             py::arg("timeout_seconds") = 300, py::call_guard<py::gil_scoped_release>())
         .def("reset_async_parity", &FRCheckNative::reset_async_parity)
         .def("wait_layer", &FRCheckNative::wait_layer,
              py::call_guard<py::gil_scoped_release>())

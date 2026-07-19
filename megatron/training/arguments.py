@@ -2463,9 +2463,11 @@ def _add_checkpointing_args(parser):
                             'splitting blocks and running RS encode. Async P2 behavior '
                             'and shard format are unchanged.')
     group.add_argument('--frcheck-recovery-async-parity', action='store_true',
-                       help='Enable async parity repair after FRCheck hardware recovery. '
-                            'This is a load/recovery-side option and is independent '
-                            'from --frcheck-async-parity, which only controls save.')
+                       help='Run mandatory FRCheck hardware-recovery parity repair in '
+                            'the background after data recovery. When unset (default), '
+                            'the same repair runs synchronously before recovery returns. '
+                            'This is independent from --frcheck-async-parity, which only '
+                            'controls save-side parity delivery.')
     group.add_argument('--frcheck-async-recovery-forward', action='store_true',
                        help='Experimental: overlap FRCheck hardware recovery with '
                             'forward by recovering transformer layers in a '

@@ -318,6 +318,7 @@ class FRCheckManager:
     @staticmethod
     def _get_ranks_per_node() -> int:
         env_keys = (
+            "FRCHECK_RANKS_PER_NODE",
             "LOCAL_WORLD_SIZE",
             "OMPI_COMM_WORLD_LOCAL_SIZE",
             "MPI_LOCALNRANKS",
@@ -822,6 +823,32 @@ class FRCheckManager:
                 {r.name: sum(1 for p in self.stripe_plans if p.role == r)
                  for r in StripeRole},
             )
+
+    def allocate_registered_save_buffer(self, size_bytes: int) -> torch.Tensor:
+        """Allocate and register a save-scoped CPU transfer buffer."""
+        if size_bytes <= 0:
+            raise ValueError("FRCheck save buffer size must be positive")
+        native = self._frcheck_native
+        if native is None:
+            raise RuntimeError("FRCheck native module is not initialized")
+        buffer = allocate_hugepage_tensor(
+            size_bytes, fallback_pin_memory=torch.cuda.is_available(),
+        )
+        addr = int(buffer.data_ptr())
+        native.register_buffer(addr, int(buffer.numel()))
+        self._rdma_registered_addrs.add(addr)
+        return buffer
+
+    def release_registered_save_buffers(self, buffers: List[torch.Tensor]) -> None:
+        """Unregister save-scoped transfer buffers after native completion."""
+        native = self._frcheck_native
+        for buffer in buffers:
+            addr = int(buffer.data_ptr())
+            if addr not in self._rdma_registered_addrs:
+                continue
+            if native is not None:
+                native.unregister_buffer(addr)
+            self._rdma_registered_addrs.discard(addr)
 
     def get_native(self) -> Any:
         return self._frcheck_native

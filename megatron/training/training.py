@@ -965,6 +965,7 @@ def pretrain(
             )
 
         print_datetime('after training is done')
+        _teardown_gemini_inprocess_workspace()
 
         if args.save and iteration != 0 and iteration % args.save_interval != 0:
             save_checkpoint(
@@ -1048,6 +1049,33 @@ def pretrain(
             logger.info("FRCHECK teardown trace rank=%d: after FRCheck teardown import", args.rank)
         _teardown_frcheck_after_training()
         _force_exit_after_frcheck_load()
+
+
+def _teardown_gemini_inprocess_workspace() -> None:
+    """Release Gemini recovery scratch after the final recovered train step."""
+    args = get_args()
+    if not (
+        getattr(args, "use_gemini_replicas", False)
+        and getattr(args, "ft_inprocess_recovery_benchmark", False)
+        and getattr(args, "_ft_inprocess_recovery_done", False)
+        and not getattr(args, "_gemini_inprocess_workspace_released", False)
+    ):
+        return
+
+    # All directed recovery operations are synchronous, but ranks can finish the
+    # final pipeline step at different times. Align before stopping transports.
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    from megatron.training.gemini_replicas_legacy import (
+        release_gemini_replicas_inprocess_workspace,
+    )
+
+    release_gemini_replicas_inprocess_workspace()
+    args._gemini_inprocess_workspace_released = True
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    if args.rank == 0:
+        logger.info("Gemini in-process recovery workspace released after training")
 
 
 def update_train_iters(args):
@@ -2948,6 +2976,7 @@ def train(
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
+        _teardown_gemini_inprocess_workspace()
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()

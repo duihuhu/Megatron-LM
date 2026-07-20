@@ -84,7 +84,13 @@ class GeminiReplicasManager:
         # Track registered buffers (for RDMA)
         self.registered_buffers: Dict[int, Tuple[int, int]] = {}  # {buffer_addr: (size, iteration)}
         self.current_iteration: int = 0
-        
+
+        # In-process recovery-only workspace. It owns transport scratch buffers,
+        # their RDMA registrations, and the sparse recovery connection topology.
+        self._recovery_workspace_key: Optional[tuple] = None
+        self._recovery_workspace_buffers: Dict[tuple, torch.Tensor] = {}
+        self._recovery_topology_key: Optional[tuple] = None
+
         self._initialized = True
     
     @staticmethod
@@ -917,12 +923,73 @@ class GeminiReplicasManager:
 
         return sorted(target_set), sorted(source_set)
 
+
+    def recovery_workspace_matches(self, base_key: tuple) -> bool:
+        """Return whether the active workspace has the same stable identity."""
+        return bool(
+            self._recovery_workspace_key is not None
+            and self._recovery_workspace_key[0] == base_key
+        )
+
+    def begin_recovery_workspace(self, base_key: tuple, size_key: tuple) -> bool:
+        """Select the in-process recovery workspace and return whether it hit."""
+        key = (base_key, size_key)
+        if self._recovery_workspace_key == key:
+            return True
+        self.release_recovery_workspace()
+        self._recovery_workspace_key = key
+        return False
+
+    def get_recovery_buffer(self, name: tuple, size_bytes: int) -> torch.Tensor:
+        """Return registered, page-backed scratch owned only by the workspace."""
+        cached = self._recovery_workspace_buffers.get(name)
+        if cached is not None and cached.numel() >= size_bytes:
+            return cached[:size_bytes]
+        if cached is not None:
+            self.unregister_buffer(cached)
+        pin = self.gemini_replicas_pin_memory and torch.cuda.is_available()
+        buffer = allocate_hugepage_tensor(
+            size_bytes, fallback_pin_memory=pin, touch_pages=True,
+        )
+        if self.use_rdma:
+            self.register_buffer(buffer)
+        self._recovery_workspace_buffers[name] = buffer
+        return buffer
+
+    def reset_recovery_transport(self) -> None:
+        """Reset all native per-operation completion state before workspace reuse."""
+        native = self._gemini_replicas_native
+        if native is not None:
+            native.reset_exchange_state()
+
+    def release_recovery_workspace(self) -> None:
+        """Stop transport before releasing registered recovery scratch buffers."""
+        if self._gemini_replicas_native is not None:
+            try:
+                self._gemini_replicas_native.stop_workers()
+            except Exception:
+                pass
+            for buffer_addr in list(self.registered_buffers):
+                try:
+                    self._gemini_replicas_native.unregister_buffer(buffer_addr)
+                except Exception as exc:
+                    logger.warning(
+                        "Gemini Replicas: failed to unregister recovery buffer "
+                        "at 0x%x: %s", buffer_addr, exc,
+                    )
+            self.registered_buffers.clear()
+            self._stop_native_gracefully()
+        self._recovery_workspace_buffers.clear()
+        self._recovery_workspace_key = None
+        self._recovery_topology_key = None
+
     def reinit_for_recovery(
         self,
         recovery_ranks: set,
         main_assignments: Optional[Dict[int, int]] = None,
         replica_needed: Optional[Dict[int, int]] = None,
         replica_failed_sources: Optional[Dict[int, List[int]]] = None,
+        reuse_connections: bool = False,
     ) -> None:
         """Rebuild sparse P2P connections for HW recovery.
 
@@ -965,6 +1032,14 @@ class GeminiReplicasManager:
         # the global sync below so all_gather/barriers do not deadlock.
         participates = bool(failed_in_group and healthy_in_group)
         has_p2p_role = participates and bool(target_ranks or source_ranks)
+        topology_key = (
+            rank, world_size, tuple(sorted(recovery_ranks)),
+            tuple(target_ranks), tuple(source_ranks), self.use_rdma,
+            self.channels_per_peer,
+        )
+        if reuse_connections and self._recovery_topology_key == topology_key:
+            self.reset_recovery_transport()
+            return
 
         if participates:
             logger.debug(
@@ -1036,6 +1111,7 @@ class GeminiReplicasManager:
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
                     torch.distributed.barrier()
+                self._recovery_topology_key = topology_key
                 return
 
             current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1084,6 +1160,8 @@ class GeminiReplicasManager:
             # Starting persistent exchange workers here leaves recv workers alive
             # across in-process recovery cycles and can block the next reinit.
 
+            self._recovery_topology_key = topology_key
+            self.reset_recovery_transport()
             logger.debug(
                 f"Gemini Replicas recovery: [Rank {rank}] reinit complete, "
                 f"targets={target_ranks}, sources={source_ranks}"
@@ -1120,4 +1198,7 @@ class GeminiReplicasManager:
         self.replica_buffers = []
         self.replica_metadata = []
         self._cached_recv_buffers = {}
+        self._recovery_workspace_buffers.clear()
+        self._recovery_workspace_key = None
+        self._recovery_topology_key = None
 

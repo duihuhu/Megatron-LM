@@ -935,11 +935,57 @@ def _hw_recovery_preload(
     return torch.zeros(0, dtype=torch.uint8)
 
 
+def _recovery_workspace_base_key(
+    manager: GeminiReplicasManager,
+    checkpoint_dir: Path,
+    rank: int,
+    world_size: int,
+    failed: Set[int],
+) -> tuple:
+    """Build a stable identity for in-process transport scratch and topology."""
+    local_files = []
+    for path in sorted(checkpoint_dir.glob("gemini_replicas_*.pt")):
+        name = path.name
+        if f"rank{rank}" not in name and f"from{rank}" not in name:
+            continue
+        stat = path.stat()
+        local_files.append((name, stat.st_size, stat.st_mtime_ns))
+    backend = "rdma" if manager.use_rdma else "asio"
+    return (
+        str(checkpoint_dir.resolve()), rank, world_size, manager.group_size,
+        manager.num_replicas, tuple(sorted(failed)), "hardware",
+        manager.gemini_replicas_pin_memory, manager.use_gdr, manager.use_rdma,
+        manager.channels_per_peer, backend, tuple(local_files),
+    )
+
+
+def _recovery_workspace_size_key(rank: int) -> tuple:
+    hw = _hw_assignments.get(rank, {})
+    return (
+        tuple(sorted(hw.get("combined_sizes", {}).items())),
+        int(hw.get("combined_size", 0)),
+        tuple(sorted(_replica_sizes.items())),
+    )
+
+
+def release_gemini_replicas_inprocess_workspace() -> None:
+    """Explicitly release Gemini-only in-process recovery resources."""
+    manager = GeminiReplicasManager()
+    manager.release_recovery_workspace()
+    _recovery_meta.clear()
+    _hw_preloaded.clear()
+    _hw_recv_bufs.clear()
+    _replica_preloaded.clear()
+    _replica_recv_bufs.clear()
+    _replica_tensor_sizes.clear()
+
+
 def _recovery_prealloc_buffers(
     manager: GeminiReplicasManager,
     rank: int,
     failed: Set[int],
     healthy: Set[int],
+    reuse_workspace: bool = False,
 ) -> None:
     """Pre-barrier: normalize send buffers, alloc recv buffers, RDMA register."""
     pin = manager.gemini_replicas_pin_memory and torch.cuda.is_available()
@@ -962,11 +1008,14 @@ def _recovery_prealloc_buffers(
             for m in _recovery_meta.get(rank, {}).get("tensor_infos", [])
         ) or info.get("combined_size", 0)
         if tensor_size > 0:
-            buf = allocate_hugepage_tensor(
-                tensor_size, fallback_pin_memory=pin, touch_pages=True,
-            )
-            if manager.use_rdma:
-                manager.register_buffer(buf)
+            if reuse_workspace:
+                buf = manager.get_recovery_buffer(("main_recv", rank), tensor_size)
+            else:
+                buf = allocate_hugepage_tensor(
+                    tensor_size, fallback_pin_memory=pin, touch_pages=True,
+                )
+                if manager.use_rdma:
+                    manager.register_buffer(buf)
             _hw_recv_bufs[rank] = buf
 
     global_needed = _replica_needed
@@ -987,11 +1036,14 @@ def _recovery_prealloc_buffers(
                 tensor_size = _replica_sizes.get(src, 0)
             if tensor_size <= 0:
                 continue
-            buf = allocate_hugepage_tensor(
-                tensor_size, fallback_pin_memory=pin, touch_pages=True,
-            )
-            if manager.use_rdma:
-                manager.register_buffer(buf)
+            if reuse_workspace:
+                buf = manager.get_recovery_buffer(("replica_recv", rank, src), tensor_size)
+            else:
+                buf = allocate_hugepage_tensor(
+                    tensor_size, fallback_pin_memory=pin, touch_pages=True,
+                )
+                if manager.use_rdma:
+                    manager.register_buffer(buf)
             _replica_recv_bufs.setdefault(rank, {})[src] = buf
 
 
@@ -1946,25 +1998,9 @@ def load_gemini_replicas_legacy_checkpoint(
         else:
             failed_override = None
 
-        t_setup = time.time()
+        t_setup = time.perf_counter()
         _gemini_recovery_profile(recovery_role, "setup_start")
 
-        # Setup (not timed): metadata collection
-        t_meta = time.time()
-        if main_payload is None and main_file_exists:
-            main_payload = _load_local_main_payload(load_tensor_buffer=False)
-        meta = _collect_metadata_for_failed_rank(checkpoint_dir, rank, world_size)
-        _gemini_recovery_profile(
-            recovery_role, "metadata_collect_done", elapsed_s=time.time() - t_meta
-        )
-
-        # Setup (not timed): group membership + health determination
-        rank_to_group: Dict[int, List[int]] = {}
-        for r in range(world_size):
-            if r not in rank_to_group:
-                members = manager.get_group_members(r, world_size)
-                for m in members:
-                    rank_to_group[m] = members
         if failed_override:
             healthy = {r for r in range(world_size) if r not in failed_override}
             failed = failed_override
@@ -1972,16 +2008,44 @@ def load_gemini_replicas_legacy_checkpoint(
             healthy = {r for r, ok in enumerate(health_list) if ok}
             failed = {r for r in range(world_size) if r not in healthy}
 
-        # Setup (not timed): role assignment (all_gather, not in network timing)
-        _hw_recovery_prepare(
-            manager, checkpoint_dir, rank, world_size,
-            rank_to_group, healthy, failed,
+        workspace_base_key = _recovery_workspace_base_key(
+            manager, checkpoint_dir, rank, world_size, failed,
         )
-        _replica_recovery_prepare(
-            manager, checkpoint_dir, rank, world_size, failed, healthy,
+        workspace_hit = bool(
+            inprocess_recovery_active
+            and manager.recovery_workspace_matches(workspace_base_key)
         )
 
-        # Setup (not timed): rebuild sparse P2P connections from role assignments
+        t_meta = time.perf_counter()
+        if workspace_hit:
+            meta = {}
+        else:
+            if main_payload is None and main_file_exists:
+                main_payload = _load_local_main_payload(load_tensor_buffer=False)
+            meta = _collect_metadata_for_failed_rank(checkpoint_dir, rank, world_size)
+        metadata_s = time.perf_counter() - t_meta
+
+        t_plan = time.perf_counter()
+        if not workspace_hit:
+            rank_to_group: Dict[int, List[int]] = {}
+            for r in range(world_size):
+                if r not in rank_to_group:
+                    members = manager.get_group_members(r, world_size)
+                    for m in members:
+                        rank_to_group[m] = members
+            _hw_recovery_prepare(
+                manager, checkpoint_dir, rank, world_size,
+                rank_to_group, healthy, failed,
+            )
+            _replica_recovery_prepare(
+                manager, checkpoint_dir, rank, world_size, failed, healthy,
+            )
+            manager.begin_recovery_workspace(
+                workspace_base_key, _recovery_workspace_size_key(rank),
+            )
+        plan_s = time.perf_counter() - t_plan
+
+        t_reset = time.perf_counter()
         if failed_override:
             main_assignments = _hw_assignments.get(rank, {}).get("assignments", {})
             manager.reinit_for_recovery(
@@ -1989,31 +2053,56 @@ def load_gemini_replicas_legacy_checkpoint(
                 main_assignments=main_assignments,
                 replica_needed=_replica_needed,
                 replica_failed_sources=_replica_failed_sources,
+                reuse_connections=inprocess_recovery_active,
             )
+        reset_s = time.perf_counter() - t_reset
 
         # Setup (not timed): preload files + exchange metadata via NCCL
         # All disk I/O and pickle serialization happens here, before the barrier.
-        t_preload = time.time()
-        _hw_recovery_preload(
-            manager, checkpoint_dir, rank, world_size, failed,
-        )
-        _replica_recovery_preload(
-            manager, checkpoint_dir, rank, world_size, failed,
-        )
+        t_preload = time.perf_counter()
+        if not workspace_hit:
+            _hw_recovery_preload(
+                manager, checkpoint_dir, rank, world_size, failed,
+            )
+            _replica_recovery_preload(
+                manager, checkpoint_dir, rank, world_size, failed,
+            )
         _gemini_recovery_profile(
-            recovery_role, "preload_done", elapsed_s=time.time() - t_preload
+            recovery_role, "preload_done", elapsed_s=time.perf_counter() - t_preload
         )
 
         # Setup (not timed): alloc recv buffers, normalize send buffers, RDMA reg
-        _hw_recv_bufs.pop(rank, None)
-        _replica_recv_bufs.pop(rank, None)
-        t_prealloc = time.time()
-        _recovery_prealloc_buffers(manager, rank, failed, healthy)
-        _gemini_recovery_profile(
-            recovery_role, "prealloc_done", elapsed_s=time.time() - t_prealloc
+        if not workspace_hit:
+            _hw_recv_bufs.pop(rank, None)
+            _replica_recv_bufs.pop(rank, None)
+        t_prealloc = time.perf_counter()
+        _recovery_prealloc_buffers(
+            manager, rank, failed, healthy,
+            reuse_workspace=inprocess_recovery_active,
         )
+        alloc_register_s = time.perf_counter() - t_prealloc
+        disk_preload_s = time.perf_counter() - t_preload
+        setup_s = time.perf_counter() - t_setup
+        setup_summary = _timing_max_dict({
+            "metadata": metadata_s,
+            "plan": plan_s,
+            "alloc_register": alloc_register_s,
+            "reset": reset_s,
+            "disk_preload": disk_preload_s,
+            "total": setup_s,
+        })
+        if rank == 0 and inprocess_recovery_active:
+            logger.info(
+                "Gemini recovery workspace: cache=%s setup_s=%.3f "
+                "metadata_s=%.3f plan_s=%.3f alloc_register_s=%.3f "
+                "reset_s=%.3f disk_preload_s=%.3f",
+                "hit" if workspace_hit else "miss", setup_summary["total"],
+                setup_summary["metadata"], setup_summary["plan"],
+                setup_summary["alloc_register"], setup_summary["reset"],
+                setup_summary["disk_preload"],
+            )
         _gemini_recovery_profile(
-            recovery_role, "setup_done", elapsed_s=time.time() - t_setup,
+            recovery_role, "setup_done", elapsed_s=setup_s,
             failed_count=len(failed), healthy_count=len(healthy),
         )
 
@@ -2038,16 +2127,16 @@ def load_gemini_replicas_legacy_checkpoint(
             manager, checkpoint_dir, rank, world_size, failed,
         )
         _t['network_encode'] = time.time() - _t0  # RDMA tensor transfer only
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("gemini_network_done")
+            mark_recovery_to_forward_timer("gemini_transport_buffer_ready")
+        except Exception:
+            pass
         _gemini_recovery_profile(
             recovery_role, "network_transfer_done",
             elapsed_s=_t['network_encode'], is_failed=is_failed,
         )
-        try:
-            from megatron.training.global_vars import mark_recovery_to_forward_timer
-            mark_recovery_to_forward_timer("gemini_network_done")
-        except Exception:
-            pass
-
         # Rebuild happens after network transfer completion; no extra timing barrier needed.
         prep_copy_s = 0.0
         if not is_failed and (
@@ -2061,7 +2150,10 @@ def load_gemini_replicas_legacy_checkpoint(
         _gemini_recovery_profile(recovery_role, "rebuild_start")
         if is_failed:
             if rank in _recovery_meta:
-                meta.update(_recovery_meta.pop(rank))
+                cached_meta = _recovery_meta[rank]
+                meta.update(cached_meta)
+                if not inprocess_recovery_active:
+                    _recovery_meta.pop(rank, None)
             state_dict = _reconstruct_from_payload(
                 tensor_infos=meta["tensor_infos"],
                 non_tensor_data=meta["non_tensor_data"],

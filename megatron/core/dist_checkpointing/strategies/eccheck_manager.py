@@ -7,7 +7,7 @@ import queue
 import socket
 import threading
 from logging import getLogger
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from dataclasses import replace
@@ -82,6 +82,11 @@ class ECCHECKManager:
         self.registered_buffers: Dict[int, Tuple[int, int]] = {}  # {buffer_addr: (size, iteration)}
         self.current_iteration: int = 0
         self.preallocated_cpu_buffer: Optional[torch.Tensor] = None
+
+        # Legacy in-process recovery workspace. It is populated only while the
+        # benchmark recovery cycle is active and intentionally lives until exit.
+        self._legacy_inprocess_workspace_key: Optional[tuple] = None
+        self._legacy_inprocess_workspace: Optional[Dict[str, Any]] = None
 
         self._initialized = True
 
@@ -911,6 +916,61 @@ class ECCHECKManager:
         self._buffer_poller_stop_event = None
         self._buffer_poller_active_event = None
     
+    def find_legacy_inprocess_workspace(
+        self, bootstrap_key: tuple
+    ) -> Optional[Dict[str, Any]]:
+        """Find a workspace before metadata-derived key dimensions are available."""
+        if self._legacy_inprocess_workspace_key is None:
+            return None
+        if self._legacy_inprocess_workspace_key[0] != bootstrap_key:
+            if self._eccheck_native is not None:
+                raise RuntimeError(
+                    "ECCHECK in-process recovery workspace inputs changed while native "
+                    "buffers are registered; restart the process before using the new "
+                    "checkpoint or recovery configuration"
+                )
+            self._legacy_inprocess_workspace_key = None
+            self._legacy_inprocess_workspace = None
+            return None
+        return self._legacy_inprocess_workspace
+
+    def get_legacy_inprocess_workspace(self, key: tuple) -> Optional[Dict[str, Any]]:
+        """Return the exact-match legacy recovery workspace, if installed."""
+        if self._legacy_inprocess_workspace_key is None:
+            return None
+        if self._legacy_inprocess_workspace_key != key:
+            if self._eccheck_native is not None:
+                raise RuntimeError(
+                    "ECCHECK in-process recovery workspace inputs changed while native "
+                    "buffers are registered; restart the process before using the new "
+                    "checkpoint or recovery configuration"
+                )
+            self._legacy_inprocess_workspace_key = None
+            self._legacy_inprocess_workspace = None
+            return None
+        return self._legacy_inprocess_workspace
+
+    def install_legacy_inprocess_workspace(
+        self, key: tuple, workspace: Dict[str, Any]
+    ) -> None:
+        """Install the manager-owned legacy recovery workspace once."""
+        existing = self.get_legacy_inprocess_workspace(key)
+        if existing is not None and existing is not workspace:
+            raise RuntimeError("ECCHECK in-process recovery workspace was replaced unexpectedly")
+        self._legacy_inprocess_workspace_key = key
+        self._legacy_inprocess_workspace = workspace
+
+    def reset_native_for_inprocess_recovery(self, failed_rank: int) -> None:
+        """Restart load workers, then clear all native and Python cycle state."""
+        if self._eccheck_native is None:
+            raise RuntimeError("ECCHECK native module is not initialized")
+        # set_load_mode joins workers completed by the previous sentinel batch and
+        # starts a fresh worker set. Resetting before this call would clear the
+        # completion flags needed to join those workers.
+        self._eccheck_native.set_load_mode(True, failed_rank)
+        self._eccheck_native.reset_encoding_completion_flags()
+        self.reset_free_buffer_queues_for_inprocess_recovery()
+
     def reset_free_buffer_queues_for_inprocess_recovery(self):
         """Reset reusable free-buffer queues between in-process recovery cycles."""
         if self.eccheck_data_buffers is None:
@@ -1181,6 +1241,8 @@ class ECCHECKManager:
 
             # Release cached allocations
             self.preallocated_cpu_buffer = None
+            self._legacy_inprocess_workspace_key = None
+            self._legacy_inprocess_workspace = None
             self._cached_blocks = None
             self._cached_block_count = 0
             self._cached_block_size = 0

@@ -8,6 +8,7 @@ singleton and its C++ native module.
 """
 
 import ctypes
+import os
 import queue
 import time
 from logging import getLogger
@@ -1123,6 +1124,7 @@ def _run_eccheck_legacy_recovery(
     recovered_buffer: Optional[torch.Tensor],
     total_size: int,
     registry: GlobalMetadataRegistry,
+    native_prepared: bool = False,
 ) -> float:
     """Drive C++ recovery for ECCHECK legacy load using submit_load_pipeline_chunk.
 
@@ -1168,7 +1170,8 @@ def _run_eccheck_legacy_recovery(
 
     # ---- hardware failure path (rank_in_group 2) ----
     failed_rank = 2
-    native.set_load_mode(True, failed_rank)
+    if not native_prepared:
+        native.set_load_mode(True, failed_rank)
     logger.debug(f"ECCHECK legacy: set load mode (failed_rank={failed_rank})")
 
     # Compute pipeline size
@@ -1813,6 +1816,59 @@ def state_dict_from_eccheck_main_metadata_only(
 
 
 # ---------------------------------------------------------------------------
+# In-process recovery workspace
+# ---------------------------------------------------------------------------
+
+
+def _eccheck_input_file_signature(checkpoint_dir: Path) -> Tuple[Tuple[str, int, int], ...]:
+    files = []
+    for path in sorted(checkpoint_dir.glob("eccheck*.pt")):
+        stat = path.stat()
+        files.append((path.name, int(stat.st_size), int(stat.st_mtime_ns)))
+    return tuple(files)
+
+
+def _eccheck_inprocess_bootstrap_key(
+    checkpoint_dir: Path, rank: int, world_size: int, args: Any, mode: str,
+    rank_in_group: int, cluster_id: int, layout: Dict[str, int],
+) -> tuple:
+    env_names = (
+        "ECCHECK_USE_ASIO", "ECCHECK_BASE_IP", "ECCHECK_INTERFACE",
+        "ECCHECK_BASE_PORT", "MASTER_ADDR", "MASTER_PORT",
+        "CUDA_VISIBLE_DEVICES", "NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME",
+    )
+    rank_ip_env = tuple(
+        sorted((name, value) for name, value in os.environ.items()
+               if name.startswith("ECCHECK_RANK_IP_") or name.startswith("ECCHECK_LOCAL_RANK_NIC_"))
+    )
+    failed_roles = (1, 2) if mode == "HW2" else (2,)
+    return (
+        str(checkpoint_dir.resolve()), _eccheck_input_file_signature(checkpoint_dir),
+        rank, world_size, tuple(sorted(layout.items())), cluster_id, rank_in_group,
+        int(getattr(args, "eccheck_recovery_cluster", 0)),
+        int(getattr(args, "eccheck_rig_remap_offset", 0)), failed_roles, mode,
+        bool(getattr(args, "use_rdma", False)),
+        (torch.distributed.get_backend() if torch.distributed.is_initialized() else None),
+        tuple((name, os.environ.get(name)) for name in env_names), rank_ip_env,
+    )
+
+
+def _metadata_workspace_key(
+    bootstrap_key: tuple, manager: ECCHECKManager, rank_metadata: Dict[int, List[TensorMetadata]],
+    blocks: Dict[str, Any], recovered_capacity: int,
+) -> tuple:
+    rank_sizes = tuple(
+        (rank, sum(meta.size_bytes for meta in metadata), len(metadata))
+        for rank, metadata in sorted(rank_metadata.items())
+    )
+    return (
+        bootstrap_key, rank_sizes, int(manager.eccheck_buffer_size), 64,
+        int(blocks.get("pipeline_size", 0)), int(blocks.get("aligned_size", 0)),
+        tuple(blocks.get("block_names", ())), int(recovered_capacity),
+        manager.eccheck_data_buffers_count, manager.eccheck_encoding_buffers_count,
+    )
+
+# ---------------------------------------------------------------------------
 # Main load entry point
 # ---------------------------------------------------------------------------
 
@@ -1854,9 +1910,24 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         else:
             load_tensor_buffer = rank_in_group != 2
 
-    main_payload = _load_eccheck_main_payload(
-        checkpoint_dir, rank, world_size, load_tensor_buffer=load_tensor_buffer,
+    inprocess_cache = bool(
+        getattr(args, "ft_inprocess_recovery_benchmark", False)
+        and getattr(args, "_ft_inprocess_recovery_active", False)
+        and not sw_failure
+        and not two_failures
     )
+    if two_failures:
+        _mode = "HW2"
+    elif sw_failure:
+        _mode = "SW"
+    else:
+        _mode = "HW"
+
+    setup_start = time.perf_counter()
+    metadata_plan_s = 0.0
+    disk_preload_s = 0.0
+    alloc_touch_register_s = 0.0
+    native_reset_s = 0.0
 
     if not getattr(args, "use_eccheck", False):
         logger.warning(
@@ -1864,93 +1935,162 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         )
         args.use_eccheck = True
 
+    alloc_start = time.perf_counter()
     manager = ECCHECKManager()
     manager.init_eccheck_if_enabled()
     if manager._eccheck_native is None:
         raise RuntimeError("ECCHECK native module is not available in legacy load path")
-    if getattr(args, "ft_inprocess_recovery_benchmark", False):
-        manager.reset_free_buffer_queues_for_inprocess_recovery()
+    alloc_touch_register_s += time.perf_counter() - alloc_start
 
-    tensor_infos = main_payload["tensor_infos"]
-    local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
+    bootstrap_key = None
+    workspace = None
+    if inprocess_cache:
+        metadata_start = time.perf_counter()
+        bootstrap_key = _eccheck_inprocess_bootstrap_key(
+            checkpoint_dir, rank, world_size, args, _mode, rank_in_group,
+            cluster_id, layout,
+        )
+        workspace = manager.find_legacy_inprocess_workspace(bootstrap_key)
+        metadata_plan_s += time.perf_counter() - metadata_start
 
-    if world_size > 1 and torch.distributed.is_initialized():
-        gathered_meta: List[Any] = [None for _ in range(world_size)]
-        torch.distributed.all_gather_object(gathered_meta, local_metadata)
-        rank_metadata = {i: gathered_meta[i] for i in range(world_size)}
+    if workspace is not None:
+        main_payload = workspace["main_payload"]
+        rank_metadata = workspace["rank_metadata"]
+        registry = workspace["registry"]
+        total_size = workspace["total_size"]
+        blocks = workspace["blocks"]
+        recovered_buffer = workspace["recovered_buffer"]
+        cache_status = "hit"
     else:
-        rank_metadata = {0: local_metadata}
-
-    registry = GlobalMetadataRegistry(rank_metadata=rank_metadata, rank_non_tensor_data={})
-
-    if world_size <= 1:
-        return _reconstruct_state_dict_from_eccheck_buffer(main_payload, None)
-
-    total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
-
-    if recovery_cluster_active:
-        if sw_failure:
-            required_block_names = ["partner_buffer"] if rank_in_group == 0 else []
+        cache_status = "miss"
+        metadata_start = time.perf_counter()
+        main_payload = _load_eccheck_main_payload(
+            checkpoint_dir, rank, world_size, load_tensor_buffer=load_tensor_buffer,
+        )
+        tensor_infos = main_payload["tensor_infos"]
+        local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
+        if world_size > 1 and torch.distributed.is_initialized():
+            gathered_meta: List[Any] = [None for _ in range(world_size)]
+            torch.distributed.all_gather_object(gathered_meta, local_metadata)
+            rank_metadata = {i: gathered_meta[i] for i in range(world_size)}
         else:
-            required_block_names = ["own_buffer", "partner_buffer"]
-        blocks = _allocate_eccheck_blocks_legacy(
-            manager, rank_metadata, block_names=required_block_names,
+            rank_metadata = {0: local_metadata}
+        registry = GlobalMetadataRegistry(
+            rank_metadata=rank_metadata, rank_non_tensor_data={}
         )
-    else:
-        blocks = {}
+        total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
+        metadata_plan_s += time.perf_counter() - metadata_start
 
-    recovered_buffer: Optional[torch.Tensor] = None
+        if world_size <= 1:
+            return _reconstruct_state_dict_from_eccheck_buffer(main_payload, None)
 
-    if not recovery_cluster_active:
-        pass
-    elif two_failures:
-        pin = True
-        actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
-        blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
-
-        if rank_in_group in (0, 3):
-            _load_eccheck_blocks_from_disk_into(
-                blocks, checkpoint_dir, rank, rank_in_group,
-                software_failure=False, two_failures=True,
-            )
-        elif rank_in_group in (1, 2):
-            recovered_buffer = _allocate_recovered_buffer(actual_tensor_bytes, pin)
-            total_size = actual_tensor_bytes
-    elif sw_failure:
-        if rank_in_group == 0:
+        alloc_start = time.perf_counter()
+        if recovery_cluster_active:
+            if sw_failure:
+                required_block_names = ["partner_buffer"] if rank_in_group == 0 else []
+            else:
+                required_block_names = ["own_buffer", "partner_buffer"]
             blocks = _allocate_eccheck_blocks_legacy(
-                manager, rank_metadata, block_names=["partner_buffer"],
+                manager, rank_metadata, block_names=required_block_names,
             )
-            _load_eccheck_blocks_from_disk_into(
-                blocks, checkpoint_dir, rank, rank_in_group, software_failure=True,
-            )
-        elif rank_in_group == 1:
+        else:
+            blocks = {}
+        recovered_buffer: Optional[torch.Tensor] = None
+
+        if not recovery_cluster_active:
+            pass
+        elif two_failures:
             actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
-            pin = True
-            recovered_buffer = _allocate_recovered_buffer(actual_tensor_bytes, pin)
-            total_size = actual_tensor_bytes
-    elif rank_in_group == 2:
-        blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
-        pin = True
-        recovered_capacity = _max_tensor_bytes_from_registry(registry, world_size)
-        recovered_buffer = _allocate_recovered_buffer(recovered_capacity, pin)
-    else:
-        blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
-        _load_eccheck_blocks_from_disk_into(
-            blocks, checkpoint_dir, rank, rank_in_group, software_failure=False,
-        )
-    if manager.use_rdma and recovered_buffer is not None:
-        manager.register_buffer(recovered_buffer)
+            blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
+            if rank_in_group in (1, 2):
+                recovered_buffer = _allocate_recovered_buffer(actual_tensor_bytes, True)
+                total_size = actual_tensor_bytes
+        elif sw_failure:
+            if rank_in_group == 0:
+                blocks = _allocate_eccheck_blocks_legacy(
+                    manager, rank_metadata, block_names=["partner_buffer"],
+                )
+            elif rank_in_group == 1:
+                actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
+                recovered_buffer = _allocate_recovered_buffer(actual_tensor_bytes, True)
+                total_size = actual_tensor_bytes
+        elif rank_in_group == 2:
+            blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
+            recovered_capacity = _max_tensor_bytes_from_registry(registry, world_size)
+            recovered_buffer = _allocate_recovered_buffer(recovered_capacity, True)
+        else:
+            blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
+
+        if (
+            inprocess_cache
+            and manager.eccheck_recv_encoding_buffers is None
+            and recovery_cluster_active
+        ):
+            manager.eccheck_recv_encoding_buffers = (
+                manager.allocate_recv_encoding_buffers_phase2(registry)
+            )
+        if manager.use_rdma and recovered_buffer is not None:
+            manager.register_buffer(recovered_buffer)
+        alloc_touch_register_s += time.perf_counter() - alloc_start
+
+        disk_start = time.perf_counter()
+        if recovery_cluster_active:
+            if two_failures and rank_in_group in (0, 3):
+                _load_eccheck_blocks_from_disk_into(
+                    blocks, checkpoint_dir, rank, rank_in_group,
+                    software_failure=False, two_failures=True,
+                )
+            elif sw_failure and rank_in_group == 0:
+                _load_eccheck_blocks_from_disk_into(
+                    blocks, checkpoint_dir, rank, rank_in_group, software_failure=True,
+                )
+            elif not sw_failure and not two_failures and rank_in_group != 2:
+                _load_eccheck_blocks_from_disk_into(
+                    blocks, checkpoint_dir, rank, rank_in_group, software_failure=False,
+                )
+        disk_preload_s = time.perf_counter() - disk_start
+
+        if inprocess_cache:
+            recovered_capacity = recovered_buffer.numel() if recovered_buffer is not None else 0
+            workspace_key = _metadata_workspace_key(
+                bootstrap_key, manager, rank_metadata, blocks, recovered_capacity,
+            )
+            workspace = {
+                "main_payload": main_payload, "rank_metadata": rank_metadata,
+                "registry": registry, "total_size": total_size, "blocks": blocks,
+                "recovered_buffer": recovered_buffer, "workspace_key": workspace_key,
+            }
+            manager.install_legacy_inprocess_workspace(workspace_key, workspace)
+
+    native_start = time.perf_counter()
+    native_prepared = False
+    if inprocess_cache and recovery_cluster_active:
+        manager.reset_native_for_inprocess_recovery(2)
+        native_prepared = True
+    native_reset_s = time.perf_counter() - native_start
+
+    setup_total_s = time.perf_counter() - setup_start
+    if inprocess_cache:
+        setup_summary = _timing_max_dict({
+            "metadata_plan_s": metadata_plan_s,
+            "disk_preload_s": disk_preload_s,
+            "alloc_touch_register_s": alloc_touch_register_s,
+            "native_reset_s": native_reset_s,
+            "total_s": setup_total_s,
+        })
+        if rank == 0:
+            logger.info(
+                "ECCHECK in-process setup cache=%s metadata_plan_s=%.3f "
+                "disk_preload_s=%.3f alloc_touch_register_s=%.3f "
+                "native_reset_s=%.3f total_s=%.3f",
+                cache_status, setup_summary["metadata_plan_s"],
+                setup_summary["disk_preload_s"],
+                setup_summary["alloc_touch_register_s"],
+                setup_summary["native_reset_s"], setup_summary["total_s"],
+            )
 
     # Sync all ranks after setup so network timing excludes setup skew.
     barrier_s = _timed_barrier()
-
-    if two_failures:
-        _mode = "HW2"
-    elif sw_failure:
-        _mode = "SW"
-    else:
-        _mode = "HW"
 
     should_time_recovery_to_forward = (
         _mode in ("HW", "HW2")
@@ -1991,6 +2131,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             recovered_buffer=recovered_buffer,
             total_size=total_size,
             registry=registry,
+            native_prepared=native_prepared,
         )
     if should_time_recovery_to_forward:
         try:

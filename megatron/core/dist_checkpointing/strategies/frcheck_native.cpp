@@ -1173,13 +1173,19 @@ public:
     void set_debug(bool d) { debug_ = d; }
 
     // ---- Hardware recovery batch pipeline ----
-    void init_recovery_plans(const std::vector<int>& failed_nodes_1based) {
+    void reset_recovery_generation() {
         const int pending_chunks = pending_recovery_chunks_.load(std::memory_order_acquire);
-        if (pending_chunks != 0)
+        const int active_workers =
+            helper_active_.load(std::memory_order_acquire) +
+            decoder_active_.load(std::memory_order_acquire) +
+            decoder_send_active_.load(std::memory_order_acquire) +
+            failed_active_.load(std::memory_order_acquire);
+        if (pending_chunks != 0 || active_workers != 0)
             throw std::runtime_error(
-                "FRCheck: init_recovery_plans called with pending recovery chunks: " +
-                std::to_string(pending_chunks));
-        clear_recovery_buffers();
+                "FRCheck: recovery generation reset before drain: pending=" +
+                std::to_string(pending_chunks) + " active=" +
+                std::to_string(active_workers));
+        reset_recovery_completion_();
         {
             std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
             recovery_batches_.clear();
@@ -1191,6 +1197,11 @@ public:
             legacy_recovery_batch_active_ = false;
             legacy_recovery_batch_id_ = 0;
         }
+    }
+
+    void init_recovery_plans(const std::vector<int>& failed_nodes_1based) {
+        reset_recovery_generation();
+        clear_recovery_buffers();
 
         if (failed_nodes_1based.empty())
             throw std::runtime_error("FRCheck: init_recovery_plans requires failed nodes");
@@ -1209,7 +1220,7 @@ public:
         }
     }
 
-    uint64_t begin_recovery_batch() {
+    uint64_t begin_recovery_batch(bool low_priority = false) {
         if (encoding_batch_active_)
             throw std::runtime_error("FRCheck: encode batch active, cannot start recovery batch");
         ensure_recovery_workers_();
@@ -1222,10 +1233,12 @@ public:
             if (recovery_generation_ == 0 || next_recovery_batch_id_ >= generation_end)
                 throw std::runtime_error("FRCheck: recovery batch ID exhausted for generation");
             batch_id = next_recovery_batch_id_++;
-            RecoveryBatchState state;
-            state.batch_start_us = frcheck_now_us();
-            recovery_batches_[batch_id] = state;
         }
+        std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+        RecoveryBatchState state;
+        state.batch_start_us = frcheck_now_us();
+        state.low_priority = low_priority;
+        recovery_batches_[batch_id] = state;
         return batch_id;
     }
 
@@ -1307,6 +1320,7 @@ public:
                 }
             }
             int decoder_outputs = plan.dual_failure ? (int)plan.failed_targets.size() : 1;
+            task.completion_count = decoder_outputs;
             recovery_batch_add_expected_(batch_id, decoder_outputs);
             pending_recovery_chunks_.fetch_add(decoder_outputs, std::memory_order_acq_rel);
             {
@@ -1397,15 +1411,23 @@ public:
     }
 
     void wait_recovery_batch_id(uint64_t batch_id) {
-        std::unique_lock<std::mutex> lk(recovery_batch_mtx_);
-        recovery_batch_cv_.wait(lk, [&] {
-            if (stopped_.load()) return true;
+        std::string error;
+        {
+            std::unique_lock<std::mutex> lk(recovery_batch_mtx_);
+            recovery_batch_cv_.wait(lk, [&] {
+                if (stopped_.load()) return true;
+                auto it = recovery_batches_.find(batch_id);
+                return it != recovery_batches_.end() && it->second.closed &&
+                       it->second.done >= it->second.expected;
+            });
             auto it = recovery_batches_.find(batch_id);
-            return it != recovery_batches_.end() && it->second.closed &&
-                   it->second.done >= it->second.expected;
-        });
-        lk.unlock();
+            if (it != recovery_batches_.end()) {
+                error = it->second.error;
+            }
+        }
         print_recovery_batch_profile_();
+        if (!error.empty())
+            throw std::runtime_error(error);
     }
 
     void submit_recovery_sentinel() {
@@ -3135,15 +3157,28 @@ public:
                 aggregate_p2_cv_.notify_all();
             });
         };
-        for (const auto& task : recv_tasks) {
-            int peer, lane; uintptr_t addr; size_t size;
-            std::tie(peer, lane, addr, size) = task;
-            launch(false, peer, lane, addr, size);
-        }
-        for (const auto& task : send_tasks) {
-            int peer, lane; uintptr_t addr; size_t size;
-            std::tie(peer, lane, addr, size) = task;
-            launch(true, peer, lane, addr, size);
+        try {
+            for (const auto& task : recv_tasks) {
+                int peer, lane; uintptr_t addr; size_t size;
+                std::tie(peer, lane, addr, size) = task;
+                launch(false, peer, lane, addr, size);
+            }
+            for (const auto& task : send_tasks) {
+                int peer, lane; uintptr_t addr; size_t size;
+                std::tie(peer, lane, addr, size) = task;
+                launch(true, peer, lane, addr, size);
+            }
+        } catch (...) {
+            // Thread construction can fail after earlier tasks have started. Abort
+            // their blocking channel operations and join them before Python may
+            // unregister or free the submitted transfer buffers.
+            abort_all_channels_();
+            for (auto& thread : aggregate_p2_threads_)
+                if (thread.joinable()) thread.join();
+            aggregate_p2_threads_.clear();
+            aggregate_p2_total_.store(0, std::memory_order_release);
+            aggregate_p2_done_.store(0, std::memory_order_release);
+            throw;
         }
         return {static_cast<int>(send_tasks.size()), static_cast<int>(recv_tasks.size())};
     }
@@ -3304,13 +3339,20 @@ public:
     }
 
     void dec_pause_async_p2p() {
-        int prev = async_p2p_pause_count_.fetch_sub(1, std::memory_order_acq_rel);
-        if (prev <= 1) {
-            async_p2p_pause_count_.store(0, std::memory_order_release);
+        int current = async_p2p_pause_count_.load(std::memory_order_acquire);
+        while (current > 0) {
+            if (async_p2p_pause_count_.compare_exchange_weak(
+                    current, current - 1,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                if (debug_)
+                    std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
+                              << " dec_pause_async_p2p prev=" << current << std::endl;
+                return;
+            }
         }
         if (debug_)
             std::cerr << "[FRCHECK-DEBUG] rank " << rank_in_group_
-                      << " dec_pause_async_p2p prev=" << prev << std::endl;
+                      << " dec_pause_async_p2p ignored underflow" << std::endl;
     }
 
     void wait_mirror_completion() {
@@ -3323,6 +3365,8 @@ public:
         int expected = 0;
         int done = 0;
         bool closed = false;
+        bool low_priority = false;
+        std::string error;
         uint64_t batch_start_us = 0;
         uint64_t decoder_decode_done_us = 0;
         uint64_t decoder_send_done_us = 0;
@@ -3350,6 +3394,7 @@ public:
         int failed_pos = 0;
         std::vector<int> failed_positions;
         std::vector<int> failed_rigs;
+        int completion_count = 1;
     };
 
     struct RecoveryDecoderSendTask {
@@ -3475,11 +3520,46 @@ public:
         }
     }
 
+    bool recovery_batch_is_low_priority_(uint64_t batch_id) {
+        std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+        auto it = recovery_batches_.find(batch_id);
+        return it != recovery_batches_.end() && it->second.low_priority;
+    }
+
+    void send_recovery_to_peer_(int peer_rig, int stripe_id, uintptr_t addr,
+                                size_t size, uint64_t batch_id, int tag_kind) {
+        if (!recovery_batch_is_low_priority_(batch_id)) {
+            send_to_peer(peer_rig, stripe_id, addr, size, batch_id, tag_kind);
+            return;
+        }
+
+        struct AsyncRdmaScope {
+            FRCheckNative* owner;
+            explicit AsyncRdmaScope(FRCheckNative* native) : owner(native) {
+                const uint64_t wait_start = frcheck_now_us();
+                owner->_wait_if_paused();
+                owner->_async_rdma_begin();
+                const uint64_t waited = frcheck_now_us() - wait_start;
+                owner->recovery_low_priority_pause_wait_us_.fetch_add(
+                    waited, std::memory_order_relaxed);
+                owner->recovery_low_priority_send_tasks_.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (owner->debug_ && waited > 0) {
+                    std::cerr << "[FRCHECK-DEBUG] rank " << owner->rank_in_group_
+                              << " recovery parity send pause_wait_us=" << waited
+                              << std::endl;
+                }
+            }
+            ~AsyncRdmaScope() { owner->_async_rdma_end(); }
+        } scope(this);
+        send_to_peer(peer_rig, stripe_id, addr, size, batch_id, tag_kind);
+    }
+
     void execute_recovery_helper_(const RecoveryHelperTask& task) {
         uint64_t t0 = frcheck_now_us();
         record_recovery_net_start_(t0);
-        send_to_peer(task.decoder_rig, task.stripe_id,
-                     task.helper_block, task.block_size, task.batch_id, 3);
+        send_recovery_to_peer_(task.decoder_rig, task.stripe_id,
+                               task.helper_block, task.block_size, task.batch_id, 3);
         uint64_t t1 = frcheck_now_us();
         record_recovery_net_end_(t1);
         recovery_helper_send_us_.fetch_add(t1 - t0, std::memory_order_relaxed);
@@ -3581,8 +3661,8 @@ public:
     void execute_recovery_decoder_send_(const RecoveryDecoderSendTask& task) {
         uint64_t t_send = frcheck_now_us();
         record_recovery_net_start_(t_send);
-        send_to_peer(task.failed_rig, task.stripe_id,
-                     task.recovered_buf, task.block_size, task.batch_id, 4);
+        send_recovery_to_peer_(task.failed_rig, task.stripe_id,
+                               task.recovered_buf, task.block_size, task.batch_id, 4);
         uint64_t t_send_done = frcheck_now_us();
         recovery_batch_record_event_(task.batch_id, RecoveryBatchEvent::DECODER_SEND, t_send_done);
         record_recovery_net_end_(t_send_done);
@@ -3630,13 +3710,14 @@ public:
                 pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
                 if (recovery_workers_stop_) return;
                 std::cerr << "FRCheck helper_worker: " << e.what() << std::endl;
-                recovery_batch_mark_done_(task.batch_id);
-                return;
+                recovery_batch_mark_error_(task.batch_id, "FRCheck helper_worker: " + std::string(e.what()));
+                continue;
             } catch (...) {
                 helper_active_.fetch_sub(1, std::memory_order_acq_rel);
                 pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
                 if (recovery_workers_stop_) return;
-                throw;
+                recovery_batch_mark_error_(task.batch_id, "FRCheck helper_worker: unknown exception");
+                continue;
             }
             helper_active_.fetch_sub(1, std::memory_order_acq_rel);
             pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
@@ -3661,16 +3742,17 @@ public:
                 execute_recovery_decoder_(task);
             } catch (const std::exception& e) {
                 decoder_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_recovery_chunks_.fetch_sub(task.completion_count, std::memory_order_acq_rel);
                 if (recovery_workers_stop_) return;
                 std::cerr << "FRCheck decoder_worker: " << e.what() << std::endl;
-                recovery_batch_mark_done_(task.batch_id);
-                return;
+                recovery_batch_mark_error_(task.batch_id, "FRCheck decoder_worker: " + std::string(e.what()), task.completion_count);
+                continue;
             } catch (...) {
                 decoder_active_.fetch_sub(1, std::memory_order_acq_rel);
-                pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_recovery_chunks_.fetch_sub(task.completion_count, std::memory_order_acq_rel);
                 if (recovery_workers_stop_) return;
-                throw;
+                recovery_batch_mark_error_(task.batch_id, "FRCheck decoder_worker: unknown exception", task.completion_count);
+                continue;
             }
             decoder_active_.fetch_sub(1, std::memory_order_acq_rel);
         }
@@ -3696,13 +3778,14 @@ public:
                 pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
                 if (recovery_workers_stop_) return;
                 std::cerr << "FRCheck decoder_send_worker: " << e.what() << std::endl;
-                recovery_batch_mark_done_(task.batch_id);
-                return;
+                recovery_batch_mark_error_(task.batch_id, "FRCheck decoder_send_worker: " + std::string(e.what()));
+                continue;
             } catch (...) {
                 decoder_send_active_.fetch_sub(1, std::memory_order_acq_rel);
                 pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
                 if (recovery_workers_stop_) return;
-                throw;
+                recovery_batch_mark_error_(task.batch_id, "FRCheck decoder_send_worker: unknown exception");
+                continue;
             }
             decoder_send_active_.fetch_sub(1, std::memory_order_acq_rel);
             pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
@@ -3730,13 +3813,14 @@ public:
                 pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
                 if (recovery_workers_stop_) return;
                 std::cerr << "FRCheck failed_worker: " << e.what() << std::endl;
-                recovery_batch_mark_done_(task.batch_id);
-                return;
+                recovery_batch_mark_error_(task.batch_id, "FRCheck failed_worker: " + std::string(e.what()));
+                continue;
             } catch (...) {
                 failed_active_.fetch_sub(1, std::memory_order_acq_rel);
                 pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
                 if (recovery_workers_stop_) return;
-                throw;
+                recovery_batch_mark_error_(task.batch_id, "FRCheck failed_worker: unknown exception");
+                continue;
             }
             failed_active_.fetch_sub(1, std::memory_order_acq_rel);
             pending_recovery_chunks_.fetch_sub(1, std::memory_order_acq_rel);
@@ -3860,6 +3944,10 @@ public:
             recovery_failed_tasks_.load(std::memory_order_relaxed));
         result["skipped_stripes"] = static_cast<double>(
             recovery_skipped_stripes_.load(std::memory_order_relaxed));
+        result["low_priority_pause_wait_s"] = static_cast<double>(
+            recovery_low_priority_pause_wait_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["low_priority_send_tasks"] = static_cast<double>(
+            recovery_low_priority_send_tasks_.load(std::memory_order_relaxed));
         return result;
     }
 
@@ -3912,6 +4000,20 @@ private:
             if (it == recovery_batches_.end())
                 throw std::runtime_error("FRCheck: unknown recovery batch id");
             it->second.expected += count;
+        }
+        recovery_batch_cv_.notify_all();
+    }
+
+    void recovery_batch_mark_error_(
+        uint64_t batch_id, const std::string& error, int completion_count = 1) {
+        {
+            std::lock_guard<std::mutex> lk(recovery_batch_mtx_);
+            auto it = recovery_batches_.find(batch_id);
+            if (it != recovery_batches_.end()) {
+                if (it->second.error.empty())
+                    it->second.error = error;
+                it->second.done += std::max(1, completion_count);
+            }
         }
         recovery_batch_cv_.notify_all();
     }
@@ -4266,6 +4368,8 @@ private:
     std::atomic<int> recovery_helper_tasks_{0};
     std::atomic<int> recovery_decoder_tasks_{0};
     std::atomic<int> recovery_failed_tasks_{0};
+    std::atomic<uint64_t> recovery_low_priority_pause_wait_us_{0};
+    std::atomic<int> recovery_low_priority_send_tasks_{0};
 
     // ---- RS encode thread pool (matches ecnaive xor_pool pattern) ----
     static constexpr int kRsPoolWorkers = 16;
@@ -4379,7 +4483,10 @@ PYBIND11_MODULE(frcheck_native, m) {
         // Hardware recovery batch pipeline
         .def("init_recovery_plans", &FRCheckNative::init_recovery_plans,
              py::arg("failed_nodes_1based"))
-        .def("begin_recovery_batch", &FRCheckNative::begin_recovery_batch)
+        .def("reset_recovery_generation", &FRCheckNative::reset_recovery_generation,
+             "Start a drained recovery generation while preserving plans and registered buffers")
+        .def("begin_recovery_batch", &FRCheckNative::begin_recovery_batch,
+             py::arg("low_priority") = false)
         .def("end_recovery_batch", &FRCheckNative::end_recovery_batch,
              py::arg("batch_id"))
         .def("wait_recovery_batch_id", &FRCheckNative::wait_recovery_batch_id,

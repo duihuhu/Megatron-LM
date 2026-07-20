@@ -123,6 +123,9 @@ class FRCheckManager:
         self.recovery_decoder_bufs: List[Optional[torch.Tensor]] = []
         self.recovery_failed_bufs: List[Optional[torch.Tensor]] = []
         self._retired_runtime_buffers: List[Any] = []
+        # Recovery-only cache used exclusively by the in-process FT benchmark.
+        self._inprocess_recovery_workspace_key: Optional[Any] = None
+        self._inprocess_recovery_workspace: Optional[Dict[str, Any]] = None
 
         self._frcheck_recovery_native_cleaned: bool = False
         self._initialized = True
@@ -236,7 +239,7 @@ class FRCheckManager:
                 self._allocate_layer_stripe_bufs(native, lidx, bs)
 
         if _frcheck_debug_enabled():
-            logger.info(
+            logger.debug(
                 "FRCheck: computed per-layer block sizes (max=%dMB): %s",
                 max_blk // (1024*1024),
                 [(f"layer_{k}", f"{v//(1024*1024)}MB") for k, v
@@ -269,20 +272,20 @@ class FRCheckManager:
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: begin init_frcheck_if_enabled", rank)
+            logger.debug("FRCHECK init trace rank=%d: begin init_frcheck_if_enabled", rank)
         n = self._resolve_frcheck_n(args)
         path = self._resolve_frcheck_table_path(args, n)
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: resolved n=%d table=%s", rank, n, path)
+            logger.debug("FRCHECK init trace rank=%d: resolved n=%d table=%s", rank, n, path)
         self._validate_and_build_grouping(n)
         if _frcheck_debug_enabled():
-            logger.info(
+            logger.debug(
                 "FRCHECK init trace rank=%d: grouping group_id=%s rank_in_group=%s members=%s",
                 rank, self.group_id, self.rank_in_group, self.group_member_ranks,
             )
         self._init_frcheck_native(path)
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: native module loaded", rank)
+            logger.debug("FRCHECK init trace rank=%d: native module loaded", rank)
 
         native = self._frcheck_native
         if native is not None:
@@ -296,22 +299,22 @@ class FRCheckManager:
             if _frcheck_debug_enabled():
                 native.set_debug(True)
         if _frcheck_debug_enabled():
-            logger.info(
+            logger.debug(
                 "FRCheck: GDR required (enabled), n=%d num_stripes=%d",
                 self.frcheck_n, self.num_stripes,
             )
 
         # Init RDMA connections within group (allocates buffers using num_stripes)
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: before _init_rdma", rank)
+            logger.debug("FRCHECK init trace rank=%d: before _init_rdma", rank)
         self._init_rdma(args)
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: after _init_rdma", rank)
+            logger.debug("FRCHECK init trace rank=%d: after _init_rdma", rank)
 
         # Pre-compile stripe plans (reads from native after init_rdma)
         self._compile_stripe_plans()
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: compiled stripe plans", rank)
+            logger.debug("FRCHECK init trace rank=%d: compiled stripe plans", rank)
 
         # Per-stripe buffers allocated lazily on first save (after adaptive block_size)
 
@@ -504,11 +507,11 @@ class FRCheckManager:
             assert spec.loader is not None
             spec.loader.exec_module(mod)
             if _frcheck_debug_enabled():
-                logger.info("FRCheck: loaded native module from %s", so_path)
+                logger.debug("FRCheck: loaded native module from %s", so_path)
             self._frcheck_native = mod.FRCheckNative(poa_path)
             self.frcheck_table_path = poa_path
             if _frcheck_debug_enabled():
-                logger.info(
+                logger.debug(
                     "FRCheck: native initialized n=%s num_stripes=%s",
                     self._frcheck_native.n(),
                     self._frcheck_native.num_stripes(),
@@ -535,17 +538,17 @@ class FRCheckManager:
         # Determine my IP
         my_ip = self._resolve_my_ip()
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: resolved my_ip=%s", rank, my_ip)
+            logger.debug("FRCHECK init trace rank=%d: resolved my_ip=%s", rank, my_ip)
 
         # Exchange IPs across all ranks (GPU tensors required for NCCL backend)
         ip_bytes = my_ip.encode("utf-8").ljust(64, b"\x00")[:64]
         ip_tensor = torch.tensor([b for b in ip_bytes], dtype=torch.uint8, device="cuda")
         ip_list_tensors = [torch.zeros(64, dtype=torch.uint8, device="cuda") for _ in range(world_size)]
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: before ip all_gather world_size=%d", rank, world_size)
+            logger.debug("FRCHECK init trace rank=%d: before ip all_gather world_size=%d", rank, world_size)
         torch.distributed.all_gather(ip_list_tensors, ip_tensor)
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: after ip all_gather", rank)
+            logger.debug("FRCHECK init trace rank=%d: after ip all_gather", rank)
         ip_list = []
         for t in ip_list_tensors:
             raw = bytes(t.cpu().tolist()).rstrip(b"\x00")
@@ -567,11 +570,11 @@ class FRCheckManager:
         rg = self.rank_in_group
 
         if _frcheck_debug_enabled():
-            logger.info(
+            logger.debug(
                 "FRCHECK init trace rank=%d: before native.init_rdma rg=%d/%d base_port=%d peers=%s",
                 rank, rg, n, base_port, peer_ips,
             )
-            logger.info(
+            logger.debug(
                 "FRCheck RDMA: rank_in_group=%d/%d base_port=%d my_ip=%s peers=%s",
                 rg, n, base_port, my_ip, peer_ips,
             )
@@ -585,23 +588,23 @@ class FRCheckManager:
             use_rdma=True,
         )
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: after native.init_rdma", rank)
+            logger.debug("FRCHECK init trace rank=%d: after native.init_rdma", rank)
 
         # Register default buffers
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: before default buffers", rank)
+            logger.debug("FRCHECK init trace rank=%d: before default buffers", rank)
         self._allocate_default_buffers(native, n)
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: after default buffers", rank)
+            logger.debug("FRCHECK init trace rank=%d: after default buffers", rank)
 
         # Barrier after RDMA init
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: before RDMA barrier", rank)
+            logger.debug("FRCHECK init trace rank=%d: before RDMA barrier", rank)
         torch.distributed.barrier()
         if _frcheck_debug_enabled():
-            logger.info("FRCHECK init trace rank=%d: after RDMA barrier", rank)
+            logger.debug("FRCHECK init trace rank=%d: after RDMA barrier", rank)
         if _frcheck_debug_enabled():
-            logger.info("FRCheck RDMA: group initialized (rank_in_group=%d/%d)", rg, n)
+            logger.debug("FRCheck RDMA: group initialized (rank_in_group=%d/%d)", rg, n)
 
     def _resolve_my_ip(self) -> str:
         """Determine my IP for listen socket, with multi-NIC per-rank support."""
@@ -630,7 +633,7 @@ class FRCheckManager:
             self.parity1_buffer = None
             self.parity2_buffer = None
             if _frcheck_debug_enabled():
-                logger.info(
+                logger.debug(
                     "FRCheck: skipped legacy default buffers block_size=%s",
                     default_block_size,
                 )
@@ -645,7 +648,7 @@ class FRCheckManager:
         self.parity2_buffer = allocate_hugepage_tensor(default_block_size, fallback_pin_memory=True)
 
         if _frcheck_debug_enabled():
-            logger.info(
+            logger.debug(
                 "FRCheck: allocated legacy default buffer block_size=%s recv_total=%s",
                 default_block_size, recv_total,
             )
@@ -790,7 +793,7 @@ class FRCheckManager:
 
         if _frcheck_debug_enabled():
             lname = f"layer_{layer_idx}" if layer_idx >= 0 else "layer_common"
-            logger.info(
+            logger.debug(
                 "FRCheck: allocated %s bufs blk=%dMB cap=%dMB: %d enc, %d par",
                 lname,
                 block_sz // (1024 * 1024),
@@ -817,7 +820,7 @@ class FRCheckManager:
             )
             self.stripe_plans.append(plan)
         if _frcheck_debug_enabled():
-            logger.info(
+            logger.debug(
                 "FRCheck: compiled %d stripe plans, role_counts=%s",
                 ns,
                 {r.name: sum(1 for p in self.stripe_plans if p.role == r)
@@ -993,14 +996,18 @@ class FRCheckManager:
                 from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
                     allocate_hugepage_slices, allocate_hugepage_tensor,
                 )
-                self.recovery_decoder_bufs[sid] = torch.cuda.ByteTensor(recv_sz + block_sz)
+                self.recovery_decoder_bufs[sid] = torch.empty(
+                    recv_sz + block_sz, dtype=torch.uint8, device="cuda"
+                )
                 native.register_buffer(
                     self.recovery_decoder_bufs[sid].data_ptr(),
                     self.recovery_decoder_bufs[sid].numel())
 
             elif my_node in plan['helper_nodes']:
                 # Allocate block-sized buffer for reading from disk
-                self.recovery_helper_bufs[sid] = torch.cuda.ByteTensor(block_sz)
+                self.recovery_helper_bufs[sid] = torch.empty(
+                    block_sz, dtype=torch.uint8, device="cuda"
+                )
                 native.register_buffer(
                     self.recovery_helper_bufs[sid].data_ptr(),
                     self.recovery_helper_bufs[sid].numel())
@@ -1108,6 +1115,54 @@ class FRCheckManager:
 
         return recovery_contexts
 
+
+    def get_inprocess_recovery_workspace(self, key: Any) -> Optional[Dict[str, Any]]:
+        """Return the benchmark recovery workspace, rejecting unsafe key changes."""
+        if self._inprocess_recovery_workspace is None:
+            return None
+        if self._inprocess_recovery_workspace_key != key:
+            raise RuntimeError(
+                "FRCheck in-process recovery workspace key changed while registered "
+                "native buffers are live. Restart the process to use the new checkpoint "
+                "or recovery configuration."
+            )
+        return self._inprocess_recovery_workspace
+
+    def set_inprocess_recovery_workspace(
+        self, key: Any, workspace: Dict[str, Any]
+    ) -> None:
+        """Install one manager-owned benchmark workspace after setup completes."""
+        if self._inprocess_recovery_workspace is not None:
+            if self._inprocess_recovery_workspace_key != key:
+                raise RuntimeError(
+                    "FRCheck cannot replace a live in-process recovery workspace; "
+                    "restart the process after changing checkpoint or recovery layout."
+                )
+            return
+        self._inprocess_recovery_workspace_key = key
+        self._inprocess_recovery_workspace = workspace
+
+    def activate_cached_recovery_plans(
+        self, failed_global_ranks: List[int], plans: List[Dict], dual_failure: bool
+    ) -> None:
+        """Reset manager/native recovery state using cached immutable plans."""
+        self.is_recovery_mode = True
+        self.failed_global_ranks = list(failed_global_ranks)
+        self.recovery_stripe_plans = plans
+        self.recovery_dual_failure = bool(dual_failure)
+        native = self._frcheck_native
+        if native is not None:
+            if not hasattr(native, "reset_recovery_generation"):
+                raise RuntimeError(
+                    "FRCheck cached recovery requires native reset_recovery_generation"
+                )
+            native.reset_recovery_generation()
+
+    def release_inprocess_recovery_workspace(self) -> None:
+        """Drop Python owners after native registration/RDMA teardown is complete."""
+        self._inprocess_recovery_workspace = None
+        self._inprocess_recovery_workspace_key = None
+
     def _unregister_all_buffers(self) -> None:
         """Unregister all RDMA-registered buffers (ECLATIN-style cleanup)."""
         native = self._frcheck_native
@@ -1187,6 +1242,7 @@ class FRCheckManager:
         self.recv_buffer = None
         self.parity1_buffer = None
         self.parity2_buffer = None
+        self.release_inprocess_recovery_workspace()
 
     def _clear_recovery_native_handle(self) -> None:
         # Keep old tensor/native objects alive at the pre-dataloader safe point,
@@ -1213,6 +1269,7 @@ class FRCheckManager:
         self.recv_buffer = None
         self.parity1_buffer = None
         self.parity2_buffer = None
+        self.release_inprocess_recovery_workspace()
 
     def end_recovery(self) -> None:
         """Clear recovery-mode state without tearing down RDMA / RS pool."""

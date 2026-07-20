@@ -1550,7 +1550,14 @@ def create_layer_groups_by_param_count(optimizer, num_groups=None):
 def _frcheck_any_async_parity_enabled(args) -> bool:
     return (
         bool(getattr(args, 'frcheck_async_parity', False))
-        or bool(getattr(args, 'frcheck_recovery_async_parity', False))
+        or (
+            bool(getattr(args, 'use_frcheck', False))
+            and (
+                bool(getattr(args, 'use_frcheck_hardware_failure', False))
+                or bool(getattr(args, 'ft_inprocess_recovery_benchmark', False))
+                or bool(getattr(args, 'frcheck_recovery_async_parity', False))
+            )
+        )
     )
 
 
@@ -1561,7 +1568,7 @@ def _frcheck_inc_net_busy():
     workers will pause while the count is > 0.  Call _frcheck_dec_net_busy()
     after the NCCL operation completes.
 
-    No-op when neither save nor recovery async parity is enabled.
+    No-op when neither save parity nor hardware-recovery parity can overlap.
     """
     try:
         from megatron.training import get_args
@@ -1738,6 +1745,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             )
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
+        if getattr(args, "use_frcheck", False):
+            from megatron.training.frcheck_legacy import frcheck_drain_recovery_parity
+            frcheck_drain_recovery_parity("train_step_early_exit", allow_start_pending=True)
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
 
     # Empty unused memory.
@@ -1758,76 +1768,86 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             bool(getattr(args, "frcheck_async_parity", False)),
             bool(getattr(args, "frcheck_recovery_async_parity", False)),
         )
-    timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    if getattr(args, "use_frcheck", False):
-        try:
-            from megatron.training.frcheck_legacy import (
-                frcheck_recovery_safe_point,
-                frcheck_wait_for_optimizer_state,
-            )
-            frcheck_recovery_safe_point("before_optimizer_step")
-            frcheck_wait_for_optimizer_state(optimizer)
-        except ImportError:
-            pass
-    # Check if layer-wise update is enabled
-    use_layer_wise_update = (
-        hasattr(args, 'layer_wise_optimizer_update') 
-        and args.layer_wise_optimizer_update
-        and hasattr(optimizer, 'step_layer_by_layer')
-    )
-    
-    if use_layer_wise_update:
-        # Log verification message on first iteration
-        if args.curr_iteration == args.iteration:
-            print_rank_0(
-                "[VERIFICATION] Layer-wise optimizer update is ENABLED. "
-                "Parameters will be updated layer by layer."
-            )
-        
-        # Try automatic layer detection first, then fallback to manual grouping if needed
-        layer_groups = None
-        if hasattr(args, 'layer_wise_fallback_grouping') and args.layer_wise_fallback_grouping:
-            # Use fallback grouping strategy
-            layer_groups = create_layer_groups_by_param_count(optimizer)
+    optimizer_error = None
+    try:
+        if getattr(args, "use_frcheck", False):
+            try:
+                from megatron.training.frcheck_legacy import (
+                    frcheck_recovery_safe_point,
+                    frcheck_wait_for_optimizer_state,
+                    frcheck_start_or_run_recovery_parity_after_forward_backward,
+                )
+                # This safe point drains only remaining layerwise data recovery.
+                # Parity is then dispatched before optimizer state is materialized.
+                frcheck_recovery_safe_point("before_optimizer_step")
+                frcheck_start_or_run_recovery_parity_after_forward_backward()
+                frcheck_wait_for_optimizer_state(optimizer)
+            except ImportError:
+                pass
 
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step_layer_by_layer(
-            layer_params_groups=layer_groups
+        timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+        use_layer_wise_update = (
+            hasattr(args, 'layer_wise_optimizer_update')
+            and args.layer_wise_optimizer_update
+            and hasattr(optimizer, 'step_layer_by_layer')
         )
-    else:
-        # Log if layer-wise was requested but not available
-        if (
-            hasattr(args, 'layer_wise_optimizer_update') 
-            and args.layer_wise_optimizer_update 
-            and args.curr_iteration == args.iteration
-        ):
-            print_rank_0(
-                "[VERIFICATION] Layer-wise optimizer update was requested but not supported "
-                "by current optimizer. Falling back to standard update."
+
+        if use_layer_wise_update:
+            if args.curr_iteration == args.iteration:
+                print_rank_0(
+                    "[VERIFICATION] Layer-wise optimizer update is ENABLED. "
+                    "Parameters will be updated layer by layer."
+                )
+            layer_groups = None
+            if hasattr(args, 'layer_wise_fallback_grouping') and args.layer_wise_fallback_grouping:
+                layer_groups = create_layer_groups_by_param_count(optimizer)
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step_layer_by_layer(
+                layer_params_groups=layer_groups
             )
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-    timers('optimizer').stop()
+        else:
+            if (
+                hasattr(args, 'layer_wise_optimizer_update')
+                and args.layer_wise_optimizer_update
+                and args.curr_iteration == args.iteration
+            ):
+                print_rank_0(
+                    "[VERIFICATION] Layer-wise optimizer update was requested but not supported "
+                    "by current optimizer. Falling back to standard update."
+                )
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        timers('optimizer').stop()
 
-    # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
-    # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful)
-    # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
-    # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
-    if args.log_num_zeros_in_grad:
-        num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
+        update_successful = logical_and_across_model_parallel_group(update_successful)
+        grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+        if args.log_num_zeros_in_grad:
+            num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
 
-    # Vision momentum.
-    if args.vision_pretraining and args.vision_pretraining_type == "dino":
-        unwrapped_model = unwrap_model(model[0])
-        unwrapped_model.update_momentum(args.curr_iteration)
+        if args.vision_pretraining and args.vision_pretraining_type == "dino":
+            unwrapped_model = unwrap_model(model[0])
+            unwrapped_model.update_momentum(args.curr_iteration)
 
-    # Update learning rate.
-    if update_successful:
-        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
-        opt_param_scheduler.step(increment=increment)
-        skipped_iter = 0
-    else:
-        skipped_iter = 1
+        if update_successful:
+            increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
+            opt_param_scheduler.step(increment=increment)
+            skipped_iter = 0
+        else:
+            skipped_iter = 1
+    except BaseException as exc:
+        optimizer_error = exc
+        raise
+    finally:
+        if getattr(args, "use_frcheck", False):
+            try:
+                from megatron.training.frcheck_legacy import (
+                    frcheck_finish_recovery_parity_after_optimizer,
+                )
+                frcheck_finish_recovery_parity_after_optimizer(
+                    allow_start_pending=False
+                )
+            except BaseException as parity_exc:
+                if optimizer_error is not None:
+                    raise optimizer_error from parity_exc
+                raise
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 2:

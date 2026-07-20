@@ -41,7 +41,14 @@ def _frcheck_async_parity_debug_enabled(args=None):
 def _frcheck_any_async_parity_enabled(args) -> bool:
     return (
         bool(getattr(args, 'frcheck_async_parity', False))
-        or bool(getattr(args, 'frcheck_recovery_async_parity', False))
+        or (
+            bool(getattr(args, 'use_frcheck', False))
+            and (
+                bool(getattr(args, 'use_frcheck_hardware_failure', False))
+                or bool(getattr(args, 'ft_inprocess_recovery_benchmark', False))
+                or bool(getattr(args, 'frcheck_recovery_async_parity', False))
+            )
+        )
     )
 
 
@@ -51,20 +58,22 @@ def _frcheck_inc_net_busy():
     Called right before issuing NCCL P2P operations so that background P2
     parity sends do not contend for IB bandwidth with PP communication.
 
-    No-op when neither save nor recovery async parity is enabled.
+    No-op when neither save parity nor hardware-recovery parity can overlap.
     """
     try:
         from megatron.training import get_args
         args = get_args()
         if not _frcheck_any_async_parity_enabled(args):
-            return
+            return False
         from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
         mgr = FRCheckManager()
         native = mgr.get_native()
         if native is not None:
             native.inc_pause_async_p2p()
+            return True
     except Exception:
         pass
+    return False
 
 
 def _frcheck_dec_net_busy():
@@ -448,42 +457,39 @@ def _communicate(
             "FRCHECK async parity trace rank %d save_async_parity=%s recovery_async_parity=%s: pp_p2p_pause_begin",
             frcheck_trace_rank, frcheck_save_async_parity, frcheck_recovery_async_parity,
         )
-    _frcheck_inc_net_busy()
-    p2p_reqs = p2p_func(
-        tensor_send_prev=tensor_send_prev,
-        tensor_recv_prev=tensor_recv_prev,
-        tensor_send_next=tensor_send_next,
-        tensor_recv_next=tensor_recv_next,
-        group=pp_group,
-        prev_pipeline_rank=prev_rank,
-        next_pipeline_rank=next_rank,
-    )
-    frcheck_p2p_call_elapsed = time.time() - frcheck_p2p_call_t0
-    if isinstance(p2p_reqs, list):
-        reqs.extend(p2p_reqs)
-    else:
-        reqs.update(p2p_reqs)
-
+    frcheck_pause_acquired = _frcheck_inc_net_busy()
     frcheck_p2p_wait_elapsed = 0.0
-    # Batched and ring-exchange paths do blocking wait inside p2p_func
-    # and return an empty list — NCCL is already complete.
-    if config.use_ring_exchange_p2p or config.batch_p2p_comm:
-        _frcheck_dec_net_busy()
-    elif wait_on_reqs and len(reqs) > 0:
-        frcheck_p2p_wait_t0 = time.time()
-        for req in reqs if isinstance(reqs, list) else reqs.values():
-            req.wait()
-        frcheck_p2p_wait_elapsed = time.time() - frcheck_p2p_wait_t0
-        _frcheck_dec_net_busy()
-        reqs = None
-    elif len(reqs) > 0:
-        # Overlap / deferred-wait mode: FRCheck only waited for already-started
-        # async RDMA to become idle before issuing PP work. Do not wrap NCCL Work
-        # objects or hold a long-lived pause waiting for a later req.wait().
-        _frcheck_dec_net_busy()
-    else:
-        # No ops issued (edge case), dec to avoid refcount leak
-        _frcheck_dec_net_busy()
+    try:
+        p2p_reqs = p2p_func(
+            tensor_send_prev=tensor_send_prev,
+            tensor_recv_prev=tensor_recv_prev,
+            tensor_send_next=tensor_send_next,
+            tensor_recv_next=tensor_recv_next,
+            group=pp_group,
+            prev_pipeline_rank=prev_rank,
+            next_pipeline_rank=next_rank,
+        )
+        frcheck_p2p_call_elapsed = time.time() - frcheck_p2p_call_t0
+        if isinstance(p2p_reqs, list):
+            reqs.extend(p2p_reqs)
+        else:
+            reqs.update(p2p_reqs)
+
+        # Batched and ring-exchange paths wait inside p2p_func and return no work.
+        if not (config.use_ring_exchange_p2p or config.batch_p2p_comm):
+            if wait_on_reqs and len(reqs) > 0:
+                frcheck_p2p_wait_t0 = time.time()
+                for req in reqs if isinstance(reqs, list) else reqs.values():
+                    req.wait()
+                frcheck_p2p_wait_elapsed = time.time() - frcheck_p2p_wait_t0
+                reqs = None
+            elif len(reqs) > 0:
+                # Deferred-wait mode pauses only while issuing PP work, matching
+                # the existing save-side behavior.
+                pass
+    finally:
+        if frcheck_pause_acquired:
+            _frcheck_dec_net_busy()
     if frcheck_async_debug:
         logger.info(
             "FRCHECK async parity trace rank %d save_async_parity=%s recovery_async_parity=%s: pp_p2p_pause_end total=%.6fs call=%.6fs wait=%.6fs reqs=%d",

@@ -1530,6 +1530,7 @@ public:
             save_net_wall_have_any_ = false;
         }
         load_send_total_ns_.store(0, std::memory_order_relaxed);
+        load_recv_total_ns_.store(0, std::memory_order_relaxed);
         save_send_bytes_.store(0, std::memory_order_relaxed);
         save_recv_bytes_.store(0, std::memory_order_relaxed);
         save_send_tasks_.store(0, std::memory_order_relaxed);

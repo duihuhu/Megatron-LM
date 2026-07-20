@@ -1,4 +1,5 @@
 import ctypes
+import os
 import queue
 import time
 from logging import getLogger
@@ -46,6 +47,38 @@ def _timing_max(value: float) -> float:
 
 def _timing_max_dict(timings: Dict[str, float]) -> Dict[str, float]:
     return {key: _timing_max(value) for key, value in timings.items()}
+
+
+def _ecnaive_inprocess_workspace_enabled(args) -> bool:
+    return bool(
+        getattr(args, "ft_inprocess_recovery_benchmark", False)
+        and getattr(args, "_ft_inprocess_recovery_active", False)
+    )
+
+
+def _ecnaive_checkpoint_identity(checkpoint_dir: Path) -> tuple:
+    """Return a stable identity without reading checkpoint payload bytes."""
+    files = []
+    for path in sorted(checkpoint_dir.glob("ecnaive_*"), key=lambda item: item.name):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        files.append((path.name, int(stat.st_size), int(stat.st_mtime_ns)))
+    return (str(checkpoint_dir.resolve()), tuple(files))
+
+
+def _log_ecnaive_inprocess_setup(rank: int, cache_hit: bool, timings: Dict[str, float]) -> None:
+    aggregated = _timing_max_dict(timings)
+    if rank == 0:
+        logger.info(
+            "EC-NAIVE in-process setup cache=%s metadata_plan_s=%.3f "
+            "disk_preload_s=%.3f alloc_touch_register_s=%.3f "
+            "native_reset_s=%.3f total_s=%.3f",
+            "hit" if cache_hit else "miss",
+            aggregated["metadata_plan"], aggregated["disk_preload"],
+            aggregated["alloc_touch_register"], aggregated["native_reset"],
+            aggregated["total"],
+        )
 
 
 def _native_ft_timing(native) -> Dict[str, float]:
@@ -640,20 +673,22 @@ def _run_hw_source_streaming_send(
     block_paths: List[Path],
     block_sizes: List[int],
     stripe_bytes: int,
+    scratch: Optional[List[torch.Tensor]] = None,
 ) -> int:
     """Send all checkpoint blocks stripe-by-stripe without full-block resident memory."""
     ecnaive_n = len(block_paths)
-    scratch = list(
-        allocate_hugepage_slices(
-            stripe_bytes,
-            ecnaive_n,
-            fallback_pin_memory=True,
-            touch_pages=True,
+    if scratch is None:
+        scratch = list(
+            allocate_hugepage_slices(
+                stripe_bytes,
+                ecnaive_n,
+                fallback_pin_memory=True,
+                touch_pages=True,
+            )
         )
-    )
-    if manager.use_rdma:
-        for buf in scratch:
-            manager.register_buffer(buf)
+        if manager.use_rdma:
+            for buf in scratch:
+                manager.register_buffer(buf)
 
     max_size = max(block_sizes) if block_sizes else 0
     stripes = list(_iter_ecnaive_load_stripes(max_size, stripe_bytes))
@@ -1938,17 +1973,58 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         not getattr(args, "ft_inprocess_recovery_benchmark", False)
         or bool(getattr(args, "_ft_inprocess_recovery_active", False))
     )
-    # Step 1: Load main payload + exchange metadata
-    main_payload = _load_ecnaive_main_payload(checkpoint_dir, rank, world_size)
-    tensor_infos = main_payload.get("tensor_infos", [])
-    local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
-    gathered_meta: List[Any] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(gathered_meta, local_metadata)
+    inprocess_cache = _ecnaive_inprocess_workspace_enabled(args)
+    setup_start = time.perf_counter()
+    setup_timing = {
+        "metadata_plan": 0.0,
+        "disk_preload": 0.0,
+        "alloc_touch_register": 0.0,
+        "native_reset": 0.0,
+        "total": 0.0,
+    }
+    metadata_start = time.perf_counter()
+    workspace_hit = False
+    if inprocess_cache:
+        layout = manager._get_group_layout(world_size)
+        workspace_key = (
+            _ecnaive_checkpoint_identity(checkpoint_dir),
+            rank, world_size, tuple(sorted(failed_global_ranks)), "hardware",
+            ecnaive_k, ecnaive_n, manager.ecnaive_buffer_size,
+            tuple(sorted(layout.items())), manager.ecnaive_pin_memory,
+            manager.use_rdma, torch.distributed.get_backend(),
+            os.environ.get("ECNAIVE_INTERFACE"),
+            os.environ.get(f"ECNAIVE_RANK_IP_{rank}"),
+            os.environ.get(f"ECNAIVE_LOCAL_RANK_NIC_{os.environ.get('LOCAL_RANK', '0')}"),
+            os.environ.get("ECNAIVE_NIC_LIST"),
+            os.environ.get("ECNAIVE_RANKS_PER_NIC"),
+            os.environ.get("ECNAIVE_BASE_PORT"),
+        )
+        workspace_hit = manager.begin_recovery_workspace(workspace_key)
 
-    # Step 2: Compute recovery plan
-    recovery_plan = manager.get_multi_failure_recovery_plan(
-        failed_global_ranks, world_size
+    cached_metadata = (
+        manager.get_recovery_workspace_value("metadata_plan")
+        if inprocess_cache and workspace_hit else None
     )
+    if cached_metadata is not None:
+        main_payload, gathered_meta, recovery_plan = cached_metadata
+    else:
+        # Step 1: Load main payload + exchange metadata.
+        main_payload = _load_ecnaive_main_payload(checkpoint_dir, rank, world_size)
+        tensor_infos = main_payload.get("tensor_infos", [])
+        local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
+        gathered_meta: List[Any] = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_meta, local_metadata)
+
+        # Step 2: Compute recovery plan.
+        recovery_plan = manager.get_multi_failure_recovery_plan(
+            failed_global_ranks, world_size
+        )
+        if inprocess_cache:
+            manager.set_recovery_workspace_value(
+                "metadata_plan", (main_payload, gathered_meta, recovery_plan),
+            )
+    tensor_infos = main_payload.get("tensor_infos", [])
+    setup_timing["metadata_plan"] = time.perf_counter() - metadata_start
 
     block_files = main_payload.get("block_files", {})
     pipeline_total_bytes = int(main_payload.get("pipeline_total_bytes", 0))
@@ -2012,6 +2088,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     recv_pool_prealloc: List[torch.Tensor] = []
     source_blocks_prealloc: List[torch.Tensor] = []
     source_block_paths: List[Path] = []
+    source_stream_scratch: Optional[List[torch.Tensor]] = None
     # Pre-computed decode layout and buffers for failed ranks (moved here to keep outside timing)
     _rig_to_si: Dict[int, int] = {}
     _owner_rigs: List[int] = []
@@ -2035,53 +2112,132 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 _owner_rigs.append(_ow)
         _num_owners = len(_owner_rigs)
 
+        alloc_start = time.perf_counter()
         if has_padded_recv:
-            recv_pool_prealloc = list(allocate_hugepage_slices(
-                recv_block_size, total_pool_blocks,
-                fallback_pin_memory=True, touch_pages=True,
-            ))
-            # Pre-allocate decode/encode/store/tensor buffers for legacy padded checkpoints.
-            recovered_slot_pool_pre = [
-                torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners * ecnaive_k)
-            ]
-            parity_pool_0_pre = [
-                torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners)
-            ]
-            parity_pool_1_pre = [
-                torch.empty(block_data_size, dtype=torch.uint8) for _ in range(_num_owners)
-            ]
-            store_bufs_pre = {
-                _name: torch.empty(block_data_size, dtype=torch.uint8)
-                for _name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2')
-            }
+            if inprocess_cache:
+                recv_pool_prealloc = manager.get_recovery_slices(
+                    "failed_recv_pool", recv_block_size, total_pool_blocks,
+                    register=True,
+                )
+                recovered_slot_pool_pre = manager.get_recovery_slices(
+                    "recovered_slots", block_data_size, _num_owners * ecnaive_k,
+                )
+                parity_pool_0_pre = manager.get_recovery_slices(
+                    "parity_pool_0", block_data_size, _num_owners,
+                )
+                parity_pool_1_pre = manager.get_recovery_slices(
+                    "parity_pool_1", block_data_size, _num_owners,
+                )
+                store_bufs_pre = {
+                    name: manager.get_recovery_buffer(
+                        f"store_{name}", block_data_size,
+                    )
+                    for name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2')
+                }
+            else:
+                recv_pool_prealloc = list(allocate_hugepage_slices(
+                    recv_block_size, total_pool_blocks,
+                    fallback_pin_memory=True, touch_pages=True,
+                ))
+                recovered_slot_pool_pre = [
+                    torch.empty(block_data_size, dtype=torch.uint8)
+                    for _ in range(_num_owners * ecnaive_k)
+                ]
+                parity_pool_0_pre = [
+                    torch.empty(block_data_size, dtype=torch.uint8)
+                    for _ in range(_num_owners)
+                ]
+                parity_pool_1_pre = [
+                    torch.empty(block_data_size, dtype=torch.uint8)
+                    for _ in range(_num_owners)
+                ]
+                store_bufs_pre = {
+                    name: torch.empty(block_data_size, dtype=torch.uint8)
+                    for name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2')
+                }
         else:
-            recv_pool_prealloc = list(allocate_hugepage_slices(
-                stripe_bytes := manager.ecnaive_buffer_size, total_pool_blocks,
-                fallback_pin_memory=True, touch_pages=True,
-            ))
-            store_bufs_pre = {
-                'own_data0': torch.empty(stripe_bytes, dtype=torch.uint8),
-                'my_data1': torch.empty(stripe_bytes, dtype=torch.uint8),
-            }
+            stripe_bytes = manager.ecnaive_buffer_size
+            if inprocess_cache:
+                recv_pool_prealloc = manager.get_recovery_slices(
+                    "failed_recv_pool", stripe_bytes, total_pool_blocks,
+                    register=True,
+                )
+                store_bufs_pre = {
+                    name: manager.get_recovery_buffer(f"store_{name}", stripe_bytes)
+                    for name in ('own_data0', 'my_data1')
+                }
+            else:
+                recv_pool_prealloc = list(allocate_hugepage_slices(
+                    stripe_bytes, total_pool_blocks,
+                    fallback_pin_memory=True, touch_pages=True,
+                ))
+                store_bufs_pre = {
+                    'own_data0': torch.empty(stripe_bytes, dtype=torch.uint8),
+                    'my_data1': torch.empty(stripe_bytes, dtype=torch.uint8),
+                }
 
-        if manager.use_rdma:
+        if manager.use_rdma and not inprocess_cache:
             for buf in recv_pool_prealloc:
                 manager.register_buffer(buf)
-        tensor_buffer_pre = _allocate_pinned_uint8_buffer(
-            max(block_data_size * ecnaive_k, actual_tensor_size)
+        tensor_size = max(block_data_size * ecnaive_k, actual_tensor_size)
+        tensor_buffer_pre = (
+            manager.get_recovery_buffer("final_tensor", tensor_size, pin=True)
+            if inprocess_cache else _allocate_pinned_uint8_buffer(tensor_size)
         )
+        setup_timing["alloc_touch_register"] += time.perf_counter() - alloc_start
     elif affected_group and not is_failed and is_source:
+        disk_start = time.perf_counter()
         if has_padded_recv:
-            source_blocks_prealloc = _load_all_blocks_from_disk(
-                checkpoint_dir, rank, ecnaive_k, ecnaive_n, block_files,
+            cached_source_blocks = (
+                manager.get_recovery_workspace_value("source_blocks")
+                if inprocess_cache else None
             )
-            if manager.use_rdma:
-                for b in source_blocks_prealloc:
-                    manager.register_buffer(b)
+            if cached_source_blocks is None:
+                source_blocks_prealloc = _load_all_blocks_from_disk(
+                    checkpoint_dir, rank, ecnaive_k, ecnaive_n, block_files,
+                )
+                if manager.use_rdma:
+                    for block in source_blocks_prealloc:
+                        manager.register_buffer(block)
+                if inprocess_cache:
+                    manager.set_recovery_workspace_value(
+                        "source_blocks", source_blocks_prealloc,
+                    )
+            else:
+                source_blocks_prealloc = cached_source_blocks
         else:
-            source_block_paths = _resolve_ecnaive_block_paths(
-                checkpoint_dir, rank, ecnaive_k, ecnaive_n, block_files,
+            cached_source_paths = (
+                manager.get_recovery_workspace_value("source_paths")
+                if inprocess_cache else None
             )
+            if cached_source_paths is None:
+                source_block_paths = _resolve_ecnaive_block_paths(
+                    checkpoint_dir, rank, ecnaive_k, ecnaive_n, block_files,
+                )
+                if inprocess_cache:
+                    manager.set_recovery_workspace_value(
+                        "source_paths", source_block_paths,
+                    )
+            else:
+                source_block_paths = cached_source_paths
+            setup_timing["disk_preload"] += time.perf_counter() - disk_start
+            disk_start = None
+            alloc_start = time.perf_counter()
+            if inprocess_cache:
+                source_stream_scratch = manager.get_recovery_slices(
+                    "source_stream_scratch", manager.ecnaive_buffer_size,
+                    ecnaive_n, register=True,
+                )
+            setup_timing["alloc_touch_register"] += time.perf_counter() - alloc_start
+        if disk_start is not None:
+            setup_timing["disk_preload"] += time.perf_counter() - disk_start
+
+    reset_start = time.perf_counter()
+    native.reset_encoding_completion_flags()
+    setup_timing["native_reset"] = time.perf_counter() - reset_start
+    setup_timing["total"] = time.perf_counter() - setup_start
+    if inprocess_cache:
+        _log_ecnaive_inprocess_setup(rank, workspace_hit, setup_timing)
 
     # Sync after pre-alloc/load so network timing excludes setup skew.
     barrier_s += _timed_barrier()
@@ -2101,7 +2257,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
     # ── Pipeline: SOURCE ranks send all n blocks to each failed rank ──
     if affected_group and not is_failed and is_source:
-        native.reset_encoding_completion_flags()
         stripe_bytes = manager.ecnaive_buffer_size
 
         if has_padded_recv:
@@ -2136,6 +2291,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 source_block_paths,
                 local_block_sizes,
                 stripe_bytes,
+                scratch=source_stream_scratch,
             )
             logger.debug(
                 f"EC-NAIVE hw recovery: source rank {rank} streamed "
@@ -2156,7 +2312,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
 
     elif affected_group and not is_failed and not is_source:
         # Survivor but not selected as source: no-op on channels
-        native.reset_encoding_completion_flags()
         native.submit_send_sentinels(num_channels)
         native.submit_recv_sentinels(num_channels)
         native.wait_for_encoding_completion()
@@ -2188,7 +2343,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         parity_pool_1 = parity_pool_1_pre
         store_bufs = store_bufs_pre
 
-        native.reset_encoding_completion_flags()
         stripe_bytes = manager.ecnaive_buffer_size
         _t0_decode = time.time()
 
@@ -2425,7 +2579,6 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         # ═══════════════════════════════════════════════════════════════
         # UNAFFECTED rank (different group): no-op on ASIO channels
         # ═══════════════════════════════════════════════════════════════
-        native.reset_encoding_completion_flags()
         native.submit_send_sentinels(num_channels)
         native.submit_recv_sentinels(num_channels)
         native.wait_for_encoding_completion()

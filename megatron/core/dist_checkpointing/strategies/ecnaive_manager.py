@@ -96,6 +96,12 @@ class ECNAIVEManager:
         # {global_rank: {"own_data0": tensor, "recv_0": tensor, ...}}
         self._recovered_blocks: Dict[int, Dict[str, torch.Tensor]] = {}
 
+        # In-process HW recovery owns buffers whose addresses may remain registered
+        # in the native transport. The workspace is intentionally retained until
+        # process exit; replacing it while native is live is unsafe.
+        self._recovery_workspace_key: Optional[tuple] = None
+        self._recovery_workspace: Dict[str, Any] = {}
+
         self._initialized = True
 
     def allocate_preallocated_buffer(self, size_bytes: int):
@@ -1371,6 +1377,82 @@ class ECNAIVEManager:
         except Exception as e:
             logger.error(f"EC-NAIVE: [Rank {rank}] Failed to unregister buffer: {e}")
             raise
+
+    # ===== In-process HW recovery workspace =====
+
+    def recovery_workspace_matches(self, key: tuple) -> bool:
+        """Return whether the active recovery workspace has this identity."""
+        return self._recovery_workspace_key == key
+
+    def begin_recovery_workspace(self, key: tuple) -> bool:
+        """Select a stable workspace, rejecting unsafe in-process replacement."""
+        if self._recovery_workspace_key is None:
+            self._recovery_workspace_key = key
+            return False
+        if self._recovery_workspace_key != key:
+            raise RuntimeError(
+                "EC-NAIVE in-process recovery workspace identity changed while "
+                "native/RDMA resources are live. Restart the process for a different "
+                "checkpoint, failure set, topology, or transport configuration."
+            )
+        return True
+
+    def get_recovery_workspace_value(self, name: str, default=None):
+        """Read an object owned by the active recovery workspace."""
+        return self._recovery_workspace.get(name, default)
+
+    def set_recovery_workspace_value(self, name: str, value: Any) -> None:
+        """Keep an object alive for subsequent in-process recovery rounds."""
+        self._recovery_workspace[name] = value
+
+    def get_recovery_slices(
+        self, name: str, slice_bytes: int, count: int, *, register: bool = False
+    ) -> List[torch.Tensor]:
+        """Return page-backed slices with stable addresses across recovery rounds."""
+        cached = self._recovery_workspace.get(name)
+        if cached is not None:
+            if len(cached) != count or any(buf.numel() < slice_bytes for buf in cached):
+                raise RuntimeError(
+                    f"EC-NAIVE cached recovery slices {name!r} no longer match "
+                    f"count={count}, bytes={slice_bytes}"
+                )
+            return [buf[:slice_bytes] for buf in cached]
+        slices = list(allocate_hugepage_slices(
+            slice_bytes, count, fallback_pin_memory=True, touch_pages=True,
+        ))
+        if register and self.use_rdma:
+            for buffer in slices:
+                self.register_buffer(buffer)
+        self._recovery_workspace[name] = slices
+        return slices
+
+    def get_recovery_buffer(
+        self, name: str, size_bytes: int, *, pin: bool = False, register: bool = False
+    ) -> torch.Tensor:
+        """Return one stable recovery buffer without reallocating or retouching it."""
+        cached = self._recovery_workspace.get(name)
+        if cached is not None:
+            if cached.numel() < size_bytes:
+                raise RuntimeError(
+                    f"EC-NAIVE cached recovery buffer {name!r} is too small: "
+                    f"{cached.numel()} < {size_bytes}"
+                )
+            return cached[:size_bytes]
+        if pin and torch.cuda.is_available():
+            try:
+                buffer = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
+            except Exception:
+                buffer = allocate_hugepage_tensor(
+                    size_bytes, fallback_pin_memory=True, touch_pages=True,
+                )
+        else:
+            buffer = allocate_hugepage_tensor(
+                size_bytes, fallback_pin_memory=pin, touch_pages=True,
+            )
+        if register and self.use_rdma:
+            self.register_buffer(buffer)
+        self._recovery_workspace[name] = buffer
+        return buffer
 
     # ===== HW recovery: recovered checkpoint block storage =====
 

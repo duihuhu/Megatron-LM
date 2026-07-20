@@ -203,6 +203,24 @@ def _clone_inprocess_optimizer_tensors(value):
     return value
 
 
+def _optimizer_uses_cpu_offload(optimizer, args):
+    config = getattr(optimizer, "config", None)
+    enabled = getattr(config, "optimizer_cpu_offload", None)
+    fraction = getattr(config, "optimizer_offload_fraction", None)
+    if enabled is None:
+        enabled = getattr(args, "optimizer_cpu_offload", False)
+    if fraction is None:
+        fraction = getattr(args, "optimizer_offload_fraction", None)
+    if not enabled:
+        return False
+    if fraction is None:
+        return True
+    try:
+        return float(fraction) > 0.0
+    except (TypeError, ValueError):
+        return True
+
+
 def _inject_inprocess_recovered_state(
     ddp_model,
     optimizer,
@@ -573,6 +591,20 @@ def run_inprocess_ft_recovery_benchmark(
                     opt_param_scheduler,
                     state_dict,
                     strict=strict,
+                    # GPU optimizer/model loaders copy recovered CPU tensors into their
+                    # CUDA-owned storage. CPU-offloaded optimizers may retain optimizer-state
+                    # views, so detach only that subtree from reusable transport workspaces.
+                    # Keep EC-NAIVE's existing unconditional behavior unchanged.
+                    clone_optimizer_tensors=(
+                        getattr(args, "use_ecnaive", False)
+                        or (
+                            (
+                                getattr(args, "use_eccheck", False)
+                                or getattr(args, "use_gemini_replicas", False)
+                            )
+                            and _optimizer_uses_cpu_offload(optimizer, args)
+                        )
+                    ),
                 )
     h2d_total_s = time() - h2d_start
     mark_recovery_to_forward_timer("h2d_done")

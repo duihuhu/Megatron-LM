@@ -7,6 +7,7 @@ save/load .pt files with torch.save / torch.load.
 
 import os
 import pickle
+import re
 import struct
 import time
 from logging import getLogger
@@ -58,6 +59,22 @@ def _timed_barrier() -> float:
     start = time.time()
     torch.distributed.barrier()
     return time.time() - start
+
+
+def _collective_bool_and(value: bool) -> bool:
+    """Return a process-group-wide AND without assuming NCCL or Gloo."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return bool(value)
+    backend = str(torch.distributed.get_backend()).lower()
+    if "nccl" in backend:
+        if not torch.cuda.is_available():
+            raise RuntimeError("Gemini Replicas: NCCL boolean collective requires CUDA")
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device("cpu")
+    flag = torch.tensor([1 if value else 0], dtype=torch.int32, device=device)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+    return bool(flag.item())
 
 
 def _gemini_recovery_profile(role: str, event: str, **fields) -> None:
@@ -775,106 +792,70 @@ def _hw_recovery_prepare(
     healthy: Set[int],
     failed: Set[int],
 ) -> None:
-    """Phase 2: role assignment + size exchange (all_gather — not timed)."""
+    """Collect replica availability once and build one deterministic global plan."""
+    local_available: Dict[int, int] = {}
     if rank in healthy:
-        # Load-balanced sender selection: each healthy rank computes the same
-        # assignment using a greedy min-load strategy.  Candidates must be in
-        # the failed rank's group AND in its target list (i.e. hold a replica).
-        sender_load: Dict[int, int] = {}
-        assignments: Dict[int, int] = {}
-        for f in sorted(failed):
-            f_group = set(rank_to_group.get(f, []))
-            f_targets = manager._calculate_target_ranks(f, world_size)
-            candidates = sorted(
-                c for c in healthy if c in f_group and c in f_targets
+        for failed_rank in sorted(failed):
+            if rank not in manager._calculate_target_ranks(failed_rank, world_size):
+                continue
+            replica_path = (
+                checkpoint_dir
+                / f"gemini_replicas_replica_rank{rank}_from{failed_rank}.pt"
             )
-            if candidates:
-                sender = min(candidates, key=lambda c: sender_load.get(c, 0))
-                sender_load[sender] = sender_load.get(sender, 0) + 1
-                assignments[f] = sender
-                logger.debug(
-                    f"Gemini Replicas recovery: failed rank {f} → sender {sender}"
-                )
-            else:
-                logger.warning(
-                    f"Gemini Replicas recovery: no replica found for failed rank {f}"
-                )
+            if not replica_path.is_file():
+                continue
+            replica = _load_replica_metadata(replica_path)
+            if replica is None:
+                continue
+            tensor_size = int(replica.get("source_tensor_buffer_size", 0))
+            meta = {
+                "tensor_infos": replica["source_tensor_infos"],
+                "non_tensor_data": replica["source_non_tensor_data"],
+                "flat_key_roots": replica["source_flat_key_roots"],
+                "tensor_buffer_size": tensor_size,
+            }
+            local_available[failed_rank] = 8 + len(pickle.dumps(meta)) + tensor_size
 
-        my_assignments: List[Tuple[int, int]] = []
-        combined_sizes: Dict[int, int] = {}
-        for f, s in assignments.items():
-            if s == rank:
-                my_assignments.append((f, s))
-                replica_path = (
-                    checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{f}.pt"
-                )
-                rp = _load_replica_metadata(replica_path)
-                if rp is not None:
-                    tensor_buf_size = rp.get("source_tensor_buffer_size", 0)
-                    meta = {
-                        "tensor_infos": rp["source_tensor_infos"],
-                        "non_tensor_data": rp["source_non_tensor_data"],
-                        "flat_key_roots": rp["source_flat_key_roots"],
-                        "tensor_buffer_size": tensor_buf_size,
-                    }
-                    meta_bytes = pickle.dumps(meta)
-                    combined_sizes[f] = 8 + len(meta_bytes) + tensor_buf_size
+    gathered: List[Any] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, local_available)
 
-        all_assignments = [None for _ in range(world_size)]
-        torch.distributed.all_gather_object(all_assignments, my_assignments)
-        global_assignments: Dict[int, int] = {}
-        for r_assign in all_assignments:
-            if r_assign:
-                for f, s in r_assign:
-                    global_assignments[f] = s
+    sender_load: Dict[int, int] = {}
+    assignments: Dict[int, int] = {}
+    combined_sizes: Dict[int, int] = {}
+    unavailable: List[int] = []
+    for failed_rank in sorted(failed):
+        group = set(rank_to_group.get(failed_rank, []))
+        candidates = [
+            candidate for candidate in sorted(healthy & group)
+            if failed_rank in (gathered[candidate] or {})
+        ]
+        if not candidates:
+            unavailable.append(failed_rank)
+            continue
+        sender = min(candidates, key=lambda candidate: (sender_load.get(candidate, 0), candidate))
+        sender_load[sender] = sender_load.get(sender, 0) + 1
+        assignments[failed_rank] = sender
+        combined_sizes[failed_rank] = int(gathered[sender][failed_rank])
 
-        all_combined_sizes = [None for _ in range(world_size)]
-        torch.distributed.all_gather_object(all_combined_sizes, combined_sizes)
-        global_combined_sizes: Dict[int, int] = {}
-        for cs in all_combined_sizes:
-            if cs:
-                global_combined_sizes.update(cs)
+    if unavailable:
+        raise RuntimeError(
+            "Gemini Replicas: no healthy on-disk replica file is available for "
+            f"failed source ranks {unavailable}; failed={sorted(failed)}"
+        )
 
+    if rank in failed:
         _hw_assignments[rank] = {
-            "assignments": global_assignments,
-            "combined_sizes": global_combined_sizes,
-            "is_sender": True,
+            "sender": assignments[rank],
+            "combined_size": combined_sizes[rank],
+            "is_sender": False,
+            "assignments": assignments,
+            "combined_sizes": combined_sizes,
         }
     else:
-        my_assignments: List[Tuple[int, int]] = []
-        all_assignments = [None for _ in range(world_size)]
-        torch.distributed.all_gather_object(all_assignments, my_assignments)
-        global_assignments: Dict[int, int] = {}
-        for r_assign in all_assignments:
-            if r_assign:
-                for f, s in r_assign:
-                    global_assignments[f] = s
-
-        sender = global_assignments.get(rank)
-        if sender is None:
-            raise RuntimeError(
-                f"Gemini Replicas recovery rank {rank}: no sender assigned."
-            )
-
-        combined_sizes: Dict[int, int] = {}
-        all_combined_sizes = [None for _ in range(world_size)]
-        torch.distributed.all_gather_object(all_combined_sizes, combined_sizes)
-        global_combined_sizes: Dict[int, int] = {}
-        for cs in all_combined_sizes:
-            if cs:
-                global_combined_sizes.update(cs)
-
-        combined_size = global_combined_sizes.get(rank)
-        if combined_size is None:
-            raise RuntimeError(
-                f"Gemini Replicas recovery rank {rank}: no combined size info."
-            )
-
         _hw_assignments[rank] = {
-            "sender": sender,
-            "combined_size": combined_size,
-            "is_sender": False,
-            "assignments": global_assignments,
+            "assignments": assignments,
+            "combined_sizes": combined_sizes,
+            "is_sender": True,
         }
 
 
@@ -944,9 +925,13 @@ def _recovery_workspace_base_key(
 ) -> tuple:
     """Build a stable identity for in-process transport scratch and topology."""
     local_files = []
+    local_rank_pattern = re.compile(
+        rf"^gemini_replicas_(?:main_rank{rank}|replica_rank{rank}_from\d+|"
+        rf"replica_rank\d+_from{rank})\.pt$"
+    )
     for path in sorted(checkpoint_dir.glob("gemini_replicas_*.pt")):
         name = path.name
-        if f"rank{rank}" not in name and f"from{rank}" not in name:
+        if local_rank_pattern.fullmatch(name) is None:
             continue
         stat = path.stat()
         local_files.append((name, stat.st_size, stat.st_mtime_ns))
@@ -968,16 +953,30 @@ def _recovery_workspace_size_key(rank: int) -> tuple:
     )
 
 
-def release_gemini_replicas_inprocess_workspace() -> None:
-    """Explicitly release Gemini-only in-process recovery resources."""
-    manager = GeminiReplicasManager()
-    manager.release_recovery_workspace()
+def _reset_recovery_planning_caches() -> None:
+    """Clear every module-level object tied to a recovery plan or workspace."""
+    global _replica_failed, _replica_healthy
+    _hw_assignments.clear()
+    _replica_needed.clear()
+    _replica_sizes.clear()
+    _replica_failed_sources.clear()
+    _replica_failed = set()
+    _replica_healthy = set()
     _recovery_meta.clear()
     _hw_preloaded.clear()
     _hw_recv_bufs.clear()
     _replica_preloaded.clear()
     _replica_recv_bufs.clear()
     _replica_tensor_sizes.clear()
+
+
+def release_gemini_replicas_inprocess_workspace() -> None:
+    """Explicitly release Gemini-only in-process recovery resources."""
+    manager = GeminiReplicasManager()
+    try:
+        manager.release_recovery_workspace()
+    finally:
+        _reset_recovery_planning_caches()
 
 
 def _recovery_prealloc_buffers(
@@ -1337,104 +1336,77 @@ def _replica_recovery_prepare(
     failed: Set[int],
     healthy: Set[int],
 ) -> None:
-    """Phase 4a: replica role assignment + size exchange (all_gather — not timed).
-
-    Sender selection uses greedy min-load (count), seeded from main-recovery
-    assignments in _hw_assignments.
-    """
+    """Build replica-restoration assignments from globally observed files."""
     global _replica_needed, _replica_sizes, _replica_failed_sources, _replica_failed, _replica_healthy
 
     failed_sources: Dict[int, List[int]] = {}
     all_sources: Set[int] = set()
-    for f in failed:
-        sources: List[int] = []
-        for s in range(world_size):
-            if s == f:
-                continue
-            targets = manager._calculate_target_ranks(s, world_size)
-            if f in targets:
-                sources.append(s)
-                all_sources.add(s)
+    for failed_rank in failed:
+        sources = [
+            source for source in range(world_size)
+            if source != failed_rank
+            and failed_rank in manager._calculate_target_ranks(source, world_size)
+        ]
         if sources:
-            failed_sources[f] = sources
+            failed_sources[failed_rank] = sources
+            all_sources.update(sources)
 
     _replica_failed_sources = failed_sources
-    _replica_failed = failed
-    _replica_healthy = healthy
-
+    _replica_failed = set(failed)
+    _replica_healthy = set(healthy)
     if not all_sources:
         _replica_needed = {}
         _replica_sizes = {}
         return
 
-    if rank in failed:
-        logger.debug(
-            f"Gemini Replicas replica recovery rank {rank}: "
-            f"need replicas from sources {failed_sources.get(rank, [])}"
-        )
-
-    # Count-balanced sender selection (greedy min-load), seeded from main-recovery
-    # assignments so send tasks are spread across healthy ranks overall.
-    sender_load: Dict[int, int] = {}
-    for _f, _s in _hw_assignments.get(rank, {}).get("assignments", {}).items():
-        sender_load[_s] = sender_load.get(_s, 0) + 1
-
-    needed: Dict[int, int] = {}
-    for src in sorted(all_sources):
-        if src in healthy:
-            needed[src] = src
-            sender_load[src] = sender_load.get(src, 0) + 1
-        else:
-            src_targets = manager._calculate_target_ranks(src, world_size)
-            candidates = sorted(c for c in healthy if c in src_targets)
-            if candidates:
-                sender = min(candidates, key=lambda c: sender_load.get(c, 0))
-                needed[src] = sender
-                sender_load[sender] = sender_load.get(sender, 0) + 1
-            else:
-                logger.warning(
-                    f"Gemini Replicas replica recovery rank {rank}: "
-                    f"no source found for replica from rank {src}"
-                )
-
-    if not needed:
-        _replica_needed = {}
-        _replica_sizes = {}
-        return
-
-    my_needed: List[Tuple[int, int]] = [(src, snd) for src, snd in needed.items()]
-    all_needed: List[Any] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(all_needed, my_needed)
-
-    global_needed: Dict[int, int] = {}
-    for entry in all_needed:
-        if entry:
-            for src, snd in entry:
-                global_needed[src] = snd
-
-    combined_sizes: Dict[int, int] = {}
+    local_available: Dict[int, int] = {}
     if rank in healthy:
-        for src, snd in global_needed.items():
-            if snd != rank:
-                continue
-            info = _read_source_data_for_replica(
-                checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt",
-                checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{src}.pt"
-                if src != rank else None,
-                rank, src,
-            )
+        for source in sorted(all_sources):
+            if rank == source:
+                info = _read_source_data_for_replica(
+                    checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt",
+                    None, rank, source,
+                )
+            elif rank in manager._calculate_target_ranks(source, world_size):
+                info = _read_source_data_for_replica(
+                    checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt",
+                    checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{source}.pt",
+                    rank, source,
+                )
+            else:
+                info = None
             if info is not None:
-                combined_sizes[src] = info[3]
+                local_available[source] = int(info[3])
 
-    all_sizes: List[Any] = [None for _ in range(world_size)]
-    torch.distributed.all_gather_object(all_sizes, combined_sizes)
-    global_sizes: Dict[int, int] = {}
-    for entry in all_sizes:
-        if entry:
-            global_sizes.update(entry)
+    gathered: List[Any] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, local_available)
 
-    _replica_needed = global_needed
-    _replica_sizes = global_sizes
+    sender_load: Dict[int, int] = {}
+    for sender in _hw_assignments.get(rank, {}).get("assignments", {}).values():
+        sender_load[sender] = sender_load.get(sender, 0) + 1
+    needed: Dict[int, int] = {}
+    sizes: Dict[int, int] = {}
+    unavailable: List[int] = []
+    for source in sorted(all_sources):
+        candidates = [
+            candidate for candidate in sorted(healthy)
+            if source in (gathered[candidate] or {})
+        ]
+        if not candidates:
+            unavailable.append(source)
+            continue
+        sender = min(candidates, key=lambda candidate: (sender_load.get(candidate, 0), candidate))
+        sender_load[sender] = sender_load.get(sender, 0) + 1
+        needed[source] = sender
+        sizes[source] = int(gathered[sender][source])
+
+    if unavailable:
+        raise RuntimeError(
+            "Gemini Replicas: no healthy on-disk source is available to restore "
+            f"replicas for source ranks {unavailable}"
+        )
+    _replica_needed = needed
+    _replica_sizes = sizes
 
 
 def _replica_recovery_preload(
@@ -1871,8 +1843,20 @@ def load_gemini_replicas_legacy_checkpoint(
         getattr(args, "ft_inprocess_recovery_benchmark", False)
         and getattr(args, "_ft_inprocess_recovery_active", False)
     )
-    if not inprocess_recovery_active:
-        manager.init_gemini_replicas_if_enabled()
+    manager.init_gemini_replicas_if_enabled(initialize_transport=False)
+
+    recovery_ranks: Set[int] = set()
+    if recovery_rank_str:
+        try:
+            requested_ranks = [
+                int(token.strip()) for token in recovery_rank_str.split(",")
+                if token.strip()
+            ]
+        except ValueError as exc:
+            raise ValueError(
+                f"Gemini Replicas: invalid recovery rank list {recovery_rank_str!r}"
+            ) from exc
+        recovery_ranks = manager.validate_recovery_ranks(requested_ranks, world_size)
 
     # ---- Determine which ranks need recovery ----
     main_path = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
@@ -1882,7 +1866,6 @@ def load_gemini_replicas_legacy_checkpoint(
 
     if recovery_rank_str:
         # Explicit ranks treated as failed (for testing)
-        recovery_ranks = {int(x.strip()) for x in recovery_rank_str.split(",")}
         is_failed = rank in recovery_ranks
         logger.debug(
             f"Gemini Replicas load rank {rank}: "
@@ -1934,6 +1917,14 @@ def load_gemini_replicas_legacy_checkpoint(
     # ---- Software failure path ----
     sw_failure = bool(getattr(args, "use_gemini_replicas_software_failure", False))
     if sw_failure:
+        if inprocess_recovery_active:
+            try:
+                from megatron.training.global_vars import update_recovery_to_forward_timer_context
+                update_recovery_to_forward_timer_context(role="SW")
+            except Exception:
+                pass
+        if rank == 0 and inprocess_recovery_active:
+            logger.info("Gemini software in-process workspace cache=disabled")
         prep_copy_s = 0.0
         if main_payload is None:
             t_prep = time.time()
@@ -2008,13 +1999,19 @@ def load_gemini_replicas_legacy_checkpoint(
             healthy = {r for r, ok in enumerate(health_list) if ok}
             failed = {r for r in range(world_size) if r not in healthy}
 
+        failed = manager.validate_recovery_ranks(failed, world_size)
+        healthy = set(range(world_size)) - failed
+
         workspace_base_key = _recovery_workspace_base_key(
             manager, checkpoint_dir, rank, world_size, failed,
         )
-        workspace_hit = bool(
+        workspace_hit = _collective_bool_and(
             inprocess_recovery_active
             and manager.recovery_workspace_matches(workspace_base_key)
         )
+        if not workspace_hit and inprocess_recovery_active:
+            # A base-key change on any rank invalidates planning and transport everywhere.
+            release_gemini_replicas_inprocess_workspace()
 
         t_meta = time.perf_counter()
         if workspace_hit:
@@ -2040,21 +2037,17 @@ def load_gemini_replicas_legacy_checkpoint(
             _replica_recovery_prepare(
                 manager, checkpoint_dir, rank, world_size, failed, healthy,
             )
-            manager.begin_recovery_workspace(
-                workspace_base_key, _recovery_workspace_size_key(rank),
-            )
         plan_s = time.perf_counter() - t_plan
 
         t_reset = time.perf_counter()
-        if failed_override:
-            main_assignments = _hw_assignments.get(rank, {}).get("assignments", {})
-            manager.reinit_for_recovery(
-                failed_override,
-                main_assignments=main_assignments,
-                replica_needed=_replica_needed,
-                replica_failed_sources=_replica_failed_sources,
-                reuse_connections=inprocess_recovery_active,
-            )
+        main_assignments = _hw_assignments.get(rank, {}).get("assignments", {})
+        manager.reinit_for_recovery(
+            failed,
+            main_assignments=main_assignments,
+            replica_needed=_replica_needed,
+            replica_failed_sources=_replica_failed_sources,
+            reuse_connections=inprocess_recovery_active,
+        )
         reset_s = time.perf_counter() - t_reset
 
         # Setup (not timed): preload files + exchange metadata via NCCL
@@ -2081,6 +2074,10 @@ def load_gemini_replicas_legacy_checkpoint(
             reuse_workspace=inprocess_recovery_active,
         )
         alloc_register_s = time.perf_counter() - t_prealloc
+        if not workspace_hit and inprocess_recovery_active:
+            manager.begin_recovery_workspace(
+                workspace_base_key, _recovery_workspace_size_key(rank),
+            )
         disk_preload_s = time.perf_counter() - t_preload
         setup_s = time.perf_counter() - t_setup
         setup_summary = _timing_max_dict({
@@ -2174,10 +2171,11 @@ def load_gemini_replicas_legacy_checkpoint(
         _t['barrier'] = barrier_s
         _t['total'] = _t['network_encode'] + _t['rebuild_sd']
         from megatron.training.global_vars import set_ft_load_timing_context
-        set_ft_load_timing_context("GEMINI", "HW", _t)
+        hw_mode = "HW1" if len(failed) == 1 else ("HW2" if len(failed) == 2 else "HWN")
+        set_ft_load_timing_context("GEMINI", hw_mode, _t)
 
         logger.debug(
-            "GEMINI load timing (HW local): e2e_s=%(total).2fs "
+            f"GEMINI load timing ({hw_mode} local): e2e_s=%(total).2fs "
             "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
             "barrier_s=%(barrier).2fs", _t
         )

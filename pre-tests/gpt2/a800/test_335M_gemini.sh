@@ -109,17 +109,41 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/gpt2/data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/models/gpt2-345m-0/logs"
-CHECKPOINT_PATH="/dev/shm/data/checkpoint/models/gpt2-345m-0-gemini-replicas-legacy"
+GEMINI_CHECKPOINT_BASE="/dev/shm/data/checkpoint/models/gpt2-345m-0-gemini-replicas-legacy"
 DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 
 SHM_PKT="/dev/shm/shm_pkt"
 
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess|inprocess2|inprocess_sw)$ ]]; then
     MODE="$1"
     shift
 fi
+
+GEMINI_REPLICAS_NUM_WAS_SET=0
+if [ -n "${GEMINI_REPLICAS_NUM+x}" ]; then
+    GEMINI_REPLICAS_NUM_WAS_SET=1
+fi
+GEMINI_REPLICAS_NUM=${GEMINI_REPLICAS_NUM:-2}
+if [[ "$MODE" == "hardware2" || "$MODE" == "inprocess2" ]]; then
+    if [ "$GEMINI_REPLICAS_NUM_WAS_SET" -eq 0 ]; then
+        GEMINI_REPLICAS_NUM=3
+    elif [ "$GEMINI_REPLICAS_NUM" -lt 3 ]; then
+        echo "Error: $MODE requires GEMINI_REPLICAS_NUM>=3 in this benchmark." >&2
+        echo "Save and load the HW2 checkpoint with the same GEMINI_REPLICAS_NUM value." >&2
+        exit 1
+    fi
+fi
+if [ -n "${CHECKPOINT_PATH+x}" ]; then
+    CHECKPOINT_PATH=${CHECKPOINT_PATH}
+elif [ "$GEMINI_REPLICAS_NUM" -eq 2 ]; then
+    CHECKPOINT_PATH=$GEMINI_CHECKPOINT_BASE
+else
+    CHECKPOINT_PATH="${GEMINI_CHECKPOINT_BASE}-r${GEMINI_REPLICAS_NUM}"
+fi
+GEMINI_FAILED_RANKS=${GEMINI_FAILED_RANKS:-0}
+GEMINI_HW2_FAILED_RANKS=${GEMINI_HW2_FAILED_RANKS:-0,1}
 
 LATEST_ITER=1
 if [[ "$MODE" == "hardware" || "$MODE" == "hardware2" ]]; then
@@ -127,10 +151,12 @@ if [[ "$MODE" == "hardware" || "$MODE" == "hardware2" ]]; then
         LATEST_ITER="$1"
         shift
     fi
-    # Update latest_checkpointed_iteration.txt in the checkpoint path
-    LATEST_ITER_FILE="$CHECKPOINT_PATH/latest_checkpointed_iteration.txt"
-    mkdir -p "$CHECKPOINT_PATH"
-    echo "$LATEST_ITER" > "$LATEST_ITER_FILE"
+    # Update the tracker only for a real run; PRINT_CMD must remain read-only.
+    if [ "${PRINT_CMD:-0}" = "0" ]; then
+        LATEST_ITER_FILE="$CHECKPOINT_PATH/latest_checkpointed_iteration.txt"
+        mkdir -p "$CHECKPOINT_PATH"
+        echo "$LATEST_ITER" > "$LATEST_ITER_FILE"
+    fi
 fi
 
 ARGS_TO_PASS=("$@")
@@ -150,30 +176,45 @@ case "$MODE" in
         RECOVERY_MODE_ARGS+=(
             --load $CHECKPOINT_PATH
             --use-gemini-replicas-software-failure
-            --gemini-replicas-recovery-rank "0"
+            --gemini-replicas-recovery-rank "$GEMINI_FAILED_RANKS"
         )
         ;;
-    hardware)
+    hardware|hardware2)
+        FAILED_RANKS=$GEMINI_FAILED_RANKS
+        if [ "$MODE" = "hardware2" ]; then
+            FAILED_RANKS=$GEMINI_HW2_FAILED_RANKS
+        fi
         RECOVERY_MODE_ARGS+=(
             --load $CHECKPOINT_PATH
             --use-gemini-replicas-hardware-failure
-            --gemini-replicas-recovery-rank "0"
+            --gemini-replicas-recovery-rank "$FAILED_RANKS"
         )
         ;;
-    hardware2)
+    inprocess_sw)
         RECOVERY_MODE_ARGS+=(
             --load $CHECKPOINT_PATH
-            --use-gemini-replicas-hardware-failure
-            --gemini-replicas-recovery-rank "0,1"
+            --use-gemini-replicas-software-failure
+            --gemini-replicas-recovery-rank "$GEMINI_FAILED_RANKS"
+            --ft-inprocess-recovery-benchmark
+            --ft-inprocess-recovery-software-failure
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-failed-ranks "$GEMINI_FAILED_RANKS"
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
         )
         ;;
-    inprocess)
+    inprocess|inprocess2)
+        FAILED_RANKS=$GEMINI_FAILED_RANKS
+        if [ "$MODE" = "inprocess2" ]; then
+            FAILED_RANKS=$GEMINI_HW2_FAILED_RANKS
+        fi
         RECOVERY_MODE_ARGS+=(
             --load $CHECKPOINT_PATH
             --ft-inprocess-recovery-benchmark
             --rerun-mode disabled
             --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
-            --ft-inprocess-recovery-failed-ranks "0"
+            --ft-inprocess-recovery-failed-ranks "$FAILED_RANKS"
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
         )
@@ -256,7 +297,7 @@ EVAL_AND_LOGGING_ARGS=(
     # ---------------------------------------------------------------------------
     # 副本数：每个 rank 的数据在组内存放 N 份（含本地）
     # ---------------------------------------------------------------------------
-    --gemini-replicas-num 2        # 默认 3。设为 2 即两副本，设为 N 即 N 副本
+    --gemini-replicas-num $GEMINI_REPLICAS_NUM
                                         # 在组内 round-robin 轮询放置副本
                                         # 容错能力 = num_replicas - 1 个 rank 同时故障
 
@@ -349,6 +390,7 @@ fi
 
 echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (Gemini Replicas Legacy)"
 echo "WORLD_SIZE=$WORLD_SIZE  GPUS_PER_NODE=$GPUS_PER_NODE  NNODES=$NNODES"
+echo "MODE=$MODE  GEMINI_REPLICAS_NUM=$GEMINI_REPLICAS_NUM  CHECKPOINT_PATH=$CHECKPOINT_PATH"
 echo "GEMINI_REPLICAS_BASE_PORT=$GEMINI_REPLICAS_BASE_PORT  GEMINI_REPLICAS_RECOVERY_BASE_PORT=$GEMINI_REPLICAS_RECOVERY_BASE_PORT"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 

@@ -87,7 +87,8 @@ class GeminiReplicasManager:
 
         # In-process recovery-only workspace. It owns transport scratch buffers,
         # their RDMA registrations, and the sparse recovery connection topology.
-        self._recovery_workspace_key: Optional[tuple] = None
+        self._recovery_workspace_base_key: Optional[tuple] = None
+        self._recovery_workspace_size_key: Optional[tuple] = None
         self._recovery_workspace_buffers: Dict[tuple, torch.Tensor] = {}
         self._recovery_topology_key: Optional[tuple] = None
 
@@ -278,6 +279,33 @@ class GeminiReplicasManager:
         group_end = min(group_start + gs, world_size)
         return list(range(group_start, group_end))
 
+    def validate_recovery_ranks(self, failed, world_size: int) -> Set[int]:
+        """Validate failed ranks and ensure every source has a healthy replica holder."""
+        if world_size <= 0:
+            raise ValueError(f"Gemini Replicas: world_size must be positive, got {world_size}")
+        try:
+            normalized = {int(rank) for rank in failed}
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Gemini Replicas: invalid failed ranks {failed!r}") from exc
+        invalid = sorted(rank for rank in normalized if rank < 0 or rank >= world_size)
+        if invalid:
+            raise ValueError(
+                f"Gemini Replicas: failed ranks {invalid} outside [0, {world_size - 1}]"
+            )
+        healthy = set(range(world_size)) - normalized
+        unrecoverable = []
+        for source in sorted(normalized):
+            holders = set(self._calculate_target_ranks(source, world_size)) - {source}
+            if not (holders & healthy):
+                unrecoverable.append(source)
+        if unrecoverable:
+            raise RuntimeError(
+                "Gemini Replicas: recovery topology has no healthy replica holder for "
+                f"failed source ranks {unrecoverable}; failed={sorted(normalized)}, "
+                f"num_replicas={self.num_replicas}, group_size={self.group_size}"
+            )
+        return normalized
+
     def _get_gemini_replicas_network_config(self, rank: int, world_size: int) -> dict:
         """
         Get network configuration for Gemini Replicas ASIO connections.
@@ -423,8 +451,8 @@ class GeminiReplicasManager:
         
         return config
     
-    def init_gemini_replicas_if_enabled(self):
-        """Initialize Gemini Replicas C++ module if enabled and distributed environment is ready."""
+    def init_gemini_replicas_if_enabled(self, initialize_transport: bool = True):
+        """Configure Gemini Replicas and optionally initialize its native transport."""
         if self._gemini_replicas_native is not None:
             logger.debug("Gemini Replicas: Already initialized, skipping")
             return
@@ -450,6 +478,8 @@ class GeminiReplicasManager:
                 self.channels_per_peer = 1
             
             if not self.use_gemini_replicas or not self.use_gemini_replicas_optimized:
+                return
+            if not initialize_transport:
                 return
             
             # Check if distributed environment is initialized
@@ -925,20 +955,15 @@ class GeminiReplicasManager:
 
 
     def recovery_workspace_matches(self, base_key: tuple) -> bool:
-        """Return whether the active workspace has the same stable identity."""
-        return bool(
-            self._recovery_workspace_key is not None
-            and self._recovery_workspace_key[0] == base_key
-        )
+        """Return whether cached planning and buffers belong to this base identity."""
+        return self._recovery_workspace_base_key == base_key
 
-    def begin_recovery_workspace(self, base_key: tuple, size_key: tuple) -> bool:
-        """Select the in-process recovery workspace and return whether it hit."""
-        key = (base_key, size_key)
-        if self._recovery_workspace_key == key:
-            return True
-        self.release_recovery_workspace()
-        self._recovery_workspace_key = key
-        return False
+    def begin_recovery_workspace(self, base_key: tuple, size_key: tuple) -> None:
+        """Record the base identity and derived buffer-size contract."""
+        if self._recovery_workspace_base_key not in (None, base_key):
+            self.release_recovery_workspace()
+        self._recovery_workspace_base_key = base_key
+        self._recovery_workspace_size_key = size_key
 
     def get_recovery_buffer(self, name: tuple, size_bytes: int) -> torch.Tensor:
         """Return registered, page-backed scratch owned only by the workspace."""
@@ -980,7 +1005,8 @@ class GeminiReplicasManager:
             self.registered_buffers.clear()
             self._stop_native_gracefully()
         self._recovery_workspace_buffers.clear()
-        self._recovery_workspace_key = None
+        self._recovery_workspace_base_key = None
+        self._recovery_workspace_size_key = None
         self._recovery_topology_key = None
 
     def reinit_for_recovery(
@@ -1199,6 +1225,7 @@ class GeminiReplicasManager:
         self.replica_metadata = []
         self._cached_recv_buffers = {}
         self._recovery_workspace_buffers.clear()
-        self._recovery_workspace_key = None
+        self._recovery_workspace_base_key = None
+        self._recovery_workspace_size_key = None
         self._recovery_topology_key = None
 

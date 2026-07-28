@@ -94,6 +94,7 @@ def start_recovery_to_forward_timer(
         "start": now,
         "marks": [(phase, now)],
         "context": dict(context),
+        "first_layer_start_recorded": False,
     }
 
 
@@ -130,6 +131,56 @@ def restart_recovery_to_forward_timer(label: str) -> None:
     timer["phase"] = label
     timer["start"] = now
     timer["marks"] = [(label, now)]
+
+
+def _get_ranks_per_node() -> int:
+    """Detect local world size using the recovery managers' precedence."""
+    for key in (
+        "LOCAL_WORLD_SIZE",
+        "OMPI_COMM_WORLD_LOCAL_SIZE",
+        "MPI_LOCALNRANKS",
+        "MV2_COMM_WORLD_LOCAL_SIZE",
+    ):
+        value = os.environ.get(key)
+        if not value:
+            continue
+        try:
+            parsed = int(value.strip())
+            if parsed > 0:
+                return parsed
+        except (TypeError, ValueError):
+            continue
+    slurm_value = os.environ.get("SLURM_NTASKS_PER_NODE")
+    if slurm_value:
+        token = slurm_value.split(",", 1)[0].split("(", 1)[0].strip()
+        try:
+            parsed = int(token)
+            if parsed > 0:
+                return parsed
+        except (TypeError, ValueError):
+            pass
+    return max(1, torch.cuda.device_count())
+
+
+def record_recovery_first_layer_start() -> None:
+    """Record the first real layer start after an active recovery."""
+    timer = _GLOBAL_RECOVERY_TO_FORWARD_TIMER
+    if timer is None or timer.get("first_layer_start_recorded", False):
+        return
+    timer["first_layer_start_recorded"] = True
+    elapsed_s = time.time() - float(timer.get("start", 0.0))
+    rank = int(timer.get("rank", 0))
+    is_node0_rank = rank < _get_ranks_per_node()
+    stash_recovery_timing_summary(
+        "recovery_first_layer_start",
+        {
+            "present": bool(is_node0_rank),
+            "elapsed_s": elapsed_s if is_node0_rank else -1.0,
+            "rank": rank,
+            "scheme": str(timer.get("scheme", "FT")),
+            "phase": str(timer.get("phase", "")),
+        },
+    )
 
 
 def stash_recovery_timing_summary(name: str, values: dict) -> None:
@@ -275,6 +326,7 @@ def flush_recovery_timing_summaries() -> None:
     pipeline = pending_summaries.get("frcheck_hw_pipeline")
     rtf = pending_summaries.get("recovery_to_forward")
     first_layer = pending_summaries.get("frcheck_first_layer_milestones")
+    recovery_first_layer = pending_summaries.get("recovery_first_layer_start")
     frcheck_forward_backward = pending_summaries.get("frcheck_forward_backward")
 
     rtf_elapsed_s = float((rtf or {}).get("elapsed_s", 0.0))
@@ -308,6 +360,20 @@ def flush_recovery_timing_summaries() -> None:
         "forward_step_to_forward_backward_done_s",
     ]
     values.extend(float((rtf or {}).get(key, 0.0)) for key in breakdown_keys)
+    recovery_first_layer_offset = len(values)
+    recovery_first_layer_present = bool(
+        (recovery_first_layer or {}).get("present", False)
+    )
+    values.extend(
+        [
+            1.0 if recovery_first_layer_present else 0.0,
+            (
+                float((recovery_first_layer or {}).get("elapsed_s", -1.0e30))
+                if recovery_first_layer_present
+                else -1.0e30
+            ),
+        ]
+    )
     frcheck_forward_backward_offset = len(values)
     frcheck_forward_backward_elapsed_s = float(
         (frcheck_forward_backward or {}).get("elapsed_s", 0.0)
@@ -469,6 +535,18 @@ def flush_recovery_timing_summaries() -> None:
                 summary["last_common_done_s"],
                 summary["last_materialize_done_s"],
                 summary["pipeline_start_delay_s"],
+            )
+        if values[recovery_first_layer_offset] > 0.0:
+            scheme = str(
+                (recovery_first_layer or {}).get(
+                    "scheme", (rtf or {}).get("scheme", "FT")
+                )
+            )
+            logger.info(
+                "%s recovery timing: "
+                "node0.all_rank.max(recovery_start_to_train_start_s)=%.6fs",
+                scheme,
+                values[recovery_first_layer_offset + 1],
             )
         if values[frcheck_forward_backward_offset] > 0.0:
             elapsed_max_s = values[frcheck_forward_backward_offset + 1]

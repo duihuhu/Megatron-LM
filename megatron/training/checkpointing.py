@@ -95,7 +95,7 @@ def _parse_rank_list(value):
 
 def _inprocess_recovery_failed_ranks(args):
     explicit = _parse_rank_list(getattr(args, "ft_inprocess_recovery_failed_ranks", None))
-    if explicit is not None:
+    if explicit is not None and not getattr(args, "use_eccheck", False):
         return explicit
     if getattr(args, "use_gemini_replicas", False):
         return _parse_rank_list(getattr(args, "gemini_replicas_recovery_rank", None))
@@ -111,23 +111,44 @@ def _inprocess_recovery_failed_ranks(args):
         )
 
         world_size = torch.distributed.get_world_size()
-        target_cluster = int(getattr(args, "eccheck_recovery_cluster", 0))
-        layout = ECCHECKManager._get_group_layout(world_size)
-        num_clusters = int(layout["clusters"] if layout["mode"] == 1 else layout["num_groups"])
-        if target_cluster < 0 or target_cluster >= num_clusters:
-            raise ValueError(
-                f"ECCHECK recovery cluster {target_cluster} is outside [0, {num_clusters - 1}]"
-            )
-        failed_group_positions = (
-            (1, 2) if getattr(args, "use_eccheck_two_failures", False) else (2,)
+        software_failure = bool(
+            getattr(args, "ft_inprocess_recovery_software_failure", False)
         )
-        return [
-            rank
-            for rank in range(world_size)
-            if ECCHECKManager._get_cluster_id(rank, world_size) == target_cluster
-            and ECCHECKManager._get_rank_in_group(rank, world_size)
-            in failed_group_positions
-        ]
+        if software_failure:
+            failed_group_positions = (1,)
+            derived = [
+                rank
+                for rank in range(world_size)
+                if ECCHECKManager._get_rank_in_group(rank, world_size)
+                in failed_group_positions
+            ]
+        else:
+            target_cluster = int(getattr(args, "eccheck_recovery_cluster", 0))
+            layout = ECCHECKManager._get_group_layout(world_size)
+            num_clusters = int(
+                layout["clusters"] if layout["mode"] == 1 else layout["num_groups"]
+            )
+            if target_cluster < 0 or target_cluster >= num_clusters:
+                raise ValueError(
+                    f"ECCHECK recovery cluster {target_cluster} is outside "
+                    f"[0, {num_clusters - 1}]"
+                )
+            failed_group_positions = (
+                (1, 2) if getattr(args, "use_eccheck_two_failures", False) else (2,)
+            )
+            derived = [
+                rank
+                for rank in range(world_size)
+                if ECCHECKManager._get_cluster_id(rank, world_size) == target_cluster
+                and ECCHECKManager._get_rank_in_group(rank, world_size)
+                in failed_group_positions
+            ]
+        if explicit is not None and sorted(set(explicit)) != sorted(set(derived)):
+            raise RuntimeError(
+                "ECCHECK explicit in-process affected ranks do not match the "
+                f"mode-derived roles: explicit={explicit}, derived={derived}"
+            )
+        return derived
     return None
 
 
@@ -478,15 +499,56 @@ def run_inprocess_ft_recovery_benchmark(
         return False
 
     rank = torch.distributed.get_rank()
-    failed_ranks = _inprocess_recovery_failed_ranks(args)
-    if not failed_ranks:
-        if getattr(args, "use_eccheck", False):
-            failed_ranks = _inprocess_recovery_failed_ranks(args)
-        if not failed_ranks:
+    software_failure = bool(
+        getattr(args, "ft_inprocess_recovery_software_failure", False)
+    )
+    if software_failure:
+        incompatible = []
+        for enabled, option in (
+            (getattr(args, "use_gemini_replicas_hardware_failure", False), "--use-gemini-replicas-hardware-failure"),
+            (getattr(args, "use_frcheck_hardware_failure", False), "--use-frcheck-hardware-failure"),
+            (getattr(args, "use_eccheck_two_failures", False), "--use-eccheck-two-failures"),
+            (getattr(args, "_ecnaive_require_hw2", False), "--ecnaive-require-hw2"),
+        ):
+            if enabled:
+                incompatible.append(option)
+        if incompatible:
             raise RuntimeError(
-                "in-process FT recovery benchmark needs failed ranks via "
-                "--ft-inprocess-recovery-failed-ranks or scheme-specific option"
+                "--ft-inprocess-recovery-software-failure is incompatible with "
+                + ", ".join(incompatible)
             )
+        if getattr(args, "use_gemini_replicas", False):
+            args.use_gemini_replicas_software_failure = True
+        elif getattr(args, "use_ecnaive", False):
+            args.use_ecnaive_software_failure = True
+        elif getattr(args, "use_eccheck", False):
+            args.use_eccheck_software_failure = True
+
+    failed_ranks = _inprocess_recovery_failed_ranks(args)
+    if software_failure and not failed_ranks:
+        if getattr(args, "use_ecnaive", False):
+            from megatron.core.dist_checkpointing.strategies.ecnaive_manager import ECNAIVEManager
+            manager = ECNAIVEManager()
+            world_size = torch.distributed.get_world_size()
+            failed_ranks = [
+                candidate for candidate in range(world_size)
+                if manager._get_rank_in_group(candidate, world_size) == 2
+            ]
+        elif getattr(args, "use_eccheck", False):
+            from megatron.core.dist_checkpointing.strategies.eccheck_manager import ECCHECKManager
+            world_size = torch.distributed.get_world_size()
+            failed_ranks = [
+                candidate for candidate in range(world_size)
+                if ECCHECKManager._get_rank_in_group(candidate, world_size) == 1
+            ]
+        elif getattr(args, "use_frcheck", False):
+            ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+            failed_ranks = list(range(min(ranks_per_node, torch.distributed.get_world_size())))
+    if not failed_ranks:
+        raise RuntimeError(
+            "in-process FT recovery needs affected ranks via "
+            "--ft-inprocess-recovery-failed-ranks or a scheme-specific option"
+        )
     world_size = torch.distributed.get_world_size()
     for failed_rank in failed_ranks:
         if failed_rank < 0 or failed_rank >= world_size:
@@ -494,16 +556,31 @@ def run_inprocess_ft_recovery_benchmark(
                 f"in-process FT recovery failed rank {failed_rank} out of range [0, {world_size - 1}]"
             )
     failed_set = set(failed_ranks)
-    _set_scheme_failed_ranks_for_inprocess(args, failed_ranks)
+    if not software_failure:
+        _set_scheme_failed_ranks_for_inprocess(args, failed_ranks)
 
     iteration, release = read_metadata(get_checkpoint_tracker_filename(args.load))
     checkpoint_name = get_checkpoint_name(args.load, iteration, release, return_base_dir=False)
+    mode = "software" if software_failure else "hardware"
     if rank == 0:
         logger.info(
-            "FT in-process recovery benchmark: run=%d/%d load=%s iteration=%s failed_ranks=%s",
-            runs_done + 1, repeat, args.load, iteration, failed_ranks,
+            "FT in-process recovery benchmark: run=%d/%d mode=%s load=%s "
+            "iteration=%s affected_ranks=%s",
+            runs_done + 1, repeat, mode, args.load, iteration, failed_ranks,
         )
     torch.distributed.barrier()
+    if software_failure:
+        scheme = next(
+            name for flag, name in (
+                ("use_gemini_replicas", "Gemini Replicas"),
+                ("use_frcheck", "FRCHECK"),
+                ("use_ecnaive", "EC-NAIVE"),
+                ("use_eccheck", "ECCHECK"),
+            ) if getattr(args, flag, False)
+        )
+        start_recovery_to_forward_timer(
+            scheme, "software_recovery", role="SW", rank0_only_max=True,
+        )
 
     state_dict = None
     args._ft_inprocess_recovery_active = True
@@ -512,30 +589,42 @@ def run_inprocess_ft_recovery_benchmark(
             from .gemini_replicas_legacy import load_gemini_replicas_legacy_checkpoint
             state_dict = load_gemini_replicas_legacy_checkpoint(checkpoint_name)
         elif getattr(args, "use_frcheck", False):
-            from .frcheck_legacy import (
-                frcheck_filter_layerwise_model_placeholders,
-                frcheck_register_pending_optimizer_state,
-                get_frcheck_layerwise_runtime_summary,
-                install_frcheck_layerwise_runtime_from_state_dict,
-                recover_frcheck_legacy_hardware,
-                wait_for_frcheck_parity_flush,
-            )
-            wait_for_frcheck_parity_flush()
-            state_dict, timings = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
-            timings["total"] = timings.get("network_encode", 0.0) + timings.get("rebuild_sd", 0.0)
-            from megatron.training.global_vars import set_ft_load_timing_context
-            set_ft_load_timing_context("FRCHECK", "HW-INPROCESS", timings)
-            if rank in failed_set:
-                install_frcheck_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
-                frcheck_filter_layerwise_model_placeholders(state_dict)
-                runtime_summary = get_frcheck_layerwise_runtime_summary()
-                if runtime_summary is not None:
-                    frcheck_register_pending_optimizer_state(state_dict)
+            if software_failure:
+                if rank == 0:
+                    logger.info(
+                        "FRCHECK software in-process workspace cache=disabled; "
+                        "native teardown is deferred for repeat safety"
+                    )
+                from .frcheck_legacy import load_frcheck_legacy_checkpoint
+                state_dict = load_frcheck_legacy_checkpoint(checkpoint_name)
+            else:
+                from .frcheck_legacy import (
+                    frcheck_filter_layerwise_model_placeholders,
+                    frcheck_register_pending_optimizer_state,
+                    get_frcheck_layerwise_runtime_summary,
+                    install_frcheck_layerwise_runtime_from_state_dict,
+                    recover_frcheck_legacy_hardware,
+                    wait_for_frcheck_parity_flush,
+                )
+                wait_for_frcheck_parity_flush()
+                state_dict, timings = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
+                timings["total"] = timings.get("network_encode", 0.0) + timings.get("rebuild_sd", 0.0)
+                from megatron.training.global_vars import set_ft_load_timing_context
+                set_ft_load_timing_context("FRCHECK", "HW-INPROCESS", timings)
+                if rank in failed_set:
+                    install_frcheck_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
+                    frcheck_filter_layerwise_model_placeholders(state_dict)
+                    runtime_summary = get_frcheck_layerwise_runtime_summary()
+                    if runtime_summary is not None:
+                        frcheck_register_pending_optimizer_state(state_dict)
         elif getattr(args, "use_ecnaive", False):
-            from .ecnaive_legacy import load_ecnaive_legacy_checkpoint_hardware_recovery
-            state_dict = load_ecnaive_legacy_checkpoint_hardware_recovery(checkpoint_name, failed_ranks)
+            if software_failure:
+                from .ecnaive_legacy import load_ecnaive_legacy_checkpoint
+                state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
+            else:
+                from .ecnaive_legacy import load_ecnaive_legacy_checkpoint_hardware_recovery
+                state_dict = load_ecnaive_legacy_checkpoint_hardware_recovery(checkpoint_name, failed_ranks)
         elif getattr(args, "use_eccheck", False):
-            # ECCHECK legacy HW recovery uses its established rank_in_group failure roles.
             from .eccheck_legacy import load_eccheck_legacy_checkpoint
             state_dict = load_eccheck_legacy_checkpoint(checkpoint_name)
         else:
@@ -545,7 +634,11 @@ def run_inprocess_ft_recovery_benchmark(
 
     h2d_start = time()
     if state_dict is not None:
-        if rank in failed_set and getattr(args, "use_frcheck", False):
+        if (
+            not software_failure
+            and rank in failed_set
+            and getattr(args, "use_frcheck", False)
+        ):
             from .frcheck_legacy import get_frcheck_layerwise_runtime_summary
             runtime_summary = get_frcheck_layerwise_runtime_summary()
             if runtime_summary is None:
@@ -563,7 +656,8 @@ def run_inprocess_ft_recovery_benchmark(
                 mark_recovery_to_forward_timer("inprocess_scheduler_done")
         else:
             defer_frcheck_optimizer = bool(
-                getattr(args, "use_frcheck", False)
+                not software_failure
+                and getattr(args, "use_frcheck", False)
                 and rank not in failed_set
                 and optimizer is not None
                 and not getattr(optimizer, "is_stub_optimizer", False)
@@ -609,7 +703,20 @@ def run_inprocess_ft_recovery_benchmark(
     h2d_total_s = time() - h2d_start
     mark_recovery_to_forward_timer("h2d_done")
     _stash_inprocess_ft_load_timing(h2d_total_s)
-    mark_recovery_to_forward_timer("inprocess_post_h2d_barrier_skipped")
+    post_h2d_barrier_required = (
+        torch.distributed.is_initialized()
+        and any(
+            getattr(args, scheme_flag, False)
+            for scheme_flag in ("use_gemini_replicas", "use_ecnaive", "use_eccheck")
+        )
+    )
+    if post_h2d_barrier_required:
+        # Keep unified in-process recovery ranks aligned after H2D while recovery timing is active.
+        torch.distributed.barrier()
+        mark_recovery_to_forward_timer("inprocess_post_h2d_barrier_done")
+    else:
+        # FRCheck and the native legacy baseline intentionally keep their existing no-barrier path.
+        mark_recovery_to_forward_timer("inprocess_post_h2d_barrier_skipped")
     _mark_inprocess_recovery_cycle_done()
     return True
 
@@ -1062,8 +1169,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 raise RuntimeError(
                     "EC-NAIVE --ecnaive-failed-ranks requires torch.distributed to be initialized"
                 )
-            # Parse comma-separated list
-            failed_ranks = [int(x.strip()) for x in ecnaive_failed_ranks_str.split(",")]
+            # Parse, de-duplicate, and canonicalize before any recovery network starts.
+            try:
+                failed_ranks = sorted({
+                    int(x.strip()) for x in ecnaive_failed_ranks_str.split(",") if x.strip()
+                })
+            except ValueError as exc:
+                raise RuntimeError(
+                    "EC-NAIVE --ecnaive-failed-ranks must be a comma-separated integer list"
+                ) from exc
             if len(failed_ranks) < 1:
                 raise RuntimeError(
                     "EC-NAIVE --ecnaive-failed-ranks requires at least 1 rank"
@@ -1090,6 +1204,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     raise RuntimeError(
                         f"EC-NAIVE --ecnaive-failed-ranks: group {gid} has {count} failed ranks, "
                         f"but RS({ecnaive_k}+2,{ecnaive_k}) supports at most {max_per_group} per group"
+                    )
+            if getattr(args, "_ecnaive_require_hw2", False):
+                non_pairs = {gid: count for gid, count in group_counts.items() if count != 2}
+                if non_pairs or len(failed_ranks) < 2:
+                    raise RuntimeError(
+                        "EC-NAIVE HW2 requires exactly two failed ranks in every targeted "
+                        f"group; observed {dict(group_counts)}"
                     )
             logger.info(
                 f"EC-NAIVE: {len(failed_ranks)} failed ranks across "

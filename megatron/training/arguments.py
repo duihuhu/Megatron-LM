@@ -390,6 +390,21 @@ def validate_args(args, defaults={}):
             raise RuntimeError(
                 "--ft-inprocess-recovery-repeat must be >= 1"
             )
+        if getattr(args, "ft_inprocess_recovery_software_failure", False):
+            incompatible = []
+            for enabled, option in (
+                (getattr(args, "use_gemini_replicas_hardware_failure", False), "--use-gemini-replicas-hardware-failure"),
+                (getattr(args, "use_frcheck_hardware_failure", False), "--use-frcheck-hardware-failure"),
+                (getattr(args, "use_eccheck_two_failures", False), "--use-eccheck-two-failures"),
+                (getattr(args, "_ecnaive_require_hw2", False), "--ecnaive-require-hw2"),
+            ):
+                if enabled:
+                    incompatible.append(option)
+            if incompatible:
+                raise RuntimeError(
+                    "--ft-inprocess-recovery-software-failure is incompatible with "
+                    + ", ".join(incompatible)
+                )
         if train_iter is None and save_iter is not None:
             args.ft_inprocess_recovery_after_train_iter = save_iter
     if getattr(args, "no_shared_block", False):
@@ -2329,8 +2344,11 @@ def _add_checkpointing_args(parser):
                             'only on the penultimate training iteration (train_iters - 1).')
     group.add_argument('--ft-inprocess-recovery-benchmark', action='store_true',
                        help='After warmup training iterations in a checkpoint-loaded process, run one '
-                            'simulated hardware recovery before the next training step so recovery-to-forward '
-                            'timing excludes process restart and cold checkpoint load overhead.')
+                            'simulated hardware or software recovery before the next training step so '
+                            'recovery-to-forward timing excludes process restart and cold load overhead.')
+    group.add_argument('--ft-inprocess-recovery-software-failure', action='store_true',
+                       help='Run the in-process benchmark through the selected scheme software-failure '
+                            'loader instead of its hardware-recovery path.')
     group.add_argument('--ft-inprocess-recovery-after-train-iter', type=int, default=None,
                        help='Completed training iteration after which --ft-inprocess-recovery-benchmark runs. '
                             'If unset, the first completed training iteration triggers it.')
@@ -2425,6 +2443,8 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ecnaive-hw-debug', action='store_true',
                        help='Debug HW recovery by using main.pt tensor_buffer directly '
                             '(bypasses RS decode/encode).')
+    group.add_argument('--ecnaive-require-hw2', action='store_true', dest='_ecnaive_require_hw2',
+                       help='Require exactly two failed ranks in every targeted EC-NAIVE group.')
 
     group.add_argument('--use-frcheck', action='store_true',
                        help='Enable FRCheck legacy checkpoint skeleton: validates POA file via native module '

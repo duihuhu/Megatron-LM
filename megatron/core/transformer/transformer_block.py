@@ -68,6 +68,8 @@ logger = logging.getLogger(__name__)
 _frcheck_wait_layer_hook = None
 _frcheck_forward_done_hook = None
 _frcheck_hooks_loaded = False
+_recovery_first_layer_start_hook = None
+_recovery_first_layer_start_hook_loaded = False
 
 
 def _load_frcheck_layer_hooks() -> None:
@@ -100,6 +102,20 @@ def _frcheck_record_layer_forward_done(layer_idx: int) -> None:
         _load_frcheck_layer_hooks()
     if _frcheck_forward_done_hook is not None:
         _frcheck_forward_done_hook(layer_idx)
+
+
+def _record_recovery_first_layer_start() -> None:
+    """Record the first layer start for any active recovery scheme."""
+    global _recovery_first_layer_start_hook, _recovery_first_layer_start_hook_loaded
+    if not _recovery_first_layer_start_hook_loaded:
+        _recovery_first_layer_start_hook_loaded = True
+        try:
+            from megatron.training.global_vars import record_recovery_first_layer_start
+        except ImportError:
+            return
+        _recovery_first_layer_start_hook = record_recovery_first_layer_start
+    if _recovery_first_layer_start_hook is not None:
+        _recovery_first_layer_start_hook()
 
 
 def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
@@ -420,6 +436,8 @@ class TransformerBlock(MegatronModule):
                 for index in range(start, end):
                     layer = self._get_layer(index)
                     _frcheck_wait_for_layer(index)
+                    if index == 0:
+                        _record_recovery_first_layer_start()
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
@@ -615,6 +633,8 @@ class TransformerBlock(MegatronModule):
             else:
                 for l_no, layer in enumerate(self.layers):
                     _frcheck_wait_for_layer(l_no)
+                    if l_no == 0:
+                        _record_recovery_first_layer_start()
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context

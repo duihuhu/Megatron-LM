@@ -67,7 +67,7 @@ DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 SHM_PKT="/dev/shm/shm_pkt"
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess|inprocess2|inprocess_sw)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -102,7 +102,20 @@ case "$MODE" in
             --eccheck-recovery-cluster $ECCHECK_RECOVERY_CLUSTER
         )
         ;;
-    inprocess)
+    inprocess_sw)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --use-eccheck-software-failure
+            --ft-inprocess-recovery-benchmark
+            --ft-inprocess-recovery-software-failure
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
+            --eccheck-recovery-cluster $ECCHECK_RECOVERY_CLUSTER
+        )
+        ;;
+    inprocess|inprocess2)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --ft-inprocess-recovery-benchmark
@@ -112,6 +125,9 @@ case "$MODE" in
             --ft-inprocess-recovery-exit-after-forward
             --eccheck-recovery-cluster $ECCHECK_RECOVERY_CLUSTER
         )
+        if [ "$MODE" = "inprocess2" ]; then
+            RECOVERY_MODE_ARGS+=(--use-eccheck-two-failures)
+        fi
         ;;
 esac
 

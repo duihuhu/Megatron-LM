@@ -1378,9 +1378,11 @@ def _run_eccheck_two_failures_recovery(
     rank: int,
     world_size: int,
     blocks: Dict[str, Any],
+    source_blocks: Dict[str, torch.Tensor],
     recovered_buffer: Optional[torch.Tensor],
     total_size: int,
     registry: GlobalMetadataRegistry,
+    native_prepared: bool = False,
 ) -> float:
     """Drive C++ two-failure recovery for ECCHECK legacy load.
 
@@ -1403,8 +1405,9 @@ def _run_eccheck_two_failures_recovery(
     is_failed = rank_in_group in (1, 2)
     is_survivor = rank_in_group in (0, 3)
 
-    # Set C++ to two-failure mode (failed_rank=10, following ECLATIN convention)
-    native.set_load_mode(True, 10)
+    # HW2 uses persistent save-path workers; reset the completed cycle before submission.
+    if not native_prepared:
+        manager.reset_native_for_inprocess_recovery(10)
     logger.debug(
         f"ECCHECK legacy two-failures: load mode set (failed_rank=10), "
         f"rank={rank}, rank_in_group={rank_in_group}"
@@ -1466,6 +1469,21 @@ def _run_eccheck_two_failures_recovery(
     partner_base = int(blocks["partner_buffer"].data_ptr())
     own_buf = blocks["own_buffer"]
     partner_buf = blocks["partner_buffer"]
+    if rank_in_group == 0:
+        input_buf = source_blocks.get("d0")
+        phase1_buf = source_blocks.get("d1")
+    elif rank_in_group == 3:
+        input_buf = source_blocks.get("p3")
+        phase1_buf = source_blocks.get("p2")
+    elif rank_in_group == 1:
+        input_buf = partner_buf
+        phase1_buf = None
+    else:
+        input_buf = own_buf
+        phase1_buf = None
+    if input_buf is None or (is_survivor and phase1_buf is None):
+        raise RuntimeError(f"ECCHECK HW2 immutable sources missing for rig{rank_in_group}")
+    input_base = int(input_buf.data_ptr())
 
     if active_event is not None:
         active_event.set()
@@ -1485,9 +1503,9 @@ def _run_eccheck_two_failures_recovery(
         )
         send_size = min(
             _rank_data_transfer_bytes(registry, rig1_rank, world_size),
-            partner_buf.numel(),
+            phase1_buf.numel(),
         )
-        native.simple_p2p_send(int(partner_buf.data_ptr()), send_size)
+        native.simple_p2p_send(int(phase1_buf.data_ptr()), send_size)
         logger.debug(
             f"ECCHECK two-failures: rig0 sent d1 to rig1 "
             f"({send_size / (1024**3):.2f} GB)"
@@ -1512,8 +1530,8 @@ def _run_eccheck_two_failures_recovery(
             f"({recv_size / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 3:
-        send_size = min(phase1_parity_bytes, partner_buf.numel())
-        native.simple_p2p_send(int(partner_buf.data_ptr()), send_size)
+        send_size = min(phase1_parity_bytes, phase1_buf.numel())
+        native.simple_p2p_send(int(phase1_buf.data_ptr()), send_size)
         logger.debug(
             f"ECCHECK two-failures: rig3 sent p2 to rig2 "
             f"({send_size / (1024**3):.2f} GB)"
@@ -1537,56 +1555,16 @@ def _run_eccheck_two_failures_recovery(
             buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
             buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
 
-            if rank_in_group == 0:
-                # Survivor: use d0 from own_buffer (loaded from disk)
-                src_off = processed
-                bytes_to_copy = min(take, own_buf.numel() - src_off)
-                if bytes_to_copy > 0:
-                    ctypes.memmove(buffer_array.contents,
-                                   own_base + src_off, bytes_to_copy)
-                if take > bytes_to_copy:
-                    ctypes.memset(
-                        ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
-                                    ctypes.POINTER(ctypes.c_uint8)),
-                        0, take - bytes_to_copy)
-            elif rank_in_group == 1:
-                # Failed: use d1 from partner_buffer (received via Phase 1 P2P from rig0)
-                src_off = processed
-                bytes_to_copy = min(take, partner_buf.numel() - src_off)
-                if bytes_to_copy > 0:
-                    ctypes.memmove(buffer_array.contents,
-                                   partner_base + src_off, bytes_to_copy)
-                if take > bytes_to_copy:
-                    ctypes.memset(
-                        ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
-                                    ctypes.POINTER(ctypes.c_uint8)),
-                        0, take - bytes_to_copy)
-            elif rank_in_group == 2:
-                # Failed: use p2 from own_buffer (received via Phase 1 P2P from rig3)
-                src_off = processed
-                bytes_to_copy = min(take, own_buf.numel() - src_off)
-                if bytes_to_copy > 0:
-                    ctypes.memmove(buffer_array.contents,
-                                   own_base + src_off, bytes_to_copy)
-                if take > bytes_to_copy:
-                    ctypes.memset(
-                        ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
-                                    ctypes.POINTER(ctypes.c_uint8)),
-                        0, take - bytes_to_copy)
-            elif rank_in_group == 3:
-                # Survivor: use d3 from own_buffer (loaded from disk)
-                src_off = processed
-                bytes_to_copy = min(take, own_buf.numel() - src_off)
-                if bytes_to_copy > 0:
-                    ctypes.memmove(buffer_array.contents,
-                                   own_base + src_off, bytes_to_copy)
-                if take > bytes_to_copy:
-                    ctypes.memset(
-                        ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
-                                    ctypes.POINTER(ctypes.c_uint8)),
-                        0, take - bytes_to_copy)
-            else:
-                ctypes.memset(buffer_array.contents, 0, take)
+            src_off = processed
+            bytes_to_copy = min(take, max(0, input_buf.numel() - src_off))
+            if bytes_to_copy > 0:
+                ctypes.memmove(buffer_array.contents, input_base + src_off, bytes_to_copy)
+            if take > bytes_to_copy:
+                ctypes.memset(
+                    ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
+                                ctypes.POINTER(ctypes.c_uint8)),
+                    0, take - bytes_to_copy,
+                )
 
             # ---- Phase 3: allocate encoding buffers (TWO per chunk) ----
             enc_addr_0 = _get_free_encoding()  # for parity row 0
@@ -1841,7 +1819,7 @@ def _eccheck_inprocess_bootstrap_key(
         sorted((name, value) for name, value in os.environ.items()
                if name.startswith("ECCHECK_RANK_IP_") or name.startswith("ECCHECK_LOCAL_RANK_NIC_"))
     )
-    failed_roles = (1, 2) if mode == "HW2" else (2,)
+    failed_roles = (1, 2) if mode == "HW2" else ((1,) if mode == "SW" else (2,))
     return (
         str(checkpoint_dir.resolve()), _eccheck_input_file_signature(checkpoint_dir),
         rank, world_size, tuple(sorted(layout.items())), cluster_id, rank_in_group,
@@ -1913,8 +1891,6 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     inprocess_cache = bool(
         getattr(args, "ft_inprocess_recovery_benchmark", False)
         and getattr(args, "_ft_inprocess_recovery_active", False)
-        and not sw_failure
-        and not two_failures
     )
     if two_failures:
         _mode = "HW2"
@@ -1959,7 +1935,10 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         registry = workspace["registry"]
         total_size = workspace["total_size"]
         blocks = workspace["blocks"]
+        source_blocks = workspace.get("source_blocks", {})
         recovered_buffer = workspace["recovered_buffer"]
+        if workspace.get("recv_buffers") is not manager.eccheck_recv_encoding_buffers:
+            raise RuntimeError("ECCHECK cached receive-buffer identity changed")
         cache_status = "hit"
     else:
         cache_status = "miss"
@@ -1996,12 +1975,23 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         else:
             blocks = {}
         recovered_buffer: Optional[torch.Tensor] = None
+        source_blocks: Dict[str, torch.Tensor] = {}
 
         if not recovery_cluster_active:
             pass
         elif two_failures:
             actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
             blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
+            if rank_in_group in (0, 3):
+                source_names = ("d0", "d1") if rank_in_group == 0 else ("p3", "p2")
+                source_tensors = allocate_hugepage_slices(
+                    blocks["aligned_size"], len(source_names),
+                    fallback_pin_memory=torch.cuda.is_available(), touch_pages=True,
+                )
+                source_blocks = dict(zip(source_names, source_tensors))
+                if manager.use_rdma and inprocess_cache:
+                    for source in source_blocks.values():
+                        manager.register_buffer(source)
             if rank_in_group in (1, 2):
                 recovered_buffer = _allocate_recovered_buffer(actual_tensor_bytes, True)
                 total_size = actual_tensor_bytes
@@ -2023,6 +2013,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
         if (
             inprocess_cache
+            and not sw_failure
             and manager.eccheck_recv_encoding_buffers is None
             and recovery_cluster_active
         ):
@@ -2035,10 +2026,24 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
         disk_start = time.perf_counter()
         if recovery_cluster_active:
-            if two_failures and rank_in_group in (0, 3):
-                _load_eccheck_blocks_from_disk_into(
-                    blocks, checkpoint_dir, rank, rank_in_group,
-                    software_failure=False, two_failures=True,
+            if two_failures and rank_in_group == 0:
+                tensor_buffer = main_payload.get("tensor_buffer")
+                if not isinstance(tensor_buffer, torch.Tensor):
+                    raise RuntimeError("ECCHECK HW2 rig0 requires main tensor_buffer as authoritative d0")
+                d0 = _tensor_buffer_as_uint8_view(tensor_buffer)
+                source_blocks["d0"].zero_()
+                source_blocks["d0"][:min(d0.numel(), source_blocks["d0"].numel())].copy_(
+                    d0[:min(d0.numel(), source_blocks["d0"].numel())]
+                )
+                _copy_block_file_into_tensor(
+                    checkpoint_dir, rank, "partner_buffer", source_blocks["d1"]
+                )
+            elif two_failures and rank_in_group == 3:
+                _copy_block_file_into_tensor(
+                    checkpoint_dir, rank, "own_buffer", source_blocks["p3"]
+                )
+                _copy_block_file_into_tensor(
+                    checkpoint_dir, rank, "partner_buffer", source_blocks["p2"]
                 )
             elif sw_failure and rank_in_group == 0:
                 _load_eccheck_blocks_from_disk_into(
@@ -2058,14 +2063,16 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             workspace = {
                 "main_payload": main_payload, "rank_metadata": rank_metadata,
                 "registry": registry, "total_size": total_size, "blocks": blocks,
-                "recovered_buffer": recovered_buffer, "workspace_key": workspace_key,
+                "source_blocks": source_blocks, "recovered_buffer": recovered_buffer,
+                "recv_buffers": manager.eccheck_recv_encoding_buffers,
+                "workspace_key": workspace_key,
             }
             manager.install_legacy_inprocess_workspace(workspace_key, workspace)
 
     native_start = time.perf_counter()
     native_prepared = False
-    if inprocess_cache and recovery_cluster_active:
-        manager.reset_native_for_inprocess_recovery(2)
+    if inprocess_cache and recovery_cluster_active and not sw_failure:
+        manager.reset_native_for_inprocess_recovery(10 if two_failures else 2)
         native_prepared = True
     native_reset_s = time.perf_counter() - native_start
 
@@ -2080,10 +2087,11 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         })
         if rank == 0:
             logger.info(
-                "ECCHECK in-process setup cache=%s metadata_plan_s=%.3f "
+                "ECCHECK %s in-process setup cache=%s metadata_plan_s=%.3f "
                 "disk_preload_s=%.3f alloc_touch_register_s=%.3f "
                 "native_reset_s=%.3f total_s=%.3f",
-                cache_status, setup_summary["metadata_plan_s"],
+                "software" if sw_failure else "hardware", cache_status,
+                setup_summary["metadata_plan_s"],
                 setup_summary["disk_preload_s"],
                 setup_summary["alloc_touch_register_s"],
                 setup_summary["native_reset_s"], setup_summary["total_s"],
@@ -2117,9 +2125,11 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             rank=rank,
             world_size=world_size,
             blocks=blocks,
+            source_blocks=source_blocks,
             recovered_buffer=recovered_buffer,
             total_size=total_size,
             registry=registry,
+            native_prepared=native_prepared,
         )
     else:
         network_encode = _run_eccheck_legacy_recovery(
@@ -2188,6 +2198,23 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         "rebuild_sd_s=%(rebuild_sd).2fs barrier_s=%(barrier).2fs",
         load_log,
     )
+
+    prebenchmark_software_load = bool(
+        sw_failure
+        and getattr(args, "ft_inprocess_recovery_benchmark", False)
+        and not getattr(args, "_ft_inprocess_recovery_active", False)
+    )
+    if (
+        prebenchmark_software_load
+        and manager.use_rdma
+        and recovered_buffer is not None
+    ):
+        manager.unregister_buffer(recovered_buffer)
+        if rank == 0:
+            logger.info(
+                "ECCHECK software preload: retained native P2P topology and "
+                "released temporary recovery-buffer registration"
+            )
 
     if should_time_recovery_to_forward:
         try:

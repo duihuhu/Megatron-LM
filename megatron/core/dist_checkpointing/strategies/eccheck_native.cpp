@@ -3693,10 +3693,28 @@ public:
             pending_encoding_tasks_.clear();
         }
         
-        // Clear pending XOR encoding
+        // Clear pending XOR encoding and save-path address maps.
         {
             std::lock_guard<std::mutex> lock(pending_xor_mutex_);
             pending_xor_encoding_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(recv_to_parity_mutex_);
+            recv_to_parity_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(recv_to_data_mutex_);
+            recv_to_data_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(recv_to_p2p_mutex_);
+            recv_to_p2p_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(release_queue_mutex_);
+            while (!data_buffers_to_release_.empty()) data_buffers_to_release_.pop();
+            while (!encoding_buffers_to_release_.empty()) encoding_buffers_to_release_.pop();
+            while (!parity_buffers_to_release_.empty()) parity_buffers_to_release_.pop();
         }
         
         // Clear load mode queues
@@ -4156,7 +4174,7 @@ public:
     pybind11::dict get_ft_timing_stats() const {
         double net_s = 0.0;
         double encode_s = 0.0;
-        if (is_load_mode_) {
+        if (is_load_mode_ && !is_two_failures_load_mode_) {
             net_s = static_cast<double>(
                 load_net_wall_span_ns_.load(std::memory_order_relaxed)) / 1e9;
             const uint64_t enc_total_ns =
@@ -4321,7 +4339,7 @@ public:
             load_step6_p2p_send_worker_.joinable() || load_step6_p2p_recv_worker_.joinable();
 
         // Start load workers when entering load mode and no previous load worker remains.
-        if (is_load && !load_workers_active) {
+        if (is_load && !is_two_failures_load_mode_ && !load_workers_active) {
             // Reset all load worker flags
             load_encoding_completed_ = false;
             load_encoding_sentinel_received_ = false;

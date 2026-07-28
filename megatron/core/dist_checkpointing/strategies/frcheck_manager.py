@@ -968,6 +968,16 @@ class FRCheckManager:
                 'helper_positions': helper_positions,
                 'survivor_positions': survivor_positions,
                 'original_role': int(sp.role),
+                # HW2 must restore SOURCE data and the first parity block (p0)
+                # in the critical per-layer phase to retain one-failure tolerance.
+                'recovery_kind': (
+                    'data' if any(
+                        target['original_role'] in (
+                            int(StripeRole.SOURCE), int(StripeRole.ENCODER)
+                        )
+                        for target in failed_targets
+                    ) else 'parity'
+                ),
             })
         return plans
 
@@ -991,13 +1001,14 @@ class FRCheckManager:
             my_node = self.rank_in_group + 1
 
             if my_node == plan['decoder_node']:
-                # Allocate recv buffer for helpers' blocks + decode output
+                # Allocate recv buffer for helpers plus one output per erasure.
+                output_count = 2 if plan.get('dual_failure') else 1
                 recv_sz = num_helper * block_sz
                 from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
                     allocate_hugepage_slices, allocate_hugepage_tensor,
                 )
                 self.recovery_decoder_bufs[sid] = torch.empty(
-                    recv_sz + block_sz, dtype=torch.uint8, device="cuda"
+                    recv_sz + output_count * block_sz, dtype=torch.uint8, device="cuda"
                 )
                 native.register_buffer(
                     self.recovery_decoder_bufs[sid].data_ptr(),
@@ -1012,7 +1023,10 @@ class FRCheckManager:
                     self.recovery_helper_bufs[sid].data_ptr(),
                     self.recovery_helper_bufs[sid].numel())
 
-            elif my_node == plan['failed_node']:
+            elif (
+                my_node in plan.get('failed_nodes', [])
+                if plan.get('dual_failure') else my_node == plan.get('failed_node')
+            ):
                 # Allocate recv buffer for decoded block
                 from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
                     allocate_hugepage_tensor,

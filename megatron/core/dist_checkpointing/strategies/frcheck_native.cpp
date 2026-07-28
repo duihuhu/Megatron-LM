@@ -993,22 +993,30 @@ public:
         uintptr_t recovered_addr,
         size_t block_size)
     {
-        if (stopped_) return;
+        if (stopped_)
+            throw std::runtime_error("FRCheck decode: native runtime is stopped");
+        if (k <= 0 || block_size == 0 || recovered_addr == 0)
+            throw std::runtime_error("FRCheck decode: invalid decode arguments");
         int surviving_count = k;
         if ((int)survivor_positions.size() != surviving_count ||
             (int)survivor_addrs.size() != surviving_count) {
-            std::cerr << "FRCheck decode: survivor count mismatch" << std::endl;
-            return;
+            throw std::runtime_error(
+                "FRCheck decode: survivor count/address mismatch: positions=" +
+                std::to_string(survivor_positions.size()) + " addrs=" +
+                std::to_string(survivor_addrs.size()) + " expected=" +
+                std::to_string(surviving_count));
+        }
+        for (uintptr_t addr : survivor_addrs) {
+            if (addr == 0)
+                throw std::runtime_error("FRCheck decode: null survivor address");
         }
 
         std::lock_guard<std::mutex> lk(decode_mtx_);
 
         // Build decode tables for this stripe
         init_decode_tables_(k, survivor_positions, lost_position);
-        if (!decode_tbls_) {
-            std::cerr << "FRCheck decode: failed to init decode tables" << std::endl;
-            return;
-        }
+        if (!decode_tbls_)
+            throw std::runtime_error("FRCheck decode: failed to initialize decode tables");
 
         // Run parallel decode via RS pool (reuses encode pool)
         if (rs_pool_inited_.load(std::memory_order_acquire)) {
@@ -1264,7 +1272,8 @@ public:
         bool store_to_layer_buf,
         bool active)
     {
-        if (stopped_) return;
+        if (stopped_)
+            throw std::runtime_error("FRCheck recovery submit: native runtime is stopped");
         ensure_recovery_batch_exists_(batch_id);
         if (stripe_id < 0 || stripe_id >= (int)recovery_plans_.size())
             throw std::runtime_error("FRCheck: invalid recovery stripe_id");
@@ -1705,6 +1714,19 @@ private:
                              int lost_position) {
         int m_parity = 2;
         int full_rows = k + m_parity;  // = n
+        if ((int)survivor_positions.size() != k)
+            throw std::runtime_error("FRCheck decode table: survivor count mismatch");
+        if (lost_position < 0 || lost_position >= full_rows)
+            throw std::runtime_error("FRCheck decode table: lost position out of range");
+        std::set<int> unique_positions;
+        for (int pos : survivor_positions) {
+            if (pos < 0 || pos >= full_rows)
+                throw std::runtime_error("FRCheck decode table: survivor position out of range");
+            if (pos == lost_position)
+                throw std::runtime_error("FRCheck decode table: lost position listed as survivor");
+            if (!unique_positions.insert(pos).second)
+                throw std::runtime_error("FRCheck decode table: duplicate survivor position");
+        }
 
         // Free old decode tables
         if (decode_tbls_) { free(decode_tbls_); decode_tbls_ = nullptr; }
@@ -1720,7 +1742,6 @@ private:
         std::vector<unsigned char> A((size_t)k * (size_t)k, 0);
         int a_row = 0;
         for (int pos : survivor_positions) {
-            if (pos < 0 || pos >= full_rows) continue;
             if (pos < k) {
                 A[a_row * k + pos] = 1;
             } else {
@@ -1737,8 +1758,9 @@ private:
         for (int i = 0; i < k * k; ++i) inv_workspace[i] = A[i];
         int ret = gf_invert_matrix(inv_workspace.data(), A_inv.data(), k);
         if (ret != 0) {
-            std::cerr << "FRCheck: gf_invert_matrix failed (singular), ret=" << ret << std::endl;
-            return;
+            throw std::runtime_error(
+                "FRCheck decode table: gf_invert_matrix failed, ret=" +
+                std::to_string(ret));
         }
 
         // Step 4: Extract decode coefficients from A_inv
@@ -1769,7 +1791,8 @@ private:
         if (posix_memalign(&tmp, 32, tbl_size) != 0) tmp = nullptr;
         if (tmp == nullptr) tmp = malloc(tbl_size);
         decode_tbls_ = (unsigned char*)tmp;
-        if (!decode_tbls_) return;
+        if (!decode_tbls_)
+            throw std::runtime_error("FRCheck decode table: allocation failed");
         ec_init_tables(k, 1, decode_mat.data(), decode_tbls_);
     }
 

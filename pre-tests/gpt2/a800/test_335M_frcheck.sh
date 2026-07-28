@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# FRCheck (POA-driven stripe encode with RDMA) — single-node script.
-# Usage: ./test_eccheck_4nodes_node_335M_frcheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]
-# Example: ./test_eccheck_4nodes_node_335M_frcheck.sh 0 0
-# Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_frcheck.sh 0 2 3
+# FRCheck (POA-driven stripe encode with RDMA) multi-node script.
+# Usage: ./test_335M_frcheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [mode] [additional_args...]
+# Example: ./test_335M_frcheck.sh 0 0
+# Example (2 GPUs per container): ./test_335M_frcheck.sh 0 2 3 inprocess2
 export FRCHECK_ENABLE_RECOVERY_PARITY_REPAIR=1
 export FRCHECK_RECOVERY_SKIP_PADDING=0
 #export FRCHECK_TRACE_INIT=1
@@ -56,11 +56,24 @@ done
 
 if [ "${#GPU_IDS[@]}" -eq 0 ]; then
     echo "Error: At least one GPU id must be specified."
-    echo "Usage: ./test_eccheck_4nodes_node_335M_frcheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]"
+    echo "Usage: ./test_335M_frcheck.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [mode] [additional_args...]"
     exit 1
 fi
 
 GPUS_PER_NODE=${#GPU_IDS[@]}
+
+make_rank_range() {
+    local count=$1
+    local ranks=()
+    local rank
+    for ((rank=0; rank<count; rank++)); do
+        ranks+=("$rank")
+    done
+    (IFS=,; echo "${ranks[*]}")
+}
+
+FRCHECK_SINGLE_NODE_FAILED_RANKS=${FRCHECK_FAILED_RANKS:-$(make_rank_range "$GPUS_PER_NODE")}
+FRCHECK_TWO_NODE_FAILED_RANKS=${FRCHECK_HW2_FAILED_RANKS:-$(make_rank_range "$((2 * GPUS_PER_NODE))")}
 
 export CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_IDS[*]}")
 export NCCL_DEBUG_FILE=./nccl.log.node${NODE_RANK}
@@ -76,7 +89,7 @@ DATA_PATH="/workspace/models/gpt2-345m-0/codeparrot_content_document"
 SHM_PKT="/dev/shm/shm_pkt"
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess|inprocess2|inprocess_sw)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -86,6 +99,24 @@ fi
 ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-3}
+
+set_inprocess_recovery_args() {
+    local failed_ranks=$1
+    RECOVERY_MODE_ARGS=(
+        --load $CHECKPOINT_PATH
+        --ft-inprocess-recovery-benchmark
+        --rerun-mode disabled
+        --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+        --ft-inprocess-recovery-failed-ranks "$failed_ranks"
+        --ft-inprocess-recovery-after-train-iter 0
+        --ft-inprocess-recovery-exit-after-forward
+        --frcheck-async-recovery-forward
+        --frcheck-recovery-safe-point optimizer_step
+        --frcheck-recovery-only-teardown
+        --num-workers 0
+    )
+}
+
 case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
@@ -107,7 +138,7 @@ case "$MODE" in
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
             --frcheck-async-recovery-forward
-            --frcheck-failed-ranks "0"
+            --frcheck-failed-ranks "$FRCHECK_SINGLE_NODE_FAILED_RANKS"
             --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
             # Native RDMA stays alive until optimizer_step; forked DataLoader workers segfault.
@@ -118,27 +149,35 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
-            --frcheck-failed-ranks "0,1"
-        )
-        ;;
-    inprocess)
-        RECOVERY_MODE_ARGS=(
-            --load $CHECKPOINT_PATH
-            --ft-inprocess-recovery-benchmark
-            --rerun-mode disabled
-            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
-            --ft-inprocess-recovery-failed-ranks "0"
-            --ft-inprocess-recovery-after-train-iter 0
-            --ft-inprocess-recovery-exit-after-forward
             --frcheck-async-recovery-forward
+            --frcheck-failed-ranks "$FRCHECK_TWO_NODE_FAILED_RANKS"
             --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
+            # Native RDMA stays alive until optimizer_step; forked DataLoader workers segfault.
             --num-workers 0
         )
         ;;
+    inprocess_sw)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --ft-inprocess-recovery-benchmark
+            --ft-inprocess-recovery-software-failure
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-failed-ranks "$FRCHECK_SINGLE_NODE_FAILED_RANKS"
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
+        )
+        ;;
+    inprocess)
+        set_inprocess_recovery_args "$FRCHECK_SINGLE_NODE_FAILED_RANKS"
+        ;;
+    inprocess2)
+        set_inprocess_recovery_args "$FRCHECK_TWO_NODE_FAILED_RANKS"
+        ;;
 esac
 
-if [[ "$MODE" =~ ^(hardware|hardware2|inprocess)$ ]] \
+if [[ "$MODE" =~ ^(hardware|hardware2|inprocess|inprocess2)$ ]] \
     && [ "${FRCHECK_RECOVERY_ASYNC_PARITY:-1}" != "0" ]; then
     RECOVERY_MODE_ARGS+=(--frcheck-recovery-async-parity)
 fi

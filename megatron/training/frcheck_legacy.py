@@ -750,6 +750,8 @@ class _FRCheckLayerRecoveryJob:
     layer_block_size: int
     actual_size: int
     layer_infos: List
+    target_actual_sizes: Dict[int, int]
+    member_actual_sizes: Dict[int, int]
 
 
 @dataclass
@@ -1341,6 +1343,8 @@ def _make_pending_layerwise_records(
             encode_iter, rank, is_failed, main_payload, all_layer_order,
             all_layer_metadata, all_frcheck_dirs, checkpoint_dir, saved_block_size,
             recovery_rank=recovery_rank,
+            failed_group_ranks=[rank] if is_failed else [],
+            group_members=[rank],
         )
         if job is None or job.layer_idx < 0:
             continue
@@ -2319,20 +2323,6 @@ def _gather_all_frcheck_dirs(
         torch.distributed.all_gather_object(gathered, my_dir)
         return [_path_from_gathered_entry(p, "frcheck dir gather") for p in gathered]
     return [Path(my_dir)]
-
-
-def _primary_failed_rank_in_group(
-    failed_global_ranks: List[int],
-    group_members: List[int],
-) -> Optional[int]:
-    """Return the failed global rank in this FRCheck group, if any."""
-    failed_set = set(failed_global_ranks or [])
-    for member in group_members or []:
-        if member in failed_set:
-            return member
-    return None
-
-
 
 
 def _prep_layer_phase1(
@@ -4473,6 +4463,20 @@ def _max_layer_block_size(
     return max_bs
 
 
+def _recovery_common_wave_size(n: int) -> int:
+    """Return the role-independent recovery wave size for every POA rank."""
+    max_concurrency = max((n - 1) * (n - 2), 1)
+    configured = os.environ.get("FRCHECK_RECOVERY_CONCURRENCY")
+    if configured is None:
+        return max_concurrency
+    try:
+        return max(1, min(int(configured), max_concurrency))
+    except ValueError as exc:
+        raise RuntimeError(
+            "FRCheck recovery: FRCHECK_RECOVERY_CONCURRENCY must be an integer"
+        ) from exc
+
+
 def _allocate_recovery_buf_pool(
     native,
     n: int,
@@ -4495,13 +4499,9 @@ def _allocate_recovery_buf_pool(
     # per-window in the network path.
     max_concurrency = max(num_source_stripes, 1)
     if concurrency_override is not None:
-        concurrency = max(1, int(concurrency_override))
+        concurrency = max(1, min(int(concurrency_override), max_concurrency))
     else:
-        env_concurrency = os.environ.get("FRCHECK_RECOVERY_CONCURRENCY")
-        if env_concurrency:
-            concurrency = max(1, min(int(env_concurrency), max_concurrency))
-        else:
-            concurrency = max_concurrency
+        concurrency = _recovery_common_wave_size(n)
     decoder_recv_buf_slots: List[List[torch.Tensor]] = []
     if is_decoder and num_helper > 0:
         decoder_recv_buf_slots = [
@@ -4640,34 +4640,82 @@ def _make_layer_recovery_job(
     checkpoint_dir: Path,
     saved_block_size: int,
     recovery_rank: Optional[int] = None,
+    failed_group_ranks: Optional[List[int]] = None,
+    group_members: Optional[List[int]] = None,
 ) -> Optional[_FRCheckLayerRecoveryJob]:
-    metadata_rank = recovery_rank if recovery_rank is not None else rank
-    my_order = all_layer_order.get(metadata_rank, main_payload.get("layer_names", []))
-    if encode_iter >= len(my_order):
-        return None
+    """Build one group-synchronized recovery iteration with rank-local schema."""
+    metadata_rank = rank
+    participating_ranks = list(group_members or [metadata_rank])
+    metadata_by_rank: Dict[int, Tuple[str, Dict[str, Any]]] = {}
+    for member in participating_ranks:
+        member_order = all_layer_order.get(member)
+        if member_order is None:
+            if member == metadata_rank:
+                member_order = list(main_payload.get("layer_names", []))
+            else:
+                raise RuntimeError(
+                    "FRCheck recovery: missing saved layer order for group member "
+                    f"rank={member} encode_iter={encode_iter}"
+                )
+        if encode_iter >= len(member_order):
+            raise RuntimeError(
+                "FRCheck recovery: group member is missing synchronized encode iteration "
+                f"rank={member} encode_iter={encode_iter} order_len={len(member_order)}"
+            )
+        member_layer_name = member_order[encode_iter]
+        member_meta = all_layer_metadata.get(member, {}).get(member_layer_name)
+        if member_meta is None:
+            member_dir = (
+                all_frcheck_dirs[member]
+                if member < len(all_frcheck_dirs) else checkpoint_dir
+            )
+            member_meta = _read_local_layer_metadata(
+                member_dir, member_layer_name, member,
+            )
+        if member_meta is None:
+            raise RuntimeError(
+                "FRCheck recovery: missing metadata for synchronized encode iteration "
+                f"rank={member} encode_iter={encode_iter} layer={member_layer_name}"
+            )
+        metadata_by_rank[member] = (member_layer_name, member_meta)
 
-    layer_name = my_order[encode_iter]
-    layer_block_size = _resolve_layer_block_size(
-        metadata_rank, layer_name, all_layer_metadata, saved_block_size,
-    )
+    block_sizes = {
+        int(meta.get("block_size", saved_block_size) or saved_block_size)
+        for _layer_name, meta in metadata_by_rank.values()
+    }
+    if len(block_sizes) != 1:
+        details = {
+            member: (layer_name, int(meta.get("block_size", saved_block_size) or saved_block_size))
+            for member, (layer_name, meta) in metadata_by_rank.items()
+        }
+        raise RuntimeError(
+            "FRCheck recovery: inconsistent saved block_size at synchronized "
+            f"encode_iter={encode_iter}: {details}"
+        )
+    layer_block_size = next(iter(block_sizes))
+    layer_name, meta = metadata_by_rank[metadata_rank]
+    actual_size = int(meta.get("actual_tensor_size", 0) or 0)
 
-    meta = all_layer_metadata.get(metadata_rank, {}).get(layer_name)
-    if meta is None:
-        failed_dir = (
-            all_frcheck_dirs[metadata_rank]
-            if metadata_rank < len(all_frcheck_dirs)
-            else checkpoint_dir
+    member_to_node = {
+        int(member): node_id
+        for node_id, member in enumerate(participating_ranks, start=1)
+    }
+    member_actual_sizes = {
+        member_to_node[int(member)]: int(meta.get("actual_tensor_size", 0) or 0)
+        for member, (_member_layer_name, meta) in metadata_by_rank.items()
+    }
+    target_actual_sizes: Dict[int, int] = {}
+    for failed_rank in failed_group_ranks or []:
+        failed_node = member_to_node.get(int(failed_rank))
+        if failed_node is None:
+            raise RuntimeError(
+                f"FRCheck recovery: failed rank {failed_rank} is not in group {participating_ranks}"
+            )
+        _failed_layer_name, failed_meta = metadata_by_rank[int(failed_rank)]
+        target_actual_sizes[failed_node] = int(
+            failed_meta.get("actual_tensor_size", 0) or 0
         )
-        meta = _read_local_layer_metadata(failed_dir, layer_name, metadata_rank)
-    if meta is None:
-        logger.warning(
-            "FRCheck recovery: no metadata for rank %d layer %s (iter %d)",
-            metadata_rank, layer_name, encode_iter,
-        )
-        return None
-    actual_size = int(meta.get("actual_tensor_size", 0))
-    if actual_size == 0:
-        return None
+
     layer_idx = -1
     if layer_name.startswith("layer_"):
         try:
@@ -4681,6 +4729,8 @@ def _make_layer_recovery_job(
         layer_block_size=layer_block_size,
         actual_size=actual_size,
         layer_infos=meta.get("tensor_infos", []),
+        target_actual_sizes=target_actual_sizes,
+        member_actual_sizes=member_actual_sizes,
     )
 
 
@@ -4843,58 +4893,60 @@ def _run_layer_recovery_job(
         materialize_s=layer_timing.get("materialize_s", 0.0),
     )
     return record, layer_timing
-def _recovery_data_failed_pos(plan: Dict[str, Any], n: int, my_node: int) -> Optional[int]:
+def _recovery_data_failed_pos(plan: Dict[str, Any], n: int) -> Optional[int]:
+    """Return the first critical failed column (SOURCE or first parity/p0)."""
     if plan.get('dual_failure'):
         positions = [
             int(target.get('failed_pos', n))
             for target in plan.get('failed_targets', [])
-            if target.get('failed_node') == my_node
+            if int(target.get('original_role', -1)) in (
+                int(StripeRole.SOURCE), int(StripeRole.ENCODER)
+            )
         ]
-        data_positions = [pos for pos in positions if pos < n - 2]
-        return min(data_positions) if data_positions else None
+        return min(positions) if positions else None
     pos = int(plan.get('failed_pos', n))
     return pos if pos < n - 2 else None
 
 
 def _build_failed_source_block_indices(
+    manager,
     plans: List[Dict[str, Any]],
     active_by_stripe: Dict[int, bool],
     n: int,
 ) -> Dict[Tuple[int, int], int]:
-    source_counts: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
     source_indices: Dict[Tuple[int, int], int] = {}
     for plan in plans:
         sid = int(plan['stripe_id'])
         if not active_by_stripe.get(sid, True):
             continue
-        if plan.get('dual_failure'):
-            for target in plan.get('failed_targets', []):
-                failed_node = int(target.get('failed_node', -1))
-                original_role = int(target.get('original_role', -1))
-                if original_role != int(StripeRole.SOURCE):
-                    continue
-                source_indices[(sid, failed_node)] = source_counts[failed_node]
-                source_counts[failed_node] += 1
-        else:
-            failed_node = int(plan.get('failed_node', -1))
-            original_role = int(plan.get('original_role', -1))
+        targets = plan.get('failed_targets', []) if plan.get('dual_failure') else [plan]
+        for target in targets:
+            failed_node = int(target.get('failed_node', -1))
+            original_role = int(target.get('original_role', -1))
             if original_role != int(StripeRole.SOURCE):
                 continue
-            source_indices[(sid, failed_node)] = source_counts[failed_node]
-            source_counts[failed_node] += 1
+            blk_idx = _source_blk_idx_for_node_stripe(
+                manager.stripe_plans, sid, failed_node,
+            )
+            if blk_idx < 0:
+                raise RuntimeError(
+                    "FRCheck recovery: failed SOURCE has no saved block index "
+                    f"stripe={sid} node={failed_node}"
+                )
+            source_indices[(sid, failed_node)] = blk_idx
     return source_indices
 
 
 def _group_recovery_data_windows_by_column(
     data_plans: List[Dict[str, Any]],
     n: int,
-    my_node: int,
 ) -> List[List[Dict[str, Any]]]:
     windows: List[List[Dict[str, Any]]] = []
-    for failed_pos in range(max(n - 2, 0)):
+    # HW2 critical recovery includes all SOURCE columns plus ENCODER (p0).
+    for failed_pos in range(max(n - 1, 0)):
         column_plans = [
             plan for plan in data_plans
-            if _recovery_data_failed_pos(plan, n, my_node) == failed_pos
+            if _recovery_data_failed_pos(plan, n) == failed_pos
         ]
         column_plans.sort(key=lambda plan: int(plan['stripe_id']))
         for start in range(0, len(column_plans), max(n - 1, 1)):
@@ -4924,13 +4976,13 @@ def _iter_recovery_windows_for_job(
         return [], {}, layer_timing
 
     raw_data_plans, parity_plans, active_by_stripe, skipped_padding_stripes, n_filled_blocks = (
-        _build_recovery_layer_context(manager, n, job.actual_size, job.layer_block_size)
+        _build_recovery_layer_context(manager, n, job, job.actual_size, job.layer_block_size)
     )
     data_plans = list(raw_data_plans)
     if not data_plans:
         if _frcheck_debug_enabled():
             logger.debug(
-                "FRCheck recovery layer %s: rank %d has no data recovery stripes "
+                "FRCheck recovery layer %s: rank %d has no critical data+p0 stripes "
                 "(skipped parity stripes=%d padding stripes=%d)",
                 job.layer_name, rank, len(parity_plans), skipped_padding_stripes,
             )
@@ -4945,9 +4997,9 @@ def _iter_recovery_windows_for_job(
     num_source_stripes = (n - 1) * (n - 2)
     my_node = manager.rank_in_group + 1
     source_block_indices = _build_failed_source_block_indices(
-        data_plans, active_by_stripe, n,
+        manager, data_plans, active_by_stripe, n,
     )
-    column_windows = _group_recovery_data_windows_by_column(data_plans, n, my_node)
+    column_windows = _group_recovery_data_windows_by_column(data_plans, n)
     windows: List[_FRCheckRecoveryWindow] = []
     for wave_plans in column_windows:
         windows.append(_FRCheckRecoveryWindow(
@@ -4969,8 +5021,8 @@ def _iter_recovery_windows_for_job(
 
     if _frcheck_debug_enabled():
         logger.debug(
-            "FRCheck recovery layer %s: rank %d — data=%d raw_data=%d "
-            "parity_skipped=%d padding_skipped=%d filled=%d/%d "
+            "FRCheck recovery layer %s: rank %d — critical=%d raw_critical=%d "
+            "parity_deferred=%d padding_skipped=%d filled=%d/%d "
             "decoder=%d helper=%d failed=%d stripes windows=%d max_window_size=%d",
             job.layer_name, rank, len(data_plans), len(raw_data_plans),
             len(parity_plans), skipped_padding_stripes,
@@ -5029,9 +5081,8 @@ def _ensure_recovery_parity_layer_buffers(
         )
         per_rank = manager._layer_per_rank_bytes.setdefault(layer_idx, {})
         if group_members:
-            for rig, global_rank in enumerate(group_members):
-                meta = all_layer_metadata.get(global_rank, {}).get(job.layer_name, {})
-                per_rank[rig] = int(meta.get("actual_tensor_size", 0) or 0)
+            for rig, _global_rank in enumerate(group_members):
+                per_rank[rig] = int(job.member_actual_sizes.get(rig + 1, 0))
         else:
             per_rank[int(manager.rank_in_group)] = int(job.actual_size)
         manager._allocate_layer_stripe_bufs(
@@ -5209,7 +5260,7 @@ def _submit_recovery_async_parity_p2(
     p2_addrs = [0 if buf is None else int(buf.data_ptr()) for buf in layer_bufs.parity2_bufs]
     timing["build_s"] = timing.get("build_s", 0.0) + (time.time() - build_t0)
     submit_p2_t0 = time.time()
-    repair_batch_id = int(job.layer_idx) + 1
+    repair_batch_id = int(job.encode_iter) + 1
     if has_batch_submit:
         counts = native.submit_async_p2_layer_with_batch(
             p2_addrs, job.layer_block_size, repair_batch_id
@@ -5247,6 +5298,66 @@ def _flush_recovery_async_parity(reason: str, role: str = "unknown") -> None:
         return
     # The decode-batch repair core waits every native batch before returning.
     _recovery_async_parity_submitted = False
+
+
+def _validate_recovery_alignment(
+    jobs: List[_FRCheckLayerRecoveryJob],
+    plans: List[Dict[str, Any]],
+    n: int,
+    common_wave_size: int,
+) -> None:
+    """Validate local protocol inputs without adding distributed synchronization."""
+    encode_iters = [int(job.encode_iter) for job in jobs]
+    if encode_iters != list(range(len(jobs))):
+        raise RuntimeError(
+            "FRCheck recovery: jobs must contain contiguous encode_iter values; "
+            f"got {encode_iters}"
+        )
+    for job in jobs:
+        if int(job.layer_block_size) <= 0:
+            raise RuntimeError(
+                "FRCheck recovery: invalid layer block size "
+                f"encode_iter={job.encode_iter} size={job.layer_block_size}"
+            )
+    stripe_ids = [int(plan.get("stripe_id", -1)) for plan in plans]
+    if stripe_ids != sorted(stripe_ids) or len(stripe_ids) != len(set(stripe_ids)):
+        raise RuntimeError(
+            "FRCheck recovery: recovery plans require unique ordered stripe IDs; "
+            f"got {stripe_ids}"
+        )
+    expected_stripes = int(n) * max(int(n) - 1, 0)
+    if stripe_ids and stripe_ids != list(range(expected_stripes)):
+        raise RuntimeError(
+            "FRCheck recovery: recovery plan stripe IDs are incomplete; "
+            f"expected 0..{expected_stripes - 1}, got {stripe_ids}"
+        )
+    if common_wave_size <= 0:
+        raise RuntimeError(
+            f"FRCheck recovery: invalid common wave size {common_wave_size}"
+        )
+
+    dual_plans = [plan for plan in plans if plan.get('dual_failure')]
+    if dual_plans:
+        deferred_ids = [
+            int(plan.get('stripe_id', -1))
+            for plan in dual_plans
+            if not _is_data_recovery_plan(plan, n)
+        ]
+        if deferred_ids:
+            raise RuntimeError(
+                "FRCheck HW2 recovery requires every dual-failure stripe in the "
+                f"critical data+p0 phase; deferred stripes={deferred_ids}"
+            )
+        inconsistent_ids = [
+            int(plan.get('stripe_id', -1))
+            for plan in dual_plans
+            if plan.get('recovery_kind') != 'data'
+        ]
+        if inconsistent_ids:
+            raise RuntimeError(
+                "FRCheck HW2 manager classification disagrees with the critical "
+                f"data+p0 phase; stripes={inconsistent_ids}"
+            )
 
 
 def _build_recovery_parity_repair_context(
@@ -5391,6 +5502,59 @@ def _submit_recovery_parity_repair_window(
     }
 
 
+
+def _persist_recovered_parity_wave(
+    plans: List[Dict[str, Any]],
+    job: _FRCheckLayerRecoveryJob,
+    manager,
+    buf_pool: Optional[_RecoveryBufPool],
+    checkpoint_dir: Path,
+    rank: int,
+    slot_start: int = 0,
+) -> int:
+    """Persist this failed rank's repaired parity shards before slot reuse."""
+    if buf_pool is None or _frcheck_inprocess_workspace_enabled():
+        return 0
+    my_node = int(manager.rank_in_group) + 1
+    written = 0
+    for relative_slot, plan in enumerate(plans):
+        slot = slot_start + relative_slot
+        if not _is_failed_in_recovery_plan(plan, my_node):
+            continue
+        role = _recovery_original_role_for_node(plan, my_node)
+        if role not in (int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)):
+            continue
+        if slot >= len(buf_pool.failed_recv_bufs):
+            raise RuntimeError("FRCheck parity persistence: missing failed receive slot")
+        sid = int(plan['stripe_id'])
+        suffix = "_p1" if role == int(StripeRole.ENCODER) else ""
+        stripe_dir = checkpoint_dir / job.layer_name / f"stripe_{sid}"
+        stripe_dir.mkdir(parents=True, exist_ok=True)
+        path = stripe_dir / f"frcheck_shard_rank{rank}{suffix}.pt"
+        block = buf_pool.failed_recv_bufs[slot][:job.layer_block_size]
+        if block.device.type != "cpu":
+            block = block.cpu()
+        header = struct.pack(
+            "<4sIIQQ", b"FRBK", sid, int(role),
+            int(job.layer_block_size), int(job.layer_block_size),
+        )
+        temp_path = path.with_name(
+            f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            with open(temp_path, "wb") as file:
+                file.write(header)
+                file.write(memoryview(block.contiguous().numpy()))
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temp_path, path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+        written += 1
+    return written
+
+
 def _submit_recovery_parity_repair(
     manager,
     native,
@@ -5399,6 +5563,8 @@ def _submit_recovery_parity_repair(
     buf_pool: Optional[_RecoveryBufPool],
     recovery_role: str,
     low_priority: bool,
+    checkpoint_dir: Path,
+    rank: int,
 ) -> Dict[str, float]:
     timing: Dict[str, float] = {
         "submit_s": 0.0,
@@ -5424,7 +5590,12 @@ def _submit_recovery_parity_repair(
     timing["failed_stripes"] = float(failed_count)
     timing["parity_stripes"] = float(len(parity_plans))
 
-    max_inflight = buf_pool.concurrency if buf_pool is not None else max(len(parity_plans), 1)
+    max_inflight = _recovery_common_wave_size(n)
+    if buf_pool is not None and buf_pool.concurrency != max_inflight:
+        raise RuntimeError(
+            "FRCheck recovery parity: buffer concurrency differs from common wave size "
+            f"({buf_pool.concurrency} != {max_inflight})"
+        )
     t_network = time.time()
     waves = 0
     for start in range(0, len(parity_plans), max_inflight):
@@ -5437,11 +5608,16 @@ def _submit_recovery_parity_repair(
         wait_t0 = time.time()
         batch_id = int(batch_timing.get("batch_id", 0))
         native.wait_recovery_batch_id(batch_id)
-        if hasattr(native, "get_recovery_batch_milestones"):
-            # The next wave reuses slot zero, so release this completed batch before
-            # any buffer address can be submitted again.
-            native.get_recovery_batch_milestones(batch_id)
         timing["wait_s"] += time.time() - wait_t0
+        timing["persisted_shards"] = timing.get("persisted_shards", 0.0) + float(
+            _persist_recovered_parity_wave(
+                wave_plans, job, manager, buf_pool, checkpoint_dir, rank,
+            )
+        )
+        if hasattr(native, "get_recovery_batch_milestones"):
+            # Milestone retrieval erases native batch state. Keep it alive through
+            # persistence so completion/error state has a single lifetime boundary.
+            native.get_recovery_batch_milestones(batch_id)
         waves += 1
     timing["waves"] = float(waves)
     timing["network_batch_s"] = time.time() - t_network
@@ -5478,7 +5654,7 @@ def _set_pending_recovery_parity_repair(
 
 
 def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str) -> None:
-    """Recover failed parity stripes after data recovery completes."""
+    """Recover deferred parity stripes after critical data+p0 recovery completes."""
     global _recovery_async_parity_error, _recovery_async_parity_submitted
     manager = FRCheckManager()
     native = manager.get_native()
@@ -5504,6 +5680,7 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
     total_waves = 0
     total_submit_s = 0.0
     total_wait_s = 0.0
+    total_persisted_shards = 0
     _recovery_async_parity_submitted = True
     _frcheck_recovery_profile(
         recovery_role,
@@ -5518,11 +5695,13 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
             timing = _submit_recovery_parity_repair(
                 manager, native, job, preloaded.get(job.encode_iter, {}),
                 buf_pool, recovery_role, True,
+                Path(pending["checkpoint_dir"]), int(pending["rank"]),
             )
             total_stripes += int(timing.get("parity_stripes", 0.0))
             total_waves += int(timing.get("waves", 0.0))
             total_submit_s += float(timing.get("submit_s", 0.0))
             total_wait_s += float(timing.get("wait_s", 0.0))
+            total_persisted_shards += int(timing.get("persisted_shards", 0.0))
             _frcheck_recovery_profile(
                 recovery_role,
                 "recovery_parity_repair_layer_done",
@@ -5561,11 +5740,12 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
             waves=total_waves,
             mode=execution_mode,
             pause_policy="save_style_send",
-            trigger="after_data_recovery",
+            trigger="after_critical_recovery",
             submit_s=total_submit_s,
             wait_s=total_wait_s,
             pause_wait_s=pause_wait_s,
             pause_send_tasks=pause_send_tasks,
+            persisted_shards=total_persisted_shards,
             elapsed_s=time.time() - t0,
         )
     except BaseException as exc:
@@ -5626,7 +5806,7 @@ def _finish_recovery_parity_repair_submissions(reason: str, role: str = "unknown
 
 
 def _wait_recovery_data_before_parity(reason: str) -> _FRCheckRecoveryService:
-    """Drain data recovery without materializing or loading optimizer state."""
+    """Drain critical data+p0 recovery without materializing optimizer state."""
     service = _get_active_frcheck_recovery_service()
     if service.worker is not None and service.worker is not threading.current_thread():
         service.wait_all(reason=f"{reason}_data_recovery")
@@ -5650,13 +5830,13 @@ def _frcheck_recovery_lifecycle_needs_finish(
 def _dispatch_recovery_parity_after_data_recovery(
     role: str = "unknown",
 ) -> None:
-    """Start parity from the data-recovery completion context without collectives."""
+    """Start deferred parity from the critical-phase completion context."""
     if _pending_recovery_parity_repair is None:
         return
     _frcheck_recovery_profile(
         role,
         "recovery_parity_dispatch",
-        trigger="after_data_recovery",
+        trigger="after_critical_recovery",
         mode=(
             "async_background"
             if _frcheck_recovery_async_parity_enabled()
@@ -5729,7 +5909,7 @@ def frcheck_finish_recovery_parity_after_optimizer(
 def _run_pending_recovery_parity_repair_sync(
     reason: str, role: str = "unknown"
 ) -> None:
-    """Run the same parity repair core synchronously after data recovery."""
+    """Run deferred parity repair synchronously after critical recovery."""
     global _pending_recovery_parity_repair
     pending = _pending_recovery_parity_repair
     if pending is None:
@@ -5758,6 +5938,7 @@ def _run_recovery_pipeline(
     clone_runtime_tensors: bool = True,
     recovery_role: str = "unknown",
     tensor_views_by_key: Optional[Dict[str, torch.Tensor]] = None,
+    checkpoint_dir: Optional[Path] = None,
 ) -> List[Tuple[Optional[_FRCheckLayerReadyRecord], Dict[str, float]]]:
     t_pipeline = time.time()
     completed: "queue.Queue[Optional[_FRCheckRecoveredWindow]]" = queue.Queue(maxsize=2)
@@ -5819,6 +6000,15 @@ def _run_recovery_pipeline(
             native.wait_recovery_batch_id(batch_id)
             wait_s = time.time() - t_wait
             recovered.timing['wait_s'] = wait_s
+            if checkpoint_dir is not None:
+                persisted = _persist_recovered_parity_wave(
+                    recovered.window.plans, job, manager, buf_pool,
+                    checkpoint_dir, rank, recovered.window.slot_start,
+                )
+                layer_timing['persisted_mixed_parity_shards'] = (
+                    layer_timing.get('persisted_mixed_parity_shards', 0.0)
+                    + float(persisted)
+                )
             if hasattr(native, 'get_recovery_batch_milestones'):
                 _record_frcheck_native_batch_milestones(native, batch_id, job.layer_idx)
             batch_timing = {}
@@ -5871,9 +6061,12 @@ def _run_recovery_pipeline(
                 for window in windows:
                     pending_windows.append((window, my_blocks))
 
-            max_inflight_stripes = (
-                buf_pool.concurrency if buf_pool is not None else max((n - 1) * (n - 2), 1)
-            )
+            max_inflight_stripes = _recovery_common_wave_size(n)
+            if buf_pool is not None and buf_pool.concurrency != max_inflight_stripes:
+                raise RuntimeError(
+                    "FRCheck recovery: buffer concurrency differs from common wave size "
+                    f"({buf_pool.concurrency} != {max_inflight_stripes})"
+                )
             free_ranges: List[Tuple[int, int]] = [(0, max_inflight_stripes)]
             active_windows: List[Tuple[_FRCheckRecoveredWindow, int, int]] = []
             idx = 0
@@ -6081,6 +6274,7 @@ def _start_layer_recovery_worker(
                     clone_runtime_tensors=clone_runtime_tensors,
                     recovery_role=recovery_role,
                     tensor_views_by_key=tensor_views_by_key,
+                    checkpoint_dir=checkpoint_dir,
                 )
                 _dispatch_recovery_parity_after_data_recovery(recovery_role)
             except Exception as exc:
@@ -6122,7 +6316,10 @@ def _normalize_stripe_block(
 ) -> torch.Tensor:
     """Pad/truncate a stripe block to layer_block_size."""
     if blk is None or blk.numel() == 0:
-        return torch.zeros(layer_block_size, dtype=torch.uint8)
+        raise RuntimeError(
+            "FRCheck recovery: required stripe block is missing or empty "
+            f"rank={rank} layer={layer_name} stripe={stripe_id}"
+        )
     if blk.numel() < layer_block_size:
         padded = torch.zeros(layer_block_size, dtype=torch.uint8)
         padded[:blk.numel()] = blk
@@ -6191,7 +6388,10 @@ def _preload_recovery_stripe_blocks(
             FRCheckManager(), sid, my_node, FRCheckManager().frcheck_n,
         )
         if encode_iter >= len(my_order):
-            return encode_iter, sid, role, torch.zeros(1, dtype=torch.uint8)
+            raise RuntimeError(
+                "FRCheck recovery: group layer order mismatch during preload "
+                f"rank={rank} encode_iter={encode_iter} order_len={len(my_order)}"
+            )
         layer_name = my_order[encode_iter]
         meta = all_layer_metadata.get(rank, {}).get(layer_name, {})
         layer_block_size = int(
@@ -6234,6 +6434,8 @@ def _preload_recovery_stripe_blocks(
         for encode_iter in range(n_encode_iters)
         for plan in participating
     ]
+    if not jobs:
+        return result
     n_workers = min(len(jobs), 8)
     loaded_by_role: Dict[int, int] = {}
     loaded_bytes_by_role: Dict[int, int] = {}
@@ -6327,9 +6529,19 @@ def _prep_survivor_hw_disk(
 # ---------------------------------------------------------------------------
 
 def _is_data_recovery_plan(plan: Dict[str, Any], n: int) -> bool:
-    """Return True if this recovery plan restores training data, not parity."""
+    """Return whether a plan belongs to the per-layer critical phase.
+
+    HW2 restores SOURCE data and ENCODER (the first parity block, p0) together so
+    that recovery completion leaves at least one parity block available. HW1 keeps
+    its existing SOURCE-only critical classification because one parity survives.
+    """
     if plan.get('dual_failure'):
-        return True
+        return any(
+            int(target.get('original_role', -1)) in (
+                int(StripeRole.SOURCE), int(StripeRole.ENCODER)
+            )
+            for target in plan.get('failed_targets', [])
+        )
     return int(plan.get('failed_pos', n)) < n - 2
 
 
@@ -6350,6 +6562,7 @@ def _recovery_window_rows(n: int) -> int:
 def _build_recovery_layer_context(
     manager,
     n: int,
+    job: _FRCheckLayerRecoveryJob,
     layer_total_bytes: int,
     layer_block_size: int,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[int, bool], int, int]:
@@ -6362,41 +6575,38 @@ def _build_recovery_layer_context(
         if not _is_data_recovery_plan(p, n)
     ]
     num_source_stripes = (n - 1) * (n - 2)
-    n_filled_blocks = _n_filled_blocks_for_layer(
-        layer_total_bytes, layer_block_size, num_source_stripes,
-    )
+    target_filled = {
+        int(node): _n_filled_blocks_for_layer(size, layer_block_size, num_source_stripes)
+        for node, size in job.target_actual_sizes.items()
+    }
     active_by_stripe: Dict[int, bool] = {}
     skipped_padding_stripes = 0
     enable_padding_skip = os.environ.get("FRCHECK_RECOVERY_SKIP_PADDING", "0") == "1"
     for plan in raw_data_plans:
-        active = True
         sid = int(plan['stripe_id'])
-        if plan.get('dual_failure'):
-            # Match save's source-block indexing exactly instead of relying on
-            # recovery-plan order, which can differ from POA stripe order.
-            for target in plan.get('failed_targets', []):
-                if int(target.get('original_role', -1)) != int(StripeRole.SOURCE):
-                    continue
-                failed_node = int(target.get('failed_node', -1))
-                blk_idx = _source_blk_idx_for_node_stripe(
-                    manager.stripe_plans, sid, failed_node,
-                )
-                if blk_idx >= n_filled_blocks:
-                    skipped_padding_stripes += 1
-                    active = not enable_padding_skip
-                    break
-        else:
-            original_role = int(plan.get('original_role', -1))
-            if original_role == int(StripeRole.SOURCE):
-                failed_node = int(plan.get('failed_node', -1))
-                blk_idx = _source_blk_idx_for_node_stripe(
-                    manager.stripe_plans, sid, failed_node,
-                )
-                if blk_idx >= n_filled_blocks:
-                    skipped_padding_stripes += 1
-                    active = not enable_padding_skip
+        targets = plan.get('failed_targets', []) if plan.get('dual_failure') else [plan]
+        source_validity: List[bool] = []
+        for target in targets:
+            original_role = int(target.get('original_role', -1))
+            if original_role != int(StripeRole.SOURCE):
+                continue
+            failed_node = int(target.get('failed_node', -1))
+            blk_idx = _source_blk_idx_for_node_stripe(
+                manager.stripe_plans, sid, failed_node,
+            )
+            source_validity.append(blk_idx < target_filled.get(failed_node, 0))
+        # A dual decode produces both erasures together. SOURCE padding can skip
+        # only an all-SOURCE-padding plan; p0+p1 has no SOURCE validity entries and
+        # must remain active so both parity outputs are recovered.
+        active = not source_validity or any(source_validity)
+        if source_validity and not active:
+            skipped_padding_stripes += 1
+            active = not enable_padding_skip
         active_by_stripe[sid] = active
-    return raw_data_plans, parity_plans, active_by_stripe, skipped_padding_stripes, n_filled_blocks
+    local_filled = _n_filled_blocks_for_layer(
+        layer_total_bytes, layer_block_size, num_source_stripes,
+    )
+    return raw_data_plans, parity_plans, active_by_stripe, skipped_padding_stripes, local_filled
 
 
 def _prepare_recovery_layer_buffers(
@@ -6420,8 +6630,11 @@ def _prepare_recovery_layer_buffers(
         sid = plan['stripe_id']
         blk = preloaded_blocks.get(sid)
         if blk is None:
-            blk = torch.zeros(layer_block_size, dtype=torch.uint8)
-            native.register_recovery_buffer(blk.data_ptr(), blk.numel())
+            role = _stripe_role_for_node(manager, int(sid), my_node, n)
+            raise RuntimeError(
+                "FRCheck recovery: missing active preloaded block "
+                f"layer_idx={layer_idx} stripe={sid} role={role} node={my_node}"
+            )
         my_blocks[sid] = blk
 
     layer_buf = None
@@ -6621,6 +6834,7 @@ def _submit_recovery_network(
         active = True
         sid = int(plan['stripe_id'])
         if plan.get('dual_failure'):
+            source_validity = []
             for target in plan.get('failed_targets', []):
                 if int(target.get('original_role', -1)) != int(StripeRole.SOURCE):
                     continue
@@ -6628,10 +6842,10 @@ def _submit_recovery_network(
                 blk_idx = _source_blk_idx_for_node_stripe(
                     manager.stripe_plans, sid, failed_node,
                 )
-                if blk_idx >= n_filled_blocks:
-                    skipped_padding_stripes += 1
-                    active = not enable_padding_skip
-                    break
+                source_validity.append(blk_idx < n_filled_blocks)
+            if source_validity and not any(source_validity):
+                skipped_padding_stripes += 1
+                active = not enable_padding_skip
         else:
             original_role = int(plan.get('original_role', -1))
             if original_role == int(StripeRole.SOURCE):
@@ -6648,7 +6862,7 @@ def _submit_recovery_network(
     if not data_plans:
         if _dbg:
             logger.debug(
-                "FRCheck recovery layer %s: rank %d has no data recovery stripes "
+                "FRCheck recovery layer %s: rank %d has no critical data+p0 stripes "
                 "(skipped parity stripes=%d padding stripes=%d)",
                 layer_name, rank, len(parity_plans), skipped_padding_stripes,
             )
@@ -6663,8 +6877,8 @@ def _submit_recovery_network(
 
     if _dbg:
         logger.debug(
-            "FRCheck recovery layer %s: rank %d — data=%d raw_data=%d "
-            "parity_skipped=%d padding_skipped=%d filled=%d/%d "
+            "FRCheck recovery layer %s: rank %d — critical=%d raw_critical=%d "
+            "parity_deferred=%d padding_skipped=%d filled=%d/%d "
             "decoder=%d helper=%d failed=%d stripes",
             layer_name, rank, len(data_plans), len(raw_data_plans),
             len(parity_plans), skipped_padding_stripes,
@@ -6677,8 +6891,11 @@ def _submit_recovery_network(
         sid = plan['stripe_id']
         blk = preloaded_blocks.get(sid)
         if blk is None:
-            blk = torch.zeros(layer_block_size, dtype=torch.uint8)
-            native.register_recovery_buffer(blk.data_ptr(), blk.numel())
+            role = _stripe_role_for_node(manager, int(sid), my_node, n)
+            raise RuntimeError(
+                "FRCheck recovery: missing active preloaded block "
+                f"layer_idx={layer_idx} stripe={sid} role={role} node={my_node}"
+            )
         my_blocks[sid] = blk
 
     layer_buf = None
@@ -7181,9 +7398,10 @@ def recover_frcheck_legacy_hardware(
             failed_global_ranks, workspace["recovery_stripe_plans"],
             workspace["recovery_dual_failure"],
         )
-    primary_failed = _primary_failed_rank_in_group(
-        failed_global_ranks, manager.group_member_ranks or [],
-    )
+    failed_group_ranks = [
+        member for member in (manager.group_member_ranks or [])
+        if member in set(failed_global_ranks)
+    ]
 
     # All ranks must participate in the same metadata all_gather (failed ranks may
     # lack local main.pt).
@@ -7193,7 +7411,7 @@ def recover_frcheck_legacy_hardware(
             checkpoint_dir, rank, world_size, load_tensor_buffer=False,
         )
         all_tensor_infos, all_layer_order, all_layer_metadata = _frcheck_metadata_from_payload(
-            main_payload, primary_failed,
+            main_payload, rank if is_failed else None,
         )
     else:
         main_payload = copy.copy(workspace["main_payload"])
@@ -7254,9 +7472,22 @@ def recover_frcheck_legacy_hardware(
 
     if manager.recovery_stripe_plans and _dbg:
         logger.debug(
-            "FRCheck recovery: phase1 data-only mode data_stripes=%d "
-            "parity_stripes_skipped=%d",
+            "FRCheck recovery: phase1 critical data+p0 mode critical_stripes=%d "
+            "deferred_parity_stripes=%d",
             len(data_recovery_plans), len(parity_recovery_plans),
+        )
+    failed_by_group: Dict[int, int] = {}
+    for failed_rank in failed_global_ranks:
+        failed_group = manager._get_group_id(failed_rank, world_size, n)
+        failed_by_group[failed_group] = failed_by_group.get(failed_group, 0) + 1
+    dual_group_count = sum(count == 2 for count in failed_by_group.values())
+    if rank == 0 and dual_group_count:
+        logger.info(
+            "FRCheck HW2 recovery: failed_ranks=%s dual_groups=%d "
+            "local_critical_stripes=%d local_deferred_parity_stripes=%d "
+            "group_synchronized_layers=%d",
+            failed_global_ranks, dual_group_count, len(data_recovery_plans),
+            len(parity_recovery_plans), n_encode_iters,
         )
 
     t_disk = time.time()
@@ -7287,8 +7518,11 @@ def recover_frcheck_legacy_hardware(
             rank,
         )
 
-    max_block_size = _max_layer_block_size(
-        rank, all_layer_order, all_layer_metadata, saved_block_size,
+    max_block_size = max(
+        _max_layer_block_size(
+            member, all_layer_order, all_layer_metadata, saved_block_size,
+        )
+        for member in group_members
     )
     role_plans_for_buffers = (
         manager.recovery_stripe_plans
@@ -7306,8 +7540,8 @@ def recover_frcheck_legacy_hardware(
     _get_active_frcheck_recovery_service().reset_for_load(recovery_role)
     _frcheck_recovery_profile(
         recovery_role, "rank_role", is_failed=is_failed, is_decoder=is_decoder,
-        is_helper=is_helper, involved=involved, data_stripes=len(data_recovery_plans),
-        parity_stripes=len(parity_recovery_plans), encode_iters=n_encode_iters,
+        is_helper=is_helper, involved=involved, critical_stripes=len(data_recovery_plans),
+        deferred_parity_stripes=len(parity_recovery_plans), encode_iters=n_encode_iters,
         disk_io_s=timings['disk_io'],
     )
     try:
@@ -7336,7 +7570,7 @@ def recover_frcheck_legacy_hardware(
         pending_records = _make_pending_layerwise_records(
             rank, is_failed, main_payload, all_layer_order, all_layer_metadata,
             all_frcheck_dirs, checkpoint_dir, saved_block_size, n_encode_iters,
-            recovery_rank=primary_failed,
+            recovery_rank=rank,
         )
         runtime_for_recovery = _FRCheckLayerwiseRuntime(pending_records)
         _set_active_frcheck_layerwise_runtime(runtime_for_recovery)
@@ -7357,11 +7591,16 @@ def recover_frcheck_legacy_hardware(
             job = _make_layer_recovery_job(
                 encode_iter, rank, is_failed, main_payload, all_layer_order,
                 all_layer_metadata, all_frcheck_dirs, checkpoint_dir, saved_block_size,
-                recovery_rank=primary_failed,
+                recovery_rank=rank,
+                failed_group_ranks=failed_group_ranks,
+                group_members=manager.group_member_ranks or [rank],
             )
             if job is not None:
                 recovery_jobs.append(job)
-        recovery_jobs = _sort_recovery_jobs_by_forward_priority(recovery_jobs)
+    common_wave_size = _recovery_common_wave_size(n)
+    _validate_recovery_alignment(
+        recovery_jobs, manager.recovery_stripe_plans, n, common_wave_size,
+    )
     if _dbg:
         logger.debug(
             "FRCheck recovery job order rank=%d role=%s: %s",
@@ -7377,14 +7616,12 @@ def recover_frcheck_legacy_hardware(
         buf_pool = _allocate_recovery_buf_pool(
             native, n, max_block_size, is_failed, is_decoder, is_helper,
             dual_failure=getattr(manager, 'recovery_dual_failure', False),
+            concurrency_override=common_wave_size,
         )
 
-    detached_transformer_recovery = bool(
-        async_forward
-        and async_detach_safe
-        and is_failed
-        and runtime_for_recovery is not None
-    )
+    # Recovery network ordering is an encode_iter protocol invariant. Splitting
+    # rank-local common/transformer jobs by layer_idx can reorder PP stages.
+    detached_transformer_recovery = False
     if direct_tensor_views_by_key is not None:
         if workspace is None:
             _preallocate_stable_failed_layer_bufs(native, buf_pool, recovery_jobs, n)
@@ -7536,6 +7773,7 @@ def recover_frcheck_legacy_hardware(
                 clone_runtime_tensors=sync_clone_runtime_tensors,
                 recovery_role=recovery_role,
                 tensor_views_by_key=direct_tensor_views_by_key,
+                checkpoint_dir=checkpoint_dir,
             )
             _accumulate_layer_timings(sync_results)
             for record, _layer_timing in sync_results:
@@ -7605,6 +7843,7 @@ def recover_frcheck_legacy_hardware(
             clone_runtime_tensors=sync_clone_runtime_tensors,
             recovery_role=recovery_role,
             tensor_views_by_key=direct_tensor_views_by_key,
+            checkpoint_dir=checkpoint_dir,
         )
         _dispatch_recovery_parity_after_data_recovery(recovery_role)
         _accumulate_layer_timings(sync_results)
@@ -8163,12 +8402,36 @@ def _assemble_state_dict_from_local_blocks(
     except Exception:
         pass
     if teardown_native:
+        args = None
         try:
             from megatron.training import get_args
-            safe_point = getattr(get_args(), "frcheck_recovery_safe_point", "load")
+            args = get_args()
+            safe_point = getattr(args, "frcheck_recovery_safe_point", "load")
         except Exception:
             safe_point = "load"
-        if safe_point == "load":
+        inprocess_software_active = bool(
+            args is not None
+            and getattr(args, "ft_inprocess_recovery_benchmark", False)
+            and getattr(args, "_ft_inprocess_recovery_active", False)
+            and getattr(args, "ft_inprocess_recovery_software_failure", False)
+        )
+        if inprocess_software_active:
+            manager = FRCheckManager()
+            role = getattr(manager, "_frcheck_recovery_role", "local_load")
+            _flush_recovery_async_parity(
+                "load_teardown_inprocess_software", role,
+            )
+            manager.end_recovery()
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:
+                logger.info(
+                    "FRCheck software in-process load: deferring native teardown "
+                    "until training exit"
+                )
+            _frcheck_recovery_profile(
+                role, "teardown_skipped_inprocess_software",
+            )
+        elif safe_point == "load":
             _teardown_frcheck_native_after_load()
         else:
             _frcheck_recovery_profile(

@@ -113,13 +113,25 @@ def _timed_barrier() -> float:
 
 _BUILD_GLOBAL_REGISTRY_CACHE: Dict[tuple, tuple] = {}
 
+
+def _tensor_schema_fingerprint(metadata: List[TensorMetadata]) -> tuple:
+    return tuple(
+        (
+            str(meta.key), tuple(meta.shape), str(meta.dtype), int(meta.size_bytes),
+            tuple(meta.global_offset or ()), int(meta.shard_index or 0), str(meta.chunk_type),
+            int(meta.target_rank), int(meta.source_rank),
+        )
+        for meta in metadata
+    )
+
+
 def _build_global_registry(local_metadata: List[TensorMetadata], local_non_tensor: Dict[str, Any]) -> Tuple[Dict[int, List[TensorMetadata]], Dict[int, Dict[str, Any]]]:
     if not torch.distributed.is_initialized():
         return {0: local_metadata}, {0: local_non_tensor}
 
     world_size = torch.distributed.get_world_size()
-    total_bytes = sum(m.size_bytes for m in local_metadata)
-    cache_key = (world_size, len(local_metadata), total_bytes)
+    rank = torch.distributed.get_rank()
+    cache_key = (world_size, rank, _tensor_schema_fingerprint(local_metadata))
     if cache_key in _BUILD_GLOBAL_REGISTRY_CACHE:
         return _BUILD_GLOBAL_REGISTRY_CACHE[cache_key]
 
@@ -497,6 +509,11 @@ def _build_hw_owner_codeword_plans(
                 "owner_rig": owner_rig,
                 "m_owner": m_owner,
                 "lost": lost,
+                "surviving_rows": [
+                    int(label.split("_")[1]) if label.startswith("data_")
+                    else ecnaive_k + int(label[-1])
+                    for label in (surviving_addrs_ordered if m_owner > 0 else [])
+                ],
                 "surviving_bases": surviving_bases,
                 "recovered_bases": recovered_bases,
                 "encode_input_bases": encode_input_bases,
@@ -527,6 +544,7 @@ def _hw_decode_encode_all_owners_stripe(
                 ecnaive_k,
                 m_owner,
                 plan["lost"],
+                plan["surviving_rows"],
                 [addr + byte_offset for addr in plan["surviving_bases"]],
                 [addr + byte_offset for addr in plan["recovered_bases"]],
                 stripe_size,
@@ -776,6 +794,11 @@ def _run_hw_failed_own_tensor_streaming_recovery(
                 ecnaive_k,
                 m_owner,
                 lost,
+                [
+                    int(label.split("_")[1]) if label.startswith("data_")
+                    else ecnaive_k + int(label[-1])
+                    for label in surviving_order
+                ],
                 [int(raw_surviving[label].data_ptr()) for label in surviving_order],
                 [int(block.data_ptr()) for block in recovered_blocks],
                 take,
@@ -1578,8 +1601,32 @@ def _load_ecnaive_legacy_software_failure(
         aligned_block_size = max(aligned_block_size, block_data_size)
 
     block_files_legacy = main_payload.get("_block_files_legacy", None)
+    from megatron.training import get_args as _get_args
+    args = _get_args()
+    inprocess_cache = bool(
+        getattr(args, "ft_inprocess_recovery_benchmark", False)
+        and getattr(args, "_ft_inprocess_recovery_active", False)
+    )
+    workspace_hit = False
+    if inprocess_cache:
+        layout = manager._get_group_layout(world_size)
+        workspace_key = (
+            _ecnaive_checkpoint_identity(checkpoint_dir), rank, world_size,
+            k, n, failed_rig, "software", manager.ecnaive_buffer_size,
+            tuple(sorted(layout.items())), manager.ecnaive_pin_memory,
+            manager.use_rdma, torch.distributed.get_backend(),
+            os.environ.get("ECNAIVE_INTERFACE"),
+            os.environ.get(f"ECNAIVE_RANK_IP_{rank}"),
+            os.environ.get("ECNAIVE_BASE_PORT"),
+        )
+        workspace_hit = manager.begin_recovery_workspace(workspace_key)
+        if rank == 0:
+            logger.info(
+                "EC-NAIVE software in-process workspace cache=%s",
+                "hit" if workspace_hit else "miss",
+            )
 
-    # Phase 1: setup (not timed) — RDMA connection setup + barrier
+    # Phase 1: setup (not timed) — persistent ASIO/RDMA connections + barrier
     manager.init_ecnaive_sw_recovery(rank, world_size, failed_rank_in_group=failed_rig)
 
     # ---- prepare buffers / disk reads (not timed) ----
@@ -1597,7 +1644,10 @@ def _load_ecnaive_legacy_software_failure(
         # pipeline_total_bytes by up to (k - 1) bytes due to ceil division.
         layout_bytes = k * block_data_size
         buf_len = max(actual_tensor_size, layout_bytes)
-        tensor_buffer = _allocate_pinned_uint8_buffer(buf_len)
+        tensor_buffer = (
+            manager.get_recovery_buffer("sw_final_tensor", buf_len, pin=True)
+            if inprocess_cache else _allocate_pinned_uint8_buffer(buf_len)
+        )
         # Load local d_{f,0} into tensor_buffer
         own_data0 = _load_ecnaive_block_file(
             checkpoint_dir, rank,
@@ -1616,11 +1666,16 @@ def _load_ecnaive_legacy_software_failure(
             tensor_buffer[:n_copy].copy_(own_data0[:n_copy])
         own_data0 = None  # free ref
         recv_alloc_size = aligned_block_size if has_padded_sw else block_data_size
-        for _j in range(1, k):
-            buf = torch.zeros(recv_alloc_size, dtype=torch.uint8)
-            if manager.use_rdma:
-                manager.register_buffer(buf)
-            recv_blocks.append(buf)
+        if inprocess_cache:
+            recv_blocks = manager.get_recovery_slices(
+                "sw_recv_blocks", recv_alloc_size, k - 1, register=True,
+            )
+        else:
+            for _j in range(1, k):
+                buf = torch.zeros(recv_alloc_size, dtype=torch.uint8)
+                if manager.use_rdma:
+                    manager.register_buffer(buf)
+                recv_blocks.append(buf)
     else:
         sender_rig = rank_in_group
         j = (sender_rig - failed_rig + n) % n
@@ -1633,16 +1688,24 @@ def _load_ecnaive_legacy_software_failure(
                 legacy_name = legacy_map_2.get(recv_idx, canonical_name)
             else:
                 legacy_name = canonical_name
-            send_block = _load_ecnaive_block_file(
-                checkpoint_dir, rank,
-                canonical_name=canonical_name,
-                legacy_name=legacy_name,
-                block_files_legacy=block_files_legacy,
+            send_cache_name = f"sw_send_block_{block_idx}"
+            send_block = (
+                manager.get_recovery_workspace_value(send_cache_name)
+                if inprocess_cache else None
             )
-            if not has_padded_sw and send_block.numel() > block_data_size:
-                send_block = send_block[:block_data_size].contiguous()
-            if manager.use_rdma:
-                manager.register_buffer(send_block)
+            if send_block is None:
+                send_block = _load_ecnaive_block_file(
+                    checkpoint_dir, rank,
+                    canonical_name=canonical_name,
+                    legacy_name=legacy_name,
+                    block_files_legacy=block_files_legacy,
+                )
+                if not has_padded_sw and send_block.numel() > block_data_size:
+                    send_block = send_block[:block_data_size].contiguous()
+                if manager.use_rdma:
+                    manager.register_buffer(send_block)
+                if inprocess_cache:
+                    manager.set_recovery_workspace_value(send_cache_name, send_block)
             send_block_idx = block_idx
 
     # Sync all ranks after setup so network timing excludes setup skew.
@@ -1716,6 +1779,21 @@ def _load_ecnaive_legacy_software_failure(
             main_payload, flat_key_roots=flat_key_roots,
         )
     _t['rebuild_sd'] = _time() - t_rebuild
+
+    prebenchmark_software_load = bool(
+        getattr(args, "ft_inprocess_recovery_benchmark", False)
+        and not getattr(args, "_ft_inprocess_recovery_active", False)
+    )
+    if prebenchmark_software_load and manager.use_rdma:
+        for buffer in recv_blocks:
+            manager.unregister_buffer(buffer)
+        if send_block is not None:
+            manager.unregister_buffer(send_block)
+        if rank == 0:
+            logger.info(
+                "EC-NAIVE software preload: retained persistent connections and "
+                "released temporary RDMA registrations"
+            )
 
     # NOTE: the old standalone else clause for ranks 0,1 (k=2) is absorbed into
     # the generalized else branch above.
@@ -1955,13 +2033,49 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     args = get_args()
     ecnaive_k = getattr(args, "ecnaive_rs_k", 2)
     ecnaive_n = ecnaive_k + 2
-    failed_set = set(failed_global_ranks)
+    if ecnaive_k < 2 or world_size <= 0 or world_size % ecnaive_n != 0:
+        raise ValueError(
+            f"EC-NAIVE hardware recovery requires k >= 2 and group size "
+            f"n={ecnaive_n} dividing world_size={world_size}"
+        )
+    try:
+        failed_ranks = sorted({int(rank) for rank in failed_global_ranks})
+    except (TypeError, ValueError) as exc:
+        raise ValueError("EC-NAIVE failed ranks must be integers") from exc
+    if not failed_ranks:
+        raise ValueError("EC-NAIVE hardware recovery requires at least one failed rank")
+    invalid = [failed for failed in failed_ranks if failed < 0 or failed >= world_size]
+    if invalid:
+        raise ValueError(
+            f"EC-NAIVE failed ranks {invalid} are outside [0, {world_size - 1}]"
+        )
+    failed_global_ranks = failed_ranks
+    failed_set = set(failed_ranks)
 
     manager = ECNAIVEManager()
     manager.ecnaive_k = ecnaive_k
     manager.ecnaive_n = ecnaive_n
     if not getattr(args, "use_ecnaive", False):
         args.use_ecnaive = True
+    group_failures: Dict[int, List[int]] = {}
+    for failed in failed_ranks:
+        group_failures.setdefault(manager._get_group_id(failed, world_size), []).append(failed)
+    invalid_groups = {gid: ranks for gid, ranks in group_failures.items() if len(ranks) > 2}
+    if invalid_groups:
+        raise ValueError(
+            f"EC-NAIVE RS({ecnaive_n},{ecnaive_k}) supports at most two failed "
+            f"ranks per group; invalid groups: {invalid_groups}"
+        )
+    require_hw2 = bool(getattr(args, "_ecnaive_require_hw2", False))
+    if require_hw2:
+        non_pairs = {gid: ranks for gid, ranks in group_failures.items() if len(ranks) != 2}
+        if non_pairs or len(failed_ranks) < 2:
+            raise ValueError(
+                "EC-NAIVE HW2 requires every targeted group to contain exactly two "
+                f"failed ranks; observed {group_failures}"
+            )
+    if rank == 0:
+        logger.info("EC-NAIVE recovery failure groups: %s", group_failures)
 
     # Init C++ native module for ALL ranks (ASIO connections needed for send/recv)
     manager.init_ecnaive_if_enabled()
@@ -1988,7 +2102,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         layout = manager._get_group_layout(world_size)
         workspace_key = (
             _ecnaive_checkpoint_identity(checkpoint_dir),
-            rank, world_size, tuple(sorted(failed_global_ranks)), "hardware",
+            rank, world_size, tuple(failed_ranks), "hardware",
             ecnaive_k, ecnaive_n, manager.ecnaive_buffer_size,
             tuple(sorted(layout.items())), manager.ecnaive_pin_memory,
             manager.use_rdma, torch.distributed.get_backend(),
@@ -2102,9 +2216,10 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         total_pool_blocks = len(source_ranks) * ecnaive_n
         # Pre-compute block locator metadata
         _source_rig_map = {r: manager._get_rank_in_group(r, world_size) for r in source_ranks}
-        _rig_to_si = {rig: si for si, (_, rig) in enumerate(
-            sorted(((r, _source_rig_map[r]) for r in source_ranks), key=lambda x: x[1])
-        )}
+        _rig_to_si = {
+            _source_rig_map[source_rank]: source_index
+            for source_index, source_rank in enumerate(source_ranks)
+        }
         _owner_rigs = [my_rig]
         for _recv_idx in range(ecnaive_n - 1):
             _ow = (my_rig - _recv_idx - 1) % ecnaive_n
@@ -2113,6 +2228,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         _num_owners = len(_owner_rigs)
 
         alloc_start = time.perf_counter()
+        store_block_names = ['own_data0', 'my_data1'] + [
+            f'recv_{idx}' for idx in range(ecnaive_n - 1)
+        ]
         if has_padded_recv:
             if inprocess_cache:
                 recv_pool_prealloc = manager.get_recovery_slices(
@@ -2132,7 +2250,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                     name: manager.get_recovery_buffer(
                         f"store_{name}", block_data_size,
                     )
-                    for name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2')
+                    for name in store_block_names
                 }
             else:
                 recv_pool_prealloc = list(allocate_hugepage_slices(
@@ -2153,7 +2271,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                 ]
                 store_bufs_pre = {
                     name: torch.empty(block_data_size, dtype=torch.uint8)
-                    for name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2')
+                    for name in store_block_names
                 }
         else:
             stripe_bytes = manager.ecnaive_buffer_size
@@ -2406,6 +2524,11 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
                         recovered_blocks = recovered_slot_pool[base : base + m_owner]
                     native.submit_ecnaive_decode_recovery(
                         ecnaive_k, m_owner, lost,
+                        [
+                            int(label.split("_")[1]) if label.startswith("data_")
+                            else ecnaive_k + int(label[-1])
+                            for label in surviving_addrs_ordered
+                        ],
                         [int(b.data_ptr()) for b in continuous_surviving],
                         [int(b.data_ptr()) for b in recovered_blocks],
                         block_data_size,
@@ -2485,7 +2608,9 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         _t['network_encode'] = time.time() - _t0_decode
 
         # Copy recovered refs to pre-allocated store buffers (not timed)
-        for _name in ('own_data0', 'my_data1', 'recv_0', 'recv_1', 'recv_2'):
+        for _name in ['own_data0', 'my_data1'] + [
+            f'recv_{idx}' for idx in range(ecnaive_n - 1)
+        ]:
             _ref = recovered.pop(f'{_name}_ref', None)
             if _ref is not None:
                 store_bufs[_name].copy_(_ref[:store_bufs[_name].numel()])
@@ -2600,10 +2725,11 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         + _t.get('rebuild_sd', 0.0)
     )
     from megatron.training.global_vars import set_ft_load_timing_context
-    set_ft_load_timing_context("EC-NAIVE", "HW", _t)
+    recovery_mode = "HW2" if max(len(ranks) for ranks in group_failures.values()) == 2 else "HW1"
+    set_ft_load_timing_context("EC-NAIVE", recovery_mode, _t)
 
     load_log = dict(_t)
-    load_log["mode"] = "HW"
+    load_log["mode"] = recovery_mode
     logger.debug(
         "EC-NAIVE load timing (%(mode)s local): e2e_s=%(total).2fs "
         "network_encode_s=%(network_encode).2fs decode_s=%(decode_s).2fs "

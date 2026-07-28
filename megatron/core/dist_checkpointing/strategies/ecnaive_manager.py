@@ -101,6 +101,7 @@ class ECNAIVEManager:
         # process exit; replacing it while native is live is unsafe.
         self._recovery_workspace_key: Optional[tuple] = None
         self._recovery_workspace: Dict[str, Any] = {}
+        self._sw_recovery_connection_key: Optional[tuple] = None
 
         self._initialized = True
 
@@ -701,6 +702,24 @@ class ECNAIVEManager:
                     rank_ips[r] = base_ip
         receiver_ip = rank_ips.get(load_receiver_rank, base_ip)
 
+        connection_key = (
+            rank, world_size, self.ecnaive_k, self.ecnaive_n,
+            failed_rank_in_group, group_id, rank_in_group, receiver_ip,
+            tuple(sw_ports), self.use_rdma,
+            os.environ.get("ECNAIVE_INTERFACE"),
+        )
+        if self._sw_recovery_connection_key is not None:
+            if self._sw_recovery_connection_key != connection_key:
+                raise RuntimeError(
+                    "EC-NAIVE software recovery connection topology changed while "
+                    "persistent channels are live; restart the process"
+                )
+            native.reset_load_timing_stats()
+            logger.info("EC-NAIVE software in-process connection cache=hit rank=%d", rank)
+            torch.distributed.barrier()
+            return
+
+        logger.info("EC-NAIVE software in-process connection cache=miss rank=%d", rank)
         # Phase 1: bind/listen (receiver) + RDMA CQs (all ranks)
         logger.debug(f"EC-NAIVE: [Rank {rank}] SW recovery phase 1: {num_blocks} ports")
         native.init_ecnaive_load_sw_bind_listen(
@@ -725,6 +744,8 @@ class ECNAIVEManager:
                 logger.debug("EC-NAIVE: [Rank %d] SW recovery phase 2: no block, skipping",
                             rank)
         torch.distributed.barrier()
+        self._sw_recovery_connection_key = connection_key
+        native.reset_load_timing_stats()
         logger.debug("EC-NAIVE: [Rank %d] SW recovery connections ready (%d blocks)",
                     rank, num_blocks)
 
@@ -806,7 +827,33 @@ class ECNAIVEManager:
         """
         k = self.ecnaive_k
         n = self.ecnaive_n
+        if k < 2 or n != k + 2 or world_size <= 0 or world_size % n != 0:
+            raise ValueError(
+                f"EC-NAIVE recovery requires n=k+2 dividing world_size; "
+                f"got k={k}, n={n}, world_size={world_size}"
+            )
+        try:
+            failed_global_ranks = sorted({int(rank) for rank in failed_global_ranks})
+        except (TypeError, ValueError) as exc:
+            raise ValueError("EC-NAIVE failed ranks must be integers") from exc
+        if not failed_global_ranks:
+            raise ValueError("EC-NAIVE recovery requires at least one failed rank")
+        invalid = [rank for rank in failed_global_ranks if rank < 0 or rank >= world_size]
+        if invalid:
+            raise ValueError(
+                f"EC-NAIVE failed ranks {invalid} are outside [0, {world_size - 1}]"
+            )
         failed_set = set(failed_global_ranks)
+        group_counts: Dict[int, int] = {}
+        for failed in failed_global_ranks:
+            gid = self._get_group_id(failed, world_size)
+            group_counts[gid] = group_counts.get(gid, 0) + 1
+        excessive = {gid: count for gid, count in group_counts.items() if count > 2}
+        if excessive:
+            raise ValueError(
+                f"EC-NAIVE RS({n},{k}) supports at most two failed ranks per group; "
+                f"observed {excessive}"
+            )
 
         # Map each failed rank to group/rig
         failed_info = {}
@@ -1544,6 +1591,9 @@ class ECNAIVEManager:
             self.ecnaive_parity_buffers = None
             self._free_data_buffer_queue = None
             self._free_parity_buffer_queue = None
+            self._recovery_workspace.clear()
+            self._recovery_workspace_key = None
+            self._sw_recovery_connection_key = None
 
         except Exception as e:
             logger.warning(f"EC-NAIVE: Error during manager cleanup: {e}")

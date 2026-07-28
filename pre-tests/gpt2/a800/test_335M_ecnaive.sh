@@ -66,6 +66,19 @@ fi
 
 GPUS_PER_NODE=${#GPU_IDS[@]}
 
+make_rank_range() {
+    local count=$1
+    local ranks=()
+    local rank
+    for ((rank=0; rank<count; rank++)); do
+        ranks+=("$rank")
+    done
+    (IFS=,; echo "${ranks[*]}")
+}
+
+ECNAIVE_SINGLE_NODE_FAILED_RANKS=${ECNAIVE_FAILED_RANKS:-$(make_rank_range "$GPUS_PER_NODE")}
+ECNAIVE_TWO_NODE_FAILED_RANKS=${ECNAIVE_HW2_FAILED_RANKS:-$(make_rank_range "$((2 * GPUS_PER_NODE))")}
+
 # Set CUDA_VISIBLE_DEVICES by explicitly listing all provided GPU IDs (as comma-separated values)
 export CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_IDS[*]}")
 
@@ -85,13 +98,27 @@ SHM_PKT="/dev/shm/shm_pkt"
 # Remaining args after node-rank and GPU ids are passed to the training script
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess|inprocess2|inprocess_sw)$ ]]; then
     MODE="$1"
     shift
 fi
 ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
 FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-3}
+
+set_inprocess_recovery_args() {
+    local failed_ranks=$1
+    RECOVERY_MODE_ARGS=(
+        --load $CHECKPOINT_PATH
+        --ft-inprocess-recovery-benchmark
+        --rerun-mode disabled
+        --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+        --ft-inprocess-recovery-failed-ranks "$failed_ranks"
+        --ft-inprocess-recovery-after-train-iter 0
+        --ft-inprocess-recovery-exit-after-forward
+    )
+}
+
 case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
@@ -108,26 +135,35 @@ case "$MODE" in
     hardware)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            --ecnaive-failed-ranks "0"
+            --ecnaive-failed-ranks "$ECNAIVE_SINGLE_NODE_FAILED_RANKS"
             #--ecnaive-hw-debug
         )
         ;;
     hardware2)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            --ecnaive-failed-ranks "0,1"
+            --ecnaive-failed-ranks "$ECNAIVE_TWO_NODE_FAILED_RANKS"
+            --ecnaive-require-hw2
         )
         ;;
-    inprocess)
+    inprocess_sw)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
+            --use-ecnaive-software-failure
             --ft-inprocess-recovery-benchmark
+            --ft-inprocess-recovery-software-failure
             --rerun-mode disabled
             --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
-            --ft-inprocess-recovery-failed-ranks "0"
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
         )
+        ;;
+    inprocess)
+        set_inprocess_recovery_args "$ECNAIVE_SINGLE_NODE_FAILED_RANKS"
+        ;;
+    inprocess2)
+        set_inprocess_recovery_args "$ECNAIVE_TWO_NODE_FAILED_RANKS"
+        RECOVERY_MODE_ARGS+=(--ecnaive-require-hw2)
         ;;
 esac
 

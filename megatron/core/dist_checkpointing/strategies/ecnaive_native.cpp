@@ -52,6 +52,7 @@ inline uint64_t ntohll(uint64_t value) {
 #include <thread>
 #include <vector>
 #include <map>
+#include <limits>
 #include <memory>
 
 #include <isa-l/erasure_code.h>
@@ -1277,84 +1278,80 @@ public:
     void submit_ecnaive_decode_recovery(
             int k_orig, int m,
             const std::vector<int>& lost_positions,
+            const std::vector<int>& surviving_rows,
             const std::vector<uintptr_t>& surviving_addrs,
             const std::vector<uintptr_t>& recovered_addrs,
             size_t size)
     {
         if (k_orig < 2 || m < 1 || m > 2) {
-            std::cerr << "ECNAIVE: decode_recovery invalid params k_orig=" << k_orig << " m=" << m << std::endl;
-            return;
+            throw std::invalid_argument("ECNAIVE decode: require k >= 2 and 1 <= m <= 2");
         }
-        int surviving_count = static_cast<int>(surviving_addrs.size());
-        int num_surviving_parity = surviving_count - (k_orig - m);
-        if (num_surviving_parity < 1 || num_surviving_parity > 2) {
-            std::cerr << "ECNAIVE: decode_recovery invalid parity count " << num_surviving_parity << std::endl;
-            return;
+        if (static_cast<int>(lost_positions.size()) != m ||
+            static_cast<int>(recovered_addrs.size()) != m) {
+            throw std::invalid_argument("ECNAIVE decode: lost and recovered lists must have length m");
         }
-        if (static_cast<int>(recovered_addrs.size()) != m) {
-            std::cerr << "ECNAIVE: decode_recovery need exactly m recovered buffers" << std::endl;
-            return;
+        if (static_cast<int>(surviving_rows.size()) != k_orig ||
+            static_cast<int>(surviving_addrs.size()) != k_orig) {
+            throw std::invalid_argument("ECNAIVE decode: exactly k ordered survivors are required");
+        }
+        std::vector<bool> lost_seen(k_orig, false);
+        for (int pos : lost_positions) {
+            if (pos < 0 || pos >= k_orig || lost_seen[pos]) {
+                throw std::invalid_argument("ECNAIVE decode: lost data rows must be unique and in range");
+            }
+            lost_seen[pos] = true;
+        }
+        std::vector<bool> survivor_seen(k_orig + 2, false);
+        for (int row : surviving_rows) {
+            if (row < 0 || row >= k_orig + 2 || survivor_seen[row] ||
+                (row < k_orig && lost_seen[row])) {
+                throw std::invalid_argument("ECNAIVE decode: survivor rows must be unique, valid, and not lost");
+            }
+            survivor_seen[row] = true;
+        }
+        if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw std::invalid_argument("ECNAIVE decode: stripe size exceeds ISA-L int limit");
+        }
+        for (uintptr_t addr : surviving_addrs) {
+            if (addr == 0) throw std::invalid_argument("ECNAIVE decode: null survivor address");
+        }
+        for (uintptr_t addr : recovered_addrs) {
+            if (addr == 0) throw std::invalid_argument("ECNAIVE decode: null recovery address");
         }
 
-        // Step 1: Build full (k_orig+2) x k_orig Vandermonde encoding matrix
-        int full_rows = k_orig + 2;
+        // ISA-L's generator matrix is row-major: rows identify encoded blocks and
+        // columns identify original data. Build A in the exact compact order of
+        // surviving_addrs; columns of A^{-1} therefore use compact survivor indices.
+        const int full_rows = k_orig + 2;
         std::vector<unsigned char> encode_mat(k_orig * full_rows);
         gf_gen_rs_matrix(encode_mat.data(), full_rows, k_orig);
-
-        // Step 2: Build k_orig x k_orig survivor matrix A
-        std::vector<unsigned char> A(k_orig * k_orig, 0);
-        int data_row = 0;
-        for (int pos = 0; pos < k_orig; ++pos) {
-            bool is_lost = false;
-            for (int lp : lost_positions) {
-                if (lp == pos) { is_lost = true; break; }
-            }
-            if (!is_lost) {
-                A[data_row * k_orig + pos] = 1;
-                ++data_row;
-            }
-        }
-        // Fill in surviving parity rows
-        for (int parity_idx = 0; parity_idx < num_surviving_parity; ++parity_idx) {
-            int src_row = k_orig + parity_idx;
-            for (int col = 0; col < k_orig; ++col) {
-                A[data_row * k_orig + col] = encode_mat[src_row * k_orig + col];
-            }
-            ++data_row;
+        std::vector<unsigned char> survivor_matrix(k_orig * k_orig);
+        for (int compact = 0; compact < k_orig; ++compact) {
+            const int source_row = surviving_rows[compact];
+            std::memcpy(
+                survivor_matrix.data() + compact * k_orig,
+                encode_mat.data() + source_row * k_orig,
+                static_cast<size_t>(k_orig));
         }
 
-        // Step 3: Invert A in GF(2^8)
-        std::vector<unsigned char> inv_workspace(k_orig * 2 * k_orig);
-        std::vector<unsigned char> A_inv(k_orig * k_orig);
-        for (int i = 0; i < k_orig * k_orig; ++i) inv_workspace[i] = A[i];
-        int ret = gf_invert_matrix(inv_workspace.data(), A_inv.data(), k_orig);
+        std::vector<unsigned char> survivor_inverse(k_orig * k_orig);
+        const int ret = gf_invert_matrix(
+            survivor_matrix.data(), survivor_inverse.data(), k_orig);
         if (ret != 0) {
-            std::cerr << "ECNAIVE: gf_invert_matrix failed (singular matrix), ret=" << ret << std::endl;
-            for (int i = 0; i < m; ++i)
-                std::memset(reinterpret_cast<void*>(recovered_addrs[i]), 0, size);
-            return;
+            throw std::runtime_error(
+                "ECNAIVE decode: ISA-L gf_invert_matrix failed with code " +
+                std::to_string(ret));
         }
 
-        // Step 4: Extract decode coefficients (surviving_count columns per lost position)
-        std::vector<unsigned char> decode_mat(m * surviving_count);
-        for (int i = 0; i < m; ++i) {
-            int lost_pos = lost_positions[i];
-            int col = 0;
-            // Coefficients for surviving data blocks (at their original positions)
-            for (int pos = 0; pos < k_orig; ++pos) {
-                bool is_lost = false;
-                for (int lp : lost_positions) { if (lp == pos) { is_lost = true; break; } }
-                if (!is_lost) {
-                    decode_mat[i * surviving_count + col] = A_inv[lost_pos * k_orig + pos];
-                    ++col;
-                }
-            }
-            // Coefficients for surviving parity blocks
-            for (int pi = 0; pi < num_surviving_parity; ++pi) {
-                decode_mat[i * surviving_count + col] = A_inv[lost_pos * k_orig + k_orig + pi];
-                ++col;
+        std::vector<unsigned char> decode_mat(m * k_orig);
+        for (int lost_idx = 0; lost_idx < m; ++lost_idx) {
+            const int lost_row = lost_positions[lost_idx];
+            for (int compact = 0; compact < k_orig; ++compact) {
+                decode_mat[lost_idx * k_orig + compact] =
+                    survivor_inverse[lost_row * k_orig + compact];
             }
         }
+        const int surviving_count = k_orig;
 
         // Step 5: Generate decode tables
         size_t decode_tbls_size = 32 * (size_t)surviving_count * (size_t)m;
@@ -1443,6 +1440,11 @@ public:
             return;
         }
         std::cerr << "EC-NAIVE: sw_recv_data(" << block_idx << ", " << size << "): no channel" << std::endl;
+    }
+
+    void reset_load_timing_stats() {
+        load_send_total_ns_.store(0, std::memory_order_relaxed);
+        load_recv_total_ns_.store(0, std::memory_order_relaxed);
     }
 
     // Release helpers: Python can poll these to free buffers.
@@ -3252,6 +3254,8 @@ PYBIND11_MODULE(ecnaive_native, m) {
         .def("reset_encoding_completion_flags", &ECNaiveNative::reset_encoding_completion_flags)
         .def("get_ft_timing_stats", &ECNaiveNative::get_ft_timing_stats,
              "Return per-rank timing: net_s wall-span; encode_s serial-equivalent encode CPU sum")
+        .def("reset_load_timing_stats", &ECNaiveNative::reset_load_timing_stats,
+             "Reset software/load timing counters without rebuilding connections")
         .def("wait_for_encoding_completion", &ECNaiveNative::wait_for_encoding_completion)
         .def("wait_for_pending_network_tasks", &ECNaiveNative::wait_for_pending_network_tasks,
              "Wait until all in-flight save-path send/recv tasks complete (no sentinels)")
@@ -3312,6 +3316,7 @@ PYBIND11_MODULE(ecnaive_native, m) {
              pybind11::arg("k"),
              pybind11::arg("m"),
              pybind11::arg("lost_positions"),
+             pybind11::arg("surviving_rows"),
              pybind11::arg("surviving_addrs"),
              pybind11::arg("recovered_addrs"),
              pybind11::arg("size"))

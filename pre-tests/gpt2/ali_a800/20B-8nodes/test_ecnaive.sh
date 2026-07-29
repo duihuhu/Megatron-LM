@@ -248,11 +248,24 @@ EVAL_AND_LOGGING_ARGS=(
 mkdir -p logs
 mkdir -p logs/csv
 
+EC_RANK_LAUNCH='
+set -e
+cores_per_rank=16
+start=$((LOCAL_RANK * cores_per_rank))
+end=$((start + cores_per_rank - 1))
+cpu_list=$(seq -s, "$start" "$end")
+export ECNAIVE_XOR_CPU_LIST="$cpu_list"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+echo "[cpu_bind] local_rank=$LOCAL_RANK cpus=$cpu_list"
+exec taskset -c "$start-$end" "${PYTHON_BIN:-python}" "$@"
+'
+
 # -------------------------------------------------------------------------
 # Print command if PRINT_CMD is set
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK, mode=$MODE): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} ${RECOVERY_MODE_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    echo "Would run (Node $NODE_RANK, mode=$MODE): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[*]} --no-python bash -c '<per-rank CPU binding>' _ pretrain_gpt.py ${GPT_ARGS[*]} ${DATA_ARGS[*]} ${MODEL_PARALLEL_ARGS[*]} ${EVAL_AND_LOGGING_ARGS[*]} ${RECOVERY_MODE_ARGS[*]} --distributed-backend nccl ${ARGS_TO_PASS[*]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
@@ -263,12 +276,13 @@ echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \
 
-PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
+PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun "${DISTRIBUTED_ARGS[@]}" \
+    --no-python bash -c "$EC_RANK_LAUNCH" _ \
     pretrain_gpt.py \
-    ${GPT_ARGS[@]} \
-    ${DATA_ARGS[@]} \
-    ${MODEL_PARALLEL_ARGS[@]} \
-    ${EVAL_AND_LOGGING_ARGS[@]} \
-    ${RECOVERY_MODE_ARGS[@]} \
+    "${GPT_ARGS[@]}" \
+    "${DATA_ARGS[@]}" \
+    "${MODEL_PARALLEL_ARGS[@]}" \
+    "${EVAL_AND_LOGGING_ARGS[@]}" \
+    "${RECOVERY_MODE_ARGS[@]}" \
     --distributed-backend nccl \
-    ${ARGS_TO_PASS[@]}
+    "${ARGS_TO_PASS[@]}"

@@ -178,13 +178,16 @@ private:
         attr.rq_psn = 0;
         attr.max_dest_rd_atomic = 1;
         attr.min_rnr_timer = 12;
-        attr.ah_attr.is_global = 1;
+        const bool use_gid = (remote_info.lid == 0);
+        attr.ah_attr.is_global = use_gid ? 1 : 0;
         attr.ah_attr.port_num = 1;
         attr.ah_attr.sl = 0;
         attr.ah_attr.dlid = remote_info.lid;
-        memcpy(&attr.ah_attr.grh.dgid, remote_info.gid, 16);
-        attr.ah_attr.grh.sgid_index = 1; // GID index 1 for erdma (RoCE v2)
-        attr.ah_attr.grh.hop_limit = 64;
+        if (use_gid) {
+            memcpy(&attr.ah_attr.grh.dgid, remote_info.gid, 16);
+            attr.ah_attr.grh.sgid_index = 1; // GID index 1 for erdma (RoCE v2)
+            attr.ah_attr.grh.hop_limit = 64;
+        }
         if (ibv_modify_qp(qp_, &attr,
             IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
             IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
@@ -5554,8 +5557,8 @@ private:
             throw std::runtime_error("ECLATIN RDMA: No RDMA devices found");
         }
 
-        rdma_context_ = ibv_open_device(
-            find_rdma_device_by_ip(parity1_recv1_ip_, device_list, num_devices));
+        rdma_context_ = ibv_open_device(find_rdma_device_by_ip(
+            parity1_recv1_ip_, device_list, num_devices, {"ECLATIN"}));
         if (!rdma_context_) {
             ibv_free_device_list(device_list);
             throw std::runtime_error("ECLATIN RDMA: Failed to open RDMA device");

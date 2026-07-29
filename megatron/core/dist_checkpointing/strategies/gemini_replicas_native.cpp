@@ -1549,7 +1549,8 @@ private:
             throw std::runtime_error("No RDMA devices found");
         }
         
-        context_ = ibv_open_device(find_rdma_device_by_ip(my_ip_, device_list, num_devices));
+        context_ = ibv_open_device(find_rdma_device_by_ip(
+            my_ip_, device_list, num_devices, {"GEMINI_REPLICAS"}));
         if (!context_) {
             ibv_free_device_list(device_list);
             throw std::runtime_error("Failed to open RDMA device");
@@ -1941,14 +1942,9 @@ private:
         attr.max_dest_rd_atomic = 1;
         attr.min_rnr_timer = 12;
         
-        // Check if we should use GID (RoCE) or LID (InfiniBand)
-        bool use_gid = false;
-        for (int i = 0; i < 16; ++i) {
-            if (remote_info.gid[i] != 0) {
-                use_gid = true;
-                break;
-            }
-        }
+        // RoCE ports have no LID; native InfiniBand must use LID routing even
+        // when its GID table contains a non-zero link-local GID.
+        const bool use_gid = (remote_info.lid == 0);
         
         if (use_gid) {
             if (debug_)

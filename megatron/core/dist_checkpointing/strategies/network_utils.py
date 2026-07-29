@@ -9,6 +9,7 @@ Phase 2: per-local-rank NIC binding via ``{PREFIX}_LOCAL_RANK_NIC_{local_rank}``
 
 import os
 import socket
+import struct
 from logging import getLogger
 from typing import List, Optional
 
@@ -25,20 +26,30 @@ def _get_local_rank() -> int:
 
 
 def _try_get_ip_from_interface(interface_name: str) -> Optional[str]:
-    """Try to resolve an IPv4 address from a named network interface via netifaces."""
-    try:
-        import netifaces
-        addrs = netifaces.ifaddresses(interface_name)
-        if netifaces.AF_INET in addrs:
-            ip = addrs[netifaces.AF_INET][0]['addr']
-            logger.debug("Resolved IP %s from interface %s", ip, interface_name)
-            return ip
-        logger.warning("Interface %s has no IPv4 address", interface_name)
-    except ImportError:
-        logger.warning(
-            "netifaces not installed. Install via 'pip install netifaces'. "
-            "Falling back to auto-detection."
+    """Try to resolve an IPv4 address from a named Linux network interface."""
+    if os.path.isdir(f'/sys/class/infiniband/{interface_name}'):
+        logger.debug(
+            "Interface value %s is an RDMA device name; skipping IPv4 lookup",
+            interface_name,
         )
+        return None
+
+    try:
+        import fcntl
+
+        ifname = interface_name.encode('utf-8')
+        if len(ifname) >= 16:
+            logger.warning("Interface name %s is too long for IPv4 lookup", interface_name)
+            return None
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            ifreq = struct.pack('256s', ifname)
+            result = fcntl.ioctl(sock.fileno(), 0x8915, ifreq)  # SIOCGIFADDR
+        ip = socket.inet_ntoa(result[20:24])
+        logger.debug("Resolved IP %s from interface %s", ip, interface_name)
+        return ip
+    except OSError as e:
+        logger.warning("Interface %s has no usable IPv4 address: %s", interface_name, e)
     except Exception as e:
         logger.warning("Failed to get IP from interface %s: %s", interface_name, e)
     return None

@@ -98,6 +98,7 @@ struct RdmaBuffer {
 // ---------------------------------------------------------------------------
 static constexpr size_t FRCHECK_RDMA_CHUNK = 64ULL * 1024 * 1024;     // 64 MB per RDMA op
 static constexpr int    FRCHECK_MAX_WR = 64;
+static constexpr int    FRCHECK_DEFAULT_MAX_SEND_SGE = 16;
 
 struct ConnectHello {
     int32_t rank;
@@ -116,7 +117,7 @@ public:
           tcp_sock_(tcp_sock), peer_rank_(peer_rank),
           bufs_(bufs), buf_mtx_(buf_mtx),
           qp_(nullptr),
-          connected_(false)
+          max_send_sge_(1), connected_(false)
     {
         send_cq_ = ibv_create_cq(ctx_, 256, nullptr, nullptr, 0);
         recv_cq_ = ibv_create_cq(ctx_, 256, nullptr, nullptr, 0);
@@ -132,11 +133,24 @@ public:
         attr.qp_type = IBV_QPT_RC;
         attr.cap.max_send_wr = FRCHECK_MAX_WR;
         attr.cap.max_recv_wr = FRCHECK_MAX_WR;
-        attr.cap.max_send_sge = 1;
+        int requested_max_send_sge = FRCHECK_DEFAULT_MAX_SEND_SGE;
+        if (const char* env = std::getenv("FRCHECK_MAX_SEND_SGE")) {
+            try {
+                requested_max_send_sge = std::max(1, std::stoi(env));
+            } catch (...) {
+                throw std::runtime_error("FRCheck RDMA: invalid FRCHECK_MAX_SEND_SGE");
+            }
+        }
+        ibv_device_attr device_attr{};
+        if (ibv_query_device(ctx_, &device_attr) == 0 && device_attr.max_sge > 0)
+            requested_max_send_sge = std::min(requested_max_send_sge, device_attr.max_sge);
+        attr.cap.max_send_sge = requested_max_send_sge;
         attr.cap.max_recv_sge = 1;
         qp_ = ibv_create_qp(pd_, &attr);
         if (!qp_)
             throw std::runtime_error("FRCheck RDMA: failed to create QP");
+        max_send_sge_ = std::max(1, std::min(requested_max_send_sge,
+                                             static_cast<int>(attr.cap.max_send_sge)));
     }
 
     ~FRCheckRdmaChannel() {
@@ -149,6 +163,7 @@ public:
 
     int peer_rank() const { return peer_rank_; }
     bool is_connected() const { return connected_; }
+    int max_send_sge() const { return max_send_sge_; }
 
     // Break blocking send/recv during shutdown (ECLATIN-style conn cleanup).
     void abort_connection() {
@@ -211,6 +226,29 @@ public:
                 std::to_string((uintptr_t)data) + " size=" + std::to_string(size) + ")");
         }
         send_chunked(data, size, mr, wait_cb, done_cb);
+    }
+
+
+    void send_segments(const std::vector<std::pair<uintptr_t, size_t>>& segments,
+                       size_t logical_size,
+                       const std::function<void()>& wait_cb = nullptr,
+                       const std::function<void()>& done_cb = nullptr) {
+        std::lock_guard<std::mutex> lock(send_mtx_);
+        if (!connected_)
+            throw std::runtime_error("FRCheck RDMA: channel not connected");
+        size_t segment_total = 0;
+        for (const auto& segment : segments) segment_total += segment.second;
+        if (segment_total != logical_size)
+            throw std::runtime_error("FRCheck RDMA: scatter logical size mismatch");
+        if (wait_cb) wait_cb();
+        uint64_t net_sz = htobe64(logical_size);
+        if (send(tcp_sock_, &net_sz, sizeof(net_sz), 0) != sizeof(net_sz))
+            throw std::runtime_error("FRCheck RDMA: failed to send scatter size");
+        uint8_t ack;
+        if (recv(tcp_sock_, &ack, 1, MSG_WAITALL) != 1)
+            throw std::runtime_error("FRCheck RDMA: failed to recv scatter ack");
+        if (done_cb) done_cb();
+        send_segments_chunked_(segments, logical_size, wait_cb, done_cb);
     }
 
     // RDMA RECEIVE data from peer (blocking)
@@ -323,6 +361,62 @@ private:
         _send_chunked(data, total, mr, wait_cb, done_cb);
     }
 
+    void send_segments_chunked_(
+            const std::vector<std::pair<uintptr_t, size_t>>& segments,
+            size_t total,
+            const std::function<void()>& wait_cb,
+            const std::function<void()>& done_cb) {
+        size_t segment_idx = 0;
+        size_t segment_offset = 0;
+        size_t remaining = total;
+        while (remaining > 0) {
+            if (wait_cb) wait_cb();
+            size_t message_remaining = std::min(remaining, FRCHECK_RDMA_CHUNK);
+            std::vector<ibv_sge> sges;
+            while (message_remaining > 0) {
+                while (segment_idx < segments.size() &&
+                       segment_offset == segments[segment_idx].second) {
+                    ++segment_idx;
+                    segment_offset = 0;
+                }
+                if (segment_idx >= segments.size())
+                    throw std::runtime_error("FRCheck RDMA: scatter segments ended early");
+                const auto& segment = segments[segment_idx];
+                size_t length = std::min(message_remaining, segment.second - segment_offset);
+                ibv_mr* mr = find_mr(segment.first + segment_offset, length);
+                if (!mr)
+                    throw std::runtime_error(
+                        "FRCheck RDMA: unregistered scatter segment addr=" +
+                        std::to_string(segment.first + segment_offset) +
+                        " size=" + std::to_string(length));
+                ibv_sge sge{};
+                sge.addr = static_cast<uint64_t>(segment.first + segment_offset);
+                sge.length = static_cast<uint32_t>(length);
+                sge.lkey = mr->lkey;
+                sges.push_back(sge);
+                if (sges.size() > static_cast<size_t>(max_send_sge_))
+                    throw std::runtime_error(
+                        "FRCheck RDMA: one 64MiB scatter message requires " +
+                        std::to_string(sges.size()) + " SGEs, exceeding effective max_send_sge=" +
+                        std::to_string(max_send_sge_) +
+                        "; reduce blocks per Python layer-exchange task");
+                segment_offset += length;
+                message_remaining -= length;
+                remaining -= length;
+            }
+            ibv_send_wr wr{};
+            wr.sg_list = sges.data();
+            wr.num_sge = static_cast<int>(sges.size());
+            wr.opcode = IBV_WR_SEND;
+            wr.send_flags = IBV_SEND_SIGNALED;
+            ibv_send_wr* bad = nullptr;
+            if (ibv_post_send(qp_, &wr, &bad))
+                throw std::runtime_error("FRCheck RDMA: scatter post_send failed");
+            poll_cq(send_cq_, 1);
+            if (done_cb) done_cb();
+        }
+    }
+
     void recv_chunked(uint8_t* buf, size_t total, ibv_mr* mr,
                       const std::function<void()>& wait_cb = nullptr,
                       const std::function<void()>& done_cb = nullptr) {
@@ -414,6 +508,7 @@ private:
     std::map<uintptr_t, RdmaBuffer>* bufs_;
     std::mutex* buf_mtx_;
     ibv_qp* qp_;
+    int max_send_sge_;
     bool connected_;
     std::mutex send_mtx_;
     std::mutex recv_mtx_;
@@ -544,6 +639,44 @@ public:
         if (!mr)
             throw std::runtime_error("FRCheck RDMA: unregistered tagged send buffer");
         send_chunked(data, size, mr, wait_cb, done_cb);
+    }
+
+    void send_tagged_segments(
+            uint64_t tag,
+            const std::vector<std::pair<uintptr_t, size_t>>& segments,
+            size_t logical_size,
+            const std::function<void()>& wait_cb = nullptr,
+            const std::function<void()>& done_cb = nullptr) {
+        std::lock_guard<std::mutex> lock(send_mtx_);
+        if (!connected_)
+            throw std::runtime_error("FRCheck RDMA: channel not connected");
+        size_t segment_total = 0;
+        for (const auto& segment : segments) segment_total += segment.second;
+        if (segment_total != logical_size)
+            throw std::runtime_error("FRCheck RDMA: tagged scatter logical size mismatch");
+        if (wait_cb) wait_cb();
+        {
+            std::lock_guard<std::mutex> lk(tag_mtx_);
+            ack_ready_[tag] = false;
+        }
+        TaggedCtl c{htobe32(kTagData), 0, htobe64(tag), htobe64(logical_size)};
+        if (!write_full_locked_(&c, sizeof(c)))
+            throw std::runtime_error("FRCheck RDMA: failed to send tagged scatter header");
+        {
+            std::unique_lock<std::mutex> lk(tag_mtx_);
+            tag_cv_.wait(lk, [&]{
+                auto it = ack_ready_.find(tag);
+                return (it != ack_ready_.end() && it->second) ||
+                       tag_stop_.load(std::memory_order_acquire);
+            });
+            ack_ready_.erase(tag);
+            if (tag_stop_.load(std::memory_order_acquire)) {
+                if (done_cb) done_cb();
+                return;
+            }
+        }
+        if (done_cb) done_cb();
+        send_segments_chunked_(segments, logical_size, wait_cb, done_cb);
     }
 
     // Register a tagged recv target and block until its DATA header arrives.
@@ -1099,6 +1232,82 @@ public:
         save_source_send_total_us_.fetch_add(elapsed, std::memory_order_relaxed);
         save_source_send_tasks_.fetch_add(1, std::memory_order_relaxed);
         save_source_send_bytes_.fetch_add(size, std::memory_order_relaxed);
+        record_atomic_max_(save_source_send_max_us_, elapsed);
+    }
+
+    int get_max_send_sge() const {
+        int result = FRCHECK_DEFAULT_MAX_SEND_SGE;
+        bool found = false;
+        for (const auto& channel : channel_owners_) {
+            if (!channel) continue;
+            result = found ? std::min(result, channel->max_send_sge()) : channel->max_send_sge();
+            found = true;
+        }
+        return found ? result : 1;
+    }
+
+    void send_layer_blocks_to_peer(
+            int peer_rig, uintptr_t mirror_base,
+            const std::vector<size_t>& block_indices, size_t block_size,
+            uint64_t batch_id, int lane_id = 0) {
+        if (block_size == 0 || block_indices.empty())
+            throw std::runtime_error("FRCheck layer scatter send: empty block list or block size");
+        if (block_indices.size() > SIZE_MAX / block_size)
+            throw std::runtime_error("FRCheck layer scatter send: logical size overflow");
+        int mapped_lane_id = map_save_send_lane_(peer_rig, lane_id);
+        FRCheckRdmaChannel* ch = get_channel_by_lane_(peer_rig, mapped_lane_id);
+        if (!ch)
+            throw std::runtime_error("FRCheck layer scatter send: no channel to rig " +
+                                     std::to_string(peer_rig));
+        std::vector<std::pair<uintptr_t, size_t>> segments;
+        segments.reserve(block_indices.size());
+        for (size_t block_idx : block_indices) {
+            if (block_idx > (SIZE_MAX - mirror_base) / block_size)
+                throw std::runtime_error("FRCheck layer scatter send: block address overflow");
+            segments.emplace_back(mirror_base + block_idx * block_size, block_size);
+        }
+        size_t logical_size = block_indices.size() * block_size;
+        uint64_t net_t0 = frcheck_now_us();
+        record_save_net_start_(net_t0);
+        if (shared_lane_)
+            ch->send_tagged_segments(make_channel_tag_(2, mapped_lane_id, batch_id),
+                                     segments, logical_size);
+        else
+            ch->send_segments(segments, logical_size);
+        uint64_t net_t1 = frcheck_now_us();
+        record_save_net_end_(net_t1);
+        uint64_t elapsed = net_t1 - net_t0;
+        save_source_send_total_us_.fetch_add(elapsed, std::memory_order_relaxed);
+        save_source_send_tasks_.fetch_add(1, std::memory_order_relaxed);
+        save_source_send_bytes_.fetch_add(logical_size, std::memory_order_relaxed);
+        size_t wr_count = 0;
+        size_t sge_count = 0;
+        size_t max_sge = 0;
+        size_t segment_idx = 0;
+        size_t segment_offset = 0;
+        size_t stats_remaining = logical_size;
+        while (stats_remaining > 0) {
+            size_t message_remaining = std::min(stats_remaining, FRCHECK_RDMA_CHUNK);
+            size_t message_sge = 0;
+            while (message_remaining > 0) {
+                while (segment_offset == segments[segment_idx].second) {
+                    ++segment_idx;
+                    segment_offset = 0;
+                }
+                size_t length = std::min(
+                    message_remaining, segments[segment_idx].second - segment_offset);
+                segment_offset += length;
+                message_remaining -= length;
+                stats_remaining -= length;
+                ++message_sge;
+            }
+            ++wr_count;
+            sge_count += message_sge;
+            max_sge = std::max(max_sge, message_sge);
+        }
+        save_source_send_wr_count_.fetch_add(wr_count, std::memory_order_relaxed);
+        save_source_send_sge_count_.fetch_add(sge_count, std::memory_order_relaxed);
+        record_atomic_max_(save_source_send_max_sge_, max_sge);
         record_atomic_max_(save_source_send_max_us_, elapsed);
     }
 
@@ -2034,6 +2243,9 @@ private:
     std::atomic<uint64_t> save_source_send_tasks_{0};
     std::atomic<uint64_t> save_enc_recv_tasks_{0};
     std::atomic<uint64_t> save_source_send_bytes_{0};
+    std::atomic<uint64_t> save_source_send_wr_count_{0};
+    std::atomic<uint64_t> save_source_send_sge_count_{0};
+    std::atomic<uint64_t> save_source_send_max_sge_{0};
     std::atomic<uint64_t> save_enc_recv_bytes_{0};
 
     // ---- Role-based queues: n workers each, encoder split into RECV→encode+SEND ----
@@ -2721,6 +2933,9 @@ public:
         save_source_send_tasks_.store(0, std::memory_order_relaxed);
         save_enc_recv_tasks_.store(0, std::memory_order_relaxed);
         save_source_send_bytes_.store(0, std::memory_order_relaxed);
+        save_source_send_wr_count_.store(0, std::memory_order_relaxed);
+        save_source_send_sge_count_.store(0, std::memory_order_relaxed);
+        save_source_send_max_sge_.store(0, std::memory_order_relaxed);
         save_enc_recv_bytes_.store(0, std::memory_order_relaxed);
         mirror_d2h_busy_total_us_.store(0, std::memory_order_relaxed);
         mirror_tasks_submitted_.store(0, std::memory_order_relaxed);
@@ -2772,6 +2987,12 @@ public:
             save_enc_recv_tasks_.load(std::memory_order_relaxed));
         result["source_send_bytes"] = static_cast<double>(
             save_source_send_bytes_.load(std::memory_order_relaxed));
+        result["source_send_wr_count"] = static_cast<double>(
+            save_source_send_wr_count_.load(std::memory_order_relaxed));
+        result["source_send_sge_count"] = static_cast<double>(
+            save_source_send_sge_count_.load(std::memory_order_relaxed));
+        result["source_send_max_sge"] = static_cast<double>(
+            save_source_send_max_sge_.load(std::memory_order_relaxed));
         result["enc_recv_bytes"] = static_cast<double>(
             save_enc_recv_bytes_.load(std::memory_order_relaxed));
         return result;
@@ -4083,7 +4304,8 @@ private:
         ibv_device** devs = ibv_get_device_list(&ndev);
         if (!devs || ndev == 0)
             throw std::runtime_error("FRCheck RDMA: no IB devices found");
-        rdma_ctx_ = ibv_open_device(find_rdma_device_by_ip(my_ip_, devs, ndev));
+        rdma_ctx_ = ibv_open_device(find_rdma_device_by_ip(
+            my_ip_, devs, ndev, {"FRCHECK", "ECLATIN"}));
         ibv_free_device_list(devs);
         if (!rdma_ctx_)
             throw std::runtime_error("FRCheck RDMA: failed to open device");
@@ -4480,6 +4702,11 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("peer_rig"), py::arg("addr"), py::arg("size"), py::arg("batch_id"),
              py::arg("lane_id") = 0,
              py::call_guard<py::gil_scoped_release>())
+        .def("send_layer_blocks_to_peer", &FRCheckNative::send_layer_blocks_to_peer,
+             py::arg("peer_rig"), py::arg("mirror_base"), py::arg("block_indices"),
+             py::arg("block_size"), py::arg("batch_id"), py::arg("lane_id") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("get_max_send_sge", &FRCheckNative::get_max_send_sge)
         .def("recv_layer_from_peer", &FRCheckNative::recv_layer_from_peer,
              py::arg("peer_rig"), py::arg("addr"), py::arg("capacity"), py::arg("batch_id"),
              py::arg("lane_id") = 0,

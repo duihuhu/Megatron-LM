@@ -1784,8 +1784,8 @@ public:
                     int num_devices;
                     ibv_device** device_list = ibv_get_device_list(&num_devices);
                     if (device_list && num_devices > 0) {
-                        rdma_context_ = ibv_open_device(
-                            find_rdma_device_by_ip(recv_ips_[0], device_list, num_devices));
+                        rdma_context_ = ibv_open_device(find_rdma_device_by_ip(
+                            recv_ips_[0], device_list, num_devices, {"ECNAIVE"}));
                         ibv_free_device_list(device_list);
                     }
                 }
@@ -2140,8 +2140,8 @@ private:
         }
         
         // Select RDMA device by local IP (recv_ips_[0])
-        rdma_context_ = ibv_open_device(
-            find_rdma_device_by_ip(recv_ips_[0], device_list, num_devices));
+        rdma_context_ = ibv_open_device(find_rdma_device_by_ip(
+            recv_ips_[0], device_list, num_devices, {"ECNAIVE"}));
         if (!rdma_context_) {
             ibv_free_device_list(device_list);
             throw std::runtime_error("Failed to open RDMA device");
@@ -2186,8 +2186,8 @@ private:
             if (!device_list || num_devices == 0) {
                 throw std::runtime_error("No RDMA devices found");
             }
-            rdma_context_ = ibv_open_device(
-                find_rdma_device_by_ip(recv_ips_[0], device_list, num_devices));
+            rdma_context_ = ibv_open_device(find_rdma_device_by_ip(
+                recv_ips_[0], device_list, num_devices, {"ECNAIVE"}));
             if (!rdma_context_) {
                 ibv_free_device_list(device_list);
                 throw std::runtime_error("Failed to open RDMA device");

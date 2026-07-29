@@ -2459,10 +2459,10 @@ def _prepare_layer_exchange_network(
     prepared: Dict[str, Any],
     n: int,
     pack_stream,
+    effective_max_send_sge: int,
 ) -> Dict[str, Any]:
-    """Pack one layer's source blocks and create non-started RDMA threads."""
+    """Stage one canonical layer mirror and build its RDMA task metadata."""
     result = prepared["result"]
-    state = prepared["state"]
     layer_bufs = prepared["layer_bufs"]
     layer_idx = int(result.layer_idx)
     block_size = int(result.block_size)
@@ -2472,42 +2472,25 @@ def _prepare_layer_exchange_network(
     lane_id = (int(prepared["batch_id"]) - 1) % max(1, int(getattr(manager, "num_stripes", 1)))
 
     payload_bytes = int(result.n_filled_blocks) * block_size
-    if payload_bytes > 0:
-        native.mirror_layer(state.layer_buf_base, int(layer_bufs.layer_mirror_cpu.data_ptr()), payload_bytes)
-
-    # Gather each layer's scattered source blocks into a contiguous per-peer CPU
-    # staging buffer so the exchange can issue a few large RDMA sends instead of
-    # one send per block. The gather D2H copies are queued on `pack_stream` and
-    # overlapped; the caller performs a single pack_stream.synchronize() before
-    # any send is issued.
     layer_gpu = layer_bufs.layer_buf_gpu
-    send_offsets: Dict[int, Dict[int, int]] = {}
-    stage_pack_s = 0.0
-    stage_pack_bytes = 0
-    stage_pack_blocks = 0
+    layer_mirror_cpu = layer_bufs.layer_mirror_cpu
+    if payload_bytes > int(layer_gpu.numel()) or payload_bytes > int(layer_mirror_cpu.numel()):
+        raise RuntimeError(
+            f"FRCheck layer exchange: canonical mirror too small for layer {layer_idx}"
+        )
+
+    # Queue one contiguous D2H into the canonical source-block layout. Network
+    # staging is gathered from this mirror by the first send worker for the layer.
     stage_pack_t0 = time.time()
     with torch.cuda.stream(pack_stream):
-        for dst_node, blocks in send_blocks.items():
-            pack_buf = layer_bufs.send_layer_bufs.get(dst_node)
-            if pack_buf is None:
-                raise RuntimeError(f"FRCheck layer exchange: missing send buffer for node {dst_node}")
-            if int(pack_buf.numel()) < len(blocks) * block_size:
-                raise RuntimeError(
-                    f"FRCheck layer exchange: send buffer too small for node {dst_node}"
-                )
-            offsets: Dict[int, int] = {}
-            for slot, (sid, blk_idx) in enumerate(blocks):
-                dst_start = slot * block_size
-                src_start = int(blk_idx) * block_size
-                pack_buf[dst_start:dst_start + block_size].copy_(
-                    layer_gpu[src_start:src_start + block_size], non_blocking=True
-                )
-                offsets[sid] = dst_start
-                stage_pack_bytes += block_size
-                stage_pack_blocks += 1
-            send_offsets[dst_node] = offsets
-        stage_event = torch.cuda.Event()
-        stage_event.record(pack_stream)
+        d2h_start_event = torch.cuda.Event(enable_timing=True)
+        d2h_end_event = torch.cuda.Event(enable_timing=True)
+        d2h_start_event.record(pack_stream)
+        if payload_bytes > 0:
+            layer_mirror_cpu[:payload_bytes].copy_(
+                layer_gpu[:payload_bytes], non_blocking=True
+            )
+        d2h_end_event.record(pack_stream)
     stage_pack_s = time.time() - stage_pack_t0
 
     recv_offsets: Dict[int, Dict[int, int]] = {}
@@ -2525,15 +2508,17 @@ def _prepare_layer_exchange_network(
         }
 
     num_stripes_local = max(1, int(getattr(manager, "num_stripes", 1)))
-    # Segments per peer for the aggregated exchange. Staging makes each peer's
-    # payload contiguous, so a small segment count yields few large transfers.
-    # Keep it symmetric on send/recv so tagged transfers match across the pair.
+    # Both peers derive identical balanced task boundaries from block count,
+    # the configured minimum segment target, and the globally reduced SGE cap.
     send_seg = max(1, int(os.environ.get("FRCHECK_LAYER_EXCHANGE_SEG", "1")))
 
-    def _iter_staged_segments(block_count: int):
+    def _iter_direct_segments(block_count: int):
         if block_count <= 0:
             return
-        nseg = min(send_seg, block_count)
+        required_segments = (
+            block_count + effective_max_send_sge - 1
+        ) // effective_max_send_sge
+        nseg = min(block_count, max(send_seg, required_segments))
         base = block_count // nseg
         rem = block_count % nseg
         start = 0
@@ -2550,7 +2535,7 @@ def _prepare_layer_exchange_network(
         if not blocks:
             continue
         recv_buf = layer_bufs.remote_layer_bufs[src_node]
-        for seg_idx, start, take in _iter_staged_segments(len(blocks)):
+        for seg_idx, start, take in _iter_direct_segments(len(blocks)):
             seg_lane = (lane_id + seg_idx) % num_stripes_local
             segment_blocks = list(blocks[start:start + take])
             recv_tasks.append({
@@ -2565,13 +2550,15 @@ def _prepare_layer_exchange_network(
     for dst_node, blocks in sorted(send_blocks.items()):
         if not blocks:
             continue
-        pack_buf = layer_bufs.send_layer_bufs[dst_node]
-        for seg_idx, start, take in _iter_staged_segments(len(blocks)):
+        for seg_idx, start, take in _iter_direct_segments(len(blocks)):
             seg_lane = (lane_id + seg_idx) % num_stripes_local
+            task_blocks = blocks[start:start + take]
             send_tasks.append({
                 "peer_node": dst_node,
                 "peer_rig": dst_node - 1,
-                "addr": int(pack_buf.data_ptr()) + start * block_size,
+                "mirror_base": int(layer_mirror_cpu.data_ptr()),
+                "block_indices": [int(blk_idx) for _sid, blk_idx in task_blocks],
+                "block_size": block_size,
                 "size": take * block_size,
                 "batch_id": batch_base + my_node * 1009 + dst_node + seg_idx * 104729,
                 "lane_id": seg_lane,
@@ -2595,10 +2582,17 @@ def _prepare_layer_exchange_network(
         "done_event": done_event,
         "errors": [],
         "start_time": time.time(),
-        "stage_event": stage_event,
+        "d2h_start_event": d2h_start_event,
+        "d2h_end_event": d2h_end_event,
         "stage_pack_s": stage_pack_s,
-        "stage_pack_bytes": stage_pack_bytes,
-        "stage_pack_blocks": stage_pack_blocks,
+        "stage_pack_bytes": payload_bytes,
+        "stage_pack_blocks": int(result.n_filled_blocks),
+        "mirror_ready_lock": threading.Lock(),
+        "mirror_ready_event": threading.Event(),
+        "mirror_ready_started": False,
+        "mirror_ready_error": None,
+        "mirror_ready_wait_sum_s": 0.0,
+        "mirror_ready_wait_max_s": 0.0,
     }
     encode_specs = _build_layer_exchange_encode_specs(manager, ctx, n)
     ready_queue: queue.Queue = queue.Queue()
@@ -2867,43 +2861,69 @@ def _write_frcheck_aggregate_p2_files(
             future.result()
 
 
-def _finish_aggregate_p2_context(context: Dict[str, Any], debug: bool = False) -> None:
-    """Wait for aggregate P2, write received shards, and release registered buffers."""
-    manager = context["manager"]
-    native = manager.get_native()
+def _wait_aggregate_p2_context(context: Dict[str, Any]) -> float:
+    """Wait once for aggregate P2 while retaining all registered buffers."""
+    if context.get("native_completed", False):
+        return float(context["timings"].get("wait_s", 0.0))
+
+    native = context["manager"].get_native()
     if native is None:
         raise RuntimeError("FRCheck aggregate P2 native module is unavailable")
-    wait_s = 0.0
-    write_s = 0.0
-    try:
-        wait_start = time.time()
-        native.wait_aggregate_p2(300)
-        wait_s = time.time() - wait_start
-        if context["write_to_disk"]:
-            write_start = time.time()
-            _write_frcheck_aggregate_p2_files(
-                context["output_dir"], context["rank"], context["recv_segments"],
-            )
-            write_s = time.time() - write_start
-    finally:
+    wait_start = time.time()
+    native.wait_aggregate_p2(300)
+    wait_s = time.time() - wait_start
+    context["timings"]["wait_s"] = wait_s
+    context["native_completed"] = True
+    return wait_s
+
+
+def _release_aggregate_p2_context(context: Dict[str, Any]) -> None:
+    """Release save-scoped aggregate P2 buffers after native completion."""
+    manager = context["manager"]
+    if not context.get("buffers_released", False):
         manager.release_registered_save_buffers(context["buffers"])
-    context["timings"].update({"wait_s": wait_s, "write_s": write_s})
+        context["buffers_released"] = True
+
+
+def _finish_aggregate_p2_context(context: Dict[str, Any], debug: bool = False) -> None:
+    """Wait for aggregate P2 and release temporary context ownership once."""
+    if context.get("finished", False):
+        return
+    try:
+        _wait_aggregate_p2_context(context)
+    except BaseException:
+        _release_aggregate_p2_context(context)
+        raise
+    else:
+        _release_aggregate_p2_context(context)
+        context["finished"] = True
     if debug:
         timings = context["timings"]
         logger.info(
             "FRCHECK aggregate P2 background rank %d: generation=%d "
-            "prepare_s=%.3f submit_s=%.3f wait_s=%.3f write_s=%.3f",
+            "prepare_s=%.3f submit_s=%.3f wait_s=%.3f",
             context["rank"], context["generation"], timings["prepare_s"],
-            timings["submit_s"], timings["wait_s"], timings["write_s"],
+            timings["submit_s"], timings["wait_s"],
         )
 
 
 def _async_run_aggregate_p2(descriptor: Dict[str, Any], debug: bool = False) -> None:
     global _async_writer_error
+    context = None
     try:
         context, _summary = _prepare_and_submit_aggregate_p2(descriptor)
-        _finish_aggregate_p2_context(context, debug=debug)
+        if descriptor["write_to_disk"]:
+            _wait_aggregate_p2_context(context)
+            descriptor["completed_context"] = context
+        else:
+            _finish_aggregate_p2_context(context, debug=debug)
     except BaseException as exc:
+        descriptor["completed_context"] = None
+        try:
+            if context is not None:
+                _release_aggregate_p2_context(context)
+        except BaseException:
+            logger.exception("FRCheck failed to clean up aggregate P2 writer state")
         _async_writer_error = exc
         logger.exception("FRCheck async aggregate P2 writer failed")
 
@@ -2927,6 +2947,33 @@ def _wait_previous_async_writers(debug: bool = False, rank: int = -1) -> None:
         error = _async_writer_error
         _async_writer_error = None
         raise RuntimeError("FRCheck asynchronous writer failed") from error
+
+
+def _wait_async_p2_writer(
+    descriptor: Dict[str, Any], debug: bool = False, rank: int = -1,
+) -> Dict[str, Any]:
+    """Drain the current P2 writer and return its completed in-memory context."""
+    global _async_p2_writer_thread, _async_writer_error
+    thread = _async_p2_writer_thread
+    if thread is not None:
+        start = time.time()
+        if debug:
+            logger.info("FRCHECK async writer rank %d: joining current %s", rank, thread.name)
+        thread.join()
+        _async_p2_writer_thread = None
+        if debug:
+            logger.info(
+                "FRCHECK async writer rank %d: joined current %s in %.3fs",
+                rank, thread.name, time.time() - start,
+            )
+    if _async_writer_error is not None:
+        error = _async_writer_error
+        _async_writer_error = None
+        raise RuntimeError("FRCheck asynchronous P2 writer failed") from error
+    context = descriptor.get("completed_context")
+    if context is None:
+        raise RuntimeError("FRCheck asynchronous P2 writer produced no completed context")
+    return context
 
 
 def _start_async_p1_writer(
@@ -3014,6 +3061,7 @@ def _build_aggregate_p2_descriptor(
         "send_groups": send_groups,
         "recv_groups": recv_groups,
         "write_to_disk": write_to_disk,
+        "completed_context": None,
     }
     return descriptor, summary
 
@@ -3021,7 +3069,7 @@ def _build_aggregate_p2_descriptor(
 def _prepare_and_submit_aggregate_p2(
     descriptor: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Allocate, pack, register, and submit aggregate P2 transfer buffers."""
+    """Allocate, pack, and submit save-scoped aggregate P2 transfer buffers."""
     manager = descriptor["manager"]
     native = descriptor["native"]
     buffers: List[torch.Tensor] = []
@@ -3032,7 +3080,9 @@ def _prepare_and_submit_aggregate_p2(
     try:
         for (peer, lane), segments in sorted(descriptor["send_groups"].items()):
             size = sum(int(result.block_size) for result, _sid, _source in segments)
-            buffer = manager.allocate_registered_save_buffer(size)
+            buffer = manager.get_aggregate_p2_buffer(
+                "send", peer, lane, size,
+            )
             buffers.append(buffer)
             offset = 0
             for result, _sid, source in segments:
@@ -3042,7 +3092,9 @@ def _prepare_and_submit_aggregate_p2(
             send_tasks.append((peer, lane, int(buffer.data_ptr()), size))
         for (peer, lane), segments in sorted(descriptor["recv_groups"].items()):
             size = sum(int(result.block_size) for result, _sid in segments)
-            buffer = manager.allocate_registered_save_buffer(size)
+            buffer = manager.get_aggregate_p2_buffer(
+                "recv", peer, lane, size,
+            )
             buffers.append(buffer)
             offset = 0
             for result, sid in segments:
@@ -3078,6 +3130,8 @@ def _prepare_and_submit_aggregate_p2(
         "buffers": buffers,
         "recv_segments": recv_segments,
         "write_to_disk": descriptor["write_to_disk"],
+        "native_completed": False,
+        "buffers_released": False,
         "timings": {"prepare_s": prepare_s, "submit_s": submit_s},
     }
     summary = {
@@ -3266,12 +3320,21 @@ def save_frcheck_legacy_checkpoint(
         and hasattr(native, "send_layer_to_peer")
         and hasattr(native, "recv_layer_from_peer")
         and hasattr(native, "encode_layer_stripes")
-        and hasattr(native, "mirror_layer")
     )
     use_cross_layer_encode = (
         has_encode_batch and hasattr(native, "reset_encode_layer")
         and not use_layer_exchange_encode
     )
+    effective_max_send_sge = 1
+    if use_layer_exchange_encode:
+        if not hasattr(native, "send_layer_blocks_to_peer") or not hasattr(native, "get_max_send_sge"):
+            raise RuntimeError("FRCheck layer exchange requires native Multi-SGE support")
+        local_max_send_sge = max(1, int(native.get_max_send_sge()))
+        reduce_device = "cuda" if torch.distributed.is_initialized() and torch.distributed.get_backend() == "nccl" else "cpu"
+        max_sge_tensor = torch.tensor(local_max_send_sge, dtype=torch.int32, device=reduce_device)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(max_sge_tensor, op=torch.distributed.ReduceOp.MIN)
+        effective_max_send_sge = int(max_sge_tensor.item())
 
     prepared_layers: List[Dict[str, Any]] = []
 
@@ -3441,10 +3504,12 @@ def save_frcheck_legacy_checkpoint(
         layer_exchange_contexts: List[Dict[str, Any]] = []
         for prepared in prepared_layers:
             layer_exchange_contexts.append(
-                _prepare_layer_exchange_network(manager, native, prepared, n, pack_stream)
+                _prepare_layer_exchange_network(
+                    manager, native, prepared, n, pack_stream, effective_max_send_sge
+                )
             )
-        # No global stage sync: each layer's send waits on its own CUDA event so
-        # gather D2H overlaps with network of already-staged layers.
+        # No global stage sync: each layer's first send worker waits on only its
+        # canonical D2H event, allowing later copies to remain queued independently.
         lx_stage_sync_s = 0.0
 
         worker_errors: List[BaseException] = []
@@ -3483,6 +3548,33 @@ def save_frcheck_legacy_checkpoint(
                         ctx["ready_first_s"] = now_s
                     ctx["ready_last_s"] = now_s
 
+        def _wait_layer_mirror_ready(ctx: Dict[str, Any]) -> None:
+            wait_t0 = time.time()
+            ready_event = ctx["mirror_ready_event"]
+            is_owner = False
+            with ctx["mirror_ready_lock"]:
+                if not ctx["mirror_ready_started"]:
+                    ctx["mirror_ready_started"] = True
+                    is_owner = True
+            if is_owner:
+                try:
+                    ctx["d2h_end_event"].synchronize()
+                except BaseException as exc:
+                    ctx["mirror_ready_error"] = exc
+                finally:
+                    ready_event.set()
+            else:
+                ready_event.wait()
+            wait_s = time.time() - wait_t0
+            with ctx["mirror_ready_lock"]:
+                ctx["mirror_ready_wait_sum_s"] += wait_s
+                ctx["mirror_ready_wait_max_s"] = max(
+                    ctx["mirror_ready_wait_max_s"], wait_s
+                )
+            error = ctx.get("mirror_ready_error")
+            if error is not None:
+                raise RuntimeError("FRCheck layer mirror D2H failed") from error
+
         def _send_worker(peer_key: Tuple[int, int], q: queue.Queue) -> None:
             while True:
                 item = q.get()
@@ -3490,15 +3582,11 @@ def save_frcheck_legacy_checkpoint(
                     return
                 ctx, task = item
                 try:
-                    # Send from the CPU staging buffer only once this layer's
-                    # gather D2H has completed; this overlaps later layers' D2H
-                    # with earlier layers' network transfers.
-                    stage_event = ctx.get("stage_event")
-                    if stage_event is not None:
-                        stage_event.synchronize()
-                    native.send_layer_to_peer(
-                        int(task["peer_rig"]), int(task["addr"]),
-                        int(task["size"]), int(task["batch_id"]), int(task["lane_id"]),
+                    _wait_layer_mirror_ready(ctx)
+                    native.send_layer_blocks_to_peer(
+                        int(task["peer_rig"]), int(task["mirror_base"]),
+                        task["block_indices"], int(task["block_size"]),
+                        int(task["batch_id"]), int(task["lane_id"]),
                     )
                     _mark_task_done(ctx)
                 except BaseException as exc:
@@ -3657,6 +3745,27 @@ def save_frcheck_legacy_checkpoint(
         lx_stage_pack_s = sum(float(ctx.get("stage_pack_s", 0.0)) for ctx in layer_exchange_contexts)
         lx_stage_pack_bytes = sum(int(ctx.get("stage_pack_bytes", 0)) for ctx in layer_exchange_contexts)
         lx_stage_pack_blocks = sum(int(ctx.get("stage_pack_blocks", 0)) for ctx in layer_exchange_contexts)
+        lx_cpu_gather_s = 0.0
+        lx_cpu_gather_bytes = 0
+        lx_direct_sge_tasks = layer_exchange_send_tasks
+        lx_direct_sge_count = sum(
+            len(task["block_indices"])
+            for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+        )
+        lx_direct_sge_bytes = layer_exchange_send_bytes
+        lx_mirror_ready_wait_sum_s = sum(
+            float(ctx.get("mirror_ready_wait_sum_s", 0.0)) for ctx in layer_exchange_contexts
+        )
+        lx_mirror_ready_wait_max_s = max(
+            (float(ctx.get("mirror_ready_wait_max_s", 0.0)) for ctx in layer_exchange_contexts),
+            default=0.0,
+        )
+        for ctx in layer_exchange_contexts:
+            ctx["d2h_end_event"].synchronize()
+        lx_d2h_s = sum(
+            float(ctx["d2h_start_event"].elapsed_time(ctx["d2h_end_event"])) / 1000.0
+            for ctx in layer_exchange_contexts
+        )
         lx_exchange_wait_sum_s = sum(float(ctx.get("exchange_wait_s", 0.0)) for ctx in layer_exchange_contexts)
         lx_exchange_wait_max_s = max(
             (float(ctx.get("exchange_wait_s", 0.0)) for ctx in layer_exchange_contexts),
@@ -3807,6 +3916,14 @@ def save_frcheck_legacy_checkpoint(
     lx_stage_pack_s = locals().get("lx_stage_pack_s", 0.0)
     lx_stage_pack_bytes = locals().get("lx_stage_pack_bytes", 0)
     lx_stage_pack_blocks = locals().get("lx_stage_pack_blocks", 0)
+    lx_cpu_gather_s = locals().get("lx_cpu_gather_s", 0.0)
+    lx_cpu_gather_bytes = locals().get("lx_cpu_gather_bytes", 0)
+    lx_d2h_s = locals().get("lx_d2h_s", 0.0)
+    lx_direct_sge_tasks = locals().get("lx_direct_sge_tasks", 0)
+    lx_direct_sge_count = locals().get("lx_direct_sge_count", 0)
+    lx_direct_sge_bytes = locals().get("lx_direct_sge_bytes", 0)
+    lx_mirror_ready_wait_sum_s = locals().get("lx_mirror_ready_wait_sum_s", 0.0)
+    lx_mirror_ready_wait_max_s = locals().get("lx_mirror_ready_wait_max_s", 0.0)
     lx_exchange_wait_sum_s = locals().get("lx_exchange_wait_sum_s", 0.0)
     lx_exchange_wait_max_s = locals().get("lx_exchange_wait_max_s", 0.0)
     lx_encode_wall_sum_s = locals().get("lx_encode_wall_sum_s", 0.0)
@@ -3825,8 +3942,8 @@ def save_frcheck_legacy_checkpoint(
 
     # ---- aggregate P2 phase: one transfer per physical peer/lane ----
     # Route construction only retains small descriptors and strong references to
-    # parity2 source buffers. Async allocation, registration, packing, transfer,
-    # write, and release run entirely in the writer thread.
+    # parity2 source buffers. The async writer completes all in-memory P2 work;
+    # disk checkpoints retain its completed context for the unified shard write.
     p2_dispatch_t0 = time.time()
     p2_descriptor, p2_summary = _build_aggregate_p2_descriptor(
         manager, native, encode_results, str(checkpoint_dir), rank, write_to_disk,
@@ -3834,9 +3951,14 @@ def save_frcheck_legacy_checkpoint(
     p2_context = None
     p2_dispatch_s = 0.0
     p2_sync_foreground_s = 0.0
+    p2_prepare_s = 0.0
+    p2_submit_s = 0.0
+    p2_wait_s = 0.0
     if not _use_async_parity:
         p2_context, p2_summary = _prepare_and_submit_aggregate_p2(p2_descriptor)
         p2_sync_foreground_s = time.time() - p2_dispatch_t0
+        p2_prepare_s = float(p2_context["timings"]["prepare_s"])
+        p2_submit_s = float(p2_context["timings"]["submit_s"])
 
     _mirror_t0 = time.time()
     native.wait_mirror_completion()
@@ -3845,8 +3967,15 @@ def save_frcheck_legacy_checkpoint(
         native.start_mirror_worker()
 
     if not _use_async_parity:
+        try:
+            p2_wait_s = _wait_aggregate_p2_context(p2_context)
+        except BaseException:
+            _release_aggregate_p2_context(p2_context)
+            raise
+        if not write_to_disk:
+            _release_aggregate_p2_context(p2_context)
+            p2_context["finished"] = True
         network_encode_s += p2_sync_foreground_s
-    e2e_before_dispatch_s = time.time() - e2e_t0
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     if world_size > 1:
@@ -3869,7 +3998,7 @@ def save_frcheck_legacy_checkpoint(
         p2_dispatch_t0 = time.time()
         _start_async_p2_writer(p2_descriptor, debug=_dbg)
         p2_dispatch_s = time.time() - p2_dispatch_t0
-    e2e_s = e2e_before_dispatch_s + p2_dispatch_s
+    e2e_s = time.time() - e2e_t0
     if rank == 0:
         logger.info(
             "FRCHECK aggregate P2: generation=%d send_tasks=%d recv_tasks=%d "
@@ -3888,6 +4017,9 @@ def save_frcheck_legacy_checkpoint(
         "wait_total_s": wait_total_s,
         "mirror_elapsed_s": _mirror_elapsed,
         "aggregate_p2_dispatch_s": p2_dispatch_s,
+        "aggregate_p2_prepare_s": p2_prepare_s,
+        "aggregate_p2_submit_s": p2_submit_s,
+        "aggregate_p2_wait_s": p2_wait_s,
         "layer_exchange_send_tasks": layer_exchange_send_tasks,
         "layer_exchange_recv_tasks": layer_exchange_recv_tasks,
         "layer_exchange_send_bytes": layer_exchange_send_bytes,
@@ -3896,6 +4028,15 @@ def save_frcheck_legacy_checkpoint(
         "lx_stage_pack_s": lx_stage_pack_s,
         "lx_stage_pack_bytes": lx_stage_pack_bytes,
         "lx_stage_pack_blocks": lx_stage_pack_blocks,
+        "lx_cpu_gather_s": lx_cpu_gather_s,
+        "lx_cpu_gather_bytes": lx_cpu_gather_bytes,
+        "lx_d2h_s": lx_d2h_s,
+        "d2h_s": lx_d2h_s,
+        "lx_direct_sge_tasks": lx_direct_sge_tasks,
+        "lx_direct_sge_count": lx_direct_sge_count,
+        "lx_direct_sge_bytes": lx_direct_sge_bytes,
+        "lx_mirror_ready_wait_sum_s": lx_mirror_ready_wait_sum_s,
+        "lx_mirror_ready_wait_max_s": lx_mirror_ready_wait_max_s,
         "lx_exchange_wait_sum_s": lx_exchange_wait_sum_s,
         "lx_exchange_wait_max_s": lx_exchange_wait_max_s,
         "lx_encode_wall_sum_s": lx_encode_wall_sum_s,
@@ -3913,7 +4054,7 @@ def save_frcheck_legacy_checkpoint(
     }
     if has_native_timing:
         summary_fields.update({
-            "d2h_s": native_timing.get("d2h_s", 0.0),
+            "d2h_s": float(native_timing.get("d2h_s", 0.0)) + lx_d2h_s,
             "net_s": native_timing.get("net_s", 0.0),
             "encode_s": native_timing.get("encode_s", 0.0),
             "encode_wait_s": native_timing.get("encode_wait_s", 0.0),
@@ -3924,6 +4065,9 @@ def save_frcheck_legacy_checkpoint(
             "source_send_tasks": native_timing.get("source_send_tasks", 0.0),
             "enc_recv_tasks": native_timing.get("enc_recv_tasks", 0.0),
             "source_send_bytes": native_timing.get("source_send_bytes", 0.0),
+            "source_send_wr_count": native_timing.get("source_send_wr_count", 0.0),
+            "source_send_sge_count": native_timing.get("source_send_sge_count", 0.0),
+            "source_send_max_sge": native_timing.get("source_send_max_sge", 0.0),
             "enc_recv_bytes": native_timing.get("enc_recv_bytes", 0.0),
             "mirror_tasks_submitted": native_timing.get("mirror_tasks_submitted", 0.0),
             "mirror_bytes_submitted": native_timing.get("mirror_bytes_submitted", 0.0),
@@ -3949,11 +4093,21 @@ def save_frcheck_legacy_checkpoint(
                 "phase1_s=%(phase1_total_s).2fs submit_s=%(submit_total_s).2fs "
                 "wait_s=%(wait_total_s).2fs mirror_wait_s=%(mirror_elapsed_s).2fs "
                 "p2_dispatch_s=%(aggregate_p2_dispatch_s).6fs "
+                "p2_prepare_s=%(aggregate_p2_prepare_s).3fs "
+                "p2_submit_s=%(aggregate_p2_submit_s).3fs "
+                "p2_wait_s=%(aggregate_p2_wait_s).3fs "
                 "layer_exchange_send_tasks=%(layer_exchange_send_tasks).0f "
                 "layer_exchange_recv_tasks=%(layer_exchange_recv_tasks).0f "
                 "layer_exchange_send_bytes=%(layer_exchange_send_bytes).0f "
                 "layer_exchange_recv_bytes=%(layer_exchange_recv_bytes).0f "
-                "lx_stage_pack_bytes=%(lx_stage_pack_bytes).0f mirror_tasks=%(mirror_tasks_completed).0f/%(mirror_tasks_submitted).0f "
+                "lx_stage_pack_bytes=%(lx_stage_pack_bytes).0f "
+                "lx_cpu_gather_s=%(lx_cpu_gather_s).4fs "
+                "lx_cpu_gather_bytes=%(lx_cpu_gather_bytes).0f "
+                "direct_sge_tasks=%(lx_direct_sge_tasks).0f direct_sge_count=%(lx_direct_sge_count).0f "
+                "direct_sge_bytes=%(lx_direct_sge_bytes).0f "
+                "mirror_ready_wait_sum_s=%(lx_mirror_ready_wait_sum_s).4fs "
+                "mirror_ready_wait_max_s=%(lx_mirror_ready_wait_max_s).4fs "
+                "mirror_tasks=%(mirror_tasks_completed).0f/%(mirror_tasks_submitted).0f "
                 "mirror_bytes=%(mirror_bytes_completed).0f/%(mirror_bytes_submitted).0f "
                 "mirror_failed_tasks=%(mirror_tasks_failed).0f mirror_failed_bytes=%(mirror_bytes_failed).0f",
                 summary,
@@ -3962,7 +4116,9 @@ def save_frcheck_legacy_checkpoint(
                 logger.info(
                     "FRCHECK save native tasks (%(mode)s): source_send_tasks=%(source_send_tasks).0f "
                     "enc_recv_tasks=%(enc_recv_tasks).0f source_send_bytes=%(source_send_bytes).0f "
-                    "enc_recv_bytes=%(enc_recv_bytes).0f",
+                    "enc_recv_bytes=%(enc_recv_bytes).0f source_send_wr_count=%(source_send_wr_count).0f "
+                    "source_send_sge_count=%(source_send_sge_count).0f "
+                    "source_send_max_sge=%(source_send_max_sge).0f",
                     summary,
                 )
                 logger.info(
@@ -3979,6 +4135,8 @@ def save_frcheck_legacy_checkpoint(
                     "FRCHECK save stage detail (%(mode)s): stage_pack_s=%(lx_stage_pack_s).4fs "
                     "stage_sync_s=%(lx_stage_sync_s).4fs "
                     "stage_pack_bytes=%(lx_stage_pack_bytes).0f stage_pack_blocks=%(lx_stage_pack_blocks).0f "
+                    "canonical_d2h_s=%(lx_d2h_s).4fs cpu_gather_s=%(lx_cpu_gather_s).4fs "
+                    "cpu_gather_bytes=%(lx_cpu_gather_bytes).0f "
                     "exchange_wait_sum_s=%(lx_exchange_wait_sum_s).4fs "
                     "exchange_wait_max_s=%(lx_exchange_wait_max_s).4fs "
                     "encode_wall_sum_s=%(lx_encode_wall_sum_s).4fs "
@@ -3997,12 +4155,31 @@ def save_frcheck_legacy_checkpoint(
                 summary,
             )
 
-    if write_to_disk:
-        _save_frcheck_stripe_files(
-            manager, str(checkpoint_dir), rank, num_stripes, encode_results,
-            include_encoder_p1=True, include_source=True, include_p2=False,
+    if _use_async_parity and write_to_disk:
+        p2_context = _wait_async_p2_writer(
+            p2_descriptor, debug=_dbg, rank=rank,
         )
-    if not _use_async_parity:
+    if write_to_disk:
+        import concurrent.futures
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                shard_futures = [
+                    executor.submit(
+                        _save_frcheck_stripe_files,
+                        manager, str(checkpoint_dir), rank, num_stripes, encode_results,
+                        True, True, False,
+                    ),
+                    executor.submit(
+                        _write_frcheck_aggregate_p2_files,
+                        str(checkpoint_dir), rank, p2_context["recv_segments"],
+                    ),
+                ]
+                for future in shard_futures:
+                    future.result()
+        finally:
+            _release_aggregate_p2_context(p2_context)
+    elif not _use_async_parity:
         _finish_aggregate_p2_context(p2_context, debug=_dbg)
 
     groups_by_name = {
@@ -4140,16 +4317,10 @@ def save_frcheck_legacy_checkpoint(
     if world_size > 1:
         torch.distributed.barrier()
 
-    release_save_buffers = bool(
-        getattr(args, "frcheck_layer_exchange_encode", False) and not _use_async_parity
-    )
-    if release_save_buffers:
-        manager.release_save_layer_buffers(empty_cuda_cache=True)
-
     if _dbg:
         logger.info(
-            "FRCheck save: native module kept alive for reuse (no shutdown, rank=%d, released_save_buffers=%s)",
-            rank, release_save_buffers,
+            "FRCheck save: native module and save buffers kept alive for reuse (rank=%d)",
+            rank,
         )
 
 

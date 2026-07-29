@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from logging import getLogger
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -64,7 +64,6 @@ class LayerStripeBufs:
     parity1_bufs: List[Optional[torch.Tensor]]
     parity2_bufs: List[Optional[torch.Tensor]]
     remote_layer_bufs: Dict[int, torch.Tensor] = field(default_factory=dict)
-    send_layer_bufs: Dict[int, torch.Tensor] = field(default_factory=dict)
     zero_block: Optional[torch.Tensor] = None
     source_on_cpu: bool = False
 
@@ -87,6 +86,11 @@ class FRCheckManager:
         if hasattr(self, "_initialized") and self._initialized:
             return
         self._frcheck_native: Any = None
+        self._rdma_registered_addrs: set = set()
+        self._registered_save_buffer_owners: Dict[int, torch.Tensor] = {}
+        self._layer_block_sizes: Optional[Dict[int, int]] = None
+        self._layer_per_rank_bytes: Optional[Dict[int, Dict[int, int]]] = None
+        self._full_buf: Optional[torch.Tensor] = None
         self.use_frcheck = False
         self.frcheck_n: Optional[int] = None
         self.frcheck_table_path: Optional[str] = None
@@ -130,10 +134,6 @@ class FRCheckManager:
         self._frcheck_recovery_native_cleaned: bool = False
         self._initialized = True
 
-    _rdma_registered_addrs: set = set()
-    _layer_block_sizes: Optional[Dict[int, int]] = None  # layer_idx → block_size
-    _layer_per_rank_bytes: Optional[Dict[int, Dict[int, int]]] = None  # layer_idx → {rank_in_group(0-based): total_bytes}
-    _full_buf: Optional[torch.Tensor] = None
     def allocate_full_buf(self, size_bytes: int):
         """Allocate or reuse cached full tensor buffer (grows-only)."""
         if self._full_buf is not None:
@@ -687,45 +687,30 @@ class FRCheckManager:
         else:
             layer_buf_gpu = torch.zeros(layer_capacity, dtype=torch.uint8, device="cuda")
 
-        buf_addr = layer_buf_gpu.data_ptr()
-        if buf_addr not in self._rdma_registered_addrs:
-            native.register_buffer(buf_addr, layer_buf_gpu.numel())
-            self._rdma_registered_addrs.add(buf_addr)
+        for buffer in (layer_buf_gpu, layer_mirror_cpu):
+            buf_addr = int(buffer.data_ptr())
+            if buf_addr not in self._rdma_registered_addrs:
+                native.register_buffer(buf_addr, int(buffer.numel()))
+                self._rdma_registered_addrs.add(buf_addr)
 
         recv_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
         parity1_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
         parity2_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
         remote_layer_bufs: Dict[int, torch.Tensor] = {}
-        send_layer_bufs: Dict[int, torch.Tensor] = {}
         my_node = self.rank_in_group + 1 if self.rank_in_group is not None else None
         recv_counts: Dict[int, int] = {}
-        send_counts: Dict[int, int] = {}
         if my_node is not None:
             for plan in self.stripe_plans:
                 if plan.role == StripeRole.ENCODER:
                     for src_node in plan.source_node_ids:
                         if src_node != my_node:
                             recv_counts[src_node] = recv_counts.get(src_node, 0) + 1
-                if my_node in plan.source_node_ids and plan.encoder_node_id != my_node:
-                    peer = plan.encoder_node_id
-                    send_counts[peer] = send_counts.get(peer, 0) + 1
         for node, count in recv_counts.items():
             if count <= 0:
                 continue
             buf = allocate_hugepage_tensor(count * block_sz, fallback_pin_memory=True)
             buf.zero_()
             remote_layer_bufs[node] = buf
-            addr = buf.data_ptr()
-            if addr not in self._rdma_registered_addrs:
-                native.register_buffer(addr, buf.numel())
-                self._rdma_registered_addrs.add(addr)
-        # CPU staging buffers to gather a layer's scattered source blocks into a
-        # contiguous per-peer region, enabling few large aggregated RDMA sends.
-        for node, count in send_counts.items():
-            if count <= 0:
-                continue
-            buf = allocate_hugepage_tensor(count * block_sz, fallback_pin_memory=True)
-            send_layer_bufs[node] = buf
             addr = buf.data_ptr()
             if addr not in self._rdma_registered_addrs:
                 native.register_buffer(addr, buf.numel())
@@ -780,7 +765,6 @@ class FRCheckManager:
             parity1_bufs=parity1_bufs,
             parity2_bufs=parity2_bufs,
             remote_layer_bufs=remote_layer_bufs,
-            send_layer_bufs=send_layer_bufs,
             zero_block=zero_block,
             source_on_cpu=source_on_cpu,
         )
@@ -840,18 +824,43 @@ class FRCheckManager:
         addr = int(buffer.data_ptr())
         native.register_buffer(addr, int(buffer.numel()))
         self._rdma_registered_addrs.add(addr)
+        self._registered_save_buffer_owners[addr] = buffer
         return buffer
 
+    def get_aggregate_p2_buffer(
+        self, direction: str, peer: int, lane: int, size_bytes: int
+    ) -> torch.Tensor:
+        """Allocate a registered aggregate P2 buffer for the current save."""
+        if direction not in ("send", "recv"):
+            raise ValueError(f"Invalid aggregate P2 direction: {direction}")
+        return self.allocate_registered_save_buffer(size_bytes)
+
     def release_registered_save_buffers(self, buffers: List[torch.Tensor]) -> None:
-        """Unregister save-scoped transfer buffers after native completion."""
+        """Unregister save-scoped buffers after native completion."""
         native = self._frcheck_native
+        failures: List[Tuple[int, BaseException]] = []
         for buffer in buffers:
             addr = int(buffer.data_ptr())
             if addr not in self._rdma_registered_addrs:
+                self._registered_save_buffer_owners.pop(addr, None)
                 continue
-            if native is not None:
-                native.unregister_buffer(addr)
+            try:
+                if native is not None:
+                    native.unregister_buffer(addr)
+            except BaseException as exc:
+                failures.append((addr, exc))
+                logger.warning(
+                    "FRCheck: failed to unregister save buffer addr=0x%x: %s",
+                    addr, exc,
+                )
+                continue
             self._rdma_registered_addrs.discard(addr)
+            self._registered_save_buffer_owners.pop(addr, None)
+
+        if failures:
+            raise RuntimeError(
+                f"FRCheck failed to release {len(failures)} save buffer(s)"
+            ) from failures[0][1]
 
     def get_native(self) -> Any:
         return self._frcheck_native
@@ -1191,7 +1200,9 @@ class FRCheckManager:
                     "FRCheck: rank %d failed to unregister buffer 0x%x: %s",
                     rank, addr, e,
                 )
-        self._rdma_registered_addrs.clear()
+                continue
+            self._rdma_registered_addrs.discard(addr)
+            self._registered_save_buffer_owners.pop(addr, None)
 
     def release_save_layer_buffers(self, empty_cuda_cache: bool = True) -> None:
         """Release per-layer save buffers that can be rebuilt at the next checkpoint."""
@@ -1245,6 +1256,7 @@ class FRCheckManager:
         self._frcheck_native = None
         self._frcheck_recovery_native_cleaned = False
         self._rdma_registered_addrs.clear()
+        self._registered_save_buffer_owners.clear()
         self.stripe_plans.clear()
         self.layer_stripe_bufs.clear()
         self._layer_stripe_alloc_sizes.clear()
@@ -1272,6 +1284,7 @@ class FRCheckManager:
         self._frcheck_native = None
         self._frcheck_recovery_native_cleaned = False
         self._rdma_registered_addrs.clear()
+        self._registered_save_buffer_owners.clear()
         self.stripe_plans.clear()
         self.layer_stripe_bufs.clear()
         self._layer_stripe_alloc_sizes.clear()

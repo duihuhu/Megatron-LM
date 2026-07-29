@@ -872,7 +872,8 @@ private:
         }
         
         // Open first device
-        context_ = ibv_open_device(find_rdma_device_by_ip(my_ip_, device_list, num_devices));
+        context_ = ibv_open_device(find_rdma_device_by_ip(
+            my_ip_, device_list, num_devices, {"GEMINI"}));
         ibv_free_device_list(device_list);
         
         if (!context_) {

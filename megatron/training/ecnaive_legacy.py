@@ -392,24 +392,54 @@ def _submit_hw_failed_recv_stripe(
     stripe_size: int,
     source_block_sizes: Optional[List[List[int]]] = None,
     buffer_offset: Optional[int] = None,
-) -> None:
-    """Submit one recv stripe from all source ranks (failed rank HW recovery)."""
+) -> int:
+    """Submit one protocol stripe from every source channel in sender order."""
     write_offset = byte_offset if buffer_offset is None else buffer_offset
+    if source_block_sizes is not None and len(source_block_sizes) != len(source_ranks):
+        raise ValueError(
+            "EC-NAIVE hw recovery: source schedule count mismatch "
+            f"(sources={len(source_ranks)}, schedules={len(source_block_sizes)})"
+        )
+
+    submitted = 0
     for si, src_rank in enumerate(source_ranks):
         recv_ch = manager.get_recv_channel_from_source(rank, src_rank, world_size)
         base = si * ecnaive_n
+        block_sizes = source_block_sizes[si] if source_block_sizes is not None else None
+        if block_sizes is not None and len(block_sizes) != ecnaive_n:
+            raise ValueError(
+                "EC-NAIVE hw recovery: source block schedule width mismatch "
+                f"(source={src_rank}, channel={recv_ch}, expected={ecnaive_n}, "
+                f"actual={len(block_sizes)})"
+            )
         for bi in range(ecnaive_n):
             take = stripe_size
-            if source_block_sizes is not None:
-                valid = max(0, int(source_block_sizes[si][bi]) - byte_offset)
+            if block_sizes is not None:
+                valid = max(0, int(block_sizes[bi]) - byte_offset)
                 take = min(stripe_size, valid)
             if take <= 0:
                 continue
+            pool_idx = base + bi
+            if pool_idx >= len(recv_pool):
+                raise ValueError(
+                    "EC-NAIVE hw recovery: recv pool entry missing "
+                    f"(source={src_rank}, channel={recv_ch}, offset={byte_offset}, "
+                    f"expected={take}, capacity=0)"
+                )
+            capacity = int(recv_pool[pool_idx].numel()) - write_offset
+            if capacity < take:
+                raise ValueError(
+                    "EC-NAIVE hw recovery: recv buffer smaller than protocol message "
+                    f"(source={src_rank}, channel={recv_ch}, offset={byte_offset}, "
+                    f"expected={take}, capacity={max(0, capacity)})"
+                )
             native.submit_recv_task(
                 recv_ch,
-                int(recv_pool[base + bi].data_ptr()) + write_offset,
+                int(recv_pool[pool_idx].data_ptr()) + write_offset,
                 take,
             )
+            submitted += 1
+    return submitted
 
 
 def _build_hw_owner_codeword_plans(
@@ -764,15 +794,26 @@ def _run_hw_failed_own_tensor_streaming_recovery(
         if nbytes > 0:
             tensor_buffer[dst : dst + nbytes].copy_(src[:nbytes])
 
-    stripes = list(_iter_ecnaive_load_stripes(block_data_size, stripe_bytes))
+    if source_block_sizes is None:
+        source_block_sizes = [
+            [block_data_size for _ in range(ecnaive_n)]
+            for _ in source_ranks
+        ]
+    source_max_sizes = [max(sizes, default=0) for sizes in source_block_sizes]
+    protocol_bytes = max(source_max_sizes, default=0)
+    stripes = list(_iter_ecnaive_load_stripes(protocol_bytes, stripe_bytes))
     decode_s = 0.0
+    recv_tasks = 0
     for byte_offset, take in stripes:
-        _submit_hw_failed_recv_stripe(
+        recv_tasks += _submit_hw_failed_recv_stripe(
             native, manager, rank, world_size, source_ranks, ecnaive_n,
             recv_pool, byte_offset, take, source_block_sizes, buffer_offset=0,
         )
         native.wait_for_pending_network_tasks()
 
+        decode_take = min(take, max(0, block_data_size - byte_offset))
+        if decode_take <= 0:
+            continue
         decode_t0 = time.time()
         raw_surviving, lost = _collect_owner_codeword_survivors(
             my_rig, ecnaive_k, ecnaive_n, rig_to_si, recv_pool,
@@ -801,7 +842,7 @@ def _run_hw_failed_own_tensor_streaming_recovery(
                 ],
                 [int(raw_surviving[label].data_ptr()) for label in surviving_order],
                 [int(block.data_ptr()) for block in recovered_blocks],
-                take,
+                decode_take,
             )
             recovered_data: List[Optional[torch.Tensor]] = [None] * ecnaive_k
             ri = 0
@@ -814,9 +855,14 @@ def _run_hw_failed_own_tensor_streaming_recovery(
                     ri += 1
 
         for j in range(ecnaive_k):
-            _copy_data_stripe(j, recovered_data[j], byte_offset, take)
+            _copy_data_stripe(j, recovered_data[j], byte_offset, decode_take)
         decode_s += time.time() - decode_t0
 
+    logger.debug(
+        "EC-NAIVE hw recovery: rank %d recv protocol summary "
+        "(sources=%d, source_max_bytes=%s, stripes=%d, tasks=%d)",
+        rank, len(source_ranks), source_max_sizes, len(stripes), recv_tasks,
+    )
     return len(stripes), decode_s
 
 

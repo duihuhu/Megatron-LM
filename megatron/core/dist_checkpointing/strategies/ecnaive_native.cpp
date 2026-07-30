@@ -1496,6 +1496,7 @@ public:
     }
 
     void reset_encoding_completion_flags() {
+        wait_for_pending_network_tasks();
         // Reset generalized flags
         for (int i = 0; i < num_channels_; ++i) {
             send_completed_[i] = false;
@@ -1588,25 +1589,25 @@ public:
     // Wait until all queued/in-flight save-path send/recv tasks finish (no sentinels required).
     void wait_for_pending_network_tasks() {
         while (true) {
-            if (network_tasks_inflight_.load(std::memory_order_acquire) == 0) {
-                bool queues_empty = true;
-                for (int i = 0; i < num_channels_; ++i) {
-                    std::lock_guard<std::mutex> lk_send(send_mutexes_[i]);
-                    if (!send_queues_[i].empty()) {
-                        queues_empty = false;
-                        break;
-                    }
-                    std::lock_guard<std::mutex> lk_recv(recv_mutexes_[i]);
-                    if (!recv_queues_[i].empty()) {
-                        queues_empty = false;
-                        break;
-                    }
+            bool queues_empty = true;
+            for (int i = 0; i < num_channels_; ++i) {
+                std::lock_guard<std::mutex> lk_send(send_mutexes_[i]);
+                if (!send_queues_[i].empty()) {
+                    queues_empty = false;
+                    break;
                 }
-                if (queues_empty) {
+                std::lock_guard<std::mutex> lk_recv(recv_mutexes_[i]);
+                if (!recv_queues_[i].empty()) {
+                    queues_empty = false;
                     break;
                 }
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            if (queues_empty &&
+                    network_tasks_inflight_.load(std::memory_order_acquire) == 0) {
+                return;
+            }
+            std::unique_lock<std::mutex> lk(network_tasks_mutex_);
+            network_tasks_cv_.wait_for(lk, std::chrono::microseconds(100));
         }
     }
 
@@ -1870,6 +1871,8 @@ private:
     std::queue<uintptr_t> parity_buffers_to_release_;
     std::mutex release_queue_mutex_;
     std::atomic<int> network_tasks_inflight_{0};
+    std::mutex network_tasks_mutex_;
+    std::condition_variable network_tasks_cv_;
     std::atomic<uint64_t> save_send_bytes_{0};
     std::atomic<uint64_t> save_recv_bytes_{0};
     std::atomic<uint64_t> save_send_tasks_{0};
@@ -2810,6 +2813,9 @@ private:
                 if (stop_) break;
                 task = send_queues_[idx].front();
                 send_queues_[idx].pop();
+                if (task.addr != 0 && task.size != 0) {
+                    network_tasks_inflight_.fetch_add(1, std::memory_order_release);
+                }
             }
             if (task.addr == 0 && task.size == 0) {
                 send_sentinel_received_[idx] = true;
@@ -2823,9 +2829,9 @@ private:
                 continue;
             }
             if (task.size == 0 || task.addr == 0) continue;
-            network_tasks_inflight_.fetch_add(1, std::memory_order_relaxed);
-            SaveNetScopeTimer save_net_timer(this);
-            if (use_rdma_ && send_channels_[idx] && send_channels_[idx]->is_connected()) {
+            try {
+                SaveNetScopeTimer save_net_timer(this);
+                if (use_rdma_ && send_channels_[idx] && send_channels_[idx]->is_connected()) {
                 // std::cout << "[ECNAIVE RDMA] SendWorker[" << idx << "] RDMA send "
                 //           << (task.size / (1024.0*1024.0)) << " MB" << std::endl;
                 send_channels_[idx]->send_data(
@@ -2833,9 +2839,15 @@ private:
             } else if (conn_.send_socket(idx).is_open()) {
                 send_with_size(conn_.send_socket(idx), task.addr, task.size);
             }
-            save_send_bytes_.fetch_add(task.size, std::memory_order_relaxed);
-            save_send_tasks_.fetch_add(1, std::memory_order_relaxed);
-            network_tasks_inflight_.fetch_sub(1, std::memory_order_relaxed);
+                save_send_bytes_.fetch_add(task.size, std::memory_order_relaxed);
+                save_send_tasks_.fetch_add(1, std::memory_order_relaxed);
+            } catch (...) {
+                network_tasks_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+                network_tasks_cv_.notify_all();
+                throw;
+            }
+            network_tasks_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+            network_tasks_cv_.notify_all();
             // Release buffer after send: data channels 0..k-2, parity channels k-1..k
             {
                 std::lock_guard<std::mutex> lk(release_queue_mutex_);
@@ -2859,6 +2871,9 @@ private:
                 if (stop_) break;
                 task = recv_queues_[idx].front();
                 recv_queues_[idx].pop();
+                if (task.addr != 0 && task.size != 0) {
+                    network_tasks_inflight_.fetch_add(1, std::memory_order_release);
+                }
             }
             if (task.addr == 0 && task.size == 0) {
                 recv_sentinel_received_[idx] = true;
@@ -2872,9 +2887,9 @@ private:
                 continue;
             }
             if (task.size == 0 || task.addr == 0) continue;
-            network_tasks_inflight_.fetch_add(1, std::memory_order_relaxed);
-            SaveNetScopeTimer save_net_timer(this);
-            if (use_rdma_ && recv_channels_[idx] && recv_channels_[idx]->is_connected()) {
+            try {
+                SaveNetScopeTimer save_net_timer(this);
+                if (use_rdma_ && recv_channels_[idx] && recv_channels_[idx]->is_connected()) {
                 // std::cout << "[ECNAIVE RDMA] RecvWorker[" << idx << "] RDMA recv "
                 //           << (task.size / (1024.0*1024.0)) << " MB" << std::endl;
                 recv_channels_[idx]->receive_data(
@@ -2885,9 +2900,15 @@ private:
                     std::cerr << "ECNAIVE: RecvWorker[" << idx << "] recv failed" << std::endl;
                 }
             }
-            save_recv_bytes_.fetch_add(task.size, std::memory_order_relaxed);
-            save_recv_tasks_.fetch_add(1, std::memory_order_relaxed);
-            network_tasks_inflight_.fetch_sub(1, std::memory_order_relaxed);
+                save_recv_bytes_.fetch_add(task.size, std::memory_order_relaxed);
+                save_recv_tasks_.fetch_add(1, std::memory_order_relaxed);
+            } catch (...) {
+                network_tasks_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+                network_tasks_cv_.notify_all();
+                throw;
+            }
+            network_tasks_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+            network_tasks_cv_.notify_all();
         }
     }
 

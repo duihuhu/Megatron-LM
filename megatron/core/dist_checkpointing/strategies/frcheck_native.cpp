@@ -7,6 +7,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -31,6 +32,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -96,7 +98,21 @@ struct RdmaBuffer {
 // ---------------------------------------------------------------------------
 // RdmaConnectionChannel — wraps a TCP socket for QP exchange + RDMA send/recv
 // ---------------------------------------------------------------------------
-static constexpr size_t FRCHECK_RDMA_CHUNK = 64ULL * 1024 * 1024;     // 64 MB per RDMA op
+static constexpr size_t FRCHECK_DEFAULT_RDMA_CHUNK = 64ULL * 1024 * 1024;
+
+static size_t frcheck_rdma_chunk_size() {
+    static const size_t chunk = []() -> size_t {
+        const char* env = std::getenv("FRCHECK_RDMA_CHUNK_MB");
+        if (!env || !*env) return FRCHECK_DEFAULT_RDMA_CHUNK;
+        char* end = nullptr;
+        errno = 0;
+        unsigned long long value = std::strtoull(env, &end, 10);
+        if (errno != 0 || end == env || *end != '\0' || value == 0 || value > 4095)
+            throw std::runtime_error("FRCheck RDMA: invalid FRCHECK_RDMA_CHUNK_MB");
+        return static_cast<size_t>(value) * 1024ULL * 1024ULL;
+    }();
+    return chunk;
+}
 static constexpr int    FRCHECK_MAX_WR = 64;
 static constexpr int    FRCHECK_DEFAULT_MAX_SEND_SGE = 16;
 
@@ -371,7 +387,7 @@ private:
         size_t remaining = total;
         while (remaining > 0) {
             if (wait_cb) wait_cb();
-            size_t message_remaining = std::min(remaining, FRCHECK_RDMA_CHUNK);
+            size_t message_remaining = std::min(remaining, frcheck_rdma_chunk_size());
             std::vector<ibv_sge> sges;
             while (message_remaining > 0) {
                 while (segment_idx < segments.size() &&
@@ -396,7 +412,7 @@ private:
                 sges.push_back(sge);
                 if (sges.size() > static_cast<size_t>(max_send_sge_))
                     throw std::runtime_error(
-                        "FRCheck RDMA: one 64MiB scatter message requires " +
+                        "FRCheck RDMA: one RDMA scatter message requires " +
                         std::to_string(sges.size()) + " SGEs, exceeding effective max_send_sge=" +
                         std::to_string(max_send_sge_) +
                         "; reduce blocks per Python layer-exchange task");
@@ -429,11 +445,11 @@ private:
         size_t remaining = total, offset = 0;
         while (remaining > 0) {
             if (wait_cb) wait_cb();
-            size_t nchunks = (std::min(remaining, FRCHECK_RDMA_CHUNK) + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK;
+            size_t nchunks = (std::min(remaining, frcheck_rdma_chunk_size()) + frcheck_rdma_chunk_size() - 1) / frcheck_rdma_chunk_size();
             std::vector<ibv_sge> sge(nchunks);
             std::vector<ibv_send_wr> wr(nchunks);
             for (size_t i = 0; i < nchunks; ++i) {
-                size_t cur = std::min(FRCHECK_RDMA_CHUNK, remaining);
+                size_t cur = std::min(frcheck_rdma_chunk_size(), remaining);
                 sge[i].addr = (uint64_t)(data + offset);
                 sge[i].length = (uint32_t)cur;
                 sge[i].lkey = mr->lkey;
@@ -454,17 +470,46 @@ private:
         }
     }
 
+    int post_recv_chunked_(uint8_t* buf, size_t total, ibv_mr* mr) {
+        size_t remaining = total, offset = 0;
+        int posted = 0;
+        while (remaining > 0) {
+            size_t group_bytes = std::min(remaining, frcheck_rdma_chunk_size());
+            size_t nchunks = (group_bytes + frcheck_rdma_chunk_size() - 1) /
+                             frcheck_rdma_chunk_size();
+            std::vector<ibv_sge> sge(nchunks);
+            std::vector<ibv_recv_wr> wr(nchunks);
+            for (size_t i = 0; i < nchunks; ++i) {
+                size_t cur = std::min(frcheck_rdma_chunk_size(), remaining);
+                sge[i].addr = reinterpret_cast<uint64_t>(buf + offset);
+                sge[i].length = static_cast<uint32_t>(cur);
+                sge[i].lkey = mr->lkey;
+                memset(&wr[i], 0, sizeof(wr[i]));
+                wr[i].sg_list = &sge[i];
+                wr[i].num_sge = 1;
+                wr[i].next = (i + 1 < nchunks) ? &wr[i + 1] : nullptr;
+                offset += cur;
+                remaining -= cur;
+            }
+            ibv_recv_wr* bad = nullptr;
+            if (ibv_post_recv(qp_, &wr[0], &bad))
+                throw std::runtime_error("FRCheck RDMA: prepost recv failed");
+            posted += static_cast<int>(nchunks);
+        }
+        return posted;
+    }
+
     void _recv_chunked(uint8_t* buf, size_t total, ibv_mr* mr,
                        const std::function<void()>& wait_cb,
                        const std::function<void()>& done_cb) {
         size_t remaining = total, offset = 0;
         while (remaining > 0) {
             if (wait_cb) wait_cb();
-            size_t nchunks = (std::min(remaining, FRCHECK_RDMA_CHUNK) + FRCHECK_RDMA_CHUNK - 1) / FRCHECK_RDMA_CHUNK;
+            size_t nchunks = (std::min(remaining, frcheck_rdma_chunk_size()) + frcheck_rdma_chunk_size() - 1) / frcheck_rdma_chunk_size();
             std::vector<ibv_sge> sge(nchunks);
             std::vector<ibv_recv_wr> wr(nchunks);
             for (size_t i = 0; i < nchunks; ++i) {
-                size_t cur = std::min(FRCHECK_RDMA_CHUNK, remaining);
+                size_t cur = std::min(frcheck_rdma_chunk_size(), remaining);
                 sge[i].addr = (uint64_t)(buf + offset);
                 sge[i].length = (uint32_t)cur;
                 sge[i].lkey = mr->lkey;
@@ -530,7 +575,19 @@ private:
     std::mutex tag_mtx_;
     std::condition_variable tag_cv_;
     std::map<uint64_t, size_t> pending_data_sizes_;
+    struct PreparedTaggedRecv {
+        uint8_t* buffer = nullptr;
+        size_t capacity = 0;
+        size_t size = 0;
+        int completions = 0;
+        bool posted = false;
+        std::string error;
+    };
     std::map<uint64_t, bool> ack_ready_;
+    std::map<uint64_t, PreparedTaggedRecv> prepared_tagged_recvs_;
+    std::atomic<uint64_t> tagged_ack_wait_total_us_{0};
+    std::atomic<uint64_t> tagged_ack_wait_max_us_{0};
+    std::atomic<uint64_t> tagged_ack_wait_count_{0};
     std::mutex sock_write_mtx_;
     std::thread tag_receiver_thread_;
     std::atomic<bool> tag_stop_{false};
@@ -574,14 +631,59 @@ private:
                 continue;
             }
 
-            // DATA: cache the header and keep draining control records.  Do
-            // not wait for recv_tagged() here; otherwise one early DATA for an
-            // unregistered tag can block ACK/DATA handling for the whole lane.
+            bool prepared = false;
             {
                 std::lock_guard<std::mutex> lk(tag_mtx_);
-                pending_data_sizes_[tag] = size;
+                prepared = prepared_tagged_recvs_.count(tag) != 0;
+                if (!prepared) pending_data_sizes_[tag] = size;
+            }
+            if (!prepared) {
+                tag_cv_.notify_all();
+                continue;
+            }
+
+            std::string error;
+            int completions = 0;
+            {
+                std::lock_guard<std::mutex> recv_lock(recv_mtx_);
+                uint8_t* buffer = nullptr;
+                size_t capacity = 0;
+                {
+                    std::lock_guard<std::mutex> lk(tag_mtx_);
+                    auto& target = prepared_tagged_recvs_.at(tag);
+                    buffer = target.buffer;
+                    capacity = target.capacity;
+                }
+                try {
+                    if (size > capacity)
+                        throw std::runtime_error("prepared tagged receive exceeds capacity");
+                    ibv_mr* mr = find_mr(reinterpret_cast<uintptr_t>(buffer), size);
+                    if (!mr) throw std::runtime_error("unregistered prepared tagged receive buffer");
+                    completions = post_recv_chunked_(buffer, size, mr);
+                } catch (const std::exception& e) {
+                    error = e.what();
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(tag_mtx_);
+                auto& target = prepared_tagged_recvs_.at(tag);
+                target.size = size;
+                target.completions = completions;
+                target.error = error;
+                target.posted = true;
             }
             tag_cv_.notify_all();
+            if (!error.empty()) {
+                tag_stop_.store(true, std::memory_order_release);
+                tag_cv_.notify_all();
+                break;
+            }
+            TaggedCtl ack{htobe32(kTagAck), 0, htobe64(tag), 0};
+            if (!write_full_locked_(&ack, sizeof(ack))) {
+                tag_stop_.store(true, std::memory_order_release);
+                tag_cv_.notify_all();
+                break;
+            }
         }
         tag_stop_.store(true, std::memory_order_release);
         tag_cv_.notify_all();
@@ -621,6 +723,7 @@ public:
         TaggedCtl c{htobe32(kTagData), 0, htobe64(tag), htobe64(size)};
         if (!write_full_locked_(&c, sizeof(c)))
             throw std::runtime_error("FRCheck RDMA: failed to send tagged header");
+        const uint64_t ack_wait_t0 = frcheck_now_us();
         {
             std::unique_lock<std::mutex> lk(tag_mtx_);
             tag_cv_.wait(lk, [&]{
@@ -634,6 +737,13 @@ public:
                 return;
             }
         }
+        const uint64_t ack_wait_us = frcheck_now_us() - ack_wait_t0;
+        tagged_ack_wait_total_us_.fetch_add(ack_wait_us, std::memory_order_relaxed);
+        tagged_ack_wait_count_.fetch_add(1, std::memory_order_relaxed);
+        uint64_t ack_max = tagged_ack_wait_max_us_.load(std::memory_order_relaxed);
+        while (ack_max < ack_wait_us &&
+               !tagged_ack_wait_max_us_.compare_exchange_weak(
+                   ack_max, ack_wait_us, std::memory_order_relaxed)) {}
         if (done_cb) done_cb();
         ibv_mr* mr = find_mr((uintptr_t)data, size);
         if (!mr)
@@ -662,6 +772,7 @@ public:
         TaggedCtl c{htobe32(kTagData), 0, htobe64(tag), htobe64(logical_size)};
         if (!write_full_locked_(&c, sizeof(c)))
             throw std::runtime_error("FRCheck RDMA: failed to send tagged scatter header");
+        const uint64_t ack_wait_t0 = frcheck_now_us();
         {
             std::unique_lock<std::mutex> lk(tag_mtx_);
             tag_cv_.wait(lk, [&]{
@@ -675,8 +786,62 @@ public:
                 return;
             }
         }
+        const uint64_t ack_wait_us = frcheck_now_us() - ack_wait_t0;
+        tagged_ack_wait_total_us_.fetch_add(ack_wait_us, std::memory_order_relaxed);
+        tagged_ack_wait_count_.fetch_add(1, std::memory_order_relaxed);
+        uint64_t ack_max = tagged_ack_wait_max_us_.load(std::memory_order_relaxed);
+        while (ack_max < ack_wait_us &&
+               !tagged_ack_wait_max_us_.compare_exchange_weak(
+                   ack_max, ack_wait_us, std::memory_order_relaxed)) {}
         if (done_cb) done_cb();
         send_segments_chunked_(segments, logical_size, wait_cb, done_cb);
+    }
+
+    void prepare_tagged_recv(uint64_t tag, uint8_t* buf, size_t capacity) {
+        if (!buf || capacity == 0)
+            throw std::runtime_error("FRCheck prepared tagged receive: empty target");
+        if (!find_mr(reinterpret_cast<uintptr_t>(buf), capacity))
+            throw std::runtime_error("FRCheck prepared tagged receive: unregistered target");
+        std::lock_guard<std::mutex> lk(tag_mtx_);
+        if (prepared_tagged_recvs_.count(tag) || pending_data_sizes_.count(tag))
+            throw std::runtime_error("FRCheck prepared tagged receive: duplicate or late tag");
+        PreparedTaggedRecv target;
+        target.buffer = buf;
+        target.capacity = capacity;
+        prepared_tagged_recvs_.emplace(tag, std::move(target));
+    }
+
+    size_t wait_prepared_tagged_recv(uint64_t tag) {
+        int completions = 0;
+        size_t size = 0;
+        std::string error;
+        {
+            std::unique_lock<std::mutex> lk(tag_mtx_);
+            tag_cv_.wait(lk, [&] {
+                auto it = prepared_tagged_recvs_.find(tag);
+                return (it != prepared_tagged_recvs_.end() && it->second.posted) ||
+                       tag_stop_.load(std::memory_order_acquire);
+            });
+            auto it = prepared_tagged_recvs_.find(tag);
+            if (it == prepared_tagged_recvs_.end())
+                throw std::runtime_error("FRCheck prepared tagged receive: unknown tag");
+            completions = it->second.completions;
+            size = it->second.size;
+            error = it->second.error;
+        }
+        if (!error.empty())
+            throw std::runtime_error("FRCheck prepared tagged receive: " + error);
+        if (tag_stop_.load(std::memory_order_acquire) && completions == 0)
+            throw std::runtime_error("FRCheck prepared tagged receive: channel stopped");
+        {
+            std::lock_guard<std::mutex> recv_lock(recv_mtx_);
+            poll_cq(recv_cq_, completions);
+        }
+        {
+            std::lock_guard<std::mutex> lk(tag_mtx_);
+            prepared_tagged_recvs_.erase(tag);
+        }
+        return size;
     }
 
     // Register a tagged recv target and block until its DATA header arrives.
@@ -717,6 +882,21 @@ public:
         }
         recv_chunked(buf, size, mr, wait_cb, done_cb);
         return size;
+    }
+
+    void reset_tagged_ack_timing() {
+        tagged_ack_wait_total_us_.store(0, std::memory_order_relaxed);
+        tagged_ack_wait_max_us_.store(0, std::memory_order_relaxed);
+        tagged_ack_wait_count_.store(0, std::memory_order_relaxed);
+    }
+    uint64_t tagged_ack_wait_total_us() const {
+        return tagged_ack_wait_total_us_.load(std::memory_order_relaxed);
+    }
+    uint64_t tagged_ack_wait_max_us() const {
+        return tagged_ack_wait_max_us_.load(std::memory_order_relaxed);
+    }
+    uint64_t tagged_ack_wait_count() const {
+        return tagged_ack_wait_count_.load(std::memory_order_relaxed);
     }
 };
 
@@ -1118,6 +1298,78 @@ public:
     }
 
     // ---- Stripe decode (hardware recovery) ----
+    void submit_stripe_decode_batch(
+        int k,
+        const std::vector<int>& survivor_positions,
+        const std::vector<int>& lost_positions,
+        const std::vector<uintptr_t>& survivor_addrs,
+        const std::vector<uintptr_t>& recovered_addrs,
+        size_t block_size)
+    {
+        if (stopped_)
+            throw std::runtime_error("FRCheck decode: native runtime is stopped");
+        if (k <= 0 || k > 253 || block_size == 0 ||
+            block_size > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw std::runtime_error("FRCheck decode: invalid decode arguments");
+        if (lost_positions.empty() || lost_positions.size() > 2)
+            throw std::runtime_error("FRCheck decode: invalid lost position count");
+        if (recovered_addrs.size() != lost_positions.size())
+            throw std::runtime_error("FRCheck decode: lost position/output count mismatch");
+        if (survivor_positions.size() != static_cast<size_t>(k) ||
+            survivor_addrs.size() != static_cast<size_t>(k)) {
+            throw std::runtime_error(
+                "FRCheck decode: survivor count/address mismatch: positions=" +
+                std::to_string(survivor_positions.size()) + " addrs=" +
+                std::to_string(survivor_addrs.size()) + " expected=" +
+                std::to_string(k));
+        }
+        std::set<uintptr_t> unique_survivor_addrs;
+        for (uintptr_t addr : survivor_addrs) {
+            if (addr == 0)
+                throw std::runtime_error("FRCheck decode: null survivor address");
+            if (!unique_survivor_addrs.insert(addr).second)
+                throw std::runtime_error("FRCheck decode: duplicate survivor address");
+        }
+        std::set<uintptr_t> unique_outputs;
+        for (uintptr_t addr : recovered_addrs) {
+            if (addr == 0)
+                throw std::runtime_error("FRCheck decode: null recovered address");
+            if (!unique_outputs.insert(addr).second)
+                throw std::runtime_error("FRCheck decode: duplicate recovered address");
+            if (unique_survivor_addrs.count(addr) != 0)
+                throw std::runtime_error("FRCheck decode: recovered address aliases survivor");
+        }
+
+        std::lock_guard<std::mutex> lk(decode_mtx_);
+        init_decode_tables_(k, survivor_positions, lost_positions);
+        if (!decode_tbls_)
+            throw std::runtime_error("FRCheck decode: failed to initialize decode tables");
+
+        const int output_count = static_cast<int>(lost_positions.size());
+        std::vector<unsigned char*> data_ptrs(static_cast<size_t>(k));
+        for (int i = 0; i < k; ++i)
+            data_ptrs[static_cast<size_t>(i)] =
+                reinterpret_cast<unsigned char*>(survivor_addrs[static_cast<size_t>(i)]);
+        std::vector<unsigned char*> output_ptrs(static_cast<size_t>(output_count));
+        for (int i = 0; i < output_count; ++i)
+            output_ptrs[static_cast<size_t>(i)] =
+                reinterpret_cast<unsigned char*>(recovered_addrs[static_cast<size_t>(i)]);
+
+        if (rs_pool_inited_.load(std::memory_order_acquire)) {
+            RsEncodeJob job;
+            job.len = static_cast<int>(block_size);
+            job.k = k;
+            job.m = output_count;
+            job.g_tbls = decode_tbls_;
+            job.data_ptrs = data_ptrs.data();
+            job.parity_ptrs = output_ptrs.data();
+            rs_pool_run_parallel_encode(job);
+        } else {
+            ec_encode_data(static_cast<int>(block_size), k, output_count,
+                           decode_tbls_, data_ptrs.data(), output_ptrs.data());
+        }
+    }
+
     void submit_stripe_decode(
         int k,
         const std::vector<int>& survivor_positions,
@@ -1126,54 +1378,9 @@ public:
         uintptr_t recovered_addr,
         size_t block_size)
     {
-        if (stopped_)
-            throw std::runtime_error("FRCheck decode: native runtime is stopped");
-        if (k <= 0 || block_size == 0 || recovered_addr == 0)
-            throw std::runtime_error("FRCheck decode: invalid decode arguments");
-        int surviving_count = k;
-        if ((int)survivor_positions.size() != surviving_count ||
-            (int)survivor_addrs.size() != surviving_count) {
-            throw std::runtime_error(
-                "FRCheck decode: survivor count/address mismatch: positions=" +
-                std::to_string(survivor_positions.size()) + " addrs=" +
-                std::to_string(survivor_addrs.size()) + " expected=" +
-                std::to_string(surviving_count));
-        }
-        for (uintptr_t addr : survivor_addrs) {
-            if (addr == 0)
-                throw std::runtime_error("FRCheck decode: null survivor address");
-        }
-
-        std::lock_guard<std::mutex> lk(decode_mtx_);
-
-        // Build decode tables for this stripe
-        init_decode_tables_(k, survivor_positions, lost_position);
-        if (!decode_tbls_)
-            throw std::runtime_error("FRCheck decode: failed to initialize decode tables");
-
-        // Run parallel decode via RS pool (reuses encode pool)
-        if (rs_pool_inited_.load(std::memory_order_acquire)) {
-            RsEncodeJob job;
-            job.len = (int)block_size;
-            job.k = surviving_count;
-            job.m = 1;  // recover 1 block
-            job.g_tbls = decode_tbls_;
-            std::vector<unsigned char*> data_ptrs(surviving_count);
-            for (int i = 0; i < surviving_count; ++i)
-                data_ptrs[i] = (unsigned char*)survivor_addrs[i];
-            job.data_ptrs = data_ptrs.data();
-            unsigned char* out[1] = { (unsigned char*)recovered_addr };
-            job.parity_ptrs = out;
-            rs_pool_run_parallel_encode(job);
-        } else {
-            // Fallback: single-threaded decode
-            std::vector<unsigned char*> data_ptrs(surviving_count);
-            for (int i = 0; i < surviving_count; ++i)
-                data_ptrs[i] = (unsigned char*)survivor_addrs[i];
-            unsigned char* out[1] = { (unsigned char*)recovered_addr };
-            ec_encode_data((int)block_size, surviving_count, 1,
-                          decode_tbls_, data_ptrs.data(), out);
-        }
+        submit_stripe_decode_batch(
+            k, survivor_positions, std::vector<int>{lost_position}, survivor_addrs,
+            std::vector<uintptr_t>{recovered_addr}, block_size);
     }
 
     // ---- Point-to-point RDMA (for recovery) ----
@@ -1287,7 +1494,7 @@ public:
         size_t segment_offset = 0;
         size_t stats_remaining = logical_size;
         while (stats_remaining > 0) {
-            size_t message_remaining = std::min(stats_remaining, FRCHECK_RDMA_CHUNK);
+            size_t message_remaining = std::min(stats_remaining, frcheck_rdma_chunk_size());
             size_t message_sge = 0;
             while (message_remaining > 0) {
                 while (segment_offset == segments[segment_idx].second) {
@@ -1309,6 +1516,38 @@ public:
         save_source_send_sge_count_.fetch_add(sge_count, std::memory_order_relaxed);
         record_atomic_max_(save_source_send_max_sge_, max_sge);
         record_atomic_max_(save_source_send_max_us_, elapsed);
+    }
+
+    void prepare_layer_recv_from_peer(
+            int peer_rig, uintptr_t addr, size_t capacity,
+            uint64_t batch_id, int lane_id = 0) {
+        int mapped_lane_id = map_save_recv_lane_(peer_rig, lane_id);
+        FRCheckRdmaChannel* ch = get_channel_by_lane_(peer_rig, mapped_lane_id);
+        if (!ch) throw std::runtime_error("FRCheck prepared layer recv: no channel");
+        if (!shared_lane_)
+            throw std::runtime_error("FRCheck prepared layer recv requires shared lanes");
+        ch->prepare_tagged_recv(
+            make_channel_tag_(2, mapped_lane_id, batch_id),
+            reinterpret_cast<uint8_t*>(addr), capacity);
+    }
+
+    size_t wait_prepared_layer_recv_from_peer(
+            int peer_rig, uint64_t batch_id, int lane_id = 0) {
+        int mapped_lane_id = map_save_recv_lane_(peer_rig, lane_id);
+        FRCheckRdmaChannel* ch = get_channel_by_lane_(peer_rig, mapped_lane_id);
+        if (!ch) throw std::runtime_error("FRCheck prepared layer recv wait: no channel");
+        uint64_t net_t0 = frcheck_now_us();
+        record_save_net_start_(net_t0);
+        size_t got = ch->wait_prepared_tagged_recv(
+            make_channel_tag_(2, mapped_lane_id, batch_id));
+        uint64_t net_t1 = frcheck_now_us();
+        record_save_net_end_(net_t1);
+        uint64_t elapsed = net_t1 - net_t0;
+        save_enc_recv_total_us_.fetch_add(elapsed, std::memory_order_relaxed);
+        save_enc_recv_tasks_.fetch_add(1, std::memory_order_relaxed);
+        save_enc_recv_bytes_.fetch_add(got, std::memory_order_relaxed);
+        record_atomic_max_(save_enc_recv_max_us_, elapsed);
+        return got;
     }
 
     size_t recv_layer_from_peer(int peer_rig, uintptr_t addr, size_t capacity, uint64_t batch_id, int lane_id = 0) {
@@ -1479,7 +1718,8 @@ public:
         size_t failed_layer_offset,
         size_t failed_ncopy,
         bool store_to_layer_buf,
-        bool active)
+        bool active,
+        const std::vector<int>& target_roles = {})
     {
         if (stopped_)
             throw std::runtime_error("FRCheck recovery submit: native runtime is stopped");
@@ -1495,12 +1735,43 @@ public:
             return;
         }
 
+        std::set<int> requested_roles;
+        for (int role : target_roles) {
+            if (role < (int)StripeRole::SOURCE || role > (int)StripeRole::PARITY_TARGET)
+                throw std::runtime_error("FRCheck recovery submit: invalid target role");
+            if (!requested_roles.insert(role).second)
+                throw std::runtime_error("FRCheck recovery submit: duplicate target role");
+        }
+        auto role_selected = [&](int role) {
+            return requested_roles.empty() || requested_roles.count(role) != 0;
+        };
+
+        std::vector<const RecoveryFailedTarget*> selected_targets;
+        RecoveryFailedTarget single_target;
+        if (plan.dual_failure) {
+            for (const auto& ft : plan.failed_targets) {
+                if (role_selected(ft.original_role))
+                    selected_targets.push_back(&ft);
+            }
+        } else if (role_selected(plan.original_role)) {
+            single_target.failed_node = plan.failed_node;
+            single_target.failed_pos = plan.failed_pos;
+            single_target.original_role = plan.original_role;
+            selected_targets.push_back(&single_target);
+        }
+        if (selected_targets.empty())
+            return;
+        if (selected_targets.size() > 2)
+            throw std::runtime_error("FRCheck recovery submit: too many selected targets");
+
         auto is_helper = [&]() {
             return std::find(plan.helper_nodes.begin(), plan.helper_nodes.end(), my_node)
                    != plan.helper_nodes.end();
         };
 
-        if (is_helper() && helper_block_addr != 0) {
+        if (is_helper() && helper_block_addr == 0)
+            throw std::runtime_error("FRCheck recovery submit: missing helper block");
+        if (is_helper()) {
             RecoveryHelperTask task;
             task.batch_id = batch_id;
             task.stripe_id = stripe_id;
@@ -1516,7 +1787,13 @@ public:
             helper_cv_.notify_all();
         }
 
-        if (my_node == plan.decoder_node && decoder_self_block_addr != 0) {
+        if (my_node == plan.decoder_node && decoder_self_block_addr == 0)
+            throw std::runtime_error("FRCheck recovery submit: missing decoder self block");
+        if (my_node == plan.decoder_node) {
+            if (decoder_helper_recv_addrs.size() != plan.helper_nodes.size())
+                throw std::runtime_error("FRCheck recovery submit: helper buffer count mismatch");
+            if (decoder_recovered_addrs.size() < selected_targets.size())
+                throw std::runtime_error("FRCheck recovery submit: recovered buffer count mismatch");
             RecoveryDecoderTask task;
             task.batch_id = batch_id;
             task.stripe_id = stripe_id;
@@ -1525,19 +1802,16 @@ public:
             task.helper_recv_bufs = decoder_helper_recv_addrs;
             for (int hn : plan.helper_nodes)
                 task.helper_rigs.push_back(hn - 1);
-            task.recovered_bufs = decoder_recovered_addrs;
             task.dual_failure = plan.dual_failure;
             task.survivor_positions = plan.survivor_positions;
-            if (!plan.dual_failure) {
-                task.failed_pos = plan.failed_pos;
-                task.failed_rigs.push_back(plan.failed_node - 1);
-            } else {
-                for (const auto& ft : plan.failed_targets) {
-                    task.failed_positions.push_back(ft.failed_pos);
-                    task.failed_rigs.push_back(ft.failed_node - 1);
-                }
+            for (size_t i = 0; i < selected_targets.size(); ++i) {
+                const auto& ft = *selected_targets[i];
+                task.failed_positions.push_back(ft.failed_pos);
+                task.failed_rigs.push_back(ft.failed_node - 1);
+                task.recovered_bufs.push_back(decoder_recovered_addrs[i]);
             }
-            int decoder_outputs = plan.dual_failure ? (int)plan.failed_targets.size() : 1;
+            task.failed_pos = selected_targets[0]->failed_pos;
+            int decoder_outputs = (int)selected_targets.size();
             task.completion_count = decoder_outputs;
             recovery_batch_add_expected_(batch_id, decoder_outputs);
             pending_recovery_chunks_.fetch_add(decoder_outputs, std::memory_order_acq_rel);
@@ -1548,49 +1822,29 @@ public:
             decoder_cv_.notify_all();
         }
 
-        if (!plan.dual_failure) {
-            if (my_node == plan.failed_node && failed_recv_buf_addr != 0) {
-                RecoveryFailedTask task;
-                task.batch_id = batch_id;
-                task.stripe_id = stripe_id;
-                task.block_size = block_size;
-                task.recv_buf = failed_recv_buf_addr;
-                task.decoder_rig = plan.decoder_node - 1;
-                task.layer_buf = failed_layer_buf_addr;
-                task.layer_offset = failed_layer_offset;
-                task.ncopy = failed_ncopy;
-                task.store_to_layer = store_to_layer_buf;
-                recovery_batch_add_expected_(batch_id, 1);
-                pending_recovery_chunks_.fetch_add(1, std::memory_order_acq_rel);
-                {
-                    std::lock_guard<std::mutex> lk(failed_mtx_);
-                    failed_q_.push(std::move(task));
-                }
-                failed_cv_.notify_all();
+        for (const RecoveryFailedTarget* ft : selected_targets) {
+            if (my_node != ft->failed_node)
+                continue;
+            if (failed_recv_buf_addr == 0)
+                throw std::runtime_error("FRCheck recovery submit: missing failed receive buffer");
+            RecoveryFailedTask task;
+            task.batch_id = batch_id;
+            task.stripe_id = stripe_id;
+            task.block_size = block_size;
+            task.recv_buf = failed_recv_buf_addr;
+            task.decoder_rig = plan.decoder_node - 1;
+            task.layer_buf = failed_layer_buf_addr;
+            task.layer_offset = failed_layer_offset;
+            task.ncopy = failed_ncopy;
+            task.store_to_layer = store_to_layer_buf;
+            recovery_batch_add_expected_(batch_id, 1);
+            pending_recovery_chunks_.fetch_add(1, std::memory_order_acq_rel);
+            {
+                std::lock_guard<std::mutex> lk(failed_mtx_);
+                failed_q_.push(std::move(task));
             }
-        } else {
-            for (const auto& ft : plan.failed_targets) {
-                if (my_node != ft.failed_node || failed_recv_buf_addr == 0)
-                    continue;
-                RecoveryFailedTask task;
-                task.batch_id = batch_id;
-                task.stripe_id = stripe_id;
-                task.block_size = block_size;
-                task.recv_buf = failed_recv_buf_addr;
-                task.decoder_rig = plan.decoder_node - 1;
-                task.layer_buf = failed_layer_buf_addr;
-                task.layer_offset = failed_layer_offset;
-                task.ncopy = failed_ncopy;
-                task.store_to_layer = store_to_layer_buf;
-                recovery_batch_add_expected_(batch_id, 1);
-                pending_recovery_chunks_.fetch_add(1, std::memory_order_acq_rel);
-                {
-                    std::lock_guard<std::mutex> lk(failed_mtx_);
-                    failed_q_.push(std::move(task));
-                }
-                failed_cv_.notify_all();
-                break;
-            }
+            failed_cv_.notify_all();
+            break;
         }
     }
 
@@ -1914,95 +2168,83 @@ private:
     }
 
     // ---- RS decode table init (hardware recovery) ----
-    // Builds decode tables for recovering one lost block from k=n-2 surviving blocks.
-    // survivor_positions: k positions in [0, n-1] of the surviving blocks
-    //   positions 0..k-1 are data blocks (identity); positions k, k+1 are parity
-    // lost_position: position in [0, n-1] of the failed rank's block
+    // Builds output rows for one or more losses from the same survivor matrix.
     void init_decode_tables_(int k,
                              const std::vector<int>& survivor_positions,
-                             int lost_position) {
-        int m_parity = 2;
-        int full_rows = k + m_parity;  // = n
-        if ((int)survivor_positions.size() != k)
+                             const std::vector<int>& lost_positions) {
+        const int m_parity = 2;
+        const int full_rows = k + m_parity;
+        if (k <= 0 || survivor_positions.size() != static_cast<size_t>(k))
             throw std::runtime_error("FRCheck decode table: survivor count mismatch");
-        if (lost_position < 0 || lost_position >= full_rows)
-            throw std::runtime_error("FRCheck decode table: lost position out of range");
-        std::set<int> unique_positions;
+        if (lost_positions.empty() || lost_positions.size() > static_cast<size_t>(m_parity))
+            throw std::runtime_error("FRCheck decode table: invalid lost position count");
+
+        std::set<int> unique_survivors;
         for (int pos : survivor_positions) {
             if (pos < 0 || pos >= full_rows)
                 throw std::runtime_error("FRCheck decode table: survivor position out of range");
-            if (pos == lost_position)
-                throw std::runtime_error("FRCheck decode table: lost position listed as survivor");
-            if (!unique_positions.insert(pos).second)
+            if (!unique_survivors.insert(pos).second)
                 throw std::runtime_error("FRCheck decode table: duplicate survivor position");
         }
-
-        // Free old decode tables
-        if (decode_tbls_) { free(decode_tbls_); decode_tbls_ = nullptr; }
-
-        // Step 1: Build full (k+2) x k Vandermonde encoding matrix
-        std::vector<unsigned char> encode_mat((size_t)k * (size_t)full_rows);
-        gf_gen_rs_matrix(encode_mat.data(), full_rows, k);
-
-        // Step 2: Build k x k survivor matrix A
-        // For each surviving position:
-        //   - pos < k: identity row (1 at column pos)
-        //   - pos >= k: Vandermonde row from encode_mat
-        std::vector<unsigned char> A((size_t)k * (size_t)k, 0);
-        int a_row = 0;
-        for (int pos : survivor_positions) {
-            if (pos < k) {
-                A[a_row * k + pos] = 1;
-            } else {
-                // Parity row from Vandermonde
-                for (int col = 0; col < k; ++col)
-                    A[a_row * k + col] = encode_mat[pos * k + col];
-            }
-            ++a_row;
+        std::set<int> unique_losses;
+        for (int pos : lost_positions) {
+            if (pos < 0 || pos >= full_rows)
+                throw std::runtime_error("FRCheck decode table: lost position out of range");
+            if (!unique_losses.insert(pos).second)
+                throw std::runtime_error("FRCheck decode table: duplicate lost position");
+            if (unique_survivors.count(pos) != 0)
+                throw std::runtime_error("FRCheck decode table: lost position listed as survivor");
         }
 
-        // Step 3: Invert A in GF(2^8)
-        std::vector<unsigned char> inv_workspace((size_t)k * 2 * k);
-        std::vector<unsigned char> A_inv((size_t)k * k);
-        for (int i = 0; i < k * k; ++i) inv_workspace[i] = A[i];
-        int ret = gf_invert_matrix(inv_workspace.data(), A_inv.data(), k);
+        std::vector<unsigned char> encode_mat(
+            static_cast<size_t>(k) * static_cast<size_t>(full_rows));
+        gf_gen_rs_matrix(encode_mat.data(), full_rows, k);
+
+        std::vector<unsigned char> survivor_mat(
+            static_cast<size_t>(k) * static_cast<size_t>(k), 0);
+        for (int row = 0; row < k; ++row) {
+            const int pos = survivor_positions[static_cast<size_t>(row)];
+            for (int col = 0; col < k; ++col)
+                survivor_mat[static_cast<size_t>(row) * k + col] =
+                    encode_mat[static_cast<size_t>(pos) * k + col];
+        }
+
+        std::vector<unsigned char> inverse(
+            static_cast<size_t>(k) * static_cast<size_t>(k));
+        const int ret = gf_invert_matrix(survivor_mat.data(), inverse.data(), k);
         if (ret != 0) {
             throw std::runtime_error(
                 "FRCheck decode table: gf_invert_matrix failed, ret=" +
                 std::to_string(ret));
         }
 
-        // Step 4: Extract decode coefficients from A_inv
-        // A_inv is k x k, mapping survivor outputs → original data blocks
-        // Row j of A_inv recovers data block j from the k survivor inputs
-        std::vector<unsigned char> decode_mat((size_t)k);  // 1 row, k cols
-        if (lost_position < k) {
-            // Lost is a data block: use row lost_position of A_inv directly
-            for (int s = 0; s < k; ++s)
-                decode_mat[s] = A_inv[lost_position * k + s];
-        } else {
-            // Lost is a parity block at position P (k or k+1)
-            // Parity P = sum_{j=0}^{k-1} encode_mat[P*k + j] * data_j
-            // data_j = sum_{s=0}^{k-1} A_inv[j*k + s] * survivor_s
-            // => Parity P = sum_{s} (sum_{j} encode_mat[P*k + j] * A_inv[j*k + s]) * survivor_s
-            for (int s = 0; s < k; ++s) {
+        const int output_count = static_cast<int>(lost_positions.size());
+        std::vector<unsigned char> decode_mat(
+            static_cast<size_t>(output_count) * static_cast<size_t>(k), 0);
+        for (int output = 0; output < output_count; ++output) {
+            const int lost_pos = lost_positions[static_cast<size_t>(output)];
+            for (int survivor = 0; survivor < k; ++survivor) {
                 unsigned char coeff = 0;
-                for (int j = 0; j < k; ++j)
-                    coeff ^= gf_mul(encode_mat[lost_position * k + j],
-                                    A_inv[j * k + s]);
-                decode_mat[s] = coeff;
+                for (int data = 0; data < k; ++data) {
+                    coeff ^= gf_mul(
+                        encode_mat[static_cast<size_t>(lost_pos) * k + data],
+                        inverse[static_cast<size_t>(data) * k + survivor]);
+                }
+                decode_mat[static_cast<size_t>(output) * k + survivor] = coeff;
             }
         }
 
-        // Step 5: Generate decode tables (1 output row, k input columns)
-        size_t tbl_size = 32 * (size_t)k * 1;
+        const size_t tbl_size = 32 * static_cast<size_t>(k) *
+                                static_cast<size_t>(output_count);
         void* tmp = nullptr;
         if (posix_memalign(&tmp, 32, tbl_size) != 0) tmp = nullptr;
         if (tmp == nullptr) tmp = malloc(tbl_size);
-        decode_tbls_ = (unsigned char*)tmp;
-        if (!decode_tbls_)
+        if (tmp == nullptr)
             throw std::runtime_error("FRCheck decode table: allocation failed");
-        ec_init_tables(k, 1, decode_mat.data(), decode_tbls_);
+        unsigned char* new_decode_tbls = static_cast<unsigned char*>(tmp);
+        ec_init_tables(k, output_count, decode_mat.data(), new_decode_tbls);
+        if (decode_tbls_) free(decode_tbls_);
+        decode_tbls_ = new_decode_tbls;
     }
 
     // ---- RS encode thread pool (matches ecnaive xor_pool) ----
@@ -2095,8 +2337,7 @@ private:
             lk.unlock();
 
             if (jobs != nullptr) {
-                for (const auto& j : *jobs)
-                    rs_pool_execute_slice(j, wid);
+                rs_pool_execute_batch_slice(*jobs, wid);
             } else {
                 rs_pool_execute_slice(job, wid);
             }
@@ -2145,6 +2386,64 @@ private:
         ec_encode_data(len, job.k, job.m, job.g_tbls, src.data(), dest.data());
     }
 
+    void rs_pool_execute_batch_slice(const std::vector<RsEncodeJob>& jobs, int wid) {
+        uint64_t total_bytes = 0;
+        for (const auto& job : jobs) {
+            if (job.len > 0) {
+                const uint64_t len = static_cast<uint64_t>(job.len);
+                if (total_bytes > std::numeric_limits<uint64_t>::max() - len)
+                    return;
+                total_bytes += len;
+            }
+        }
+        if (total_bytes == 0) return;
+
+        const uint64_t base = total_bytes / static_cast<uint64_t>(kRsPoolSize);
+        const uint64_t rem = total_bytes % static_cast<uint64_t>(kRsPoolSize);
+        const uint64_t worker_len = base + (static_cast<uint64_t>(wid) < rem ? 1 : 0);
+        const uint64_t worker_begin = static_cast<uint64_t>(wid) * base +
+            std::min<uint64_t>(static_cast<uint64_t>(wid), rem);
+        const uint64_t worker_end = worker_begin + worker_len;
+        if (worker_len == 0) return;
+
+        uint64_t job_begin = 0;
+        for (const auto& job : jobs) {
+            const uint64_t job_len = job.len > 0 ? static_cast<uint64_t>(job.len) : 0;
+            const uint64_t job_end = job_begin + job_len;
+            const uint64_t begin = std::max(worker_begin, job_begin);
+            const uint64_t end = std::min(worker_end, job_end);
+            if (begin < end) {
+                const uint64_t offset = begin - job_begin;
+                const uint64_t length = end - begin;
+                if (offset <= static_cast<uint64_t>(std::numeric_limits<int>::max()) &&
+                    length <= static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                    rs_pool_execute_range(job, static_cast<int>(offset), static_cast<int>(length));
+                }
+            }
+            job_begin = job_end;
+            if (job_begin >= worker_end) break;
+        }
+    }
+
+    void rs_pool_execute_range(const RsEncodeJob& job, int off, int len) {
+        if (len <= 0 || off < 0 || off > job.len || len > job.len - off ||
+            job.k <= 0 || job.m <= 0 || job.g_tbls == nullptr ||
+            job.data_ptrs == nullptr || job.parity_ptrs == nullptr)
+            return;
+        std::vector<unsigned char*> src(static_cast<size_t>(job.k));
+        for (int i = 0; i < job.k; ++i) {
+            if (job.data_ptrs[i] == nullptr) return;
+            src[static_cast<size_t>(i)] = job.data_ptrs[i] + off;
+        }
+        std::vector<unsigned char*> dest(static_cast<size_t>(job.m));
+        for (int i = 0; i < job.m; ++i) {
+            if (job.parity_ptrs[i] == nullptr) return;
+            dest[static_cast<size_t>(i)] = job.parity_ptrs[i] + off;
+        }
+        ec_encode_data(len, job.k, job.m, job.g_tbls, src.data(), dest.data());
+        save_encode_ec_calls_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     void rs_pool_run_parallel_encode(const RsEncodeJob& job) {
         {
             std::lock_guard<std::mutex> publish(rs_pool_mutex_);
@@ -2162,10 +2461,9 @@ private:
         });
     }
 
-    // Encode multiple stripes in a single pool dispatch: each worker processes
-    // its byte-slice across ALL jobs, so a whole layer's encoder stripes share
-    // one barrier instead of one barrier per stripe. `jobs` must stay alive
-    // until this call returns.
+    // Encode multiple stripes in one pool dispatch. Workers divide the combined
+    // logical byte range, so each job is touched only by intersecting workers.
+    // `jobs` must stay alive until this call returns.
     void rs_pool_run_parallel_encode_batch(const std::vector<RsEncodeJob>& jobs) {
         if (jobs.empty()) return;
         {
@@ -2236,6 +2534,9 @@ private:
     std::atomic<uint64_t> save_net_end_us_{0};
     std::atomic<uint64_t> save_encode_total_us_{0};
     std::atomic<uint64_t> save_encode_wait_total_us_{0};
+    std::atomic<uint64_t> save_encode_batch_dispatches_{0};
+    std::atomic<uint64_t> save_encode_batch_jobs_{0};
+    std::atomic<uint64_t> save_encode_ec_calls_{0};
     std::atomic<uint64_t> save_source_send_total_us_{0};
     std::atomic<uint64_t> save_source_send_max_us_{0};
     std::atomic<uint64_t> save_enc_recv_total_us_{0};
@@ -2870,6 +3171,63 @@ public:
         push_mirror_task_(gpu_addr, cpu_addr, size);
     }
 
+    void encode_layer_stripes_batch(
+        const std::vector<int>& stripe_ids,
+        const std::vector<uintptr_t>& data_addrs,
+        const std::vector<uintptr_t>& p1_addrs,
+        const std::vector<uintptr_t>& p2_addrs,
+        const std::vector<size_t>& block_sizes)
+    {
+        const int n_src = n_ - 2;
+        const size_t n_jobs = stripe_ids.size();
+        if (n_src <= 0 || n_jobs == 0) return;
+        if (n_jobs > std::numeric_limits<size_t>::max() / static_cast<size_t>(n_src) ||
+            data_addrs.size() != n_jobs * static_cast<size_t>(n_src) ||
+            p1_addrs.size() != n_jobs || p2_addrs.size() != n_jobs ||
+            block_sizes.size() != n_jobs) {
+            throw std::runtime_error("FRCheck layer batch encode: invalid argument sizes");
+        }
+
+        std::vector<std::vector<unsigned char*>> src_ptrs(n_jobs);
+        std::vector<std::array<unsigned char*, 2>> par_ptrs(n_jobs);
+        std::vector<RsEncodeJob> jobs(n_jobs);
+        for (size_t job_idx = 0; job_idx < n_jobs; ++job_idx) {
+            const size_t block_size = block_sizes[job_idx];
+            if (block_size == 0 || block_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                throw std::runtime_error("FRCheck layer batch encode: invalid block size");
+            }
+            if (p1_addrs[job_idx] == 0 || p2_addrs[job_idx] == 0) {
+                throw std::runtime_error("FRCheck layer batch encode: missing parity output buffer");
+            }
+            src_ptrs[job_idx].resize(static_cast<size_t>(n_src));
+            for (int src_idx = 0; src_idx < n_src; ++src_idx) {
+                const size_t flat_idx = job_idx * static_cast<size_t>(n_src) +
+                    static_cast<size_t>(src_idx);
+                const uintptr_t addr = data_addrs[flat_idx];
+                if (addr == 0) {
+                    throw std::runtime_error("FRCheck layer batch encode: missing source block buffer");
+                }
+                src_ptrs[job_idx][static_cast<size_t>(src_idx)] =
+                    reinterpret_cast<unsigned char*>(addr);
+            }
+            par_ptrs[job_idx][0] = reinterpret_cast<unsigned char*>(p1_addrs[job_idx]);
+            par_ptrs[job_idx][1] = reinterpret_cast<unsigned char*>(p2_addrs[job_idx]);
+            jobs[job_idx] = RsEncodeJob{
+                static_cast<int>(block_size), n_src, 2, g_tbls_,
+                src_ptrs[job_idx].data(), par_ptrs[job_idx].data(),
+            };
+        }
+
+        const uint64_t wait_t0 = frcheck_now_us();
+        std::lock_guard<std::mutex> lk(encoder_encode_mtx_);
+        const uint64_t encode_t0 = frcheck_now_us();
+        save_encode_wait_total_us_.fetch_add(encode_t0 - wait_t0, std::memory_order_relaxed);
+        save_encode_batch_dispatches_.fetch_add(1, std::memory_order_relaxed);
+        save_encode_batch_jobs_.fetch_add(n_jobs, std::memory_order_relaxed);
+        rs_pool_run_parallel_encode_batch(jobs);
+        save_encode_total_us_.fetch_add(frcheck_now_us() - encode_t0, std::memory_order_relaxed);
+    }
+
     void encode_layer_stripes(
         const std::vector<int>& stripe_ids,
         const std::vector<uintptr_t>& data_addrs,
@@ -2877,55 +3235,22 @@ public:
         const std::vector<uintptr_t>& p2_addrs,
         size_t block_size)
     {
-        const int n_src = n_ - 2;
-        if (n_src <= 0 || block_size == 0 || stripe_ids.empty()) return;
-        if (data_addrs.size() != stripe_ids.size() * (size_t)n_src ||
-            p1_addrs.size() != stripe_ids.size() ||
-            p2_addrs.size() != stripe_ids.size()) {
-            throw std::runtime_error("FRCheck layer encode: invalid argument sizes");
-        }
-        // Build persistent per-stripe pointer arrays so all encoder stripes of
-        // this layer can be encoded in a single RS pool dispatch (one barrier)
-        // instead of one barrier per stripe.
-        const size_t n_stripes = stripe_ids.size();
-        std::vector<std::vector<unsigned char*>> src_ptrs(n_stripes);
-        std::vector<std::array<unsigned char*, 2>> par_ptrs(n_stripes);
-        std::vector<RsEncodeJob> jobs(n_stripes);
-        for (size_t si = 0; si < n_stripes; ++si) {
-            if (p1_addrs[si] == 0 || p2_addrs[si] == 0) {
-                throw std::runtime_error("FRCheck layer encode: missing parity output buffer");
-            }
-            src_ptrs[si].resize((size_t)n_src);
-            for (int i = 0; i < n_src; ++i) {
-                uintptr_t addr = data_addrs[si * (size_t)n_src + (size_t)i];
-                if (addr == 0) {
-                    throw std::runtime_error("FRCheck layer encode: missing source block buffer");
-                }
-                src_ptrs[si][(size_t)i] = (unsigned char*)addr;
-            }
-            par_ptrs[si][0] = (unsigned char*)p1_addrs[si];
-            par_ptrs[si][1] = (unsigned char*)p2_addrs[si];
-            jobs[si] = RsEncodeJob{
-                (int)block_size, n_src, 2, g_tbls_,
-                src_ptrs[si].data(), par_ptrs[si].data(),
-            };
-        }
-
-        uint64_t wait_t0 = frcheck_now_us();
-        std::lock_guard<std::mutex> lk(encoder_encode_mtx_);
-        uint64_t encode_t0 = frcheck_now_us();
-        save_encode_wait_total_us_.fetch_add(
-            encode_t0 - wait_t0, std::memory_order_relaxed);
-        rs_pool_run_parallel_encode_batch(jobs);
-        save_encode_total_us_.fetch_add(
-            frcheck_now_us() - encode_t0, std::memory_order_relaxed);
+        std::vector<size_t> block_sizes(stripe_ids.size(), block_size);
+        encode_layer_stripes_batch(
+            stripe_ids, data_addrs, p1_addrs, p2_addrs, block_sizes);
     }
 
     void reset_ft_timing_stats() {
+        for (auto& peer_row : channels_)
+            for (auto* ch : peer_row)
+                if (ch) ch->reset_tagged_ack_timing();
         save_net_start_us_.store(0, std::memory_order_relaxed);
         save_net_end_us_.store(0, std::memory_order_relaxed);
         save_encode_total_us_.store(0, std::memory_order_relaxed);
         save_encode_wait_total_us_.store(0, std::memory_order_relaxed);
+        save_encode_batch_dispatches_.store(0, std::memory_order_relaxed);
+        save_encode_batch_jobs_.store(0, std::memory_order_relaxed);
+        save_encode_ec_calls_.store(0, std::memory_order_relaxed);
         save_source_send_total_us_.store(0, std::memory_order_relaxed);
         save_source_send_max_us_.store(0, std::memory_order_relaxed);
         save_enc_recv_total_us_.store(0, std::memory_order_relaxed);
@@ -2959,6 +3284,12 @@ public:
             save_encode_total_us_.load(std::memory_order_relaxed)) / 1e6;
         result["encode_wait_s"] = static_cast<double>(
             save_encode_wait_total_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["encode_batch_dispatches"] = static_cast<double>(
+            save_encode_batch_dispatches_.load(std::memory_order_relaxed));
+        result["encode_batch_jobs"] = static_cast<double>(
+            save_encode_batch_jobs_.load(std::memory_order_relaxed));
+        result["encode_ec_calls"] = static_cast<double>(
+            save_encode_ec_calls_.load(std::memory_order_relaxed));
         result["d2h_s"] = static_cast<double>(
             mirror_d2h_busy_total_us_.load(std::memory_order_relaxed)) / 1e6;
         result["mirror_tasks_submitted"] = static_cast<double>(
@@ -2973,6 +3304,21 @@ public:
             mirror_tasks_failed_.load(std::memory_order_relaxed));
         result["mirror_bytes_failed"] = static_cast<double>(
             mirror_bytes_failed_.load(std::memory_order_relaxed));
+        uint64_t tagged_ack_wait_total_us = 0;
+        uint64_t tagged_ack_wait_max_us = 0;
+        uint64_t tagged_ack_wait_count = 0;
+        for (const auto& peer_row : channels_) {
+            for (const auto* ch : peer_row) {
+                if (!ch) continue;
+                tagged_ack_wait_total_us += ch->tagged_ack_wait_total_us();
+                tagged_ack_wait_max_us = std::max(
+                    tagged_ack_wait_max_us, ch->tagged_ack_wait_max_us());
+                tagged_ack_wait_count += ch->tagged_ack_wait_count();
+            }
+        }
+        result["tagged_ack_wait_sum_s"] = static_cast<double>(tagged_ack_wait_total_us) / 1e6;
+        result["tagged_ack_wait_max_s"] = static_cast<double>(tagged_ack_wait_max_us) / 1e6;
+        result["tagged_ack_wait_count"] = static_cast<double>(tagged_ack_wait_count);
         result["source_send_sum_s"] = static_cast<double>(
             save_source_send_total_us_.load(std::memory_order_relaxed)) / 1e6;
         result["source_send_max_s"] = static_cast<double>(
@@ -3862,19 +4208,23 @@ public:
                 task.batch_id, task.stripe_id, task.block_size,
                 task.recovered_bufs[0], task.failed_rigs[0]);
         } else {
-            if (task.recovered_bufs.size() < task.failed_positions.size())
-                throw std::runtime_error("FRCheck recovery: insufficient recovered buffers");
+            if (task.failed_positions.empty() || task.failed_positions.size() > 2 ||
+                task.recovered_bufs.size() != task.failed_positions.size() ||
+                task.failed_rigs.size() != task.failed_positions.size()) {
+                throw std::runtime_error("FRCheck recovery: invalid filtered dual outputs");
+            }
+            uint64_t t_decode = frcheck_now_us();
+            record_recovery_decode_start_(t_decode);
+            submit_stripe_decode_batch(
+                k, task.survivor_positions, task.failed_positions,
+                survivor_addrs, task.recovered_bufs, task.block_size);
+            uint64_t t_decode_done = frcheck_now_us();
+            recovery_batch_record_event_(
+                task.batch_id, RecoveryBatchEvent::DECODER_DECODE, t_decode_done);
+            record_recovery_decode_end_(t_decode_done);
+            recovery_decoder_decode_us_.fetch_add(
+                t_decode_done - t_decode, std::memory_order_relaxed);
             for (size_t slot = 0; slot < task.failed_positions.size(); ++slot) {
-                uint64_t t_decode = frcheck_now_us();
-                record_recovery_decode_start_(t_decode);
-                submit_stripe_decode(
-                    k, task.survivor_positions, task.failed_positions[slot],
-                    survivor_addrs, task.recovered_bufs[slot], task.block_size);
-                uint64_t t_decode_done = frcheck_now_us();
-                recovery_batch_record_event_(
-                    task.batch_id, RecoveryBatchEvent::DECODER_DECODE, t_decode_done);
-                record_recovery_decode_end_(t_decode_done);
-                recovery_decoder_decode_us_.fetch_add(t_decode_done - t_decode, std::memory_order_relaxed);
                 enqueue_recovery_decoder_send_(
                     task.batch_id, task.stripe_id, task.block_size,
                     task.recovered_bufs[slot], task.failed_rigs[slot]);
@@ -4349,6 +4699,14 @@ private:
     }
 
     // ---- TCP helpers ----
+    static void configure_control_socket_(int fd) {
+        int enabled = 1;
+        if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0) {
+            throw std::runtime_error(
+                "FRCheck: failed to enable TCP_NODELAY: " + std::string(std::strerror(errno)));
+        }
+    }
+
     int create_tcp_connect(const std::string& ip, uint16_t port) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) throw std::runtime_error("FRCheck: socket() failed");
@@ -4367,8 +4725,10 @@ private:
         const int max_attempts = 20;
         const int base_delay_us = 5000;  // 5 ms
         while (true) {
-            if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0)
+            if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                configure_control_socket_(fd);
                 return fd;
+            }
             if (++attempt >= max_attempts) {
                 int err = errno;
                 close(fd);
@@ -4402,6 +4762,13 @@ private:
                 if (fd < 0) {
                     if (errno == EINTR) continue;
                     if (errno == EINVAL || errno == EBADF) break; // closed
+                    continue;
+                }
+                try {
+                    configure_control_socket_(fd);
+                } catch (const std::exception& e) {
+                    std::cerr << "[FRCheck RDMA] accept: " << e.what() << std::endl;
+                    close(fd);
                     continue;
                 }
                 // Receive peer rank + lane (stripe_id)
@@ -4679,6 +5046,13 @@ PYBIND11_MODULE(frcheck_native, m) {
         .def_static("gdr_available", &FRCheckNative::gdr_available)
 
         // Stripe decode (hardware recovery)
+        .def("submit_stripe_decode_batch", &FRCheckNative::submit_stripe_decode_batch,
+             py::arg("k"),
+             py::arg("survivor_positions"),
+             py::arg("lost_positions"),
+             py::arg("survivor_addrs"),
+             py::arg("recovered_addrs"),
+             py::arg("block_size"))
         .def("submit_stripe_decode", &FRCheckNative::submit_stripe_decode,
              py::arg("k"),
              py::arg("survivor_positions"),
@@ -4707,6 +5081,12 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("block_size"), py::arg("batch_id"), py::arg("lane_id") = 0,
              py::call_guard<py::gil_scoped_release>())
         .def("get_max_send_sge", &FRCheckNative::get_max_send_sge)
+        .def("prepare_layer_recv_from_peer", &FRCheckNative::prepare_layer_recv_from_peer,
+             py::arg("peer_rig"), py::arg("addr"), py::arg("capacity"), py::arg("batch_id"),
+             py::arg("lane_id") = 0)
+        .def("wait_prepared_layer_recv_from_peer", &FRCheckNative::wait_prepared_layer_recv_from_peer,
+             py::arg("peer_rig"), py::arg("batch_id"), py::arg("lane_id") = 0,
+             py::call_guard<py::gil_scoped_release>())
         .def("recv_layer_from_peer", &FRCheckNative::recv_layer_from_peer,
              py::arg("peer_rig"), py::arg("addr"), py::arg("capacity"), py::arg("batch_id"),
              py::arg("lane_id") = 0,
@@ -4725,6 +5105,10 @@ PYBIND11_MODULE(frcheck_native, m) {
         .def("encode_layer_stripes", &FRCheckNative::encode_layer_stripes,
              py::arg("stripe_ids"), py::arg("data_addrs"), py::arg("p1_addrs"),
              py::arg("p2_addrs"), py::arg("block_size"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("encode_layer_stripes_batch", &FRCheckNative::encode_layer_stripes_batch,
+             py::arg("stripe_ids"), py::arg("data_addrs"), py::arg("p1_addrs"),
+             py::arg("p2_addrs"), py::arg("block_sizes"),
              py::call_guard<py::gil_scoped_release>())
         .def("reset_ft_timing_stats", &FRCheckNative::reset_ft_timing_stats)
         .def("get_ft_timing_stats", &FRCheckNative::get_ft_timing_stats,
@@ -4773,7 +5157,8 @@ PYBIND11_MODULE(frcheck_native, m) {
              py::arg("failed_layer_offset"),
              py::arg("failed_ncopy"),
              py::arg("store_to_layer_buf"),
-             py::arg("active") = true)
+             py::arg("active") = true,
+             py::arg("target_roles") = std::vector<int>{})
         .def("submit_recovery_sentinel", &FRCheckNative::submit_recovery_sentinel)
         .def("wait_recovery_batch", &FRCheckNative::wait_recovery_batch,
              py::call_guard<py::gil_scoped_release>())

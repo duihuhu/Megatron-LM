@@ -2469,7 +2469,12 @@ def _prepare_layer_exchange_network(
     my_node = int(manager.rank_in_group) + 1
     send_blocks, recv_blocks, encoder_sids = _build_layer_exchange_plan(manager, layer_idx)
     batch_base = int(prepared["batch_id"]) * 1000003
-    lane_id = (int(prepared["batch_id"]) - 1) % max(1, int(getattr(manager, "num_stripes", 1)))
+    layer_exchange_lanes = max(
+        1, int(os.environ.get(
+            "FRCHECK_LAYER_EXCHANGE_LANES", str(getattr(manager, "num_stripes", 1))
+        ))
+    )
+    lane_id = (int(prepared["batch_id"]) - 1) % layer_exchange_lanes
 
     payload_bytes = int(result.n_filled_blocks) * block_size
     layer_gpu = layer_bufs.layer_buf_gpu
@@ -2479,17 +2484,24 @@ def _prepare_layer_exchange_network(
             f"FRCheck layer exchange: canonical mirror too small for layer {layer_idx}"
         )
 
-    # Queue one contiguous D2H into the canonical source-block layout. Network
-    # staging is gathered from this mirror by the first send worker for the layer.
+    # Keep one canonical D2H copy per source byte, but expose block completion
+    # events so RDMA can start before the entire layer mirror is ready.
     stage_pack_t0 = time.time()
+    d2h_block_events: List[torch.cuda.Event] = []
     with torch.cuda.stream(pack_stream):
         d2h_start_event = torch.cuda.Event(enable_timing=True)
         d2h_end_event = torch.cuda.Event(enable_timing=True)
         d2h_start_event.record(pack_stream)
-        if payload_bytes > 0:
-            layer_mirror_cpu[:payload_bytes].copy_(
-                layer_gpu[:payload_bytes], non_blocking=True
-            )
+        for block_idx in range(int(result.n_filled_blocks)):
+            block_start = block_idx * block_size
+            block_end = min(block_start + block_size, payload_bytes)
+            if block_end > block_start:
+                layer_mirror_cpu[block_start:block_end].copy_(
+                    layer_gpu[block_start:block_end], non_blocking=True
+                )
+            block_event = torch.cuda.Event()
+            block_event.record(pack_stream)
+            d2h_block_events.append(block_event)
         d2h_end_event.record(pack_stream)
     stage_pack_s = time.time() - stage_pack_t0
 
@@ -2507,7 +2519,7 @@ def _prepare_layer_exchange_network(
             sid: slot * block_size for slot, (sid, _blk_idx) in enumerate(blocks)
         }
 
-    num_stripes_local = max(1, int(getattr(manager, "num_stripes", 1)))
+    num_stripes_local = layer_exchange_lanes
     # Both peers derive identical balanced task boundaries from block count,
     # the configured minimum segment target, and the globally reduced SGE cap.
     send_seg = max(1, int(os.environ.get("FRCHECK_LAYER_EXCHANGE_SEG", "1")))
@@ -2584,13 +2596,11 @@ def _prepare_layer_exchange_network(
         "start_time": time.time(),
         "d2h_start_event": d2h_start_event,
         "d2h_end_event": d2h_end_event,
+        "d2h_block_events": d2h_block_events,
         "stage_pack_s": stage_pack_s,
         "stage_pack_bytes": payload_bytes,
         "stage_pack_blocks": int(result.n_filled_blocks),
         "mirror_ready_lock": threading.Lock(),
-        "mirror_ready_event": threading.Event(),
-        "mirror_ready_started": False,
-        "mirror_ready_error": None,
         "mirror_ready_wait_sum_s": 0.0,
         "mirror_ready_wait_max_s": 0.0,
     }
@@ -2616,7 +2626,6 @@ def _prepare_layer_exchange_network(
         "ready_first_s": 0.0,
         "ready_last_s": 0.0,
         "stream_encode_active_s": 0.0,
-        "encode_batch_size": max(1, int(os.environ.get("FRCHECK_LAYER_ENCODE_BATCH", "1"))),
     })
     return ctx
 
@@ -2701,13 +2710,27 @@ def _encode_layer_exchange_stripes(
     )
 
 
-def _encode_layer_exchange_context(manager, native, ctx: Dict[str, Any], n: int) -> float:
-    """Encode local encoder stripes after all layer-exchange network tasks finish."""
-    if "encode_specs" not in ctx:
-        ctx["encode_specs"] = _build_layer_exchange_encode_specs(manager, ctx, n)
-    stripe_ids = sorted(int(sid) for sid in ctx["encode_specs"].keys())
-    _encode_layer_exchange_stripes(native, ctx, stripe_ids)
-    return time.time() - float(ctx["start_time"])
+def _encode_layer_exchange_batch(
+    native, jobs: List[Tuple[Dict[str, Any], int]]
+) -> None:
+    """Encode ready stripes from multiple layers in one native dispatch."""
+    if not jobs:
+        return
+    stripe_ids: List[int] = []
+    data_addrs: List[int] = []
+    p1_addrs: List[int] = []
+    p2_addrs: List[int] = []
+    block_sizes: List[int] = []
+    for ctx, sid in jobs:
+        spec = ctx["encode_specs"][int(sid)]
+        stripe_ids.append(int(sid))
+        data_addrs.extend(int(addr) for addr in spec["data_addrs"])
+        p1_addrs.append(int(spec["p1_addr"]))
+        p2_addrs.append(int(spec["p2_addr"]))
+        block_sizes.append(int(spec["block_size"]))
+    native.encode_layer_stripes_batch(
+        stripe_ids, data_addrs, p1_addrs, p2_addrs, block_sizes
+    )
 
 
 def _save_frcheck_stripe_files(
@@ -3320,6 +3343,7 @@ def save_frcheck_legacy_checkpoint(
         and hasattr(native, "send_layer_to_peer")
         and hasattr(native, "recv_layer_from_peer")
         and hasattr(native, "encode_layer_stripes")
+        and hasattr(native, "encode_layer_stripes_batch")
     )
     use_cross_layer_encode = (
         has_encode_batch and hasattr(native, "reset_encode_layer")
@@ -3514,6 +3538,7 @@ def save_frcheck_legacy_checkpoint(
 
         worker_errors: List[BaseException] = []
         worker_errors_lock = threading.Lock()
+        coordinator_wakeup: queue.Queue = queue.Queue()
         send_queues: Dict[Tuple[int, int], queue.Queue] = {}
         recv_queues: Dict[Tuple[int, int], queue.Queue] = {}
 
@@ -3521,11 +3546,14 @@ def save_frcheck_legacy_checkpoint(
             with ctx["remaining_lock"]:
                 ctx["remaining"] -= 1
                 if ctx["remaining"] == 0:
+                    ctx["network_done_s"] = time.time()
                     ctx["done_event"].set()
+                    coordinator_wakeup.put(ctx)
 
         def _record_worker_error(ctx: Dict[str, Any], exc: BaseException) -> None:
             ctx["errors"].append(exc)
             ctx["done_event"].set()
+            coordinator_wakeup.put(ctx)
             with worker_errors_lock:
                 worker_errors.append(exc)
 
@@ -3543,37 +3571,30 @@ def save_frcheck_legacy_checkpoint(
                     if pending or sid in ctx["ready_queued_sids"] or sid in ctx["encoded_sids"]:
                         continue
                     ctx["ready_queue"].put(sid)
+                    coordinator_wakeup.put(ctx)
                     ctx["ready_queued_sids"].add(sid)
                     if float(ctx.get("ready_first_s", 0.0)) == 0.0:
                         ctx["ready_first_s"] = now_s
                     ctx["ready_last_s"] = now_s
 
-        def _wait_layer_mirror_ready(ctx: Dict[str, Any]) -> None:
+        def _wait_layer_blocks_ready(ctx: Dict[str, Any], block_indices: List[int]) -> None:
+            if not block_indices:
+                return
+            last_block = max(int(block_idx) for block_idx in block_indices)
+            block_events = ctx["d2h_block_events"]
+            if last_block < 0 or last_block >= len(block_events):
+                raise RuntimeError(
+                    f"FRCheck layer mirror block index {last_block} is outside "
+                    f"the {len(block_events)} staged blocks"
+                )
             wait_t0 = time.time()
-            ready_event = ctx["mirror_ready_event"]
-            is_owner = False
-            with ctx["mirror_ready_lock"]:
-                if not ctx["mirror_ready_started"]:
-                    ctx["mirror_ready_started"] = True
-                    is_owner = True
-            if is_owner:
-                try:
-                    ctx["d2h_end_event"].synchronize()
-                except BaseException as exc:
-                    ctx["mirror_ready_error"] = exc
-                finally:
-                    ready_event.set()
-            else:
-                ready_event.wait()
+            block_events[last_block].synchronize()
             wait_s = time.time() - wait_t0
             with ctx["mirror_ready_lock"]:
                 ctx["mirror_ready_wait_sum_s"] += wait_s
                 ctx["mirror_ready_wait_max_s"] = max(
                     ctx["mirror_ready_wait_max_s"], wait_s
                 )
-            error = ctx.get("mirror_ready_error")
-            if error is not None:
-                raise RuntimeError("FRCheck layer mirror D2H failed") from error
 
         def _send_worker(peer_key: Tuple[int, int], q: queue.Queue) -> None:
             while True:
@@ -3582,7 +3603,7 @@ def save_frcheck_legacy_checkpoint(
                     return
                 ctx, task = item
                 try:
-                    _wait_layer_mirror_ready(ctx)
+                    _wait_layer_blocks_ready(ctx, task["block_indices"])
                     native.send_layer_blocks_to_peer(
                         int(task["peer_rig"]), int(task["mirror_base"]),
                         task["block_indices"], int(task["block_size"]),
@@ -3592,6 +3613,18 @@ def save_frcheck_legacy_checkpoint(
                 except BaseException as exc:
                     _record_worker_error(ctx, exc)
 
+        use_prepared_layer_recv = bool(
+            hasattr(native, "prepare_layer_recv_from_peer")
+            and hasattr(native, "wait_prepared_layer_recv_from_peer")
+        )
+        if use_prepared_layer_recv:
+            for ctx in layer_exchange_contexts:
+                for task in ctx["recv_tasks"]:
+                    native.prepare_layer_recv_from_peer(
+                        int(task["peer_rig"]), int(task["addr"]), int(task["size"]),
+                        int(task["batch_id"]), int(task["lane_id"]),
+                    )
+
         def _recv_worker(peer_key: Tuple[int, int], q: queue.Queue) -> None:
             while True:
                 item = q.get()
@@ -3599,10 +3632,16 @@ def save_frcheck_legacy_checkpoint(
                     return
                 ctx, task = item
                 try:
-                    native.recv_layer_from_peer(
-                        int(task["peer_rig"]), int(task["addr"]),
-                        int(task["size"]), int(task["batch_id"]), int(task["lane_id"]),
-                    )
+                    if use_prepared_layer_recv:
+                        native.wait_prepared_layer_recv_from_peer(
+                            int(task["peer_rig"]), int(task["batch_id"]),
+                            int(task["lane_id"]),
+                        )
+                    else:
+                        native.recv_layer_from_peer(
+                            int(task["peer_rig"]), int(task["addr"]),
+                            int(task["size"]), int(task["batch_id"]), int(task["lane_id"]),
+                        )
                     _mark_ready_stripes(ctx, int(task["peer_node"]), task.get("ready_sids", []))
                     _mark_task_done(ctx)
                 except BaseException as exc:
@@ -3631,82 +3670,125 @@ def save_frcheck_legacy_checkpoint(
         lx_exchange_thread_start_s = time.time() - lx_exchange_thread_start_t0
 
         encode_errors: List[BaseException] = []
-        encode_threads: List[threading.Thread] = []
+        stream_encode = os.environ.get("FRCHECK_LAYER_STREAM_ENCODE", "1") != "0"
+        global_batch_size = max(
+            1, int(os.environ.get("FRCHECK_LAYER_ENCODE_BATCH", "1"))
+        )
 
-        def _wait_and_encode(ctx: Dict[str, Any]) -> None:
+        def _encoding_complete(ctx: Dict[str, Any]) -> bool:
+            return len(ctx["encoded_sids"]) >= len(ctx.get("encode_specs", {}))
+
+        def _finalize_context_if_ready(ctx: Dict[str, Any]) -> None:
+            if not _encoding_complete(ctx):
+                return
+            if not ctx["encode_done_event"].is_set():
+                ctx["encode_done_event"].set()
+                ctx["encode_end_s"] = time.time() - float(ctx["start_time"])
+            if ctx["done_event"].is_set() and "layer_elapsed" not in ctx:
+                now = time.time()
+                network_done_s = float(ctx.get("network_done_s", now))
+                ctx["exchange_wait_s"] = network_done_s - float(ctx["coordinator_start_s"])
+                ctx["layer_elapsed"] = now - float(ctx["start_time"])
+                ctx["encode_wall_s"] = float(ctx.get("stream_encode_active_s", 0.0))
+
+        def _collect_fair_batch(start_idx: int) -> Tuple[List[Tuple[Dict[str, Any], int]], int]:
+            batch: List[Tuple[Dict[str, Any], int]] = []
+            count = len(layer_exchange_contexts)
+            if count == 0:
+                return batch, start_idx
+            cursor = start_idx % count
+            while len(batch) < global_batch_size:
+                added = False
+                for step in range(count):
+                    idx = (cursor + step) % count
+                    ctx = layer_exchange_contexts[idx]
+                    if not stream_encode and not ctx["done_event"].is_set():
+                        continue
+                    try:
+                        sid = int(ctx["ready_queue"].get_nowait())
+                    except queue.Empty:
+                        continue
+                    with ctx["ready_lock"]:
+                        if sid in ctx["encoded_sids"]:
+                            continue
+                    batch.append((ctx, sid))
+                    cursor = (idx + 1) % count
+                    added = True
+                    if len(batch) >= global_batch_size:
+                        break
+                if not added:
+                    break
+            return batch, cursor
+
+        def _encode_coordinator() -> None:
+            coordinator_start_s = time.time()
+            for ctx in layer_exchange_contexts:
+                ctx["coordinator_start_s"] = coordinator_start_s
+            cursor = 0
             try:
-                wait_t0 = time.time()
-                encode_t0 = time.time()
-                if os.environ.get("FRCHECK_LAYER_STREAM_ENCODE", "1") == "0":
-                    ctx["done_event"].wait()
-                    ctx["exchange_wait_s"] = time.time() - wait_t0
-                    if ctx["errors"]:
-                        raise RuntimeError("FRCheck layer exchange failed") from ctx["errors"][0]
-                    ctx["layer_elapsed"] = _encode_layer_exchange_context(manager, native, ctx, n)
-                else:
-                    total_stripes = len(ctx.get("encode_specs", {}))
-                    batch_size = int(ctx.get("encode_batch_size", 1))
-                    while len(ctx["encoded_sids"]) < total_stripes:
+                while True:
+                    for ctx in layer_exchange_contexts:
                         if ctx["errors"]:
                             raise RuntimeError("FRCheck layer exchange failed") from ctx["errors"][0]
-                        batch: List[int] = []
-                        try:
-                            sid = ctx["ready_queue"].get(timeout=0.01)
-                        except queue.Empty:
-                            if ctx["done_event"].is_set() and ctx["ready_queue"].empty():
-                                if ctx["errors"]:
-                                    raise RuntimeError("FRCheck layer exchange failed") from ctx["errors"][0]
+                        _finalize_context_if_ready(ctx)
+                    if all(
+                        _encoding_complete(ctx) and ctx["done_event"].is_set()
+                        for ctx in layer_exchange_contexts
+                    ):
+                        break
+
+                    batch, cursor = _collect_fair_batch(cursor)
+                    if not batch:
+                        incomplete_done = []
+                        for ctx in layer_exchange_contexts:
+                            if ctx["done_event"].is_set() and not _encoding_complete(ctx):
                                 pending = sorted(
-                                    int(sid) for sid in ctx["encode_specs"].keys()
+                                    int(sid) for sid in ctx["encode_specs"]
                                     if int(sid) not in ctx["encoded_sids"]
                                 )
-                                if pending:
-                                    raise RuntimeError(
-                                        f"FRCheck layer exchange encode incomplete: pending stripes {pending[:8]}"
-                                    )
-                                break
-                            continue
-                        batch.append(int(sid))
-                        while len(batch) < batch_size:
-                            try:
-                                batch.append(int(ctx["ready_queue"].get_nowait()))
-                            except queue.Empty:
-                                break
+                                if ctx["ready_queue"].empty() and pending:
+                                    incomplete_done.append((ctx, pending))
+                        if incomplete_done:
+                            ctx, pending = incomplete_done[0]
+                            layer_name = ctx["prepared"]["result"].layer_name
+                            raise RuntimeError(
+                                f"FRCheck layer exchange encode incomplete for {layer_name}: "
+                                f"pending stripes {pending[:8]}"
+                            )
+                        coordinator_wakeup.get()
+                        continue
+
+                    batch_t0 = time.time()
+                    _encode_layer_exchange_batch(native, batch)
+                    batch_elapsed = time.time() - batch_t0
+                    jobs_per_ctx: Dict[int, int] = {}
+                    for ctx, _sid in batch:
+                        key = id(ctx)
+                        jobs_per_ctx[key] = jobs_per_ctx.get(key, 0) + 1
+                    for ctx, sid in batch:
                         with ctx["ready_lock"]:
-                            batch = [
-                                int(sid) for sid in batch
-                                if int(sid) not in ctx["encoded_sids"]
-                            ]
-                        if not batch:
+                            ctx["encoded_sids"].add(int(sid))
+                    for ctx, _sid in batch:
+                        key = id(ctx)
+                        count = jobs_per_ctx.pop(key, 0)
+                        if count == 0:
                             continue
-                        batch_encode_t0 = time.time()
-                        _encode_layer_exchange_stripes(native, ctx, batch)
-                        batch_encode_s = time.time() - batch_encode_t0
-                        with ctx["ready_lock"]:
-                            ctx["stream_encode_active_s"] += batch_encode_s
-                            ctx["encoded_sids"].update(batch)
-                            ctx["ready_encode_batches"] += 1
-                            if len(ctx["encoded_sids"]) >= total_stripes:
-                                ctx["encode_done_event"].set()
-                    ctx["done_event"].wait()
-                    ctx["exchange_wait_s"] = time.time() - wait_t0
-                    if ctx["errors"]:
-                        raise RuntimeError("FRCheck layer exchange failed") from ctx["errors"][0]
-                    ctx["layer_elapsed"] = time.time() - float(ctx["start_time"])
-                ctx["encode_wall_s"] = float(ctx.get("stream_encode_active_s", time.time() - encode_t0))
-                ctx["encode_end_s"] = time.time() - float(ctx["start_time"])
+                        ctx["stream_encode_active_s"] += (
+                            batch_elapsed * count / len(batch)
+                        )
+                        ctx["ready_encode_batches"] += 1
+                        _finalize_context_if_ready(ctx)
             except BaseException as exc:
                 encode_errors.append(exc)
+                for ctx in layer_exchange_contexts:
+                    ctx["encode_done_event"].set()
 
         lx_encode_thread_start_t0 = time.time()
-        for ctx in layer_exchange_contexts:
-            th = threading.Thread(
-                target=_wait_and_encode,
-                args=(ctx,),
-                name=f"frcheck-layer-encode-{ctx['prepared']['result'].layer_name}",
-            )
-            th.start()
-            encode_threads.append(th)
+        encode_thread = threading.Thread(
+            target=_encode_coordinator,
+            name="frcheck-layer-encode-coordinator",
+        )
+        encode_thread.start()
         lx_encode_thread_start_s = time.time() - lx_encode_thread_start_t0
 
         lx_queue_put_t0 = time.time()
@@ -3726,8 +3808,7 @@ def save_frcheck_legacy_checkpoint(
             th.join()
         lx_exchange_join_s = time.time() - lx_join_t0
         lx_encode_join_t0 = time.time()
-        for th in encode_threads:
-            th.join()
+        encode_thread.join()
         lx_encode_join_s = time.time() - lx_encode_join_t0
         if worker_errors:
             raise RuntimeError("FRCheck layer exchange worker failed") from worker_errors[0]
@@ -4058,8 +4139,14 @@ def save_frcheck_legacy_checkpoint(
             "net_s": native_timing.get("net_s", 0.0),
             "encode_s": native_timing.get("encode_s", 0.0),
             "encode_wait_s": native_timing.get("encode_wait_s", 0.0),
+            "encode_batch_dispatches": native_timing.get("encode_batch_dispatches", 0.0),
+            "encode_batch_jobs": native_timing.get("encode_batch_jobs", 0.0),
+            "encode_ec_calls": native_timing.get("encode_ec_calls", 0.0),
             "source_send_sum_s": native_timing.get("source_send_sum_s", 0.0),
             "source_send_max_s": native_timing.get("source_send_max_s", 0.0),
+            "tagged_ack_wait_sum_s": native_timing.get("tagged_ack_wait_sum_s", 0.0),
+            "tagged_ack_wait_max_s": native_timing.get("tagged_ack_wait_max_s", 0.0),
+            "tagged_ack_wait_count": native_timing.get("tagged_ack_wait_count", 0.0),
             "enc_recv_sum_s": native_timing.get("enc_recv_sum_s", 0.0),
             "enc_recv_max_s": native_timing.get("enc_recv_max_s", 0.0),
             "source_send_tasks": native_timing.get("source_send_tasks", 0.0),
@@ -4112,13 +4199,16 @@ def save_frcheck_legacy_checkpoint(
                 "mirror_failed_tasks=%(mirror_tasks_failed).0f mirror_failed_bytes=%(mirror_bytes_failed).0f",
                 summary,
             )
-            if _dbg:
+            if _dbg or trace_save:
                 logger.info(
                     "FRCHECK save native tasks (%(mode)s): source_send_tasks=%(source_send_tasks).0f "
                     "enc_recv_tasks=%(enc_recv_tasks).0f source_send_bytes=%(source_send_bytes).0f "
                     "enc_recv_bytes=%(enc_recv_bytes).0f source_send_wr_count=%(source_send_wr_count).0f "
                     "source_send_sge_count=%(source_send_sge_count).0f "
-                    "source_send_max_sge=%(source_send_max_sge).0f",
+                    "source_send_max_sge=%(source_send_max_sge).0f "
+                    "tagged_ack_wait_sum_s=%(tagged_ack_wait_sum_s).4fs "
+                    "tagged_ack_wait_max_s=%(tagged_ack_wait_max_s).4fs "
+                    "tagged_ack_wait_count=%(tagged_ack_wait_count).0f",
                     summary,
                 )
                 logger.info(
@@ -5065,14 +5155,12 @@ def _run_layer_recovery_job(
     )
     return record, layer_timing
 def _recovery_data_failed_pos(plan: Dict[str, Any], n: int) -> Optional[int]:
-    """Return the first critical failed column (SOURCE or first parity/p0)."""
+    """Return the first critical failed SOURCE column."""
     if plan.get('dual_failure'):
         positions = [
             int(target.get('failed_pos', n))
             for target in plan.get('failed_targets', [])
-            if int(target.get('original_role', -1)) in (
-                int(StripeRole.SOURCE), int(StripeRole.ENCODER)
-            )
+            if int(target.get('original_role', -1)) == int(StripeRole.SOURCE)
         ]
         return min(positions) if positions else None
     pos = int(plan.get('failed_pos', n))
@@ -5113,8 +5201,8 @@ def _group_recovery_data_windows_by_column(
     n: int,
 ) -> List[List[Dict[str, Any]]]:
     windows: List[List[Dict[str, Any]]] = []
-    # HW2 critical recovery includes all SOURCE columns plus ENCODER (p0).
-    for failed_pos in range(max(n - 1, 0)):
+    # HW2 critical recovery includes SOURCE columns only.
+    for failed_pos in range(max(n - 2, 0)):
         column_plans = [
             plan for plan in data_plans
             if _recovery_data_failed_pos(plan, n) == failed_pos
@@ -5153,7 +5241,7 @@ def _iter_recovery_windows_for_job(
     if not data_plans:
         if _frcheck_debug_enabled():
             logger.debug(
-                "FRCheck recovery layer %s: rank %d has no critical data+p0 stripes "
+                "FRCheck recovery layer %s: rank %d has no critical SOURCE stripes "
                 "(skipped parity stripes=%d padding stripes=%d)",
                 job.layer_name, rank, len(parity_plans), skipped_padding_stripes,
             )
@@ -5507,27 +5595,44 @@ def _validate_recovery_alignment(
             f"FRCheck recovery: invalid common wave size {common_wave_size}"
         )
 
-    dual_plans = [plan for plan in plans if plan.get('dual_failure')]
-    if dual_plans:
-        deferred_ids = [
-            int(plan.get('stripe_id', -1))
-            for plan in dual_plans
-            if not _is_data_recovery_plan(plan, n)
-        ]
-        if deferred_ids:
+    for plan in (plan for plan in plans if plan.get('dual_failure')):
+        targets = list(plan.get('failed_targets', []))
+        if len(targets) != 2:
             raise RuntimeError(
-                "FRCheck HW2 recovery requires every dual-failure stripe in the "
-                f"critical data+p0 phase; deferred stripes={deferred_ids}"
+                "FRCheck HW2 recovery requires exactly two failed targets; "
+                f"stripe={plan.get('stripe_id', -1)} targets={len(targets)}"
             )
-        inconsistent_ids = [
-            int(plan.get('stripe_id', -1))
-            for plan in dual_plans
-            if plan.get('recovery_kind') != 'data'
-        ]
-        if inconsistent_ids:
+        covered_targets = 0
+        for target in targets:
+            role = int(target.get('original_role', -1))
+            critical = role == int(StripeRole.SOURCE)
+            deferred = role in (
+                int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)
+            )
+            if critical == deferred:
+                raise RuntimeError(
+                    "FRCheck HW2 target must be covered by exactly one recovery phase; "
+                    f"stripe={plan.get('stripe_id', -1)} role={role}"
+                )
+            covered_targets += 1
+        has_source = any(
+            int(target.get('original_role', -1)) == int(StripeRole.SOURCE)
+            for target in targets
+        )
+        has_parity = any(
+            int(target.get('original_role', -1)) in (
+                int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)
+            )
+            for target in targets
+        )
+        if (
+            covered_targets != len(targets)
+            or _is_data_recovery_plan(plan, n) != has_source
+            or _is_parity_recovery_plan(plan, n) != has_parity
+        ):
             raise RuntimeError(
-                "FRCheck HW2 manager classification disagrees with the critical "
-                f"data+p0 phase; stripes={inconsistent_ids}"
+                "FRCheck HW2 recovery target coverage mismatch; "
+                f"stripe={plan.get('stripe_id', -1)}"
             )
 
 
@@ -5538,7 +5643,7 @@ def _build_recovery_parity_repair_context(
 ) -> Tuple[List[Dict[str, Any]], Dict[int, bool]]:
     parity_plans = [
         p for p in manager.recovery_stripe_plans
-        if not _is_data_recovery_plan(p, n)
+        if _is_parity_recovery_plan(p, n)
     ]
     active_by_stripe = {int(plan['stripe_id']): True for plan in parity_plans}
     return parity_plans, active_by_stripe
@@ -5662,6 +5767,10 @@ def _submit_recovery_parity_repair_window(
             0,
             False,
             active,
+            (
+                [int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)]
+                if stri_plan.get('dual_failure') else []
+            ),
         )
 
     native.end_recovery_batch(batch_id)
@@ -5825,7 +5934,7 @@ def _set_pending_recovery_parity_repair(
 
 
 def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str) -> None:
-    """Recover deferred parity stripes after critical data+p0 recovery completes."""
+    """Recover deferred parity stripes after critical SOURCE recovery completes."""
     global _recovery_async_parity_error, _recovery_async_parity_submitted
     manager = FRCheckManager()
     native = manager.get_native()
@@ -5977,7 +6086,7 @@ def _finish_recovery_parity_repair_submissions(reason: str, role: str = "unknown
 
 
 def _wait_recovery_data_before_parity(reason: str) -> _FRCheckRecoveryService:
-    """Drain critical data+p0 recovery without materializing optimizer state."""
+    """Drain critical SOURCE recovery without materializing optimizer state."""
     service = _get_active_frcheck_recovery_service()
     if service.worker is not None and service.worker is not threading.current_thread():
         service.wait_all(reason=f"{reason}_data_recovery")
@@ -6700,20 +6809,25 @@ def _prep_survivor_hw_disk(
 # ---------------------------------------------------------------------------
 
 def _is_data_recovery_plan(plan: Dict[str, Any], n: int) -> bool:
-    """Return whether a plan belongs to the per-layer critical phase.
-
-    HW2 restores SOURCE data and ENCODER (the first parity block, p0) together so
-    that recovery completion leaves at least one parity block available. HW1 keeps
-    its existing SOURCE-only critical classification because one parity survives.
-    """
+    """Return whether a plan has a target for the critical SOURCE phase."""
     if plan.get('dual_failure'):
         return any(
-            int(target.get('original_role', -1)) in (
-                int(StripeRole.SOURCE), int(StripeRole.ENCODER)
-            )
+            int(target.get('original_role', -1)) == int(StripeRole.SOURCE)
             for target in plan.get('failed_targets', [])
         )
     return int(plan.get('failed_pos', n)) < n - 2
+
+
+def _is_parity_recovery_plan(plan: Dict[str, Any], n: int) -> bool:
+    """Return whether a plan has a target for deferred parity repair."""
+    if plan.get('dual_failure'):
+        return any(
+            int(target.get('original_role', -1)) in (
+                int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)
+            )
+            for target in plan.get('failed_targets', [])
+        )
+    return not _is_data_recovery_plan(plan, n)
 
 
 def _stripe_role_for_node(manager, sid: int, node_id: int, n: int) -> int:
@@ -6743,7 +6857,7 @@ def _build_recovery_layer_context(
     ]
     parity_plans = [
         p for p in manager.recovery_stripe_plans
-        if not _is_data_recovery_plan(p, n)
+        if _is_parity_recovery_plan(p, n)
     ]
     num_source_stripes = (n - 1) * (n - 2)
     target_filled = {
@@ -6766,9 +6880,8 @@ def _build_recovery_layer_context(
                 manager.stripe_plans, sid, failed_node,
             )
             source_validity.append(blk_idx < target_filled.get(failed_node, 0))
-        # A dual decode produces both erasures together. SOURCE padding can skip
-        # only an all-SOURCE-padding plan; p0+p1 has no SOURCE validity entries and
-        # must remain active so both parity outputs are recovered.
+        # The critical phase selects SOURCE targets only. Skip a stripe only when
+        # every selected SOURCE target is padding.
         active = not source_validity or any(source_validity)
         if source_validity and not active:
             skipped_padding_stripes += 1
@@ -6947,6 +7060,7 @@ def _submit_recovery_window(
             failed_ncopy,
             store_to_layer_buf,
             active,
+            [int(StripeRole.SOURCE)] if stri_plan.get('dual_failure') else [],
         )
 
     native.end_recovery_batch(batch_id)
@@ -6989,7 +7103,7 @@ def _submit_recovery_network(
     ]
     parity_plans = [
         p for p in manager.recovery_stripe_plans
-        if not _is_data_recovery_plan(p, n)
+        if _is_parity_recovery_plan(p, n)
     ]
 
     _dbg = _frcheck_debug_enabled()
@@ -7033,7 +7147,7 @@ def _submit_recovery_network(
     if not data_plans:
         if _dbg:
             logger.debug(
-                "FRCheck recovery layer %s: rank %d has no critical data+p0 stripes "
+                "FRCheck recovery layer %s: rank %d has no critical SOURCE stripes "
                 "(skipped parity stripes=%d padding stripes=%d)",
                 layer_name, rank, len(parity_plans), skipped_padding_stripes,
             )
@@ -7637,13 +7751,13 @@ def recover_frcheck_legacy_hardware(
     ]
     parity_recovery_plans = [
         p for p in manager.recovery_stripe_plans
-        if not _is_data_recovery_plan(p, n)
+        if _is_parity_recovery_plan(p, n)
     ]
     setup_timing["metadata_plan_s"] = time.time() - metadata_plan_start
 
     if manager.recovery_stripe_plans and _dbg:
         logger.debug(
-            "FRCheck recovery: phase1 critical data+p0 mode critical_stripes=%d "
+            "FRCheck recovery: phase1 critical SOURCE mode critical_stripes=%d "
             "deferred_parity_stripes=%d",
             len(data_recovery_plans), len(parity_recovery_plans),
         )
@@ -7653,12 +7767,30 @@ def recover_frcheck_legacy_hardware(
         failed_by_group[failed_group] = failed_by_group.get(failed_group, 0) + 1
     dual_group_count = sum(count == 2 for count in failed_by_group.values())
     if rank == 0 and dual_group_count:
+        critical_targets = sum(
+            sum(
+                int(target.get('original_role', -1)) == int(StripeRole.SOURCE)
+                for target in plan.get('failed_targets', [])
+            )
+            for plan in data_recovery_plans if plan.get('dual_failure')
+        )
+        deferred_targets = sum(
+            sum(
+                int(target.get('original_role', -1)) in (
+                    int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)
+                )
+                for target in plan.get('failed_targets', [])
+            )
+            for plan in parity_recovery_plans if plan.get('dual_failure')
+        )
         logger.info(
             "FRCheck HW2 recovery: failed_ranks=%s dual_groups=%d "
             "local_critical_stripes=%d local_deferred_parity_stripes=%d "
+            "local_critical_targets=%d local_deferred_parity_targets=%d "
             "group_synchronized_layers=%d",
             failed_global_ranks, dual_group_count, len(data_recovery_plans),
-            len(parity_recovery_plans), n_encode_iters,
+            len(parity_recovery_plans), critical_targets, deferred_targets,
+            n_encode_iters,
         )
 
     t_disk = time.time()
@@ -7881,6 +8013,7 @@ def recover_frcheck_legacy_hardware(
     t_net = time.time()
     _start_frcheck_first_layer_recovery_timer(first_recovery_layer_idx)
     recovery_to_forward_started = False
+    recovery_worker: Optional[threading.Thread] = None
 
     def _start_recovery_to_forward_from_pipeline_start() -> None:
         nonlocal recovery_to_forward_started
@@ -7952,7 +8085,7 @@ def recover_frcheck_legacy_hardware(
                     layerwise_records.append(record)
         if async_jobs:
             _start_recovery_to_forward_from_pipeline_start()
-            worker = _start_layer_recovery_worker(
+            recovery_worker = _start_layer_recovery_worker(
                 async_jobs, manager, native, n, rank, is_failed, preloaded,
                 buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
                 cleanup_after=False,
@@ -7963,7 +8096,7 @@ def recover_frcheck_legacy_hardware(
                 checkpoint_dir=checkpoint_dir,
                 all_layer_metadata=all_layer_metadata,
             )
-            _set_active_frcheck_recovery_worker(worker)
+            _set_active_frcheck_recovery_worker(recovery_worker)
             if _dbg:
                 logger.debug(
                     "FRCheck recovery: async-forward detached transformer worker "
@@ -7981,7 +8114,7 @@ def recover_frcheck_legacy_hardware(
             _dispatch_recovery_parity_after_data_recovery(recovery_role)
     elif async_forward and involved and recovery_jobs:
         _start_recovery_to_forward_from_pipeline_start()
-        worker = _start_layer_recovery_worker(
+        recovery_worker = _start_layer_recovery_worker(
             recovery_jobs, manager, native, n, rank, is_failed, preloaded,
             buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
             cleanup_after=False,
@@ -7992,7 +8125,7 @@ def recover_frcheck_legacy_hardware(
             checkpoint_dir=checkpoint_dir,
             all_layer_metadata=all_layer_metadata,
         )
-        _set_active_frcheck_recovery_worker(worker)
+        _set_active_frcheck_recovery_worker(recovery_worker)
         if _dbg:
             logger.debug(
                 "FRCheck recovery: async-forward worker started rank=%d jobs=%d",
@@ -8021,6 +8154,13 @@ def recover_frcheck_legacy_hardware(
         for record, _layer_timing in sync_results:
             if record is not None:
                 layerwise_records.append(record)
+
+    if (
+        recovery_worker is not None
+        and direct_tensor_views_by_key is not None
+        and not detached_transformer_recovery
+    ):
+        frcheck_wait_for_async_recovery()
 
     # network_encode measures data recovery. Parity starts from the unified
     # pipeline-completion tail and is profiled independently.
@@ -8156,7 +8296,9 @@ def _reconstruct_from_tensor_views(
     if missing_keys:
         raise RuntimeError(
             "FRCheck load: missing tensor views for direct reconstruct: "
-            f"{missing_keys[:8]} (total {len(missing_keys)})"
+            f"actual_view_count={len(tensor_views_by_key)} "
+            f"expected_tensor_count={len(tensor_infos)} "
+            f"missing_count={len(missing_keys)} keys={missing_keys[:8]}"
         )
 
     decomposed = DecomposedStateDict(
@@ -8244,9 +8386,12 @@ def _reconstruct_common_from_tensor_views(
         missing_keys.append(key)
 
     if missing_keys:
+        expected_tensor_count = len(common_infos) + len(missing_keys)
         raise RuntimeError(
             "FRCheck load: missing common tensor views for async reconstruct: "
-            f"{missing_keys[:8]} (total {len(missing_keys)})"
+            f"actual_view_count={len(tensor_views_by_key)} "
+            f"expected_tensor_count={expected_tensor_count} "
+            f"missing_count={len(missing_keys)} keys={missing_keys[:8]}"
         )
 
     decomposed = DecomposedStateDict(

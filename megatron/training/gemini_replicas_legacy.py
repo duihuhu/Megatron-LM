@@ -513,7 +513,7 @@ def save_gemini_replicas_legacy_checkpoint(
             "mirror_d2h_s=%(mirror_d2h_s).2fs network_encode_s=%(network_encode_s).2fs",
             summary,
         )
-        logger.debug(
+        logger.info(
             "GEMINI save network bytes: send_bytes=%(send_bytes).0f recv_bytes=%(recv_bytes).0f "
             "send_tasks=%(send_tasks).0f recv_tasks=%(recv_tasks).0f "
             "mirror_tasks=%(mirror_tasks).0f mirror_bytes=%(mirror_bytes).0f "

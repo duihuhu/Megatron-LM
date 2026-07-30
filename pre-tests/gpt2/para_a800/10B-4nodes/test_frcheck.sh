@@ -16,8 +16,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
 export DEBUG_PARALLEL_STATES=1
 export NETIFACES_INTERFACE=${NETIFACES_INTERFACE:-bond0}
-export FRCHECK_LAYER_EXCHANGE_SEG=12
-export FRCHECK_LAYER_ENCODE_BATCH=12
+export FRCHECK_LAYER_EXCHANGE_SEG=${FRCHECK_LAYER_EXCHANGE_SEG:-12}
+export FRCHECK_LAYER_ENCODE_BATCH=${FRCHECK_LAYER_ENCODE_BATCH:-12}
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
@@ -116,7 +116,7 @@ SHM_PKT="/dev/shm/shm_pkt"
 
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess|inprocess_sw)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess|inprocess2|inprocess_sw)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -154,7 +154,7 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
-            --frcheck-failed-ranks "0,1"
+            --frcheck-failed-ranks "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
         )
         ;;
     inprocess_sw)
@@ -167,6 +167,22 @@ case "$MODE" in
             --ft-inprocess-recovery-failed-ranks "0,1,2,3,4,5,6,7"
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
+        )
+        ;;
+    inprocess2)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --ft-inprocess-recovery-benchmark
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-failed-ranks "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
+            --frcheck-async-recovery-forward
+            --frcheck-recovery-async-parity
+            --frcheck-recovery-safe-point optimizer_step
+            --frcheck-recovery-only-teardown
+            --num-workers 0
         )
         ;;
     inprocess)
@@ -268,9 +284,57 @@ EVAL_AND_LOGGING_ARGS=(
 mkdir -p logs
 mkdir -p logs/csv
 
+EC_RANK_LAUNCH='
+set -e
+if [[ ! "${LOCAL_RANK:-}" =~ ^[0-9]+$ ]]; then
+    echo "Error: Invalid LOCAL_RANK: ${LOCAL_RANK:-<unset>}" >&2
+    exit 1
+fi
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    echo "Error: CUDA_VISIBLE_DEVICES is empty or unset." >&2
+    exit 1
+fi
+IFS=, read -r -a visible_gpus <<< "$CUDA_VISIBLE_DEVICES"
+if (( LOCAL_RANK >= ${#visible_gpus[@]} )); then
+    echo "Error: LOCAL_RANK $LOCAL_RANK is outside CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" >&2
+    exit 1
+fi
+physical_gpu=${visible_gpus[$LOCAL_RANK]//[[:space:]]/}
+if [[ ! "$physical_gpu" =~ ^[0-7]$ ]]; then
+    echo "Error: Invalid physical GPU id for LOCAL_RANK $LOCAL_RANK: ${physical_gpu:-<empty>}" >&2
+    exit 1
+fi
+if (( physical_gpu < 4 )); then
+    numa_node=0
+    base=0
+else
+    numa_node=1
+    base=32
+fi
+slot=$((physical_gpu % 4))
+first_start=$((base + slot * 8))
+first_end=$((first_start + 7))
+sibling_start=$((first_start + 64))
+sibling_end=$((sibling_start + 7))
+first_cpus=$(seq -s, "$first_start" "$first_end")
+sibling_cpus=$(seq -s, "$sibling_start" "$sibling_end")
+rs_cpus="$first_cpus,$sibling_cpus"
+export FRCHECK_RS_CPU_LIST="$rs_cpus"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+echo "[cpu_bind] local_rank=$LOCAL_RANK physical_gpu=$physical_gpu numa_node=$numa_node rs_cpus=$rs_cpus"
+exec taskset -c "$rs_cpus" "${PYTHON_BIN:-python}" "$@"
+'
+
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${RECOVERY_MODE_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
+    printf 'Would run (Node %s, topology-aware per-rank CPU binding): ' "$NODE_RANK"
+    printf 'PYTHONPATH=%q CUDA_VISIBLE_DEVICES=%q ' "$PYTHONPATH:/workspace/Megatron-LM" "$CUDA_VISIBLE_DEVICES"
+    printf '%q ' torchrun "${DISTRIBUTED_ARGS[@]}" --no-python bash -c '<physical-GPU CPU binding>' _ \
+        pretrain_gpt.py "${GPT_ARGS[@]}" "${DATA_ARGS[@]}" "${MODEL_PARALLEL_ARGS[@]}" \
+        "${RECOVERY_MODE_ARGS[@]}" "${EVAL_AND_LOGGING_ARGS[@]}" --distributed-backend nccl \
+        "${ARGS_TO_PASS[@]}"
+    printf '\n'
     exit 0
 fi
 # -------------------------------------------------------------------------
@@ -283,12 +347,13 @@ echo "FRCHECK_INTERFACE: $FRCHECK_INTERFACE"
 export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \
 
-PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} \
+PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun "${DISTRIBUTED_ARGS[@]}" \
+    --no-python bash -c "$EC_RANK_LAUNCH" _ \
     pretrain_gpt.py \
-    ${GPT_ARGS[@]} \
-    ${DATA_ARGS[@]} \
-    ${MODEL_PARALLEL_ARGS[@]} \
-    ${RECOVERY_MODE_ARGS[@]} \
-    ${EVAL_AND_LOGGING_ARGS[@]} \
+    "${GPT_ARGS[@]}" \
+    "${DATA_ARGS[@]}" \
+    "${MODEL_PARALLEL_ARGS[@]}" \
+    "${RECOVERY_MODE_ARGS[@]}" \
+    "${EVAL_AND_LOGGING_ARGS[@]}" \
     --distributed-backend nccl \
-    ${ARGS_TO_PASS[@]}
+    "${ARGS_TO_PASS[@]}"

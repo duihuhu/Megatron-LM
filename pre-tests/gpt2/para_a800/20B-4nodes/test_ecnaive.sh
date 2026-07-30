@@ -266,22 +266,57 @@ mkdir -p logs/csv
 
 EC_RANK_LAUNCH='
 set -e
-cores_per_rank=16
-start=$((LOCAL_RANK * cores_per_rank))
-end=$((start + cores_per_rank - 1))
-cpu_list=$(seq -s, "$start" "$end")
-export ECNAIVE_XOR_CPU_LIST="$cpu_list"
+if [[ ! "${LOCAL_RANK:-}" =~ ^[0-9]+$ ]]; then
+    echo "Error: Invalid LOCAL_RANK: ${LOCAL_RANK:-<unset>}" >&2
+    exit 1
+fi
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    echo "Error: CUDA_VISIBLE_DEVICES is empty or unset." >&2
+    exit 1
+fi
+IFS=, read -r -a visible_gpus <<< "$CUDA_VISIBLE_DEVICES"
+if (( LOCAL_RANK >= ${#visible_gpus[@]} )); then
+    echo "Error: LOCAL_RANK $LOCAL_RANK is outside CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" >&2
+    exit 1
+fi
+physical_gpu=${visible_gpus[$LOCAL_RANK]//[[:space:]]/}
+if [[ ! "$physical_gpu" =~ ^[0-7]$ ]]; then
+    echo "Error: Invalid physical GPU id for LOCAL_RANK $LOCAL_RANK: ${physical_gpu:-<empty>}" >&2
+    exit 1
+fi
+if (( physical_gpu < 4 )); then
+    numa_node=0
+    base=0
+else
+    numa_node=1
+    base=32
+fi
+slot=$((physical_gpu % 4))
+first_start=$((base + slot * 8))
+first_end=$((first_start + 7))
+sibling_start=$((first_start + 64))
+sibling_end=$((sibling_start + 7))
+first_cpus=$(seq -s, "$first_start" "$first_end")
+sibling_cpus=$(seq -s, "$sibling_start" "$sibling_end")
+ec_cpus="$first_cpus,$sibling_cpus"
+export ECNAIVE_XOR_CPU_LIST="$ec_cpus"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
-echo "[cpu_bind] local_rank=$LOCAL_RANK cpus=$cpu_list"
-exec taskset -c "$start-$end" "${PYTHON_BIN:-python}" "$@"
+echo "[cpu_bind] local_rank=$LOCAL_RANK physical_gpu=$physical_gpu numa_node=$numa_node ec_cpus=$ec_cpus"
+exec taskset -c "$ec_cpus" "${PYTHON_BIN:-python}" "$@"
 '
 
 # -------------------------------------------------------------------------
 # Print command if PRINT_CMD is set
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
-    echo "Would run (Node $NODE_RANK, mode=$MODE): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun ${DISTRIBUTED_ARGS[*]} --no-python bash -c '<per-rank CPU binding>' _ pretrain_gpt.py ${GPT_ARGS[*]} ${DATA_ARGS[*]} ${MODEL_PARALLEL_ARGS[*]} ${EVAL_AND_LOGGING_ARGS[*]} ${RECOVERY_MODE_ARGS[*]} --distributed-backend nccl ${ARGS_TO_PASS[*]}"
+    printf 'Would run (Node %s, mode=%s, topology-aware per-rank CPU binding): ' "$NODE_RANK" "$MODE"
+    printf 'PYTHONPATH=%q CUDA_VISIBLE_DEVICES=%q ' "$PYTHONPATH:/workspace/Megatron-LM" "$CUDA_VISIBLE_DEVICES"
+    printf '%q ' torchrun "${DISTRIBUTED_ARGS[@]}" --no-python bash -c '<physical-GPU CPU binding>' _ \
+        pretrain_gpt.py "${GPT_ARGS[@]}" "${DATA_ARGS[@]}" "${MODEL_PARALLEL_ARGS[@]}" \
+        "${EVAL_AND_LOGGING_ARGS[@]}" "${RECOVERY_MODE_ARGS[@]}" --distributed-backend nccl \
+        "${ARGS_TO_PASS[@]}"
+    printf '\n'
     exit 0
 fi
 # -------------------------------------------------------------------------

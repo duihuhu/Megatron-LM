@@ -39,7 +39,7 @@ export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 # ---------------------------------------------------------------------------
 export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
 export GEMINI_MIRROR_MODE=${GEMINI_MIRROR_MODE:-cpu_pipeline}
-export GEMINI_PIPELINE_SEGMENTS=16
+export GEMINI_PIPELINE_SEGMENTS=${GEMINI_PIPELINE_SEGMENTS:-16}
 # export GEMINI_REPLICAS_BASE_IP=$MASTER_ADDR
 # export GEMINI_REPLICAS_BASE_PORT=12345
 
@@ -74,7 +74,7 @@ if [ "${#GPU_IDS[@]}" -eq 0 ]; then
 fi
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|inprocess|inprocess_sw)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|inprocess|inprocess2|inprocess_sw)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -128,7 +128,7 @@ case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
-            --gemini-replicas-channels-per-peer 16
+            --gemini-replicas-channels-per-peer ${GEMINI_REPLICAS_CHANNELS_PER_PEER:-16}
             --ec-checkpoint-write-only-penultimate-iter
         )
         ;;
@@ -159,6 +159,10 @@ case "$MODE" in
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
         )
+        ;;
+    inprocess2)
+        echo "Error: unsupported topology for Gemini2 inprocess2; two replicas cannot recover ranks 0..15 on two consecutive nodes." >&2
+        exit 2
         ;;
     inprocess)
         RECOVERY_MODE_ARGS=(

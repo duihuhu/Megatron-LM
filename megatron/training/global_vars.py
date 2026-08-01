@@ -241,12 +241,18 @@ def finish_recovery_to_forward_timer(label: str = "forward_step_end") -> None:
             pp_world_size = parallel_state.get_pipeline_model_parallel_world_size()
         except Exception:
             pass
+        forward_start_elapsed_s = 0.0
+        forward_start_time = mark_times.get("forward_step_start")
+        if forward_start_time is not None and forward_start_time >= start:
+            forward_start_elapsed_s = float(forward_start_time - start)
         stash_recovery_timing_summary(
             "recovery_to_forward",
             {
                 "elapsed_s": elapsed,
+                "forward_start_elapsed_s": forward_start_elapsed_s,
                 "teardown_s": teardown_s,
                 "scheme": timer["scheme"],
+                "role": str(context.get("role", "")),
                 "marks": mark_deltas,
                 "h2d_to_loop_iter_s": delta_between("h2d_done", "train_loop_iteration_start"),
                 "loop_iter_to_async_save_done_s": delta_between("train_loop_iteration_start", "async_save_finalize_done"),
@@ -311,7 +317,7 @@ def flush_recovery_timing_summaries() -> None:
         "materialize_s",
         "recovery_net_s",
         "recovery_decode_s",
-        "h2d_s",
+        "failed_cpu_copy_s",
         "serial_work_s",
         "pipeline_overlap_s",
         "first_network_done_s",
@@ -320,10 +326,19 @@ def flush_recovery_timing_summaries() -> None:
         "last_common_done_s",
         "last_materialize_done_s",
         "pipeline_start_delay_s",
+        "model_h2d_span_s",
+        "model_h2d_done_s",
+        "forward_wait_model_s",
+        "model_h2d_timed_layers",
+        "model_h2d_total_layers",
     ]
     with _GLOBAL_RECOVERY_TIMING_SUMMARIES_LOCK:
         pending_summaries = dict(_GLOBAL_RECOVERY_TIMING_SUMMARIES)
     pipeline = pending_summaries.get("frcheck_hw_pipeline")
+    model_h2d = pending_summaries.get("frcheck_model_h2d")
+    if pipeline is not None and model_h2d is not None:
+        pipeline = dict(pipeline)
+        pipeline.update(model_h2d)
     rtf = pending_summaries.get("recovery_to_forward")
     first_layer = pending_summaries.get("frcheck_first_layer_milestones")
     recovery_first_layer = pending_summaries.get("recovery_first_layer_start")
@@ -391,6 +406,9 @@ def flush_recovery_timing_summaries() -> None:
     )
 
     max_contributor = None
+    failed_elapsed_max_s = None
+    failed_forward_start_max_s = None
+    all_forward_start_max_s = None
     frcheck_forward_backward_max_contributor = None
     gathered_timing_info = []
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -406,7 +424,9 @@ def flush_recovery_timing_summaries() -> None:
         ):
             local_info = {
                 "elapsed_s": rtf_adjusted_elapsed_s,
+                "forward_start_elapsed_s": float((rtf or {}).get("forward_start_elapsed_s", 0.0)),
                 "raw_elapsed_s": rtf_elapsed_s,
+                "role": str((rtf or {}).get("role", "")),
                 "rank": int((rtf or {}).get("rank", rank)),
                 "pp_rank": int((rtf or {}).get("pp_rank", -1)),
                 "tp_rank": int((rtf or {}).get("tp_rank", -1)),
@@ -449,6 +469,23 @@ def flush_recovery_timing_summaries() -> None:
             gathered_timing_info = valid
             if valid and values[1 + len(pipeline_keys)] > 0.0:
                 max_contributor = max(valid, key=lambda item: float(item.get("elapsed_s", -1.0)))
+                all_forward_start_max_s = max(
+                    float(item.get("forward_start_elapsed_s", -1.0)) for item in valid
+                )
+            failed_contributors = [
+                item
+                for item in valid
+                if "failed" in str(item.get("role", "")).split("+")
+            ]
+            if failed_contributors:
+                failed_elapsed_max_s = max(
+                    float(item.get("elapsed_s", -1.0))
+                    for item in failed_contributors
+                )
+                failed_forward_start_max_s = max(
+                    float(item.get("forward_start_elapsed_s", -1.0))
+                    for item in failed_contributors
+                )
             frcheck_forward_backward_contributors = [
                 item
                 for item in valid
@@ -466,7 +503,9 @@ def flush_recovery_timing_summaries() -> None:
         if rtf is not None:
             max_contributor = {
                 "elapsed_s": rtf_adjusted_elapsed_s,
+                "forward_start_elapsed_s": float((rtf or {}).get("forward_start_elapsed_s", 0.0)),
                 "raw_elapsed_s": rtf_elapsed_s,
+                "role": str((rtf or {}).get("role", "")),
                 "rank": int((rtf or {}).get("rank", 0)),
                 "pp_rank": int((rtf or {}).get("pp_rank", -1)),
                 "tp_rank": int((rtf or {}).get("tp_rank", -1)),
@@ -493,6 +532,10 @@ def flush_recovery_timing_summaries() -> None:
                 "marks": list((rtf or {}).get("marks", [])),
             }
             gathered_timing_info = [max_contributor]
+            all_forward_start_max_s = float(max_contributor.get("forward_start_elapsed_s", 0.0))
+            if "failed" in str(max_contributor.get("role", "")).split("+"):
+                failed_elapsed_max_s = rtf_adjusted_elapsed_s
+                failed_forward_start_max_s = all_forward_start_max_s
         if frcheck_forward_backward is not None:
             frcheck_forward_backward_max_contributor = {
                 "frcheck_forward_backward_elapsed_s": frcheck_forward_backward_elapsed_s,
@@ -513,28 +556,23 @@ def flush_recovery_timing_summaries() -> None:
         if values[0] > 0.0:
             summary = dict(zip(pipeline_keys, values[1:1 + len(pipeline_keys)]))
             logger.info(
-                "FRCheck HW pipeline breakdown: pipeline_s=%.2fs "
-                "network_submit_s=%.2fs network_wait_s=%.2fs materialize_s=%.2fs "
-                "net_s=%.2fs decode_s=%.2fs h2d_s=%.2fs "
-                "serial_work_s=%.2fs overlap_s=%.2fs first_network_done_s=%.2fs "
-                "last_model_done_s=%.2fs last_optimizer_done_s=%.2fs "
-                "last_common_done_s=%.2fs last_materialize_done_s=%.2fs "
-                "pipeline_start_delay_s=%.4fs",
+                "FRCheck HW pipeline breakdown: "
+                "start_to_forward_start_failed_max_s=%.6fs start_to_forward_start_all_max_s=%.6fs "
+                "recovery_pipeline_s=%.6fs recovery_network_s=%.6fs "
+                "recovery_decode_s=%.6fs materialize_s=%.6fs "
+                "model_h2d_span_s=%.6fs model_h2d_done_s=%.6fs "
+                "forward_wait_model_s=%.6fs model_h2d_coverage=%d/%d",
+                failed_forward_start_max_s if failed_forward_start_max_s is not None else -1.0,
+                all_forward_start_max_s if all_forward_start_max_s is not None else -1.0,
                 summary["pipeline_s"],
-                summary["network_submit_s"],
-                summary["network_wait_s"],
-                summary["materialize_s"],
                 summary["recovery_net_s"],
                 summary["recovery_decode_s"],
-                summary["h2d_s"],
-                summary["serial_work_s"],
-                summary["pipeline_overlap_s"],
-                summary["first_network_done_s"],
-                summary["last_model_done_s"],
-                summary["last_optimizer_done_s"],
-                summary["last_common_done_s"],
-                summary["last_materialize_done_s"],
-                summary["pipeline_start_delay_s"],
+                summary["materialize_s"],
+                summary["model_h2d_span_s"],
+                summary["model_h2d_done_s"],
+                summary["forward_wait_model_s"],
+                int(summary["model_h2d_timed_layers"]),
+                int(summary["model_h2d_total_layers"]),
             )
         if values[recovery_first_layer_offset] > 0.0:
             scheme = str(
@@ -542,7 +580,8 @@ def flush_recovery_timing_summaries() -> None:
                     "scheme", (rtf or {}).get("scheme", "FT")
                 )
             )
-            logger.info(
+            log_recovery_timing = logger.debug if scheme == "FRCheck" else logger.info
+            log_recovery_timing(
                 "%s recovery timing: "
                 "node0.all_rank.max(recovery_start_to_train_start_s)=%.6fs",
                 scheme,
@@ -577,7 +616,14 @@ def flush_recovery_timing_summaries() -> None:
             breakdown_offset = 6 + len(pipeline_keys)
             breakdown = dict(zip(breakdown_keys, values[breakdown_offset:breakdown_offset + len(breakdown_keys)]))
             logger.info(
-                "%s recovery-to-forward post-H2D breakdown: "
+                "%s forward max: forward_failed_max_s=%.6fs forward_all_max_s=%.6fs",
+                scheme,
+                failed_elapsed_max_s if failed_elapsed_max_s is not None else -1.0,
+                elapsed_max_s,
+            )
+            if scheme != "FRCheck":
+                logger.info(
+                    "%s recovery-to-forward post-H2D breakdown: "
                 "h2d_to_loop_iter_s=%.4fs loop_iter_to_async_save_done_s=%.4fs "
                 "async_save_to_microbatch_done_s=%.4fs microbatch_to_ft_hook_done_s=%.4fs "
                 "ft_hook_to_train_entry_s=%.4fs train_entry_to_zero_grad_done_s=%.4fs "
@@ -607,7 +653,7 @@ def flush_recovery_timing_summaries() -> None:
                 breakdown["forward_step_s"],
                 breakdown["forward_step_to_forward_backward_done_s"],
             )
-            if max_contributor is not None:
+            if scheme != "FRCheck" and max_contributor is not None:
                 logger.info(
                     "%s recovery-to-forward max contributor: "
                     "rank=%d pp_rank=%d/%d tp_rank=%d elapsed_s=%.4fs raw_elapsed_s=%.4fs "
@@ -656,12 +702,13 @@ def flush_recovery_timing_summaries() -> None:
                             for label, delta in max_marks
                         ),
                     )
-            print(
-                f"{scheme} recovery-to-forward: "
-                f"elapsed_min={elapsed_min_s:.4f}s elapsed_max={elapsed_max_s:.4f}s "
-                f"raw_elapsed_max={raw_elapsed_max_s:.4f}s teardown_max={teardown_max_s:.4f}s",
-                flush=True,
-            )
+            if scheme != "FRCheck":
+                print(
+                    f"{scheme} recovery-to-forward: "
+                    f"elapsed_min={elapsed_min_s:.4f}s elapsed_max={elapsed_max_s:.4f}s "
+                    f"raw_elapsed_max={raw_elapsed_max_s:.4f}s teardown_max={teardown_max_s:.4f}s",
+                    flush=True,
+                )
             if scheme == "FRCheck":
                 milestone_items = [
                     item.get("first_layer_milestones", {})
@@ -700,9 +747,9 @@ def flush_recovery_timing_summaries() -> None:
                     return f"{value[0]:.6f}s(rank={value[1]})"
 
                 logger.info(
-                    "FRCheck first-layer milestones: layer_idx=%d repair_s=%s "
-                    "sent_to_failed_s=%s h2d_s=%s forward_done_s=%s "
-                    "delivered_s=%s",
+                    "FRCheck first-layer breakdown (milestones from recovery start): "
+                    "layer_idx=%d repair_done_s=%s network_sent_s=%s "
+                    "model_h2d_done_s=%s forward_done_s=%s network_delivered_s=%s",
                     layer_idx,
                     format_milestone(repair),
                     format_milestone(sent_to_failed),

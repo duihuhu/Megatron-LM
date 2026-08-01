@@ -2108,10 +2108,16 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         )
     )
     if should_time_recovery_to_forward:
+        if not recovery_cluster_active:
+            recovery_role = "uninvolved"
+        elif two_failures:
+            recovery_role = "failed" if rank_in_group in (1, 2) else "survivor"
+        else:
+            recovery_role = "failed" if rank_in_group == 2 else "survivor"
         try:
             from megatron.training.global_vars import start_recovery_to_forward_timer
             start_recovery_to_forward_timer(
-                "ECCHECK", "network_recovery", role=_mode, rank0_only_max=True,
+                "ECCHECK", "network_recovery", role=recovery_role, rank0_only_max=True,
             )
         except Exception:
             pass

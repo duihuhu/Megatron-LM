@@ -2410,7 +2410,8 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
         try:
             from megatron.training.global_vars import start_recovery_to_forward_timer
             start_recovery_to_forward_timer(
-                "EC-NAIVE", "network_recovery", role="HW", rank0_only_max=True,
+                "EC-NAIVE", "network_recovery",
+                role="failed" if is_failed else "survivor", rank0_only_max=True,
             )
         except Exception:
             pass

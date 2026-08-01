@@ -6,7 +6,7 @@ import os
 import queue
 import threading
 from logging import getLogger
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -60,6 +60,8 @@ class GeminiReplicasManager:
         self.use_gemini_replicas = False
         self.use_gemini_replicas_optimized = False
         self.use_rdma = False
+        self.gdr_requested = False
+        self.gdr_available = False
         self.use_gdr = False
         self.channels_per_peer = 1
         
@@ -90,6 +92,9 @@ class GeminiReplicasManager:
         self._recovery_workspace_base_key: Optional[tuple] = None
         self._recovery_workspace_size_key: Optional[tuple] = None
         self._recovery_workspace_buffers: Dict[tuple, torch.Tensor] = {}
+        # Python payloads are cached separately from transport buffers. In
+        # particular, pinned checkpoint tensors here must never be RDMA-registered.
+        self._recovery_workspace_objects: Dict[Tuple[tuple, tuple], Any] = {}
         self._recovery_topology_key: Optional[tuple] = None
 
         self._initialized = True
@@ -465,6 +470,13 @@ class GeminiReplicasManager:
             self.num_replicas = getattr(args, 'gemini_replicas_num', 3)
             self.group_size = getattr(args, 'gemini_replicas_group_size', None)
             self.use_rdma = getattr(args, 'use_rdma', False)
+            self.gdr_requested = getattr(args, 'gemini_replicas_gdr', False)
+            self.gdr_available = False
+            self.use_gdr = False
+            if self.gdr_requested and not self.use_rdma:
+                raise RuntimeError(
+                    "Gemini Replicas: --gemini-replicas-gdr requires --use-rdma"
+                )
             self.channels_per_peer = int(getattr(args, 'gemini_replicas_channels_per_peer', 1))
             if self.channels_per_peer < 1:
                 raise ValueError(
@@ -592,21 +604,36 @@ class GeminiReplicasManager:
 
             logger.debug(f"Gemini Replicas: C++ native module fully initialized (rank={rank}, targets={net_config['target_ranks']}, mode={mode_str})")
 
-            # GDR setup: check availability and start mirror worker for async D2H
+            # Preserve capability independently from the explicit save transport request.
             if self.use_rdma:
+                probe_error = None
                 try:
-                    self.use_gdr = gemini_replicas_native.GeminiReplicasNative.gdr_available()
-                    if not self.use_gdr:
-                        # Module not found in /proc/modules — try actual GPU MR registration
-                        self.use_gdr = self._gemini_replicas_native.probe_gdr()
-                except AttributeError:
-                    self.use_gdr = False  # old .so without GDR support
+                    self.gdr_available = gemini_replicas_native.GeminiReplicasNative.gdr_available()
+                    if not self.gdr_available:
+                        # Module not found in /proc/modules; try actual GPU MR registration.
+                        self.gdr_available = self._gemini_replicas_native.probe_gdr()
+                except Exception as exc:
+                    self.gdr_available = False
+                    probe_error = exc
+                self.use_gdr = self.gdr_requested and self.gdr_available
+                if self.gdr_requested and not self.gdr_available:
+                    detail = f": {probe_error}" if probe_error is not None else ""
+                    raise RuntimeError(
+                        "Gemini Replicas: --gemini-replicas-gdr was requested, but "
+                        f"GPUDirect RDMA probing failed{detail}"
+                    ) from probe_error
                 if self.use_gdr:
-                    logger.debug(f"Gemini Replicas: [Rank {rank}] GDR (GPU Direct RDMA) available, starting mirror worker")
+                    logger.debug(
+                        f"Gemini Replicas: [Rank {rank}] GDR requested and available, "
+                        "starting mirror worker"
+                    )
                     self._gemini_replicas_native.set_require_registered_mr(True)
                     self._gemini_replicas_native.start_mirror_worker()
                 else:
-                    logger.warning(f"Gemini Replicas: [Rank {rank}] GDR not available (nvidia-peermem missing)")
+                    logger.debug(
+                        f"Gemini Replicas: [Rank {rank}] GDR capability={self.gdr_available}, "
+                        "save transport remains CPU"
+                    )
             
         except Exception as e:
             logger.error(f"Gemini Replicas: Failed to initialize C++ native module: {e}")
@@ -965,7 +992,35 @@ class GeminiReplicasManager:
         self._recovery_workspace_base_key = base_key
         self._recovery_workspace_size_key = size_key
 
-    def get_recovery_buffer(self, name: tuple, size_bytes: int) -> torch.Tensor:
+    def set_recovery_workspace_object(
+        self, base_key: tuple, name: tuple, value: Any,
+    ) -> None:
+        """Cache an arbitrary Python object without transport registration.
+
+        Object insertion may precede ``begin_recovery_workspace``. The workspace
+        does not become reusable until begin records the completed size contract.
+        """
+        self._recovery_workspace_objects[(base_key, name)] = value
+
+    def get_recovery_workspace_object(self, base_key: tuple, name: tuple) -> Any:
+        """Return an object cached for the requested recovery identity."""
+        if self._recovery_workspace_base_key != base_key:
+            raise KeyError(
+                f"Recovery workspace identity mismatch for object {name!r}"
+            )
+        try:
+            return self._recovery_workspace_objects[(base_key, name)]
+        except KeyError as exc:
+            raise KeyError(
+                f"Recovery workspace object {name!r} is not cached"
+            ) from exc
+
+    def get_recovery_buffer(
+        self,
+        name: tuple,
+        size_bytes: int,
+        prefer_torch_pinned: bool = False,
+    ) -> torch.Tensor:
         """Return registered, page-backed scratch owned only by the workspace."""
         cached = self._recovery_workspace_buffers.get(name)
         if cached is not None and cached.numel() >= size_bytes:
@@ -973,9 +1028,19 @@ class GeminiReplicasManager:
         if cached is not None:
             self.unregister_buffer(cached)
         pin = self.gemini_replicas_pin_memory and torch.cuda.is_available()
-        buffer = allocate_hugepage_tensor(
-            size_bytes, fallback_pin_memory=pin, touch_pages=True,
-        )
+        buffer = None
+        if prefer_torch_pinned and pin:
+            try:
+                buffer = torch.empty(
+                    size_bytes, dtype=torch.uint8, pin_memory=True,
+                )
+            except Exception:
+                # Preserve the existing hugepage allocation as the fallback.
+                pass
+        if buffer is None:
+            buffer = allocate_hugepage_tensor(
+                size_bytes, fallback_pin_memory=pin, touch_pages=True,
+            )
         if self.use_rdma:
             self.register_buffer(buffer)
         self._recovery_workspace_buffers[name] = buffer
@@ -1005,6 +1070,7 @@ class GeminiReplicasManager:
             self.registered_buffers.clear()
             self._stop_native_gracefully()
         self._recovery_workspace_buffers.clear()
+        self._recovery_workspace_objects.clear()
         self._recovery_workspace_base_key = None
         self._recovery_workspace_size_key = None
         self._recovery_topology_key = None
@@ -1225,6 +1291,7 @@ class GeminiReplicasManager:
         self.replica_metadata = []
         self._cached_recv_buffers = {}
         self._recovery_workspace_buffers.clear()
+        self._recovery_workspace_objects.clear()
         self._recovery_workspace_base_key = None
         self._recovery_workspace_size_key = None
         self._recovery_topology_key = None

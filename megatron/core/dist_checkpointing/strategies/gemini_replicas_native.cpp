@@ -26,6 +26,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <cerrno>
 #include <cstdlib>
@@ -33,6 +34,7 @@
 #include <deque>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <atomic>
 #include <sys/socket.h>
 
@@ -690,6 +692,8 @@ private:
     std::mutex buffer_mutex_;
     std::mutex recv_mutex_;
     std::mutex send_cq_poll_mutex_;
+    std::unordered_set<uint64_t> pending_send_completions_;
+    std::atomic<uint64_t> next_send_completion_id_{1};
     // Guards concurrent libibverbs QP setup (ibv_create_qp / connect_qp) while
     // multiple per-channel accept threads and the connect thread run in
     // parallel during connect_and_wait(). Held only around the (fast) verbs
@@ -727,11 +731,37 @@ private:
     static const size_t CHUNK_SIZE = 64 * 1024 * 1024;  // 64 MB per RDMA operation
     static const int MAX_BATCH_WR = 8;
 
-    // Invoked after each RDMA send batch completes: (batch_idx, offset, bytes).
-    ChunkDoneCb on_chunk_done_;
+    struct SendBatchConfig {
+        ChunkDoneCb on_chunk_done;
+        size_t batch_wr;
+    };
+    std::shared_ptr<const SendBatchConfig> send_batch_config_;
 
 public:
-    void set_chunk_done_callback(ChunkDoneCb cb) override { on_chunk_done_ = std::move(cb); }
+    void set_chunk_done_callback(ChunkDoneCb cb) override {
+        if (!cb) {
+            std::atomic_store(
+                &send_batch_config_, std::shared_ptr<const SendBatchConfig>{});
+            return;
+        }
+
+        long batch_wr = 1;
+        if (const char* env = std::getenv("GEMINI_GDR_BATCH_WR")) {
+            char* end = nullptr;
+            errno = 0;
+            batch_wr = std::strtol(env, &end, 10);
+            if (errno != 0 || end == env || *end != '\0' ||
+                batch_wr < 1 || batch_wr > MAX_BATCH_WR) {
+                throw std::runtime_error(
+                    "GEMINI_GDR_BATCH_WR must be an integer in [1, " +
+                    std::to_string(MAX_BATCH_WR) + "], got '" + env + "'");
+            }
+        }
+
+        auto config = std::make_shared<const SendBatchConfig>(
+            SendBatchConfig{std::move(cb), static_cast<size_t>(batch_wr)});
+        std::atomic_store(&send_batch_config_, std::move(config));
+    }
 
     GeminiReplicasRdmaConnectionManager(
         int rank, int world_size,
@@ -969,6 +999,8 @@ private:
         const uint8_t* data, size_t total_size, ibv_mr* mr, ibv_qp* qp,
         size_t global_base_offset = 0) {
         size_t chunk_count = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        const auto batch_config = std::atomic_load(&send_batch_config_);
+        const size_t batch_wr = batch_config ? batch_config->batch_wr : MAX_BATCH_WR;
 
         std::vector<ibv_sge> sges(chunk_count);
         std::vector<ibv_send_wr> wrs(chunk_count);
@@ -986,35 +1018,36 @@ private:
             wrs[i].num_sge = 1;
             wrs[i].opcode = IBV_WR_SEND;
             wrs[i].send_flags = 0;
-            wrs[i].next = (i < chunk_count - 1) ? &wrs[i + 1] : nullptr;
+            wrs[i].next = nullptr;
         }
 
-        // Post send work requests in batches
-        for (size_t batch_start = 0; batch_start < chunk_count; batch_start += MAX_BATCH_WR) {
-            size_t batch_end = std::min(batch_start + MAX_BATCH_WR, chunk_count);
-            // Detach this batch's tail from the next batch
-            if (batch_end < chunk_count)
-                wrs[batch_end - 1].next = nullptr;
-            wrs[batch_end - 1].send_flags = IBV_SEND_SIGNALED;
+        // Post send work requests in batches. Rebuild each batch chain so a
+        // runtime batch size cannot inherit a stale link from another batch.
+        for (size_t batch_start = 0; batch_start < chunk_count; batch_start += batch_wr) {
+            const size_t batch_end = std::min(batch_start + batch_wr, chunk_count);
+            for (size_t i = batch_start; i < batch_end; ++i) {
+                wrs[i].next = (i + 1 < batch_end) ? &wrs[i + 1] : nullptr;
+                wrs[i].send_flags = (i + 1 == batch_end) ? IBV_SEND_SIGNALED : 0;
+            }
+            const uint64_t completion_id =
+                next_send_completion_id_.fetch_add(1, std::memory_order_relaxed);
+            wrs[batch_end - 1].wr_id = completion_id;
 
             ibv_send_wr* bad_wr = nullptr;
             if (ibv_post_send(qp, &wrs[batch_start], &bad_wr) != 0) {
                 throw std::runtime_error("Failed to post send work request");
             }
+            wait_for_send_completion(completion_id);
 
-            {
-                std::lock_guard<std::mutex> cq_lock(send_cq_poll_mutex_);
-                poll_completion(send_cq_, 1);
-            }
-
-            if (on_chunk_done_) {
-                size_t offset = batch_start * CHUNK_SIZE;
-                size_t batch_bytes = std::min(
+            if (batch_config) {
+                const size_t offset = batch_start * CHUNK_SIZE;
+                const size_t completed_bytes = std::min(
                     total_size - offset,
                     (batch_end - batch_start) * CHUNK_SIZE);
-                size_t global_offset = global_base_offset + offset;
-                size_t global_batch_idx = global_offset / (CHUNK_SIZE * MAX_BATCH_WR);
-                on_chunk_done_(global_batch_idx, global_offset, batch_bytes);
+                const size_t global_offset = global_base_offset + offset;
+                const size_t global_batch_idx = global_offset / CHUNK_SIZE;
+                batch_config->on_chunk_done(
+                    global_batch_idx, global_offset, completed_bytes);
             }
         }
     }
@@ -1158,7 +1191,8 @@ public:
                         try {
                             int target_rank = target_ranks_[peer_idx];
                             send_size_and_wait_ack(send_idx, part_size, target_rank);
-                            send_data_chunked(send_data + offset, part_size, mr, send_qps_[send_idx], offset);
+                            send_data_chunked(
+                                send_data + offset, part_size, mr, send_qps_[send_idx], offset);
                         } catch (...) {
                             send_exceptions[send_idx] = std::current_exception();
                         }
@@ -2009,6 +2043,35 @@ private:
         return nullptr;
     }
     
+    void wait_for_send_completion(uint64_t completion_id) {
+        std::lock_guard<std::mutex> cq_lock(send_cq_poll_mutex_);
+        auto pending = pending_send_completions_.find(completion_id);
+        if (pending != pending_send_completions_.end()) {
+            pending_send_completions_.erase(pending);
+            return;
+        }
+
+        while (true) {
+            ibv_wc wc;
+            const int n = ibv_poll_cq(send_cq_, 1, &wc);
+            if (n < 0) {
+                throw std::runtime_error("Failed to poll send completion queue");
+            }
+            if (n == 0) {
+                continue;
+            }
+            if (wc.status != IBV_WC_SUCCESS) {
+                throw std::runtime_error(
+                    "RDMA send completion failed: " +
+                    std::string(ibv_wc_status_str(wc.status)));
+            }
+            if (wc.wr_id == completion_id) {
+                return;
+            }
+            pending_send_completions_.insert(wc.wr_id);
+        }
+    }
+
     void poll_completion(ibv_cq* cq, int num_completions) {
         // Tight spin on the hot path (matches ecnaive_native). No sleep between polls.
         int polled = 0;
@@ -2158,6 +2221,7 @@ struct MirrorTask {
     uintptr_t gpu_addr;
     uintptr_t cpu_addr;
     size_t size;
+    bool last_in_generation;
 };
 
 /**
@@ -2224,6 +2288,48 @@ private:
     std::atomic<uint64_t> exchange_recv_bytes_{0};
     std::atomic<uint64_t> exchange_send_tasks_{0};
     std::atomic<uint64_t> exchange_recv_tasks_{0};
+    std::atomic<uint64_t> exchange_net_start_us_{0};
+    std::atomic<uint64_t> exchange_net_end_us_{0};
+
+    static uint64_t steady_time_us_() {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    void record_exchange_net_start_() {
+        const uint64_t value = steady_time_us_();
+        uint64_t old = exchange_net_start_us_.load(std::memory_order_relaxed);
+        while ((old == 0 || value < old) &&
+               !exchange_net_start_us_.compare_exchange_weak(
+                   old, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+
+    void record_exchange_net_end_() {
+        const uint64_t value = steady_time_us_();
+        uint64_t old = exchange_net_end_us_.load(std::memory_order_relaxed);
+        while (value > old &&
+               !exchange_net_end_us_.compare_exchange_weak(
+                   old, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+
+    class NetworkTimingScope {
+    public:
+        explicit NetworkTimingScope(GeminiReplicasNative* owner) : owner_(owner) {
+            owner_->record_exchange_net_start_();
+        }
+
+        ~NetworkTimingScope() noexcept {
+            owner_->record_exchange_net_end_();
+        }
+
+        NetworkTimingScope(const NetworkTimingScope&) = delete;
+        NetworkTimingScope& operator=(const NetworkTimingScope&) = delete;
+
+    private:
+        GeminiReplicasNative* owner_;
+    };
 
     // ---- GDR mirror worker (D2H copy in background, overlaps with RDMA) ----
     bool require_registered_mr_{false};
@@ -2236,44 +2342,72 @@ private:
     std::atomic<size_t> mirror_tasks_submitted_{0};
     std::atomic<size_t> mirror_bytes_submitted_{0};
     std::atomic<uint64_t> mirror_d2h_busy_total_ns_{0};
+    // True from eager task submission through mirror completion. The send
+    // worker uses this to preserve the already configured queue and timing.
+    std::atomic<bool> eager_mirror_active_{false};
 
-    struct MirrorCopyTiming {
-        cudaEvent_t start{};
-        cudaEvent_t end{};
-        bool valid{false};
-    };
-    std::vector<MirrorCopyTiming> mirror_copy_timings_;
+    cudaEvent_t mirror_d2h_start_event_{};
+    cudaEvent_t mirror_d2h_end_event_{};
+    bool mirror_d2h_events_valid_{false};
+    bool mirror_d2h_started_{false};
+    bool mirror_d2h_end_recorded_{false};
     std::mutex mirror_timing_mutex_;
 
-    void reset_mirror_d2h_timing_() {
+    void destroy_mirror_d2h_events_locked_() {
+        if (!mirror_d2h_events_valid_) {
+            return;
+        }
+        cudaEventDestroy(mirror_d2h_start_event_);
+        cudaEventDestroy(mirror_d2h_end_event_);
+        mirror_d2h_events_valid_ = false;
+        mirror_d2h_started_ = false;
+        mirror_d2h_end_recorded_ = false;
+    }
+
+    void reset_mirror_d2h_timing_(bool create_events) {
         mirror_d2h_busy_total_ns_.store(0, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
-        for (auto& timing : mirror_copy_timings_) {
-            if (!timing.valid) {
-                continue;
-            }
-            cudaEventDestroy(timing.start);
-            cudaEventDestroy(timing.end);
+        if (mirror_d2h_events_valid_) {
+            throw std::runtime_error(
+                "Cannot reset mirror D2H timing before the previous exchange is finalized");
         }
-        mirror_copy_timings_.clear();
+        if (!create_events) {
+            return;
+        }
+
+        cudaSetDevice(resolve_cuda_device());
+        const bool start_ok =
+            cudaEventCreate(&mirror_d2h_start_event_) == cudaSuccess;
+        const bool end_ok = cudaEventCreate(&mirror_d2h_end_event_) == cudaSuccess;
+        if (!start_ok || !end_ok) {
+            if (start_ok) {
+                cudaEventDestroy(mirror_d2h_start_event_);
+            }
+            if (end_ok) {
+                cudaEventDestroy(mirror_d2h_end_event_);
+            }
+            mirror_d2h_start_event_ = {};
+            mirror_d2h_end_event_ = {};
+            return;
+        }
+        mirror_d2h_events_valid_ = true;
+        mirror_d2h_started_ = false;
+        mirror_d2h_end_recorded_ = false;
     }
 
     void finalize_mirror_d2h_timing_() {
         uint64_t total_ns = 0;
         std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
-        for (auto& timing : mirror_copy_timings_) {
-            if (!timing.valid) {
-                continue;
-            }
+        if (mirror_d2h_events_valid_ && mirror_d2h_started_ &&
+            mirror_d2h_end_recorded_) {
             float elapsed_ms = 0.0f;
-            if (cudaEventElapsedTime(&elapsed_ms, timing.start, timing.end) == cudaSuccess) {
-                total_ns += static_cast<uint64_t>(elapsed_ms * 1e6);
+            if (cudaEventElapsedTime(
+                    &elapsed_ms, mirror_d2h_start_event_,
+                    mirror_d2h_end_event_) == cudaSuccess) {
+                total_ns = static_cast<uint64_t>(elapsed_ms * 1e6);
             }
-            cudaEventDestroy(timing.start);
-            cudaEventDestroy(timing.end);
-            timing.valid = false;
         }
-        mirror_copy_timings_.clear();
+        destroy_mirror_d2h_events_locked_();
         mirror_d2h_busy_total_ns_.store(total_ns, std::memory_order_relaxed);
     }
 
@@ -2356,8 +2490,9 @@ public:
         connection_manager_->set_chunk_done_callback(nullptr);
         mirror_tasks_submitted_ = 0;
         mirror_bytes_submitted_ = 0;
-        reset_mirror_d2h_timing_();
-        if (gpu_base == 0 || cpu_base == 0 || total_size == 0) {
+        const bool mirror_enabled = gpu_base != 0 && cpu_base != 0 && total_size != 0;
+        reset_mirror_d2h_timing_(mirror_enabled);
+        if (!mirror_enabled) {
             return;
         }
         if (target_ranks_.empty()) {
@@ -2602,18 +2737,20 @@ public:
         if (mirror_thread_.joinable()) {
             {
                 std::lock_guard<std::mutex> lk(mirror_mutex_);
-                mirror_queue_.push({0, 0, 0});  // sentinel
+                mirror_queue_.push({0, 0, 0, false});  // sentinel
             }
-            mirror_cv_.notify_one();
+            mirror_cv_.notify_all();
             mirror_thread_.join();
         }
         if (d2h_stream_ != nullptr) {
             cudaSetDevice(resolve_cuda_device());
             cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(d2h_stream_));
+            finalize_mirror_d2h_timing_();
             cudaStreamDestroy(reinterpret_cast<cudaStream_t>(d2h_stream_));
             d2h_stream_ = nullptr;
         }
 
+        eager_mirror_active_.store(false, std::memory_order_release);
         workers_started_ = false;
         if (debug_)
             std::cout << "[Rank " << rank_ << "] Workers stopped" << std::endl;
@@ -2652,8 +2789,19 @@ private:
                 uintptr_t gpu_base = mirror_gpu_base_;
                 uintptr_t cpu_base = mirror_cpu_base_;
 
-                configure_exchange_mirror(gpu_base, cpu_base, send_task_size_);
-                connection_manager_->broadcast_to_targets(data, send_task_size_);
+                if (eager_mirror_active_.load(std::memory_order_acquire)) {
+                    // Eager D2H was configured before this send was submitted.
+                    // Disable callbacks without resetting its queue or events.
+                    connection_manager_->set_chunk_done_callback(nullptr);
+                } else {
+                    configure_exchange_mirror(gpu_base, cpu_base, send_task_size_);
+                }
+                if (target_ranks_.empty()) {
+                    connection_manager_->broadcast_to_targets(data, send_task_size_);
+                } else {
+                    NetworkTimingScope network_timing(this);
+                    connection_manager_->broadcast_to_targets(data, send_task_size_);
+                }
                 exchange_send_bytes_.fetch_add(
                     send_task_size_ * target_ranks_.size(), std::memory_order_relaxed);
                 exchange_send_tasks_.fetch_add(
@@ -2692,8 +2840,12 @@ private:
 
             try {
                 uint8_t* buf = reinterpret_cast<uint8_t*>(recv_task_addrs_[idx]);
-                auto result = connection_manager_->receive_data_from_source(
-                    source_rank, buf, recv_task_sizes_[idx]);
+                std::pair<int, size_t> result;
+                {
+                    NetworkTimingScope network_timing(this);
+                    result = connection_manager_->receive_data_from_source(
+                        source_rank, buf, recv_task_sizes_[idx]);
+                }
                 exchange_recv_bytes_.fetch_add(result.second, std::memory_order_relaxed);
                 exchange_recv_tasks_.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& e) {
@@ -2724,6 +2876,8 @@ public:
         exchange_recv_bytes_.store(0, std::memory_order_relaxed);
         exchange_send_tasks_.store(0, std::memory_order_relaxed);
         exchange_recv_tasks_.store(0, std::memory_order_relaxed);
+        exchange_net_start_us_.store(0, std::memory_order_relaxed);
+        exchange_net_end_us_.store(0, std::memory_order_relaxed);
         for (size_t i = 0; i < recv_source_ranks_.size(); ++i) {
             recv_ready_[i] = false;
             recv_done_[i] = false;
@@ -2815,7 +2969,13 @@ public:
     }
 
     pybind11::dict get_exchange_stats() const {
+        const uint64_t net_start_us = exchange_net_start_us_.load(std::memory_order_relaxed);
+        const uint64_t net_end_us = exchange_net_end_us_.load(std::memory_order_relaxed);
+        const double net_s = (net_start_us > 0 && net_end_us > net_start_us)
+            ? static_cast<double>(net_end_us - net_start_us) / 1e6
+            : 0.0;
         pybind11::dict result;
+        result["net_s"] = net_s;
         result["send_bytes"] = static_cast<double>(exchange_send_bytes_.load(std::memory_order_relaxed));
         result["recv_bytes"] = static_cast<double>(exchange_recv_bytes_.load(std::memory_order_relaxed));
         result["send_tasks"] = static_cast<double>(exchange_send_tasks_.load(std::memory_order_relaxed));
@@ -2884,18 +3044,85 @@ public:
     }
 
     void start_mirror_worker() {
+        if (mirror_thread_.joinable() || d2h_stream_ != nullptr) {
+            throw std::runtime_error("Mirror worker is already running");
+        }
+        eager_mirror_active_.store(false, std::memory_order_release);
         mirror_done_ = false;
-        d2h_stream_ = nullptr;
         cudaSetDevice(resolve_cuda_device());
-        cudaStreamCreate(reinterpret_cast<cudaStream_t*>(&d2h_stream_));
+        const cudaError_t stream_err = cudaStreamCreate(
+            reinterpret_cast<cudaStream_t*>(&d2h_stream_));
+        if (stream_err != cudaSuccess) {
+            d2h_stream_ = nullptr;
+            throw std::runtime_error(
+                "Failed to create mirror CUDA stream: " +
+                std::string(cudaGetErrorString(stream_err)));
+        }
         mirror_thread_ = std::thread(&GeminiReplicasNative::mirror_worker_func, this);
+    }
+
+    void start_eager_mirror(
+        uintptr_t gpu_base, uintptr_t cpu_base, size_t total_size,
+        size_t chunk_size) {
+        if (!initialized_) {
+            throw std::runtime_error("GeminiReplicasNative not initialized");
+        }
+        if (!workers_started_) {
+            throw std::runtime_error("Workers not started - call start_workers first");
+        }
+        if (!mirror_thread_.joinable() || d2h_stream_ == nullptr || mirror_done_) {
+            throw std::runtime_error("Mirror worker is not running");
+        }
+        if (gpu_base == 0 || cpu_base == 0 || total_size == 0 || chunk_size == 0) {
+            throw std::runtime_error(
+                "Eager mirror addresses, total size, and chunk size must be non-zero");
+        }
+        bool expected = false;
+        if (!eager_mirror_active_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            throw std::runtime_error("An eager mirror exchange is already active");
+        }
+
+        try {
+            connection_manager_->set_chunk_done_callback(nullptr);
+            mirror_tasks_submitted_.store(0, std::memory_order_relaxed);
+            mirror_bytes_submitted_.store(0, std::memory_order_relaxed);
+            reset_mirror_d2h_timing_(true);
+
+            size_t task_count = 0;
+            {
+                std::lock_guard<std::mutex> lk(mirror_mutex_);
+                if (!mirror_queue_.empty()) {
+                    throw std::runtime_error(
+                        "Cannot start eager mirror with pending mirror tasks");
+                }
+                for (size_t offset = 0; offset < total_size; offset += chunk_size) {
+                    const size_t bytes = std::min(chunk_size, total_size - offset);
+                    mirror_queue_.push({
+                        gpu_base + offset, cpu_base + offset, bytes,
+                        offset + bytes == total_size});
+                    ++task_count;
+                }
+            }
+            mirror_tasks_submitted_.store(task_count, std::memory_order_relaxed);
+            mirror_bytes_submitted_.store(total_size, std::memory_order_relaxed);
+            mirror_cv_.notify_one();
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(mirror_mutex_);
+                while (!mirror_queue_.empty()) mirror_queue_.pop();
+            }
+            finalize_mirror_d2h_timing_();
+            eager_mirror_active_.store(false, std::memory_order_release);
+            throw;
+        }
     }
 
     void push_mirror_task(uintptr_t gpu_addr, uintptr_t cpu_addr, size_t size) {
         if (gpu_addr == 0 || cpu_addr == 0 || size == 0) return;
         {
             std::lock_guard<std::mutex> lk(mirror_mutex_);
-            mirror_queue_.push({gpu_addr, cpu_addr, size});
+            mirror_queue_.push({gpu_addr, cpu_addr, size, false});
         }
         mirror_tasks_submitted_.fetch_add(1, std::memory_order_relaxed);
         mirror_bytes_submitted_.fetch_add(size, std::memory_order_relaxed);
@@ -2906,7 +3133,7 @@ public:
         // Push sentinel then wait for the worker to finish all tasks.
         {
             std::lock_guard<std::mutex> lk(mirror_mutex_);
-            mirror_queue_.push({0, 0, 0});  // sentinel
+            mirror_queue_.push({0, 0, 0, false});  // sentinel
         }
         mirror_cv_.notify_one();
         while (!mirror_done_) {
@@ -2924,6 +3151,7 @@ public:
         } else {
             finalize_mirror_d2h_timing_();
         }
+        eager_mirror_active_.store(false, std::memory_order_release);
         if (debug_ && mirror_tasks_submitted_.load() > 0) {
             std::cout << "[Rank " << rank_ << "] Mirror submitted "
                       << mirror_tasks_submitted_.load() << " tasks, "
@@ -2948,21 +3176,34 @@ private:
                 mirror_queue_.pop();
             }
             if (task.gpu_addr == 0 && task.cpu_addr == 0) {
+                {
+                    std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
+                    if (mirror_d2h_events_valid_ && mirror_d2h_started_ &&
+                        !mirror_d2h_end_recorded_) {
+                        const cudaError_t record_err = cudaEventRecord(
+                            mirror_d2h_end_event_,
+                            reinterpret_cast<cudaStream_t>(d2h_stream_));
+                        if (record_err == cudaSuccess) {
+                            mirror_d2h_end_recorded_ = true;
+                        } else {
+                            destroy_mirror_d2h_events_locked_();
+                        }
+                    }
+                }
                 mirror_done_ = true;
                 break;  // sentinel
             }
-            MirrorCopyTiming timing{};
-            const bool start_ok = cudaEventCreate(&timing.start) == cudaSuccess;
-            const bool end_ok = cudaEventCreate(&timing.end) == cudaSuccess;
-            if (start_ok && end_ok) {
-                cudaEventRecord(
-                    timing.start, reinterpret_cast<cudaStream_t>(d2h_stream_));
-            } else {
-                if (start_ok) {
-                    cudaEventDestroy(timing.start);
-                }
-                if (end_ok) {
-                    cudaEventDestroy(timing.end);
+            {
+                std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
+                if (mirror_d2h_events_valid_ && !mirror_d2h_started_) {
+                    const cudaError_t record_err = cudaEventRecord(
+                        mirror_d2h_start_event_,
+                        reinterpret_cast<cudaStream_t>(d2h_stream_));
+                    if (record_err == cudaSuccess) {
+                        mirror_d2h_started_ = true;
+                    } else {
+                        destroy_mirror_d2h_events_locked_();
+                    }
                 }
             }
             const cudaError_t copy_err = cudaMemcpyAsync(
@@ -2971,16 +3212,30 @@ private:
                 task.size,
                 cudaMemcpyDeviceToHost,
                 reinterpret_cast<cudaStream_t>(d2h_stream_));
-            if (copy_err != cudaSuccess && debug_) {
-                std::cerr << "[Rank " << rank_ << "] Mirror cudaMemcpyAsync failed: "
-                          << cudaGetErrorString(copy_err) << std::endl;
+            if (copy_err != cudaSuccess) {
+                {
+                    std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
+                    destroy_mirror_d2h_events_locked_();
+                }
+                if (debug_) {
+                    std::cerr << "[Rank " << rank_ << "] Mirror cudaMemcpyAsync failed: "
+                              << cudaGetErrorString(copy_err) << std::endl;
+                }
+                continue;
             }
-            if (start_ok && end_ok) {
-                cudaEventRecord(
-                    timing.end, reinterpret_cast<cudaStream_t>(d2h_stream_));
-                timing.valid = true;
+            if (task.last_in_generation) {
                 std::lock_guard<std::mutex> lk(mirror_timing_mutex_);
-                mirror_copy_timings_.push_back(timing);
+                if (mirror_d2h_events_valid_ && mirror_d2h_started_ &&
+                    !mirror_d2h_end_recorded_) {
+                    const cudaError_t record_err = cudaEventRecord(
+                        mirror_d2h_end_event_,
+                        reinterpret_cast<cudaStream_t>(d2h_stream_));
+                    if (record_err == cudaSuccess) {
+                        mirror_d2h_end_recorded_ = true;
+                    } else {
+                        destroy_mirror_d2h_events_locked_();
+                    }
+                }
             }
         }
     }
@@ -3118,6 +3373,10 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
         .def("push_mirror_task", &GeminiReplicasNative::push_mirror_task,
              py::arg("gpu_addr"), py::arg("cpu_addr"), py::arg("size"),
              "Push a GPU→CPU D2H copy task to the mirror worker (non-blocking)")
+        .def("start_eager_mirror", &GeminiReplicasNative::start_eager_mirror,
+             py::arg("gpu_base"), py::arg("cpu_base"),
+             py::arg("total_size"), py::arg("chunk_size"),
+             "Configure and enqueue a chunked full-buffer eager D2H mirror")
         .def("start_mirror_worker", &GeminiReplicasNative::start_mirror_worker,
              "Start the mirror worker thread for async D2H copies")
         .def("wait_mirror_completion", &GeminiReplicasNative::wait_mirror_completion,

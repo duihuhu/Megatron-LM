@@ -133,7 +133,8 @@ public:
           tcp_sock_(tcp_sock), peer_rank_(peer_rank),
           bufs_(bufs), buf_mtx_(buf_mtx),
           qp_(nullptr),
-          max_send_sge_(1), connected_(false)
+          max_send_sge_(1), max_recv_sge_(1), segment_sge_limit_(1),
+          segment_chunk_size_(frcheck_rdma_chunk_size()), connected_(false)
     {
         send_cq_ = ibv_create_cq(ctx_, 256, nullptr, nullptr, 0);
         recv_cq_ = ibv_create_cq(ctx_, 256, nullptr, nullptr, 0);
@@ -161,12 +162,14 @@ public:
         if (ibv_query_device(ctx_, &device_attr) == 0 && device_attr.max_sge > 0)
             requested_max_send_sge = std::min(requested_max_send_sge, device_attr.max_sge);
         attr.cap.max_send_sge = requested_max_send_sge;
-        attr.cap.max_recv_sge = 1;
+        attr.cap.max_recv_sge = requested_max_send_sge;
         qp_ = ibv_create_qp(pd_, &attr);
         if (!qp_)
             throw std::runtime_error("FRCheck RDMA: failed to create QP");
         max_send_sge_ = std::max(1, std::min(requested_max_send_sge,
                                              static_cast<int>(attr.cap.max_send_sge)));
+        max_recv_sge_ = std::max(1, std::min(requested_max_send_sge,
+                                             static_cast<int>(attr.cap.max_recv_sge)));
     }
 
     ~FRCheckRdmaChannel() {
@@ -180,6 +183,7 @@ public:
     int peer_rank() const { return peer_rank_; }
     bool is_connected() const { return connected_; }
     int max_send_sge() const { return max_send_sge_; }
+    int max_recv_sge() const { return max_recv_sge_; }
 
     // Break blocking send/recv during shutdown (ECLATIN-style conn cleanup).
     void abort_connection() {
@@ -215,6 +219,28 @@ public:
             throw std::runtime_error("FRCheck RDMA: failed to recv conn info");
 
         connect_qp(remote);
+
+        uint64_t local_segment_caps[2] = {
+            htobe64(static_cast<uint64_t>(std::min(max_send_sge_, max_recv_sge_))),
+            htobe64(static_cast<uint64_t>(frcheck_rdma_chunk_size())),
+        };
+        uint64_t remote_segment_caps[2]{};
+        if (send(tcp_sock_, local_segment_caps, sizeof(local_segment_caps), 0) !=
+                static_cast<ssize_t>(sizeof(local_segment_caps)))
+            throw std::runtime_error("FRCheck RDMA: failed to send segment capabilities");
+        if (recv(tcp_sock_, remote_segment_caps, sizeof(remote_segment_caps), MSG_WAITALL) !=
+                static_cast<ssize_t>(sizeof(remote_segment_caps)))
+            throw std::runtime_error("FRCheck RDMA: failed to recv segment capabilities");
+        const uint64_t remote_sge = be64toh(remote_segment_caps[0]);
+        const uint64_t remote_chunk = be64toh(remote_segment_caps[1]);
+        if (remote_sge == 0 || remote_chunk == 0)
+            throw std::runtime_error("FRCheck RDMA: invalid peer segment capabilities");
+        segment_sge_limit_ = std::max(
+            1, std::min(std::min(max_send_sge_, max_recv_sge_),
+                        static_cast<int>(std::min<uint64_t>(
+                            remote_sge, static_cast<uint64_t>(std::numeric_limits<int>::max())))));
+        segment_chunk_size_ = std::min(
+            frcheck_rdma_chunk_size(), static_cast<size_t>(remote_chunk));
     }
 
     // RDMA SEND data to peer (blocking)
@@ -265,6 +291,30 @@ public:
             throw std::runtime_error("FRCheck RDMA: failed to recv scatter ack");
         if (done_cb) done_cb();
         send_segments_chunked_(segments, logical_size, wait_cb, done_cb);
+    }
+
+    size_t recv_segments(
+            const std::vector<std::pair<uintptr_t, size_t>>& segments,
+            size_t logical_size,
+            const std::function<void()>& wait_cb = nullptr,
+            const std::function<void()>& done_cb = nullptr) {
+        std::lock_guard<std::mutex> lock(recv_mtx_);
+        if (!connected_)
+            throw std::runtime_error("FRCheck RDMA: channel not connected");
+        validate_segments_(segments, logical_size, "receive");
+        if (wait_cb) wait_cb();
+        uint64_t net_sz = 0;
+        if (recv(tcp_sock_, &net_sz, sizeof(net_sz), MSG_WAITALL) != sizeof(net_sz))
+            throw std::runtime_error("FRCheck RDMA: failed to recv scatter size");
+        const size_t size = be64toh(net_sz);
+        if (size != logical_size)
+            throw std::runtime_error("FRCheck RDMA: scatter receive size mismatch");
+        uint8_t ack = 1;
+        if (send(tcp_sock_, &ack, 1, 0) != 1)
+            throw std::runtime_error("FRCheck RDMA: failed to send scatter ack");
+        if (done_cb) done_cb();
+        recv_segments_chunked_(segments, logical_size, wait_cb, done_cb);
+        return size;
     }
 
     // RDMA RECEIVE data from peer (blocking)
@@ -387,9 +437,10 @@ private:
         size_t remaining = total;
         while (remaining > 0) {
             if (wait_cb) wait_cb();
-            size_t message_remaining = std::min(remaining, frcheck_rdma_chunk_size());
+            size_t message_remaining = std::min(remaining, segment_chunk_size_);
             std::vector<ibv_sge> sges;
-            while (message_remaining > 0) {
+            while (message_remaining > 0 &&
+                   sges.size() < static_cast<size_t>(segment_sge_limit_)) {
                 while (segment_idx < segments.size() &&
                        segment_offset == segments[segment_idx].second) {
                     ++segment_idx;
@@ -410,12 +461,6 @@ private:
                 sge.length = static_cast<uint32_t>(length);
                 sge.lkey = mr->lkey;
                 sges.push_back(sge);
-                if (sges.size() > static_cast<size_t>(max_send_sge_))
-                    throw std::runtime_error(
-                        "FRCheck RDMA: one RDMA scatter message requires " +
-                        std::to_string(sges.size()) + " SGEs, exceeding effective max_send_sge=" +
-                        std::to_string(max_send_sge_) +
-                        "; reduce blocks per Python layer-exchange task");
                 segment_offset += length;
                 message_remaining -= length;
                 remaining -= length;
@@ -429,6 +474,75 @@ private:
             if (ibv_post_send(qp_, &wr, &bad))
                 throw std::runtime_error("FRCheck RDMA: scatter post_send failed");
             poll_cq(send_cq_, 1);
+            if (done_cb) done_cb();
+        }
+    }
+
+    void validate_segments_(
+            const std::vector<std::pair<uintptr_t, size_t>>& segments,
+            size_t logical_size,
+            const char* operation) {
+        size_t total = 0;
+        for (const auto& segment : segments) {
+            if (segment.first == 0 || segment.second == 0)
+                throw std::runtime_error(std::string("FRCheck RDMA: empty ") + operation + " segment");
+            if (segment.second > std::numeric_limits<size_t>::max() - total)
+                throw std::runtime_error("FRCheck RDMA: segment size overflow");
+            total += segment.second;
+            if (!find_mr(segment.first, segment.second))
+                throw std::runtime_error(
+                    std::string("FRCheck RDMA: unregistered ") + operation +
+                    " segment addr=" + std::to_string(segment.first) +
+                    " size=" + std::to_string(segment.second));
+        }
+        if (segments.empty() || total != logical_size)
+            throw std::runtime_error(std::string("FRCheck RDMA: ") + operation +
+                                     " segment logical size mismatch");
+    }
+
+    void recv_segments_chunked_(
+            const std::vector<std::pair<uintptr_t, size_t>>& segments,
+            size_t total,
+            const std::function<void()>& wait_cb,
+            const std::function<void()>& done_cb) {
+        size_t segment_idx = 0;
+        size_t segment_offset = 0;
+        size_t remaining = total;
+        while (remaining > 0) {
+            if (wait_cb) wait_cb();
+            size_t message_remaining = std::min(remaining, segment_chunk_size_);
+            std::vector<ibv_sge> sges;
+            while (message_remaining > 0 &&
+                   sges.size() < static_cast<size_t>(segment_sge_limit_)) {
+                while (segment_idx < segments.size() &&
+                       segment_offset == segments[segment_idx].second) {
+                    ++segment_idx;
+                    segment_offset = 0;
+                }
+                if (segment_idx >= segments.size())
+                    throw std::runtime_error("FRCheck RDMA: receive segments ended early");
+                const auto& segment = segments[segment_idx];
+                const size_t length = std::min(message_remaining,
+                                               segment.second - segment_offset);
+                ibv_mr* mr = find_mr(segment.first + segment_offset, length);
+                if (!mr)
+                    throw std::runtime_error("FRCheck RDMA: receive segment MR disappeared");
+                ibv_sge sge{};
+                sge.addr = static_cast<uint64_t>(segment.first + segment_offset);
+                sge.length = static_cast<uint32_t>(length);
+                sge.lkey = mr->lkey;
+                sges.push_back(sge);
+                segment_offset += length;
+                message_remaining -= length;
+                remaining -= length;
+            }
+            ibv_recv_wr wr{};
+            wr.sg_list = sges.data();
+            wr.num_sge = static_cast<int>(sges.size());
+            ibv_recv_wr* bad = nullptr;
+            if (ibv_post_recv(qp_, &wr, &bad))
+                throw std::runtime_error("FRCheck RDMA: scatter post_recv failed");
+            poll_cq(recv_cq_, 1);
             if (done_cb) done_cb();
         }
     }
@@ -554,6 +668,9 @@ private:
     std::mutex* buf_mtx_;
     ibv_qp* qp_;
     int max_send_sge_;
+    int max_recv_sge_;
+    int segment_sge_limit_;
+    size_t segment_chunk_size_;
     bool connected_;
     std::mutex send_mtx_;
     std::mutex recv_mtx_;
@@ -881,6 +998,38 @@ public:
             throw std::runtime_error("FRCheck RDMA: failed to send tagged ack");
         }
         recv_chunked(buf, size, mr, wait_cb, done_cb);
+        return size;
+    }
+
+    size_t recv_tagged_segments(
+            uint64_t tag,
+            const std::vector<std::pair<uintptr_t, size_t>>& segments,
+            size_t logical_size,
+            const std::function<void()>& wait_cb = nullptr,
+            const std::function<void()>& done_cb = nullptr) {
+        validate_segments_(segments, logical_size, "tagged receive");
+        if (wait_cb) wait_cb();
+        size_t size = 0;
+        {
+            std::unique_lock<std::mutex> lk(tag_mtx_);
+            tag_cv_.wait(lk, [&] {
+                return pending_data_sizes_.count(tag) ||
+                       tag_stop_.load(std::memory_order_acquire);
+            });
+            if (tag_stop_.load(std::memory_order_acquire)) {
+                if (done_cb) done_cb();
+                return 0;
+            }
+            size = pending_data_sizes_[tag];
+            pending_data_sizes_.erase(tag);
+        }
+        if (size != logical_size)
+            throw std::runtime_error("FRCheck tagged scatter receive size mismatch");
+        std::lock_guard<std::mutex> lock(recv_mtx_);
+        TaggedCtl ack{htobe32(kTagAck), 0, htobe64(tag), 0};
+        if (!write_full_locked_(&ack, sizeof(ack)))
+            throw std::runtime_error("FRCheck RDMA: failed to send tagged scatter ack");
+        recv_segments_chunked_(segments, logical_size, wait_cb, done_cb);
         return size;
     }
 
@@ -3689,9 +3838,12 @@ public:
         return {role, -1, -1};
     }
 
+    using AggregateP2Task = std::tuple<
+        int, int, std::vector<std::pair<uintptr_t, size_t>>>;
+
     std::vector<int> submit_aggregate_p2(
-        const std::vector<std::tuple<int, int, uintptr_t, size_t>>& send_tasks,
-        const std::vector<std::tuple<int, int, uintptr_t, size_t>>& recv_tasks,
+        const std::vector<AggregateP2Task>& send_tasks,
+        const std::vector<AggregateP2Task>& recv_tasks,
         uint64_t generation) {
         if (!aggregate_p2_threads_.empty() ||
             aggregate_p2_done_.load(std::memory_order_acquire) <
@@ -3706,35 +3858,40 @@ public:
         const int total = static_cast<int>(send_tasks.size() + recv_tasks.size());
         aggregate_p2_total_.store(total, std::memory_order_release);
 
-        auto launch = [this, generation](bool is_send, int peer, int lane,
-                                         uintptr_t addr, size_t size) {
-            aggregate_p2_threads_.emplace_back([this, generation, is_send, peer, lane, addr, size]() {
+        auto launch = [this, generation](
+                bool is_send, int peer, int lane,
+                std::vector<std::pair<uintptr_t, size_t>> segments) {
+            aggregate_p2_threads_.emplace_back([
+                    this, generation, is_send, peer, lane,
+                    segments = std::move(segments)]() {
                 try {
                     FRCheckRdmaChannel* ch = get_channel_by_lane_(peer, lane);
                     if (!ch)
                         throw std::runtime_error(
                             "FRCheck aggregate P2: missing channel peer=" +
                             std::to_string(peer) + " lane=" + std::to_string(lane));
+                    size_t size = 0;
+                    for (const auto& segment : segments) {
+                        if (segment.second > std::numeric_limits<size_t>::max() - size)
+                            throw std::runtime_error("FRCheck aggregate P2: segment size overflow");
+                        size += segment.second;
+                    }
                     const uint64_t tag = make_channel_tag_(5, lane, generation);
-                    uint64_t net_t0 = frcheck_now_us();
-                    record_save_net_start_(net_t0);
+                    record_save_net_start_(frcheck_now_us());
                     if (is_send) {
                         _wait_if_paused();
                         auto wait_cb = [this]() { this->_async_rdma_begin(); };
                         auto done_cb = [this]() { this->_async_rdma_end(); };
                         if (shared_lane_)
-                            ch->send_tagged(tag, reinterpret_cast<const uint8_t*>(addr), size,
-                                            wait_cb, done_cb);
+                            ch->send_tagged_segments(tag, segments, size, wait_cb, done_cb);
                         else
-                            ch->send_data(reinterpret_cast<const uint8_t*>(addr), size,
-                                          wait_cb, done_cb);
+                            ch->send_segments(segments, size, wait_cb, done_cb);
                     } else if (shared_lane_) {
-                        const size_t got = ch->recv_tagged(
-                            tag, reinterpret_cast<uint8_t*>(addr), size);
+                        const size_t got = ch->recv_tagged_segments(tag, segments, size);
                         if (got != size)
                             throw std::runtime_error("FRCheck aggregate P2: short tagged receive");
                     } else {
-                        const size_t got = ch->recv_data(reinterpret_cast<uint8_t*>(addr), size);
+                        const size_t got = ch->recv_segments(segments, size);
                         if (got != size)
                             throw std::runtime_error("FRCheck aggregate P2: short receive");
                     }
@@ -3748,20 +3905,11 @@ public:
             });
         };
         try {
-            for (const auto& task : recv_tasks) {
-                int peer, lane; uintptr_t addr; size_t size;
-                std::tie(peer, lane, addr, size) = task;
-                launch(false, peer, lane, addr, size);
-            }
-            for (const auto& task : send_tasks) {
-                int peer, lane; uintptr_t addr; size_t size;
-                std::tie(peer, lane, addr, size) = task;
-                launch(true, peer, lane, addr, size);
-            }
+            for (const auto& task : recv_tasks)
+                launch(false, std::get<0>(task), std::get<1>(task), std::get<2>(task));
+            for (const auto& task : send_tasks)
+                launch(true, std::get<0>(task), std::get<1>(task), std::get<2>(task));
         } catch (...) {
-            // Thread construction can fail after earlier tasks have started. Abort
-            // their blocking channel operations and join them before Python may
-            // unregister or free the submitted transfer buffers.
             abort_all_channels_();
             for (auto& thread : aggregate_p2_threads_)
                 if (thread.joinable()) thread.join();

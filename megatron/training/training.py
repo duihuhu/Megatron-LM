@@ -1635,6 +1635,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         torch.cuda.empty_cache()
 
     rerun_state_machine = get_rerun_state_machine()
+    frcheck_optimizer_overlap_started = False
+    frcheck_optimizer_overlap_diagnostic_logged = False
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         mark_recovery_to_forward_timer("zero_grad_start")
@@ -1672,14 +1674,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 mark_recovery_to_forward_timer("frcheck_train_prep_start")
                 frcheck_recovery_safe_point("train_step_start")
                 mark_recovery_to_forward_timer("frcheck_train_safe_point_done")
-                if not getattr(args, "frcheck_async_recovery_forward", False):
+                if (
+                    not getattr(args, "frcheck_async_recovery_forward", False)
+                    and not getattr(args, "frcheck_hw_optimizer_overlap", False)
+                ):
                     frcheck_wait_for_optimizer_state(optimizer)
                 mark_recovery_to_forward_timer("frcheck_train_optimizer_state_done")
             except ImportError:
                 pass
 
         @functools.wraps(forward_step_func)
-        def forward_step_func_with_recovery_timing(*args, **kwargs):
+        def forward_step_func_with_recovery_timing(*forward_args, **forward_kwargs):
+            nonlocal frcheck_optimizer_overlap_started
             mark_recovery_to_forward_timer("forward_step_start")
             _log_recovery_to_forward_profile("forward_step_start")
             if getattr(args, "use_frcheck", False):
@@ -1688,7 +1694,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     frcheck_recovery_safe_point("forward_step_start")
                 except ImportError:
                     pass
-            result = forward_step_func(*args, **kwargs)
+            result = forward_step_func(*forward_args, **forward_kwargs)
+            if (
+                not frcheck_optimizer_overlap_started
+                and getattr(args, "frcheck_hw_optimizer_overlap", False)
+                and bool(getattr(args, "_ft_inprocess_recovery_awaiting_forward", False))
+            ):
+                from megatron.training.frcheck_legacy import frcheck_start_optimizer_h2d
+
+                frcheck_optimizer_overlap_started = frcheck_start_optimizer_h2d(optimizer)
             finish_recovery_to_forward_timer("forward_step_end")
             _log_recovery_to_forward_profile("forward_step_end")
             return result
@@ -1718,6 +1732,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
+        if (
+            getattr(args, "frcheck_hw_optimizer_overlap", False)
+            and getattr(args, "_ft_inprocess_recovery_awaiting_forward", False)
+            and not frcheck_optimizer_overlap_started
+            and not frcheck_optimizer_overlap_diagnostic_logged
+        ):
+            from megatron.training.frcheck_legacy import (
+                frcheck_log_optimizer_overlap_not_started,
+            )
+
+            frcheck_log_optimizer_overlap_not_started()
+            frcheck_optimizer_overlap_diagnostic_logged = True
         if getattr(args, "use_frcheck", False):
             frcheck_forward_backward_elapsed_s = time.time() - frcheck_forward_backward_t0
             stash_recovery_timing_summary(

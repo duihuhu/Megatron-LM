@@ -125,6 +125,15 @@ if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess|inproc
 fi
 ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
+FRCHECK_HW_EARLY_OPTIMIZER=${FRCHECK_HW_EARLY_OPTIMIZER:-0}
+case "$FRCHECK_HW_EARLY_OPTIMIZER" in
+    0) FRCHECK_HW_EARLY_OPTIMIZER_ARGS=() ;;
+    1) FRCHECK_HW_EARLY_OPTIMIZER_ARGS=(--frcheck-hw-early-optimizer) ;;
+    *)
+        echo "Error: FRCHECK_HW_EARLY_OPTIMIZER must be 0 or 1: $FRCHECK_HW_EARLY_OPTIMIZER" >&2
+        exit 1
+        ;;
+esac
 FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-3}
 case "$MODE" in
     save)
@@ -176,6 +185,7 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --ft-inprocess-recovery-benchmark
+            "${FRCHECK_HW_EARLY_OPTIMIZER_ARGS[@]}"
             --rerun-mode disabled
             --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
             --ft-inprocess-recovery-failed-ranks "0,1,2,3,4,5,6,7"
@@ -332,6 +342,7 @@ echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (FRCheck mode=$MO
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 echo "FRCHECK_TABLE_DIR: $FRCHECK_TABLE_DIR"
 echo "FRCHECK_INTERFACE: $FRCHECK_INTERFACE"
+echo "FRCHECK_HW_EARLY_OPTIMIZER: $FRCHECK_HW_EARLY_OPTIMIZER"
 
 export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \

@@ -253,6 +253,35 @@ def _record_frcheck_first_layer_milestone(
         _stash_frcheck_first_layer_milestones_locked()
 
 
+def _stash_frcheck_first_layer_cuda_event(
+    name: str,
+    layer_idx: int,
+    event: torch.cuda.Event,
+    device_idx: int,
+    generation: int,
+) -> None:
+    """Register an event already recorded on the stream doing the measured work."""
+    if layer_idx != _frcheck_first_layer_recovery_target_idx:
+        return
+    if not _frcheck_first_layer_failed_rank:
+        return
+    with _frcheck_first_layer_milestones_lock:
+        if (
+            layer_idx != _frcheck_first_layer_recovery_target_idx
+            or _frcheck_first_layer_milestones.get(f"{name}_valid", False)
+            or name in _frcheck_first_layer_pending_cuda_events
+        ):
+            return
+        if generation != _frcheck_first_layer_generation:
+            return
+        _frcheck_first_layer_pending_cuda_events[name] = {
+            "event": event,
+            "device": int(device_idx),
+            "generation": generation,
+            "layer_idx": layer_idx,
+        }
+
+
 def _record_frcheck_first_layer_cuda_event(name: str, layer_idx: int) -> None:
     if layer_idx != _frcheck_first_layer_recovery_target_idx:
         return
@@ -830,6 +859,18 @@ class _FRCheckLayerwiseRuntime:
         self._model_events_by_layer: Dict[int, threading.Event] = {}
         self._optimizer_events_by_layer: Dict[int, threading.Event] = {}
         self._injected_layers: Set[int] = set()
+        self._runtime_lock = threading.RLock()
+        self._prefetch_streams_by_device: Dict[int, torch.cuda.Stream] = {}
+        self._prefetch_events_by_layer: Dict[int, torch.cuda.Event] = {}
+        self._model_h2d_start_events_by_device: Dict[int, torch.cuda.Event] = {}
+        self._model_h2d_completion_events: List[Tuple[int, torch.cuda.Event]] = []
+        self.model_h2d_span_s: float = 0.0
+        self.model_h2d_done_s: float = 0.0
+        self.model_h2d_timed_layers: int = 0
+        self.model_h2d_timing_resolved: bool = False
+        # Keep pinned sources alive for the complete runtime cycle. A stream dependency
+        # protects the destination, but does not extend the CPU storage lifetime.
+        self._prefetch_sources_by_layer: Dict[int, List[torch.Tensor]] = {}
         for layer_idx, record in self._records_by_layer.items():
             model_event = threading.Event()
             optimizer_event = threading.Event()
@@ -842,8 +883,8 @@ class _FRCheckLayerwiseRuntime:
         self.wait_s: float = 0.0
         self.forward_wait_model_s: float = 0.0
         self.optimizer_wait_s: float = 0.0
-        self.optimizer_materialize_s: float = 0.0
-        self.optimizer_load_s: float = 0.0
+        self.optimizer_cpu_prepare_s: float = 0.0
+        self.optimizer_h2d_load_s: float = 0.0
         self.optimizer_sync_s: float = 0.0
         self.materialized_layers: Set[int] = set()
         self.optimizer_materialized: bool = False
@@ -852,6 +893,22 @@ class _FRCheckLayerwiseRuntime:
         self.first_layer_ready_s: Optional[float] = None
         self.last_layer_ready_s: Optional[float] = None
         self.inject_s: float = 0.0
+        self.inject_bytes: int = 0
+        self.inject_direct_tensors: int = 0
+        self.inject_fallback_tensors: int = 0
+        self.inject_pinned_bytes: int = 0
+        self.inject_unpinned_bytes: int = 0
+        self.inject_non_cpu_bytes: int = 0
+        self.inject_contiguous_tensors: int = 0
+        self.inject_noncontiguous_tensors: int = 0
+        self.prefetch_submit_s: float = 0.0
+        self.prefetch_submitted_layers: int = 0
+        self.prefetch_submitted_bytes: int = 0
+        self.prefetch_submitted_tensors: int = 0
+        self.prefetch_fallback_layers: int = 0
+        self.forward_event_wait_layers: int = 0
+        self._prefetch_fallback_layer_indices: Set[int] = set()
+        self._forward_event_wait_layer_indices: Set[int] = set()
 
     def attach_model_state_keys(self, model_state_keys) -> None:
         keys_by_layer: Dict[int, Set[str]] = {}
@@ -859,7 +916,8 @@ class _FRCheckLayerwiseRuntime:
             layer_idx = _extract_layer_idx(str(key))
             if layer_idx >= 0:
                 keys_by_layer.setdefault(layer_idx, set()).add(str(key))
-        self._model_keys_by_layer = keys_by_layer
+        with self._runtime_lock:
+            self._model_keys_by_layer = keys_by_layer
 
     def attach_live_model(self, model) -> None:
         live_tensors: Dict[str, torch.Tensor] = {}
@@ -884,7 +942,13 @@ class _FRCheckLayerwiseRuntime:
             for name, buf in module.named_buffers():
                 register_live_tensor(name, buf)
         live_tensors.update(canonical_live_tensors)
-        self._live_tensors = live_tensors
+        with self._runtime_lock:
+            self._live_tensors = live_tensors
+            # Recovery may have completed layers before checkpoint loading attached
+            # the live model. Submit those layers now, still before forward can use them.
+            for layer_idx, record in self._records_by_layer.items():
+                if record.model_ready and layer_idx not in self._injected_layers:
+                    self._try_prefetch_layer_locked(layer_idx)
 
     def _lookup_live_tensor(self, key: str) -> Optional[torch.Tensor]:
         candidates = (
@@ -903,40 +967,17 @@ class _FRCheckLayerwiseRuntime:
                 return dst
         return None
 
-    def _inject_layer_tensors(self, layer_idx: int) -> None:
-        if layer_idx in self._injected_layers:
-            return
-        record = self._records_by_layer.get(layer_idx)
-        if record is None:
-            return
+    def _layer_model_tensors(
+        self, record: _FRCheckLayerReadyRecord
+    ) -> Optional[Dict[str, torch.Tensor]]:
         tensors = record.model_tensors
         if not tensors and record.tensors:
             tensors, _ = _split_recovered_tensors(
                 record.tensors, record.model_tensor_keys, record.optimizer_tensor_keys,
             )
-        if not tensors:
-            return
-        t0 = time.time()
-        copied = 0
-        matched = 0
-        missing = 0
-        with torch.no_grad():
-            for key in record.model_tensor_keys:
-                tensor = tensors.get(key)
-                if tensor is None:
-                    continue
-                dst = self._lookup_live_tensor(key)
-                if dst is None:
-                    missing += 1
-                    continue
-                dst.copy_(tensor.to(device=dst.device, dtype=dst.dtype), non_blocking=True)
-                copied += tensor.numel() * tensor.element_size()
-                matched += 1
-        if layer_idx == _frcheck_first_layer_recovery_target_idx and matched > 0:
-            _record_frcheck_first_layer_cuda_event("h2d_s", layer_idx)
-        self._injected_layers.add(layer_idx)
-        inject_s = time.time() - t0
-        self.inject_s += inject_s
+        return tensors
+
+    def _release_injected_record_tensors(self, record: _FRCheckLayerReadyRecord) -> None:
         record.model_tensors = None
         if record.optimizer_tensors is None and record.tensors is not None:
             _, optimizer_tensors = _split_recovered_tensors(
@@ -946,6 +987,174 @@ class _FRCheckLayerwiseRuntime:
             )
             record.optimizer_tensors = optimizer_tensors
         record.tensors = record.optimizer_tensors if record.contains_optimizer_state else None
+
+    def _try_prefetch_layer_locked(self, layer_idx: int) -> bool:
+        record = self._records_by_layer.get(layer_idx)
+        tensors = None if record is None else self._layer_model_tensors(record)
+        if record is None or not tensors or layer_idx in self._injected_layers:
+            return False
+
+        copies: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
+        device_idx: Optional[int] = None
+        eligible = torch.cuda.is_available()
+        for key in record.model_tensor_keys:
+            src = tensors.get(key)
+            if src is None:
+                continue
+            dst = self._lookup_live_tensor(key)
+            if dst is None or dst.device.type != "cuda" or src.device.type != "cpu":
+                eligible = False
+                break
+            if src.layout != torch.strided or tuple(src.shape) != tuple(dst.shape):
+                eligible = False
+                break
+            try:
+                if not src.is_pinned():
+                    eligible = False
+                    break
+            except RuntimeError:
+                eligible = False
+                break
+            current_device_idx = int(dst.device.index)
+            if device_idx is None:
+                device_idx = current_device_idx
+            elif device_idx != current_device_idx:
+                eligible = False
+                break
+            copies.append((dst, src, src.numel() * src.element_size()))
+
+        if not copies:
+            eligible = False
+        if not eligible or device_idx is None:
+            return False
+
+        t0 = time.time()
+        with _frcheck_first_layer_milestones_lock:
+            milestone_generation = _frcheck_first_layer_generation
+        try:
+            with torch.cuda.device(device_idx):
+                stream = self._prefetch_streams_by_device.get(device_idx)
+                if stream is None:
+                    stream = torch.cuda.Stream(device=device_idx)
+                    self._prefetch_streams_by_device[device_idx] = stream
+        except Exception:
+            return False
+
+        # Once submission begins, do not fall back to a different stream: that could
+        # race a partially submitted copy. Unexpected enqueue failures propagate.
+        with torch.cuda.device(device_idx):
+            with torch.cuda.stream(stream), torch.no_grad():
+                if device_idx not in self._model_h2d_start_events_by_device:
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    start_event.record(stream)
+                    self._model_h2d_start_events_by_device[device_idx] = start_event
+                for dst, src, _ in copies:
+                    dst.copy_(src, non_blocking=True)
+                completion = torch.cuda.Event(enable_timing=True)
+                completion.record(stream)
+
+        copied_bytes = sum(item[2] for item in copies)
+        self._prefetch_events_by_layer[layer_idx] = completion
+        self._model_h2d_completion_events.append((device_idx, completion))
+        self.model_h2d_timed_layers += 1
+        self._prefetch_sources_by_layer[layer_idx] = [item[1] for item in copies]
+        self._injected_layers.add(layer_idx)
+        self.prefetch_submit_s += time.time() - t0
+        self.prefetch_submitted_layers += 1
+        self.prefetch_submitted_bytes += copied_bytes
+        self.prefetch_submitted_tensors += len(copies)
+        self.inject_bytes += copied_bytes
+        self.inject_direct_tensors += len(copies)
+        self.inject_pinned_bytes += copied_bytes
+        for _, src, _ in copies:
+            if src.is_contiguous():
+                self.inject_contiguous_tensors += 1
+            else:
+                self.inject_noncontiguous_tensors += 1
+        self._release_injected_record_tensors(record)
+        if layer_idx == _frcheck_first_layer_recovery_target_idx:
+            _stash_frcheck_first_layer_cuda_event(
+                "h2d_s", layer_idx, completion, device_idx, milestone_generation,
+            )
+        return True
+
+    def _inject_layer_tensors(self, layer_idx: int) -> None:
+        with self._runtime_lock:
+            if layer_idx in self._injected_layers:
+                return
+            record = self._records_by_layer.get(layer_idx)
+            if record is None:
+                return
+            tensors = self._layer_model_tensors(record)
+            if not tensors:
+                return
+            t0 = time.time()
+            copied = 0
+            matched = 0
+            missing = 0
+            fallback_device_idx: Optional[int] = None
+            with torch.no_grad():
+                for key in record.model_tensor_keys:
+                    tensor = tensors.get(key)
+                    if tensor is None:
+                        continue
+                    dst = self._lookup_live_tensor(key)
+                    if dst is None:
+                        missing += 1
+                        continue
+                    nbytes = tensor.numel() * tensor.element_size()
+                    source_is_cpu = tensor.device.type == "cpu"
+                    source_is_contiguous = (
+                        tensor.layout == torch.strided and tensor.is_contiguous()
+                    )
+                    if source_is_contiguous:
+                        self.inject_contiguous_tensors += 1
+                    else:
+                        self.inject_noncontiguous_tensors += 1
+                    if source_is_cpu:
+                        try:
+                            source_is_pinned = tensor.is_pinned()
+                        except RuntimeError:
+                            source_is_pinned = False
+                        if source_is_pinned:
+                            self.inject_pinned_bytes += nbytes
+                        else:
+                            self.inject_unpinned_bytes += nbytes
+                    else:
+                        self.inject_non_cpu_bytes += nbytes
+
+                    direct_copy = tensor.layout == torch.strided and (
+                        source_is_cpu or tensor.device == dst.device
+                    )
+                    if dst.device.type == "cuda" and fallback_device_idx is None:
+                        fallback_device_idx = int(dst.device.index)
+                        stream = torch.cuda.current_stream(fallback_device_idx)
+                        if fallback_device_idx not in self._model_h2d_start_events_by_device:
+                            start_event = torch.cuda.Event(enable_timing=True)
+                            start_event.record(stream)
+                            self._model_h2d_start_events_by_device[fallback_device_idx] = start_event
+                    if direct_copy:
+                        dst.copy_(tensor, non_blocking=True)
+                        self.inject_direct_tensors += 1
+                    else:
+                        converted = tensor.to(device=dst.device, dtype=dst.dtype)
+                        dst.copy_(converted, non_blocking=True)
+                        self.inject_fallback_tensors += 1
+                    copied += nbytes
+                    matched += 1
+            if matched > 0 and fallback_device_idx is not None:
+                completion_event = torch.cuda.Event(enable_timing=True)
+                completion_event.record(torch.cuda.current_stream(fallback_device_idx))
+                self._model_h2d_completion_events.append(
+                    (fallback_device_idx, completion_event)
+                )
+                self.model_h2d_timed_layers += 1
+            if layer_idx == _frcheck_first_layer_recovery_target_idx and matched > 0:
+                _record_frcheck_first_layer_cuda_event("h2d_s", layer_idx)
+            self._injected_layers.add(layer_idx)
+            self.inject_s += time.time() - t0
+            self.inject_bytes += copied
+            self._release_injected_record_tensors(record)
 
     def mark_model_ready(
         self,
@@ -958,20 +1167,23 @@ class _FRCheckLayerwiseRuntime:
         record = self._records_by_layer.get(layer_idx)
         if record is None:
             return
-        record.materialize_s = materialize_s
-        record.nbytes = nbytes
-        if model_tensors is not None:
-            record.model_tensors = model_tensors
-        record.error = error
-        record.model_ready = not error
-        record.ready = record.model_ready and (
-            record.optimizer_ready or not record.contains_optimizer_state
-        )
-        if self.first_layer_ready_s is None:
-            self.first_layer_ready_s = time.time()
-        self.last_layer_ready_s = time.time()
-        event = self._model_events_by_layer.setdefault(layer_idx, threading.Event())
-        event.set()
+        with self._runtime_lock:
+            record.materialize_s = materialize_s
+            record.nbytes = nbytes
+            if model_tensors is not None:
+                record.model_tensors = model_tensors
+            record.error = error
+            record.model_ready = not error
+            record.ready = record.model_ready and (
+                record.optimizer_ready or not record.contains_optimizer_state
+            )
+            if self.first_layer_ready_s is None:
+                self.first_layer_ready_s = time.time()
+            self.last_layer_ready_s = time.time()
+            if record.model_ready:
+                self._try_prefetch_layer_locked(layer_idx)
+            event = self._model_events_by_layer.setdefault(layer_idx, threading.Event())
+            event.set()
         _frcheck_recovery_profile(
             "runtime", "model_ready_done", layer=record.layer_name,
             layer_idx=layer_idx, model_tensors=len(model_tensors or {}),
@@ -987,15 +1199,16 @@ class _FRCheckLayerwiseRuntime:
         record = self._records_by_layer.get(layer_idx)
         if record is None:
             return
-        if optimizer_tensors is not None:
-            record.optimizer_tensors = optimizer_tensors
-        record.error = error or record.error
-        record.optimizer_ready = not error
-        record.ready = record.model_ready and (
-            record.optimizer_ready or not record.contains_optimizer_state
-        )
-        event = self._optimizer_events_by_layer.setdefault(layer_idx, threading.Event())
-        event.set()
+        with self._runtime_lock:
+            if optimizer_tensors is not None:
+                record.optimizer_tensors = optimizer_tensors
+            record.error = error or record.error
+            record.optimizer_ready = not error
+            record.ready = record.model_ready and (
+                record.optimizer_ready or not record.contains_optimizer_state
+            )
+            event = self._optimizer_events_by_layer.setdefault(layer_idx, threading.Event())
+            event.set()
         _frcheck_recovery_profile(
             "runtime", "optimizer_ready_done", layer=record.layer_name,
             layer_idx=layer_idx,
@@ -1046,13 +1259,26 @@ class _FRCheckLayerwiseRuntime:
                 raise RuntimeError(
                     f"FRCheck layer {record.layer_name} model is not ready: {record.error}"
                 )
-            self._inject_layer_tensors(layer_idx)
-            first_touch = layer_idx not in self.materialized_layers
-            self.materialized_layers.add(layer_idx)
+            with self._runtime_lock:
+                prefetch_event = self._prefetch_events_by_layer.get(layer_idx)
+                if prefetch_event is not None:
+                    device_idx = int(prefetch_event.device.index)
+                    torch.cuda.current_stream(device_idx).wait_event(prefetch_event)
+                    if layer_idx not in self._forward_event_wait_layer_indices:
+                        self._forward_event_wait_layer_indices.add(layer_idx)
+                        self.forward_event_wait_layers += 1
+                else:
+                    if layer_idx not in self._prefetch_fallback_layer_indices:
+                        self._prefetch_fallback_layer_indices.add(layer_idx)
+                        self.prefetch_fallback_layers += 1
+                    self._inject_layer_tensors(layer_idx)
+                first_touch = layer_idx not in self.materialized_layers
+                self.materialized_layers.add(layer_idx)
             waited = time.time() - t0
-            self.forward_wait_model_s += waited
-            if self.first_wait_s is None:
-                self.first_wait_s = waited
+            with self._runtime_lock:
+                self.forward_wait_model_s += waited
+                if self.first_wait_s is None:
+                    self.first_wait_s = waited
             if first_touch and _frcheck_debug_enabled():
                 logger.debug(
                     "FRCheck layerwise forward: layer=%s idx=%d ready "
@@ -1066,7 +1292,8 @@ class _FRCheckLayerwiseRuntime:
                     pass
             return True
         finally:
-            self.wait_s += time.time() - t0
+            with self._runtime_lock:
+                self.wait_s += time.time() - t0
 
     def wait_for_optimizer_layers(self) -> None:
         t0 = time.time()
@@ -1084,32 +1311,103 @@ class _FRCheckLayerwiseRuntime:
         finally:
             self.optimizer_wait_s += time.time() - t0
 
+    def resolve_model_h2d_timing(self) -> None:
+        """Resolve actual model-copy CUDA spans at the post-forward safe point."""
+        with self._runtime_lock:
+            if self.model_h2d_timing_resolved:
+                return
+            starts = dict(self._model_h2d_start_events_by_device)
+            completions = list(self._model_h2d_completion_events)
+            self.model_h2d_timing_resolved = True
+        recovery_starts = {}
+        with _frcheck_first_layer_milestones_lock:
+            recovery_starts = dict(_frcheck_first_layer_cuda_start_events)
+        span_s = 0.0
+        done_s = 0.0
+        for device_idx, completion in completions:
+            copy_start = starts.get(device_idx)
+            recovery_start = recovery_starts.get(device_idx)
+            if copy_start is None:
+                continue
+            try:
+                completion.synchronize()
+                span_s = max(span_s, float(copy_start.elapsed_time(completion)) / 1000.0)
+                if recovery_start is not None:
+                    done_s = max(
+                        done_s,
+                        float(recovery_start.elapsed_time(completion)) / 1000.0,
+                    )
+            except Exception:
+                continue
+        with self._runtime_lock:
+            self.model_h2d_span_s = span_s
+            self.model_h2d_done_s = done_s
+        try:
+            from megatron.training.global_vars import stash_recovery_timing_summary
+            stash_recovery_timing_summary(
+                "frcheck_model_h2d",
+                {
+                    "model_h2d_span_s": span_s,
+                    "model_h2d_done_s": done_s,
+                    "forward_wait_model_s": self.forward_wait_model_s,
+                    "model_h2d_timed_layers": self.model_h2d_timed_layers,
+                    "model_h2d_total_layers": len(self._injected_layers),
+                },
+            )
+        except Exception:
+            pass
+
     def summary(self) -> Dict[str, Any]:
-        pending_runtime_tensors = sum(
-            len(record.model_tensors or {})
-            + len(record.optimizer_tensors or {})
-            + len(record.tensors or {})
-            for record in self._records_by_layer.values()
-        )
-        return {
-            "ready_layers": len(self._records_by_layer),
-            "materialized_layers": len(self.materialized_layers),
-            "missing_layers": sorted(self.missing_layers),
-            "wait_s": self.wait_s,
-            "forward_wait_model_s": self.forward_wait_model_s,
-            "optimizer_wait_s": self.optimizer_wait_s,
-            "optimizer_materialize_s": self.optimizer_materialize_s,
-            "optimizer_load_s": self.optimizer_load_s,
-            "optimizer_sync_s": self.optimizer_sync_s,
-            "optimizer_h2d_s": self.optimizer_materialize_s + self.optimizer_load_s + self.optimizer_sync_s,
-            "first_wait_s": self.first_wait_s,
-            "first_layer_ready_s": self.first_layer_ready_s,
-            "last_layer_ready_s": self.last_layer_ready_s,
-            "inject_s": self.inject_s,
-            "injected_layers": len(self._injected_layers),
-            "optimizer_materialized": self.optimizer_materialized,
-            "pending_runtime_tensors": pending_runtime_tensors,
-        }
+        with self._runtime_lock:
+            pending_runtime_tensors = sum(
+                len(record.model_tensors or {})
+                + len(record.optimizer_tensors or {})
+                + len(record.tensors or {})
+                for record in self._records_by_layer.values()
+            )
+            retained_prefetch_source_tensors = sum(
+                len(tensors) for tensors in self._prefetch_sources_by_layer.values()
+            )
+            return {
+                "ready_layers": len(self._records_by_layer),
+                "materialized_layers": len(self.materialized_layers),
+                "missing_layers": sorted(self.missing_layers),
+                "wait_s": self.wait_s,
+                "forward_wait_model_s": self.forward_wait_model_s,
+                "model_h2d_span_s": self.model_h2d_span_s,
+                "model_h2d_done_s": self.model_h2d_done_s,
+                "model_h2d_timed_layers": self.model_h2d_timed_layers,
+                "optimizer_wait_s": self.optimizer_wait_s,
+                "optimizer_cpu_prepare_s": self.optimizer_cpu_prepare_s,
+                "optimizer_h2d_load_s": self.optimizer_h2d_load_s,
+                # Compatibility aliases for existing timing consumers.
+                "optimizer_materialize_s": self.optimizer_cpu_prepare_s,
+                "optimizer_load_s": self.optimizer_h2d_load_s,
+                "optimizer_sync_s": self.optimizer_sync_s,
+                "optimizer_h2d_s": self.optimizer_h2d_load_s + self.optimizer_sync_s,
+                "first_wait_s": self.first_wait_s,
+                "first_layer_ready_s": self.first_layer_ready_s,
+                "last_layer_ready_s": self.last_layer_ready_s,
+                "inject_s": self.inject_s,
+                "inject_bytes": self.inject_bytes,
+                "inject_direct_tensors": self.inject_direct_tensors,
+                "inject_fallback_tensors": self.inject_fallback_tensors,
+                "inject_pinned_bytes": self.inject_pinned_bytes,
+                "inject_unpinned_bytes": self.inject_unpinned_bytes,
+                "inject_non_cpu_bytes": self.inject_non_cpu_bytes,
+                "inject_contiguous_tensors": self.inject_contiguous_tensors,
+                "inject_noncontiguous_tensors": self.inject_noncontiguous_tensors,
+                "prefetch_submit_s": self.prefetch_submit_s,
+                "prefetch_submitted_layers": self.prefetch_submitted_layers,
+                "prefetch_submitted_bytes": self.prefetch_submitted_bytes,
+                "prefetch_submitted_tensors": self.prefetch_submitted_tensors,
+                "prefetch_fallback_layers": self.prefetch_fallback_layers,
+                "forward_event_wait_layers": self.forward_event_wait_layers,
+                "retained_prefetch_source_tensors": retained_prefetch_source_tensors,
+                "injected_layers": len(self._injected_layers),
+                "optimizer_materialized": self.optimizer_materialized,
+                "pending_runtime_tensors": pending_runtime_tensors,
+            }
 
 
 class _FRCheckRecoveryService:
@@ -1235,6 +1533,15 @@ _active_recovery_service: Optional[_FRCheckRecoveryService] = None
 _pending_recovery_parity_repair: Optional[Dict[str, Any]] = None
 _pending_optimizer_state: Optional[Dict[str, Any]] = None
 _pending_optimizer_container: Optional[Dict[str, Any]] = None
+_optimizer_h2d_stream: Optional[torch.cuda.Stream] = None
+_optimizer_h2d_start_event: Optional[torch.cuda.Event] = None
+_optimizer_h2d_done_event: Optional[torch.cuda.Event] = None
+_optimizer_h2d_start_wall_s: Optional[float] = None
+_optimizer_h2d_load_submit_s: float = 0.0
+_optimizer_h2d_started: bool = False
+_optimizer_h2d_prepared: bool = False
+_optimizer_h2d_copy_pairs: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+_optimizer_h2d_prepare_s: float = 0.0
 
 
 def _get_active_frcheck_recovery_service() -> _FRCheckRecoveryService:
@@ -1661,8 +1968,14 @@ def frcheck_normalize_optimizer_state_param_keys(optim_state: Dict[str, Any]) ->
     normalize_optimizer_state_param_keys(optim_state)
 
 
-def _assign_deferred_optimizer_tensor(root: Dict[str, Any], flat_key: str, tensor: torch.Tensor) -> bool:
-    """Materialize optimizer tensors without aliasing recovery buffers."""
+def _assign_deferred_optimizer_tensor(
+    root: Dict[str, Any],
+    flat_key: str,
+    tensor: torch.Tensor,
+    clone_recovery_tensor: bool,
+) -> bool:
+    """Install a recovery tensor, cloning only when optimizer state may remain on CPU."""
+    value = tensor.detach().clone() if clone_recovery_tensor else tensor.detach()
     fp32_prefix = "optimizer.fp32_params_flat."
     if flat_key.startswith(fp32_prefix):
         suffix = flat_key[len(fp32_prefix):]
@@ -1671,7 +1984,7 @@ def _assign_deferred_optimizer_tensor(root: Dict[str, Any], flat_key: str, tenso
         flat = root.setdefault("fp32_params_flat", {})
         if not isinstance(flat, dict):
             return False
-        flat[suffix] = tensor.detach().clone()
+        flat[suffix] = value
         return True
 
     if not flat_key.startswith("optimizer.optimizer.state."):
@@ -1698,9 +2011,85 @@ def _assign_deferred_optimizer_tensor(root: Dict[str, Any], flat_key: str, tenso
     entry = state.setdefault(state_key, {})
     if not isinstance(entry, dict):
         return False
-    # Optimizer state must not alias reusable FRCheck recovery buffers.
-    entry[leaf] = tensor.detach().clone()
+    entry[leaf] = value
     return True
+
+
+def _frcheck_optimizer_uses_cpu_offload(optimizer) -> bool:
+    """Conservatively detect optimizer instances that may retain CPU state views."""
+    chained_optimizers = getattr(optimizer, "chained_optimizers", None)
+    optimizers = [optimizer]
+    if chained_optimizers is not None:
+        optimizers.extend(chained_optimizers)
+    try:
+        from megatron.training import get_args
+        args = get_args()
+    except Exception:
+        args = None
+    for optim_instance in optimizers:
+        config = getattr(optim_instance, "config", None)
+        enabled = getattr(config, "optimizer_cpu_offload", None)
+        fraction = getattr(config, "optimizer_offload_fraction", None)
+        if enabled is None and args is not None:
+            enabled = getattr(args, "optimizer_cpu_offload", False)
+        if fraction is None and args is not None:
+            fraction = getattr(args, "optimizer_offload_fraction", None)
+        if not enabled:
+            continue
+        if fraction is None:
+            return True
+        try:
+            if float(fraction) > 0.0:
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _fp32_master_groups_match_param_groups(
+    value: Any, optim_state: Dict[str, Any],
+) -> bool:
+    if not isinstance(value, (list, tuple)) or not value:
+        return False
+    torch_optim = optim_state.get("optimizer", optim_state)
+    param_groups = torch_optim.get("param_groups") if isinstance(torch_optim, dict) else None
+    if not isinstance(param_groups, list) or len(value) != len(param_groups):
+        return False
+    for fp32_group, param_group in zip(value, param_groups):
+        params = param_group.get("params") if isinstance(param_group, dict) else None
+        if not isinstance(fp32_group, (list, tuple)) or not isinstance(params, list):
+            return False
+        if len(fp32_group) != len(params) or not all(torch.is_tensor(item) for item in fp32_group):
+            return False
+    return True
+
+
+def _pending_optimizer_has_complete_fp32_master(
+    runtime: _FRCheckLayerwiseRuntime,
+    optim_state: Dict[str, Any],
+) -> bool:
+    """Determine master-weight completeness from pending containers and layer metadata."""
+    for key in ("fp32_from_fp16_params", "fp32_from_fp16"):
+        if _fp32_master_groups_match_param_groups(optim_state.get(key), optim_state):
+            return True
+
+    structure = optim_state.get("_fp32_structure")
+    flat = optim_state.get("fp32_params_flat")
+    if not isinstance(structure, (list, tuple)) or not isinstance(flat, dict):
+        return False
+    expected_flat_keys = {
+        key[len("optimizer.fp32_params_flat."):]
+        for record in runtime._records_by_layer.values()
+        for key in record.optimizer_tensor_keys
+        if key.startswith("optimizer.fp32_params_flat.")
+    }
+    available_flat_keys = set(flat).union(expected_flat_keys)
+    required_flat_keys = {
+        f"_fp32_group{group_idx}_param{param_idx}"
+        for group_idx, group_size in enumerate(structure)
+        for param_idx in range(int(group_size))
+    }
+    return bool(required_flat_keys) and required_flat_keys.issubset(available_flat_keys)
 
 
 def _sync_frcheck_model_params_to_optimizer_main_params(optimizer) -> bool:
@@ -1724,7 +2113,7 @@ def _sync_frcheck_model_params_to_optimizer_main_params(optimizer) -> bool:
 
 def _install_current_fp32_params_for_optimizer_load(optimizer, optim_state: Dict[str, Any]) -> None:
     """Fallback to live fp32 master params when the checkpoint lacks them."""
-    if "fp32_from_fp16_params" in optim_state:
+    if "fp32_from_fp16_params" in optim_state or "fp32_from_fp16" in optim_state:
         return
 
     source_optimizer = optimizer
@@ -1743,6 +2132,7 @@ def _install_current_fp32_params_for_optimizer_load(optimizer, optim_state: Dict
 def _materialize_pending_optimizer_tensors(
     runtime: _FRCheckLayerwiseRuntime,
     optim_state: Dict[str, Any],
+    clone_recovery_tensors: bool,
 ) -> Tuple[int, int, List[str]]:
     expected = 0
     updated = 0
@@ -1766,114 +2156,40 @@ def _materialize_pending_optimizer_tensors(
             if tensor is None:
                 missing_keys.append(key)
                 continue
-            if _assign_deferred_optimizer_tensor(optim_state, key, tensor):
+            if _assign_deferred_optimizer_tensor(
+                optim_state, key, tensor, clone_recovery_tensors,
+            ):
                 updated += 1
             else:
                 missing_keys.append(key)
     return updated, expected, missing_keys
 
 
-def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
-    """Wait for layerwise optimizer tensors and load deferred optimizer state once."""
-    global _pending_optimizer_container, _pending_optimizer_state
-    service = _get_active_frcheck_recovery_service()
-    runtime = service.runtime
-    if runtime is None:
-        loaded = False
-        if _pending_optimizer_state is not None and optimizer is not None:
-            # Survivor state may reference reusable recovery buffers. Preserve the
-            # original ownership guarantee, but move the clone off the first-forward
-            # critical path together with optimizer loading.
-            from megatron.training.checkpointing import _clone_inprocess_optimizer_tensors
+def _frcheck_hw_optimizer_overlap_enabled() -> bool:
+    try:
+        from megatron.training.global_vars import get_args
 
-            t_clone = time.time()
-            optimizer_state = _clone_inprocess_optimizer_tensors(
-                _pending_optimizer_state
-            )
-            clone_s = time.time() - t_clone
-            t_load = time.time()
-            optimizer.load_state_dict(optimizer_state)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            load_s = time.time() - t_load
-            logger.debug(
-                "FRCheck deferred survivor optimizer restore: clone_s=%.4fs "
-                "load_s=%.4fs total_s=%.4fs",
-                clone_s,
-                load_s,
-                clone_s + load_s,
-            )
-            _pending_optimizer_container = None
-            _pending_optimizer_state = None
-            loaded = True
-        if (
-            not _frcheck_recovery_async_parity_enabled()
-            and _pending_recovery_parity_repair is None
-            and _pending_optimizer_state is None
-            and not service.safe_point_teardown_done
-        ):
-            _flush_recovery_async_parity("after_optimizer_state", service.role)
-            _teardown_frcheck_native_after_load()
-            service.safe_point_teardown_done = True
-            service.state = service.TORN_DOWN
-        return loaded
-    t0 = time.time()
-    if not runtime.optimizer_materialized and optimizer is not None:
-        if _sync_frcheck_model_params_to_optimizer_main_params(optimizer):
-            if _frcheck_debug_enabled():
-                logger.debug(
-                    "FRCheck optimizer recovery: synced injected model params to optimizer main params"
-                )
-    if _pending_optimizer_state is None:
+        args = get_args()
+    except Exception:
+        return False
+    return bool(
+        getattr(args, "use_frcheck", False)
+        and getattr(args, "ft_inprocess_recovery_benchmark", False)
+        and not getattr(args, "ft_inprocess_recovery_software_failure", False)
+        and getattr(args, "frcheck_hw_optimizer_overlap", False)
+    )
+
+
+def _finish_deferred_optimizer_state(runtime, service) -> None:
+    global _pending_optimizer_container, _pending_optimizer_state
+    if runtime is not None:
+        for record in runtime._records_by_layer.values():
+            if record.contains_optimizer_state:
+                record.optimizer_tensors = None
+                record.tensors = None
         runtime.optimizer_materialized = True
-        if (
-            not _frcheck_recovery_async_parity_enabled()
-            and _pending_recovery_parity_repair is None
-            and not service.safe_point_teardown_done
-        ):
-            _flush_recovery_async_parity("after_optimizer_state", service.role)
-            _teardown_frcheck_native_after_load()
-            service.safe_point_teardown_done = True
-            service.state = service.TORN_DOWN
-        return False
-    service.wait_optimizer()
-    if optimizer is None:
-        return False
-    t_materialize = time.time()
-    updated, expected, missing_keys = _materialize_pending_optimizer_tensors(
-        runtime, _pending_optimizer_state,
-    )
-    runtime.optimizer_materialize_s += time.time() - t_materialize
-    frcheck_normalize_optimizer_state_param_keys(_pending_optimizer_state)
-    if updated != expected:
-        logger.error(
-            "FRCheck optimizer recovery: materialized %d/%d optimizer tensors; "
-            "missing examples=%s",
-            updated, expected, missing_keys[:8],
-        )
-        raise RuntimeError(
-            "FRCheck optimizer recovery: incomplete deferred optimizer "
-            f"materialization ({updated}/{expected})"
-        )
-    from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
-        unflatten_optimizer_fp32_params,
-    )
-    unflatten_optimizer_fp32_params({"optimizer": _pending_optimizer_state})
-    _install_current_fp32_params_for_optimizer_load(optimizer, _pending_optimizer_state)
-    t_load = time.time()
-    optimizer.load_state_dict(_pending_optimizer_state)
-    runtime.optimizer_load_s += time.time() - t_load
-    for record in runtime._records_by_layer.values():
-        if record.contains_optimizer_state:
-            record.optimizer_tensors = None
-            record.tensors = None
     _pending_optimizer_container = None
     _pending_optimizer_state = None
-    runtime.optimizer_materialized = True
-    if torch.cuda.is_available():
-        t_sync = time.time()
-        torch.cuda.synchronize()
-        runtime.optimizer_sync_s += time.time() - t_sync
     if (
         not _frcheck_recovery_async_parity_enabled()
         and _pending_recovery_parity_repair is None
@@ -1883,17 +2199,219 @@ def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
         _teardown_frcheck_native_after_load()
         service.safe_point_teardown_done = True
         service.state = service.TORN_DOWN
-    if torch.cuda.is_available():
-        t_sync = time.time()
-        torch.cuda.synchronize()
-        runtime.optimizer_sync_s += time.time() - t_sync
-    _log_frcheck_async_runtime_timing_once("after_optimizer_state")
-    if _frcheck_debug_enabled():
-        logger.debug(
-            "FRCheck optimizer recovery: loaded deferred optimizer state in %.4fs "
-            "(updated_tensors=%d)",
-            time.time() - t0, updated,
+
+
+def _prepare_deferred_optimizer_state(optimizer, runtime, service):
+    if runtime is None:
+        optimizer_state = _pending_optimizer_state
+        cpu_offload = _frcheck_optimizer_uses_cpu_offload(optimizer)
+        prepare_s = 0.0
+        if cpu_offload:
+            from megatron.training.checkpointing import _clone_inprocess_optimizer_tensors
+
+            t_prepare = time.time()
+            optimizer_state = _clone_inprocess_optimizer_tensors(optimizer_state)
+            prepare_s = time.time() - t_prepare
+        return optimizer_state, prepare_s, cpu_offload, 0
+
+    service.wait_optimizer()
+    has_checkpoint_fp32_master = _pending_optimizer_has_complete_fp32_master(
+        runtime, _pending_optimizer_state
+    )
+    if not runtime.optimizer_materialized and not has_checkpoint_fp32_master:
+        _sync_frcheck_model_params_to_optimizer_main_params(optimizer)
+    clone_recovery_tensors = _frcheck_optimizer_uses_cpu_offload(optimizer)
+    t_prepare = time.time()
+    updated, expected, missing_keys = _materialize_pending_optimizer_tensors(
+        runtime, _pending_optimizer_state, clone_recovery_tensors
+    )
+    frcheck_normalize_optimizer_state_param_keys(_pending_optimizer_state)
+    if updated != expected:
+        raise RuntimeError(
+            "FRCheck optimizer recovery: incomplete deferred optimizer "
+            f"materialization ({updated}/{expected}); missing examples={missing_keys[:8]}"
         )
+    from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
+        unflatten_optimizer_fp32_params,
+    )
+
+    unflatten_optimizer_fp32_params({"optimizer": _pending_optimizer_state})
+    _install_current_fp32_params_for_optimizer_load(optimizer, _pending_optimizer_state)
+    prepare_s = time.time() - t_prepare
+    runtime.optimizer_cpu_prepare_s += prepare_s
+    return _pending_optimizer_state, prepare_s, clone_recovery_tensors, updated
+
+
+def frcheck_discard_pending_optimizer_state() -> bool:
+    """Discard redundant pending optimizer payload on a healthy in-process rank."""
+    global _pending_optimizer_container, _pending_optimizer_state
+    if _pending_optimizer_state is None and _pending_optimizer_container is None:
+        return False
+    if _get_active_frcheck_recovery_service().runtime is not None:
+        raise RuntimeError(
+            "FRCheck cannot discard pending optimizer state on a failed recovery rank"
+        )
+    _pending_optimizer_container = None
+    _pending_optimizer_state = None
+    return True
+
+
+def frcheck_log_optimizer_overlap_not_started() -> None:
+    """Log one diagnostic when a recovery train step never starts optimizer overlap."""
+    service = _get_active_frcheck_recovery_service()
+    runtime = service.runtime
+    pending = _pending_optimizer_state is not None
+    if runtime is None and not pending and not _optimizer_h2d_prepared:
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    logger.info(
+        "FRCheck optimizer overlap was not started after forward/backward: "
+        "rank=%d pending_optimizer=%s runtime=%s optimizer_h2d_started=%s "
+        "service_state=%s",
+        rank, pending, runtime is not None, _optimizer_h2d_started, service.state,
+    )
+
+
+def frcheck_prepare_optimizer_h2d(optimizer=None) -> bool:
+    """Install failed-rank optimizer structures and retain H2D copies for first forward."""
+    global _optimizer_h2d_copy_pairs, _optimizer_h2d_prepare_s, _optimizer_h2d_prepared
+    if _optimizer_h2d_prepared or _pending_optimizer_state is None or optimizer is None:
+        return False
+    if not _frcheck_hw_optimizer_overlap_enabled():
+        return False
+    service = _get_active_frcheck_recovery_service()
+    runtime = service.runtime
+    if runtime is None:
+        return False
+    optimizer_state, cpu_prepare_s, cpu_offload, updated = _prepare_deferred_optimizer_state(
+        optimizer, runtime, service
+    )
+    from megatron.core.optimizer.optimizer import (
+        prepare_optimizer_state_h2d_into_existing,
+    )
+
+    t_prepare = time.time()
+    copy_pairs = prepare_optimizer_state_h2d_into_existing(optimizer, optimizer_state)
+    _optimizer_h2d_prepare_s = time.time() - t_prepare
+    _optimizer_h2d_copy_pairs = copy_pairs
+    _optimizer_h2d_prepared = True
+    logger.debug(
+        "FRCheck optimizer overlap prepared into existing state: "
+        "optimizer_cpu_prepare_s=%.6fs optimizer_existing_map_s=%.6fs "
+        "optimizer_h2d_tensors=%d "
+        "cpu_offload=%s updated_tensors=%d",
+        cpu_prepare_s, _optimizer_h2d_prepare_s, len(copy_pairs), cpu_offload, updated,
+    )
+    return True
+
+
+def frcheck_start_optimizer_h2d(optimizer=None) -> bool:
+    """Submit prepared failed-rank optimizer H2D copies once after first forward."""
+    global _optimizer_h2d_done_event, _optimizer_h2d_load_submit_s
+    global _optimizer_h2d_start_event, _optimizer_h2d_started
+    global _optimizer_h2d_start_wall_s, _optimizer_h2d_stream
+    global _optimizer_h2d_copy_pairs, _optimizer_h2d_prepare_s, _optimizer_h2d_prepared
+    if _optimizer_h2d_started or not _optimizer_h2d_prepared:
+        return False
+    if not _frcheck_hw_optimizer_overlap_enabled():
+        return False
+    copy_pairs = _optimizer_h2d_copy_pairs or []
+    _optimizer_h2d_start_wall_s = time.time()
+    _optimizer_h2d_started = True
+    t_submit = time.time()
+    if torch.cuda.is_available():
+        _optimizer_h2d_stream = torch.cuda.Stream()
+        _optimizer_h2d_start_event = torch.cuda.Event(enable_timing=True)
+        _optimizer_h2d_done_event = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(_optimizer_h2d_stream):
+            _optimizer_h2d_start_event.record()
+            for dst, src in copy_pairs:
+                dst.copy_(src, non_blocking=True)
+            _optimizer_h2d_done_event.record()
+    else:
+        for dst, src in copy_pairs:
+            dst.copy_(src)
+    _optimizer_h2d_load_submit_s = time.time() - t_submit
+    logger.debug(
+        "FRCheck optimizer overlap started: optimizer_overlap_start_s=%.6f "
+        "optimizer_h2d_submit_s=%.6fs optimizer_h2d_tensors=%d",
+        _optimizer_h2d_start_wall_s, _optimizer_h2d_load_submit_s, len(copy_pairs),
+    )
+    return True
+
+
+def frcheck_wait_optimizer_h2d(optimizer=None) -> bool:
+    """Fence a started optimizer H2D load before optimizer state is consumed."""
+    global _optimizer_h2d_done_event, _optimizer_h2d_load_submit_s
+    global _optimizer_h2d_start_event, _optimizer_h2d_started
+    global _optimizer_h2d_start_wall_s, _optimizer_h2d_stream
+    global _optimizer_h2d_copy_pairs, _optimizer_h2d_prepare_s, _optimizer_h2d_prepared
+    if not _optimizer_h2d_started:
+        return False
+    tail_t0 = time.time()
+    if _optimizer_h2d_done_event is not None:
+        torch.cuda.current_stream().wait_event(_optimizer_h2d_done_event)
+        _optimizer_h2d_done_event.synchronize()
+    tail_wait_s = time.time() - tail_t0
+    h2d_load_s = 0.0
+    if _optimizer_h2d_start_event is not None and _optimizer_h2d_done_event is not None:
+        h2d_load_s = _optimizer_h2d_start_event.elapsed_time(_optimizer_h2d_done_event) / 1000.0
+    wall_span_s = (
+        0.0 if _optimizer_h2d_start_wall_s is None
+        else time.time() - _optimizer_h2d_start_wall_s
+    )
+    overlap_hidden_s = max(0.0, h2d_load_s - tail_wait_s)
+    service = _get_active_frcheck_recovery_service()
+    runtime = service.runtime
+    if runtime is not None:
+        runtime.optimizer_h2d_load_s += h2d_load_s
+        runtime.optimizer_sync_s += tail_wait_s
+    _finish_deferred_optimizer_state(runtime, service)
+    logger.debug(
+        "FRCheck optimizer overlap completed: optimizer_overlap_wall_span_s=%.6fs "
+        "optimizer_h2d_load_s=%.6fs optimizer_h2d_submit_s=%.6fs "
+        "optimizer_tail_wait_s=%.6fs optimizer_overlap_hidden_s=%.6fs",
+        wall_span_s, h2d_load_s, _optimizer_h2d_load_submit_s, tail_wait_s, overlap_hidden_s,
+    )
+    _optimizer_h2d_copy_pairs = None
+    _optimizer_h2d_prepare_s = 0.0
+    _optimizer_h2d_prepared = False
+    _optimizer_h2d_stream = None
+    _optimizer_h2d_start_event = None
+    _optimizer_h2d_done_event = None
+    _optimizer_h2d_start_wall_s = None
+    _optimizer_h2d_load_submit_s = 0.0
+    _optimizer_h2d_started = False
+    return True
+
+
+def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
+    """Wait for a started H2D load or synchronously load deferred optimizer state."""
+    if _optimizer_h2d_prepared and not _optimizer_h2d_started:
+        frcheck_start_optimizer_h2d(optimizer)
+    if frcheck_wait_optimizer_h2d(optimizer):
+        return True
+    if _pending_optimizer_state is None or optimizer is None:
+        return False
+    service = _get_active_frcheck_recovery_service()
+    runtime = service.runtime
+    optimizer_state, prepare_s, cpu_offload, updated = _prepare_deferred_optimizer_state(
+        optimizer, runtime, service
+    )
+    t_load = time.time()
+    optimizer.load_state_dict(optimizer_state)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    load_s = time.time() - t_load
+    if runtime is not None:
+        runtime.optimizer_h2d_load_s += load_s
+    _finish_deferred_optimizer_state(runtime, service)
+    logger.debug(
+        "FRCheck deferred optimizer restore: cpu_offload=%s cpu_prepare_s=%.4fs "
+        "h2d_load_s=%.4fs total_s=%.4fs updated_tensors=%d",
+        cpu_offload, prepare_s, load_s, prepare_s + load_s, updated,
+    )
+    _log_frcheck_async_runtime_timing_once("after_optimizer_state")
     return True
 
 
@@ -1910,23 +2428,45 @@ def _log_frcheck_async_runtime_timing_once(context: str) -> None:
     summary = get_frcheck_layerwise_runtime_summary()
     runtime = (summary or {}).get("runtime", {}) or {}
     layer_inject_s = float(runtime.get("inject_s", 0.0) or 0.0)
+    prefetch_submit_s = float(runtime.get("prefetch_submit_s", 0.0) or 0.0)
     forward_wait_model_s = float(runtime.get("forward_wait_model_s", 0.0) or 0.0)
     optimizer_wait_s = float(runtime.get("optimizer_wait_s", 0.0) or 0.0)
-    optimizer_materialize_s = float(runtime.get("optimizer_materialize_s", 0.0) or 0.0)
-    optimizer_load_s = float(runtime.get("optimizer_load_s", 0.0) or 0.0)
+    optimizer_cpu_prepare_s = float(
+        runtime.get("optimizer_cpu_prepare_s", runtime.get("optimizer_materialize_s", 0.0)) or 0.0
+    )
+    optimizer_h2d_load_s = float(
+        runtime.get("optimizer_h2d_load_s", runtime.get("optimizer_load_s", 0.0)) or 0.0
+    )
     optimizer_sync_s = float(runtime.get("optimizer_sync_s", 0.0) or 0.0)
     optimizer_h2d_s = float(runtime.get("optimizer_h2d_s", 0.0) or 0.0)
-    h2d_s = layer_inject_s + optimizer_h2d_s
+    # h2d_s includes measured copy/load work but excludes non-blocking stream waits.
+    h2d_s = layer_inject_s + prefetch_submit_s + optimizer_h2d_s
     wait_s = float(runtime.get("wait_s", 0.0) or 0.0)
     materialized_layers = float(runtime.get("materialized_layers", 0.0) or 0.0)
     injected_layers = float(runtime.get("injected_layers", 0.0) or 0.0)
     first_wait_s = float(runtime.get("first_wait_s", 0.0) or 0.0)
+    inject_bytes = float(runtime.get("inject_bytes", 0.0) or 0.0)
+    inject_direct_tensors = float(runtime.get("inject_direct_tensors", 0.0) or 0.0)
+    inject_fallback_tensors = float(runtime.get("inject_fallback_tensors", 0.0) or 0.0)
+    inject_pinned_bytes = float(runtime.get("inject_pinned_bytes", 0.0) or 0.0)
+    inject_unpinned_bytes = float(runtime.get("inject_unpinned_bytes", 0.0) or 0.0)
+    inject_non_cpu_bytes = float(runtime.get("inject_non_cpu_bytes", 0.0) or 0.0)
+    inject_contiguous_tensors = float(runtime.get("inject_contiguous_tensors", 0.0) or 0.0)
+    inject_noncontiguous_tensors = float(
+        runtime.get("inject_noncontiguous_tensors", 0.0) or 0.0
+    )
+    prefetch_submitted_layers = float(runtime.get("prefetch_submitted_layers", 0.0) or 0.0)
+    prefetch_submitted_bytes = float(runtime.get("prefetch_submitted_bytes", 0.0) or 0.0)
+    prefetch_submitted_tensors = float(runtime.get("prefetch_submitted_tensors", 0.0) or 0.0)
+    prefetch_fallback_layers = float(runtime.get("prefetch_fallback_layers", 0.0) or 0.0)
+    forward_event_wait_layers = float(runtime.get("forward_event_wait_layers", 0.0) or 0.0)
     local_values = {
         "layer_inject_s": layer_inject_s,
+        "prefetch_submit_s": prefetch_submit_s,
         "forward_wait_model_s": forward_wait_model_s,
         "optimizer_wait_s": optimizer_wait_s,
-        "optimizer_materialize_s": optimizer_materialize_s,
-        "optimizer_load_s": optimizer_load_s,
+        "optimizer_cpu_prepare_s": optimizer_cpu_prepare_s,
+        "optimizer_h2d_load_s": optimizer_h2d_load_s,
         "optimizer_sync_s": optimizer_sync_s,
         "optimizer_h2d_s": optimizer_h2d_s,
         "h2d_s": h2d_s,
@@ -1934,6 +2474,19 @@ def _log_frcheck_async_runtime_timing_once(context: str) -> None:
         "materialized_layers": materialized_layers,
         "injected_layers": injected_layers,
         "first_wait_s": first_wait_s,
+        "inject_bytes": inject_bytes,
+        "inject_direct_tensors": inject_direct_tensors,
+        "inject_fallback_tensors": inject_fallback_tensors,
+        "inject_pinned_bytes": inject_pinned_bytes,
+        "inject_unpinned_bytes": inject_unpinned_bytes,
+        "inject_non_cpu_bytes": inject_non_cpu_bytes,
+        "inject_contiguous_tensors": inject_contiguous_tensors,
+        "inject_noncontiguous_tensors": inject_noncontiguous_tensors,
+        "prefetch_submitted_layers": prefetch_submitted_layers,
+        "prefetch_submitted_bytes": prefetch_submitted_bytes,
+        "prefetch_submitted_tensors": prefetch_submitted_tensors,
+        "prefetch_fallback_layers": prefetch_fallback_layers,
+        "forward_event_wait_layers": forward_event_wait_layers,
     }
     try:
         from megatron.training import get_args
@@ -1950,16 +2503,22 @@ def _log_frcheck_async_runtime_timing_once(context: str) -> None:
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     _frcheck_async_runtime_timing_reported = True
     if rank == 0:
-        logger.info(
+        logger.debug(
             "FRCheck async runtime timing (%s): layer_inject_s=%.6fs "
-            "optimizer_materialize_s=%.6fs optimizer_load_s=%.6fs "
+            "prefetch_submit_s=%.6fs optimizer_cpu_prepare_s=%.6fs optimizer_h2d_load_s=%.6fs "
             "optimizer_sync_s=%.6fs h2d_s=%.6fs forward_wait_model_s=%.6fs "
             "optimizer_wait_s=%.6fs wait_s=%.6fs first_wait_s=%.6fs "
-            "materialized_layers=%d injected_layers=%d",
+            "materialized_layers=%d injected_layers=%d inject_bytes=%d "
+            "direct_tensors=%d fallback_tensors=%d pinned_bytes=%d "
+            "unpinned_bytes=%d non_cpu_bytes=%d contiguous_tensors=%d "
+            "noncontiguous_tensors=%d prefetch_submitted_layers=%d "
+            "prefetch_submitted_bytes=%d prefetch_submitted_tensors=%d "
+            "prefetch_fallback_layers=%d forward_event_wait_layers=%d",
             context,
             values["layer_inject_s"],
-            values["optimizer_materialize_s"],
-            values["optimizer_load_s"],
+            values["prefetch_submit_s"],
+            values["optimizer_cpu_prepare_s"],
+            values["optimizer_h2d_load_s"],
             values["optimizer_sync_s"],
             values["h2d_s"],
             values["forward_wait_model_s"],
@@ -1968,6 +2527,19 @@ def _log_frcheck_async_runtime_timing_once(context: str) -> None:
             values["first_wait_s"],
             int(values["materialized_layers"]),
             int(values["injected_layers"]),
+            int(values["inject_bytes"]),
+            int(values["inject_direct_tensors"]),
+            int(values["inject_fallback_tensors"]),
+            int(values["inject_pinned_bytes"]),
+            int(values["inject_unpinned_bytes"]),
+            int(values["inject_non_cpu_bytes"]),
+            int(values["inject_contiguous_tensors"]),
+            int(values["inject_noncontiguous_tensors"]),
+            int(values["prefetch_submitted_layers"]),
+            int(values["prefetch_submitted_bytes"]),
+            int(values["prefetch_submitted_tensors"]),
+            int(values["prefetch_fallback_layers"]),
+            int(values["forward_event_wait_layers"]),
         )
 
 
@@ -1977,6 +2549,9 @@ def finalize_frcheck_recovery_timing() -> None:
     if _frcheck_first_layer_recovery_start_s is None:
         return
     resolve_frcheck_first_layer_cuda_events()
+    runtime = _get_active_frcheck_recovery_service().runtime
+    if runtime is not None:
+        runtime.resolve_model_h2d_timing()
     _log_frcheck_async_runtime_timing_once("after_forward_backward")
 
 def frcheck_recovery_safe_point(point: str) -> None:
@@ -2460,6 +3035,7 @@ def _prepare_layer_exchange_network(
     n: int,
     pack_stream,
     effective_max_send_sge: int,
+    use_gdr: bool,
 ) -> Dict[str, Any]:
     """Stage one canonical layer mirror and build its RDMA task metadata."""
     result = prepared["result"]
@@ -2484,8 +3060,10 @@ def _prepare_layer_exchange_network(
             f"FRCheck layer exchange: canonical mirror too small for layer {layer_idx}"
         )
 
-    # Keep one canonical D2H copy per source byte, but expose block completion
-    # events so RDMA can start before the entire layer mirror is ready.
+    # Keep one canonical D2H copy per source byte for encode and disk output,
+    # even when RDMA reads the immutable GPU buffer concurrently. Packing was
+    # synchronized before this point, and the buffer is not modified afterward.
+    # Block events let the CPU send path start before the full mirror is ready.
     stage_pack_t0 = time.time()
     d2h_block_events: List[torch.cuda.Event] = []
     with torch.cuda.stream(pack_stream):
@@ -2568,7 +3146,10 @@ def _prepare_layer_exchange_network(
             send_tasks.append({
                 "peer_node": dst_node,
                 "peer_rig": dst_node - 1,
-                "mirror_base": int(layer_mirror_cpu.data_ptr()),
+                "source_base": int(
+                    layer_gpu.data_ptr() if use_gdr else layer_mirror_cpu.data_ptr()
+                ),
+                "send_from_gpu": bool(use_gdr),
                 "block_indices": [int(blk_idx) for _sid, blk_idx in task_blocks],
                 "block_size": block_size,
                 "size": take * block_size,
@@ -2597,6 +3178,9 @@ def _prepare_layer_exchange_network(
         "d2h_start_event": d2h_start_event,
         "d2h_end_event": d2h_end_event,
         "d2h_block_events": d2h_block_events,
+        # Keep the registered source tensor alive until all network tasks finish.
+        "send_source_tensor": layer_gpu if use_gdr else layer_mirror_cpu,
+        "gdr_enabled": bool(use_gdr),
         "stage_pack_s": stage_pack_s,
         "stage_pack_bytes": payload_bytes,
         "stage_pack_blocks": int(result.n_filled_blocks),
@@ -2870,7 +3454,7 @@ def _write_frcheck_aggregate_p2_files(
         size = int(segment["size"])
         block_size = int(segment["block_size"])
         header = struct.pack("<4sIIQQ", b"FRBK", int(segment["sid"]), 2, size, block_size)
-        data = segment["buffer"][int(segment["offset"]):int(segment["offset"]) + size]
+        data = segment["buffer"][:size]
         with open(path, "wb") as file:
             file.write(header)
             if size > 0:
@@ -2889,44 +3473,50 @@ def _wait_aggregate_p2_context(context: Dict[str, Any]) -> float:
     if context.get("native_completed", False):
         return float(context["timings"].get("wait_s", 0.0))
 
-    native = context["manager"].get_native()
+    native = context["native"]
     if native is None:
         raise RuntimeError("FRCheck aggregate P2 native module is unavailable")
     wait_start = time.time()
-    native.wait_aggregate_p2(300)
-    wait_s = time.time() - wait_start
-    context["timings"]["wait_s"] = wait_s
-    context["native_completed"] = True
+    try:
+        native.wait_aggregate_p2(300)
+    finally:
+        wait_s = time.time() - wait_start
+        context["timings"]["wait_s"] = wait_s
+        context["native_completed"] = True
     return wait_s
 
 
 def _release_aggregate_p2_context(context: Dict[str, Any]) -> None:
-    """Release save-scoped aggregate P2 buffers after native completion."""
-    manager = context["manager"]
-    if not context.get("buffers_released", False):
-        manager.release_registered_save_buffers(context["buffers"])
-        context["buffers_released"] = True
+    """Drop direct P2 tensor ownership after native and disk users complete."""
+    if context.get("buffers_released", False):
+        return
+    if not context.get("native_completed", False):
+        raise RuntimeError("FRCheck aggregate P2 buffers released before native completion")
+    if context["write_to_disk"] and not context.get("disk_users_done", False):
+        raise RuntimeError("FRCheck aggregate P2 buffers released before disk users completed")
+    for segment in context["recv_segments"]:
+        segment["buffer"] = None
+    context["recv_segments"].clear()
+    context["tensor_refs"].clear()
+    context["buffers_released"] = True
 
 
 def _finish_aggregate_p2_context(context: Dict[str, Any], debug: bool = False) -> None:
     """Wait for aggregate P2 and release temporary context ownership once."""
     if context.get("finished", False):
         return
-    try:
-        _wait_aggregate_p2_context(context)
-    except BaseException:
-        _release_aggregate_p2_context(context)
-        raise
-    else:
-        _release_aggregate_p2_context(context)
-        context["finished"] = True
+    _wait_aggregate_p2_context(context)
+    _release_aggregate_p2_context(context)
+    context["finished"] = True
     if debug:
         timings = context["timings"]
         logger.info(
             "FRCHECK aggregate P2 background rank %d: generation=%d "
+            "mode=direct-multi-sge recv_segments=%d recv_bytes=%d "
             "prepare_s=%.3f submit_s=%.3f wait_s=%.3f",
-            context["rank"], context["generation"], timings["prepare_s"],
-            timings["submit_s"], timings["wait_s"],
+            context["rank"], context["generation"], context["direct_recv_segments"],
+            context["direct_recv_bytes"],
+            timings["prepare_s"], timings["submit_s"], timings["wait_s"],
         )
 
 
@@ -2941,12 +3531,10 @@ def _async_run_aggregate_p2(descriptor: Dict[str, Any], debug: bool = False) -> 
         else:
             _finish_aggregate_p2_context(context, debug=debug)
     except BaseException as exc:
-        descriptor["completed_context"] = None
-        try:
-            if context is not None:
-                _release_aggregate_p2_context(context)
-        except BaseException:
-            logger.exception("FRCheck failed to clean up aggregate P2 writer state")
+        descriptor["completed_context"] = context
+        if context is not None:
+            context["disk_users_done"] = True
+            _release_aggregate_p2_context(context)
         _async_writer_error = exc
         logger.exception("FRCheck async aggregate P2 writer failed")
 
@@ -3041,90 +3629,42 @@ def _build_aggregate_p2_descriptor(
     rank: int,
     write_to_disk: bool,
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Build lightweight P2 routes while retaining strong source-buffer references."""
+    """Build direct P2 Multi-SGE tasks and retain every referenced tensor."""
     global _p2_save_generation
+    prepare_start = time.time()
     _p2_save_generation += 1
     generation = _p2_save_generation
-    send_groups: Dict[Tuple[int, int], List[Tuple[_LayerEncodeResult, int, torch.Tensor]]] = {}
-    recv_groups: Dict[Tuple[int, int], List[Tuple[_LayerEncodeResult, int]]] = {}
+    send_groups: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+    recv_groups: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+    recv_segments: List[Dict[str, Any]] = []
+    tensor_refs: List[torch.Tensor] = []
     ordered_results = sorted(encode_results, key=lambda result: (result.layer_idx, result.layer_name))
     for result in ordered_results:
         layer_bufs = manager.get_layer_stripe_bufs(result.layer_idx)
         for sid in range(native.num_stripes()):
             route = native.get_p2_route(sid)
             role, peer, lane = int(route[0]), int(route[1]), int(route[2])
+            if role not in (int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)):
+                continue
+            buffer = layer_bufs.parity2_bufs[sid]
+            if buffer is None:
+                raise RuntimeError(
+                    f"FRCheck aggregate P2 missing parity2 buffer for stripe {sid}"
+                )
+            block_size = int(result.block_size)
+            if int(buffer.numel()) < block_size:
+                raise RuntimeError(
+                    f"FRCheck aggregate P2 parity2 buffer is too small for stripe {sid}: "
+                    f"size={buffer.numel()} required={block_size}"
+                )
+            tensor_refs.append(buffer)
+            segment = (int(buffer.data_ptr()), block_size)
             if role == int(StripeRole.ENCODER):
-                source = layer_bufs.parity2_bufs[sid]
-                if source is None:
-                    raise RuntimeError(f"FRCheck aggregate P2 missing encoder buffer for stripe {sid}")
-                send_groups.setdefault((peer, lane), []).append((result, sid, source))
-            elif role == int(StripeRole.PARITY_TARGET):
-                recv_groups.setdefault((peer, lane), []).append((result, sid))
-
-    summary = {
-        "send_tasks": len(send_groups),
-        "recv_tasks": len(recv_groups),
-        "send_bytes": sum(
-            int(result.block_size)
-            for segments in send_groups.values()
-            for result, _sid, _source in segments
-        ),
-        "recv_bytes": sum(
-            int(result.block_size)
-            for segments in recv_groups.values()
-            for result, _sid in segments
-        ),
-    }
-    descriptor = {
-        "manager": manager,
-        "native": native,
-        "output_dir": output_dir,
-        "rank": rank,
-        "generation": generation,
-        "send_groups": send_groups,
-        "recv_groups": recv_groups,
-        "write_to_disk": write_to_disk,
-        "completed_context": None,
-    }
-    return descriptor, summary
-
-
-def _prepare_and_submit_aggregate_p2(
-    descriptor: Dict[str, Any],
-) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Allocate, pack, and submit save-scoped aggregate P2 transfer buffers."""
-    manager = descriptor["manager"]
-    native = descriptor["native"]
-    buffers: List[torch.Tensor] = []
-    send_tasks: List[Tuple[int, int, int, int]] = []
-    recv_tasks: List[Tuple[int, int, int, int]] = []
-    recv_segments: List[Dict[str, Any]] = []
-    prepare_start = time.time()
-    try:
-        for (peer, lane), segments in sorted(descriptor["send_groups"].items()):
-            size = sum(int(result.block_size) for result, _sid, _source in segments)
-            buffer = manager.get_aggregate_p2_buffer(
-                "send", peer, lane, size,
-            )
-            buffers.append(buffer)
-            offset = 0
-            for result, _sid, source in segments:
-                block_size = int(result.block_size)
-                buffer[offset:offset + block_size].copy_(source[:block_size])
-                offset += block_size
-            send_tasks.append((peer, lane, int(buffer.data_ptr()), size))
-        for (peer, lane), segments in sorted(descriptor["recv_groups"].items()):
-            size = sum(int(result.block_size) for result, _sid in segments)
-            buffer = manager.get_aggregate_p2_buffer(
-                "recv", peer, lane, size,
-            )
-            buffers.append(buffer)
-            offset = 0
-            for result, sid in segments:
-                block_size = int(result.block_size)
+                send_groups.setdefault((peer, lane), []).append(segment)
+            else:
+                recv_groups.setdefault((peer, lane), []).append(segment)
                 recv_segments.append({
                     "buffer": buffer,
-                    "offset": offset,
                     "size": block_size,
                     "block_size": block_size,
                     "layer_name": result.layer_name,
@@ -3133,36 +3673,83 @@ def _prepare_and_submit_aggregate_p2(
                     "peer": peer,
                     "lane": lane,
                 })
-                offset += block_size
-            recv_tasks.append((peer, lane, int(buffer.data_ptr()), size))
-        prepare_s = time.time() - prepare_start
-        submit_start = time.time()
+
+    send_tasks = [
+        (peer, lane, segments)
+        for (peer, lane), segments in sorted(send_groups.items())
+    ]
+    recv_tasks = [
+        (peer, lane, segments)
+        for (peer, lane), segments in sorted(recv_groups.items())
+    ]
+    summary = {
+        "send_tasks": len(send_tasks),
+        "recv_tasks": len(recv_tasks),
+        "send_segments": sum(len(task[2]) for task in send_tasks),
+        "recv_segments": sum(len(task[2]) for task in recv_tasks),
+        "send_bytes": sum(size for _peer, _lane, segments in send_tasks for _addr, size in segments),
+        "recv_bytes": sum(size for _peer, _lane, segments in recv_tasks for _addr, size in segments),
+    }
+    descriptor = {
+        "manager": manager,
+        "native": native,
+        "output_dir": output_dir,
+        "rank": rank,
+        "generation": generation,
+        "send_tasks": send_tasks,
+        "recv_tasks": recv_tasks,
+        "recv_segments": recv_segments,
+        "tensor_refs": tensor_refs,
+        "summary": summary,
+        "prepare_s": time.time() - prepare_start,
+        "write_to_disk": write_to_disk,
+        "completed_context": None,
+    }
+    return descriptor, dict(summary)
+
+
+def _prepare_and_submit_aggregate_p2(
+    descriptor: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Submit direct P2 descriptors without allocating, registering, or copying."""
+    native = descriptor["native"]
+    send_tasks = descriptor["send_tasks"]
+    recv_tasks = descriptor["recv_tasks"]
+    tensor_refs = descriptor["tensor_refs"]
+    recv_segments = descriptor["recv_segments"]
+    prepare_s = float(descriptor["prepare_s"])
+    submit_start = time.time()
+    try:
         counts = native.submit_aggregate_p2(
             send_tasks, recv_tasks, descriptor["generation"],
         )
-        submit_s = time.time() - submit_start
     except BaseException:
-        manager.release_registered_save_buffers(buffers)
+        descriptor["tensor_refs"] = []
+        descriptor["recv_segments"] = []
         raise
+    submit_s = time.time() - submit_start
 
     context = {
-        "manager": manager,
+        "manager": descriptor["manager"],
+        "native": descriptor["native"],
         "output_dir": descriptor["output_dir"],
         "rank": descriptor["rank"],
         "generation": descriptor["generation"],
-        "buffers": buffers,
+        "tensor_refs": tensor_refs,
         "recv_segments": recv_segments,
         "write_to_disk": descriptor["write_to_disk"],
         "native_completed": False,
+        "disk_users_done": not descriptor["write_to_disk"],
         "buffers_released": False,
+        "direct_recv_segments": int(descriptor["summary"]["recv_segments"]),
+        "direct_recv_bytes": int(descriptor["summary"]["recv_bytes"]),
         "timings": {"prepare_s": prepare_s, "submit_s": submit_s},
     }
-    summary = {
-        "send_tasks": int(counts[0]),
-        "recv_tasks": int(counts[1]),
-        "send_bytes": sum(task[3] for task in send_tasks),
-        "recv_bytes": sum(task[3] for task in recv_tasks),
-    }
+    descriptor["tensor_refs"] = []
+    descriptor["recv_segments"] = []
+    summary = dict(descriptor["summary"])
+    summary["send_tasks"] = int(counts[0])
+    summary["recv_tasks"] = int(counts[1])
     return context, summary
 
 
@@ -3179,6 +3766,7 @@ def save_frcheck_legacy_checkpoint(
     args = get_args()
     _dbg = getattr(args, "frcheck_debug", False)
     _use_async_parity = getattr(args, 'frcheck_async_parity', False)
+    frcheck_gdr = bool(getattr(args, "frcheck_gdr", False))
 
     # Drain the previous generation before touching native timing/mirror state or
     # decomposing tensors that may lead into layer-buffer reuse.
@@ -3271,8 +3859,8 @@ def save_frcheck_legacy_checkpoint(
         n_encoder_my = sum(1 for p in stripe_plans if p.role == StripeRole.ENCODER)
         n_parity_my = sum(1 for p in stripe_plans if p.role == StripeRole.PARITY_TARGET)
         logger.info(
-            "[FRCHECK-DEBUG] rank=%d n=%d stripes=%d roles(src=%d enc=%d par=%d) gdr=True",
-            rank, n, num_stripes, n_source_my, n_encoder_my, n_parity_my,
+            "[FRCHECK-DEBUG] rank=%d n=%d stripes=%d roles(src=%d enc=%d par=%d) gdr=%s",
+            rank, n, num_stripes, n_source_my, n_encoder_my, n_parity_my, frcheck_gdr,
         )
         total_cap = 0
         total_data = 0
@@ -3345,6 +3933,11 @@ def save_frcheck_legacy_checkpoint(
         and hasattr(native, "encode_layer_stripes")
         and hasattr(native, "encode_layer_stripes_batch")
     )
+    if frcheck_gdr and not use_layer_exchange_encode:
+        raise RuntimeError(
+            "FRCheck --frcheck-gdr requires enabled layer-exchange encode support "
+            "(--frcheck-layer-exchange-encode and required native APIs)"
+        )
     use_cross_layer_encode = (
         has_encode_batch and hasattr(native, "reset_encode_layer")
         and not use_layer_exchange_encode
@@ -3529,7 +4122,8 @@ def save_frcheck_legacy_checkpoint(
         for prepared in prepared_layers:
             layer_exchange_contexts.append(
                 _prepare_layer_exchange_network(
-                    manager, native, prepared, n, pack_stream, effective_max_send_sge
+                    manager, native, prepared, n, pack_stream,
+                    effective_max_send_sge, frcheck_gdr,
                 )
             )
         # No global stage sync: each layer's first send worker waits on only its
@@ -3603,9 +4197,10 @@ def save_frcheck_legacy_checkpoint(
                     return
                 ctx, task = item
                 try:
-                    _wait_layer_blocks_ready(ctx, task["block_indices"])
+                    if not task["send_from_gpu"]:
+                        _wait_layer_blocks_ready(ctx, task["block_indices"])
                     native.send_layer_blocks_to_peer(
-                        int(task["peer_rig"]), int(task["mirror_base"]),
+                        int(task["peer_rig"]), int(task["source_base"]),
                         task["block_indices"], int(task["block_size"]),
                         int(task["batch_id"]), int(task["lane_id"]),
                     )
@@ -3624,6 +4219,9 @@ def save_frcheck_legacy_checkpoint(
                         int(task["peer_rig"]), int(task["addr"]), int(task["size"]),
                         int(task["batch_id"]), int(task["lane_id"]),
                     )
+            if world_size > 1:
+                # Ensure every rank has prepared receives before sends can start.
+                torch.distributed.barrier()
 
         def _recv_worker(peer_key: Tuple[int, int], q: queue.Queue) -> None:
             while True:
@@ -3674,6 +4272,15 @@ def save_frcheck_legacy_checkpoint(
         global_batch_size = max(
             1, int(os.environ.get("FRCHECK_LAYER_ENCODE_BATCH", "1"))
         )
+        coalesce_us = max(
+            0, int(os.environ.get("FRCHECK_LAYER_ENCODE_COALESCE_US", "0"))
+        )
+        coalesce_window_s = coalesce_us / 1_000_000.0
+        coordinator_stats = {
+            "coalesce_wait_s": 0.0,
+            "dispatches": 0,
+            "jobs": 0,
+        }
 
         def _encoding_complete(ctx: Dict[str, Any]) -> bool:
             return len(ctx["encoded_sids"]) >= len(ctx.get("encode_specs", {}))
@@ -3691,13 +4298,16 @@ def save_frcheck_legacy_checkpoint(
                 ctx["layer_elapsed"] = now - float(ctx["start_time"])
                 ctx["encode_wall_s"] = float(ctx.get("stream_encode_active_s", 0.0))
 
-        def _collect_fair_batch(start_idx: int) -> Tuple[List[Tuple[Dict[str, Any], int]], int]:
+        def _collect_fair_batch(
+            start_idx: int, max_jobs: Optional[int] = None
+        ) -> Tuple[List[Tuple[Dict[str, Any], int]], int]:
             batch: List[Tuple[Dict[str, Any], int]] = []
             count = len(layer_exchange_contexts)
-            if count == 0:
+            limit = global_batch_size if max_jobs is None else max(0, int(max_jobs))
+            if count == 0 or limit == 0:
                 return batch, start_idx
             cursor = start_idx % count
-            while len(batch) < global_batch_size:
+            while len(batch) < limit:
                 added = False
                 for step in range(count):
                     idx = (cursor + step) % count
@@ -3714,7 +4324,7 @@ def save_frcheck_legacy_checkpoint(
                     batch.append((ctx, sid))
                     cursor = (idx + 1) % count
                     added = True
-                    if len(batch) >= global_batch_size:
+                    if len(batch) >= limit:
                         break
                 if not added:
                     break
@@ -3758,9 +4368,40 @@ def save_frcheck_legacy_checkpoint(
                         coordinator_wakeup.get()
                         continue
 
+                    if (
+                        len(batch) < global_batch_size
+                        and coalesce_window_s > 0.0
+                        and any(not ctx["done_event"].is_set() for ctx in layer_exchange_contexts)
+                    ):
+                        deadline = time.monotonic() + coalesce_window_s
+                        while (
+                            len(batch) < global_batch_size
+                            and any(
+                                not ctx["done_event"].is_set()
+                                for ctx in layer_exchange_contexts
+                            )
+                        ):
+                            remaining_s = deadline - time.monotonic()
+                            if remaining_s <= 0.0:
+                                break
+                            wait_t0 = time.monotonic()
+                            try:
+                                coordinator_wakeup.get(timeout=remaining_s)
+                            except queue.Empty:
+                                pass
+                            coordinator_stats["coalesce_wait_s"] += (
+                                time.monotonic() - wait_t0
+                            )
+                            more_jobs, cursor = _collect_fair_batch(
+                                cursor, global_batch_size - len(batch)
+                            )
+                            batch.extend(more_jobs)
+
                     batch_t0 = time.time()
                     _encode_layer_exchange_batch(native, batch)
                     batch_elapsed = time.time() - batch_t0
+                    coordinator_stats["dispatches"] += 1
+                    coordinator_stats["jobs"] += len(batch)
                     jobs_per_ctx: Dict[int, int] = {}
                     for ctx, _sid in batch:
                         key = id(ctx)
@@ -3823,6 +4464,15 @@ def save_frcheck_legacy_checkpoint(
         layer_exchange_recv_bytes = sum(
             int(task["size"]) for ctx in layer_exchange_contexts for task in ctx["recv_tasks"]
         )
+        gdr_send_tasks = sum(
+            1 for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+            if task["send_from_gpu"]
+        )
+        gdr_send_bytes = sum(
+            int(task["size"])
+            for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+            if task["send_from_gpu"]
+        )
         lx_stage_pack_s = sum(float(ctx.get("stage_pack_s", 0.0)) for ctx in layer_exchange_contexts)
         lx_stage_pack_bytes = sum(int(ctx.get("stage_pack_bytes", 0)) for ctx in layer_exchange_contexts)
         lx_stage_pack_blocks = sum(int(ctx.get("stage_pack_blocks", 0)) for ctx in layer_exchange_contexts)
@@ -3859,6 +4509,14 @@ def save_frcheck_legacy_checkpoint(
         )
         lx_ready_encode_batches = sum(
             int(ctx.get("ready_encode_batches", 0)) for ctx in layer_exchange_contexts
+        )
+        lx_encode_coalesce_wait_s = float(coordinator_stats["coalesce_wait_s"])
+        lx_encode_batch_dispatches = int(coordinator_stats["dispatches"])
+        lx_encode_batch_jobs = int(coordinator_stats["jobs"])
+        lx_encode_batch_avg_occupancy = (
+            float(lx_encode_batch_jobs)
+            / float(lx_encode_batch_dispatches * global_batch_size)
+            if lx_encode_batch_dispatches else 0.0
         )
         lx_ready_first_s = min(
             (float(ctx.get("ready_first_s", 0.0)) for ctx in layer_exchange_contexts
@@ -3993,6 +4651,8 @@ def save_frcheck_legacy_checkpoint(
     layer_exchange_recv_tasks = locals().get("layer_exchange_recv_tasks", 0)
     layer_exchange_send_bytes = locals().get("layer_exchange_send_bytes", 0)
     layer_exchange_recv_bytes = locals().get("layer_exchange_recv_bytes", 0)
+    gdr_send_tasks = locals().get("gdr_send_tasks", 0)
+    gdr_send_bytes = locals().get("gdr_send_bytes", 0)
     lx_stage_sync_s = locals().get("lx_stage_sync_s", 0.0)
     lx_stage_pack_s = locals().get("lx_stage_pack_s", 0.0)
     lx_stage_pack_bytes = locals().get("lx_stage_pack_bytes", 0)
@@ -4017,6 +4677,10 @@ def save_frcheck_legacy_checkpoint(
     lx_exchange_join_s = locals().get("lx_exchange_join_s", 0.0)
     lx_encode_join_s = locals().get("lx_encode_join_s", 0.0)
     lx_ready_encode_batches = locals().get("lx_ready_encode_batches", 0)
+    lx_encode_coalesce_wait_s = locals().get("lx_encode_coalesce_wait_s", 0.0)
+    lx_encode_batch_dispatches = locals().get("lx_encode_batch_dispatches", 0)
+    lx_encode_batch_jobs = locals().get("lx_encode_batch_jobs", 0)
+    lx_encode_batch_avg_occupancy = locals().get("lx_encode_batch_avg_occupancy", 0.0)
     lx_ready_first_s = locals().get("lx_ready_first_s", 0.0)
     lx_ready_last_s = locals().get("lx_ready_last_s", 0.0)
     lx_layer_elapsed_max = locals().get("lx_layer_elapsed_max", 0.0)
@@ -4051,6 +4715,7 @@ def save_frcheck_legacy_checkpoint(
         try:
             p2_wait_s = _wait_aggregate_p2_context(p2_context)
         except BaseException:
+            p2_context["disk_users_done"] = True
             _release_aggregate_p2_context(p2_context)
             raise
         if not write_to_disk:
@@ -4082,10 +4747,12 @@ def save_frcheck_legacy_checkpoint(
     e2e_s = time.time() - e2e_t0
     if rank == 0:
         logger.info(
-            "FRCHECK aggregate P2: generation=%d send_tasks=%d recv_tasks=%d "
+            "FRCHECK aggregate P2: mode=direct-multi-sge generation=%d "
+            "send_tasks=%d recv_tasks=%d send_segments=%d recv_segments=%d "
             "send_bytes=%d recv_bytes=%d async=%s p2_dispatch_s=%.6f",
             p2_descriptor["generation"], p2_summary["send_tasks"],
-            p2_summary["recv_tasks"], p2_summary["send_bytes"],
+            p2_summary["recv_tasks"], p2_summary["send_segments"],
+            p2_summary["recv_segments"], p2_summary["send_bytes"],
             p2_summary["recv_bytes"], _use_async_parity, p2_dispatch_s,
         )
 
@@ -4101,10 +4768,18 @@ def save_frcheck_legacy_checkpoint(
         "aggregate_p2_prepare_s": p2_prepare_s,
         "aggregate_p2_submit_s": p2_submit_s,
         "aggregate_p2_wait_s": p2_wait_s,
+        "aggregate_p2_direct": 1.0,
+        "aggregate_p2_send_segments": p2_summary["send_segments"],
+        "aggregate_p2_recv_segments": p2_summary["recv_segments"],
+        "aggregate_p2_send_bytes": p2_summary["send_bytes"],
+        "aggregate_p2_recv_bytes": p2_summary["recv_bytes"],
         "layer_exchange_send_tasks": layer_exchange_send_tasks,
         "layer_exchange_recv_tasks": layer_exchange_recv_tasks,
         "layer_exchange_send_bytes": layer_exchange_send_bytes,
         "layer_exchange_recv_bytes": layer_exchange_recv_bytes,
+        "gdr_enabled": float(frcheck_gdr),
+        "gdr_send_tasks": gdr_send_tasks,
+        "gdr_send_bytes": gdr_send_bytes,
         "lx_stage_sync_s": lx_stage_sync_s,
         "lx_stage_pack_s": lx_stage_pack_s,
         "lx_stage_pack_bytes": lx_stage_pack_bytes,
@@ -4129,6 +4804,10 @@ def save_frcheck_legacy_checkpoint(
         "lx_exchange_join_s": lx_exchange_join_s,
         "lx_encode_join_s": lx_encode_join_s,
         "lx_ready_encode_batches": lx_ready_encode_batches,
+        "lx_encode_coalesce_wait_s": lx_encode_coalesce_wait_s,
+        "lx_encode_batch_dispatches": lx_encode_batch_dispatches,
+        "lx_encode_batch_jobs": lx_encode_batch_jobs,
+        "lx_encode_batch_avg_occupancy": lx_encode_batch_avg_occupancy,
         "lx_ready_first_s": lx_ready_first_s,
         "lx_ready_last_s": lx_ready_last_s,
         "lx_layer_elapsed_max": lx_layer_elapsed_max,
@@ -4166,6 +4845,12 @@ def save_frcheck_legacy_checkpoint(
     summary = _timing_max_dict(summary_fields)
     if rank == 0:
         summary["mode"] = "async" if _use_async_parity else "sync"
+        logger.info(
+            "FRCHECK save layer-exchange transport (%(mode)s): "
+            "gdr_enabled=%(gdr_enabled).0f gdr_send_tasks=%(gdr_send_tasks).0f "
+            "gdr_send_bytes=%(gdr_send_bytes).0f",
+            summary,
+        )
         if has_native_timing:
             logger.info(
                 "FRCHECK save timing (%(mode)s): e2e_s=%(e2e_s).2fs "
@@ -4182,11 +4867,17 @@ def save_frcheck_legacy_checkpoint(
                 "p2_dispatch_s=%(aggregate_p2_dispatch_s).6fs "
                 "p2_prepare_s=%(aggregate_p2_prepare_s).3fs "
                 "p2_submit_s=%(aggregate_p2_submit_s).3fs "
-                "p2_wait_s=%(aggregate_p2_wait_s).3fs "
+                "p2_wait_s=%(aggregate_p2_wait_s).3fs p2_direct=%(aggregate_p2_direct).0f "
+                "p2_send_segments=%(aggregate_p2_send_segments).0f "
+                "p2_recv_segments=%(aggregate_p2_recv_segments).0f "
+                "p2_send_bytes=%(aggregate_p2_send_bytes).0f "
+                "p2_recv_bytes=%(aggregate_p2_recv_bytes).0f "
                 "layer_exchange_send_tasks=%(layer_exchange_send_tasks).0f "
                 "layer_exchange_recv_tasks=%(layer_exchange_recv_tasks).0f "
                 "layer_exchange_send_bytes=%(layer_exchange_send_bytes).0f "
                 "layer_exchange_recv_bytes=%(layer_exchange_recv_bytes).0f "
+                "gdr_enabled=%(gdr_enabled).0f gdr_send_tasks=%(gdr_send_tasks).0f "
+                "gdr_send_bytes=%(gdr_send_bytes).0f "
                 "lx_stage_pack_bytes=%(lx_stage_pack_bytes).0f "
                 "lx_cpu_gather_s=%(lx_cpu_gather_s).4fs "
                 "lx_cpu_gather_bytes=%(lx_cpu_gather_bytes).0f "
@@ -4194,6 +4885,10 @@ def save_frcheck_legacy_checkpoint(
                 "direct_sge_bytes=%(lx_direct_sge_bytes).0f "
                 "mirror_ready_wait_sum_s=%(lx_mirror_ready_wait_sum_s).4fs "
                 "mirror_ready_wait_max_s=%(lx_mirror_ready_wait_max_s).4fs "
+                "coalesce_wait_s=%(lx_encode_coalesce_wait_s).6fs "
+                "encode_batch_dispatches=%(lx_encode_batch_dispatches).0f "
+                "encode_batch_jobs=%(lx_encode_batch_jobs).0f "
+                "encode_batch_avg_occupancy=%(lx_encode_batch_avg_occupancy).3f "
                 "mirror_tasks=%(mirror_tasks_completed).0f/%(mirror_tasks_submitted).0f "
                 "mirror_bytes=%(mirror_bytes_completed).0f/%(mirror_bytes_submitted).0f "
                 "mirror_failed_tasks=%(mirror_tasks_failed).0f mirror_failed_bytes=%(mirror_bytes_failed).0f",
@@ -4268,6 +4963,7 @@ def save_frcheck_legacy_checkpoint(
                 for future in shard_futures:
                     future.result()
         finally:
+            p2_context["disk_users_done"] = True
             _release_aggregate_p2_context(p2_context)
     elif not _use_async_parity:
         _finish_aggregate_p2_context(p2_context, debug=_dbg)
@@ -4313,7 +5009,7 @@ def save_frcheck_legacy_checkpoint(
                     "num_stripes": num_stripes,
                     "block_size": result.block_size,
                     "rank_in_group": rg,
-                    "gdr": True,
+                    "gdr": frcheck_gdr,
                     "tensor_infos": result.tensor_infos,
                     "actual_tensor_size": result.total_bytes,
                 },
@@ -4376,7 +5072,7 @@ def save_frcheck_legacy_checkpoint(
         "group_id": manager.group_id, "rank_in_group": rg,
         "poa_path": manager.get_resolved_table_path() or native.path(),
         "n": n, "num_stripes": num_stripes, "num_layers": num_layers,
-        "block_size": block_size, "gdr": True,
+        "block_size": block_size, "gdr": frcheck_gdr,
         "actual_tensor_size": total_tensor_size,
         "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
         "state_dict_keys": list(state_dict.keys()),
@@ -4398,8 +5094,8 @@ def save_frcheck_legacy_checkpoint(
 
     if _dbg:
         logger.info(
-            "FRCheck save: done rank=%d node=%d gdr=True layers=%d file=%s (metadata-only, write_to_disk=%s)",
-            rank, my_node, num_layers, main_file, write_to_disk,
+            "FRCheck save: done rank=%d node=%d gdr=%s layers=%d file=%s (metadata-only, write_to_disk=%s)",
+            rank, my_node, frcheck_gdr, num_layers, main_file, write_to_disk,
         )
 
     del _global_offsets
@@ -5010,6 +5706,8 @@ def _materialize_recovered_layer(
 ) -> Tuple[Optional[_FRCheckLayerReadyRecord], Dict[str, float]]:
     layer_timing: Dict[str, float] = {}
     record = None
+    # Materialization only performs optional CPU mapping, optional cloning, view
+    # construction, and runtime publication. Device transfer is deferred to runtime.
     if is_failed and layer_buf is not None:
         t_materialize = time.time()
         copied = 0
@@ -5068,19 +5766,10 @@ def _materialize_recovered_layer(
         if runtime is not None and job.layer_idx >= 0:
             t_mark = time.time()
             pending_record = runtime._records_by_layer.get(job.layer_idx)
-            opt_map = getattr(manager, "_frcheck_optimizer_layer_map", None)
-            split_model_keys = (
-                pending_record.model_tensor_keys if pending_record is not None else []
-            )
-            split_optimizer_keys = (
-                pending_record.optimizer_tensor_keys if pending_record is not None else []
-            )
-            model_tensors, optimizer_tensors = _split_recovered_tensors(
-                layer_tensors,
-                split_model_keys,
-                split_optimizer_keys,
-                opt_map,
-            )
+            # The record already split the recovered views with the pending runtime
+            # keys above; publish those same dictionaries without another traversal.
+            model_tensors = record.model_tensors
+            optimizer_tensors = record.optimizer_tensors
             runtime.mark_model_ready(
                 job.layer_idx,
                 materialize_s=materialize_s,
@@ -6305,7 +6994,10 @@ def _run_recovery_pipeline(
                     layer_timing[start_key] = start_us if old_start == 0.0 else min(old_start, start_us)
                 if end_us > 0.0:
                     layer_timing[end_key] = max(float(layer_timing.get(end_key, 0.0) or 0.0), end_us)
-            layer_timing['failed_copy_s'] = layer_timing.get('failed_copy_s', 0.0) + float(batch_timing.get('copy_s', 0.0) or 0.0)
+            layer_timing['failed_cpu_copy_s'] = (
+                layer_timing.get('failed_cpu_copy_s', 0.0)
+                + float(batch_timing.get('failed_copy_s', 0.0) or 0.0)
+            )
             layer_timing['decoder_decode_sum_s'] = (
                 layer_timing.get('decoder_decode_sum_s', 0.0)
                 + float(batch_timing.get('decoder_decode_sum_s', 0.0) or 0.0)
@@ -6319,6 +7011,7 @@ def _run_recovery_pipeline(
                 wait_s=wait_s,
                 net_s=batch_timing.get('net_s', 0.0),
                 decode_s=batch_timing.get('decode_s', 0.0),
+                failed_cpu_copy_s=batch_timing.get('failed_copy_s', 0.0),
             )
             first_network_done["time"] = first_network_done["time"] or time.time()
             if recovered.window.wave_idx + 1 == len(job_windows.get(id(job), [])):
@@ -6472,7 +7165,9 @@ def _run_recovery_pipeline(
     total_recovery_decode_s = sum(
         timing.get('decoder_decode_sum_s', 0.0) for _record, timing in results
     )
-    total_failed_copy_s = sum(timing.get('failed_copy_s', 0.0) for _record, timing in results)
+    total_failed_cpu_copy_s = sum(
+        timing.get('failed_cpu_copy_s', 0.0) for _record, timing in results
+    )
     for _record, timing in results:
         timing['pipeline_overlap_s'] = overlap_s
         timing['pipeline_critical_s'] = elapsed
@@ -6498,7 +7193,7 @@ def _run_recovery_pipeline(
         "materialize_s": total_materialize_s,
         "recovery_net_s": total_recovery_net_s,
         "recovery_decode_s": total_recovery_decode_s,
-        "h2d_s": total_failed_copy_s,
+        "failed_cpu_copy_s": total_failed_cpu_copy_s,
         "serial_work_s": serial_work_s,
         "pipeline_overlap_s": overlap_s,
         "first_network_done_s": first_network_done_s,

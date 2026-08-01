@@ -361,6 +361,42 @@ def validate_args(args, defaults={}):
             "At most one of --use-ecnaive, --use-eclatin, --use-frcheck, "
             "and --use-gemini-replicas may be enabled."
         )
+    if (
+        getattr(args, "frcheck_hw_early_optimizer", False)
+        and getattr(args, "frcheck_hw_optimizer_overlap", False)
+    ):
+        raise RuntimeError(
+            "--frcheck-hw-early-optimizer and --frcheck-hw-optimizer-overlap "
+            "are mutually exclusive"
+        )
+    if getattr(args, "frcheck_hw_optimizer_overlap", False):
+        if not getattr(args, "use_frcheck", False):
+            raise RuntimeError(
+                "--frcheck-hw-optimizer-overlap requires --use-frcheck"
+            )
+        if not getattr(args, "ft_inprocess_recovery_benchmark", False):
+            raise RuntimeError(
+                "--frcheck-hw-optimizer-overlap is only supported by the FRCheck HW "
+                "in-process recovery benchmark"
+            )
+        if getattr(args, "ft_inprocess_recovery_software_failure", False):
+            raise RuntimeError(
+                "--frcheck-hw-optimizer-overlap is not supported for software recovery"
+            )
+    if getattr(args, "frcheck_hw_early_optimizer", False):
+        if not getattr(args, "use_frcheck", False):
+            raise RuntimeError(
+                "--frcheck-hw-early-optimizer requires --use-frcheck"
+            )
+        if not getattr(args, "ft_inprocess_recovery_benchmark", False):
+            raise RuntimeError(
+                "--frcheck-hw-early-optimizer is only supported by the FRCheck HW "
+                "in-process recovery benchmark"
+            )
+        if getattr(args, "ft_inprocess_recovery_software_failure", False):
+            raise RuntimeError(
+                "--frcheck-hw-early-optimizer is not supported for software recovery"
+            )
     if getattr(args, "ft_inprocess_recovery_benchmark", False):
         if args.ckpt_format != "torch":
             raise RuntimeError(
@@ -2482,6 +2518,11 @@ def _add_checkpointing_args(parser):
                             'sending one layer payload per encoder peer, then locally '
                             'splitting blocks and running RS encode. Async P2 behavior '
                             'and shard format are unchanged.')
+    group.add_argument('--frcheck-gdr', action='store_true',
+                       help='Send FRCheck save layer-exchange SOURCE data directly from the '
+                            'registered GPU layer buffer with GPUDirect RDMA. The CPU mirror '
+                            'D2H copy remains enabled for encode and disk output. This option '
+                            'requires --frcheck-layer-exchange-encode and defaults to disabled.')
     group.add_argument('--frcheck-recovery-async-parity', action='store_true',
                        help='Run mandatory FRCheck hardware-recovery parity repair in '
                             'the background after data recovery. When unset (default), '
@@ -2492,6 +2533,14 @@ def _add_checkpointing_args(parser):
                        help='Experimental: overlap FRCheck hardware recovery with '
                             'forward by recovering transformer layers in a '
                             'background worker.')
+    group.add_argument('--frcheck-hw-early-optimizer', action='store_true',
+                       help='FRCheck HW in-process benchmark only: fully materialize, load, '
+                            'and synchronize optimizer state during the measured H2D interval '
+                            'before the first forward. Disabled by default.')
+    group.add_argument('--frcheck-hw-optimizer-overlap', action='store_true',
+                       help='FRCheck HW in-process benchmark only: after the first forward, '
+                            'install optimizer state on the training thread and submit H2D '
+                            'copies on a dedicated CUDA stream, then wait before optimizer.step.')
     group.add_argument('--frcheck-defer-load-teardown', action='store_true',
                        help='Defer FRCheck native teardown after hardware recovery load '
                             'until the training/eval teardown path. The recovery worker '
@@ -2567,6 +2616,10 @@ def _add_checkpointing_args(parser):
                        help='Number of RDMA channels to open per Gemini Replicas peer during save '
                             'and hardware recovery. Default: 1 preserves the existing one-QP-per-peer '
                             'behavior. Only affects optimized RDMA save and hardware recovery paths.')
+    group.add_argument('--gemini-replicas-gdr', action='store_true',
+                       help='Send Gemini Replicas save payloads directly from a registered GPU '
+                            'buffer using GPUDirect RDMA while retaining the D2H CPU mirror. '
+                            'Requires --use-rdma and working RDMA/GDR support. Default: disabled.')
     group.add_argument('--gemini-replicas-debug', action='store_true',
                        help='Enable detailed debug logging for Gemini Replicas operations.')
     group.add_argument('--use-gemini-replicas-hardware-failure', action='store_true',

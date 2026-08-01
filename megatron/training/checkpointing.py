@@ -280,6 +280,32 @@ def _format_inprocess_load_timing_summary(ft_context: dict, h2d_total_s: float) 
     recovery_e2e_s = float(recovery.get("total", 0.0))
     scheme = ft_context.get("scheme")
 
+    if scheme == "FRCHECK" and getattr(args, "use_frcheck", False):
+        summary = _timing_max_dict({
+            "e2e_s": recovery_e2e_s + h2d_total_s,
+            "recovery_e2e_s": recovery_e2e_s,
+            "assemble_s": float(recovery.get("assemble", 0.0)),
+            "assemble_read_s": float(recovery.get("assemble_read", 0.0)),
+            "assemble_copy_s": float(recovery.get("assemble_copy", 0.0)),
+            "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
+            "restore_wall_s": h2d_total_s,
+        })
+        return (
+            "FRCheck load timing (%s): early_optimizer=%s e2e_s=%.2fs "
+            "recovery_e2e_s=%.2fs assemble_s=%.2fs assemble_read_s=%.2fs "
+            "assemble_copy_s=%.2fs rebuild_sd_s=%.2fs restore_wall_s=%.2fs"
+            % (
+                ft_context.get("mode", "unknown"),
+                bool(recovery.get("early_optimizer", False)),
+                summary["e2e_s"],
+                summary["recovery_e2e_s"],
+                summary["assemble_s"],
+                summary["assemble_read_s"],
+                summary["assemble_copy_s"],
+                summary["rebuild_sd_s"],
+                summary["restore_wall_s"],
+            )
+        )
     if scheme == "GEMINI" and getattr(args, "use_gemini_replicas", False):
         network_encode_s = float(recovery.get("network_encode", 0.0))
         summary = _timing_max_dict({
@@ -562,11 +588,17 @@ def run_inprocess_ft_recovery_benchmark(
     iteration, release = read_metadata(get_checkpoint_tracker_filename(args.load))
     checkpoint_name = get_checkpoint_name(args.load, iteration, release, return_base_dir=False)
     mode = "software" if software_failure else "hardware"
+    frcheck_hw_early_optimizer = bool(
+        not software_failure
+        and getattr(args, "use_frcheck", False)
+        and getattr(args, "frcheck_hw_early_optimizer", False)
+    )
     if rank == 0:
         logger.info(
             "FT in-process recovery benchmark: run=%d/%d mode=%s load=%s "
-            "iteration=%s affected_ranks=%s",
+            "iteration=%s affected_ranks=%s early_optimizer=%s",
             runs_done + 1, repeat, mode, args.load, iteration, failed_ranks,
+            frcheck_hw_early_optimizer,
         )
     torch.distributed.barrier()
     if software_failure:
@@ -609,6 +641,7 @@ def run_inprocess_ft_recovery_benchmark(
                 wait_for_frcheck_parity_flush()
                 state_dict, timings = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
                 timings["total"] = timings.get("network_encode", 0.0) + timings.get("rebuild_sd", 0.0)
+                timings["early_optimizer"] = frcheck_hw_early_optimizer
                 from megatron.training.global_vars import set_ft_load_timing_context
                 set_ft_load_timing_context("FRCHECK", "HW-INPROCESS", timings)
                 if rank in failed_set:
@@ -654,9 +687,25 @@ def run_inprocess_ft_recovery_benchmark(
                 mark_recovery_to_forward_timer("inprocess_model_sync_done")
                 _inject_inprocess_scheduler_state(opt_param_scheduler, state_dict)
                 mark_recovery_to_forward_timer("inprocess_scheduler_done")
+                if frcheck_hw_early_optimizer:
+                    from .frcheck_legacy import frcheck_wait_for_optimizer_state
+
+                    mark_recovery_to_forward_timer("inprocess_optimizer_early_start")
+                    frcheck_wait_for_optimizer_state(optimizer)
+                    mark_recovery_to_forward_timer("inprocess_optimizer_early_done")
+                elif getattr(args, "frcheck_hw_optimizer_overlap", False):
+                    from .frcheck_legacy import frcheck_prepare_optimizer_h2d
+
+                    mark_recovery_to_forward_timer("inprocess_optimizer_prepare_start")
+                    if not frcheck_prepare_optimizer_h2d(optimizer):
+                        raise RuntimeError(
+                            "FRCheck failed rank could not prepare optimizer H2D overlap"
+                        )
+                    mark_recovery_to_forward_timer("inprocess_optimizer_prepare_done")
         else:
             defer_frcheck_optimizer = bool(
-                not software_failure
+                not frcheck_hw_early_optimizer
+                and not software_failure
                 and getattr(args, "use_frcheck", False)
                 and rank not in failed_set
                 and optimizer is not None
@@ -665,11 +714,24 @@ def run_inprocess_ft_recovery_benchmark(
                 and "optimizer" in state_dict
             )
             if defer_frcheck_optimizer:
-                from .frcheck_legacy import frcheck_register_pending_optimizer_state
+                if getattr(args, "frcheck_hw_optimizer_overlap", False):
+                    # Healthy ranks retain the live optimizer restored before the fault.
+                    # Drop the redundant recovery payload and any pending initial-load
+                    # payload so the optimizer-step fallback cannot reload stale state.
+                    from .frcheck_legacy import frcheck_discard_pending_optimizer_state
 
-                frcheck_register_pending_optimizer_state(
-                    state_dict, allow_without_runtime=True,
-                )
+                    state_dict.pop("optimizer", None)
+                    frcheck_discard_pending_optimizer_state()
+                    logger.debug(
+                        "FRCheck optimizer overlap: healthy rank %d retained live optimizer state",
+                        rank,
+                    )
+                else:
+                    from .frcheck_legacy import frcheck_register_pending_optimizer_state
+
+                    frcheck_register_pending_optimizer_state(
+                        state_dict, allow_without_runtime=True,
+                    )
                 mark_recovery_to_forward_timer("inprocess_inject_start")
                 _inject_inprocess_model_state(ddp_model, state_dict, strict=strict)
                 mark_recovery_to_forward_timer("inprocess_model_load_done")
@@ -685,19 +747,17 @@ def run_inprocess_ft_recovery_benchmark(
                     opt_param_scheduler,
                     state_dict,
                     strict=strict,
-                    # GPU optimizer/model loaders copy recovered CPU tensors into their
-                    # CUDA-owned storage. CPU-offloaded optimizers may retain optimizer-state
-                    # views, so detach only that subtree from reusable transport workspaces.
-                    # Keep EC-NAIVE's existing unconditional behavior unchanged.
+                    # GPU optimizer fast loaders allocate independent CUDA state,
+                    # copy recovered tensors, and synchronize. CPU-offloaded optimizers
+                    # may retain optimizer-state views, so detach only that subtree from
+                    # reusable transport workspaces for EC-NAIVE, ECCheck, and Gemini.
                     clone_optimizer_tensors=(
-                        getattr(args, "use_ecnaive", False)
-                        or (
-                            (
-                                getattr(args, "use_eccheck", False)
-                                or getattr(args, "use_gemini_replicas", False)
-                            )
-                            and _optimizer_uses_cpu_offload(optimizer, args)
+                        (
+                            getattr(args, "use_ecnaive", False)
+                            or getattr(args, "use_eccheck", False)
+                            or getattr(args, "use_gemini_replicas", False)
                         )
+                        and _optimizer_uses_cpu_offload(optimizer, args)
                     ),
                 )
     h2d_total_s = time() - h2d_start

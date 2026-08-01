@@ -18,6 +18,35 @@ export DEBUG_PARALLEL_STATES=1
 export NETIFACES_INTERFACE=${NETIFACES_INTERFACE:-bond0}
 export FRCHECK_LAYER_EXCHANGE_SEG=${FRCHECK_LAYER_EXCHANGE_SEG:-12}
 export FRCHECK_LAYER_ENCODE_BATCH=${FRCHECK_LAYER_ENCODE_BATCH:-12}
+FRCHECK_GDR=${FRCHECK_GDR:-0}
+case "$FRCHECK_GDR" in
+    0) FRCHECK_GDR_ARGS=() ;;
+    1) FRCHECK_GDR_ARGS=(--frcheck-gdr) ;;
+    *)
+        echo "Error: FRCHECK_GDR must be 0 or 1: $FRCHECK_GDR" >&2
+        exit 1
+        ;;
+esac
+
+FRCHECK_ASYNC_PARITY=${FRCHECK_ASYNC_PARITY:-1}
+case "$FRCHECK_ASYNC_PARITY" in
+    0) FRCHECK_ASYNC_PARITY_ARGS=() ;;
+    1) FRCHECK_ASYNC_PARITY_ARGS=(--frcheck-async-parity) ;;
+    *)
+        echo "Error: FRCHECK_ASYNC_PARITY must be 0 or 1: $FRCHECK_ASYNC_PARITY" >&2
+        exit 1
+        ;;
+esac
+
+FRCHECK_RECOVERY_ASYNC_PARITY=${FRCHECK_RECOVERY_ASYNC_PARITY:-1}
+case "$FRCHECK_RECOVERY_ASYNC_PARITY" in
+    0) FRCHECK_RECOVERY_ASYNC_PARITY_ARGS=() ;;
+    1) FRCHECK_RECOVERY_ASYNC_PARITY_ARGS=(--frcheck-recovery-async-parity) ;;
+    *)
+        echo "Error: FRCHECK_RECOVERY_ASYNC_PARITY must be 0 or 1: $FRCHECK_RECOVERY_ASYNC_PARITY" >&2
+        exit 1
+        ;;
+esac
 
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=ALL
@@ -122,13 +151,35 @@ if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess|inproc
 fi
 ARGS_TO_PASS=("$@")
 RECOVERY_MODE_ARGS=()
+FRCHECK_HW_EARLY_OPTIMIZER=${FRCHECK_HW_EARLY_OPTIMIZER:-0}
+case "$FRCHECK_HW_EARLY_OPTIMIZER" in
+    0) FRCHECK_HW_EARLY_OPTIMIZER_ARGS=() ;;
+    1) FRCHECK_HW_EARLY_OPTIMIZER_ARGS=(--frcheck-hw-early-optimizer) ;;
+    *)
+        echo "Error: FRCHECK_HW_EARLY_OPTIMIZER must be 0 or 1: $FRCHECK_HW_EARLY_OPTIMIZER" >&2
+        exit 1
+        ;;
+esac
+FRCHECK_HW_OPTIMIZER_OVERLAP=${FRCHECK_HW_OPTIMIZER_OVERLAP:-0}
+case "$FRCHECK_HW_OPTIMIZER_OVERLAP" in
+    0) FRCHECK_HW_OPTIMIZER_OVERLAP_ARGS=() ;;
+    1) FRCHECK_HW_OPTIMIZER_OVERLAP_ARGS=(--frcheck-hw-optimizer-overlap) ;;
+    *)
+        echo "Error: FRCHECK_HW_OPTIMIZER_OVERLAP must be 0 or 1: $FRCHECK_HW_OPTIMIZER_OVERLAP" >&2
+        exit 1
+        ;;
+esac
+if [ "$FRCHECK_HW_EARLY_OPTIMIZER" = 1 ] && [ "$FRCHECK_HW_OPTIMIZER_OVERLAP" = 1 ]; then
+    echo "Error: FRCHECK_HW_EARLY_OPTIMIZER and FRCHECK_HW_OPTIMIZER_OVERLAP are mutually exclusive" >&2
+    exit 1
+fi
 FT_INPROCESS_RECOVERY_REPEAT=${FT_INPROCESS_RECOVERY_REPEAT:-3}
 case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
             --ec-checkpoint-write-only-penultimate-iter
-            --frcheck-async-parity
+            "${FRCHECK_ASYNC_PARITY_ARGS[@]}"
             --frcheck-layer-exchange-encode
         )
         ;;
@@ -142,7 +193,7 @@ case "$MODE" in
             --load $CHECKPOINT_PATH
             --use-frcheck-hardware-failure
             --frcheck-async-recovery-forward
-            --frcheck-recovery-async-parity
+            "${FRCHECK_RECOVERY_ASYNC_PARITY_ARGS[@]}"
             --frcheck-failed-ranks "0,1,2,3,4,5,6,7"
             --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
@@ -173,13 +224,15 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --ft-inprocess-recovery-benchmark
+            "${FRCHECK_HW_EARLY_OPTIMIZER_ARGS[@]}"
+            "${FRCHECK_HW_OPTIMIZER_OVERLAP_ARGS[@]}"
             --rerun-mode disabled
             --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
             --ft-inprocess-recovery-failed-ranks "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
             --frcheck-async-recovery-forward
-            --frcheck-recovery-async-parity
+            "${FRCHECK_RECOVERY_ASYNC_PARITY_ARGS[@]}"
             --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
             --num-workers 0
@@ -189,13 +242,15 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --ft-inprocess-recovery-benchmark
+            "${FRCHECK_HW_EARLY_OPTIMIZER_ARGS[@]}"
+            "${FRCHECK_HW_OPTIMIZER_OVERLAP_ARGS[@]}"
             --rerun-mode disabled
             --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
             --ft-inprocess-recovery-failed-ranks "0,1,2,3,4,5,6,7"
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
             --frcheck-async-recovery-forward
-            --frcheck-recovery-async-parity
+            "${FRCHECK_RECOVERY_ASYNC_PARITY_ARGS[@]}"
             --frcheck-recovery-safe-point optimizer_step
             --frcheck-recovery-only-teardown
             --num-workers 0
@@ -246,6 +301,7 @@ GPT_ARGS=(
     --fp16
     --tokenizer-type GPT2BPETokenizer
     --use-mcore-models
+    "${FRCHECK_GDR_ARGS[@]}"
     --transformer-impl transformer_engine
     --no-scatter-gather-tensors-in-pipeline
     --num-layers $NUM_LAYERS
@@ -316,20 +372,47 @@ first_start=$((base + slot * 8))
 first_end=$((first_start + 7))
 sibling_start=$((first_start + 64))
 sibling_end=$((sibling_start + 7))
-first_cpus=$(seq -s, "$first_start" "$first_end")
-sibling_cpus=$(seq -s, "$sibling_start" "$sibling_end")
-rs_cpus="$first_cpus,$sibling_cpus"
+net_physical_cores=${FRCHECK_NET_PHYSICAL_CORES:-0}
+if [[ ! "$net_physical_cores" =~ ^[0-9]+$ ]] || (( net_physical_cores > 7 )); then
+    echo "Error: FRCHECK_NET_PHYSICAL_CORES must be an integer from 0 to 7: $net_physical_cores" >&2
+    exit 1
+fi
+if (( net_physical_cores == 0 )); then
+    first_cpus=$(seq -s, "$first_start" "$first_end")
+    sibling_cpus=$(seq -s, "$sibling_start" "$sibling_end")
+    rs_cpus="$first_cpus,$sibling_cpus"
+    rs_unique_cpus="$rs_cpus"
+    process_cpus="$rs_cpus"
+else
+    net_first_end=$((first_start + net_physical_cores - 1))
+    net_sibling_end=$((sibling_start + net_physical_cores - 1))
+    rs_first_start=$((net_first_end + 1))
+    rs_sibling_start=$((net_sibling_end + 1))
+    net_first_cpus=$(seq -s, "$first_start" "$net_first_end")
+    net_sibling_cpus=$(seq -s, "$sibling_start" "$net_sibling_end")
+    rs_first_cpus=$(seq -s, "$rs_first_start" "$first_end")
+    rs_sibling_cpus=$(seq -s, "$rs_sibling_start" "$sibling_end")
+    process_cpus="$net_first_cpus,$net_sibling_cpus"
+    rs_unique_cpus="$rs_first_cpus,$rs_sibling_cpus"
+    IFS=, read -r -a rs_unique_cpu_array <<< "$rs_unique_cpus"
+    rs_cpu_array=()
+    for ((i = 0; i < 16; i++)); do
+        rs_cpu_array+=("${rs_unique_cpu_array[$((i % ${#rs_unique_cpu_array[@]}))]}")
+    done
+    rs_cpus=$(IFS=,; echo "${rs_cpu_array[*]}")
+fi
 export FRCHECK_RS_CPU_LIST="$rs_cpus"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
-echo "[cpu_bind] local_rank=$LOCAL_RANK physical_gpu=$physical_gpu numa_node=$numa_node rs_cpus=$rs_cpus"
-exec taskset -c "$rs_cpus" "${PYTHON_BIN:-python}" "$@"
+echo "[cpu_bind] local_rank=$LOCAL_RANK physical_gpu=$physical_gpu numa_node=$numa_node net_physical_cores=$net_physical_cores rs_cpus=$rs_cpus rs_unique_cpus=$rs_unique_cpus process_cpus=$process_cpus"
+exec taskset -c "$process_cpus" "${PYTHON_BIN:-python}" "$@"
 '
 
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
     printf 'Would run (Node %s, topology-aware per-rank CPU binding): ' "$NODE_RANK"
-    printf 'PYTHONPATH=%q CUDA_VISIBLE_DEVICES=%q ' "$PYTHONPATH:/workspace/Megatron-LM" "$CUDA_VISIBLE_DEVICES"
+    printf 'FRCHECK_GDR=%q PYTHONPATH=%q CUDA_VISIBLE_DEVICES=%q ' \
+        "$FRCHECK_GDR" "$PYTHONPATH:/workspace/Megatron-LM" "$CUDA_VISIBLE_DEVICES"
     printf '%q ' torchrun "${DISTRIBUTED_ARGS[@]}" --no-python bash -c '<physical-GPU CPU binding>' _ \
         pretrain_gpt.py "${GPT_ARGS[@]}" "${DATA_ARGS[@]}" "${MODEL_PARALLEL_ARGS[@]}" \
         "${RECOVERY_MODE_ARGS[@]}" "${EVAL_AND_LOGGING_ARGS[@]}" --distributed-backend nccl \
@@ -343,6 +426,9 @@ echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (FRCheck)"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 echo "FRCHECK_TABLE_DIR: $FRCHECK_TABLE_DIR"
 echo "FRCHECK_INTERFACE: $FRCHECK_INTERFACE"
+echo "FRCHECK_HW_EARLY_OPTIMIZER: $FRCHECK_HW_EARLY_OPTIMIZER"
+echo "FRCHECK_HW_OPTIMIZER_OVERLAP: $FRCHECK_HW_OPTIMIZER_OVERLAP"
+echo "FRCHECK_GDR: $FRCHECK_GDR"
 
 export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \

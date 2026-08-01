@@ -88,6 +88,159 @@ def normalize_optimizer_state_param_keys(optim_state: Dict[str, Any]) -> None:
     state.update(normalized)
 
 
+
+def _validate_existing_optimizer_copy(
+    dst: torch.Tensor, src: torch.Tensor, label: str, copies: List[Tuple[torch.Tensor, torch.Tensor]]
+) -> None:
+    """Validate and collect a checkpoint copy into an existing optimizer tensor."""
+    if not torch.is_tensor(dst) or not torch.is_tensor(src):
+        raise RuntimeError(f"FRCheck optimizer reuse expected tensors for {label}")
+    if dst.shape != src.shape:
+        raise RuntimeError(
+            f"FRCheck optimizer reuse shape mismatch for {label}: "
+            f"live={tuple(dst.shape)} saved={tuple(src.shape)}"
+        )
+    if dst.dtype != src.dtype:
+        raise RuntimeError(
+            f"FRCheck optimizer reuse dtype mismatch for {label}: "
+            f"live={dst.dtype} saved={src.dtype}"
+        )
+    if src.device.type != "cpu":
+        raise RuntimeError(
+            f"FRCheck optimizer reuse requires a CPU checkpoint source for {label}, "
+            f"got {src.device}"
+        )
+    if dst.device.type != "cuda":
+        raise RuntimeError(
+            f"FRCheck optimizer reuse requires an existing CUDA destination for {label}, "
+            f"got {dst.device}"
+        )
+    copies.append((dst, src))
+
+
+def prepare_optimizer_state_h2d_into_existing(
+    optimizer, state_dict: Dict[str, Any]
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Prepare FRCheck H2D copies using only existing optimizer CUDA tensors."""
+    chained = getattr(optimizer, "chained_optimizers", None)
+    if chained is not None:
+        if len(chained) != 1:
+            raise RuntimeError(
+                "FRCheck optimizer reuse currently requires exactly one chained optimizer"
+            )
+        optimizer = chained[0]
+
+    inner_optimizer = getattr(optimizer, "optimizer", None)
+    fp32_groups = getattr(optimizer, "fp32_from_float16_groups", None)
+    if inner_optimizer is None or fp32_groups is None:
+        raise RuntimeError(
+            "FRCheck optimizer reuse requires Float16OptimizerWithFloat16Params"
+        )
+    if not inner_optimizer.state:
+        raise RuntimeError(
+            "FRCheck optimizer reuse requires initialized live optimizer state; "
+            "run a warmup optimizer step before recovery"
+        )
+
+    optimizer_key = "optimizer" if "optimizer" in state_dict else "optimizer_state_dict"
+    if optimizer_key not in state_dict:
+        raise RuntimeError("FRCheck optimizer reuse checkpoint has no optimizer state")
+    saved_optimizer = state_dict[optimizer_key]
+    if "common_step" in saved_optimizer.get("state", {}):
+        common_step = saved_optimizer["state"].pop("common_step")
+        optimizer._restore_common_per_param_step(saved_optimizer, common_step)
+    normalize_optimizer_state_param_keys(saved_optimizer)
+
+    saved_groups = optimizer._filter_and_reorder_param_groups(
+        inner_optimizer.param_groups, saved_optimizer["param_groups"]
+    )
+    if len(saved_groups) != len(inner_optimizer.param_groups):
+        raise RuntimeError(
+            "FRCheck optimizer reuse parameter-group count mismatch: "
+            f"live={len(inner_optimizer.param_groups)} saved={len(saved_groups)}"
+        )
+
+    saved_id_to_live_param = {}
+    for group_idx, (live_group, saved_group) in enumerate(
+        zip(inner_optimizer.param_groups, saved_groups)
+    ):
+        live_params = live_group["params"]
+        saved_ids = saved_group["params"]
+        if len(live_params) != len(saved_ids):
+            raise RuntimeError(
+                f"FRCheck optimizer reuse parameter count mismatch in group {group_idx}: "
+                f"live={len(live_params)} saved={len(saved_ids)}"
+            )
+        for saved_id, live_param in zip(saved_ids, live_params):
+            if saved_id in saved_id_to_live_param:
+                raise RuntimeError(
+                    f"FRCheck optimizer reuse duplicate saved parameter ID {saved_id}"
+                )
+            saved_id_to_live_param[saved_id] = live_param
+        for key, value in saved_group.items():
+            if key != "params":
+                live_group[key] = copy.deepcopy(value)
+
+    copies: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    saved_state = saved_optimizer.get("state", {})
+    for saved_id, saved_param_state in saved_state.items():
+        if saved_id not in saved_id_to_live_param:
+            raise RuntimeError(
+                f"FRCheck optimizer reuse has unmapped saved parameter ID {saved_id}"
+            )
+        live_param = saved_id_to_live_param[saved_id]
+        live_param_state = inner_optimizer.state.get(live_param)
+        if not isinstance(live_param_state, dict):
+            raise RuntimeError(
+                f"FRCheck optimizer reuse missing live state for saved parameter ID {saved_id}"
+            )
+        if not isinstance(saved_param_state, dict):
+            raise RuntimeError(
+                f"FRCheck optimizer reuse invalid saved state for parameter ID {saved_id}"
+            )
+        for state_key, saved_value in saved_param_state.items():
+            label = f"state[{saved_id!r}][{state_key!r}]"
+            if torch.is_tensor(saved_value):
+                live_value = live_param_state.get(state_key)
+                if not torch.is_tensor(live_value):
+                    raise RuntimeError(
+                        f"FRCheck optimizer reuse missing live tensor for {label}"
+                    )
+                _validate_existing_optimizer_copy(live_value, saved_value, label, copies)
+            else:
+                live_param_state[state_key] = copy.deepcopy(saved_value)
+
+    fp32_key = (
+        "fp32_from_fp16_params"
+        if "fp32_from_fp16_params" in state_dict
+        else "fp32_from_fp16"
+    )
+    if fp32_key not in state_dict:
+        raise RuntimeError("FRCheck optimizer reuse checkpoint has no FP32 master parameters")
+    saved_fp32_groups = state_dict[fp32_key]
+    if len(fp32_groups) != len(saved_fp32_groups):
+        raise RuntimeError(
+            "FRCheck optimizer reuse FP32 group count mismatch: "
+            f"live={len(fp32_groups)} saved={len(saved_fp32_groups)}"
+        )
+    for group_idx, (live_group, saved_group) in enumerate(
+        zip(fp32_groups, saved_fp32_groups)
+    ):
+        if len(live_group) != len(saved_group):
+            raise RuntimeError(
+                f"FRCheck optimizer reuse FP32 parameter count mismatch in group {group_idx}: "
+                f"live={len(live_group)} saved={len(saved_group)}"
+            )
+        for param_idx, (live_param, saved_param) in enumerate(zip(live_group, saved_group)):
+            _validate_existing_optimizer_copy(
+                live_param.data, saved_param.data,
+                f"fp32_group[{group_idx}][{param_idx}]", copies,
+            )
+
+    if "grad_scaler" in state_dict and getattr(optimizer, "grad_scaler", None) is not None:
+        optimizer.grad_scaler.load_state_dict(state_dict["grad_scaler"])
+    return copies
+
 def _optimizer_state_dict_has_cpu_tensors(optim_state: Dict[str, Any]) -> bool:
     state = optim_state.get("state")
     if not isinstance(state, dict):

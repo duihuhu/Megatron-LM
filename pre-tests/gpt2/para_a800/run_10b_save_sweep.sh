@@ -188,7 +188,7 @@ run_training() {
     local scheme_log="$LOG_DIR/$scheme.log"
     local frcheck_env=""
     if [[ "$scheme" == frcheck ]]; then
-        frcheck_env=" FRCHECK_LAYER_EXCHANGE_SEG=${FRCHECK_LAYER_EXCHANGE_SEG:-12} FRCHECK_LAYER_ENCODE_BATCH=${FRCHECK_LAYER_ENCODE_BATCH:-12} FRCHECK_TRACE_INIT=${FRCHECK_TRACE_INIT:-0}"
+        frcheck_env=" FRCHECK_LAYER_EXCHANGE_SEG=${FRCHECK_LAYER_EXCHANGE_SEG:-12} FRCHECK_LAYER_ENCODE_BATCH=${FRCHECK_LAYER_ENCODE_BATCH:-12} FRCHECK_TRACE_INIT=${FRCHECK_TRACE_INIT:-0} FRCHECK_GDR=${FRCHECK_GDR:-0} FRCHECK_ASYNC_PARITY=${FRCHECK_ASYNC_PARITY:-1}"
     fi
     local remote_command="export PRINT_CMD=0 MASTER_PORT=$port$frcheck_env; ./$script {R} save"
     (
@@ -205,6 +205,8 @@ run_training() {
                 FRCHECK_LAYER_EXCHANGE_SEG="${FRCHECK_LAYER_EXCHANGE_SEG:-12}" \
                 FRCHECK_LAYER_ENCODE_BATCH="${FRCHECK_LAYER_ENCODE_BATCH:-12}" \
                 FRCHECK_TRACE_INIT="${FRCHECK_TRACE_INIT:-0}" \
+                FRCHECK_GDR="${FRCHECK_GDR:-0}" \
+                FRCHECK_ASYNC_PARITY="${FRCHECK_ASYNC_PARITY:-1}" \
                 "./$script" 0 save 2>&1 | awk '{ print "[node0 rank=0]", $0; fflush(); }'
             exit "${PIPESTATUS[0]}"
         ) &

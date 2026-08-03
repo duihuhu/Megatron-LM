@@ -1675,6 +1675,7 @@ public:
         if (!ch) throw std::runtime_error("FRCheck prepared layer recv: no channel");
         if (!shared_lane_)
             throw std::runtime_error("FRCheck prepared layer recv requires shared lanes");
+        record_save_net_start_(frcheck_now_us());
         ch->prepare_tagged_recv(
             make_channel_tag_(2, mapped_lane_id, batch_id),
             reinterpret_cast<uint8_t*>(addr), capacity);

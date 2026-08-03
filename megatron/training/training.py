@@ -1674,6 +1674,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 mark_recovery_to_forward_timer("frcheck_train_prep_start")
                 frcheck_recovery_safe_point("train_step_start")
                 mark_recovery_to_forward_timer("frcheck_train_safe_point_done")
+                if getattr(args, "frcheck_hw_optimizer_overlap", False):
+                    from megatron.training.frcheck_legacy import frcheck_start_optimizer_h2d
+                    frcheck_optimizer_overlap_started = frcheck_start_optimizer_h2d(optimizer)
                 if (
                     not getattr(args, "frcheck_async_recovery_forward", False)
                     and not getattr(args, "frcheck_hw_optimizer_overlap", False)

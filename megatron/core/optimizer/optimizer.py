@@ -237,8 +237,8 @@ def prepare_optimizer_state_h2d_into_existing(
                 f"fp32_group[{group_idx}][{param_idx}]", copies,
             )
 
-    if "grad_scaler" in state_dict and getattr(optimizer, "grad_scaler", None) is not None:
-        optimizer.grad_scaler.load_state_dict(state_dict["grad_scaler"])
+    # Grad-scaler restore is intentionally excluded here. This function may run
+    # on a CPU preparation thread, while scaler loading allocates on current CUDA device.
     return copies
 
 def _optimizer_state_dict_has_cpu_tensors(optim_state: Dict[str, Any]) -> bool:

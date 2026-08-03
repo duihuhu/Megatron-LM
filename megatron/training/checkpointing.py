@@ -649,7 +649,13 @@ def run_inprocess_ft_recovery_benchmark(
                     frcheck_filter_layerwise_model_placeholders(state_dict)
                     runtime_summary = get_frcheck_layerwise_runtime_summary()
                     if runtime_summary is not None:
-                        frcheck_register_pending_optimizer_state(state_dict)
+                        registered_optimizer = frcheck_register_pending_optimizer_state(state_dict)
+                        if registered_optimizer:
+                            from .frcheck_legacy import (
+                                frcheck_restore_optimizer_control_state,
+                            )
+
+                            frcheck_restore_optimizer_control_state(optimizer)
         elif getattr(args, "use_ecnaive", False):
             if software_failure:
                 from .ecnaive_legacy import load_ecnaive_legacy_checkpoint
@@ -682,8 +688,6 @@ def run_inprocess_ft_recovery_benchmark(
                 mark_recovery_to_forward_timer("inprocess_inject_start")
                 _inject_inprocess_model_state(ddp_model, state_dict, strict=False)
                 mark_recovery_to_forward_timer("inprocess_model_load_done")
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
                 mark_recovery_to_forward_timer("inprocess_model_sync_done")
                 _inject_inprocess_scheduler_state(opt_param_scheduler, state_dict)
                 mark_recovery_to_forward_timer("inprocess_scheduler_done")
@@ -699,7 +703,7 @@ def run_inprocess_ft_recovery_benchmark(
                     mark_recovery_to_forward_timer("inprocess_optimizer_prepare_start")
                     if not frcheck_prepare_optimizer_h2d(optimizer):
                         raise RuntimeError(
-                            "FRCheck failed rank could not prepare optimizer H2D overlap"
+                            "FRCheck failed rank could not start optimizer CPU preparation"
                         )
                     mark_recovery_to_forward_timer("inprocess_optimizer_prepare_done")
         else:

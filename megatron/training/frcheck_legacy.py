@@ -771,6 +771,62 @@ class _FRCheckLayerReadyRecord:
     optimizer_tensors: Optional[Dict[str, torch.Tensor]] = None
 
 
+class _FRCheckCommonReadiness:
+    """Thread-safe publication of state required for immediate rebuild."""
+
+    def __init__(self, required_keys: Set[str]) -> None:
+        self.required_keys = frozenset(required_keys)
+        self._views: Dict[str, torch.Tensor] = {}
+        self.snapshot: Optional[Dict[str, torch.Tensor]] = None
+        self.error: Optional[BaseException] = None
+        self.ready = threading.Event()
+        self._lock = threading.Lock()
+        if not self.required_keys:
+            self.snapshot = {}
+            self.ready.set()
+
+    def publish(self, tensors: Optional[Dict[str, torch.Tensor]]) -> None:
+        if not tensors:
+            return
+        with self._lock:
+            if self.snapshot is not None:
+                return
+            self._views.update(tensors)
+            if self.required_keys.issubset(self._views):
+                self.snapshot = dict(self._views)
+                self.ready.set()
+
+    def fail(self, error: BaseException) -> None:
+        with self._lock:
+            if self.error is None:
+                self.error = error
+            self.ready.set()
+
+    def finish(self) -> None:
+        with self._lock:
+            if self.snapshot is not None or self.error is not None:
+                return
+            missing = sorted(self.required_keys.difference(self._views))
+            self.error = RuntimeError(
+                "FRCheck ordered recovery finished without required common tensors: "
+                f"missing_count={len(missing)} keys={missing[:8]}"
+            )
+            self.ready.set()
+
+    def wait_snapshot(self) -> Dict[str, torch.Tensor]:
+        self.ready.wait()
+        with self._lock:
+            if self.error is not None:
+                raise RuntimeError("FRCheck common-state recovery failed") from self.error
+            if self.snapshot is None:
+                missing = sorted(self.required_keys.difference(self._views))
+                raise RuntimeError(
+                    "FRCheck common-state recovery completed without required tensors: "
+                    f"missing_count={len(missing)} keys={missing[:8]}"
+                )
+            return self.snapshot
+
+
 @dataclass
 class _FRCheckLayerRecoveryJob:
     encode_iter: int
@@ -1435,6 +1491,18 @@ class _FRCheckRecoveryService:
         global _recovery_async_parity_initialized, _recovery_async_parity_submitted
         global _recovery_async_parity_thread, _recovery_async_parity_error
         global _pending_recovery_parity_repair, _frcheck_async_runtime_timing_reported
+        global _optimizer_prepare_thread, _optimizer_prepare_error
+        old_prepare_thread = _optimizer_prepare_thread
+        if old_prepare_thread is not None:
+            if old_prepare_thread.is_alive():
+                raise RuntimeError(
+                    "FRCheck cannot reset recovery while the previous optimizer "
+                    "CPU prepare thread is still running"
+                )
+            if _optimizer_prepare_error is not None:
+                raise RuntimeError(
+                    "FRCheck previous optimizer CPU prepare failed before reset"
+                ) from _optimizer_prepare_error
         self.role = role
         _frcheck_async_runtime_timing_reported = False
         self.runtime = None
@@ -1449,6 +1517,9 @@ class _FRCheckRecoveryService:
         _recovery_async_parity_thread = None
         _recovery_async_parity_error = None
         _pending_recovery_parity_repair = None
+        _optimizer_prepare_thread = None
+        _optimizer_prepare_error = None
+        _optimizer_prepare_done.clear()
         _frcheck_recovery_profile(self.role, "service_reset", state=self.state)
 
     def attach_runtime(self, runtime: Optional[_FRCheckLayerwiseRuntime]) -> None:
@@ -1542,6 +1613,10 @@ _optimizer_h2d_started: bool = False
 _optimizer_h2d_prepared: bool = False
 _optimizer_h2d_copy_pairs: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
 _optimizer_h2d_prepare_s: float = 0.0
+_optimizer_prepare_thread: Optional[threading.Thread] = None
+_optimizer_prepare_done = threading.Event()
+_optimizer_prepare_error: Optional[BaseException] = None
+_optimizer_prepare_lock = threading.Lock()
 
 
 def _get_active_frcheck_recovery_service() -> _FRCheckRecoveryService:
@@ -1918,6 +1993,71 @@ def frcheck_materialize_first_layer_for_timer() -> bool:
     return True
 
 
+def frcheck_restore_optimizer_control_state(optimizer=None) -> bool:
+    """Restore small optimizer control state on the rank's main CUDA thread."""
+    if optimizer is None or _pending_optimizer_state is None:
+        return False
+
+    chained = getattr(optimizer, "chained_optimizers", None)
+    optimizers = list(chained) if chained is not None else [optimizer]
+    pending = _pending_optimizer_state
+    if len(optimizers) == 1:
+        states = [pending]
+    elif isinstance(pending, (list, tuple)):
+        states = list(pending)
+    elif isinstance(pending, dict) and all(
+        isinstance(key, int) for key in pending
+    ):
+        states = [pending[key] for key in sorted(pending)]
+    else:
+        raise RuntimeError(
+            "FRCheck optimizer control restore cannot map checkpoint state to "
+            f"{len(optimizers)} chained optimizers"
+        )
+    if len(states) != len(optimizers):
+        raise RuntimeError(
+            "FRCheck optimizer control restore count mismatch: "
+            f"live={len(optimizers)} saved={len(states)}"
+        )
+
+    restored = 0
+    current_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    for index, (optim_instance, optim_state) in enumerate(zip(optimizers, states)):
+        if not isinstance(optim_state, dict) or "grad_scaler" not in optim_state:
+            continue
+        grad_scaler = getattr(optim_instance, "grad_scaler", None)
+        if grad_scaler is None:
+            continue
+        if current_device is None:
+            raise RuntimeError(
+                "FRCheck optimizer control restore requires CUDA for grad scaler state"
+            )
+        with torch.cuda.device(current_device):
+            grad_scaler.load_state_dict(optim_state["grad_scaler"])
+        scale = getattr(grad_scaler, "_scale", None)
+        if not torch.is_tensor(scale) or scale.device.type != "cuda":
+            raise RuntimeError(
+                "FRCheck grad scaler restore did not produce a CUDA scale tensor: "
+                f"optimizer_index={index} scale={scale!r}"
+            )
+        if int(scale.device.index) != int(current_device):
+            raise RuntimeError(
+                "FRCheck grad scaler restored on the wrong CUDA device: "
+                f"optimizer_index={index} expected=cuda:{current_device} "
+                f"actual={scale.device}"
+            )
+        restored += 1
+
+    if restored and _frcheck_debug_enabled():
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logger.debug(
+            "FRCheck optimizer control state restored on main thread: "
+            "rank=%d device=cuda:%d grad_scalers=%d",
+            rank, current_device, restored,
+        )
+    return restored > 0
+
+
 def frcheck_register_pending_optimizer_state(
     state_dict: Dict[str, Any], allow_without_runtime: bool = False,
 ) -> bool:
@@ -2064,32 +2204,29 @@ def _fp32_master_groups_match_param_groups(
     return True
 
 
-def _pending_optimizer_has_complete_fp32_master(
-    runtime: _FRCheckLayerwiseRuntime,
+def _pending_optimizer_missing_flat_fp32_keys(
     optim_state: Dict[str, Any],
-) -> bool:
-    """Determine master-weight completeness from pending containers and layer metadata."""
-    for key in ("fp32_from_fp16_params", "fp32_from_fp16"):
-        if _fp32_master_groups_match_param_groups(optim_state.get(key), optim_state):
-            return True
-
+) -> Tuple[List[str], int, int]:
+    """Return missing flat FP32 keys and expected/available counts before unflatten."""
     structure = optim_state.get("_fp32_structure")
     flat = optim_state.get("fp32_params_flat")
     if not isinstance(structure, (list, tuple)) or not isinstance(flat, dict):
-        return False
-    expected_flat_keys = {
-        key[len("optimizer.fp32_params_flat."):]
-        for record in runtime._records_by_layer.values()
-        for key in record.optimizer_tensor_keys
-        if key.startswith("optimizer.fp32_params_flat.")
-    }
-    available_flat_keys = set(flat).union(expected_flat_keys)
-    required_flat_keys = {
+        return [], 0, 0
+    required = [
         f"_fp32_group{group_idx}_param{param_idx}"
         for group_idx, group_size in enumerate(structure)
         for param_idx in range(int(group_size))
-    }
-    return bool(required_flat_keys) and required_flat_keys.issubset(available_flat_keys)
+    ]
+    missing = [key for key in required if key not in flat]
+    return missing, len(required), len(flat)
+
+
+def _pending_optimizer_has_complete_fp32_master(optim_state: Dict[str, Any]) -> bool:
+    """Validate materialized FP32 master groups against optimizer parameters."""
+    return any(
+        _fp32_master_groups_match_param_groups(optim_state.get(key), optim_state)
+        for key in ("fp32_from_fp16_params", "fp32_from_fp16")
+    )
 
 
 def _sync_frcheck_model_params_to_optimizer_main_params(optimizer) -> bool:
@@ -2214,12 +2351,9 @@ def _prepare_deferred_optimizer_state(optimizer, runtime, service):
             prepare_s = time.time() - t_prepare
         return optimizer_state, prepare_s, cpu_offload, 0
 
-    service.wait_optimizer()
-    has_checkpoint_fp32_master = _pending_optimizer_has_complete_fp32_master(
-        runtime, _pending_optimizer_state
-    )
-    if not runtime.optimizer_materialized and not has_checkpoint_fp32_master:
-        _sync_frcheck_model_params_to_optimizer_main_params(optimizer)
+    # Wait only for optimizer records. Joining the ordered recovery worker here
+    # would serialize transformer recovery with optimizer CPU preparation.
+    runtime.wait_for_optimizer_layers()
     clone_recovery_tensors = _frcheck_optimizer_uses_cpu_offload(optimizer)
     t_prepare = time.time()
     updated, expected, missing_keys = _materialize_pending_optimizer_tensors(
@@ -2235,8 +2369,59 @@ def _prepare_deferred_optimizer_state(optimizer, runtime, service):
         unflatten_optimizer_fp32_params,
     )
 
-    unflatten_optimizer_fp32_params({"optimizer": _pending_optimizer_state})
-    _install_current_fp32_params_for_optimizer_load(optimizer, _pending_optimizer_state)
+    missing_fp32_keys, expected_fp32, available_fp32 = (
+        _pending_optimizer_missing_flat_fp32_keys(_pending_optimizer_state)
+    )
+    layer_fp32_keys = {
+        key[len("optimizer.fp32_params_flat."):]
+        for record in runtime._records_by_layer.values()
+        for key in record.optimizer_tensor_keys
+        if key.startswith("optimizer.fp32_params_flat.")
+    }
+    flat_fp32 = _pending_optimizer_state.get("fp32_params_flat")
+    available_fp32_keys = set(flat_fp32) if isinstance(flat_fp32, dict) else set()
+    layer_fp32_available = len(available_fp32_keys.intersection(layer_fp32_keys))
+    common_fp32_available = len(available_fp32_keys.difference(layer_fp32_keys))
+    if missing_fp32_keys and _frcheck_debug_enabled():
+        logger.debug(
+            "FRCheck optimizer FP32 materialization incomplete: expected=%d "
+            "available=%d missing=%d common_available=%d layer_available=%d/%d "
+            "optimizer_layer_updated=%d missing_examples=%s",
+            expected_fp32, available_fp32, len(missing_fp32_keys),
+            common_fp32_available, layer_fp32_available, len(layer_fp32_keys),
+            updated, missing_fp32_keys[:8],
+        )
+    fp32_unflatten_error = None
+    if not missing_fp32_keys:
+        try:
+            unflatten_optimizer_fp32_params({"optimizer": _pending_optimizer_state})
+        except KeyError as exc:
+            fp32_unflatten_error = exc
+    has_checkpoint_fp32_master = (
+        not missing_fp32_keys
+        and fp32_unflatten_error is None
+        and _pending_optimizer_has_complete_fp32_master(_pending_optimizer_state)
+    )
+    if not has_checkpoint_fp32_master:
+        if _frcheck_hw_optimizer_overlap_enabled():
+            raise RuntimeError(
+                "FRCheck optimizer overlap requires complete recovered FP32 master "
+                "parameters after deferred tensor materialization: "
+                f"expected_flat={expected_fp32} available_flat={available_fp32} "
+                f"missing_flat={len(missing_fp32_keys)} "
+                f"common_available={common_fp32_available} "
+                f"layer_available={layer_fp32_available}/{len(layer_fp32_keys)} "
+                f"optimizer_layer_updated={updated} "
+                f"missing_examples={missing_fp32_keys[:8]}"
+            ) from fp32_unflatten_error
+        _sync_frcheck_model_params_to_optimizer_main_params(optimizer)
+        _pending_optimizer_state.pop("fp32_params_flat", None)
+        _pending_optimizer_state.pop("_fp32_structure", None)
+        _pending_optimizer_state.pop("fp32_from_fp16_params", None)
+        _pending_optimizer_state.pop("fp32_from_fp16", None)
+        _install_current_fp32_params_for_optimizer_load(
+            optimizer, _pending_optimizer_state
+        )
     prepare_s = time.time() - t_prepare
     runtime.optimizer_cpu_prepare_s += prepare_s
     return _pending_optimizer_state, prepare_s, clone_recovery_tensors, updated
@@ -2273,8 +2458,8 @@ def frcheck_log_optimizer_overlap_not_started() -> None:
 
 
 def frcheck_prepare_optimizer_h2d(optimizer=None) -> bool:
-    """Install failed-rank optimizer structures and retain H2D copies for first forward."""
-    global _optimizer_h2d_copy_pairs, _optimizer_h2d_prepare_s, _optimizer_h2d_prepared
+    """Start failed-rank optimizer CPU preparation without blocking checkpoint load."""
+    global _optimizer_prepare_thread, _optimizer_prepare_error
     if _optimizer_h2d_prepared or _pending_optimizer_state is None or optimizer is None:
         return False
     if not _frcheck_hw_optimizer_overlap_enabled():
@@ -2283,25 +2468,49 @@ def frcheck_prepare_optimizer_h2d(optimizer=None) -> bool:
     runtime = service.runtime
     if runtime is None:
         return False
-    optimizer_state, cpu_prepare_s, cpu_offload, updated = _prepare_deferred_optimizer_state(
-        optimizer, runtime, service
-    )
-    from megatron.core.optimizer.optimizer import (
-        prepare_optimizer_state_h2d_into_existing,
-    )
+    with _optimizer_prepare_lock:
+        if _optimizer_prepare_thread is not None:
+            return True
+        _optimizer_prepare_done.clear()
+        _optimizer_prepare_error = None
 
-    t_prepare = time.time()
-    copy_pairs = prepare_optimizer_state_h2d_into_existing(optimizer, optimizer_state)
-    _optimizer_h2d_prepare_s = time.time() - t_prepare
-    _optimizer_h2d_copy_pairs = copy_pairs
-    _optimizer_h2d_prepared = True
-    logger.debug(
-        "FRCheck optimizer overlap prepared into existing state: "
-        "optimizer_cpu_prepare_s=%.6fs optimizer_existing_map_s=%.6fs "
-        "optimizer_h2d_tensors=%d "
-        "cpu_offload=%s updated_tensors=%d",
-        cpu_prepare_s, _optimizer_h2d_prepare_s, len(copy_pairs), cpu_offload, updated,
-    )
+        def _prepare() -> None:
+            global _optimizer_h2d_copy_pairs, _optimizer_h2d_prepare_s
+            global _optimizer_h2d_prepared, _optimizer_prepare_error
+            try:
+                optimizer_state, cpu_prepare_s, cpu_offload, updated = (
+                    _prepare_deferred_optimizer_state(optimizer, runtime, service)
+                )
+                from megatron.core.optimizer.optimizer import (
+                    prepare_optimizer_state_h2d_into_existing,
+                )
+
+                t_prepare = time.time()
+                copy_pairs = prepare_optimizer_state_h2d_into_existing(
+                    optimizer, optimizer_state
+                )
+                with _optimizer_prepare_lock:
+                    _optimizer_h2d_prepare_s = time.time() - t_prepare
+                    _optimizer_h2d_copy_pairs = copy_pairs
+                    _optimizer_h2d_prepared = True
+                logger.debug(
+                    "FRCheck optimizer overlap CPU prepare complete: "
+                    "optimizer_cpu_prepare_s=%.6fs optimizer_existing_map_s=%.6fs "
+                    "optimizer_h2d_tensors=%d cpu_offload=%s updated_tensors=%d",
+                    cpu_prepare_s, _optimizer_h2d_prepare_s, len(copy_pairs),
+                    cpu_offload, updated,
+                )
+            except BaseException as exc:
+                _optimizer_prepare_error = exc
+            finally:
+                _optimizer_prepare_done.set()
+
+        _optimizer_prepare_thread = threading.Thread(
+            target=_prepare,
+            name="frcheck-optimizer-cpu-prepare",
+            daemon=False,
+        )
+        _optimizer_prepare_thread.start()
     return True
 
 
@@ -2311,6 +2520,10 @@ def frcheck_start_optimizer_h2d(optimizer=None) -> bool:
     global _optimizer_h2d_start_event, _optimizer_h2d_started
     global _optimizer_h2d_start_wall_s, _optimizer_h2d_stream
     global _optimizer_h2d_copy_pairs, _optimizer_h2d_prepare_s, _optimizer_h2d_prepared
+    if _optimizer_prepare_error is not None:
+        raise RuntimeError("FRCheck optimizer CPU preparation failed") from _optimizer_prepare_error
+    if not _optimizer_prepare_done.is_set():
+        return False
     if _optimizer_h2d_started or not _optimizer_h2d_prepared:
         return False
     if not _frcheck_hw_optimizer_overlap_enabled():
@@ -2386,7 +2599,14 @@ def frcheck_wait_optimizer_h2d(optimizer=None) -> bool:
 
 
 def frcheck_wait_for_optimizer_state(optimizer=None) -> bool:
-    """Wait for a started H2D load or synchronously load deferred optimizer state."""
+    """Fence optimizer preparation and H2D before optimizer state is consumed."""
+    global _optimizer_prepare_thread
+    if _optimizer_prepare_thread is not None:
+        _optimizer_prepare_done.wait()
+        _optimizer_prepare_thread.join()
+        _optimizer_prepare_thread = None
+        if _optimizer_prepare_error is not None:
+            raise RuntimeError("FRCheck optimizer CPU preparation failed") from _optimizer_prepare_error
     if _optimizer_h2d_prepared and not _optimizer_h2d_started:
         frcheck_start_optimizer_h2d(optimizer)
     if frcheck_wait_optimizer_h2d(optimizer):
@@ -6908,6 +7128,7 @@ def _run_recovery_pipeline(
     recovery_role: str = "unknown",
     tensor_views_by_key: Optional[Dict[str, torch.Tensor]] = None,
     checkpoint_dir: Optional[Path] = None,
+    common_readiness: Optional[_FRCheckCommonReadiness] = None,
 ) -> List[Tuple[Optional[_FRCheckLayerReadyRecord], Dict[str, float]]]:
     t_pipeline = time.time()
     completed: "queue.Queue[Optional[_FRCheckRecoveredWindow]]" = queue.Queue(maxsize=2)
@@ -7091,6 +7312,8 @@ def _run_recovery_pipeline(
                 _free_slots(free_ranges, old_start, old_len)
         except BaseException as exc:
             error_holder["error"] = exc
+            if common_readiness is not None:
+                common_readiness.fail(exc)
         finally:
             completed.put(None)
 
@@ -7127,6 +7350,12 @@ def _run_recovery_pipeline(
             + layer_timing.get('materialize_s', 0.0)
         )
         results.append((record, layer_timing))
+        if common_readiness is not None and is_failed:
+            common_readiness.publish(
+                _extract_layer_tensors_from_buf(
+                    item.window.layer_buf, job.layer_infos, clone_storage=False,
+                )
+            )
         materialized_jobs.add(id(job))
         done_time = time.time()
         last_materialize_done["time"] = done_time
@@ -7146,7 +7375,11 @@ def _run_recovery_pipeline(
             waves=layer_timing.get('waves', 0),
         )
     network_thread.join()
+    if common_readiness is not None and error_holder["error"] is None:
+        common_readiness.finish()
     if error_holder["error"] is not None:
+        if common_readiness is not None:
+            common_readiness.fail(error_holder["error"])
         raise error_holder["error"]
     elapsed = time.time() - t_pipeline
     serial_work_s = sum(
@@ -7231,6 +7464,7 @@ def _start_layer_recovery_worker(
     tensor_views_by_key: Optional[Dict[str, torch.Tensor]] = None,
     checkpoint_dir: Optional[Path] = None,
     all_layer_metadata: Optional[Dict[int, Dict[str, Dict[str, Any]]]] = None,
+    common_readiness: Optional[_FRCheckCommonReadiness] = None,
 ) -> threading.Thread:
     error_holder: Dict[str, Optional[BaseException]] = {"error": None}
 
@@ -7241,30 +7475,40 @@ def _start_layer_recovery_worker(
             map_to_full_buf=map_to_full_buf, cleanup_after=cleanup_after,
         )
         try:
-            try:
-                _run_recovery_pipeline(
-                    jobs, manager, native, n, rank, is_failed, preloaded,
-                    buf_pool, full_buf, global_tensor_infos, runtime=runtime,
-                    map_to_full_buf=map_to_full_buf,
-                    clone_runtime_tensors=clone_runtime_tensors,
-                    recovery_role=recovery_role,
-                    tensor_views_by_key=tensor_views_by_key,
-                    checkpoint_dir=checkpoint_dir,
-                )
-                _dispatch_recovery_parity_after_data_recovery(recovery_role)
-            except Exception as exc:
-                if runtime is not None:
-                    for job in jobs:
-                        if job.layer_idx >= 0:
-                            runtime.mark_layer_error(
-                                job.layer_idx, f"{type(exc).__name__}: {exc}"
-                            )
-                raise
+            _run_recovery_pipeline(
+                jobs, manager, native, n, rank, is_failed, preloaded,
+                buf_pool, full_buf, global_tensor_infos, runtime=runtime,
+                map_to_full_buf=map_to_full_buf,
+                clone_runtime_tensors=clone_runtime_tensors,
+                recovery_role=recovery_role,
+                tensor_views_by_key=tensor_views_by_key,
+                checkpoint_dir=checkpoint_dir,
+                common_readiness=common_readiness,
+            )
+            _dispatch_recovery_parity_after_data_recovery(recovery_role)
         except BaseException as exc:
             error_holder["error"] = exc
+            if common_readiness is not None:
+                common_readiness.fail(exc)
+            if runtime is not None:
+                error_text = f"{type(exc).__name__}: {exc}"
+                for job in jobs:
+                    if job.layer_idx >= 0:
+                        runtime.mark_layer_error(job.layer_idx, error_text)
         finally:
-            if cleanup_after:
-                _teardown_frcheck_native_after_load()
+            try:
+                if cleanup_after:
+                    _teardown_frcheck_native_after_load()
+            except BaseException as exc:
+                if error_holder["error"] is None:
+                    error_holder["error"] = exc
+                if common_readiness is not None:
+                    common_readiness.fail(exc)
+                if runtime is not None:
+                    error_text = f"{type(exc).__name__}: {exc}"
+                    for job in jobs:
+                        if job.layer_idx >= 0:
+                            runtime.mark_layer_error(job.layer_idx, error_text)
             _frcheck_recovery_profile(
                 recovery_role, "worker_done", jobs=len(jobs),
                 elapsed_s=time.time() - t_worker, cleanup_after=cleanup_after,
@@ -8617,23 +8861,34 @@ def recover_frcheck_legacy_hardware(
             concurrency_override=common_wave_size,
         )
 
-    # Recovery network ordering is an encode_iter protocol invariant. Splitting
-    # rank-local common/transformer jobs by layer_idx can reorder PP stages.
-    detached_transformer_recovery = False
+    # Recovery network ordering is an encode_iter protocol invariant. The detached
+    # worker therefore owns the complete ordered job sequence without splitting it.
+    detached_transformer_recovery = bool(
+        async_forward and async_detach_safe and is_failed
+        and runtime_for_recovery is not None and recovery_jobs
+        and direct_tensor_views_by_key is not None
+    )
+    common_readiness: Optional[_FRCheckCommonReadiness] = None
+    if detached_transformer_recovery:
+        optimizer_layer_map = main_payload.get("optimizer_layer_map", {})
+        distributed_common_keys = _distributed_common_keys_for_payload(main_payload)
+        required_common_keys = {
+            getattr(info, "key", "")
+            for info in main_payload.get("tensor_infos", [])
+            if getattr(info, "key", "")
+            and getattr(info, "key", "") not in distributed_common_keys
+            and _classify_frcheck_tensor(
+                getattr(info, "key", ""), optimizer_layer_map
+            ).kind not in ("model_layer", "optimizer_layer")
+            and int(getattr(info, "size_bytes", 0)) > 0
+        }
+        common_readiness = _FRCheckCommonReadiness(required_common_keys)
     if direct_tensor_views_by_key is not None:
         if workspace is None:
             _preallocate_stable_failed_layer_bufs(native, buf_pool, recovery_jobs, n)
         _frcheck_recovery_profile(
             recovery_role, "stable_failed_layer_bufs_enabled",
             jobs=len(recovery_jobs), direct_reconstruct=True,
-        )
-    elif detached_transformer_recovery:
-        async_jobs_for_buffers = [job for job in recovery_jobs if job.layer_idx >= 0]
-        if workspace is None:
-            _preallocate_stable_failed_layer_bufs(native, buf_pool, async_jobs_for_buffers, n)
-        _frcheck_recovery_profile(
-            recovery_role, "stable_failed_layer_bufs_enabled",
-            jobs=len(async_jobs_for_buffers), direct_reconstruct=False,
         )
 
     parity_preloaded: Dict[int, Dict[int, torch.Tensor]] = {}
@@ -8760,53 +9015,26 @@ def recover_frcheck_legacy_hardware(
             detached_transformer_recovery,
         )
     if detached_transformer_recovery:
-        sync_jobs = [job for job in recovery_jobs if job.layer_idx < 0]
-        async_jobs = [job for job in recovery_jobs if job.layer_idx >= 0]
-        if sync_jobs:
-            _start_recovery_to_forward_from_pipeline_start()
-            sync_results = _run_recovery_pipeline(
-                sync_jobs, manager, native, n, rank, is_failed, preloaded,
-                buf_pool, full_buf, global_tensor_infos,
-                runtime=runtime_for_recovery,
-                map_to_full_buf=sync_map_to_full_buf,
-                clone_runtime_tensors=sync_clone_runtime_tensors,
-                recovery_role=recovery_role,
-                tensor_views_by_key=direct_tensor_views_by_key,
-                checkpoint_dir=checkpoint_dir,
+        _start_recovery_to_forward_from_pipeline_start()
+        recovery_worker = _start_layer_recovery_worker(
+            recovery_jobs, manager, native, n, rank, is_failed, preloaded,
+            buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
+            cleanup_after=False,
+            map_to_full_buf=async_map_to_full_buf,
+            clone_runtime_tensors=async_clone_runtime_tensors,
+            recovery_role=recovery_role,
+            tensor_views_by_key=None,
+            checkpoint_dir=checkpoint_dir,
+            all_layer_metadata=all_layer_metadata,
+            common_readiness=common_readiness,
+        )
+        _set_active_frcheck_recovery_worker(recovery_worker)
+        if _dbg:
+            logger.debug(
+                "FRCheck recovery: detached ordered worker started rank=%d jobs=%d "
+                "required_common=%d",
+                rank, len(recovery_jobs), len(common_readiness.required_keys),
             )
-            _accumulate_layer_timings(sync_results)
-            for record, _layer_timing in sync_results:
-                if record is not None:
-                    layerwise_records.append(record)
-        if async_jobs:
-            _start_recovery_to_forward_from_pipeline_start()
-            recovery_worker = _start_layer_recovery_worker(
-                async_jobs, manager, native, n, rank, is_failed, preloaded,
-                buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
-                cleanup_after=False,
-                map_to_full_buf=async_map_to_full_buf,
-                clone_runtime_tensors=async_clone_runtime_tensors,
-                recovery_role=recovery_role,
-                tensor_views_by_key=None,
-                checkpoint_dir=checkpoint_dir,
-                all_layer_metadata=all_layer_metadata,
-            )
-            _set_active_frcheck_recovery_worker(recovery_worker)
-            if _dbg:
-                logger.debug(
-                    "FRCheck recovery: async-forward detached transformer worker "
-                    "started rank=%d sync_jobs=%d async_jobs=%d",
-                    rank, len(sync_jobs), len(async_jobs),
-                )
-            safe_point = getattr(args, "frcheck_recovery_safe_point", "load")
-            if _dbg:
-                logger.debug(
-                    "FRCheck recovery: deferring detached transformer worker join "
-                    "to safe_point=%s rank=%d",
-                    safe_point, rank,
-                )
-        else:
-            _dispatch_recovery_parity_after_data_recovery(recovery_role)
     elif async_forward and involved and recovery_jobs:
         _start_recovery_to_forward_from_pipeline_start()
         recovery_worker = _start_layer_recovery_worker(
@@ -8866,8 +9094,9 @@ def recover_frcheck_legacy_hardware(
         if full_buf is not None:
             main_payload['tensor_buffer'] = full_buf[:total_tensor_size]
         if detached_transformer_recovery:
+            common_snapshot = common_readiness.wait_snapshot()
             result = _reconstruct_common_from_tensor_views(
-                main_payload, direct_tensor_views_by_key, flat_key_roots,
+                main_payload, common_snapshot, flat_key_roots,
             )
         elif direct_tensor_views_by_key is not None:
             result = _reconstruct_from_tensor_views(
@@ -9019,7 +9248,10 @@ def _infer_distributed_common_keys_from_metadata(main_payload: Dict) -> set:
         if not isinstance(rank_meta, dict):
             continue
         for layer_name, layer_meta in rank_meta.items():
-            if not str(layer_name).startswith("layer_"):
+            # Only numeric transformer groups can contain common tensors moved by
+            # distribute_common. layer_common owns immediate rebuild state and must
+            # never be inferred as deferred merely because its name starts with layer_.
+            if re.fullmatch(r"layer_\d+", str(layer_name)) is None:
                 continue
             tensor_infos = layer_meta.get("tensor_infos", []) if isinstance(layer_meta, dict) else []
             for info in tensor_infos:
@@ -9032,6 +9264,13 @@ def _infer_distributed_common_keys_from_metadata(main_payload: Dict) -> set:
     return inferred
 
 
+def _distributed_common_keys_for_payload(main_payload: Dict) -> set:
+    """Read explicit distribution metadata, inferring only for old payloads."""
+    if "distributed_common_keys" in main_payload:
+        return set(main_payload.get("distributed_common_keys") or [])
+    return _infer_distributed_common_keys_from_metadata(main_payload)
+
+
 def _reconstruct_common_from_tensor_views(
     main_payload: Dict,
     tensor_views_by_key: Dict[str, torch.Tensor],
@@ -9042,9 +9281,7 @@ def _reconstruct_common_from_tensor_views(
     non_tensor_data = main_payload.get("non_tensor_data", {})
     flat_key_roots = flat_key_roots or main_payload.get("flat_key_roots", [])
     optimizer_layer_map = main_payload.get("optimizer_layer_map", {})
-    distributed_common_keys = set(main_payload.get("distributed_common_keys", []))
-    if not distributed_common_keys:
-        distributed_common_keys = _infer_distributed_common_keys_from_metadata(main_payload)
+    distributed_common_keys = _distributed_common_keys_for_payload(main_payload)
 
     common_infos = []
     common_tensor_data: List[torch.Tensor] = []

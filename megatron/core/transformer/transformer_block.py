@@ -67,13 +67,15 @@ logger = logging.getLogger(__name__)
 
 _frcheck_wait_layer_hook = None
 _frcheck_forward_done_hook = None
+_frcheck_stage_last_layer_start_hook = None
 _frcheck_hooks_loaded = False
 _recovery_first_layer_start_hook = None
 _recovery_first_layer_start_hook_loaded = False
 
 
 def _load_frcheck_layer_hooks() -> None:
-    global _frcheck_wait_layer_hook, _frcheck_forward_done_hook, _frcheck_hooks_loaded
+    global _frcheck_wait_layer_hook, _frcheck_forward_done_hook
+    global _frcheck_stage_last_layer_start_hook, _frcheck_hooks_loaded
     if _frcheck_hooks_loaded:
         return
     _frcheck_hooks_loaded = True
@@ -82,10 +84,12 @@ def _load_frcheck_layer_hooks() -> None:
             frcheck_wait_and_materialize_layer,
             record_frcheck_first_layer_forward_done,
         )
+        from megatron.training.global_vars import record_frcheck_stage_last_layer_forward_start
     except Exception:
         return
     _frcheck_wait_layer_hook = frcheck_wait_and_materialize_layer
     _frcheck_forward_done_hook = record_frcheck_first_layer_forward_done
+    _frcheck_stage_last_layer_start_hook = record_frcheck_stage_last_layer_forward_start
 
 
 def _frcheck_wait_for_layer(layer_idx: int) -> None:
@@ -94,6 +98,14 @@ def _frcheck_wait_for_layer(layer_idx: int) -> None:
         _load_frcheck_layer_hooks()
     if _frcheck_wait_layer_hook is not None:
         _frcheck_wait_layer_hook(layer_idx)
+
+
+def _frcheck_record_stage_last_layer_start(layer_number: int, target_layer_number: int) -> None:
+    """Record the first forward start of this physical stage's last owned layer."""
+    if not _frcheck_hooks_loaded:
+        _load_frcheck_layer_hooks()
+    if _frcheck_stage_last_layer_start_hook is not None:
+        _frcheck_stage_last_layer_start_hook(layer_number, target_layer_number)
 
 
 def _frcheck_record_layer_forward_done(layer_idx: int) -> None:
@@ -428,6 +440,9 @@ class TransformerBlock(MegatronModule):
         use_inner_fp8_context: bool,
     ):
         """Forward method with activation checkpointing."""
+        stage_last_layer_number = max(
+            (layer.layer_number for layer in self.layers), default=-1
+        )
 
         def custom(start: int, end: int):
             def custom_forward(
@@ -436,6 +451,9 @@ class TransformerBlock(MegatronModule):
                 for index in range(start, end):
                     layer = self._get_layer(index)
                     _frcheck_wait_for_layer(index)
+                    _frcheck_record_stage_last_layer_start(
+                        layer.layer_number, stage_last_layer_number
+                    )
                     if index == 0:
                         _record_recovery_first_layer_start()
                     inner_fp8_context = (
@@ -631,8 +649,14 @@ class TransformerBlock(MegatronModule):
                     use_inner_fp8_context=use_inner_fp8_context,
                 )
             else:
+                stage_last_layer_number = max(
+                    (layer.layer_number for layer in self.layers), default=-1
+                )
                 for l_no, layer in enumerate(self.layers):
                     _frcheck_wait_for_layer(l_no)
+                    _frcheck_record_stage_last_layer_start(
+                        layer.layer_number, stage_last_layer_number
+                    )
                     if l_no == 0:
                         _record_recovery_first_layer_start()
                     inner_fp8_context = (

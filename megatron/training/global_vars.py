@@ -26,6 +26,8 @@ _GLOBAL_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
 _GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
+_GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER = None
+_GLOBAL_FRCHECK_STAGE_LAST_LAYER_GENERATION = 0
 _GLOBAL_RECOVERY_TIMING_SUMMARIES = {}
 _GLOBAL_RECOVERY_TIMING_SUMMARIES_LOCK = threading.Lock()
 _GLOBAL_FT_LOAD_TIMING_CONTEXT = None
@@ -85,8 +87,22 @@ def start_recovery_to_forward_timer(
 ) -> None:
     """Start a one-shot timer that ends after the next forward step."""
     global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
+    global _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER
+    global _GLOBAL_FRCHECK_STAGE_LAST_LAYER_GENERATION
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     now = time.time()
+    if scheme == "FRCheck":
+        _GLOBAL_FRCHECK_STAGE_LAST_LAYER_GENERATION += 1
+        _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER = {
+            "generation": _GLOBAL_FRCHECK_STAGE_LAST_LAYER_GENERATION,
+            "start": now,
+            "rank": rank,
+            "scheme": scheme,
+            "context": dict(context),
+            "target_layer_number": -1,
+        }
+    else:
+        _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER = None
     _GLOBAL_RECOVERY_TO_FORWARD_TIMER = {
         "scheme": scheme,
         "phase": phase,
@@ -104,6 +120,9 @@ def update_recovery_to_forward_timer_context(**context) -> None:
     if timer is None:
         return
     timer.setdefault("context", {}).update(context)
+    stage_timer = _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER
+    if stage_timer is not None:
+        stage_timer.setdefault("context", {}).update(context)
 
 
 def mark_recovery_to_forward_timer(label: str) -> None:
@@ -179,6 +198,47 @@ def record_recovery_first_layer_start() -> None:
             "rank": rank,
             "scheme": str(timer.get("scheme", "FT")),
             "phase": str(timer.get("phase", "")),
+        },
+    )
+
+
+def record_frcheck_stage_last_layer_forward_start(
+    layer_number: int, target_layer_number: int
+) -> None:
+    """Record the highest TransformerBlock target reached in this recovery cycle."""
+    timer = _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER
+    if timer is None or timer.get("scheme") != "FRCheck":
+        return
+    layer_number = int(layer_number)
+    target_layer_number = int(target_layer_number)
+    if target_layer_number < 0 or layer_number != target_layer_number:
+        return
+    previous_target = int(timer.get("target_layer_number", -1))
+    if target_layer_number <= previous_target:
+        return
+    timer["target_layer_number"] = target_layer_number
+    start_time = time.time()
+    context = timer.get("context", {}) or {}
+    role = str(context.get("role", ""))
+    rank = int(timer.get("rank", -1))
+    pp_rank = -1
+    tp_rank = -1
+    try:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    except Exception:
+        pass
+    stash_recovery_timing_summary(
+        "frcheck_stage_last_layer_start",
+        {
+            "present": True,
+            "elapsed_s": start_time - float(timer.get("start", 0.0)),
+            "generation": int(timer.get("generation", -1)),
+            "rank": rank,
+            "pp_rank": pp_rank,
+            "tp_rank": tp_rank,
+            "role": role,
+            "layer_number": target_layer_number,
         },
     )
 
@@ -300,6 +360,7 @@ def finish_recovery_to_forward_timer(label: str = "forward_step_end") -> None:
 def flush_recovery_timing_summaries() -> None:
     """All-reduce and log pending recovery timings at a common train-step boundary."""
     global _GLOBAL_RECOVERY_TIMING_SUMMARIES
+    global _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER
     with _GLOBAL_RECOVERY_TIMING_SUMMARIES_LOCK:
         has_frcheck_milestones = "frcheck_first_layer_milestones" in (
             _GLOBAL_RECOVERY_TIMING_SUMMARIES
@@ -343,6 +404,7 @@ def flush_recovery_timing_summaries() -> None:
     first_layer = pending_summaries.get("frcheck_first_layer_milestones")
     recovery_first_layer = pending_summaries.get("recovery_first_layer_start")
     frcheck_forward_backward = pending_summaries.get("frcheck_forward_backward")
+    stage_last_layer = pending_summaries.get("frcheck_stage_last_layer_start")
 
     rtf_elapsed_s = float((rtf or {}).get("elapsed_s", 0.0))
     rtf_teardown_s = float((rtf or {}).get("teardown_s", 0.0))
@@ -408,7 +470,10 @@ def flush_recovery_timing_summaries() -> None:
     max_contributor = None
     failed_elapsed_max_s = None
     failed_forward_start_max_s = None
-    all_forward_start_max_s = None
+    failed_stage_last_layer_max_s = None
+    failed_stage_last_layer_coverage = 0
+    failed_rank_coverage = 0
+    stage_last_layer_max_contributor = None
     frcheck_forward_backward_max_contributor = None
     gathered_timing_info = []
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -451,6 +516,9 @@ def flush_recovery_timing_summaries() -> None:
                 "forward_step_to_forward_backward_done_s": float((rtf or {}).get("forward_step_to_forward_backward_done_s", 0.0)),
                 "first_layer_milestones": dict(first_layer or {}),
                 "marks": list((rtf or {}).get("marks", [])),
+                "stage_last_layer_present": bool((stage_last_layer or {}).get("present", False)),
+                "stage_last_layer_elapsed_s": float((stage_last_layer or {}).get("elapsed_s", -1.0)),
+                "stage_last_layer_layer_number": int((stage_last_layer or {}).get("layer_number", -1)),
                 "frcheck_forward_backward_present": frcheck_forward_backward is not None,
                 "frcheck_forward_backward_elapsed_s": frcheck_forward_backward_elapsed_s,
                 "frcheck_forward_backward_rank": int(
@@ -469,9 +537,6 @@ def flush_recovery_timing_summaries() -> None:
             gathered_timing_info = valid
             if valid and values[1 + len(pipeline_keys)] > 0.0:
                 max_contributor = max(valid, key=lambda item: float(item.get("elapsed_s", -1.0)))
-                all_forward_start_max_s = max(
-                    float(item.get("forward_start_elapsed_s", -1.0)) for item in valid
-                )
             failed_contributors = [
                 item
                 for item in valid
@@ -486,6 +551,20 @@ def flush_recovery_timing_summaries() -> None:
                     float(item.get("forward_start_elapsed_s", -1.0))
                     for item in failed_contributors
                 )
+                failed_rank_coverage = len(failed_contributors)
+                stage_contributors = [
+                    item for item in failed_contributors
+                    if item.get("stage_last_layer_present", False)
+                ]
+                failed_stage_last_layer_coverage = len(stage_contributors)
+                if stage_contributors:
+                    stage_last_layer_max_contributor = max(
+                        stage_contributors,
+                        key=lambda item: float(item.get("stage_last_layer_elapsed_s", -1.0)),
+                    )
+                    failed_stage_last_layer_max_s = float(
+                        stage_last_layer_max_contributor["stage_last_layer_elapsed_s"]
+                    )
             frcheck_forward_backward_contributors = [
                 item
                 for item in valid
@@ -530,12 +609,23 @@ def flush_recovery_timing_summaries() -> None:
                 "forward_step_to_forward_backward_done_s": float((rtf or {}).get("forward_step_to_forward_backward_done_s", 0.0)),
                 "first_layer_milestones": dict(first_layer or {}),
                 "marks": list((rtf or {}).get("marks", [])),
+                "stage_last_layer_present": bool((stage_last_layer or {}).get("present", False)),
+                "stage_last_layer_elapsed_s": float((stage_last_layer or {}).get("elapsed_s", -1.0)),
+                "stage_last_layer_layer_number": int((stage_last_layer or {}).get("layer_number", -1)),
             }
             gathered_timing_info = [max_contributor]
-            all_forward_start_max_s = float(max_contributor.get("forward_start_elapsed_s", 0.0))
             if "failed" in str(max_contributor.get("role", "")).split("+"):
                 failed_elapsed_max_s = rtf_adjusted_elapsed_s
-                failed_forward_start_max_s = all_forward_start_max_s
+                failed_forward_start_max_s = float(
+                    max_contributor.get("forward_start_elapsed_s", 0.0)
+                )
+                failed_rank_coverage = 1
+                if max_contributor.get("stage_last_layer_present", False):
+                    failed_stage_last_layer_coverage = 1
+                    stage_last_layer_max_contributor = max_contributor
+                    failed_stage_last_layer_max_s = float(
+                        max_contributor.get("stage_last_layer_elapsed_s", -1.0)
+                    )
         if frcheck_forward_backward is not None:
             frcheck_forward_backward_max_contributor = {
                 "frcheck_forward_backward_elapsed_s": frcheck_forward_backward_elapsed_s,
@@ -557,13 +647,15 @@ def flush_recovery_timing_summaries() -> None:
             summary = dict(zip(pipeline_keys, values[1:1 + len(pipeline_keys)]))
             logger.info(
                 "FRCheck HW pipeline breakdown: "
-                "start_to_forward_start_failed_max_s=%.6fs start_to_forward_start_all_max_s=%.6fs "
+                "start_to_stage_last_layer_forward_start_failed_max_s=%.6fs "
+                "stage_last_layer_coverage=%d/%d "
                 "recovery_pipeline_s=%.6fs recovery_network_s=%.6fs "
                 "recovery_decode_s=%.6fs materialize_s=%.6fs "
                 "model_h2d_span_s=%.6fs model_h2d_done_s=%.6fs "
                 "forward_wait_model_s=%.6fs model_h2d_coverage=%d/%d",
-                failed_forward_start_max_s if failed_forward_start_max_s is not None else -1.0,
-                all_forward_start_max_s if all_forward_start_max_s is not None else -1.0,
+                failed_stage_last_layer_max_s if failed_stage_last_layer_max_s is not None else -1.0,
+                failed_stage_last_layer_coverage,
+                failed_rank_coverage,
                 summary["pipeline_s"],
                 summary["recovery_net_s"],
                 summary["recovery_decode_s"],
@@ -574,6 +666,16 @@ def flush_recovery_timing_summaries() -> None:
                 int(summary["model_h2d_timed_layers"]),
                 int(summary["model_h2d_total_layers"]),
             )
+            if stage_last_layer_max_contributor is not None:
+                logger.info(
+                    "FRCheck stage-last-layer max contributor: rank=%d pp_rank=%d "
+                    "tp_rank=%d layer_number=%d elapsed_s=%.6f",
+                    int(stage_last_layer_max_contributor.get("rank", -1)),
+                    int(stage_last_layer_max_contributor.get("pp_rank", -1)),
+                    int(stage_last_layer_max_contributor.get("tp_rank", -1)),
+                    int(stage_last_layer_max_contributor.get("stage_last_layer_layer_number", -1)),
+                    float(stage_last_layer_max_contributor.get("stage_last_layer_elapsed_s", -1.0)),
+                )
         if values[recovery_first_layer_offset] > 0.0:
             scheme = str(
                 (recovery_first_layer or {}).get(
@@ -760,6 +862,7 @@ def flush_recovery_timing_summaries() -> None:
 
     with _GLOBAL_RECOVERY_TIMING_SUMMARIES_LOCK:
         _GLOBAL_RECOVERY_TIMING_SUMMARIES = {}
+    _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER = None
 
 
 
@@ -839,6 +942,7 @@ def unset_global_variables():
     global _GLOBAL_ENERGY_MONITOR
     global _GLOBAL_SIGNAL_HANDLER
     global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
+    global _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER
     global _GLOBAL_RECOVERY_TIMING_SUMMARIES
 
     _GLOBAL_ARGS = None
@@ -852,6 +956,7 @@ def unset_global_variables():
     _GLOBAL_ENERGY_MONITOR = None
     _GLOBAL_SIGNAL_HANDLER = None
     _GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
+    _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER = None
     _GLOBAL_RECOVERY_TIMING_SUMMARIES = {}
     _GLOBAL_FT_LOAD_TIMING_CONTEXT = None
 

@@ -71,8 +71,8 @@ def _get_ip(rank: int, local_rank: int) -> str:
 def _init_dist(args) -> None:
     if dist.is_initialized():
         return
-    os.environ.setdefault("MASTER_ADDR", args.master_addr)
-    os.environ.setdefault("MASTER_PORT", str(args.master_port))
+    os.environ["MASTER_ADDR"] = str(args.master_addr)
+    os.environ["MASTER_PORT"] = str(args.master_port)
     dist.init_process_group(
         backend=args.backend,
         rank=args.rank,

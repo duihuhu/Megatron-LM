@@ -15,6 +15,7 @@ NNODES="${NNODES:-8}"
 BASE_PORT="${NETWORK_BENCH_BASE_PORT:-45000}"
 CHANNELS_PER_PEER="${GEMINI2_CHANNELS_PER_PEER:-16}"
 GEMINI_GROUP_SIZE="${GEMINI2_GROUP_SIZE:-8}"
+GEMINI2_CPU_SEND="${GEMINI2_CPU_SEND:-0}"
 FRCHECK_N="${FRCHECK_N:-8}"
 FRCHECK_LANES_PER_PEER="${FRCHECK_RDMA_LANES_PER_PEER:-16}"
 FRCHECK_SEND_LANES_PER_PEER="${FRCHECK_SEND_LANES_PER_PEER:-$FRCHECK_LANES_PER_PEER}"
@@ -25,23 +26,23 @@ FRCHECK_CPU_SEND="${FRCHECK_CPU_SEND:-0}"
 BACKEND="${BENCH_DIST_BACKEND:-gloo}"
 NETIFACES_INTERFACE="${NETIFACES_INTERFACE:-eth0}"
 
-export FRCHECK_LOCAL_RANK_NIC_0=eth0
-export FRCHECK_LOCAL_RANK_NIC_1=eth0
-export FRCHECK_LOCAL_RANK_NIC_2=eth0
-export FRCHECK_LOCAL_RANK_NIC_3=eth0
-export FRCHECK_LOCAL_RANK_NIC_4=eth1
-export FRCHECK_LOCAL_RANK_NIC_5=eth1
-export FRCHECK_LOCAL_RANK_NIC_6=eth1
-export FRCHECK_LOCAL_RANK_NIC_7=eth1
+export FRCHECK_LOCAL_RANK_NIC_0=${FRCHECK_LOCAL_RANK_NIC_0:-eth0}
+export FRCHECK_LOCAL_RANK_NIC_1=${FRCHECK_LOCAL_RANK_NIC_1:-eth0}
+export FRCHECK_LOCAL_RANK_NIC_2=${FRCHECK_LOCAL_RANK_NIC_2:-eth0}
+export FRCHECK_LOCAL_RANK_NIC_3=${FRCHECK_LOCAL_RANK_NIC_3:-eth0}
+export FRCHECK_LOCAL_RANK_NIC_4=${FRCHECK_LOCAL_RANK_NIC_4:-eth1}
+export FRCHECK_LOCAL_RANK_NIC_5=${FRCHECK_LOCAL_RANK_NIC_5:-eth1}
+export FRCHECK_LOCAL_RANK_NIC_6=${FRCHECK_LOCAL_RANK_NIC_6:-eth1}
+export FRCHECK_LOCAL_RANK_NIC_7=${FRCHECK_LOCAL_RANK_NIC_7:-eth1}
 
-export GEMINI_REPLICAS_LOCAL_RANK_NIC_0=eth0
-export GEMINI_REPLICAS_LOCAL_RANK_NIC_1=eth0
-export GEMINI_REPLICAS_LOCAL_RANK_NIC_2=eth0
-export GEMINI_REPLICAS_LOCAL_RANK_NIC_3=eth0
-export GEMINI_REPLICAS_LOCAL_RANK_NIC_4=eth1
-export GEMINI_REPLICAS_LOCAL_RANK_NIC_5=eth1
-export GEMINI_REPLICAS_LOCAL_RANK_NIC_6=eth1
-export GEMINI_REPLICAS_LOCAL_RANK_NIC_7=eth1
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_0=${GEMINI_REPLICAS_LOCAL_RANK_NIC_0:-eth0}
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_1=${GEMINI_REPLICAS_LOCAL_RANK_NIC_1:-eth0}
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_2=${GEMINI_REPLICAS_LOCAL_RANK_NIC_2:-eth0}
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_3=${GEMINI_REPLICAS_LOCAL_RANK_NIC_3:-eth0}
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_4=${GEMINI_REPLICAS_LOCAL_RANK_NIC_4:-eth1}
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_5=${GEMINI_REPLICAS_LOCAL_RANK_NIC_5:-eth1}
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_6=${GEMINI_REPLICAS_LOCAL_RANK_NIC_6:-eth1}
+export GEMINI_REPLICAS_LOCAL_RANK_NIC_7=${GEMINI_REPLICAS_LOCAL_RANK_NIC_7:-eth1}
 
 usage() {
     cat <<EOF
@@ -57,6 +58,7 @@ Options:
   --base-port PORT          default: $BASE_PORT
   --channels-per-peer N     Gemini2 channels, default: $CHANNELS_PER_PEER
   --gemini-group-size N      Gemini2 ring group size, default: $GEMINI_GROUP_SIZE
+  --gemini-cpu-send          use pinned CPU send buffers for Gemini2
   --frcheck-n N              FRCheck group size, default: $FRCHECK_N
   --frcheck-lanes-per-peer N default shared lanes: $FRCHECK_LANES_PER_PEER
   --frcheck-send-lanes-per-peer N default: $FRCHECK_SEND_LANES_PER_PEER
@@ -90,6 +92,7 @@ while [[ $# -gt 0 ]]; do
         --base-port) BASE_PORT="$2"; shift 2 ;;
         --channels-per-peer) CHANNELS_PER_PEER="$2"; shift 2 ;;
         --gemini-group-size) GEMINI_GROUP_SIZE="$2"; shift 2 ;;
+        --gemini-cpu-send) GEMINI2_CPU_SEND=1; shift ;;
         --frcheck-n) FRCHECK_N="$2"; shift 2 ;;
         --frcheck-lanes-per-peer) FRCHECK_LANES_PER_PEER="$2"; FRCHECK_SEND_LANES_PER_PEER="$2"; FRCHECK_RECV_LANES_PER_PEER="$2"; shift 2 ;;
         --frcheck-send-lanes-per-peer) FRCHECK_SEND_LANES_PER_PEER="$2"; shift 2 ;;
@@ -155,6 +158,9 @@ run_one_mode() {
         return 1
     fi
     local extra_args=()
+    if [[ "$mode" == "gemini2" && "$GEMINI2_CPU_SEND" == "1" ]]; then
+        extra_args+=(--cpu-send)
+    fi
     if [[ "$mode" == "frcheck" && "$FRCHECK_SIMPLE" == "1" ]]; then
         extra_args+=(--simple)
     fi
@@ -195,6 +201,7 @@ run_one_mode() {
                 --warmup "$WARMUP" \
                 --channels-per-peer "$CHANNELS_PER_PEER" \
                 --group-size "$GEMINI_GROUP_SIZE" \
+                "${extra_args[@]}" \
                 --backend "$BACKEND" > "$log_file" 2>&1 &
         else
             CUDA_VISIBLE_DEVICES="$gpu_id" PYTHONUNBUFFERED=1 python3 -X faulthandler "$script" \

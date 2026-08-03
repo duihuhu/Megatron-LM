@@ -253,6 +253,14 @@ ibv_device* select_rdma_device(
         return dev_list[0];
     }
 
+    for (int i = 0; i < num_devices; ++i) {
+        if (std::strcmp(ibv_get_device_name(dev_list[i]), iface) == 0) {
+            *selected_iface = iface;
+            *selected_ip = "";
+            return dev_list[i];
+        }
+    }
+
     *selected_iface = iface;
     *selected_ip = get_interface_ipv4(*selected_iface);
     ibv_device* matched = find_rdma_device_by_ip(*selected_ip, dev_list, num_devices, cfg.gid_index);

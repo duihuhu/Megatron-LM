@@ -10,6 +10,8 @@ singleton and its C++ native module.
 import ctypes
 import os
 import queue
+from collections import deque
+import struct
 import time
 from logging import getLogger
 from pathlib import Path
@@ -36,6 +38,23 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
 logger = getLogger(__name__)
 
 
+def _eccheck_hw2_recv_ring_depth() -> int:
+    raw_depth = os.getenv("ECCHECK_HW2_RECV_RING_DEPTH", "12")
+    try:
+        depth = int(raw_depth)
+    except ValueError as exc:
+        raise ValueError(
+            "ECCHECK_HW2_RECV_RING_DEPTH must be an integer in [1, 64], "
+            f"got {raw_depth!r}"
+        ) from exc
+    if depth < 1 or depth > 64:
+        raise ValueError(
+            "ECCHECK_HW2_RECV_RING_DEPTH must be in [1, 64], "
+            f"got {depth}"
+        )
+    return depth
+
+
 def _timing_max(value: float) -> float:
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return float(value)
@@ -51,15 +70,16 @@ def _timing_max_dict(timings: Dict[str, float]) -> Dict[str, float]:
 
 def _native_ft_timing(native) -> Dict[str, float]:
     if native is None:
-        return {"net_s": 0.0, "encode_s": 0.0}
+        return {"net_s": 0.0, "encode_s": 0.0, "decode_s": 0.0}
     try:
         stats = native.get_ft_timing_stats()
         return {
             "net_s": float(stats.get("net_s", 0.0)),
             "encode_s": float(stats.get("encode_s", 0.0)),
+            "decode_s": float(stats.get("decode_s", stats.get("xor_s", 0.0))),
         }
     except AttributeError:
-        return {"net_s": 0.0, "encode_s": 0.0}
+        return {"net_s": 0.0, "encode_s": 0.0, "decode_s": 0.0}
 
 
 def _timed_barrier() -> float:
@@ -975,16 +995,31 @@ def _copy_block_file_into_tensor(
     if not block_path.is_file():
         raise FileNotFoundError(f"ECCHECK legacy load: missing block file {block_path}")
     from megatron.training.legacy_io_utils import (
-        is_raw_format, read_raw_block, MAGIC_BLOCK, pin_uint8_tensor_if_available,
+        is_raw_format, read_raw_block_range, MAGIC_BLOCK, pin_uint8_tensor_if_available,
     )
+    if dest.device.type != "cpu" or dest.dtype != torch.uint8 or not dest.is_contiguous():
+        raise ValueError("ECCHECK raw block destination must be a contiguous CPU uint8 tensor")
+    dst = dest.view(-1)
     if is_raw_format(str(block_path), MAGIC_BLOCK):
-        src = read_raw_block(str(block_path), MAGIC_BLOCK, pin_tensor=True)
+        with open(block_path, "rb") as block_file:
+            header = block_file.read(12)
+        if len(header) != 12:
+            raise EOFError(f"Incomplete raw block header in {block_path}")
+        magic, data_len = header[:4], struct.unpack("<Q", header[4:])[0]
+        if magic != MAGIC_BLOCK:
+            raise ValueError(
+                f"Unexpected magic {magic!r} (expected {MAGIC_BLOCK!r}) in {block_path}"
+            )
+        n = min(data_len, dst.numel())
+        read_raw_block_range(str(block_path), MAGIC_BLOCK, dst, 0, n)
+        if n < dst.numel():
+            dst[n:].zero_()
+        return
     else:
         payload = torch.load(block_path, map_location="cpu", weights_only=False)
         src = pin_uint8_tensor_if_available(
             payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
         )
-    dst = dest.contiguous().view(-1)
     n = min(src.numel(), dst.numel())
     dst[:n].copy_(src[:n])
     if n < dst.numel():
@@ -1003,7 +1038,7 @@ def _load_eccheck_blocks_from_disk_into(
 
     Normal recovery layout:
     - rank_in_group 2: loads nothing (data comes via network XOR recovery)
-    - rank_in_group 0: loads partner_buffer (received from rank1 during save)
+    - rank_in_group 0: loads own_buffer parity and partner_buffer data
     - rank_in_group 1: loads own_buffer (its own data)
     - rank_in_group 3: loads own_buffer + partner_buffer (its own data + received)
 
@@ -1052,6 +1087,11 @@ def _load_eccheck_blocks_from_disk_into(
         return
 
     if rank_in_group == 0:
+        # Even save roles keep parity in own_buffer and partner data in partner_buffer.
+        # HW1 encodes from own_buffer and sends partner_buffer in Step2.
+        _copy_block_file_into_tensor(
+            checkpoint_dir, rank, "own_buffer", blocks["own_buffer"]
+        )
         _copy_block_file_into_tensor(
             checkpoint_dir, rank, "partner_buffer", blocks["partner_buffer"]
         )
@@ -1133,7 +1173,7 @@ def _run_eccheck_legacy_recovery(
     Uses the same chunked pipeline API as the modern path but sources data
     from pre-loaded .pt block buffers instead of mmap files.
     """
-    from time import time
+    from time import monotonic, sleep, time
 
     native = manager._eccheck_native
     if native is None:
@@ -1217,18 +1257,35 @@ def _run_eccheck_legacy_recovery(
             logger.error("ECCHECK legacy: timeout waiting for free parity buffer")
             return free_parity_queue.get()
 
-    # Ensure recv encoding buffers are allocated
-    if manager.eccheck_recv_encoding_buffers is None:
-        manager.eccheck_recv_encoding_buffers = (
-            manager.allocate_recv_encoding_buffers_phase2(registry)
+    # HW1 uses an isolated single-physical receive cache. Save may retain its
+    # independent two-buffer cache in an in-process manager.
+    if manager.eccheck_hw1_recv_encoding_buffers is None:
+        manager.allocate_recv_encoding_buffers_phase2(
+            registry, hw1_single_physical_buffer=True,
         )
-    __, recv_buf2 = manager.eccheck_recv_encoding_buffers
+    __, recv_buf2 = manager.eccheck_hw1_recv_encoding_buffers
     recv_base2 = int(recv_buf2.data_ptr())
 
     own_base = int(blocks["own_buffer"].data_ptr())
     partner_base = int(blocks["partner_buffer"].data_ptr())
     own_buf = blocks["own_buffer"]
     partner_buf = blocks["partner_buffer"]
+    full_buffers = [own_buf, partner_buf]
+    if recovered_buffer is not None:
+        full_buffers.append(recovered_buffer)
+    recovered_alias = (
+        "own" if recovered_buffer is own_buf
+        else "partner" if recovered_buffer is partner_buf
+        else "none"
+    )
+    logger.debug(
+        "ECCHECK HW1 memory layout: role=rig%d alias=recovered:%s "
+        "unique_full_buffers=%d recv_physical=%d logical_recv=2",
+        rank_in_group,
+        recovered_alias,
+        len({int(buffer.data_ptr()) for buffer in full_buffers}),
+        len({int(buffer.data_ptr()) for buffer in manager.eccheck_hw1_recv_encoding_buffers}),
+    )
 
     if active_event is not None:
         active_event.set()
@@ -1241,6 +1298,7 @@ def _run_eccheck_legacy_recovery(
     t_pipeline_net = 0.0
     try:
         while processed < max_total_bytes:
+            # Track only submissions accepted by the native HW2 pipeline.
             remaining = max_total_bytes - processed
             take = min(buffer_size, remaining)
 
@@ -1383,10 +1441,10 @@ def _run_eccheck_two_failures_recovery(
     total_size: int,
     registry: GlobalMetadataRegistry,
     native_prepared: bool = False,
-) -> float:
+) -> Dict[str, float]:
     """Drive C++ two-failure recovery for ECCHECK legacy load.
 
-    Returns the network and encoding time in seconds.
+    Returns the recovery wall-time breakdown in seconds.
 
     Two physical nodes lost → rig1 and rig2 in each 4-rank group are failed.
     Survivors rig0 and rig3 use bidirectional XOR exchange to recover
@@ -1395,7 +1453,7 @@ def _run_eccheck_two_failures_recovery(
     Uses save-path 16-thread encode pool (ec_rs_encode_pool) and RDMA transport,
     aligned with the save encoding pipeline.
     """
-    from time import time
+    from time import monotonic, sleep, time
 
     native = manager._eccheck_native
     if native is None:
@@ -1416,7 +1474,7 @@ def _run_eccheck_two_failures_recovery(
     # Compute pipeline size
     max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
     if max_total_bytes == 0:
-        return 0.0
+        return {"network_encode": 0.0, "phase1_p2p_s": 0.0, "pipeline_wall_s": 0.0}
     buffer_size = manager.eccheck_buffer_size
 
     # Get buffer pools
@@ -1456,12 +1514,18 @@ def _run_eccheck_two_failures_recovery(
             logger.error("ECCHECK two-failures: timeout waiting for free parity buffer")
             return free_parity_queue.get()
 
-    # Allocate recv encoding buffers
-    if manager.eccheck_recv_encoding_buffers is None:
-        manager.eccheck_recv_encoding_buffers = (
-            manager.allocate_recv_encoding_buffers_phase2(registry)
+    # Allocate the bounded receive ring and preserve the two-lane tuple API.
+    ring_depth = _eccheck_hw2_recv_ring_depth()
+    if manager.eccheck_hw2_recv_encoding_buffers is None:
+        manager.allocate_recv_encoding_buffers_phase2(
+            registry, hw2_single_physical_buffer=True, hw2_ring_depth=ring_depth,
         )
-    recv_buf1, recv_buf2 = manager.eccheck_recv_encoding_buffers
+    elif manager.eccheck_hw2_recv_ring_depth != ring_depth:
+        raise RuntimeError(
+            "ECCHECK HW2 cached receive ring depth mismatch: "
+            f"allocated={manager.eccheck_hw2_recv_ring_depth}, requested={ring_depth}"
+        )
+    recv_buf1, recv_buf2 = manager.eccheck_hw2_recv_encoding_buffers
     recv_base_1 = int(recv_buf1.data_ptr())
     recv_base_2 = int(recv_buf2.data_ptr())
 
@@ -1469,6 +1533,24 @@ def _run_eccheck_two_failures_recovery(
     partner_base = int(blocks["partner_buffer"].data_ptr())
     own_buf = blocks["own_buffer"]
     partner_buf = blocks["partner_buffer"]
+    full_buffers = [own_buf, partner_buf]
+    if recovered_buffer is not None:
+        full_buffers.append(recovered_buffer)
+    recovered_alias = (
+        "partner_buffer" if recovered_buffer is partner_buf
+        else "own_buffer" if recovered_buffer is own_buf
+        else "none"
+    )
+    logger.debug(
+        "ECCHECK HW2 memory layout: role=rig%d unique_full_blocks=%d "
+        "recv_physical_buffers=1 recv_ring_depth=%d recv_ring_bytes=%d "
+        "logical_lanes=2 alias=recovered:%s",
+        rank_in_group,
+        len({int(buffer.data_ptr()) for buffer in full_buffers}),
+        ring_depth,
+        ring_depth * buffer_size,
+        recovered_alias,
+    )
     if rank_in_group == 0:
         input_buf = source_blocks.get("d0")
         phase1_buf = source_blocks.get("d1")
@@ -1541,8 +1623,86 @@ def _run_eccheck_two_failures_recovery(
     processed = 0
     own_offset = 0
     partner_offset = 0
-    recv_offset_1 = 0
-    recv_offset_2 = 0
+
+    stale_releases = native.get_two_failure_recv_buffers_to_release()
+    if stale_releases:
+        raise RuntimeError(
+            "ECCHECK HW2 typed receive release queue was not empty at cycle start: "
+            f"count={len(stale_releases)}"
+        )
+    if recv_base_1 != recv_base_2:
+        raise RuntimeError("ECCHECK HW2 logical receive lanes must alias one physical ring")
+    ring_base = recv_base_1
+    ring_bytes = ring_depth * buffer_size
+    if recv_buf1.numel() != ring_bytes or recv_buf2.numel() != ring_bytes:
+        raise RuntimeError(
+            "ECCHECK HW2 receive ring size mismatch: "
+            f"expected={ring_bytes}, lane1={recv_buf1.numel()}, lane2={recv_buf2.numel()}"
+        )
+    free_slots = deque(ring_base + index * buffer_size for index in range(ring_depth))
+    inflight: Set[int] = set()
+    logger.debug(
+        "ECCHECK HW2 receive ring setup: ring_depth=%d ring_bytes=%d",
+        ring_depth, ring_bytes,
+    )
+    ring_stall_s = 0.0
+    ring_wait_count = 0
+    max_inflight = 0
+    submitted_chunks = 0
+
+    def _poll_recv_slot_releases() -> int:
+        released = native.get_two_failure_recv_buffers_to_release()
+        for address_value in released:
+            address = int(address_value)
+            offset = address - ring_base
+            if offset < 0 or offset >= ring_bytes:
+                raise RuntimeError(
+                    f"ECCHECK HW2 native released address outside receive ring: 0x{address:x}"
+                )
+            if offset % buffer_size != 0:
+                raise RuntimeError(
+                    f"ECCHECK HW2 native released unaligned receive slot: 0x{address:x}"
+                )
+            if address not in inflight:
+                raise RuntimeError(
+                    f"ECCHECK HW2 duplicate or non-inflight receive slot release: 0x{address:x}"
+                )
+            inflight.remove(address)
+            free_slots.append(address)
+        return len(released)
+
+    def _get_recv_slot() -> int:
+        nonlocal ring_stall_s, ring_wait_count
+        _poll_recv_slot_releases()
+        if free_slots:
+            address = free_slots.popleft()
+            inflight.add(address)
+            return address
+        wait_start = monotonic()
+        deadline = wait_start + 120.0
+        next_warning = wait_start + 5.0
+        ring_wait_count += 1
+        while not free_slots:
+            _poll_recv_slot_releases()
+            if free_slots:
+                break
+            now = monotonic()
+            if now >= deadline:
+                raise RuntimeError(
+                    "ECCHECK HW2 timed out waiting for a free receive ring slot: "
+                    f"inflight={len(inflight)}, free={len(free_slots)}, depth={ring_depth}"
+                )
+            if now >= next_warning:
+                logger.warning(
+                    "ECCHECK HW2 waiting for a free receive ring slot for %.1fs",
+                    now - wait_start,
+                )
+                next_warning = now + 5.0
+            sleep(0.001)
+        ring_stall_s += monotonic() - wait_start
+        address = free_slots.popleft()
+        inflight.add(address)
+        return address
 
     network_encode = 0.0
     try:
@@ -1550,101 +1710,113 @@ def _run_eccheck_two_failures_recovery(
             remaining = max_total_bytes - processed
             take = min(buffer_size, remaining)
 
-            # ---- Phase 2: copy data into chunk buffer (local, not timed as network) ----
-            cur_buffer_addr = _get_free_data()
-            buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
-            buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
-
-            src_off = processed
-            bytes_to_copy = min(take, max(0, input_buf.numel() - src_off))
-            if bytes_to_copy > 0:
-                ctypes.memmove(buffer_array.contents, input_base + src_off, bytes_to_copy)
-            if take > bytes_to_copy:
-                ctypes.memset(
-                    ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
-                                ctypes.POINTER(ctypes.c_uint8)),
-                    0, take - bytes_to_copy,
-                )
-
-            # ---- Phase 3: allocate encoding buffers (TWO per chunk) ----
-            enc_addr_0 = _get_free_encoding()  # for parity row 0
-            enc_addr_1 = _get_free_encoding()  # for parity row 1
-
-            # ---- Phase 3: XOR exchange (bidirectional) ----
-            # Each rank both sends and receives:
-            #   rig0 ↔ rig2  (parity row 0: rig0 sends enc_0(d0), recvs enc_0(p2), XOR → p0)
-            #   rig1 ↔ rig3  (parity row 1: rig1 sends enc_1(d1), recvs enc_1(p3), XOR → d2)
-
-            # Bounds check
+            # Bounds cover only role-owned, partner, and recovered destinations.
             own_offset_aligned = ((own_offset + 63) // 64) * 64
             partner_offset_aligned = ((partner_offset + 63) // 64) * 64
-            p2p_rem_own = (
+            own_remaining = own_buf.numel() - own_offset_aligned
+            partner_remaining = partner_buf.numel() - partner_offset_aligned
+            recovered_remaining = (
                 recovered_buffer.numel() - processed
-                if rank_in_group == 2 and recovered_buffer is not None
-                else own_buf.numel() - own_offset_aligned
+                if recovered_buffer is not None else take
             )
-            p2p_rem_partner = (
-                recovered_buffer.numel() - processed
-                if rank_in_group == 1 and recovered_buffer is not None
-                else partner_buf.numel() - partner_offset_aligned
-            )
-            max_p2p = min(p2p_rem_own, p2p_rem_partner)
-
-            recv_offset_1_aligned = ((recv_offset_1 + 63) // 64) * 64
-            recv_offset_2_aligned = ((recv_offset_2 + 63) // 64) * 64
-            recv_rem_1 = recv_buf1.numel() - recv_offset_1_aligned
-            recv_rem_2 = recv_buf2.numel() - recv_offset_2_aligned
-            max_recv = min(recv_rem_1, recv_rem_2)
-
-            take_bounded = min(take, max_p2p, max_recv)
-            if take_bounded < 64:
+            if rank_in_group == 1:
+                destination_remaining = min(own_remaining, recovered_remaining)
+            elif rank_in_group == 2:
+                destination_remaining = min(partner_remaining, recovered_remaining)
+            else:
+                destination_remaining = min(own_remaining, partner_remaining)
+            take = min(take, destination_remaining)
+            if take < 64:
                 logger.warning(
-                    f"ECCHECK two-failures: buffers exhausted at "
-                    f"{processed / (1024**3):.2f} GB"
+                    "ECCHECK two-failures: destination buffers exhausted at %.2f GB",
+                    processed / (1024**3),
                 )
                 break
-            take = take_bounded
 
-            # Addresses for encode output and recv
-            own_write_addr = own_base + own_offset_aligned
-            partner_write_addr = partner_base + partner_offset_aligned
-            recv_addr_1 = recv_base_1 + recv_offset_1_aligned
-            recv_addr_2 = recv_base_2 + recv_offset_2_aligned
+            # Reserve the receive slot before taking pooled data/encoding resources.
+            recv_slot_addr = _get_recv_slot()
+            max_inflight = max(max_inflight, len(inflight))
 
-            # Advance offsets
-            if rank_in_group in (0, 1):
-                own_offset = own_offset_aligned + take
-            if rank_in_group in (2, 3):
-                partner_offset = partner_offset_aligned + take
-            recv_offset_1 = recv_offset_1_aligned + take
-            recv_offset_2 = recv_offset_2_aligned + take
+            submitted = False
+            try:
+                cur_buffer_addr = _get_free_data()
+                buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
+                buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
+                src_off = processed
+                bytes_to_copy = min(take, max(0, input_buf.numel() - src_off))
+                if bytes_to_copy > 0:
+                    ctypes.memmove(buffer_array.contents, input_base + src_off, bytes_to_copy)
+                if take > bytes_to_copy:
+                    ctypes.memset(
+                        ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
+                                    ctypes.POINTER(ctypes.c_uint8)),
+                        0, take - bytes_to_copy,
+                    )
 
-            # Phase 2b: dual-coefficient encoding → route to save-path 16-thread pool
-            if t_pipeline_net_start is None:
-                t_pipeline_net_start = time()
-            native.submit_two_failure_encoding_chunk(
-                data_addr=cur_buffer_addr,
-                size=take,
-                enc_addr_0=enc_addr_0,
-                enc_addr_1=enc_addr_1,
-                recv_addr_1=recv_addr_1,
-                recv_addr_2=recv_addr_2,
-                recv_chunk_size=take,
-                own_write_addr=own_write_addr,
-                partner_write_addr=partner_write_addr,
-                recovered_write_addr=(
-                    int(recovered_buffer.data_ptr()) + processed
-                    if is_failed and recovered_buffer is not None else 0
-                ),
-            )
+                enc_addr_0 = _get_free_encoding()
+                enc_addr_1 = _get_free_encoding()
+                own_write_addr = own_base + own_offset_aligned
+                partner_write_addr = partner_base + partner_offset_aligned
 
+                if rank_in_group in (0, 1):
+                    own_offset = own_offset_aligned + take
+                if rank_in_group in (2, 3):
+                    partner_offset = partner_offset_aligned + take
+
+                if t_pipeline_net_start is None:
+                    t_pipeline_net_start = time()
+                native.submit_two_failure_encoding_chunk(
+                    data_addr=cur_buffer_addr,
+                    size=take,
+                    enc_addr_0=enc_addr_0,
+                    enc_addr_1=enc_addr_1,
+                    recv_addr_1=recv_slot_addr,
+                    recv_addr_2=recv_slot_addr,
+                    recv_chunk_size=take,
+                    own_write_addr=own_write_addr,
+                    partner_write_addr=partner_write_addr,
+                    recovered_write_addr=(
+                        int(recovered_buffer.data_ptr()) + processed
+                        if is_failed and recovered_buffer is not None else 0
+                    ),
+                )
+                submitted = True
+                submitted_chunks += 1
+            except Exception:
+                if not submitted and recv_slot_addr in inflight:
+                    inflight.remove(recv_slot_addr)
+                    free_slots.appendleft(recv_slot_addr)
+                raise
             processed += take
 
         # Sentinels and completion
         if t_pipeline_net_start is None:
             t_pipeline_net_start = time()
         native.submit_two_failure_encoding_sentinels()
+        native.wait_for_two_failure_chunk_completion(
+            expected_chunks=submitted_chunks, timeout_seconds=120.0
+        )
         native.wait_for_encoding_completion()
+        release_deadline = monotonic() + 120.0
+        while inflight:
+            _poll_recv_slot_releases()
+            if not inflight:
+                break
+            if monotonic() >= release_deadline:
+                raise RuntimeError(
+                    "ECCHECK HW2 timed out waiting for receive ring slots after completion: "
+                    f"inflight={len(inflight)}, free={len(free_slots)}, depth={ring_depth}"
+                )
+            sleep(0.001)
+        if len(free_slots) != ring_depth:
+            raise RuntimeError(
+                "ECCHECK HW2 receive ring did not fully return at cycle end: "
+                f"free={len(free_slots)}, depth={ring_depth}"
+            )
+        logger.debug(
+            "ECCHECK HW2 pipeline ring_stall_s=%.3f ring_wait_count=%d max_inflight=%d",
+            ring_stall_s, ring_wait_count, max_inflight,
+        )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t_pipeline_net = time() - t_pipeline_net_start
@@ -1662,7 +1834,11 @@ def _run_eccheck_two_failures_recovery(
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    return network_encode
+    return {
+        "network_encode": network_encode,
+        "phase1_p2p_s": t_phase1_p2p,
+        "pipeline_wall_s": t_pipeline_net,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1862,6 +2038,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     cluster_id = ECCHECKManager._get_cluster_id(rank, world_size) if world_size > 1 else 0
     sw_failure = bool(getattr(args, "use_eccheck_software_failure", False))
     two_failures = bool(getattr(args, "use_eccheck_two_failures", False))
+    hw2_ring_depth = _eccheck_hw2_recv_ring_depth() if two_failures else None
     target_cluster = int(getattr(args, "eccheck_recovery_cluster", 0))
     layout = ECCHECKManager._get_group_layout(world_size)
     num_clusters = int(
@@ -1937,8 +2114,20 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         blocks = workspace["blocks"]
         source_blocks = workspace.get("source_blocks", {})
         recovered_buffer = workspace["recovered_buffer"]
-        if workspace.get("recv_buffers") is not manager.eccheck_recv_encoding_buffers:
+        cached_recv_buffers = (
+            manager.eccheck_hw2_recv_encoding_buffers
+            if two_failures
+            else manager.eccheck_recv_encoding_buffers
+            if sw_failure
+            else manager.eccheck_hw1_recv_encoding_buffers
+        )
+        if workspace.get("recv_buffers") is not cached_recv_buffers:
             raise RuntimeError("ECCHECK cached receive-buffer identity changed")
+        if two_failures and manager.eccheck_hw2_recv_ring_depth != hw2_ring_depth:
+            raise RuntimeError(
+                "ECCHECK cached HW2 receive ring depth mismatch: "
+                f"allocated={manager.eccheck_hw2_recv_ring_depth}, requested={hw2_ring_depth}"
+            )
         cache_status = "hit"
     else:
         cache_status = "miss"
@@ -1980,21 +2169,49 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         if not recovery_cluster_active:
             pass
         elif two_failures:
-            actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
-            blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
-            if rank_in_group in (0, 3):
-                source_names = ("d0", "d1") if rank_in_group == 0 else ("p3", "p2")
+            pipeline_capacity_bytes = _max_tensor_bytes_from_registry(registry, world_size)
+            if rank_in_group == 0:
+                local_canonical_required_bytes = _rank_total_bytes(rank_metadata, rank)
+                tensor_buffer = main_payload.get("tensor_buffer")
+                if not isinstance(tensor_buffer, torch.Tensor):
+                    raise RuntimeError("ECCHECK HW2 rig0 requires main tensor_buffer as authoritative d0")
+                if tensor_buffer.device.type != "cpu" or not tensor_buffer.is_contiguous():
+                    raise RuntimeError(
+                        "ECCHECK HW2 rig0 canonical main tensor_buffer must be contiguous CPU storage"
+                    )
+                d0 = _tensor_buffer_as_uint8_view(tensor_buffer)
+                if d0.numel() < local_canonical_required_bytes:
+                    raise RuntimeError(
+                        "ECCHECK HW2 rig0 canonical main buffer must cover local rank data: "
+                        f"required={local_canonical_required_bytes}, have={d0.numel()}"
+                    )
                 source_tensors = allocate_hugepage_slices(
-                    blocks["aligned_size"], len(source_names),
+                    blocks["aligned_size"], 1,
                     fallback_pin_memory=torch.cuda.is_available(), touch_pages=True,
                 )
-                source_blocks = dict(zip(source_names, source_tensors))
+                source_blocks = {"d0": d0, "d1": source_tensors[0]}
+                logger.debug(
+                    "ECCHECK HW2 rig0 sources: d0 kind=canonical_main, "
+                    "allocated_source_blocks=1, local_bytes=%d, pipeline_bytes=%d",
+                    local_canonical_required_bytes, pipeline_capacity_bytes,
+                )
+                if manager.use_rdma and inprocess_cache:
+                    manager.register_buffer(source_blocks["d1"])
+            elif rank_in_group == 3:
+                source_tensors = allocate_hugepage_slices(
+                    blocks["aligned_size"], 2,
+                    fallback_pin_memory=torch.cuda.is_available(), touch_pages=True,
+                )
+                source_blocks = {"p3": source_tensors[0], "p2": source_tensors[1]}
                 if manager.use_rdma and inprocess_cache:
                     for source in source_blocks.values():
                         manager.register_buffer(source)
-            if rank_in_group in (1, 2):
-                recovered_buffer = _allocate_recovered_buffer(actual_tensor_bytes, True)
-                total_size = actual_tensor_bytes
+            if rank_in_group == 1:
+                recovered_buffer = blocks["partner_buffer"]
+                total_size = pipeline_capacity_bytes
+            elif rank_in_group == 2:
+                recovered_buffer = blocks["own_buffer"]
+                total_size = pipeline_capacity_bytes
         elif sw_failure:
             if rank_in_group == 0:
                 blocks = _allocate_eccheck_blocks_legacy(
@@ -2007,34 +2224,43 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         elif rank_in_group == 2:
             blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
             recovered_capacity = _max_tensor_bytes_from_registry(registry, world_size)
-            recovered_buffer = _allocate_recovered_buffer(recovered_capacity, True)
+            recovered_buffer = blocks["own_buffer"]
+            total_size = recovered_capacity
         else:
             blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
 
         if (
             inprocess_cache
             and not sw_failure
-            and manager.eccheck_recv_encoding_buffers is None
             and recovery_cluster_active
-        ):
-            manager.eccheck_recv_encoding_buffers = (
-                manager.allocate_recv_encoding_buffers_phase2(registry)
+            and (
+                manager.eccheck_hw2_recv_encoding_buffers is None
+                if two_failures else manager.eccheck_hw1_recv_encoding_buffers is None
             )
-        if manager.use_rdma and recovered_buffer is not None:
+        ):
+            manager.allocate_recv_encoding_buffers_phase2(
+                registry,
+                hw1_single_physical_buffer=not two_failures,
+                hw2_single_physical_buffer=two_failures,
+                hw2_ring_depth=hw2_ring_depth if two_failures else None,
+            )
+        recovered_is_block_alias = recovered_buffer is not None and any(
+            recovered_buffer is buffer
+            for name, buffer in blocks.items()
+            if name in ("own_buffer", "partner_buffer")
+        )
+        if (
+            manager.use_rdma
+            and recovered_buffer is not None
+            and not two_failures
+            and not recovered_is_block_alias
+        ):
             manager.register_buffer(recovered_buffer)
         alloc_touch_register_s += time.perf_counter() - alloc_start
 
         disk_start = time.perf_counter()
         if recovery_cluster_active:
             if two_failures and rank_in_group == 0:
-                tensor_buffer = main_payload.get("tensor_buffer")
-                if not isinstance(tensor_buffer, torch.Tensor):
-                    raise RuntimeError("ECCHECK HW2 rig0 requires main tensor_buffer as authoritative d0")
-                d0 = _tensor_buffer_as_uint8_view(tensor_buffer)
-                source_blocks["d0"].zero_()
-                source_blocks["d0"][:min(d0.numel(), source_blocks["d0"].numel())].copy_(
-                    d0[:min(d0.numel(), source_blocks["d0"].numel())]
-                )
                 _copy_block_file_into_tensor(
                     checkpoint_dir, rank, "partner_buffer", source_blocks["d1"]
                 )
@@ -2064,7 +2290,13 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
                 "main_payload": main_payload, "rank_metadata": rank_metadata,
                 "registry": registry, "total_size": total_size, "blocks": blocks,
                 "source_blocks": source_blocks, "recovered_buffer": recovered_buffer,
-                "recv_buffers": manager.eccheck_recv_encoding_buffers,
+                "recv_buffers": (
+                    manager.eccheck_hw2_recv_encoding_buffers
+                    if two_failures
+                    else manager.eccheck_recv_encoding_buffers
+                    if sw_failure
+                    else manager.eccheck_hw1_recv_encoding_buffers
+                ),
                 "workspace_key": workspace_key,
             }
             manager.install_legacy_inprocess_workspace(workspace_key, workspace)
@@ -2123,10 +2355,12 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             pass
 
     # === timing: network/encode (C++ P2P or XOR pipeline, excluding setup/copy) ===
+    phase1_p2p_s = 0.0
+    pipeline_wall_s = 0.0
     if not recovery_cluster_active:
         network_encode = 0.0
     elif two_failures:
-        network_encode = _run_eccheck_two_failures_recovery(
+        hw2_breakdown = _run_eccheck_two_failures_recovery(
             manager=manager,
             rank=rank,
             world_size=world_size,
@@ -2137,6 +2371,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             registry=registry,
             native_prepared=native_prepared,
         )
+        network_encode = hw2_breakdown["network_encode"]
+        phase1_p2p_s = hw2_breakdown["phase1_p2p_s"]
+        pipeline_wall_s = hw2_breakdown["pipeline_wall_s"]
     else:
         network_encode = _run_eccheck_legacy_recovery(
             manager=manager,
@@ -2186,7 +2423,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         "network_encode": network_encode,
         "net_s": native_timing["net_s"],
         "encode_s": native_timing["encode_s"],
-        "decode_s": native_timing["encode_s"],
+        "decode_s": native_timing["decode_s"],
+        "phase1_p2p_s": phase1_p2p_s,
+        "pipeline_wall_s": pipeline_wall_s,
         "rebuild_sd": rebuild_sd,
         "barrier": barrier_s,
         "rebuild_from_recovered": float(rebuild_recovered_buffer is not None),

@@ -65,7 +65,7 @@ fi
 
 # ---- mode parsing (save | software | hardware, after GPU IDs) ----
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess|inprocess_sw)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|hardware2|inprocess|inprocess2|inprocess_sw)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -153,6 +153,18 @@ case "$MODE" in
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
             --eccheck-recovery-cluster 0
+        )
+        ;;
+    inprocess2)
+        RECOVERY_MODE_ARGS=(
+            --load $CHECKPOINT_PATH
+            --ft-inprocess-recovery-benchmark
+            --rerun-mode disabled
+            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
+            --ft-inprocess-recovery-after-train-iter 0
+            --ft-inprocess-recovery-exit-after-forward
+            --eccheck-recovery-cluster 0
+            --use-eccheck-two-failures
         )
         ;;
     inprocess)

@@ -107,8 +107,8 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-merges.txt"
 
-TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"/workspace/Megatron-LM/logs/gpt2-20b-4nodes/eccheck"}
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/dev/shm/models/gpt2-20b-4nodes-eccheck"}
+TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"/workspace/Megatron-LM/logs/gpt2-14b-4nodes/eccheck"}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/dev/shm/models/gpt2-14b-4nodes-eccheck"}
 # DATA_PATH="/workspace/Megatron-LM/pre-tests/opt/opt_data/wiki_text_sentence"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -183,7 +183,7 @@ esac
 # Model related configuration here, please do not overlap with json config
 HIDDEN_SIZE=5120
 NUM_ATTENTION_HEADS=40
-NUM_LAYERS=64
+NUM_LAYERS=40
 
 SEQ_LENGTH=4096
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH

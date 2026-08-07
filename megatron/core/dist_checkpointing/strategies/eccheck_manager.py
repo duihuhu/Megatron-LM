@@ -65,6 +65,9 @@ class ECCHECKManager:
         self.eccheck_data_buffers: Optional[List[torch.Tensor]] = None
         self.eccheck_encoding_buffers: Optional[List[torch.Tensor]] = None
         self.eccheck_recv_encoding_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self.eccheck_hw1_recv_encoding_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self.eccheck_hw2_recv_encoding_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self.eccheck_hw2_recv_ring_depth: Optional[int] = None
         self.eccheck_parity_buffers: Optional[List[torch.Tensor]] = None
         self.eccheck_p2p_buffers: Optional[Dict[str, torch.Tensor]] = None
         
@@ -740,6 +743,9 @@ class ECCHECKManager:
         
         # Allocate receive buffers for peer encoded packets (will be allocated later)
         self.eccheck_recv_encoding_buffers = None
+        self.eccheck_hw1_recv_encoding_buffers = None
+        self.eccheck_hw2_recv_encoding_buffers = None
+        self.eccheck_hw2_recv_ring_depth = None
         
         # Allocate parity buffers for XOR computation results
         self.eccheck_parity_buffers = self._allocate_parity_buffers()
@@ -1023,11 +1029,21 @@ class ECCHECKManager:
             # Note: recv_encoding_buffers will be allocated by FileSystemWriterAsync after metadata exchange
         }
     
-    def allocate_recv_encoding_buffers_phase2(self, global_registry: GlobalMetadataRegistry):
+    def allocate_recv_encoding_buffers_phase2(
+        self,
+        global_registry: GlobalMetadataRegistry,
+        *,
+        hw1_single_physical_buffer: bool = False,
+        hw2_single_physical_buffer: bool = False,
+        hw2_ring_depth: Optional[int] = None,
+    ):
         """
-        Allocate TWO large receive buffers for peer encoded packets (one per encoding thread).
-        
-        Each buffer is equal to peer's total data size, aligned to buffer_size (64MB).
+        Allocate logical receive buffers for peer encoded packets.
+
+        HW1 and HW2 each have one receiving encoding lane per role, so their two
+        logical lanes can safely alias one physical buffer. HW2 uses a bounded chunk
+        ring; HW1 uses full aligned storage. Save and other modes retain two full
+        physical buffers. The modes use independent caches.
         This is called after metadata exchange when peer data sizes are known.
         
         Args:
@@ -1036,6 +1052,25 @@ class ECCHECKManager:
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Two receive buffers (one for thread1, one for thread2)
         """
+        if hw1_single_physical_buffer and hw2_single_physical_buffer:
+            raise ValueError("HW1 and HW2 receive-buffer modes are mutually exclusive")
+        if hw2_ring_depth is not None and not hw2_single_physical_buffer:
+            raise ValueError("hw2_ring_depth requires hw2_single_physical_buffer=True")
+        if hw2_single_physical_buffer:
+            if isinstance(hw2_ring_depth, bool) or not isinstance(hw2_ring_depth, int) or hw2_ring_depth <= 0:
+                raise ValueError("hw2_ring_depth must be a positive integer for HW2")
+            if self.eccheck_hw2_recv_encoding_buffers is not None:
+                if self.eccheck_hw2_recv_ring_depth != hw2_ring_depth:
+                    raise RuntimeError(
+                        "ECCHECK HW2 receive ring depth changed after allocation: "
+                        f"allocated={self.eccheck_hw2_recv_ring_depth}, requested={hw2_ring_depth}"
+                    )
+                return self.eccheck_hw2_recv_encoding_buffers
+        elif hw1_single_physical_buffer and self.eccheck_hw1_recv_encoding_buffers is not None:
+            return self.eccheck_hw1_recv_encoding_buffers
+        elif not hw1_single_physical_buffer and self.eccheck_recv_encoding_buffers is not None:
+            return self.eccheck_recv_encoding_buffers
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         paired_rank = self._get_xor_paired_rank(rank, world_size)
@@ -1044,48 +1079,78 @@ class ECCHECKManager:
         peer_metadata = global_registry.rank_metadata.get(paired_rank, [])
         peer_total_size = sum(meta.size_bytes for meta in peer_metadata)
         
-        # Calculate maximum total size across all ranks for pipeline synchronization
+        # HW2 uses a bounded chunk ring; HW1/save retain full aligned receive storage.
         max_total_size = 0
         for r in range(world_size):
             rank_metadata = global_registry.rank_metadata.get(r, [])
             rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
             if rank_total_size > max_total_size:
                 max_total_size = rank_total_size
-        
-        # Align maximum size to buffer_size (64MB) so recv buffers match pipeline iterations
-        aligned_size = ((max_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size + 1) * self.eccheck_buffer_size
-        
-        logger.debug(
-            f"EC-CHECK: Allocating TWO receive buffers using global maximum size\n"
-            f"  Paired rank: {paired_rank}\n"
-            f"  Peer data size: {peer_total_size / (1024**3):.2f} GB\n"
-            f"  Pipeline max size: {max_total_size / (1024**3):.2f} GB\n"
-            f"  Aligned buffer size (per buffer): {aligned_size / (1024**3):.2f} GB\n"
-            f"  Total receive memory: {2 * aligned_size / (1024**3):.2f} GB"
+        full_aligned_size = max(
+            1, (max_total_size + self.eccheck_buffer_size - 1) // self.eccheck_buffer_size
+        ) * self.eccheck_buffer_size
+        aligned_size = (
+            hw2_ring_depth * self.eccheck_buffer_size
+            if hw2_single_physical_buffer else full_aligned_size
         )
-        
-        # Allocate two large continuous buffers (one for each encoding thread)
-        recv_buffer_thread1, recv_buffer_thread2 = allocate_hugepage_slices(
+
+        single_physical_buffer = hw1_single_physical_buffer or hw2_single_physical_buffer
+        physical_buffer_count = 1 if single_physical_buffer else 2
+        logger.debug(
+            "EC-CHECK: Allocating receive buffers using global maximum size\n"
+            "  Paired rank: %d\n"
+            "  Peer data size: %.2f GB\n"
+            "  Pipeline max size: %.2f GB\n"
+            "  Aligned buffer size (per buffer): %.2f GB\n"
+            "  Physical buffers: %d\n"
+            "  Total receive memory: %.2f GB",
+            paired_rank,
+            peer_total_size / (1024**3),
+            max_total_size / (1024**3),
+            aligned_size / (1024**3),
+            physical_buffer_count,
+            physical_buffer_count * aligned_size / (1024**3),
+        )
+
+        physical_buffers = allocate_hugepage_slices(
             aligned_size,
-            2,
+            physical_buffer_count,
             fallback_pin_memory=self.eccheck_pin_memory,
             touch_pages=True,
         )
-        
-        logger.debug(
-            f"EC-CHECK: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "
-            f"({aligned_size / (1024**2):.0f} MB each)"
-        )
-        
-        self.eccheck_recv_encoding_buffers = (recv_buffer_thread1, recv_buffer_thread2)
-        
-        # Register receive buffers for RDMA if RDMA is enabled
+        recv_buffer_thread1 = physical_buffers[0]
+        recv_buffer_thread2 = physical_buffers[-1]
+
+        if single_physical_buffer:
+            mode = "HW1" if hw1_single_physical_buffer else "HW2"
+            logger.debug(
+                "EC-CHECK receive layout: mode=%s physical=1 logical=2 "
+                "aligned_size=%d alias=lane1:lane2",
+                mode,
+                aligned_size,
+            )
+        else:
+            logger.debug(
+                f"EC-CHECK: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "
+                f"({aligned_size / (1024**2):.0f} MB each)"
+            )
+
+        recv_buffers = (recv_buffer_thread1, recv_buffer_thread2)
+        if hw1_single_physical_buffer:
+            self.eccheck_hw1_recv_encoding_buffers = recv_buffers
+        elif hw2_single_physical_buffer:
+            self.eccheck_hw2_recv_encoding_buffers = recv_buffers
+            self.eccheck_hw2_recv_ring_depth = hw2_ring_depth
+        else:
+            self.eccheck_recv_encoding_buffers = recv_buffers
+
+        # Register each physical receive buffer once when RDMA is enabled.
         if self.use_rdma:
             logger.debug(f"EC-CHECK: [Rank {rank}] Registering receive buffers for RDMA...")
-            self.register_buffer(recv_buffer_thread1)
-            self.register_buffer(recv_buffer_thread2)
-        
-        return (recv_buffer_thread1, recv_buffer_thread2)
+            for buffer in physical_buffers:
+                self.register_buffer(buffer)
+
+        return recv_buffers
     
     def register_buffer(self, buffer: torch.Tensor):
         """Register buffer for RDMA operations (called during buffer allocation).
@@ -1187,11 +1252,21 @@ class ECCHECKManager:
             for i, buffer in enumerate(self.eccheck_parity_buffers):
                 self.register_buffer(buffer)
         
-        # Register receive encoding buffers (if already allocated)
-        if self.eccheck_recv_encoding_buffers:
-            recv_buffer_thread1, recv_buffer_thread2 = self.eccheck_recv_encoding_buffers
-            self.register_buffer(recv_buffer_thread1)
-            self.register_buffer(recv_buffer_thread2)
+        # Register each physical receive buffer once across all mode caches.
+        registered_recv_ptrs = set()
+        for recv_buffers in (
+            self.eccheck_recv_encoding_buffers,
+            self.eccheck_hw1_recv_encoding_buffers,
+            self.eccheck_hw2_recv_encoding_buffers,
+        ):
+            if not recv_buffers:
+                continue
+            for buffer in recv_buffers:
+                buffer_ptr = int(buffer.data_ptr())
+                if buffer_ptr in registered_recv_ptrs:
+                    continue
+                registered_recv_ptrs.add(buffer_ptr)
+                self.register_buffer(buffer)
         
         logger.debug(f"EC-CHECK: [Rank {rank}] All buffers registered for RDMA (total: {len(self.registered_buffers)})")
     
@@ -1203,12 +1278,19 @@ class ECCHECKManager:
                 release_hugepage_host_registration,
             )
 
+            released_host_ptrs = set()
+
             def _release_host_registrations_for_buffers(buffers) -> None:
                 if not buffers:
                     return
                 for buffer in buffers:
-                    if torch.is_tensor(buffer):
-                        release_hugepage_host_registration(buffer)
+                    if not torch.is_tensor(buffer):
+                        continue
+                    buffer_ptr = int(buffer.data_ptr())
+                    if buffer_ptr in released_host_ptrs:
+                        continue
+                    released_host_ptrs.add(buffer_ptr)
+                    release_hugepage_host_registration(buffer)
 
             # Unregister all RDMA buffers
             if self.use_rdma and self._eccheck_native is not None:
@@ -1224,12 +1306,16 @@ class ECCHECKManager:
 
             _release_host_registrations_for_buffers(self._cached_blocks)
             if self.preallocated_cpu_buffer is not None:
-                release_hugepage_host_registration(self.preallocated_cpu_buffer)
+                _release_host_registrations_for_buffers([self.preallocated_cpu_buffer])
             _release_host_registrations_for_buffers(self.eccheck_data_buffers)
             _release_host_registrations_for_buffers(self.eccheck_encoding_buffers)
             _release_host_registrations_for_buffers(self.eccheck_parity_buffers)
             if self.eccheck_recv_encoding_buffers:
                 _release_host_registrations_for_buffers(self.eccheck_recv_encoding_buffers)
+            if self.eccheck_hw1_recv_encoding_buffers:
+                _release_host_registrations_for_buffers(self.eccheck_hw1_recv_encoding_buffers)
+            if self.eccheck_hw2_recv_encoding_buffers:
+                _release_host_registrations_for_buffers(self.eccheck_hw2_recv_encoding_buffers)
             
             # Stop buffer poller thread
             self._stop_buffer_poller_thread()
@@ -1250,6 +1336,9 @@ class ECCHECKManager:
             self.eccheck_encoding_buffers = None
             self.eccheck_parity_buffers = None
             self.eccheck_recv_encoding_buffers = None
+            self.eccheck_hw1_recv_encoding_buffers = None
+            self.eccheck_hw2_recv_encoding_buffers = None
+            self.eccheck_hw2_recv_ring_depth = None
             self._free_data_buffer_queue = None
             self._free_encoding_buffer_queue = None
             self._free_parity_buffer_queue = None

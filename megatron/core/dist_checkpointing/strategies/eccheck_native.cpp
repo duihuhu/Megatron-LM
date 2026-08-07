@@ -382,6 +382,7 @@ private:
         size_t p2p_data_size;             // Save path: valid P2P data bytes in this chunk
         size_t sequence_id;               // Save path chunk order for P2P transfers
         bool parity_is_pooled = true;
+        bool two_failure_chunk = false;
     };
     
     std::queue<EncodingTask> encoding_tasks_1_;  // Thread1的编码任务
@@ -414,6 +415,7 @@ private:
         size_t p2p_data_size;       // Save path: valid P2P data bytes in this chunk
         size_t sequence_id;         // Save path chunk order for downstream P2P tasks
         bool parity_is_pooled = true; // Result address belongs to parity scratch pool
+        bool two_failure_chunk = false;
     };
     std::queue<RecvTask> recv_queue_;
     std::mutex recv_queue_mutex_;
@@ -427,6 +429,34 @@ private:
     std::atomic<bool> xor_worker_completed_;
     std::atomic<bool> p2p_send_worker_completed_;
     std::atomic<bool> p2p_recv_worker_completed_;
+
+    // Deterministic per-cycle completion state for two-failure load chunks.
+    std::atomic<size_t> two_failure_submitted_chunks_{0};
+    std::atomic<size_t> two_failure_xor_completed_chunks_{0};
+    std::atomic<size_t> two_failure_p2p_send_completed_chunks_{0};
+    std::atomic<size_t> two_failure_p2p_recv_completed_chunks_{0};
+    std::atomic<bool> two_failure_pipeline_error_{false};
+    std::mutex two_failure_pipeline_error_mutex_;
+    std::string two_failure_pipeline_error_message_;
+
+    struct AtomicCompletionGuard {
+        std::atomic<size_t>* counter;
+        explicit AtomicCompletionGuard(std::atomic<size_t>* value) : counter(value) {}
+        ~AtomicCompletionGuard() {
+            if (counter != nullptr) {
+                counter->fetch_add(1, std::memory_order_release);
+            }
+        }
+    };
+
+    void set_two_failure_pipeline_error(const std::string& message) {
+        bool expected = false;
+        if (two_failure_pipeline_error_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            std::lock_guard<std::mutex> lock(two_failure_pipeline_error_mutex_);
+            two_failure_pipeline_error_message_ = message;
+        }
+    }
     
     // Sentinel received flags (to track if sentinel was received, but queue may not be empty yet)
     std::atomic<bool> encoding_thread_1_sentinel_received_;
@@ -451,6 +481,7 @@ private:
     // Buffers ready for release
     std::queue<uintptr_t> data_buffers_to_release_;
     std::queue<uintptr_t> encoding_buffers_to_release_;
+    std::queue<uintptr_t> two_failure_recv_buffers_to_release_;
     std::queue<uintptr_t> parity_buffers_to_release_;
     std::mutex release_queue_mutex_;
     
@@ -477,6 +508,7 @@ private:
         size_t p2p_data_size;
         size_t sequence_id;
         bool parity_is_pooled = true;
+        bool two_failure_chunk = false;
     };
     
     // Unified XOR task queue
@@ -537,6 +569,7 @@ private:
         size_t zero_fill_tail_size;     // save path: zero-fill remaining bytes after valid data
         size_t sequence_id;             // save path chunk order for network transfer
         bool parity_is_pooled = true;
+        bool two_failure_chunk = false;
     };
     
     struct P2PRecvTask {
@@ -549,6 +582,7 @@ private:
         bool skip_network;              // save path: fill zeros without receiving data
         size_t zero_fill_tail_size;      // save path: zero-fill remaining bytes after valid data
         size_t sequence_id;              // save path chunk order for network transfer
+        bool two_failure_chunk = false;
     };
     
     // P2P task queues (two independent workers)
@@ -739,31 +773,75 @@ private:
         load_net_wall_span_ns_.store(span_ns, std::memory_order_relaxed);
     }
 
-    struct SaveEncodeScopeTimer {
+    struct ModeAwareEncodeScopeTimer {
         ECCHECKNative* owner;
         std::chrono::steady_clock::time_point t0;
         bool record;
-        explicit SaveEncodeScopeTimer(ECCHECKNative* o, bool should_record = true)
+        explicit ModeAwareEncodeScopeTimer(ECCHECKNative* o, bool should_record = true)
             : owner(o), t0(std::chrono::steady_clock::now()), record(should_record) {}
-        ~SaveEncodeScopeTimer() {
-            if (record && owner != nullptr && !owner->is_load_mode_) {
-                const auto t1 = std::chrono::steady_clock::now();
-                const uint64_t ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+        ~ModeAwareEncodeScopeTimer() {
+            if (!record || owner == nullptr) {
+                return;
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            const uint64_t ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            if (owner->is_load_mode_ && owner->is_two_failures_load_mode_) {
+                owner->record_load_encode_op_(ns);
+            } else if (!owner->is_load_mode_) {
                 owner->record_save_encode_op_(ns);
             }
         }
     };
 
-    struct SaveNetScopeTimer {
+    struct ModeAwareNetScopeTimer {
         ECCHECKNative* owner;
         std::chrono::steady_clock::time_point t0;
-        explicit SaveNetScopeTimer(ECCHECKNative* o)
-            : owner(o), t0(std::chrono::steady_clock::now()) {}
-        ~SaveNetScopeTimer() {
-            if (owner != nullptr && !owner->is_load_mode_) {
-                const auto t1 = std::chrono::steady_clock::now();
+        std::atomic<uint64_t>* load_busy_ns;
+        std::atomic<size_t>* load_task_count;
+        bool record_any_load;
+        explicit ModeAwareNetScopeTimer(
+            ECCHECKNative* o,
+            std::atomic<uint64_t>* busy_ns = nullptr,
+            std::atomic<size_t>* task_count = nullptr,
+            bool any_load = false)
+            : owner(o), t0(std::chrono::steady_clock::now()), load_busy_ns(busy_ns),
+              load_task_count(task_count), record_any_load(any_load) {}
+        ~ModeAwareNetScopeTimer() {
+            if (owner == nullptr) {
+                return;
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            if (!owner->is_load_mode_) {
                 owner->touch_save_net_wall_(t0, t1);
+                return;
+            }
+            if (!record_any_load && !owner->is_two_failures_load_mode_) {
+                return;
+            }
+            owner->touch_load_net_wall_(t0, t1);
+            if (load_busy_ns != nullptr) {
+                const uint64_t ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                load_busy_ns->fetch_add(ns, std::memory_order_relaxed);
+            }
+            if (load_task_count != nullptr) {
+                load_task_count->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    struct TwoFailureLoadXorScopeTimer {
+        ECCHECKNative* owner;
+        std::chrono::steady_clock::time_point t0;
+        explicit TwoFailureLoadXorScopeTimer(ECCHECKNative* o)
+            : owner(o), t0(std::chrono::steady_clock::now()) {}
+        ~TwoFailureLoadXorScopeTimer() {
+            if (owner != nullptr && owner->is_load_mode_ && owner->is_two_failures_load_mode_) {
+                const auto t1 = std::chrono::steady_clock::now();
+                const uint64_t ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                owner->record_load_xor_op_(ns);
             }
         }
     };
@@ -1640,14 +1718,15 @@ private:
             std::lock_guard<std::mutex> work_lk(ec_rs_encode_pool_work_mutex_);
             int parity_idx = coefficient;
             if (parity_idx < 0 || parity_idx >= rows_) parity_idx = 0;
-            SaveEncodeScopeTimer encode_timer(this, parity_idx == 0);
+            ModeAwareEncodeScopeTimer encode_timer(
+                this, parity_idx == 0 || (is_load_mode_ && is_two_failures_load_mode_));
             if (data_block_index_ >= 0 && data_block_index_ < k_) {
                 size_t tbl_off = (static_cast<size_t>(parity_idx * k_ + data_block_index_)) * 32u;
                 ec_rs_encode_pool_run_parallel(data_addr, encoding_addr, size, g_tbls_ + tbl_off);
             }
             return;
         }
-        SaveEncodeScopeTimer encode_timer(this);
+        ModeAwareEncodeScopeTimer encode_timer(this);
         if (load_encode_pool_inited_.load(std::memory_order_acquire)) {
             LoadEncodePoolJob job{};
             if (try_build_load_encode_pool_job(data_addr, size, encoding_addr, coefficient, &job)) {
@@ -1870,7 +1949,7 @@ private:
                     task.encoding_addr, 0, task.parity_addr, task.size,
                     task.p2p_own_write_addr, task.p2p_partner_write_addr, task.data_addr,
                     task.local_is_zero_tail, true, task.p2p_data_is_zero_tail,
-                    task.p2p_data_size, task.sequence_id, task.parity_is_pooled
+                    task.p2p_data_size, task.sequence_id, task.parity_is_pooled, task.two_failure_chunk
                 });
                 xor_queue_cv_.notify_one();
                 need_recv = false;
@@ -1881,7 +1960,7 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(recv_queue_mutex_);
                     recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr, task.local_is_zero_tail, task.remote_is_zero_tail, task.p2p_data_is_zero_tail, task.p2p_data_size, task.sequence_id,
-                                      task.parity_is_pooled});
+                                      task.parity_is_pooled, task.two_failure_chunk});
                 }
                 recv_queue_cv_.notify_one();
             }
@@ -2071,7 +2150,7 @@ private:
                     task.encoding_addr, 0, task.parity_addr, task.size,
                     task.p2p_own_write_addr, task.p2p_partner_write_addr, task.data_addr,
                     task.local_is_zero_tail, true, task.p2p_data_is_zero_tail,
-                    task.p2p_data_size, task.sequence_id, task.parity_is_pooled
+                    task.p2p_data_size, task.sequence_id, task.parity_is_pooled, task.two_failure_chunk
                 });
                 xor_queue_cv_.notify_one();
                 need_recv = false;
@@ -2082,7 +2161,7 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(recv_queue_mutex_);
                     recv_queue_.push({task.recv_addr, task.recv_chunk_size, task.parity_addr, task.local_is_zero_tail, task.remote_is_zero_tail, task.p2p_data_is_zero_tail, task.p2p_data_size, task.sequence_id,
-                                      task.parity_is_pooled});
+                                      task.parity_is_pooled, task.two_failure_chunk});
                 }
                 recv_queue_cv_.notify_one();
             }
@@ -2153,7 +2232,7 @@ private:
             
             // Send data using RDMA, ASIO, or NCCL
             {
-            SaveNetScopeTimer save_net_timer(this);
+            ModeAwareNetScopeTimer net_timer(this, &load_enc_xor_send_total_ns_, &load_enc_xor_send_task_count_);
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_send_qp_) {
                 try {
@@ -2308,7 +2387,7 @@ private:
             
             // Receive data using RDMA, ASIO, or NCCL
             {
-            SaveNetScopeTimer save_net_timer(this);
+            ModeAwareNetScopeTimer net_timer(this, &load_enc_xor_recv_total_ns_, &load_enc_xor_recv_task_count_);
 #ifdef __linux__
             if (use_rdma_ && rdma_xor_recv_qp_) {
                 try {
@@ -2447,7 +2526,8 @@ private:
                         task.p2p_data_is_zero_tail,
                         task.p2p_data_size,
                         task.sequence_id,
-                        task.parity_is_pooled
+                        task.parity_is_pooled,
+                        task.two_failure_chunk
                     });
                 }
                 xor_queue_cv_.notify_one();
@@ -2521,6 +2601,8 @@ private:
                 continue;
             }
             
+            {
+            TwoFailureLoadXorScopeTimer xor_timer(this);
             unsigned char* dest = reinterpret_cast<unsigned char*>(task.parity_addr);
             if (task.local_is_zero_tail && task.remote_is_zero_tail) {
                 std::memset(dest, 0, task.size);
@@ -2547,6 +2629,7 @@ private:
                     xor_array[2] = dest;
                     xor_gen(3, static_cast<int>(task.size), xor_array);
                 }
+            }
             }
             
             if (task.p2p_own_write_addr != 0 && task.p2p_partner_write_addr != 0 && task.parity_addr != 0) {
@@ -2577,7 +2660,8 @@ private:
                         0,      // load_mode_data_addr (not needed for save mode)
                         p2p_send_zero_tail,
                         task.sequence_id,
-                        task.parity_is_pooled
+                        task.parity_is_pooled,
+                        task.two_failure_chunk
                     });
                 }
                 p2p_send_queue_cv_.notify_one();
@@ -2592,10 +2676,14 @@ private:
                         0,      // data_buffer_addr
                         skip_p2p_recv,
                         p2p_recv_zero_tail,
-                        task.sequence_id
+                        task.sequence_id,
+                        task.two_failure_chunk
                     });
                 }
                 p2p_recv_queue_cv_.notify_one();
+            }
+            if (task.two_failure_chunk) {
+                two_failure_xor_completed_chunks_.fetch_add(1, std::memory_order_release);
             }
             
             {
@@ -2603,9 +2691,13 @@ private:
                 // Always release local encoding buffer
                 encoding_buffers_to_release_.push(task.local_encoding_addr);
                 
-                // Release remote encoding buffer (received encoding)
+                // HW2 receive-ring slots have a separate lifecycle from pooled encoding buffers.
                 if (task.remote_encoding_addr != 0) {
-                    encoding_buffers_to_release_.push(task.remote_encoding_addr);
+                    if (is_two_failures_load_mode_) {
+                        two_failure_recv_buffers_to_release_.push(task.remote_encoding_addr);
+                    } else {
+                        encoding_buffers_to_release_.push(task.remote_encoding_addr);
+                    }
                 }
                 
                 // Parity buffer release logic
@@ -2704,6 +2796,9 @@ private:
                 continue;
             }
             
+            AtomicCompletionGuard two_failure_completion(
+                task.two_failure_chunk ? &two_failure_p2p_send_completed_chunks_ : nullptr);
+
             // Step 1: Copy own data/parity to own_buffer (save path only)
             if (task.p2p_own_write_addr != 0 && task.send_buffer_addr == 0 &&
                 (task.size > 0 || task.zero_fill_tail_size > 0)) {
@@ -2759,7 +2854,7 @@ private:
                 network_send_addr = task.p2p_own_write_addr;
             }
             if (p2p_partner_rank_ >= 0 && task.size > 0 && network_send_addr != 0) {
-            SaveNetScopeTimer save_net_timer(this);
+            ModeAwareNetScopeTimer net_timer(this, &load_step6_p2p_send_total_ns_, &load_step6_p2p_send_task_count_);
 #ifdef __linux__
             if (use_rdma_ && rdma_p2p_send_qp_) {
                     try {
@@ -2767,6 +2862,9 @@ private:
                             rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(network_send_addr), task.size);
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA P2P send failed: " << e.what() << std::endl;
+                        if (task.two_failure_chunk) {
+                            set_two_failure_pipeline_error(std::string("RDMA P2P send failed: ") + e.what());
+                        }
                     }
                 } else
 #endif
@@ -2806,6 +2904,9 @@ private:
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
                                   << "] P2P ASIO send failed: " << e.what() << std::endl;
+                        if (task.two_failure_chunk) {
+                            set_two_failure_pipeline_error(std::string("ASIO P2P send failed: ") + e.what());
+                        }
                     }
                 }
 #ifdef NCCL_AVAILABLE
@@ -3022,6 +3123,9 @@ private:
                 continue;
             }
             
+            AtomicCompletionGuard two_failure_completion(
+                task.two_failure_chunk ? &two_failure_p2p_recv_completed_chunks_ : nullptr);
+
             // Receive data using RDMA, ASIO, or NCCL
             bool task_processed = false;  // Track whether task was successfully processed
             if (task.skip_network && task.recv_buffer_addr != 0 &&
@@ -3030,6 +3134,8 @@ private:
                             task.size + task.zero_fill_tail_size);
                 task_processed = true;
             } else if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
+                ModeAwareNetScopeTimer net_timer(
+                    this, &load_step6_p2p_recv_total_ns_, &load_step6_p2p_recv_task_count_);
 #ifdef __linux__
                 if (use_rdma_ && rdma_p2p_recv_qp_) {
                     // std::cout << "[EC-CHECK RDMA] Save_P2P_Recv: Receiving " << task.size << " bytes via RDMA" << std::endl;
@@ -3040,6 +3146,9 @@ private:
                             RdmaLoadRecvPollLane::None);
                         if (recv_size == task.size) task_processed = true;
                         else {
+                            if (task.two_failure_chunk) {
+                                set_two_failure_pipeline_error("RDMA P2P recv size mismatch");
+                            }
                             std::cerr << "EC-CHECK: [Rank " << rank_ << "] P2P RDMA recv size mismatch: expected "
                                       << task.size << ", got " << recv_size
                                       << ", rank_in_group=" << rank_in_group_
@@ -3050,6 +3159,9 @@ private:
                         }
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA P2P recv failed: " << e.what() << std::endl;
+                        if (task.two_failure_chunk) {
+                            set_two_failure_pipeline_error(std::string("RDMA P2P recv failed: ") + e.what());
+                        }
                     }
                     if (!task_processed) continue;
                 } else
@@ -3069,6 +3181,9 @@ private:
                         
                         uint32_t size = ntohl(size_net);
                         if (size != task.size) {
+                            if (task.two_failure_chunk) {
+                                set_two_failure_pipeline_error("ASIO P2P recv size mismatch");
+                            }
                             std::cerr << "EC-CHECK: [Rank " << rank_ 
                                       << "] P2P size mismatch: expected " << task.size 
                                       << ", got " << size << std::endl;
@@ -3091,6 +3206,9 @@ private:
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
                                   << "] P2P ASIO recv failed: " << e.what() << std::endl;
+                        if (task.two_failure_chunk) {
+                            set_two_failure_pipeline_error(std::string("ASIO P2P recv failed: ") + e.what());
+                        }
                         continue;  // Skip processing on error
                     }
                 }
@@ -3636,6 +3754,15 @@ public:
         xor_worker_sentinel_received_ = false;
         p2p_send_worker_sentinel_received_ = false;
         p2p_recv_worker_sentinel_received_ = false;
+        two_failure_submitted_chunks_.store(0, std::memory_order_relaxed);
+        two_failure_xor_completed_chunks_.store(0, std::memory_order_relaxed);
+        two_failure_p2p_send_completed_chunks_.store(0, std::memory_order_relaxed);
+        two_failure_p2p_recv_completed_chunks_.store(0, std::memory_order_relaxed);
+        two_failure_pipeline_error_.store(false, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(two_failure_pipeline_error_mutex_);
+            two_failure_pipeline_error_message_.clear();
+        }
         
         // Clear queues to remove any residual tasks from previous pipeline
         {
@@ -3714,6 +3841,7 @@ public:
             std::lock_guard<std::mutex> lock(release_queue_mutex_);
             while (!data_buffers_to_release_.empty()) data_buffers_to_release_.pop();
             while (!encoding_buffers_to_release_.empty()) encoding_buffers_to_release_.pop();
+            while (!two_failure_recv_buffers_to_release_.empty()) two_failure_recv_buffers_to_release_.pop();
             while (!parity_buffers_to_release_.empty()) parity_buffers_to_release_.pop();
         }
         
@@ -3883,6 +4011,51 @@ public:
         
     }
     
+    void wait_for_two_failure_chunk_completion(
+        size_t expected_chunks, double timeout_seconds = 120.0) {
+        if (timeout_seconds < 0.0) {
+            throw std::invalid_argument("timeout_seconds must be non-negative");
+        }
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::duration<double>(timeout_seconds);
+        while (true) {
+            const size_t submitted = two_failure_submitted_chunks_.load(std::memory_order_acquire);
+            const size_t xor_completed = two_failure_xor_completed_chunks_.load(std::memory_order_acquire);
+            const size_t p2p_send_completed =
+                two_failure_p2p_send_completed_chunks_.load(std::memory_order_acquire);
+            const size_t p2p_recv_completed =
+                two_failure_p2p_recv_completed_chunks_.load(std::memory_order_acquire);
+            if (two_failure_pipeline_error_.load(std::memory_order_acquire)) {
+                std::string pipeline_error;
+                {
+                    std::lock_guard<std::mutex> lock(two_failure_pipeline_error_mutex_);
+                    pipeline_error = two_failure_pipeline_error_message_;
+                }
+                std::ostringstream error;
+                error << "EC-CHECK: two-failure chunk pipeline failed: " << pipeline_error
+                      << "; submitted=" << submitted << ", xor_completed=" << xor_completed
+                      << ", p2p_send_completed=" << p2p_send_completed
+                      << ", p2p_recv_completed=" << p2p_recv_completed
+                      << ", expected=" << expected_chunks;
+                throw std::runtime_error(error.str());
+            }
+            if (submitted >= expected_chunks && xor_completed >= expected_chunks &&
+                p2p_send_completed >= expected_chunks && p2p_recv_completed >= expected_chunks) {
+                return;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                std::ostringstream error;
+                error << "EC-CHECK: two-failure chunk completion timeout: submitted=" << submitted
+                      << ", xor_completed=" << xor_completed
+                      << ", p2p_send_completed=" << p2p_send_completed
+                      << ", p2p_recv_completed=" << p2p_recv_completed
+                      << ", expected=" << expected_chunks;
+                throw std::runtime_error(error.str());
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
     void wait_for_encoding_completion() {
         if (is_two_failures_load_mode_) {
             // Two-failure mode: wait for save-path workers (encoder threads,
@@ -4161,6 +4334,16 @@ public:
         return buffers;
     }
     
+    std::vector<uintptr_t> get_two_failure_recv_buffers_to_release() {
+        std::vector<uintptr_t> buffers;
+        std::lock_guard<std::mutex> lock(release_queue_mutex_);
+        while (!two_failure_recv_buffers_to_release_.empty()) {
+            buffers.push_back(two_failure_recv_buffers_to_release_.front());
+            two_failure_recv_buffers_to_release_.pop();
+        }
+        return buffers;
+    }
+
     std::vector<uintptr_t> get_parity_buffers_to_release() {
         std::vector<uintptr_t> buffers;
         std::lock_guard<std::mutex> lock(release_queue_mutex_);
@@ -4172,15 +4355,26 @@ public:
     }
 
     pybind11::dict get_ft_timing_stats() const {
+        uint64_t send_busy_ns = 0;
+        uint64_t recv_busy_ns = 0;
         double net_s = 0.0;
         double encode_s = 0.0;
-        if (is_load_mode_ && !is_two_failures_load_mode_) {
+        double decode_s = 0.0;
+        if (is_load_mode_) {
             net_s = static_cast<double>(
                 load_net_wall_span_ns_.load(std::memory_order_relaxed)) / 1e9;
-            const uint64_t enc_total_ns =
-                load_encode_total_ns_.load(std::memory_order_relaxed) +
-                load_xor_total_ns_.load(std::memory_order_relaxed);
-            encode_s = static_cast<double>(enc_total_ns) / 1e9;
+            encode_s = static_cast<double>(
+                load_encode_total_ns_.load(std::memory_order_relaxed)) / 1e9;
+            decode_s = static_cast<double>(
+                load_xor_total_ns_.load(std::memory_order_relaxed)) / 1e9;
+            send_busy_ns =
+                load_enc_xor_send_total_ns_.load(std::memory_order_relaxed) +
+                load_step2_p2p_send_total_ns_.load(std::memory_order_relaxed) +
+                load_step6_p2p_send_total_ns_.load(std::memory_order_relaxed);
+            recv_busy_ns =
+                load_enc_xor_recv_total_ns_.load(std::memory_order_relaxed) +
+                load_step2_p2p_recv_total_ns_.load(std::memory_order_relaxed) +
+                load_step6_p2p_recv_total_ns_.load(std::memory_order_relaxed);
         } else {
             net_s = static_cast<double>(
                 save_net_wall_span_ns_.load(std::memory_order_relaxed)) / 1e9;
@@ -4190,6 +4384,10 @@ public:
         pybind11::dict result;
         result["net_s"] = net_s;
         result["encode_s"] = encode_s;
+        result["decode_s"] = decode_s;
+        result["xor_s"] = decode_s;
+        result["send_busy_s"] = static_cast<double>(send_busy_ns) / 1e9;
+        result["recv_busy_s"] = static_cast<double>(recv_busy_ns) / 1e9;
         return result;
     }
     
@@ -4521,6 +4719,22 @@ public:
             return;
         }
 
+        const bool row0_is_receiver = xor_config_.thread0_is_receiver;
+        const bool row1_is_receiver = xor_config_.thread1_is_receiver;
+        if (row0_is_receiver == row1_is_receiver) {
+            throw std::runtime_error(
+                "Exactly one two-failure encoding lane must be the receiver");
+        }
+        if ((row0_is_receiver && recv_addr_1 == 0) ||
+            (row1_is_receiver && recv_addr_2 == 0) || recv_chunk_size == 0) {
+            throw std::invalid_argument(
+                "The active two-failure receiver requires a nonzero address and chunk size");
+        }
+
+        const uintptr_t row0_recv_addr = row0_is_receiver ? recv_addr_1 : 0;
+        const size_t row0_recv_size = row0_is_receiver ? recv_chunk_size : 0;
+        const uintptr_t row1_recv_addr = row1_is_receiver ? recv_addr_2 : 0;
+        const size_t row1_recv_size = row1_is_receiver ? recv_chunk_size : 0;
         const size_t sequence_id_1 = save_sequence_id_thread1_.fetch_add(1, std::memory_order_relaxed);
         const size_t sequence_id_2 = save_sequence_id_thread2_.fetch_add(1, std::memory_order_relaxed);
         const uintptr_t row0_xor_output_addr =
@@ -4538,10 +4752,10 @@ public:
             std::lock_guard<std::mutex> lock(encoding_tasks_1_mutex_);
             encoding_tasks_1_.push({
                 data_addr, size, enc_addr_0,
-                recv_addr_1, recv_chunk_size,
+                row0_recv_addr, row0_recv_size,
                 row0_xor_output_addr,
                 row0_p2p_own_addr, partner_write_addr,
-                false, false, false, size, sequence_id_1, false
+                false, false, false, size, sequence_id_1, false, true
             });
         }
         encoding_tasks_1_cv_.notify_one();
@@ -4553,10 +4767,10 @@ public:
             std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_);
             encoding_tasks_2_.push({
                 data_addr, size, enc_addr_1,
-                recv_addr_2, recv_chunk_size,
+                row1_recv_addr, row1_recv_size,
                 row1_xor_output_addr,
                 own_write_addr, row1_p2p_recv_addr,
-                false, false, false, size, sequence_id_2, false
+                false, false, false, size, sequence_id_2, false, true
             });
         }
         encoding_tasks_2_cv_.notify_one();
@@ -4568,6 +4782,7 @@ public:
                 data_buffer_states_[data_addr] = {false, false};
             }
         }
+        two_failure_submitted_chunks_.fetch_add(1, std::memory_order_release);
     }
 
     void submit_two_failure_encoding_sentinels() {
@@ -6294,6 +6509,8 @@ public:
     
     // Simple synchronous P2P send/recv for rank1 software failure recovery (no worker queue)
     void simple_p2p_send(uintptr_t buffer_addr, size_t size) {
+        ModeAwareNetScopeTimer net_timer(
+            this, &load_step2_p2p_send_total_ns_, &load_step2_p2p_send_task_count_, true);
         if (!use_asio_ || !asio_initialized_ || !asio_conn_mgr_.is_p2p_send_connected()) {
             throw std::runtime_error("ASIO P2P send not initialized");
         }
@@ -6341,6 +6558,8 @@ public:
     }
     
     void simple_p2p_recv(uintptr_t buffer_addr, size_t size) {
+        ModeAwareNetScopeTimer net_timer(
+            this, &load_step2_p2p_recv_total_ns_, &load_step2_p2p_recv_task_count_, true);
         if (!use_asio_ || !asio_initialized_ || !asio_conn_mgr_.is_p2p_recv_connected()) {
             throw std::runtime_error("ASIO P2P recv not initialized");
         }
@@ -6987,6 +7206,11 @@ PYBIND11_MODULE(eccheck_native, m) {
         .def("set_buffer_addresses", &ECCHECKNative::set_buffer_addresses)
         .def("reset_encoding_completion_flags", &ECCHECKNative::reset_encoding_completion_flags)
         .def("wait_for_encoding_completion", &ECCHECKNative::wait_for_encoding_completion)
+        .def("wait_for_two_failure_chunk_completion",
+             &ECCHECKNative::wait_for_two_failure_chunk_completion,
+             pybind11::arg("expected_chunks"),
+             pybind11::arg("timeout_seconds") = 120.0,
+             pybind11::call_guard<pybind11::gil_scoped_release>())
         .def("stop_pipeline", &ECCHECKNative::stop_pipeline)
         .def("submit_data_for_encoding_thread1", &ECCHECKNative::submit_data_for_encoding_thread1,
              pybind11::arg("data_addr") = 0,
@@ -7016,6 +7240,7 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("p2p_data_size") = 0)
         .def("get_data_buffers_to_release", &ECCHECKNative::get_data_buffers_to_release)
         .def("get_encoding_buffers_to_release", &ECCHECKNative::get_encoding_buffers_to_release)
+        .def("get_two_failure_recv_buffers_to_release", &ECCHECKNative::get_two_failure_recv_buffers_to_release)
         .def("get_parity_buffers_to_release", &ECCHECKNative::get_parity_buffers_to_release)
         .def("get_ft_timing_stats", &ECCHECKNative::get_ft_timing_stats,
              "Return per-rank timing: net_s wall-span; encode_s serial-equivalent encode CPU sum")

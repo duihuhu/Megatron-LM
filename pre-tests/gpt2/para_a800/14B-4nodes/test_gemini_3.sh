@@ -131,8 +131,8 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-merges.txt"
 
-TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"/workspace/Megatron-LM/logs/gpt2-2.7b-4nodes/gemini-3-replicas"}
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/dev/shm/models/gpt2-2.7b-4nodes-gemini-3-replicas"}
+TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"/workspace/Megatron-LM/logs/gpt2-14b-4nodes/gemini-3-replicas"}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/dev/shm/models/gpt2-14b-4nodes-gemini-3-replicas"}
 # DATA_PATH="/workspace/Megatron-LM/pre-tests/opt/opt_data/wiki_text_sentence"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -202,9 +202,9 @@ case "$MODE" in
         ;;
 esac
 
-HIDDEN_SIZE=2560
-NUM_ATTENTION_HEADS=32
-NUM_LAYERS=32
+HIDDEN_SIZE=5120
+NUM_ATTENTION_HEADS=40
+NUM_LAYERS=40
 
 SEQ_LENGTH=4096
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH

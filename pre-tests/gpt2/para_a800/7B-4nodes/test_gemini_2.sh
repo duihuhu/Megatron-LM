@@ -8,18 +8,18 @@ export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=${PROTOCOL_BUFFERS_PYTHON_IMPLEMEN
 #
 # =============================================================================
 #
-#   ./test_gemini_3.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [mode] [additional_args...]
+#   ./test_gemini_2.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [mode] [additional_args...]
 #
 # mode (optional, default: save):
 #   save      - checkpoint save only (no load / recovery flags)
 #   software  - load checkpoint + software failure recovery
 #   hardware  - load checkpoint + hardware failure recovery
 #
-#   ./test_gemini_3.sh 0 0
+#   ./test_gemini_2.sh 0 0
 #
-#   ./test_gemini_3.sh 0 0 1 2 3 4 5 6 7 software
+#   ./test_gemini_2.sh 0 0 1 2 3 4 5 6 7 software
 #
-#   ./test_gemini_3.sh 0 2 3 hardware --train-iters 50
+#   ./test_gemini_2.sh 0 2 3 hardware --train-iters 50
 # =============================================================================
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -50,14 +50,19 @@ case "$GEMINI_GDR" in
         ;;
     *) echo "Error: GEMINI_GDR must be 0 or 1, got '$GEMINI_GDR'." >&2; exit 2 ;;
 esac
-GEMINI_REPLICAS_CHANNELS_PER_PEER=${GEMINI_REPLICAS_CHANNELS_PER_PEER:-16}
+if [ -z "${GEMINI_REPLICAS_CHANNELS_PER_PEER+x}" ]; then
+    if [ "$GEMINI_GDR" = "1" ]; then
+        GEMINI_REPLICAS_CHANNELS_PER_PEER=12
+    else
+        GEMINI_REPLICAS_CHANNELS_PER_PEER=16
+    fi
+fi
 if [ "${GEMINI_GDR_MIRROR_MODE:-}" = "eager" ]; then
     GEMINI_GDR_BATCH_WR_DISPLAY=n/a
 else
     GEMINI_GDR_BATCH_WR_DISPLAY=${GEMINI_GDR_BATCH_WR:-n/a}
 fi
-export GEMINI_PIPELINE_SEGMENTS=16
-# ---------------------------------------------------------------------------
+export GEMINI_PIPELINE_SEGMENTS=${GEMINI_PIPELINE_SEGMENTS:-16}
 # export GEMINI_REPLICAS_BASE_IP=$MASTER_ADDR
 # export GEMINI_REPLICAS_BASE_PORT=12345
 
@@ -131,8 +136,8 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-merges.txt"
 
-TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"/workspace/Megatron-LM/logs/gpt2-2.7b-4nodes/gemini-3-replicas"}
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/dev/shm/models/gpt2-2.7b-4nodes-gemini-3-replicas"}
+TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"/workspace/Megatron-LM/logs/gpt2-7b-4nodes/gemini-2-replicas"}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/dev/shm/models/gpt2-7b-4nodes-gemini-2-replicas"}
 # DATA_PATH="/workspace/Megatron-LM/pre-tests/opt/opt_data/wiki_text_sentence"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -146,8 +151,8 @@ case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
-            --ec-checkpoint-write-only-penultimate-iter
             --gemini-replicas-channels-per-peer $GEMINI_REPLICAS_CHANNELS_PER_PEER
+            --ec-checkpoint-write-only-penultimate-iter
         )
         ;;
     software)
@@ -179,15 +184,8 @@ case "$MODE" in
         )
         ;;
     inprocess2)
-        RECOVERY_MODE_ARGS=(
-            --load $CHECKPOINT_PATH
-            --ft-inprocess-recovery-benchmark
-            --rerun-mode disabled
-            --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
-            --ft-inprocess-recovery-failed-ranks "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
-            --ft-inprocess-recovery-after-train-iter 0
-            --ft-inprocess-recovery-exit-after-forward
-        )
+        echo "Error: unsupported topology for Gemini2 inprocess2; two replicas cannot recover ranks 0..15 on two consecutive nodes." >&2
+        exit 2
         ;;
     inprocess)
         RECOVERY_MODE_ARGS=(
@@ -202,7 +200,7 @@ case "$MODE" in
         ;;
 esac
 
-HIDDEN_SIZE=2560
+HIDDEN_SIZE=4096
 NUM_ATTENTION_HEADS=32
 NUM_LAYERS=32
 
@@ -268,6 +266,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     #--save $CHECKPOINT_PATH
+    --ec-checkpoint-write-only-penultimate-iter
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
@@ -278,7 +277,7 @@ EVAL_AND_LOGGING_ARGS=(
 
     # ---------------------------------------------------------------------------
     # ---------------------------------------------------------------------------
-    --gemini-replicas-num 3
+    --gemini-replicas-num 2
 
     # ---------------------------------------------------------------------------
     # ---------------------------------------------------------------------------
@@ -297,7 +296,7 @@ EVAL_AND_LOGGING_ARGS=(
     #   --gemini-replicas-recovery-rank "0,1,2,3,4,5,6,7"
     #
     #   --gemini-replicas-recovery-rank 2,3
-
+    #
     # ---------------------------------------------------------------------------
     # ---------------------------------------------------------------------------
     --ckpt-format torch

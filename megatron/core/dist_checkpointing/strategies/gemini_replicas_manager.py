@@ -731,30 +731,52 @@ class GeminiReplicasManager:
             f"  Total tensors: {stats['num_tensors']}"
         )
     
-    def allocate_preallocated_buffer(self, size_bytes: int):
+    def allocate_preallocated_buffer(
+        self, size_bytes: int, prefer_torch_pinned: bool = False,
+    ):
         """Allocate preallocated CPU buffer for data transfer.
-        
+
         Args:
-            size_bytes: Size of buffer to allocate in bytes
+            size_bytes: Size of buffer to allocate in bytes.
+            prefer_torch_pinned: Try the torch pinned allocator before hugepages.
         """
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        
+
         if self.preallocated_cpu_buffer is not None:
             if self.preallocated_cpu_buffer.numel() >= size_bytes:
                 if _gemini_replicas_debug_enabled():
-                    logger.info(f"Gemini Replicas: [Rank {rank}] Reusing existing preallocated buffer")
+                    logger.info(
+                        f"Gemini Replicas: [Rank {rank}] Reusing existing "
+                        "preallocated buffer"
+                    )
                 return
-        
+
         if _gemini_replicas_debug_enabled():
-            logger.info(f"Gemini Replicas: [Rank {rank}] Allocating preallocated buffer: {size_bytes / (1024**3):.2f} GB")
-        
+            logger.info(
+                f"Gemini Replicas: [Rank {rank}] Allocating preallocated buffer: "
+                f"{size_bytes / (1024**3):.2f} GB"
+            )
+
         pin = self.gemini_replicas_pin_memory and torch.cuda.is_available()
-        self.preallocated_cpu_buffer = allocate_hugepage_tensor(
-            size_bytes, fallback_pin_memory=pin, touch_pages=False,
-        )
+        buffer = None
+        if prefer_torch_pinned and pin:
+            try:
+                buffer = torch.empty(
+                    size_bytes, dtype=torch.uint8, pin_memory=True,
+                )
+            except Exception:
+                # Preserve the existing hugepage allocation as the fallback.
+                pass
+        if buffer is None:
+            buffer = allocate_hugepage_tensor(
+                size_bytes, fallback_pin_memory=pin, touch_pages=False,
+            )
+        self.preallocated_cpu_buffer = buffer
         if _gemini_replicas_debug_enabled():
-            logger.info(f"Gemini Replicas: [Rank {rank}] Allocated preallocated buffer: "
-                        f"{size_bytes / (1024**3):.2f} GB (hugepage, pin={pin})")
+            logger.info(
+                f"Gemini Replicas: [Rank {rank}] Allocated preallocated buffer: "
+                f"{size_bytes / (1024**3):.2f} GB (pin={pin})"
+            )
 
     _cached_recv_buffers: Dict[int, torch.Tensor] = {}
 

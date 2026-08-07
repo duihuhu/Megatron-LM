@@ -26,6 +26,7 @@ from megatron.training.legacy_io_utils import (
 )
 from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
     allocate_hugepage_tensor,
+    is_hugepage_cuda_registered,
 )
 from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     DecomposedStateDict,
@@ -242,6 +243,17 @@ def save_gemini_replicas_legacy_checkpoint(
                 "expected cpu_pipeline"
             )
     use_cpu_pipeline = not manager.use_gdr
+    prefer_torch_pinned_env = os.environ.get(
+        "GEMINI_SAVE_PREFER_TORCH_PINNED", "0"
+    ).strip()
+    if prefer_torch_pinned_env not in {"0", "1"}:
+        raise RuntimeError(
+            "Invalid GEMINI_SAVE_PREFER_TORCH_PINNED="
+            f"{prefer_torch_pinned_env!r}; expected 0 or 1"
+        )
+    prefer_torch_pinned = (
+        use_cpu_pipeline and prefer_torch_pinned_env == "1"
+    )
     t0 = time.time()
     decomposed, save_copy_s, save_flatten_s, decompose_s = decompose_state_dict_for_save(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
@@ -252,7 +264,10 @@ def save_gemini_replicas_legacy_checkpoint(
         )
 
     safety_margin = max(int(total_tensor_size * 0.01), 1024 * 1024)
-    manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
+    manager.allocate_preallocated_buffer(
+        total_tensor_size + safety_margin,
+        prefer_torch_pinned=prefer_torch_pinned,
+    )
     tensor_buffer = manager.preallocated_cpu_buffer
 
     # Both transports pack on GPU. GDR sends it directly; CPU pipeline mirrors segments.
@@ -325,6 +340,63 @@ def save_gemini_replicas_legacy_checkpoint(
 
     send_buffer_size = total_tensor_size
 
+    pipeline_chunk_mb = 0
+    num_seg = 1
+    if use_cpu_pipeline:
+        pipeline_chunk_mb_env = os.environ.get(
+            "GEMINI_PIPELINE_CHUNK_MB", "0"
+        ).strip()
+        pipeline_max_segments_env = os.environ.get(
+            "GEMINI_PIPELINE_MAX_SEGMENTS", "128"
+        ).strip()
+        pipeline_segments_env = os.environ.get(
+            "GEMINI_PIPELINE_SEGMENTS", "4"
+        ).strip()
+        try:
+            pipeline_chunk_mb = int(pipeline_chunk_mb_env)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid GEMINI_PIPELINE_CHUNK_MB={pipeline_chunk_mb_env!r}; "
+                "expected a non-negative integer"
+            ) from exc
+        if pipeline_chunk_mb < 0:
+            raise RuntimeError(
+                f"Invalid GEMINI_PIPELINE_CHUNK_MB={pipeline_chunk_mb_env!r}; "
+                "expected a non-negative integer"
+            )
+        try:
+            pipeline_max_segments = int(pipeline_max_segments_env)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Invalid GEMINI_PIPELINE_MAX_SEGMENTS="
+                f"{pipeline_max_segments_env!r}; expected a positive integer"
+            ) from exc
+        if pipeline_max_segments <= 0:
+            raise RuntimeError(
+                "Invalid GEMINI_PIPELINE_MAX_SEGMENTS="
+                f"{pipeline_max_segments_env!r}; expected a positive integer"
+            )
+        if pipeline_chunk_mb == 0:
+            try:
+                num_seg = int(pipeline_segments_env)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Invalid GEMINI_PIPELINE_SEGMENTS={pipeline_segments_env!r}; "
+                    "expected a positive integer"
+                ) from exc
+            if num_seg <= 0:
+                raise RuntimeError(
+                    f"Invalid GEMINI_PIPELINE_SEGMENTS={pipeline_segments_env!r}; "
+                    "expected a positive integer"
+                )
+        else:
+            chunk_bytes = pipeline_chunk_mb * 1024 * 1024
+            global_max_bytes = max(rank_sizes.values(), default=0)
+            num_seg = max(
+                1, (global_max_bytes + chunk_bytes - 1) // chunk_bytes
+            )
+            num_seg = min(num_seg, pipeline_max_segments)
+
     # Determine source ranks (ranks whose target list includes us)
     target_ranks = manager._calculate_target_ranks(rank, world_size)
     source_ranks = []
@@ -388,10 +460,9 @@ def save_gemini_replicas_legacy_checkpoint(
         # FRCheck-style pipeline: the GPU buffer is already packed above. Send from
         # the CPU buffer (NIC reads host memory, no GPU-read contention with the
         # concurrent D2H), and overlap each segment's D2H (GPU->CPU) with the
-        # network send of earlier segments. Segment count via GEMINI_PIPELINE_SEGMENTS.
+        # network send of earlier segments. Segment count is shared by all ranks.
         manager.register_buffer(tensor_buffer)
         native.set_mirror_bases(0, 0)
-        num_seg = max(1, int(os.environ.get("GEMINI_PIPELINE_SEGMENTS", "4")))
 
         d2h_stream = torch.cuda.Stream()
         seg_ranges: List[Tuple[int, int]] = []
@@ -532,14 +603,25 @@ def save_gemini_replicas_legacy_checkpoint(
         "mirror_d2h_busy_s": float(exchange_stats.get("mirror_d2h_busy_s", 0.0)),
     })
     if rank == 0:
+        if is_hugepage_cuda_registered(tensor_buffer):
+            cpu_buffer_kind = "hugepage_registered"
+        elif tensor_buffer.is_pinned():
+            cpu_buffer_kind = "torch_pinned"
+        else:
+            cpu_buffer_kind = "host"
         summary["mirror_mode"] = mirror_mode
         summary["gdr_requested"] = manager.gdr_requested
         summary["gdr_enabled"] = manager.use_gdr
         summary["send_from_gpu"] = manager.use_gdr
+        summary["cpu_buffer_kind"] = cpu_buffer_kind
+        summary["pipeline_segments"] = num_seg
+        summary["pipeline_chunk_mb"] = pipeline_chunk_mb
         logger.info(
             "GEMINI save transport: gdr_requested=%(gdr_requested)s "
             "gdr_enabled=%(gdr_enabled)s send_from_gpu=%(send_from_gpu)s "
-            "mirror_mode=%(mirror_mode)s",
+            "mirror_mode=%(mirror_mode)s cpu_buffer_kind=%(cpu_buffer_kind)s "
+            "pipeline_segments=%(pipeline_segments)d "
+            "pipeline_chunk_mb=%(pipeline_chunk_mb)d",
             summary,
         )
         logger.info(

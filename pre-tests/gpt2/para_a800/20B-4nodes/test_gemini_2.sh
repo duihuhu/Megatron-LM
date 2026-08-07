@@ -38,10 +38,31 @@ export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
-# Mirror scheduling: batch (overlap), after_network (serial D2H), or off (network-only).
-export GEMINI_MIRROR_MODE=${GEMINI_MIRROR_MODE:-cpu_pipeline}
-export GEMINI_PIPELINE_SEGMENTS=16
-export GEMINI_MIRROR_CHUNK_MB=64
+GEMINI_GDR=${GEMINI_GDR:-0}
+GEMINI_GDR_ARGS=()
+case "$GEMINI_GDR" in
+    0) export GEMINI_MIRROR_MODE=${GEMINI_MIRROR_MODE:-cpu_pipeline} ;;
+    1)
+        export GEMINI_GDR_MIRROR_MODE=${GEMINI_GDR_MIRROR_MODE:-eager}
+        export GEMINI_GDR_BATCH_WR=${GEMINI_GDR_BATCH_WR:-1}
+        export GEMINI_MIRROR_CHUNK_MB=${GEMINI_MIRROR_CHUNK_MB:-64}
+        GEMINI_GDR_ARGS=(--gemini-replicas-gdr)
+        ;;
+    *) echo "Error: GEMINI_GDR must be 0 or 1, got '$GEMINI_GDR'." >&2; exit 2 ;;
+esac
+if [ -z "${GEMINI_REPLICAS_CHANNELS_PER_PEER+x}" ]; then
+    if [ "$GEMINI_GDR" = "1" ]; then
+        GEMINI_REPLICAS_CHANNELS_PER_PEER=12
+    else
+        GEMINI_REPLICAS_CHANNELS_PER_PEER=16
+    fi
+fi
+if [ "${GEMINI_GDR_MIRROR_MODE:-}" = "eager" ]; then
+    GEMINI_GDR_BATCH_WR_DISPLAY=n/a
+else
+    GEMINI_GDR_BATCH_WR_DISPLAY=${GEMINI_GDR_BATCH_WR:-n/a}
+fi
+export GEMINI_PIPELINE_SEGMENTS=${GEMINI_PIPELINE_SEGMENTS:-16}
 # export GEMINI_REPLICAS_BASE_IP=$MASTER_ADDR
 # export GEMINI_REPLICAS_BASE_PORT=12345
 
@@ -76,7 +97,7 @@ if [ "${#GPU_IDS[@]}" -eq 0 ]; then
 fi
 
 MODE=save
-if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|inprocess|inprocess_sw)$ ]]; then
+if [ -n "$1" ] && [[ "$1" =~ ^(save|software|hardware|inprocess|inprocess2|inprocess_sw)$ ]]; then
     MODE="$1"
     shift
 fi
@@ -130,8 +151,8 @@ case "$MODE" in
     save)
         RECOVERY_MODE_ARGS=(
             --save $CHECKPOINT_PATH
+            --gemini-replicas-channels-per-peer $GEMINI_REPLICAS_CHANNELS_PER_PEER
             --ec-checkpoint-write-only-penultimate-iter
-            --gemini-replicas-channels-per-peer 16
         )
         ;;
     software)
@@ -161,6 +182,10 @@ case "$MODE" in
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
         )
+        ;;
+    inprocess2)
+        echo "Error: unsupported topology for Gemini2 inprocess2; two replicas cannot recover ranks 0..15 on two consecutive nodes." >&2
+        exit 2
         ;;
     inprocess)
         RECOVERY_MODE_ARGS=(
@@ -261,6 +286,7 @@ EVAL_AND_LOGGING_ARGS=(
     # ---------------------------------------------------------------------------
     # ---------------------------------------------------------------------------
     --use-rdma
+    ${GEMINI_GDR_ARGS[@]}
 
     # ---------------------------------------------------------------------------
     # ---------------------------------------------------------------------------
@@ -302,12 +328,14 @@ mkdir -p logs/csv
 
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
+    echo "Gemini GDR: requested=$GEMINI_GDR mirror_mode=${GEMINI_GDR_MIRROR_MODE:-${GEMINI_MIRROR_MODE}} batch_wr=$GEMINI_GDR_BATCH_WR_DISPLAY mirror_chunk_mb=${GEMINI_MIRROR_CHUNK_MB:-n/a} channels_per_peer=$GEMINI_REPLICAS_CHANNELS_PER_PEER"
     echo "Would run (Node $NODE_RANK, mode=$MODE): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} ${RECOVERY_MODE_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
 fi
 # -------------------------------------------------------------------------
 
 echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (Gemini Replicas Legacy, mode=$MODE)"
+echo "Gemini GDR: requested=$GEMINI_GDR mirror_mode=${GEMINI_GDR_MIRROR_MODE:-${GEMINI_MIRROR_MODE}} batch_wr=$GEMINI_GDR_BATCH_WR_DISPLAY mirror_chunk_mb=${GEMINI_MIRROR_CHUNK_MB:-n/a} channels_per_peer=$GEMINI_REPLICAS_CHANNELS_PER_PEER"
 echo "WORLD_SIZE=$WORLD_SIZE  GPUS_PER_NODE=$GPUS_PER_NODE  NNODES=$NNODES"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"
 

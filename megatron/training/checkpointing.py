@@ -337,14 +337,17 @@ def _format_inprocess_load_timing_summary(ft_context: dict, h2d_total_s: float) 
             "network_encode_s": float(recovery.get("network_encode", 0.0)),
             "net_s": float(recovery.get("net_s", 0.0)),
             "encode_s": float(recovery.get("encode_s", 0.0)),
-            "decode_s": float(recovery.get("decode_s", recovery.get("encode_s", 0.0))),
+            "decode_s": float(recovery.get("decode_s", 0.0)),
+            "phase1_p2p_s": float(recovery.get("phase1_p2p_s", 0.0)),
+            "pipeline_wall_s": float(recovery.get("pipeline_wall_s", 0.0)),
             "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
             "h2d_s": h2d_total_s,
         })
         return (
             "ECCHECK load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
             "network_encode_s=%.2fs net_s=%.2fs encode_s=%.2fs "
-            "decode_s=%.2fs rebuild_sd_s=%.2fs h2d_s=%.2fs"
+            "decode_s=%.2fs phase1_p2p_s=%.2fs pipeline_wall_s=%.2fs "
+            "rebuild_sd_s=%.2fs h2d_s=%.2fs"
             % (
                 ft_context.get("mode", "unknown"),
                 summary["e2e_s"],
@@ -353,6 +356,8 @@ def _format_inprocess_load_timing_summary(ft_context: dict, h2d_total_s: float) 
                 summary["net_s"],
                 summary["encode_s"],
                 summary["decode_s"],
+                summary["phase1_p2p_s"],
+                summary["pipeline_wall_s"],
                 summary["rebuild_sd_s"],
                 summary["h2d_s"],
             )
@@ -3185,7 +3190,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     "network_encode_s": float(recovery.get("network_encode", 0.0)),
                     "net_s": float(recovery.get("net_s", 0.0)),
                     "encode_s": float(recovery.get("encode_s", 0.0)),
-                    "decode_s": float(recovery.get("decode_s", recovery.get("encode_s", 0.0))),
+                    "decode_s": float(recovery.get("decode_s", 0.0)),
+                    "phase1_p2p_s": float(recovery.get("phase1_p2p_s", 0.0)),
+                    "pipeline_wall_s": float(recovery.get("pipeline_wall_s", 0.0)),
                     "rebuild_sd_s": float(recovery.get("rebuild_sd", 0.0)),
                     "h2d_s": h2d_total_s,
                 })
@@ -3193,7 +3200,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     logger.info(
                         "ECCHECK load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
                         "network_encode_s=%.2fs net_s=%.2fs encode_s=%.2fs "
-                        "decode_s=%.2fs rebuild_sd_s=%.2fs h2d_s=%.2fs",
+                        "decode_s=%.2fs phase1_p2p_s=%.2fs pipeline_wall_s=%.2fs "
+                        "rebuild_sd_s=%.2fs h2d_s=%.2fs",
                         ft_context.get("mode", "unknown"),
                         summary["e2e_s"],
                         summary["recovery_e2e_s"],
@@ -3201,6 +3209,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                         summary["net_s"],
                         summary["encode_s"],
                         summary["decode_s"],
+                        summary["phase1_p2p_s"],
+                        summary["pipeline_wall_s"],
                         summary["rebuild_sd_s"],
                         summary["h2d_s"],
                     )

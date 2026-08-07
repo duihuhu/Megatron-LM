@@ -17,10 +17,20 @@ import torch
 from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
     allocate_hugepage_slices,
     allocate_hugepage_tensor,
+    is_hugepage_cuda_registered,
 )
 from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 
 logger = getLogger(__name__)
+
+
+def _save_prefer_torch_pinned() -> bool:
+    value = os.environ.get("FRCHECK_SAVE_PREFER_TORCH_PINNED", "0")
+    if value not in ("0", "1"):
+        raise RuntimeError(
+            "FRCHECK_SAVE_PREFER_TORCH_PINNED must be exactly 0 or 1"
+        )
+    return value == "1"
 
 
 def _frcheck_debug_enabled() -> bool:
@@ -66,6 +76,8 @@ class LayerStripeBufs:
     remote_layer_bufs: Dict[int, torch.Tensor] = field(default_factory=dict)
     zero_block: Optional[torch.Tensor] = None
     source_on_cpu: bool = False
+    mirror_prefer_torch_pinned: bool = False
+    mirror_buffer_kind: str = "host"
 
 
 class FRCheckManager:
@@ -657,12 +669,18 @@ class FRCheckManager:
         self, native, layer_idx: int, block_sz: int, source_on_cpu: bool = False
     ) -> None:
         """Allocate per-stripe buffers for one layer (grows-only per layer_idx)."""
+        prefer_torch_pinned = (
+            _save_prefer_torch_pinned() if not source_on_cpu else False
+        )
+        mirror_prefer_torch_pinned = prefer_torch_pinned
         prev = self._layer_stripe_alloc_sizes.get(layer_idx, 0)
         prev_bufs = self.layer_stripe_bufs.get(layer_idx)
         if (
             prev >= block_sz
             and prev_bufs is not None
             and bool(getattr(prev_bufs, "source_on_cpu", False)) == bool(source_on_cpu)
+            and bool(getattr(prev_bufs, "mirror_prefer_torch_pinned", False))
+            == mirror_prefer_torch_pinned
         ):
             return
 
@@ -678,9 +696,26 @@ class FRCheckManager:
         par_indices = [sid for sid in range(self.num_stripes)
                        if self.stripe_plans[sid].role == StripeRole.PARITY_TARGET]
 
-        layer_mirror_cpu = allocate_hugepage_tensor(
-            layer_capacity, fallback_pin_memory=True,
-        )
+        mirror_buffer_kind = "host"
+        if mirror_prefer_torch_pinned and torch.cuda.is_available():
+            try:
+                layer_mirror_cpu = torch.empty(
+                    layer_capacity, dtype=torch.uint8, pin_memory=True
+                )
+                mirror_buffer_kind = "torch_pinned"
+            except Exception:
+                layer_mirror_cpu = allocate_hugepage_tensor(
+                    layer_capacity, fallback_pin_memory=True
+                )
+        else:
+            layer_mirror_cpu = allocate_hugepage_tensor(
+                layer_capacity, fallback_pin_memory=True
+            )
+        if mirror_buffer_kind != "torch_pinned":
+            if is_hugepage_cuda_registered(layer_mirror_cpu):
+                mirror_buffer_kind = "hugepage_registered"
+            elif layer_mirror_cpu.is_pinned():
+                mirror_buffer_kind = "torch_pinned"
         layer_mirror_cpu.zero_()
         if source_on_cpu:
             layer_buf_gpu = layer_mirror_cpu
@@ -767,6 +802,8 @@ class FRCheckManager:
             remote_layer_bufs=remote_layer_bufs,
             zero_block=zero_block,
             source_on_cpu=source_on_cpu,
+            mirror_prefer_torch_pinned=mirror_prefer_torch_pinned,
+            mirror_buffer_kind=mirror_buffer_kind,
         )
         self.layer_stripe_bufs[layer_idx] = layer_bufs
 

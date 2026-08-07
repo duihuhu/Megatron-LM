@@ -49,6 +49,9 @@
 
 // RS encode thread pool
 static constexpr int kRsPoolSize = 16;
+static constexpr int kRsMaxDataBlocks = 254;
+static constexpr int kRsMaxParityBlocks = 2;
+static constexpr size_t kRsInitialPlanSpans = 4096;
 static constexpr const char* kRsCpuListEnv = "FRCHECK_RS_CPU_LIST";
 
 struct RsEncodeJob {
@@ -63,6 +66,12 @@ struct RsEncodeJob {
 struct RsPoolWorkerCtx {
     class FRCheckNative* self = nullptr;
     int wid = 0;
+};
+
+struct RsPoolSpan {
+    uint32_t job_index = 0;
+    int offset = 0;
+    int length = 0;
 };
 
 namespace py = pybind11;
@@ -2295,6 +2304,11 @@ private:
 
     // ---- ISA-L RS encode table init ----
     void init_encode_tables_() {
+        if (n_ < 3 || n_ > kRsMaxDataBlocks + kRsMaxParityBlocks) {
+            throw std::runtime_error(
+                "FRCheck: RS coding requires n in [3," +
+                std::to_string(kRsMaxDataBlocks + kRsMaxParityBlocks) + "]");
+        }
         int k = n_ - 2;       // data blocks per stripe
         int rows = 2;         // parity blocks
         int m = k + rows;     // total blocks per stripe (= n)
@@ -2430,7 +2444,10 @@ private:
         rs_pool_stop_.store(false, std::memory_order_release);
         rs_pool_epoch_.store(0, std::memory_order_release);
         rs_pool_remaining_.store(0, std::memory_order_release);
+        rs_pool_plan_spans_.reserve(kRsInitialPlanSpans);
         for (auto& e : rs_pool_last_epoch_) e = 0;
+        for (auto& elapsed : rs_pool_worker_elapsed_us_)
+            elapsed.store(0, std::memory_order_relaxed);
         for (int i = 0; i < kRsPoolSize; ++i) {
             rs_pool_ctx_[i].self = this;
             rs_pool_ctx_[i].wid = i;
@@ -2487,7 +2504,10 @@ private:
             lk.unlock();
 
             if (jobs != nullptr) {
+                const uint64_t compute_t0 = frcheck_now_us();
                 rs_pool_execute_batch_slice(*jobs, wid);
+                rs_pool_worker_elapsed_us_[wid].store(
+                    frcheck_now_us() - compute_t0, std::memory_order_release);
             } else {
                 rs_pool_execute_slice(job, wid);
             }
@@ -2537,61 +2557,110 @@ private:
     }
 
     void rs_pool_execute_batch_slice(const std::vector<RsEncodeJob>& jobs, int wid) {
-        uint64_t total_bytes = 0;
-        for (const auto& job : jobs) {
-            if (job.len > 0) {
-                const uint64_t len = static_cast<uint64_t>(job.len);
-                if (total_bytes > std::numeric_limits<uint64_t>::max() - len)
-                    return;
-                total_bytes += len;
-            }
-        }
-        if (total_bytes == 0) return;
-
-        const uint64_t base = total_bytes / static_cast<uint64_t>(kRsPoolSize);
-        const uint64_t rem = total_bytes % static_cast<uint64_t>(kRsPoolSize);
-        const uint64_t worker_len = base + (static_cast<uint64_t>(wid) < rem ? 1 : 0);
-        const uint64_t worker_begin = static_cast<uint64_t>(wid) * base +
-            std::min<uint64_t>(static_cast<uint64_t>(wid), rem);
-        const uint64_t worker_end = worker_begin + worker_len;
-        if (worker_len == 0) return;
-
-        uint64_t job_begin = 0;
-        for (const auto& job : jobs) {
-            const uint64_t job_len = job.len > 0 ? static_cast<uint64_t>(job.len) : 0;
-            const uint64_t job_end = job_begin + job_len;
-            const uint64_t begin = std::max(worker_begin, job_begin);
-            const uint64_t end = std::min(worker_end, job_end);
-            if (begin < end) {
-                const uint64_t offset = begin - job_begin;
-                const uint64_t length = end - begin;
-                if (offset <= static_cast<uint64_t>(std::numeric_limits<int>::max()) &&
-                    length <= static_cast<uint64_t>(std::numeric_limits<int>::max())) {
-                    rs_pool_execute_range(job, static_cast<int>(offset), static_cast<int>(length));
-                }
-            }
-            job_begin = job_end;
-            if (job_begin >= worker_end) break;
+        const size_t begin = rs_pool_worker_plan_begin_[static_cast<size_t>(wid)];
+        const size_t count = rs_pool_worker_plan_count_[static_cast<size_t>(wid)];
+        for (size_t i = 0; i < count; ++i) {
+            const RsPoolSpan& span = rs_pool_plan_spans_[begin + i];
+            rs_pool_execute_range(
+                jobs[static_cast<size_t>(span.job_index)], span.offset, span.length);
         }
     }
 
     void rs_pool_execute_range(const RsEncodeJob& job, int off, int len) {
         if (len <= 0 || off < 0 || off > job.len || len > job.len - off ||
-            job.k <= 0 || job.m <= 0 || job.g_tbls == nullptr ||
-            job.data_ptrs == nullptr || job.parity_ptrs == nullptr)
+            job.k <= 0 || job.k > kRsMaxDataBlocks ||
+            job.m <= 0 || job.m > kRsMaxParityBlocks ||
+            job.g_tbls == nullptr || job.data_ptrs == nullptr ||
+            job.parity_ptrs == nullptr)
             return;
-        std::vector<unsigned char*> src(static_cast<size_t>(job.k));
+
+        std::array<unsigned char*, kRsMaxDataBlocks> src;
+        std::array<unsigned char*, kRsMaxParityBlocks> dest;
         for (int i = 0; i < job.k; ++i) {
             if (job.data_ptrs[i] == nullptr) return;
             src[static_cast<size_t>(i)] = job.data_ptrs[i] + off;
         }
-        std::vector<unsigned char*> dest(static_cast<size_t>(job.m));
         for (int i = 0; i < job.m; ++i) {
             if (job.parity_ptrs[i] == nullptr) return;
             dest[static_cast<size_t>(i)] = job.parity_ptrs[i] + off;
         }
         ec_encode_data(len, job.k, job.m, job.g_tbls, src.data(), dest.data());
         save_encode_ec_calls_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void rs_pool_build_batch_plan(const std::vector<RsEncodeJob>& jobs) {
+        uint64_t total_bytes = 0;
+        for (const auto& job : jobs) {
+            if (job.len < 0 || job.k <= 0 || job.k > kRsMaxDataBlocks ||
+                job.m <= 0 || job.m > kRsMaxParityBlocks ||
+                job.g_tbls == nullptr || job.data_ptrs == nullptr ||
+                job.parity_ptrs == nullptr) {
+                throw std::runtime_error("FRCheck: invalid RS batch job");
+            }
+            for (int i = 0; i < job.k; ++i) {
+                if (job.data_ptrs[i] == nullptr)
+                    throw std::runtime_error("FRCheck: null RS batch source pointer");
+            }
+            for (int i = 0; i < job.m; ++i) {
+                if (job.parity_ptrs[i] == nullptr)
+                    throw std::runtime_error("FRCheck: null RS batch parity pointer");
+            }
+            const uint64_t len = static_cast<uint64_t>(job.len);
+            if (total_bytes > std::numeric_limits<uint64_t>::max() - len)
+                throw std::runtime_error("FRCheck: RS batch byte count overflow");
+            total_bytes += len;
+        }
+
+        rs_pool_plan_spans_.clear();
+        if (jobs.size() <= std::numeric_limits<size_t>::max() - kRsPoolSize &&
+            rs_pool_plan_spans_.capacity() < jobs.size() + kRsPoolSize) {
+            rs_pool_plan_spans_.reserve(jobs.size() + kRsPoolSize);
+        }
+
+        const uint64_t base = total_bytes / static_cast<uint64_t>(kRsPoolSize);
+        const uint64_t rem = total_bytes % static_cast<uint64_t>(kRsPoolSize);
+        size_t job_index = 0;
+        uint64_t job_begin = 0;
+        for (int wid = 0; wid < kRsPoolSize; ++wid) {
+            const uint64_t worker_begin = static_cast<uint64_t>(wid) * base +
+                std::min<uint64_t>(static_cast<uint64_t>(wid), rem);
+            const uint64_t worker_len = base +
+                (static_cast<uint64_t>(wid) < rem ? 1 : 0);
+            const uint64_t worker_end = worker_begin + worker_len;
+            rs_pool_worker_plan_begin_[static_cast<size_t>(wid)] =
+                rs_pool_plan_spans_.size();
+
+            while (job_index < jobs.size() &&
+                   job_begin + static_cast<uint64_t>(jobs[job_index].len) <= worker_begin) {
+                job_begin += static_cast<uint64_t>(jobs[job_index].len);
+                ++job_index;
+            }
+            size_t scan_index = job_index;
+            uint64_t scan_begin = job_begin;
+            while (scan_index < jobs.size() && scan_begin < worker_end) {
+                const uint64_t scan_end =
+                    scan_begin + static_cast<uint64_t>(jobs[scan_index].len);
+                const uint64_t begin = std::max(worker_begin, scan_begin);
+                const uint64_t end = std::min(worker_end, scan_end);
+                if (begin < end) {
+                    const uint64_t offset = begin - scan_begin;
+                    const uint64_t length = end - begin;
+                    if (scan_index > std::numeric_limits<uint32_t>::max() ||
+                        offset > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+                        length > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                        throw std::runtime_error("FRCheck: RS batch span exceeds supported range");
+                    }
+                    rs_pool_plan_spans_.push_back(RsPoolSpan{
+                        static_cast<uint32_t>(scan_index), static_cast<int>(offset),
+                        static_cast<int>(length)});
+                }
+                scan_begin = scan_end;
+                ++scan_index;
+            }
+            rs_pool_worker_plan_count_[static_cast<size_t>(wid)] =
+                rs_pool_plan_spans_.size() -
+                rs_pool_worker_plan_begin_[static_cast<size_t>(wid)];
+        }
     }
 
     void rs_pool_run_parallel_encode(const RsEncodeJob& job) {
@@ -2616,6 +2685,13 @@ private:
     // `jobs` must stay alive until this call returns.
     void rs_pool_run_parallel_encode_batch(const std::vector<RsEncodeJob>& jobs) {
         if (jobs.empty()) return;
+        const uint64_t plan_t0 = frcheck_now_us();
+        rs_pool_build_batch_plan(jobs);
+        save_encode_pool_plan_total_us_.fetch_add(
+            frcheck_now_us() - plan_t0, std::memory_order_relaxed);
+        for (auto& elapsed : rs_pool_worker_elapsed_us_)
+            elapsed.store(0, std::memory_order_relaxed);
+        const uint64_t barrier_t0 = frcheck_now_us();
         {
             std::lock_guard<std::mutex> publish(rs_pool_mutex_);
             if (stopped_) return;
@@ -2632,6 +2708,16 @@ private:
             });
             rs_pool_shared_jobs_ = nullptr;
         }
+        const uint64_t barrier_us = frcheck_now_us() - barrier_t0;
+        uint64_t worker_max_us = 0;
+        for (const auto& elapsed : rs_pool_worker_elapsed_us_) {
+            worker_max_us = std::max(
+                worker_max_us, elapsed.load(std::memory_order_acquire));
+        }
+        save_encode_pool_barrier_total_us_.fetch_add(
+            barrier_us, std::memory_order_relaxed);
+        save_encode_worker_compute_max_total_us_.fetch_add(
+            worker_max_us, std::memory_order_relaxed);
     }
 
     // ---- EC-aligned role encoding workers (1 thread per role) ----
@@ -2687,6 +2773,9 @@ private:
     std::atomic<uint64_t> save_encode_batch_dispatches_{0};
     std::atomic<uint64_t> save_encode_batch_jobs_{0};
     std::atomic<uint64_t> save_encode_ec_calls_{0};
+    std::atomic<uint64_t> save_encode_pool_plan_total_us_{0};
+    std::atomic<uint64_t> save_encode_pool_barrier_total_us_{0};
+    std::atomic<uint64_t> save_encode_worker_compute_max_total_us_{0};
     std::atomic<uint64_t> save_source_send_total_us_{0};
     std::atomic<uint64_t> save_source_send_max_us_{0};
     std::atomic<uint64_t> save_enc_recv_total_us_{0};
@@ -3401,6 +3490,9 @@ public:
         save_encode_batch_dispatches_.store(0, std::memory_order_relaxed);
         save_encode_batch_jobs_.store(0, std::memory_order_relaxed);
         save_encode_ec_calls_.store(0, std::memory_order_relaxed);
+        save_encode_pool_plan_total_us_.store(0, std::memory_order_relaxed);
+        save_encode_pool_barrier_total_us_.store(0, std::memory_order_relaxed);
+        save_encode_worker_compute_max_total_us_.store(0, std::memory_order_relaxed);
         save_source_send_total_us_.store(0, std::memory_order_relaxed);
         save_source_send_max_us_.store(0, std::memory_order_relaxed);
         save_enc_recv_total_us_.store(0, std::memory_order_relaxed);
@@ -3440,6 +3532,12 @@ public:
             save_encode_batch_jobs_.load(std::memory_order_relaxed));
         result["encode_ec_calls"] = static_cast<double>(
             save_encode_ec_calls_.load(std::memory_order_relaxed));
+        result["encode_pool_plan_s"] = static_cast<double>(
+            save_encode_pool_plan_total_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["encode_pool_barrier_s"] = static_cast<double>(
+            save_encode_pool_barrier_total_us_.load(std::memory_order_relaxed)) / 1e6;
+        result["encode_worker_compute_max_sum_s"] = static_cast<double>(
+            save_encode_worker_compute_max_total_us_.load(std::memory_order_relaxed)) / 1e6;
         result["d2h_s"] = static_cast<double>(
             mirror_d2h_busy_total_us_.load(std::memory_order_relaxed)) / 1e6;
         result["mirror_tasks_submitted"] = static_cast<double>(
@@ -5147,6 +5245,10 @@ private:
     std::atomic<int> rs_pool_remaining_{0};
     RsEncodeJob rs_pool_shared_job_{};
     const std::vector<RsEncodeJob>* rs_pool_shared_jobs_ = nullptr;
+    std::vector<RsPoolSpan> rs_pool_plan_spans_;
+    std::array<size_t, kRsPoolWorkers> rs_pool_worker_plan_begin_{};
+    std::array<size_t, kRsPoolWorkers> rs_pool_worker_plan_count_{};
+    std::array<std::atomic<uint64_t>, kRsPoolWorkers> rs_pool_worker_elapsed_us_{};
 };
 
 // ---------------------------------------------------------------------------

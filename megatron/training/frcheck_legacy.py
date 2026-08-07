@@ -3256,21 +3256,48 @@ def _prepare_layer_exchange_network(
     pack_stream,
     effective_max_send_sge: int,
     use_gdr: bool,
+    exchange_chunk_bytes: int,
+    layer_exchange_lanes: int,
 ) -> Dict[str, Any]:
-    """Stage one canonical layer mirror and build its RDMA task metadata."""
+    """Stage one canonical layer mirror and build deterministic RDMA tasks."""
     result = prepared["result"]
     layer_bufs = prepared["layer_bufs"]
     layer_idx = int(result.layer_idx)
     block_size = int(result.block_size)
     my_node = int(manager.rank_in_group) + 1
     send_blocks, recv_blocks, encoder_sids = _build_layer_exchange_plan(manager, layer_idx)
-    batch_base = int(prepared["batch_id"]) * 1000003
-    layer_exchange_lanes = max(
-        1, int(os.environ.get(
-            "FRCHECK_LAYER_EXCHANGE_LANES", str(getattr(manager, "num_stripes", 1))
-        ))
-    )
-    lane_id = (int(prepared["batch_id"]) - 1) % layer_exchange_lanes
+    frontier_remote_deps: Dict[int, int] = {}
+    frontier_block_per_node: Dict[int, int] = {
+        node: 0 for node in range(1, manager.frcheck_n + 1)
+    }
+    for sid, plan in enumerate(manager.stripe_plans):
+        remote_deps = 0
+        for src_node in plan.source_node_ids:
+            blk_idx = frontier_block_per_node[src_node]
+            if (
+                src_node != plan.encoder_node_id
+                and blk_idx < manager.get_n_filled_for_node(layer_idx, src_node)
+            ):
+                remote_deps += 1
+            frontier_block_per_node[src_node] = blk_idx + 1
+        frontier_remote_deps[sid] = remote_deps
+    lane_base = (int(prepared["batch_id"]) - 1) % layer_exchange_lanes
+    chunk_size = block_size if exchange_chunk_bytes == 0 else min(exchange_chunk_bytes, block_size)
+    chunks = [
+        (chunk_idx, offset, min(chunk_size, block_size - offset))
+        for chunk_idx, offset in enumerate(range(0, block_size, chunk_size))
+    ]
+    if not chunks and block_size > 0:
+        raise RuntimeError("FRCheck layer exchange produced no chunks")
+    chunks_per_block = len(chunks)
+
+    def _task_id(sid: int, chunk_idx: int) -> int:
+        batch_id = int(prepared["batch_id"])
+        if batch_id >= (1 << 12) or sid >= (1 << 10) or chunk_idx >= (1 << 10):
+            raise RuntimeError(
+                "FRCheck layer exchange task id fields exceed deterministic tag layout"
+            )
+        return (batch_id << 20) | (int(sid) << 10) | int(chunk_idx)
 
     payload_bytes = int(result.n_filled_blocks) * block_size
     layer_gpu = layer_bufs.layer_buf_gpu
@@ -3280,26 +3307,20 @@ def _prepare_layer_exchange_network(
             f"FRCheck layer exchange: canonical mirror too small for layer {layer_idx}"
         )
 
-    # Keep one canonical D2H copy per source byte for encode and disk output,
-    # even when RDMA reads the immutable GPU buffer concurrently. Packing was
-    # synchronized before this point, and the buffer is not modified afterward.
-    # Block events let the CPU send path start before the full mirror is ready.
     stage_pack_t0 = time.time()
-    d2h_block_events: List[torch.cuda.Event] = []
+    d2h_chunk_events: Dict[Tuple[int, int], torch.cuda.Event] = {}
     with torch.cuda.stream(pack_stream):
         d2h_start_event = torch.cuda.Event(enable_timing=True)
         d2h_end_event = torch.cuda.Event(enable_timing=True)
         d2h_start_event.record(pack_stream)
         for block_idx in range(int(result.n_filled_blocks)):
-            block_start = block_idx * block_size
-            block_end = min(block_start + block_size, payload_bytes)
-            if block_end > block_start:
-                layer_mirror_cpu[block_start:block_end].copy_(
-                    layer_gpu[block_start:block_end], non_blocking=True
-                )
-            block_event = torch.cuda.Event()
-            block_event.record(pack_stream)
-            d2h_block_events.append(block_event)
+            for chunk_idx, chunk_offset, chunk_length in chunks:
+                start = block_idx * block_size + chunk_offset
+                end = start + chunk_length
+                layer_mirror_cpu[start:end].copy_(layer_gpu[start:end], non_blocking=True)
+                chunk_event = torch.cuda.Event()
+                chunk_event.record(pack_stream)
+                d2h_chunk_events[(block_idx, chunk_idx)] = chunk_event
         d2h_end_event.record(pack_stream)
     stage_pack_s = time.time() - stage_pack_t0
 
@@ -3317,127 +3338,139 @@ def _prepare_layer_exchange_network(
             sid: slot * block_size for slot, (sid, _blk_idx) in enumerate(blocks)
         }
 
-    num_stripes_local = layer_exchange_lanes
-    # Both peers derive identical balanced task boundaries from block count,
-    # the configured minimum segment target, and the globally reduced SGE cap.
-    send_seg = max(1, int(os.environ.get("FRCHECK_LAYER_EXCHANGE_SEG", "1")))
-
-    def _iter_direct_segments(block_count: int):
-        if block_count <= 0:
-            return
-        required_segments = (
-            block_count + effective_max_send_sge - 1
-        ) // effective_max_send_sge
-        nseg = min(block_count, max(send_seg, required_segments))
-        base = block_count // nseg
-        rem = block_count % nseg
-        start = 0
-        for seg_idx in range(nseg):
-            take = base + (1 if seg_idx < rem else 0)
-            if take <= 0:
-                continue
-            yield seg_idx, start, take
-            start += take
-
     send_tasks: List[Dict[str, Any]] = []
     recv_tasks: List[Dict[str, Any]] = []
-    for src_node, blocks in sorted(recv_blocks.items()):
-        if not blocks:
-            continue
-        recv_buf = layer_bufs.remote_layer_bufs[src_node]
-        for seg_idx, start, take in _iter_direct_segments(len(blocks)):
-            seg_lane = (lane_id + seg_idx) % num_stripes_local
-            segment_blocks = list(blocks[start:start + take])
-            recv_tasks.append({
-                "peer_node": src_node,
-                "peer_rig": src_node - 1,
-                "addr": int(recv_buf.data_ptr()) + start * block_size,
-                "size": take * block_size,
-                "batch_id": batch_base + src_node * 1009 + my_node + seg_idx * 104729,
-                "lane_id": seg_lane,
-                "ready_sids": [int(sid) for sid, _blk_idx in segment_blocks],
-            })
-    for dst_node, blocks in sorted(send_blocks.items()):
-        if not blocks:
-            continue
-        for seg_idx, start, take in _iter_direct_segments(len(blocks)):
-            seg_lane = (lane_id + seg_idx) % num_stripes_local
-            task_blocks = blocks[start:start + take]
-            send_tasks.append({
-                "peer_node": dst_node,
-                "peer_rig": dst_node - 1,
-                "source_base": int(
-                    layer_gpu.data_ptr() if use_gdr else layer_mirror_cpu.data_ptr()
-                ),
-                "send_from_gpu": bool(use_gdr),
-                "block_indices": [int(blk_idx) for _sid, blk_idx in task_blocks],
-                "block_size": block_size,
-                "size": take * block_size,
-                "batch_id": batch_base + my_node * 1009 + dst_node + seg_idx * 104729,
-                "lane_id": seg_lane,
-            })
+    if exchange_chunk_bytes == 0:
+        send_seg = max(1, int(os.environ.get("FRCHECK_LAYER_EXCHANGE_SEG", "1")))
+
+        def _iter_direct_segments(block_count: int):
+            required_segments = (block_count + effective_max_send_sge - 1) // effective_max_send_sge
+            nseg = min(block_count, max(send_seg, required_segments))
+            base, rem = divmod(block_count, nseg)
+            start = 0
+            for seg_idx in range(nseg):
+                take = base + (1 if seg_idx < rem else 0)
+                yield seg_idx, start, take
+                start += take
+
+        for src_node, blocks in sorted(recv_blocks.items()):
+            recv_buf = layer_bufs.remote_layer_bufs[src_node]
+            for seg_idx, start, take in _iter_direct_segments(len(blocks)):
+                segment_blocks = list(blocks[start:start + take])
+                recv_tasks.append({
+                    "peer_node": src_node, "peer_rig": src_node - 1,
+                    "addr": int(recv_buf.data_ptr()) + start * block_size,
+                    "size": take * block_size,
+                    "batch_id": int(prepared["batch_id"]) * 1000003 + src_node * 1009 + my_node + seg_idx * 104729,
+                    "lane_id": (lane_base + seg_idx) % layer_exchange_lanes,
+                    "ready_keys": [(int(sid), 0) for sid, _ in segment_blocks],
+                })
+        for dst_node, blocks in sorted(send_blocks.items()):
+            for seg_idx, start, take in _iter_direct_segments(len(blocks)):
+                task_blocks = blocks[start:start + take]
+                send_tasks.append({
+                    "peer_node": dst_node, "peer_rig": dst_node - 1,
+                    "source_base": int(layer_gpu.data_ptr() if use_gdr else layer_mirror_cpu.data_ptr()),
+                    "send_from_gpu": bool(use_gdr),
+                    "block_indices": [int(blk_idx) for _sid, blk_idx in task_blocks],
+                    "block_size": block_size, "size": take * block_size,
+                    "batch_id": int(prepared["batch_id"]) * 1000003 + my_node * 1009 + dst_node + seg_idx * 104729,
+                    "lane_id": (lane_base + seg_idx) % layer_exchange_lanes,
+                })
+    else:
+        for src_node, blocks in sorted(recv_blocks.items()):
+            recv_buf = layer_bufs.remote_layer_bufs[src_node]
+            for sid, _blk_idx in blocks:
+                block_offset = recv_offsets[src_node][sid]
+                for chunk_idx, chunk_offset, chunk_length in chunks:
+                    recv_tasks.append({
+                        "peer_node": src_node, "peer_rig": src_node - 1,
+                        "addr": int(recv_buf.data_ptr()) + block_offset + chunk_offset,
+                        "size": chunk_length, "batch_id": _task_id(sid, chunk_idx),
+                        "lane_id": (lane_base + sid + chunk_idx) % layer_exchange_lanes,
+                        "sid": int(sid), "chunk_idx": int(chunk_idx),
+                        "layer_batch_id": int(prepared["batch_id"]),
+                        "critical_remote_deps": int(frontier_remote_deps[sid]),
+                        "ready_keys": [(int(sid), int(chunk_idx))],
+                    })
+        source_base = int(layer_gpu.data_ptr() if use_gdr else layer_mirror_cpu.data_ptr())
+        for dst_node, blocks in sorted(send_blocks.items()):
+            for sid, blk_idx in blocks:
+                for chunk_idx, chunk_offset, chunk_length in chunks:
+                    send_tasks.append({
+                        "peer_node": dst_node, "peer_rig": dst_node - 1,
+                        "addr": source_base + blk_idx * block_size + chunk_offset,
+                        "send_from_gpu": bool(use_gdr),
+                        "ready_chunk": (int(blk_idx), int(chunk_idx)),
+                        "size": chunk_length, "batch_id": _task_id(sid, chunk_idx),
+                        "lane_id": (lane_base + sid + chunk_idx) % layer_exchange_lanes,
+                        "sid": int(sid), "chunk_idx": int(chunk_idx),
+                        "layer_batch_id": int(prepared["batch_id"]),
+                        "critical_remote_deps": int(frontier_remote_deps[sid]),
+                    })
+
+    task_ids = [
+        (task["peer_node"], task["lane_id"], task["batch_id"])
+        for task in send_tasks + recv_tasks
+    ]
+    if len(task_ids) != len(set(task_ids)):
+        raise RuntimeError("FRCheck layer exchange generated duplicate task ids")
+    recv_ranges = sorted(
+        (task["addr"], task["addr"] + task["size"]) for task in recv_tasks
+    )
+    if any(left[1] > right[0] for left, right in zip(recv_ranges, recv_ranges[1:])):
+        raise RuntimeError("FRCheck layer exchange generated overlapping receive ranges")
+    for sid in set(ctx_sid for blocks in list(send_blocks.values()) + list(recv_blocks.values()) for ctx_sid, _ in blocks):
+        covered = [(offset, offset + length) for _idx, offset, length in chunks]
+        if covered[0][0] != 0 or covered[-1][1] != block_size or any(
+            left[1] != right[0] for left, right in zip(covered, covered[1:])
+        ):
+            raise RuntimeError(f"FRCheck layer exchange chunk coverage is incomplete for stripe {sid}")
 
     remaining = len(send_tasks) + len(recv_tasks)
     done_event = threading.Event()
     if remaining == 0:
         done_event.set()
-
     ctx = {
-        "prepared": prepared,
-        "send_blocks": send_blocks,
-        "recv_blocks": recv_blocks,
-        "encoder_sids": encoder_sids,
-        "recv_offsets": recv_offsets,
-        "send_tasks": send_tasks,
-        "recv_tasks": recv_tasks,
-        "remaining": remaining,
-        "remaining_lock": threading.Lock(),
-        "done_event": done_event,
-        "errors": [],
-        "start_time": time.time(),
-        "d2h_start_event": d2h_start_event,
-        "d2h_end_event": d2h_end_event,
-        "d2h_block_events": d2h_block_events,
-        # Keep the registered source tensor alive until all network tasks finish.
+        "prepared": prepared, "send_blocks": send_blocks, "recv_blocks": recv_blocks,
+        "encoder_sids": encoder_sids, "recv_offsets": recv_offsets,
+        "send_tasks": send_tasks, "recv_tasks": recv_tasks, "remaining": remaining,
+        "remaining_lock": threading.Lock(), "done_event": done_event, "errors": [],
+        "start_time": time.time(), "d2h_start_event": d2h_start_event,
+        "d2h_end_event": d2h_end_event, "d2h_chunk_events": d2h_chunk_events,
         "send_source_tensor": layer_gpu if use_gdr else layer_mirror_cpu,
-        "gdr_enabled": bool(use_gdr),
-        "stage_pack_s": stage_pack_s,
-        "stage_pack_bytes": payload_bytes,
+        "remote_source_tensors": list(layer_bufs.remote_layer_bufs.values()),
+        "gdr_enabled": bool(use_gdr), "exchange_chunk_bytes": exchange_chunk_bytes,
+        "chunks": chunks, "chunks_per_block": chunks_per_block,
+        "stage_pack_s": stage_pack_s, "stage_pack_bytes": payload_bytes,
         "stage_pack_blocks": int(result.n_filled_blocks),
-        "mirror_ready_lock": threading.Lock(),
-        "mirror_ready_wait_sum_s": 0.0,
+        "mirror_ready_lock": threading.Lock(), "mirror_ready_wait_sum_s": 0.0,
         "mirror_ready_wait_max_s": 0.0,
     }
     encode_specs = _build_layer_exchange_encode_specs(manager, ctx, n)
     ready_queue: queue.Queue = queue.Queue()
     ready_pending_remote = {
-        int(sid): set(spec["remote_deps"]) for sid, spec in encode_specs.items()
+        key: set(spec["remote_deps"]) for key, spec in encode_specs.items()
     }
-    ready_queued_sids: Set[int] = set()
-    for sid, pending in ready_pending_remote.items():
+    ready_queued_keys: Set[Tuple[int, int]] = set()
+    for key, pending in ready_pending_remote.items():
         if not pending:
-            ready_queue.put(int(sid))
-            ready_queued_sids.add(int(sid))
+            ready_queue.put(key)
+            ready_queued_keys.add(key)
     ctx.update({
-        "encode_specs": encode_specs,
-        "ready_queue": ready_queue,
-        "ready_lock": threading.Lock(),
-        "ready_pending_remote": ready_pending_remote,
-        "ready_queued_sids": ready_queued_sids,
-        "encoded_sids": set(),
-        "encode_done_event": threading.Event(),
-        "ready_encode_batches": 0,
-        "ready_first_s": 0.0,
-        "ready_last_s": 0.0,
-        "stream_encode_active_s": 0.0,
+        "encode_specs": encode_specs, "ready_queue": ready_queue,
+        "ready_lock": threading.Lock(), "ready_pending_remote": ready_pending_remote,
+        "ready_queued_keys": ready_queued_keys, "encoded_keys": set(),
+        "encode_done_event": threading.Event(), "ready_encode_batches": 0,
+        "ready_first_s": 0.0, "ready_last_s": 0.0, "stream_encode_active_s": 0.0,
     })
     return ctx
 
 
 def _build_layer_exchange_encode_specs(
     manager, ctx: Dict[str, Any], n: int
-) -> Dict[int, Dict[str, Any]]:
-    """Build per-stripe encode inputs and remote dependencies for layer exchange."""
+) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    """Build per-stripe, per-chunk encode inputs and remote dependencies."""
     prepared = ctx["prepared"]
     result = prepared["result"]
     state = prepared["state"]
@@ -3447,93 +3480,64 @@ def _build_layer_exchange_encode_specs(
     my_node = int(manager.rank_in_group) + 1
     encoder_sids = set(ctx["encoder_sids"])
     recv_offsets = ctx["recv_offsets"]
-
-    specs: Dict[int, Dict[str, Any]] = {}
+    specs: Dict[Tuple[int, int], Dict[str, Any]] = {}
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
     for sid, plan in enumerate(manager.stripe_plans):
-        source_block_indices: List[int] = []
-        for src_node in plan.source_node_ids:
-            source_block_indices.append(src_block_per_node.get(src_node, 0))
+        source_block_indices = [src_block_per_node.get(node, 0) for node in plan.source_node_ids]
         for src_node in plan.source_node_ids:
             src_block_per_node[src_node] = src_block_per_node.get(src_node, 0) + 1
         if sid not in encoder_sids:
             continue
-        p1b = layer_bufs.parity1_bufs[sid]
-        p2b = layer_bufs.parity2_bufs[sid]
+        p1b, p2b = layer_bufs.parity1_bufs[sid], layer_bufs.parity2_bufs[sid]
         if p1b is None or p2b is None:
             continue
-
-        data_addrs: List[int] = []
-        remote_deps: Set[int] = set()
-        for src_node, blk_idx in zip(plan.source_node_ids, source_block_indices):
-            nf = manager.get_n_filled_for_node(layer_idx, src_node)
-            if blk_idx >= nf:
-                data_addrs.append(int(layer_bufs.zero_block.data_ptr()))
-            elif src_node == my_node:
-                data_addrs.append(state.layer_buf_base + blk_idx * block_size)
-            else:
-                remote_buf = layer_bufs.remote_layer_bufs.get(src_node)
-                off = recv_offsets.get(src_node, {}).get(sid)
-                if remote_buf is None or off is None:
-                    raise RuntimeError(
-                        f"FRCheck layer exchange: missing packed data for node {src_node} stripe {sid}"
-                    )
-                data_addrs.append(int(remote_buf.data_ptr()) + off)
-                remote_deps.add(int(src_node))
-        specs[sid] = {
-            "data_addrs": data_addrs,
-            "p1_addr": int(p1b.data_ptr()),
-            "p2_addr": int(p2b.data_ptr()),
-            "remote_deps": remote_deps,
-            "block_size": block_size,
-        }
+        for chunk_idx, chunk_offset, chunk_length in ctx["chunks"]:
+            data_addrs: List[int] = []
+            remote_deps: Set[int] = set()
+            for src_node, blk_idx in zip(plan.source_node_ids, source_block_indices):
+                nf = manager.get_n_filled_for_node(layer_idx, src_node)
+                if blk_idx >= nf:
+                    data_addrs.append(int(layer_bufs.zero_block.data_ptr()) + chunk_offset)
+                elif src_node == my_node:
+                    data_addrs.append(state.layer_buf_base + blk_idx * block_size + chunk_offset)
+                else:
+                    remote_buf = layer_bufs.remote_layer_bufs.get(src_node)
+                    off = recv_offsets.get(src_node, {}).get(sid)
+                    if remote_buf is None or off is None:
+                        raise RuntimeError(
+                            f"FRCheck layer exchange: missing packed data for node {src_node} stripe {sid}"
+                        )
+                    data_addrs.append(int(remote_buf.data_ptr()) + off + chunk_offset)
+                    remote_deps.add(int(src_node))
+            specs[(sid, chunk_idx)] = {
+                "data_addrs": data_addrs,
+                "p1_addr": int(p1b.data_ptr()) + chunk_offset,
+                "p2_addr": int(p2b.data_ptr()) + chunk_offset,
+                "remote_deps": remote_deps, "chunk_length": chunk_length,
+            }
     return specs
 
 
-def _encode_layer_exchange_stripes(
-    native, ctx: Dict[str, Any], stripe_ids: List[int]
-) -> None:
-    """Encode a ready subset of local encoder stripes."""
-    if not stripe_ids:
-        return
-    specs = ctx["encode_specs"]
-    data_addrs: List[int] = []
-    p1_addrs: List[int] = []
-    p2_addrs: List[int] = []
-    for sid in stripe_ids:
-        spec = specs[int(sid)]
-        data_addrs.extend(spec["data_addrs"])
-        p1_addrs.append(int(spec["p1_addr"]))
-        p2_addrs.append(int(spec["p2_addr"]))
-    native.encode_layer_stripes(
-        [int(sid) for sid in stripe_ids],
-        data_addrs,
-        p1_addrs,
-        p2_addrs,
-        int(ctx["prepared"]["result"].block_size),
-    )
-
-
 def _encode_layer_exchange_batch(
-    native, jobs: List[Tuple[Dict[str, Any], int]]
+    native, jobs: List[Tuple[Dict[str, Any], int, int]]
 ) -> None:
-    """Encode ready stripes from multiple layers in one native dispatch."""
+    """Encode ready stripe chunks from multiple layers in one native dispatch."""
     if not jobs:
         return
     stripe_ids: List[int] = []
     data_addrs: List[int] = []
     p1_addrs: List[int] = []
     p2_addrs: List[int] = []
-    block_sizes: List[int] = []
-    for ctx, sid in jobs:
-        spec = ctx["encode_specs"][int(sid)]
+    chunk_lengths: List[int] = []
+    for ctx, sid, chunk_idx in jobs:
+        spec = ctx["encode_specs"][(int(sid), int(chunk_idx))]
         stripe_ids.append(int(sid))
         data_addrs.extend(int(addr) for addr in spec["data_addrs"])
         p1_addrs.append(int(spec["p1_addr"]))
         p2_addrs.append(int(spec["p2_addr"]))
-        block_sizes.append(int(spec["block_size"]))
+        chunk_lengths.append(int(spec["chunk_length"]))
     native.encode_layer_stripes_batch(
-        stripe_ids, data_addrs, p1_addrs, p2_addrs, block_sizes
+        stripe_ids, data_addrs, p1_addrs, p2_addrs, chunk_lengths
     )
 
 
@@ -4163,15 +4167,68 @@ def save_frcheck_legacy_checkpoint(
         and not use_layer_exchange_encode
     )
     effective_max_send_sge = 1
+    exchange_chunk_mb = int(os.environ.get("FRCHECK_LAYER_EXCHANGE_CHUNK_MB", "32"))
+    if exchange_chunk_mb < 0:
+        raise RuntimeError("FRCHECK_LAYER_EXCHANGE_CHUNK_MB must be non-negative")
+    exchange_chunk_bytes = exchange_chunk_mb * 1024 * 1024
+    layer_frontier_order = "chunk_layer_sid"
+    layer_frontier_order_id = 0
+    if exchange_chunk_bytes > 0:
+        layer_frontier_order = os.environ.get(
+            "FRCHECK_LAYER_FRONTIER_ORDER", "chunk_layer_sid"
+        )
+        frontier_order_ids = {
+            "chunk_layer_sid": 0,
+            "chunk_sid_layer": 1,
+            "critical_frontier": 2,
+        }
+        if layer_frontier_order not in frontier_order_ids:
+            raise RuntimeError(
+                "FRCHECK_LAYER_FRONTIER_ORDER must be one of "
+                "chunk_layer_sid, chunk_sid_layer, or critical_frontier"
+            )
+        layer_frontier_order_id = frontier_order_ids[layer_frontier_order]
     if use_layer_exchange_encode:
-        if not hasattr(native, "send_layer_blocks_to_peer") or not hasattr(native, "get_max_send_sge"):
-            raise RuntimeError("FRCheck layer exchange requires native Multi-SGE support")
-        local_max_send_sge = max(1, int(native.get_max_send_sge()))
+        layer_exchange_lanes = int(os.environ.get(
+            "FRCHECK_LAYER_EXCHANGE_LANES", str(manager.num_stripes)
+        ))
+        if layer_exchange_lanes <= 0:
+            raise RuntimeError("FRCHECK_LAYER_EXCHANGE_LANES must be positive")
         reduce_device = "cuda" if torch.distributed.is_initialized() and torch.distributed.get_backend() == "nccl" else "cpu"
-        max_sge_tensor = torch.tensor(local_max_send_sge, dtype=torch.int32, device=reduce_device)
+        chunk_min = torch.tensor(exchange_chunk_mb, dtype=torch.int64, device=reduce_device)
+        chunk_max = chunk_min.clone()
+        lanes_min = torch.tensor(layer_exchange_lanes, dtype=torch.int64, device=reduce_device)
+        lanes_max = lanes_min.clone()
+        order_min = torch.tensor(layer_frontier_order_id, dtype=torch.int64, device=reduce_device)
+        order_max = order_min.clone()
         if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(max_sge_tensor, op=torch.distributed.ReduceOp.MIN)
-        effective_max_send_sge = int(max_sge_tensor.item())
+            torch.distributed.all_reduce(chunk_min, op=torch.distributed.ReduceOp.MIN)
+            torch.distributed.all_reduce(chunk_max, op=torch.distributed.ReduceOp.MAX)
+            torch.distributed.all_reduce(lanes_min, op=torch.distributed.ReduceOp.MIN)
+            torch.distributed.all_reduce(lanes_max, op=torch.distributed.ReduceOp.MAX)
+            torch.distributed.all_reduce(order_min, op=torch.distributed.ReduceOp.MIN)
+            torch.distributed.all_reduce(order_max, op=torch.distributed.ReduceOp.MAX)
+        if int(chunk_min.item()) != int(chunk_max.item()):
+            raise RuntimeError(
+                "FRCHECK_LAYER_EXCHANGE_CHUNK_MB must match across all distributed ranks"
+            )
+        if int(lanes_min.item()) != int(lanes_max.item()):
+            raise RuntimeError(
+                "FRCHECK_LAYER_EXCHANGE_LANES must match across all distributed ranks"
+            )
+        if int(order_min.item()) != int(order_max.item()):
+            raise RuntimeError(
+                "FRCHECK_LAYER_FRONTIER_ORDER must match across all distributed ranks"
+            )
+        layer_exchange_lanes = int(lanes_min.item())
+        if exchange_chunk_bytes == 0:
+            if not hasattr(native, "send_layer_blocks_to_peer") or not hasattr(native, "get_max_send_sge"):
+                raise RuntimeError("FRCheck unchunked layer exchange requires native Multi-SGE support")
+            local_max_send_sge = max(1, int(native.get_max_send_sge()))
+            max_sge_tensor = torch.tensor(local_max_send_sge, dtype=torch.int32, device=reduce_device)
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(max_sge_tensor, op=torch.distributed.ReduceOp.MIN)
+            effective_max_send_sge = int(max_sge_tensor.item())
 
     prepared_layers: List[Dict[str, Any]] = []
 
@@ -4343,7 +4400,8 @@ def save_frcheck_legacy_checkpoint(
             layer_exchange_contexts.append(
                 _prepare_layer_exchange_network(
                     manager, native, prepared, n, pack_stream,
-                    effective_max_send_sge, frcheck_gdr,
+                    effective_max_send_sge, frcheck_gdr, exchange_chunk_bytes,
+                    layer_exchange_lanes,
                 )
             )
         # No global stage sync: each layer's first send worker waits on only its
@@ -4371,38 +4429,40 @@ def save_frcheck_legacy_checkpoint(
             with worker_errors_lock:
                 worker_errors.append(exc)
 
-        def _mark_ready_stripes(ctx: Dict[str, Any], src_node: int, sids: List[int]) -> None:
-            if not sids:
+        def _mark_ready_chunks(
+            ctx: Dict[str, Any], src_node: int, keys: List[Tuple[int, int]]
+        ) -> None:
+            if not keys:
                 return
             now_s = time.time() - float(ctx["start_time"])
             with ctx["ready_lock"]:
-                for sid in sids:
-                    sid = int(sid)
-                    pending = ctx["ready_pending_remote"].get(sid)
+                for sid, chunk_idx in keys:
+                    key = (int(sid), int(chunk_idx))
+                    pending = ctx["ready_pending_remote"].get(key)
                     if pending is None:
                         continue
                     pending.discard(int(src_node))
-                    if pending or sid in ctx["ready_queued_sids"] or sid in ctx["encoded_sids"]:
+                    if pending or key in ctx["ready_queued_keys"] or key in ctx["encoded_keys"]:
                         continue
-                    ctx["ready_queue"].put(sid)
+                    ctx["ready_queue"].put(key)
                     coordinator_wakeup.put(ctx)
-                    ctx["ready_queued_sids"].add(sid)
+                    ctx["ready_queued_keys"].add(key)
                     if float(ctx.get("ready_first_s", 0.0)) == 0.0:
                         ctx["ready_first_s"] = now_s
                     ctx["ready_last_s"] = now_s
 
-        def _wait_layer_blocks_ready(ctx: Dict[str, Any], block_indices: List[int]) -> None:
-            if not block_indices:
+        def _wait_layer_chunks_ready(
+            ctx: Dict[str, Any], chunks: List[Tuple[int, int]]
+        ) -> None:
+            if not chunks:
                 return
-            last_block = max(int(block_idx) for block_idx in block_indices)
-            block_events = ctx["d2h_block_events"]
-            if last_block < 0 or last_block >= len(block_events):
-                raise RuntimeError(
-                    f"FRCheck layer mirror block index {last_block} is outside "
-                    f"the {len(block_events)} staged blocks"
-                )
+            chunk_events = ctx["d2h_chunk_events"]
+            missing = [key for key in chunks if key not in chunk_events]
+            if missing:
+                raise RuntimeError(f"FRCheck layer mirror chunk events missing: {missing[:4]}")
             wait_t0 = time.time()
-            block_events[last_block].synchronize()
+            for key in chunks:
+                chunk_events[key].synchronize()
             wait_s = time.time() - wait_t0
             with ctx["mirror_ready_lock"]:
                 ctx["mirror_ready_wait_sum_s"] += wait_s
@@ -4417,13 +4477,26 @@ def save_frcheck_legacy_checkpoint(
                     return
                 ctx, task = item
                 try:
-                    if not task["send_from_gpu"]:
-                        _wait_layer_blocks_ready(ctx, task["block_indices"])
-                    native.send_layer_blocks_to_peer(
-                        int(task["peer_rig"]), int(task["source_base"]),
-                        task["block_indices"], int(task["block_size"]),
-                        int(task["batch_id"]), int(task["lane_id"]),
-                    )
+                    if "addr" in task:
+                        if not task["send_from_gpu"]:
+                            _wait_layer_chunks_ready(ctx, [task["ready_chunk"]])
+                        native.send_layer_to_peer(
+                            int(task["peer_rig"]), int(task["addr"]), int(task["size"]),
+                            int(task["batch_id"]), int(task["lane_id"]),
+                        )
+                    else:
+                        if not task["send_from_gpu"]:
+                            ready_chunks = [
+                                (int(block_idx), chunk_idx)
+                                for block_idx in task["block_indices"]
+                                for chunk_idx in range(int(ctx["chunks_per_block"]))
+                            ]
+                            _wait_layer_chunks_ready(ctx, ready_chunks)
+                        native.send_layer_blocks_to_peer(
+                            int(task["peer_rig"]), int(task["source_base"]),
+                            task["block_indices"], int(task["block_size"]),
+                            int(task["batch_id"]), int(task["lane_id"]),
+                        )
                     _mark_task_done(ctx)
                 except BaseException as exc:
                     _record_worker_error(ctx, exc)
@@ -4451,16 +4524,20 @@ def save_frcheck_legacy_checkpoint(
                 ctx, task = item
                 try:
                     if use_prepared_layer_recv:
-                        native.wait_prepared_layer_recv_from_peer(
+                        received = native.wait_prepared_layer_recv_from_peer(
                             int(task["peer_rig"]), int(task["batch_id"]),
                             int(task["lane_id"]),
                         )
                     else:
-                        native.recv_layer_from_peer(
+                        received = native.recv_layer_from_peer(
                             int(task["peer_rig"]), int(task["addr"]),
                             int(task["size"]), int(task["batch_id"]), int(task["lane_id"]),
                         )
-                    _mark_ready_stripes(ctx, int(task["peer_node"]), task.get("ready_sids", []))
+                    if int(received) != int(task["size"]):
+                        raise RuntimeError(
+                            f"FRCheck layer recv size mismatch: got {received}, expected {task['size']}"
+                        )
+                    _mark_ready_chunks(ctx, int(task["peer_node"]), task.get("ready_keys", []))
                     _mark_task_done(ctx)
                 except BaseException as exc:
                     _record_worker_error(ctx, exc)
@@ -4490,20 +4567,44 @@ def save_frcheck_legacy_checkpoint(
         encode_errors: List[BaseException] = []
         stream_encode = os.environ.get("FRCHECK_LAYER_STREAM_ENCODE", "1") != "0"
         global_batch_size = max(
-            1, int(os.environ.get("FRCHECK_LAYER_ENCODE_BATCH", "1"))
+            1, int(os.environ.get("FRCHECK_LAYER_ENCODE_BATCH", "24"))
         )
+        adaptive_encode = os.environ.get("FRCHECK_LAYER_ENCODE_ADAPTIVE", "0") == "1"
+        adaptive_batch_multiplier = max(
+            1, int(os.environ.get("FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER", "3"))
+        )
+        default_coalesce_us = "200" if adaptive_encode else "0"
         coalesce_us = max(
-            0, int(os.environ.get("FRCHECK_LAYER_ENCODE_COALESCE_US", "0"))
+            0, int(os.environ.get("FRCHECK_LAYER_ENCODE_COALESCE_US", default_coalesce_us))
         )
         coalesce_window_s = coalesce_us / 1_000_000.0
         coordinator_stats = {
             "coalesce_wait_s": 0.0,
             "dispatches": 0,
             "jobs": 0,
+            "bytes": 0,
+            "dispatch_capacity_sum": 0,
+            "max_jobs": 0,
+            "max_bytes": 0,
+            "network_active_dispatches": 0,
+            "network_active_jobs": 0,
+            "network_active_bytes": 0,
+            "tail_drain_dispatches": 0,
+            "tail_drain_jobs": 0,
+            "tail_drain_bytes": 0,
+            "network_done_encoded_jobs": 0,
+            "network_done_ready_jobs": 0,
+            "network_done_ready_bytes": 0,
+            "network_done_not_ready_jobs": 0,
+            "network_done_inflight_jobs": 0,
+            "collect_overlap_s": 0.0,
+            "submit_worker_busy_s": 0.0,
+            "inflight_ready_jobs_max": 0,
+            "inflight_collected_jobs": 0,
         }
 
         def _encoding_complete(ctx: Dict[str, Any]) -> bool:
-            return len(ctx["encoded_sids"]) >= len(ctx.get("encode_specs", {}))
+            return len(ctx["encoded_keys"]) >= len(ctx.get("encode_specs", {}))
 
         def _finalize_context_if_ready(ctx: Dict[str, Any]) -> None:
             if not _encoding_complete(ctx):
@@ -4520,8 +4621,8 @@ def save_frcheck_legacy_checkpoint(
 
         def _collect_fair_batch(
             start_idx: int, max_jobs: Optional[int] = None
-        ) -> Tuple[List[Tuple[Dict[str, Any], int]], int]:
-            batch: List[Tuple[Dict[str, Any], int]] = []
+        ) -> Tuple[List[Tuple[Dict[str, Any], int, int]], int]:
+            batch: List[Tuple[Dict[str, Any], int, int]] = []
             count = len(layer_exchange_contexts)
             limit = global_batch_size if max_jobs is None else max(0, int(max_jobs))
             if count == 0 or limit == 0:
@@ -4535,13 +4636,14 @@ def save_frcheck_legacy_checkpoint(
                     if not stream_encode and not ctx["done_event"].is_set():
                         continue
                     try:
-                        sid = int(ctx["ready_queue"].get_nowait())
+                        sid, chunk_idx = ctx["ready_queue"].get_nowait()
+                        sid, chunk_idx = int(sid), int(chunk_idx)
                     except queue.Empty:
                         continue
                     with ctx["ready_lock"]:
-                        if sid in ctx["encoded_sids"]:
+                        if (sid, chunk_idx) in ctx["encoded_keys"]:
                             continue
-                    batch.append((ctx, sid))
+                    batch.append((ctx, sid, chunk_idx))
                     cursor = (idx + 1) % count
                     added = True
                     if len(batch) >= limit:
@@ -4552,38 +4654,223 @@ def save_frcheck_legacy_checkpoint(
 
         def _encode_coordinator() -> None:
             coordinator_start_s = time.time()
+            use_submit_worker = (
+                os.environ.get("FRCHECK_LAYER_ENCODE_SUBMIT_WORKER", "0") == "1"
+            )
+            reserved_keys: Dict[int, Set[Tuple[int, int]]] = {
+                id(ctx): set() for ctx in layer_exchange_contexts
+            }
+            submit_queue: "queue.Queue[Optional[Tuple[List[Tuple[Dict[str, Any], int, int]], bool, int, float]]]" = queue.Queue(maxsize=1)
+            completion_queue: "queue.Queue[Tuple[List[Tuple[Dict[str, Any], int, int]], bool, int, float, Optional[BaseException]]]" = queue.Queue()
+            submit_thread: Optional[threading.Thread] = None
+            inflight = False
+            inflight_started_s = 0.0
+            staged_batch: Optional[List[Tuple[Dict[str, Any], int, int]]] = None
+
+            def _submit_worker() -> None:
+                while True:
+                    item = submit_queue.get()
+                    if item is None:
+                        return
+                    batch, network_complete_at_submit, batch_bytes, submit_s = item
+                    error: Optional[BaseException] = None
+                    try:
+                        _encode_layer_exchange_batch(native, batch)
+                    except BaseException as exc:
+                        error = exc
+                    completion_queue.put(
+                        (batch, network_complete_at_submit, batch_bytes, submit_s, error)
+                    )
+                    coordinator_wakeup.put(None)
+
+            def _finish_batch(
+                batch: List[Tuple[Dict[str, Any], int, int]],
+                network_complete_at_submit: bool,
+                batch_bytes: int,
+                submit_s: float,
+                error: Optional[BaseException],
+            ) -> None:
+                if error is not None:
+                    raise RuntimeError("FRCheck native layer encode failed") from error
+                batch_elapsed = time.time() - submit_s
+                jobs_per_ctx: Dict[int, int] = {}
+                for ctx, sid, chunk_idx in batch:
+                    key = id(ctx)
+                    jobs_per_ctx[key] = jobs_per_ctx.get(key, 0) + 1
+                    with ctx["ready_lock"]:
+                        reserved_keys[key].discard((int(sid), int(chunk_idx)))
+                        ctx["encoded_keys"].add((int(sid), int(chunk_idx)))
+                coordinator_stats["dispatches"] += 1
+                coordinator_stats["jobs"] += len(batch)
+                coordinator_stats["bytes"] += batch_bytes
+                coordinator_stats["max_jobs"] = max(
+                    coordinator_stats["max_jobs"], len(batch)
+                )
+                coordinator_stats["max_bytes"] = max(
+                    coordinator_stats["max_bytes"], batch_bytes
+                )
+                if network_complete_at_submit:
+                    coordinator_stats["tail_drain_dispatches"] += 1
+                    coordinator_stats["tail_drain_jobs"] += len(batch)
+                    coordinator_stats["tail_drain_bytes"] += batch_bytes
+                else:
+                    coordinator_stats["network_active_dispatches"] += 1
+                    coordinator_stats["network_active_jobs"] += len(batch)
+                    coordinator_stats["network_active_bytes"] += batch_bytes
+                for ctx, _sid, _chunk_idx in batch:
+                    key = id(ctx)
+                    count = jobs_per_ctx.pop(key, 0)
+                    if count == 0:
+                        continue
+                    ctx["stream_encode_active_s"] += batch_elapsed * count / len(batch)
+                    ctx["ready_encode_batches"] += 1
+                    _finalize_context_if_ready(ctx)
+
+            if use_submit_worker:
+                submit_thread = threading.Thread(
+                    target=_submit_worker, name="frcheck-layer-encode-submit"
+                )
+                submit_thread.start()
             for ctx in layer_exchange_contexts:
                 ctx["coordinator_start_s"] = coordinator_start_s
             cursor = 0
+            network_frontier_recorded = False
             try:
                 while True:
+                    if use_submit_worker and inflight:
+                        try:
+                            completed = completion_queue.get_nowait()
+                        except queue.Empty:
+                            completed = None
+                        if completed is not None:
+                            _finish_batch(*completed)
+                            coordinator_stats["submit_worker_busy_s"] += (
+                                time.time() - inflight_started_s
+                            )
+                            inflight = False
                     for ctx in layer_exchange_contexts:
                         if ctx["errors"]:
                             raise RuntimeError("FRCheck layer exchange failed") from ctx["errors"][0]
                         _finalize_context_if_ready(ctx)
+                    network_complete = all(
+                        ctx["done_event"].is_set() for ctx in layer_exchange_contexts
+                    )
+                    if network_complete and not network_frontier_recorded:
+                        for ctx in layer_exchange_contexts:
+                            with ctx["ready_lock"]:
+                                encoded_keys = ctx["encoded_keys"]
+                                reserved = reserved_keys[id(ctx)]
+                                encoded_jobs = len(encoded_keys)
+                                ready_keys = (
+                                    ctx["ready_queued_keys"]
+                                    - encoded_keys
+                                    - reserved
+                                )
+                                ready_jobs = len(ready_keys)
+                                ready_bytes = sum(
+                                    int(ctx["encode_specs"][key]["chunk_length"])
+                                    for key in ready_keys
+                                )
+                                total_jobs = len(ctx["encode_specs"])
+                            coordinator_stats["network_done_encoded_jobs"] += encoded_jobs
+                            coordinator_stats["network_done_ready_jobs"] += ready_jobs
+                            coordinator_stats["network_done_ready_bytes"] += ready_bytes
+                            coordinator_stats["network_done_inflight_jobs"] += len(reserved)
+                            coordinator_stats["network_done_not_ready_jobs"] += max(
+                                0,
+                                total_jobs
+                                - encoded_jobs
+                                - ready_jobs
+                                - len(reserved),
+                            )
+                        network_frontier_recorded = True
                     if all(
                         _encoding_complete(ctx) and ctx["done_event"].is_set()
                         for ctx in layer_exchange_contexts
-                    ):
+                    ) and not inflight:
                         break
 
-                    batch, cursor = _collect_fair_batch(cursor)
+                    pending_job_limit = sum(
+                        max(
+                            0,
+                            len(ctx["encode_specs"])
+                            - len(ctx["encoded_keys"])
+                            - len(reserved_keys[id(ctx)]),
+                        )
+                        for ctx in layer_exchange_contexts
+                    )
+                    if inflight:
+                        collect_t0 = time.time()
+                        if staged_batch is None and pending_job_limit > 0:
+                            stage_capacity = (
+                                pending_job_limit if network_complete else global_batch_size
+                            )
+                            staged_batch, cursor = _collect_fair_batch(
+                                cursor, stage_capacity
+                            )
+                            if staged_batch:
+                                for ctx, sid, chunk_idx in staged_batch:
+                                    reserved_keys[id(ctx)].add(
+                                        (int(sid), int(chunk_idx))
+                                    )
+                                coordinator_stats["inflight_collected_jobs"] += len(
+                                    staged_batch
+                                )
+                            else:
+                                staged_batch = None
+                        ready_during_inflight = sum(
+                            ctx["ready_queue"].qsize() for ctx in layer_exchange_contexts
+                        )
+                        coordinator_stats["inflight_ready_jobs_max"] = max(
+                            coordinator_stats["inflight_ready_jobs_max"],
+                            ready_during_inflight,
+                        )
+                        coordinator_stats["collect_overlap_s"] += time.time() - collect_t0
+                        try:
+                            coordinator_wakeup.get(timeout=0.001)
+                        except queue.Empty:
+                            pass
+                        continue
+
+                    if staged_batch is not None:
+                        batch = staged_batch
+                        staged_batch = None
+                        dispatch_capacity = len(batch)
+                    elif network_complete:
+                        dispatch_capacity = pending_job_limit
+                        batch, cursor = _collect_fair_batch(cursor, dispatch_capacity)
+                    elif adaptive_encode:
+                        ready_backlog = sum(
+                            ctx["ready_queue"].qsize() for ctx in layer_exchange_contexts
+                        )
+                        adaptive_limit = min(
+                            pending_job_limit,
+                            global_batch_size * adaptive_batch_multiplier,
+                        )
+                        dispatch_capacity = min(
+                            adaptive_limit, max(global_batch_size, ready_backlog)
+                        )
+                        batch, cursor = _collect_fair_batch(cursor, dispatch_capacity)
+                    else:
+                        dispatch_capacity = global_batch_size
+                        batch, cursor = _collect_fair_batch(cursor, dispatch_capacity)
                     if not batch:
                         incomplete_done = []
                         for ctx in layer_exchange_contexts:
                             if ctx["done_event"].is_set() and not _encoding_complete(ctx):
                                 pending = sorted(
-                                    int(sid) for sid in ctx["encode_specs"]
-                                    if int(sid) not in ctx["encoded_sids"]
+                                    key for key in ctx["encode_specs"]
+                                    if key not in ctx["encoded_keys"]
+                                    and key not in reserved_keys[id(ctx)]
                                 )
-                                if ctx["ready_queue"].empty() and pending:
+                                if ctx["ready_queue"].empty() and pending and not inflight:
                                     incomplete_done.append((ctx, pending))
                         if incomplete_done:
                             ctx, pending = incomplete_done[0]
                             layer_name = ctx["prepared"]["result"].layer_name
                             raise RuntimeError(
                                 f"FRCheck layer exchange encode incomplete for {layer_name}: "
-                                f"pending stripes {pending[:8]}"
+                                f"pending stripe chunks {pending[:8]}"
                             )
                         coordinator_wakeup.get()
                         continue
@@ -4591,16 +4878,10 @@ def save_frcheck_legacy_checkpoint(
                     if (
                         len(batch) < global_batch_size
                         and coalesce_window_s > 0.0
-                        and any(not ctx["done_event"].is_set() for ctx in layer_exchange_contexts)
+                        and not network_complete
                     ):
                         deadline = time.monotonic() + coalesce_window_s
-                        while (
-                            len(batch) < global_batch_size
-                            and any(
-                                not ctx["done_event"].is_set()
-                                for ctx in layer_exchange_contexts
-                            )
-                        ):
+                        while len(batch) < global_batch_size:
                             remaining_s = deadline - time.monotonic()
                             if remaining_s <= 0.0:
                                 break
@@ -4609,40 +4890,60 @@ def save_frcheck_legacy_checkpoint(
                                 coordinator_wakeup.get(timeout=remaining_s)
                             except queue.Empty:
                                 pass
-                            coordinator_stats["coalesce_wait_s"] += (
-                                time.monotonic() - wait_t0
-                            )
+                            coordinator_stats["coalesce_wait_s"] += time.monotonic() - wait_t0
                             more_jobs, cursor = _collect_fair_batch(
                                 cursor, global_batch_size - len(batch)
                             )
                             batch.extend(more_jobs)
-
-                    batch_t0 = time.time()
-                    _encode_layer_exchange_batch(native, batch)
-                    batch_elapsed = time.time() - batch_t0
-                    coordinator_stats["dispatches"] += 1
-                    coordinator_stats["jobs"] += len(batch)
-                    jobs_per_ctx: Dict[int, int] = {}
-                    for ctx, _sid in batch:
-                        key = id(ctx)
-                        jobs_per_ctx[key] = jobs_per_ctx.get(key, 0) + 1
-                    for ctx, sid in batch:
-                        with ctx["ready_lock"]:
-                            ctx["encoded_sids"].add(int(sid))
-                    for ctx, _sid in batch:
-                        key = id(ctx)
-                        count = jobs_per_ctx.pop(key, 0)
-                        if count == 0:
-                            continue
-                        ctx["stream_encode_active_s"] += (
-                            batch_elapsed * count / len(batch)
+                    for ctx, sid, chunk_idx in batch:
+                        reserved_keys[id(ctx)].add((int(sid), int(chunk_idx)))
+                    batch_bytes = sum(
+                        int(ctx["encode_specs"][(sid, chunk_idx)]["chunk_length"])
+                        for ctx, sid, chunk_idx in batch
+                    )
+                    coordinator_stats["dispatch_capacity_sum"] += dispatch_capacity
+                    submit_s = time.time()
+                    if use_submit_worker:
+                        submit_queue.put(
+                            (batch, network_complete, batch_bytes, submit_s)
                         )
-                        ctx["ready_encode_batches"] += 1
-                        _finalize_context_if_ready(ctx)
+                        inflight = True
+                        inflight_started_s = submit_s
+                    else:
+                        error = None
+                        try:
+                            _encode_layer_exchange_batch(native, batch)
+                        except BaseException as exc:
+                            error = exc
+                        _finish_batch(
+                            batch, network_complete, batch_bytes, submit_s, error
+                        )
+                for ctx in layer_exchange_contexts:
+                    missing = set(ctx["encode_specs"]) - ctx["encoded_keys"]
+                    if missing or reserved_keys[id(ctx)]:
+                        raise RuntimeError(
+                            f"FRCheck layer encode final validation failed: "
+                            f"missing={len(missing)} reserved={len(reserved_keys[id(ctx)])}"
+                        )
             except BaseException as exc:
                 encode_errors.append(exc)
                 for ctx in layer_exchange_contexts:
                     ctx["encode_done_event"].set()
+            finally:
+                if submit_thread is not None:
+                    if inflight:
+                        try:
+                            completed = completion_queue.get(timeout=30.0)
+                            _finish_batch(*completed)
+                        except BaseException as exc:
+                            if not encode_errors:
+                                encode_errors.append(exc)
+                    submit_queue.put(None)
+                    submit_thread.join(timeout=30.0)
+                    if submit_thread.is_alive() and not encode_errors:
+                        encode_errors.append(
+                            RuntimeError("FRCheck encode submit worker failed to stop")
+                        )
 
         lx_encode_thread_start_t0 = time.time()
         encode_thread = threading.Thread(
@@ -4653,11 +4954,57 @@ def save_frcheck_legacy_checkpoint(
         lx_encode_thread_start_s = time.time() - lx_encode_thread_start_t0
 
         lx_queue_put_t0 = time.time()
-        for ctx in layer_exchange_contexts:
-            for task in ctx["recv_tasks"]:
-                recv_queues[(int(task["peer_node"]), int(task["lane_id"]))].put((ctx, task))
-            for task in ctx["send_tasks"]:
-                send_queues[(int(task["peer_node"]), int(task["lane_id"]))].put((ctx, task))
+        if exchange_chunk_bytes == 0:
+            for ctx in layer_exchange_contexts:
+                for task in ctx["recv_tasks"]:
+                    recv_queues[(int(task["peer_node"]), int(task["lane_id"]))].put((ctx, task))
+                for task in ctx["send_tasks"]:
+                    send_queues[(int(task["peer_node"]), int(task["lane_id"]))].put((ctx, task))
+        else:
+            send_queue_items: Dict[Tuple[int, int], List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+            recv_queue_items: Dict[Tuple[int, int], List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+            for ctx in layer_exchange_contexts:
+                for task in ctx["recv_tasks"]:
+                    key = (int(task["peer_node"]), int(task["lane_id"]))
+                    recv_queue_items.setdefault(key, []).append((ctx, task))
+                for task in ctx["send_tasks"]:
+                    key = (int(task["peer_node"]), int(task["lane_id"]))
+                    send_queue_items.setdefault(key, []).append((ctx, task))
+
+            def _chunk_task_order(
+                item: Tuple[Dict[str, Any], Dict[str, Any]]
+            ) -> Tuple[int, ...]:
+                ctx, task = item
+                if layer_frontier_order == "chunk_sid_layer":
+                    return (
+                        int(task["chunk_idx"]), int(task["sid"]),
+                        int(task["layer_batch_id"]), int(task["batch_id"]),
+                    )
+                if layer_frontier_order == "critical_frontier":
+                    spec = ctx["encode_specs"].get(
+                        (int(task["sid"]), int(task["chunk_idx"]))
+                    )
+                    remote_deps = (
+                        len(spec["remote_deps"])
+                        if spec is not None
+                        else int(task["critical_remote_deps"])
+                    )
+                    return (
+                        remote_deps, int(task["chunk_idx"]),
+                        int(task["layer_batch_id"]), int(task["sid"]),
+                        int(task["batch_id"]),
+                    )
+                return (
+                    int(task["chunk_idx"]), int(task["layer_batch_id"]),
+                    int(task["sid"]), int(task["batch_id"]),
+                )
+
+            for key, items in send_queue_items.items():
+                for item in sorted(items, key=_chunk_task_order):
+                    send_queues[key].put(item)
+            for key, items in recv_queue_items.items():
+                for item in sorted(items, key=_chunk_task_order):
+                    recv_queues[key].put(item)
         for q in send_queues.values():
             q.put(None)
         for q in recv_queues.values():
@@ -4698,12 +5045,20 @@ def save_frcheck_legacy_checkpoint(
         lx_stage_pack_blocks = sum(int(ctx.get("stage_pack_blocks", 0)) for ctx in layer_exchange_contexts)
         lx_cpu_gather_s = 0.0
         lx_cpu_gather_bytes = 0
-        lx_direct_sge_tasks = layer_exchange_send_tasks
+        lx_direct_sge_tasks = sum(
+            1 for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+            if "block_indices" in task
+        )
         lx_direct_sge_count = sum(
             len(task["block_indices"])
             for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+            if "block_indices" in task
         )
-        lx_direct_sge_bytes = layer_exchange_send_bytes
+        lx_direct_sge_bytes = sum(
+            int(task["size"])
+            for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+            if "block_indices" in task
+        )
         lx_mirror_ready_wait_sum_s = sum(
             float(ctx.get("mirror_ready_wait_sum_s", 0.0)) for ctx in layer_exchange_contexts
         )
@@ -4733,10 +5088,32 @@ def save_frcheck_legacy_checkpoint(
         lx_encode_coalesce_wait_s = float(coordinator_stats["coalesce_wait_s"])
         lx_encode_batch_dispatches = int(coordinator_stats["dispatches"])
         lx_encode_batch_jobs = int(coordinator_stats["jobs"])
+        lx_encode_batch_bytes = int(coordinator_stats["bytes"])
+        lx_encode_batch_max_jobs = int(coordinator_stats["max_jobs"])
+        lx_encode_batch_max_bytes = int(coordinator_stats["max_bytes"])
+        lx_network_active_dispatches = int(coordinator_stats["network_active_dispatches"])
+        lx_network_active_jobs = int(coordinator_stats["network_active_jobs"])
+        lx_network_active_bytes = int(coordinator_stats["network_active_bytes"])
+        lx_network_done_encoded_jobs = int(coordinator_stats["network_done_encoded_jobs"])
+        lx_network_done_ready_jobs = int(coordinator_stats["network_done_ready_jobs"])
+        lx_network_done_ready_bytes = int(coordinator_stats["network_done_ready_bytes"])
+        lx_network_done_not_ready_jobs = int(coordinator_stats["network_done_not_ready_jobs"])
+        lx_network_done_inflight_jobs = int(coordinator_stats["network_done_inflight_jobs"])
+        lx_collect_overlap_s = float(coordinator_stats["collect_overlap_s"])
+        lx_submit_worker_busy_s = float(coordinator_stats["submit_worker_busy_s"])
+        lx_inflight_ready_jobs_max = int(coordinator_stats["inflight_ready_jobs_max"])
+        lx_inflight_collected_jobs = int(coordinator_stats["inflight_collected_jobs"])
+        lx_tail_drain_dispatches = int(coordinator_stats["tail_drain_dispatches"])
+        lx_tail_drain_jobs = int(coordinator_stats["tail_drain_jobs"])
+        lx_tail_drain_bytes = int(coordinator_stats["tail_drain_bytes"])
+        lx_encode_batch_avg_bytes = (
+            float(lx_encode_batch_bytes) / float(lx_encode_batch_dispatches)
+            if lx_encode_batch_dispatches else 0.0
+        )
         lx_encode_batch_avg_occupancy = (
             float(lx_encode_batch_jobs)
-            / float(lx_encode_batch_dispatches * global_batch_size)
-            if lx_encode_batch_dispatches else 0.0
+            / float(coordinator_stats["dispatch_capacity_sum"])
+            if coordinator_stats["dispatch_capacity_sum"] else 0.0
         )
         lx_ready_first_s = min(
             (float(ctx.get("ready_first_s", 0.0)) for ctx in layer_exchange_contexts
@@ -4900,7 +5277,26 @@ def save_frcheck_legacy_checkpoint(
     lx_encode_coalesce_wait_s = locals().get("lx_encode_coalesce_wait_s", 0.0)
     lx_encode_batch_dispatches = locals().get("lx_encode_batch_dispatches", 0)
     lx_encode_batch_jobs = locals().get("lx_encode_batch_jobs", 0)
+    lx_encode_batch_bytes = locals().get("lx_encode_batch_bytes", 0)
+    lx_encode_batch_max_jobs = locals().get("lx_encode_batch_max_jobs", 0)
+    lx_encode_batch_avg_bytes = locals().get("lx_encode_batch_avg_bytes", 0.0)
+    lx_encode_batch_max_bytes = locals().get("lx_encode_batch_max_bytes", 0)
     lx_encode_batch_avg_occupancy = locals().get("lx_encode_batch_avg_occupancy", 0.0)
+    lx_network_active_dispatches = locals().get("lx_network_active_dispatches", 0)
+    lx_network_active_jobs = locals().get("lx_network_active_jobs", 0)
+    lx_network_active_bytes = locals().get("lx_network_active_bytes", 0)
+    lx_network_done_encoded_jobs = locals().get("lx_network_done_encoded_jobs", 0)
+    lx_network_done_ready_jobs = locals().get("lx_network_done_ready_jobs", 0)
+    lx_network_done_ready_bytes = locals().get("lx_network_done_ready_bytes", 0)
+    lx_network_done_not_ready_jobs = locals().get("lx_network_done_not_ready_jobs", 0)
+    lx_network_done_inflight_jobs = locals().get("lx_network_done_inflight_jobs", 0)
+    lx_collect_overlap_s = locals().get("lx_collect_overlap_s", 0.0)
+    lx_submit_worker_busy_s = locals().get("lx_submit_worker_busy_s", 0.0)
+    lx_inflight_ready_jobs_max = locals().get("lx_inflight_ready_jobs_max", 0)
+    lx_inflight_collected_jobs = locals().get("lx_inflight_collected_jobs", 0)
+    lx_tail_drain_dispatches = locals().get("lx_tail_drain_dispatches", 0)
+    lx_tail_drain_jobs = locals().get("lx_tail_drain_jobs", 0)
+    lx_tail_drain_bytes = locals().get("lx_tail_drain_bytes", 0)
     lx_ready_first_s = locals().get("lx_ready_first_s", 0.0)
     lx_ready_last_s = locals().get("lx_ready_last_s", 0.0)
     lx_layer_elapsed_max = locals().get("lx_layer_elapsed_max", 0.0)
@@ -5027,7 +5423,26 @@ def save_frcheck_legacy_checkpoint(
         "lx_encode_coalesce_wait_s": lx_encode_coalesce_wait_s,
         "lx_encode_batch_dispatches": lx_encode_batch_dispatches,
         "lx_encode_batch_jobs": lx_encode_batch_jobs,
+        "lx_encode_batch_bytes": lx_encode_batch_bytes,
+        "lx_encode_batch_max_jobs": lx_encode_batch_max_jobs,
+        "lx_encode_batch_avg_bytes": lx_encode_batch_avg_bytes,
+        "lx_encode_batch_max_bytes": lx_encode_batch_max_bytes,
         "lx_encode_batch_avg_occupancy": lx_encode_batch_avg_occupancy,
+        "lx_network_active_dispatches": lx_network_active_dispatches,
+        "lx_network_active_jobs": lx_network_active_jobs,
+        "lx_network_active_bytes": lx_network_active_bytes,
+        "lx_network_done_encoded_jobs": lx_network_done_encoded_jobs,
+        "lx_network_done_ready_jobs": lx_network_done_ready_jobs,
+        "lx_network_done_ready_bytes": lx_network_done_ready_bytes,
+        "lx_network_done_not_ready_jobs": lx_network_done_not_ready_jobs,
+        "lx_network_done_inflight_jobs": lx_network_done_inflight_jobs,
+        "lx_collect_overlap_s": lx_collect_overlap_s,
+        "lx_submit_worker_busy_s": lx_submit_worker_busy_s,
+        "lx_inflight_ready_jobs_max": lx_inflight_ready_jobs_max,
+        "lx_inflight_collected_jobs": lx_inflight_collected_jobs,
+        "lx_tail_drain_dispatches": lx_tail_drain_dispatches,
+        "lx_tail_drain_jobs": lx_tail_drain_jobs,
+        "lx_tail_drain_bytes": lx_tail_drain_bytes,
         "lx_ready_first_s": lx_ready_first_s,
         "lx_ready_last_s": lx_ready_last_s,
         "lx_layer_elapsed_max": lx_layer_elapsed_max,
@@ -5041,6 +5456,11 @@ def save_frcheck_legacy_checkpoint(
             "encode_batch_dispatches": native_timing.get("encode_batch_dispatches", 0.0),
             "encode_batch_jobs": native_timing.get("encode_batch_jobs", 0.0),
             "encode_ec_calls": native_timing.get("encode_ec_calls", 0.0),
+            "encode_pool_plan_s": native_timing.get("encode_pool_plan_s", 0.0),
+            "encode_pool_barrier_s": native_timing.get("encode_pool_barrier_s", 0.0),
+            "encode_worker_compute_max_sum_s": native_timing.get(
+                "encode_worker_compute_max_sum_s", 0.0
+            ),
             "source_send_sum_s": native_timing.get("source_send_sum_s", 0.0),
             "source_send_max_s": native_timing.get("source_send_max_s", 0.0),
             "tagged_ack_wait_sum_s": native_timing.get("tagged_ack_wait_sum_s", 0.0),
@@ -5064,11 +5484,30 @@ def save_frcheck_legacy_checkpoint(
         })
     summary = _timing_max_dict(summary_fields)
     if rank == 0:
+        mirror_kinds = {
+            manager.get_layer_stripe_bufs(result.layer_idx).mirror_buffer_kind
+            for result in encode_results
+        }
+        canonical_mirror_kind = (
+            next(iter(mirror_kinds)) if len(mirror_kinds) == 1 else "mixed"
+        )
+        prefer_torch_pinned = int(
+            any(
+                manager.get_layer_stripe_bufs(
+                    result.layer_idx
+                ).mirror_prefer_torch_pinned
+                for result in encode_results
+            )
+        )
         summary["mode"] = "async" if _use_async_parity else "sync"
+        summary["canonical_mirror_kind"] = canonical_mirror_kind
+        summary["prefer_torch_pinned"] = prefer_torch_pinned
         logger.info(
             "FRCHECK save layer-exchange transport (%(mode)s): "
             "gdr_enabled=%(gdr_enabled).0f gdr_send_tasks=%(gdr_send_tasks).0f "
-            "gdr_send_bytes=%(gdr_send_bytes).0f",
+            "gdr_send_bytes=%(gdr_send_bytes).0f "
+            "canonical_mirror_kind=%(canonical_mirror_kind)s "
+            "prefer_torch_pinned=%(prefer_torch_pinned)d",
             summary,
         )
         if has_native_timing:
@@ -5076,6 +5515,9 @@ def save_frcheck_legacy_checkpoint(
                 "FRCHECK save timing (%(mode)s): e2e_s=%(e2e_s).2fs "
                 "d2h_s=%(d2h_s).2fs network_encode_s=%(network_encode_s).2fs "
                 "net_s=%(net_s).2fs encode_s=%(encode_s).2fs encode_wait_s=%(encode_wait_s).2fs "
+                "pool_plan_s=%(encode_pool_plan_s).4fs "
+                "pool_barrier_s=%(encode_pool_barrier_s).4fs "
+                "worker_compute_max_sum_s=%(encode_worker_compute_max_sum_s).4fs "
                 "source_send_sum_s=%(source_send_sum_s).2fs source_send_max_s=%(source_send_max_s).2fs "
                 "enc_recv_sum_s=%(enc_recv_sum_s).2fs enc_recv_max_s=%(enc_recv_max_s).2fs",
                 summary,
@@ -5108,7 +5550,27 @@ def save_frcheck_legacy_checkpoint(
                 "coalesce_wait_s=%(lx_encode_coalesce_wait_s).6fs "
                 "encode_batch_dispatches=%(lx_encode_batch_dispatches).0f "
                 "encode_batch_jobs=%(lx_encode_batch_jobs).0f "
+                "encode_batch_bytes=%(lx_encode_batch_bytes).0f "
+                "encode_batch_max_jobs=%(lx_encode_batch_max_jobs).0f "
+                "encode_batch_avg_bytes=%(lx_encode_batch_avg_bytes).0f "
+                "encode_batch_max_bytes=%(lx_encode_batch_max_bytes).0f "
                 "encode_batch_avg_occupancy=%(lx_encode_batch_avg_occupancy).3f "
+                "network_active_dispatches=%(lx_network_active_dispatches).0f "
+                "network_active_jobs=%(lx_network_active_jobs).0f "
+                "network_active_bytes=%(lx_network_active_bytes).0f "
+                f"frontier_order={layer_frontier_order} "
+                "network_done_encoded_jobs=%(lx_network_done_encoded_jobs).0f "
+                "network_done_ready_jobs=%(lx_network_done_ready_jobs).0f "
+                "network_done_ready_bytes=%(lx_network_done_ready_bytes).0f "
+                "network_done_not_ready_jobs=%(lx_network_done_not_ready_jobs).0f "
+                "network_done_inflight_jobs=%(lx_network_done_inflight_jobs).0f "
+                "collect_overlap_s=%(lx_collect_overlap_s).6f "
+                "submit_worker_busy_s=%(lx_submit_worker_busy_s).6f "
+                "inflight_ready_jobs_max=%(lx_inflight_ready_jobs_max).0f "
+                "inflight_collected_jobs=%(lx_inflight_collected_jobs).0f "
+                "tail_drain_dispatches=%(lx_tail_drain_dispatches).0f "
+                "tail_drain_jobs=%(lx_tail_drain_jobs).0f "
+                "tail_drain_bytes=%(lx_tail_drain_bytes).0f "
                 "mirror_tasks=%(mirror_tasks_completed).0f/%(mirror_tasks_submitted).0f "
                 "mirror_bytes=%(mirror_bytes_completed).0f/%(mirror_bytes_submitted).0f "
                 "mirror_failed_tasks=%(mirror_tasks_failed).0f mirror_failed_bytes=%(mirror_bytes_failed).0f",

@@ -8,10 +8,14 @@ ENCODE_BINARY="$SCRIPT_DIR/isal_encode_bench"
 NETWORK_BENCH="$SCRIPT_DIR/bench_frcheck_network.py"
 STRATEGY_DIR="$ROOT_DIR/megatron/core/dist_checkpointing/strategies"
 
-CPU_THREADS=${CPU_THREADS:-128}
-CPU_BLOCK=${CPU_BLOCK:-2M}
+CPU_WORKERS=${CPU_WORKERS:-16}
+CPU_LIST=${CPU_LIST:-0-7,64-71}
+CPU_TOTAL=${CPU_TOTAL:-2774274048}
+CPU_JOBS=${CPU_JOBS:-102}
+CPU_K=${CPU_K:-2}
+CPU_M=${CPU_M:-2}
 CPU_WARMUP=${CPU_WARMUP:-3}
-CPU_ITERS=${CPU_ITERS:-10}
+CPU_REPEATS=${CPU_REPEATS:-7}
 MASTER_ADDR=${MASTER_ADDR:-10.252.129.35}
 MASTER_PORT=${MASTER_PORT:-29600}
 FRCHECK_BASE_PORT=${FRCHECK_BASE_PORT:-27200}
@@ -32,8 +36,10 @@ build_encode() {
 
 run_encode() {
     build_encode
-    echo "Running ISA-L encode: logical_cpu_threads=$CPU_THREADS block=$CPU_BLOCK"
-    "$ENCODE_BINARY" --threads "$CPU_THREADS" --block "$CPU_BLOCK" --warmup "$CPU_WARMUP" --iters "$CPU_ITERS" "$@"
+    echo "Running ISA-L FRCheck batch encode: workers=$CPU_WORKERS cpus=$CPU_LIST total=$CPU_TOTAL jobs=$CPU_JOBS"
+    "$ENCODE_BINARY" --workers "$CPU_WORKERS" --cpus "$CPU_LIST" \
+        --k "$CPU_K" --m "$CPU_M" --total "$CPU_TOTAL" --jobs "$CPU_JOBS" \
+        --warmup "$CPU_WARMUP" --repeats "$CPU_REPEATS" "$@"
 }
 
 check_network_node() {

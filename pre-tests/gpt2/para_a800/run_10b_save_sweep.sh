@@ -4,7 +4,18 @@ set -euo pipefail
 
 WORKDIR="/workspace/Megatron-LM"
 REMOTE_HELPER="$WORKDIR/pre-tests/gpt2/para_a800/run_remote_parallel.sh"
-SCRIPT_DIR="pre-tests/gpt2/para_a800/10B-4nodes"
+MODEL_SIZE="${MODEL_SIZE:-10B}"
+case "$MODEL_SIZE" in
+    2.7B) MODEL_DIR=2.7B-4nodes; MODEL_SLUG=2.7b ;;
+    7B) MODEL_DIR=7B-4nodes; MODEL_SLUG=7b ;;
+    10B) MODEL_DIR=10B-4nodes; MODEL_SLUG=10b ;;
+    14B) MODEL_DIR=14B-4nodes; MODEL_SLUG=14b ;;
+    20B) MODEL_DIR=20B-4nodes; MODEL_SLUG=20b ;;
+    *) echo "MODEL_SIZE must be 2.7B, 7B, 10B, 14B, or 20B." >&2; exit 2 ;;
+esac
+SCRIPT_DIR="pre-tests/gpt2/para_a800/$MODEL_DIR"
+CHECKPOINT_PREFIX="/dev/shm/models/gpt2-$MODEL_SLUG-4nodes"
+SWEEP_TAG="${MODEL_SLUG}_save_sweep"
 HOSTS=(node1 node2 node3)
 ALL_NODES=(node0 node1 node2 node3)
 SSH_USER="${SSH_USER:-root}"
@@ -13,6 +24,30 @@ SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
 SSH_IDENTITY_FILE="${SSH_IDENTITY_FILE:-$HOME/.ssh/id_ed25519}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+GEMINI_ENV_VARS=(
+    GEMINI_GDR
+    GEMINI_GDR_MIRROR_MODE
+    GEMINI_GDR_BATCH_WR
+    GEMINI_MIRROR_CHUNK_MB
+    GEMINI_REPLICAS_CHANNELS_PER_PEER
+    GEMINI_SAVE_PREFER_TORCH_PINNED
+    GEMINI_PIPELINE_CHUNK_MB
+    GEMINI_PIPELINE_MAX_SEGMENTS
+    GEMINI_PIPELINE_SEGMENTS
+)
+
+build_gemini_env_prefix() {
+    local name value prefix=""
+    printf -v value '%q' "${GEMINI_GDR:-0}"
+    prefix="GEMINI_GDR=$value"
+    for name in "${GEMINI_ENV_VARS[@]:1}"; do
+        if [[ -v $name ]]; then
+            printf -v value '%q' "${!name}"
+            prefix+=" $name=$value"
+        fi
+    done
+    printf '%s' "$prefix"
+}
 
 DEFAULT_SCHEMES=(gemini2 gemini3 frcheck eccheck ecnaive)
 declare -A SCRIPTS=(
@@ -23,11 +58,11 @@ declare -A SCRIPTS=(
     [ecnaive]="$SCRIPT_DIR/test_ecnaive.sh"
 )
 declare -A CHECKPOINT_PATHS=(
-    [gemini2]="/dev/shm/models/gpt2-10b-4nodes-gemini-2-replicas"
-    [gemini3]="/dev/shm/models/gpt2-10b-4nodes-gemini-3-replicas"
-    [frcheck]="/dev/shm/models/gpt2-10b-4nodes-frcheck"
-    [eccheck]="/dev/shm/models/gpt2-10b-4nodes-eccheck"
-    [ecnaive]="/dev/shm/models/gpt2-10b-4nodes-ecnaive"
+    [gemini2]="$CHECKPOINT_PREFIX-gemini-2-replicas"
+    [gemini3]="$CHECKPOINT_PREFIX-gemini-3-replicas"
+    [frcheck]="$CHECKPOINT_PREFIX-frcheck"
+    [eccheck]="$CHECKPOINT_PREFIX-eccheck"
+    [ecnaive]="$CHECKPOINT_PREFIX-ecnaive"
 )
 declare -A MASTER_PORTS=(
     [gemini2]="${MASTER_PORT_GEMINI2:-6100}"
@@ -39,10 +74,16 @@ declare -A MASTER_PORTS=(
 
 usage() {
     echo "Usage: $0 [--dry-run] [gemini2|gemini3|frcheck|eccheck|ecnaive ...]"
-    echo "Environment: LOG_DIR, CONTINUE_ON_ERROR=0|1, DRY_RUN=0|1"
+    echo "Environment: MODEL_SIZE=2.7B|7B|10B|14B|20B, LOG_DIR, CONTINUE_ON_ERROR=0|1, DRY_RUN=0|1"
     echo "             SSH_USER, SSH_PORT, SSH_CONNECT_TIMEOUT, SSH_IDENTITY_FILE"
     echo "             MASTER_PORT_GEMINI2, MASTER_PORT_GEMINI3, MASTER_PORT_FRCHECK,"
     echo "             MASTER_PORT_ECCHECK, MASTER_PORT_ECNAIVE"
+    echo "             FRCHECK_LAYER_FRONTIER_ORDER (default: chunk_layer_sid)"
+    echo "             FRCHECK_SAVE_PREFER_TORCH_PINNED=0|1 (default: 0)"
+    echo "             GEMINI_GDR, GEMINI_GDR_MIRROR_MODE, GEMINI_GDR_BATCH_WR,"
+    echo "             GEMINI_MIRROR_CHUNK_MB, GEMINI_REPLICAS_CHANNELS_PER_PEER,"
+    echo "             GEMINI_SAVE_PREFER_TORCH_PINNED, GEMINI_PIPELINE_CHUNK_MB,"
+    echo "             GEMINI_PIPELINE_MAX_SEGMENTS, GEMINI_PIPELINE_SEGMENTS"
 }
 
 schemes=()
@@ -74,8 +115,12 @@ ssh_run() {
 }
 
 validate_checkpoint_path() {
-    local checkpoint_path=$1
-    [[ -n "$checkpoint_path" && "$checkpoint_path" != "/" && "$checkpoint_path" == /dev/shm/models/gpt2-10b-4nodes-* ]]
+    local checkpoint_path=$1 scheme
+    [[ -n "$checkpoint_path" && "$checkpoint_path" != "/" ]] || return 1
+    for scheme in "${DEFAULT_SCHEMES[@]}"; do
+        [[ "$checkpoint_path" == "${CHECKPOINT_PATHS[$scheme]}" ]] && return 0
+    done
+    return 1
 }
 
 check_no_training_processes() {
@@ -129,15 +174,25 @@ if [[ "$DRY_RUN" == 1 ]]; then
         checkpoint_path=${CHECKPOINT_PATHS[$scheme]}
         port=${MASTER_PORTS[$scheme]}
         echo "SCHEME=$scheme PORT=$port PATH=$checkpoint_path"
-        echo "  remote: MASTER_PORT=$port ./$script {R} save"
-        echo "  local:  MASTER_PORT=$port ./$script 0 save"
+        gemini_env=""
+        frcheck_env=""
+        if [[ "$scheme" == frcheck ]]; then
+            frcheck_env="FRCHECK_SAVE_PREFER_TORCH_PINNED=${FRCHECK_SAVE_PREFER_TORCH_PINNED:-0} "
+            echo "  frcheck_config: ${frcheck_env% }"
+        fi
+        if [[ "$scheme" == gemini2 || "$scheme" == gemini3 ]]; then
+            gemini_env="$(build_gemini_env_prefix) "
+            echo "  gemini_config: ${gemini_env% }"
+        fi
+        echo "  remote: ${frcheck_env}${gemini_env}MASTER_PORT=$port ./$script {R} save --train-iters 10"
+        echo "  local:  ${frcheck_env}${gemini_env}MASTER_PORT=$port ./$script 0 save --train-iters 10"
         echo "  cleanup: rm -rf -- $checkpoint_path on node0,node1,node2,node3"
     done
     exit 0
 fi
 
 UTC_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
-LOG_DIR="${LOG_DIR:-$WORKDIR/logs/10b_save_sweep/$UTC_TIMESTAMP}"
+LOG_DIR="${LOG_DIR:-$WORKDIR/logs/${SWEEP_TAG}/$UTC_TIMESTAMP}"
 python3 -c 'from pathlib import Path; import sys; Path(sys.argv[1]).mkdir(parents=True, exist_ok=True)' "$LOG_DIR"
 [[ -d "$LOG_DIR" ]] || {
     echo "Failed to create log directory: $LOG_DIR" >&2
@@ -186,11 +241,21 @@ trap terminate_jobs INT TERM
 run_training() {
     local scheme=$1 script=${SCRIPTS[$1]} port=${MASTER_PORTS[$1]}
     local scheme_log="$LOG_DIR/$scheme.log"
-    local frcheck_env=""
+    local frcheck_env="" gemini_env="" name
+    local -a gemini_env_args=()
     if [[ "$scheme" == frcheck ]]; then
-        frcheck_env=" FRCHECK_LAYER_EXCHANGE_SEG=${FRCHECK_LAYER_EXCHANGE_SEG:-12} FRCHECK_LAYER_ENCODE_BATCH=${FRCHECK_LAYER_ENCODE_BATCH:-12} FRCHECK_TRACE_INIT=${FRCHECK_TRACE_INIT:-0} FRCHECK_GDR=${FRCHECK_GDR:-0} FRCHECK_ASYNC_PARITY=${FRCHECK_ASYNC_PARITY:-1}"
+        echo "[driver] FRCHECK_LAYER_FRONTIER_ORDER=${FRCHECK_LAYER_FRONTIER_ORDER:-chunk_layer_sid}"
+        frcheck_env=" FRCHECK_LAYER_EXCHANGE_SEG=${FRCHECK_LAYER_EXCHANGE_SEG:-12} FRCHECK_LAYER_EXCHANGE_CHUNK_MB=${FRCHECK_LAYER_EXCHANGE_CHUNK_MB:-32} FRCHECK_LAYER_FRONTIER_ORDER=${FRCHECK_LAYER_FRONTIER_ORDER:-chunk_layer_sid} FRCHECK_LAYER_ENCODE_BATCH=${FRCHECK_LAYER_ENCODE_BATCH:-24} FRCHECK_LAYER_ENCODE_SUBMIT_WORKER=${FRCHECK_LAYER_ENCODE_SUBMIT_WORKER:-0} FRCHECK_LAYER_ENCODE_ADAPTIVE=${FRCHECK_LAYER_ENCODE_ADAPTIVE:-0} FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER=${FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER:-3} FRCHECK_TRACE_INIT=${FRCHECK_TRACE_INIT:-0} FRCHECK_GDR=${FRCHECK_GDR:-0} FRCHECK_ASYNC_PARITY=${FRCHECK_ASYNC_PARITY:-1} FRCHECK_SAVE_PREFER_TORCH_PINNED=${FRCHECK_SAVE_PREFER_TORCH_PINNED:-0}"
     fi
-    local remote_command="export PRINT_CMD=0 MASTER_PORT=$port$frcheck_env; ./$script {R} save"
+    if [[ "$scheme" == gemini2 || "$scheme" == gemini3 ]]; then
+        gemini_env=" $(build_gemini_env_prefix)"
+        gemini_env_args+=("GEMINI_GDR=${GEMINI_GDR:-0}")
+        for name in "${GEMINI_ENV_VARS[@]:1}"; do
+            [[ ! -v $name ]] || gemini_env_args+=("$name=${!name}")
+        done
+        echo "[driver] Gemini config:${gemini_env}"
+    fi
+    local remote_command="export PRINT_CMD=0 MASTER_PORT=$port$frcheck_env$gemini_env; ./$script {R} save --train-iters 10"
     (
         local remote_pid local_pid remote_rc local_rc
         trap 'kill "${remote_pid:-}" "${local_pid:-}" 2>/dev/null || true' INT TERM
@@ -202,12 +267,19 @@ run_training() {
             set -o pipefail
             cd "$WORKDIR"
             env PRINT_CMD=0 MASTER_PORT="$port" \
+                "${gemini_env_args[@]}" \
                 FRCHECK_LAYER_EXCHANGE_SEG="${FRCHECK_LAYER_EXCHANGE_SEG:-12}" \
-                FRCHECK_LAYER_ENCODE_BATCH="${FRCHECK_LAYER_ENCODE_BATCH:-12}" \
+                FRCHECK_LAYER_EXCHANGE_CHUNK_MB="${FRCHECK_LAYER_EXCHANGE_CHUNK_MB:-32}" \
+                FRCHECK_LAYER_FRONTIER_ORDER="${FRCHECK_LAYER_FRONTIER_ORDER:-chunk_layer_sid}" \
+                FRCHECK_LAYER_ENCODE_BATCH="${FRCHECK_LAYER_ENCODE_BATCH:-24}" \
+                FRCHECK_LAYER_ENCODE_SUBMIT_WORKER="${FRCHECK_LAYER_ENCODE_SUBMIT_WORKER:-0}" \
+                FRCHECK_LAYER_ENCODE_ADAPTIVE="${FRCHECK_LAYER_ENCODE_ADAPTIVE:-0}" \
+                FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER="${FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER:-3}" \
                 FRCHECK_TRACE_INIT="${FRCHECK_TRACE_INIT:-0}" \
                 FRCHECK_GDR="${FRCHECK_GDR:-0}" \
                 FRCHECK_ASYNC_PARITY="${FRCHECK_ASYNC_PARITY:-1}" \
-                "./$script" 0 save 2>&1 | awk '{ print "[node0 rank=0]", $0; fflush(); }'
+                FRCHECK_SAVE_PREFER_TORCH_PINNED="${FRCHECK_SAVE_PREFER_TORCH_PINNED:-0}" \
+                "./$script" 0 save --train-iters 10 2>&1 | awk '{ print "[node0 rank=0]", $0; fflush(); }'
             exit "${PIPESTATUS[0]}"
         ) &
         local_pid=$!

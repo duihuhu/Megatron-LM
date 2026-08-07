@@ -3,7 +3,18 @@
 set -uo pipefail
 
 WORKDIR="/workspace/Megatron-LM"
-SCRIPT_DIR="pre-tests/gpt2/para_a800/10B-4nodes"
+MODEL_SIZE="${MODEL_SIZE:-10B}"
+case "$MODEL_SIZE" in
+    2.7B) MODEL_DIR=2.7B-4nodes; MODEL_SLUG=2.7b ;;
+    7B) MODEL_DIR=7B-4nodes; MODEL_SLUG=7b ;;
+    10B) MODEL_DIR=10B-4nodes; MODEL_SLUG=10b ;;
+    14B) MODEL_DIR=14B-4nodes; MODEL_SLUG=14b ;;
+    20B) MODEL_DIR=20B-4nodes; MODEL_SLUG=20b ;;
+    *) echo "MODEL_SIZE must be 2.7B, 7B, 10B, 14B, or 20B." >&2; exit 2 ;;
+esac
+SCRIPT_DIR="pre-tests/gpt2/para_a800/$MODEL_DIR"
+CHECKPOINT_PREFIX="/dev/shm/models/gpt2-$MODEL_SLUG-4nodes"
+SWEEP_TAG="${MODEL_SLUG}_inprocess_sweep"
 HOSTS=(node1 node2 node3)
 ALL_NODES=(node0 node1 node2 node3)
 SSH_USER="${SSH_USER:-root}"
@@ -11,9 +22,17 @@ SSH_PORT="${SSH_PORT:-2222}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
 SSH_IDENTITY_FILE="${SSH_IDENTITY_FILE:-$HOME/.ssh/id_ed25519}"
 RUN_TIMEOUT_SECONDS="${RUN_TIMEOUT_SECONDS:-1800}"
+INPROCESS_REPEAT="${INPROCESS_REPEAT:-10}"
 DRY_RUN="${DRY_RUN:-0}"
 RECOVERY_MODES_RAW="${RECOVERY_MODES-inprocess_sw inprocess inprocess2}"
 TRAIN_ENV_PREFIX="${TRAIN_ENV_PREFIX:-}"
+GEMINI_ENV_VARS=(
+    GEMINI_GDR
+    GEMINI_GDR_MIRROR_MODE
+    GEMINI_GDR_BATCH_WR
+    GEMINI_MIRROR_CHUNK_MB
+    GEMINI_REPLICAS_CHANNELS_PER_PEER
+)
 
 DEFAULT_SCHEMES=(gemini2 gemini3 frcheck eccheck ecnaive)
 SELECTED_RECOVERY_MODES=()
@@ -27,11 +46,11 @@ declare -A SCRIPTS=(
     [ecnaive]="$SCRIPT_DIR/test_ecnaive.sh"
 )
 declare -A CHECKPOINT_PATHS=(
-    [gemini2]="/dev/shm/models/gpt2-10b-4nodes-gemini-2-replicas"
-    [gemini3]="/dev/shm/models/gpt2-10b-4nodes-gemini-3-replicas"
-    [frcheck]="/dev/shm/models/gpt2-10b-4nodes-frcheck"
-    [eccheck]="/dev/shm/models/gpt2-10b-4nodes-eccheck"
-    [ecnaive]="/dev/shm/models/gpt2-10b-4nodes-ecnaive"
+    [gemini2]="$CHECKPOINT_PREFIX-gemini-2-replicas"
+    [gemini3]="$CHECKPOINT_PREFIX-gemini-3-replicas"
+    [frcheck]="$CHECKPOINT_PREFIX-frcheck"
+    [eccheck]="$CHECKPOINT_PREFIX-eccheck"
+    [ecnaive]="$CHECKPOINT_PREFIX-ecnaive"
 )
 declare -A BASE_PORTS=(
     [gemini2]="${MASTER_PORT_GEMINI2:-6200}"
@@ -43,8 +62,10 @@ declare -A BASE_PORTS=(
 
 usage() {
     echo "Usage: $0 [--dry-run] [gemini2|gemini3|frcheck|eccheck|ecnaive ...]"
-    echo "Environment: LOG_DIR, RUN_TIMEOUT_SECONDS, DRY_RUN=0|1"
-    echo "             RECOVERY_MODES, TRAIN_ENV_PREFIX"
+    echo "Environment: MODEL_SIZE=2.7B|7B|10B|14B|20B, LOG_DIR, RUN_TIMEOUT_SECONDS, DRY_RUN=0|1"
+    echo "             RECOVERY_MODES, TRAIN_ENV_PREFIX, INPROCESS_REPEAT (positive integer, default: 10)"
+    echo "             GEMINI_GDR, GEMINI_GDR_MIRROR_MODE, GEMINI_GDR_BATCH_WR,"
+    echo "             GEMINI_MIRROR_CHUNK_MB, GEMINI_REPLICAS_CHANNELS_PER_PEER"
     echo "             SSH_USER, SSH_PORT, SSH_CONNECT_TIMEOUT, SSH_IDENTITY_FILE"
     echo "             MASTER_PORT_GEMINI2, MASTER_PORT_GEMINI3, MASTER_PORT_FRCHECK,"
     echo "             MASTER_PORT_ECCHECK, MASTER_PORT_ECNAIVE"
@@ -72,10 +93,30 @@ for mode in "${requested_recovery_modes[@]}"; do
     fi
 done
 [[ ${#SELECTED_RECOVERY_MODES[@]} -gt 0 ]] || { echo "RECOVERY_MODES must select at least one recovery mode." >&2; exit 2; }
+build_command_env_prefix() {
+    local scheme=$1 name value prefix="env ${TRAIN_ENV_PREFIX:+$TRAIN_ENV_PREFIX }"
+    if [[ "$scheme" == gemini2 || "$scheme" == gemini3 ]]; then
+        printf -v value '%q' "${GEMINI_GDR:-0}"
+        prefix+="GEMINI_GDR=$value "
+        for name in "${GEMINI_ENV_VARS[@]:1}"; do
+            if [[ -v $name ]]; then
+                printf -v value '%q' "${!name}"
+                prefix+="$name=$value "
+            fi
+        done
+    fi
+    printf '%s' "$prefix"
+}
+
 TRAIN_ENV_COMMAND_PREFIX="env ${TRAIN_ENV_PREFIX:+$TRAIN_ENV_PREFIX }"
+FRCHECK_HW2_ASYNC_OFF=0
+if [[ "${FRCHECK_RECOVERY_ASYNC_PARITY:-1}" == 0 || " $TRAIN_ENV_PREFIX " == *" FRCHECK_RECOVERY_ASYNC_PARITY=0 "* ]]; then
+    FRCHECK_HW2_ASYNC_OFF=1
+fi
 
 [[ "$DRY_RUN" == 0 || "$DRY_RUN" == 1 ]] || { echo "DRY_RUN must be 0 or 1." >&2; exit 2; }
 [[ "$RUN_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || { echo "RUN_TIMEOUT_SECONDS must be a positive integer." >&2; exit 2; }
+[[ "$INPROCESS_REPEAT" =~ ^[1-9][0-9]*$ ]] || { echo "INPROCESS_REPEAT must be a positive integer." >&2; exit 2; }
 for scheme in "${schemes[@]}"; do
     [[ "${BASE_PORTS[$scheme]}" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid base port for $scheme." >&2; exit 2; }
 done
@@ -90,8 +131,12 @@ ssh_run() {
 }
 
 validate_checkpoint_path() {
-    local checkpoint_path=$1
-    [[ -n "$checkpoint_path" && "$checkpoint_path" != "/" && "$checkpoint_path" == /dev/shm/models/gpt2-10b-4nodes-* ]]
+    local checkpoint_path=$1 scheme
+    [[ -n "$checkpoint_path" && "$checkpoint_path" != "/" ]] || return 1
+    for scheme in "${DEFAULT_SCHEMES[@]}"; do
+        [[ "$checkpoint_path" == "${CHECKPOINT_PATHS[$scheme]}" ]] && return 0
+    done
+    return 1
 }
 
 training_processes() {
@@ -176,17 +221,23 @@ preflight() {
 preflight || exit 1
 
 print_dry_run() {
-    local scheme mode script path base port
+    local scheme mode script path base port command_env_prefix
     echo "Dry-run command plan: recovery_modes=$(IFS=:; echo "${SELECTED_RECOVERY_MODES[*]}") train_env_prefix=${TRAIN_ENV_PREFIX:-<empty>}"
     for scheme in "${schemes[@]}"; do
         script=${SCRIPTS[$scheme]}; path=${CHECKPOINT_PATHS[$scheme]}; base=${BASE_PORTS[$scheme]}
+        command_env_prefix=$(build_command_env_prefix "$scheme")
         echo "SCHEME=$scheme PATH=$path BASE_PORT=$base"
+        if [[ "$scheme" == gemini2 || "$scheme" == gemini3 ]]; then
+            echo "  gemini_config: ${command_env_prefix#env ${TRAIN_ENV_PREFIX:+$TRAIN_ENV_PREFIX }}"
+        fi
         for mode in save "${SELECTED_RECOVERY_MODES[@]}"; do
             port=$((base + MODE_OFFSETS[$mode]))
             if [[ "$scheme" == gemini2 && "$mode" == inprocess2 ]]; then
-                echo "  node0-only expected unsupported: ${TRAIN_ENV_COMMAND_PREFIX}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=10 MASTER_PORT=$port ./$script 0 $mode --train-iters 2"
+                echo "  node0-only expected unsupported: ${command_env_prefix}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=$INPROCESS_REPEAT MASTER_PORT=$port ./$script 0 $mode --train-iters 2"
+            elif [[ "$scheme" == frcheck && "$mode" == inprocess2 && "$FRCHECK_HW2_ASYNC_OFF" == 1 ]]; then
+                echo "  not required: FRCheck HW2 with recovery async parity off"
             else
-                echo "  four-node: ${TRAIN_ENV_COMMAND_PREFIX}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=10 MASTER_PORT=$port ./$script {R} $mode --train-iters 2"
+                echo "  four-node: ${command_env_prefix}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=$INPROCESS_REPEAT MASTER_PORT=$port ./$script {R} $mode --train-iters 2"
             fi
         done
         echo "  cleanup before save and after all recovery modes: $path on node0,node1,node2,node3"
@@ -199,7 +250,7 @@ if [[ "$DRY_RUN" == 1 ]]; then
 fi
 
 UTC_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
-LOG_DIR="${LOG_DIR:-$WORKDIR/logs/10b_inprocess_sweep/$UTC_TIMESTAMP}"
+LOG_DIR="${LOG_DIR:-$WORKDIR/logs/${SWEEP_TAG}/$UTC_TIMESTAMP}"
 python3 -c 'from pathlib import Path; import sys; Path(sys.argv[1]).mkdir(parents=True, exist_ok=True)' "$LOG_DIR" || exit 1
 [[ -d "$LOG_DIR" ]] || { echo "Failed to create log directory: $LOG_DIR" >&2; exit 1; }
 SUMMARY_LOG="$LOG_DIR/summary.log"
@@ -383,7 +434,7 @@ run_four_nodes() {
         return 0
     fi
 
-    local script workdir remote_command local_command timeout_seconds
+    local script workdir remote_command local_command timeout_seconds command_env_prefix
     local ssh_user ssh_port ssh_timeout ssh_key self_test_case
     workdir=${WORKDIR:-$PWD}
     timeout_seconds=${RUN_TIMEOUT_SECONDS:-30}
@@ -402,13 +453,14 @@ EOF
         script=self_test
     else
         script=${SCRIPTS[$scheme]:?}
-        remote_command="${TRAIN_ENV_COMMAND_PREFIX}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=10 MASTER_PORT=$port SWEEP_RUN_TAG=$tag SWEEP_SCRIPT=$script SWEEP_MODE=$mode ./$script {R} $mode --train-iters 2"
-        local_command="${TRAIN_ENV_COMMAND_PREFIX}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=10 MASTER_PORT=$port SWEEP_RUN_TAG=$tag SWEEP_SCRIPT=$script SWEEP_MODE=$mode ./$script 0 $mode --train-iters 2"
+        command_env_prefix=$(build_command_env_prefix "$scheme")
+        remote_command="${command_env_prefix}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=$INPROCESS_REPEAT MASTER_PORT=$port SWEEP_RUN_TAG=$tag SWEEP_SCRIPT=$script SWEEP_MODE=$mode ./$script {R} $mode --train-iters 2"
+        local_command="${command_env_prefix}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=$INPROCESS_REPEAT MASTER_PORT=$port SWEEP_RUN_TAG=$tag SWEEP_SCRIPT=$script SWEEP_MODE=$mode ./$script 0 $mode --train-iters 2"
     fi
 
     {
-        echo "COMMAND,scope=remote,nodes=node1:node2:node3,scheme=$scheme,mode=$mode,repeat=10,train_iters=2,port=$port,command=$remote_command"
-        echo "COMMAND,scope=local,node=node0,scheme=$scheme,mode=$mode,repeat=10,train_iters=2,port=$port,command=$local_command"
+        echo "COMMAND,scope=remote,nodes=node1:node2:node3,scheme=$scheme,mode=$mode,repeat=$INPROCESS_REPEAT,train_iters=2,port=$port,command=$remote_command"
+        echo "COMMAND,scope=local,node=node0,scheme=$scheme,mode=$mode,repeat=$INPROCESS_REPEAT,train_iters=2,port=$port,command=$local_command"
     } >"$log"
 
     run_four_nodes_launcher() {
@@ -524,9 +576,10 @@ EOF
 }
 
 run_expected_unsupported() {
-    local scheme=$1 mode=$2 port=$3 log=$4 tag=$5 script=${SCRIPTS[$1]} command
-    command="${TRAIN_ENV_COMMAND_PREFIX}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=10 MASTER_PORT=$port SWEEP_RUN_TAG=$tag SWEEP_SCRIPT=$script SWEEP_MODE=$mode ./$script 0 $mode --train-iters 2"
-    echo "COMMAND,scope=local,node=node0,scheme=$scheme,mode=$mode,repeat=10,train_iters=2,port=$port,command=$command" >"$log"
+    local scheme=$1 mode=$2 port=$3 log=$4 tag=$5 script=${SCRIPTS[$1]} command command_env_prefix
+    command_env_prefix=$(build_command_env_prefix "$scheme")
+    command="${command_env_prefix}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=$INPROCESS_REPEAT MASTER_PORT=$port SWEEP_RUN_TAG=$tag SWEEP_SCRIPT=$script SWEEP_MODE=$mode ./$script 0 $mode --train-iters 2"
+    echo "COMMAND,scope=local,node=node0,scheme=$scheme,mode=$mode,repeat=$INPROCESS_REPEAT,train_iters=2,port=$port,command=$command" >"$log"
     timeout --signal=TERM --kill-after=10s "$RUN_TIMEOUT_SECONDS" bash -c 'cd "$1" && bash -lc "$2"' _ "$WORKDIR" "$command" 2>&1 | tee -a "$log"
     local rc=${PIPESTATUS[0]}
     if [[ $rc -eq 124 || $rc -eq 137 || $rc -eq 143 ]]; then terminate_owned_run "$tag"; fi
@@ -554,12 +607,13 @@ count_log_matches() {
 }
 
 record_shm_available
-summary "SWEEP,status=started,utc=$UTC_TIMESTAMP,schemes=$(IFS=:; echo "${schemes[*]}"),recovery_modes=$(IFS=:; echo "${SELECTED_RECOVERY_MODES[*]}"),train_env_prefix=${TRAIN_ENV_PREFIX:-<empty>},repeat=10,train_iters=2,timeout_seconds=$RUN_TIMEOUT_SECONDS,log_dir=$LOG_DIR"
+summary "SWEEP,status=started,utc=$UTC_TIMESTAMP,schemes=$(IFS=:; echo "${schemes[*]}"),recovery_modes=$(IFS=:; echo "${SELECTED_RECOVERY_MODES[*]}"),train_env_prefix=${TRAIN_ENV_PREFIX:-<empty>},repeat=$INPROCESS_REPEAT,train_iters=2,timeout_seconds=$RUN_TIMEOUT_SECONDS,log_dir=$LOG_DIR"
 overall_status=0
 
 for scheme in "${schemes[@]}"; do
     script=${SCRIPTS[$scheme]}
     base=${BASE_PORTS[$scheme]}
+    command_env_prefix=$(build_command_env_prefix "$scheme")
     scheme_failed=0
     summary "SCHEME,scheme=$scheme,status=started,utc=$(utc_now),base_port=$base,path=${CHECKPOINT_PATHS[$scheme]}"
 
@@ -568,17 +622,17 @@ for scheme in "${schemes[@]}"; do
 
     save_log="$LOG_DIR/${scheme}_save.log"
     save_port=$((base + MODE_OFFSETS[save]))
-    save_tag="10b_inprocess_sweep_${UTC_TIMESTAMP}_${scheme}_save_${save_port}"
+    save_tag="${SWEEP_TAG}_${UTC_TIMESTAMP}_${scheme}_save_${save_port}"
     save_start_utc=$(utc_now); save_start_epoch=$(epoch_now)
     save_rc=1; iter_status=failed
-    save_planned="${TRAIN_ENV_COMMAND_PREFIX}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=10 MASTER_PORT=$save_port SWEEP_RUN_TAG=$save_tag SWEEP_SCRIPT=$script SWEEP_MODE=save ./$script {R} save --train-iters 2"
+    save_planned="${command_env_prefix}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=$INPROCESS_REPEAT MASTER_PORT=$save_port SWEEP_RUN_TAG=$save_tag SWEEP_SCRIPT=$script SWEEP_MODE=save ./$script {R} save --train-iters 2"
     if [[ $pre_cleanup_ok -eq 0 ]]; then
-        printf '%s\n%s\n' "COMMAND,scope=four_nodes,scheme=$scheme,mode=save,repeat=10,train_iters=2,port=$save_port,command=$save_planned" "COMMAND_SKIPPED,reason=pre_cleanup_failed" >"$save_log"
+        printf '%s\n%s\n' "COMMAND,scope=four_nodes,scheme=$scheme,mode=save,repeat=$INPROCESS_REPEAT,train_iters=2,port=$save_port,command=$save_planned" "COMMAND_SKIPPED,reason=pre_cleanup_failed" >"$save_log"
     elif check_before_run "$scheme" save; then
         run_four_nodes "$scheme" save "$save_port" "$save_log" "$save_tag"; save_rc=$?
         if [[ $save_rc -eq 0 ]] && validate_checkpoint "$scheme"; then iter_status=success; fi
     else
-        printf '%s\n%s\n' "COMMAND,scope=four_nodes,scheme=$scheme,mode=save,repeat=10,train_iters=2,port=$save_port,command=$save_planned" "COMMAND_SKIPPED,reason=training_process_found" >"$save_log"
+        printf '%s\n%s\n' "COMMAND,scope=four_nodes,scheme=$scheme,mode=save,repeat=$INPROCESS_REPEAT,train_iters=2,port=$save_port,command=$save_planned" "COMMAND_SKIPPED,reason=training_process_found" >"$save_log"
     fi
     save_end_epoch=$(epoch_now); save_end_utc=$(utc_now)
     if [[ $save_rc -eq 0 && "$iter_status" == success ]]; then
@@ -593,13 +647,17 @@ for scheme in "${schemes[@]}"; do
         for mode in "${SELECTED_RECOVERY_MODES[@]}"; do
             port=$((base + MODE_OFFSETS[$mode]))
             log="$LOG_DIR/${scheme}_${MODE_LABELS[$mode]}.log"
-            tag="10b_inprocess_sweep_${UTC_TIMESTAMP}_${scheme}_${mode}_${port}"
+            tag="${SWEEP_TAG}_${UTC_TIMESTAMP}_${scheme}_${mode}_${port}"
             start_utc=$(utc_now); start_epoch=$(epoch_now)
-            rc=1; status=failed; run10_count=0; recovery_forward_count=0
+            rc=1; status=failed; target_run_count=0; run10_count=0; recovery_forward_count=0
 
-            if ! check_before_run "$scheme" "$mode" "$previous_tag"; then
-                planned="${TRAIN_ENV_COMMAND_PREFIX}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=10 MASTER_PORT=$port SWEEP_RUN_TAG=$tag SWEEP_SCRIPT=$script SWEEP_MODE=$mode ./$script {R} $mode --train-iters 2"
-                printf '%s\n%s\n' "COMMAND,scope=four_nodes,scheme=$scheme,mode=$mode,repeat=10,train_iters=2,port=$port,command=$planned" "COMMAND_SKIPPED,reason=training_process_found" >"$log"
+            if [[ "$scheme" == frcheck && "$mode" == inprocess2 && "$FRCHECK_HW2_ASYNC_OFF" == 1 ]]; then
+                printf '%s\n' "COMMAND_SKIPPED,reason=frcheck_hw2_async_off_not_required" >"$log"
+                rc=0
+                status=not_required
+            elif ! check_before_run "$scheme" "$mode" "$previous_tag"; then
+                planned="${command_env_prefix}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=$INPROCESS_REPEAT MASTER_PORT=$port SWEEP_RUN_TAG=$tag SWEEP_SCRIPT=$script SWEEP_MODE=$mode ./$script {R} $mode --train-iters 2"
+                printf '%s\n%s\n' "COMMAND,scope=four_nodes,scheme=$scheme,mode=$mode,repeat=$INPROCESS_REPEAT,train_iters=2,port=$port,command=$planned" "COMMAND_SKIPPED,reason=training_process_found" >"$log"
                 overall_status=1; scheme_failed=1
             elif [[ "$scheme" == gemini2 && "$mode" == inprocess2 ]]; then
                 run_expected_unsupported "$scheme" "$mode" "$port" "$log" "$tag"; rc=$?
@@ -610,15 +668,16 @@ for scheme in "${schemes[@]}"; do
                 fi
             else
                 run_four_nodes "$scheme" "$mode" "$port" "$log" "$tag"; rc=$?
-                run10_count=$(count_log_matches 'FT in-process recovery benchmark: run=10/10' "$log")
+                target_run_count=$(count_log_matches "FT in-process recovery benchmark: run=$INPROCESS_REPEAT/$INPROCESS_REPEAT" "$log")
+                run10_count=$target_run_count
                 recovery_forward_count=$(count_log_matches ' forward max: forward_failed_max_s=' "$log")
-                if [[ $recovery_forward_count -lt 10 ]]; then
+                if [[ $recovery_forward_count -lt $INPROCESS_REPEAT ]]; then
                     legacy_recovery_forward_count=$(count_log_matches 'recovery-to-forward' "$log")
                     if [[ $legacy_recovery_forward_count -gt $recovery_forward_count ]]; then
                         recovery_forward_count=$legacy_recovery_forward_count
                     fi
                 fi
-                if [[ $rc -eq 0 && $run10_count -ge 1 && $recovery_forward_count -ge 10 ]]; then
+                if [[ $rc -eq 0 && $target_run_count -ge 1 && $recovery_forward_count -ge $INPROCESS_REPEAT ]]; then
                     status=success
                 else
                     overall_status=1; scheme_failed=1
@@ -626,15 +685,15 @@ for scheme in "${schemes[@]}"; do
             fi
             previous_tag=$tag
             end_epoch=$(epoch_now); end_utc=$(utc_now)
-            summary "RUN,scheme=$scheme,mode=$mode,status=$status,exit=$rc,run10_count=$run10_count,recovery_forward_count=$recovery_forward_count,port=$port,start_utc=$start_utc,end_utc=$end_utc,duration_seconds=$((end_epoch-start_epoch)),log=$log"
+            summary "RUN,scheme=$scheme,mode=$mode,status=$status,exit=$rc,target_run_count=$target_run_count,run10_count=$run10_count,recovery_forward_count=$recovery_forward_count,port=$port,start_utc=$start_utc,end_utc=$end_utc,duration_seconds=$((end_epoch-start_epoch)),log=$log"
         done
     else
         for mode in "${SELECTED_RECOVERY_MODES[@]}"; do
             port=$((base + MODE_OFFSETS[$mode]))
             log="$LOG_DIR/${scheme}_${MODE_LABELS[$mode]}.log"
-            planned="${TRAIN_ENV_COMMAND_PREFIX}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=10 MASTER_PORT=$port SWEEP_RUN_TAG=not_run SWEEP_SCRIPT=$script SWEEP_MODE=$mode ./$script {R} $mode --train-iters 2"
-            printf '%s\n%s\n' "COMMAND,scope=four_nodes,scheme=$scheme,mode=$mode,repeat=10,train_iters=2,port=$port,command=$planned" "COMMAND_SKIPPED,reason=save_failed" >"$log"
-            summary "RUN,scheme=$scheme,mode=$mode,status=failed,exit=not_run,run10_count=0,recovery_forward_count=0,port=$port,start_utc=$(utc_now),end_utc=$(utc_now),duration_seconds=0,log=$log,reason=save_failed"
+            planned="${command_env_prefix}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=$INPROCESS_REPEAT MASTER_PORT=$port SWEEP_RUN_TAG=not_run SWEEP_SCRIPT=$script SWEEP_MODE=$mode ./$script {R} $mode --train-iters 2"
+            printf '%s\n%s\n' "COMMAND,scope=four_nodes,scheme=$scheme,mode=$mode,repeat=$INPROCESS_REPEAT,train_iters=2,port=$port,command=$planned" "COMMAND_SKIPPED,reason=save_failed" >"$log"
+            summary "RUN,scheme=$scheme,mode=$mode,status=failed,exit=not_run,target_run_count=0,run10_count=0,recovery_forward_count=0,port=$port,start_utc=$(utc_now),end_utc=$(utc_now),duration_seconds=0,log=$log,reason=save_failed"
         done
     fi
 

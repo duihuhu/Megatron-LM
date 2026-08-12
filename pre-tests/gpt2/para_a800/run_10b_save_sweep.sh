@@ -24,6 +24,8 @@ SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
 SSH_IDENTITY_FILE="${SSH_IDENTITY_FILE:-$HOME/.ssh/id_ed25519}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+RDMA_HCA_PROFILE="${RDMA_HCA_PROFILE:-full}"
+ECCHECK_DATA_BUFFERS_COUNT="${ECCHECK_DATA_BUFFERS_COUNT:-12}"
 GEMINI_ENV_VARS=(
     GEMINI_GDR
     GEMINI_GDR_MIRROR_MODE
@@ -38,7 +40,7 @@ GEMINI_ENV_VARS=(
 
 build_gemini_env_prefix() {
     local name value prefix=""
-    printf -v value '%q' "${GEMINI_GDR:-0}"
+    printf -v value '%q' "${GEMINI_GDR:-1}"
     prefix="GEMINI_GDR=$value"
     for name in "${GEMINI_ENV_VARS[@]:1}"; do
         if [[ -v $name ]]; then
@@ -75,11 +77,16 @@ declare -A MASTER_PORTS=(
 usage() {
     echo "Usage: $0 [--dry-run] [gemini2|gemini3|frcheck|eccheck|ecnaive ...]"
     echo "Environment: MODEL_SIZE=2.7B|7B|10B|14B|20B, LOG_DIR, CONTINUE_ON_ERROR=0|1, DRY_RUN=0|1"
+    echo "             RDMA_HCA_PROFILE=full|half|quarter (default: full)"
+    echo "             ECCHECK_DATA_BUFFERS_COUNT (default: 12; positive integer)"
     echo "             SSH_USER, SSH_PORT, SSH_CONNECT_TIMEOUT, SSH_IDENTITY_FILE"
     echo "             MASTER_PORT_GEMINI2, MASTER_PORT_GEMINI3, MASTER_PORT_FRCHECK,"
     echo "             MASTER_PORT_ECCHECK, MASTER_PORT_ECNAIVE"
     echo "             FRCHECK_LAYER_FRONTIER_ORDER (default: chunk_layer_sid)"
     echo "             FRCHECK_SAVE_PREFER_TORCH_PINNED=0|1 (default: 0)"
+    echo "             FRCHECK_LAYER_STREAM_ENCODE (default: 1), FRCHECK_LAYER_ENCODE_COALESCE_US (default: 0)"
+    echo "             FRCHECK_SEND_LANES_PER_PEER (default: 12), FRCHECK_RECV_LANES_PER_PEER (default: 12)"
+    echo "             FRCHECK_NET_PHYSICAL_CORES (default: 0), FRCHECK_RDMA_CHUNK_MB (default: 64)"
     echo "             GEMINI_GDR, GEMINI_GDR_MIRROR_MODE, GEMINI_GDR_BATCH_WR,"
     echo "             GEMINI_MIRROR_CHUNK_MB, GEMINI_REPLICAS_CHANNELS_PER_PEER,"
     echo "             GEMINI_SAVE_PREFER_TORCH_PINNED, GEMINI_PIPELINE_CHUNK_MB,"
@@ -104,6 +111,16 @@ done
     echo "DRY_RUN must be 0 or 1." >&2
     exit 2
 }
+[[ "$RDMA_HCA_PROFILE" == full || "$RDMA_HCA_PROFILE" == half || "$RDMA_HCA_PROFILE" == quarter ]] || {
+    echo "RDMA_HCA_PROFILE must be full, half, or quarter." >&2
+    exit 2
+}
+for scheme in "${schemes[@]}"; do
+    if [[ "$scheme" == eccheck && ! "$ECCHECK_DATA_BUFFERS_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ECCHECK_DATA_BUFFERS_COUNT must be a positive integer." >&2
+        exit 2
+    fi
+done
 
 SSH_OPTIONS=(-n -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -o StrictHostKeyChecking=accept-new)
 [[ -z "$SSH_IDENTITY_FILE" ]] || SSH_OPTIONS+=(-i "$SSH_IDENTITY_FILE")
@@ -173,19 +190,24 @@ if [[ "$DRY_RUN" == 1 ]]; then
         script=${SCRIPTS[$scheme]}
         checkpoint_path=${CHECKPOINT_PATHS[$scheme]}
         port=${MASTER_PORTS[$scheme]}
-        echo "SCHEME=$scheme PORT=$port PATH=$checkpoint_path"
+        echo "SCHEME=$scheme PORT=$port PATH=$checkpoint_path RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE"
         gemini_env=""
         frcheck_env=""
+        eccheck_env=""
         if [[ "$scheme" == frcheck ]]; then
-            frcheck_env="FRCHECK_SAVE_PREFER_TORCH_PINNED=${FRCHECK_SAVE_PREFER_TORCH_PINNED:-0} "
+            frcheck_env="FRCHECK_SAVE_PREFER_TORCH_PINNED=${FRCHECK_SAVE_PREFER_TORCH_PINNED:-0} FRCHECK_LAYER_STREAM_ENCODE=${FRCHECK_LAYER_STREAM_ENCODE:-1} FRCHECK_LAYER_ENCODE_COALESCE_US=${FRCHECK_LAYER_ENCODE_COALESCE_US:-0} FRCHECK_SEND_LANES_PER_PEER=${FRCHECK_SEND_LANES_PER_PEER:-12} FRCHECK_RECV_LANES_PER_PEER=${FRCHECK_RECV_LANES_PER_PEER:-12} FRCHECK_NET_PHYSICAL_CORES=${FRCHECK_NET_PHYSICAL_CORES:-0} FRCHECK_RDMA_CHUNK_MB=${FRCHECK_RDMA_CHUNK_MB:-64} "
             echo "  frcheck_config: ${frcheck_env% }"
         fi
         if [[ "$scheme" == gemini2 || "$scheme" == gemini3 ]]; then
             gemini_env="$(build_gemini_env_prefix) "
             echo "  gemini_config: ${gemini_env% }"
         fi
-        echo "  remote: ${frcheck_env}${gemini_env}MASTER_PORT=$port ./$script {R} save --train-iters 10"
-        echo "  local:  ${frcheck_env}${gemini_env}MASTER_PORT=$port ./$script 0 save --train-iters 10"
+        if [[ "$scheme" == eccheck ]]; then
+            eccheck_env="ECCHECK_DATA_BUFFERS_COUNT=$ECCHECK_DATA_BUFFERS_COUNT "
+            echo "  eccheck_config: ${eccheck_env% }"
+        fi
+        echo "  remote: RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE ${frcheck_env}${gemini_env}${eccheck_env}MASTER_PORT=$port ./$script {R} save --train-iters 10"
+        echo "  local:  RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE ${frcheck_env}${gemini_env}${eccheck_env}MASTER_PORT=$port ./$script 0 save --train-iters 10"
         echo "  cleanup: rm -rf -- $checkpoint_path on node0,node1,node2,node3"
     done
     exit 0
@@ -241,21 +263,27 @@ trap terminate_jobs INT TERM
 run_training() {
     local scheme=$1 script=${SCRIPTS[$1]} port=${MASTER_PORTS[$1]}
     local scheme_log="$LOG_DIR/$scheme.log"
-    local frcheck_env="" gemini_env="" name
-    local -a gemini_env_args=()
+    local frcheck_env="" gemini_env="" eccheck_env="" name
+    local -a gemini_env_args=() eccheck_env_args=()
+    echo "[driver] RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE"
     if [[ "$scheme" == frcheck ]]; then
         echo "[driver] FRCHECK_LAYER_FRONTIER_ORDER=${FRCHECK_LAYER_FRONTIER_ORDER:-chunk_layer_sid}"
-        frcheck_env=" FRCHECK_LAYER_EXCHANGE_SEG=${FRCHECK_LAYER_EXCHANGE_SEG:-12} FRCHECK_LAYER_EXCHANGE_CHUNK_MB=${FRCHECK_LAYER_EXCHANGE_CHUNK_MB:-32} FRCHECK_LAYER_FRONTIER_ORDER=${FRCHECK_LAYER_FRONTIER_ORDER:-chunk_layer_sid} FRCHECK_LAYER_ENCODE_BATCH=${FRCHECK_LAYER_ENCODE_BATCH:-24} FRCHECK_LAYER_ENCODE_SUBMIT_WORKER=${FRCHECK_LAYER_ENCODE_SUBMIT_WORKER:-0} FRCHECK_LAYER_ENCODE_ADAPTIVE=${FRCHECK_LAYER_ENCODE_ADAPTIVE:-0} FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER=${FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER:-3} FRCHECK_TRACE_INIT=${FRCHECK_TRACE_INIT:-0} FRCHECK_GDR=${FRCHECK_GDR:-0} FRCHECK_ASYNC_PARITY=${FRCHECK_ASYNC_PARITY:-1} FRCHECK_SAVE_PREFER_TORCH_PINNED=${FRCHECK_SAVE_PREFER_TORCH_PINNED:-0}"
+        frcheck_env=" FRCHECK_LAYER_EXCHANGE_SEG=${FRCHECK_LAYER_EXCHANGE_SEG:-12} FRCHECK_LAYER_EXCHANGE_CHUNK_MB=${FRCHECK_LAYER_EXCHANGE_CHUNK_MB:-32} FRCHECK_LAYER_FRONTIER_ORDER=${FRCHECK_LAYER_FRONTIER_ORDER:-chunk_layer_sid} FRCHECK_LAYER_ENCODE_BATCH=${FRCHECK_LAYER_ENCODE_BATCH:-24} FRCHECK_LAYER_ENCODE_SUBMIT_WORKER=${FRCHECK_LAYER_ENCODE_SUBMIT_WORKER:-0} FRCHECK_LAYER_ENCODE_ADAPTIVE=${FRCHECK_LAYER_ENCODE_ADAPTIVE:-0} FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER=${FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER:-3} FRCHECK_LAYER_STREAM_ENCODE=${FRCHECK_LAYER_STREAM_ENCODE:-1} FRCHECK_LAYER_ENCODE_COALESCE_US=${FRCHECK_LAYER_ENCODE_COALESCE_US:-0} FRCHECK_SEND_LANES_PER_PEER=${FRCHECK_SEND_LANES_PER_PEER:-12} FRCHECK_RECV_LANES_PER_PEER=${FRCHECK_RECV_LANES_PER_PEER:-12} FRCHECK_NET_PHYSICAL_CORES=${FRCHECK_NET_PHYSICAL_CORES:-0} FRCHECK_RDMA_CHUNK_MB=${FRCHECK_RDMA_CHUNK_MB:-64} FRCHECK_TRACE_INIT=${FRCHECK_TRACE_INIT:-0} FRCHECK_GDR=${FRCHECK_GDR:-0} FRCHECK_ASYNC_PARITY=${FRCHECK_ASYNC_PARITY:-1} FRCHECK_SAVE_PREFER_TORCH_PINNED=${FRCHECK_SAVE_PREFER_TORCH_PINNED:-0}"
     fi
     if [[ "$scheme" == gemini2 || "$scheme" == gemini3 ]]; then
         gemini_env=" $(build_gemini_env_prefix)"
-        gemini_env_args+=("GEMINI_GDR=${GEMINI_GDR:-0}")
+        gemini_env_args+=("GEMINI_GDR=${GEMINI_GDR:-1}")
         for name in "${GEMINI_ENV_VARS[@]:1}"; do
             [[ ! -v $name ]] || gemini_env_args+=("$name=${!name}")
         done
         echo "[driver] Gemini config:${gemini_env}"
     fi
-    local remote_command="export PRINT_CMD=0 MASTER_PORT=$port$frcheck_env$gemini_env; ./$script {R} save --train-iters 10"
+    if [[ "$scheme" == eccheck ]]; then
+        eccheck_env=" ECCHECK_DATA_BUFFERS_COUNT=$ECCHECK_DATA_BUFFERS_COUNT"
+        eccheck_env_args+=("ECCHECK_DATA_BUFFERS_COUNT=$ECCHECK_DATA_BUFFERS_COUNT")
+        echo "[driver] ECCHECK config:${eccheck_env}"
+    fi
+    local remote_command="export PRINT_CMD=0 MASTER_PORT=$port RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE$frcheck_env$gemini_env$eccheck_env; ./$script {R} save --train-iters 10"
     (
         local remote_pid local_pid remote_rc local_rc
         trap 'kill "${remote_pid:-}" "${local_pid:-}" 2>/dev/null || true' INT TERM
@@ -266,8 +294,9 @@ run_training() {
         (
             set -o pipefail
             cd "$WORKDIR"
-            env PRINT_CMD=0 MASTER_PORT="$port" \
+            env PRINT_CMD=0 MASTER_PORT="$port" RDMA_HCA_PROFILE="$RDMA_HCA_PROFILE" \
                 "${gemini_env_args[@]}" \
+                "${eccheck_env_args[@]}" \
                 FRCHECK_LAYER_EXCHANGE_SEG="${FRCHECK_LAYER_EXCHANGE_SEG:-12}" \
                 FRCHECK_LAYER_EXCHANGE_CHUNK_MB="${FRCHECK_LAYER_EXCHANGE_CHUNK_MB:-32}" \
                 FRCHECK_LAYER_FRONTIER_ORDER="${FRCHECK_LAYER_FRONTIER_ORDER:-chunk_layer_sid}" \
@@ -275,8 +304,14 @@ run_training() {
                 FRCHECK_LAYER_ENCODE_SUBMIT_WORKER="${FRCHECK_LAYER_ENCODE_SUBMIT_WORKER:-0}" \
                 FRCHECK_LAYER_ENCODE_ADAPTIVE="${FRCHECK_LAYER_ENCODE_ADAPTIVE:-0}" \
                 FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER="${FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER:-3}" \
+                FRCHECK_LAYER_STREAM_ENCODE="${FRCHECK_LAYER_STREAM_ENCODE:-1}" \
+                FRCHECK_LAYER_ENCODE_COALESCE_US="${FRCHECK_LAYER_ENCODE_COALESCE_US:-0}" \
+                FRCHECK_SEND_LANES_PER_PEER="${FRCHECK_SEND_LANES_PER_PEER:-12}" \
+                FRCHECK_RECV_LANES_PER_PEER="${FRCHECK_RECV_LANES_PER_PEER:-12}" \
+                FRCHECK_NET_PHYSICAL_CORES="${FRCHECK_NET_PHYSICAL_CORES:-0}" \
+                FRCHECK_RDMA_CHUNK_MB="${FRCHECK_RDMA_CHUNK_MB:-64}" \
                 FRCHECK_TRACE_INIT="${FRCHECK_TRACE_INIT:-0}" \
-                FRCHECK_GDR="${FRCHECK_GDR:-0}" \
+                FRCHECK_GDR="${FRCHECK_GDR:-1}" \
                 FRCHECK_ASYNC_PARITY="${FRCHECK_ASYNC_PARITY:-1}" \
                 FRCHECK_SAVE_PREFER_TORCH_PINNED="${FRCHECK_SAVE_PREFER_TORCH_PINNED:-0}" \
                 "./$script" 0 save --train-iters 10 2>&1 | awk '{ print "[node0 rank=0]", $0; fflush(); }'
@@ -359,7 +394,7 @@ collect_sizes() {
 }
 
 record_shm_available
-summary "SWEEP,status=started,utc=$UTC_TIMESTAMP,schemes=$(IFS=:; echo "${schemes[*]}")"
+summary "SWEEP,status=started,utc=$UTC_TIMESTAMP,schemes=$(IFS=:; echo "${schemes[*]}"),rdma_hca_profile=$RDMA_HCA_PROFILE"
 overall_status=0
 for scheme in "${schemes[@]}"; do
     summary "SCHEME,scheme=$scheme,status=starting,master_port=${MASTER_PORTS[$scheme]}"

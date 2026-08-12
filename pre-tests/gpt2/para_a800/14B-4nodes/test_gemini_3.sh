@@ -38,7 +38,7 @@ export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
-GEMINI_GDR=${GEMINI_GDR:-0}
+GEMINI_GDR=${GEMINI_GDR:-1}
 GEMINI_GDR_ARGS=()
 case "$GEMINI_GDR" in
     0) export GEMINI_MIRROR_MODE=${GEMINI_MIRROR_MODE:-cpu_pipeline} ;;
@@ -99,16 +99,40 @@ fi
 
 GPUS_PER_NODE=${#GPU_IDS[@]}
 
+export RDMA_HCA_PROFILE=${RDMA_HCA_PROFILE:-full}
+case "$RDMA_HCA_PROFILE" in
+    full|half|quarter) ;;
+    *)
+        echo "Error: RDMA_HCA_PROFILE must be full, half, or quarter, got '$RDMA_HCA_PROFILE'." >&2
+        exit 2
+        ;;
+esac
+
 rdma_hca_for_gpu() {
     case "$1" in
-        0|1) echo mlx5_0 ;;
-        2|3) echo mlx5_1 ;;
-        4|5) echo mlx5_4 ;;
-        6|7) echo mlx5_5 ;;
+        [0-7]) ;;
         *)
             echo "Unsupported physical GPU id for RDMA binding: $1" >&2
             return 1
             ;;
+    esac
+
+    case "$RDMA_HCA_PROFILE" in
+        full)
+            case "$1" in
+                0|1) echo mlx5_0 ;;
+                2|3) echo mlx5_1 ;;
+                4|5) echo mlx5_4 ;;
+                6|7) echo mlx5_5 ;;
+            esac
+            ;;
+        half)
+            case "$1" in
+                0|1|2|3) echo mlx5_0 ;;
+                4|5|6|7) echo mlx5_4 ;;
+            esac
+            ;;
+        quarter) echo mlx5_0 ;;
     esac
 }
 
@@ -329,6 +353,7 @@ mkdir -p logs/csv
 
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
+    echo "RDMA_HCA_PROFILE: $RDMA_HCA_PROFILE"
     echo "Gemini GDR: requested=$GEMINI_GDR mirror_mode=${GEMINI_GDR_MIRROR_MODE:-${GEMINI_MIRROR_MODE}} batch_wr=$GEMINI_GDR_BATCH_WR_DISPLAY mirror_chunk_mb=${GEMINI_MIRROR_CHUNK_MB:-n/a} channels_per_peer=$GEMINI_REPLICAS_CHANNELS_PER_PEER"
     echo "Would run (Node $NODE_RANK, mode=$MODE): PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py ${GPT_ARGS[@]} ${DATA_ARGS[@]} ${MODEL_PARALLEL_ARGS[@]} ${EVAL_AND_LOGGING_ARGS[@]} ${RECOVERY_MODE_ARGS[@]} --distributed-backend nccl ${ARGS_TO_PASS[@]}"
     exit 0
@@ -336,6 +361,7 @@ fi
 # -------------------------------------------------------------------------
 
 echo "Starting Node $NODE_RANK with GPUs $CUDA_VISIBLE_DEVICES (Gemini Replicas Legacy, mode=$MODE)"
+echo "RDMA_HCA_PROFILE: $RDMA_HCA_PROFILE"
 echo "Gemini GDR: requested=$GEMINI_GDR mirror_mode=${GEMINI_GDR_MIRROR_MODE:-${GEMINI_MIRROR_MODE}} batch_wr=$GEMINI_GDR_BATCH_WR_DISPLAY mirror_chunk_mb=${GEMINI_MIRROR_CHUNK_MB:-n/a} channels_per_peer=$GEMINI_REPLICAS_CHANNELS_PER_PEER"
 echo "WORLD_SIZE=$WORLD_SIZE  GPUS_PER_NODE=$GPUS_PER_NODE  NNODES=$NNODES"
 echo "NCCL_DEBUG_FILE: $NCCL_DEBUG_FILE"

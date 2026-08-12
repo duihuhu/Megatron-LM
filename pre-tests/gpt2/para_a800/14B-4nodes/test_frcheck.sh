@@ -107,16 +107,40 @@ fi
 
 GPUS_PER_NODE=${#GPU_IDS[@]}
 
+export RDMA_HCA_PROFILE=${RDMA_HCA_PROFILE:-full}
+case "$RDMA_HCA_PROFILE" in
+    full|half|quarter) ;;
+    *)
+        echo "Error: RDMA_HCA_PROFILE must be full, half, or quarter, got '$RDMA_HCA_PROFILE'." >&2
+        exit 2
+        ;;
+esac
+
 rdma_hca_for_gpu() {
     case "$1" in
-        0|1) echo mlx5_0 ;;
-        2|3) echo mlx5_1 ;;
-        4|5) echo mlx5_4 ;;
-        6|7) echo mlx5_5 ;;
+        [0-7]) ;;
         *)
             echo "Unsupported physical GPU id for RDMA binding: $1" >&2
             return 1
             ;;
+    esac
+
+    case "$RDMA_HCA_PROFILE" in
+        full)
+            case "$1" in
+                0|1) echo mlx5_0 ;;
+                2|3) echo mlx5_1 ;;
+                4|5) echo mlx5_4 ;;
+                6|7) echo mlx5_5 ;;
+            esac
+            ;;
+        half)
+            case "$1" in
+                0|1|2|3) echo mlx5_0 ;;
+                4|5|6|7) echo mlx5_4 ;;
+            esac
+            ;;
+        quarter) echo mlx5_0 ;;
     esac
 }
 
@@ -413,8 +437,8 @@ exec taskset -c "$process_cpus" "${PYTHON_BIN:-python}" "$@"
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
     printf 'Would run (Node %s, topology-aware per-rank CPU binding): ' "$NODE_RANK"
-    printf 'FRCHECK_GDR=%q PYTHONPATH=%q CUDA_VISIBLE_DEVICES=%q ' \
-        "$FRCHECK_GDR" "$PYTHONPATH:/workspace/Megatron-LM" "$CUDA_VISIBLE_DEVICES"
+    printf 'FRCHECK_GDR=%q RDMA_HCA_PROFILE=%q PYTHONPATH=%q CUDA_VISIBLE_DEVICES=%q ' \
+        "$FRCHECK_GDR" "$RDMA_HCA_PROFILE" "$PYTHONPATH:/workspace/Megatron-LM" "$CUDA_VISIBLE_DEVICES"
     printf '%q ' torchrun "${DISTRIBUTED_ARGS[@]}" --no-python bash -c '<physical-GPU CPU binding>' _ \
         pretrain_gpt.py "${GPT_ARGS[@]}" "${DATA_ARGS[@]}" "${MODEL_PARALLEL_ARGS[@]}" \
         "${RECOVERY_MODE_ARGS[@]}" "${EVAL_AND_LOGGING_ARGS[@]}" --distributed-backend nccl \
@@ -431,6 +455,7 @@ echo "FRCHECK_INTERFACE: $FRCHECK_INTERFACE"
 echo "FRCHECK_HW_EARLY_OPTIMIZER: $FRCHECK_HW_EARLY_OPTIMIZER"
 echo "FRCHECK_HW_OPTIMIZER_OVERLAP: $FRCHECK_HW_OPTIMIZER_OVERLAP"
 echo "FRCHECK_GDR: $FRCHECK_GDR"
+echo "RDMA_HCA_PROFILE: $RDMA_HCA_PROFILE"
 echo "FRCHECK_LAYER_EXCHANGE_CHUNK_MB: $FRCHECK_LAYER_EXCHANGE_CHUNK_MB"
 echo "FRCHECK_LAYER_FRONTIER_ORDER: $FRCHECK_LAYER_FRONTIER_ORDER"
 

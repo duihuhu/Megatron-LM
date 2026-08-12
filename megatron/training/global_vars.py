@@ -249,6 +249,11 @@ def stash_recovery_timing_summary(name: str, values: dict) -> None:
         _GLOBAL_RECOVERY_TIMING_SUMMARIES[name] = dict(values)
 
 
+def clear_recovery_timing_summary(name: str) -> None:
+    """Discard one pending recovery timing summary."""
+    with _GLOBAL_RECOVERY_TIMING_SUMMARIES_LOCK:
+        _GLOBAL_RECOVERY_TIMING_SUMMARIES.pop(name, None)
+
 
 def add_recovery_teardown_time(elapsed_s: float) -> None:
     """Accumulate local teardown time to exclude from recovery-to-forward."""
@@ -405,6 +410,7 @@ def flush_recovery_timing_summaries() -> None:
     recovery_first_layer = pending_summaries.get("recovery_first_layer_start")
     frcheck_forward_backward = pending_summaries.get("frcheck_forward_backward")
     stage_last_layer = pending_summaries.get("frcheck_stage_last_layer_start")
+    parity_completion = pending_summaries.get("frcheck_parity_completion")
 
     rtf_elapsed_s = float((rtf or {}).get("elapsed_s", 0.0))
     rtf_teardown_s = float((rtf or {}).get("teardown_s", 0.0))
@@ -455,17 +461,31 @@ def flush_recovery_timing_summaries() -> None:
     frcheck_forward_backward_elapsed_s = float(
         (frcheck_forward_backward or {}).get("elapsed_s", 0.0)
     )
-    values.extend(
-        [
-            1.0 if frcheck_forward_backward is not None else 0.0,
-            frcheck_forward_backward_elapsed_s,
-            (
-                -frcheck_forward_backward_elapsed_s
-                if frcheck_forward_backward is not None
-                else -1.0e30
-            ),
-        ]
+    frcheck_forward_backward_first_forward_s = float(
+        (frcheck_forward_backward or {}).get("first_forward_s", 0.0)
     )
+    frcheck_forward_backward_inline_parity_tail_wait_s = float(
+        (frcheck_forward_backward or {}).get("inline_parity_tail_wait_s", 0.0)
+    )
+    frcheck_forward_backward_post_first_forward_to_end_s = float(
+        (frcheck_forward_backward or {}).get("post_first_forward_to_end_s", 0.0)
+    )
+    frcheck_forward_backward_metrics = [
+        frcheck_forward_backward_elapsed_s,
+        frcheck_forward_backward_first_forward_s,
+        frcheck_forward_backward_inline_parity_tail_wait_s,
+        frcheck_forward_backward_post_first_forward_to_end_s,
+    ]
+    values.append(1.0 if frcheck_forward_backward is not None else 0.0)
+    for metric in frcheck_forward_backward_metrics:
+        values.extend(
+            [
+                metric,
+                -metric if frcheck_forward_backward is not None else -1.0e30,
+            ]
+        )
+    parity_completion_offset = len(values)
+    values.append(1.0 if parity_completion is not None else 0.0)
 
     max_contributor = None
     failed_elapsed_max_s = None
@@ -486,6 +506,7 @@ def flush_recovery_timing_summaries() -> None:
         if (
             values[1 + len(pipeline_keys)] > 0.0
             or values[frcheck_forward_backward_offset] > 0.0
+            or values[parity_completion_offset] > 0.0
         ):
             local_info = {
                 "elapsed_s": rtf_adjusted_elapsed_s,
@@ -521,6 +542,15 @@ def flush_recovery_timing_summaries() -> None:
                 "stage_last_layer_layer_number": int((stage_last_layer or {}).get("layer_number", -1)),
                 "frcheck_forward_backward_present": frcheck_forward_backward is not None,
                 "frcheck_forward_backward_elapsed_s": frcheck_forward_backward_elapsed_s,
+                "frcheck_forward_backward_first_forward_s": (
+                    frcheck_forward_backward_first_forward_s
+                ),
+                "frcheck_forward_backward_inline_parity_tail_wait_s": (
+                    frcheck_forward_backward_inline_parity_tail_wait_s
+                ),
+                "frcheck_forward_backward_post_first_forward_to_end_s": (
+                    frcheck_forward_backward_post_first_forward_to_end_s
+                ),
                 "frcheck_forward_backward_rank": int(
                     (frcheck_forward_backward or {}).get("rank", rank)
                 ),
@@ -529,6 +559,22 @@ def flush_recovery_timing_summaries() -> None:
                 ),
                 "frcheck_forward_backward_tp_rank": int(
                     (frcheck_forward_backward or {}).get("tp_rank", -1)
+                ),
+                "parity_failed_rank": bool(
+                    (parity_completion or {}).get("failed_rank", False)
+                ),
+                "parity_present": bool(
+                    (parity_completion or {}).get("present", False)
+                ),
+                "recovery_start_to_parity_done_s": float(
+                    (parity_completion or {}).get(
+                        "recovery_start_to_parity_done_s", -1.0
+                    )
+                ),
+                "first_microbatch_done_to_parity_done_s": float(
+                    (parity_completion or {}).get(
+                        "first_microbatch_done_to_parity_done_s", -1.0
+                    )
                 ),
             }
             gathered = [None for _ in range(torch.distributed.get_world_size())]
@@ -612,6 +658,22 @@ def flush_recovery_timing_summaries() -> None:
                 "stage_last_layer_present": bool((stage_last_layer or {}).get("present", False)),
                 "stage_last_layer_elapsed_s": float((stage_last_layer or {}).get("elapsed_s", -1.0)),
                 "stage_last_layer_layer_number": int((stage_last_layer or {}).get("layer_number", -1)),
+                "parity_failed_rank": bool(
+                    (parity_completion or {}).get("failed_rank", False)
+                ),
+                "parity_present": bool(
+                    (parity_completion or {}).get("present", False)
+                ),
+                "recovery_start_to_parity_done_s": float(
+                    (parity_completion or {}).get(
+                        "recovery_start_to_parity_done_s", -1.0
+                    )
+                ),
+                "first_microbatch_done_to_parity_done_s": float(
+                    (parity_completion or {}).get(
+                        "first_microbatch_done_to_parity_done_s", -1.0
+                    )
+                ),
             }
             gathered_timing_info = [max_contributor]
             if "failed" in str(max_contributor.get("role", "")).split("+"):
@@ -626,9 +688,31 @@ def flush_recovery_timing_summaries() -> None:
                     failed_stage_last_layer_max_s = float(
                         max_contributor.get("stage_last_layer_elapsed_s", -1.0)
                     )
+        if parity_completion is not None and max_contributor is None:
+            gathered_timing_info = [{
+                "parity_failed_rank": bool(parity_completion.get("failed_rank", False)),
+                "parity_present": bool(parity_completion.get("present", False)),
+                "recovery_start_to_parity_done_s": float(
+                    parity_completion.get("recovery_start_to_parity_done_s", -1.0)
+                ),
+                "first_microbatch_done_to_parity_done_s": float(
+                    parity_completion.get(
+                        "first_microbatch_done_to_parity_done_s", -1.0
+                    )
+                ),
+            }]
         if frcheck_forward_backward is not None:
             frcheck_forward_backward_max_contributor = {
                 "frcheck_forward_backward_elapsed_s": frcheck_forward_backward_elapsed_s,
+                "frcheck_forward_backward_first_forward_s": (
+                    frcheck_forward_backward_first_forward_s
+                ),
+                "frcheck_forward_backward_inline_parity_tail_wait_s": (
+                    frcheck_forward_backward_inline_parity_tail_wait_s
+                ),
+                "frcheck_forward_backward_post_first_forward_to_end_s": (
+                    frcheck_forward_backward_post_first_forward_to_end_s
+                ),
                 "frcheck_forward_backward_rank": int(
                     frcheck_forward_backward.get("rank", 0)
                 ),
@@ -639,6 +723,19 @@ def flush_recovery_timing_summaries() -> None:
                     frcheck_forward_backward.get("tp_rank", -1)
                 ),
             }
+
+    parity_failed = [
+        item for item in gathered_timing_info
+        if item.get("parity_failed_rank", False)
+    ]
+    parity_complete = [
+        item for item in parity_failed if item.get("parity_present", False)
+    ]
+    parity_failed_total = len(parity_failed)
+    parity_coverage = len(parity_complete)
+    parity_globally_complete = (
+        parity_failed_total > 0 and parity_coverage == parity_failed_total
+    )
 
     if rank == 0:
         import logging
@@ -676,6 +773,23 @@ def flush_recovery_timing_summaries() -> None:
                     int(stage_last_layer_max_contributor.get("stage_last_layer_layer_number", -1)),
                     float(stage_last_layer_max_contributor.get("stage_last_layer_elapsed_s", -1.0)),
                 )
+        if parity_globally_complete:
+            logger.info(
+                "FRCheck parity completion timing: "
+                "recovery_start_to_parity_done_failed_max_s=%.6f "
+                "first_microbatch_done_to_parity_done_failed_max_s=%.6f "
+                "coverage=%d/%d",
+                max(
+                    item["recovery_start_to_parity_done_s"]
+                    for item in parity_complete
+                ),
+                max(
+                    item["first_microbatch_done_to_parity_done_s"]
+                    for item in parity_complete
+                ),
+                parity_coverage,
+                parity_failed_total,
+            )
         if values[recovery_first_layer_offset] > 0.0:
             scheme = str(
                 (recovery_first_layer or {}).get(
@@ -690,14 +804,40 @@ def flush_recovery_timing_summaries() -> None:
                 values[recovery_first_layer_offset + 1],
             )
         if values[frcheck_forward_backward_offset] > 0.0:
-            elapsed_max_s = values[frcheck_forward_backward_offset + 1]
-            elapsed_min_s = -values[frcheck_forward_backward_offset + 2]
+            total_max_s = values[frcheck_forward_backward_offset + 1]
+            total_min_s = -values[frcheck_forward_backward_offset + 2]
+            first_forward_max_s = values[frcheck_forward_backward_offset + 3]
+            first_forward_min_s = -values[frcheck_forward_backward_offset + 4]
+            inline_parity_tail_wait_max_s = values[
+                frcheck_forward_backward_offset + 5
+            ]
+            inline_parity_tail_wait_min_s = -values[
+                frcheck_forward_backward_offset + 6
+            ]
+            post_first_forward_to_end_max_s = values[
+                frcheck_forward_backward_offset + 7
+            ]
+            post_first_forward_to_end_min_s = -values[
+                frcheck_forward_backward_offset + 8
+            ]
             contributor = frcheck_forward_backward_max_contributor or {}
             logger.info(
-                "FRCheck forward-backward timing: elapsed_min_s=%.6f "
-                "elapsed_max_s=%.6f max_rank=%d pp_rank=%d tp_rank=%d",
-                elapsed_min_s,
-                elapsed_max_s,
+                "FRCheck forward-backward timing: total_min_s=%.6f "
+                "total_max_s=%.6f first_forward_min_s=%.6f "
+                "first_forward_max_s=%.6f "
+                "inline_parity_tail_wait_min_s=%.6f "
+                "inline_parity_tail_wait_max_s=%.6f "
+                "post_first_forward_to_end_min_s=%.6f "
+                "post_first_forward_to_end_max_s=%.6f "
+                "max_rank=%d pp_rank=%d tp_rank=%d",
+                total_min_s,
+                total_max_s,
+                first_forward_min_s,
+                first_forward_max_s,
+                inline_parity_tail_wait_min_s,
+                inline_parity_tail_wait_max_s,
+                post_first_forward_to_end_min_s,
+                post_first_forward_to_end_max_s,
                 int(contributor.get("frcheck_forward_backward_rank", -1)),
                 int(contributor.get("frcheck_forward_backward_pp_rank", -1)),
                 int(contributor.get("frcheck_forward_backward_tp_rank", -1)),
@@ -861,7 +1001,18 @@ def flush_recovery_timing_summaries() -> None:
                 )
 
     with _GLOBAL_RECOVERY_TIMING_SUMMARIES_LOCK:
+        preserved_parity = None
+        if parity_completion is not None and not parity_globally_complete:
+            preserved_parity = dict(
+                _GLOBAL_RECOVERY_TIMING_SUMMARIES.get(
+                    "frcheck_parity_completion", parity_completion
+                )
+            )
         _GLOBAL_RECOVERY_TIMING_SUMMARIES = {}
+        if preserved_parity is not None:
+            _GLOBAL_RECOVERY_TIMING_SUMMARIES[
+                "frcheck_parity_completion"
+            ] = preserved_parity
     _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER = None
 
 

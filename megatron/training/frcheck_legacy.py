@@ -167,9 +167,87 @@ _frcheck_first_layer_cuda_start_events: Dict[int, Any] = {}
 _frcheck_first_layer_pending_cuda_events: Dict[str, Dict[str, Any]] = {}
 _frcheck_first_layer_generation: int = 0
 _frcheck_first_layer_failed_rank: bool = False
+_frcheck_parity_timing_lock = threading.Lock()
+_frcheck_parity_timing: Dict[str, Any] = {}
 
 
 _frcheck_async_runtime_timing_reported: bool = False
+
+
+def _reset_frcheck_parity_completion_timing() -> None:
+    global _frcheck_parity_timing
+    with _frcheck_parity_timing_lock:
+        _frcheck_parity_timing = {}
+    try:
+        from megatron.training.global_vars import clear_recovery_timing_summary
+        clear_recovery_timing_summary("frcheck_parity_completion")
+    except Exception:
+        pass
+
+
+def _stash_frcheck_parity_completion_timing_locked() -> None:
+    if not _frcheck_parity_timing.get("failed_rank", False):
+        return
+    recovery_start_s = float(
+        _frcheck_parity_timing.get("recovery_start_s", 0.0) or 0.0
+    )
+    first_microbatch_done_s = float(
+        _frcheck_parity_timing.get("first_microbatch_done_s", 0.0) or 0.0
+    )
+    parity_done_s = float(
+        _frcheck_parity_timing.get("parity_done_s", 0.0) or 0.0
+    )
+    if recovery_start_s <= 0.0 or first_microbatch_done_s <= 0.0 or parity_done_s <= 0.0:
+        return
+    try:
+        from megatron.training.global_vars import stash_recovery_timing_summary
+        stash_recovery_timing_summary(
+            "frcheck_parity_completion",
+            {
+                "present": True,
+                "failed_rank": True,
+                "generation": int(_frcheck_parity_timing.get("generation", -1)),
+                "rank": int(_frcheck_parity_timing.get("rank", -1)),
+                "recovery_start_to_parity_done_s": max(
+                    0.0, parity_done_s - recovery_start_s
+                ),
+                "first_microbatch_done_to_parity_done_s": max(
+                    0.0, parity_done_s - first_microbatch_done_s
+                ),
+            },
+        )
+    except Exception:
+        pass
+
+
+def frcheck_record_first_microbatch_done(done_s: Optional[float] = None) -> None:
+    """Publish the first real forward return for the active recovery generation."""
+    now = float(done_s) if done_s is not None else time.time()
+    with _frcheck_parity_timing_lock:
+        if not _frcheck_parity_timing or not _frcheck_parity_timing.get(
+            "failed_rank", False
+        ):
+            return
+        if int(_frcheck_parity_timing.get("generation", -1)) != int(
+            _frcheck_first_layer_generation
+        ):
+            return
+        if float(_frcheck_parity_timing.get("first_microbatch_done_s", 0.0)) <= 0.0:
+            _frcheck_parity_timing["first_microbatch_done_s"] = now
+        _stash_frcheck_parity_completion_timing_locked()
+
+
+def _record_frcheck_parity_done() -> None:
+    now = time.time()
+    with _frcheck_parity_timing_lock:
+        if not _frcheck_parity_timing:
+            return
+        if int(_frcheck_parity_timing.get("generation", -1)) != int(
+            _frcheck_first_layer_generation
+        ):
+            return
+        _frcheck_parity_timing["parity_done_s"] = now
+        _stash_frcheck_parity_completion_timing_locked()
 
 
 def _stash_frcheck_first_layer_milestones_locked() -> None:
@@ -188,6 +266,7 @@ def _start_frcheck_first_layer_recovery_timer(target_layer_idx: Optional[int] = 
     global _frcheck_first_layer_failed_rank
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     failed_rank = rank in _get_frcheck_failed_ranks()
+    _reset_frcheck_parity_completion_timing()
     with _frcheck_first_layer_milestones_lock:
         _frcheck_first_layer_generation += 1
         _frcheck_first_layer_recovery_start_s = None
@@ -213,7 +292,7 @@ def _start_frcheck_first_layer_recovery_timer(target_layer_idx: Optional[int] = 
 
 
 def _arm_frcheck_first_layer_cuda_timer() -> None:
-    global _frcheck_first_layer_recovery_start_s
+    global _frcheck_first_layer_recovery_start_s, _frcheck_parity_timing
     try:
         from megatron.training.global_vars import get_recovery_to_forward_timer_start
         timer_start_s = get_recovery_to_forward_timer_start()
@@ -233,8 +312,34 @@ def _arm_frcheck_first_layer_cuda_timer() -> None:
             device_idx = -1
     with _frcheck_first_layer_milestones_lock:
         _frcheck_first_layer_recovery_start_s = timer_start_s
+        generation = _frcheck_first_layer_generation
+        failed_rank = _frcheck_first_layer_failed_rank
         if start_event is not None:
             _frcheck_first_layer_cuda_start_events[device_idx] = start_event
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    with _frcheck_parity_timing_lock:
+        _frcheck_parity_timing = {
+            "generation": int(generation),
+            "rank": int(rank),
+            "failed_rank": bool(failed_rank),
+            "recovery_start_s": float(timer_start_s),
+            "first_microbatch_done_s": 0.0,
+            "parity_done_s": 0.0,
+        }
+        if failed_rank and _pending_recovery_parity_repair is not None:
+            try:
+                from megatron.training.global_vars import stash_recovery_timing_summary
+                stash_recovery_timing_summary(
+                    "frcheck_parity_completion",
+                    {
+                        "present": False,
+                        "failed_rank": True,
+                        "generation": int(generation),
+                        "rank": int(rank),
+                    },
+                )
+            except Exception:
+                pass
 
 
 def _record_frcheck_first_layer_milestone(
@@ -1520,6 +1625,7 @@ class _FRCheckRecoveryService:
         _optimizer_prepare_thread = None
         _optimizer_prepare_error = None
         _optimizer_prepare_done.clear()
+        _reset_frcheck_parity_completion_timing()
         _frcheck_recovery_profile(self.role, "service_reset", state=self.state)
 
     def attach_runtime(self, runtime: Optional[_FRCheckLayerwiseRuntime]) -> None:
@@ -7161,10 +7267,11 @@ def _persist_recovered_parity_wave(
     buf_pool: Optional[_RecoveryBufPool],
     checkpoint_dir: Path,
     rank: int,
+    persist_repaired_parity: bool,
     slot_start: int = 0,
 ) -> int:
     """Persist this failed rank's repaired parity shards before slot reuse."""
-    if buf_pool is None or _frcheck_inprocess_workspace_enabled():
+    if buf_pool is None or not persist_repaired_parity:
         return 0
     my_node = int(manager.rank_in_group) + 1
     written = 0
@@ -7216,6 +7323,7 @@ def _submit_recovery_parity_repair(
     low_priority: bool,
     checkpoint_dir: Path,
     rank: int,
+    persist_repaired_parity: bool,
 ) -> Dict[str, float]:
     timing: Dict[str, float] = {
         "submit_s": 0.0,
@@ -7263,6 +7371,7 @@ def _submit_recovery_parity_repair(
         timing["persisted_shards"] = timing.get("persisted_shards", 0.0) + float(
             _persist_recovered_parity_wave(
                 wave_plans, job, manager, buf_pool, checkpoint_dir, rank,
+                persist_repaired_parity,
             )
         )
         if hasattr(native, "get_recovery_batch_milestones"):
@@ -7296,6 +7405,7 @@ def _set_pending_recovery_parity_repair(
         "all_layer_metadata": all_layer_metadata,
         "recovery_role": recovery_role,
         "parity_preloaded": parity_preloaded or {},
+        "persist_repaired_parity": not _frcheck_inprocess_workspace_enabled(),
         "execution_mode": (
             "async_background"
             if _frcheck_recovery_async_parity_enabled()
@@ -7316,6 +7426,7 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
     jobs = list(pending["jobs"])
     preloaded = pending.get("parity_preloaded", {})
     execution_mode = str(pending.get("execution_mode", "sync_data_worker"))
+    persist_repaired_parity = bool(pending["persist_repaired_parity"])
     t0 = time.time()
     pause_wait_start_s = 0.0
     pause_send_start = 0
@@ -7347,6 +7458,7 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
                 manager, native, job, preloaded.get(job.encode_iter, {}),
                 buf_pool, recovery_role, True,
                 Path(pending["checkpoint_dir"]), int(pending["rank"]),
+                persist_repaired_parity,
             )
             total_stripes += int(timing.get("parity_stripes", 0.0))
             total_waves += int(timing.get("waves", 0.0))
@@ -7369,6 +7481,7 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
                 wait_s=timing.get("wait_s", 0.0),
                 network_batch_s=timing.get("network_batch_s", 0.0),
             )
+        _record_frcheck_parity_done()
         pause_wait_s = 0.0
         pause_send_tasks = 0
         if hasattr(native, "get_recovery_batch_timing_stats"):
@@ -7397,6 +7510,7 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
             pause_wait_s=pause_wait_s,
             pause_send_tasks=pause_send_tasks,
             persisted_shards=total_persisted_shards,
+            persist_repaired_parity=int(persist_repaired_parity),
             elapsed_s=time.time() - t0,
         )
     except BaseException as exc:
@@ -7406,6 +7520,7 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
             mode=execution_mode,
             error=f"{type(exc).__name__}: {exc}",
         )
+        _reset_frcheck_parity_completion_timing()
         if execution_mode == "async_background":
             _recovery_async_parity_error = exc
             return
@@ -7537,6 +7652,34 @@ def frcheck_drain_recovery_parity(
     _flush_recovery_async_parity(reason, service.role)
 
 
+def frcheck_wait_for_inline_parity_after_first_microbatch() -> bool:
+    """Wait for synchronous hardware recovery parity after the first microbatch."""
+    if (
+        not _frcheck_recovery_parity_repair_enabled()
+        or _frcheck_recovery_async_parity_enabled()
+    ):
+        return False
+    service = _get_active_frcheck_recovery_service()
+    if not _frcheck_recovery_lifecycle_needs_finish(service):
+        return False
+    wait_t0 = time.time()
+    _frcheck_recovery_profile(
+        service.role,
+        "inline_parity_tail_wait_start",
+        point="after_first_microbatch",
+    )
+    frcheck_drain_recovery_parity(
+        "after_first_microbatch", allow_start_pending=True
+    )
+    _frcheck_recovery_profile(
+        service.role,
+        "inline_parity_tail_wait_done",
+        point="after_first_microbatch",
+        tail_wait_s=time.time() - wait_t0,
+    )
+    return True
+
+
 def frcheck_finish_recovery_parity_after_optimizer(
     allow_start_pending: bool = True,
 ) -> None:
@@ -7590,6 +7733,7 @@ def _run_recovery_pipeline(
     recovery_role: str = "unknown",
     tensor_views_by_key: Optional[Dict[str, torch.Tensor]] = None,
     checkpoint_dir: Optional[Path] = None,
+    persist_repaired_parity: bool = True,
     common_readiness: Optional[_FRCheckCommonReadiness] = None,
 ) -> List[Tuple[Optional[_FRCheckLayerReadyRecord], Dict[str, float]]]:
     t_pipeline = time.time()
@@ -7655,7 +7799,8 @@ def _run_recovery_pipeline(
             if checkpoint_dir is not None:
                 persisted = _persist_recovered_parity_wave(
                     recovered.window.plans, job, manager, buf_pool,
-                    checkpoint_dir, rank, recovered.window.slot_start,
+                    checkpoint_dir, rank, persist_repaired_parity,
+                    recovered.window.slot_start,
                 )
                 layer_timing['persisted_mixed_parity_shards'] = (
                     layer_timing.get('persisted_mixed_parity_shards', 0.0)
@@ -7925,6 +8070,7 @@ def _start_layer_recovery_worker(
     recovery_role: str = "unknown",
     tensor_views_by_key: Optional[Dict[str, torch.Tensor]] = None,
     checkpoint_dir: Optional[Path] = None,
+    persist_repaired_parity: bool = True,
     all_layer_metadata: Optional[Dict[int, Dict[str, Dict[str, Any]]]] = None,
     common_readiness: Optional[_FRCheckCommonReadiness] = None,
 ) -> threading.Thread:
@@ -7945,6 +8091,7 @@ def _start_layer_recovery_worker(
                 recovery_role=recovery_role,
                 tensor_views_by_key=tensor_views_by_key,
                 checkpoint_dir=checkpoint_dir,
+                persist_repaired_parity=persist_repaired_parity,
                 common_readiness=common_readiness,
             )
             _dispatch_recovery_parity_after_data_recovery(recovery_role)
@@ -9487,6 +9634,7 @@ def recover_frcheck_legacy_hardware(
             recovery_role=recovery_role,
             tensor_views_by_key=None,
             checkpoint_dir=checkpoint_dir,
+            persist_repaired_parity=not workspace_enabled,
             all_layer_metadata=all_layer_metadata,
             common_readiness=common_readiness,
         )
@@ -9508,6 +9656,7 @@ def recover_frcheck_legacy_hardware(
             recovery_role=recovery_role,
             tensor_views_by_key=direct_tensor_views_by_key,
             checkpoint_dir=checkpoint_dir,
+            persist_repaired_parity=not workspace_enabled,
             all_layer_metadata=all_layer_metadata,
         )
         _set_active_frcheck_recovery_worker(recovery_worker)
@@ -9533,6 +9682,7 @@ def recover_frcheck_legacy_hardware(
             recovery_role=recovery_role,
             tensor_views_by_key=direct_tensor_views_by_key,
             checkpoint_dir=checkpoint_dir,
+            persist_repaired_parity=not workspace_enabled,
         )
         _dispatch_recovery_parity_after_data_recovery(recovery_role)
         _accumulate_layer_timings(sync_results)

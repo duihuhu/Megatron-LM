@@ -1686,9 +1686,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             except ImportError:
                 pass
 
+        frcheck_inline_parity_checked = False
+        frcheck_first_forward_s = 0.0
+        frcheck_inline_parity_tail_wait_s = 0.0
+        frcheck_post_first_forward_t0 = None
+
         @functools.wraps(forward_step_func)
         def forward_step_func_with_recovery_timing(*forward_args, **forward_kwargs):
-            nonlocal frcheck_optimizer_overlap_started
+            nonlocal frcheck_optimizer_overlap_started, frcheck_inline_parity_checked
+            nonlocal frcheck_first_forward_s, frcheck_inline_parity_tail_wait_s
+            nonlocal frcheck_post_first_forward_t0
             mark_recovery_to_forward_timer("forward_step_start")
             _log_recovery_to_forward_profile("forward_step_start")
             if getattr(args, "use_frcheck", False):
@@ -1697,7 +1704,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     frcheck_recovery_safe_point("forward_step_start")
                 except ImportError:
                     pass
+            is_first_forward = not frcheck_inline_parity_checked
+            first_forward_t0 = time.time() if is_first_forward else None
             result = forward_step_func(*forward_args, **forward_kwargs)
+            if is_first_forward:
+                first_forward_done_s = time.time()
+                frcheck_first_forward_s = first_forward_done_s - first_forward_t0
+                if getattr(args, "use_frcheck", False):
+                    from megatron.training.frcheck_legacy import (
+                        frcheck_record_first_microbatch_done,
+                    )
+                    frcheck_record_first_microbatch_done(first_forward_done_s)
             if (
                 not frcheck_optimizer_overlap_started
                 and getattr(args, "frcheck_hw_optimizer_overlap", False)
@@ -1708,6 +1725,33 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 frcheck_optimizer_overlap_started = frcheck_start_optimizer_h2d(optimizer)
             finish_recovery_to_forward_timer("forward_step_end")
             _log_recovery_to_forward_profile("forward_step_end")
+            if not frcheck_inline_parity_checked:
+                frcheck_inline_parity_checked = True
+                if (
+                    getattr(args, "use_frcheck", False)
+                    and bool(
+                        getattr(args, "_ft_inprocess_recovery_awaiting_forward", False)
+                    )
+                    and not getattr(
+                        args, "ft_inprocess_recovery_software_failure", False
+                    )
+                    and not bool(
+                        getattr(args, "frcheck_recovery_async_parity", False)
+                    )
+                ):
+                    from megatron.training.frcheck_legacy import (
+                        frcheck_wait_for_inline_parity_after_first_microbatch,
+                    )
+
+                    inline_parity_tail_wait_t0 = time.time()
+                    inline_parity_waited = (
+                        frcheck_wait_for_inline_parity_after_first_microbatch()
+                    )
+                    if inline_parity_waited:
+                        frcheck_inline_parity_tail_wait_s = (
+                            time.time() - inline_parity_tail_wait_t0
+                        )
+                frcheck_post_first_forward_t0 = time.time()
             return result
 
         # Forward pass.
@@ -1735,6 +1779,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
+        frcheck_forward_backward_end = time.time()
         if (
             getattr(args, "frcheck_hw_optimizer_overlap", False)
             and getattr(args, "_ft_inprocess_recovery_awaiting_forward", False)
@@ -1748,11 +1793,21 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             frcheck_log_optimizer_overlap_not_started()
             frcheck_optimizer_overlap_diagnostic_logged = True
         if getattr(args, "use_frcheck", False):
-            frcheck_forward_backward_elapsed_s = time.time() - frcheck_forward_backward_t0
+            frcheck_forward_backward_elapsed_s = (
+                frcheck_forward_backward_end - frcheck_forward_backward_t0
+            )
+            frcheck_post_first_forward_to_end_s = (
+                frcheck_forward_backward_end - frcheck_post_first_forward_t0
+                if frcheck_post_first_forward_t0 is not None
+                else 0.0
+            )
             stash_recovery_timing_summary(
                 "frcheck_forward_backward",
                 {
                     "elapsed_s": frcheck_forward_backward_elapsed_s,
+                    "first_forward_s": frcheck_first_forward_s,
+                    "inline_parity_tail_wait_s": frcheck_inline_parity_tail_wait_s,
+                    "post_first_forward_to_end_s": frcheck_post_first_forward_to_end_s,
                     "rank": frcheck_trace_rank,
                     "pp_rank": mpu.get_pipeline_model_parallel_rank(),
                     "tp_rank": mpu.get_tensor_model_parallel_rank(),
@@ -1777,6 +1832,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if getattr(args, "use_frcheck", False):
             from megatron.training.frcheck_legacy import frcheck_drain_recovery_parity
             frcheck_drain_recovery_parity("train_step_early_exit", allow_start_pending=True)
+            flush_recovery_timing_summaries()
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
 
     # Empty unused memory.
@@ -1873,6 +1929,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 frcheck_finish_recovery_parity_after_optimizer(
                     allow_start_pending=False
                 )
+                flush_recovery_timing_summaries()
             except BaseException as parity_exc:
                 if optimizer_error is not None:
                     raise optimizer_error from parity_exc

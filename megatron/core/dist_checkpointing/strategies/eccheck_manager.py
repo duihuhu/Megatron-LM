@@ -56,8 +56,20 @@ class ECCHECKManager:
         self.use_rdma = False
         
         # Buffer configuration
-        self.eccheck_data_buffers_count = 12
-        self.eccheck_encoding_buffers_count = 24  # data_count * m (12 * 2)
+        data_buffers_count_value = os.environ.get("ECCHECK_DATA_BUFFERS_COUNT", "12")
+        try:
+            self.eccheck_data_buffers_count = int(data_buffers_count_value)
+        except ValueError as exc:
+            raise RuntimeError(
+                "ECCHECK_DATA_BUFFERS_COUNT must be a positive integer, "
+                f"got {data_buffers_count_value!r}"
+            ) from exc
+        if self.eccheck_data_buffers_count <= 0:
+            raise RuntimeError(
+                "ECCHECK_DATA_BUFFERS_COUNT must be a positive integer, "
+                f"got {data_buffers_count_value!r}"
+            )
+        self.eccheck_encoding_buffers_count = self.eccheck_data_buffers_count * 2
         self.eccheck_buffer_size = 64 * 1024 * 1024  # 64MB
         self.eccheck_pin_memory = True
         
@@ -812,7 +824,7 @@ class ECCHECKManager:
     def _allocate_parity_buffers(self):
         """Allocate parity buffers for XOR computation results.
         
-        Note: Parity buffer count should match encoding buffer count (24) to support
+        Note: Parity buffer count should match encoding buffer count to support
         pipelined operations where each data chunk needs 2 parity buffers (one per thread).
         """
         # Use encoding buffer count instead of data buffer count

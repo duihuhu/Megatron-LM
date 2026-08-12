@@ -439,6 +439,11 @@ private:
     std::mutex two_failure_pipeline_error_mutex_;
     std::string two_failure_pipeline_error_message_;
 
+    std::atomic<bool> save_pipeline_error_{false};
+    std::atomic<bool> save_cycle_active_{false};
+    std::mutex save_pipeline_error_mutex_;
+    std::string save_pipeline_error_message_;
+
     struct AtomicCompletionGuard {
         std::atomic<size_t>* counter;
         explicit AtomicCompletionGuard(std::atomic<size_t>* value) : counter(value) {}
@@ -455,6 +460,14 @@ private:
                 expected, true, std::memory_order_acq_rel)) {
             std::lock_guard<std::mutex> lock(two_failure_pipeline_error_mutex_);
             two_failure_pipeline_error_message_ = message;
+        }
+    }
+
+    void set_save_pipeline_error(const std::string& message) {
+        std::lock_guard<std::mutex> lock(save_pipeline_error_mutex_);
+        if (!save_pipeline_error_.load(std::memory_order_relaxed)) {
+            save_pipeline_error_message_ = message;
+            save_pipeline_error_.store(true, std::memory_order_release);
         }
     }
     
@@ -1834,11 +1847,6 @@ private:
                             recv_queue_.push({0, 0, 0, false, false, false, 0, 0});
                         }
                         recv_queue_cv_.notify_one();
-                        {
-                            std::lock_guard<std::mutex> xor_lock(xor_queue_mutex_);
-                            xor_queue_.push({0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0});
-                        }
-                        xor_queue_cv_.notify_one();
                         // Reset sentinel flag and continue (don't exit)
                         encoding_thread_1_sentinel_received_ = false;
                         continue;
@@ -1981,11 +1989,6 @@ private:
                         recv_queue_.push({0, 0, 0, false, false, false, 0, 0});
                     }
                     recv_queue_cv_.notify_one();
-                    {
-                        std::lock_guard<std::mutex> xor_lock(xor_queue_mutex_);
-                        xor_queue_.push({0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0});
-                    }
-                    xor_queue_cv_.notify_one();
                     // Reset sentinel flag and continue (don't exit)
                     encoding_thread_1_sentinel_received_ = false;
                     continue;
@@ -2037,11 +2040,6 @@ private:
                             recv_queue_.push({0, 0, 0, false, false, false, 0, 0});
                         }
                         recv_queue_cv_.notify_one();
-                        {
-                            std::lock_guard<std::mutex> xor_lock(xor_queue_mutex_);
-                            xor_queue_.push({0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0});
-                        }
-                        xor_queue_cv_.notify_one();
                         // Reset sentinel flag and continue (don't exit)
                         encoding_thread_2_sentinel_received_ = false;
                 continue;
@@ -2183,11 +2181,6 @@ private:
                         recv_queue_.push({0, 0, 0, false, false, false, 0, 0});
                     }
                     recv_queue_cv_.notify_one();
-                    {
-                        std::lock_guard<std::mutex> xor_lock(xor_queue_mutex_);
-                        xor_queue_.push({0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0});
-                    }
-                    xor_queue_cv_.notify_one();
                     // Reset sentinel flag and continue (don't exit)
                     encoding_thread_2_sentinel_received_ = false;
                     continue;
@@ -2199,6 +2192,7 @@ private:
     // Unified send worker (handles all encoded chunks that need to be sent)
     void send_worker() {
         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Send worker started" << std::endl;
+        size_t closed_encoder_count = 0;
         
         while (!should_stop_threads_) {
             SendTask task;
@@ -2219,12 +2213,16 @@ private:
             
             // Check for sentinel
             if (task.encoding_addr == 0 && task.size == 0) {
-                send_worker_sentinel_received_ = true;
+                if (++closed_encoder_count > 2) {
+                    set_save_pipeline_error("Send worker received duplicate encoder sentinel");
+                }
+                send_worker_sentinel_received_ = (closed_encoder_count == 2);
                 {
                     std::lock_guard<std::mutex> lock(send_queue_mutex_);
-                    if (send_queue_.empty()) {
+                    if (closed_encoder_count == 2 && send_queue_.empty()) {
                         send_worker_completed_ = true;
                         send_worker_sentinel_received_ = false;
+                        closed_encoder_count = 0;
                     }
                 }
                 continue;
@@ -2242,6 +2240,7 @@ private:
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 } catch (const std::exception& e) {
                     std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA XOR send failed: " << e.what() << std::endl;
+                    if (!is_load_mode_) set_save_pipeline_error(std::string("RDMA XOR send failed: ") + e.what());
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 }
@@ -2272,6 +2271,7 @@ private:
                 } catch (const boost::system::system_error& e) {
                     std::cerr << "EC-CHECK: [Rank " << rank_ 
                               << "] ASIO send failed: " << e.what() << std::endl;
+                    if (!is_load_mode_) set_save_pipeline_error(std::string("ASIO XOR send failed: ") + e.what());
                     // Release buffer even on error to avoid memory leak
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
@@ -2314,6 +2314,7 @@ private:
                 // No communication method available
                 std::cerr << "EC-CHECK: [Rank " << rank_ 
                           << "] WARNING: No communication method available, releasing buffer" << std::endl;
+                if (!is_load_mode_) set_save_pipeline_error("No communication method available for XOR send");
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
                 encoding_buffers_to_release_.push(task.encoding_addr);
             }
@@ -2322,9 +2323,10 @@ private:
             // After processing task, check if sentinel was received and queue is empty
             if (send_worker_sentinel_received_.load()) {
                 std::lock_guard<std::mutex> lock(send_queue_mutex_);
-                if (send_queue_.empty()) {
+                if (send_queue_.empty() && closed_encoder_count == 2) {
                     send_worker_completed_ = true;
                     send_worker_sentinel_received_ = false;
+                    closed_encoder_count = 0;
                 }
             }
         }
@@ -2333,6 +2335,15 @@ private:
     // Unified recv worker
     void recv_worker() {
         // std::cout << "EC-CHECK: [Rank " << rank_ << "] Recv worker started" << std::endl;
+        size_t closed_encoder_count = 0;
+
+        auto close_xor_input = [this]() {
+            {
+                std::lock_guard<std::mutex> lock(xor_queue_mutex_);
+                xor_queue_.push({0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0});
+            }
+            xor_queue_cv_.notify_one();
+        };
         
         // Wait for initialization to complete
         if (use_asio_) {
@@ -2363,9 +2374,12 @@ private:
                     break;
                 }
                 
-                if (recv_worker_sentinel_received_.load() && recv_queue_.empty()) {
+                if (recv_worker_sentinel_received_.load() && recv_queue_.empty() &&
+                    closed_encoder_count == 2) {
                     recv_worker_completed_ = true;
                     recv_worker_sentinel_received_ = false;
+                    closed_encoder_count = 0;
+                    close_xor_input();
                     continue;
                 }
                 
@@ -2374,14 +2388,21 @@ private:
             }
             
             if (task.recv_addr == 0 && task.size == 0) {
-                recv_worker_sentinel_received_ = true;
+                if (++closed_encoder_count > 2) {
+                    set_save_pipeline_error("Recv worker received duplicate encoder sentinel");
+                }
+                recv_worker_sentinel_received_ = (closed_encoder_count == 2);
+                bool close_now = false;
                 {
                     std::lock_guard<std::mutex> lock(recv_queue_mutex_);
-                    if (recv_queue_.empty()) {
+                    close_now = (closed_encoder_count == 2 && recv_queue_.empty());
+                    if (close_now) {
                         recv_worker_completed_ = true;
                         recv_worker_sentinel_received_ = false;
+                        closed_encoder_count = 0;
                     }
                 }
+                if (close_now) close_xor_input();
                 continue;
             }
             
@@ -2398,10 +2419,12 @@ private:
                     if (recv_size != task.size) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA XOR recv size mismatch: expected "
                                   << task.size << ", got " << recv_size << std::endl;
+                        if (!is_load_mode_) set_save_pipeline_error("RDMA XOR recv size mismatch");
                         continue;
                     }
                 } catch (const std::exception& e) {
                     std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA XOR recv failed: " << e.what() << std::endl;
+                    if (!is_load_mode_) set_save_pipeline_error(std::string("RDMA XOR recv failed: ") + e.what());
                     continue;
                 }
             } else
@@ -2424,6 +2447,7 @@ private:
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
                                   << "] Size mismatch: expected " << task.size 
                                   << ", got " << size << std::endl;
+                        if (!is_load_mode_) set_save_pipeline_error("ASIO XOR recv size mismatch");
                         continue;  // Skip this task
                     }
                     
@@ -2437,6 +2461,7 @@ private:
                 } catch (const boost::system::system_error& e) {
                     std::cerr << "EC-CHECK: [Rank " << rank_ 
                               << "] ASIO recv failed: " << e.what() << std::endl;
+                    if (!is_load_mode_) set_save_pipeline_error(std::string("ASIO XOR recv failed: ") + e.what());
                     continue;  // Skip XOR processing on error
                 }
             }
@@ -2466,6 +2491,7 @@ private:
             else {
                 std::cerr << "EC-CHECK: [Rank " << rank_ 
                           << "] WARNING: No communication method available for recv" << std::endl;
+                if (!is_load_mode_) set_save_pipeline_error("No communication method available for XOR recv");
                 continue;  // Skip processing
             }
             }
@@ -2535,9 +2561,11 @@ private:
             
             if (recv_worker_sentinel_received_.load()) {
                 std::lock_guard<std::mutex> lock(recv_queue_mutex_);
-                if (recv_queue_.empty()) {
+                if (recv_queue_.empty() && closed_encoder_count == 2) {
                     recv_worker_completed_ = true;
                     recv_worker_sentinel_received_ = false;
+                    closed_encoder_count = 0;
+                    close_xor_input();
                 }
             }
         }
@@ -2547,14 +2575,17 @@ private:
         // std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker started" << std::endl;
         
         auto submit_p2p_sentinel = [this]() {
+            const size_t cycle_end = xor_config_.thread0_is_receiver
+                ? save_sequence_id_thread1_.load(std::memory_order_acquire)
+                : save_sequence_id_thread2_.load(std::memory_order_acquire);
             {
                 std::lock_guard<std::mutex> send_lock(p2p_send_queue_mutex_);
-                p2p_send_queue_.push({0, 0, 0, 0, 0, false, false, 0, 0, 0});
+                p2p_send_queue_.push({0, 0, 0, 0, 0, false, false, 0, 0, cycle_end});
             }
             p2p_send_queue_cv_.notify_one();
             {
                 std::lock_guard<std::mutex> recv_lock(p2p_recv_queue_mutex_);
-                p2p_recv_queue_.push({0, 0, false, false, 0, false, 0, 0});
+                p2p_recv_queue_.push({0, 0, false, false, 0, false, 0, cycle_end});
             }
             p2p_recv_queue_cv_.notify_one();
             // std::cout << "EC-CHECK: [Rank " << rank_ << "] XOR worker: Sent sentinel to P2P workers" << std::endl;
@@ -2729,6 +2760,8 @@ private:
         // NCCL is already initialized in main thread, no need to initialize here
         size_t next_save_sequence_id = 0;
         std::map<size_t, P2PSendTask> pending_save_tasks;
+        bool save_sentinel_seen = false;
+        size_t save_cycle_end = 0;
         
         while (!should_stop_threads_) {
             P2PSendTask task{};
@@ -2739,8 +2772,9 @@ private:
                 auto ready_pending = [&]() {
                     return pending_save_tasks.find(next_save_sequence_id) != pending_save_tasks.end();
                 };
-                p2p_send_queue_cv_.wait(lock, [this, &ready_pending] {
-                    return !p2p_send_queue_.empty() || should_stop_threads_ || ready_pending();
+                p2p_send_queue_cv_.wait(lock, [this, &ready_pending, &save_sentinel_seen] {
+                    return !p2p_send_queue_.empty() || should_stop_threads_ || ready_pending() ||
+                           save_sentinel_seen;
                 });
                 
                 if (should_stop_threads_ && p2p_send_queue_.empty() && !ready_pending()) {
@@ -2758,7 +2792,14 @@ private:
                         has_task = true;
                         break;
                     }
-                    pending_save_tasks[candidate.sequence_id] = candidate;
+                    if (candidate.sequence_id < next_save_sequence_id ||
+                        (save_sentinel_seen && candidate.sequence_id >= save_cycle_end)) {
+                        set_save_pipeline_error("P2P send received stale or out-of-cycle sequence");
+                        continue;
+                    }
+                    if (!pending_save_tasks.emplace(candidate.sequence_id, candidate).second) {
+                        set_save_pipeline_error("P2P send received duplicate sequence");
+                    }
                 }
 
                 if (task.send_buffer_addr == 0 && task.p2p_own_write_addr == 0 &&
@@ -2769,6 +2810,18 @@ private:
                     has_task = true;
                 }
                 if (!has_task) {
+                    if (save_sentinel_seen) {
+                        if (next_save_sequence_id == save_cycle_end && pending_save_tasks.empty() &&
+                            p2p_send_queue_.empty()) {
+                            p2p_send_worker_completed_ = true;
+                            p2p_send_worker_sentinel_received_ = false;
+                            save_sentinel_seen = false;
+                        } else if (p2p_send_queue_.empty() && !ready_pending()) {
+                            set_save_pipeline_error("P2P send closed with a sequence gap");
+                            p2p_send_worker_completed_ = true;
+                            save_sentinel_seen = false;
+                        }
+                    }
                     continue;
                 }
                 // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker: Popped task, "
@@ -2780,19 +2833,20 @@ private:
             
             // Check for sentinel
             if (task.send_buffer_addr == 0 && task.p2p_own_write_addr == 0 && task.size == 0) {
-                p2p_send_worker_sentinel_received_ = true;
-                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker received sentinel, waiting for queue to empty" << std::endl;
-                // Check if queue is empty now
-                {
-                    std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
-                    if (p2p_send_queue_.empty()) {
-                        p2p_send_worker_completed_ = true;
-                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker queue is empty, marking completed" << std::endl;
-                        // Reset sentinel flag and continue (don't exit)
-                        p2p_send_worker_sentinel_received_ = false;
-                        continue;
-                    }
+                if (task.is_load_mode_transfer) {
+                    p2p_send_worker_completed_ = true;
+                    continue;
                 }
+                if (save_sentinel_seen) {
+                    set_save_pipeline_error("P2P send received duplicate save sentinel");
+                } else if (task.sequence_id < next_save_sequence_id) {
+                    set_save_pipeline_error("P2P send sentinel end precedes processed sequence");
+                } else {
+                    save_sentinel_seen = true;
+                    save_cycle_end = task.sequence_id;
+                    p2p_send_worker_sentinel_received_ = true;
+                }
+                p2p_send_queue_cv_.notify_one();
                 continue;
             }
             
@@ -2865,6 +2919,9 @@ private:
                         if (task.two_failure_chunk) {
                             set_two_failure_pipeline_error(std::string("RDMA P2P send failed: ") + e.what());
                         }
+                        if (!task.is_load_mode_transfer) {
+                            set_save_pipeline_error(std::string("RDMA P2P send failed: ") + e.what());
+                        }
                     }
                 } else
 #endif
@@ -2906,6 +2963,9 @@ private:
                                   << "] P2P ASIO send failed: " << e.what() << std::endl;
                         if (task.two_failure_chunk) {
                             set_two_failure_pipeline_error(std::string("ASIO P2P send failed: ") + e.what());
+                        }
+                        if (!task.is_load_mode_transfer) {
+                            set_save_pipeline_error(std::string("ASIO P2P send failed: ") + e.what());
                         }
                     }
                 }
@@ -2967,6 +3027,9 @@ private:
                 else {
                     std::cerr << "EC-CHECK: [Rank " << rank_ 
                               << "] WARNING: No communication method available for P2P send" << std::endl;
+                    if (!task.is_load_mode_transfer) {
+                        set_save_pipeline_error("No communication method available for P2P send");
+                    }
                 }
             } else {
             }
@@ -3037,17 +3100,6 @@ private:
                 p2p_send_queue_cv_.notify_one();
             }
 
-            // After processing task, check if sentinel was received and queue is empty
-            if (p2p_send_worker_sentinel_received_.load()) {
-                std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_);
-                if (p2p_send_queue_.empty()) {
-                    p2p_send_worker_completed_ = true;
-                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P send worker queue is empty after processing, marking completed" << std::endl;
-                    // Reset sentinel flag and continue (don't exit)
-                    p2p_send_worker_sentinel_received_ = false;
-                    continue;
-                }
-            }
         }
     }
     
@@ -3058,6 +3110,8 @@ private:
         // NCCL is already initialized in main thread, no need to initialize here
         size_t next_save_sequence_id = 0;
         std::map<size_t, P2PRecvTask> pending_save_tasks;
+        bool save_sentinel_seen = false;
+        size_t save_cycle_end = 0;
         
         while (!should_stop_threads_) {
             P2PRecvTask task{};
@@ -3068,8 +3122,9 @@ private:
                 auto ready_pending = [&]() {
                     return pending_save_tasks.find(next_save_sequence_id) != pending_save_tasks.end();
                 };
-                p2p_recv_queue_cv_.wait(lock, [this, &ready_pending] {
-                    return !p2p_recv_queue_.empty() || should_stop_threads_ || ready_pending();
+                p2p_recv_queue_cv_.wait(lock, [this, &ready_pending, &save_sentinel_seen] {
+                    return !p2p_recv_queue_.empty() || should_stop_threads_ || ready_pending() ||
+                           save_sentinel_seen;
                 });
                 
                 if (should_stop_threads_ && p2p_recv_queue_.empty() && !ready_pending()) {
@@ -3086,7 +3141,14 @@ private:
                         has_task = true;
                         break;
                     }
-                    pending_save_tasks[candidate.sequence_id] = candidate;
+                    if (candidate.sequence_id < next_save_sequence_id ||
+                        (save_sentinel_seen && candidate.sequence_id >= save_cycle_end)) {
+                        set_save_pipeline_error("P2P recv received stale or out-of-cycle sequence");
+                        continue;
+                    }
+                    if (!pending_save_tasks.emplace(candidate.sequence_id, candidate).second) {
+                        set_save_pipeline_error("P2P recv received duplicate sequence");
+                    }
                 }
 
                 if (task.recv_buffer_addr == 0 && task.size == 0 &&
@@ -3097,6 +3159,18 @@ private:
                     has_task = true;
                 }
                 if (!has_task) {
+                    if (save_sentinel_seen) {
+                        if (next_save_sequence_id == save_cycle_end && pending_save_tasks.empty() &&
+                            p2p_recv_queue_.empty()) {
+                            p2p_recv_worker_completed_ = true;
+                            p2p_recv_worker_sentinel_received_ = false;
+                            save_sentinel_seen = false;
+                        } else if (p2p_recv_queue_.empty() && !ready_pending()) {
+                            set_save_pipeline_error("P2P recv closed with a sequence gap");
+                            p2p_recv_worker_completed_ = true;
+                            save_sentinel_seen = false;
+                        }
+                    }
                     continue;
                 }
                 // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker: Popped task, "
@@ -3107,19 +3181,20 @@ private:
             
             // Check for sentinel
             if (task.recv_buffer_addr == 0 && task.size == 0) {
-                p2p_recv_worker_sentinel_received_ = true;
-                // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker received sentinel, waiting for queue to empty" << std::endl;
-                // Check if queue is empty now
-                {
-                    std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
-                    if (p2p_recv_queue_.empty()) {
-                        p2p_recv_worker_completed_ = true;
-                        // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker queue is empty, marking completed" << std::endl;
-                        // Reset sentinel flag and continue (don't exit)
-                        p2p_recv_worker_sentinel_received_ = false;
-                        continue;
-                    }
+                if (task.is_load_mode_transfer) {
+                    p2p_recv_worker_completed_ = true;
+                    continue;
                 }
+                if (save_sentinel_seen) {
+                    set_save_pipeline_error("P2P recv received duplicate save sentinel");
+                } else if (task.sequence_id < next_save_sequence_id) {
+                    set_save_pipeline_error("P2P recv sentinel end precedes processed sequence");
+                } else {
+                    save_sentinel_seen = true;
+                    save_cycle_end = task.sequence_id;
+                    p2p_recv_worker_sentinel_received_ = true;
+                }
+                p2p_recv_queue_cv_.notify_one();
                 continue;
             }
             
@@ -3149,6 +3224,9 @@ private:
                             if (task.two_failure_chunk) {
                                 set_two_failure_pipeline_error("RDMA P2P recv size mismatch");
                             }
+                            if (!task.is_load_mode_transfer) {
+                                set_save_pipeline_error("RDMA P2P recv size mismatch");
+                            }
                             std::cerr << "EC-CHECK: [Rank " << rank_ << "] P2P RDMA recv size mismatch: expected "
                                       << task.size << ", got " << recv_size
                                       << ", rank_in_group=" << rank_in_group_
@@ -3161,6 +3239,9 @@ private:
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA P2P recv failed: " << e.what() << std::endl;
                         if (task.two_failure_chunk) {
                             set_two_failure_pipeline_error(std::string("RDMA P2P recv failed: ") + e.what());
+                        }
+                        if (!task.is_load_mode_transfer) {
+                            set_save_pipeline_error(std::string("RDMA P2P recv failed: ") + e.what());
                         }
                     }
                     if (!task_processed) continue;
@@ -3183,6 +3264,9 @@ private:
                         if (size != task.size) {
                             if (task.two_failure_chunk) {
                                 set_two_failure_pipeline_error("ASIO P2P recv size mismatch");
+                            }
+                            if (!task.is_load_mode_transfer) {
+                                set_save_pipeline_error("ASIO P2P recv size mismatch");
                             }
                             std::cerr << "EC-CHECK: [Rank " << rank_ 
                                       << "] P2P size mismatch: expected " << task.size 
@@ -3208,6 +3292,9 @@ private:
                                   << "] P2P ASIO recv failed: " << e.what() << std::endl;
                         if (task.two_failure_chunk) {
                             set_two_failure_pipeline_error(std::string("ASIO P2P recv failed: ") + e.what());
+                        }
+                        if (!task.is_load_mode_transfer) {
+                            set_save_pipeline_error(std::string("ASIO P2P recv failed: ") + e.what());
                         }
                         continue;  // Skip processing on error
                     }
@@ -3268,6 +3355,9 @@ private:
                 else {
                     std::cerr << "EC-CHECK: [Rank " << rank_ 
                               << "] WARNING: No communication method available for P2P recv" << std::endl;
+                    if (!task.is_load_mode_transfer) {
+                        set_save_pipeline_error("No communication method available for P2P recv");
+                    }
                     task_processed = true;  // Mark as processed to avoid blocking
                 }
             } else {
@@ -3349,17 +3439,6 @@ private:
                 p2p_recv_queue_cv_.notify_one();
             }
 
-            // After processing task, check if sentinel was received and queue is empty
-            if (p2p_recv_worker_sentinel_received_.load()) {
-                std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_);
-                if (p2p_recv_queue_.empty()) {
-                    p2p_recv_worker_completed_ = true;
-                    // std::cout << "EC-CHECK: [Rank " << rank_ << "] P2P recv worker queue is empty after processing, marking completed" << std::endl;
-                    // Reset sentinel flag and continue (don't exit)
-                    p2p_recv_worker_sentinel_received_ = false;
-                    continue;
-                }
-            }
         }
     }
 
@@ -3739,6 +3818,11 @@ public:
     }
     
     void reset_encoding_completion_flags() {
+        if (save_cycle_active_.load(std::memory_order_acquire)) {
+            throw std::runtime_error(
+                "EC-CHECK: reset requested before the previous save cycle completed");
+        }
+
         // Reset completion flags
         encoding_thread_1_completed_ = false;
         encoding_thread_2_completed_ = false;
@@ -3762,6 +3846,11 @@ public:
         {
             std::lock_guard<std::mutex> lock(two_failure_pipeline_error_mutex_);
             two_failure_pipeline_error_message_.clear();
+        }
+        save_pipeline_error_.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(save_pipeline_error_mutex_);
+            save_pipeline_error_message_.clear();
         }
         
         // Clear queues to remove any residual tasks from previous pipeline
@@ -3837,13 +3926,7 @@ public:
             std::lock_guard<std::mutex> lock(recv_to_p2p_mutex_);
             recv_to_p2p_.clear();
         }
-        {
-            std::lock_guard<std::mutex> lock(release_queue_mutex_);
-            while (!data_buffers_to_release_.empty()) data_buffers_to_release_.pop();
-            while (!encoding_buffers_to_release_.empty()) encoding_buffers_to_release_.pop();
-            while (!two_failure_recv_buffers_to_release_.empty()) two_failure_recv_buffers_to_release_.pop();
-            while (!parity_buffers_to_release_.empty()) parity_buffers_to_release_.pop();
-        }
+        // Completed release notifications remain valid across cycles and are drained by Python.
         
         // Clear load mode queues
         {
@@ -4148,35 +4231,48 @@ public:
             }
             return;  // Load mode 下直接返回，不等待 save mode 的 workers
         } else {
-            // Save mode: 现有逻辑保持不变
-        // Wait for all encoding threads to complete
-        bool need_thread1 = true;
-        
-        int encoding_wait_count = 0;
-        while ((need_thread1 && !encoding_thread_1_completed_) || !encoding_thread_2_completed_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            encoding_wait_count++;
-        }
-        }
-        
-        // Wait for send worker to complete (only for save mode)
-        while (!send_worker_completed_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        
-        // Wait for recv worker to complete
-        while (!recv_worker_completed_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        
-        // Wait for XOR worker to complete
-        while (!xor_worker_completed_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        
-        // Wait for both P2P workers to complete
-        while (!p2p_send_worker_completed_ || !p2p_recv_worker_completed_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+            while (true) {
+                if (save_pipeline_error_.load(std::memory_order_acquire)) {
+                    std::string message;
+                    {
+                        std::lock_guard<std::mutex> lock(save_pipeline_error_mutex_);
+                        message = save_pipeline_error_message_;
+                    }
+                    throw std::runtime_error("EC-CHECK: save pipeline failed: " + message);
+                }
+                if (encoding_thread_1_completed_.load() && encoding_thread_2_completed_.load() &&
+                    send_worker_completed_.load() && recv_worker_completed_.load() &&
+                    xor_worker_completed_.load() && p2p_send_worker_completed_.load() &&
+                    p2p_recv_worker_completed_.load()) {
+                    save_cycle_active_.store(false, std::memory_order_release);
+                    return;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    size_t enc1_q, enc2_q, send_q, recv_q, xor_q, p2ps_q, p2pr_q;
+                    { std::lock_guard<std::mutex> lock(encoding_tasks_1_mutex_); enc1_q = encoding_tasks_1_.size(); }
+                    { std::lock_guard<std::mutex> lock(encoding_tasks_2_mutex_); enc2_q = encoding_tasks_2_.size(); }
+                    { std::lock_guard<std::mutex> lock(send_queue_mutex_); send_q = send_queue_.size(); }
+                    { std::lock_guard<std::mutex> lock(recv_queue_mutex_); recv_q = recv_queue_.size(); }
+                    { std::lock_guard<std::mutex> lock(xor_queue_mutex_); xor_q = xor_queue_.size(); }
+                    { std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_); p2ps_q = p2p_send_queue_.size(); }
+                    { std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_); p2pr_q = p2p_recv_queue_.size(); }
+                    std::ostringstream error;
+                    error << "EC-CHECK: [Rank " << rank_ << "] save completion timeout after 120s:"
+                          << " enc1=" << encoding_thread_1_completed_.load()
+                          << " enc2=" << encoding_thread_2_completed_.load()
+                          << " send=" << send_worker_completed_.load()
+                          << " recv=" << recv_worker_completed_.load()
+                          << " xor=" << xor_worker_completed_.load()
+                          << " p2ps=" << p2p_send_worker_completed_.load()
+                          << " p2pr=" << p2p_recv_worker_completed_.load()
+                          << " queues=[" << enc1_q << ',' << enc2_q << ',' << send_q << ','
+                          << recv_q << ',' << xor_q << ',' << p2ps_q << ',' << p2pr_q << ']';
+                    set_save_pipeline_error(error.str());
+                    throw std::runtime_error(error.str());
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
         }
     }
     
@@ -4266,6 +4362,7 @@ public:
                                           size_t p2p_data_size = 0) {
         size_t sequence_id = 0;
         if (data_addr != 0 || size != 0) {
+            save_cycle_active_.store(true, std::memory_order_release);
             sequence_id = save_sequence_id_thread1_.fetch_add(1, std::memory_order_relaxed);
         }
         {
@@ -4295,6 +4392,7 @@ public:
                                           size_t p2p_data_size = 0) {
         size_t sequence_id = 0;
         if (data_addr != 0 || size != 0) {
+            save_cycle_active_.store(true, std::memory_order_release);
             sequence_id = save_sequence_id_thread2_.fetch_add(1, std::memory_order_relaxed);
         }
         {
@@ -7205,7 +7303,8 @@ PYBIND11_MODULE(eccheck_native, m) {
              pybind11::arg("p2p_partner_rank") = -1)
         .def("set_buffer_addresses", &ECCHECKNative::set_buffer_addresses)
         .def("reset_encoding_completion_flags", &ECCHECKNative::reset_encoding_completion_flags)
-        .def("wait_for_encoding_completion", &ECCHECKNative::wait_for_encoding_completion)
+        .def("wait_for_encoding_completion", &ECCHECKNative::wait_for_encoding_completion,
+             pybind11::call_guard<pybind11::gil_scoped_release>())
         .def("wait_for_two_failure_chunk_completion",
              &ECCHECKNative::wait_for_two_failure_chunk_completion,
              pybind11::arg("expected_chunks"),

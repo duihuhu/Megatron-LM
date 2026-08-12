@@ -640,6 +640,8 @@ def _encode_eccheck_with_native(
         native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0, 0, 0)
 
         native.wait_for_encoding_completion()
+        if poll_and_release is not None:
+            poll_and_release()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         blocks["block_write_sizes"] = {

@@ -747,7 +747,7 @@ def _reconstruct_from_payload(
     """Reconstruct state_dict from metadata + tensor buffer.
 
     Supports both old format (tensor_infos as list of dicts) and new format
-    (tensor_infos as list of TensorMetadata objects, matching ecnaive/eclatin).
+    (tensor_infos as list of TensorMetadata objects, matching erasure-coded checkpoint metadata).
     """
     tb = tensor_buffer.detach().contiguous().reshape(-1).view(torch.uint8)
     if tensor_infos and isinstance(tensor_infos[0], dict):

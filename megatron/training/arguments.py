@@ -352,14 +352,13 @@ def validate_args(args, defaults={}):
 
     _ec_legacy_flags = (
         bool(getattr(args, "use_ecnaive", False)),
-        bool(getattr(args, "use_eclatin", False)),
         bool(getattr(args, "use_frcheck", False)),
         bool(getattr(args, "use_gemini_replicas", False)),
     )
     if sum(_ec_legacy_flags) > 1:
         raise RuntimeError(
-            "At most one of --use-ecnaive, --use-eclatin, --use-frcheck, "
-            "and --use-gemini-replicas may be enabled."
+            "At most one of --use-ecnaive, --use-frcheck, and "
+            "--use-gemini-replicas may be enabled."
         )
     if (
         getattr(args, "frcheck_hw_early_optimizer", False)
@@ -443,23 +442,6 @@ def validate_args(args, defaults={}):
                 )
         if train_iter is None and save_iter is not None:
             args.ft_inprocess_recovery_after_train_iter = save_iter
-    if getattr(args, "no_shared_block", False):
-        if not getattr(args, "use_eclatin", False):
-            raise RuntimeError(
-                "--no-shared-block requires --use-eclatin."
-            )
-        if getattr(args, "use_eclatin_two_failures", False):
-            raise RuntimeError(
-                "--no-shared-block is incompatible with --use-eclatin-two-failures."
-            )
-        if getattr(args, "use_eclatin_software_failure", False):
-            raise RuntimeError(
-                "--no-shared-block is incompatible with --use-eclatin-software-failure."
-            )
-        if getattr(args, "use_eclatin_layerwise", False):
-            raise RuntimeError(
-                "--no-shared-block is incompatible with --use-eclatin-layerwise."
-            )
     if getattr(args, "use_frcheck", False):
         frcheck_path = getattr(args, "frcheck_table_path", None)
         frcheck_n = getattr(args, "frcheck_n", None)
@@ -2437,27 +2419,6 @@ def _add_checkpointing_args(parser):
                        help='Rotate physical ECCHECK group positions into logical rig positions. '
                             'Save and load must use the same value; offset 2 maps physical rig0 '
                             'to the logical rig2 hardware-failure role.')
-
-    # ECLATIN (Erasure Coding Checkpoint with different pipeline) arguments
-    group.add_argument('--use-eclatin', action='store_true',
-                       help='Enable ECLATIN (Erasure Coding Checkpoint with different pipeline) '
-                            'for serialization-free checkpoint encoding. Similar to EC-CHECK but '
-                            'uses a different internal pipeline structure for saving.')
-    group.add_argument('--use-eclatin-layerwise', action='store_true',
-                       help='Use layer-wise ECLATIN checkpointing mode. This enables layer-by-layer '
-                            'pipelined D2H transfer followed by encoding and network transmission.')
-    group.add_argument('--use-eclatin-software-failure', action='store_true',
-                       help='Enable ECLATIN checkpointing for software failure recovery. '
-                            'When enabled, rank2 reads data_block_1 and data_block_2 from local files directly.')
-    group.add_argument('--use-eclatin-two-failures', action='store_true',
-                       help='Enable ECLATIN two-failure hardware recovery mode. '
-                            'rank_in_group 0 and 1 are treated as failed; they recover from '
-                            'surviving ranks 2 and 3 using RDMA transport and 16-thread XOR pool.')
-    group.add_argument('--no-shared-block', action='store_true',
-                       help='ECLATIN HW1 load breakdown: recover node2 via 8 independent network '
-                            'blocks with no recv-buffer reuse in XOR (vs default 6-channel shared). '
-                            'Requires --load and --use-eclatin; incompatible with layerwise, '
-                            'software-failure, and two-failures modes.')
 
     # EC-NAIVE (Erasure Coding Checkpoint with naive Reed-Solomon encoding) arguments
     group.add_argument('--use-ecnaive', action='store_true',

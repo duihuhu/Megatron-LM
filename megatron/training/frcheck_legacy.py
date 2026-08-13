@@ -8945,7 +8945,7 @@ def _recover_one_layer_network(
 
 
 # ---------------------------------------------------------------------------
-# Training exit teardown (ECLATIN-style: explicit stop after eval, not in __del__)
+# Training exit teardown: explicit stop after eval, not in __del__
 # ---------------------------------------------------------------------------
 
 def _teardown_frcheck_after_training() -> None:
@@ -8985,7 +8985,7 @@ def _teardown_frcheck_after_training() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Load teardown (ECLATIN-style: explicit cleanup after recovery only)
+# Load teardown: explicit cleanup after recovery only
 # ---------------------------------------------------------------------------
 
 def _teardown_frcheck_native_after_load() -> None:

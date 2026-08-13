@@ -2106,7 +2106,7 @@ private:
             throw std::runtime_error("ECNAIVE: data_addrs size must equal k_");
         }
 
-        // Use 16-pthread pool when available (aligns with FRCheck rs_pool / ECLATIN xor_pool)
+        // Use 16-pthread pool when available (matches the available erasure-coding worker pools)
         if (ec_rs_pool_inited_.load(std::memory_order_acquire)) {
             ec_rs_pool_run_encode(data_addrs, parity0_addr, parity1_addr, size);
             return;
@@ -2432,7 +2432,7 @@ private:
 
     // Create RDMA channels and connect QPs for save (after ASIO connections are up).
     // Create RDMA save channels using ASIO socket fds for control
-    // (same pattern as eclatin init_rdma_save_channels).
+    // (same pattern as the other RDMA save-channel initialization).
     void init_rdma_save_channels() {
         if (!use_rdma_ || !rdma_pd_) return;
 

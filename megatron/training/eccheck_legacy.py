@@ -3,7 +3,7 @@
 """LEGACY checkpoint path for ECCHECK (XOR-based erasure coding with 4-rank groups).
 
 Saves/loads via torch.save / torch.load with .pt files (same pattern as
-eclatin_legacy.py and ecnaive_legacy.py), reusing the shared ECCHECKManager
+the other erasure-coded checkpoint implementations), reusing the shared ECCHECKManager
 singleton and its C++ native module.
 """
 

@@ -65,7 +65,7 @@ def _load_native():
 
 
 def _get_ip(rank: int, local_rank: int) -> str:
-    return resolve_ip("FRCHECK", rank=rank, local_rank=local_rank, fallback_prefixes=["ECLATIN"])
+    return resolve_ip("FRCHECK", rank=rank, local_rank=local_rank)
 
 
 def _init_dist(args) -> None:

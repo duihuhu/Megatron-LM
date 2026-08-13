@@ -1,16 +1,16 @@
 #!/bin/bash
 
 # Script to run a single node in 4-node simulation (default 1 GPU per node)
-# Usage: ./test_eccheck_4nodes_node_335M_eclatin.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [mode] [additional_args...]
+# Usage: ./test_train.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [mode] [additional_args...]
 #
 # mode (optional, default: save):
 #   save      - checkpoint save only (no load / recovery flags)
 #   software  - load checkpoint + software failure recovery
 #   hardware  - load checkpoint + hardware failure recovery
 #
-# Example: ./test_eccheck_4nodes_node_335M_eclatin.sh 0 0
-# Example (2 GPUs per container): ./test_eccheck_4nodes_node_335M_eclatin.sh 0 2 3 software
-# Example (8 GPUs, hardware recovery): ./test_eccheck_4nodes_node_335M_eclatin.sh 0 0 1 2 3 4 5 6 7 hardware
+# Example: ./test_train.sh 0 0
+# Example (2 GPUs per container): ./test_train.sh 0 2 3 software
+# Example (8 GPUs, hardware recovery): ./test_train.sh 0 0 1 2 3 4 5 6 7 hardware
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
@@ -28,15 +28,6 @@ NNODES=4
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
-export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
-export ECLATIN_LOCAL_RANK_NIC_0=eth0
-export ECLATIN_LOCAL_RANK_NIC_1=eth0
-export ECLATIN_LOCAL_RANK_NIC_2=eth0
-export ECLATIN_LOCAL_RANK_NIC_3=eth0
-export ECLATIN_LOCAL_RANK_NIC_4=eth1
-export ECLATIN_LOCAL_RANK_NIC_5=eth1
-export ECLATIN_LOCAL_RANK_NIC_6=eth1
-export ECLATIN_LOCAL_RANK_NIC_7=eth1
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -88,7 +79,7 @@ VOCAB_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-merges.txt"
 
 TENSORBOARD_LOGS_PATH="/workspace/Megatron-LM/pre-tests/opt/7B/opt-7b-0/logs"
-CHECKPOINT_PATH="/dev/shm/models/opt-7b-0-eclatin"
+CHECKPOINT_PATH="/dev/shm/models/opt-7b-0-checkpoint"
 # DATA_PATH="/workspace/Megatron-LM/pre-tests/opt/opt_data/wiki_text_sentence"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -104,7 +95,6 @@ case "$MODE" in
     software)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            #--use-eclatin-software-failure
         )
         ;;
     hardware)
@@ -115,7 +105,6 @@ case "$MODE" in
     hardware2)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            #--use-eclatin-two-failures
         )
         ;;
 esac
@@ -195,7 +184,6 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-gemini-hardware-failure
     # --use-distributed-optimizer
     # --use-ecnaive-software-failure
-    #--use-eclatin
     --ckpt-format torch
     # --no-save-optim
     # --no-load-optim

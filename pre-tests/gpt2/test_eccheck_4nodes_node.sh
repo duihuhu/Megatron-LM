@@ -119,7 +119,6 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     #--use-eccheck
-    --use-eclatin
 
     --use-gemini
     # --use-gemini-software-failure

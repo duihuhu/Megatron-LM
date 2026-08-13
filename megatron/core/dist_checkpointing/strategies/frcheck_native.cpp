@@ -132,7 +132,7 @@ struct ConnectHello {
 
 class FRCheckRdmaChannel {
 public:
-    // ECLATIN/ECNaive-aligned: each channel owns dedicated send/recv CQs.
+    // Per-channel design: each channel owns dedicated send/recv CQs.
     FRCheckRdmaChannel(ibv_context* ctx, ibv_pd* pd,
                        int tcp_sock, int peer_rank,
                        std::map<uintptr_t, RdmaBuffer>* bufs,
@@ -194,7 +194,7 @@ public:
     int max_send_sge() const { return max_send_sge_; }
     int max_recv_sge() const { return max_recv_sge_; }
 
-    // Break blocking send/recv during shutdown (ECLATIN-style conn cleanup).
+    // Break blocking send/recv during shutdown (connection cleanup).
     void abort_connection() {
         connected_ = false;
         tag_stop_.store(true, std::memory_order_release);
@@ -651,7 +651,7 @@ private:
         }
     }
 
-    // ECLATIN-style: poll one completion at a time on this channel's private CQ.
+    // Poll one completion at a time on this channel's private CQ.
     void poll_cq(ibv_cq* cq, int count) {
         int done = 0;
         while (done < count) {
@@ -1165,7 +1165,7 @@ public:
 
     ~FRCheckNative() {
         // Lightweight destructor: free POA/ISA-L tables only.
-        // Full RDMA/worker teardown is explicit via stop() (ECLATIN-style).
+        // Full RDMA/worker teardown is explicit via stop().
         if (a_mat_) { free(a_mat_); a_mat_ = nullptr; }
         if (g_tbls_) { free(g_tbls_); g_tbls_ = nullptr; }
         if (decode_tbls_) { free(decode_tbls_); decode_tbls_ = nullptr; }
@@ -4902,7 +4902,7 @@ private:
         if (!devs || ndev == 0)
             throw std::runtime_error("FRCheck RDMA: no IB devices found");
         rdma_ctx_ = ibv_open_device(find_rdma_device_by_ip(
-            my_ip_, devs, ndev, {"FRCHECK", "ECLATIN"}));
+            my_ip_, devs, ndev, {"FRCHECK"}));
         ibv_free_device_list(devs);
         if (!rdma_ctx_)
             throw std::runtime_error("FRCheck RDMA: failed to open device");

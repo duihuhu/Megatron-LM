@@ -4592,7 +4592,7 @@ public:
     void set_load_mode(bool is_load, int failed_rank) {
         is_load_mode_ = is_load;
         failed_rank_ = failed_rank;
-        // failed_rank=10 → two-failure hardware recovery (following ECLATIN convention)
+        // failed_rank=10 → two-failure hardware recovery
         is_two_failures_load_mode_ = (is_load && failed_rank == 10);
         failed_rank_in_group_ =
             (failed_rank >= 0 && failed_rank != 10) ? (failed_rank % ECCHECK_RANKS_PER_GROUP) : -1;

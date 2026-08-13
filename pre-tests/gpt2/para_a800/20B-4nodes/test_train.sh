@@ -31,7 +31,6 @@ NNODES=${NNODES:-4}
 
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
-export ECLATIN_INTERFACE=$NETIFACES_INTERFACE
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
 if [ -n "$1" ]; then
@@ -95,7 +94,6 @@ configure_rdma_local_rank_bindings() {
     done
 }
 
-configure_rdma_local_rank_bindings ECLATIN
 
 # Set CUDA_VISIBLE_DEVICES by explicitly listing all provided GPU IDs (as comma-separated values)
 export CUDA_VISIBLE_DEVICES=$(IFS=, ; echo "${GPU_IDS[*]}")
@@ -125,7 +123,6 @@ case "$MODE" in
     software)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            #--use-eclatin-software-failure
         )
         ;;
     hardware)
@@ -136,7 +133,6 @@ case "$MODE" in
     hardware2)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            #--use-eclatin-two-failures
         )
         ;;
 esac
@@ -216,7 +212,6 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-gemini-hardware-failure
     # --use-distributed-optimizer
     # --use-ecnaive-software-failure
-    #--use-eclatin
     --ckpt-format torch
     # --no-save-optim
     # --no-load-optim

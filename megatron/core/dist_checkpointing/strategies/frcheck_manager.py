@@ -625,7 +625,7 @@ class FRCheckManager:
             if torch.distributed.is_initialized()
             else None
         )
-        return resolve_ip("FRCHECK", rank=rank, fallback_prefixes=["ECLATIN"])
+        return resolve_ip("FRCHECK", rank=rank)
 
     def _allocate_default_buffers(self, native, n: int) -> None:
         """Keep legacy default sizes; per-layer save/recovery allocates real buffers."""
@@ -1224,7 +1224,7 @@ class FRCheckManager:
         self._inprocess_recovery_workspace_key = None
 
     def _unregister_all_buffers(self) -> None:
-        """Unregister all RDMA-registered buffers (ECLATIN-style cleanup)."""
+        """Unregister all RDMA-registered buffers (explicit resource cleanup)."""
         native = self._frcheck_native
         if native is None:
             return
@@ -1257,7 +1257,7 @@ class FRCheckManager:
             torch.cuda.empty_cache()
 
     def stop(self) -> None:
-        """Stop C++ encode workers and RS pool (synchronous, ECLATIN-style)."""
+        """Stop C++ encode workers and RS pool (synchronous teardown)."""
         if self._frcheck_native is None or not hasattr(self._frcheck_native, "stop"):
             return
         try:
@@ -1359,7 +1359,7 @@ class FRCheckManager:
             logger.warning("FRCheck: error during recovery cleanup: %s", e)
 
     def cleanup(self, teardown: bool = False, sync: bool = True) -> None:
-        """Cleanup FRCheck resources (ECLATIN-style).
+        """Cleanup FRCheck resources explicitly.
 
         Save/train/eval: do not call — native module stays alive for reuse.
         Load path: call with teardown=True after recovery completes.
@@ -1377,6 +1377,6 @@ class FRCheckManager:
             logger.warning("FRCheck: error during manager cleanup: %s", e)
 
     def __del__(self):
-        # Do not stop native here — save/eval keep resources alive (ECLATIN save path).
+        # Do not stop native here — save/eval keep resources alive (checkpoint save path).
         # Load path calls cleanup(teardown=True) explicitly before returning state_dict.
         pass

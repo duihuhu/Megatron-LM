@@ -1118,7 +1118,7 @@ def _encode_with_native(
                 parity1_addr = get_free_parity_buffer()
                 native.encode_ec_blocks(data_block_addrs, parity0_addr, parity1_addr, own_take)
 
-            # Continuous recv block write addresses (no padding, aligned with ECLATIN).
+            # Continuous recv block write addresses (no padding, stored contiguously).
             recv_write_addrs = []
             recv_takes = []
             for i in range(num_recv):
@@ -2191,7 +2191,7 @@ def load_ecnaive_legacy_checkpoint_hardware_recovery(
     block_data_size = int(main_payload.get("block_data_size",
                           (pipeline_total_bytes + ecnaive_k - 1) // ecnaive_k))
     # version < 3: old checkpoints have 64B alignment gaps in recv blocks
-    # version >= 3: continuous (no padding, aligned with ECLATIN)
+    # version >= 3: continuous (no padding, stored contiguously)
     ckpt_version = int(main_payload.get("version", 3))
     has_padded_recv = ckpt_version < 3
 

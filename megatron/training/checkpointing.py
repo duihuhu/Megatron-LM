@@ -82,7 +82,7 @@ def _ft_legacy_timing_enabled(args) -> bool:
             "use_gemini_replicas",
             "use_eccheck",
             "use_ecnaive",
-            "use_frcheck",
+            "use_concord",
         )
     )
 
@@ -99,8 +99,8 @@ def _inprocess_recovery_failed_ranks(args):
         return explicit
     if getattr(args, "use_gemini_replicas", False):
         return _parse_rank_list(getattr(args, "gemini_replicas_recovery_rank", None))
-    if getattr(args, "use_frcheck", False):
-        return _parse_rank_list(getattr(args, "frcheck_failed_ranks", None))
+    if getattr(args, "use_concord", False):
+        return _parse_rank_list(getattr(args, "concord_failed_ranks", None))
     if getattr(args, "use_ecnaive", False):
         return _parse_rank_list(getattr(args, "ecnaive_failed_ranks", None))
     if getattr(args, "use_eccheck", False):
@@ -157,11 +157,11 @@ def _set_scheme_failed_ranks_for_inprocess(args, failed_ranks):
     if getattr(args, "use_gemini_replicas", False):
         args.use_gemini_replicas_hardware_failure = True
         args.gemini_replicas_recovery_rank = failed_text
-    elif getattr(args, "use_frcheck", False):
-        args.use_frcheck_hardware_failure = True
-        args.frcheck_failed_ranks = failed_text
-        args.frcheck_failed_ranks_parsed = list(failed_ranks)
-        args.frcheck_recovery_only_teardown = True
+    elif getattr(args, "use_concord", False):
+        args.use_concord_hardware_failure = True
+        args.concord_failed_ranks = failed_text
+        args.concord_failed_ranks_parsed = list(failed_ranks)
+        args.concord_recovery_only_teardown = True
     elif getattr(args, "use_ecnaive", False):
         args.ecnaive_failed_ranks = failed_text
         args.ecnaive_failed_ranks_parsed = list(failed_ranks)
@@ -280,7 +280,7 @@ def _format_inprocess_load_timing_summary(ft_context: dict, h2d_total_s: float) 
     recovery_e2e_s = float(recovery.get("total", 0.0))
     scheme = ft_context.get("scheme")
 
-    if scheme == "FRCHECK" and getattr(args, "use_frcheck", False):
+    if scheme == "CONCORD" and getattr(args, "use_concord", False):
         summary = _timing_max_dict({
             "e2e_s": recovery_e2e_s + h2d_total_s,
             "recovery_e2e_s": recovery_e2e_s,
@@ -291,7 +291,7 @@ def _format_inprocess_load_timing_summary(ft_context: dict, h2d_total_s: float) 
             "restore_wall_s": h2d_total_s,
         })
         return (
-            "FRCheck load timing (%s): early_optimizer=%s e2e_s=%.2fs "
+            "Concord load timing (%s): early_optimizer=%s e2e_s=%.2fs "
             "recovery_e2e_s=%.2fs assemble_s=%.2fs assemble_read_s=%.2fs "
             "assemble_copy_s=%.2fs rebuild_sd_s=%.2fs restore_wall_s=%.2fs"
             % (
@@ -446,7 +446,7 @@ def _native_legacy_inprocess_enabled(args) -> bool:
     return not any(
         bool(getattr(args, flag, False))
         for flag in (
-            "use_frcheck",
+            "use_concord",
             "use_eccheck",
             "use_ecnaive",
             "use_gemini",
@@ -536,7 +536,7 @@ def run_inprocess_ft_recovery_benchmark(
         incompatible = []
         for enabled, option in (
             (getattr(args, "use_gemini_replicas_hardware_failure", False), "--use-gemini-replicas-hardware-failure"),
-            (getattr(args, "use_frcheck_hardware_failure", False), "--use-frcheck-hardware-failure"),
+            (getattr(args, "use_concord_hardware_failure", False), "--use-concord-hardware-failure"),
             (getattr(args, "use_eccheck_two_failures", False), "--use-eccheck-two-failures"),
             (getattr(args, "_ecnaive_require_hw2", False), "--ecnaive-require-hw2"),
         ):
@@ -571,7 +571,7 @@ def run_inprocess_ft_recovery_benchmark(
                 candidate for candidate in range(world_size)
                 if ECCHECKManager._get_rank_in_group(candidate, world_size) == 1
             ]
-        elif getattr(args, "use_frcheck", False):
+        elif getattr(args, "use_concord", False):
             ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
             failed_ranks = list(range(min(ranks_per_node, torch.distributed.get_world_size())))
     if not failed_ranks:
@@ -592,24 +592,24 @@ def run_inprocess_ft_recovery_benchmark(
     iteration, release = read_metadata(get_checkpoint_tracker_filename(args.load))
     checkpoint_name = get_checkpoint_name(args.load, iteration, release, return_base_dir=False)
     mode = "software" if software_failure else "hardware"
-    frcheck_hw_early_optimizer = bool(
+    concord_hw_early_optimizer = bool(
         not software_failure
-        and getattr(args, "use_frcheck", False)
-        and getattr(args, "frcheck_hw_early_optimizer", False)
+        and getattr(args, "use_concord", False)
+        and getattr(args, "concord_hw_early_optimizer", False)
     )
     if rank == 0:
         logger.info(
             "FT in-process recovery benchmark: run=%d/%d mode=%s load=%s "
             "iteration=%s affected_ranks=%s early_optimizer=%s",
             runs_done + 1, repeat, mode, args.load, iteration, failed_ranks,
-            frcheck_hw_early_optimizer,
+            concord_hw_early_optimizer,
         )
     torch.distributed.barrier()
     if software_failure:
         scheme = next(
             name for flag, name in (
                 ("use_gemini_replicas", "Gemini Replicas"),
-                ("use_frcheck", "FRCHECK"),
+                ("use_concord", "CONCORD"),
                 ("use_ecnaive", "EC-NAIVE"),
                 ("use_eccheck", "ECCHECK"),
             ) if getattr(args, flag, False)
@@ -624,42 +624,42 @@ def run_inprocess_ft_recovery_benchmark(
         if getattr(args, "use_gemini_replicas", False):
             from .gemini_replicas_legacy import load_gemini_replicas_legacy_checkpoint
             state_dict = load_gemini_replicas_legacy_checkpoint(checkpoint_name)
-        elif getattr(args, "use_frcheck", False):
+        elif getattr(args, "use_concord", False):
             if software_failure:
                 if rank == 0:
                     logger.info(
-                        "FRCHECK software in-process workspace cache=disabled; "
+                        "CONCORD software in-process workspace cache=disabled; "
                         "native teardown is deferred for repeat safety"
                     )
-                from .frcheck_legacy import load_frcheck_legacy_checkpoint
-                state_dict = load_frcheck_legacy_checkpoint(checkpoint_name)
+                from .concord_legacy import load_concord_legacy_checkpoint
+                state_dict = load_concord_legacy_checkpoint(checkpoint_name)
             else:
-                from .frcheck_legacy import (
-                    frcheck_filter_layerwise_model_placeholders,
-                    frcheck_register_pending_optimizer_state,
-                    get_frcheck_layerwise_runtime_summary,
-                    install_frcheck_layerwise_runtime_from_state_dict,
-                    recover_frcheck_legacy_hardware,
-                    wait_for_frcheck_parity_flush,
+                from .concord_legacy import (
+                    concord_filter_layerwise_model_placeholders,
+                    concord_register_pending_optimizer_state,
+                    get_concord_layerwise_runtime_summary,
+                    install_concord_layerwise_runtime_from_state_dict,
+                    recover_concord_legacy_hardware,
+                    wait_for_concord_parity_flush,
                 )
-                wait_for_frcheck_parity_flush()
-                state_dict, timings = recover_frcheck_legacy_hardware(checkpoint_name, failed_ranks)
+                wait_for_concord_parity_flush()
+                state_dict, timings = recover_concord_legacy_hardware(checkpoint_name, failed_ranks)
                 timings["total"] = timings.get("network_encode", 0.0) + timings.get("rebuild_sd", 0.0)
-                timings["early_optimizer"] = frcheck_hw_early_optimizer
+                timings["early_optimizer"] = concord_hw_early_optimizer
                 from megatron.training.global_vars import set_ft_load_timing_context
-                set_ft_load_timing_context("FRCHECK", "HW-INPROCESS", timings)
+                set_ft_load_timing_context("CONCORD", "HW-INPROCESS", timings)
                 if rank in failed_set:
-                    install_frcheck_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
-                    frcheck_filter_layerwise_model_placeholders(state_dict)
-                    runtime_summary = get_frcheck_layerwise_runtime_summary()
+                    install_concord_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
+                    concord_filter_layerwise_model_placeholders(state_dict)
+                    runtime_summary = get_concord_layerwise_runtime_summary()
                     if runtime_summary is not None:
-                        registered_optimizer = frcheck_register_pending_optimizer_state(state_dict)
+                        registered_optimizer = concord_register_pending_optimizer_state(state_dict)
                         if registered_optimizer:
-                            from .frcheck_legacy import (
-                                frcheck_restore_optimizer_control_state,
+                            from .concord_legacy import (
+                                concord_restore_optimizer_control_state,
                             )
 
-                            frcheck_restore_optimizer_control_state(optimizer)
+                            concord_restore_optimizer_control_state(optimizer)
         elif getattr(args, "use_ecnaive", False):
             if software_failure:
                 from .ecnaive_legacy import load_ecnaive_legacy_checkpoint
@@ -680,10 +680,10 @@ def run_inprocess_ft_recovery_benchmark(
         if (
             not software_failure
             and rank in failed_set
-            and getattr(args, "use_frcheck", False)
+            and getattr(args, "use_concord", False)
         ):
-            from .frcheck_legacy import get_frcheck_layerwise_runtime_summary
-            runtime_summary = get_frcheck_layerwise_runtime_summary()
+            from .concord_legacy import get_concord_layerwise_runtime_summary
+            runtime_summary = get_concord_layerwise_runtime_summary()
             if runtime_summary is None:
                 _inject_inprocess_recovered_state(
                     ddp_model, optimizer, opt_param_scheduler, state_dict, strict=strict,
@@ -695,49 +695,49 @@ def run_inprocess_ft_recovery_benchmark(
                 mark_recovery_to_forward_timer("inprocess_model_sync_done")
                 _inject_inprocess_scheduler_state(opt_param_scheduler, state_dict)
                 mark_recovery_to_forward_timer("inprocess_scheduler_done")
-                if frcheck_hw_early_optimizer:
-                    from .frcheck_legacy import frcheck_wait_for_optimizer_state
+                if concord_hw_early_optimizer:
+                    from .concord_legacy import concord_wait_for_optimizer_state
 
                     mark_recovery_to_forward_timer("inprocess_optimizer_early_start")
-                    frcheck_wait_for_optimizer_state(optimizer)
+                    concord_wait_for_optimizer_state(optimizer)
                     mark_recovery_to_forward_timer("inprocess_optimizer_early_done")
-                elif getattr(args, "frcheck_hw_optimizer_overlap", False):
-                    from .frcheck_legacy import frcheck_prepare_optimizer_h2d
+                elif getattr(args, "concord_hw_optimizer_overlap", False):
+                    from .concord_legacy import concord_prepare_optimizer_h2d
 
                     mark_recovery_to_forward_timer("inprocess_optimizer_prepare_start")
-                    if not frcheck_prepare_optimizer_h2d(optimizer):
+                    if not concord_prepare_optimizer_h2d(optimizer):
                         raise RuntimeError(
-                            "FRCheck failed rank could not start optimizer CPU preparation"
+                            "Concord failed rank could not start optimizer CPU preparation"
                         )
                     mark_recovery_to_forward_timer("inprocess_optimizer_prepare_done")
         else:
-            defer_frcheck_optimizer = bool(
-                not frcheck_hw_early_optimizer
+            defer_concord_optimizer = bool(
+                not concord_hw_early_optimizer
                 and not software_failure
-                and getattr(args, "use_frcheck", False)
+                and getattr(args, "use_concord", False)
                 and rank not in failed_set
                 and optimizer is not None
                 and not getattr(optimizer, "is_stub_optimizer", False)
                 and isinstance(state_dict, dict)
                 and "optimizer" in state_dict
             )
-            if defer_frcheck_optimizer:
-                if getattr(args, "frcheck_hw_optimizer_overlap", False):
+            if defer_concord_optimizer:
+                if getattr(args, "concord_hw_optimizer_overlap", False):
                     # Healthy ranks retain the live optimizer restored before the fault.
                     # Drop the redundant recovery payload and any pending initial-load
                     # payload so the optimizer-step fallback cannot reload stale state.
-                    from .frcheck_legacy import frcheck_discard_pending_optimizer_state
+                    from .concord_legacy import concord_discard_pending_optimizer_state
 
                     state_dict.pop("optimizer", None)
-                    frcheck_discard_pending_optimizer_state()
+                    concord_discard_pending_optimizer_state()
                     logger.debug(
-                        "FRCheck optimizer overlap: healthy rank %d retained live optimizer state",
+                        "Concord optimizer overlap: healthy rank %d retained live optimizer state",
                         rank,
                     )
                 else:
-                    from .frcheck_legacy import frcheck_register_pending_optimizer_state
+                    from .concord_legacy import concord_register_pending_optimizer_state
 
-                    frcheck_register_pending_optimizer_state(
+                    concord_register_pending_optimizer_state(
                         state_dict, allow_without_runtime=True,
                     )
                 mark_recovery_to_forward_timer("inprocess_inject_start")
@@ -783,7 +783,7 @@ def run_inprocess_ft_recovery_benchmark(
         torch.distributed.barrier()
         mark_recovery_to_forward_timer("inprocess_post_h2d_barrier_done")
     else:
-        # FRCheck and the native legacy baseline intentionally keep their existing no-barrier path.
+        # Concord and the native legacy baseline intentionally keep their existing no-barrier path.
         mark_recovery_to_forward_timer("inprocess_post_h2d_barrier_skipped")
     _mark_inprocess_recovery_cycle_done()
     return True
@@ -1285,36 +1285,36 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             )
             # Store parsed list back on args for downstream use
             args.ecnaive_failed_ranks_parsed = failed_ranks
-    if getattr(args, "use_frcheck", False) and (
+    if getattr(args, "use_concord", False) and (
         args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
     ):
         raise RuntimeError(
-            "FRCheck skeleton only supports torch checkpoint format and LEGACY checkpoints. "
+            "Concord skeleton only supports torch checkpoint format and LEGACY checkpoints. "
             "Please use --ckpt-format torch without distributed checkpoint save."
         )
-    if getattr(args, "use_frcheck_hardware_failure", False):
-        if not getattr(args, "use_frcheck", False):
+    if getattr(args, "use_concord_hardware_failure", False):
+        if not getattr(args, "use_concord", False):
             raise RuntimeError(
-                "FRCheck --use-frcheck-hardware-failure requires --use-frcheck"
+                "Concord --use-concord-hardware-failure requires --use-concord"
             )
-        frcheck_failed_ranks_str = getattr(args, "frcheck_failed_ranks", None)
-        if frcheck_failed_ranks_str is not None:
+        concord_failed_ranks_str = getattr(args, "concord_failed_ranks", None)
+        if concord_failed_ranks_str is not None:
             if not torch.distributed.is_initialized():
                 raise RuntimeError(
-                    "FRCheck --frcheck-failed-ranks requires torch.distributed to be initialized"
+                    "Concord --concord-failed-ranks requires torch.distributed to be initialized"
                 )
             world_size = torch.distributed.get_world_size()
-            failed_ranks = [int(x.strip()) for x in frcheck_failed_ranks_str.split(",")]
+            failed_ranks = [int(x.strip()) for x in concord_failed_ranks_str.split(",")]
             if len(failed_ranks) < 1:
                 raise RuntimeError(
-                    f"FRCheck --frcheck-failed-ranks requires at least 1 rank, got {len(failed_ranks)}"
+                    f"Concord --concord-failed-ranks requires at least 1 rank, got {len(failed_ranks)}"
                 )
             for fr in failed_ranks:
                 if fr < 0 or fr >= world_size:
                     raise RuntimeError(
-                        f"FRCheck --frcheck-failed-ranks rank {fr} out of range [0, {world_size - 1}]"
+                        f"Concord --concord-failed-ranks rank {fr} out of range [0, {world_size - 1}]"
                     )
-            args.frcheck_failed_ranks_parsed = failed_ranks
+            args.concord_failed_ranks_parsed = failed_ranks
     if getattr(args, "use_gemini_replicas", False) and (
         args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
     ):
@@ -1324,7 +1324,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         )
     ec_legacy_checkpointing = any((
         getattr(args, "use_ecnaive", False),
-        getattr(args, "use_frcheck", False),
+        getattr(args, "use_concord", False),
         getattr(args, "use_gemini_replicas", False),
         getattr(args, "use_eccheck", False),
     ))
@@ -1481,9 +1481,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     from .ecnaive_legacy import save_ecnaive_legacy_checkpoint
                     save_ecnaive_legacy_checkpoint(state_dict, checkpoint_name, write_to_disk=ec_write_to_disk)
                     checkpoint_name = str(Path(checkpoint_name).parent)
-                elif getattr(args, "use_frcheck", False):
-                    from .frcheck_legacy import save_frcheck_legacy_checkpoint
-                    save_frcheck_legacy_checkpoint(state_dict, checkpoint_name, write_to_disk=ec_write_to_disk)
+                elif getattr(args, "use_concord", False):
+                    from .concord_legacy import save_concord_legacy_checkpoint
+                    save_concord_legacy_checkpoint(state_dict, checkpoint_name, write_to_disk=ec_write_to_disk)
                     checkpoint_name = str(Path(checkpoint_name).parent)
                 elif getattr(args, "use_gemini_replicas", False):
                     from .gemini_replicas_legacy import save_gemini_replicas_legacy_checkpoint
@@ -2148,9 +2148,9 @@ def _load_base_checkpoint(
                         str(marker), MAGIC_ECNAIVE, pin_tensor_buffer=True,
                     )
                     state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
-            elif getattr(args, "use_frcheck", False):
-                from .frcheck_legacy import load_frcheck_legacy_checkpoint
-                state_dict = load_frcheck_legacy_checkpoint(checkpoint_name)
+            elif getattr(args, "use_concord", False):
+                from .concord_legacy import load_concord_legacy_checkpoint
+                state_dict = load_concord_legacy_checkpoint(checkpoint_name)
             elif getattr(args, "use_eccheck", False):
                 from .eccheck_legacy import (
                     load_eccheck_legacy_checkpoint,
@@ -2211,32 +2211,32 @@ def _load_base_checkpoint(
                         )
                         state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
                 else:
-                    frcheck_marker = None
+                    concord_marker = None
                     if torch.distributed.is_initialized():
                         rank = torch.distributed.get_rank()
-                        frcheck_rank_marker = ckpt_parent_path / f"frcheck_main_rank{rank}.pt"
-                        if frcheck_rank_marker.is_file():
-                            frcheck_marker = str(frcheck_rank_marker)
-                    if frcheck_marker is None:
-                        frcheck_rank0 = ckpt_parent_path / "frcheck_main_rank0.pt"
-                        if frcheck_rank0.is_file():
-                            frcheck_marker = str(frcheck_rank0)
-                    if frcheck_marker is None:
-                        any_frcheck = sorted(ckpt_parent_path.glob("frcheck_main_rank*.pt"))
-                        if any_frcheck:
-                            frcheck_marker = str(any_frcheck[0])
-                    if frcheck_marker is not None:
-                        from .frcheck_legacy import load_frcheck_legacy_checkpoint
-                        logger.info("FRCheck: auto-detected format, loading via legacy path")
-                        # Hardware recovery requires explicit --use-frcheck-hardware-failure;
+                        concord_rank_marker = ckpt_parent_path / f"concord_main_rank{rank}.pt"
+                        if concord_rank_marker.is_file():
+                            concord_marker = str(concord_rank_marker)
+                    if concord_marker is None:
+                        concord_rank0 = ckpt_parent_path / "concord_main_rank0.pt"
+                        if concord_rank0.is_file():
+                            concord_marker = str(concord_rank0)
+                    if concord_marker is None:
+                        any_concord = sorted(ckpt_parent_path.glob("concord_main_rank*.pt"))
+                        if any_concord:
+                            concord_marker = str(any_concord[0])
+                    if concord_marker is not None:
+                        from .concord_legacy import load_concord_legacy_checkpoint
+                        logger.info("Concord: auto-detected format, loading via legacy path")
+                        # Hardware recovery requires explicit --use-concord-hardware-failure;
                         # auto-detection loads metadata-only in single-process mode.
                         if torch.distributed.is_initialized():
-                            state_dict = load_frcheck_legacy_checkpoint(checkpoint_name)
+                            state_dict = load_concord_legacy_checkpoint(checkpoint_name)
                         else:
                             # Metadata-only fallback for single-process inspection
                             raise NotImplementedError(
-                                "FRCheck legacy load without distributed init is not implemented. "
-                                "Use --use-frcheck with distributed training."
+                                "Concord legacy load without distributed init is not implemented. "
+                                "Use --use-concord with distributed training."
                             )
                     eccheck_marker = None
                     if torch.distributed.is_initialized():
@@ -2664,30 +2664,30 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
-    frcheck_runtime_summary = None
-    frcheck_skipped_model_placeholders = False
-    frcheck_deferred_model_keys = set()
-    if ckpt_type == CheckpointType.LEGACY and getattr(args, "use_frcheck", False):
-        from .frcheck_legacy import (
-            frcheck_filter_layerwise_model_placeholders,
-            get_frcheck_layerwise_runtime_summary,
-            install_frcheck_layerwise_runtime_from_state_dict,
+    concord_runtime_summary = None
+    concord_skipped_model_placeholders = False
+    concord_deferred_model_keys = set()
+    if ckpt_type == CheckpointType.LEGACY and getattr(args, "use_concord", False):
+        from .concord_legacy import (
+            concord_filter_layerwise_model_placeholders,
+            get_concord_layerwise_runtime_summary,
+            install_concord_layerwise_runtime_from_state_dict,
         )
-        frcheck_rank = (
+        concord_rank = (
             torch.distributed.get_rank()
             if torch.distributed.is_initialized() else 0
         )
-        install_frcheck_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
-        mark_recovery_to_forward_timer("frcheck_runtime_install_done")
+        install_concord_layerwise_runtime_from_state_dict(state_dict, model=ddp_model)
+        mark_recovery_to_forward_timer("concord_runtime_install_done")
         (
             removed_placeholders,
             _,
-            frcheck_deferred_model_keys,
-        ) = frcheck_filter_layerwise_model_placeholders(state_dict)
-        mark_recovery_to_forward_timer("frcheck_filter_placeholders_done")
-        frcheck_runtime_summary = get_frcheck_layerwise_runtime_summary()
-        frcheck_skipped_model_placeholders = (
-            removed_placeholders > 0 or frcheck_runtime_summary is not None
+            concord_deferred_model_keys,
+        ) = concord_filter_layerwise_model_placeholders(state_dict)
+        mark_recovery_to_forward_timer("concord_filter_placeholders_done")
+        concord_runtime_summary = get_concord_layerwise_runtime_summary()
+        concord_skipped_model_placeholders = (
+            removed_placeholders > 0 or concord_runtime_summary is not None
         )
 
     # Convert to regular torch tensor to DTensor.
@@ -2759,7 +2759,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             load_return = module.load_state_dict(state_dict, strict=strict)
             if ft_timing_enabled:
                 stats = _model_load_key_stats(
-                    module, state_dict, frcheck_deferred_model_keys,
+                    module, state_dict, concord_deferred_model_keys,
                 )
                 if stats["missing_key_count"] or stats["unexpected_key_count"]:
                     logger.info(
@@ -2778,7 +2778,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         except Exception as e:
             if strict:
                 stats = _model_load_key_stats(
-                    module, state_dict, frcheck_deferred_model_keys,
+                    module, state_dict, concord_deferred_model_keys,
                 )
                 logger.warning(
                     "model load strict=True failed; retrying strict=False. "
@@ -2875,7 +2875,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         and not any(
             bool(getattr(args, flag, False))
             for flag in (
-                "use_frcheck",
+                "use_concord",
                 "use_eccheck",
                 "use_ecnaive",
                 "use_gemini",
@@ -2894,7 +2894,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     load_model_start_time = time()
     load_model_start = time()
     strict = False if args.retro_add_retriever else strict
-    if frcheck_skipped_model_placeholders:
+    if concord_skipped_model_placeholders:
         strict = False
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     ft_timing_enabled = _ft_legacy_timing_enabled(args)
@@ -2917,7 +2917,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         ft_timing_enabled
         and model_tensor_count == 0
         and state_dict_has_model_keys(state_dict)
-        and not frcheck_skipped_model_placeholders
+        and not concord_skipped_model_placeholders
     ):
         logger.warning(
             "FT load timing: rank %d checkpoint has model keys but 0 model tensors "
@@ -2925,13 +2925,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             rank,
         )
     model_submit_start = time()
-    if getattr(args, "use_frcheck", False):
-        mark_recovery_to_forward_timer("frcheck_load_state_dict_start")
+    if getattr(args, "use_concord", False):
+        mark_recovery_to_forward_timer("concord_load_state_dict_start")
     if not skip_load_to_model_and_opt:
         if not state_dict_has_model_keys(state_dict):
-            if frcheck_skipped_model_placeholders:
+            if concord_skipped_model_placeholders:
                 print_rank_0(
-                    'FRCheck layerwise recovery: checkpoint has no model state; '
+                    'Concord layerwise recovery: checkpoint has no model state; '
                     'layers will be injected before forward'
                 )
             else:
@@ -2946,34 +2946,34 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     continue
                 load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
     model_submit_end = time()
-    if getattr(args, "use_frcheck", False):
-        mark_recovery_to_forward_timer("frcheck_load_state_dict_done")
+    if getattr(args, "use_concord", False):
+        mark_recovery_to_forward_timer("concord_load_state_dict_done")
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     model_sync_end = time()
-    if getattr(args, "use_frcheck", False):
-        mark_recovery_to_forward_timer("frcheck_cuda_sync_done")
-    if getattr(args, "use_frcheck", False) or getattr(args, "use_gemini_replicas", False):
+    if getattr(args, "use_concord", False):
+        mark_recovery_to_forward_timer("concord_cuda_sync_done")
+    if getattr(args, "use_concord", False) or getattr(args, "use_gemini_replicas", False):
         mark_recovery_to_forward_timer("model_load_done")
     h2d_model_s = model_sync_end - model_submit_start
     h2d_model_submit_s = model_submit_end - model_submit_start
     h2d_model_sync_s = model_sync_end - model_submit_end
-    if frcheck_runtime_summary is not None:
-        from .frcheck_legacy import frcheck_log_layerwise_runtime_summary
-        frcheck_log_layerwise_runtime_summary("after_model_load")
+    if concord_runtime_summary is not None:
+        from .concord_legacy import concord_log_layerwise_runtime_summary
+        concord_log_layerwise_runtime_summary("after_model_load")
     torch.distributed.barrier()
-    if getattr(args, "use_frcheck", False):
-        mark_recovery_to_forward_timer("frcheck_model_load_barrier_done")
+    if getattr(args, "use_concord", False):
+        mark_recovery_to_forward_timer("concord_model_load_barrier_done")
     load_model_start_time = time()
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
     if (
-        frcheck_runtime_summary is not None
+        concord_runtime_summary is not None
         and checkpoint_version < 2.0
     ):
-        from .frcheck_legacy import frcheck_materialize_all_layers
-        frcheck_materialize_all_layers()
+        from .concord_legacy import concord_materialize_all_layers
+        concord_materialize_all_layers()
     fix_query_key_value_ordering(model, checkpoint_version)
 
     h2d_optimizer_s = 0.0
@@ -2986,7 +2986,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     optim_pinned_count = 0
 
     # Optimizer.
-    frcheck_deferred_optimizer = False
+    concord_deferred_optimizer = False
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
@@ -2998,12 +2998,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     optim_non_contig_count,
                     optim_pinned_count,
                 ) = collect_tensor_stats(state_dict.get('optimizer'))
-                if frcheck_runtime_summary is not None:
-                    from .frcheck_legacy import frcheck_register_pending_optimizer_state
-                    frcheck_deferred_optimizer = frcheck_register_pending_optimizer_state(
+                if concord_runtime_summary is not None:
+                    from .concord_legacy import concord_register_pending_optimizer_state
+                    concord_deferred_optimizer = concord_register_pending_optimizer_state(
                         state_dict
                     )
-                if not frcheck_deferred_optimizer:
+                if not concord_deferred_optimizer:
                     if rank == 0:
                         base_optimizer = getattr(optimizer, "optimizer", None)
                         chained = getattr(optimizer, "chained_optimizers", None)
@@ -3029,7 +3029,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
             is_torch_dist = ckpt_format == "torch_dist"
-            if args.use_distributed_optimizer and not is_torch_dist and not frcheck_deferred_optimizer:
+            if args.use_distributed_optimizer and not is_torch_dist and not concord_deferred_optimizer:
                 # NOTE: this is a manual read of the tracker file.
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_torch_dist
@@ -3070,14 +3070,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             get_ft_load_timing_context,
         )
         ft_context = get_ft_load_timing_context()
-        if getattr(args, "use_frcheck", False):
+        if getattr(args, "use_concord", False):
             recovery = (ft_context or {}).get("timings", {})
             recovery_e2e_s = float(recovery.get("total", 0.0))
             mode = (ft_context or {}).get("mode", "SW")
             layer_inject_s = 0.0
             try:
-                from .frcheck_legacy import get_frcheck_layerwise_runtime_summary
-                runtime_summary = get_frcheck_layerwise_runtime_summary()
+                from .concord_legacy import get_concord_layerwise_runtime_summary
+                runtime_summary = get_concord_layerwise_runtime_summary()
                 runtime = (runtime_summary or {}).get("runtime", {})
                 layer_inject_s = float(runtime.get("inject_s", 0.0))
             except Exception:
@@ -3089,7 +3089,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             })
             if rank == 0:
                 logger.info(
-                    "FRCheck load timing (%s): e2e_s=%.2fs h2d_s=%.2fs "
+                    "Concord load timing (%s): e2e_s=%.2fs h2d_s=%.2fs "
                     "layer_inject_s=%.2fs",
                     mode,
                     summary["e2e_s"],

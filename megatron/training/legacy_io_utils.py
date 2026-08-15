@@ -44,12 +44,12 @@ _HEADER_MAGIC_LEN = 4
 MAGIC_ECCHECK = b"ECCK"
 MAGIC_ECNAIVE = b"ECNV"
 MAGIC_GEMINI = b"GEMR"
-MAGIC_FRCHECK = b"FRCK"
+MAGIC_CONCORD = b"CONC"
 
 # Magic strings for block / replica files
 MAGIC_BLOCK = b"ECBK"  # generic block: ECCHECK / ECNAIVE
 MAGIC_GEMINI_REPLICA = b"GMRP"
-MAGIC_FRCHECK_BLOCK = b"FRBK"
+MAGIC_CONCORD_BLOCK = b"CNBK"
 
 # ---- write helpers ----------------------------------------------------------
 

@@ -1,4 +1,4 @@
-# FRCheck
+# Concord
 
 Fault-tolerant checkpointing for large-model training, built on [Megatron-LM](https://github.com/NVIDIA/Megatron-LM).
 
@@ -6,24 +6,24 @@ This repository keeps Megatron's training stack and replaces the NVIDIA-facing d
 
 | Scheme | Flag | Placement | Coding |
 | --- | --- | --- | --- |
-| FRCheck | `--use-frcheck` | POA stripes over node groups of size `n` | Reed–Solomon `(n, n-2)` |
+| Concord | `--use-concord` | POA stripes over node groups of size `n` | Reed–Solomon `(n, n-2)` |
 | ECCHECK | `--use-eccheck` | 4-rank XOR groups | XOR parity |
 | ECNaive | `--use-ecnaive` | Round-robin RS groups | ISA-L Reed–Solomon `(k+2, k)` |
 | Gemini Replicas | `--use-gemini-replicas` | Round-robin replicas | Replication (`--gemini-replicas-num`) |
 
-At most one of `--use-frcheck`, `--use-ecnaive`, and `--use-gemini-replicas` may be enabled. ECCHECK is selected independently with `--use-eccheck`.
+At most one of `--use-concord`, `--use-ecnaive`, and `--use-gemini-replicas` may be enabled. ECCHECK is selected independently with `--use-eccheck`.
 
-## What FRCheck does
+## What Concord does
 
-FRCheck precomputes a POA table for each supported node-group size and loads the selected table into memory at initialization. Each row represents one stripe and records the nodes that store its data and parity blocks. Checkpoint blocks are assigned by scanning these rows in a fixed order, ensuring that blocks in the same stripe reside on different nodes while original blocks remain local. FRCheck retains the table and block-layout metadata throughout execution and stores the information needed to reproduce the mapping with the checkpoint, allowing saving and recovery to use identical placement decisions without runtime coordination.
+Concord precomputes a POA table for each supported node-group size and loads the selected table into memory at initialization. Each row represents one stripe and records the nodes that store its data and parity blocks. Checkpoint blocks are assigned by scanning these rows in a fixed order, ensuring that blocks in the same stripe reside on different nodes while original blocks remain local. Concord retains the table and block-layout metadata throughout execution and stores the information needed to reproduce the mapping with the checkpoint, allowing saving and recovery to use identical placement decisions without runtime coordination.
 
-Save and recovery both go through RDMA. A layer is flattened into fixed-size blocks, encoded into stripes, and written as per-rank metadata plus per-stripe shards. Hardware recovery reconstructs a failed rank from surviving source and parity blocks in the same POA group (at most two failed node-slots per group). Optional async parity, layer-exchange encode, GPUDirect RDMA, and overlap of recovery with the first training steps are available on the FRCheck path.
+Save and recovery both go through RDMA. A layer is flattened into fixed-size blocks, encoded into stripes, and written as per-rank metadata plus per-stripe shards. Hardware recovery reconstructs a failed rank from surviving source and parity blocks in the same POA group (at most two failed node-slots per group). Optional async parity, layer-exchange encode, GPUDirect RDMA, and overlap of recovery with the first training steps are available on the Concord path.
 
 ## Layout
 
 ```
 megatron/training/
-  frcheck_legacy.py          FRCheck save / load / recovery
+  concord_legacy.py          Concord save / load / recovery
   eccheck_legacy.py          ECCHECK save / load / recovery
   ecnaive_legacy.py          ECNaive save / load / recovery
   gemini_replicas_legacy.py  Gemini replica save / load / recovery
@@ -31,10 +31,10 @@ megatron/training/
   arguments.py               CLI flags
 
 megatron/core/dist_checkpointing/strategies/
-  frcheck_manager.py         POA grouping, stripe plans, RDMA buffers
-  frcheck_native.cpp         RS encode / decode and RDMA
+  concord_manager.py         POA grouping, stripe plans, RDMA buffers
+  concord_native.cpp         RS encode / decode and RDMA
   poa_n4.txt  poa_n8.txt     offline POA tables
-  setup_simple_frcheck.py    FRCheck native build
+  setup_simple_concord.py    Concord native build
   setup_simple.py            ECCHECK native build
   setup_simple_ecnaive.py    ECNaive native build
   setup_simple_gemini.py     Gemini native build
@@ -51,7 +51,7 @@ Each scheme has a pybind11 extension. Build them in `megatron/core/dist_checkpoi
 
 ```bash
 cd megatron/core/dist_checkpointing/strategies
-python3 setup_simple_frcheck.py build_ext --inplace
+python3 setup_simple_concord.py build_ext --inplace
 bash build_clean.sh            # ECCHECK
 bash build_clean_ecnaive.sh    # ECNaive
 python3 setup_simple_gemini.py build_ext --inplace
@@ -65,19 +65,19 @@ The four-node A800 scripts under `pre-tests/gpt2/para_a800/` are the current ent
 
 ```bash
 # save
-./pre-tests/gpt2/para_a800/14B-4nodes/test_frcheck.sh <node_rank> save
+./pre-tests/gpt2/para_a800/14B-4nodes/test_concord.sh <node_rank> save
 
 # software in-process recovery
-./pre-tests/gpt2/para_a800/14B-4nodes/test_frcheck.sh <node_rank> inprocess_sw
+./pre-tests/gpt2/para_a800/14B-4nodes/test_concord.sh <node_rank> inprocess_sw
 
 # hardware in-process recovery (one or two failures)
-./pre-tests/gpt2/para_a800/14B-4nodes/test_frcheck.sh <node_rank> inprocess
-./pre-tests/gpt2/para_a800/14B-4nodes/test_frcheck.sh <node_rank> inprocess2
+./pre-tests/gpt2/para_a800/14B-4nodes/test_concord.sh <node_rank> inprocess
+./pre-tests/gpt2/para_a800/14B-4nodes/test_concord.sh <node_rank> inprocess2
 ```
 
 The same `save | inprocess_sw | inprocess | inprocess2` modes exist for `test_eccheck.sh`, `test_ecnaive.sh`, `test_gemini_2.sh`, and `test_gemini_3.sh`.
 
-Sweep drivers (default schemes: `gemini2 gemini3 frcheck eccheck ecnaive`):
+Sweep drivers (default schemes: `gemini2 gemini3 concord eccheck ecnaive`):
 
 ```bash
 MODEL_SIZE=14B ./pre-tests/gpt2/para_a800/run_10b_save_sweep.sh
@@ -88,28 +88,28 @@ Useful environment variables:
 
 | Variable | Meaning |
 | --- | --- |
-| `FRCHECK_INTERFACE` | RDMA / control-plane NIC |
-| `FRCHECK_N` / `--frcheck-n` | POA group size |
-| `FRCHECK_TABLE_DIR` / `--frcheck-table-dir` | directory of `poa_n{N}.txt` |
-| `FRCHECK_GDR` | `1` to enable GPUDirect RDMA on save |
-| `FRCHECK_ASYNC_PARITY` | `1` to send P2 in the background after encode |
+| `CONCORD_INTERFACE` | RDMA / control-plane NIC |
+| `CONCORD_N` / `--concord-n` | POA group size |
+| `CONCORD_TABLE_DIR` / `--concord-table-dir` | directory of `poa_n{N}.txt` |
+| `CONCORD_GDR` | `1` to enable GPUDirect RDMA on save |
+| `CONCORD_ASYNC_PARITY` | `1` to send P2 in the background after encode |
 | `RDMA_HCA_PROFILE` | `full`, `half`, or `quarter` NIC binding |
 
-## FRCheck flags
+## Concord flags
 
 ```
---use-frcheck
---frcheck-n 4
---frcheck-table-dir megatron/core/dist_checkpointing/strategies
---frcheck-layer-exchange-encode
---frcheck-gdr
---frcheck-async-parity
---use-frcheck-hardware-failure
---frcheck-failed-ranks 0,1,2,3,4,5,6,7
---frcheck-recovery-async-parity
---frcheck-async-recovery-forward
+--use-concord
+--concord-n 4
+--concord-table-dir megatron/core/dist_checkpointing/strategies
+--concord-layer-exchange-encode
+--concord-gdr
+--concord-async-parity
+--use-concord-hardware-failure
+--concord-failed-ranks 0,1,2,3,4,5,6,7
+--concord-recovery-async-parity
+--concord-async-recovery-forward
 --ft-inprocess-recovery-benchmark
 ```
 
-`--frcheck-n` must divide the number of nodes. The manager loads `poa_n{n}.txt` (or `--frcheck-table-path`) once, compiles per-stripe descriptors, and reuses them for save and recovery.
+`--concord-n` must divide the number of nodes. The manager loads `poa_n{n}.txt` (or `--concord-table-path`) once, compiles per-stripe descriptors, and reuses them for save and recovery.
 

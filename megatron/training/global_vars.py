@@ -26,8 +26,8 @@ _GLOBAL_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
 _GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
-_GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER = None
-_GLOBAL_FRCHECK_STAGE_LAST_LAYER_GENERATION = 0
+_GLOBAL_CONCORD_STAGE_LAST_LAYER_TIMER = None
+_GLOBAL_CONCORD_STAGE_LAST_LAYER_GENERATION = 0
 _GLOBAL_RECOVERY_TIMING_SUMMARIES = {}
 _GLOBAL_RECOVERY_TIMING_SUMMARIES_LOCK = threading.Lock()
 _GLOBAL_FT_LOAD_TIMING_CONTEXT = None
@@ -87,14 +87,14 @@ def start_recovery_to_forward_timer(
 ) -> None:
     """Start a one-shot timer that ends after the next forward step."""
     global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
-    global _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER
-    global _GLOBAL_FRCHECK_STAGE_LAST_LAYER_GENERATION
+    global _GLOBAL_CONCORD_STAGE_LAST_LAYER_TIMER
+    global _GLOBAL_CONCORD_STAGE_LAST_LAYER_GENERATION
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     now = time.time()
-    if scheme == "FRCheck":
-        _GLOBAL_FRCHECK_STAGE_LAST_LAYER_GENERATION += 1
-        _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER = {
-            "generation": _GLOBAL_FRCHECK_STAGE_LAST_LAYER_GENERATION,
+    if scheme == "Concord":
+        _GLOBAL_CONCORD_STAGE_LAST_LAYER_GENERATION += 1
+        _GLOBAL_CONCORD_STAGE_LAST_LAYER_TIMER = {
+            "generation": _GLOBAL_CONCORD_STAGE_LAST_LAYER_GENERATION,
             "start": now,
             "rank": rank,
             "scheme": scheme,
@@ -102,7 +102,7 @@ def start_recovery_to_forward_timer(
             "target_layer_number": -1,
         }
     else:
-        _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER = None
+        _GLOBAL_CONCORD_STAGE_LAST_LAYER_TIMER = None
     _GLOBAL_RECOVERY_TO_FORWARD_TIMER = {
         "scheme": scheme,
         "phase": phase,
@@ -120,7 +120,7 @@ def update_recovery_to_forward_timer_context(**context) -> None:
     if timer is None:
         return
     timer.setdefault("context", {}).update(context)
-    stage_timer = _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER
+    stage_timer = _GLOBAL_CONCORD_STAGE_LAST_LAYER_TIMER
     if stage_timer is not None:
         stage_timer.setdefault("context", {}).update(context)
 
@@ -202,12 +202,12 @@ def record_recovery_first_layer_start() -> None:
     )
 
 
-def record_frcheck_stage_last_layer_forward_start(
+def record_concord_stage_last_layer_forward_start(
     layer_number: int, target_layer_number: int
 ) -> None:
     """Record the highest TransformerBlock target reached in this recovery cycle."""
-    timer = _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER
-    if timer is None or timer.get("scheme") != "FRCheck":
+    timer = _GLOBAL_CONCORD_STAGE_LAST_LAYER_TIMER
+    if timer is None or timer.get("scheme") != "Concord":
         return
     layer_number = int(layer_number)
     target_layer_number = int(target_layer_number)
@@ -229,7 +229,7 @@ def record_frcheck_stage_last_layer_forward_start(
     except Exception:
         pass
     stash_recovery_timing_summary(
-        "frcheck_stage_last_layer_start",
+        "concord_stage_last_layer_start",
         {
             "present": True,
             "elapsed_s": start_time - float(timer.get("start", 0.0)),
@@ -365,15 +365,15 @@ def finish_recovery_to_forward_timer(label: str = "forward_step_end") -> None:
 def flush_recovery_timing_summaries() -> None:
     """All-reduce and log pending recovery timings at a common train-step boundary."""
     global _GLOBAL_RECOVERY_TIMING_SUMMARIES
-    global _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER
+    global _GLOBAL_CONCORD_STAGE_LAST_LAYER_TIMER
     with _GLOBAL_RECOVERY_TIMING_SUMMARIES_LOCK:
-        has_frcheck_milestones = "frcheck_first_layer_milestones" in (
+        has_concord_milestones = "concord_first_layer_milestones" in (
             _GLOBAL_RECOVERY_TIMING_SUMMARIES
         )
-    if has_frcheck_milestones:
+    if has_concord_milestones:
         try:
-            from megatron.training.frcheck_legacy import resolve_frcheck_first_layer_cuda_events
-            resolve_frcheck_first_layer_cuda_events()
+            from megatron.training.concord_legacy import resolve_concord_first_layer_cuda_events
+            resolve_concord_first_layer_cuda_events()
         except (ImportError, RuntimeError):
             pass
     pipeline_keys = [
@@ -400,17 +400,17 @@ def flush_recovery_timing_summaries() -> None:
     ]
     with _GLOBAL_RECOVERY_TIMING_SUMMARIES_LOCK:
         pending_summaries = dict(_GLOBAL_RECOVERY_TIMING_SUMMARIES)
-    pipeline = pending_summaries.get("frcheck_hw_pipeline")
-    model_h2d = pending_summaries.get("frcheck_model_h2d")
+    pipeline = pending_summaries.get("concord_hw_pipeline")
+    model_h2d = pending_summaries.get("concord_model_h2d")
     if pipeline is not None and model_h2d is not None:
         pipeline = dict(pipeline)
         pipeline.update(model_h2d)
     rtf = pending_summaries.get("recovery_to_forward")
-    first_layer = pending_summaries.get("frcheck_first_layer_milestones")
+    first_layer = pending_summaries.get("concord_first_layer_milestones")
     recovery_first_layer = pending_summaries.get("recovery_first_layer_start")
-    frcheck_forward_backward = pending_summaries.get("frcheck_forward_backward")
-    stage_last_layer = pending_summaries.get("frcheck_stage_last_layer_start")
-    parity_completion = pending_summaries.get("frcheck_parity_completion")
+    concord_forward_backward = pending_summaries.get("concord_forward_backward")
+    stage_last_layer = pending_summaries.get("concord_stage_last_layer_start")
+    parity_completion = pending_summaries.get("concord_parity_completion")
 
     rtf_elapsed_s = float((rtf or {}).get("elapsed_s", 0.0))
     rtf_teardown_s = float((rtf or {}).get("teardown_s", 0.0))
@@ -457,31 +457,31 @@ def flush_recovery_timing_summaries() -> None:
             ),
         ]
     )
-    frcheck_forward_backward_offset = len(values)
-    frcheck_forward_backward_elapsed_s = float(
-        (frcheck_forward_backward or {}).get("elapsed_s", 0.0)
+    concord_forward_backward_offset = len(values)
+    concord_forward_backward_elapsed_s = float(
+        (concord_forward_backward or {}).get("elapsed_s", 0.0)
     )
-    frcheck_forward_backward_first_forward_s = float(
-        (frcheck_forward_backward or {}).get("first_forward_s", 0.0)
+    concord_forward_backward_first_forward_s = float(
+        (concord_forward_backward or {}).get("first_forward_s", 0.0)
     )
-    frcheck_forward_backward_inline_parity_tail_wait_s = float(
-        (frcheck_forward_backward or {}).get("inline_parity_tail_wait_s", 0.0)
+    concord_forward_backward_inline_parity_tail_wait_s = float(
+        (concord_forward_backward or {}).get("inline_parity_tail_wait_s", 0.0)
     )
-    frcheck_forward_backward_post_first_forward_to_end_s = float(
-        (frcheck_forward_backward or {}).get("post_first_forward_to_end_s", 0.0)
+    concord_forward_backward_post_first_forward_to_end_s = float(
+        (concord_forward_backward or {}).get("post_first_forward_to_end_s", 0.0)
     )
-    frcheck_forward_backward_metrics = [
-        frcheck_forward_backward_elapsed_s,
-        frcheck_forward_backward_first_forward_s,
-        frcheck_forward_backward_inline_parity_tail_wait_s,
-        frcheck_forward_backward_post_first_forward_to_end_s,
+    concord_forward_backward_metrics = [
+        concord_forward_backward_elapsed_s,
+        concord_forward_backward_first_forward_s,
+        concord_forward_backward_inline_parity_tail_wait_s,
+        concord_forward_backward_post_first_forward_to_end_s,
     ]
-    values.append(1.0 if frcheck_forward_backward is not None else 0.0)
-    for metric in frcheck_forward_backward_metrics:
+    values.append(1.0 if concord_forward_backward is not None else 0.0)
+    for metric in concord_forward_backward_metrics:
         values.extend(
             [
                 metric,
-                -metric if frcheck_forward_backward is not None else -1.0e30,
+                -metric if concord_forward_backward is not None else -1.0e30,
             ]
         )
     parity_completion_offset = len(values)
@@ -494,7 +494,7 @@ def flush_recovery_timing_summaries() -> None:
     failed_stage_last_layer_coverage = 0
     failed_rank_coverage = 0
     stage_last_layer_max_contributor = None
-    frcheck_forward_backward_max_contributor = None
+    concord_forward_backward_max_contributor = None
     gathered_timing_info = []
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
@@ -505,7 +505,7 @@ def flush_recovery_timing_summaries() -> None:
 
         if (
             values[1 + len(pipeline_keys)] > 0.0
-            or values[frcheck_forward_backward_offset] > 0.0
+            or values[concord_forward_backward_offset] > 0.0
             or values[parity_completion_offset] > 0.0
         ):
             local_info = {
@@ -540,25 +540,25 @@ def flush_recovery_timing_summaries() -> None:
                 "stage_last_layer_present": bool((stage_last_layer or {}).get("present", False)),
                 "stage_last_layer_elapsed_s": float((stage_last_layer or {}).get("elapsed_s", -1.0)),
                 "stage_last_layer_layer_number": int((stage_last_layer or {}).get("layer_number", -1)),
-                "frcheck_forward_backward_present": frcheck_forward_backward is not None,
-                "frcheck_forward_backward_elapsed_s": frcheck_forward_backward_elapsed_s,
-                "frcheck_forward_backward_first_forward_s": (
-                    frcheck_forward_backward_first_forward_s
+                "concord_forward_backward_present": concord_forward_backward is not None,
+                "concord_forward_backward_elapsed_s": concord_forward_backward_elapsed_s,
+                "concord_forward_backward_first_forward_s": (
+                    concord_forward_backward_first_forward_s
                 ),
-                "frcheck_forward_backward_inline_parity_tail_wait_s": (
-                    frcheck_forward_backward_inline_parity_tail_wait_s
+                "concord_forward_backward_inline_parity_tail_wait_s": (
+                    concord_forward_backward_inline_parity_tail_wait_s
                 ),
-                "frcheck_forward_backward_post_first_forward_to_end_s": (
-                    frcheck_forward_backward_post_first_forward_to_end_s
+                "concord_forward_backward_post_first_forward_to_end_s": (
+                    concord_forward_backward_post_first_forward_to_end_s
                 ),
-                "frcheck_forward_backward_rank": int(
-                    (frcheck_forward_backward or {}).get("rank", rank)
+                "concord_forward_backward_rank": int(
+                    (concord_forward_backward or {}).get("rank", rank)
                 ),
-                "frcheck_forward_backward_pp_rank": int(
-                    (frcheck_forward_backward or {}).get("pp_rank", -1)
+                "concord_forward_backward_pp_rank": int(
+                    (concord_forward_backward or {}).get("pp_rank", -1)
                 ),
-                "frcheck_forward_backward_tp_rank": int(
-                    (frcheck_forward_backward or {}).get("tp_rank", -1)
+                "concord_forward_backward_tp_rank": int(
+                    (concord_forward_backward or {}).get("tp_rank", -1)
                 ),
                 "parity_failed_rank": bool(
                     (parity_completion or {}).get("failed_rank", False)
@@ -611,16 +611,16 @@ def flush_recovery_timing_summaries() -> None:
                     failed_stage_last_layer_max_s = float(
                         stage_last_layer_max_contributor["stage_last_layer_elapsed_s"]
                     )
-            frcheck_forward_backward_contributors = [
+            concord_forward_backward_contributors = [
                 item
                 for item in valid
-                if item.get("frcheck_forward_backward_present", False)
+                if item.get("concord_forward_backward_present", False)
             ]
-            if frcheck_forward_backward_contributors:
-                frcheck_forward_backward_max_contributor = max(
-                    frcheck_forward_backward_contributors,
+            if concord_forward_backward_contributors:
+                concord_forward_backward_max_contributor = max(
+                    concord_forward_backward_contributors,
                     key=lambda item: float(
-                        item.get("frcheck_forward_backward_elapsed_s", -1.0)
+                        item.get("concord_forward_backward_elapsed_s", -1.0)
                     ),
                 )
     else:
@@ -701,26 +701,26 @@ def flush_recovery_timing_summaries() -> None:
                     )
                 ),
             }]
-        if frcheck_forward_backward is not None:
-            frcheck_forward_backward_max_contributor = {
-                "frcheck_forward_backward_elapsed_s": frcheck_forward_backward_elapsed_s,
-                "frcheck_forward_backward_first_forward_s": (
-                    frcheck_forward_backward_first_forward_s
+        if concord_forward_backward is not None:
+            concord_forward_backward_max_contributor = {
+                "concord_forward_backward_elapsed_s": concord_forward_backward_elapsed_s,
+                "concord_forward_backward_first_forward_s": (
+                    concord_forward_backward_first_forward_s
                 ),
-                "frcheck_forward_backward_inline_parity_tail_wait_s": (
-                    frcheck_forward_backward_inline_parity_tail_wait_s
+                "concord_forward_backward_inline_parity_tail_wait_s": (
+                    concord_forward_backward_inline_parity_tail_wait_s
                 ),
-                "frcheck_forward_backward_post_first_forward_to_end_s": (
-                    frcheck_forward_backward_post_first_forward_to_end_s
+                "concord_forward_backward_post_first_forward_to_end_s": (
+                    concord_forward_backward_post_first_forward_to_end_s
                 ),
-                "frcheck_forward_backward_rank": int(
-                    frcheck_forward_backward.get("rank", 0)
+                "concord_forward_backward_rank": int(
+                    concord_forward_backward.get("rank", 0)
                 ),
-                "frcheck_forward_backward_pp_rank": int(
-                    frcheck_forward_backward.get("pp_rank", -1)
+                "concord_forward_backward_pp_rank": int(
+                    concord_forward_backward.get("pp_rank", -1)
                 ),
-                "frcheck_forward_backward_tp_rank": int(
-                    frcheck_forward_backward.get("tp_rank", -1)
+                "concord_forward_backward_tp_rank": int(
+                    concord_forward_backward.get("tp_rank", -1)
                 ),
             }
 
@@ -739,11 +739,11 @@ def flush_recovery_timing_summaries() -> None:
 
     if rank == 0:
         import logging
-        logger = logging.getLogger("megatron.training.frcheck_legacy")
+        logger = logging.getLogger("megatron.training.concord_legacy")
         if values[0] > 0.0:
             summary = dict(zip(pipeline_keys, values[1:1 + len(pipeline_keys)]))
             logger.info(
-                "FRCheck HW pipeline breakdown: "
+                "Concord HW pipeline breakdown: "
                 "start_to_stage_last_layer_forward_start_failed_max_s=%.6fs "
                 "stage_last_layer_coverage=%d/%d "
                 "recovery_pipeline_s=%.6fs recovery_network_s=%.6fs "
@@ -765,7 +765,7 @@ def flush_recovery_timing_summaries() -> None:
             )
             if stage_last_layer_max_contributor is not None:
                 logger.info(
-                    "FRCheck stage-last-layer max contributor: rank=%d pp_rank=%d "
+                    "Concord stage-last-layer max contributor: rank=%d pp_rank=%d "
                     "tp_rank=%d layer_number=%d elapsed_s=%.6f",
                     int(stage_last_layer_max_contributor.get("rank", -1)),
                     int(stage_last_layer_max_contributor.get("pp_rank", -1)),
@@ -775,7 +775,7 @@ def flush_recovery_timing_summaries() -> None:
                 )
         if parity_globally_complete:
             logger.info(
-                "FRCheck parity completion timing: "
+                "Concord parity completion timing: "
                 "recovery_start_to_parity_done_failed_max_s=%.6f "
                 "first_microbatch_done_to_parity_done_failed_max_s=%.6f "
                 "coverage=%d/%d",
@@ -796,33 +796,33 @@ def flush_recovery_timing_summaries() -> None:
                     "scheme", (rtf or {}).get("scheme", "FT")
                 )
             )
-            log_recovery_timing = logger.debug if scheme == "FRCheck" else logger.info
+            log_recovery_timing = logger.debug if scheme == "Concord" else logger.info
             log_recovery_timing(
                 "%s recovery timing: "
                 "node0.all_rank.max(recovery_start_to_train_start_s)=%.6fs",
                 scheme,
                 values[recovery_first_layer_offset + 1],
             )
-        if values[frcheck_forward_backward_offset] > 0.0:
-            total_max_s = values[frcheck_forward_backward_offset + 1]
-            total_min_s = -values[frcheck_forward_backward_offset + 2]
-            first_forward_max_s = values[frcheck_forward_backward_offset + 3]
-            first_forward_min_s = -values[frcheck_forward_backward_offset + 4]
+        if values[concord_forward_backward_offset] > 0.0:
+            total_max_s = values[concord_forward_backward_offset + 1]
+            total_min_s = -values[concord_forward_backward_offset + 2]
+            first_forward_max_s = values[concord_forward_backward_offset + 3]
+            first_forward_min_s = -values[concord_forward_backward_offset + 4]
             inline_parity_tail_wait_max_s = values[
-                frcheck_forward_backward_offset + 5
+                concord_forward_backward_offset + 5
             ]
             inline_parity_tail_wait_min_s = -values[
-                frcheck_forward_backward_offset + 6
+                concord_forward_backward_offset + 6
             ]
             post_first_forward_to_end_max_s = values[
-                frcheck_forward_backward_offset + 7
+                concord_forward_backward_offset + 7
             ]
             post_first_forward_to_end_min_s = -values[
-                frcheck_forward_backward_offset + 8
+                concord_forward_backward_offset + 8
             ]
-            contributor = frcheck_forward_backward_max_contributor or {}
+            contributor = concord_forward_backward_max_contributor or {}
             logger.info(
-                "FRCheck forward-backward timing: total_min_s=%.6f "
+                "Concord forward-backward timing: total_min_s=%.6f "
                 "total_max_s=%.6f first_forward_min_s=%.6f "
                 "first_forward_max_s=%.6f "
                 "inline_parity_tail_wait_min_s=%.6f "
@@ -838,9 +838,9 @@ def flush_recovery_timing_summaries() -> None:
                 inline_parity_tail_wait_max_s,
                 post_first_forward_to_end_min_s,
                 post_first_forward_to_end_max_s,
-                int(contributor.get("frcheck_forward_backward_rank", -1)),
-                int(contributor.get("frcheck_forward_backward_pp_rank", -1)),
-                int(contributor.get("frcheck_forward_backward_tp_rank", -1)),
+                int(contributor.get("concord_forward_backward_rank", -1)),
+                int(contributor.get("concord_forward_backward_pp_rank", -1)),
+                int(contributor.get("concord_forward_backward_tp_rank", -1)),
             )
         if values[1 + len(pipeline_keys)] > 0.0:
             marks = (rtf or {}).get("marks", [])
@@ -850,7 +850,7 @@ def flush_recovery_timing_summaries() -> None:
                 )
                 scheme_for_marks = str((rtf or {}).get("scheme", "FT"))
                 logger.debug("%s recovery-to-forward marks (rank0): %s", scheme_for_marks, mark_text)
-            scheme = str((rtf or {}).get("scheme", "FRCheck"))
+            scheme = str((rtf or {}).get("scheme", "Concord"))
             elapsed_max_s = values[2 + len(pipeline_keys)]
             elapsed_min_s = -values[3 + len(pipeline_keys)]
             raw_elapsed_max_s = values[4 + len(pipeline_keys)]
@@ -863,7 +863,7 @@ def flush_recovery_timing_summaries() -> None:
                 failed_elapsed_max_s if failed_elapsed_max_s is not None else -1.0,
                 elapsed_max_s,
             )
-            if scheme != "FRCheck":
+            if scheme != "Concord":
                 logger.info(
                     "%s recovery-to-forward post-H2D breakdown: "
                 "h2d_to_loop_iter_s=%.4fs loop_iter_to_async_save_done_s=%.4fs "
@@ -895,7 +895,7 @@ def flush_recovery_timing_summaries() -> None:
                 breakdown["forward_step_s"],
                 breakdown["forward_step_to_forward_backward_done_s"],
             )
-            if scheme != "FRCheck" and max_contributor is not None:
+            if scheme != "Concord" and max_contributor is not None:
                 logger.info(
                     "%s recovery-to-forward max contributor: "
                     "rank=%d pp_rank=%d/%d tp_rank=%d elapsed_s=%.4fs raw_elapsed_s=%.4fs "
@@ -944,14 +944,14 @@ def flush_recovery_timing_summaries() -> None:
                             for label, delta in max_marks
                         ),
                     )
-            if scheme != "FRCheck":
+            if scheme != "Concord":
                 print(
                     f"{scheme} recovery-to-forward: "
                     f"elapsed_min={elapsed_min_s:.4f}s elapsed_max={elapsed_max_s:.4f}s "
                     f"raw_elapsed_max={raw_elapsed_max_s:.4f}s teardown_max={teardown_max_s:.4f}s",
                     flush=True,
                 )
-            if scheme == "FRCheck":
+            if scheme == "Concord":
                 milestone_items = [
                     item.get("first_layer_milestones", {})
                     for item in gathered_timing_info
@@ -989,7 +989,7 @@ def flush_recovery_timing_summaries() -> None:
                     return f"{value[0]:.6f}s(rank={value[1]})"
 
                 logger.info(
-                    "FRCheck first-layer breakdown (milestones from recovery start): "
+                    "Concord first-layer breakdown (milestones from recovery start): "
                     "layer_idx=%d repair_done_s=%s network_sent_s=%s "
                     "model_h2d_done_s=%s forward_done_s=%s network_delivered_s=%s",
                     layer_idx,
@@ -1005,15 +1005,15 @@ def flush_recovery_timing_summaries() -> None:
         if parity_completion is not None and not parity_globally_complete:
             preserved_parity = dict(
                 _GLOBAL_RECOVERY_TIMING_SUMMARIES.get(
-                    "frcheck_parity_completion", parity_completion
+                    "concord_parity_completion", parity_completion
                 )
             )
         _GLOBAL_RECOVERY_TIMING_SUMMARIES = {}
         if preserved_parity is not None:
             _GLOBAL_RECOVERY_TIMING_SUMMARIES[
-                "frcheck_parity_completion"
+                "concord_parity_completion"
             ] = preserved_parity
-    _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER = None
+    _GLOBAL_CONCORD_STAGE_LAST_LAYER_TIMER = None
 
 
 
@@ -1093,7 +1093,7 @@ def unset_global_variables():
     global _GLOBAL_ENERGY_MONITOR
     global _GLOBAL_SIGNAL_HANDLER
     global _GLOBAL_RECOVERY_TO_FORWARD_TIMER
-    global _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER
+    global _GLOBAL_CONCORD_STAGE_LAST_LAYER_TIMER
     global _GLOBAL_RECOVERY_TIMING_SUMMARIES
 
     _GLOBAL_ARGS = None
@@ -1107,7 +1107,7 @@ def unset_global_variables():
     _GLOBAL_ENERGY_MONITOR = None
     _GLOBAL_SIGNAL_HANDLER = None
     _GLOBAL_RECOVERY_TO_FORWARD_TIMER = None
-    _GLOBAL_FRCHECK_STAGE_LAST_LAYER_TIMER = None
+    _GLOBAL_CONCORD_STAGE_LAST_LAYER_TIMER = None
     _GLOBAL_RECOVERY_TIMING_SUMMARIES = {}
     _GLOBAL_FT_LOAD_TIMING_CONTEXT = None
 

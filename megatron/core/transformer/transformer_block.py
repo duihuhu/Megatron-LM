@@ -65,55 +65,55 @@ else:
 logger = logging.getLogger(__name__)
 
 
-_frcheck_wait_layer_hook = None
-_frcheck_forward_done_hook = None
-_frcheck_stage_last_layer_start_hook = None
-_frcheck_hooks_loaded = False
+_concord_wait_layer_hook = None
+_concord_forward_done_hook = None
+_concord_stage_last_layer_start_hook = None
+_concord_hooks_loaded = False
 _recovery_first_layer_start_hook = None
 _recovery_first_layer_start_hook_loaded = False
 
 
-def _load_frcheck_layer_hooks() -> None:
-    global _frcheck_wait_layer_hook, _frcheck_forward_done_hook
-    global _frcheck_stage_last_layer_start_hook, _frcheck_hooks_loaded
-    if _frcheck_hooks_loaded:
+def _load_concord_layer_hooks() -> None:
+    global _concord_wait_layer_hook, _concord_forward_done_hook
+    global _concord_stage_last_layer_start_hook, _concord_hooks_loaded
+    if _concord_hooks_loaded:
         return
-    _frcheck_hooks_loaded = True
+    _concord_hooks_loaded = True
     try:
-        from megatron.training.frcheck_legacy import (
-            frcheck_wait_and_materialize_layer,
-            record_frcheck_first_layer_forward_done,
+        from megatron.training.concord_legacy import (
+            concord_wait_and_materialize_layer,
+            record_concord_first_layer_forward_done,
         )
-        from megatron.training.global_vars import record_frcheck_stage_last_layer_forward_start
+        from megatron.training.global_vars import record_concord_stage_last_layer_forward_start
     except Exception:
         return
-    _frcheck_wait_layer_hook = frcheck_wait_and_materialize_layer
-    _frcheck_forward_done_hook = record_frcheck_first_layer_forward_done
-    _frcheck_stage_last_layer_start_hook = record_frcheck_stage_last_layer_forward_start
+    _concord_wait_layer_hook = concord_wait_and_materialize_layer
+    _concord_forward_done_hook = record_concord_first_layer_forward_done
+    _concord_stage_last_layer_start_hook = record_concord_stage_last_layer_forward_start
 
 
-def _frcheck_wait_for_layer(layer_idx: int) -> None:
-    """Best-effort hook for FRCheck layerwise recovery readiness."""
-    if not _frcheck_hooks_loaded:
-        _load_frcheck_layer_hooks()
-    if _frcheck_wait_layer_hook is not None:
-        _frcheck_wait_layer_hook(layer_idx)
+def _concord_wait_for_layer(layer_idx: int) -> None:
+    """Best-effort hook for Concord layerwise recovery readiness."""
+    if not _concord_hooks_loaded:
+        _load_concord_layer_hooks()
+    if _concord_wait_layer_hook is not None:
+        _concord_wait_layer_hook(layer_idx)
 
 
-def _frcheck_record_stage_last_layer_start(layer_number: int, target_layer_number: int) -> None:
+def _concord_record_stage_last_layer_start(layer_number: int, target_layer_number: int) -> None:
     """Record the first forward start of this physical stage's last owned layer."""
-    if not _frcheck_hooks_loaded:
-        _load_frcheck_layer_hooks()
-    if _frcheck_stage_last_layer_start_hook is not None:
-        _frcheck_stage_last_layer_start_hook(layer_number, target_layer_number)
+    if not _concord_hooks_loaded:
+        _load_concord_layer_hooks()
+    if _concord_stage_last_layer_start_hook is not None:
+        _concord_stage_last_layer_start_hook(layer_number, target_layer_number)
 
 
-def _frcheck_record_layer_forward_done(layer_idx: int) -> None:
-    """Best-effort hook for FRCheck first-layer forward completion."""
-    if not _frcheck_hooks_loaded:
-        _load_frcheck_layer_hooks()
-    if _frcheck_forward_done_hook is not None:
-        _frcheck_forward_done_hook(layer_idx)
+def _concord_record_layer_forward_done(layer_idx: int) -> None:
+    """Best-effort hook for Concord first-layer forward completion."""
+    if not _concord_hooks_loaded:
+        _load_concord_layer_hooks()
+    if _concord_forward_done_hook is not None:
+        _concord_forward_done_hook(layer_idx)
 
 
 def _record_recovery_first_layer_start() -> None:
@@ -450,8 +450,8 @@ class TransformerBlock(MegatronModule):
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
-                    _frcheck_wait_for_layer(index)
-                    _frcheck_record_stage_last_layer_start(
+                    _concord_wait_for_layer(index)
+                    _concord_record_stage_last_layer_start(
                         layer.layer_number, stage_last_layer_number
                     )
                     if index == 0:
@@ -472,7 +472,7 @@ class TransformerBlock(MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                         )
-                    _frcheck_record_layer_forward_done(index)
+                    _concord_record_layer_forward_done(index)
                 return hidden_states, context
 
             return custom_forward
@@ -653,8 +653,8 @@ class TransformerBlock(MegatronModule):
                     (layer.layer_number for layer in self.layers), default=-1
                 )
                 for l_no, layer in enumerate(self.layers):
-                    _frcheck_wait_for_layer(l_no)
-                    _frcheck_record_stage_last_layer_start(
+                    _concord_wait_for_layer(l_no)
+                    _concord_record_stage_last_layer_start(
                         layer.layer_number, stage_last_layer_number
                     )
                     if l_no == 0:
@@ -678,7 +678,7 @@ class TransformerBlock(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
-                    _frcheck_record_layer_forward_done(l_no)
+                    _concord_record_layer_forward_done(l_no)
 
                     if (
                         torch.is_grad_enabled()

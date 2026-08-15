@@ -68,7 +68,7 @@ int resolve_cuda_device() {
 constexpr int kGeminiReplicasTcpConnectMaxRetries = 600;
 constexpr int kGeminiReplicasTcpConnectRetryDelayMs = 100;
 
-// Connect TCP socket with retry (aligned with gemini_native / FRCheck patterns).
+// Connect TCP socket with retry (aligned with gemini_native / Concord patterns).
 void asio_tcp_connect_with_retry(
     boost::asio::io_context& io_ctx,
     boost::asio::ip::tcp::socket& socket,

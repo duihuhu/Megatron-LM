@@ -1,5 +1,5 @@
 // RDMA microbenchmark: measure per-QP throughput vs QP count.
-// Mirrors FRCheck's RDMA usage: same libibverbs API, SEND/RECV,
+// Mirrors Concord's RDMA usage: same libibverbs API, SEND/RECV,
 // dedicated CQ per QP, chunked transfers, TCP handshake per transfer.
 //
 // Build:  g++ -std=c++17 -O2 -o rdma_bench rdma_bench.cpp -libverbs -lpthread
@@ -25,7 +25,7 @@
 #include <vector>
 
 // ---- config ----
-static constexpr size_t kRdmaChunk = 64ULL * 1024 * 1024;  // 64 MB per RDMA op (matches FRCheck)
+static constexpr size_t kRdmaChunk = 64ULL * 1024 * 1024;  // 64 MB per RDMA op (matches Concord)
 
 // ---- utilities ----
 static double now_sec() {
@@ -40,7 +40,7 @@ struct QPInfo {
     uint8_t  gid[16];
 } __attribute__((packed));
 
-// ---- A single QP with dedicated CQs (matches FRCheckRdmaChannel) ----
+// ---- A single QP with dedicated CQs (matches ConcordRdmaChannel) ----
 struct Lane {
     ibv_context* ctx;
     ibv_pd*     pd;
@@ -159,7 +159,7 @@ struct Lane {
         }
     }
 
-    // RDMA SEND (matches FRCheck: chunked, poll after each post)
+    // RDMA SEND (matches Concord: chunked, poll after each post)
     void send_data(const uint8_t* data, size_t size, ibv_mr* mr) {
         size_t remaining = size, offset = 0;
         while (remaining > 0) {
@@ -187,7 +187,7 @@ struct Lane {
         }
     }
 
-    // RDMA RECV (matches FRCheck)
+    // RDMA RECV (matches Concord)
     void recv_data(uint8_t* buf, size_t size, ibv_mr* mr, bool sync = true) {
         // Pre-post RECV
         ibv_sge sge;

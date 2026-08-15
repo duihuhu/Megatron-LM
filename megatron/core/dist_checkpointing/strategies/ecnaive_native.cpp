@@ -1941,7 +1941,7 @@ private:
     int rank_;  // Current rank_in_group (0..3) for load mode, set in init_ecnaive_load_connections
     int rank_in_group_;  // rank_in_group for save mode (0..3), set in constructor
 
-    // EC RS pthread pool (encode + decode, same pattern as FRCheck rs_pool)
+    // EC RS pthread pool (encode + decode, same pattern as Concord rs_pool)
     static constexpr int kEcRsPoolSize = 16;
     std::array<pthread_t, kEcRsPoolSize> ec_rs_pool_threads_{};
     std::array<EcRsPoolWorkerCtx, kEcRsPoolSize> ec_rs_pool_ctx_{};

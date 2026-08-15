@@ -341,7 +341,7 @@ int main(int argc, char** argv) {
         const double parity_bytes = static_cast<double>(options.total_bytes) * options.m;
         std::cout.setf(std::ios::fixed);
         std::cout.precision(6);
-        std::cout << "RESULT,mode=frcheck_batch,workers=" << options.workers
+        std::cout << "RESULT,mode=concord_batch,workers=" << options.workers
                   << ",cpus=" << join_cpus(options.cpus)
                   << ",k=" << options.k << ",m=" << options.m << ",jobs=" << options.jobs
                   << ",logical_range_bytes=" << options.total_bytes

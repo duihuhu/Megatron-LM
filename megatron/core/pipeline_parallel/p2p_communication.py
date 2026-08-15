@@ -23,9 +23,9 @@ Shape = Union[List[int], torch.Size]
 logger = logging.getLogger(__name__)
 
 
-# ---- FRCheck async parity hooks (no-op when flag not set) ----
+# ---- Concord async parity hooks (no-op when flag not set) ----
 
-def _frcheck_async_parity_debug_enabled(args=None):
+def _concord_async_parity_debug_enabled(args=None):
     if args is None:
         try:
             from megatron.training import get_args
@@ -33,27 +33,27 @@ def _frcheck_async_parity_debug_enabled(args=None):
         except Exception:
             return False
     return (
-        bool(getattr(args, 'use_frcheck', False))
-        and bool(getattr(args, 'frcheck_debug', False))
+        bool(getattr(args, 'use_concord', False))
+        and bool(getattr(args, 'concord_debug', False))
     )
 
 
-def _frcheck_any_async_parity_enabled(args) -> bool:
+def _concord_any_async_parity_enabled(args) -> bool:
     return (
-        bool(getattr(args, 'frcheck_async_parity', False))
+        bool(getattr(args, 'concord_async_parity', False))
         or (
-            bool(getattr(args, 'use_frcheck', False))
+            bool(getattr(args, 'use_concord', False))
             and (
-                bool(getattr(args, 'use_frcheck_hardware_failure', False))
+                bool(getattr(args, 'use_concord_hardware_failure', False))
                 or bool(getattr(args, 'ft_inprocess_recovery_benchmark', False))
-                or bool(getattr(args, 'frcheck_recovery_async_parity', False))
+                or bool(getattr(args, 'concord_recovery_async_parity', False))
             )
         )
     )
 
 
-def _frcheck_inc_net_busy():
-    """Increment the FRCheck async-pause refcount.
+def _concord_inc_net_busy():
+    """Increment the Concord async-pause refcount.
 
     Called right before issuing NCCL P2P operations so that background P2
     parity sends do not contend for IB bandwidth with PP communication.
@@ -63,10 +63,10 @@ def _frcheck_inc_net_busy():
     try:
         from megatron.training import get_args
         args = get_args()
-        if not _frcheck_any_async_parity_enabled(args):
+        if not _concord_any_async_parity_enabled(args):
             return False
-        from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
-        mgr = FRCheckManager()
+        from megatron.core.dist_checkpointing.strategies.concord_manager import ConcordManager
+        mgr = ConcordManager()
         native = mgr.get_native()
         if native is not None:
             native.inc_pause_async_p2p()
@@ -76,8 +76,8 @@ def _frcheck_inc_net_busy():
     return False
 
 
-def _frcheck_dec_net_busy():
-    """Decrement the FRCheck async-pause refcount.
+def _concord_dec_net_busy():
+    """Decrement the Concord async-pause refcount.
 
     Called after NCCL P2P operations complete (req.wait() returns).
     When the refcount reaches zero, background P2 parity sends resume.
@@ -85,10 +85,10 @@ def _frcheck_dec_net_busy():
     try:
         from megatron.training import get_args
         args = get_args()
-        if not _frcheck_any_async_parity_enabled(args):
+        if not _concord_any_async_parity_enabled(args):
             return
-        from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
-        mgr = FRCheckManager()
+        from megatron.core.dist_checkpointing.strategies.concord_manager import ConcordManager
+        mgr = ConcordManager()
         native = mgr.get_native()
         if native is not None:
             native.dec_pause_async_p2p()
@@ -437,28 +437,28 @@ def _communicate(
     if tensor_recv_next_func is not None:
         tensor_recv_next = tensor_recv_next_func()
 
-    frcheck_async_debug = _frcheck_async_parity_debug_enabled()
-    frcheck_trace_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    frcheck_save_async_parity = False
-    frcheck_recovery_async_parity = False
-    if frcheck_async_debug:
+    concord_async_debug = _concord_async_parity_debug_enabled()
+    concord_trace_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    concord_save_async_parity = False
+    concord_recovery_async_parity = False
+    if concord_async_debug:
         try:
             from megatron.training import get_args
-            _frcheck_args = get_args()
-            frcheck_save_async_parity = bool(getattr(_frcheck_args, 'frcheck_async_parity', False))
-            frcheck_recovery_async_parity = bool(getattr(_frcheck_args, 'frcheck_recovery_async_parity', False))
+            _concord_args = get_args()
+            concord_save_async_parity = bool(getattr(_concord_args, 'concord_async_parity', False))
+            concord_recovery_async_parity = bool(getattr(_concord_args, 'concord_recovery_async_parity', False))
         except Exception:
-            frcheck_save_async_parity = False
-            frcheck_recovery_async_parity = False
-    frcheck_p2p_total_t0 = time.time()
-    frcheck_p2p_call_t0 = frcheck_p2p_total_t0
-    if frcheck_async_debug:
+            concord_save_async_parity = False
+            concord_recovery_async_parity = False
+    concord_p2p_total_t0 = time.time()
+    concord_p2p_call_t0 = concord_p2p_total_t0
+    if concord_async_debug:
         logger.info(
-            "FRCHECK async parity trace rank %d save_async_parity=%s recovery_async_parity=%s: pp_p2p_pause_begin",
-            frcheck_trace_rank, frcheck_save_async_parity, frcheck_recovery_async_parity,
+            "CONCORD async parity trace rank %d save_async_parity=%s recovery_async_parity=%s: pp_p2p_pause_begin",
+            concord_trace_rank, concord_save_async_parity, concord_recovery_async_parity,
         )
-    frcheck_pause_acquired = _frcheck_inc_net_busy()
-    frcheck_p2p_wait_elapsed = 0.0
+    concord_pause_acquired = _concord_inc_net_busy()
+    concord_p2p_wait_elapsed = 0.0
     try:
         p2p_reqs = p2p_func(
             tensor_send_prev=tensor_send_prev,
@@ -469,7 +469,7 @@ def _communicate(
             prev_pipeline_rank=prev_rank,
             next_pipeline_rank=next_rank,
         )
-        frcheck_p2p_call_elapsed = time.time() - frcheck_p2p_call_t0
+        concord_p2p_call_elapsed = time.time() - concord_p2p_call_t0
         if isinstance(p2p_reqs, list):
             reqs.extend(p2p_reqs)
         else:
@@ -478,24 +478,24 @@ def _communicate(
         # Batched and ring-exchange paths wait inside p2p_func and return no work.
         if not (config.use_ring_exchange_p2p or config.batch_p2p_comm):
             if wait_on_reqs and len(reqs) > 0:
-                frcheck_p2p_wait_t0 = time.time()
+                concord_p2p_wait_t0 = time.time()
                 for req in reqs if isinstance(reqs, list) else reqs.values():
                     req.wait()
-                frcheck_p2p_wait_elapsed = time.time() - frcheck_p2p_wait_t0
+                concord_p2p_wait_elapsed = time.time() - concord_p2p_wait_t0
                 reqs = None
             elif len(reqs) > 0:
                 # Deferred-wait mode pauses only while issuing PP work, matching
                 # the existing save-side behavior.
                 pass
     finally:
-        if frcheck_pause_acquired:
-            _frcheck_dec_net_busy()
-    if frcheck_async_debug:
+        if concord_pause_acquired:
+            _concord_dec_net_busy()
+    if concord_async_debug:
         logger.info(
-            "FRCHECK async parity trace rank %d save_async_parity=%s recovery_async_parity=%s: pp_p2p_pause_end total=%.6fs call=%.6fs wait=%.6fs reqs=%d",
-            frcheck_trace_rank, frcheck_save_async_parity, frcheck_recovery_async_parity,
-            time.time() - frcheck_p2p_total_t0,
-            frcheck_p2p_call_elapsed, frcheck_p2p_wait_elapsed, len(reqs) if reqs is not None else 0,
+            "CONCORD async parity trace rank %d save_async_parity=%s recovery_async_parity=%s: pp_p2p_pause_end total=%.6fs call=%.6fs wait=%.6fs reqs=%d",
+            concord_trace_rank, concord_save_async_parity, concord_recovery_async_parity,
+            time.time() - concord_p2p_total_t0,
+            concord_p2p_call_elapsed, concord_p2p_wait_elapsed, len(reqs) if reqs is not None else 0,
         )
 
     if config.batch_p2p_comm and config.batch_p2p_sync:

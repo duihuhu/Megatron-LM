@@ -31,15 +31,15 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def _frcheck_async_parity_debug_enabled(args=None):
+def _concord_async_parity_debug_enabled(args=None):
     if args is None:
         try:
             args = get_args()
         except Exception:
             return False
     return (
-        bool(getattr(args, "use_frcheck", False))
-        and bool(getattr(args, "frcheck_debug", False))
+        bool(getattr(args, "use_concord", False))
+        and bool(getattr(args, "concord_debug", False))
     )
 
 
@@ -175,10 +175,10 @@ def destroy_global_state():
 def _log_recovery_to_forward_profile(event: str) -> None:
     return
 
-def _force_exit_after_frcheck_load() -> None:
-    """Terminate leftover worker resources and bypass Python exit hooks for FRCheck load-only runs."""
+def _force_exit_after_concord_load() -> None:
+    """Terminate leftover worker resources and bypass Python exit hooks for Concord load-only runs."""
     args = get_args()
-    if not getattr(args, "use_frcheck_hardware_failure", False):
+    if not getattr(args, "use_concord_hardware_failure", False):
         return
     for child in multiprocessing.active_children():
         if child.is_alive():
@@ -1022,33 +1022,33 @@ def pretrain(
     if wandb_writer:
         wandb_writer.finish()
 
-    if getattr(args, "frcheck_debug", False):
-        logger.info("FRCHECK teardown trace rank=%d: before async save finalize", args.rank)
+    if getattr(args, "concord_debug", False):
+        logger.info("CONCORD teardown trace rank=%d: before async save finalize", args.rank)
     ft_integration.on_checkpointing_start()
     maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
-    if getattr(args, "frcheck_debug", False):
-        logger.info("FRCHECK teardown trace rank=%d: after async save finalize", args.rank)
+    if getattr(args, "concord_debug", False):
+        logger.info("CONCORD teardown trace rank=%d: after async save finalize", args.rank)
 
     one_logger and one_logger.log_metrics(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
 
-    if getattr(args, "frcheck_debug", False):
-        logger.info("FRCHECK teardown trace rank=%d: before FT/logger shutdown", args.rank)
+    if getattr(args, "concord_debug", False):
+        logger.info("CONCORD teardown trace rank=%d: before FT/logger shutdown", args.rank)
     ft_integration.shutdown()
     one_logger_utils.finish()
-    if getattr(args, "frcheck_debug", False):
-        logger.info("FRCHECK teardown trace rank=%d: after FT/logger shutdown", args.rank)
+    if getattr(args, "concord_debug", False):
+        logger.info("CONCORD teardown trace rank=%d: after FT/logger shutdown", args.rank)
 
-    if getattr(args, "use_frcheck", False):
-        if getattr(args, "frcheck_debug", False):
-            logger.info("FRCHECK teardown trace rank=%d: before FRCheck teardown import", args.rank)
-        from megatron.training.frcheck_legacy import _teardown_frcheck_after_training
-        if getattr(args, "frcheck_debug", False):
-            logger.info("FRCHECK teardown trace rank=%d: after FRCheck teardown import", args.rank)
-        _teardown_frcheck_after_training()
-        _force_exit_after_frcheck_load()
+    if getattr(args, "use_concord", False):
+        if getattr(args, "concord_debug", False):
+            logger.info("CONCORD teardown trace rank=%d: before Concord teardown import", args.rank)
+        from megatron.training.concord_legacy import _teardown_concord_after_training
+        if getattr(args, "concord_debug", False):
+            logger.info("CONCORD teardown trace rank=%d: after Concord teardown import", args.rank)
+        _teardown_concord_after_training()
+        _force_exit_after_concord_load()
 
 
 def _teardown_gemini_inprocess_workspace() -> None:
@@ -1445,20 +1445,20 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
-        if getattr(args, "use_frcheck", False):
-            from megatron.training.frcheck_legacy import (
-                frcheck_async_layerwise_active,
-                frcheck_log_layerwise_runtime_summary,
-                frcheck_materialize_all_layers,
-                frcheck_recovery_safe_point,
+        if getattr(args, "use_concord", False):
+            from megatron.training.concord_legacy import (
+                concord_async_layerwise_active,
+                concord_log_layerwise_runtime_summary,
+                concord_materialize_all_layers,
+                concord_recovery_safe_point,
             )
-            frcheck_log_layerwise_runtime_summary("after_load_checkpoint")
-            frcheck_recovery_safe_point("after_load_checkpoint")
-            if not frcheck_async_layerwise_active():
-                frcheck_materialize_all_layers()
-                frcheck_log_layerwise_runtime_summary("after_load_checkpoint_materialized")
+            concord_log_layerwise_runtime_summary("after_load_checkpoint")
+            concord_recovery_safe_point("after_load_checkpoint")
+            if not concord_async_layerwise_active():
+                concord_materialize_all_layers()
+                concord_log_layerwise_runtime_summary("after_load_checkpoint_materialized")
             else:
-                frcheck_log_layerwise_runtime_summary("after_load_checkpoint_async_active")
+                concord_log_layerwise_runtime_summary("after_load_checkpoint_async_active")
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
@@ -1547,25 +1547,25 @@ def create_layer_groups_by_param_count(optimizer, num_groups=None):
     return layer_groups
 
 
-def _frcheck_any_async_parity_enabled(args) -> bool:
+def _concord_any_async_parity_enabled(args) -> bool:
     return (
-        bool(getattr(args, 'frcheck_async_parity', False))
+        bool(getattr(args, 'concord_async_parity', False))
         or (
-            bool(getattr(args, 'use_frcheck', False))
+            bool(getattr(args, 'use_concord', False))
             and (
-                bool(getattr(args, 'use_frcheck_hardware_failure', False))
+                bool(getattr(args, 'use_concord_hardware_failure', False))
                 or bool(getattr(args, 'ft_inprocess_recovery_benchmark', False))
-                or bool(getattr(args, 'frcheck_recovery_async_parity', False))
+                or bool(getattr(args, 'concord_recovery_async_parity', False))
             )
         )
     )
 
 
-def _frcheck_inc_net_busy():
+def _concord_inc_net_busy():
     """Mark the network as busy (PP NCCL communication in flight).
 
-    Increments a refcount in the FRCheck C++ native module; background P2
-    workers will pause while the count is > 0.  Call _frcheck_dec_net_busy()
+    Increments a refcount in the Concord C++ native module; background P2
+    workers will pause while the count is > 0.  Call _concord_dec_net_busy()
     after the NCCL operation completes.
 
     No-op when neither save parity nor hardware-recovery parity can overlap.
@@ -1573,10 +1573,10 @@ def _frcheck_inc_net_busy():
     try:
         from megatron.training import get_args
         args = get_args()
-        if not _frcheck_any_async_parity_enabled(args):
+        if not _concord_any_async_parity_enabled(args):
             return
-        from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
-        mgr = FRCheckManager()
+        from megatron.core.dist_checkpointing.strategies.concord_manager import ConcordManager
+        mgr = ConcordManager()
         native = mgr.get_native()
         if native is not None:
             native.inc_pause_async_p2p()
@@ -1584,7 +1584,7 @@ def _frcheck_inc_net_busy():
         pass
 
 
-def _frcheck_dec_net_busy():
+def _concord_dec_net_busy():
     """Mark the network as free (NCCL operation complete).
 
     Decrements the refcount.  When the count reaches zero, background P2
@@ -1593,10 +1593,10 @@ def _frcheck_dec_net_busy():
     try:
         from megatron.training import get_args
         args = get_args()
-        if not _frcheck_any_async_parity_enabled(args):
+        if not _concord_any_async_parity_enabled(args):
             return
-        from megatron.core.dist_checkpointing.strategies.frcheck_manager import FRCheckManager
-        mgr = FRCheckManager()
+        from megatron.core.dist_checkpointing.strategies.concord_manager import ConcordManager
+        mgr = ConcordManager()
         native = mgr.get_native()
         if native is not None:
             native.dec_pause_async_p2p()
@@ -1610,15 +1610,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     _log_recovery_to_forward_profile("train_step_entry")
     args = get_args()
     timers = get_timers()
-    frcheck_async_debug = _frcheck_async_parity_debug_enabled(args)
-    frcheck_trace_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    frcheck_train_step_t0 = time.time()
-    if frcheck_async_debug:
+    concord_async_debug = _concord_async_parity_debug_enabled(args)
+    concord_trace_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    concord_train_step_t0 = time.time()
+    if concord_async_debug:
         logger.info(
-            "FRCHECK async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: train_step_start",
-            frcheck_trace_rank, getattr(args, "curr_iteration", -1),
-            bool(getattr(args, "frcheck_async_parity", False)),
-            bool(getattr(args, "frcheck_recovery_async_parity", False)),
+            "CONCORD async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: train_step_start",
+            concord_trace_rank, getattr(args, "curr_iteration", -1),
+            bool(getattr(args, "concord_async_parity", False)),
+            bool(getattr(args, "concord_recovery_async_parity", False)),
         )
 
     # CUDA Graph capturing only executes once, when it's the first training iteration.
@@ -1635,8 +1635,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         torch.cuda.empty_cache()
 
     rerun_state_machine = get_rerun_state_machine()
-    frcheck_optimizer_overlap_started = False
-    frcheck_optimizer_overlap_diagnostic_logged = False
+    concord_optimizer_overlap_started = False
+    concord_optimizer_overlap_diagnostic_logged = False
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         mark_recovery_to_forward_timer("zero_grad_start")
@@ -1665,70 +1665,70 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
         mark_recovery_to_forward_timer("train_step_start")
         _log_recovery_to_forward_profile("train_step_start")
-        if getattr(args, "use_frcheck", False):
+        if getattr(args, "use_concord", False):
             try:
-                from megatron.training.frcheck_legacy import (
-                    frcheck_recovery_safe_point,
-                    frcheck_wait_for_optimizer_state,
+                from megatron.training.concord_legacy import (
+                    concord_recovery_safe_point,
+                    concord_wait_for_optimizer_state,
                 )
-                mark_recovery_to_forward_timer("frcheck_train_prep_start")
-                frcheck_recovery_safe_point("train_step_start")
-                mark_recovery_to_forward_timer("frcheck_train_safe_point_done")
-                if getattr(args, "frcheck_hw_optimizer_overlap", False):
-                    from megatron.training.frcheck_legacy import frcheck_start_optimizer_h2d
-                    frcheck_optimizer_overlap_started = frcheck_start_optimizer_h2d(optimizer)
+                mark_recovery_to_forward_timer("concord_train_prep_start")
+                concord_recovery_safe_point("train_step_start")
+                mark_recovery_to_forward_timer("concord_train_safe_point_done")
+                if getattr(args, "concord_hw_optimizer_overlap", False):
+                    from megatron.training.concord_legacy import concord_start_optimizer_h2d
+                    concord_optimizer_overlap_started = concord_start_optimizer_h2d(optimizer)
                 if (
-                    not getattr(args, "frcheck_async_recovery_forward", False)
-                    and not getattr(args, "frcheck_hw_optimizer_overlap", False)
+                    not getattr(args, "concord_async_recovery_forward", False)
+                    and not getattr(args, "concord_hw_optimizer_overlap", False)
                 ):
-                    frcheck_wait_for_optimizer_state(optimizer)
-                mark_recovery_to_forward_timer("frcheck_train_optimizer_state_done")
+                    concord_wait_for_optimizer_state(optimizer)
+                mark_recovery_to_forward_timer("concord_train_optimizer_state_done")
             except ImportError:
                 pass
 
-        frcheck_inline_parity_checked = False
-        frcheck_first_forward_s = 0.0
-        frcheck_inline_parity_tail_wait_s = 0.0
-        frcheck_post_first_forward_t0 = None
+        concord_inline_parity_checked = False
+        concord_first_forward_s = 0.0
+        concord_inline_parity_tail_wait_s = 0.0
+        concord_post_first_forward_t0 = None
 
         @functools.wraps(forward_step_func)
         def forward_step_func_with_recovery_timing(*forward_args, **forward_kwargs):
-            nonlocal frcheck_optimizer_overlap_started, frcheck_inline_parity_checked
-            nonlocal frcheck_first_forward_s, frcheck_inline_parity_tail_wait_s
-            nonlocal frcheck_post_first_forward_t0
+            nonlocal concord_optimizer_overlap_started, concord_inline_parity_checked
+            nonlocal concord_first_forward_s, concord_inline_parity_tail_wait_s
+            nonlocal concord_post_first_forward_t0
             mark_recovery_to_forward_timer("forward_step_start")
             _log_recovery_to_forward_profile("forward_step_start")
-            if getattr(args, "use_frcheck", False):
+            if getattr(args, "use_concord", False):
                 try:
-                    from megatron.training.frcheck_legacy import frcheck_recovery_safe_point
-                    frcheck_recovery_safe_point("forward_step_start")
+                    from megatron.training.concord_legacy import concord_recovery_safe_point
+                    concord_recovery_safe_point("forward_step_start")
                 except ImportError:
                     pass
-            is_first_forward = not frcheck_inline_parity_checked
+            is_first_forward = not concord_inline_parity_checked
             first_forward_t0 = time.time() if is_first_forward else None
             result = forward_step_func(*forward_args, **forward_kwargs)
             if is_first_forward:
                 first_forward_done_s = time.time()
-                frcheck_first_forward_s = first_forward_done_s - first_forward_t0
-                if getattr(args, "use_frcheck", False):
-                    from megatron.training.frcheck_legacy import (
-                        frcheck_record_first_microbatch_done,
+                concord_first_forward_s = first_forward_done_s - first_forward_t0
+                if getattr(args, "use_concord", False):
+                    from megatron.training.concord_legacy import (
+                        concord_record_first_microbatch_done,
                     )
-                    frcheck_record_first_microbatch_done(first_forward_done_s)
+                    concord_record_first_microbatch_done(first_forward_done_s)
             if (
-                not frcheck_optimizer_overlap_started
-                and getattr(args, "frcheck_hw_optimizer_overlap", False)
+                not concord_optimizer_overlap_started
+                and getattr(args, "concord_hw_optimizer_overlap", False)
                 and bool(getattr(args, "_ft_inprocess_recovery_awaiting_forward", False))
             ):
-                from megatron.training.frcheck_legacy import frcheck_start_optimizer_h2d
+                from megatron.training.concord_legacy import concord_start_optimizer_h2d
 
-                frcheck_optimizer_overlap_started = frcheck_start_optimizer_h2d(optimizer)
+                concord_optimizer_overlap_started = concord_start_optimizer_h2d(optimizer)
             finish_recovery_to_forward_timer("forward_step_end")
             _log_recovery_to_forward_profile("forward_step_end")
-            if not frcheck_inline_parity_checked:
-                frcheck_inline_parity_checked = True
+            if not concord_inline_parity_checked:
+                concord_inline_parity_checked = True
                 if (
-                    getattr(args, "use_frcheck", False)
+                    getattr(args, "use_concord", False)
                     and bool(
                         getattr(args, "_ft_inprocess_recovery_awaiting_forward", False)
                     )
@@ -1736,38 +1736,38 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                         args, "ft_inprocess_recovery_software_failure", False
                     )
                     and not bool(
-                        getattr(args, "frcheck_recovery_async_parity", False)
+                        getattr(args, "concord_recovery_async_parity", False)
                     )
                 ):
-                    from megatron.training.frcheck_legacy import (
-                        frcheck_wait_for_inline_parity_after_first_microbatch,
+                    from megatron.training.concord_legacy import (
+                        concord_wait_for_inline_parity_after_first_microbatch,
                     )
 
                     inline_parity_tail_wait_t0 = time.time()
                     inline_parity_waited = (
-                        frcheck_wait_for_inline_parity_after_first_microbatch()
+                        concord_wait_for_inline_parity_after_first_microbatch()
                     )
                     if inline_parity_waited:
-                        frcheck_inline_parity_tail_wait_s = (
+                        concord_inline_parity_tail_wait_s = (
                             time.time() - inline_parity_tail_wait_t0
                         )
-                frcheck_post_first_forward_t0 = time.time()
+                concord_post_first_forward_t0 = time.time()
             return result
 
         # Forward pass.
-        if frcheck_async_debug:
+        if concord_async_debug:
             logger.info(
-                "FRCHECK async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: forward_backward_start",
-                frcheck_trace_rank, getattr(args, "curr_iteration", -1),
-                bool(getattr(args, "frcheck_async_parity", False)),
-                bool(getattr(args, "frcheck_recovery_async_parity", False)),
+                "CONCORD async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: forward_backward_start",
+                concord_trace_rank, getattr(args, "curr_iteration", -1),
+                bool(getattr(args, "concord_async_parity", False)),
+                bool(getattr(args, "concord_recovery_async_parity", False)),
             )
-        if getattr(args, "use_frcheck", False):
+        if getattr(args, "use_concord", False):
             mark_recovery_to_forward_timer("pipeline_start")
             _log_recovery_to_forward_profile("pipeline_start")
         mark_recovery_to_forward_timer("forward_backward_start")
         _log_recovery_to_forward_profile("forward_backward_start")
-        frcheck_forward_backward_t0 = time.time()
+        concord_forward_backward_t0 = time.time()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func_with_recovery_timing,
             data_iterator=data_iterator,
@@ -1779,59 +1779,59 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
-        frcheck_forward_backward_end = time.time()
+        concord_forward_backward_end = time.time()
         if (
-            getattr(args, "frcheck_hw_optimizer_overlap", False)
+            getattr(args, "concord_hw_optimizer_overlap", False)
             and getattr(args, "_ft_inprocess_recovery_awaiting_forward", False)
-            and not frcheck_optimizer_overlap_started
-            and not frcheck_optimizer_overlap_diagnostic_logged
+            and not concord_optimizer_overlap_started
+            and not concord_optimizer_overlap_diagnostic_logged
         ):
-            from megatron.training.frcheck_legacy import (
-                frcheck_log_optimizer_overlap_not_started,
+            from megatron.training.concord_legacy import (
+                concord_log_optimizer_overlap_not_started,
             )
 
-            frcheck_log_optimizer_overlap_not_started()
-            frcheck_optimizer_overlap_diagnostic_logged = True
-        if getattr(args, "use_frcheck", False):
-            frcheck_forward_backward_elapsed_s = (
-                frcheck_forward_backward_end - frcheck_forward_backward_t0
+            concord_log_optimizer_overlap_not_started()
+            concord_optimizer_overlap_diagnostic_logged = True
+        if getattr(args, "use_concord", False):
+            concord_forward_backward_elapsed_s = (
+                concord_forward_backward_end - concord_forward_backward_t0
             )
-            frcheck_post_first_forward_to_end_s = (
-                frcheck_forward_backward_end - frcheck_post_first_forward_t0
-                if frcheck_post_first_forward_t0 is not None
+            concord_post_first_forward_to_end_s = (
+                concord_forward_backward_end - concord_post_first_forward_t0
+                if concord_post_first_forward_t0 is not None
                 else 0.0
             )
             stash_recovery_timing_summary(
-                "frcheck_forward_backward",
+                "concord_forward_backward",
                 {
-                    "elapsed_s": frcheck_forward_backward_elapsed_s,
-                    "first_forward_s": frcheck_first_forward_s,
-                    "inline_parity_tail_wait_s": frcheck_inline_parity_tail_wait_s,
-                    "post_first_forward_to_end_s": frcheck_post_first_forward_to_end_s,
-                    "rank": frcheck_trace_rank,
+                    "elapsed_s": concord_forward_backward_elapsed_s,
+                    "first_forward_s": concord_first_forward_s,
+                    "inline_parity_tail_wait_s": concord_inline_parity_tail_wait_s,
+                    "post_first_forward_to_end_s": concord_post_first_forward_to_end_s,
+                    "rank": concord_trace_rank,
                     "pp_rank": mpu.get_pipeline_model_parallel_rank(),
                     "tp_rank": mpu.get_tensor_model_parallel_rank(),
                 },
             )
         mark_recovery_to_forward_timer("forward_backward_done")
         _log_recovery_to_forward_profile("forward_backward_done")
-        if getattr(args, "use_frcheck", False):
-            from megatron.training.frcheck_legacy import finalize_frcheck_recovery_timing
-            finalize_frcheck_recovery_timing()
+        if getattr(args, "use_concord", False):
+            from megatron.training.concord_legacy import finalize_concord_recovery_timing
+            finalize_concord_recovery_timing()
         flush_recovery_timing_summaries()
-        if frcheck_async_debug:
+        if concord_async_debug:
             logger.info(
-                "FRCHECK async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: forward_backward_end elapsed=%.6fs",
-                frcheck_trace_rank, getattr(args, "curr_iteration", -1),
-                bool(getattr(args, "frcheck_async_parity", False)),
-                bool(getattr(args, "frcheck_recovery_async_parity", False)),
-                time.time() - frcheck_forward_backward_t0,
+                "CONCORD async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: forward_backward_end elapsed=%.6fs",
+                concord_trace_rank, getattr(args, "curr_iteration", -1),
+                bool(getattr(args, "concord_async_parity", False)),
+                bool(getattr(args, "concord_recovery_async_parity", False)),
+                time.time() - concord_forward_backward_t0,
             )
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        if getattr(args, "use_frcheck", False):
-            from megatron.training.frcheck_legacy import frcheck_drain_recovery_parity
-            frcheck_drain_recovery_parity("train_step_early_exit", allow_start_pending=True)
+        if getattr(args, "use_concord", False):
+            from megatron.training.concord_legacy import concord_drain_recovery_parity
+            concord_drain_recovery_parity("train_step_early_exit", allow_start_pending=True)
             flush_recovery_timing_summaries()
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
 
@@ -1846,27 +1846,27 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
-    if frcheck_async_debug:
+    if concord_async_debug:
         logger.info(
-            "FRCHECK async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: before_optimizer_step",
-            frcheck_trace_rank, getattr(args, "curr_iteration", -1),
-            bool(getattr(args, "frcheck_async_parity", False)),
-            bool(getattr(args, "frcheck_recovery_async_parity", False)),
+            "CONCORD async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: before_optimizer_step",
+            concord_trace_rank, getattr(args, "curr_iteration", -1),
+            bool(getattr(args, "concord_async_parity", False)),
+            bool(getattr(args, "concord_recovery_async_parity", False)),
         )
     optimizer_error = None
     try:
-        if getattr(args, "use_frcheck", False):
+        if getattr(args, "use_concord", False):
             try:
-                from megatron.training.frcheck_legacy import (
-                    frcheck_recovery_safe_point,
-                    frcheck_wait_for_optimizer_state,
-                    frcheck_start_or_run_recovery_parity_after_forward_backward,
+                from megatron.training.concord_legacy import (
+                    concord_recovery_safe_point,
+                    concord_wait_for_optimizer_state,
+                    concord_start_or_run_recovery_parity_after_forward_backward,
                 )
                 # This safe point drains only remaining layerwise data recovery.
                 # Parity is then dispatched before optimizer state is materialized.
-                frcheck_recovery_safe_point("before_optimizer_step")
-                frcheck_start_or_run_recovery_parity_after_forward_backward()
-                frcheck_wait_for_optimizer_state(optimizer)
+                concord_recovery_safe_point("before_optimizer_step")
+                concord_start_or_run_recovery_parity_after_forward_backward()
+                concord_wait_for_optimizer_state(optimizer)
             except ImportError:
                 pass
 
@@ -1921,12 +1921,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         optimizer_error = exc
         raise
     finally:
-        if getattr(args, "use_frcheck", False):
+        if getattr(args, "use_concord", False):
             try:
-                from megatron.training.frcheck_legacy import (
-                    frcheck_finish_recovery_parity_after_optimizer,
+                from megatron.training.concord_legacy import (
+                    concord_finish_recovery_parity_after_optimizer,
                 )
-                frcheck_finish_recovery_parity_after_optimizer(
+                concord_finish_recovery_parity_after_optimizer(
                     allow_start_pending=False
                 )
                 flush_recovery_timing_summaries()
@@ -1944,13 +1944,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if args.use_distributed_optimizer and args.overlap_param_gather:
             cuda_graph_set_manual_hooks(model)
 
-    if frcheck_async_debug:
+    if concord_async_debug:
         logger.info(
-            "FRCHECK async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: train_step_end elapsed=%.6fs",
-            frcheck_trace_rank, getattr(args, "curr_iteration", -1),
-            bool(getattr(args, "frcheck_async_parity", False)),
-            bool(getattr(args, "frcheck_recovery_async_parity", False)),
-            time.time() - frcheck_train_step_t0,
+            "CONCORD async parity trace rank %d iter %d save_async_parity=%s recovery_async_parity=%s: train_step_end elapsed=%.6fs",
+            concord_trace_rank, getattr(args, "curr_iteration", -1),
+            bool(getattr(args, "concord_async_parity", False)),
+            bool(getattr(args, "concord_recovery_async_parity", False)),
+            time.time() - concord_train_step_t0,
         )
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
@@ -2348,8 +2348,8 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
-    frcheck_async_debug = _frcheck_async_parity_debug_enabled(args)
-    frcheck_save_t0 = time.time()
+    concord_async_debug = _concord_async_parity_debug_enabled(args)
+    concord_save_t0 = time.time()
     save_checkpoint(
         iteration,
         model,
@@ -2361,12 +2361,12 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
-    if frcheck_async_debug:
+    if concord_async_debug:
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         logger.info(
-            "FRCHECK async parity trace rank %d iter %d async_parity=%s: save_return elapsed=%.6fs",
-            rank, iteration, bool(getattr(args, "frcheck_async_parity", False)),
-            time.time() - frcheck_save_t0,
+            "CONCORD async parity trace rank %d iter %d async_parity=%s: save_return elapsed=%.6fs",
+            rank, iteration, bool(getattr(args, "concord_async_parity", False)),
+            time.time() - concord_save_t0,
         )
     if args.fp8:
         # Run garbage collection after checkpoint saving to free memory from

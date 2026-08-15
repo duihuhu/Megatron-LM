@@ -457,7 +457,7 @@ def save_gemini_replicas_legacy_checkpoint(
     mirror_d2h_s = 0.0
     _submit_elapsed = 0.0
     if use_cpu_pipeline:
-        # FRCheck-style pipeline: the GPU buffer is already packed above. Send from
+        # Concord-style pipeline: the GPU buffer is already packed above. Send from
         # the CPU buffer (NIC reads host memory, no GPU-read contention with the
         # concurrent D2H), and overlap each segment's D2H (GPU->CPU) with the
         # network send of earlier segments. Segment count is shared by all ranks.

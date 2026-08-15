@@ -34,40 +34,40 @@ GEMINI_ENV_VARS=(
     GEMINI_REPLICAS_CHANNELS_PER_PEER
 )
 
-DEFAULT_SCHEMES=(gemini2 gemini3 frcheck eccheck ecnaive)
+DEFAULT_SCHEMES=(gemini2 gemini3 concord eccheck ecnaive)
 SELECTED_RECOVERY_MODES=()
 declare -A MODE_LABELS=([inprocess_sw]=inprocess_sw [inprocess]=inprocess [inprocess2]=inprocess2)
 declare -A MODE_OFFSETS=([save]=0 [inprocess_sw]=1 [inprocess]=2 [inprocess2]=3)
 declare -A SCRIPTS=(
     [gemini2]="$SCRIPT_DIR/test_gemini_2.sh"
     [gemini3]="$SCRIPT_DIR/test_gemini_3.sh"
-    [frcheck]="$SCRIPT_DIR/test_frcheck.sh"
+    [concord]="$SCRIPT_DIR/test_concord.sh"
     [eccheck]="$SCRIPT_DIR/test_eccheck.sh"
     [ecnaive]="$SCRIPT_DIR/test_ecnaive.sh"
 )
 declare -A CHECKPOINT_PATHS=(
     [gemini2]="$CHECKPOINT_PREFIX-gemini-2-replicas"
     [gemini3]="$CHECKPOINT_PREFIX-gemini-3-replicas"
-    [frcheck]="$CHECKPOINT_PREFIX-frcheck"
+    [concord]="$CHECKPOINT_PREFIX-concord"
     [eccheck]="$CHECKPOINT_PREFIX-eccheck"
     [ecnaive]="$CHECKPOINT_PREFIX-ecnaive"
 )
 declare -A BASE_PORTS=(
     [gemini2]="${MASTER_PORT_GEMINI2:-6200}"
     [gemini3]="${MASTER_PORT_GEMINI3:-6240}"
-    [frcheck]="${MASTER_PORT_FRCHECK:-6280}"
+    [concord]="${MASTER_PORT_CONCORD:-6280}"
     [eccheck]="${MASTER_PORT_ECCHECK:-6320}"
     [ecnaive]="${MASTER_PORT_ECNAIVE:-6360}"
 )
 
 usage() {
-    echo "Usage: $0 [--dry-run] [gemini2|gemini3|frcheck|eccheck|ecnaive ...]"
+    echo "Usage: $0 [--dry-run] [gemini2|gemini3|concord|eccheck|ecnaive ...]"
     echo "Environment: MODEL_SIZE=2.7B|7B|10B|14B|20B, LOG_DIR, RUN_TIMEOUT_SECONDS, DRY_RUN=0|1"
     echo "             RECOVERY_MODES, TRAIN_ENV_PREFIX, INPROCESS_REPEAT (positive integer, default: 10)"
     echo "             GEMINI_GDR, GEMINI_GDR_MIRROR_MODE, GEMINI_GDR_BATCH_WR,"
     echo "             GEMINI_MIRROR_CHUNK_MB, GEMINI_REPLICAS_CHANNELS_PER_PEER"
     echo "             SSH_USER, SSH_PORT, SSH_CONNECT_TIMEOUT, SSH_IDENTITY_FILE"
-    echo "             MASTER_PORT_GEMINI2, MASTER_PORT_GEMINI3, MASTER_PORT_FRCHECK,"
+    echo "             MASTER_PORT_GEMINI2, MASTER_PORT_GEMINI3, MASTER_PORT_CONCORD,"
     echo "             MASTER_PORT_ECCHECK, MASTER_PORT_ECNAIVE"
 }
 
@@ -76,7 +76,7 @@ for argument in "$@"; do
     case "$argument" in
         --dry-run) DRY_RUN=1 ;;
         -h|--help) usage; exit 0 ;;
-        gemini2|gemini3|frcheck|eccheck|ecnaive) schemes+=("$argument") ;;
+        gemini2|gemini3|concord|eccheck|ecnaive) schemes+=("$argument") ;;
         *) echo "Unknown scheme or option: $argument" >&2; usage >&2; exit 2 ;;
     esac
 done
@@ -109,9 +109,9 @@ build_command_env_prefix() {
 }
 
 TRAIN_ENV_COMMAND_PREFIX="env ${TRAIN_ENV_PREFIX:+$TRAIN_ENV_PREFIX }"
-FRCHECK_HW2_ASYNC_OFF=0
-if [[ "${FRCHECK_RECOVERY_ASYNC_PARITY:-1}" == 0 || " $TRAIN_ENV_PREFIX " == *" FRCHECK_RECOVERY_ASYNC_PARITY=0 "* ]]; then
-    FRCHECK_HW2_ASYNC_OFF=1
+CONCORD_HW2_ASYNC_OFF=0
+if [[ "${CONCORD_RECOVERY_ASYNC_PARITY:-1}" == 0 || " $TRAIN_ENV_PREFIX " == *" CONCORD_RECOVERY_ASYNC_PARITY=0 "* ]]; then
+    CONCORD_HW2_ASYNC_OFF=1
 fi
 
 [[ "$DRY_RUN" == 0 || "$DRY_RUN" == 1 ]] || { echo "DRY_RUN must be 0 or 1." >&2; exit 2; }
@@ -234,8 +234,8 @@ print_dry_run() {
             port=$((base + MODE_OFFSETS[$mode]))
             if [[ "$scheme" == gemini2 && "$mode" == inprocess2 ]]; then
                 echo "  node0-only expected unsupported: ${command_env_prefix}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=$INPROCESS_REPEAT MASTER_PORT=$port ./$script 0 $mode --train-iters 2"
-            elif [[ "$scheme" == frcheck && "$mode" == inprocess2 && "$FRCHECK_HW2_ASYNC_OFF" == 1 ]]; then
-                echo "  not required: FRCheck HW2 with recovery async parity off"
+            elif [[ "$scheme" == concord && "$mode" == inprocess2 && "$CONCORD_HW2_ASYNC_OFF" == 1 ]]; then
+                echo "  not required: Concord HW2 with recovery async parity off"
             else
                 echo "  four-node: ${command_env_prefix}PRINT_CMD=0 FT_INPROCESS_RECOVERY_REPEAT=$INPROCESS_REPEAT MASTER_PORT=$port ./$script {R} $mode --train-iters 2"
             fi
@@ -651,8 +651,8 @@ for scheme in "${schemes[@]}"; do
             start_utc=$(utc_now); start_epoch=$(epoch_now)
             rc=1; status=failed; target_run_count=0; run10_count=0; recovery_forward_count=0
 
-            if [[ "$scheme" == frcheck && "$mode" == inprocess2 && "$FRCHECK_HW2_ASYNC_OFF" == 1 ]]; then
-                printf '%s\n' "COMMAND_SKIPPED,reason=frcheck_hw2_async_off_not_required" >"$log"
+            if [[ "$scheme" == concord && "$mode" == inprocess2 && "$CONCORD_HW2_ASYNC_OFF" == 1 ]]; then
+                printf '%s\n' "COMMAND_SKIPPED,reason=concord_hw2_async_off_not_required" >"$log"
                 rc=0
                 status=not_required
             elif ! check_before_run "$scheme" "$mode" "$previous_tag"; then

@@ -51,42 +51,42 @@ build_gemini_env_prefix() {
     printf '%s' "$prefix"
 }
 
-DEFAULT_SCHEMES=(gemini2 gemini3 frcheck eccheck ecnaive)
+DEFAULT_SCHEMES=(gemini2 gemini3 concord eccheck ecnaive)
 declare -A SCRIPTS=(
     [gemini2]="$SCRIPT_DIR/test_gemini_2.sh"
     [gemini3]="$SCRIPT_DIR/test_gemini_3.sh"
-    [frcheck]="$SCRIPT_DIR/test_frcheck.sh"
+    [concord]="$SCRIPT_DIR/test_concord.sh"
     [eccheck]="$SCRIPT_DIR/test_eccheck.sh"
     [ecnaive]="$SCRIPT_DIR/test_ecnaive.sh"
 )
 declare -A CHECKPOINT_PATHS=(
     [gemini2]="$CHECKPOINT_PREFIX-gemini-2-replicas"
     [gemini3]="$CHECKPOINT_PREFIX-gemini-3-replicas"
-    [frcheck]="$CHECKPOINT_PREFIX-frcheck"
+    [concord]="$CHECKPOINT_PREFIX-concord"
     [eccheck]="$CHECKPOINT_PREFIX-eccheck"
     [ecnaive]="$CHECKPOINT_PREFIX-ecnaive"
 )
 declare -A MASTER_PORTS=(
     [gemini2]="${MASTER_PORT_GEMINI2:-6100}"
     [gemini3]="${MASTER_PORT_GEMINI3:-6110}"
-    [frcheck]="${MASTER_PORT_FRCHECK:-6120}"
+    [concord]="${MASTER_PORT_CONCORD:-6120}"
     [eccheck]="${MASTER_PORT_ECCHECK:-6130}"
     [ecnaive]="${MASTER_PORT_ECNAIVE:-6140}"
 )
 
 usage() {
-    echo "Usage: $0 [--dry-run] [gemini2|gemini3|frcheck|eccheck|ecnaive ...]"
+    echo "Usage: $0 [--dry-run] [gemini2|gemini3|concord|eccheck|ecnaive ...]"
     echo "Environment: MODEL_SIZE=2.7B|7B|10B|14B|20B, LOG_DIR, CONTINUE_ON_ERROR=0|1, DRY_RUN=0|1"
     echo "             RDMA_HCA_PROFILE=full|half|quarter (default: full)"
     echo "             ECCHECK_DATA_BUFFERS_COUNT (default: 12; positive integer)"
     echo "             SSH_USER, SSH_PORT, SSH_CONNECT_TIMEOUT, SSH_IDENTITY_FILE"
-    echo "             MASTER_PORT_GEMINI2, MASTER_PORT_GEMINI3, MASTER_PORT_FRCHECK,"
+    echo "             MASTER_PORT_GEMINI2, MASTER_PORT_GEMINI3, MASTER_PORT_CONCORD,"
     echo "             MASTER_PORT_ECCHECK, MASTER_PORT_ECNAIVE"
-    echo "             FRCHECK_LAYER_FRONTIER_ORDER (default: chunk_layer_sid)"
-    echo "             FRCHECK_SAVE_PREFER_TORCH_PINNED=0|1 (default: 0)"
-    echo "             FRCHECK_LAYER_STREAM_ENCODE (default: 1), FRCHECK_LAYER_ENCODE_COALESCE_US (default: 0)"
-    echo "             FRCHECK_SEND_LANES_PER_PEER (default: 12), FRCHECK_RECV_LANES_PER_PEER (default: 12)"
-    echo "             FRCHECK_NET_PHYSICAL_CORES (default: 0), FRCHECK_RDMA_CHUNK_MB (default: 64)"
+    echo "             CONCORD_LAYER_FRONTIER_ORDER (default: chunk_layer_sid)"
+    echo "             CONCORD_SAVE_PREFER_TORCH_PINNED=0|1 (default: 0)"
+    echo "             CONCORD_LAYER_STREAM_ENCODE (default: 1), CONCORD_LAYER_ENCODE_COALESCE_US (default: 0)"
+    echo "             CONCORD_SEND_LANES_PER_PEER (default: 12), CONCORD_RECV_LANES_PER_PEER (default: 12)"
+    echo "             CONCORD_NET_PHYSICAL_CORES (default: 0), CONCORD_RDMA_CHUNK_MB (default: 64)"
     echo "             GEMINI_GDR, GEMINI_GDR_MIRROR_MODE, GEMINI_GDR_BATCH_WR,"
     echo "             GEMINI_MIRROR_CHUNK_MB, GEMINI_REPLICAS_CHANNELS_PER_PEER,"
     echo "             GEMINI_SAVE_PREFER_TORCH_PINNED, GEMINI_PIPELINE_CHUNK_MB,"
@@ -98,7 +98,7 @@ for argument in "$@"; do
     case "$argument" in
         --dry-run) DRY_RUN=1 ;;
         -h|--help) usage; exit 0 ;;
-        gemini2|gemini3|frcheck|eccheck|ecnaive) schemes+=("$argument") ;;
+        gemini2|gemini3|concord|eccheck|ecnaive) schemes+=("$argument") ;;
         *) echo "Unknown scheme or option: $argument" >&2; usage >&2; exit 2 ;;
     esac
 done
@@ -192,11 +192,11 @@ if [[ "$DRY_RUN" == 1 ]]; then
         port=${MASTER_PORTS[$scheme]}
         echo "SCHEME=$scheme PORT=$port PATH=$checkpoint_path RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE"
         gemini_env=""
-        frcheck_env=""
+        concord_env=""
         eccheck_env=""
-        if [[ "$scheme" == frcheck ]]; then
-            frcheck_env="FRCHECK_SAVE_PREFER_TORCH_PINNED=${FRCHECK_SAVE_PREFER_TORCH_PINNED:-0} FRCHECK_LAYER_STREAM_ENCODE=${FRCHECK_LAYER_STREAM_ENCODE:-1} FRCHECK_LAYER_ENCODE_COALESCE_US=${FRCHECK_LAYER_ENCODE_COALESCE_US:-0} FRCHECK_SEND_LANES_PER_PEER=${FRCHECK_SEND_LANES_PER_PEER:-12} FRCHECK_RECV_LANES_PER_PEER=${FRCHECK_RECV_LANES_PER_PEER:-12} FRCHECK_NET_PHYSICAL_CORES=${FRCHECK_NET_PHYSICAL_CORES:-0} FRCHECK_RDMA_CHUNK_MB=${FRCHECK_RDMA_CHUNK_MB:-64} "
-            echo "  frcheck_config: ${frcheck_env% }"
+        if [[ "$scheme" == concord ]]; then
+            concord_env="CONCORD_SAVE_PREFER_TORCH_PINNED=${CONCORD_SAVE_PREFER_TORCH_PINNED:-0} CONCORD_LAYER_STREAM_ENCODE=${CONCORD_LAYER_STREAM_ENCODE:-1} CONCORD_LAYER_ENCODE_COALESCE_US=${CONCORD_LAYER_ENCODE_COALESCE_US:-0} CONCORD_SEND_LANES_PER_PEER=${CONCORD_SEND_LANES_PER_PEER:-12} CONCORD_RECV_LANES_PER_PEER=${CONCORD_RECV_LANES_PER_PEER:-12} CONCORD_NET_PHYSICAL_CORES=${CONCORD_NET_PHYSICAL_CORES:-0} CONCORD_RDMA_CHUNK_MB=${CONCORD_RDMA_CHUNK_MB:-64} "
+            echo "  concord_config: ${concord_env% }"
         fi
         if [[ "$scheme" == gemini2 || "$scheme" == gemini3 ]]; then
             gemini_env="$(build_gemini_env_prefix) "
@@ -206,8 +206,8 @@ if [[ "$DRY_RUN" == 1 ]]; then
             eccheck_env="ECCHECK_DATA_BUFFERS_COUNT=$ECCHECK_DATA_BUFFERS_COUNT "
             echo "  eccheck_config: ${eccheck_env% }"
         fi
-        echo "  remote: RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE ${frcheck_env}${gemini_env}${eccheck_env}MASTER_PORT=$port ./$script {R} save --train-iters 10"
-        echo "  local:  RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE ${frcheck_env}${gemini_env}${eccheck_env}MASTER_PORT=$port ./$script 0 save --train-iters 10"
+        echo "  remote: RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE ${concord_env}${gemini_env}${eccheck_env}MASTER_PORT=$port ./$script {R} save --train-iters 10"
+        echo "  local:  RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE ${concord_env}${gemini_env}${eccheck_env}MASTER_PORT=$port ./$script 0 save --train-iters 10"
         echo "  cleanup: rm -rf -- $checkpoint_path on node0,node1,node2,node3"
     done
     exit 0
@@ -263,12 +263,12 @@ trap terminate_jobs INT TERM
 run_training() {
     local scheme=$1 script=${SCRIPTS[$1]} port=${MASTER_PORTS[$1]}
     local scheme_log="$LOG_DIR/$scheme.log"
-    local frcheck_env="" gemini_env="" eccheck_env="" name
+    local concord_env="" gemini_env="" eccheck_env="" name
     local -a gemini_env_args=() eccheck_env_args=()
     echo "[driver] RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE"
-    if [[ "$scheme" == frcheck ]]; then
-        echo "[driver] FRCHECK_LAYER_FRONTIER_ORDER=${FRCHECK_LAYER_FRONTIER_ORDER:-chunk_layer_sid}"
-        frcheck_env=" FRCHECK_LAYER_EXCHANGE_SEG=${FRCHECK_LAYER_EXCHANGE_SEG:-12} FRCHECK_LAYER_EXCHANGE_CHUNK_MB=${FRCHECK_LAYER_EXCHANGE_CHUNK_MB:-32} FRCHECK_LAYER_FRONTIER_ORDER=${FRCHECK_LAYER_FRONTIER_ORDER:-chunk_layer_sid} FRCHECK_LAYER_ENCODE_BATCH=${FRCHECK_LAYER_ENCODE_BATCH:-24} FRCHECK_LAYER_ENCODE_SUBMIT_WORKER=${FRCHECK_LAYER_ENCODE_SUBMIT_WORKER:-0} FRCHECK_LAYER_ENCODE_ADAPTIVE=${FRCHECK_LAYER_ENCODE_ADAPTIVE:-0} FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER=${FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER:-3} FRCHECK_LAYER_STREAM_ENCODE=${FRCHECK_LAYER_STREAM_ENCODE:-1} FRCHECK_LAYER_ENCODE_COALESCE_US=${FRCHECK_LAYER_ENCODE_COALESCE_US:-0} FRCHECK_SEND_LANES_PER_PEER=${FRCHECK_SEND_LANES_PER_PEER:-12} FRCHECK_RECV_LANES_PER_PEER=${FRCHECK_RECV_LANES_PER_PEER:-12} FRCHECK_NET_PHYSICAL_CORES=${FRCHECK_NET_PHYSICAL_CORES:-0} FRCHECK_RDMA_CHUNK_MB=${FRCHECK_RDMA_CHUNK_MB:-64} FRCHECK_TRACE_INIT=${FRCHECK_TRACE_INIT:-0} FRCHECK_GDR=${FRCHECK_GDR:-0} FRCHECK_ASYNC_PARITY=${FRCHECK_ASYNC_PARITY:-1} FRCHECK_SAVE_PREFER_TORCH_PINNED=${FRCHECK_SAVE_PREFER_TORCH_PINNED:-0}"
+    if [[ "$scheme" == concord ]]; then
+        echo "[driver] CONCORD_LAYER_FRONTIER_ORDER=${CONCORD_LAYER_FRONTIER_ORDER:-chunk_layer_sid}"
+        concord_env=" CONCORD_LAYER_EXCHANGE_SEG=${CONCORD_LAYER_EXCHANGE_SEG:-12} CONCORD_LAYER_EXCHANGE_CHUNK_MB=${CONCORD_LAYER_EXCHANGE_CHUNK_MB:-32} CONCORD_LAYER_FRONTIER_ORDER=${CONCORD_LAYER_FRONTIER_ORDER:-chunk_layer_sid} CONCORD_LAYER_ENCODE_BATCH=${CONCORD_LAYER_ENCODE_BATCH:-24} CONCORD_LAYER_ENCODE_SUBMIT_WORKER=${CONCORD_LAYER_ENCODE_SUBMIT_WORKER:-0} CONCORD_LAYER_ENCODE_ADAPTIVE=${CONCORD_LAYER_ENCODE_ADAPTIVE:-0} CONCORD_LAYER_ENCODE_ADAPTIVE_MULTIPLIER=${CONCORD_LAYER_ENCODE_ADAPTIVE_MULTIPLIER:-3} CONCORD_LAYER_STREAM_ENCODE=${CONCORD_LAYER_STREAM_ENCODE:-1} CONCORD_LAYER_ENCODE_COALESCE_US=${CONCORD_LAYER_ENCODE_COALESCE_US:-0} CONCORD_SEND_LANES_PER_PEER=${CONCORD_SEND_LANES_PER_PEER:-12} CONCORD_RECV_LANES_PER_PEER=${CONCORD_RECV_LANES_PER_PEER:-12} CONCORD_NET_PHYSICAL_CORES=${CONCORD_NET_PHYSICAL_CORES:-0} CONCORD_RDMA_CHUNK_MB=${CONCORD_RDMA_CHUNK_MB:-64} CONCORD_TRACE_INIT=${CONCORD_TRACE_INIT:-0} CONCORD_GDR=${CONCORD_GDR:-0} CONCORD_ASYNC_PARITY=${CONCORD_ASYNC_PARITY:-1} CONCORD_SAVE_PREFER_TORCH_PINNED=${CONCORD_SAVE_PREFER_TORCH_PINNED:-0}"
     fi
     if [[ "$scheme" == gemini2 || "$scheme" == gemini3 ]]; then
         gemini_env=" $(build_gemini_env_prefix)"
@@ -283,7 +283,7 @@ run_training() {
         eccheck_env_args+=("ECCHECK_DATA_BUFFERS_COUNT=$ECCHECK_DATA_BUFFERS_COUNT")
         echo "[driver] ECCHECK config:${eccheck_env}"
     fi
-    local remote_command="export PRINT_CMD=0 MASTER_PORT=$port RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE$frcheck_env$gemini_env$eccheck_env; ./$script {R} save --train-iters 10"
+    local remote_command="export PRINT_CMD=0 MASTER_PORT=$port RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE$concord_env$gemini_env$eccheck_env; ./$script {R} save --train-iters 10"
     (
         local remote_pid local_pid remote_rc local_rc
         trap 'kill "${remote_pid:-}" "${local_pid:-}" 2>/dev/null || true' INT TERM
@@ -297,23 +297,23 @@ run_training() {
             env PRINT_CMD=0 MASTER_PORT="$port" RDMA_HCA_PROFILE="$RDMA_HCA_PROFILE" \
                 "${gemini_env_args[@]}" \
                 "${eccheck_env_args[@]}" \
-                FRCHECK_LAYER_EXCHANGE_SEG="${FRCHECK_LAYER_EXCHANGE_SEG:-12}" \
-                FRCHECK_LAYER_EXCHANGE_CHUNK_MB="${FRCHECK_LAYER_EXCHANGE_CHUNK_MB:-32}" \
-                FRCHECK_LAYER_FRONTIER_ORDER="${FRCHECK_LAYER_FRONTIER_ORDER:-chunk_layer_sid}" \
-                FRCHECK_LAYER_ENCODE_BATCH="${FRCHECK_LAYER_ENCODE_BATCH:-24}" \
-                FRCHECK_LAYER_ENCODE_SUBMIT_WORKER="${FRCHECK_LAYER_ENCODE_SUBMIT_WORKER:-0}" \
-                FRCHECK_LAYER_ENCODE_ADAPTIVE="${FRCHECK_LAYER_ENCODE_ADAPTIVE:-0}" \
-                FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER="${FRCHECK_LAYER_ENCODE_ADAPTIVE_MULTIPLIER:-3}" \
-                FRCHECK_LAYER_STREAM_ENCODE="${FRCHECK_LAYER_STREAM_ENCODE:-1}" \
-                FRCHECK_LAYER_ENCODE_COALESCE_US="${FRCHECK_LAYER_ENCODE_COALESCE_US:-0}" \
-                FRCHECK_SEND_LANES_PER_PEER="${FRCHECK_SEND_LANES_PER_PEER:-12}" \
-                FRCHECK_RECV_LANES_PER_PEER="${FRCHECK_RECV_LANES_PER_PEER:-12}" \
-                FRCHECK_NET_PHYSICAL_CORES="${FRCHECK_NET_PHYSICAL_CORES:-0}" \
-                FRCHECK_RDMA_CHUNK_MB="${FRCHECK_RDMA_CHUNK_MB:-64}" \
-                FRCHECK_TRACE_INIT="${FRCHECK_TRACE_INIT:-0}" \
-                FRCHECK_GDR="${FRCHECK_GDR:-1}" \
-                FRCHECK_ASYNC_PARITY="${FRCHECK_ASYNC_PARITY:-1}" \
-                FRCHECK_SAVE_PREFER_TORCH_PINNED="${FRCHECK_SAVE_PREFER_TORCH_PINNED:-0}" \
+                CONCORD_LAYER_EXCHANGE_SEG="${CONCORD_LAYER_EXCHANGE_SEG:-12}" \
+                CONCORD_LAYER_EXCHANGE_CHUNK_MB="${CONCORD_LAYER_EXCHANGE_CHUNK_MB:-32}" \
+                CONCORD_LAYER_FRONTIER_ORDER="${CONCORD_LAYER_FRONTIER_ORDER:-chunk_layer_sid}" \
+                CONCORD_LAYER_ENCODE_BATCH="${CONCORD_LAYER_ENCODE_BATCH:-24}" \
+                CONCORD_LAYER_ENCODE_SUBMIT_WORKER="${CONCORD_LAYER_ENCODE_SUBMIT_WORKER:-0}" \
+                CONCORD_LAYER_ENCODE_ADAPTIVE="${CONCORD_LAYER_ENCODE_ADAPTIVE:-0}" \
+                CONCORD_LAYER_ENCODE_ADAPTIVE_MULTIPLIER="${CONCORD_LAYER_ENCODE_ADAPTIVE_MULTIPLIER:-3}" \
+                CONCORD_LAYER_STREAM_ENCODE="${CONCORD_LAYER_STREAM_ENCODE:-1}" \
+                CONCORD_LAYER_ENCODE_COALESCE_US="${CONCORD_LAYER_ENCODE_COALESCE_US:-0}" \
+                CONCORD_SEND_LANES_PER_PEER="${CONCORD_SEND_LANES_PER_PEER:-12}" \
+                CONCORD_RECV_LANES_PER_PEER="${CONCORD_RECV_LANES_PER_PEER:-12}" \
+                CONCORD_NET_PHYSICAL_CORES="${CONCORD_NET_PHYSICAL_CORES:-0}" \
+                CONCORD_RDMA_CHUNK_MB="${CONCORD_RDMA_CHUNK_MB:-64}" \
+                CONCORD_TRACE_INIT="${CONCORD_TRACE_INIT:-0}" \
+                CONCORD_GDR="${CONCORD_GDR:-1}" \
+                CONCORD_ASYNC_PARITY="${CONCORD_ASYNC_PARITY:-1}" \
+                CONCORD_SAVE_PREFER_TORCH_PINNED="${CONCORD_SAVE_PREFER_TORCH_PINNED:-0}" \
                 "./$script" 0 save --train-iters 10 2>&1 | awk '{ print "[node0 rank=0]", $0; fflush(); }'
             exit "${PIPESTATUS[0]}"
         ) &

@@ -352,49 +352,49 @@ def validate_args(args, defaults={}):
 
     _ec_legacy_flags = (
         bool(getattr(args, "use_ecnaive", False)),
-        bool(getattr(args, "use_frcheck", False)),
+        bool(getattr(args, "use_concord", False)),
         bool(getattr(args, "use_gemini_replicas", False)),
     )
     if sum(_ec_legacy_flags) > 1:
         raise RuntimeError(
-            "At most one of --use-ecnaive, --use-frcheck, and "
+            "At most one of --use-ecnaive, --use-concord, and "
             "--use-gemini-replicas may be enabled."
         )
     if (
-        getattr(args, "frcheck_hw_early_optimizer", False)
-        and getattr(args, "frcheck_hw_optimizer_overlap", False)
+        getattr(args, "concord_hw_early_optimizer", False)
+        and getattr(args, "concord_hw_optimizer_overlap", False)
     ):
         raise RuntimeError(
-            "--frcheck-hw-early-optimizer and --frcheck-hw-optimizer-overlap "
+            "--concord-hw-early-optimizer and --concord-hw-optimizer-overlap "
             "are mutually exclusive"
         )
-    if getattr(args, "frcheck_hw_optimizer_overlap", False):
-        if not getattr(args, "use_frcheck", False):
+    if getattr(args, "concord_hw_optimizer_overlap", False):
+        if not getattr(args, "use_concord", False):
             raise RuntimeError(
-                "--frcheck-hw-optimizer-overlap requires --use-frcheck"
+                "--concord-hw-optimizer-overlap requires --use-concord"
             )
         if not getattr(args, "ft_inprocess_recovery_benchmark", False):
             raise RuntimeError(
-                "--frcheck-hw-optimizer-overlap is only supported by the FRCheck HW "
+                "--concord-hw-optimizer-overlap is only supported by the Concord HW "
                 "in-process recovery benchmark"
             )
         if getattr(args, "ft_inprocess_recovery_software_failure", False):
             raise RuntimeError(
-                "--frcheck-hw-optimizer-overlap is not supported for software recovery"
+                "--concord-hw-optimizer-overlap is not supported for software recovery"
             )
-    if getattr(args, "frcheck_hw_early_optimizer", False):
-        if not getattr(args, "use_frcheck", False):
+    if getattr(args, "concord_hw_early_optimizer", False):
+        if not getattr(args, "use_concord", False):
             raise RuntimeError(
-                "--frcheck-hw-early-optimizer requires --use-frcheck"
+                "--concord-hw-early-optimizer requires --use-concord"
             )
         if not getattr(args, "ft_inprocess_recovery_benchmark", False):
             raise RuntimeError(
-                "--frcheck-hw-early-optimizer is only supported by the FRCheck HW "
+                "--concord-hw-early-optimizer is only supported by the Concord HW "
                 "in-process recovery benchmark"
             )
         if getattr(args, "ft_inprocess_recovery_software_failure", False):
             raise RuntimeError(
-                "--frcheck-hw-early-optimizer is not supported for software recovery"
+                "--concord-hw-early-optimizer is not supported for software recovery"
             )
     if getattr(args, "ft_inprocess_recovery_benchmark", False):
         if args.ckpt_format != "torch":
@@ -429,7 +429,7 @@ def validate_args(args, defaults={}):
             incompatible = []
             for enabled, option in (
                 (getattr(args, "use_gemini_replicas_hardware_failure", False), "--use-gemini-replicas-hardware-failure"),
-                (getattr(args, "use_frcheck_hardware_failure", False), "--use-frcheck-hardware-failure"),
+                (getattr(args, "use_concord_hardware_failure", False), "--use-concord-hardware-failure"),
                 (getattr(args, "use_eccheck_two_failures", False), "--use-eccheck-two-failures"),
                 (getattr(args, "_ecnaive_require_hw2", False), "--ecnaive-require-hw2"),
             ):
@@ -442,31 +442,31 @@ def validate_args(args, defaults={}):
                 )
         if train_iter is None and save_iter is not None:
             args.ft_inprocess_recovery_after_train_iter = save_iter
-    if getattr(args, "use_frcheck", False):
-        frcheck_path = getattr(args, "frcheck_table_path", None)
-        frcheck_n = getattr(args, "frcheck_n", None)
-        frcheck_dir = getattr(args, "frcheck_table_dir", None)
-        if frcheck_path:
-            if not os.path.isfile(frcheck_path):
-                raise RuntimeError(f"FRCheck: --frcheck-table-path not found: {frcheck_path}")
+    if getattr(args, "use_concord", False):
+        concord_path = getattr(args, "concord_table_path", None)
+        concord_n = getattr(args, "concord_n", None)
+        concord_dir = getattr(args, "concord_table_dir", None)
+        if concord_path:
+            if not os.path.isfile(concord_path):
+                raise RuntimeError(f"Concord: --concord-table-path not found: {concord_path}")
         else:
-            if frcheck_n is None or frcheck_n <= 0:
+            if concord_n is None or concord_n <= 0:
                 raise RuntimeError(
-                    "FRCheck: --frcheck-n must be provided and > 0 when --frcheck-table-path is not set."
+                    "Concord: --concord-n must be provided and > 0 when --concord-table-path is not set."
                 )
-            if not frcheck_dir:
+            if not concord_dir:
                 raise RuntimeError(
-                    "FRCheck: --frcheck-table-dir is required when --frcheck-table-path is not set."
+                    "Concord: --concord-table-dir is required when --concord-table-path is not set."
                 )
         if getattr(args, "num_workers", 0) > 0:
             force_num_workers_zero = getattr(args, "use_rdma", False)
-            if getattr(args, "use_frcheck_hardware_failure", False):
-                safe_point = getattr(args, "frcheck_recovery_safe_point", "load")
+            if getattr(args, "use_concord_hardware_failure", False):
+                safe_point = getattr(args, "concord_recovery_safe_point", "load")
                 if safe_point in ("train_step_start", "forward_step_start", "optimizer_step"):
                     force_num_workers_zero = True
             if force_num_workers_zero:
                 print(
-                    "FRCheck: forcing --num-workers 0 because forked DataLoader workers are "
+                    "Concord: forcing --num-workers 0 because forked DataLoader workers are "
                     "unsafe while native RDMA/CUDA recovery resources are active"
                 )
                 args.num_workers = 0
@@ -2443,87 +2443,87 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ecnaive-require-hw2', action='store_true', dest='_ecnaive_require_hw2',
                        help='Require exactly two failed ranks in every targeted EC-NAIVE group.')
 
-    group.add_argument('--use-frcheck', action='store_true',
-                       help='Enable FRCheck legacy checkpoint skeleton: validates POA file via native module '
-                            'and writes layer/stripe directory layout with frcheck_torch_legacy metadata.')
-    group.add_argument('--frcheck-n', type=int, default=None,
-                       help='FRCheck group size n (POA columns). Used for node-aware grouping and automatic POA file selection.')
-    group.add_argument('--frcheck-table-dir', type=str, default=None,
-                       help='Directory containing FRCheck POA tables. Used with --frcheck-n when --frcheck-table-path is not set.')
-    group.add_argument('--frcheck-table-path', type=str, default=None,
-                       help='Path to POA table file (highest priority). If unset, manager resolves from --frcheck-table-dir and --frcheck-n.')
-    group.add_argument('--use-frcheck-hardware-failure', action='store_true',
-                       help='Enable FRCheck checkpointing for hardware failure recovery. '
+    group.add_argument('--use-concord', action='store_true',
+                       help='Enable Concord legacy checkpoint skeleton: validates POA file via native module '
+                            'and writes layer/stripe directory layout with concord_torch_legacy metadata.')
+    group.add_argument('--concord-n', type=int, default=None,
+                       help='Concord group size n (POA columns). Used for node-aware grouping and automatic POA file selection.')
+    group.add_argument('--concord-table-dir', type=str, default=None,
+                       help='Directory containing Concord POA tables. Used with --concord-n when --concord-table-path is not set.')
+    group.add_argument('--concord-table-path', type=str, default=None,
+                       help='Path to POA table file (highest priority). If unset, manager resolves from --concord-table-dir and --concord-n.')
+    group.add_argument('--use-concord-hardware-failure', action='store_true',
+                       help='Enable Concord checkpointing for hardware failure recovery. '
                             'When enabled, the load path uses RS decode over RDMA to recover '
                             'failed ranks\' data from surviving ranks in the POA-based stripe group. '
-                            'Use --frcheck-failed-ranks to specify which ranks to treat as failed.')
-    group.add_argument('--frcheck-failed-ranks', type=str, default=None,
+                            'Use --concord-failed-ranks to specify which ranks to treat as failed.')
+    group.add_argument('--concord-failed-ranks', type=str, default=None,
                        help='Comma-separated list of global ranks to treat as failed '
-                            'for FRCheck hardware recovery (e.g. "1" or "0,1,2,3,4,5,6,7" '
+                            'for Concord hardware recovery (e.g. "1" or "0,1,2,3,4,5,6,7" '
                             'for a full 8-GPU node). '
                             'In node-aware mode each POA group gets ≤1 rank per node, '
                             'so an entire node\'s ranks are legal as long as no single group '
                             'exceeds 2 failed ranks. '
-                            'Used with --use-frcheck-hardware-failure for testing.')
-    group.add_argument('--frcheck-async-parity', action='store_true',
-                       help='Enable async P2 parity delivery in FRCheck save. '
+                            'Used with --use-concord-hardware-failure for testing.')
+    group.add_argument('--concord-async-parity', action='store_true',
+                       help='Enable async P2 parity delivery in Concord save. '
                             'When set, save blocks only until RS encode completes '
                             '(P1 = 1-fault tolerant), and P2 is sent in background '
                             'during subsequent training steps. '
                             'Async P2 is paused during PP forward/backward to avoid '
                             'network contention. '
                             'When unset (default), save is fully synchronous as before.')
-    group.add_argument('--frcheck-layer-exchange-encode', action='store_true',
-                       help='Use FRCheck layer-level source exchange for the synchronous '
+    group.add_argument('--concord-layer-exchange-encode', action='store_true',
+                       help='Use Concord layer-level source exchange for the synchronous '
                             'save encode phase. This reduces per-stripe RDMA tasks by '
                             'sending one layer payload per encoder peer, then locally '
                             'splitting blocks and running RS encode. Async P2 behavior '
                             'and shard format are unchanged.')
-    group.add_argument('--frcheck-gdr', action='store_true',
-                       help='Send FRCheck save layer-exchange SOURCE data directly from the '
+    group.add_argument('--concord-gdr', action='store_true',
+                       help='Send Concord save layer-exchange SOURCE data directly from the '
                             'registered GPU layer buffer with GPUDirect RDMA. The CPU mirror '
                             'D2H copy remains enabled for encode and disk output. This option '
-                            'requires --frcheck-layer-exchange-encode and defaults to disabled.')
-    group.add_argument('--frcheck-recovery-async-parity', action='store_true',
-                       help='Run mandatory FRCheck hardware-recovery parity repair in '
+                            'requires --concord-layer-exchange-encode and defaults to disabled.')
+    group.add_argument('--concord-recovery-async-parity', action='store_true',
+                       help='Run mandatory Concord hardware-recovery parity repair in '
                             'the background after data recovery. When unset (default), '
                             'the same repair runs synchronously before recovery returns. '
-                            'This is independent from --frcheck-async-parity, which only '
+                            'This is independent from --concord-async-parity, which only '
                             'controls save-side parity delivery.')
-    group.add_argument('--frcheck-async-recovery-forward', action='store_true',
-                       help='Experimental: overlap FRCheck hardware recovery with '
+    group.add_argument('--concord-async-recovery-forward', action='store_true',
+                       help='Experimental: overlap Concord hardware recovery with '
                             'forward by recovering transformer layers in a '
                             'background worker.')
-    group.add_argument('--frcheck-hw-early-optimizer', action='store_true',
-                       help='FRCheck HW in-process benchmark only: fully materialize, load, '
+    group.add_argument('--concord-hw-early-optimizer', action='store_true',
+                       help='Concord HW in-process benchmark only: fully materialize, load, '
                             'and synchronize optimizer state during the measured H2D interval '
                             'before the first forward. Disabled by default.')
-    group.add_argument('--frcheck-hw-optimizer-overlap', action='store_true',
-                       help='FRCheck HW in-process benchmark only: after the first forward, '
+    group.add_argument('--concord-hw-optimizer-overlap', action='store_true',
+                       help='Concord HW in-process benchmark only: after the first forward, '
                             'install optimizer state on the training thread and submit H2D '
                             'copies on a dedicated CUDA stream, then wait before optimizer.step.')
-    group.add_argument('--frcheck-defer-load-teardown', action='store_true',
-                       help='Defer FRCheck native teardown after hardware recovery load '
+    group.add_argument('--concord-defer-load-teardown', action='store_true',
+                       help='Defer Concord native teardown after hardware recovery load '
                             'until the training/eval teardown path. The recovery worker '
                             'still completes before load returns; only native resource '
                             'release is moved out of the recovery-to-forward path.')
-    group.add_argument('--frcheck-skip-load-teardown-barrier', action='store_true',
-                       help='Use a Gemini-style FRCheck load teardown that still releases '
+    group.add_argument('--concord-skip-load-teardown-barrier', action='store_true',
+                       help='Use a Gemini-style Concord load teardown that still releases '
                             'native/RDMA resources before returning from load, but skips '
                             'the extra distributed barrier inside cleanup(teardown=True).')
-    group.add_argument('--frcheck-recovery-safe-point', type=str, default='load',
+    group.add_argument('--concord-recovery-safe-point', type=str, default='load',
                        choices=['load', 'after_load_checkpoint', 'train_step_start', 'forward_step_start', 'optimizer_step'],
-                       help='Experimental FRCheck recovery lifecycle safe point. Default load keeps '
+                       help='Experimental Concord recovery lifecycle safe point. Default load keeps '
                             'current behavior. Other values move async recovery wait and native '
                             'teardown to the selected training boundary. Use after_load_checkpoint '
                             'to cleanup before DataLoader workers are created.')
-    group.add_argument('--frcheck-recovery-only-teardown', action='store_true',
-                       help='Experimental: use FRCheck native recovery-only shutdown during load '
+    group.add_argument('--concord-recovery-only-teardown', action='store_true',
+                       help='Experimental: use Concord native recovery-only shutdown during load '
                             'recovery cleanup when the native module supports it.')
-    group.add_argument('--frcheck-debug', action='store_true',
-                       help='Enable detailed size/encoding debug logging for FRCheck operations.')
-    group.add_argument('--frcheck-distribute-common', action='store_true',
-                       help='FRCheck: distribute layer_common (embedding, optimizer states, etc.) '
+    group.add_argument('--concord-debug', action='store_true',
+                       help='Enable detailed size/encoding debug logging for Concord operations.')
+    group.add_argument('--concord-distribute-common', action='store_true',
+                       help='Concord: distribute layer_common (embedding, optimizer states, etc.) '
                             'tensors to transformer layers instead of a separate group. '
                             'Reduces block_size inflation from heterogeneous common data across PP ranks.')
 
@@ -2572,7 +2572,7 @@ def _add_checkpointing_args(parser):
                             'and round-robin replica placement happens within each group. '
                             'Default: None (global round-robin across all ranks). '
                             'Must evenly divide world_size when set. '
-                            'Similar to --frcheck-n for FRCheck.')
+                            'Similar to --concord-n for Concord.')
     group.add_argument('--gemini-replicas-channels-per-peer', type=int, default=1,
                        help='Number of RDMA channels to open per Gemini Replicas peer during save '
                             'and hardware recovery. Default: 1 preserves the existing one-QP-per-peer '

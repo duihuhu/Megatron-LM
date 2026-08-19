@@ -33,6 +33,8 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     extract_tensors_from_continuous_buffer,
     reconstruct_state_dict,
     unflatten_optimizer_fp32_params,
+    assign_tensor_offsets,
+    tensor_layout_size,
 )
 
 logger = getLogger(__name__)
@@ -112,7 +114,7 @@ def _build_global_registry(
         return {0: local_metadata}, {0: local_non_tensor}
 
     world_size = torch.distributed.get_world_size()
-    total_bytes = sum(m.size_bytes for m in local_metadata)
+    total_bytes = tensor_layout_size(local_metadata)
     cache_key = (world_size, len(local_metadata), total_bytes)
     if cache_key in _BUILD_GLOBAL_REGISTRY_CACHE:
         return _BUILD_GLOBAL_REGISTRY_CACHE[cache_key]
@@ -141,6 +143,7 @@ def _tensor_infos_to_local_metadata(
                 shape=tuple(info.shape),
                 dtype=str(info.dtype),
                 size_bytes=info.size_bytes,
+                offset=info.offset,
                 global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
                 shard_index=info.shard_index if info.shard_index is not None else 0,
                 chunk_type=chunk_type,
@@ -155,7 +158,7 @@ def _max_tensor_bytes_from_registry(registry: GlobalMetadataRegistry, world_size
     max_bytes = 0
     for r in range(world_size):
         rank_metadata = registry.rank_metadata.get(r, [])
-        rank_total = sum(meta.size_bytes for meta in rank_metadata)
+        rank_total = tensor_layout_size(rank_metadata)
         if rank_total > max_bytes:
             max_bytes = rank_total
     return max_bytes
@@ -167,7 +170,7 @@ def _eccheck_pipeline_transfer_bytes(registry: GlobalMetadataRegistry, world_siz
 
 
 def _rank_total_bytes(rank_metadata: Dict[int, List[TensorMetadata]], rank: int) -> int:
-    return sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
+    return tensor_layout_size(rank_metadata.get(rank, []))
 
 
 def _rank_data_transfer_bytes(
@@ -237,13 +240,13 @@ def _allocate_eccheck_blocks_legacy(
 ) -> Dict[str, Any]:
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-    own_total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
+    own_total_size = tensor_layout_size(rank_metadata.get(rank, []))
     if block_names is None:
         block_names = ["own_buffer", "partner_buffer"]
 
     if world_size > 1:
         all_sizes = [
-            sum(meta.size_bytes for meta in rank_metadata.get(r, []))
+            tensor_layout_size(rank_metadata.get(r, []))
             for r in range(world_size)
         ]
         max_total_bytes = max(all_sizes)
@@ -765,17 +768,17 @@ def save_eccheck_legacy_checkpoint(
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
 
-    offset = 0
+    total_tensor_size = assign_tensor_offsets(decomposed.tensor_infos)
+    decomposed.total_tensor_size_bytes = total_tensor_size
     local_tensor_metadata: List[TensorMetadata] = []
     for info in decomposed.tensor_infos:
-        info.offset = offset
         local_tensor_metadata.append(
             TensorMetadata(
                 key=info.key,
                 shape=info.shape,
                 dtype=str(info.dtype),
                 size_bytes=info.size_bytes,
-                offset=offset,
+                offset=info.offset,
                 global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
                 shard_index=info.shard_index if info.shard_index is not None else 0,
                 chunk_type="data",
@@ -783,7 +786,6 @@ def save_eccheck_legacy_checkpoint(
                 source_rank=rank,
             )
         )
-        offset += info.size_bytes
 
     t0 = time.time()
     # Only tensor metadata needed for block sizing; non_tensor_data (~250MB)
@@ -2014,7 +2016,7 @@ def _metadata_workspace_key(
     blocks: Dict[str, Any], recovered_capacity: int,
 ) -> tuple:
     rank_sizes = tuple(
-        (rank, sum(meta.size_bytes for meta in metadata), len(metadata))
+        (rank, tensor_layout_size(metadata), len(metadata))
         for rank, metadata in sorted(rank_metadata.items())
     )
     return (
@@ -2148,7 +2150,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         registry = GlobalMetadataRegistry(
             rank_metadata=rank_metadata, rank_non_tensor_data={}
         )
-        total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
+        total_size = tensor_layout_size(rank_metadata.get(rank, []))
         metadata_plan_s += time.perf_counter() - metadata_start
 
         if world_size <= 1:

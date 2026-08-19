@@ -13,7 +13,9 @@ import torch
 from dataclasses import replace
 
 from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
-from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
+from .state_dict_decomposer import (
+    GlobalMetadataRegistry, TensorMetadata, tensor_layout_size,
+)
 from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 
 logger = getLogger(__name__)
@@ -1089,13 +1091,13 @@ class ECCHECKManager:
         
         # Get peer's total data size from global registry (actual reference)
         peer_metadata = global_registry.rank_metadata.get(paired_rank, [])
-        peer_total_size = sum(meta.size_bytes for meta in peer_metadata)
+        peer_total_size = tensor_layout_size(peer_metadata)
         
         # HW2 uses a bounded chunk ring; HW1/save retain full aligned receive storage.
         max_total_size = 0
         for r in range(world_size):
             rank_metadata = global_registry.rank_metadata.get(r, [])
-            rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+            rank_total_size = tensor_layout_size(rank_metadata)
             if rank_total_size > max_total_size:
                 max_total_size = rank_total_size
         full_aligned_size = max(

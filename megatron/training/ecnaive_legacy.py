@@ -22,6 +22,8 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     extract_tensors_from_continuous_buffer,
     reconstruct_state_dict,
     unflatten_optimizer_fp32_params,
+    assign_tensor_offsets,
+    tensor_layout_size,
 )
 
 logger = getLogger(__name__)
@@ -148,7 +150,7 @@ def _build_global_registry(local_metadata: List[TensorMetadata], local_non_tenso
 def _rank_tensor_sizes_from_metadata(
     rank_metadata: Dict[int, List[TensorMetadata]], world_size: int
 ) -> List[int]:
-    return [sum(meta.size_bytes for meta in rank_metadata.get(r, [])) for r in range(world_size)]
+    return [tensor_layout_size(rank_metadata.get(r, [])) for r in range(world_size)]
 
 
 def _rank_block_sizes_from_actual_sizes(actual_sizes: List[int], k: int) -> List[int]:
@@ -228,7 +230,7 @@ def _allocate_ecnaive_blocks(
     """
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-    own_total_size = sum(meta.size_bytes for meta in rank_metadata.get(rank, []))
+    own_total_size = tensor_layout_size(rank_metadata.get(rank, []))
     k = manager.ecnaive_k
     n = manager.ecnaive_n
 
@@ -1277,6 +1279,7 @@ def _tensor_infos_to_local_metadata(
                 shape=tuple(info.shape),
                 dtype=str(info.dtype),
                 size_bytes=info.size_bytes,
+                offset=info.offset,
                 global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
                 shard_index=info.shard_index if info.shard_index is not None else 0,
                 chunk_type=chunk_type,
@@ -2823,16 +2826,17 @@ def save_ecnaive_legacy_checkpoint(
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
 
-    offset = 0
+    total_tensor_size = assign_tensor_offsets(decomposed.tensor_infos)
+    decomposed.total_tensor_size_bytes = total_tensor_size
     local_tensor_metadata: List[TensorMetadata] = []
     for info in decomposed.tensor_infos:
-        info.offset = offset
         local_tensor_metadata.append(
             TensorMetadata(
                 key=info.key,
                 shape=info.shape,
                 dtype=str(info.dtype),
                 size_bytes=info.size_bytes,
+                offset=info.offset,
                 global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
                 shard_index=info.shard_index if info.shard_index is not None else 0,
                 chunk_type="data",
@@ -2840,7 +2844,6 @@ def save_ecnaive_legacy_checkpoint(
                 source_rank=rank,
             )
         )
-        offset += info.size_bytes
 
     t0 = time.time()
     rank_metadata, _ = _build_global_registry(local_tensor_metadata, {})

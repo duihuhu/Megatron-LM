@@ -445,15 +445,28 @@ def validate_args(args, defaults={}):
     if getattr(args, "use_concord", False):
         concord_path = getattr(args, "concord_table_path", None)
         concord_n = getattr(args, "concord_n", None)
+        concord_k = getattr(args, "concord_k", None)
+        concord_m = getattr(args, "concord_m", None)
         concord_dir = getattr(args, "concord_table_dir", None)
+        if concord_n is None or concord_n < 3:
+            raise RuntimeError("Concord: --concord-n must be provided and >= 3.")
+        if concord_k is None and concord_m is None:
+            concord_k, concord_m = concord_n - 2, 2
+        elif concord_k is None:
+            concord_k = concord_n - concord_m
+        elif concord_m is None:
+            concord_m = concord_n - concord_k
+        if concord_k < 1 or concord_m < 1 or concord_k + concord_m > concord_n:
+            raise RuntimeError(
+                "Concord: --concord-k and --concord-m must be positive and satisfy k + m <= n "
+                f"(n={concord_n}, k={concord_k}, m={concord_m})."
+            )
+        args.concord_k = concord_k
+        args.concord_m = concord_m
         if concord_path:
             if not os.path.isfile(concord_path):
                 raise RuntimeError(f"Concord: --concord-table-path not found: {concord_path}")
         else:
-            if concord_n is None or concord_n <= 0:
-                raise RuntimeError(
-                    "Concord: --concord-n must be provided and > 0 when --concord-table-path is not set."
-                )
             if not concord_dir:
                 raise RuntimeError(
                     "Concord: --concord-table-dir is required when --concord-table-path is not set."
@@ -2448,6 +2461,10 @@ def _add_checkpointing_args(parser):
                             'and writes layer/stripe directory layout with concord_torch_legacy metadata.')
     group.add_argument('--concord-n', type=int, default=None,
                        help='Concord group size n (POA columns). Used for node-aware grouping and automatic POA file selection.')
+    group.add_argument('--concord-k', type=int, default=None,
+                       help='Concord RS data block count k. Defaults to n-2, or n-m when only m is set.')
+    group.add_argument('--concord-m', type=int, default=None,
+                       help='Concord RS parity block count m. Defaults to 2, or n-k when only k is set.')
     group.add_argument('--concord-table-dir', type=str, default=None,
                        help='Directory containing Concord POA tables. Used with --concord-n when --concord-table-path is not set.')
     group.add_argument('--concord-table-path', type=str, default=None,

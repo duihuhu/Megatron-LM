@@ -69,6 +69,14 @@ export CONCORD_LAYER_EXCHANGE_SEG=${CONCORD_LAYER_EXCHANGE_SEG:-12}
 export CONCORD_ALLOW_UNSAFE_LANE_SHARING=${CONCORD_ALLOW_UNSAFE_LANE_SHARING:-1}
 MASTER_PORT=${MASTER_PORT:-6000}
 NNODES=${NNODES:-4}
+CONCORD_N=${CONCORD_N:-4}
+CONCORD_TOPOLOGY_ARGS=(--concord-n "$CONCORD_N")
+if [ -n "${CONCORD_K:-}" ]; then
+    CONCORD_TOPOLOGY_ARGS+=(--concord-k "$CONCORD_K")
+fi
+if [ -n "${CONCORD_M:-}" ]; then
+    CONCORD_TOPOLOGY_ARGS+=(--concord-m "$CONCORD_M")
+fi
 export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 
@@ -106,6 +114,15 @@ if [ "${#GPU_IDS[@]}" -eq 0 ]; then
 fi
 
 GPUS_PER_NODE=${#GPU_IDS[@]}
+if [ -z "${CONCORD_RANKS_PER_NODE:-}" ]; then
+    if [ "$CONCORD_N" = 8 ] && [ "$NNODES" = 4 ]; then
+        export CONCORD_RANKS_PER_NODE=4
+    else
+        export CONCORD_RANKS_PER_NODE=$GPUS_PER_NODE
+    fi
+else
+    export CONCORD_RANKS_PER_NODE
+fi
 
 export RDMA_HCA_PROFILE=${RDMA_HCA_PROFILE:-full}
 case "$RDMA_HCA_PROFILE" in
@@ -163,8 +180,9 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-vocab.json"
 MERGE_FILE="/workspace/Megatron-LM/pre-tests/opt/opt_data/gpt2-merges.txt"
 
-TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"/workspace/Megatron-LM/logs/gpt2-14b-4nodes/concord"}
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/dev/shm/models/gpt2-14b-4nodes-concord"}
+CONCORD_PATH_TAG="n${CONCORD_N}-k${CONCORD_K:-auto}-m${CONCORD_M:-auto}"
+TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"/workspace/Megatron-LM/logs/gpt2-14b-4nodes/concord-${CONCORD_PATH_TAG}"}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-"/dev/shm/models/gpt2-14b-4nodes-concord-${CONCORD_PATH_TAG}"}
 # DATA_PATH="/workspace/Megatron-LM/pre-tests/opt/opt_data/wiki_text_sentence"
 
 SHM_PKT="/dev/shm/shm_pkt"
@@ -220,7 +238,7 @@ case "$MODE" in
             --use-concord-hardware-failure
             --concord-async-recovery-forward
             "${CONCORD_RECOVERY_ASYNC_PARITY_ARGS[@]}"
-            --concord-failed-ranks "0,1,2,3,4,5,6,7"
+            --concord-failed-ranks "${CONCORD_FAILED_RANKS:-0,1,2,3,4,5,6,7}"
             --concord-recovery-safe-point optimizer_step
             --concord-recovery-only-teardown
             # Native RDMA stays alive until optimizer_step; forked DataLoader workers segfault.
@@ -231,7 +249,7 @@ case "$MODE" in
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
             --use-concord-hardware-failure
-            --concord-failed-ranks "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+            --concord-failed-ranks "${CONCORD_FAILED_RANKS_HW2:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
         )
         ;;
     inprocess_sw)
@@ -241,7 +259,7 @@ case "$MODE" in
             --ft-inprocess-recovery-software-failure
             --rerun-mode disabled
             --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
-            --ft-inprocess-recovery-failed-ranks "0,1,2,3,4,5,6,7"
+            --ft-inprocess-recovery-failed-ranks "${FT_INPROCESS_FAILED_RANKS:-0,1,2,3,4,5,6,7}"
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
         )
@@ -254,7 +272,7 @@ case "$MODE" in
             "${CONCORD_HW_OPTIMIZER_OVERLAP_ARGS[@]}"
             --rerun-mode disabled
             --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
-            --ft-inprocess-recovery-failed-ranks "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+            --ft-inprocess-recovery-failed-ranks "${FT_INPROCESS_FAILED_RANKS_HW2:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
             --concord-async-recovery-forward
@@ -272,7 +290,7 @@ case "$MODE" in
             "${CONCORD_HW_OPTIMIZER_OVERLAP_ARGS[@]}"
             --rerun-mode disabled
             --ft-inprocess-recovery-repeat $FT_INPROCESS_RECOVERY_REPEAT
-            --ft-inprocess-recovery-failed-ranks "0,1,2,3,4,5,6,7"
+            --ft-inprocess-recovery-failed-ranks "${FT_INPROCESS_FAILED_RANKS:-0,1,2,3,4,5,6,7}"
             --ft-inprocess-recovery-after-train-iter 0
             --ft-inprocess-recovery-exit-after-forward
             --concord-async-recovery-forward
@@ -285,14 +303,17 @@ case "$MODE" in
 esac
 
 # Model configuration
-HIDDEN_SIZE=5120
-NUM_ATTENTION_HEADS=40
-NUM_LAYERS=40
+HIDDEN_SIZE=${HIDDEN_SIZE:-5120}
+NUM_ATTENTION_HEADS=${NUM_ATTENTION_HEADS:-40}
+NUM_LAYERS=${NUM_LAYERS:-40}
 
-SEQ_LENGTH=4096
+SEQ_LENGTH=${SEQ_LENGTH:-4096}
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
-MICRO_BATCH_SIZE=4
-GLOBAL_BATCH_SIZE=32
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-4}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32}
+TENSOR_MODEL_PARALLEL_SIZE=${TENSOR_MODEL_PARALLEL_SIZE:-8}
+PIPELINE_MODEL_PARALLEL_SIZE=${PIPELINE_MODEL_PARALLEL_SIZE:-4}
+TRAIN_ITERS=${TRAIN_ITERS:-10}
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -317,7 +338,7 @@ GPT_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00005
-    --train-iters 10
+    --train-iters $TRAIN_ITERS
     --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
@@ -339,8 +360,8 @@ GPT_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-    --tensor-model-parallel-size 8
-    --pipeline-model-parallel-size 4
+    --tensor-model-parallel-size $TENSOR_MODEL_PARALLEL_SIZE
+    --pipeline-model-parallel-size $PIPELINE_MODEL_PARALLEL_SIZE
     --sequence-parallel
 )
 
@@ -356,7 +377,7 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
     --use-concord
-    --concord-n 4
+    "${CONCORD_TOPOLOGY_ARGS[@]}"
     --concord-table-dir $CONCORD_TABLE_DIR
     --ckpt-format torch
     --save-embeddings-separately
@@ -437,7 +458,8 @@ exec taskset -c "$process_cpus" "${PYTHON_BIN:-python}" "$@"
 # -------------------------------------------------------------------------
 if [ "${PRINT_CMD:-0}" != "0" ]; then
     printf 'Would run (Node %s, topology-aware per-rank CPU binding): ' "$NODE_RANK"
-    printf 'CONCORD_GDR=%q RDMA_HCA_PROFILE=%q PYTHONPATH=%q CUDA_VISIBLE_DEVICES=%q ' \
+    printf 'CONCORD_N=%q CONCORD_K=%q CONCORD_M=%q CONCORD_RANKS_PER_NODE=%q CONCORD_GDR=%q RDMA_HCA_PROFILE=%q PYTHONPATH=%q CUDA_VISIBLE_DEVICES=%q ' \
+        "$CONCORD_N" "${CONCORD_K:-}" "${CONCORD_M:-}" "$CONCORD_RANKS_PER_NODE" \
         "$CONCORD_GDR" "$RDMA_HCA_PROFILE" "$PYTHONPATH:/workspace/Megatron-LM" "$CUDA_VISIBLE_DEVICES"
     printf '%q ' torchrun "${DISTRIBUTED_ARGS[@]}" --no-python bash -c '<physical-GPU CPU binding>' _ \
         pretrain_gpt.py "${GPT_ARGS[@]}" "${DATA_ARGS[@]}" "${MODEL_PARALLEL_ARGS[@]}" \
@@ -458,6 +480,7 @@ echo "CONCORD_GDR: $CONCORD_GDR"
 echo "RDMA_HCA_PROFILE: $RDMA_HCA_PROFILE"
 echo "CONCORD_LAYER_EXCHANGE_CHUNK_MB: $CONCORD_LAYER_EXCHANGE_CHUNK_MB"
 echo "CONCORD_LAYER_FRONTIER_ORDER: $CONCORD_LAYER_FRONTIER_ORDER"
+echo "Concord topology: n=$CONCORD_N k=${CONCORD_K:-unset} m=${CONCORD_M:-unset} ranks_per_node=$CONCORD_RANKS_PER_NODE"
 
 export USE_FLASH_ATTN=1 && \
 export NVTE_SYNC_P2P=1 && \

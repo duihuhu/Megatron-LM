@@ -34,6 +34,8 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     DecomposedStateDict,
     TensorInfo,
     TensorMetadata,
+    assign_tensor_offsets,
+    tensor_layout_size,
     reconstruct_state_dict,
     extract_tensors_from_continuous_buffer,
 )
@@ -66,7 +68,6 @@ _async_p1_writer_thread: Optional[threading.Thread] = None
 _async_p2_writer_thread: Optional[threading.Thread] = None
 _async_writer_error: Optional[BaseException] = None
 _p2_save_generation: int = 0
-_recovery_async_parity_initialized: bool = False
 _recovery_async_parity_submitted: bool = False
 _recovery_async_parity_thread: Optional[threading.Thread] = None
 _recovery_async_parity_error: Optional[BaseException] = None
@@ -1593,7 +1594,7 @@ class _ConcordRecoveryService:
 
     def reset_for_load(self, role: str) -> None:
         global _active_layerwise_runtime, _active_recovery_worker
-        global _recovery_async_parity_initialized, _recovery_async_parity_submitted
+        global _recovery_async_parity_submitted
         global _recovery_async_parity_thread, _recovery_async_parity_error
         global _pending_recovery_parity_repair, _concord_async_runtime_timing_reported
         global _optimizer_prepare_thread, _optimizer_prepare_error
@@ -1617,7 +1618,6 @@ class _ConcordRecoveryService:
         self.state = self.INIT
         self.error = None
         self.safe_point_teardown_done = False
-        _recovery_async_parity_initialized = False
         _recovery_async_parity_submitted = False
         _recovery_async_parity_thread = None
         _recovery_async_parity_error = None
@@ -3063,6 +3063,10 @@ def _group_by_layer(
                 len(optimizer_model_key_map or {}),
             )
 
+    # Assign an independent aligned layout after all common tensors have moved.
+    for group in groups.values():
+        group.total_bytes = assign_tensor_offsets(group.tensor_infos)
+
     # Sort: non-layer (-1) first, then by layer index
     result = sorted(groups.values(), key=lambda g: (0 if g.layer_idx < 0 else 1, g.layer_idx))
     ownership_counts: Dict[str, int] = {}
@@ -3249,7 +3253,7 @@ def _prep_layer_phase1(
     actual_sizes = [0] * num_stripes
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
     n_filled_blocks = (layer_tensor_size + block_size - 1) // block_size if block_size > 0 else 0
-    n_filled_blocks = min(n_filled_blocks, (n - 1) * (n - 2))  # cap at n_src
+    n_filled_blocks = min(n_filled_blocks, (n - 1) * int(manager.concord_k))
 
     for stripe_id in range(num_stripes):
         plan = stripe_plans[stripe_id]
@@ -3594,8 +3598,8 @@ def _build_layer_exchange_encode_specs(
             src_block_per_node[src_node] = src_block_per_node.get(src_node, 0) + 1
         if sid not in encoder_sids:
             continue
-        p1b, p2b = layer_bufs.parity1_bufs[sid], layer_bufs.parity2_bufs[sid]
-        if p1b is None or p2b is None:
+        parity_bufs = [buffers[sid] for buffers in layer_bufs.parity_bufs]
+        if any(buffer is None for buffer in parity_bufs):
             continue
         for chunk_idx, chunk_offset, chunk_length in ctx["chunks"]:
             data_addrs: List[int] = []
@@ -3617,8 +3621,9 @@ def _build_layer_exchange_encode_specs(
                     remote_deps.add(int(src_node))
             specs[(sid, chunk_idx)] = {
                 "data_addrs": data_addrs,
-                "p1_addr": int(p1b.data_ptr()) + chunk_offset,
-                "p2_addr": int(p2b.data_ptr()) + chunk_offset,
+                "parity_addrs": [
+                    int(buffer.data_ptr()) + chunk_offset for buffer in parity_bufs
+                ],
                 "remote_deps": remote_deps, "chunk_length": chunk_length,
             }
     return specs
@@ -3632,19 +3637,52 @@ def _encode_layer_exchange_batch(
         return
     stripe_ids: List[int] = []
     data_addrs: List[int] = []
-    p1_addrs: List[int] = []
-    p2_addrs: List[int] = []
+    parity_addrs: List[int] = []
     chunk_lengths: List[int] = []
     for ctx, sid, chunk_idx in jobs:
         spec = ctx["encode_specs"][(int(sid), int(chunk_idx))]
         stripe_ids.append(int(sid))
         data_addrs.extend(int(addr) for addr in spec["data_addrs"])
-        p1_addrs.append(int(spec["p1_addr"]))
-        p2_addrs.append(int(spec["p2_addr"]))
+        parity_addrs.extend(int(addr) for addr in spec["parity_addrs"])
         chunk_lengths.append(int(spec["chunk_length"]))
-    native.encode_layer_stripes_batch(
-        stripe_ids, data_addrs, p1_addrs, p2_addrs, chunk_lengths
+    native.encode_layer_stripes_generic_batch(
+        stripe_ids, data_addrs, parity_addrs, chunk_lengths
     )
+
+
+def _parity_shard_suffix(parity_index: int) -> str:
+    return f"_p{int(parity_index)}"
+
+
+def _write_concord_shard(
+    output_dir: str,
+    layer_name: str,
+    rank: int,
+    stripe_id: int,
+    role: int,
+    parity_index: int,
+    block_size: int,
+    buffer: torch.Tensor,
+    size: Optional[int] = None,
+) -> None:
+    """Write one self-describing CNBK shard."""
+    ncopy = int(block_size if size is None else size)
+    data = buffer[:ncopy]
+    if data.device.type != "cpu":
+        data = data.cpu()
+    stripe_dir = Path(output_dir) / layer_name / f"stripe_{stripe_id}"
+    stripe_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "" if parity_index < 0 else _parity_shard_suffix(parity_index)
+    path = stripe_dir / f"concord_shard_rank{rank}{suffix}.pt"
+    header_parity_index = 0xFFFFFFFF if parity_index < 0 else int(parity_index)
+    header = struct.pack(
+        "<4sIIIQQ", b"CNBK", int(stripe_id), int(role),
+        header_parity_index, ncopy, int(block_size),
+    )
+    with open(path, "wb") as file:
+        file.write(header)
+        if ncopy > 0:
+            file.write(memoryview(data.contiguous().numpy()))
 
 
 def _save_concord_stripe_files(
@@ -3653,88 +3691,43 @@ def _save_concord_stripe_files(
     rank: int,
     num_stripes: int,
     encode_results: List[_LayerEncodeResult],
-    include_encoder_p1: bool = True,
+    include_encoder_parity0: bool = True,
     include_source: bool = True,
-    include_p2: bool = True,
 ) -> None:
-    """Write all layer stripe files after encode completes."""
+    """Write local SOURCE shards and encoder-owned parity index zero."""
     import concurrent.futures
 
-    _CNBK_MAGIC = b"CNBK"
+    jobs: List[Tuple[Any, ...]] = []
     stripe_plans = manager.stripe_plans
-
-    def _write_frbk_shard(
-        layer_name: str,
-        block_size: int,
-        stripe_id: int,
-        role: int,
-        ncopy: int,
-        buf,
-        suffix: str,
-    ) -> None:
-        if buf is None:
-            return
-        data = buf[:ncopy]
-        if data.device.type != "cpu":
-            data = data.cpu()
-        stripe_dir = Path(output_dir) / layer_name / f"stripe_{stripe_id}"
-        stripe_dir.mkdir(parents=True, exist_ok=True)
-        path = stripe_dir / f"concord_shard_rank{rank}{suffix}.pt"
-        hdr = struct.pack("<4sIIQQ", _CNBK_MAGIC, stripe_id, role, ncopy, block_size)
-        with open(path, "wb") as f:
-            f.write(hdr)
-            if ncopy > 0:
-                f.write(memoryview(data.numpy()))
-
-    # Job tuple: (layer_name, block_size, sid, role, ncopy, buf, suffix)
-    jobs: List[Tuple] = []
     for result in encode_results:
         layer_bufs = manager.get_layer_stripe_bufs(result.layer_idx)
         block_size = result.block_size
-        layer_name = result.layer_name
-        layer_mirror = layer_bufs.layer_mirror_cpu
         for sid in range(num_stripes):
             plan = stripe_plans[sid]
-            if plan.role == StripeRole.SOURCE:
-                if not include_source:
+            if plan.role == StripeRole.SOURCE and include_source:
+                block_index = _source_blk_idx_for_stripe(stripe_plans, sid)
+                if block_index < 0 or block_index >= result.n_filled_blocks:
                     continue
-                blk_idx = _source_blk_idx_for_stripe(stripe_plans, sid)
-                if blk_idx < 0 or blk_idx >= result.n_filled_blocks:
-                    continue
-                src_buf = layer_mirror[
-                    blk_idx * block_size : (blk_idx + 1) * block_size
+                source = layer_bufs.layer_mirror_cpu[
+                    block_index * block_size:(block_index + 1) * block_size
                 ]
                 jobs.append((
-                    layer_name, block_size, sid, 0, block_size,
-                    src_buf, "",
+                    output_dir, result.layer_name, rank, sid,
+                    int(StripeRole.SOURCE), -1, block_size, source,
                 ))
-            elif plan.role == StripeRole.ENCODER:
-                if not include_encoder_p1:
-                    continue
-                jobs.append((
-                    layer_name, block_size, sid, 1, block_size,
-                    layer_bufs.parity1_bufs[sid], "_p1",
-                ))
-            elif plan.role == StripeRole.PARITY_TARGET:
-                if not include_p2:
-                    continue
-                jobs.append((
-                    layer_name, block_size, sid, 2, block_size,
-                    layer_bufs.parity2_bufs[sid], "",
-                ))
-
+            elif plan.role == StripeRole.ENCODER and include_encoder_parity0:
+                parity0 = layer_bufs.parity_bufs[0][sid]
+                if parity0 is not None:
+                    jobs.append((
+                        output_dir, result.layer_name, rank, sid,
+                        int(StripeRole.ENCODER), 0, block_size, parity0,
+                    ))
     if not jobs:
         return
-    n_workers = min(len(jobs), 8)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
-        futures = [
-            ex.submit(
-                _write_frbk_shard, layer_name, block_size, sid, role, ncopy, buf, suffix,
-            )
-            for layer_name, block_size, sid, role, ncopy, buf, suffix in jobs
-        ]
-        for fut in futures:
-            fut.result()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(jobs), 8)) as executor:
+        futures = [executor.submit(_write_concord_shard, *job) for job in jobs]
+        for future in futures:
+            future.result()
 
 
 def wait_for_concord_parity_flush() -> None:
@@ -3763,27 +3756,32 @@ def _async_write_concord_encoder_p1_files(
         rank,
         num_stripes,
         encode_results,
-        include_encoder_p1=True,
+        include_encoder_parity0=True,
         include_source=False,
-        include_p2=False,
     )
 
 
-def _write_concord_aggregate_p2_files(
+def _write_concord_aggregate_parity_files(
     output_dir: str,
     rank: int,
     segments: List[Dict[str, Any]],
 ) -> None:
-    """Write received aggregate P2 slices using the existing CNBK layout."""
+    """Write received aggregate parity slices using the existing CNBK layout."""
     import concurrent.futures
 
     def _write(segment: Dict[str, Any]) -> None:
         stripe_dir = Path(output_dir) / segment["layer_name"] / f"stripe_{segment['sid']}"
         stripe_dir.mkdir(parents=True, exist_ok=True)
-        path = stripe_dir / f"concord_shard_rank{rank}.pt"
+        parity_index = int(segment["parity_index"])
+        path = stripe_dir / (
+            f"concord_shard_rank{rank}{_parity_shard_suffix(parity_index)}.pt"
+        )
         size = int(segment["size"])
         block_size = int(segment["block_size"])
-        header = struct.pack("<4sIIQQ", b"CNBK", int(segment["sid"]), 2, size, block_size)
+        header = struct.pack(
+            "<4sIIIQQ", b"CNBK", int(segment["sid"]),
+            int(StripeRole.PARITY_TARGET), parity_index, size, block_size,
+        )
         data = segment["buffer"][:size]
         with open(path, "wb") as file:
             file.write(header)
@@ -3798,14 +3796,14 @@ def _write_concord_aggregate_p2_files(
             future.result()
 
 
-def _wait_aggregate_p2_context(context: Dict[str, Any]) -> float:
-    """Wait once for aggregate P2 while retaining all registered buffers."""
+def _wait_aggregate_parity_context(context: Dict[str, Any]) -> float:
+    """Wait once for aggregate parity while retaining all registered buffers."""
     if context.get("native_completed", False):
         return float(context["timings"].get("wait_s", 0.0))
 
     native = context["native"]
     if native is None:
-        raise RuntimeError("Concord aggregate P2 native module is unavailable")
+        raise RuntimeError("Concord aggregate parity native module is unavailable")
     wait_start = time.time()
     try:
         native.wait_aggregate_p2(300)
@@ -3816,14 +3814,14 @@ def _wait_aggregate_p2_context(context: Dict[str, Any]) -> float:
     return wait_s
 
 
-def _release_aggregate_p2_context(context: Dict[str, Any]) -> None:
+def _release_aggregate_parity_context(context: Dict[str, Any]) -> None:
     """Drop direct P2 tensor ownership after native and disk users complete."""
     if context.get("buffers_released", False):
         return
     if not context.get("native_completed", False):
-        raise RuntimeError("Concord aggregate P2 buffers released before native completion")
+        raise RuntimeError("Concord aggregate parity buffers released before native completion")
     if context["write_to_disk"] and not context.get("disk_users_done", False):
-        raise RuntimeError("Concord aggregate P2 buffers released before disk users completed")
+        raise RuntimeError("Concord aggregate parity buffers released before disk users completed")
     for segment in context["recv_segments"]:
         segment["buffer"] = None
     context["recv_segments"].clear()
@@ -3831,17 +3829,17 @@ def _release_aggregate_p2_context(context: Dict[str, Any]) -> None:
     context["buffers_released"] = True
 
 
-def _finish_aggregate_p2_context(context: Dict[str, Any], debug: bool = False) -> None:
-    """Wait for aggregate P2 and release temporary context ownership once."""
+def _finish_aggregate_parity_context(context: Dict[str, Any], debug: bool = False) -> None:
+    """Wait for aggregate parity and release temporary context ownership once."""
     if context.get("finished", False):
         return
-    _wait_aggregate_p2_context(context)
-    _release_aggregate_p2_context(context)
+    _wait_aggregate_parity_context(context)
+    _release_aggregate_parity_context(context)
     context["finished"] = True
     if debug:
         timings = context["timings"]
         logger.info(
-            "CONCORD aggregate P2 background rank %d: generation=%d "
+            "CONCORD aggregate parity background rank %d: generation=%d "
             "mode=direct-multi-sge recv_segments=%d recv_bytes=%d "
             "prepare_s=%.3f submit_s=%.3f wait_s=%.3f",
             context["rank"], context["generation"], context["direct_recv_segments"],
@@ -3856,17 +3854,17 @@ def _async_run_aggregate_p2(descriptor: Dict[str, Any], debug: bool = False) -> 
     try:
         context, _summary = _prepare_and_submit_aggregate_p2(descriptor)
         if descriptor["write_to_disk"]:
-            _wait_aggregate_p2_context(context)
+            _wait_aggregate_parity_context(context)
             descriptor["completed_context"] = context
         else:
-            _finish_aggregate_p2_context(context, debug=debug)
+            _finish_aggregate_parity_context(context, debug=debug)
     except BaseException as exc:
         descriptor["completed_context"] = context
         if context is not None:
             context["disk_users_done"] = True
-            _release_aggregate_p2_context(context)
+            _release_aggregate_parity_context(context)
         _async_writer_error = exc
-        logger.exception("Concord async aggregate P2 writer failed")
+        logger.exception("Concord async aggregate parity writer failed")
 
 
 def _wait_previous_async_writers(debug: bool = False, rank: int = -1) -> None:
@@ -3951,7 +3949,7 @@ def _start_async_p2_writer(descriptor: Dict[str, Any], debug: bool = False) -> N
         raise
 
 
-def _build_aggregate_p2_descriptor(
+def _build_aggregate_parity_descriptor(
     manager,
     native,
     encode_results: List[_LayerEncodeResult],
@@ -3959,7 +3957,7 @@ def _build_aggregate_p2_descriptor(
     rank: int,
     write_to_disk: bool,
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Build direct P2 Multi-SGE tasks and retain every referenced tensor."""
+    """Build direct descriptors for deferred parity indexes one through m-1."""
     global _p2_save_generation
     prepare_start = time.time()
     _p2_save_generation += 1
@@ -3971,38 +3969,43 @@ def _build_aggregate_p2_descriptor(
     ordered_results = sorted(encode_results, key=lambda result: (result.layer_idx, result.layer_name))
     for result in ordered_results:
         layer_bufs = manager.get_layer_stripe_bufs(result.layer_idx)
-        for sid in range(native.num_stripes()):
-            route = native.get_p2_route(sid)
-            role, peer, lane = int(route[0]), int(route[1]), int(route[2])
-            if role not in (int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)):
-                continue
-            buffer = layer_bufs.parity2_bufs[sid]
-            if buffer is None:
-                raise RuntimeError(
-                    f"Concord aggregate P2 missing parity2 buffer for stripe {sid}"
-                )
-            block_size = int(result.block_size)
-            if int(buffer.numel()) < block_size:
-                raise RuntimeError(
-                    f"Concord aggregate P2 parity2 buffer is too small for stripe {sid}: "
-                    f"size={buffer.numel()} required={block_size}"
-                )
-            tensor_refs.append(buffer)
-            segment = (int(buffer.data_ptr()), block_size)
-            if role == int(StripeRole.ENCODER):
-                send_groups.setdefault((peer, lane), []).append(segment)
-            else:
-                recv_groups.setdefault((peer, lane), []).append(segment)
-                recv_segments.append({
-                    "buffer": buffer,
-                    "size": block_size,
-                    "block_size": block_size,
-                    "layer_name": result.layer_name,
-                    "layer_idx": result.layer_idx,
-                    "sid": sid,
-                    "peer": peer,
-                    "lane": lane,
-                })
+        for parity_index in range(1, int(manager.concord_m)):
+            for sid in range(native.num_stripes()):
+                route = native.get_parity_route(sid, parity_index)
+                role, peer, lane = int(route[0]), int(route[1]), int(route[2])
+                if role not in (int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)):
+                    continue
+                buffer = layer_bufs.parity_bufs[parity_index][sid]
+                if buffer is None:
+                    raise RuntimeError(
+                        "Concord aggregate parity missing buffer for "
+                        f"stripe={sid} parity_index={parity_index}"
+                    )
+                block_size = int(result.block_size)
+                if int(buffer.numel()) < block_size:
+                    raise RuntimeError(
+                        "Concord aggregate parity buffer is too small for "
+                        f"stripe={sid} parity_index={parity_index}: "
+                        f"size={buffer.numel()} required={block_size}"
+                    )
+                tensor_refs.append(buffer)
+                segment = (int(buffer.data_ptr()), block_size)
+                route_key = (peer, lane)
+                if role == int(StripeRole.ENCODER):
+                    send_groups.setdefault(route_key, []).append(segment)
+                else:
+                    recv_groups.setdefault(route_key, []).append(segment)
+                    recv_segments.append({
+                        "buffer": buffer,
+                        "size": block_size,
+                        "block_size": block_size,
+                        "layer_name": result.layer_name,
+                        "layer_idx": result.layer_idx,
+                        "sid": sid,
+                        "parity_index": parity_index,
+                        "peer": peer,
+                        "lane": lane,
+                    })
 
     send_tasks = [
         (peer, lane, segments)
@@ -4184,7 +4187,7 @@ def save_concord_legacy_checkpoint(
     manager.compute_layer_block_sizes(layer_groups)
 
     if _dbg:
-        n_src_total = (n - 1) * (n - 2)
+        n_src_total = (n - 1) * int(manager.concord_k)
         n_source_my = sum(1 for p in stripe_plans if p.role == StripeRole.SOURCE)
         n_encoder_my = sum(1 for p in stripe_plans if p.role == StripeRole.ENCODER)
         n_parity_my = sum(1 for p in stripe_plans if p.role == StripeRole.PARITY_TARGET)
@@ -4256,13 +4259,20 @@ def save_concord_legacy_checkpoint(
         and hasattr(native, "submit_enc_recv_with_batch")
         and hasattr(native, "skip_source_batch")
     )
+    nondefault_layout = (int(manager.concord_k), int(manager.concord_m)) != (n - 2, 2)
+    layer_exchange_requested = bool(
+        getattr(args, "concord_layer_exchange_encode", False) or nondefault_layout
+    )
     use_layer_exchange_encode = bool(
-        getattr(args, "concord_layer_exchange_encode", False)
+        layer_exchange_requested
         and hasattr(native, "send_layer_to_peer")
         and hasattr(native, "recv_layer_from_peer")
-        and hasattr(native, "encode_layer_stripes")
-        and hasattr(native, "encode_layer_stripes_batch")
+        and hasattr(native, "encode_layer_stripes_generic_batch")
     )
+    if nondefault_layout and not use_layer_exchange_encode:
+        raise RuntimeError(
+            "Concord non-default RS layouts require native generic layer-exchange APIs"
+        )
     if concord_gdr and not use_layer_exchange_encode:
         raise RuntimeError(
             "Concord --concord-gdr requires enabled layer-exchange encode support "
@@ -4354,7 +4364,6 @@ def save_concord_legacy_checkpoint(
                 layer_block_size / 1e6,
             )
 
-        offset = 0
         layer_noncontig = 0
         layer_model_bytes = 0
         layer_optimizer_bytes = 0
@@ -4373,18 +4382,24 @@ def save_concord_legacy_checkpoint(
                     layer_common_bytes += info_size
                 tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
                 nbytes = tensor_view.numel()
-                layer_buf_gpu[offset : offset + nbytes].copy_(
+                layer_buf_gpu[info.offset : info.offset + nbytes].copy_(
                     tensor_view, non_blocking=True
                 )
-                info.offset = offset
-                offset += nbytes
 
-            # Only clear padding that can be transmitted in the final used block.
-            if offset > 0 and layer_block_size > 0:
-                tail_end = ((offset + layer_block_size - 1) // layer_block_size) * layer_block_size
+            # Clear alignment gaps and transmissible tail padding before packing.
+            if group.total_bytes > 0 and layer_block_size > 0:
+                tail_end = (
+                    (group.total_bytes + layer_block_size - 1) // layer_block_size
+                ) * layer_block_size
                 tail_end = min(tail_end, int(layer_buf_gpu.numel()))
-                if tail_end > offset:
-                    layer_buf_gpu[offset:tail_end].zero_()
+                # Gaps are cleared separately because tensor copies overwrite data ranges.
+                cursor = 0
+                for info in group.tensor_infos:
+                    if info.offset > cursor:
+                        layer_buf_gpu[cursor:info.offset].zero_()
+                    cursor = info.offset + info.size_bytes
+                if tail_end > cursor:
+                    layer_buf_gpu[cursor:tail_end].zero_()
         prep_stream.synchronize()
         layer_pack_s = time.time() - pack_t0
         pack_total_s += layer_pack_s
@@ -5304,7 +5319,7 @@ def save_concord_legacy_checkpoint(
             layer_wait_s = 0.0
             wait_t0 = time.time()
             if _dbg:
-                logger.info("CONCORD layer %s: wait_encode_only (P2 deferred)", result.layer_name)
+                logger.info("CONCORD layer %s: wait_encode_only (deferred parity)", result.layer_name)
             native.wait_encode_only()
             layer_wait_s = time.time() - wait_t0
             wait_total_s += layer_wait_s
@@ -5407,12 +5422,12 @@ def save_concord_legacy_checkpoint(
     lx_ready_last_s = locals().get("lx_ready_last_s", 0.0)
     lx_layer_elapsed_max = locals().get("lx_layer_elapsed_max", 0.0)
 
-    # ---- aggregate P2 phase: one transfer per physical peer/lane ----
+    # ---- aggregate parity phase: one transfer per physical peer/lane ----
     # Route construction only retains small descriptors and strong references to
     # parity2 source buffers. The async writer completes all in-memory P2 work;
     # disk checkpoints retain its completed context for the unified shard write.
     p2_dispatch_t0 = time.time()
-    p2_descriptor, p2_summary = _build_aggregate_p2_descriptor(
+    p2_descriptor, p2_summary = _build_aggregate_parity_descriptor(
         manager, native, encode_results, str(checkpoint_dir), rank, write_to_disk,
     )
     p2_context = None
@@ -5435,13 +5450,13 @@ def save_concord_legacy_checkpoint(
 
     if not _use_async_parity:
         try:
-            p2_wait_s = _wait_aggregate_p2_context(p2_context)
+            p2_wait_s = _wait_aggregate_parity_context(p2_context)
         except BaseException:
             p2_context["disk_users_done"] = True
-            _release_aggregate_p2_context(p2_context)
+            _release_aggregate_parity_context(p2_context)
             raise
         if not write_to_disk:
-            _release_aggregate_p2_context(p2_context)
+            _release_aggregate_parity_context(p2_context)
             p2_context["finished"] = True
         network_encode_s += p2_sync_foreground_s
     if torch.cuda.is_available():
@@ -5461,7 +5476,7 @@ def save_concord_legacy_checkpoint(
             )
 
     # Dispatch only after mirror shutdown and timing collection. This keeps native
-    # mirror/timing state single-owner while aggregate P2 runs in the background.
+    # mirror/timing state single-owner while aggregate parity runs in the background.
     if _use_async_parity:
         p2_dispatch_t0 = time.time()
         _start_async_p2_writer(p2_descriptor, debug=_dbg)
@@ -5469,7 +5484,7 @@ def save_concord_legacy_checkpoint(
     e2e_s = time.time() - e2e_t0
     if rank == 0:
         logger.info(
-            "CONCORD aggregate P2: mode=direct-multi-sge generation=%d "
+            "CONCORD aggregate parity: mode=direct-multi-sge generation=%d "
             "send_tasks=%d recv_tasks=%d send_segments=%d recv_segments=%d "
             "send_bytes=%d recv_bytes=%d async=%s p2_dispatch_s=%.6f",
             p2_descriptor["generation"], p2_summary["send_tasks"],
@@ -5486,15 +5501,15 @@ def save_concord_legacy_checkpoint(
         "submit_total_s": submit_total_s,
         "wait_total_s": wait_total_s,
         "mirror_elapsed_s": _mirror_elapsed,
-        "aggregate_p2_dispatch_s": p2_dispatch_s,
-        "aggregate_p2_prepare_s": p2_prepare_s,
-        "aggregate_p2_submit_s": p2_submit_s,
-        "aggregate_p2_wait_s": p2_wait_s,
-        "aggregate_p2_direct": 1.0,
-        "aggregate_p2_send_segments": p2_summary["send_segments"],
-        "aggregate_p2_recv_segments": p2_summary["recv_segments"],
-        "aggregate_p2_send_bytes": p2_summary["send_bytes"],
-        "aggregate_p2_recv_bytes": p2_summary["recv_bytes"],
+        "aggregate_parity_dispatch_s": p2_dispatch_s,
+        "aggregate_parity_prepare_s": p2_prepare_s,
+        "aggregate_parity_submit_s": p2_submit_s,
+        "aggregate_parity_wait_s": p2_wait_s,
+        "aggregate_parity_direct": 1.0,
+        "aggregate_parity_send_segments": p2_summary["send_segments"],
+        "aggregate_parity_recv_segments": p2_summary["recv_segments"],
+        "aggregate_parity_send_bytes": p2_summary["send_bytes"],
+        "aggregate_parity_recv_bytes": p2_summary["recv_bytes"],
         "layer_exchange_send_tasks": layer_exchange_send_tasks,
         "layer_exchange_recv_tasks": layer_exchange_recv_tasks,
         "layer_exchange_send_bytes": layer_exchange_send_bytes,
@@ -5632,14 +5647,14 @@ def save_concord_legacy_checkpoint(
                 "CONCORD save detail (%(mode)s): pack_s=%(pack_total_s).2fs "
                 "phase1_s=%(phase1_total_s).2fs submit_s=%(submit_total_s).2fs "
                 "wait_s=%(wait_total_s).2fs mirror_wait_s=%(mirror_elapsed_s).2fs "
-                "p2_dispatch_s=%(aggregate_p2_dispatch_s).6fs "
-                "p2_prepare_s=%(aggregate_p2_prepare_s).3fs "
-                "p2_submit_s=%(aggregate_p2_submit_s).3fs "
-                "p2_wait_s=%(aggregate_p2_wait_s).3fs p2_direct=%(aggregate_p2_direct).0f "
-                "p2_send_segments=%(aggregate_p2_send_segments).0f "
-                "p2_recv_segments=%(aggregate_p2_recv_segments).0f "
-                "p2_send_bytes=%(aggregate_p2_send_bytes).0f "
-                "p2_recv_bytes=%(aggregate_p2_recv_bytes).0f "
+                "p2_dispatch_s=%(aggregate_parity_dispatch_s).6fs "
+                "p2_prepare_s=%(aggregate_parity_prepare_s).3fs "
+                "p2_submit_s=%(aggregate_parity_submit_s).3fs "
+                "p2_wait_s=%(aggregate_parity_wait_s).3fs parity_direct=%(aggregate_parity_direct).0f "
+                "p2_send_segments=%(aggregate_parity_send_segments).0f "
+                "p2_recv_segments=%(aggregate_parity_recv_segments).0f "
+                "p2_send_bytes=%(aggregate_parity_send_bytes).0f "
+                "p2_recv_bytes=%(aggregate_parity_recv_bytes).0f "
                 "layer_exchange_send_tasks=%(layer_exchange_send_tasks).0f "
                 "layer_exchange_recv_tasks=%(layer_exchange_recv_tasks).0f "
                 "layer_exchange_send_bytes=%(layer_exchange_send_bytes).0f "
@@ -5741,10 +5756,10 @@ def save_concord_legacy_checkpoint(
                     executor.submit(
                         _save_concord_stripe_files,
                         manager, str(checkpoint_dir), rank, num_stripes, encode_results,
-                        True, True, False,
+                        True, True,
                     ),
                     executor.submit(
-                        _write_concord_aggregate_p2_files,
+                        _write_concord_aggregate_parity_files,
                         str(checkpoint_dir), rank, p2_context["recv_segments"],
                     ),
                 ]
@@ -5752,9 +5767,9 @@ def save_concord_legacy_checkpoint(
                     future.result()
         finally:
             p2_context["disk_users_done"] = True
-            _release_aggregate_p2_context(p2_context)
+            _release_aggregate_parity_context(p2_context)
     elif not _use_async_parity:
-        _finish_aggregate_p2_context(p2_context, debug=_dbg)
+        _finish_aggregate_parity_context(p2_context, debug=_dbg)
 
     groups_by_name = {
         (f"layer_{group.layer_idx}" if group.layer_idx >= 0 else "layer_common"): group
@@ -5789,11 +5804,14 @@ def save_concord_legacy_checkpoint(
             layer_main = checkpoint_dir / result.layer_name / f"concord_layer_main_rank{rank}.pt"
             torch.save(
                 {
-                    "version": 2,
+                    "version": 3,
                     "format": "concord_torch_legacy",
                     "rank": rank,
                     "layer_name": result.layer_name,
                     "n": n,
+                    "k": int(manager.concord_k),
+                    "m": int(manager.concord_m),
+                    "active_width": int(manager.concord_active_width),
                     "num_stripes": num_stripes,
                     "block_size": result.block_size,
                     "rank_in_group": rg,
@@ -5828,7 +5846,7 @@ def save_concord_legacy_checkpoint(
             optimizer_layer_map,
         )
         all_actual_tensor_sizes = {
-            r: sum(getattr(info, "size_bytes", 0) for info in infos)
+            r: tensor_layout_size(infos)
             for r, infos in all_tensor_infos.items()
         }
         _cached_all_tensor_infos = all_tensor_infos
@@ -5856,10 +5874,12 @@ def save_concord_legacy_checkpoint(
     meta1 = pickle.dumps(decomposed.non_tensor_data)
     meta2 = pickle.dumps(decomposed.tensor_infos)
     extra = pickle.dumps({
-        "version": 2, "format": "concord_torch_legacy", "rank": rank,
+        "version": 3, "format": "concord_torch_legacy", "rank": rank,
         "group_id": manager.group_id, "rank_in_group": rg,
         "poa_path": manager.get_resolved_table_path() or native.path(),
-        "n": n, "num_stripes": num_stripes, "num_layers": num_layers,
+        "n": n, "k": int(manager.concord_k), "m": int(manager.concord_m),
+        "active_width": int(manager.concord_active_width),
+        "num_stripes": num_stripes, "num_layers": num_layers,
         "block_size": block_size, "gdr": concord_gdr,
         "actual_tensor_size": total_tensor_size,
         "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
@@ -5902,40 +5922,65 @@ def save_concord_legacy_checkpoint(
 # Hardware recovery helpers
 # ---------------------------------------------------------------------------
 
+def _read_cnbk_header(file, filepath: str) -> Tuple[int, int, int, int, int]:
+    """Read and validate the fixed 32-byte CNBK header."""
+    header = file.read(32)
+    if len(header) != 32:
+        raise RuntimeError(
+            f"Concord load: short CNBK header in {filepath}: got {len(header)} bytes"
+        )
+    magic, stripe_id, role, parity_index, data_size, block_size = struct.unpack(
+        "<4sIIIQQ", header
+    )
+    if magic != b"CNBK":
+        raise RuntimeError(f"Concord load: invalid CNBK magic in {filepath}")
+    if int(data_size) > int(block_size):
+        raise RuntimeError(
+            "Concord load: CNBK data_size exceeds block_size in "
+            f"{filepath}: data_size={data_size} block_size={block_size}"
+        )
+    return (
+        int(stripe_id), int(role), int(parity_index), int(data_size), int(block_size)
+    )
+
+
+def _read_cnbk_payload_into(file, dst: torch.Tensor, size: int, filepath: str) -> None:
+    """Read exactly size CNBK payload bytes into dst."""
+    if size <= 0:
+        return
+    bytes_read = file.readinto(dst[:size].numpy())
+    if bytes_read != size:
+        raise RuntimeError(
+            f"Concord load: short CNBK payload in {filepath}: "
+            f"expected {size} bytes, got {bytes_read}"
+        )
+
+
 def _read_frbk_block(filepath: str) -> Optional[torch.Tensor]:
-    """Read a CNBK-format per-stripe block file. Returns the data tensor (CPU uint8)."""
-    import struct as _struct
+    """Read a CNBK-format per-stripe block file as a CPU uint8 tensor."""
     path = Path(filepath)
     if not path.is_file():
         return None
-    with open(path, "rb") as f:
-        hdr = f.read(28)  # <4sIIQQ: magic(4) + stripe_id(4) + role(4) + size(8) + block_size(8) = 28
-        if len(hdr) < 28:
-            return None
-        magic, stripe_id, role, data_size, block_sz = _struct.unpack("<4sIIQQ", hdr)
-        if magic != b"CNBK":
-            return None
+    with open(path, "rb") as file:
+        _stripe_id, _role, _parity_index, data_size, _block_size = (
+            _read_cnbk_header(file, filepath)
+        )
         data = torch.empty(data_size, dtype=torch.uint8)
-        if data_size > 0:
-            f.readinto(data.numpy())
+        _read_cnbk_payload_into(file, data, data_size, filepath)
     return data
 
 
 def _read_frbk_block_into(dst: torch.Tensor, filepath: str) -> int:
-    """Read CNBK payload directly into dst. Returns bytes written."""
+    """Read a CNBK payload directly into dst. Returns bytes written."""
     path = Path(filepath)
     if not path.is_file():
         return 0
-    with open(path, "rb") as f:
-        hdr = f.read(28)
-        if len(hdr) < 28:
-            return 0
-        magic, _stripe_id, _role, data_size, _block_sz = struct.unpack("<4sIIQQ", hdr)
-        if magic != b"CNBK":
-            return 0
-        ncopy = min(int(data_size), dst.numel())
-        if ncopy > 0:
-            f.readinto(dst[:ncopy].numpy())
+    with open(path, "rb") as file:
+        _stripe_id, _role, _parity_index, data_size, _block_size = (
+            _read_cnbk_header(file, filepath)
+        )
+        ncopy = min(data_size, int(dst.numel()))
+        _read_cnbk_payload_into(file, dst, ncopy, filepath)
         return ncopy
 
 
@@ -5945,27 +5990,27 @@ def _read_frbk_range_into(
     payload_offset: int,
     size: int,
 ) -> int:
-    """Read a byte range from an CNBK payload directly into dst."""
+    """Read a byte range from a CNBK payload directly into dst."""
     if size <= 0:
         return 0
+    if payload_offset < 0:
+        raise RuntimeError(
+            f"Concord load: negative CNBK payload offset {payload_offset} for {filepath}"
+        )
     path = Path(filepath)
     if not path.is_file():
         return 0
-    with open(path, "rb") as f:
-        hdr = f.read(28)
-        if len(hdr) < 28:
+    with open(path, "rb") as file:
+        _stripe_id, _role, _parity_index, data_size, _block_size = (
+            _read_cnbk_header(file, filepath)
+        )
+        if payload_offset >= data_size:
             return 0
-        magic, _stripe_id, _role, data_size, _block_sz = struct.unpack("<4sIIQQ", hdr)
-        if magic != b"CNBK":
-            return 0
-        if payload_offset >= int(data_size):
-            return 0
-        ncopy = min(int(size), int(data_size) - int(payload_offset), dst.numel())
+        ncopy = min(int(size), data_size - int(payload_offset), int(dst.numel()))
         if ncopy > 0:
-            f.seek(int(payload_offset), os.SEEK_CUR)
-            f.readinto(dst[:ncopy].numpy())
+            file.seek(int(payload_offset), os.SEEK_CUR)
+            _read_cnbk_payload_into(file, dst, ncopy, filepath)
         return ncopy
-
 
 def _stripe_block_path(
     checkpoint_dir: Path,
@@ -5973,14 +6018,18 @@ def _stripe_block_path(
     stripe_id: int,
     shard_owner_rank: int,
     stripe_role: int,
+    parity_index: Optional[int] = None,
 ) -> Path:
-    """Return the on-disk path for a participant's stripe shard."""
+    """Return the path for a source or explicitly indexed parity shard."""
     stripe_dir = checkpoint_dir / layer_name / f"stripe_{stripe_id}"
-    if stripe_role == int(StripeRole.ENCODER):
-        return stripe_dir / f"concord_shard_rank{shard_owner_rank}_p1.pt"
-    if stripe_role == int(StripeRole.PARITY_TARGET):
+    if stripe_role == int(StripeRole.SOURCE):
         return stripe_dir / f"concord_shard_rank{shard_owner_rank}.pt"
-    return stripe_dir / f"concord_shard_rank{shard_owner_rank}.pt"
+    if parity_index is None:
+        plan = ConcordManager().stripe_plans[int(stripe_id)]
+        parity_index = 0 if stripe_role == int(StripeRole.ENCODER) else int(plan.parity_index)
+    return stripe_dir / (
+        f"concord_shard_rank{shard_owner_rank}{_parity_shard_suffix(parity_index)}.pt"
+    )
 
 
 def _read_stripe_block(
@@ -6026,6 +6075,62 @@ def _assert_concord_main_metadata_only(main_path: Path) -> None:
         )
 
 
+def _concord_coding_layout(metadata: Dict[str, Any], context: str) -> Dict[str, int]:
+    """Validate and return the v3 Concord coding layout."""
+    try:
+        version = int(metadata.get("version", -1))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Concord load: invalid metadata version in {context}: "
+            f"{metadata.get('version')!r}"
+        ) from exc
+    if version != 3:
+        raise RuntimeError(
+            f"Concord load: {context} requires metadata version 3, "
+            f"got {metadata.get('version')!r}"
+        )
+    if metadata.get("format") != "concord_torch_legacy":
+        raise RuntimeError(
+            f"Concord load: invalid format in {context}: {metadata.get('format')!r}"
+        )
+    try:
+        layout = {
+            "n": int(metadata["n"]),
+            "k": int(metadata["k"]),
+            "m": int(metadata["m"]),
+            "active_width": int(metadata["active_width"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Concord load: invalid coding layout in {context}") from exc
+    if any(layout[key] <= 0 for key in ("n", "k", "m", "active_width")):
+        raise RuntimeError(
+            f"Concord load: coding layout values must be positive in {context}: {layout}"
+        )
+    if layout["active_width"] != layout["k"] + layout["m"]:
+        raise RuntimeError(
+            f"Concord load: active_width must equal k + m in {context}: {layout}"
+        )
+    if layout["active_width"] > layout["n"]:
+        raise RuntimeError(
+            f"Concord load: active_width exceeds n in {context}: {layout}"
+        )
+    return layout
+
+
+def _validate_concord_layer_metadata(
+    layer_metadata: Dict[str, Any],
+    main_layout: Dict[str, int],
+    layer_main_path: Path,
+) -> None:
+    """Require layer metadata to use the same v3 coding layout as main."""
+    layer_layout = _concord_coding_layout(layer_metadata, str(layer_main_path))
+    if layer_layout != main_layout:
+        raise RuntimeError(
+            "Concord load: layer metadata coding layout does not match main: "
+            f"path={layer_main_path} layer={layer_layout} main={main_layout}"
+        )
+
+
 def _read_local_concord_main_payload(
     checkpoint_dir: Path,
     rank: int,
@@ -6047,9 +6152,11 @@ def _read_local_concord_main_payload(
         MAGIC_CONCORD,
     )
     if is_raw_format(str(main_path), MAGIC_CONCORD):
-        return read_raw_checkpoint_metadata(str(main_path), MAGIC_CONCORD)
-    payload = torch.load(main_path, map_location="cpu", weights_only=False)
-    payload["tensor_buffer"] = None
+        payload = read_raw_checkpoint_metadata(str(main_path), MAGIC_CONCORD)
+    else:
+        payload = torch.load(main_path, map_location="cpu", weights_only=False)
+        payload["tensor_buffer"] = None
+    _concord_coding_layout(payload, str(main_path))
     return payload
 
 
@@ -6109,9 +6216,7 @@ def _load_concord_main_payload(
             if rank in all_sizes:
                 resolved["actual_tensor_size"] = all_sizes[rank]
             else:
-                resolved["actual_tensor_size"] = sum(
-                    getattr(info, "size_bytes", 0) for info in all_ti[rank]
-                )
+                resolved["actual_tensor_size"] = tensor_layout_size(all_ti[rank])
             resolved["tensor_buffer"] = None
             return resolved
         if "tensor_infos" in resolved:
@@ -6210,7 +6315,7 @@ def _max_layer_block_size(
 
 def _recovery_common_wave_size(n: int) -> int:
     """Return the role-independent recovery wave size for every POA rank."""
-    max_concurrency = max((n - 1) * (n - 2), 1)
+    max_concurrency = max((n - 1) * int(ConcordManager().concord_k), 1)
     configured = os.environ.get("CONCORD_RECOVERY_CONCURRENCY")
     if configured is None:
         return max_concurrency
@@ -6233,8 +6338,8 @@ def _allocate_recovery_buf_pool(
     concurrency_override: Optional[int] = None,
 ) -> Optional[_RecoveryBufPool]:
     """Pre-allocate stripe recovery buffers once before the per-layer network loop."""
-    num_helper = max(n - 3, 0)
-    num_source_stripes = (n - 1) * (n - 2)
+    num_helper = max(int(ConcordManager().concord_k) - 1, 0)
+    num_source_stripes = (n - 1) * int(ConcordManager().concord_k)
     need_pool = is_failed or is_decoder or is_helper
     if not need_pool:
         return None
@@ -6317,7 +6422,7 @@ def _preallocate_stable_failed_layer_bufs(
     """Allocate per-layer failed buffers whose views survive until forward."""
     if buf_pool is None or not jobs:
         return
-    num_source_stripes = (n - 1) * (n - 2)
+    num_source_stripes = (n - 1) * int(ConcordManager().concord_k)
     stable: Dict[int, torch.Tensor] = {}
     for job in jobs:
         if job.layer_idx in stable:
@@ -6641,7 +6746,7 @@ def _recovery_data_failed_pos(plan: Dict[str, Any], n: int) -> Optional[int]:
         ]
         return min(positions) if positions else None
     pos = int(plan.get('failed_pos', n))
-    return pos if pos < n - 2 else None
+    return pos if pos < int(ConcordManager().concord_k) else None
 
 
 def _build_failed_source_block_indices(
@@ -6679,7 +6784,7 @@ def _group_recovery_data_windows_by_column(
 ) -> List[List[Dict[str, Any]]]:
     windows: List[List[Dict[str, Any]]] = []
     # HW2 critical recovery includes SOURCE columns only.
-    for failed_pos in range(max(n - 2, 0)):
+    for failed_pos in range(max(int(ConcordManager().concord_k), 0)):
         column_plans = [
             plan for plan in data_plans
             if _recovery_data_failed_pos(plan, n) == failed_pos
@@ -6730,7 +6835,7 @@ def _iter_recovery_windows_for_job(
             preloaded_blocks, buf_pool,
         )
     )
-    num_source_stripes = (n - 1) * (n - 2)
+    num_source_stripes = (n - 1) * int(manager.concord_k)
     my_node = manager.rank_in_group + 1
     source_block_indices = _build_failed_source_block_indices(
         manager, data_plans, active_by_stripe, n,
@@ -6834,200 +6939,6 @@ def _ensure_recovery_parity_layer_buffers(
             layer_bufs.layer_mirror_cpu[tail_offset:tail_end].zero_()
 
 
-def _submit_recovery_async_parity_repair(
-    manager,
-    native,
-    job: _ConcordLayerRecoveryJob,
-    layer_buf: Optional[torch.Tensor],
-    checkpoint_dir: Path,
-    rank: int,
-    recovery_role: str,
-    encode_batch_id: int = 0,
-    reset_encode: bool = True,
-    wait_encode: bool = True,
-    submit_p2: bool = True,
-    log_submit: bool = True,
-) -> Dict[str, float]:
-    """Repair parity using buffers isolated from recovered training data."""
-    global _recovery_async_parity_initialized, _recovery_async_parity_submitted
-    timing: Dict[str, float] = {
-        "source_stage_s": 0.0,
-        "encode_submit_s": 0.0,
-        "encode_wait_s": 0.0,
-        "build_s": 0.0,
-        "submit_s": 0.0,
-        "parity_tasks": 0.0,
-        "send_tasks": 0.0,
-    }
-    if job.layer_idx < 0 or native is None:
-        return timing
-    if not _concord_recovery_async_parity_enabled():
-        return timing
-    has_batch_submit = hasattr(native, "submit_async_p2_layer_with_batch")
-    has_encode_batch = (
-        hasattr(native, "submit_source_with_batch")
-        and hasattr(native, "submit_enc_recv_with_batch")
-    )
-    if not has_batch_submit and not hasattr(native, "submit_async_p2_layer"):
-        return timing
-
-    if not _recovery_async_parity_initialized:
-        reset_t0 = time.time()
-        native.reset_async_parity()
-        timing["reset_s"] = time.time() - reset_t0
-        _recovery_async_parity_initialized = True
-
-    n = int(native.n())
-    num_stripes = int(native.num_stripes())
-    my_node = int(manager.rank_in_group) + 1
-    layer_name = job.layer_name
-    layer_idx = job.layer_idx
-    layer_block_size = job.layer_block_size
-    layer_bufs = manager.get_layer_stripe_bufs(layer_idx)
-    per_rank_bytes = (manager._layer_per_rank_bytes or {}).get(layer_idx, {})
-    my_total_bytes = int(per_rank_bytes.get(int(manager.rank_in_group), job.actual_size) or 0)
-
-    src_blk_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
-    enc_active_masks: Dict[int, List[int]] = {}
-    for sid in range(num_stripes):
-        plan = manager.stripe_plans[sid]
-        if plan.role == StripeRole.ENCODER:
-            mask = []
-            for src_node in plan.source_node_ids:
-                b = src_blk_per_node.get(src_node, 0)
-                nf = manager.get_n_filled_for_node(layer_idx, src_node)
-                mask.append(1 if b < nf else 0)
-            enc_active_masks[sid] = mask
-        for src_node in plan.source_node_ids:
-            src_blk_per_node[src_node] = src_blk_per_node.get(src_node, 0) + 1
-
-    def _stage_source_for_sid(sid: int) -> Tuple[int, int]:
-        blk_idx = _source_blk_idx_for_node_stripe(manager.stripe_plans, sid, my_node)
-        if blk_idx < 0:
-            return 0, 0
-        n_filled = manager.get_n_filled_for_node(layer_idx, my_node)
-        if blk_idx >= n_filled:
-            return 0, 0
-
-        src_offset = blk_idx * layer_block_size
-        actual_len = max(0, min(layer_block_size, my_total_bytes - src_offset))
-        if actual_len <= 0:
-            return 0, 0
-
-        # Failed ranks already reconstructed source blocks in the same contiguous
-        # layer layout used by POA source stripes; submit those CPU blocks directly.
-        if layer_buf is not None:
-            return int(layer_buf[src_offset:src_offset + layer_block_size].data_ptr()), 0
-
-        stage_t0 = time.time()
-        blk = _read_stripe_block(
-            checkpoint_dir, layer_name, sid, rank, int(StripeRole.SOURCE)
-        )
-        blk = _normalize_stripe_block(blk, layer_block_size, rank, layer_name, sid)
-        blk = blk[:actual_len]
-        if not blk.is_contiguous():
-            blk = blk.contiguous()
-
-        cpu_view = layer_bufs.layer_mirror_cpu[src_offset:src_offset + layer_block_size]
-        copy_len = min(int(blk.numel()), actual_len)
-        cpu_view[:copy_len].copy_(blk[:copy_len], non_blocking=False)
-        timing["source_stage_s"] += time.time() - stage_t0
-        return int(cpu_view.data_ptr()), 0
-
-    submit_t0 = time.time()
-    if reset_encode:
-        if hasattr(native, "reset_encode_layer"):
-            native.reset_encode_layer()
-        else:
-            native.reset_layer()
-    for sid in range(num_stripes):
-        plan = manager.stripe_plans[sid]
-        if plan.role == StripeRole.SOURCE:
-            addr, mirror_addr = _stage_source_for_sid(sid)
-            if addr == 0:
-                if encode_batch_id and has_encode_batch and hasattr(native, "skip_source_batch"):
-                    native.skip_source_batch(sid, int(encode_batch_id))
-                continue
-            if encode_batch_id and has_encode_batch:
-                native.submit_source_with_batch(
-                    sid, addr, mirror_addr, layer_block_size, int(encode_batch_id)
-                )
-            else:
-                native.submit_source(sid, addr, mirror_addr, layer_block_size)
-        elif plan.role == StripeRole.ENCODER:
-            rb = layer_bufs.recv_bufs[sid]
-            p1b = layer_bufs.parity1_bufs[sid]
-            p2b = layer_bufs.parity2_bufs[sid]
-            if rb is None or p1b is None or p2b is None:
-                continue
-            if encode_batch_id and has_encode_batch:
-                native.submit_enc_recv_with_batch(
-                    sid, rb.data_ptr(), p1b.data_ptr(), p2b.data_ptr(),
-                    layer_block_size, enc_active_masks.get(sid, []), int(encode_batch_id),
-                )
-            else:
-                native.submit_enc_recv(
-                    sid, rb.data_ptr(), p1b.data_ptr(), p2b.data_ptr(),
-                    layer_block_size, enc_active_masks.get(sid, []),
-                )
-    timing["encode_submit_s"] = time.time() - submit_t0
-
-    if wait_encode:
-        wait_t0 = time.time()
-        native.wait_encode_only()
-        timing["encode_wait_s"] = time.time() - wait_t0
-
-    if submit_p2:
-        _submit_recovery_async_parity_p2(
-            manager, native, job, timing, recovery_role, has_batch_submit
-        )
-    if log_submit:
-        _log_recovery_async_parity_submit(recovery_role, job, timing)
-    return timing
-
-
-def _submit_recovery_async_parity_p2(
-    manager, native, job: _ConcordLayerRecoveryJob, timing: Dict[str, float],
-    recovery_role: str, has_batch_submit: bool,
-) -> None:
-    global _recovery_async_parity_submitted
-    layer_bufs = manager.get_layer_stripe_bufs(job.layer_idx)
-    build_t0 = time.time()
-    p2_addrs = [0 if buf is None else int(buf.data_ptr()) for buf in layer_bufs.parity2_bufs]
-    timing["build_s"] = timing.get("build_s", 0.0) + (time.time() - build_t0)
-    submit_p2_t0 = time.time()
-    repair_batch_id = int(job.encode_iter) + 1
-    if has_batch_submit:
-        counts = native.submit_async_p2_layer_with_batch(
-            p2_addrs, job.layer_block_size, repair_batch_id
-        )
-    else:
-        counts = native.submit_async_p2_layer(p2_addrs, job.layer_block_size)
-    timing["submit_s"] = timing.get("submit_s", 0.0) + (time.time() - submit_p2_t0)
-    if counts is not None and len(counts) >= 2:
-        timing["parity_tasks"] = float(int(counts[0]))
-        timing["send_tasks"] = float(int(counts[1]))
-    if timing.get("parity_tasks", 0.0) or timing.get("send_tasks", 0.0):
-        _recovery_async_parity_submitted = True
-
-
-def _log_recovery_async_parity_submit(
-    recovery_role: str, job: _ConcordLayerRecoveryJob, timing: Dict[str, float]
-) -> None:
-    _concord_recovery_profile(
-        recovery_role,
-        "recovery_async_parity_submit",
-        layer=job.layer_name,
-        layer_idx=job.layer_idx,
-        parity_tasks=int(timing.get("parity_tasks", 0.0)),
-        send_tasks=int(timing.get("send_tasks", 0.0)),
-        source_stage_s=timing.get("source_stage_s", 0.0),
-        encode_submit_s=timing.get("encode_submit_s", 0.0),
-        encode_wait_s=timing.get("encode_wait_s", 0.0),
-        submit_s=timing.get("submit_s", 0.0),
-        flush_s=timing.get("flush_s", 0.0),
-    )
-
 def _flush_recovery_async_parity(reason: str, role: str = "unknown") -> None:
     global _recovery_async_parity_submitted
     if not _recovery_async_parity_submitted:
@@ -7061,12 +6972,46 @@ def _validate_recovery_alignment(
             "Concord recovery: recovery plans require unique ordered stripe IDs; "
             f"got {stripe_ids}"
         )
-    expected_stripes = int(n) * max(int(n) - 1, 0)
-    if stripe_ids and stripe_ids != list(range(expected_stripes)):
-        raise RuntimeError(
-            "Concord recovery: recovery plan stripe IDs are incomplete; "
-            f"expected 0..{expected_stripes - 1}, got {stripe_ids}"
-        )
+    if stripe_ids:
+        manager = ConcordManager()
+        dual_failure = bool(plans[0].get('dual_failure'))
+        if any(bool(plan.get('dual_failure')) != dual_failure for plan in plans):
+            raise RuntimeError(
+                "Concord recovery: recovery plans cannot mix single and dual failures"
+            )
+        if dual_failure:
+            expected_stripes = int(n) * max(int(n) - 1, 0)
+            if stripe_ids != list(range(expected_stripes)):
+                raise RuntimeError(
+                    "Concord recovery: dual-failure recovery plan stripe IDs are incomplete; "
+                    f"expected 0..{expected_stripes - 1}, got {stripe_ids}"
+                )
+        else:
+            active_width = int(manager.concord_active_width)
+            failed_node = int(plans[0].get('failed_node', -1))
+            for plan in plans:
+                failed_pos = int(plan.get('failed_pos', -1))
+                if failed_pos < 0 or failed_pos >= active_width:
+                    raise RuntimeError(
+                        "Concord recovery: single-failure plan targets an inactive column; "
+                        f"stripe={plan.get('stripe_id', -1)} "
+                        f"failed_pos={failed_pos} active_width={active_width}"
+                    )
+                if int(plan.get('failed_node', -1)) != failed_node:
+                    raise RuntimeError(
+                        "Concord recovery: single-failure plans require one failed node; "
+                        f"expected {failed_node}, got {plan.get('failed_node', -1)}"
+                    )
+            expected_stripe_ids = [
+                int(stripe_plan.stripe_id)
+                for stripe_plan in manager.stripe_plans
+                if stripe_plan.row.index(failed_node) < active_width
+            ]
+            if stripe_ids != expected_stripe_ids:
+                raise RuntimeError(
+                    "Concord recovery: single-failure recovery plan stripe IDs are incomplete; "
+                    f"expected {expected_stripe_ids}, got {stripe_ids}"
+                )
     if common_wave_size <= 0:
         raise RuntimeError(
             f"Concord recovery: invalid common wave size {common_wave_size}"
@@ -7285,15 +7230,20 @@ def _persist_recovered_parity_wave(
         if slot >= len(buf_pool.failed_recv_bufs):
             raise RuntimeError("Concord parity persistence: missing failed receive slot")
         sid = int(plan['stripe_id'])
-        suffix = "_p1" if role == int(StripeRole.ENCODER) else ""
+        parity_index = (
+            0 if role == int(StripeRole.ENCODER)
+            else int(manager.stripe_plans[sid].parity_index)
+        )
         stripe_dir = checkpoint_dir / job.layer_name / f"stripe_{sid}"
         stripe_dir.mkdir(parents=True, exist_ok=True)
-        path = stripe_dir / f"concord_shard_rank{rank}{suffix}.pt"
+        path = stripe_dir / (
+            f"concord_shard_rank{rank}{_parity_shard_suffix(parity_index)}.pt"
+        )
         block = buf_pool.failed_recv_bufs[slot][:job.layer_block_size]
         if block.device.type != "cpu":
             block = block.cpu()
         header = struct.pack(
-            "<4sIIQQ", b"CNBK", sid, int(role),
+            "<4sIIIQQ", b"CNBK", sid, int(role), parity_index,
             int(job.layer_block_size), int(job.layer_block_size),
         )
         temp_path = path.with_name(
@@ -8363,7 +8313,7 @@ def _is_data_recovery_plan(plan: Dict[str, Any], n: int) -> bool:
             int(target.get('original_role', -1)) == int(StripeRole.SOURCE)
             for target in plan.get('failed_targets', [])
         )
-    return int(plan.get('failed_pos', n)) < n - 2
+    return int(plan.get('failed_pos', n)) < int(ConcordManager().concord_k)
 
 
 def _is_parity_recovery_plan(plan: Dict[str, Any], n: int) -> bool:
@@ -8381,11 +8331,15 @@ def _is_parity_recovery_plan(plan: Dict[str, Any], n: int) -> bool:
 def _stripe_role_for_node(manager, sid: int, node_id: int, n: int) -> int:
     row = manager.stripe_plans[int(sid)].row
     pos = row.index(int(node_id))
-    if pos < n - 2:
+    k = int(manager.concord_k)
+    active_width = int(manager.concord_active_width)
+    if pos < k:
         return int(StripeRole.SOURCE)
-    if pos == n - 2:
+    if pos == k:
         return int(StripeRole.ENCODER)
-    return int(StripeRole.PARITY_TARGET)
+    if pos < active_width:
+        return int(StripeRole.PARITY_TARGET)
+    return int(StripeRole.INACTIVE)
 
 
 def _recovery_window_rows(n: int) -> int:
@@ -8407,7 +8361,7 @@ def _build_recovery_layer_context(
         p for p in manager.recovery_stripe_plans
         if _is_parity_recovery_plan(p, n)
     ]
-    num_source_stripes = (n - 1) * (n - 2)
+    num_source_stripes = (n - 1) * int(manager.concord_k)
     target_filled = {
         int(node): _n_filled_blocks_for_layer(size, layer_block_size, num_source_stripes)
         for node, size in job.target_actual_sizes.items()
@@ -8452,7 +8406,7 @@ def _prepare_recovery_layer_buffers(
     buf_pool: Optional[_RecoveryBufPool],
 ) -> Tuple[Dict[int, torch.Tensor], Optional[torch.Tensor], int, int, int]:
     my_node = manager.rank_in_group + 1
-    num_source_stripes = (n - 1) * (n - 2)
+    num_source_stripes = (n - 1) * int(manager.concord_k)
     decoder_stripes = [p for p in data_plans if my_node == p['decoder_node']]
     helper_stripes = [p for p in data_plans if my_node in p['helper_nodes']]
     failed_stripes = [p for p in data_plans if _is_failed_in_recovery_plan(p, my_node)]
@@ -8655,7 +8609,7 @@ def _submit_recovery_network(
     ]
 
     _dbg = _concord_debug_enabled()
-    num_source_stripes = (n - 1) * (n - 2)
+    num_source_stripes = (n - 1) * int(manager.concord_k)
     n_filled_blocks = _n_filled_blocks_for_layer(
         layer_total_bytes, layer_block_size, num_source_stripes,
     )
@@ -9253,6 +9207,24 @@ def recover_concord_legacy_hardware(
         all_layer_order = workspace["all_layer_order"]
         all_layer_metadata = workspace["all_layer_metadata"]
     timings['main_io'] = time.time() - t_main
+    saved_layout = {
+        "n": int(main_payload["n"]),
+        "k": int(main_payload["k"]),
+        "m": int(main_payload["m"]),
+        "active_width": int(main_payload["active_width"]),
+    }
+    runtime_layout = {
+        "n": int(manager.concord_n),
+        "k": int(manager.concord_k),
+        "m": int(manager.concord_m),
+        "active_width": int(manager.concord_active_width),
+    }
+    if saved_layout != runtime_layout:
+        raise RuntimeError(
+            "Concord checkpoint coding layout does not match runtime: "
+            f"saved={saved_layout} runtime={runtime_layout}"
+        )
+
     optimizer_layer_map = _optimizer_layer_map_for_rank(main_payload, rank)
     main_payload["optimizer_layer_map"] = optimizer_layer_map
     setattr(manager, "_concord_optimizer_layer_map", optimizer_layer_map)
@@ -9264,9 +9236,7 @@ def recover_concord_legacy_hardware(
         if rank in all_sizes:
             total_tensor_size = int(all_sizes[rank])
         else:
-            total_tensor_size = sum(
-                getattr(info, "size_bytes", 0) for info in global_tensor_infos
-            )
+            total_tensor_size = tensor_layout_size(global_tensor_infos)
         main_payload["actual_tensor_size"] = total_tensor_size
     else:
         global_tensor_infos = main_payload.get("tensor_infos", [])
@@ -9961,7 +9931,7 @@ def _reconstruct_common_from_tensor_views(
 # ---------------------------------------------------------------------------
 
 def _compile_stripe_plans_for_load(
-    poa_path: str, rank_in_group: int,
+    poa_path: str, rank_in_group: int, k: int, m: int,
 ) -> List[StripePlan]:
     """Lightweight POA compile for load (no RDMA init)."""
     import glob
@@ -9978,7 +9948,7 @@ def _compile_stripe_plans_for_load(
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(mod)
-    native = mod.ConcordNative(poa_path)
+    native = mod.ConcordNative(poa_path, int(k), int(m))
     native.compile_plans(rank_in_group)
     stripe_plans: List[StripePlan] = []
     for sid in range(native.num_stripes()):
@@ -9990,6 +9960,8 @@ def _compile_stripe_plans_for_load(
                 source_node_ids=list(native.get_source_node_ids(sid)),
                 encoder_node_id=native.get_encoder_node_id(sid),
                 parity_target_node_id=native.get_parity_target_node_id(sid),
+                parity_owner_node_ids=list(native.get_parity_owner_node_ids(sid)),
+                parity_index=native.get_parity_index_for_stripe(sid),
             )
         )
     return stripe_plans
@@ -10020,6 +9992,7 @@ def _build_full_buf_from_local_blocks(
     if not poa_path:
         raise RuntimeError("Concord load: poa_path missing in main metadata")
 
+    main_layout = _concord_coding_layout(main_payload, "main metadata")
     rank_in_group = int(main_payload.get("rank_in_group", 0))
     layer_names = main_payload.get("layer_names", [])
     if not layer_names:
@@ -10028,7 +10001,9 @@ def _build_full_buf_from_local_blocks(
     total_tensor_size = int(main_payload.get("actual_tensor_size", 0))
     global_tensor_infos = main_payload.get("tensor_infos", [])
 
-    stripe_plans = _compile_stripe_plans_for_load(poa_path, rank_in_group)
+    stripe_plans = _compile_stripe_plans_for_load(
+        poa_path, rank_in_group, int(main_payload["k"]), int(main_payload["m"]),
+    )
     source_stripes = _enumerate_source_stripes(stripe_plans)
     num_source = len(source_stripes)
 
@@ -10083,13 +10058,13 @@ def _build_full_buf_from_local_blocks(
         layer_dir = checkpoint_dir / layer_name
         layer_main_path = layer_dir / f"concord_layer_main_rank{rank}.pt"
         if not layer_main_path.is_file():
-            logger.warning(
-                "Concord load: missing layer_main for %s, skipping", layer_name,
+            raise RuntimeError(
+                f"Concord load: missing layer metadata file {layer_main_path}"
             )
-            continue
 
         t_meta = time.time()
         layer_meta = torch.load(layer_main_path, map_location="cpu", weights_only=False)
+        _validate_concord_layer_metadata(layer_meta, main_layout, layer_main_path)
         if timings is not None:
             timings["layer_meta"] += time.time() - t_meta
         layer_block_size = int(layer_meta.get("block_size", 0))

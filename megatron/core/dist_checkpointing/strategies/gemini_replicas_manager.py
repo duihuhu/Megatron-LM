@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
-from .state_dict_decomposer import DecomposedStateDict, TensorInfo
+from .state_dict_decomposer import DecomposedStateDict, TensorInfo, assign_tensor_offsets
 from .hugepage_alloc import allocate_hugepage_tensor
 from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 
@@ -707,17 +707,15 @@ class GeminiReplicasManager:
             + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
         )
         
-        # Calculate offsets for tensor data
-        offset = 0
-        for info in tensor_infos:
-            info.offset = offset
-            offset += info.size_bytes
+        # Calculate aligned offsets for tensor data.
+        total_tensor_size_bytes = assign_tensor_offsets(tensor_infos)
         
         # Create decomposed structure
         self.decomposed_state_dict = DecomposedStateDict(
             non_tensor_data=non_tensor_data,
             tensor_infos=tensor_infos,
             tensor_data=tensor_data_list,
+            total_tensor_size_bytes=total_tensor_size_bytes,
         )
         
         process_time = time() - start

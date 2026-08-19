@@ -37,6 +37,8 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     extract_tensors_from_continuous_buffer,
     reconstruct_state_dict,
     unflatten_optimizer_fp32_params,
+    assign_tensor_offsets,
+    tensor_layout_size,
 )
 
 logger = getLogger(__name__)
@@ -106,7 +108,7 @@ def _build_global_registry(
         return {0: local_metadata}, {0: local_non_tensor}
 
     world_size = torch.distributed.get_world_size()
-    total_bytes = sum(m.size_bytes for m in local_metadata)
+    total_bytes = tensor_layout_size(local_metadata)
     cache_key = (world_size, len(local_metadata), total_bytes)
     if cache_key in _BUILD_GLOBAL_REGISTRY_CACHE:
         return _BUILD_GLOBAL_REGISTRY_CACHE[cache_key]
@@ -132,6 +134,7 @@ def _tensor_infos_to_local_metadata(
                 shape=tuple(info.shape),
                 dtype=str(info.dtype),
                 size_bytes=info.size_bytes,
+                offset=info.offset,
                 global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
                 shard_index=info.shard_index if info.shard_index is not None else 0,
                 chunk_type="data",
@@ -273,10 +276,10 @@ def save_gemini_replicas_legacy_checkpoint(
     # Both transports pack on GPU. GDR sends it directly; CPU pipeline mirrors segments.
     gpu_tensor_buffer = torch.zeros(total_tensor_size, dtype=torch.uint8, device="cuda")
 
-    offset = 0
+    total_tensor_size = assign_tensor_offsets(decomposed.tensor_infos)
+    decomposed.total_tensor_size_bytes = total_tensor_size
     local_tensor_metadata: List[TensorMetadata] = []
     for info in decomposed.tensor_infos:
-        info.offset = offset
         local_tensor_metadata.append(
             TensorMetadata(
                 key=info.key,
@@ -293,7 +296,6 @@ def save_gemini_replicas_legacy_checkpoint(
                 source_rank=rank,
             )
         )
-        offset += info.size_bytes
 
     t0 = time.time()
     if manager.use_rdma:
@@ -334,7 +336,7 @@ def save_gemini_replicas_legacy_checkpoint(
 
     # Compute buffer sizes from metadata (replaces separate gloo size exchange)
     rank_sizes = {
-        r: sum(m.size_bytes for m in rank_metadata[r])
+        r: tensor_layout_size(rank_metadata[r])
         for r in range(world_size)
     }
 

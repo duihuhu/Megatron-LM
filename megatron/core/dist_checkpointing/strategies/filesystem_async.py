@@ -35,8 +35,10 @@ from torch.futures import Future
 from .async_utils import _disable_gc
 from .state_dict_decomposer import (
     DecomposedStateDict,
+    assign_tensor_offsets,
     decompose_state_dict,
     organize_tensor_data_in_cpu_memory,
+    tensor_layout_size,
 )
 
 from .state_dict_decomposer import TensorMetadata
@@ -1163,7 +1165,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     rank_sizes = {}
                     for r in range(world_size):
                         r_metadata = registry.rank_metadata.get(r, [])
-                        rank_sizes[r] = sum(m.size_bytes for m in r_metadata)
+                        rank_sizes[r] = tensor_layout_size(r_metadata)
                     logger.info(f"Gemini Replicas rank {rank}: Buffer sizes from registry: { {r: f'{s/(1024**2):.1f}MB' for r, s in rank_sizes.items()} }")
 
                 # ===== Step 2: Get or allocate receive buffers based on source rank sizes =====
@@ -2863,7 +2865,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             all_total_bytes_list = []
             for r in range(torch.distributed.get_world_size()):
                 rank_metadata = self.ecnaive_global_registry.rank_metadata.get(r, [])
-                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                rank_total_size = tensor_layout_size(rank_metadata)
                 all_total_bytes_list.append(rank_total_size)
             max_total_bytes = max(all_total_bytes_list)
         else:
@@ -2896,31 +2898,22 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Step 4: Transfer tensors from GPU to continuous CPU buffer
         num_gpu_tensors = 0
-        offset = 0
+        buffer[:max_total_bytes].zero_()
         for info, tensor in zip(
             self.decomposed_state_dict.tensor_infos,
             self.decomposed_state_dict.tensor_data
         ):
             tensor_size = info.size_bytes
-            buffer_view = buffer[offset:offset + tensor_size]
+            buffer_view = buffer[info.offset:info.offset + tensor_size]
             tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
             buffer_view.copy_(tensor_flat, non_blocking=non_blocking)
             
             if tensor.device.type != 'cpu':
                 num_gpu_tensors += 1
             
-            info.offset = offset
             info.device = torch.device('cpu')
-            offset += tensor_size
-        
-        # Step 5: Fill remaining space with zeros (for pipeline synchronization)
-        if offset < max_total_bytes:
-            padding_size = max_total_bytes - offset
-            buffer[offset:max_total_bytes].fill_(0)
-            logger.debug(
-                f"EC-NAIVE: Filled {padding_size / (1024**2):.2f} MB with zeros "
-                f"for pipeline synchronization"
-            )
+
+        # Step 5: The active buffer span was zeroed before tensor copies.
         
         # Synchronize if using non-blocking transfers
         if non_blocking and num_gpu_tensors > 0:
@@ -3306,7 +3299,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             all_total_bytes_list = []
             for r in range(torch.distributed.get_world_size()):
                 rank_metadata = self.eccheck_global_registry.rank_metadata.get(r, [])
-                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                rank_total_size = tensor_layout_size(rank_metadata)
                 all_total_bytes_list.append(rank_total_size)
             
             # Compute maximum locally (all ranks have the same global_registry)
@@ -3342,7 +3335,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         
         # Step 4: Transfer tensors from GPU to continuous CPU buffer
         num_gpu_tensors = 0
-        offset = 0
+        buffer[:max_total_bytes].zero_()
         for info, tensor in zip(
             self.decomposed_state_dict.tensor_infos,
             self.decomposed_state_dict.tensor_data
@@ -3351,7 +3344,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             tensor_size = info.size_bytes
             
             # Get view of buffer at current offset
-            buffer_view = buffer[offset:offset + tensor_size]
+            buffer_view = buffer[info.offset:info.offset + tensor_size]
             
             # Flatten and copy tensor to continuous buffer
             tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
@@ -3360,21 +3353,10 @@ class FileSystemWriterAsync(FileSystemWriter):
             if tensor.device.type != 'cpu':
                 num_gpu_tensors += 1
             
-            # Update tensor info
-            info.offset = offset
+            # Update tensor info.
             info.device = torch.device('cpu')
-            
-            # Move to next tensor position
-            offset += tensor_size
-        
-        # Step 5: Fill remaining space with zeros (for pipeline synchronization)
-        if offset < max_total_bytes:
-            padding_size = max_total_bytes - offset
-            buffer[offset:max_total_bytes].fill_(0)
-            logger.debug(
-                f"EC-CHECK: Filled {padding_size / (1024**2):.2f} MB with zeros "
-                f"for pipeline synchronization"
-            )
+
+        # Step 5: The active buffer span was zeroed before tensor copies.
         
         # Synchronize if using non-blocking transfers
         if non_blocking and num_gpu_tensors > 0:
@@ -3610,6 +3592,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     shape=info.shape,
                     dtype=str(info.dtype),
                     size_bytes=info.size_bytes,
+                    offset=getattr(info, 'offset', 0),
                     global_offset=info.global_offset if info.global_offset is not None else (),
                     shard_index=info.shard_index if info.shard_index is not None else 0,
                     chunk_type=info.chunk_type,
@@ -3756,6 +3739,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     shape=info.shape,
                     dtype=str(info.dtype),
                     size_bytes=info.size_bytes,
+                    offset=getattr(info, 'offset', 0),
                     global_offset=info.global_offset if info.global_offset is not None else (),
                     shard_index=info.shard_index if info.shard_index is not None else 0,
                     chunk_type=chunk_type,
@@ -4040,16 +4024,15 @@ class FileSystemWriterAsync(FileSystemWriter):
                     buffer_np = np.frombuffer(mm[offset:offset + tensor_buffer_size], dtype=np.uint8)
                     
                     # Extract each tensor from the buffer
-                    current_offset = 0
                     for info in tensor_infos:
                         tensor_size_bytes = info.size_bytes
-                        start = current_offset
-                        end = current_offset + tensor_size_bytes
+                        start = info.offset
+                        end = info.offset + tensor_size_bytes
                         
                         if end > len(buffer_np):
                             raise RuntimeError(
                                 f"EC-NAIVE: Buffer overflow when extracting tensor {info.key} "
-                                f"(offset {current_offset}, size {tensor_size_bytes}, buffer size {len(buffer_np)})"
+                                f"(offset {info.offset}, size {tensor_size_bytes}, buffer size {len(buffer_np)})"
                             )
                         
                         # Extract numpy slice (view, not copy) from buffer
@@ -4064,7 +4047,6 @@ class FileSystemWriterAsync(FileSystemWriter):
                         tensor = tensor_view.clone().reshape(info.shape)
                         tensor_data.append(tensor)
                         
-                        current_offset += tensor_size_bytes
                     
                     logger.debug(f"EC-NAIVE: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB) and extracted {len(tensor_data)} tensors")
             

@@ -50,7 +50,7 @@
 // RS encode thread pool
 static constexpr int kRsPoolSize = 16;
 static constexpr int kRsMaxDataBlocks = 254;
-static constexpr int kRsMaxParityBlocks = 2;
+static constexpr int kRsMaxParityBlocks = 254;
 static constexpr size_t kRsInitialPlanSpans = 4096;
 static constexpr const char* kRsCpuListEnv = "CONCORD_RS_CPU_LIST";
 
@@ -1061,15 +1061,17 @@ public:
 // ---------------------------------------------------------------------------
 // StripePlan — pre-compiled role assignment for a POA row
 // ---------------------------------------------------------------------------
-enum class StripeRole { SOURCE, ENCODER, PARITY_TARGET };
+enum class StripeRole { SOURCE = 0, ENCODER = 1, PARITY_TARGET = 2, INACTIVE = 6 };
 
 struct StripePlan {
     int stripe_id;
     std::vector<int> row;               // POA row (node IDs 1..n)
     StripeRole role;                    // My role in this stripe
     int encoder_node_id;                // node ID of encoder (row[n-2])
-    int parity_target_node_id;          // node ID of parity target (row[n-1])
-    std::vector<int> source_node_ids;   // node IDs of sources (row[0..n-3])
+    int parity_target_node_id;          // legacy alias for parity index 1 owner
+    std::vector<int> parity_owner_node_ids;
+    std::vector<int> source_node_ids;
+    int parity_index = -1;
 };
 
 struct RecoveryFailedTarget {
@@ -1116,7 +1118,7 @@ bool is_comment_or_empty(const std::string& line) {
 // ---------------------------------------------------------------------------
 class ConcordNative {
 public:
-    ConcordNative(const std::string& poa_path)
+    ConcordNative(const std::string& poa_path, int k = -1, int m = -1)
         : poa_path_(poa_path), stopped_(false),
           rdma_ctx_(nullptr), rdma_pd_(nullptr),
           group_size_(0), rank_in_group_(-1),
@@ -1130,10 +1132,11 @@ public:
             int n = parse_n_from_path_(poa_path);
             generate_poa_(n);
         }
+        resolve_coding_layout_(k, m);
         init_encode_tables_();
     }
 
-    ConcordNative(int n)
+    ConcordNative(int n, int k = -1, int m = -1)
         : poa_path_("(generated)"), stopped_(false),
           rdma_ctx_(nullptr), rdma_pd_(nullptr),
           group_size_(0), rank_in_group_(-1),
@@ -1159,6 +1162,7 @@ public:
             table_.assign((size_t)lanes, std::vector<int>{1, 2});
         } else {
             generate_poa_(n);
+            resolve_coding_layout_(k, m);
             init_encode_tables_();
         }
     }
@@ -1173,6 +1177,9 @@ public:
 
     // ---- POA query (existing) ----
     int n() const { return n_; }
+    int k() const { return k_; }
+    int m() const { return m_; }
+    int active_width() const { return k_ + m_; }
     int num_stripes() const { return (int)table_.size(); }
     int entry(int r, int c) const { return table_.at(r).at(c); }
     std::vector<int> row(int r) const { return table_.at(r); }
@@ -1466,10 +1473,10 @@ public:
     {
         if (stopped_)
             throw std::runtime_error("Concord decode: native runtime is stopped");
-        if (k <= 0 || k > 253 || block_size == 0 ||
+        if (k <= 0 || k > kRsMaxDataBlocks || block_size == 0 ||
             block_size > static_cast<size_t>(std::numeric_limits<int>::max()))
             throw std::runtime_error("Concord decode: invalid decode arguments");
-        if (lost_positions.empty() || lost_positions.size() > 2)
+        if (lost_positions.empty() || lost_positions.size() > static_cast<size_t>(m_))
             throw std::runtime_error("Concord decode: invalid lost position count");
         if (recovered_addrs.size() != lost_positions.size())
             throw std::runtime_error("Concord decode: lost position/output count mismatch");
@@ -2095,6 +2102,18 @@ public:
         return stripe_plans_[stripe_id].encoder_node_id;
     }
 
+    std::vector<int> get_parity_owner_node_ids(int stripe_id) const {
+        if (stripe_id < 0 || stripe_id >= (int)stripe_plans_.size())
+            throw std::runtime_error("Concord: invalid stripe_id");
+        return stripe_plans_[stripe_id].parity_owner_node_ids;
+    }
+
+    int get_parity_index_for_stripe(int stripe_id) const {
+        if (stripe_id < 0 || stripe_id >= (int)stripe_plans_.size())
+            throw std::runtime_error("Concord: invalid stripe_id");
+        return stripe_plans_[stripe_id].parity_index;
+    }
+
     int get_parity_target_node_id(int stripe_id) const {
         if (stripe_id < 0 || stripe_id >= (int)stripe_plans_.size())
             throw std::runtime_error("Concord: invalid stripe_id");
@@ -2302,20 +2321,33 @@ private:
                                      std::to_string(table_.size()));
     }
 
+    void resolve_coding_layout_(int k, int m) {
+        if (k < 0 && m < 0) {
+            k = n_ - 2;
+            m = 2;
+        } else if (k < 0) {
+            k = n_ - m;
+        } else if (m < 0) {
+            m = n_ - k;
+        }
+        if (k < 1 || m < 1 || k + m > n_ || k + m > 255 ||
+            k > kRsMaxDataBlocks || m > kRsMaxParityBlocks) {
+            throw std::runtime_error(
+                "Concord: invalid RS layout n=" + std::to_string(n_) +
+                " k=" + std::to_string(k) + " m=" + std::to_string(m));
+        }
+        k_ = k;
+        m_ = m;
+    }
+
     // ---- ISA-L RS encode table init ----
     void init_encode_tables_() {
-        if (n_ < 3 || n_ > kRsMaxDataBlocks + kRsMaxParityBlocks) {
-            throw std::runtime_error(
-                "Concord: RS coding requires n in [3," +
-                std::to_string(kRsMaxDataBlocks + kRsMaxParityBlocks) + "]");
-        }
-        int k = n_ - 2;       // data blocks per stripe
-        int rows = 2;         // parity blocks
-        int m = k + rows;     // total blocks per stripe (= n)
-        // RS matrix: m × k (matches ecnaive); top k rows are identity, bottom rows parity
-        a_mat_ = (unsigned char*)malloc((size_t)k * (size_t)m);
+        const int k = k_;
+        const int rows = m_;
+        const int total_rows = k + rows;
+        a_mat_ = (unsigned char*)malloc((size_t)k * (size_t)total_rows);
         if (!a_mat_) throw std::runtime_error("Concord: failed to alloc RS matrix");
-        gf_gen_rs_matrix(a_mat_, m, k);
+        gf_gen_rs_matrix(a_mat_, total_rows, k);
 
         // Encoding tables: 32 * k * rows (matches ecnaive)
         size_t gtbls_size = 32 * (size_t)k * (size_t)rows;
@@ -2336,7 +2368,7 @@ private:
     void init_decode_tables_(int k,
                              const std::vector<int>& survivor_positions,
                              const std::vector<int>& lost_positions) {
-        const int m_parity = 2;
+        const int m_parity = m_;
         const int full_rows = k + m_parity;
         if (k <= 0 || survivor_positions.size() != static_cast<size_t>(k))
             throw std::runtime_error("Concord decode table: survivor count mismatch");
@@ -3410,53 +3442,42 @@ public:
         push_mirror_task_(gpu_addr, cpu_addr, size);
     }
 
-    void encode_layer_stripes_batch(
+    void encode_layer_stripes_generic_batch(
         const std::vector<int>& stripe_ids,
         const std::vector<uintptr_t>& data_addrs,
-        const std::vector<uintptr_t>& p1_addrs,
-        const std::vector<uintptr_t>& p2_addrs,
+        const std::vector<uintptr_t>& parity_addrs,
         const std::vector<size_t>& block_sizes)
     {
-        const int n_src = n_ - 2;
         const size_t n_jobs = stripe_ids.size();
-        if (n_src <= 0 || n_jobs == 0) return;
-        if (n_jobs > std::numeric_limits<size_t>::max() / static_cast<size_t>(n_src) ||
-            data_addrs.size() != n_jobs * static_cast<size_t>(n_src) ||
-            p1_addrs.size() != n_jobs || p2_addrs.size() != n_jobs ||
+        if (n_jobs == 0) return;
+        if (n_jobs > std::numeric_limits<size_t>::max() / static_cast<size_t>(k_) ||
+            data_addrs.size() != n_jobs * static_cast<size_t>(k_) ||
+            parity_addrs.size() != n_jobs * static_cast<size_t>(m_) ||
             block_sizes.size() != n_jobs) {
             throw std::runtime_error("Concord layer batch encode: invalid argument sizes");
         }
-
         std::vector<std::vector<unsigned char*>> src_ptrs(n_jobs);
-        std::vector<std::array<unsigned char*, 2>> par_ptrs(n_jobs);
+        std::vector<std::vector<unsigned char*>> par_ptrs(n_jobs);
         std::vector<RsEncodeJob> jobs(n_jobs);
         for (size_t job_idx = 0; job_idx < n_jobs; ++job_idx) {
             const size_t block_size = block_sizes[job_idx];
-            if (block_size == 0 || block_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            if (block_size == 0 || block_size > static_cast<size_t>(std::numeric_limits<int>::max()))
                 throw std::runtime_error("Concord layer batch encode: invalid block size");
+            src_ptrs[job_idx].resize(static_cast<size_t>(k_));
+            par_ptrs[job_idx].resize(static_cast<size_t>(m_));
+            for (int i = 0; i < k_; ++i) {
+                const uintptr_t addr = data_addrs[job_idx * static_cast<size_t>(k_) + static_cast<size_t>(i)];
+                if (addr == 0) throw std::runtime_error("Concord layer batch encode: missing source block buffer");
+                src_ptrs[job_idx][static_cast<size_t>(i)] = reinterpret_cast<unsigned char*>(addr);
             }
-            if (p1_addrs[job_idx] == 0 || p2_addrs[job_idx] == 0) {
-                throw std::runtime_error("Concord layer batch encode: missing parity output buffer");
+            for (int i = 0; i < m_; ++i) {
+                const uintptr_t addr = parity_addrs[job_idx * static_cast<size_t>(m_) + static_cast<size_t>(i)];
+                if (addr == 0) throw std::runtime_error("Concord layer batch encode: missing parity output buffer");
+                par_ptrs[job_idx][static_cast<size_t>(i)] = reinterpret_cast<unsigned char*>(addr);
             }
-            src_ptrs[job_idx].resize(static_cast<size_t>(n_src));
-            for (int src_idx = 0; src_idx < n_src; ++src_idx) {
-                const size_t flat_idx = job_idx * static_cast<size_t>(n_src) +
-                    static_cast<size_t>(src_idx);
-                const uintptr_t addr = data_addrs[flat_idx];
-                if (addr == 0) {
-                    throw std::runtime_error("Concord layer batch encode: missing source block buffer");
-                }
-                src_ptrs[job_idx][static_cast<size_t>(src_idx)] =
-                    reinterpret_cast<unsigned char*>(addr);
-            }
-            par_ptrs[job_idx][0] = reinterpret_cast<unsigned char*>(p1_addrs[job_idx]);
-            par_ptrs[job_idx][1] = reinterpret_cast<unsigned char*>(p2_addrs[job_idx]);
-            jobs[job_idx] = RsEncodeJob{
-                static_cast<int>(block_size), n_src, 2, g_tbls_,
-                src_ptrs[job_idx].data(), par_ptrs[job_idx].data(),
-            };
+            jobs[job_idx] = RsEncodeJob{static_cast<int>(block_size), k_, m_, g_tbls_,
+                                        src_ptrs[job_idx].data(), par_ptrs[job_idx].data()};
         }
-
         const uint64_t wait_t0 = concord_now_us();
         std::lock_guard<std::mutex> lk(encoder_encode_mtx_);
         const uint64_t encode_t0 = concord_now_us();
@@ -3467,16 +3488,34 @@ public:
         save_encode_total_us_.fetch_add(concord_now_us() - encode_t0, std::memory_order_relaxed);
     }
 
+    void encode_layer_stripes_generic(
+        const std::vector<int>& stripe_ids, const std::vector<uintptr_t>& data_addrs,
+        const std::vector<uintptr_t>& parity_addrs, size_t block_size) {
+        encode_layer_stripes_generic_batch(
+            stripe_ids, data_addrs, parity_addrs,
+            std::vector<size_t>(stripe_ids.size(), block_size));
+    }
+
+    void encode_layer_stripes_batch(
+        const std::vector<int>& stripe_ids, const std::vector<uintptr_t>& data_addrs,
+        const std::vector<uintptr_t>& p1_addrs, const std::vector<uintptr_t>& p2_addrs,
+        const std::vector<size_t>& block_sizes) {
+        if (m_ != 2) throw std::runtime_error("Concord legacy encode API requires m=2");
+        std::vector<uintptr_t> parity_addrs;
+        parity_addrs.reserve(stripe_ids.size() * 2);
+        for (size_t i = 0; i < stripe_ids.size(); ++i) {
+            parity_addrs.push_back(p1_addrs.at(i));
+            parity_addrs.push_back(p2_addrs.at(i));
+        }
+        encode_layer_stripes_generic_batch(stripe_ids, data_addrs, parity_addrs, block_sizes);
+    }
+
     void encode_layer_stripes(
-        const std::vector<int>& stripe_ids,
-        const std::vector<uintptr_t>& data_addrs,
-        const std::vector<uintptr_t>& p1_addrs,
-        const std::vector<uintptr_t>& p2_addrs,
-        size_t block_size)
-    {
-        std::vector<size_t> block_sizes(stripe_ids.size(), block_size);
-        encode_layer_stripes_batch(
-            stripe_ids, data_addrs, p1_addrs, p2_addrs, block_sizes);
+        const std::vector<int>& stripe_ids, const std::vector<uintptr_t>& data_addrs,
+        const std::vector<uintptr_t>& p1_addrs, const std::vector<uintptr_t>& p2_addrs,
+        size_t block_size) {
+        encode_layer_stripes_batch(stripe_ids, data_addrs, p1_addrs, p2_addrs,
+                                   std::vector<size_t>(stripe_ids.size(), block_size));
     }
 
     void reset_ft_timing_stats() {
@@ -3756,6 +3795,8 @@ public:
 
     void submit_enc_recv_with_batch(int sid, uintptr_t recv, uintptr_t p1, uintptr_t p2, size_t bs,
                                     const std::vector<uint8_t>& mask, uint64_t batch) {
+        if (m_ != 2)
+            throw std::runtime_error("Concord legacy stripe worker API requires m=2");
         task_total_.fetch_add(1, std::memory_order_acq_rel);
         task_encode_total_.fetch_add(1, std::memory_order_acq_rel);
         { std::lock_guard<std::mutex> lk(enc_recv_mtx_); enc_recv_q_.push({sid, recv, p1, p2, bs, mask, batch}); }
@@ -3922,19 +3963,29 @@ public:
         return submit_async_p2_layer_with_batch(p2_addrs, bs, 0);
     }
 
+    std::vector<int> get_parity_route(int sid, int parity_index) const {
+        if (sid < 0 || sid >= (int)stripe_plans_.size())
+            throw std::runtime_error("Concord parity route: invalid stripe id");
+        if (parity_index < 0 || parity_index >= m_)
+            throw std::runtime_error("Concord parity route: invalid parity index");
+        const StripePlan& plan = stripe_plans_[(size_t)sid];
+        const int my_node = rank_in_group_ + 1;
+        const int owner_node = plan.parity_owner_node_ids[(size_t)parity_index];
+        if (my_node == plan.encoder_node_id) {
+            if (parity_index == 0) return {(int)StripeRole::ENCODER, -1, -1};
+            const int peer = owner_node - 1;
+            return {(int)StripeRole::ENCODER, peer, map_save_send_lane_(peer, sid)};
+        }
+        if (my_node == owner_node) {
+            const int peer = plan.encoder_node_id - 1;
+            return {(int)StripeRole::PARITY_TARGET, peer, map_save_recv_lane_(peer, sid)};
+        }
+        return {(int)StripeRole::INACTIVE, -1, -1};
+    }
+
     std::vector<int> get_p2_route(int sid) const {
-        if (sid < 0 || sid >= (int)stripe_info_.size())
-            throw std::runtime_error("Concord P2 route: invalid stripe id");
-        const int role = get_role_for_stripe(sid);
-        if (role == (int)StripeRole::ENCODER) {
-            const int peer = stripe_info_[(size_t)sid].par_peer_rig;
-            return {role, peer, map_save_send_lane_(peer, sid)};
-        }
-        if (role == (int)StripeRole::PARITY_TARGET) {
-            const int peer = stripe_info_[(size_t)sid].enc_peer_rig;
-            return {role, peer, map_save_recv_lane_(peer, sid)};
-        }
-        return {role, -1, -1};
+        if (m_ < 2) return {(int)StripeRole::INACTIVE, -1, -1};
+        return get_parity_route(sid, 1);
     }
 
     using AggregateP2Task = std::tuple<
@@ -4264,14 +4315,15 @@ public:
         return t.block_size == 0 && t.recv_buf == 0;
     }
 
-    static StripeRole role_for_node_in_row_(const std::vector<int>& row, int node_id, int n) {
+    StripeRole role_for_node_in_row_(const std::vector<int>& row, int node_id) const {
         auto it = std::find(row.begin(), row.end(), node_id);
         if (it == row.end())
             throw std::runtime_error("Concord recovery: node not in POA row");
         int pos = (int)std::distance(row.begin(), it);
-        if (pos < n - 2) return StripeRole::SOURCE;
-        if (pos == n - 2) return StripeRole::ENCODER;
-        return StripeRole::PARITY_TARGET;
+        if (pos < k_) return StripeRole::SOURCE;
+        if (pos == k_) return StripeRole::ENCODER;
+        if (pos < k_ + m_) return StripeRole::PARITY_TARGET;
+        return StripeRole::INACTIVE;
     }
 
     void compile_recovery_plans_single_(int failed_rank_node) {
@@ -4283,10 +4335,12 @@ public:
             if (it == row.end()) continue;
 
             int failed_pos = (int)std::distance(row.begin(), it);
-            int decoder_pos = (failed_pos + 1) % n_;
-            std::vector<int> helper_positions;
-            for (int i = 0; i < n_ - 3; ++i)
-                helper_positions.push_back((failed_pos + 2 + i) % n_);
+            if (failed_pos >= k_ + m_) continue;
+            std::vector<int> survivor_positions;
+            for (int offset = 1; offset < k_ + m_ && (int)survivor_positions.size() < k_; ++offset)
+                survivor_positions.push_back((failed_pos + offset) % (k_ + m_));
+            int decoder_pos = survivor_positions.front();
+            std::vector<int> helper_positions(survivor_positions.begin() + 1, survivor_positions.end());
 
             RecoveryStripePlan plan;
             plan.stripe_id = sid;
@@ -4299,16 +4353,15 @@ public:
                 plan.helper_positions.push_back(p);
                 plan.helper_nodes.push_back(row[p]);
             }
-            plan.survivor_positions = {decoder_pos};
-            plan.survivor_positions.insert(
-                plan.survivor_positions.end(),
-                helper_positions.begin(), helper_positions.end());
-            plan.original_role = (int)sp.role;
+            plan.survivor_positions = survivor_positions;
+            plan.original_role = (int)role_for_node_in_row_(row, failed_rank_node);
             recovery_plans_[sid] = std::move(plan);
         }
     }
 
     void compile_recovery_plans_dual_(const std::vector<int>& failed_nodes) {
+        if (k_ != n_ - 2 || m_ != 2)
+            throw std::runtime_error("Concord HW2 requires the default k=n-2, m=2 layout");
         std::set<int> failed_set(failed_nodes.begin(), failed_nodes.end());
         recovery_plans_.resize(stripe_plans_.size());
         for (const auto& sp : stripe_plans_) {
@@ -4331,7 +4384,7 @@ public:
                 RecoveryFailedTarget ft;
                 ft.failed_node = fn;
                 ft.failed_pos = fp;
-                ft.original_role = (int)role_for_node_in_row_(row, fn, n_);
+                ft.original_role = (int)role_for_node_in_row_(row, fn);
                 plan.failed_targets.push_back(ft);
             }
 
@@ -4431,7 +4484,7 @@ public:
         record_recovery_net_end_(t_recv_done);
         recovery_decoder_recv_us_.fetch_add(t_recv_done - t_recv, std::memory_order_relaxed);
 
-        int k = n_ - 2;
+        int k = k_;
         std::vector<uintptr_t> survivor_addrs;
         survivor_addrs.push_back(task.self_block);
         for (uintptr_t addr : task.helper_recv_bufs)
@@ -5095,25 +5148,25 @@ private:
             StripePlan plan;
             plan.stripe_id = sid;
             plan.row = poa_row;
-            plan.encoder_node_id = poa_row[n_ - 2];
-            plan.parity_target_node_id = poa_row[n_ - 1];
-            plan.source_node_ids.assign(poa_row.begin(), poa_row.begin() + (n_ - 2));
+            plan.encoder_node_id = poa_row[k_];
+            plan.source_node_ids.assign(poa_row.begin(), poa_row.begin() + k_);
+            plan.parity_owner_node_ids.assign(
+                poa_row.begin() + k_, poa_row.begin() + k_ + m_);
+            plan.parity_target_node_id = m_ > 1 ? poa_row[k_ + 1] : -1;
 
-            int my_node = rank_in_group_ + 1; // rank_in_group is 0-based, POA IDs are 1-based
-            if (my_node == plan.encoder_node_id) {
+            int my_node = rank_in_group_ + 1;
+            auto it = std::find(poa_row.begin(), poa_row.end(), my_node);
+            const int pos = static_cast<int>(std::distance(poa_row.begin(), it));
+            if (pos < k_) {
+                plan.role = StripeRole::SOURCE;
+            } else if (pos == k_) {
                 plan.role = StripeRole::ENCODER;
-            } else if (my_node == plan.parity_target_node_id) {
+                plan.parity_index = 0;
+            } else if (pos < k_ + m_) {
                 plan.role = StripeRole::PARITY_TARGET;
+                plan.parity_index = pos - k_;
             } else {
-                // Check if I'm a source
-                bool is_src = false;
-                for (int src : plan.source_node_ids) {
-                    if (src == my_node) { is_src = true; break; }
-                }
-                if (is_src) plan.role = StripeRole::SOURCE;
-                else throw std::runtime_error(
-                    "Concord: node " + std::to_string(my_node) +
-                    " not found in stripe " + std::to_string(sid));
+                plan.role = StripeRole::INACTIVE;
             }
             stripe_plans_.push_back(std::move(plan));
         }
@@ -5123,6 +5176,8 @@ private:
     // POA
     std::string poa_path_;
     int n_ = -1;
+    int k_ = -1;
+    int m_ = -1;
     std::vector<std::vector<int>> table_;
     unsigned char* a_mat_ = nullptr;  // ISA-L RS generator matrix (rows_ × k_)
     unsigned char* g_tbls_ = nullptr; // ISA-L RS encode tables (32*k_*rows_)
@@ -5256,11 +5311,15 @@ private:
 // ---------------------------------------------------------------------------
 PYBIND11_MODULE(concord_native, m) {
     py::class_<ConcordNative>(m, "ConcordNative")
-        .def(py::init<const std::string&>(), py::arg("poa_file_path"))
-        .def(py::init<int>(), py::arg("n"))
+        .def(py::init<const std::string&, int, int>(), py::arg("poa_file_path"),
+             py::arg("k") = -1, py::arg("m") = -1)
+        .def(py::init<int, int, int>(), py::arg("n"), py::arg("k") = -1, py::arg("m") = -1)
 
         // POA queries
         .def("n", &ConcordNative::n)
+        .def("k", &ConcordNative::k)
+        .def("m", &ConcordNative::m)
+        .def("active_width", &ConcordNative::active_width)
         .def("num_stripes", &ConcordNative::num_stripes)
         .def("entry", &ConcordNative::entry, py::arg("row"), py::arg("col"))
         .def("row", &ConcordNative::row, py::arg("row"))
@@ -5353,6 +5412,12 @@ PYBIND11_MODULE(concord_native, m) {
              py::arg("debug"))
         .def("mirror_layer", &ConcordNative::mirror_layer,
              py::arg("gpu_addr"), py::arg("cpu_addr"), py::arg("size"))
+        .def("encode_layer_stripes_generic", &ConcordNative::encode_layer_stripes_generic,
+             py::arg("stripe_ids"), py::arg("data_addrs"), py::arg("parity_addrs"),
+             py::arg("block_size"), py::call_guard<py::gil_scoped_release>())
+        .def("encode_layer_stripes_generic_batch", &ConcordNative::encode_layer_stripes_generic_batch,
+             py::arg("stripe_ids"), py::arg("data_addrs"), py::arg("parity_addrs"),
+             py::arg("block_sizes"), py::call_guard<py::gil_scoped_release>())
         .def("encode_layer_stripes", &ConcordNative::encode_layer_stripes,
              py::arg("stripe_ids"), py::arg("data_addrs"), py::arg("p1_addrs"),
              py::arg("p2_addrs"), py::arg("block_size"),
@@ -5425,6 +5490,10 @@ PYBIND11_MODULE(concord_native, m) {
              py::arg("stripe_id"))
         .def("get_encoder_node_id", &ConcordNative::get_encoder_node_id,
              py::arg("stripe_id"))
+        .def("get_parity_owner_node_ids", &ConcordNative::get_parity_owner_node_ids,
+             py::arg("stripe_id"))
+        .def("get_parity_index_for_stripe", &ConcordNative::get_parity_index_for_stripe,
+             py::arg("stripe_id"))
         .def("get_parity_target_node_id", &ConcordNative::get_parity_target_node_id,
              py::arg("stripe_id"))
 
@@ -5458,6 +5527,8 @@ PYBIND11_MODULE(concord_native, m) {
              py::arg("p2_addrs"), py::arg("block_size"))
         .def("submit_async_p2_layer_with_batch", &ConcordNative::submit_async_p2_layer_with_batch,
              py::arg("p2_addrs"), py::arg("block_size"), py::arg("batch_id"))
+        .def("get_parity_route", &ConcordNative::get_parity_route,
+             py::arg("stripe_id"), py::arg("parity_index"))
         .def("get_p2_route", &ConcordNative::get_p2_route, py::arg("stripe_id"))
         .def("submit_aggregate_p2", &ConcordNative::submit_aggregate_p2,
              py::arg("send_tasks"), py::arg("recv_tasks"), py::arg("generation"))

@@ -52,6 +52,7 @@ class StripeRole(IntEnum):
     HELPER = 3        # Sends stripe block to decoder
     DECODER = 4       # Receives, RS-decodes, sends to failed rank
     FAILED_RANK = 5   # Receives decoded blocks, assembles per-layer
+    INACTIVE = 6      # Outside the active k+m POA prefix
 
 
 @dataclass
@@ -63,6 +64,8 @@ class StripePlan:
     source_node_ids: List[int] = field(default_factory=list)
     encoder_node_id: int = -1
     parity_target_node_id: int = -1
+    parity_owner_node_ids: List[int] = field(default_factory=list)
+    parity_index: int = -1
 
 
 @dataclass
@@ -71,13 +74,28 @@ class LayerStripeBufs:
     layer_buf_gpu: torch.Tensor
     layer_mirror_cpu: torch.Tensor
     recv_bufs: List[Optional[torch.Tensor]]
-    parity1_bufs: List[Optional[torch.Tensor]]
-    parity2_bufs: List[Optional[torch.Tensor]]
+    parity_bufs: List[List[Optional[torch.Tensor]]]
     remote_layer_bufs: Dict[int, torch.Tensor] = field(default_factory=dict)
     zero_block: Optional[torch.Tensor] = None
     source_on_cpu: bool = False
     mirror_prefer_torch_pinned: bool = False
     mirror_buffer_kind: str = "host"
+
+    def get_parity_bufs(self, parity_index: int) -> List[Optional[torch.Tensor]]:
+        """Return per-stripe buffers for one parity index."""
+        return self.parity_bufs[parity_index]
+
+    @property
+    def parity1_bufs(self) -> List[Optional[torch.Tensor]]:
+        """Legacy alias for parity index 0."""
+        return self.parity_bufs[0]
+
+    @property
+    def parity2_bufs(self) -> List[Optional[torch.Tensor]]:
+        """Legacy alias for parity index 1."""
+        if len(self.parity_bufs) < 2:
+            return [None] * len(self.recv_bufs)
+        return self.parity_bufs[1]
 
 
 class ConcordManager:
@@ -105,6 +123,8 @@ class ConcordManager:
         self._full_buf: Optional[torch.Tensor] = None
         self.use_concord = False
         self.concord_n: Optional[int] = None
+        self.concord_k: Optional[int] = None
+        self.concord_m: Optional[int] = None
         self.concord_table_path: Optional[str] = None
         self.group_layout: Optional[Dict[str, int]] = None
         self.group_id: Optional[int] = None
@@ -122,6 +142,7 @@ class ConcordManager:
         self._layer_stripe_alloc_sizes: Dict[int, int] = {}
         # Legacy single-layer aliases (first allocated layer, for backward compat)
         self.recv_bufs: List[Optional[torch.Tensor]] = []
+        self.parity_bufs: List[List[Optional[torch.Tensor]]] = []
         self.parity1_bufs: List[Optional[torch.Tensor]] = []
         self.parity2_bufs: List[Optional[torch.Tensor]] = []
         # Keep old single-buffer names for backward compat (tests, legacy code)
@@ -163,7 +184,7 @@ class ConcordManager:
             raise RuntimeError(
                 f"Concord: block size not computed for layer_idx={layer_idx}"
             )
-        n_src = (self.concord_n - 1) * (self.concord_n - 2)
+        n_src = (self.concord_n - 1) * self.concord_k
         return n_src * bs
 
     def get_n_filled_for_node(self, layer_idx: int, node_id: int) -> int:
@@ -185,7 +206,7 @@ class ConcordManager:
         if self._layer_block_sizes is not None:
             return
         if not torch.distributed.is_initialized():
-            n_src = (self.concord_n - 1) * (self.concord_n - 2)
+            n_src = (self.concord_n - 1) * self.concord_k
             self._layer_block_sizes = {}
             for g in layer_groups:
                 sz = g.total_bytes
@@ -199,7 +220,7 @@ class ConcordManager:
                     )
             return
         ws = torch.distributed.get_world_size()
-        n_src = (self.concord_n - 1) * (self.concord_n - 2)
+        n_src = (self.concord_n - 1) * self.concord_k
         self._layer_block_sizes = {}
 
         # Collect layer_idx → total_bytes for all groups
@@ -265,6 +286,17 @@ class ConcordManager:
             )
         return bufs
 
+    def get_layer_parity_bufs(
+        self, layer_idx: int, parity_index: int
+    ) -> List[Optional[torch.Tensor]]:
+        """Return one parity-index container for a layer."""
+        return self.get_layer_stripe_bufs(layer_idx).get_parity_bufs(parity_index)
+
+    def get_parity_owner_node_id(self, stripe_id: int, parity_index: int) -> int:
+        """Return the POA node that owns a parity index."""
+        plan = self.stripe_plans[stripe_id]
+        return plan.parity_owner_node_ids[parity_index]
+
     def init_concord_if_enabled(self) -> None:
         """Load native .so, init RDMA, compile stripe plans."""
         from megatron.training import get_args
@@ -286,6 +318,7 @@ class ConcordManager:
         if _concord_debug_enabled():
             logger.debug("CONCORD init trace rank=%d: begin init_concord_if_enabled", rank)
         n = self._resolve_concord_n(args)
+        self._resolve_concord_coding(args, n)
         path = self._resolve_concord_table_path(args, n)
         if _concord_debug_enabled():
             logger.debug("CONCORD init trace rank=%d: resolved n=%d table=%s", rank, n, path)
@@ -443,6 +476,32 @@ class ConcordManager:
         self.concord_n = int(n)
         return self.concord_n
 
+    def _resolve_concord_coding(self, args, n: int) -> Tuple[int, int]:
+        """Resolve and validate the active RS(k, m) layout."""
+        k = getattr(args, "concord_k", None)
+        m = getattr(args, "concord_m", None)
+        if k is None and m is None:
+            k, m = n - 2, 2
+        elif k is None:
+            k = n - m
+        elif m is None:
+            m = n - k
+        k, m = int(k), int(m)
+        if k < 1 or m < 1 or k + m > n:
+            raise RuntimeError(
+                "Concord: coding dimensions must be positive and satisfy k + m <= n "
+                f"(n={n}, k={k}, m={m})."
+            )
+        self.concord_k, self.concord_m = k, m
+        return k, m
+
+    @property
+    def concord_active_width(self) -> int:
+        """Number of active POA columns."""
+        if self.concord_k is None or self.concord_m is None:
+            return 0
+        return self.concord_k + self.concord_m
+
     def _resolve_concord_table_path(self, args, n: int) -> str:
         explicit_path = getattr(args, "concord_table_path", None)
         if explicit_path:
@@ -520,7 +579,9 @@ class ConcordManager:
             spec.loader.exec_module(mod)
             if _concord_debug_enabled():
                 logger.debug("Concord: loaded native module from %s", so_path)
-            self._concord_native = mod.ConcordNative(poa_path)
+            self._concord_native = mod.ConcordNative(
+                poa_path, self.concord_k, self.concord_m
+            )
             self.concord_table_path = poa_path
             if _concord_debug_enabled():
                 logger.debug(
@@ -651,7 +712,7 @@ class ConcordManager:
                 )
             return
 
-        recv_total = (n - 2) * default_block_size
+        recv_total = self.concord_k * default_block_size
         self.data_buffer = torch.empty(default_block_size, dtype=torch.uint8, device="cuda")
         native.register_buffer(self.data_buffer.data_ptr(), self.data_buffer.numel())
 
@@ -684,10 +745,10 @@ class ConcordManager:
         ):
             return
 
-        n_src = (self.concord_n - 1) * (self.concord_n - 2)
+        n_src = (self.concord_n - 1) * self.concord_k
         layer_capacity = n_src * block_sz
         self._layer_stripe_alloc_sizes[layer_idx] = block_sz
-        recv_total = (self.concord_n - 2) * block_sz
+        recv_total = self.concord_k * block_sz
 
         native.set_require_registered_mr(True)
 
@@ -729,8 +790,9 @@ class ConcordManager:
                 self._rdma_registered_addrs.add(buf_addr)
 
         recv_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
-        parity1_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
-        parity2_bufs: List[Optional[torch.Tensor]] = [None] * self.num_stripes
+        parity_bufs: List[List[Optional[torch.Tensor]]] = [
+            [None] * self.num_stripes for _ in range(self.concord_m)
+        ]
         remote_layer_bufs: Dict[int, torch.Tensor] = {}
         my_node = self.rank_in_group + 1 if self.rank_in_group is not None else None
         recv_counts: Dict[int, int] = {}
@@ -761,44 +823,41 @@ class ConcordManager:
             r_slices = allocate_hugepage_slices(
                 recv_total, len(enc_indices), fallback_pin_memory=True
             )
-            p1_slices = allocate_hugepage_slices(
-                block_sz, len(enc_indices), fallback_pin_memory=True
-            )
-            p2_slices = allocate_hugepage_slices(
-                block_sz, len(enc_indices), fallback_pin_memory=True
-            )
             for slot, sid in enumerate(enc_indices):
                 recv_bufs[sid] = r_slices[slot]
-                parity1_bufs[sid] = p1_slices[slot]
-                parity2_bufs[sid] = p2_slices[slot]
-                for buf in (recv_bufs[sid], parity1_bufs[sid], parity2_bufs[sid]):
-                    addr = buf.data_ptr()
-                    if addr not in self._rdma_registered_addrs:
-                        native.register_buffer(addr, buf.numel())
-                        self._rdma_registered_addrs.add(addr)
+                addr = recv_bufs[sid].data_ptr()
+                if addr not in self._rdma_registered_addrs:
+                    native.register_buffer(addr, recv_bufs[sid].numel())
+                    self._rdma_registered_addrs.add(addr)
 
-        if par_indices:
-            p1_slices = allocate_hugepage_slices(
-                block_sz, len(par_indices), fallback_pin_memory=True
+        for parity_index in range(self.concord_m):
+            parity_indices = [
+                sid for sid, plan in enumerate(self.stripe_plans)
+                if plan.role == StripeRole.ENCODER
+                or (plan.role == StripeRole.PARITY_TARGET and plan.parity_index == parity_index)
+            ]
+            if not parity_indices:
+                continue
+            slices = allocate_hugepage_slices(
+                block_sz, len(parity_indices), fallback_pin_memory=True
             )
-            p2_slices = allocate_hugepage_slices(
-                block_sz, len(par_indices), fallback_pin_memory=True
-            )
-            for slot, sid in enumerate(par_indices):
-                parity1_bufs[sid] = p1_slices[slot]
-                parity2_bufs[sid] = p2_slices[slot]
-                for buf in (parity1_bufs[sid], parity2_bufs[sid]):
-                    addr = buf.data_ptr()
-                    if addr not in self._rdma_registered_addrs:
-                        native.register_buffer(addr, buf.numel())
-                        self._rdma_registered_addrs.add(addr)
+            for slot, sid in enumerate(parity_indices):
+                parity_bufs[parity_index][sid] = slices[slot]
+                addr = slices[slot].data_ptr()
+                if addr not in self._rdma_registered_addrs:
+                    native.register_buffer(addr, slices[slot].numel())
+                    self._rdma_registered_addrs.add(addr)
+
+        parity1_bufs = parity_bufs[0]
+        parity2_bufs = (
+            parity_bufs[1] if self.concord_m > 1 else [None] * self.num_stripes
+        )
 
         layer_bufs = LayerStripeBufs(
             layer_buf_gpu=layer_buf_gpu,
             layer_mirror_cpu=layer_mirror_cpu,
             recv_bufs=recv_bufs,
-            parity1_bufs=parity1_bufs,
-            parity2_bufs=parity2_bufs,
+            parity_bufs=parity_bufs,
             remote_layer_bufs=remote_layer_bufs,
             zero_block=zero_block,
             source_on_cpu=source_on_cpu,
@@ -809,6 +868,7 @@ class ConcordManager:
 
         if not self.recv_bufs:
             self.recv_bufs = recv_bufs
+            self.parity_bufs = parity_bufs
             self.parity1_bufs = parity1_bufs
             self.parity2_bufs = parity2_bufs
 
@@ -838,6 +898,8 @@ class ConcordManager:
                 source_node_ids=list(native.get_source_node_ids(sid)),
                 encoder_node_id=native.get_encoder_node_id(sid),
                 parity_target_node_id=native.get_parity_target_node_id(sid),
+                parity_owner_node_ids=list(native.get_parity_owner_node_ids(sid)),
+                parity_index=native.get_parity_index_for_stripe(sid),
             )
             self.stripe_plans.append(plan)
         if _concord_debug_enabled():
@@ -908,6 +970,9 @@ class ConcordManager:
     def get_runtime_layout(self) -> Dict[str, Any]:
         return {
             "n": self.concord_n,
+            "k": self.concord_k,
+            "m": self.concord_m,
+            "active_width": self.concord_active_width,
             "table_path": self.concord_table_path,
             "group_layout": self.group_layout,
             "group_id": self.group_id,
@@ -920,56 +985,60 @@ class ConcordManager:
     # ---- Hardware recovery ----
 
     @staticmethod
-    def _role_for_node_in_row(row: List[int], node_id: int, n: int) -> StripeRole:
+    def _role_for_node_in_row(
+        row: List[int], node_id: int, k: int, m: int
+    ) -> StripeRole:
         """Stripe role for a node id (1-based) in a POA row."""
         pos = row.index(node_id)
-        if pos < n - 2:
+        if pos < k:
             return StripeRole.SOURCE
-        if pos == n - 2:
+        if pos == k:
             return StripeRole.ENCODER
-        return StripeRole.PARITY_TARGET
+        if pos < k + m:
+            return StripeRole.PARITY_TARGET
+        return StripeRole.INACTIVE
 
     def _compile_recovery_plans(self, failed_rank_node: int) -> List[Dict]:
-        """For each stripe, compute recovery roles (DECODER/HELPER/FAILED_RANK)
-        given the failed rank's node id (1-based in the POA table).
-
-        The n-2 ranks cyclically to the right of the failed rank in each POA row
-        collaborate: 1st right = DECODER, remaining n-3 = HELPERS.
-        """
-        n = self.concord_n
+        """Compile HW1 plans using exactly k active survivors per stripe."""
+        k, active_width = self.concord_k, self.concord_active_width
         plans = []
         for sp in self.stripe_plans:
-            row = sp.row  # list of 1-based node IDs
-            sid = sp.stripe_id
-            try:
-                failed_pos = row.index(failed_rank_node)
-            except ValueError:
-                continue  # Failed rank not in this stripe (should not happen)
-
-            # n-2 right-side positions (cyclic)
-            decoder_pos = (failed_pos + 1) % n
-            helper_positions = [(failed_pos + 2 + i) % n for i in range(n - 3)]
-
-            decoder_node = row[decoder_pos]
-            helper_nodes = [row[p] for p in helper_positions]
-
+            row, sid = sp.row, sp.stripe_id
+            failed_pos = row.index(failed_rank_node)
+            if failed_pos >= active_width:
+                continue
+            survivor_positions = [
+                (failed_pos + offset) % active_width
+                for offset in range(1, active_width)
+            ][:k]
+            decoder_pos = survivor_positions[0]
+            helper_positions = survivor_positions[1:]
             plans.append({
                 'stripe_id': sid,
                 'dual_failure': False,
                 'failed_node': failed_rank_node,
                 'failed_pos': failed_pos,
-                'recovery_kind': 'data' if failed_pos < n - 2 else 'parity',
+                'recovery_kind': 'data' if failed_pos < k else 'parity',
                 'round_id': failed_pos,
-                'decoder_node': decoder_node,
+                'decoder_node': row[decoder_pos],
                 'decoder_pos': decoder_pos,
-                'helper_nodes': helper_nodes,
+                'helper_nodes': [row[p] for p in helper_positions],
                 'helper_positions': helper_positions,
-                'original_role': int(sp.role),
+                'survivor_positions': survivor_positions,
+                'original_role': int(
+                    self._role_for_node_in_row(
+                        row, failed_rank_node, self.concord_k, self.concord_m
+                    )
+                ),
             })
         return plans
 
     def _compile_recovery_plans_dual(self, failed_nodes: List[int]) -> List[Dict]:
         """Per-stripe dual-failure plan: helpers send once, decoder recovers both erasures."""
+        if (self.concord_k, self.concord_m) != (self.concord_n - 2, 2):
+            raise RuntimeError(
+                "Concord HW2 requires the default k=n-2, m=2 layout."
+            )
         if len(failed_nodes) != 2:
             raise RuntimeError(
                 f"Concord dual recovery requires exactly 2 failed nodes, got {failed_nodes}"
@@ -992,7 +1061,7 @@ class ConcordManager:
                     'failed_node': fn,
                     'failed_pos': fp,
                     'original_role': int(
-                        self._role_for_node_in_row(row, fn, n)
+                        self._role_for_node_in_row(row, fn, self.concord_k, self.concord_m)
                     ),
                 })
             survivor_positions = [i for i in range(n) if row[i] not in failed_set]
@@ -1035,7 +1104,7 @@ class ConcordManager:
         FAILED_RANK: recv buffer for each stripe's recovered block.
         """
         n = self.concord_n
-        num_helper = n - 3
+        num_helper = self.concord_k - 1
         ns = self.num_stripes
 
         self.recovery_helper_bufs = [None] * ns
@@ -1136,6 +1205,11 @@ class ConcordManager:
         # produces one failed rank per group, so many global ranks are legal
         # as long as no single group exceeds 2.
         for gid, ranks in all_groups_failed.items():
+            if len(ranks) == 2 and (self.concord_k, self.concord_m) != (self.concord_n - 2, 2):
+                raise RuntimeError(
+                    "Concord: two failures per group require the default k=n-2, m=2 layout "
+                    f"(group {gid}, ranks={ranks})."
+                )
             if len(ranks) > 2:
                 raise RuntimeError(
                     f"Concord: at most 2 failed ranks per POA group, "
@@ -1251,6 +1325,7 @@ class ConcordManager:
         self._layer_block_sizes = None
         self._layer_per_rank_bytes = None
         self.recv_bufs = []
+        self.parity_bufs = []
         self.parity1_bufs = []
         self.parity2_bufs = []
         if empty_cuda_cache and torch.cuda.is_available():
@@ -1299,6 +1374,7 @@ class ConcordManager:
         self._layer_stripe_alloc_sizes.clear()
         self._layer_block_sizes = None
         self.recv_bufs = []
+        self.parity_bufs = []
         self.parity1_bufs = []
         self.parity2_bufs = []
         self.data_buffer = None
@@ -1327,6 +1403,7 @@ class ConcordManager:
         self._layer_stripe_alloc_sizes.clear()
         self._layer_block_sizes = None
         self.recv_bufs = []
+        self.parity_bufs = []
         self.parity1_bufs = []
         self.parity2_bufs = []
         self.data_buffer = None

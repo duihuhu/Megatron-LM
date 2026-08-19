@@ -20,6 +20,28 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+TENSOR_BUFFER_ALIGNMENT_BYTES = 64
+
+
+def tensor_layout_size(tensor_infos) -> int:
+    """Return the byte span described by existing tensor offsets."""
+    return max((int(info.offset) + int(info.size_bytes) for info in tensor_infos), default=0)
+
+
+def assign_tensor_offsets(tensor_infos, alignment: int = TENSOR_BUFFER_ALIGNMENT_BYTES) -> int:
+    """Assign aligned byte offsets and return the resulting layout span."""
+    if alignment <= 0:
+        raise ValueError(f"Tensor buffer alignment must be positive, got {alignment}")
+
+    offset = 0
+    for info in tensor_infos:
+        element_size = int(getattr(info.dtype, "itemsize", 1))
+        tensor_alignment = max(int(alignment), element_size)
+        offset = ((offset + tensor_alignment - 1) // tensor_alignment) * tensor_alignment
+        info.offset = offset
+        offset += int(info.size_bytes)
+    return offset
+
 
 @dataclass
 class TensorInfo:
@@ -189,9 +211,7 @@ class DecomposedStateDict:
     def __post_init__(self):
         """Calculate total tensor size after initialization."""
         if self.total_tensor_size_bytes == 0:
-            self.total_tensor_size_bytes = sum(
-                info.size_bytes for info in self.tensor_infos
-            )
+            self.total_tensor_size_bytes = tensor_layout_size(self.tensor_infos)
     
     def get_statistics(self) -> Dict[str, Any]:
         """Get statistics about the decomposed state_dict.
@@ -297,16 +317,14 @@ def decompose_state_dict(
         tensor_infos = list(tensor_infos)
         tensor_data = list(tensor_data)
     
-    # Calculate offsets for reconstruction
-    offset = 0
-    for info in tensor_infos:
-        info.offset = offset
-        offset += info.size_bytes
+    # Calculate aligned offsets for reconstruction.
+    total_tensor_size_bytes = assign_tensor_offsets(tensor_infos)
     
     decomposed = DecomposedStateDict(
         non_tensor_data=non_tensor_data,
         tensor_infos=tensor_infos,
         tensor_data=tensor_data,
+        total_tensor_size_bytes=total_tensor_size_bytes,
         flat_key_roots=flat_key_roots,
     )
     
@@ -490,7 +508,8 @@ def unflatten_optimizer_fp32_params(reconstructed: Dict[str, Any]) -> bool:
 def organize_tensor_data_in_cpu_memory(
     tensor_data_list: List[torch.Tensor],
     use_continuous_buffer: bool = True,
-    pin_memory: bool = False
+    pin_memory: bool = False,
+    tensor_infos: Optional[List[TensorInfo]] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     """Organize tensor data in CPU memory for efficient encoding.
     
@@ -529,24 +548,31 @@ def organize_tensor_data_in_cpu_memory(
             result.append(tensor)
         return result
     
-    # Create a continuous buffer
-    total_size = sum(t.numel() * t.element_size() for t in tensor_data_list)
+    # Preserve tight packing for callers that do not provide metadata.
+    if tensor_infos is not None and len(tensor_infos) != len(tensor_data_list):
+        raise ValueError("tensor_infos and tensor_data_list must have the same length")
+    total_size = (
+        tensor_layout_size(tensor_infos)
+        if tensor_infos is not None
+        else sum(t.numel() * t.element_size() for t in tensor_data_list)
+    )
     
     # Allocate continuous buffer as bytes
     if pin_memory:
-        buffer = torch.empty(total_size, dtype=torch.uint8).pin_memory()
+        buffer = torch.zeros(total_size, dtype=torch.uint8).pin_memory()
     else:
-        buffer = torch.empty(total_size, dtype=torch.uint8)
+        buffer = torch.zeros(total_size, dtype=torch.uint8)
     
-    # Copy tensors into the buffer
+    # Copy tensors into the buffer.
     offset = 0
-    for tensor in tensor_data_list:
+    for index, tensor in enumerate(tensor_data_list):
         tensor_bytes = tensor.numel() * tensor.element_size()
         # View tensor as bytes and copy
         # Must flatten first, then view as uint8 to get a 1D byte array
         tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
-        buffer[offset:offset + tensor_bytes].copy_(tensor_flat)
-        offset += tensor_bytes
+        write_offset = tensor_infos[index].offset if tensor_infos is not None else offset
+        buffer[write_offset:write_offset + tensor_bytes].copy_(tensor_flat)
+        offset = write_offset + tensor_bytes
     
     logger.debug(
         f"Organized {len(tensor_data_list)} tensors into continuous buffer "

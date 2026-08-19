@@ -73,7 +73,9 @@ from .resharding import (
     restore_nd_flattened_tensors_formulation,
 )
 from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
-from .state_dict_decomposer import DecomposedStateDict, TensorMetadata
+from .state_dict_decomposer import (
+    DecomposedStateDict, TensorMetadata, assign_tensor_offsets, tensor_layout_size,
+)
 from time import time
 from time import sleep
 import struct
@@ -844,7 +846,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         # ===== Get own data size from metadata =====
         own_metadata = global_registry.rank_metadata.get(rank, [])
-        own_total_size = sum(meta.size_bytes for meta in own_metadata)
+        own_total_size = tensor_layout_size(own_metadata)
         
         if rank % 2 == 0:
             own_metadata_updated = [
@@ -859,7 +861,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             
         # ===== Get P2P partner's data size from metadata =====
         partner_metadata = global_registry.rank_metadata.get(p2p_partner_rank, [])
-        partner_total_size = sum(meta.size_bytes for meta in partner_metadata)
+        partner_total_size = tensor_layout_size(partner_metadata)
         
         # Update partner_metadata: set source_rank to p2p_partner_rank and target_rank to rank
         if rank % 2 == 0:
@@ -880,7 +882,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             all_total_bytes_list = []
             for r in range(world_size):
                 rank_metadata = global_registry.rank_metadata.get(r, [])
-                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                rank_total_size = tensor_layout_size(rank_metadata)
                 all_total_bytes_list.append(rank_total_size)
             
             # Compute maximum locally (all ranks have the same global_registry)
@@ -1368,17 +1370,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
         )
         
-        # Calculate offsets for tensor data
-        offset = 0
-        for info in tensor_infos:
-            info.offset = offset
-            offset += info.size_bytes
+        # Calculate aligned offsets for tensor data.
+        total_tensor_size_bytes = assign_tensor_offsets(tensor_infos)
         
         # Create decomposed structure
         self.decomposed_state_dict = DecomposedStateDict(
             non_tensor_data=non_tensor_data,
             tensor_infos=tensor_infos,
             tensor_data=tensor_data_list,
+            total_tensor_size_bytes=total_tensor_size_bytes,
         )
         
         # Log statistics
@@ -1577,11 +1577,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
         )
 
-        # Calculate offsets for tensor data
-        offset = 0
-        for info in tensor_infos:
-            info.offset = offset
-            offset += info.size_bytes
+        # Calculate aligned offsets for tensor data.
+        total_tensor_size_bytes = assign_tensor_offsets(tensor_infos)
 
         # Compute flat_key_roots from item keys (top-level checkpoint keys)
         flat_key_roots = set()
@@ -1599,6 +1596,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             non_tensor_data=non_tensor_data,
             tensor_infos=tensor_infos,
             tensor_data=tensor_data_list,
+            total_tensor_size_bytes=total_tensor_size_bytes,
             flat_key_roots=flat_key_roots,
         )
         
@@ -1672,7 +1670,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 rank_sizes = {}
                 for src_rank in source_ranks:
                     src_metadata = registry.rank_metadata.get(src_rank, [])
-                    src_size = sum(m.size_bytes for m in src_metadata)
+                    src_size = tensor_layout_size(src_metadata)
                     rank_sizes[src_rank] = src_size
 
                 logger.info(
@@ -1805,17 +1803,15 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
         )
         
-        # Calculate offsets for tensor data
-        offset = 0
-        for info in tensor_infos:
-            info.offset = offset
-            offset += info.size_bytes
+        # Calculate aligned offsets for tensor data.
+        total_tensor_size_bytes = assign_tensor_offsets(tensor_infos)
         
         # Create decomposed structure
         self.decomposed_state_dict = DecomposedStateDict(
             non_tensor_data=non_tensor_data,
             tensor_infos=tensor_infos,
             tensor_data=tensor_data_list,
+            total_tensor_size_bytes=total_tensor_size_bytes,
         )
         
         process_time = time() - start
@@ -1998,11 +1994,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
         )
         
-        # Calculate offsets for tensor data
-        offset = 0
-        for info in tensor_infos:
-            info.offset = offset
-            offset += info.size_bytes
+        # Calculate aligned offsets for tensor data.
+        total_tensor_size_bytes = assign_tensor_offsets(tensor_infos)
         
         # Create decomposed structure (reuse from ECCHECK if available, otherwise create new)
         if self.decomposed_state_dict is None:
@@ -2011,12 +2004,14 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 non_tensor_data=non_tensor_data,
                 tensor_infos=tensor_infos,
                 tensor_data=tensor_data_list,
+                total_tensor_size_bytes=total_tensor_size_bytes,
             )
         else:
             # Update existing decomposed_state_dict
             self.decomposed_state_dict.non_tensor_data = non_tensor_data
             self.decomposed_state_dict.tensor_infos = tensor_infos
             self.decomposed_state_dict.tensor_data = tensor_data_list
+            self.decomposed_state_dict.total_tensor_size_bytes = total_tensor_size_bytes
         
         process_time = time() - start
         
@@ -2164,7 +2159,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             return False
         
         # Check 5: Total size matches
-        calculated_size = sum(info.size_bytes for info in decomposed.tensor_infos)
+        calculated_size = tensor_layout_size(decomposed.tensor_infos)
         if calculated_size != decomposed.total_tensor_size_bytes:
             logger.warning(
                 f"EC-NAIVE: Size mismatch - calculated {calculated_size} bytes, "
@@ -2198,7 +2193,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         # ===== Get own data size from metadata =====
         own_metadata = global_registry.rank_metadata.get(rank, [])
-        own_total_size = sum(meta.size_bytes for meta in own_metadata)
+        own_total_size = tensor_layout_size(own_metadata)
         
         # ===== Calculate maximum data size across all ranks =====
         if torch.distributed.is_initialized():
@@ -2206,7 +2201,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             all_total_bytes_list = []
             for r in range(world_size):
                 rank_metadata = global_registry.rank_metadata.get(r, [])
-                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                rank_total_size = tensor_layout_size(rank_metadata)
                 all_total_bytes_list.append(rank_total_size)
             
             # Compute maximum locally (all ranks have the same global_registry)
@@ -2445,6 +2440,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 shape=info.shape,
                 dtype=str(info.dtype),
                 size_bytes=info.size_bytes,
+                offset=info.offset,
                 global_offset=info.global_offset if info.global_offset is not None else (),
                 shard_index=info.shard_index if info.shard_index is not None else 0,
                 chunk_type='data',
@@ -2507,7 +2503,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         logger.info(
             f"[Rank {my_rank}] Derived {len(local_metadata)} tensor metadata entries from sharded_state_dict\n"
-            f"  Total size: {sum(m.size_bytes for m in local_metadata) / (1024**3):.2f} GB"
+            f"  Total size: {tensor_layout_size(local_metadata) / (1024**3):.2f} GB"
         )
         
         return local_metadata, non_tensor_data
@@ -3740,15 +3736,15 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             
             # Calculate required buffer sizes from registry
             own_metadata = registry.rank_metadata.get(rank, [])
-            # own_total_size = sum(meta.size_bytes for meta in own_metadata)
+            # own_total_size = tensor_layout_size(own_metadata)
             partner_metadata = registry.rank_metadata.get(p2p_partner_rank, [])
-            # partner_total_size = sum(meta.size_bytes for meta in partner_metadata)
+            # partner_total_size = tensor_layout_size(partner_metadata)
             
             # Calculate maximum size across all ranks (for pipeline synchronization)
             all_total_bytes_list = []
             for r in range(world_size):
                 rank_metadata = registry.rank_metadata.get(r, [])
-                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                rank_total_size = tensor_layout_size(rank_metadata)
                 all_total_bytes_list.append(rank_total_size)
             max_total_bytes = max(all_total_bytes_list)
             
@@ -3793,7 +3789,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         else:
             paired_rank_for_recv = self._get_p2p_partner_rank(rank, world_size)
         metadata_in_peer = registry.rank_metadata.get(paired_rank_for_recv, [])
-        recv_total_size = sum(meta.size_bytes for meta in metadata_in_peer)
+        recv_total_size = tensor_layout_size(metadata_in_peer)
 
         recv_own_buffer = torch.empty(recv_total_size, dtype=torch.uint8)
 
@@ -3854,14 +3850,14 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # ===== Get own data size from metadata =====
         own_metadata = global_registry.rank_metadata.get(rank, [])
-        own_total_size = sum(meta.size_bytes for meta in own_metadata)
+        own_total_size = tensor_layout_size(own_metadata)
 
         # ===== Calculate maximum data size across all ranks =====
         if torch.distributed.is_initialized():
             all_total_bytes_list = []
             for r in range(world_size):
                 rank_metadata = global_registry.rank_metadata.get(r, [])
-                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                rank_total_size = tensor_layout_size(rank_metadata)
                 all_total_bytes_list.append(rank_total_size)
             max_total_bytes = max(all_total_bytes_list)
         else:
@@ -4009,6 +4005,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 # Fallback: sequential extraction (may cause mismatches if data order differs)
                 # logger.warning(f"EC-CHECK: [Rank {rank}] No tensor_infos with offset found, using sequential extraction (may cause mismatches)")
                 current_offset = 0
+                metadata_has_layout_offsets = any(
+                    int(getattr(meta, 'offset', 0)) != 0 for meta in local_metadata
+                )
                 
                 for meta in local_metadata:
                     # Convert dtype string to torch.dtype
@@ -4034,14 +4033,17 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                         device=torch.device('cpu'),
                         numel=numel,
                         size_bytes=meta.size_bytes,
-                        offset=current_offset,
+                        offset=(
+                            int(getattr(meta, 'offset', 0))
+                            if metadata_has_layout_offsets else current_offset
+                        ),
                         global_offset=meta.global_offset,
                         shard_index=meta.shard_index
                     )
                     tensor_infos.append(tensor_info)
                     
                     # Extract tensor from buffer
-                    start = current_offset
+                    start = tensor_info.offset
                     end = start + meta.size_bytes
                     if end > recv_own_buffer.numel():
                         logger.error(f"EC-CHECK: [Rank {rank}] Buffer overflow: end={end}, buffer_size={recv_own_buffer.numel()}")
@@ -4052,13 +4054,13 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     # Reshape to original tensor
                     # Optimized: Use view operations first (zero-copy), then clone only when dtype conversion is needed
                     try:
-                        # Convert uint8 buffer to target dtype and reshape
-                        # First view as target dtype, then reshape to original shape (view operations are zero-copy)
-                        tensor_view = tensor_bytes.view(dtype).reshape(meta.shape)
-                        # Clone is required because:
-                        # 1. dtype conversion from uint8 to target dtype requires data copy
-                        # 2. tensor needs to be writable for model loading
-                        tensor = tensor_view.clone()
+                        # Old metadata has only default zero offsets and used tightly packed
+                        # tensors. Clone bytes before dtype reinterpretation so an unaligned
+                        # sequential offset remains compatible with those checkpoints.
+                        if metadata_has_layout_offsets:
+                            tensor = tensor_bytes.view(dtype).reshape(meta.shape).clone()
+                        else:
+                            tensor = tensor_bytes.clone().view(dtype).reshape(meta.shape)
                         tensor_data.append(tensor)
                     except Exception as e:
                         logger.error(f"EC-CHECK: [Rank {rank}] Failed to reshape tensor {meta.key}: {e}")
@@ -5936,7 +5938,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         all_total_bytes_list = []
         for r in range(world_size):
             rank_metadata = registry.rank_metadata.get(r, [])
-            rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+            rank_total_size = tensor_layout_size(rank_metadata)
             all_total_bytes_list.append(rank_total_size)
         
         if len(all_total_bytes_list) == 0:
@@ -6038,7 +6040,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                     logger.error(f"EC-CHECK: [Rank {rank}] No source mmap available for sending")
                     return
                 send_rank_metadata = registry.rank_metadata.get(rank, [])
-                send_total_size = sum(meta.size_bytes for meta in send_rank_metadata)
+                send_total_size = tensor_layout_size(send_rank_metadata)
                 header_bytes = source_mmap[:32]
                 magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack('4sQQQ', header_bytes)
                 tensor_buffer_start_offset = 32 + non_tensor_size + tensor_keys_size
@@ -6432,18 +6434,18 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         
         # ===== Get own data size from metadata =====
         own_metadata = global_registry.rank_metadata.get(rank, [])
-        own_total_size = sum(meta.size_bytes for meta in own_metadata)
+        own_total_size = tensor_layout_size(own_metadata)
         
         # ===== Get P2P partner's data size from metadata =====
         partner_metadata = global_registry.rank_metadata.get(p2p_partner_rank, [])
-        partner_total_size = sum(meta.size_bytes for meta in partner_metadata)
+        partner_total_size = tensor_layout_size(partner_metadata)
         
         # ===== Calculate maximum data size across all ranks (for pipeline synchronization) =====
         if torch.distributed.is_initialized():
             all_total_bytes_list = []
             for r in range(world_size):
                 rank_metadata = global_registry.rank_metadata.get(r, [])
-                rank_total_size = sum(meta.size_bytes for meta in rank_metadata)
+                rank_total_size = tensor_layout_size(rank_metadata)
                 all_total_bytes_list.append(rank_total_size)
             max_total_bytes = max(all_total_bytes_list)
         else:

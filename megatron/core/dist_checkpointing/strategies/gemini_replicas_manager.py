@@ -16,6 +16,8 @@ from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 
 logger = getLogger(__name__)
 
+PORT_STEP = 100
+
 
 def _gemini_replicas_debug_enabled() -> bool:
     try:
@@ -79,12 +81,9 @@ class GeminiReplicasManager:
         # Target ranks for replicas (calculated based on round-robin)
         self.target_ranks: List[int] = []
         
-        # Replica data buffers (for received data from peers)
-        self.replica_buffers: List[torch.Tensor] = []
-        self.replica_metadata: List[dict] = []
-        
-        # Track registered buffers (for RDMA)
-        self.registered_buffers: Dict[int, Tuple[int, int]] = {}  # {buffer_addr: (size, iteration)}
+        # Python-side index of native RDMA registrations: address -> (size, marker).
+        # The marker is caller-managed; this manager does not advance it.
+        self.registered_buffers: Dict[int, Tuple[int, int]] = {}
         self.current_iteration: int = 0
 
         # In-process recovery-only workspace. It owns transport scratch buffers,
@@ -319,10 +318,10 @@ class GeminiReplicasManager:
         1. Send data to (num_replicas - 1) target ranks
         2. Receive data from ranks that have this rank as target
         
-        Port allocation strategy (for single-machine multi-GPU):
-        - Each rank allocates unique ports for each connection pair
-        - Port for rank_i -> rank_j: base_port + rank_i * world_size + rank_j
-        - This ensures no port conflicts on the same machine
+        Port allocation strategy:
+        - Rank ``r`` owns the range beginning at ``base_port + r * PORT_STEP``.
+        - ASIO listens on the first port in that range.
+        - RDMA channel ``c`` listens at ``base_port + r * PORT_STEP + c``.
         
         Args:
             rank (int): Current rank
@@ -342,13 +341,7 @@ class GeminiReplicasManager:
         # Step 1: Get base IP address (with multi-NIC per-rank support)
         base_ip = resolve_ip("GEMINI_REPLICAS", rank=rank)
 
-        # Step 2: Get base port.
-        # IMPORTANT: keep the whole listener range below the kernel ephemeral
-        # port range (net.ipv4.ip_local_port_range, default 32768-60999).
-        # Each rank owns 100 ports (base + rank*100); with 64 ranks the save
-        # range is base .. base+6407, so master_port+12000 (=18000) keeps it at
-        # 18000-24407, well clear of ephemeral ports that NCCL/gloo/torch grab
-        # at random and would otherwise steal a rank's fixed listener port.
+        # Step 2: Get the save-time base port.
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
         base_port = int(os.environ.get('GEMINI_REPLICAS_BASE_PORT', master_port + 12000))
         
@@ -366,22 +359,17 @@ class GeminiReplicasManager:
             if rank in src_targets:
                 source_ranks.append(src_rank)
         
-        # Step 4: Calculate ports (unique per connection pair for single-machine)
-        # Strategy: Each rank uses a unique base port range
-        # Rank i uses ports: base_port + i * 100 to base_port + i * 100 + 99
-        # This ensures no conflicts on single machine with reasonable world_size
-        
-        # My port range starts at: base_port + rank * 100
-        my_port_base = base_port + rank * 100
+        # Step 4: Reserve one fixed-size port range per rank.
+        my_port_base = base_port + rank * PORT_STEP
         channels_per_peer = self.channels_per_peer if self.use_rdma else 1
         if channels_per_peer < 1:
             raise ValueError(
                 f"Gemini Replicas: channels_per_peer must be >= 1, got {channels_per_peer}"
             )
-        if channels_per_peer > 100:
+        if channels_per_peer > PORT_STEP:
             raise ValueError(
                 f"Gemini Replicas: channels_per_peer ({channels_per_peer}) exceeds "
-                "the per-rank port range size (100)"
+                f"the per-rank port range size ({PORT_STEP})"
             )
         
         # Receive port: my_port_base (only one recv port for now, accepts connections sequentially)
@@ -391,13 +379,12 @@ class GeminiReplicasManager:
         # Send ports: connect to each target's recv port
         target_ports = []
         for target in target_ranks:
-            # Target's recv port is at: base_port + target * 100
-            port = base_port + target * 100
+            port = base_port + target * PORT_STEP
             target_ports.append(port)
         
         logger.debug(
             f"Gemini Replicas: [Rank {rank}] Port allocation:\n"
-            f"  My port range: {my_port_base} - {my_port_base + 99}\n"
+            f"  My port range: {my_port_base} - {my_port_base + PORT_STEP - 1}\n"
             f"  My recv port: {recv_port}\n"
             f"  Target ports: {target_ports}"
         )
@@ -562,7 +549,11 @@ class GeminiReplicasManager:
             
             # Get my recv port (all sources will connect to this port)
             recv_ports_list = list(net_config['recv_ports'].values())
-            my_recv_port = recv_ports_list[0] if recv_ports_list else net_config['base_port'] + rank * 100
+            my_recv_port = (
+                recv_ports_list[0]
+                if recv_ports_list
+                else net_config['base_port'] + rank * PORT_STEP
+            )
             
             # Calculate number of source ranks
             num_source_ranks = len(net_config['source_ranks'])
@@ -816,17 +807,12 @@ class GeminiReplicasManager:
         
         try:
             if _gemini_replicas_debug_enabled():
-                logger.info(f"Gemini Replicas: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
+                logger.info(f"Gemini Replicas: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (marker {self.current_iteration})")
             self._gemini_replicas_native.register_buffer(buffer_addr, buffer_size)
             self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
             if _gemini_replicas_debug_enabled():
                 logger.info(f"Gemini Replicas: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
             
-            # Print all registered buffers
-            if _gemini_replicas_debug_enabled():
-                logger.info(f"Gemini Replicas: [Rank {rank}] All registered buffers:")
-            # for addr, (size, iteration) in self.registered_buffers.items():
-            #     logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
         except Exception as e:
             logger.error(f"Gemini Replicas: [Rank {rank}] Failed to register buffer: {e}")
             raise
@@ -1175,11 +1161,7 @@ class GeminiReplicasManager:
         # ---- build recovery topology ----
         base_ip = resolve_ip("GEMINI_REPLICAS", rank=rank)
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
-        # Use a different base port to avoid conflicts with the save connections,
-        # but still keep it below the kernel ephemeral range (32768-60999) so
-        # random NCCL/gloo/torch sockets never steal a fixed listener port.
-        # master_port+18500 (=24500) gives a 24500-30907 range for 64 ranks,
-        # non-overlapping with the save range (18000-24407).
+        # Recovery uses a separately configurable base port.
         reco_base_port = int(os.environ.get(
             'GEMINI_REPLICAS_RECOVERY_BASE_PORT',
             master_port + 18500
@@ -1197,9 +1179,8 @@ class GeminiReplicasManager:
                 for r in range(world_size):
                     rank_ips[r] = base_ip
 
-        # Each rank listens on its own port: reco_base_port + rank * 100
-        # Senders connect to the TARGET's listen port
-        PORT_STEP = 100
+        # Each rank listens at the start of its recovery port range.
+        # Senders connect to the target rank's listener.
         recovery_channels = self.channels_per_peer if self.use_rdma else 1
         if recovery_channels > PORT_STEP:
             raise ValueError(
@@ -1307,8 +1288,6 @@ class GeminiReplicasManager:
 
         self.preallocated_cpu_buffer = None
         self.decomposed_state_dict = None
-        self.replica_buffers = []
-        self.replica_metadata = []
         self._cached_recv_buffers = {}
         self._recovery_workspace_buffers.clear()
         self._recovery_workspace_objects.clear()

@@ -1,15 +1,15 @@
 // Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
 /**
- * Gemini Replicas Native C++ Module with ASIO
- * 
- * Provides multi-replica data transfer using Boost.ASIO for network communication.
+ * Gemini Replicas Native C++ Module with ASIO and RDMA
+ *
+ * Provides multi-replica data transfer over ASIO sockets or RDMA verbs.
  * Supports configurable number of replicas with round-robin placement strategy.
  * 
  * Features:
  * - Multi-target broadcast (send to multiple ranks simultaneously)
- * - Asynchronous I/O for efficient network communication
- * - Zero-copy data transfer using raw memory pointers
+ * - Parallel blocking transfers across target connections
+ * - Direct access to caller-provided buffers, with staging when required
  * 
  * Build:
  *   bash build_gemini_replicas.sh
@@ -35,7 +35,6 @@
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
-#include <atomic>
 #include <sys/socket.h>
 
 // RDMA headers
@@ -45,7 +44,6 @@
 #include <cuda_runtime.h>
 #include <functional>
 #include <fstream>
-#include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -123,11 +121,11 @@ public:
     // RDMA-specific methods (no-op for ASIO)
     virtual void register_buffer(uintptr_t addr, size_t size) {}
     virtual void unregister_buffer(uintptr_t addr) {}
-    virtual void set_require_registered_mr(bool v) {}
+    virtual void set_require_registered_mr(bool required) {}
     virtual bool get_require_registered_mr() const { return false; }
     virtual void set_chunk_done_callback(ChunkDoneCb cb) {}
     virtual size_t send_channel_count() const { return 1; }
-    virtual void set_debug(bool debug) {}
+    virtual void set_debug(bool enabled) {}
     
     // Receive from a specific source rank (for RDMA to avoid unnecessary memcpy)
     virtual std::pair<int, size_t> receive_data_from_source(int source_rank, uint8_t* buffer, size_t buffer_size) {
@@ -248,7 +246,7 @@ public:
         start_acceptor();
     }
 
-    void set_debug(bool debug) override { debug_ = debug; }
+    void set_debug(bool enabled) override { debug_ = enabled; }
     
     void connect_and_wait() {
         // Phase 2: Connect to all targets and wait for all connections
@@ -260,8 +258,8 @@ public:
     
     void broadcast_to_targets(const uint8_t* data, size_t size) {
         /**
-         * Broadcast data to all target ranks simultaneously.
-         * Uses asynchronous writes for better performance.
+         * Broadcast data to all target ranks in parallel worker threads.
+         * Each thread performs blocking writes to one target socket.
          * 
          * Protocol: [source_rank(4 bytes)][size(8 bytes)][data]
          */
@@ -365,7 +363,7 @@ public:
         // Wait and get socket in one atomic operation
         std::unique_ptr<boost::asio::ip::tcp::socket> socket;
         
-        // Busy-wait loop with small sleep to avoid deadlock
+        // Poll the receive-socket pool until a connection is available.
         bool got_socket = false;
         while (!got_socket) {
             {
@@ -434,7 +432,7 @@ public:
     
     std::pair<int, size_t> receive_data(uint8_t* buffer, size_t buffer_size) {
         /**
-         * Receive data from one source rank (legacy method for compatibility).
+         * Receive data from the next available source rank.
          * This method gets the next available recv socket and reads from it.
          * For multiple sources, this should be called multiple times.
          * Socket is returned to the pool for reuse (not closed).
@@ -634,8 +632,7 @@ private:
             }
             
             io_context_.stop();
-            // Join the io_context thread (was detached before; now joined for clean shutdown
-            // and to ensure the port is fully released before any rebind).
+            // Join the io_context thread before releasing connection resources.
             if (io_thread_ && io_thread_->joinable()) {
                 io_thread_->join();
             }
@@ -812,7 +809,7 @@ public:
         cleanup();
     }
 
-    void set_debug(bool debug) override { debug_ = debug; }
+    void set_debug(bool enabled) override { debug_ = enabled; }
     
     void initialize_connections() override {
         if (debug_)
@@ -832,7 +829,7 @@ public:
             // Initialize RDMA resources
             init_rdma_resources();
 
-            // Start TCP listener via ASIO (matching eccheck pattern)
+            // Start the TCP control listener via ASIO.
             start_tcp_listener();
         } catch (...) {
             cleanup();
@@ -882,9 +879,7 @@ public:
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
         // Connect to target ranks (control channel + RDMA QP).
-        // IMPORTANT: wrap in try-catch so that accept_thread is joined
-        // even on failure — otherwise std::thread destructor calls
-        // std::terminate (same pattern as the old execute_exchange bug).
+        // Preserve the connection exception until all accept threads are joined.
         std::exception_ptr connect_exception = nullptr;
         try {
             for (size_t i = 0; i < send_target_ranks_.size(); ++i) {
@@ -925,8 +920,7 @@ public:
             std::cout << "[Rank " << rank_ << "] Waiting for all connections to be ready..." << std::endl;
         wait_for_connections();
 
-        // No warmup — matching eccheck. QPs are connected during
-        // exchange_and_connect and the first real data transfer validates them.
+        // QPs are ready after the control-plane connection exchange completes.
         if (debug_)
             std::cout << "[Rank " << rank_ << "] All RDMA connections established (no warmup)" << std::endl;
     }
@@ -966,18 +960,13 @@ public:
             std::cout << "[Rank " << rank_ << "] Unregistered buffer at 0x" << std::hex << addr << std::dec << std::endl;
     }
 
-    void set_require_registered_mr(bool v) override { require_registered_mr_ = v; }
+    void set_require_registered_mr(bool required) override { require_registered_mr_ = required; }
     bool get_require_registered_mr() const override { return require_registered_mr_; }
     ibv_pd* get_pd() const { return pd_; }
 
 private:
     size_t chunk_count_for_size(size_t total_size) const {
         return (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    }
-
-    size_t batch_bytes(size_t total_size, size_t batch_start, size_t batch_end) const {
-        size_t offset = batch_start * CHUNK_SIZE;
-        return std::min(total_size - offset, (batch_end - batch_start) * CHUNK_SIZE);
     }
 
     void wait_ready_ack(int sock, int target_rank) {
@@ -1122,11 +1111,6 @@ private:
         uint8_t* buffer, size_t total_size, ibv_mr* mr, ibv_qp* qp, int control_sock) {
         size_t chunk_count = post_receive_chunked(buffer, total_size, mr, qp);
         send_ready_ack(control_sock);
-        poll_completion(recv_cq_, chunk_count);
-    }
-
-    void receive_data_chunked(uint8_t* buffer, size_t total_size, ibv_mr* mr, ibv_qp* qp) {
-        size_t chunk_count = post_receive_chunked(buffer, total_size, mr, qp);
         poll_completion(recv_cq_, chunk_count);
     }
 
@@ -1481,100 +1465,6 @@ public:
     }
 
 private:
-    void warmup_rdma_connections() {
-        if (debug_)
-            std::cout << "[Rank " << rank_ << "] Warming up RDMA connections..." << std::endl;
-        
-        const size_t warmup_size = 1024;
-        std::vector<uint8_t> warmup_data(warmup_size, 0xAB);
-        
-        // Step 1: Post all receives first (to avoid deadlock)
-        if (debug_)
-            std::cout << "[Rank " << rank_ << "] Posting " << recv_qps_.size() << " warmup receives..." << std::endl;
-        for (size_t i = 0; i < recv_qps_.size(); ++i) {
-            try {
-                // Post receive for warmup data
-                ibv_sge sge;
-                sge.addr = reinterpret_cast<uint64_t>(temp_recv_buffer_.data() + i * warmup_size);
-                sge.length = warmup_size;
-                sge.lkey = temp_recv_mr_->lkey;
-                
-                ibv_recv_wr wr{};
-                wr.wr_id = i;
-                wr.sg_list = &sge;
-                wr.num_sge = 1;
-                
-                ibv_recv_wr* bad_wr = nullptr;
-                if (ibv_post_recv(recv_qps_[i], &wr, &bad_wr) != 0) {
-                    throw std::runtime_error("Failed to post warmup receive for source " + std::to_string(recv_source_ranks_[i]));
-                }
-                if (debug_)
-                    std::cout << "[Rank " << rank_ << "] Posted warmup receive for source " << recv_source_ranks_[i] << std::endl;
-            } catch (const std::exception& e) {
-                std::cerr << "[Rank " << rank_ << "] Failed to post warmup receive: " << e.what() << std::endl;
-                throw;
-            }
-        }
-        
-        // Step 2: Send warmup data to all targets
-        if (debug_)
-            std::cout << "[Rank " << rank_ << "] Sending " << send_qps_.size() << " warmup messages..." << std::endl;
-        for (size_t i = 0; i < send_qps_.size(); ++i) {
-            try {
-                std::memcpy(temp_send_buffer_.data() + i * warmup_size, warmup_data.data(), warmup_size);
-                
-                // Send warmup data
-                ibv_sge sge;
-                sge.addr = reinterpret_cast<uint64_t>(temp_send_buffer_.data() + i * warmup_size);
-                sge.length = warmup_size;
-                sge.lkey = temp_send_mr_->lkey;
-                
-                ibv_send_wr wr{};
-                wr.wr_id = i;
-                wr.sg_list = &sge;
-                wr.num_sge = 1;
-                wr.opcode = IBV_WR_SEND;
-                wr.send_flags = IBV_SEND_SIGNALED;
-                
-                ibv_send_wr* bad_wr = nullptr;
-                if (ibv_post_send(send_qps_[i], &wr, &bad_wr) != 0) {
-                    throw std::runtime_error("Failed to post warmup send to target " + std::to_string(target_ranks_[i]));
-                }
-                if (debug_)
-                    std::cout << "[Rank " << rank_ << "] Posted warmup send to target " << target_ranks_[i] << std::endl;
-            } catch (const std::exception& e) {
-                std::cerr << "[Rank " << rank_ << "] Failed to post warmup send: " << e.what() << std::endl;
-                throw;
-            }
-        }
-        
-        // Step 3: Wait for all sends to complete (with timeout, matching
-        // eccheck which has no warmup — failures here are non-fatal)
-        if (debug_)
-            std::cout << "[Rank " << rank_ << "] Waiting for " << send_qps_.size() << " send completions..." << std::endl;
-        try {
-            for (size_t i = 0; i < send_qps_.size(); ++i) {
-                poll_completion_timeout(send_cq_, 1, 5);  // 5 second timeout per completion
-                if (debug_)
-                    std::cout << "[Rank " << rank_ << "] Warmup send " << (i+1) << "/" << send_qps_.size() << " completed" << std::endl;
-            }
-
-            // Step 4: Wait for all receives to complete
-            if (debug_)
-                std::cout << "[Rank " << rank_ << "] Waiting for " << recv_qps_.size() << " receive completions..." << std::endl;
-            for (size_t i = 0; i < recv_qps_.size(); ++i) {
-                poll_completion_timeout(recv_cq_, 1, 5);
-                if (debug_)
-                    std::cout << "[Rank " << rank_ << "] Warmup receive " << (i+1) << "/" << recv_qps_.size() << " completed" << std::endl;
-            }
-            if (debug_)
-                std::cout << "[Rank " << rank_ << "] RDMA warmup complete" << std::endl;
-        } catch (const std::exception& e) {
-            std::cerr << "[Rank " << rank_ << "] Warmup timed out: " << e.what()
-                      << " — skipping (non-fatal, matches eccheck)" << std::endl;
-        }
-    }
-    
     void init_rdma_resources() {
         // Get RDMA device
         int num_devices;
@@ -2073,7 +1963,7 @@ private:
     }
 
     void poll_completion(ibv_cq* cq, int num_completions) {
-        // Tight spin on the hot path (matches basic_ec_native). No sleep between polls.
+        // Poll continuously because this is the transfer completion hot path.
         int polled = 0;
         while (polled < num_completions) {
             ibv_wc wc;
@@ -2248,13 +2138,9 @@ private:
     std::atomic<bool> initialized_{false};
 
     // ---- Worker-thread model (aligned with basic_ec) ----
-    // Persistent worker threads: one send_worker + one recv_worker per source.
-    // Main thread only submits tasks and polls atomic flags — never blocks on I/O.
-    //
-    // NOTE: Gemini uses single-slot atomics (not queues+sentinels) because
-    // there is only 1 send + N recv tasks per exchange.  basic_ec uses
-    // per-channel queues because it has many tasks per channel.  Our simpler
-    // model avoids the sentinel ordering issues seen with queues.
+    // Persistent worker threads: one send worker and one receive worker per source.
+    // The caller submits one task per worker for each exchange and waits on a
+    // condition variable for completion or an error.
 
     bool workers_started_{false};
     std::atomic<bool> stop_workers_{false};
@@ -2448,10 +2334,10 @@ public:
         stop();
     }
 
-    void set_debug(bool debug) {
-        debug_ = debug;
+    void set_debug(bool enabled) {
+        debug_ = enabled;
         if (connection_manager_) {
-            connection_manager_->set_debug(debug);
+            connection_manager_->set_debug(enabled);
         }
     }
 
@@ -2659,9 +2545,8 @@ public:
     }
     
     // ==================== Worker-thread model ====================
-    // Persistent workers handle I/O; main thread only submits + polls.
-    // send_failures are safely isolated from recv_failures (unlike the
-    // old per-exchange std::thread that could std::terminate on recv throw).
+    // Persistent workers handle I/O while the caller submits tasks and waits.
+    // Send and receive workers retain their errors for caller-side propagation.
 
     void start_workers(const std::vector<int>& source_ranks) {
         if (workers_started_) return;
@@ -3006,10 +2891,10 @@ public:
         return false;
     }
 
-    void set_require_registered_mr(bool v) {
-        require_registered_mr_ = v;
+    void set_require_registered_mr(bool required) {
+        require_registered_mr_ = required;
         if (connection_manager_)
-            connection_manager_->set_require_registered_mr(v);
+            connection_manager_->set_require_registered_mr(required);
     }
 
     /// Set GPU/CPU base addresses for per-batch mirroring.
@@ -3293,7 +3178,7 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
         .def("stop", &GeminiReplicasNative::stop,
              "Stop workers and release connection resources")
         .def("wait_for_exchange_completion", &GeminiReplicasNative::wait_for_exchange_completion,
-             "Block until all send/recv workers finish the current exchange (polls atomics, 5ms sleep)")
+             "Block on a condition variable until all current send/recv tasks complete or a worker reports an error")
         .def("reset_exchange_state", &GeminiReplicasNative::reset_exchange_state,
              "Reset per-exchange flags for the next exchange")
         .def("is_initialized", &GeminiReplicasNative::is_initialized,
@@ -3306,7 +3191,7 @@ PYBIND11_MODULE(gemini_replicas_native, m) {
              "Get list of target ranks")
         .def("set_debug", &GeminiReplicasNative::set_debug,
              py::arg("debug"),
-             "Enable detailed Gemini Replicas native logging")
+             "Enable detailed Gemini Replicas native diagnostic logging")
         .def("register_buffer", &GeminiReplicasNative::register_buffer,
              py::arg("buffer_addr"),
              py::arg("buffer_size"),

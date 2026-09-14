@@ -10,11 +10,10 @@ from logging import getLogger
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from dataclasses import replace
 
 from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
 from .state_dict_decomposer import (
-    GlobalMetadataRegistry, TensorMetadata, tensor_layout_size,
+    GlobalMetadataRegistry, tensor_layout_size,
 )
 from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 
@@ -264,10 +263,10 @@ class ECCHECKManager:
         return group_id + num_groups * physical_rig
 
     def _get_xor_paired_rank(self, my_rank: int, world_size: int) -> int:
-        """Get the paired rank for parity exchange (XOR pairing within group).
+        """Get the paired rank for parity exchange within an EC group.
 
         Multi-rank: world_size must be divisible by 4. Each group of 4 ranks uses
-        same pairing as original 4-rank: in-group 0<->2, 1<->3 (by position).
+        the rig0<->rig2 and rig1<->rig3 pairing.
         """
         if world_size % RANKS_PER_GROUP != 0:
             raise ValueError(
@@ -275,7 +274,7 @@ class ECCHECKManager:
             )
         group_id = self._get_group_id(my_rank, world_size)
         rank_in_group = self._get_rank_in_group(my_rank, world_size)
-        # In-group XOR pairing: position 0<->2, 1<->3
+        # Pair rig0 with rig2 and rig1 with rig3.
         paired_rank_in_group = (rank_in_group + 2) % RANKS_PER_GROUP
         paired_rank = self._get_rank_by_group_position(
             group_id, paired_rank_in_group, world_size
@@ -289,9 +288,7 @@ class ECCHECKManager:
     def get_p2p_partner_rank(self, my_rank: int, world_size: int) -> int:
         """Get P2P partner rank for data/parity exchange.
 
-        Group-based pairing, same grouping as XOR:
-        - rank_in_group 0 <-> 1 (P2P pair)
-        - rank_in_group 2 <-> 3 (P2P pair)
+        Group-based pairing uses rig0<->rig1 and rig2<->rig3.
         """
         if world_size % 2 != 0:
             raise ValueError(f"EC-CHECK: World size must be even for P2P pairing, got {world_size}")
@@ -311,10 +308,10 @@ class ECCHECKManager:
         return p2p_partner_rank
 
     def get_recovery_partner_rank_for_rank1_software(self, my_rank: int, world_size: int) -> int:
-        """Get recovery partner for rank_in_group=1 software failure.
+        """Get the recovery partner when rig1 has a software failure.
 
-        Within the same EC group, rank_in_group 0 sends to rank_in_group 1.
-        Returns -1 for rank_in_group 2/3 (not participating).
+        Within the same EC group, rig0 sends to rig1. Rig2 and rig3 do not
+        participate and return -1.
         """
         if world_size < 4 or world_size % 4 != 0:
             raise ValueError(
@@ -330,7 +327,7 @@ class ECCHECKManager:
 
     def _get_eccheck_network_config(self, rank: int, world_size: int) -> dict:
         """
-        Get network configuration for EC-CHECK ASIO connections.
+        Get network configuration for EC-CHECK socket-based transports.
         
         This function:
         1. Gets base IP address (from ECCHECK_BASE_IP env var, MASTER_ADDR, or auto-detect)
@@ -370,8 +367,8 @@ class ECCHECKManager:
             'xor_recv': base_port + rank * 6 + 1,
             'p2p_send': base_port + rank * 6 + 2,
             'p2p_recv': base_port + rank * 6 + 3,
-            'step6_p2p_send': base_port + rank * 6 + 4,  # rank3 uses this to send to rank2
-            'step6_p2p_recv': base_port + rank * 6 + 5,   # rank2 uses this to receive from rank3
+            'step6_p2p_send': base_port + rank * 6 + 4,  # rig3 sends to rig2
+            'step6_p2p_recv': base_port + rank * 6 + 5,  # rig2 receives from rig3
         }
         
         # Step 4: Get partner ranks
@@ -561,7 +558,7 @@ class ECCHECKManager:
                     # For P2P: rank 0 sends to rank 1's recv port, rank 1 sends to rank 0's recv port
                     xor_partner = self._get_xor_paired_rank(rank, world_size)
                     p2p_partner = self.get_p2p_partner_rank(rank, world_size)
-                    # rank_in_group=1 software failure: use recovery partner (same EC group 0<->1) so 8-rank gets (0->2),(1->3); 4-rank unchanged
+                    # For a rig1 software failure, use the rig0<->rig1 recovery pair.
                     try:
                         from megatron.training import get_args as _get_args
                         _args = _get_args()
@@ -583,8 +580,8 @@ class ECCHECKManager:
                     xor_partner_recv_port = base_port + xor_partner * 6 + 1  # partner's xor_recv port
                     p2p_partner_recv_port = base_port + p2p_partner * 6 + 3  # partner's p2p_recv port
                     
-                    # Step6 P2P: rank_in_group 3 sends to rank_in_group 2 in same group
-                    # rank_in_group 2 listens on step6_p2p_recv port (multi-rank: per-group)
+                    # In Step 6, rig3 sends to rig2 in the same EC group.
+                    # Rig2 listens on its group-specific Step 6 receive port.
                     group_id = self._get_group_id(rank, world_size)
                     rank_in_group = self._get_rank_in_group(rank, world_size)
                     rank_ips = net_config.get('rank_ips', {})
@@ -619,7 +616,7 @@ class ECCHECKManager:
                         net_config['p2p_partner_ip'], p2p_partner_recv_port,
                         net_config['my_ip'], net_config['ports']['p2p_recv'],
                         # Step6 P2P connections: (partner_ip, partner_recv_port, my_ip, my_recv_port)
-                        # Only rank2/3 use these (rank2 recv, rank3 send)
+                        # Only rig2 and rig3 use these endpoints.
                         step6_p2p_partner_ip, step6_p2p_send_port,
                         step6_p2p_listen_ip, step6_p2p_recv_port,
                         self.use_rdma,
@@ -638,16 +635,16 @@ class ECCHECKManager:
                     logger.debug(f"EC-CHECK: [Rank {rank}] Using NCCL for communication")
                     
                     # ===== Step 1: Rank 0 generates four NCCL IDs =====
-                    # thread1: for rank0↔rank2 XOR communication
-                    # thread2: for rank1↔rank3 XOR communication
-                    # p2p_0_1: for rank0↔rank1 P2P communication
-                    # p2p_2_3: for rank2↔rank3 P2P communication
+                    # lane0 carries rig0<->rig2 XOR traffic.
+                    # lane1 carries rig1<->rig3 XOR traffic.
+                    # p2p_0_1 carries rig0<->rig1 P2P traffic.
+                    # p2p_2_3 carries rig2<->rig3 P2P traffic.
                     if rank == 0:
                         # Generate NCCL IDs using module-level function (no instance needed)
-                        nccl_id_thread1 = eccheck_native.generate_nccl_id()  # rank0↔rank2
-                        nccl_id_thread2 = eccheck_native.generate_nccl_id()  # rank1↔rank3
-                        nccl_id_p2p_0_1 = eccheck_native.generate_nccl_id()  # rank0↔rank1
-                        nccl_id_p2p_2_3 = eccheck_native.generate_nccl_id()  # rank2↔rank3
+                        nccl_id_thread1 = eccheck_native.generate_nccl_id()  # lane0: rig0<->rig2
+                        nccl_id_thread2 = eccheck_native.generate_nccl_id()  # lane1: rig1<->rig3
+                        nccl_id_p2p_0_1 = eccheck_native.generate_nccl_id()  # rig0<->rig1
+                        nccl_id_p2p_2_3 = eccheck_native.generate_nccl_id()  # rig2<->rig3
                         logger.debug(f"EC-CHECK: [Rank 0] Generated four NCCL IDs (size: {len(nccl_id_thread1)} bytes each)")
                     else:
                         # Other ranks prepare empty lists (will be filled by broadcast)
@@ -707,10 +704,10 @@ class ECCHECKManager:
                     p2p_partner_rank = self.get_p2p_partner_rank(rank, world_size)
                     self._eccheck_native = eccheck_native.ECCHECKNative(
                         rank, world_size, paired_rank,
-                        nccl_id_thread1,    # rank0↔rank2 XOR
-                        nccl_id_thread2,    # rank1↔rank3 XOR
-                        nccl_id_p2p_0_1,   # rank0↔rank1 P2P
-                        nccl_id_p2p_2_3,   # rank2↔rank3 P2P
+                        nccl_id_thread1,    # lane0: rig0<->rig2 XOR
+                        nccl_id_thread2,    # lane1: rig1<->rig3 XOR
+                        nccl_id_p2p_0_1,   # rig0<->rig1 P2P
+                        nccl_id_p2p_2_3,   # rig2<->rig3 P2P
                         rank_in_group,
                         p2p_partner_rank,
                     )
@@ -743,8 +740,8 @@ class ECCHECKManager:
         """Initialize EC-CHECK buffers during C++ module initialization.
         
         Note: Only allocates data and encoding buffers at initialization.
-        Receive and parity buffers will be allocated after metadata exchange,
-        when peer data sizes are known.
+        Receive buffers are deferred until peer sizes are known. Parity scratch
+        buffers are allocated here with the data and encoding pools.
         """
         rank = torch.distributed.get_rank()
         logger.debug("EC-CHECK: Initializing buffers for EC-CHECK (data and encoding only)")
@@ -830,7 +827,7 @@ class ECCHECKManager:
         pipelined operations where each data chunk needs 2 parity buffers (one per thread).
         """
         # Use encoding buffer count instead of data buffer count
-        # Each data chunk needs 2 parity buffers (thread1 and thread2)
+        # The pool count matches the encoding pool; buffers are reused by both lanes.
         parity_buffer_count = self.eccheck_encoding_buffers_count
         logger.debug(f"EC-CHECK: Allocating parity buffers ({parity_buffer_count} buffers)")
         
@@ -857,7 +854,6 @@ class ECCHECKManager:
         for data_addr in data_buffers:
             try:
                 self._free_data_buffer_queue.put_nowait(data_addr)
-                # logger.info(f"EC-CHECK: Released data buffer at address {data_addr}")
             except Exception:
                 logger.error(f"EC-CHECK: Data buffer queue is full, cannot release buffer {data_addr}")
         
@@ -866,7 +862,6 @@ class ECCHECKManager:
         for encoding_addr in encoding_buffers:
             try:
                 self._free_encoding_buffer_queue.put_nowait(encoding_addr)
-                # logger.info(f"EC-CHECK: Released encoding buffer at address {encoding_addr}")
             except Exception:
                 logger.error(f"EC-CHECK: Encoding buffer queue is full, cannot release buffer {encoding_addr}")
         
@@ -1020,9 +1015,9 @@ class ECCHECKManager:
     def get_eccheck_buffers(self):
         """Get EC-CHECK buffers for FileSystemWriterAsync.
         
-        Note: Returns data, encoding, and parity buffers.
-        Receive buffers will be allocated by FileSystemWriterAsync
-        after metadata exchange.
+        Returns the data, encoding, and parity pools plus their release queues.
+        Receive buffers are mode-specific and allocated separately after metadata
+        exchange.
         
         Returns:
             Dict containing all buffer information, or None if not initialized
@@ -1040,7 +1035,7 @@ class ECCHECKManager:
             # Pass buffer poller control objects
             'buffer_poller_active_event': self._buffer_poller_active_event,
             'poll_and_release_buffers': self._poll_and_release_buffers,
-            # Note: recv_encoding_buffers will be allocated by FileSystemWriterAsync after metadata exchange
+            # Receive buffers are allocated separately after metadata exchange.
         }
     
     def allocate_recv_encoding_buffers_phase2(
@@ -1064,7 +1059,7 @@ class ECCHECKManager:
             global_registry (GlobalMetadataRegistry): Complete metadata from all ranks
             
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Two receive buffers (one for thread1, one for thread2)
+            Tuple[torch.Tensor, torch.Tensor]: Logical receive buffers for lane0 and lane1.
         """
         if hw1_single_physical_buffer and hw2_single_physical_buffer:
             raise ValueError("HW1 and HW2 receive-buffer modes are mutually exclusive")
@@ -1132,14 +1127,14 @@ class ECCHECKManager:
             fallback_pin_memory=self.eccheck_pin_memory,
             touch_pages=True,
         )
-        recv_buffer_thread1 = physical_buffers[0]
-        recv_buffer_thread2 = physical_buffers[-1]
+        recv_buffer_lane0 = physical_buffers[0]
+        recv_buffer_lane1 = physical_buffers[-1]
 
         if single_physical_buffer:
             mode = "HW1" if hw1_single_physical_buffer else "HW2"
             logger.debug(
                 "EC-CHECK receive layout: mode=%s physical=1 logical=2 "
-                "aligned_size=%d alias=lane1:lane2",
+                "aligned_size=%d alias=lane0:lane1",
                 mode,
                 aligned_size,
             )
@@ -1149,7 +1144,7 @@ class ECCHECKManager:
                 f"({aligned_size / (1024**2):.0f} MB each)"
             )
 
-        recv_buffers = (recv_buffer_thread1, recv_buffer_thread2)
+        recv_buffers = (recv_buffer_lane0, recv_buffer_lane1)
         if hw1_single_physical_buffer:
             self.eccheck_hw1_recv_encoding_buffers = recv_buffers
         elif hw2_single_physical_buffer:
@@ -1208,10 +1203,6 @@ class ECCHECKManager:
             self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
             logger.debug(f"EC-CHECK: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
             
-            # Print all registered buffers
-            logger.debug(f"EC-CHECK: [Rank {rank}] All registered buffers:")
-            # for addr, (size, iteration) in self.registered_buffers.items():
-            #     logger.info(f"  - 0x{addr:x}: {size / (1024**2):.2f} MB (iteration {iteration})")
         except Exception as e:
             logger.error(f"EC-CHECK: [Rank {rank}] Failed to register buffer: {e}")
             raise
@@ -1233,10 +1224,8 @@ class ECCHECKManager:
             return
         
         try:
-            # logger.info(f"EC-CHECK: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
             self._eccheck_native.unregister_buffer(buffer_addr)
             del self.registered_buffers[buffer_addr]
-            # logger.info(f"EC-CHECK: [Rank {rank}] Buffer unregistered successfully")
         except Exception as e:
             logger.error(f"EC-CHECK: [Rank {rank}] Failed to unregister buffer: {e}")
     
@@ -1253,17 +1242,17 @@ class ECCHECKManager:
         
         # Register data buffers
         if self.eccheck_data_buffers:
-            for i, buffer in enumerate(self.eccheck_data_buffers):
+            for buffer in self.eccheck_data_buffers:
                 self.register_buffer(buffer)
         
         # Register encoding buffers
         if self.eccheck_encoding_buffers:
-            for i, buffer in enumerate(self.eccheck_encoding_buffers):
+            for buffer in self.eccheck_encoding_buffers:
                 self.register_buffer(buffer)
         
         # Register parity buffers
         if self.eccheck_parity_buffers:
-            for i, buffer in enumerate(self.eccheck_parity_buffers):
+            for buffer in self.eccheck_parity_buffers:
                 self.register_buffer(buffer)
         
         # Register each physical receive buffer once across all mode caches.
@@ -1312,7 +1301,6 @@ class ECCHECKManager:
                 logger.debug(f"EC-CHECK: [Rank {rank}] Unregistering all RDMA buffers...")
                 for buffer_addr in list(self.registered_buffers.keys()):
                     try:
-                        # logger.info(f"EC-CHECK: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x} during cleanup")
                         self._eccheck_native.unregister_buffer(buffer_addr)
                     except Exception as e:
                         logger.warning(f"EC-CHECK: [Rank {rank}] Failed to unregister buffer during cleanup: {e}")

@@ -15,9 +15,7 @@ from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
 )
 from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     DecomposedStateDict,
-    GlobalMetadataRegistry,
     TensorMetadata,
-    decompose_state_dict,
     decompose_state_dict_for_save,
     extract_tensors_from_continuous_buffer,
     reconstruct_state_dict,
@@ -1399,86 +1397,6 @@ def _load_basic_ec_main_payload(
     )
 
 
-def _load_blocks_from_disk(checkpoint_dir: Path, rank: int) -> Dict[str, torch.Tensor]:
-    from megatron.training.legacy_io_utils import (
-        is_raw_format, read_raw_block, MAGIC_BLOCK, pin_uint8_tensor_if_available,
-    )
-    blocks: Dict[str, torch.Tensor] = {}
-    for block_name in ("data0", "recv_parity1", "recv_parity0", "recv_data1"):
-        block_path = checkpoint_dir / f"basic_ec_block_rank{rank}_{block_name}.pt"
-        if not block_path.is_file():
-            block_path = checkpoint_dir / f"ecnaive_block_rank{rank}_{block_name}.pt"
-        if not block_path.is_file():
-            raise FileNotFoundError(f"BasicEC legacy: missing block file {block_path}")
-        if is_raw_format(str(block_path), MAGIC_BLOCK):
-            blocks[block_name] = read_raw_block(
-                str(block_path), MAGIC_BLOCK, pin_tensor=True,
-            )
-        else:
-            payload = torch.load(block_path, map_location="cpu", weights_only=False)
-            blocks[block_name] = pin_uint8_tensor_if_available(
-                payload["tensor"].contiguous().view(torch.uint8)
-            )
-    return blocks
-
-
-def _decode_data0_to_linear_first_half(
-    data0: torch.Tensor,
-    pipeline_total_bytes: int,
-    basic_ec_buffer_size: int,
-) -> torch.Tensor:
-    """Invert legacy encode layout: recover tensor_buffer[0:half_total) from data0."""
-    half_total = pipeline_total_bytes // 2
-    out = torch.zeros(half_total, dtype=torch.uint8, device=data0.device)
-    src_pos = 0
-    data0_offset = 0
-    block_elems = data0.numel()
-    while src_pos < half_total:
-        remaining_in_out = half_total - src_pos
-        take = min(basic_ec_buffer_size, remaining_in_out)
-        aligned = ((data0_offset + 63) // 64) * 64
-        if aligned + take > block_elems:
-            logger.warning("BasicEC legacy load: data0 exhausted during decode")
-            break
-        out[src_pos : src_pos + take].copy_(data0[aligned : aligned + take])
-        data0_offset = aligned + take
-        src_pos += take
-    return out
-
-
-def _reconstruct_state_dict_from_main_and_data0(
-    main_payload: Dict[str, Any],
-    data0_uint8: torch.Tensor,
-    manager: BasicECManager,
-    flat_key_roots: Optional[Set[str]] = None,
-) -> Dict[str, Any]:
-    tensor_infos = main_payload["tensor_infos"]
-    non_tensor_data = main_payload["non_tensor_data"]
-    pipeline_total_bytes = int(main_payload["pipeline_total_bytes"])
-    actual_tensor_size = int(main_payload["actual_tensor_size"])
-
-    half_linear = _decode_data0_to_linear_first_half(
-        data0_uint8,
-        pipeline_total_bytes=pipeline_total_bytes,
-        basic_ec_buffer_size=manager.basic_ec_buffer_size,
-    )
-    buf_len = max(pipeline_total_bytes, actual_tensor_size)
-    full_buf = torch.zeros(buf_len, dtype=torch.uint8, device=half_linear.device)
-    n = min(half_linear.numel(), buf_len)
-    full_buf[:n].copy_(half_linear[:n])
-
-    tensor_data = extract_tensors_from_continuous_buffer(full_buf, tensor_infos)
-    decomposed = DecomposedStateDict(
-        non_tensor_data=non_tensor_data,
-        tensor_infos=tensor_infos,
-        tensor_data=tensor_data,
-        flat_key_roots=flat_key_roots or set(),
-    )
-    result = reconstruct_state_dict(decomposed)
-    unflatten_optimizer_fp32_params(result)
-    return result
-
-
 def _reconstruct_full_state_dict_from_main_tensor_buffer(
     main_payload: Dict[str, Any],
     flat_key_roots: Optional[Set[str]] = None,
@@ -1553,37 +1471,6 @@ def _load_basic_ec_block_file(
     )
 
 
-def _decode_data_block(
-    block: torch.Tensor,
-    pipeline_total_bytes: int,
-    block_idx: int,
-    block_data_size: int,
-    basic_ec_buffer_size: int,
-) -> torch.Tensor:
-    """Decode one padded data block into its linear segment of tensor_buffer.
-
-    During save, data block j covers bytes [j*block_data_size, (j+1)*block_data_size)
-    of the original tensor.  The block is written with 64-byte alignment between
-    basic_ec_buffer_size chunks.
-    """
-    start_byte = block_idx * block_data_size
-    end_byte = min(start_byte + block_data_size, pipeline_total_bytes)
-    actual = max(0, end_byte - start_byte)
-    out = torch.zeros(actual, dtype=torch.uint8, device=block.device)
-    src_pos = 0
-    block_offset = 0
-    while src_pos < actual:
-        take = min(basic_ec_buffer_size, actual - src_pos)
-        aligned = ((block_offset + 63) // 64) * 64
-        if aligned + take > block.numel():
-            logger.warning("BasicEC: data block %d exhausted during decode", block_idx)
-            break
-        out[src_pos : src_pos + take].copy_(block[aligned : aligned + take])
-        block_offset = aligned + take
-        src_pos += take
-    return out
-
-
 def _decode_block_direct(
     padded_block: torch.Tensor,
     output: torch.Tensor,
@@ -1595,8 +1482,7 @@ def _decode_block_direct(
 ) -> None:
     """Decode a padded block directly into output buffer at dst_offset.
 
-    Avoids the intermediate tensor allocation + torch.cat that
-    _decode_data_block + concatenation would incur.
+    Writes decoded bytes into the final output buffer without an intermediate tensor.
     """
     start_byte = block_idx * block_data_size
     end_byte = min(start_byte + block_data_size, pipeline_total_bytes)
@@ -1622,7 +1508,6 @@ def _load_basic_ec_legacy_software_failure(
     world_size: int,
     manager: BasicECManager,
     main_payload: Dict[str, Any],
-    global_registry: GlobalMetadataRegistry,
     timings: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """BasicEC legacy load software failure path (generalized for any k >= 2).
@@ -1635,8 +1520,8 @@ def _load_basic_ec_legacy_software_failure(
     If *timings* dict is provided, it will be populated with:
       prep_copy, network_encode, rebuild_sd (all in seconds; total excludes prep_copy).
     """
-    from time import time as _time
-    _t = timings if timings is not None else {}
+    from time import time
+    timing_data = timings if timings is not None else {}
 
     native = manager._basic_ec_native
     if native is None:
@@ -1665,8 +1550,8 @@ def _load_basic_ec_legacy_software_failure(
         aligned_block_size = max(aligned_block_size, block_data_size)
 
     block_files_legacy = main_payload.get("_block_files_legacy", None)
-    from megatron.training import get_args as _get_args
-    args = _get_args()
+    from megatron.training import get_args
+    args = get_args()
     inprocess_cache = bool(
         getattr(args, "ft_inprocess_recovery_benchmark", False)
         and getattr(args, "_ft_inprocess_recovery_active", False)
@@ -1773,19 +1658,19 @@ def _load_basic_ec_legacy_software_failure(
             send_block_idx = block_idx
 
     # Sync all ranks after setup so network timing excludes setup skew.
-    _t['barrier'] = _timed_barrier() if world_size > 1 else 0.0
+    timing_data['barrier'] = _timed_barrier() if world_size > 1 else 0.0
 
     # === timing: network/encode (ASIO send/recv only) ===
-    _t0_net = _time()
+    network_start = time()
     if rank_in_group == failed_rig:
         for idx, buf in enumerate(recv_blocks):
             native.sw_recv_data(idx, int(buf.data_ptr()), buf.numel())
     elif send_block is not None:
         native.sw_send_data(send_block_idx, int(send_block.data_ptr()), send_block.numel())
-    _t['network_encode'] = _time() - _t0_net
+    timing_data['network_encode'] = time() - network_start
     native_timing = _native_ft_timing(native)
-    _t['net_s'] = native_timing['net_s']
-    _t.setdefault('encode_s', native_timing['encode_s'])
+    timing_data['net_s'] = native_timing['net_s']
+    timing_data.setdefault('encode_s', native_timing['encode_s'])
 
     # Decode recv blocks → tensor_buffer (not timed)
     if rank_in_group == failed_rig:
@@ -1814,7 +1699,7 @@ def _load_basic_ec_legacy_software_failure(
     if rank_in_group != failed_rig and not isinstance(
         main_payload.get("tensor_buffer"), torch.Tensor
     ):
-        t_prep = _time()
+        t_prep = time()
         main_payload = _load_basic_ec_main_payload_local(
             checkpoint_dir, rank, load_tensor_buffer=True
         )
@@ -1822,10 +1707,10 @@ def _load_basic_ec_legacy_software_failure(
             raise FileNotFoundError(
                 f"BasicEC legacy sw: missing main payload for rank {rank} under {checkpoint_dir}"
             )
-        prep_copy_s = _time() - t_prep
-    _t['prep_copy'] = prep_copy_s
+        prep_copy_s = time() - t_prep
+    timing_data['prep_copy'] = prep_copy_s
 
-    t_rebuild = _time()
+    t_rebuild = time()
     if rank_in_group == failed_rig:
         if actual_tensor_size > 0:
             tensor_buffer = tensor_buffer[:actual_tensor_size]
@@ -1842,7 +1727,7 @@ def _load_basic_ec_legacy_software_failure(
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
-    _t['rebuild_sd'] = _time() - t_rebuild
+    timing_data['rebuild_sd'] = time() - t_rebuild
 
     prebenchmark_software_load = bool(
         getattr(args, "ft_inprocess_recovery_benchmark", False)
@@ -1859,15 +1744,11 @@ def _load_basic_ec_legacy_software_failure(
                 "released temporary RDMA registrations"
             )
 
-    # NOTE: the old standalone else clause for ranks 0,1 (k=2) is absorbed into
-    # the generalized else branch above.
-    # barrier at end of rebuild_sd is handled by the caller (load_basic_ec_legacy_checkpoint).
-
-    # NOTE: do not call manager.cleanup() here in the software failure path.
-    # cleanup() calls native.stop() which tears down C++ resources, and the
-    # subsequent reference drop triggers the C++ destructor (double-free on the
-    # software-only RDMA channel).  The process exits shortly after load,
-    # so leaving cleanup to __del__ is safe.
+    # The caller owns the shared manager and performs the final synchronization.
+    # This path must not stop or clean up the manager: its native channels and any
+    # registered recovery buffers are shared with later checkpoint operations.
+    # Explicit application shutdown remains responsible for calling cleanup();
+    # relying only on interpreter finalization does not guarantee orderly teardown.
 
     return state_dict
 
@@ -1940,37 +1821,25 @@ def load_basic_ec_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     if manager._basic_ec_native is None:
         raise RuntimeError("BasicEC native module is not available in legacy load path")
 
-    tensor_infos = main_payload["tensor_infos"]
-    local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
-    if world_size > 1 and torch.distributed.is_initialized():
-        gathered_meta: List[Any] = [None for _ in range(world_size)]
-        torch.distributed.all_gather_object(gathered_meta, local_metadata)
-        rank_metadata = {i: gathered_meta[i] for i in range(world_size)}
-    else:
-        rank_metadata = {0: local_metadata}
-
-    global_registry = GlobalMetadataRegistry(rank_metadata=rank_metadata, rank_non_tensor_data={})
-
     # ---- Software failure fast path ----
     if sw_failure_requested:
         logger.debug("BasicEC legacy: software failure recovery path")
-        _t: Dict[str, float] = {'prep_copy': 0.0}
+        timing_data: Dict[str, float] = {'prep_copy': 0.0}
         state_dict = _load_basic_ec_legacy_software_failure(
             checkpoint_dir=checkpoint_dir,
             rank=rank,
             world_size=world_size,
             manager=manager,
             main_payload=main_payload,
-            global_registry=global_registry,
-            timings=_t,
+            timings=timing_data,
         )
-        _t['total'] = (
-            _t.get('network_encode', 0.0)
-            + _t.get('rebuild_sd', 0.0)
+        timing_data['total'] = (
+            timing_data.get('network_encode', 0.0)
+            + timing_data.get('rebuild_sd', 0.0)
         )
         from megatron.training.global_vars import set_ft_load_timing_context
-        set_ft_load_timing_context("BasicEC", "SW", _t)
-        load_log = dict(_t)
+        set_ft_load_timing_context("BasicEC", "SW", timing_data)
+        load_log = dict(timing_data)
         load_log["mode"] = "SW"
         logger.debug(
             "BasicEC load timing (%(mode)s local): e2e_s=%(total).2fs "
@@ -2248,7 +2117,6 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
     # Source ranks: first k survivors that send ALL blocks for recovery
     source_ranks = survivors_in_group[:basic_ec_k] if len(survivors_in_group) >= basic_ec_k else survivors_in_group
     is_source = rank in source_ranks
-    source_set = set(source_ranks)
 
     def _block_sizes_for_holder(holder_rank: int) -> List[int]:
         holder_rig = manager._get_rank_in_group(holder_rank, world_size)
@@ -2438,8 +2306,8 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
             pass
 
     # === timing: network/encode (C++ send/recv + RS decode only) ===
-    _t: Dict[str, float] = {'prep_copy': 0.0}
-    _t0_net = time.time()
+    timing_data: Dict[str, float] = {'prep_copy': 0.0}
+    network_start = time.time()
 
     # ── Pipeline: SOURCE ranks send all n blocks to each failed rank ──
     if affected_group and not is_failed and is_source:
@@ -2488,26 +2356,26 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
         native.submit_send_sentinels(num_channels)
         native.submit_recv_sentinels(num_channels)
         native.wait_for_encoding_completion()
-        _t['network_encode'] = time.time() - _t0_net
+        timing_data['network_encode'] = time.time() - network_start
 
         t_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
-        _t['rebuild_sd'] = time.time() - t_rebuild
+        timing_data['rebuild_sd'] = time.time() - t_rebuild
 
     elif affected_group and not is_failed and not is_source:
         # Survivor but not selected as source: no-op on channels
         native.submit_send_sentinels(num_channels)
         native.submit_recv_sentinels(num_channels)
         native.wait_for_encoding_completion()
-        _t['network_encode'] = time.time() - _t0_net
+        timing_data['network_encode'] = time.time() - network_start
 
         t_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
-        _t['rebuild_sd'] = time.time() - t_rebuild
+        timing_data['rebuild_sd'] = time.time() - t_rebuild
 
     elif affected_group and is_failed:
         # ═══════════════════════════════════════════════════════════════
@@ -2550,7 +2418,7 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
             native.submit_send_sentinels(num_channels)
             native.submit_recv_sentinels(num_channels)
             native.wait_for_encoding_completion()
-            _t['network_recv'] = time.time() - _t0_net
+            timing_data['network_recv'] = time.time() - network_start
 
             decode_t0 = time.time()
             recovered: Dict[str, torch.Tensor] = {}
@@ -2632,13 +2500,13 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
                         int(parity1.data_ptr()),
                         block_data_size,
                     )
-                    _t['encode_s'] = max(_t.get('encode_s', 0.0), time.time() - t0_encode)
+                    timing_data['encode_s'] = max(timing_data.get('encode_s', 0.0), time.time() - t0_encode)
                     if need_parity0:
                         recovered[f'recv_{basic_ec_k - 1}_ref'] = parity0
                     if need_parity1:
                         recovered[f'recv_{basic_ec_k}_ref'] = parity1
                 owner_idx += 1
-            _t['decode_s'] = time.time() - decode_t0
+            timing_data['decode_s'] = time.time() - decode_t0
         else:
             # Continuous checkpoints use stripe-sized scratch buffers and copy directly
             # into the final tensor buffer. This avoids full-block recovered/parity pools.
@@ -2664,8 +2532,8 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
             native.submit_send_sentinels(num_channels)
             native.submit_recv_sentinels(num_channels)
             native.wait_for_encoding_completion()
-            _t['network_recv'] = time.time() - _t0_net
-            _t['decode_s'] = decode_s
+            timing_data['network_recv'] = time.time() - network_start
+            timing_data['decode_s'] = decode_s
             recovered = {}
             logger.debug(
                 "BasicEC hw recovery: rank %d streamed %d recv/decode stripes "
@@ -2673,7 +2541,7 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
                 rank, n_stripes, stripe_bytes, block_data_size,
             )
 
-        _t['network_encode'] = time.time() - _t0_decode
+        timing_data['network_encode'] = time.time() - _t0_decode
 
         # Copy recovered refs to pre-allocated store buffers (not timed)
         for _name in ['own_data0', 'my_data1'] + [
@@ -2708,7 +2576,7 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
                 tensor_buffer[d0.numel():d0.numel() + end].copy_(d1[:end])
         if actual_tensor_size > 0:
             tensor_buffer = tensor_buffer[:actual_tensor_size]
-        _t['prep_copy'] = _t.get('prep_copy', 0.0) + (time.time() - t_prep)
+        timing_data['prep_copy'] = timing_data.get('prep_copy', 0.0) + (time.time() - t_prep)
 
         t_rebuild = time.time()
         # Debug: compare RS-recovered tensor_buffer with main_payload
@@ -2762,7 +2630,7 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
                 flat_key_roots=flat_key_roots,
             )
 
-        _t['rebuild_sd'] = time.time() - t_rebuild
+        timing_data['rebuild_sd'] = time.time() - t_rebuild
         logger.debug(
             f"BasicEC hw recovery: rank {rank} recovered via encode_ec_blocks "
             f"(k={basic_ec_k}, n={basic_ec_n})"
@@ -2775,28 +2643,28 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
         native.submit_send_sentinels(num_channels)
         native.submit_recv_sentinels(num_channels)
         native.wait_for_encoding_completion()
-        _t['network_encode'] = time.time() - _t0_net
+        timing_data['network_encode'] = time.time() - network_start
 
         t_rebuild = time.time()
         state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
             main_payload, flat_key_roots=flat_key_roots,
         )
-        _t['rebuild_sd'] = time.time() - t_rebuild
+        timing_data['rebuild_sd'] = time.time() - t_rebuild
 
-    _t['barrier'] = barrier_s
+    timing_data['barrier'] = barrier_s
     native_timing = _native_ft_timing(native)
-    _t['net_s'] = native_timing['net_s']
-    _t.setdefault('encode_s', native_timing['encode_s'])
-    _t.setdefault('decode_s', _t.get('decode_s', _t['encode_s']))
-    _t['total'] = (
-        _t.get('network_encode', 0.0)
-        + _t.get('rebuild_sd', 0.0)
+    timing_data['net_s'] = native_timing['net_s']
+    timing_data.setdefault('encode_s', native_timing['encode_s'])
+    timing_data.setdefault('decode_s', timing_data.get('decode_s', timing_data['encode_s']))
+    timing_data['total'] = (
+        timing_data.get('network_encode', 0.0)
+        + timing_data.get('rebuild_sd', 0.0)
     )
     from megatron.training.global_vars import set_ft_load_timing_context
     recovery_mode = "HW2" if max(len(ranks) for ranks in group_failures.values()) == 2 else "HW1"
-    set_ft_load_timing_context("BasicEC", recovery_mode, _t)
+    set_ft_load_timing_context("BasicEC", recovery_mode, timing_data)
 
-    load_log = dict(_t)
+    load_log = dict(timing_data)
     load_log["mode"] = recovery_mode
     logger.debug(
         "BasicEC load timing (%(mode)s local): e2e_s=%(total).2fs "
@@ -2812,9 +2680,10 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
         except Exception:
             pass
 
-    # NOTE: do not call manager.cleanup() or native.stop() here.
-    # The C++ destructor double-frees RDMA resources used during RS decode.
-    # The process exits shortly after load, so leaving cleanup to __del__ is safe.
+    # The caller owns the shared manager, so this recovery operation must not stop
+    # or clean it up. Native channels and registered workspace buffers remain valid
+    # for subsequent checkpoint operations. Explicit application shutdown must call
+    # manager.cleanup(); interpreter finalization alone cannot guarantee teardown order.
 
     return state_dict
 
@@ -2822,7 +2691,6 @@ def load_basic_ec_legacy_checkpoint_hardware_recovery(
 def save_basic_ec_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str, write_to_disk: bool = True
 ) -> None:
-    t0 = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -2831,7 +2699,6 @@ def save_basic_ec_legacy_checkpoint(
     if manager._basic_ec_native is None:
         raise RuntimeError("BasicEC native module is not available in legacy save path")
 
-    t0 = time.time()
     decomposed, save_copy_s, save_flatten_s, decompose_s = decompose_state_dict_for_save(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
     logger.debug(
@@ -2839,7 +2706,6 @@ def save_basic_ec_legacy_checkpoint(
         save_copy_s, save_flatten_s, decompose_s,
     )
 
-    t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), manager.basic_ec_buffer_size)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer

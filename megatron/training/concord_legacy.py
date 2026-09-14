@@ -56,18 +56,9 @@ def _timing_max_dict(timings: Dict[str, float]) -> Dict[str, float]:
     return {key: _timing_max(value) for key, value in timings.items()}
 
 
-def _timed_barrier() -> float:
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return 0.0
-    start = time.time()
-    torch.distributed.barrier()
-    return time.time() - start
-
-
-_async_p1_writer_thread: Optional[threading.Thread] = None
-_async_p2_writer_thread: Optional[threading.Thread] = None
+_async_aggregate_parity_writer_thread: Optional[threading.Thread] = None
 _async_writer_error: Optional[BaseException] = None
-_p2_save_generation: int = 0
+_aggregate_parity_save_generation: int = 0
 _recovery_async_parity_submitted: bool = False
 _recovery_async_parity_thread: Optional[threading.Thread] = None
 _recovery_async_parity_error: Optional[BaseException] = None
@@ -844,7 +835,7 @@ class _LayerEncodeResult:
 
 @dataclass
 class _LayerEncodeSubmitState:
-    """Per-layer encode state after Phase1 pack; used for batch network submit."""
+    """Per-layer source-address state retained until native batch submission."""
     layer_name: str
     layer_idx: int
     block_size: int
@@ -2881,7 +2872,7 @@ def finalize_concord_recovery_timing() -> None:
     _log_concord_async_runtime_timing_once("after_forward_backward")
 
 def concord_recovery_safe_point(point: str) -> None:
-    """Optional safe point for future async recovery wait/teardown orchestration."""
+    """Apply configured recovery wait and teardown ownership at a training safe point."""
     try:
         from megatron.training import get_args
         args = get_args()
@@ -2917,9 +2908,8 @@ def concord_recovery_safe_point(point: str) -> None:
     )
     if should_wait:
         service.wait_all(reason=point)
-        # At before_optimizer_step the deferred optimizer state may still be loaded
-        # immediately after this safe-point check. Log after that load so optimizer
-        # materialize/load/sync time is included.
+        # The optimizer-step caller owns the pending optimizer load after this check.
+        # Timing is logged there so materialize, load, and synchronization are included.
         if not (point == "before_optimizer_step" and _pending_optimizer_state is not None):
             _log_concord_async_runtime_timing_once(point)
         if (
@@ -3230,7 +3220,7 @@ def _gather_all_concord_dirs(
     return [Path(my_dir)]
 
 
-def _prep_layer_phase1(
+def _prepare_layer_source_addresses(
     manager,
     layer_buf: torch.Tensor,
     layer_mirror: torch.Tensor,
@@ -3269,7 +3259,7 @@ def _prep_layer_phase1(
 
     if _dbg:
         logger.info(
-            "[CONCORD-DEBUG] %s Phase1 ptrs: layer_bytes=%d block_size=%d "
+            "[CONCORD-DEBUG] %s source address setup: layer_bytes=%d block_size=%d "
             "source_stripes=%d",
             layer_name, layer_tensor_size, block_size,
             sum(1 for s in actual_sizes if s > 0),
@@ -3738,29 +3728,6 @@ def wait_for_concord_parity_flush() -> None:
         native.wait_parity_flush()
 
 
-def _async_write_concord_encoder_p1_files(
-    manager,
-    output_dir: str,
-    rank: int,
-    num_stripes: int,
-    encode_results: List[_LayerEncodeResult],
-) -> None:
-    """Wait for async P1 delivery, then write encoder-owned P1 shards."""
-    native = manager.get_native()
-    if native is None:
-        return
-    native.wait_parity_flush()
-    _save_concord_stripe_files(
-        manager,
-        output_dir,
-        rank,
-        num_stripes,
-        encode_results,
-        include_encoder_parity0=True,
-        include_source=False,
-    )
-
-
 def _write_concord_aggregate_parity_files(
     output_dir: str,
     rank: int,
@@ -3815,7 +3782,7 @@ def _wait_aggregate_parity_context(context: Dict[str, Any]) -> float:
 
 
 def _release_aggregate_parity_context(context: Dict[str, Any]) -> None:
-    """Drop direct P2 tensor ownership after native and disk users complete."""
+    """Drop aggregate-parity tensor ownership after native and disk users complete."""
     if context.get("buffers_released", False):
         return
     if not context.get("native_completed", False):
@@ -3848,11 +3815,11 @@ def _finish_aggregate_parity_context(context: Dict[str, Any], debug: bool = Fals
         )
 
 
-def _async_run_aggregate_p2(descriptor: Dict[str, Any], debug: bool = False) -> None:
+def _async_run_aggregate_parity(descriptor: Dict[str, Any], debug: bool = False) -> None:
     global _async_writer_error
     context = None
     try:
-        context, _summary = _prepare_and_submit_aggregate_p2(descriptor)
+        context, _summary = _prepare_and_submit_aggregate_parity(descriptor)
         if descriptor["write_to_disk"]:
             _wait_aggregate_parity_context(context)
             descriptor["completed_context"] = context
@@ -3868,38 +3835,37 @@ def _async_run_aggregate_p2(descriptor: Dict[str, Any], debug: bool = False) -> 
 
 
 def _wait_previous_async_writers(debug: bool = False, rank: int = -1) -> None:
-    global _async_p1_writer_thread, _async_p2_writer_thread, _async_writer_error
-    for attr in ("_async_p1_writer_thread", "_async_p2_writer_thread"):
-        thread = globals()[attr]
-        if thread is not None:
-            start = time.time()
-            if debug:
-                logger.info("CONCORD async writer rank %d: joining previous %s", rank, thread.name)
-            thread.join()
-            globals()[attr] = None
-            if debug:
-                logger.info(
-                    "CONCORD async writer rank %d: joined previous %s in %.3fs",
-                    rank, thread.name, time.time() - start,
-                )
+    global _async_aggregate_parity_writer_thread, _async_writer_error
+    thread = _async_aggregate_parity_writer_thread
+    if thread is not None:
+        start = time.time()
+        if debug:
+            logger.info("CONCORD async writer rank %d: joining previous %s", rank, thread.name)
+        thread.join()
+        _async_aggregate_parity_writer_thread = None
+        if debug:
+            logger.info(
+                "CONCORD async writer rank %d: joined previous %s in %.3fs",
+                rank, thread.name, time.time() - start,
+            )
     if _async_writer_error is not None:
         error = _async_writer_error
         _async_writer_error = None
         raise RuntimeError("Concord asynchronous writer failed") from error
 
 
-def _wait_async_p2_writer(
+def _wait_async_aggregate_parity_writer(
     descriptor: Dict[str, Any], debug: bool = False, rank: int = -1,
 ) -> Dict[str, Any]:
-    """Drain the current P2 writer and return its completed in-memory context."""
-    global _async_p2_writer_thread, _async_writer_error
-    thread = _async_p2_writer_thread
+    """Drain the aggregate-parity writer and return its completed context."""
+    global _async_aggregate_parity_writer_thread, _async_writer_error
+    thread = _async_aggregate_parity_writer_thread
     if thread is not None:
         start = time.time()
         if debug:
             logger.info("CONCORD async writer rank %d: joining current %s", rank, thread.name)
         thread.join()
-        _async_p2_writer_thread = None
+        _async_aggregate_parity_writer_thread = None
         if debug:
             logger.info(
                 "CONCORD async writer rank %d: joined current %s in %.3fs",
@@ -3915,37 +3881,19 @@ def _wait_async_p2_writer(
     return context
 
 
-def _start_async_p1_writer(
-    manager,
-    output_dir: str,
-    rank: int,
-    num_stripes: int,
-    encode_results: List[_LayerEncodeResult],
-) -> None:
-    global _async_p1_writer_thread
-    _wait_previous_async_writers()
-    _async_p1_writer_thread = threading.Thread(
-        target=_async_write_concord_encoder_p1_files,
-        args=(manager, output_dir, rank, num_stripes, list(encode_results)),
-        name="concord-async-p1-writer",
-        daemon=False,
-    )
-    _async_p1_writer_thread.start()
-
-
-def _start_async_p2_writer(descriptor: Dict[str, Any], debug: bool = False) -> None:
-    global _async_p2_writer_thread
+def _start_async_aggregate_parity_writer(descriptor: Dict[str, Any], debug: bool = False) -> None:
+    global _async_aggregate_parity_writer_thread
     thread = threading.Thread(
-        target=_async_run_aggregate_p2,
+        target=_async_run_aggregate_parity,
         args=(descriptor, debug),
-        name="concord-async-p2-writer",
+        name="concord-async-aggregate-parity-writer",
         daemon=False,
     )
-    _async_p2_writer_thread = thread
+    _async_aggregate_parity_writer_thread = thread
     try:
         thread.start()
     except BaseException:
-        _async_p2_writer_thread = None
+        _async_aggregate_parity_writer_thread = None
         raise
 
 
@@ -3958,10 +3906,10 @@ def _build_aggregate_parity_descriptor(
     write_to_disk: bool,
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """Build direct descriptors for deferred parity indexes one through m-1."""
-    global _p2_save_generation
+    global _aggregate_parity_save_generation
     prepare_start = time.time()
-    _p2_save_generation += 1
-    generation = _p2_save_generation
+    _aggregate_parity_save_generation += 1
+    generation = _aggregate_parity_save_generation
     send_groups: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
     recv_groups: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
     recv_segments: List[Dict[str, Any]] = []
@@ -4041,10 +3989,10 @@ def _build_aggregate_parity_descriptor(
     return descriptor, dict(summary)
 
 
-def _prepare_and_submit_aggregate_p2(
+def _prepare_and_submit_aggregate_parity(
     descriptor: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Submit direct P2 descriptors without allocating, registering, or copying."""
+    """Submit direct aggregate-parity descriptors without new buffer ownership."""
     native = descriptor["native"]
     send_tasks = descriptor["send_tasks"]
     recv_tasks = descriptor["recv_tasks"]
@@ -4247,7 +4195,7 @@ def save_concord_legacy_checkpoint(
     encode_results: List[_LayerEncodeResult] = []
     prep_stream = torch.cuda.Stream()
     pack_total_s = 0.0
-    phase1_total_s = 0.0
+    source_address_setup_total_s = 0.0
     submit_total_s = 0.0
     wait_total_s = 0.0
     noncontig_total = 0
@@ -4410,14 +4358,14 @@ def save_concord_legacy_checkpoint(
 
         group.tensor_data = []
 
-        phase1_t0 = time.time()
-        state = _prep_layer_phase1(
+        source_address_setup_t0 = time.time()
+        state = _prepare_layer_source_addresses(
             manager, layer_buf_gpu, layer_bufs.layer_mirror_cpu,
             group.total_bytes, n, num_stripes, layer_block_size, my_node,
             layer_name, layer_idx, _dbg,
         )
-        layer_phase1_s = time.time() - phase1_t0
-        phase1_total_s += layer_phase1_s
+        layer_source_address_setup_s = time.time() - source_address_setup_t0
+        source_address_setup_total_s += layer_source_address_setup_s
 
         # Pre-compute encoder active masks for this layer.
         src_blk_per_node: Dict[int, int] = {node: 0 for node in range(1, n + 1)}
@@ -4452,7 +4400,9 @@ def save_concord_legacy_checkpoint(
             "layer_bufs": layer_bufs,
             "enc_active_masks": enc_active_masks,
             "pack_s": layer_pack_s,
-            "phase1_s": layer_phase1_s,
+            "source_address_setup_s": layer_source_address_setup_s,
+            # Compatibility timing key consumed by existing profiling tooling.
+            "phase1_s": layer_source_address_setup_s,
             "noncontig": layer_noncontig,
             "model_bytes": layer_model_bytes,
             "optimizer_bytes": layer_optimizer_bytes,
@@ -4461,7 +4411,7 @@ def save_concord_legacy_checkpoint(
         if trace_save:
             logger.info(
                 "CONCORD save trace rank=%d: pack done batch=%d %s pack=%.4fs phase1=%.4fs",
-                rank, encode_batch_id, layer_name, layer_pack_s, layer_phase1_s,
+                rank, encode_batch_id, layer_name, layer_pack_s, layer_source_address_setup_s,
             )
 
     # Stage B: submit prepared layers to native workers.
@@ -4495,19 +4445,19 @@ def save_concord_legacy_checkpoint(
                 native.submit_source(sid, addr, state.mirror_addrs[sid], layer_block_size)
         elif plan.role == StripeRole.ENCODER:
             rb = layer_bufs.recv_bufs[sid]
-            p1b = layer_bufs.parity1_bufs[sid]
-            p2b = layer_bufs.parity2_bufs[sid]
-            if rb is None or p1b is None or p2b is None:
+            primary_parity = layer_bufs.parity1_bufs[sid]
+            deferred_parity = layer_bufs.parity2_bufs[sid]
+            if rb is None or primary_parity is None or deferred_parity is None:
                 return
             if use_cross_layer_encode:
                 native.submit_enc_recv_with_batch(
-                    sid, rb.data_ptr(), p1b.data_ptr(), p2b.data_ptr(),
+                    sid, rb.data_ptr(), primary_parity.data_ptr(), deferred_parity.data_ptr(),
                     layer_block_size, enc_active_masks.get(sid, []),
                     encode_batch_id,
                 )
             else:
                 native.submit_enc_recv(
-                    sid, rb.data_ptr(), p1b.data_ptr(), p2b.data_ptr(),
+                    sid, rb.data_ptr(), primary_parity.data_ptr(), deferred_parity.data_ptr(),
                     layer_block_size, enc_active_masks.get(sid, []),
                 )
         elif plan.role == StripeRole.PARITY_TARGET:
@@ -5423,24 +5373,23 @@ def save_concord_legacy_checkpoint(
     lx_layer_elapsed_max = locals().get("lx_layer_elapsed_max", 0.0)
 
     # ---- aggregate parity phase: one transfer per physical peer/lane ----
-    # Route construction only retains small descriptors and strong references to
-    # parity2 source buffers. The async writer completes all in-memory P2 work;
-    # disk checkpoints retain its completed context for the unified shard write.
-    p2_dispatch_t0 = time.time()
-    p2_descriptor, p2_summary = _build_aggregate_parity_descriptor(
+    # Descriptors and parity buffers remain owned until aggregate transfer completion.
+    # Disk checkpoints retain the completed context through the unified shard write.
+    aggregate_parity_dispatch_t0 = time.time()
+    aggregate_parity_descriptor, aggregate_parity_summary = _build_aggregate_parity_descriptor(
         manager, native, encode_results, str(checkpoint_dir), rank, write_to_disk,
     )
-    p2_context = None
-    p2_dispatch_s = 0.0
-    p2_sync_foreground_s = 0.0
-    p2_prepare_s = 0.0
-    p2_submit_s = 0.0
-    p2_wait_s = 0.0
+    aggregate_parity_context = None
+    aggregate_parity_dispatch_s = 0.0
+    aggregate_parity_sync_foreground_s = 0.0
+    aggregate_parity_prepare_s = 0.0
+    aggregate_parity_submit_s = 0.0
+    aggregate_parity_wait_s = 0.0
     if not _use_async_parity:
-        p2_context, p2_summary = _prepare_and_submit_aggregate_p2(p2_descriptor)
-        p2_sync_foreground_s = time.time() - p2_dispatch_t0
-        p2_prepare_s = float(p2_context["timings"]["prepare_s"])
-        p2_submit_s = float(p2_context["timings"]["submit_s"])
+        aggregate_parity_context, aggregate_parity_summary = _prepare_and_submit_aggregate_parity(aggregate_parity_descriptor)
+        aggregate_parity_sync_foreground_s = time.time() - aggregate_parity_dispatch_t0
+        aggregate_parity_prepare_s = float(aggregate_parity_context["timings"]["prepare_s"])
+        aggregate_parity_submit_s = float(aggregate_parity_context["timings"]["submit_s"])
 
     _mirror_t0 = time.time()
     native.wait_mirror_completion()
@@ -5450,15 +5399,15 @@ def save_concord_legacy_checkpoint(
 
     if not _use_async_parity:
         try:
-            p2_wait_s = _wait_aggregate_parity_context(p2_context)
+            aggregate_parity_wait_s = _wait_aggregate_parity_context(aggregate_parity_context)
         except BaseException:
-            p2_context["disk_users_done"] = True
-            _release_aggregate_parity_context(p2_context)
+            aggregate_parity_context["disk_users_done"] = True
+            _release_aggregate_parity_context(aggregate_parity_context)
             raise
         if not write_to_disk:
-            _release_aggregate_parity_context(p2_context)
-            p2_context["finished"] = True
-        network_encode_s += p2_sync_foreground_s
+            _release_aggregate_parity_context(aggregate_parity_context)
+            aggregate_parity_context["finished"] = True
+        network_encode_s += aggregate_parity_sync_foreground_s
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     if world_size > 1:
@@ -5478,38 +5427,40 @@ def save_concord_legacy_checkpoint(
     # Dispatch only after mirror shutdown and timing collection. This keeps native
     # mirror/timing state single-owner while aggregate parity runs in the background.
     if _use_async_parity:
-        p2_dispatch_t0 = time.time()
-        _start_async_p2_writer(p2_descriptor, debug=_dbg)
-        p2_dispatch_s = time.time() - p2_dispatch_t0
+        aggregate_parity_dispatch_t0 = time.time()
+        _start_async_aggregate_parity_writer(aggregate_parity_descriptor, debug=_dbg)
+        aggregate_parity_dispatch_s = time.time() - aggregate_parity_dispatch_t0
     e2e_s = time.time() - e2e_t0
     if rank == 0:
         logger.info(
             "CONCORD aggregate parity: mode=direct-multi-sge generation=%d "
             "send_tasks=%d recv_tasks=%d send_segments=%d recv_segments=%d "
             "send_bytes=%d recv_bytes=%d async=%s p2_dispatch_s=%.6f",
-            p2_descriptor["generation"], p2_summary["send_tasks"],
-            p2_summary["recv_tasks"], p2_summary["send_segments"],
-            p2_summary["recv_segments"], p2_summary["send_bytes"],
-            p2_summary["recv_bytes"], _use_async_parity, p2_dispatch_s,
+            aggregate_parity_descriptor["generation"], aggregate_parity_summary["send_tasks"],
+            aggregate_parity_summary["recv_tasks"], aggregate_parity_summary["send_segments"],
+            aggregate_parity_summary["recv_segments"], aggregate_parity_summary["send_bytes"],
+            aggregate_parity_summary["recv_bytes"], _use_async_parity, aggregate_parity_dispatch_s,
         )
 
     summary_fields = {
         "e2e_s": e2e_s,
         "network_encode_s": network_encode_s,
         "pack_total_s": pack_total_s,
-        "phase1_total_s": phase1_total_s,
+        "source_address_setup_total_s": source_address_setup_total_s,
+        # Compatibility timing key consumed by existing profiling tooling.
+        "phase1_total_s": source_address_setup_total_s,
         "submit_total_s": submit_total_s,
         "wait_total_s": wait_total_s,
         "mirror_elapsed_s": _mirror_elapsed,
-        "aggregate_parity_dispatch_s": p2_dispatch_s,
-        "aggregate_parity_prepare_s": p2_prepare_s,
-        "aggregate_parity_submit_s": p2_submit_s,
-        "aggregate_parity_wait_s": p2_wait_s,
+        "aggregate_parity_dispatch_s": aggregate_parity_dispatch_s,
+        "aggregate_parity_prepare_s": aggregate_parity_prepare_s,
+        "aggregate_parity_submit_s": aggregate_parity_submit_s,
+        "aggregate_parity_wait_s": aggregate_parity_wait_s,
         "aggregate_parity_direct": 1.0,
-        "aggregate_parity_send_segments": p2_summary["send_segments"],
-        "aggregate_parity_recv_segments": p2_summary["recv_segments"],
-        "aggregate_parity_send_bytes": p2_summary["send_bytes"],
-        "aggregate_parity_recv_bytes": p2_summary["recv_bytes"],
+        "aggregate_parity_send_segments": aggregate_parity_summary["send_segments"],
+        "aggregate_parity_recv_segments": aggregate_parity_summary["recv_segments"],
+        "aggregate_parity_send_bytes": aggregate_parity_summary["send_bytes"],
+        "aggregate_parity_recv_bytes": aggregate_parity_summary["recv_bytes"],
         "layer_exchange_send_tasks": layer_exchange_send_tasks,
         "layer_exchange_recv_tasks": layer_exchange_recv_tasks,
         "layer_exchange_send_bytes": layer_exchange_send_bytes,
@@ -5647,10 +5598,10 @@ def save_concord_legacy_checkpoint(
                 "CONCORD save detail (%(mode)s): pack_s=%(pack_total_s).2fs "
                 "phase1_s=%(phase1_total_s).2fs submit_s=%(submit_total_s).2fs "
                 "wait_s=%(wait_total_s).2fs mirror_wait_s=%(mirror_elapsed_s).2fs "
-                "p2_dispatch_s=%(aggregate_parity_dispatch_s).6fs "
-                "p2_prepare_s=%(aggregate_parity_prepare_s).3fs "
-                "p2_submit_s=%(aggregate_parity_submit_s).3fs "
-                "p2_wait_s=%(aggregate_parity_wait_s).3fs parity_direct=%(aggregate_parity_direct).0f "
+                "aggregate_parity_dispatch_s=%(aggregate_parity_dispatch_s).6fs "
+                "aggregate_parity_prepare_s=%(aggregate_parity_prepare_s).3fs "
+                "aggregate_parity_submit_s=%(aggregate_parity_submit_s).3fs "
+                "aggregate_parity_wait_s=%(aggregate_parity_wait_s).3fs parity_direct=%(aggregate_parity_direct).0f "
                 "p2_send_segments=%(aggregate_parity_send_segments).0f "
                 "p2_recv_segments=%(aggregate_parity_recv_segments).0f "
                 "p2_send_bytes=%(aggregate_parity_send_bytes).0f "
@@ -5744,8 +5695,8 @@ def save_concord_legacy_checkpoint(
             )
 
     if _use_async_parity and write_to_disk:
-        p2_context = _wait_async_p2_writer(
-            p2_descriptor, debug=_dbg, rank=rank,
+        aggregate_parity_context = _wait_async_aggregate_parity_writer(
+            aggregate_parity_descriptor, debug=_dbg, rank=rank,
         )
     if write_to_disk:
         import concurrent.futures
@@ -5760,16 +5711,16 @@ def save_concord_legacy_checkpoint(
                     ),
                     executor.submit(
                         _write_concord_aggregate_parity_files,
-                        str(checkpoint_dir), rank, p2_context["recv_segments"],
+                        str(checkpoint_dir), rank, aggregate_parity_context["recv_segments"],
                     ),
                 ]
                 for future in shard_futures:
                     future.result()
         finally:
-            p2_context["disk_users_done"] = True
-            _release_aggregate_parity_context(p2_context)
+            aggregate_parity_context["disk_users_done"] = True
+            _release_aggregate_parity_context(aggregate_parity_context)
     elif not _use_async_parity:
-        _finish_aggregate_parity_context(p2_context, debug=_dbg)
+        _finish_aggregate_parity_context(aggregate_parity_context, debug=_dbg)
 
     groups_by_name = {
         (f"layer_{group.layer_idx}" if group.layer_idx >= 0 else "layer_common"): group
@@ -6783,7 +6734,7 @@ def _group_recovery_data_windows_by_column(
     n: int,
 ) -> List[List[Dict[str, Any]]]:
     windows: List[List[Dict[str, Any]]] = []
-    # HW2 critical recovery includes SOURCE columns only.
+    # Dual-failure critical recovery includes SOURCE columns only.
     for failed_pos in range(max(int(ConcordManager().concord_k), 0)):
         column_plans = [
             plan for plan in data_plans
@@ -7021,7 +6972,7 @@ def _validate_recovery_alignment(
         targets = list(plan.get('failed_targets', []))
         if len(targets) != 2:
             raise RuntimeError(
-                "Concord HW2 recovery requires exactly two failed targets; "
+                "Concord dual-failure recovery (HW2 mode) requires exactly two failed targets; "
                 f"stripe={plan.get('stripe_id', -1)} targets={len(targets)}"
             )
         covered_targets = 0
@@ -7033,7 +6984,7 @@ def _validate_recovery_alignment(
             )
             if critical == deferred:
                 raise RuntimeError(
-                    "Concord HW2 target must be covered by exactly one recovery phase; "
+                    "Concord dual-failure target must be covered by exactly one recovery phase; "
                     f"stripe={plan.get('stripe_id', -1)} role={role}"
                 )
             covered_targets += 1
@@ -7053,7 +7004,7 @@ def _validate_recovery_alignment(
             or _is_parity_recovery_plan(plan, n) != has_parity
         ):
             raise RuntimeError(
-                "Concord HW2 recovery target coverage mismatch; "
+                "Concord dual-failure recovery target coverage mismatch; "
                 f"stripe={plan.get('stripe_id', -1)}"
             )
 
@@ -9275,7 +9226,7 @@ def recover_concord_legacy_hardware(
 
     if manager.recovery_stripe_plans and _dbg:
         logger.debug(
-            "Concord recovery: phase1 critical SOURCE mode critical_stripes=%d "
+            "Concord recovery: critical SOURCE recovery critical_stripes=%d "
             "deferred_parity_stripes=%d",
             len(data_recovery_plans), len(parity_recovery_plans),
         )

@@ -10,19 +10,13 @@ from logging import getLogger
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from dataclasses import replace
-
 from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
-from .state_dict_decomposer import GlobalMetadataRegistry, TensorMetadata
 from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
 
 logger = getLogger(__name__)
 
-# Default number of ranks per BasicEC group (backward compatible 2+2 scheme)
+# Legacy RS(4, 2) defaults: n = k + 2 ranks and 3 * (n - 1) ports per rank.
 DEFAULT_RANKS_PER_GROUP = 4
-# Ports per rank for default 2+2 scheme:
-# 6 ASIO (send_data1, send_parity0, send_parity1, recv_parity1, recv_parity0, recv_data1)
-# + 3 RDMA exchange (rdma_recv_parity1, rdma_recv_parity0, rdma_recv_data1)
 DEFAULT_PORTS_PER_RANK = 9
 
 
@@ -34,8 +28,8 @@ class BasicECManager:
     - Buffer allocation and management (data and parity buffers, pooled)
     - Buffer poller thread for releasing buffers
     
-    Note: The 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1) are allocated
-    in strategy after metadata exchange, not in manager.
+    Persistent storage consists of one local data block and n - 1 received
+    blocks. The strategy allocates these blocks after metadata exchange.
     
     Both TorchDistSaveShardedStrategy and TorchDistLoadShardedStrategy
     can share the same manager instance to reuse initialized resources.
@@ -60,12 +54,12 @@ class BasicECManager:
 
         self._basic_ec_native = None
         self.use_basic_ec = False
-        self.use_rdma = False  # New: RDMA support flag
+        self.use_rdma = False
 
         # BasicEC configuration
-        self.basic_ec_k = 2        # number of data blocks (default 2 → 2+2 scheme)
-        self.basic_ec_n = 4        # ranks per group = k + 2
-        self.basic_ec_ports_per_rank = DEFAULT_PORTS_PER_RANK  # computed from n
+        self.basic_ec_k = 2  # Number of RS data blocks.
+        self.basic_ec_n = DEFAULT_RANKS_PER_GROUP  # RS codeword size, n = k + 2.
+        self.basic_ec_ports_per_rank = DEFAULT_PORTS_PER_RANK
 
         # Buffer configuration
         self.basic_ec_data_buffers_count = 12
@@ -76,7 +70,7 @@ class BasicECManager:
         # Buffers (simplified: only data and parity pools)
         self.basic_ec_data_buffers: Optional[List[torch.Tensor]] = None
         self.basic_ec_parity_buffers: Optional[List[torch.Tensor]] = None  # Pooled parity buffers
-        # Note: The 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1) are allocated in strategy
+        # The strategy allocates one local and n - 1 received persistent blocks.
         
         # Free buffer queues (simplified)
         self._free_data_buffer_queue: Optional[queue.Queue] = None
@@ -96,9 +90,11 @@ class BasicECManager:
         # {global_rank: {"own_data0": tensor, "recv_0": tensor, ...}}
         self._recovered_blocks: Dict[int, Dict[str, torch.Tensor]] = {}
 
-        # In-process HW recovery owns buffers whose addresses may remain registered
-        # in the native transport. The workspace is intentionally retained until
-        # process exit; replacing it while native is live is unsafe.
+        # The manager owns recovery buffers whose addresses may remain registered
+        # with the native transport. Their lifetime must cover the native instance,
+        # so an active workspace cannot be replaced in process. cleanup() releases
+        # registrations before dropping buffers, but topology changes still require
+        # a process restart because persistent recovery channels cannot be rebuilt.
         self._recovery_workspace_key: Optional[tuple] = None
         self._recovery_workspace: Dict[str, Any] = {}
         self._sw_recovery_connection_key: Optional[tuple] = None
@@ -286,7 +282,7 @@ class BasicECManager:
             'recv_partners': list of (global_rank, label) for each recv channel
             'send_block_types': list of block type names for each send
             'recv_block_types': list of block type names for each recv
-        For backward compat with 2+2, also includes legacy keys.
+        For the legacy RS(4, 2) layout, the result also includes compatibility keys.
         """
         k = self.basic_ec_k
         n = self.basic_ec_n
@@ -332,7 +328,7 @@ class BasicECManager:
                 'recv_block_types': recv_block_types,
             }
 
-            # Backward compatibility aliases for k=2
+            # Compatibility aliases for the legacy RS(4, 2) layout.
             if k == 2:
                 result.update({
                     'send_data1_to': send_partners[0],
@@ -387,7 +383,7 @@ class BasicECManager:
         
         This function:
         1. Gets base IP address (from BASIC_EC_BASE_IP env var, MASTER_ADDR, or auto-detect)
-        2. Calculates ports for this rank (base_port + rank * 6 + offset)
+        2. Assigns 3 * (n - 1) ports to each rank or group position
         3. Exchanges IP addresses with all ranks via torch.distributed.all_gather
         4. Returns configuration dictionary
         
@@ -415,9 +411,9 @@ class BasicECManager:
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
         base_port = int(os.environ.get('BASIC_EC_BASE_PORT', os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000)))
         
-        # Step 3: Calculate ports for this rank
-        # Each rank gets 3*(n-1) ports: (n-1) ASIO send + (n-1) ASIO recv + (n-1) RDMA recv
-        # Per-group allocation to avoid port conflicts across groups
+        # Step 3: assign each rank n - 1 ASIO send ports, n - 1 ASIO
+        # receive ports, and n - 1 RDMA exchange receive ports. Group-based
+        # allocation keeps concurrently initialized groups on distinct ports.
         n = self.basic_ec_n
         ports_per_rank = self.basic_ec_ports_per_rank
         if world_size >= n and world_size % n == 0:
@@ -427,7 +423,7 @@ class BasicECManager:
         else:
             port_base = base_port + rank * ports_per_rank
 
-        # Build port dicts: generalized lists + backward-compat named keys for k=2
+        # Build general channel lists plus legacy RS(4, 2) compatibility keys.
         send_ports = [port_base + i for i in range(n - 1)]
         recv_ports = [port_base + (n - 1) + i for i in range(n - 1)]
         rdma_recv_ports = [port_base + 2 * (n - 1) + i for i in range(n - 1)]
@@ -438,7 +434,7 @@ class BasicECManager:
             'recv_ports': recv_ports,
             'rdma_recv_ports': rdma_recv_ports,
         }
-        # Backward compatibility: named keys for k=2 (original 2+2 scheme)
+        # Preserve the named port keys used by the legacy RS(4, 2) path.
         if k == 2:
             ports.update({
                 'send_data1': send_ports[0],
@@ -512,9 +508,9 @@ class BasicECManager:
     
     def _get_basic_ec_load_network_config(self, rank: int, world_size: int) -> dict:
         """
-        Get network configuration for BasicEC load mode (rank2 recovery).
-        
-        BasicEC load mode needs 8 ports for full recovery:
+        Get network configuration for the legacy k=2 hardware-recovery path.
+
+        This fixed RS(4, 2) path uses eight ports with group rank 2 as receiver:
         - load_recv_rank3_data1: rank2 listens, rank3 connects (for d_{3,1})
         - load_recv_rank0_parity0: rank2 listens, rank0 connects (for p_{2,0})
         - load_recv_rank0_data0: rank2 listens, rank0 connects (for d_{0,0})
@@ -525,7 +521,8 @@ class BasicECManager:
         - load_recv_rank0_data1: rank2 listens, rank0 connects (for d_{3,1})
         
         Args:
-            rank (int): Current rank (should be 2 for receiver, 0/1/3 for senders)
+            rank (int): Current global rank; group rank 2 receives and the other
+                RS(4, 2) group ranks send.
             world_size (int): Total number of ranks
             
         Returns:
@@ -533,7 +530,7 @@ class BasicECManager:
                 - 'my_ip': str - This rank's IP address
                 - 'base_port': int - Base port number
                 - 'rank_ips': dict - IP addresses for all ranks
-                - 'ports': dict - Port numbers for load mode connections (8 ports for rank2)
+                - 'ports': dict - Eight legacy RS(4, 2) recovery ports
         """
         # Step 1: Get base IP address (with multi-NIC per-rank support)
         base_ip = resolve_ip("BASIC_EC", rank=rank, fallback_prefixes=["ECNAIVE"])
@@ -544,7 +541,6 @@ class BasicECManager:
         
         # Multi-rank: per-group load ports to avoid conflict
         n = self.basic_ec_n
-        num_groups = max(1, world_size // n) if world_size >= n else 1
         group_id = self._get_group_id(rank, world_size)
         rank_in_group = self._get_rank_in_group(rank, world_size)
         # load_receiver_rank: global rank of rank_in_group 2 in this group (for init_basic_ec_load)
@@ -625,10 +621,11 @@ class BasicECManager:
     def init_basic_ec_load_software_only(
         self, rank: int, world_size: int, net_config: Optional[dict] = None
     ) -> None:
-        """Initialize BasicEC load for software failure only: 1 port (rank3_data1), 1 barrier.
-        Use instead of init_basic_ec_load when use_basic_ec_software_failure to avoid 8-port + 2-barrier overhead.
-        If net_config is provided (e.g. from caller who already called _get_basic_ec_load_network_config),
-        reuse it to avoid duplicate IP all_gather.
+        """Initialize the legacy k=2 software-recovery channel.
+
+        Group rank 3 sends d_{2,1} to group rank 2 over one persistent channel.
+        This fixed path avoids the eight-port hardware-recovery setup. If the
+        caller supplies ``net_config``, reuse it to avoid another IP exchange.
         """
         if self._basic_ec_native is None:
             logger.error("BasicEC: Native module not initialized, cannot initialize load mode")
@@ -643,11 +640,11 @@ class BasicECManager:
             net_config = self._get_basic_ec_load_network_config(rank, world_size)
         rank_in_group = net_config['rank_in_group']
         load_receiver_rank = net_config['load_receiver_rank']
-        rank2_ip = net_config['rank_ips'].get(load_receiver_rank, net_config['my_ip'])
+        receiver_ip = net_config['rank_ips'].get(load_receiver_rank, net_config['my_ip'])
         port = net_config['ports'].get('load_recv_rank3_data1', 0)
         torch.distributed.barrier()
         self._basic_ec_native.init_basic_ec_load_connections_software_only(
-            rank_in_group, rank2_ip, port
+            rank_in_group, receiver_ip, port
         )
         logger.debug(f"BasicEC: [Rank {rank}] Software-only load connection initialized (1 port)")
 
@@ -1096,11 +1093,10 @@ class BasicECManager:
                 # Create C++ instance with ASIO parameters
                 logger.debug(f"BasicEC: Creating C++ native module with ASIO (this will block until ASIO connections are established)...")
                 
-                # BasicEC requires 12 parameters (6 pairs of ip:port):
-                # send_data1_ip, send_data1_port, send_parity0_ip, send_parity0_port, 
-                # send_parity1_ip, send_parity1_port, recv_parity1_ip, recv_parity1_port,
-                # recv_parity0_ip, recv_parity0_port, recv_data1_ip, recv_data1_port
-                
+                # The native constructor receives variable-length ASIO endpoint
+                # lists, RDMA exchange port lists, RS k, transport mode, and the
+                # rank's position in its n = k + 2 group.
+
                 # Calculate round-robin partner ranks
                 partner_ranks = self._get_round_robin_ranks(rank, world_size)
 
@@ -1194,9 +1190,8 @@ class BasicECManager:
     def _init_basic_ec_buffers(self):
         """Initialize BasicEC buffers during C++ module initialization.
         
-        Note: Only allocates data and parity buffers (pooled) at initialization.
-        The 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1) will be allocated
-        in strategy after metadata exchange.
+        Only pooled data and parity buffers are allocated here. The strategy
+        allocates one local and n - 1 received persistent blocks after metadata exchange.
         """
         rank = torch.distributed.get_rank()
         logger.debug("BasicEC: Initializing buffers for BasicEC (data and parity pools only)")
@@ -1347,9 +1342,8 @@ class BasicECManager:
     def get_basic_ec_buffers(self):
         """Get BasicEC buffers for FileSystemWriterAsync.
         
-        Note: Returns data and parity buffers (pooled).
-        The 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1) will be allocated
-        in strategy after metadata exchange.
+        Returns pooled data and parity buffers. The strategy allocates one local
+        and n - 1 received persistent blocks after metadata exchange.
         
         Returns:
             Dict containing all buffer information, or None if not initialized
@@ -1365,8 +1359,7 @@ class BasicECManager:
             # Pass buffer poller control objects
             'buffer_poller_active_event': self._buffer_poller_active_event,
             'poll_and_release_buffers': self._poll_and_release_buffers,
-            # Note: The 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1) 
-            # will be allocated in strategy after metadata exchange
+            # Persistent local/received blocks are allocated by the strategy.
         }
     
     def register_buffer(self, buffer: torch.Tensor):

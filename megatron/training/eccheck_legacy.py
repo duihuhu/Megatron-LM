@@ -28,7 +28,6 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     DecomposedStateDict,
     GlobalMetadataRegistry,
     TensorMetadata,
-    decompose_state_dict,
     decompose_state_dict_for_save,
     extract_tensors_from_continuous_buffer,
     reconstruct_state_dict,
@@ -682,7 +681,7 @@ def _save_eccheck_pt_files(
     }
 
     main_file = checkpoint_dir / f"eccheck_main_rank{rank}.pt"
-    from megatron.training.legacy_io_utils import write_raw_checkpoint, write_raw_block, MAGIC_ECCHECK, MAGIC_BLOCK
+    from megatron.training.legacy_io_utils import MAGIC_BLOCK, MAGIC_ECCHECK
 
     # Pre-serialize metadata + prepare memoryview for main file
     import pickle as _pickle
@@ -746,7 +745,6 @@ def _save_eccheck_pt_files(
 def save_eccheck_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str, write_to_disk: bool = True
 ) -> None:
-    t0 = time.time()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -755,7 +753,6 @@ def save_eccheck_legacy_checkpoint(
     if manager._eccheck_native is None:
         raise RuntimeError("ECCHECK native module is not available in legacy save path")
 
-    t0 = time.time()
     decomposed, save_copy_s, save_flatten_s, decompose_s = decompose_state_dict_for_save(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
     logger.debug(
@@ -763,7 +760,6 @@ def save_eccheck_legacy_checkpoint(
         save_copy_s, save_flatten_s, decompose_s,
     )
 
-    t0 = time.time()
     safety_margin = max(int(total_tensor_size * 0.01), manager.eccheck_buffer_size)
     manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
     tensor_buffer = manager.preallocated_cpu_buffer
@@ -787,27 +783,21 @@ def save_eccheck_legacy_checkpoint(
             )
         )
 
-    t0 = time.time()
     # Only tensor metadata needed for block sizing; non_tensor_data (~250MB)
     # is exchanged by all_gather_object but never consumed here.  Pass an empty
     # dict to avoid wasting 5+ seconds on unnecessary exchange.
     rank_metadata, _ = _build_global_registry(local_tensor_metadata, {})
-    metadata_s = time.time() - t0
 
-    t0 = time.time()
     blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
-    block_alloc_s = time.time() - t0
 
     # Allocate recv encoding buffers now that we know peer data sizes
     registry = GlobalMetadataRegistry(
         rank_metadata=rank_metadata, rank_non_tensor_data={}
     )
-    t0 = time.time()
     if manager.eccheck_recv_encoding_buffers is None:
         manager.eccheck_recv_encoding_buffers = (
             manager.allocate_recv_encoding_buffers_phase2(registry)
         )
-    recv_alloc_s = time.time() - t0
 
     if manager.use_rdma:
         manager.register_buffer(tensor_buffer)
@@ -1041,21 +1031,21 @@ def _load_eccheck_blocks_from_disk_into(
     """Load block .pt files into pre-allocated P2P buffers.
 
     Normal recovery layout:
-    - rank_in_group 2: loads nothing (data comes via network XOR recovery)
-    - rank_in_group 0: loads own_buffer parity and partner_buffer data
-    - rank_in_group 1: loads own_buffer (its own data)
-    - rank_in_group 3: loads own_buffer + partner_buffer (its own data + received)
+    - rig2: loads nothing; data comes from network XOR recovery.
+    - rig0: loads own_buffer parity and partner_buffer data.
+    - rig1: loads own_buffer containing its own data.
+    - rig3: loads own_buffer and partner_buffer.
 
     Software failure layout (use_eccheck_software_failure=True):
-    - rank_in_group 0: loads partner_buffer (d1, to send to rig=1 via C++ P2P)
-    - rank_in_group 1: loads nothing (receives from rig=0 via C++ P2P)
-    - rank_in_group 2/3: not participating in software failure
+    - rig0: loads partner_buffer containing d1 for transmission to rig1.
+    - rig1: loads nothing and receives from rig0 via C++ P2P.
+    - rig2 and rig3 do not participate.
 
     Two-failures layout (use_eccheck_two_failures=True):
-    - rank_in_group 0 (survivor): loads partner_buffer (d1, to send to rig1)
-    - rank_in_group 1 (failed): loads nothing (receives d1 from rig0)
-    - rank_in_group 2 (failed): loads nothing (receives p2 from rig3, XOR recovers d2)
-    - rank_in_group 3 (survivor): loads own_buffer + partner_buffer (p3 + p2)
+    - rig0 survives and loads partner_buffer containing d1 for rig1.
+    - rig1 fails and receives d1 from rig0 without a local load.
+    - rig2 fails and receives parity row p2 from rig3 to recover d2 by XOR.
+    - rig3 survives and loads own_buffer p3 plus partner_buffer p2.
     """
     if software_failure:
         if rank_in_group == 0:
@@ -1082,8 +1072,6 @@ def _load_eccheck_blocks_from_disk_into(
             _copy_block_file_into_tensor(
                 checkpoint_dir, rank, "partner_buffer", blocks["partner_buffer"]
             )
-        elif rank_in_group not in (0, 3):
-            pass  # rig1, rig2: no disk load
         return
 
     if rank_in_group == 2:
@@ -1164,9 +1152,7 @@ def _run_eccheck_legacy_recovery(
     rank: int,
     world_size: int,
     blocks: Dict[str, Any],
-    recv_buffers: Optional[Dict[str, torch.Tensor]],
     recovered_buffer: Optional[torch.Tensor],
-    total_size: int,
     registry: GlobalMetadataRegistry,
     native_prepared: bool = False,
 ) -> float:
@@ -1190,8 +1176,8 @@ def _run_eccheck_legacy_recovery(
     rank_in_group = manager._get_rank_in_group(rank, world_size)
 
     # ---- software failure path ----
-    # rank_in_group 0 sends partner_buffer (d1) to rank_in_group 1 via C++ P2P.
-    # rank_in_group 1 receives into recovered_buffer.
+    # rig0 sends partner_buffer d1 to rig1 through C++ P2P.
+    # rig1 receives into recovered_buffer.
     # This exercises the network path for worst-case recovery time measurement.
     if software_failure:
         start_t = time()
@@ -1212,7 +1198,7 @@ def _run_eccheck_legacy_recovery(
         # rig=2/3: no-op
         return time() - start_t
 
-    # ---- hardware failure path (rank_in_group 2) ----
+    # Hardware failure path for rig2.
     failed_rank = 2
     if not native_prepared:
         native.set_load_mode(True, failed_rank)
@@ -1302,7 +1288,7 @@ def _run_eccheck_legacy_recovery(
     t_pipeline_net = 0.0
     try:
         while processed < max_total_bytes:
-            # Track only submissions accepted by the native HW2 pipeline.
+            # Track only submissions accepted by the native HW1 pipeline.
             remaining = max_total_bytes - processed
             take = min(buffer_size, remaining)
 
@@ -1340,7 +1326,7 @@ def _run_eccheck_legacy_recovery(
                     ctypes.memset(buffer_array.contents + bytes_to_copy, 0,
                                   take - bytes_to_copy)
             else:
-                # rank2: fill with zeros, will receive data via network
+                # rig2 starts with zeros and receives recovery input from the network.
                 ctypes.memset(buffer_array.contents, 0, take)
 
             enc_addr2 = _get_free_encoding()
@@ -1366,7 +1352,7 @@ def _run_eccheck_legacy_recovery(
                 recv_addr2 = 0
                 recv_chunk_size = 0
 
-            # Step2 P2P: rank0/3 send partner data; rank1/2 recv
+            # Step 2 P2P: rig0/rig3 send partner data; rig1/rig2 receive.
             if rank_in_group in (0, 3):
                 step2_send_addr = partner_base + processed
                 step2_recv_data_addr = 0
@@ -1380,7 +1366,7 @@ def _run_eccheck_legacy_recovery(
                 step2_recv_data_addr = 0
                 step2_size = 0
 
-            # Step6 P2P: rank2 receives d3 from rank3
+            # Step 6 P2P: rig2 receives d3 from rig3.
             if rank_in_group == 2:
                 p2p_partner_offset_aligned = ((p2p_partner_offset + 63) // 64) * 64
                 p2p_partner_write = partner_base + p2p_partner_offset_aligned
@@ -1450,9 +1436,9 @@ def _run_eccheck_two_failures_recovery(
 
     Returns the recovery wall-time breakdown in seconds.
 
-    Two physical nodes lost → rig1 and rig2 in each 4-rank group are failed.
-    Survivors rig0 and rig3 use bidirectional XOR exchange to recover
-    d2 (on rig2) and verify d3 (on rig3), then forward results via P2P.
+    Two physical nodes lost: rig1 and rig2 in each four-rig group are failed.
+    Survivors rig0 and rig3 use bidirectional XOR exchange to recover d2 on
+    rig2 and produce the current rig3-side consistency result before P2P forwarding.
 
     Uses save-path 16-thread encode pool (ec_rs_encode_pool) and RDMA transport,
     aligned with the save encoding pipeline.
@@ -1579,8 +1565,8 @@ def _run_eccheck_two_failures_recovery(
     t_pipeline_net_start: Optional[float] = None
 
     # ---- Phase 1: P2P data distribution (timed as network) ----
-    # Rig0 → Rig1: send d1 (partner_buffer)
-    # Rig3 → Rig2: send p2 = d0⊕d2 (partner_buffer)
+    # rig0 -> rig1: send d1 from partner_buffer.
+    # rig3 -> rig2: send parity row p2 = d0 XOR d2 from partner_buffer.
     phase1_parity_bytes = _eccheck_pipeline_transfer_bytes(registry, world_size)
     _t0 = time()
     if rank_in_group == 0:
@@ -2384,9 +2370,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             rank=rank,
             world_size=world_size,
             blocks=blocks,
-            recv_buffers=None,
             recovered_buffer=recovered_buffer,
-            total_size=total_size,
             registry=registry,
             native_prepared=native_prepared,
         )

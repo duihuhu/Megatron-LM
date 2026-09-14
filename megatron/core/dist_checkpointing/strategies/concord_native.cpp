@@ -219,7 +219,7 @@ public:
         RdmaConnInfo remote;
         memset(&remote, 0, sizeof(remote));
 
-        // Both sides send then recv (symmetric, safe since TCP is full-duplex)
+        // Each endpoint writes its fixed-size QP record before reading the peer record.
         ssize_t ns = send(tcp_sock_, &local, sizeof(local), 0);
         if (ns != (ssize_t)sizeof(local))
             throw std::runtime_error("Concord RDMA: failed to send conn info");
@@ -1175,7 +1175,7 @@ public:
         if (decode_tbls_) { free(decode_tbls_); decode_tbls_ = nullptr; }
     }
 
-    // ---- POA query (existing) ----
+    // ---- POA queries ----
     int n() const { return n_; }
     int k() const { return k_; }
     int m() const { return m_; }
@@ -1220,7 +1220,7 @@ public:
     }
     bool is_stopped() const { return stopped_; }
 
-    // ---- New: RDMA init ----
+    // ---- RDMA initialization ----
     void init_rdma(int group_size, int rank_in_group,
                    uint16_t base_port,
                    const std::string& my_ip,
@@ -1290,8 +1290,7 @@ public:
                         // Shared lanes are bidirectional and carry interleaved stripe
                         // messages; correctness relies on the tagged multiplexing
                         // protocol (per-channel reader thread + DATA/ACK records).
-                        // Keep it opt-in while the path is experimental.
-                        const char* unsafe_env = std::getenv("CONCORD_ALLOW_UNSAFE_LANE_SHARING");
+                                                const char* unsafe_env = std::getenv("CONCORD_ALLOW_UNSAFE_LANE_SHARING");
                         if (!unsafe_env || std::atoi(unsafe_env) == 0) {
                             throw std::runtime_error(
                                 "Concord RDMA: CONCORD_RDMA_LANES_PER_PEER < num_stripes uses the "
@@ -1320,7 +1319,7 @@ public:
         acceptor_thread_stop_ = false;
         accept_thread_ = std::thread([this]() { accept_loop_(); });
 
-        // channels_[peer_rg][lane_id], where lane_id is stripe_id % num_lanes_.
+        // channels_ owns one channel pointer per peer and physical lane.
         channels_.assign(group_size, std::vector<ConcordRdmaChannel*>(num_lanes_, nullptr));
 
         auto connect_outbound = [&](int peer, int lane) {
@@ -1397,7 +1396,7 @@ public:
                   << " lanes connected (per-channel CQ pairs="
                   << (group_size_ - 1) * num_lanes_ << ")" << std::endl;
 
-        // Init RS encode thread pool
+        // The native runtime owns one shared RS encode worker pool.
         rs_pool_init();
 
         // Pre-compile stripe plans only for real Concord POA mode.
@@ -2349,7 +2348,7 @@ private:
         if (!a_mat_) throw std::runtime_error("Concord: failed to alloc RS matrix");
         gf_gen_rs_matrix(a_mat_, total_rows, k);
 
-        // Encoding tables: 32 * k * rows (matches basic_ec)
+        // ISA-L owns 32 bytes of encoding table per source/row pair.
         size_t gtbls_size = 32 * (size_t)k * (size_t)rows;
         void* tmp = nullptr;
         if (posix_memalign(&tmp, 32, gtbls_size) != 0) tmp = nullptr;
@@ -2443,7 +2442,7 @@ private:
         decode_tbls_ = new_decode_tbls;
     }
 
-    // ---- RS encode thread pool (matches basic_ec xor_pool) ----
+    // ---- Shared RS encode worker pool ----
     static std::array<int, kRsPoolSize> rs_parse_cpus_or_default() {
         std::array<int, kRsPoolSize> cpus{};
         const char* env = std::getenv(kRsCpuListEnv);
@@ -2752,24 +2751,7 @@ private:
             worker_max_us, std::memory_order_relaxed);
     }
 
-    // ---- EC-aligned role encoding workers (1 thread per role) ----
-    struct StripeChunkTask {
-        int stripe_id = 0;
-        StripeRole role = StripeRole::SOURCE;
-        size_t block_size = 0;
-        uintptr_t source_data = 0;
-        uintptr_t source_mirror = 0;
-        uintptr_t recv_buf_addr = 0;
-        uintptr_t p1_addr = 0;
-        uintptr_t p2_out_addr = 0;
-        uintptr_t p2_in_addr = 0;
-        int n_src = 0;
-        std::vector<int> src_peer_rigs;
-        std::vector<uint8_t> source_active_mask;  // 1=active (has data), 0=skip (zero-fill)
-        int enc_peer_rig = -1;
-        int par_peer_rig = -1;
-    };
-
+    // ---- Role queues and worker pools ----
     struct MirrorTask {
         uintptr_t gpu_addr = 0;
         uintptr_t cpu_addr = 0;
@@ -2820,7 +2802,7 @@ private:
     std::atomic<uint64_t> save_source_send_max_sge_{0};
     std::atomic<uint64_t> save_enc_recv_bytes_{0};
 
-    // ---- Role-based queues: n workers each, encoder split into RECV→encode+SEND ----
+    // Source, encoder-receive, encoder-send, and parity queues each own n workers.
     struct StripeInfo {
         std::vector<int> src_peer_rigs;
         int enc_peer_rig = -1;
@@ -2829,10 +2811,10 @@ private:
     std::vector<StripeInfo> stripe_info_;
 
     struct SourceTask   { int sid; uintptr_t data, mirror; size_t bs; uint64_t encode_batch = 0; bool skip = false; };
-    struct EncRecvTask  { int sid; uintptr_t recv, p1, p2; size_t bs; std::vector<uint8_t> mask; uint64_t encode_batch = 0; };
+    struct EncRecvTask  { int sid; uintptr_t recv, primary_parity, deferred_parity; size_t bs; std::vector<uint8_t> mask; uint64_t encode_batch = 0; };
     struct EncRecvSubTask { int sid; int src_idx; uintptr_t dst; size_t bs; uint64_t batch; std::shared_ptr<std::atomic<int>> remaining; std::shared_ptr<std::mutex> done_mtx; std::shared_ptr<std::condition_variable> done_cv; };
-    struct EncSendTask  { int sid; uintptr_t recv, p1, p2; size_t bs; int n_src; std::vector<int> src_peer_rigs; int par_peer_rig; bool parity_send_only = false; uint64_t async_order = 0; uint64_t async_batch = 0; };
-    struct ParityTask   { int sid; uintptr_t parity_in; size_t bs; bool async_p2_only = false; uint64_t async_order = 0; uint64_t async_batch = 0; };
+    struct EncSendTask  { int sid; uintptr_t recv, primary_parity, deferred_parity; size_t bs; int n_src; std::vector<int> src_peer_rigs; int par_peer_rig; bool parity_send_only = false; uint64_t async_order = 0; uint64_t async_batch = 0; };
+    struct ParityTask   { int sid; uintptr_t parity_in; size_t bs; bool aggregate_parity_only = false; uint64_t async_order = 0; uint64_t async_batch = 0; };
 
     std::queue<SourceTask>   source_q_;   std::mutex source_mtx_;   std::condition_variable source_cv_;
     std::queue<EncRecvTask>  enc_recv_q_; std::mutex enc_recv_mtx_; std::condition_variable enc_recv_cv_;
@@ -2845,25 +2827,25 @@ private:
     std::atomic<int> task_total_{0}, task_done_{0};
     std::atomic<int> task_encode_total_{0}, task_encode_done_{0};
     std::atomic<int> task_async_total_{0}, task_async_done_{0};
-    std::vector<std::thread> aggregate_p2_threads_;
-    std::mutex aggregate_p2_mtx_;
-    std::condition_variable aggregate_p2_cv_;
-    std::exception_ptr aggregate_p2_error_;
-    std::atomic<int> aggregate_p2_total_{0};
-    std::atomic<int> aggregate_p2_done_{0};
-    uint64_t aggregate_p2_generation_ = 0;
+    std::vector<std::thread> aggregate_parity_threads_;
+    std::mutex aggregate_parity_mtx_;
+    std::condition_variable aggregate_parity_cv_;
+    std::exception_ptr aggregate_parity_error_;
+    std::atomic<int> aggregate_parity_total_{0};
+    std::atomic<int> aggregate_parity_done_{0};
+    uint64_t aggregate_parity_generation_ = 0;
     std::mutex encode_done_mtx_;
     std::condition_variable encode_done_cv_;
-    std::atomic<int> async_p2p_pause_count_{0};
+    std::atomic<int> async_parity_pause_count_{0};
     std::mutex async_parity_send_order_mtx_;
-    std::mutex async_p2_order_mtx_;
-    std::condition_variable async_p2_order_cv_;
-    std::vector<uint64_t> async_p2_send_enq_order_;
-    std::vector<uint64_t> async_p2_send_run_order_;
-    std::vector<uint64_t> async_p2_recv_enq_order_;
-    std::vector<uint64_t> async_p2_recv_run_order_;
-    std::vector<uint64_t> async_p2_send_batch_run_order_;
-    std::vector<uint64_t> async_p2_recv_batch_run_order_;
+    std::mutex async_parity_order_mtx_;
+    std::condition_variable async_parity_order_cv_;
+    std::vector<uint64_t> async_parity_send_enq_order_;
+    std::vector<uint64_t> async_parity_send_run_order_;
+    std::vector<uint64_t> async_parity_recv_enq_order_;
+    std::vector<uint64_t> async_parity_recv_run_order_;
+    std::vector<uint64_t> async_parity_send_batch_run_order_;
+    std::vector<uint64_t> async_parity_recv_batch_run_order_;
     std::vector<uint64_t> encode_source_batch_run_order_;
     std::vector<uint64_t> encode_recv_batch_run_order_;
     std::mutex layer_done_mtx_;
@@ -2871,9 +2853,9 @@ private:
     std::mutex async_done_mtx_;
     std::condition_variable async_done_cv_;
     std::mutex encoder_encode_mtx_;
-    std::atomic<int> async_p2p_inflight_{0};
-    std::mutex async_p2p_inflight_mtx_;
-    std::condition_variable async_p2p_inflight_cv_;
+    std::atomic<int> async_parity_inflight_{0};
+    std::mutex async_parity_inflight_mtx_;
+    std::condition_variable async_parity_inflight_cv_;
     bool debug_ = false;
 
     void check_done_() {
@@ -2901,13 +2883,13 @@ private:
     }
 
     void _wait_if_paused() {
-        while (async_p2p_pause_count_.load(std::memory_order_acquire) > 0) {
+        while (async_parity_pause_count_.load(std::memory_order_acquire) > 0) {
             if (debug_) {
                 static int log_counter = 0;
                 if (++log_counter % 1000 == 1)
                     std::cerr << "[CONCORD-DEBUG] rank " << rank_in_group_
                               << " async P2 paused (refcount="
-                              << async_p2p_pause_count_.load() << ")" << std::endl;
+                              << async_parity_pause_count_.load() << ")" << std::endl;
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
@@ -2915,8 +2897,8 @@ private:
 
     void _async_rdma_begin() {
         while (true) {
-            async_p2p_inflight_.fetch_add(1, std::memory_order_acq_rel);
-            if (async_p2p_pause_count_.load(std::memory_order_acquire) == 0) {
+            async_parity_inflight_.fetch_add(1, std::memory_order_acq_rel);
+            if (async_parity_pause_count_.load(std::memory_order_acquire) == 0) {
                 return;
             }
             _async_rdma_end();
@@ -2925,41 +2907,41 @@ private:
     }
 
     void _async_rdma_end() {
-        int prev = async_p2p_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+        int prev = async_parity_inflight_.fetch_sub(1, std::memory_order_acq_rel);
         if (prev <= 1) {
-            std::lock_guard<std::mutex> lk(async_p2p_inflight_mtx_);
-            async_p2p_inflight_cv_.notify_all();
+            std::lock_guard<std::mutex> lk(async_parity_inflight_mtx_);
+            async_parity_inflight_cv_.notify_all();
         }
     }
 
     void _wait_async_rdma_idle() {
-        if (async_p2p_inflight_.load(std::memory_order_acquire) == 0) return;
-        std::unique_lock<std::mutex> lk(async_p2p_inflight_mtx_);
-        async_p2p_inflight_cv_.wait(lk, [&] {
-            return async_p2p_inflight_.load(std::memory_order_acquire) == 0;
+        if (async_parity_inflight_.load(std::memory_order_acquire) == 0) return;
+        std::unique_lock<std::mutex> lk(async_parity_inflight_mtx_);
+        async_parity_inflight_cv_.wait(lk, [&] {
+            return async_parity_inflight_.load(std::memory_order_acquire) == 0;
         });
     }
 
-    void wait_async_p2_send_turn_(int sid, uint64_t order, uint64_t batch = 0) {
-        std::unique_lock<std::mutex> lk(async_p2_order_mtx_);
+    void wait_async_parity_send_turn_(int sid, uint64_t order, uint64_t batch = 0) {
+        std::unique_lock<std::mutex> lk(async_parity_order_mtx_);
         while (!all_stop_.load(std::memory_order_acquire) &&
-               ((batch == 0 && sid >= 0 && sid < (int)async_p2_send_run_order_.size() &&
-                 async_p2_send_run_order_[(size_t)sid] != order) ||
-                (batch != 0 && sid >= 0 && sid < (int)async_p2_send_batch_run_order_.size() &&
-                 async_p2_send_batch_run_order_[(size_t)sid] != batch))) {
+               ((batch == 0 && sid >= 0 && sid < (int)async_parity_send_run_order_.size() &&
+                 async_parity_send_run_order_[(size_t)sid] != order) ||
+                (batch != 0 && sid >= 0 && sid < (int)async_parity_send_batch_run_order_.size() &&
+                 async_parity_send_batch_run_order_[(size_t)sid] != batch))) {
             if (debug_) {
                 std::cerr << "[CONCORD-DEBUG] rank " << rank_in_group_
                           << " async_p2_send wait_turn sid=" << sid
                           << " order=" << order
                           << " batch=" << batch
-                          << " expect=" << (sid >= 0 && sid < (int)async_p2_send_run_order_.size() ? async_p2_send_run_order_[(size_t)sid] : 0)
+                          << " expect=" << (sid >= 0 && sid < (int)async_parity_send_run_order_.size() ? async_parity_send_run_order_[(size_t)sid] : 0)
                           << std::endl;
             }
-            async_p2_order_cv_.wait_for(lk, std::chrono::seconds(1));
+            async_parity_order_cv_.wait_for(lk, std::chrono::seconds(1));
         }
         if (debug_) {
-            uint64_t expect = (sid >= 0 && sid < (int)async_p2_send_run_order_.size())
-                                ? async_p2_send_run_order_[(size_t)sid] : 0;
+            uint64_t expect = (sid >= 0 && sid < (int)async_parity_send_run_order_.size())
+                                ? async_parity_send_run_order_[(size_t)sid] : 0;
             std::cerr << "[CONCORD-DEBUG] rank " << rank_in_group_
                       << " async_p2_send turn_ready sid=" << sid
                       << " order=" << order
@@ -2967,40 +2949,40 @@ private:
         }
     }
 
-    void advance_async_p2_send_turn_(int sid, uint64_t batch = 0) {
+    void advance_async_parity_send_turn_(int sid, uint64_t batch = 0) {
         {
-            std::lock_guard<std::mutex> lk(async_p2_order_mtx_);
+            std::lock_guard<std::mutex> lk(async_parity_order_mtx_);
             if (batch == 0) {
-                if (sid >= 0 && sid < (int)async_p2_send_run_order_.size())
-                    ++async_p2_send_run_order_[(size_t)sid];
+                if (sid >= 0 && sid < (int)async_parity_send_run_order_.size())
+                    ++async_parity_send_run_order_[(size_t)sid];
             } else {
-                if (sid >= 0 && sid < (int)async_p2_send_batch_run_order_.size())
-                    ++async_p2_send_batch_run_order_[(size_t)sid];
+                if (sid >= 0 && sid < (int)async_parity_send_batch_run_order_.size())
+                    ++async_parity_send_batch_run_order_[(size_t)sid];
             }
         }
-        async_p2_order_cv_.notify_all();
+        async_parity_order_cv_.notify_all();
     }
 
-    void wait_async_p2_recv_turn_(int sid, uint64_t order, uint64_t batch = 0) {
-        std::unique_lock<std::mutex> lk(async_p2_order_mtx_);
+    void wait_async_parity_recv_turn_(int sid, uint64_t order, uint64_t batch = 0) {
+        std::unique_lock<std::mutex> lk(async_parity_order_mtx_);
         while (!all_stop_.load(std::memory_order_acquire) &&
-               ((batch == 0 && sid >= 0 && sid < (int)async_p2_recv_run_order_.size() &&
-                 async_p2_recv_run_order_[(size_t)sid] != order) ||
-                (batch != 0 && sid >= 0 && sid < (int)async_p2_recv_batch_run_order_.size() &&
-                 async_p2_recv_batch_run_order_[(size_t)sid] != batch))) {
+               ((batch == 0 && sid >= 0 && sid < (int)async_parity_recv_run_order_.size() &&
+                 async_parity_recv_run_order_[(size_t)sid] != order) ||
+                (batch != 0 && sid >= 0 && sid < (int)async_parity_recv_batch_run_order_.size() &&
+                 async_parity_recv_batch_run_order_[(size_t)sid] != batch))) {
             if (debug_) {
                 std::cerr << "[CONCORD-DEBUG] rank " << rank_in_group_
                           << " async_p2_recv wait_turn sid=" << sid
                           << " order=" << order
                           << " batch=" << batch
-                          << " expect=" << (sid >= 0 && sid < (int)async_p2_recv_run_order_.size() ? async_p2_recv_run_order_[(size_t)sid] : 0)
+                          << " expect=" << (sid >= 0 && sid < (int)async_parity_recv_run_order_.size() ? async_parity_recv_run_order_[(size_t)sid] : 0)
                           << std::endl;
             }
-            async_p2_order_cv_.wait_for(lk, std::chrono::seconds(1));
+            async_parity_order_cv_.wait_for(lk, std::chrono::seconds(1));
         }
         if (debug_) {
-            uint64_t expect = (sid >= 0 && sid < (int)async_p2_recv_run_order_.size())
-                                ? async_p2_recv_run_order_[(size_t)sid] : 0;
+            uint64_t expect = (sid >= 0 && sid < (int)async_parity_recv_run_order_.size())
+                                ? async_parity_recv_run_order_[(size_t)sid] : 0;
             std::cerr << "[CONCORD-DEBUG] rank " << rank_in_group_
                       << " async_p2_recv turn_ready sid=" << sid
                       << " order=" << order
@@ -3008,58 +2990,58 @@ private:
         }
     }
 
-    void advance_async_p2_recv_turn_(int sid, uint64_t batch = 0) {
+    void advance_async_parity_recv_turn_(int sid, uint64_t batch = 0) {
         {
-            std::lock_guard<std::mutex> lk(async_p2_order_mtx_);
+            std::lock_guard<std::mutex> lk(async_parity_order_mtx_);
             if (batch == 0) {
-                if (sid >= 0 && sid < (int)async_p2_recv_run_order_.size())
-                    ++async_p2_recv_run_order_[(size_t)sid];
+                if (sid >= 0 && sid < (int)async_parity_recv_run_order_.size())
+                    ++async_parity_recv_run_order_[(size_t)sid];
             } else {
-                if (sid >= 0 && sid < (int)async_p2_recv_batch_run_order_.size())
-                    ++async_p2_recv_batch_run_order_[(size_t)sid];
+                if (sid >= 0 && sid < (int)async_parity_recv_batch_run_order_.size())
+                    ++async_parity_recv_batch_run_order_[(size_t)sid];
             }
         }
-        async_p2_order_cv_.notify_all();
+        async_parity_order_cv_.notify_all();
     }
 
     void wait_encode_source_turn_(int sid, uint64_t batch) {
         if (batch == 0) return;
-        std::unique_lock<std::mutex> lk(async_p2_order_mtx_);
+        std::unique_lock<std::mutex> lk(async_parity_order_mtx_);
         while (!all_stop_.load(std::memory_order_acquire) &&
                sid >= 0 && sid < (int)encode_source_batch_run_order_.size() &&
                encode_source_batch_run_order_[(size_t)sid] != batch) {
-            async_p2_order_cv_.wait_for(lk, std::chrono::seconds(1));
+            async_parity_order_cv_.wait_for(lk, std::chrono::seconds(1));
         }
     }
 
     void advance_encode_source_turn_(int sid, uint64_t batch) {
         if (batch == 0) return;
         {
-            std::lock_guard<std::mutex> lk(async_p2_order_mtx_);
+            std::lock_guard<std::mutex> lk(async_parity_order_mtx_);
             if (sid >= 0 && sid < (int)encode_source_batch_run_order_.size())
                 ++encode_source_batch_run_order_[(size_t)sid];
         }
-        async_p2_order_cv_.notify_all();
+        async_parity_order_cv_.notify_all();
     }
 
     void wait_encode_recv_turn_(int sid, uint64_t batch) {
         if (batch == 0) return;
-        std::unique_lock<std::mutex> lk(async_p2_order_mtx_);
+        std::unique_lock<std::mutex> lk(async_parity_order_mtx_);
         while (!all_stop_.load(std::memory_order_acquire) &&
                sid >= 0 && sid < (int)encode_recv_batch_run_order_.size() &&
                encode_recv_batch_run_order_[(size_t)sid] != batch) {
-            async_p2_order_cv_.wait_for(lk, std::chrono::seconds(1));
+            async_parity_order_cv_.wait_for(lk, std::chrono::seconds(1));
         }
     }
 
     void advance_encode_recv_turn_(int sid, uint64_t batch) {
         if (batch == 0) return;
         {
-            std::lock_guard<std::mutex> lk(async_p2_order_mtx_);
+            std::lock_guard<std::mutex> lk(async_parity_order_mtx_);
             if (sid >= 0 && sid < (int)encode_recv_batch_run_order_.size())
                 ++encode_recv_batch_run_order_[(size_t)sid];
         }
-        async_p2_order_cv_.notify_all();
+        async_parity_order_cv_.notify_all();
     }
 
     void record_save_net_start_(uint64_t t) {
@@ -3216,8 +3198,8 @@ private:
                 done_cv->wait(lk, [&]{ return remaining->load(std::memory_order_acquire) == 0 || all_stop_.load(std::memory_order_acquire); });
             }
             advance_encode_recv_turn_(t.sid, t.encode_batch);
-            // Push to enc_send_q_
-            EncSendTask es{t.sid, t.recv, t.p1, t.p2, t.bs, n_src, si.src_peer_rigs, si.par_peer_rig};
+            // Transfer ownership to the encoder-send queue.
+            EncSendTask es{t.sid, t.recv, t.primary_parity, t.deferred_parity, t.bs, n_src, si.src_peer_rigs, si.par_peer_rig};
             { std::lock_guard<std::mutex> lk(enc_send_mtx_); enc_send_q_.push(std::move(es)); }
             enc_send_cv_.notify_one();
         }
@@ -3233,7 +3215,7 @@ private:
                 t = std::move(enc_send_q_.front()); enc_send_q_.pop();
             }
             if (t.parity_send_only) {
-                wait_async_p2_send_turn_(t.sid, t.async_order, t.async_batch);
+                wait_async_parity_send_turn_(t.sid, t.async_order, t.async_batch);
                 _wait_if_paused();
                 auto wait_cb = [this]() { this->_async_rdma_begin(); };
                 auto done_cb = [this]() { this->_async_rdma_end(); };
@@ -3255,14 +3237,14 @@ private:
                         record_save_net_start_(net_t0);
                         if (shared_lane_) {
                             ch->send_tagged(make_channel_tag_(1, t.sid, t.async_batch),
-                                            (const uint8_t*)t.p1, t.bs, wait_cb, done_cb);
+                                            (const uint8_t*)t.primary_parity, t.bs, wait_cb, done_cb);
                         } else {
-                            ch->send_data((const uint8_t*)t.p1, t.bs, wait_cb, done_cb);
+                            ch->send_data((const uint8_t*)t.primary_parity, t.bs, wait_cb, done_cb);
                         }
                         record_save_net_end_(concord_now_us());
                     }
                 }
-                advance_async_p2_send_turn_(t.sid, t.async_batch);
+                advance_async_parity_send_turn_(t.sid, t.async_batch);
                 check_async_done_();
                 if (debug_) {
                     std::cerr << "[CONCORD-DEBUG] rank " << rank_in_group_
@@ -3280,7 +3262,7 @@ private:
                 std::vector<unsigned char*> data_ptrs((size_t)n_src);
                 for (int i = 0; i < n_src; ++i)
                     data_ptrs[(size_t)i] = (unsigned char*)(t.recv + (uintptr_t)i * t.bs);
-                unsigned char* parity_ptrs[2] = { (unsigned char*)t.p1, (unsigned char*)t.p2 };
+                unsigned char* parity_ptrs[2] = { (unsigned char*)t.primary_parity, (unsigned char*)t.deferred_parity };
                 RsEncodeJob rs{(int)t.bs, n_src, 2, g_tbls_, data_ptrs.data(), parity_ptrs};
                 uint64_t encode_t0 = concord_now_us();
                 { std::lock_guard<std::mutex> lk(encoder_encode_mtx_); rs_pool_run_parallel_encode(rs); }
@@ -3299,8 +3281,8 @@ private:
               if (all_stop_ && parity_q_.empty()) break; t = parity_q_.front(); parity_q_.pop(); }
             auto& si = stripe_info_[(size_t)t.sid];
             auto* ch = get_save_recv_channel_(si.enc_peer_rig, t.sid);
-            if (t.async_p2_only) wait_async_p2_recv_turn_(t.sid, t.async_order, t.async_batch);
-            if (debug_ && t.async_p2_only) {
+            if (t.aggregate_parity_only) wait_async_parity_recv_turn_(t.sid, t.async_order, t.async_batch);
+            if (debug_ && t.aggregate_parity_only) {
                 std::cerr << "[CONCORD-DEBUG] rank " << rank_in_group_
                           << " async_p2_recv begin sid=" << t.sid
                           << " order=" << t.async_order
@@ -3316,7 +3298,7 @@ private:
             if (ch) {
                 uint64_t net_t0 = concord_now_us();
                 record_save_net_start_(net_t0);
-                if (shared_lane_ && t.async_p2_only) {
+                if (shared_lane_ && t.aggregate_parity_only) {
                     ch->recv_tagged(make_channel_tag_(1, t.sid, t.async_batch),
                                     (uint8_t*)t.parity_in, t.bs);
                 } else {
@@ -3324,9 +3306,9 @@ private:
                 }
                 record_save_net_end_(concord_now_us());
             }
-            if (t.async_p2_only) advance_async_p2_recv_turn_(t.sid, t.async_batch);
+            if (t.aggregate_parity_only) advance_async_parity_recv_turn_(t.sid, t.async_batch);
             check_async_done_();
-            if (debug_ && t.async_p2_only) {
+            if (debug_ && t.aggregate_parity_only) {
                 std::cerr << "[CONCORD-DEBUG] rank " << rank_in_group_
                           << " async_p2_recv done sid=" << t.sid
                           << " order=" << t.async_order
@@ -3498,23 +3480,23 @@ public:
 
     void encode_layer_stripes_batch(
         const std::vector<int>& stripe_ids, const std::vector<uintptr_t>& data_addrs,
-        const std::vector<uintptr_t>& p1_addrs, const std::vector<uintptr_t>& p2_addrs,
+        const std::vector<uintptr_t>& primary_parity_addrs, const std::vector<uintptr_t>& deferred_parity_addrs,
         const std::vector<size_t>& block_sizes) {
         if (m_ != 2) throw std::runtime_error("Concord legacy encode API requires m=2");
         std::vector<uintptr_t> parity_addrs;
         parity_addrs.reserve(stripe_ids.size() * 2);
         for (size_t i = 0; i < stripe_ids.size(); ++i) {
-            parity_addrs.push_back(p1_addrs.at(i));
-            parity_addrs.push_back(p2_addrs.at(i));
+            parity_addrs.push_back(primary_parity_addrs.at(i));
+            parity_addrs.push_back(deferred_parity_addrs.at(i));
         }
         encode_layer_stripes_generic_batch(stripe_ids, data_addrs, parity_addrs, block_sizes);
     }
 
     void encode_layer_stripes(
         const std::vector<int>& stripe_ids, const std::vector<uintptr_t>& data_addrs,
-        const std::vector<uintptr_t>& p1_addrs, const std::vector<uintptr_t>& p2_addrs,
+        const std::vector<uintptr_t>& primary_parity_addrs, const std::vector<uintptr_t>& deferred_parity_addrs,
         size_t block_size) {
-        encode_layer_stripes_batch(stripe_ids, data_addrs, p1_addrs, p2_addrs,
+        encode_layer_stripes_batch(stripe_ids, data_addrs, primary_parity_addrs, deferred_parity_addrs,
                                    std::vector<size_t>(stripe_ids.size(), block_size));
     }
 
@@ -3719,14 +3701,14 @@ private:
     void init_stripe_workers() {
         int ns = (int)stripe_plans_.size();
         stripe_info_.resize((size_t)ns);
-        async_p2_send_batch_run_order_.assign((size_t)ns, 1);
-        async_p2_recv_batch_run_order_.assign((size_t)ns, 1);
+        async_parity_send_batch_run_order_.assign((size_t)ns, 1);
+        async_parity_recv_batch_run_order_.assign((size_t)ns, 1);
         encode_source_batch_run_order_.assign((size_t)ns, 1);
         encode_recv_batch_run_order_.assign((size_t)ns, 1);
-        async_p2_send_enq_order_.assign((size_t)ns, 0);
-        async_p2_send_run_order_.assign((size_t)ns, 0);
-        async_p2_recv_enq_order_.assign((size_t)ns, 0);
-        async_p2_recv_run_order_.assign((size_t)ns, 0);
+        async_parity_send_enq_order_.assign((size_t)ns, 0);
+        async_parity_send_run_order_.assign((size_t)ns, 0);
+        async_parity_recv_enq_order_.assign((size_t)ns, 0);
+        async_parity_recv_run_order_.assign((size_t)ns, 0);
         for (int i = 0; i < ns; ++i) {
             auto& si = stripe_info_[(size_t)i];
             si.src_peer_rigs.resize(stripe_plans_[i].source_node_ids.size());
@@ -3737,8 +3719,7 @@ private:
         }
         all_stop_.store(false, std::memory_order_release);
         int nw = n_;
-        // Each encoder stripe may recv from (n-2) remote sources in parallel.
-        // Use a dedicated pool large enough for concurrent stripes * sources.
+        // Encoder receive subworkers cover up to n concurrent stripes and n-2 sources each.
         int enc_recv_part_nw = nw * std::max(1, nw - 2);
         const char* part_env = std::getenv("CONCORD_ENC_RECV_PART_WORKERS");
         if (part_env && part_env[0] != '\0') {
@@ -3754,9 +3735,7 @@ private:
         for (int w = 0; w < enc_recv_part_nw; ++w) {
             enc_recv_part_workers_.emplace_back(&ConcordNative::enc_recv_part_worker_, this);
         }
-        // Reuse enc_send workers for deferred P2 sends (n parallel workers,
-        // same as sync path).  P2 send tasks are pushed to enc_send_q_ so
-        // the existing n workers pick them up in FIFO order.
+        // Deferred parity sends share the n encoder-send workers and their FIFO queue.
         if (debug_)
             std::cout << "Concord: " << nw << " workers/role, "
                       << enc_recv_part_nw << " enc_recv_part workers for "
@@ -3767,7 +3746,7 @@ private:
         all_stop_.store(true, std::memory_order_release);
         source_cv_.notify_all(); enc_recv_cv_.notify_all();
         enc_recv_part_cv_.notify_all(); enc_send_cv_.notify_all(); parity_cv_.notify_all();
-        async_p2_order_cv_.notify_all();
+        async_parity_order_cv_.notify_all();
         for (auto* v : {&source_workers_, &enc_recv_workers_, &enc_recv_part_workers_, &enc_send_workers_, &parity_workers_})
             for (auto& t : *v) if (t.joinable()) t.join();
         source_workers_.clear(); enc_recv_workers_.clear(); enc_recv_part_workers_.clear();
@@ -3793,19 +3772,19 @@ public:
         submit_source_with_batch(sid, data, mirror, bs, 0);
     }
 
-    void submit_enc_recv_with_batch(int sid, uintptr_t recv, uintptr_t p1, uintptr_t p2, size_t bs,
+    void submit_enc_recv_with_batch(int sid, uintptr_t recv, uintptr_t primary_parity_addr, uintptr_t deferred_parity_addr, size_t bs,
                                     const std::vector<uint8_t>& mask, uint64_t batch) {
         if (m_ != 2)
             throw std::runtime_error("Concord legacy stripe worker API requires m=2");
         task_total_.fetch_add(1, std::memory_order_acq_rel);
         task_encode_total_.fetch_add(1, std::memory_order_acq_rel);
-        { std::lock_guard<std::mutex> lk(enc_recv_mtx_); enc_recv_q_.push({sid, recv, p1, p2, bs, mask, batch}); }
+        { std::lock_guard<std::mutex> lk(enc_recv_mtx_); enc_recv_q_.push({sid, recv, primary_parity_addr, deferred_parity_addr, bs, mask, batch}); }
         enc_recv_cv_.notify_one();
     }
 
-    void submit_enc_recv(int sid, uintptr_t recv, uintptr_t p1, uintptr_t p2, size_t bs,
+    void submit_enc_recv(int sid, uintptr_t recv, uintptr_t primary_parity_addr, uintptr_t deferred_parity_addr, size_t bs,
                          const std::vector<uint8_t>& mask) {
-        submit_enc_recv_with_batch(sid, recv, p1, p2, bs, mask, 0);
+        submit_enc_recv_with_batch(sid, recv, primary_parity_addr, deferred_parity_addr, bs, mask, 0);
     }
 
     void submit_parity(int sid, uintptr_t parity_in, size_t bs) {
@@ -3815,15 +3794,11 @@ public:
         parity_cv_.notify_one();
     }
 
-    void submit_p2_send(int sid, uintptr_t p2_addr, size_t bs) {
-        submit_p1_send(sid, p2_addr, bs);
-    }
-
-    void submit_p1_send(int sid, uintptr_t p1_addr, size_t bs) {
+    void submit_deferred_parity_send(int sid, uintptr_t parity_addr, size_t bs) {
         auto& si = stripe_info_[(size_t)sid];
         EncSendTask t;
         t.sid = sid;
-        t.p1 = p1_addr;
+        t.primary_parity = parity_addr;
         t.bs = bs;
         t.par_peer_rig = si.par_peer_rig;
         t.parity_send_only = true;
@@ -3832,10 +3807,19 @@ public:
         enc_send_cv_.notify_one();
     }
 
-    void submit_async_p2_batch(
+    // Legacy two-parity API aliases; both submit an already-selected parity address.
+    void submit_p1_send(int sid, uintptr_t p1_addr, size_t bs) {
+        submit_deferred_parity_send(sid, p1_addr, bs);
+    }
+
+    void submit_p2_send(int sid, uintptr_t p2_addr, size_t bs) {
+        submit_deferred_parity_send(sid, p2_addr, bs);
+    }
+
+    void submit_async_deferred_parity_batch(
         const std::vector<std::tuple<int, uintptr_t, size_t>>& parity_tasks,
-        const std::vector<std::tuple<int, uintptr_t, size_t>>& p2_send_tasks) {
-        int total = static_cast<int>(parity_tasks.size() + p2_send_tasks.size());
+        const std::vector<std::tuple<int, uintptr_t, size_t>>& deferred_send_tasks) {
+        int total = static_cast<int>(parity_tasks.size() + deferred_send_tasks.size());
         if (total == 0) return;
         task_total_.fetch_add(static_cast<int>(parity_tasks.size()), std::memory_order_acq_rel);
         task_async_total_.fetch_add(total, std::memory_order_acq_rel);
@@ -3849,9 +3833,9 @@ public:
                 parity_q_.push({sid, parity_in, bs});
             }
         }
-        if (!p2_send_tasks.empty()) {
+        if (!deferred_send_tasks.empty()) {
             std::lock_guard<std::mutex> lk(enc_send_mtx_);
-            for (const auto& task : p2_send_tasks) {
+            for (const auto& task : deferred_send_tasks) {
                 int sid;
                 uintptr_t p2_addr;
                 size_t bs;
@@ -3859,7 +3843,7 @@ public:
                 auto& si = stripe_info_[(size_t)sid];
                 EncSendTask t;
                 t.sid = sid;
-                t.p1 = p2_addr;
+                t.primary_parity = p2_addr;
                 t.bs = bs;
                 t.par_peer_rig = si.par_peer_rig;
                 t.parity_send_only = true;
@@ -3867,18 +3851,18 @@ public:
             }
         }
         if (!parity_tasks.empty()) parity_cv_.notify_all();
-        if (!p2_send_tasks.empty()) enc_send_cv_.notify_all();
+        if (!deferred_send_tasks.empty()) enc_send_cv_.notify_all();
     }
 
-    std::vector<int> submit_async_p2_layer_with_batch(
-        const std::vector<uintptr_t>& p2_addrs,
+    std::vector<int> submit_async_deferred_parity_layer_with_batch(
+        const std::vector<uintptr_t>& deferred_parity_addrs,
         size_t bs,
         uint64_t batch) {
         int parity_count = 0;
         int send_count = 0;
-        int ns = std::min((int)p2_addrs.size(), (int)stripe_info_.size());
+        int ns = std::min((int)deferred_parity_addrs.size(), (int)stripe_info_.size());
         for (int sid = 0; sid < ns; ++sid) {
-            if (p2_addrs[(size_t)sid] == 0) continue;
+            if (deferred_parity_addrs[(size_t)sid] == 0) continue;
             int role = get_role_for_stripe(sid);
             if (role == (int)StripeRole::PARITY_TARGET) {
                 ++parity_count;
@@ -3896,20 +3880,20 @@ public:
         if (parity_count > 0) {
             parity_to_push.reserve((size_t)parity_count);
             for (int sid = 0; sid < ns; ++sid) {
-                uintptr_t addr = p2_addrs[(size_t)sid];
+                uintptr_t addr = deferred_parity_addrs[(size_t)sid];
                 if (addr == 0) continue;
                 if (get_role_for_stripe(sid) == (int)StripeRole::PARITY_TARGET) {
                     ParityTask t;
                     t.sid = sid;
                     t.parity_in = addr;
                     t.bs = bs;
-                    t.async_p2_only = true;
+                    t.aggregate_parity_only = true;
                     t.async_batch = batch;
                     {
-                        std::lock_guard<std::mutex> order_lk(async_p2_order_mtx_);
+                        std::lock_guard<std::mutex> order_lk(async_parity_order_mtx_);
                         if (batch == 0) {
-                            if (sid >= 0 && sid < (int)async_p2_recv_enq_order_.size())
-                                t.async_order = async_p2_recv_enq_order_[(size_t)sid]++;
+                            if (sid >= 0 && sid < (int)async_parity_recv_enq_order_.size())
+                                t.async_order = async_parity_recv_enq_order_[(size_t)sid]++;
                         } else {
                             t.async_order = batch;
                         }
@@ -3925,22 +3909,22 @@ public:
         if (send_count > 0) {
             send_to_push.reserve((size_t)send_count);
             for (int sid = 0; sid < ns; ++sid) {
-                uintptr_t addr = p2_addrs[(size_t)sid];
+                uintptr_t addr = deferred_parity_addrs[(size_t)sid];
                 if (addr == 0) continue;
                 if (get_role_for_stripe(sid) == (int)StripeRole::ENCODER) {
                     auto& si = stripe_info_[(size_t)sid];
                     EncSendTask t;
                     t.sid = sid;
-                    t.p1 = addr;
+                    t.primary_parity = addr;
                     t.bs = bs;
                     t.par_peer_rig = si.par_peer_rig;
                     t.parity_send_only = true;
                     t.async_batch = batch;
                     {
-                        std::lock_guard<std::mutex> order_lk(async_p2_order_mtx_);
+                        std::lock_guard<std::mutex> order_lk(async_parity_order_mtx_);
                         if (batch == 0) {
-                            if (sid >= 0 && sid < (int)async_p2_send_enq_order_.size())
-                                t.async_order = async_p2_send_enq_order_[(size_t)sid]++;
+                            if (sid >= 0 && sid < (int)async_parity_send_enq_order_.size())
+                                t.async_order = async_parity_send_enq_order_[(size_t)sid]++;
                         } else {
                             t.async_order = batch;
                         }
@@ -3957,10 +3941,11 @@ public:
         return {parity_count, send_count};
     }
 
-    std::vector<int> submit_async_p2_layer(
-        const std::vector<uintptr_t>& p2_addrs,
+    std::vector<int> submit_async_deferred_parity_layer(
+        const std::vector<uintptr_t>& deferred_parity_addrs,
         size_t bs) {
-        return submit_async_p2_layer_with_batch(p2_addrs, bs, 0);
+        return submit_async_deferred_parity_layer_with_batch(
+            deferred_parity_addrs, bs, 0);
     }
 
     std::vector<int> get_parity_route(int sid, int parity_index) const {
@@ -3983,35 +3968,35 @@ public:
         return {(int)StripeRole::INACTIVE, -1, -1};
     }
 
-    std::vector<int> get_p2_route(int sid) const {
+    std::vector<int> get_deferred_parity_route(int sid) const {
         if (m_ < 2) return {(int)StripeRole::INACTIVE, -1, -1};
         return get_parity_route(sid, 1);
     }
 
-    using AggregateP2Task = std::tuple<
+    using AggregateParityTask = std::tuple<
         int, int, std::vector<std::pair<uintptr_t, size_t>>>;
 
-    std::vector<int> submit_aggregate_p2(
-        const std::vector<AggregateP2Task>& send_tasks,
-        const std::vector<AggregateP2Task>& recv_tasks,
+    std::vector<int> submit_aggregate_parity(
+        const std::vector<AggregateParityTask>& send_tasks,
+        const std::vector<AggregateParityTask>& recv_tasks,
         uint64_t generation) {
-        if (!aggregate_p2_threads_.empty() ||
-            aggregate_p2_done_.load(std::memory_order_acquire) <
-                aggregate_p2_total_.load(std::memory_order_acquire)) {
+        if (!aggregate_parity_threads_.empty() ||
+            aggregate_parity_done_.load(std::memory_order_acquire) <
+                aggregate_parity_total_.load(std::memory_order_acquire)) {
             throw std::runtime_error("Concord aggregate P2: previous generation is still active");
         }
-        if (generation == 0 || generation <= aggregate_p2_generation_)
+        if (generation == 0 || generation <= aggregate_parity_generation_)
             throw std::runtime_error("Concord aggregate P2: generation must increase");
-        aggregate_p2_generation_ = generation;
-        aggregate_p2_error_ = nullptr;
-        aggregate_p2_done_.store(0, std::memory_order_release);
+        aggregate_parity_generation_ = generation;
+        aggregate_parity_error_ = nullptr;
+        aggregate_parity_done_.store(0, std::memory_order_release);
         const int total = static_cast<int>(send_tasks.size() + recv_tasks.size());
-        aggregate_p2_total_.store(total, std::memory_order_release);
+        aggregate_parity_total_.store(total, std::memory_order_release);
 
         auto launch = [this, generation](
                 bool is_send, int peer, int lane,
                 std::vector<std::pair<uintptr_t, size_t>> segments) {
-            aggregate_p2_threads_.emplace_back([
+            aggregate_parity_threads_.emplace_back([
                     this, generation, is_send, peer, lane,
                     segments = std::move(segments)]() {
                 try {
@@ -4047,11 +4032,11 @@ public:
                     }
                     record_save_net_end_(concord_now_us());
                 } catch (...) {
-                    std::lock_guard<std::mutex> lk(aggregate_p2_mtx_);
-                    if (!aggregate_p2_error_) aggregate_p2_error_ = std::current_exception();
+                    std::lock_guard<std::mutex> lk(aggregate_parity_mtx_);
+                    if (!aggregate_parity_error_) aggregate_parity_error_ = std::current_exception();
                 }
-                aggregate_p2_done_.fetch_add(1, std::memory_order_acq_rel);
-                aggregate_p2_cv_.notify_all();
+                aggregate_parity_done_.fetch_add(1, std::memory_order_acq_rel);
+                aggregate_parity_cv_.notify_all();
             });
         };
         try {
@@ -4061,46 +4046,46 @@ public:
                 launch(true, std::get<0>(task), std::get<1>(task), std::get<2>(task));
         } catch (...) {
             abort_all_channels_();
-            for (auto& thread : aggregate_p2_threads_)
+            for (auto& thread : aggregate_parity_threads_)
                 if (thread.joinable()) thread.join();
-            aggregate_p2_threads_.clear();
-            aggregate_p2_total_.store(0, std::memory_order_release);
-            aggregate_p2_done_.store(0, std::memory_order_release);
+            aggregate_parity_threads_.clear();
+            aggregate_parity_total_.store(0, std::memory_order_release);
+            aggregate_parity_done_.store(0, std::memory_order_release);
             throw;
         }
         return {static_cast<int>(send_tasks.size()), static_cast<int>(recv_tasks.size())};
     }
 
-    void wait_aggregate_p2(int timeout_seconds = 300) {
-        const int total = aggregate_p2_total_.load(std::memory_order_acquire);
+    void wait_aggregate_parity(int timeout_seconds = 300) {
+        const int total = aggregate_parity_total_.load(std::memory_order_acquire);
         if (total > 0) {
-            std::unique_lock<std::mutex> lk(aggregate_p2_mtx_);
-            if (!aggregate_p2_cv_.wait_for(
+            std::unique_lock<std::mutex> lk(aggregate_parity_mtx_);
+            if (!aggregate_parity_cv_.wait_for(
                     lk, std::chrono::seconds(std::max(1, timeout_seconds)), [this, total] {
-                        return aggregate_p2_done_.load(std::memory_order_acquire) >= total;
+                        return aggregate_parity_done_.load(std::memory_order_acquire) >= total;
                     })) {
-                const int done = aggregate_p2_done_.load(std::memory_order_acquire);
+                const int done = aggregate_parity_done_.load(std::memory_order_acquire);
                 lk.unlock();
                 abort_all_channels_();
-                for (auto& thread : aggregate_p2_threads_)
+                for (auto& thread : aggregate_parity_threads_)
                     if (thread.joinable()) thread.join();
-                aggregate_p2_threads_.clear();
+                aggregate_parity_threads_.clear();
                 throw std::runtime_error(
                     "Concord aggregate P2 timed out: done=" +
                     std::to_string(done) + "/" + std::to_string(total));
             }
         }
-        for (auto& thread : aggregate_p2_threads_)
+        for (auto& thread : aggregate_parity_threads_)
             if (thread.joinable()) thread.join();
-        aggregate_p2_threads_.clear();
+        aggregate_parity_threads_.clear();
         std::exception_ptr error;
         {
-            std::lock_guard<std::mutex> lk(aggregate_p2_mtx_);
-            error = aggregate_p2_error_;
-            aggregate_p2_error_ = nullptr;
+            std::lock_guard<std::mutex> lk(aggregate_parity_mtx_);
+            error = aggregate_parity_error_;
+            aggregate_parity_error_ = nullptr;
         }
         if (error) std::rethrow_exception(error);
-        if (aggregate_p2_done_.load(std::memory_order_acquire) != total)
+        if (aggregate_parity_done_.load(std::memory_order_acquire) != total)
             throw std::runtime_error("Concord aggregate P2 completion count mismatch");
     }
 
@@ -4122,15 +4107,15 @@ public:
             enc_send_q_.swap(keep);
         }
         {
-            std::lock_guard<std::mutex> lk(async_p2_order_mtx_);
-            std::fill(async_p2_send_enq_order_.begin(), async_p2_send_enq_order_.end(), 0);
-            std::fill(async_p2_send_run_order_.begin(), async_p2_send_run_order_.end(), 0);
-            std::fill(async_p2_recv_enq_order_.begin(), async_p2_recv_enq_order_.end(), 0);
-            std::fill(async_p2_recv_run_order_.begin(), async_p2_recv_run_order_.end(), 0);
-            std::fill(async_p2_send_batch_run_order_.begin(), async_p2_send_batch_run_order_.end(), 1);
-            std::fill(async_p2_recv_batch_run_order_.begin(), async_p2_recv_batch_run_order_.end(), 1);
+            std::lock_guard<std::mutex> lk(async_parity_order_mtx_);
+            std::fill(async_parity_send_enq_order_.begin(), async_parity_send_enq_order_.end(), 0);
+            std::fill(async_parity_send_run_order_.begin(), async_parity_send_run_order_.end(), 0);
+            std::fill(async_parity_recv_enq_order_.begin(), async_parity_recv_enq_order_.end(), 0);
+            std::fill(async_parity_recv_run_order_.begin(), async_parity_recv_run_order_.end(), 0);
+            std::fill(async_parity_send_batch_run_order_.begin(), async_parity_send_batch_run_order_.end(), 1);
+            std::fill(async_parity_recv_batch_run_order_.begin(), async_parity_recv_batch_run_order_.end(), 1);
         }
-        async_p2_order_cv_.notify_all();
+        async_parity_order_cv_.notify_all();
     }
 
     void reset_layer() {
@@ -4216,10 +4201,8 @@ public:
     }
 
     void inc_pause_async_p2p() {
-        // Block new async P2 RDMA before PP communication starts.
-        // Already-started RDMA is allowed to drain in the background so PP does
-        // not wait at the communication boundary.
-        int prev = async_p2p_pause_count_.fetch_add(1, std::memory_order_acq_rel);
+        // The pause count gates new asynchronous parity RDMA; in-flight work retains ownership until completion.
+        int prev = async_parity_pause_count_.fetch_add(1, std::memory_order_acq_rel);
         if (debug_)
             std::cerr << "[CONCORD-DEBUG] rank " << rank_in_group_
                       << " inc_pause_async_p2p prev=" << prev
@@ -4227,9 +4210,9 @@ public:
     }
 
     void dec_pause_async_p2p() {
-        int current = async_p2p_pause_count_.load(std::memory_order_acquire);
+        int current = async_parity_pause_count_.load(std::memory_order_acquire);
         while (current > 0) {
-            if (async_p2p_pause_count_.compare_exchange_weak(
+            if (async_parity_pause_count_.compare_exchange_weak(
                     current, current - 1,
                     std::memory_order_acq_rel, std::memory_order_acquire)) {
                 if (debug_)
@@ -4361,7 +4344,7 @@ public:
 
     void compile_recovery_plans_dual_(const std::vector<int>& failed_nodes) {
         if (k_ != n_ - 2 || m_ != 2)
-            throw std::runtime_error("Concord HW2 requires the default k=n-2, m=2 layout");
+            throw std::runtime_error("Concord dual-failure recovery (HW2 mode) requires the default k=n-2, m=2 layout");
         std::set<int> failed_set(failed_nodes.begin(), failed_nodes.end());
         recovery_plans_.resize(stripe_plans_.size());
         for (const auto& sp : stripe_plans_) {
@@ -5204,9 +5187,9 @@ private:
     bool shared_lane_ = false;
     bool lane_direction_split_ = false;
 
-    // Tag layout for shared-lane multiplexing: kind|sid|batch.
-    //   kind: 0 = sync source->encoder, 1 = async P2 encoder->parity target,
-    //         2 = layer-level source payload.
+    // Shared-lane tag layout: kind[63:60] | route[59:32] | generation[31:0].
+    // Kinds used here are 0=source stripe, 1=deferred parity, 2=layer payload,
+    // 3/4=recovery traffic selected by callers, and 5=aggregate parity.
     static uint64_t make_channel_tag_(int kind, int sid, uint64_t batch) {
         return ((uint64_t)(kind & 0xF) << 60)
              | ((uint64_t)(uint32_t)sid << 32)
@@ -5285,7 +5268,7 @@ private:
     std::atomic<uint64_t> recovery_low_priority_pause_wait_us_{0};
     std::atomic<int> recovery_low_priority_send_tasks_{0};
 
-    // ---- RS encode thread pool (matches basic_ec xor_pool pattern) ----
+    // ---- Shared RS encode worker pool state ----
     static constexpr int kRsPoolWorkers = 16;
     std::array<pthread_t, kRsPoolWorkers> rs_pool_threads_{};
     std::array<RsPoolWorkerCtx, kRsPoolWorkers> rs_pool_ctx_{};
@@ -5517,22 +5500,23 @@ PYBIND11_MODULE(concord_native, m) {
              py::arg("source_active_mask"), py::arg("batch_id"))
         .def("submit_parity", &ConcordNative::submit_parity,
              py::arg("stripe_id"), py::arg("parity_in_addr"), py::arg("block_size"))
+        // Legacy two-parity names retained for Python callers.
         .def("submit_p1_send", &ConcordNative::submit_p1_send,
              py::arg("stripe_id"), py::arg("p1_addr"), py::arg("block_size"))
         .def("submit_p2_send", &ConcordNative::submit_p2_send,
              py::arg("stripe_id"), py::arg("p2_addr"), py::arg("block_size"))
-        .def("submit_async_p2_batch", &ConcordNative::submit_async_p2_batch,
+        .def("submit_async_p2_batch", &ConcordNative::submit_async_deferred_parity_batch,
              py::arg("parity_tasks"), py::arg("p2_send_tasks"))
-        .def("submit_async_p2_layer", &ConcordNative::submit_async_p2_layer,
+        .def("submit_async_p2_layer", &ConcordNative::submit_async_deferred_parity_layer,
              py::arg("p2_addrs"), py::arg("block_size"))
-        .def("submit_async_p2_layer_with_batch", &ConcordNative::submit_async_p2_layer_with_batch,
+        .def("submit_async_p2_layer_with_batch", &ConcordNative::submit_async_deferred_parity_layer_with_batch,
              py::arg("p2_addrs"), py::arg("block_size"), py::arg("batch_id"))
         .def("get_parity_route", &ConcordNative::get_parity_route,
              py::arg("stripe_id"), py::arg("parity_index"))
-        .def("get_p2_route", &ConcordNative::get_p2_route, py::arg("stripe_id"))
-        .def("submit_aggregate_p2", &ConcordNative::submit_aggregate_p2,
+        .def("get_p2_route", &ConcordNative::get_deferred_parity_route, py::arg("stripe_id"))
+        .def("submit_aggregate_p2", &ConcordNative::submit_aggregate_parity,
              py::arg("send_tasks"), py::arg("recv_tasks"), py::arg("generation"))
-        .def("wait_aggregate_p2", &ConcordNative::wait_aggregate_p2,
+        .def("wait_aggregate_p2", &ConcordNative::wait_aggregate_parity,
              py::arg("timeout_seconds") = 300, py::call_guard<py::gil_scoped_release>())
         .def("reset_async_parity", &ConcordNative::reset_async_parity)
         .def("wait_layer", &ConcordNative::wait_layer,

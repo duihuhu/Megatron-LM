@@ -310,33 +310,23 @@ public:
     // Exchange RdmaConnInfo with peer over control socket and connect QP (aligned with Gemini: always send then recv).
     void exchange_and_connect(bool we_send_first) override {
         (void)we_send_first;
-        // std::cout << "[BasicEC RDMA] rank=" << rank_ << " exchange_and_connect: get_local_conn_info start" << std::endl;
         RdmaConnInfo local_info = get_local_conn_info();
-        // std::cout << "[BasicEC RDMA] rank=" << rank_ << " exchange_and_connect: get_local_conn_info done qp_num=" << local_info.qp_num << " lid=" << local_info.lid << std::endl;
         RdmaConnInfo remote_info;
         std::memset(&remote_info, 0, sizeof(remote_info));
         int sock = control_sock_send_;
-        // std::cout << "[BasicEC RDMA] rank=" << rank_ << " fd=" << sock
-        //           << " exchange_and_connect: send local RdmaConnInfo start" << std::endl;
         ssize_t n_sent = send(sock, &local_info, sizeof(local_info), 0);
         if (n_sent != static_cast<ssize_t>(sizeof(local_info))) {
             int err = errno;
             throw std::runtime_error(std::string("RdmaConnectionChannel: failed to send local RdmaConnInfo (ret=") +
                 std::to_string(n_sent) + ", errno=" + std::to_string(err) + ": " + std::strerror(err) + ")");
         }
-        // std::cout << "[BasicEC RDMA] rank=" << rank_ << " exchange_and_connect: send local RdmaConnInfo done" << std::endl;
-        // std::cout << "[BasicEC RDMA] rank=" << rank_ << " fd=" << sock
-        //           << " exchange_and_connect: recv remote RdmaConnInfo start" << std::endl;
         ssize_t n_recv = recv(sock, &remote_info, sizeof(remote_info), MSG_WAITALL);
         if (n_recv != static_cast<ssize_t>(sizeof(remote_info))) {
             int err = errno;
             throw std::runtime_error(std::string("RdmaConnectionChannel: failed to receive remote RdmaConnInfo (ret=") +
                 std::to_string(n_recv) + ", errno=" + std::to_string(err) + ": " + std::strerror(err) + ")");
         }
-        // std::cout << "[BasicEC RDMA] rank=" << rank_ << " exchange_and_connect: recv remote RdmaConnInfo done remote_qp=" << remote_info.qp_num << std::endl;
-        // std::cout << "[BasicEC RDMA] rank=" << rank_ << " exchange_and_connect: connect_qp start" << std::endl;
         connect_qp(remote_info);
-        // std::cout << "[BasicEC RDMA] rank=" << rank_ << " exchange_and_connect: connect_qp done" << std::endl;
     }
 
     void send_data(const uint8_t* data, size_t size) override {
@@ -558,7 +548,7 @@ private:
     boost::asio::ip::tcp::acceptor recv_parity0_acceptor_;
     boost::asio::ip::tcp::acceptor recv_data1_acceptor_;
 
-    // Software-only SW recovery sockets (k=2, rank3 -> rank2)
+    // Legacy k=2 software-recovery sockets: group rank 3 sends d_{2,1} to group rank 2.
     boost::asio::ip::tcp::socket basic_ec_load_recv_rank3_data1_socket_;
     boost::asio::ip::tcp::acceptor basic_ec_load_recv_rank3_data1_acceptor_;
     boost::asio::ip::tcp::socket basic_ec_load_send_rank3_data1_socket_;
@@ -633,10 +623,10 @@ public:
     boost::asio::ip::tcp::socket& send_socket(int idx) { return send_sockets_[idx]; }
     boost::asio::ip::tcp::socket& recv_socket(int idx) { return recv_sockets_[idx]; }
 
-    // Software-only SW recovery (k=2)
+    // Legacy k=2 software recovery; names are retained for internal call compatibility.
     void bind_listen_basic_ec_load_recv_rank3_data1(const std::string& listen_ip, uint16_t port);
     void accept_basic_ec_load_recv_rank3_data1();
-    void init_basic_ec_load_send_rank3_data1(const std::string& rank2_ip, uint16_t port);
+    void init_basic_ec_load_send_rank3_data1(const std::string& receiver_ip, uint16_t port);
     bool is_basic_ec_load_recv_rank3_data1_connected() const {
         return basic_ec_load_recv_rank3_data1_connected_;
     }
@@ -832,7 +822,7 @@ void AsioConnectionManager::wait_for_connections(int timeout_seconds) {
 
 // ========== BasicEC Load Mode Connection Methods ==========
 
-// BasicEC load mode bind+listen helpers (for rank2, before accept)
+// Legacy k=2 receiver bind/listen helper for group rank 2.
 void AsioConnectionManager::bind_listen_basic_ec_load_recv_rank3_data1(const std::string& listen_ip, uint16_t port) {
     try {
         boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
@@ -846,7 +836,7 @@ void AsioConnectionManager::bind_listen_basic_ec_load_recv_rank3_data1(const std
     }
 }
 
-// BasicEC load mode accept helpers (for rank2, after bind+listen)
+// Legacy k=2 receiver accept helper for group rank 2.
 void AsioConnectionManager::accept_basic_ec_load_recv_rank3_data1() {
     try {
         basic_ec_load_recv_rank3_data1_acceptor_.accept(basic_ec_load_recv_rank3_data1_socket_);
@@ -859,11 +849,11 @@ void AsioConnectionManager::accept_basic_ec_load_recv_rank3_data1() {
     }
 }
 
-// BasicEC load mode init functions (rank0/1/3 sender)
-void AsioConnectionManager::init_basic_ec_load_send_rank3_data1(const std::string& rank2_ip, uint16_t port) {
+// Legacy k=2 sender connection from group rank 3 to group rank 2.
+void AsioConnectionManager::init_basic_ec_load_send_rank3_data1(const std::string& receiver_ip, uint16_t port) {
     try {
         boost::asio::ip::tcp::resolver resolver(io_context_);
-        auto endpoints = resolver.resolve(rank2_ip, std::to_string(port));
+        auto endpoints = resolver.resolve(receiver_ip, std::to_string(port));
         boost::asio::connect(basic_ec_load_send_rank3_data1_socket_, endpoints);
         basic_ec_load_send_rank3_data1_connected_ = true;
         connection_cv_.notify_all();
@@ -1081,12 +1071,9 @@ public:
 
         // Check if already registered
         if (rdma_registered_buffers_.find(addr) != rdma_registered_buffers_.end()) {
-            // std::cout << "[BasicEC RDMA] Buffer already registered at 0x" << std::hex << addr << std::dec << std::endl;
             return;
         }
 
-        // std::cout << "[BasicEC RDMA] Registering buffer at 0x" << std::hex << addr << std::dec
-                //   << ", size: " << (size / (1024.0 * 1024.0)) << " MB" << std::endl;
 
         ibv_mr* mr = ibv_reg_mr(rdma_pd_, reinterpret_cast<void*>(addr), size,
                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
@@ -1096,7 +1083,6 @@ public:
         }
 
         rdma_registered_buffers_[addr] = {mr, addr, size};
-        // std::cout << "[BasicEC RDMA] Buffer registered successfully (total: " << rdma_registered_buffers_.size() << ")" << std::endl;
     }
 
     void unregister_buffer(uintptr_t addr) {
@@ -1110,14 +1096,11 @@ public:
         if (it != rdma_registered_buffers_.end()) {
             ibv_dereg_mr(it->second.mr);
             rdma_registered_buffers_.erase(it);
-            // std::cout << "[BasicEC RDMA] Buffer unregistered at 0x" << std::hex << addr << std::dec << std::endl;
         }
     }
 
-    // Save mode pipelines: 3 sends + 3 receives
+    // Legacy RS(4, 2) save pipelines: three sends and three receives
     void submit_send_data1(uintptr_t send_addr, size_t size) {
-        // std::cout << "BasicEC: Submitting send_data1 task: send_addr=" << send_addr
-        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(send_data1_mutex_);
             send_data1_q_.push({send_addr, size});
@@ -1126,8 +1109,6 @@ public:
     }
 
     void submit_send_parity0(uintptr_t send_addr, size_t size) {
-        // std::cout << "BasicEC: Submitting send_parity0 task: send_addr=" << send_addr
-        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(send_parity0_mutex_);
             send_parity0_q_.push({send_addr, size});
@@ -1136,7 +1117,6 @@ public:
     }
 
     void submit_send_parity1(uintptr_t send_addr, size_t size) {
-        // std::cout << "BasicEC: Submitting send_parity1 task: send_addr=" << send_addr << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(send_parity1_mutex_);
             send_parity1_q_.push({send_addr, size});
@@ -1145,8 +1125,6 @@ public:
     }
 
     void submit_recv_parity1(uintptr_t recv_addr, size_t size) {
-        // std::cout << "BasicEC: Submitting recv_parity1 task: recv_addr=" << recv_addr
-        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_parity1_mutex_);
             recv_parity1_q_.push({recv_addr, size});
@@ -1155,8 +1133,6 @@ public:
     }
 
     void submit_recv_parity0(uintptr_t recv_addr, size_t size) {
-        // std::cout << "BasicEC: Submitting recv_parity0 task: recv_addr=" << recv_addr
-        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_parity0_mutex_);
             recv_parity0_q_.push({recv_addr, size});
@@ -1165,8 +1141,6 @@ public:
     }
 
     void submit_recv_data1(uintptr_t recv_addr, size_t size) {
-        // std::cout << "BasicEC: Submitting recv_data1 task: recv_addr=" << recv_addr
-        //           << ", size=" << size << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_data1_mutex_);
             recv_data1_q_.push({recv_addr, size});
@@ -1185,14 +1159,6 @@ public:
                              uintptr_t recv_parity0_addr, // recv p_{i+2,0} from rank i+2
                              uintptr_t recv_data1_addr,   // recv d_{i+3,1} from rank i+3
                              size_t size) {
-        // std::cout << "BasicEC: Submitting save task: data0=" << data0_addr
-        //           << ", data1=" << data1_addr
-        //           << ", parity0=" << parity0_addr
-        //           << ", parity1=" << parity1_addr
-        //           << ", recv_p1=" << recv_parity1_addr
-        //           << ", recv_p0=" << recv_parity0_addr
-        //           << ", recv_d1=" << recv_data1_addr
-        //           << ", size=" << size << std::endl;
 
         // Step 1: Encode data blocks to get parity blocks (legacy 2-data-block call)
         {
@@ -1221,7 +1187,6 @@ public:
     }
 
     void submit_send_parity0_sentinel() {
-        // std::cout << "BasicEC: Submitting sentinel to send_parity0 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(send_parity0_mutex_);
             send_parity0_q_.push({0, 0});
@@ -1230,7 +1195,6 @@ public:
     }
 
     void submit_send_parity1_sentinel() {
-        // std::cout << "BasicEC: Submitting sentinel to send_parity1 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(send_parity1_mutex_);
             send_parity1_q_.push({0, 0});
@@ -1239,7 +1203,6 @@ public:
     }
 
     void submit_recv_parity1_sentinel() {
-        // std::cout << "BasicEC: Submitting sentinel to recv_parity1 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_parity1_mutex_);
             recv_parity1_q_.push({0, 0});
@@ -1248,7 +1211,6 @@ public:
     }
 
     void submit_recv_parity0_sentinel() {
-        // std::cout << "BasicEC: Submitting sentinel to recv_parity0 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_parity0_mutex_);
             recv_parity0_q_.push({0, 0});
@@ -1257,7 +1219,6 @@ public:
     }
 
     void submit_recv_data1_sentinel() {
-        // std::cout << "BasicEC: Submitting sentinel to recv_data1 pipeline" << std::endl;
         {
             std::lock_guard<std::mutex> lk(recv_data1_mutex_);
             recv_data1_q_.push({0, 0});
@@ -1383,10 +1344,9 @@ public:
 
     // Software failure mode interfaces (direct send/recv without pipeline)
 
-    // rank3 software failure mode send d21 (once complete transmission)
-    // ---- Generalized software failure send/recv (supports any k) ----
+        // ---- Generalized software failure send/recv (supports any k) ----
 
-    // Legacy k=2 aliases for backward compat
+    // Legacy k=2 aliases retained for the public pybind API.
     void software_send_rank3_data1(uintptr_t send_addr, size_t size) {
         sw_send_data(0, send_addr, size);
     }
@@ -1396,7 +1356,7 @@ public:
 
     void sw_send_data(int block_idx, uintptr_t send_addr, size_t size) {
         LoadNetScopeTimer net_timer(this);
-        // Forward to RANK2 (failed rank): try RDMA channel first, fall back to ASIO socket
+        // Send to the failed group rank, preferring RDMA and falling back to ASIO.
         if (use_rdma_ && block_idx >= 0 && static_cast<size_t>(block_idx) < rdma_sw_recovery_channels_.size()
             && rdma_sw_recovery_channels_[block_idx]) {
             rdma_sw_recovery_channels_[block_idx]->send_data(
@@ -1405,11 +1365,10 @@ public:
         }
 
         if (use_rdma_ && rdma_software_load_channel_) {
-            // std::cout << "[BasicEC RDMA] Load: Sending " << size << " bytes via RDMA" << std::endl;
             rdma_software_load_channel_->send_data(reinterpret_cast<const uint8_t*>(send_addr), size);
             return;
         }
-        // Legacy k=2 path: dedicated named socket
+        // Legacy k=2 path: group rank 3 sends d_{2,1} over the named socket.
         if (block_idx == 0 && conn_.is_basic_ec_load_send_rank3_data1_connected()) {
             send_with_size(conn_.get_basic_ec_load_send_rank3_data1_socket(), send_addr, size);
             return;
@@ -1427,11 +1386,10 @@ public:
         }
 
         if (use_rdma_ && rdma_software_load_channel_) {
-            // std::cout << "[BasicEC RDMA] Load: Receiving " << size << " bytes via RDMA" << std::endl;
             rdma_software_load_channel_->receive_data(reinterpret_cast<uint8_t*>(recv_addr), size);
             return;
         }
-        // Legacy k=2 path
+        // Legacy k=2 path: group rank 2 receives d_{2,1} over the named socket.
         if (block_idx == 0 && conn_.is_basic_ec_load_recv_rank3_data1_connected()) {
             if (!recv_with_size_bool(conn_.get_basic_ec_load_recv_rank3_data1_socket(),
                                      reinterpret_cast<void*>(recv_addr), size)) {
@@ -1665,12 +1623,12 @@ public:
         }
     }
 
-    // Phase 1: set rank_, create load RDMA CQs (all ranks), rank2 bind+listen on 8 ports.
-    // Software failure only: 1 port (rank3_data1), no workers; rank_ = rank_in_group
+    // Legacy k=2 software-recovery setup: group rank 2 receives d_{2,1}
+    // from group rank 3 over one persistent channel. rank_ stores rank_in_group.
     void init_basic_ec_load_connections_software_only(
         int rank_in_group,
-        const std::string& rank2_ip,
-        uint16_t load_recv_rank3_data1_port
+        const std::string& receiver_ip,
+        uint16_t legacy_data1_port
     ) {
         if (!is_load_mode_) {
             std::cerr << "BasicEC: init_basic_ec_load_connections_software_only called but not in load mode" << std::endl;
@@ -1678,10 +1636,10 @@ public:
         }
         rank_ = rank_in_group;
         if (rank_in_group == 2) {
-            conn_.bind_listen_basic_ec_load_recv_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
+            conn_.bind_listen_basic_ec_load_recv_rank3_data1(receiver_ip, legacy_data1_port);
             conn_.accept_basic_ec_load_recv_rank3_data1();
         } else if (rank_in_group == 3) {
-            conn_.init_basic_ec_load_send_rank3_data1(rank2_ip, load_recv_rank3_data1_port);
+            conn_.init_basic_ec_load_send_rank3_data1(receiver_ip, legacy_data1_port);
         }
         if (use_rdma_ && (rank_ == 2 || rank_ == 3)) {
             try {
@@ -1826,11 +1784,11 @@ private:
     std::vector<std::unique_ptr<IConnectionChannel>> send_channels_;
     std::vector<std::unique_ptr<IConnectionChannel>> recv_channels_;
 
-    // Software-only load RDMA: 1 channel (legacy k=2, kept for backward compat)
+    // Legacy k=2 software-recovery RDMA channel for group ranks 3 and 2.
     ibv_cq* rdma_software_load_send_cq_;
     ibv_cq* rdma_software_load_recv_cq_;
     std::unique_ptr<RdmaConnectionChannel> rdma_software_load_channel_;
-    // Generalized SW recovery: k-1 channels (one per non-local data block)
+    // General software recovery uses k - 1 channels, one per non-local data block.
     boost::asio::io_context sw_recovery_io_;
     int sw_recovery_num_blocks_{0};
     std::vector<std::unique_ptr<boost::asio::ip::tcp::acceptor>> sw_asio_acceptors_;
@@ -1937,9 +1895,9 @@ private:
     // Load mode flags
     std::atomic<bool> is_load_mode_{false};
     int failed_rank_{-1};
-    int failed_rank_in_group_{-1};  // failed rank within 4-rank group (for multi-group support)
-    int rank_;  // Current rank_in_group (0..3) for load mode, set in init_basic_ec_load_connections
-    int rank_in_group_;  // rank_in_group for save mode (0..3), set in constructor
+    int failed_rank_in_group_{-1};  // Failed position within the n-rank group.
+    int rank_;  // Current group position in [0, n), set by load setup.
+    int rank_in_group_;  // Save-mode group position in [0, n), set by the constructor.
 
     // EC RS pthread pool (encode + decode, same pattern as Concord rs_pool)
     static constexpr int kEcRsPoolSize = 16;
@@ -2062,9 +2020,9 @@ private:
     // BasicEC load mode sentinel flags
     // EC encoding initialization
     void init_ec_encoding() {
-        int m = k_ + rows_;  // m = 2 + 2 = 4
+        int m = k_ + rows_;  // Total RS codeword rows, n = k + parity rows.
 
-        // Allocate RS matrix (k * m = 2 * 4)
+        // Allocate the row-major RS generator matrix with n * k entries.
         a_mat_ = (unsigned char*)malloc((size_t)k_ * (size_t)m);
         if (a_mat_ == nullptr) {
             std::cerr << "BasicEC: Failed to allocate EC encoding matrix" << std::endl;
@@ -2074,7 +2032,7 @@ private:
         // Generate RS matrix
         gf_gen_rs_matrix(a_mat_, m, k_);
 
-        // Allocate encoding tables: 32 * k * rows = 32 * 2 * 2
+        // Allocate ISA-L encoding tables for k inputs and rows_ parity outputs.
         size_t gtbls_size = 32 * (size_t)k_ * (size_t)rows_;
         void* tmp = nullptr;
         if (posix_memalign(&tmp, 32, gtbls_size) != 0) tmp = nullptr;
@@ -2176,7 +2134,7 @@ private:
 
     }
 
-    // Software-only load RDMA: 1 CQ pair and 1 channel (rank3_data1). Call after init_basic_ec_load_connections_software_only.
+    // Legacy k=2 software-recovery RDMA resources; initialize after its ASIO channel.
     void init_rdma_software_load_resources() {
         if (!use_rdma_) return;
         if (rdma_software_load_send_cq_ || rdma_software_load_recv_cq_) return;  // already inited
@@ -2327,7 +2285,7 @@ private:
         conn_.wait_for_connections();
     }
 
-    // Establish 6 dedicated raw TCP sockets for RDMA RdmaConnInfo exchange only (like Gemini).
+    // Establish one dedicated raw TCP RDMA-info socket per send and receive channel.
     // Uses blocking socket()/bind()/listen()/accept() and connect() - no ASIO.
     void init_rdma_exchange_sockets() {
         if (!use_rdma_) {
@@ -2487,7 +2445,7 @@ private:
         }
     }
 
-    // Save mode workers: 3 sends + 3 receives
+    // Legacy RS(4, 2) save workers: three sends and three receives
     void recv_parity1_worker() {
         while (!stop_) {
             RecvTask task;
@@ -2521,10 +2479,8 @@ private:
             }
 
             if (use_rdma_ && recv_parity1_channel_) {
-                // std::cout << "[BasicEC RDMA] Recv_Parity1: Receiving " << task.size << " bytes via RDMA" << std::endl;
                 recv_parity1_channel_->receive_data(reinterpret_cast<uint8_t*>(task.addr), task.size);
             } else {
-                // std::cout << "[BasicEC ASIO] Recv_Parity1: Receiving " << task.size << " bytes via ASIO" << std::endl;
                 if (!recv_with_size_bool(
                         conn_.get_recv_parity1_socket(),
                         reinterpret_cast<void*>(task.addr),
@@ -2577,7 +2533,6 @@ private:
             }
 
             if (use_rdma_ && recv_parity0_channel_) {
-                // std::cout << "[BasicEC RDMA] Recv_Parity0: Receiving " << task.size << " bytes via RDMA" << std::endl;
                 recv_parity0_channel_->receive_data(reinterpret_cast<uint8_t*>(task.addr), task.size);
             } else {
                 if (!recv_with_size_bool(
@@ -2680,7 +2635,6 @@ private:
             }
             if (conn_.is_send_data1_connected()) {
                 if (use_rdma_ && send_data1_channel_) {
-                    // std::cout << "[BasicEC RDMA] Send_Data1: Sending " << task.size << " bytes via RDMA" << std::endl;
                     send_data1_channel_->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else {
                     send_with_size(conn_.get_send_data1_socket(), task.addr, task.size);
@@ -2729,7 +2683,6 @@ private:
             }
             if (conn_.is_send_parity0_connected()) {
                 if (use_rdma_ && send_parity0_channel_) {
-                    // std::cout << "[BasicEC RDMA] Send_Parity0: Sending " << task.size << " bytes via RDMA" << std::endl;
                     send_parity0_channel_->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else {
                     send_with_size(conn_.get_send_parity0_socket(), task.addr, task.size);
@@ -2778,7 +2731,6 @@ private:
             }
             if (conn_.is_send_parity1_connected()) {
                 if (use_rdma_ && send_parity1_channel_) {
-                    // std::cout << "[BasicEC RDMA] Send_Parity1: Sending " << task.size << " bytes via RDMA" << std::endl;
                     send_parity1_channel_->send_data(reinterpret_cast<const uint8_t*>(task.addr), task.size);
                 } else {
                     send_with_size(conn_.get_send_parity1_socket(), task.addr, task.size);
@@ -2832,8 +2784,6 @@ private:
             try {
                 SaveNetScopeTimer save_net_timer(this);
                 if (use_rdma_ && send_channels_[idx] && send_channels_[idx]->is_connected()) {
-                // std::cout << "[BasicEC RDMA] SendWorker[" << idx << "] RDMA send "
-                //           << (task.size / (1024.0*1024.0)) << " MB" << std::endl;
                 send_channels_[idx]->send_data(
                     reinterpret_cast<const uint8_t*>(task.addr), task.size);
             } else if (conn_.send_socket(idx).is_open()) {
@@ -2890,8 +2840,6 @@ private:
             try {
                 SaveNetScopeTimer save_net_timer(this);
                 if (use_rdma_ && recv_channels_[idx] && recv_channels_[idx]->is_connected()) {
-                // std::cout << "[BasicEC RDMA] RecvWorker[" << idx << "] RDMA recv "
-                //           << (task.size / (1024.0*1024.0)) << " MB" << std::endl;
                 recv_channels_[idx]->receive_data(
                     reinterpret_cast<uint8_t*>(task.addr), task.size);
             } else if (conn_.recv_socket(idx).is_open()) {
@@ -3014,7 +2962,7 @@ public:
 private:
     // ========== EC Decode pthread pool (RS decode, 16 workers) ==========
 
-    static std::array<int, kEcRsPoolSize> parse_xor_pool_cpus_or_throw() {
+    static std::array<int, kEcRsPoolSize> parse_ec_rs_pool_cpus_or_throw() {
         std::array<int, kEcRsPoolSize> cpus{};
         const char* env = std::getenv("BASIC_EC_RS_CPU_LIST");
         if (!env || !*env) env = std::getenv("ECNAIVE_XOR_CPU_LIST");
@@ -3056,7 +3004,7 @@ private:
         if (ec_rs_pool_inited_.load(std::memory_order_acquire)) {
             return;
         }
-        ec_rs_pool_cpus_ = parse_xor_pool_cpus_or_throw();  // reuse same CPU list
+        ec_rs_pool_cpus_ = parse_ec_rs_pool_cpus_or_throw();
         ec_rs_pool_stop_.store(false, std::memory_order_release);
         ec_rs_pool_epoch_.store(0, std::memory_order_release);
         ec_rs_pool_remaining_.store(0, std::memory_order_release);

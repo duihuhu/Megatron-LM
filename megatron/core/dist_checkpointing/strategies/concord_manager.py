@@ -155,10 +155,6 @@ class ConcordManager:
         self.failed_global_ranks: List[int] = []
         self.recovery_stripe_plans: List[Dict] = []  # Per-stripe recovery plan
         self.recovery_dual_failure: bool = False
-        # Per-stripe recovery buffers
-        self.recovery_helper_bufs: List[Optional[torch.Tensor]] = []
-        self.recovery_decoder_bufs: List[Optional[torch.Tensor]] = []
-        self.recovery_failed_bufs: List[Optional[torch.Tensor]] = []
         self._retired_runtime_buffers: List[Any] = []
         # Recovery-only cache used exclusively by the in-process FT benchmark.
         self._inprocess_recovery_workspace_key: Optional[Any] = None
@@ -633,8 +629,7 @@ class ConcordManager:
             peer_global_rank = self._get_rank_by_group_position(self.group_id, i, world_size, n)
             peer_ips.append(ip_list[peer_global_rank])
 
-        # Compute base port: same scheme as basic_ec
-        # Use MASTER_PORT + 20000 as base, offset by group_id * (n * 100)
+        # Each Concord group owns an n*100-port range above the configurable base.
         master_port = int(os.environ.get("MASTER_PORT", "6000"))
         base_port = int(os.environ.get("CONCORD_BASE_PORT", str(master_port + 20000)))
         group_offset = self.group_id * (n * 100)
@@ -666,7 +661,7 @@ class ConcordManager:
         # Register default buffers
         if _concord_debug_enabled():
             logger.debug("CONCORD init trace rank=%d: before default buffers", rank)
-        self._allocate_default_buffers(native, n)
+        self._allocate_default_buffers(native)
         if _concord_debug_enabled():
             logger.debug("CONCORD init trace rank=%d: after default buffers", rank)
 
@@ -688,7 +683,7 @@ class ConcordManager:
         )
         return resolve_ip("CONCORD", rank=rank)
 
-    def _allocate_default_buffers(self, native, n: int) -> None:
+    def _allocate_default_buffers(self, native) -> None:
         """Keep legacy default sizes; per-layer save/recovery allocates real buffers."""
         default_block_size = 64 * 1024 * 1024  # 64 MiB fallback (per-layer block_size overrides)
 
@@ -926,13 +921,19 @@ class ConcordManager:
         self._registered_save_buffer_owners[addr] = buffer
         return buffer
 
+    def get_aggregate_parity_buffer(
+        self, direction: str, peer: int, lane: int, size_bytes: int
+    ) -> torch.Tensor:
+        """Allocate a registered aggregate-parity buffer owned by the current save."""
+        if direction not in ("send", "recv"):
+            raise ValueError(f"Invalid aggregate-parity direction: {direction}")
+        return self.allocate_registered_save_buffer(size_bytes)
+
     def get_aggregate_p2_buffer(
         self, direction: str, peer: int, lane: int, size_bytes: int
     ) -> torch.Tensor:
-        """Allocate a registered aggregate P2 buffer for the current save."""
-        if direction not in ("send", "recv"):
-            raise ValueError(f"Invalid aggregate P2 direction: {direction}")
-        return self.allocate_registered_save_buffer(size_bytes)
+        """Legacy two-parity alias for get_aggregate_parity_buffer()."""
+        return self.get_aggregate_parity_buffer(direction, peer, lane, size_bytes)
 
     def release_registered_save_buffers(self, buffers: List[torch.Tensor]) -> None:
         """Unregister save-scoped buffers after native completion."""
@@ -999,7 +1000,7 @@ class ConcordManager:
         return StripeRole.INACTIVE
 
     def _compile_recovery_plans(self, failed_rank_node: int) -> List[Dict]:
-        """Compile HW1 plans using exactly k active survivors per stripe."""
+        """Compile single-failure plans with exactly k active survivors per stripe."""
         k, active_width = self.concord_k, self.concord_active_width
         plans = []
         for sp in self.stripe_plans:
@@ -1037,7 +1038,7 @@ class ConcordManager:
         """Per-stripe dual-failure plan: helpers send once, decoder recovers both erasures."""
         if (self.concord_k, self.concord_m) != (self.concord_n - 2, 2):
             raise RuntimeError(
-                "Concord HW2 requires the default k=n-2, m=2 layout."
+                "Concord dual-failure recovery (HW2 mode) requires the default k=n-2, m=2 layout."
             )
         if len(failed_nodes) != 2:
             raise RuntimeError(
@@ -1083,8 +1084,7 @@ class ConcordManager:
                 'helper_positions': helper_positions,
                 'survivor_positions': survivor_positions,
                 'original_role': int(sp.role),
-                # HW2 must restore SOURCE data and the first parity block (p0)
-                # in the critical per-layer phase to retain one-failure tolerance.
+                # Critical recovery restores SOURCE data; parity ownership is repaired later.
                 'recovery_kind': (
                     'data' if any(
                         target['original_role'] in (
@@ -1096,62 +1096,6 @@ class ConcordManager:
             })
         return plans
 
-    def _allocate_recovery_bufs(self, native, block_sz: int) -> None:
-        """Allocate per-stripe buffers for hardware recovery.
-
-        HELPER: one block-sized buffer to read from disk → send to decoder.
-        DECODER: recv buffer for (n-3) helper blocks, + one decode output buffer.
-        FAILED_RANK: recv buffer for each stripe's recovered block.
-        """
-        n = self.concord_n
-        num_helper = self.concord_k - 1
-        ns = self.num_stripes
-
-        self.recovery_helper_bufs = [None] * ns
-        self.recovery_decoder_bufs = [None] * ns
-        self.recovery_failed_bufs = [None] * ns
-
-        for plan in self.recovery_stripe_plans:
-            sid = plan['stripe_id']
-            my_node = self.rank_in_group + 1
-
-            if my_node == plan['decoder_node']:
-                # Allocate recv buffer for helpers plus one output per erasure.
-                output_count = 2 if plan.get('dual_failure') else 1
-                recv_sz = num_helper * block_sz
-                from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
-                    allocate_hugepage_slices, allocate_hugepage_tensor,
-                )
-                self.recovery_decoder_bufs[sid] = torch.empty(
-                    recv_sz + output_count * block_sz, dtype=torch.uint8, device="cuda"
-                )
-                native.register_buffer(
-                    self.recovery_decoder_bufs[sid].data_ptr(),
-                    self.recovery_decoder_bufs[sid].numel())
-
-            elif my_node in plan['helper_nodes']:
-                # Allocate block-sized buffer for reading from disk
-                self.recovery_helper_bufs[sid] = torch.empty(
-                    block_sz, dtype=torch.uint8, device="cuda"
-                )
-                native.register_buffer(
-                    self.recovery_helper_bufs[sid].data_ptr(),
-                    self.recovery_helper_bufs[sid].numel())
-
-            elif (
-                my_node in plan.get('failed_nodes', [])
-                if plan.get('dual_failure') else my_node == plan.get('failed_node')
-            ):
-                # Allocate recv buffer for decoded block
-                from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
-                    allocate_hugepage_tensor,
-                )
-                self.recovery_failed_bufs[sid] = allocate_hugepage_tensor(
-                    block_sz, fallback_pin_memory=True)
-                native.register_buffer(
-                    self.recovery_failed_bufs[sid].data_ptr(),
-                    self.recovery_failed_bufs[sid].numel())
-
     def init_concord_hardware_recovery(self, failed_global_ranks: List[int]) -> Dict[int, Dict]:
         """Initialize hardware recovery mode for up to 2 failed ranks per POA group.
 
@@ -1160,9 +1104,9 @@ class ConcordManager:
         group, so ``--concord-failed-ranks`` can list all GPU ranks on the failed
         node(s) — the per-group RS(2) recovery handles up to 2 node failures.
 
-        Single failure: per-failed-rank cyclic decoder/helper plan (HW1).
+        Single failure: per-failed-rank cyclic decoder/helper plan (external mode HW1).
         Dual failure: one plan per stripe; helpers send once, decoder recovers both
-        erasures and sends to both failed ranks (HW2).
+        erasures and sends to both failed ranks (external mode HW2).
 
         Returns a dict mapping failed_global_rank → recovery context.
         """
@@ -1384,9 +1328,8 @@ class ConcordManager:
         self.release_inprocess_recovery_workspace()
 
     def _clear_recovery_native_handle(self) -> None:
-        # Keep old tensor/native objects alive at the pre-dataloader safe point,
-        # but remove them from active maps so the next save reinitializes and
-        # re-registers all RDMA buffers with the fresh native module.
+        # This retired-owner list keeps tensor and native storage alive across worker fork.
+        # Active maps are cleared so the next save owns freshly registered RDMA buffers.
         retired = [self._concord_native]
         retired.extend(self.layer_stripe_bufs.values())
         retired.extend([
@@ -1418,9 +1361,6 @@ class ConcordManager:
         self.failed_global_ranks = []
         self.recovery_stripe_plans = []
         self.recovery_dual_failure = False
-        self.recovery_helper_bufs = []
-        self.recovery_decoder_bufs = []
-        self.recovery_failed_bufs = []
 
     def cleanup_recovery(self, teardown: bool = False, sync: bool = True) -> None:
         """Cleanup recovery-only state without full native teardown when possible."""

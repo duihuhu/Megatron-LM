@@ -2349,7 +2349,7 @@ private:
         if (!a_mat_) throw std::runtime_error("Concord: failed to alloc RS matrix");
         gf_gen_rs_matrix(a_mat_, total_rows, k);
 
-        // Encoding tables: 32 * k * rows (matches ecnaive)
+        // Encoding tables: 32 * k * rows (matches basic_ec)
         size_t gtbls_size = 32 * (size_t)k * (size_t)rows;
         void* tmp = nullptr;
         if (posix_memalign(&tmp, 32, gtbls_size) != 0) tmp = nullptr;
@@ -2443,7 +2443,7 @@ private:
         decode_tbls_ = new_decode_tbls;
     }
 
-    // ---- RS encode thread pool (matches ecnaive xor_pool) ----
+    // ---- RS encode thread pool (matches basic_ec xor_pool) ----
     static std::array<int, kRsPoolSize> rs_parse_cpus_or_default() {
         std::array<int, kRsPoolSize> cpus{};
         const char* env = std::getenv(kRsCpuListEnv);
@@ -5285,7 +5285,7 @@ private:
     std::atomic<uint64_t> recovery_low_priority_pause_wait_us_{0};
     std::atomic<int> recovery_low_priority_send_tasks_{0};
 
-    // ---- RS encode thread pool (matches ecnaive xor_pool pattern) ----
+    // ---- RS encode thread pool (matches basic_ec xor_pool pattern) ----
     static constexpr int kRsPoolWorkers = 16;
     std::array<pthread_t, kRsPoolWorkers> rs_pool_threads_{};
     std::array<RsPoolWorkerCtx, kRsPoolWorkers> rs_pool_ctx_{};

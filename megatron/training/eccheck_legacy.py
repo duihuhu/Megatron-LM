@@ -1131,7 +1131,7 @@ def _extract_dense_from_gapped_buffer(
     chunks there may be 0--63 bytes of alignment padding.  This function
     extracts only the data bytes, producing a contiguous dense buffer.
 
-    Mirrors ``_decode_data0_to_linear_first_half`` in ecnaive_legacy.py.
+    Mirrors ``_decode_data0_to_linear_first_half`` in basic_ec_legacy.py.
     """
     out = torch.zeros(total_bytes, dtype=torch.uint8, device=gapped_buf.device)
     src_pos = 0       # position in output (dense)

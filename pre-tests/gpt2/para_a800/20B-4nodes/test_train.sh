@@ -148,27 +148,27 @@ MICRO_BATCH_SIZE=4
 GLOBAL_BATCH_SIZE=32
 
 DISTRIBUTED_ARGS=(
-    --nproc_per_node $GPUS_PER_NODE 
-    --nnodes $NNODES 
-    --node_rank $NODE_RANK 
-    --master_addr $MASTER_ADDR 
+    --nproc_per_node $GPUS_PER_NODE
+    --nnodes $NNODES
+    --node_rank $NODE_RANK
+    --master_addr $MASTER_ADDR
     --master_port $MASTER_PORT
 )
 
 DATA_ARGS=(
-    --vocab-file $VOCAB_FILE 
-    --merge-file $MERGE_FILE 
-    --mock-data 
+    --vocab-file $VOCAB_FILE
+    --merge-file $MERGE_FILE
+    --mock-data
 )
 
 GPT_ARGS=(
-    --no-async-tensor-model-parallel-allreduce 
-    --hidden-size $HIDDEN_SIZE 
-    --num-attention-heads $NUM_ATTENTION_HEADS 
-    --seq-length $SEQ_LENGTH 
-    --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
-    --micro-batch-size $MICRO_BATCH_SIZE 
-    --global-batch-size $GLOBAL_BATCH_SIZE 
+    --no-async-tensor-model-parallel-allreduce
+    --hidden-size $HIDDEN_SIZE
+    --num-attention-heads $NUM_ATTENTION_HEADS
+    --seq-length $SEQ_LENGTH
+    --max-position-embeddings $MAX_POSITION_EMBEDDINGS
+    --micro-batch-size $MICRO_BATCH_SIZE
+    --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00005
     --train-iters 10
     --lr-decay-iters 320000
@@ -200,10 +200,10 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 1
     --eval-interval 100
-    #--save $CHECKPOINT_PATH 
+    #--save $CHECKPOINT_PATH
     #--load $CHECKPOINT_PATH
     --eval-iters 1
-    --tensorboard-dir $TENSORBOARD_LOGS_PATH 
+    --tensorboard-dir $TENSORBOARD_LOGS_PATH
     # --use-eccheck
 
     # --use-gemini
@@ -211,7 +211,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-gemini-software-failure
     # --use-gemini-hardware-failure
     # --use-distributed-optimizer
-    # --use-ecnaive-software-failure
+    # --use-basic-ec-software-failure
     --ckpt-format torch
     # --no-save-optim
     # --no-load-optim

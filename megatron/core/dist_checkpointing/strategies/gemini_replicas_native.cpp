@@ -514,7 +514,7 @@ private:
             // Start accepting multiple connections
             accept_next_connection();
             
-            // Run io_context in a joinable thread (aligned with EC-NAIVE pattern).
+            // Run io_context in a joinable thread (aligned with BasicEC pattern).
             // Joined in cleanup(), not detached — ensures port is released before rebind.
             io_thread_ = std::make_unique<std::thread>([this]() {
                 io_context_.run();
@@ -2073,7 +2073,7 @@ private:
     }
 
     void poll_completion(ibv_cq* cq, int num_completions) {
-        // Tight spin on the hot path (matches ecnaive_native). No sleep between polls.
+        // Tight spin on the hot path (matches basic_ec_native). No sleep between polls.
         int polled = 0;
         while (polled < num_completions) {
             ibv_wc wc;
@@ -2247,12 +2247,12 @@ private:
 
     std::atomic<bool> initialized_{false};
 
-    // ---- Worker-thread model (aligned with ecnaive) ----
+    // ---- Worker-thread model (aligned with basic_ec) ----
     // Persistent worker threads: one send_worker + one recv_worker per source.
     // Main thread only submits tasks and polls atomic flags — never blocks on I/O.
     //
     // NOTE: Gemini uses single-slot atomics (not queues+sentinels) because
-    // there is only 1 send + N recv tasks per exchange.  ecnaive uses
+    // there is only 1 send + N recv tasks per exchange.  basic_ec uses
     // per-channel queues because it has many tasks per channel.  Our simpler
     // model avoids the sentinel ordering issues seen with queues.
 

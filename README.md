@@ -8,10 +8,10 @@ This repository keeps Megatron's training stack and replaces the NVIDIA-facing d
 | --- | --- | --- | --- |
 | Concord | `--use-concord` | POA stripes over node groups of size `n` | Reed–Solomon `(n, n-2)` |
 | ECCHECK | `--use-eccheck` | 4-rank XOR groups | XOR parity |
-| ECNaive | `--use-ecnaive` | Round-robin RS groups | ISA-L Reed–Solomon `(k+2, k)` |
+| BasicEC | `--use-basic-ec` | Round-robin RS groups | ISA-L Reed–Solomon `(k+2, k)` |
 | Gemini Replicas | `--use-gemini-replicas` | Round-robin replicas | Replication (`--gemini-replicas-num`) |
 
-At most one of `--use-concord`, `--use-ecnaive`, and `--use-gemini-replicas` may be enabled. ECCHECK is selected independently with `--use-eccheck`.
+At most one of `--use-concord`, `--use-basic-ec`, and `--use-gemini-replicas` may be enabled. ECCHECK is selected independently with `--use-eccheck`.
 
 ## What Concord does
 
@@ -25,7 +25,7 @@ Save and recovery both go through RDMA. A layer is flattened into fixed-size blo
 megatron/training/
   concord_legacy.py          Concord save / load / recovery
   eccheck_legacy.py          ECCHECK save / load / recovery
-  ecnaive_legacy.py          ECNaive save / load / recovery
+  basic_ec_legacy.py          BasicEC save / load / recovery
   gemini_replicas_legacy.py  Gemini replica save / load / recovery
   checkpointing.py           scheme dispatch
   arguments.py               CLI flags
@@ -36,7 +36,7 @@ megatron/core/dist_checkpointing/strategies/
   poa_n4.txt  poa_n8.txt     offline POA tables
   setup_simple_concord.py    Concord native build
   setup_simple.py            ECCHECK native build
-  setup_simple_ecnaive.py    ECNaive native build
+  setup_simple_basic_ec.py    BasicEC native build
   setup_simple_gemini.py     Gemini native build
 
 pre-tests/gpt2/para_a800/
@@ -53,7 +53,7 @@ Each scheme has a pybind11 extension. Build them in `megatron/core/dist_checkpoi
 cd megatron/core/dist_checkpointing/strategies
 python3 setup_simple_concord.py build_ext --inplace
 bash build_clean.sh            # ECCHECK
-bash build_clean_ecnaive.sh    # ECNaive
+bash build_clean_basic_ec.sh    # BasicEC
 python3 setup_simple_gemini.py build_ext --inplace
 ```
 
@@ -75,9 +75,9 @@ The four-node A800 scripts under `pre-tests/gpt2/para_a800/` are the current ent
 ./pre-tests/gpt2/para_a800/14B-4nodes/test_concord.sh <node_rank> inprocess2
 ```
 
-The same `save | inprocess_sw | inprocess | inprocess2` modes exist for `test_eccheck.sh`, `test_ecnaive.sh`, `test_gemini_2.sh`, and `test_gemini_3.sh`.
+The same `save | inprocess_sw | inprocess | inprocess2` modes exist for `test_eccheck.sh`, `test_basic_ec.sh`, `test_gemini_2.sh`, and `test_gemini_3.sh`.
 
-Sweep drivers (default schemes: `gemini2 gemini3 concord eccheck ecnaive`):
+Sweep drivers (default schemes: `gemini2 gemini3 concord eccheck basic_ec`):
 
 ```bash
 MODEL_SIZE=14B ./pre-tests/gpt2/para_a800/run_10b_save_sweep.sh

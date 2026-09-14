@@ -593,13 +593,13 @@ class GeminiReplicasManager:
             # Phase 2: Connect to all targets
             self._gemini_replicas_native.finalize_connections()
 
-            # Post-finalize barrier (aligned with EC-NAIVE load: all TCP+RDMA ready)
+            # Post-finalize barrier (aligned with BasicEC load: all TCP+RDMA ready)
             torch.distributed.barrier()
             logger.debug(
                 f"Gemini Replicas: [Rank {rank}] All ranks finished Phase 2 connections"
             )
 
-            # Start persistent send/recv worker threads (like ecnaive)
+            # Start persistent send/recv worker threads (like basic_ec)
             self._gemini_replicas_native.start_workers(net_config['source_ranks'])
 
             logger.debug(f"Gemini Replicas: C++ native module fully initialized (rank={rank}, targets={net_config['target_ranks']}, mode={mode_str})")

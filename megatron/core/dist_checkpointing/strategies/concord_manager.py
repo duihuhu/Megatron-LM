@@ -633,7 +633,7 @@ class ConcordManager:
             peer_global_rank = self._get_rank_by_group_position(self.group_id, i, world_size, n)
             peer_ips.append(ip_list[peer_global_rank])
 
-        # Compute base port: same scheme as ecnaive
+        # Compute base port: same scheme as basic_ec
         # Use MASTER_PORT + 20000 as base, offset by group_id * (n * 100)
         master_port = int(os.environ.get("MASTER_PORT", "6000"))
         base_port = int(os.environ.get("CONCORD_BASE_PORT", str(master_port + 20000)))

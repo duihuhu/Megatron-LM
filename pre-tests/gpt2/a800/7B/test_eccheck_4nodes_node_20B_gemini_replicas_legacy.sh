@@ -6,7 +6,7 @@
 # 使用 torch legacy 路径（torch.save → .pt 文件）进行多副本 checkpoint，
 # 替代原有的 distributed checkpoint（FileSystemWriterAsync + torch_dist）路径。
 #
-# 与 ecnaive_legacy.py / concord_legacy.py 遵循相同模式。
+# 与 basic_ec_legacy.py / concord_legacy.py 遵循相同模式。
 # =============================================================================
 #
 # 用法:
@@ -94,7 +94,7 @@ ARGS_TO_PASS=("$@")
 
 HIDDEN_SIZE=5120
 NUM_ATTENTION_HEADS=40
-NUM_LAYERS=64 
+NUM_LAYERS=64
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
@@ -116,26 +116,26 @@ DATA_ARGS=(
 )
 
 GPT_ARGS=(
-    --no-async-tensor-model-parallel-allreduce 
-    --hidden-size $HIDDEN_SIZE 
-    --num-attention-heads $NUM_ATTENTION_HEADS 
-    --seq-length $SEQ_LENGTH 
-    --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
-    --micro-batch-size $MICRO_BATCH_SIZE 
-    --global-batch-size $GLOBAL_BATCH_SIZE 
-    --lr 0.00005 
+    --no-async-tensor-model-parallel-allreduce
+    --hidden-size $HIDDEN_SIZE
+    --num-attention-heads $NUM_ATTENTION_HEADS
+    --seq-length $SEQ_LENGTH
+    --max-position-embeddings $MAX_POSITION_EMBEDDINGS
+    --micro-batch-size $MICRO_BATCH_SIZE
+    --global-batch-size $GLOBAL_BATCH_SIZE
+    --lr 0.00005
     --train-iters 3
-    --lr-decay-iters 320000 
-    --lr-decay-style cosine 
-    --min-lr 1.0e-5 
-    --weight-decay 1e-2 
-    --lr-warmup-fraction .05 
-    --clip-grad 1.0 
-    --fp16 
-    --tokenizer-type GPT2BPETokenizer 
-    --use-mcore-models 
-    --transformer-impl transformer_engine 
-    --no-scatter-gather-tensors-in-pipeline 
+    --lr-decay-iters 320000
+    --lr-decay-style cosine
+    --min-lr 1.0e-5
+    --weight-decay 1e-2
+    --lr-warmup-fraction .05
+    --clip-grad 1.0
+    --fp16
+    --tokenizer-type GPT2BPETokenizer
+    --use-mcore-models
+    --transformer-impl transformer_engine
+    --no-scatter-gather-tensors-in-pipeline
     --num-layers $NUM_LAYERS
     --optimizer adam
     --loss-scale-window 100

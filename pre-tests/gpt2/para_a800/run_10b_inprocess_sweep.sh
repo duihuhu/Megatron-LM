@@ -34,7 +34,7 @@ GEMINI_ENV_VARS=(
     GEMINI_REPLICAS_CHANNELS_PER_PEER
 )
 
-DEFAULT_SCHEMES=(gemini2 gemini3 concord eccheck ecnaive)
+DEFAULT_SCHEMES=(gemini2 gemini3 concord eccheck basic_ec)
 SELECTED_RECOVERY_MODES=()
 declare -A MODE_LABELS=([inprocess_sw]=inprocess_sw [inprocess]=inprocess [inprocess2]=inprocess2)
 declare -A MODE_OFFSETS=([save]=0 [inprocess_sw]=1 [inprocess]=2 [inprocess2]=3)
@@ -43,32 +43,32 @@ declare -A SCRIPTS=(
     [gemini3]="$SCRIPT_DIR/test_gemini_3.sh"
     [concord]="$SCRIPT_DIR/test_concord.sh"
     [eccheck]="$SCRIPT_DIR/test_eccheck.sh"
-    [ecnaive]="$SCRIPT_DIR/test_ecnaive.sh"
+    [basic_ec]="$SCRIPT_DIR/test_basic_ec.sh"
 )
 declare -A CHECKPOINT_PATHS=(
     [gemini2]="$CHECKPOINT_PREFIX-gemini-2-replicas"
     [gemini3]="$CHECKPOINT_PREFIX-gemini-3-replicas"
     [concord]="$CHECKPOINT_PREFIX-concord"
     [eccheck]="$CHECKPOINT_PREFIX-eccheck"
-    [ecnaive]="$CHECKPOINT_PREFIX-ecnaive"
+    [basic_ec]="$CHECKPOINT_PREFIX-basic-ec"
 )
 declare -A BASE_PORTS=(
     [gemini2]="${MASTER_PORT_GEMINI2:-6200}"
     [gemini3]="${MASTER_PORT_GEMINI3:-6240}"
     [concord]="${MASTER_PORT_CONCORD:-6280}"
     [eccheck]="${MASTER_PORT_ECCHECK:-6320}"
-    [ecnaive]="${MASTER_PORT_ECNAIVE:-6360}"
+    [basic_ec]="${MASTER_PORT_BASIC_EC:-6360}"
 )
 
 usage() {
-    echo "Usage: $0 [--dry-run] [gemini2|gemini3|concord|eccheck|ecnaive ...]"
+    echo "Usage: $0 [--dry-run] [gemini2|gemini3|concord|eccheck|basic_ec ...]"
     echo "Environment: MODEL_SIZE=2.7B|7B|10B|14B|20B, LOG_DIR, RUN_TIMEOUT_SECONDS, DRY_RUN=0|1"
     echo "             RECOVERY_MODES, TRAIN_ENV_PREFIX, INPROCESS_REPEAT (positive integer, default: 10)"
     echo "             GEMINI_GDR, GEMINI_GDR_MIRROR_MODE, GEMINI_GDR_BATCH_WR,"
     echo "             GEMINI_MIRROR_CHUNK_MB, GEMINI_REPLICAS_CHANNELS_PER_PEER"
     echo "             SSH_USER, SSH_PORT, SSH_CONNECT_TIMEOUT, SSH_IDENTITY_FILE"
     echo "             MASTER_PORT_GEMINI2, MASTER_PORT_GEMINI3, MASTER_PORT_CONCORD,"
-    echo "             MASTER_PORT_ECCHECK, MASTER_PORT_ECNAIVE"
+    echo "             MASTER_PORT_ECCHECK, MASTER_PORT_BASIC_EC"
 }
 
 schemes=()
@@ -76,7 +76,7 @@ for argument in "$@"; do
     case "$argument" in
         --dry-run) DRY_RUN=1 ;;
         -h|--help) usage; exit 0 ;;
-        gemini2|gemini3|concord|eccheck|ecnaive) schemes+=("$argument") ;;
+        gemini2|gemini3|concord|eccheck|basic_ec) schemes+=("$argument") ;;
         *) echo "Unknown scheme or option: $argument" >&2; usage >&2; exit 2 ;;
     esac
 done

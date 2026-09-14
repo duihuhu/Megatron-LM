@@ -351,13 +351,13 @@ def validate_args(args, defaults={}):
     update_use_dist_ckpt(args)
 
     _ec_legacy_flags = (
-        bool(getattr(args, "use_ecnaive", False)),
+        bool(getattr(args, "use_basic_ec", False)),
         bool(getattr(args, "use_concord", False)),
         bool(getattr(args, "use_gemini_replicas", False)),
     )
     if sum(_ec_legacy_flags) > 1:
         raise RuntimeError(
-            "At most one of --use-ecnaive, --use-concord, and "
+            "At most one of --use-basic-ec, --use-concord, and "
             "--use-gemini-replicas may be enabled."
         )
     if (
@@ -431,7 +431,7 @@ def validate_args(args, defaults={}):
                 (getattr(args, "use_gemini_replicas_hardware_failure", False), "--use-gemini-replicas-hardware-failure"),
                 (getattr(args, "use_concord_hardware_failure", False), "--use-concord-hardware-failure"),
                 (getattr(args, "use_eccheck_two_failures", False), "--use-eccheck-two-failures"),
-                (getattr(args, "_ecnaive_require_hw2", False), "--ecnaive-require-hw2"),
+                (getattr(args, "_basic_ec_require_hw2", False), "--basic-ec-require-hw2"),
             ):
                 if enabled:
                     incompatible.append(option)
@@ -2433,28 +2433,28 @@ def _add_checkpointing_args(parser):
                             'Save and load must use the same value; offset 2 maps physical rig0 '
                             'to the logical rig2 hardware-failure role.')
 
-    # EC-NAIVE (Erasure Coding Checkpoint with naive Reed-Solomon encoding) arguments
-    group.add_argument('--use-ecnaive', action='store_true',
-                       help='Enable EC-NAIVE (Erasure Coding Checkpoint with naive Reed-Solomon encoding) '
+    # BasicEC (Erasure Coding Checkpoint with naive Reed-Solomon encoding) arguments
+    group.add_argument('--use-basic-ec', '--use-ecnaive', dest='use_basic_ec', action='store_true',
+                       help='Enable BasicEC (Erasure Coding Checkpoint with naive Reed-Solomon encoding) '
                             'for serialization-free checkpoint encoding. Uses ISA-L for Reed-Solomon '
                             'erasure coding with round-robin distribution of data and parity blocks.')
-    group.add_argument('--ecnaive-rs-k', type=int, default=2,
-                       help='Number of data blocks (k) for EC-NAIVE Reed-Solomon encoding. '
+    group.add_argument('--basic-ec-rs-k', '--ecnaive-rs-k', dest='basic_ec_rs_k', type=int, default=2,
+                       help='Number of data blocks (k) for BasicEC Reed-Solomon encoding. '
                             'Group size n = k + 2 (e.g., k=2 → 2+2=4 ranks, k=6 → 6+2=8 ranks). '
                             'Default 2 preserves the original 2+2 scheme.')
-    group.add_argument('--ecnaive-failed-ranks', type=str, default=None,
-                       help='Comma-separated global ranks to simulate as failed for EC-NAIVE '
+    group.add_argument('--basic-ec-failed-ranks', '--ecnaive-failed-ranks', dest='basic_ec_failed_ranks', type=str, default=None,
+                       help='Comma-separated global ranks to simulate as failed for BasicEC '
                             'software recovery. Uses RS decoding (ISA-L) to recover lost data blocks. '
                             'Supports 1-2 failed ranks per group. '
-                            'E.g. --ecnaive-failed-ranks 2,5')
-    group.add_argument('--use-ecnaive-software-failure', action='store_true',
-                       help='Enable EC-NAIVE checkpointing for software failure recovery. '
+                            'E.g. --basic-ec-failed-ranks 2,5')
+    group.add_argument('--use-basic-ec-software-failure', '--use-ecnaive-software-failure', dest='use_basic_ec_software_failure', action='store_true',
+                       help='Enable BasicEC checkpointing for software failure recovery. '
                             'When enabled, rank2 reads d21 from rank3 via network and merges with local d20.')
-    group.add_argument('--ecnaive-hw-debug', action='store_true',
+    group.add_argument('--basic-ec-hw-debug', '--ecnaive-hw-debug', dest='basic_ec_hw_debug', action='store_true',
                        help='Debug HW recovery by using main.pt tensor_buffer directly '
                             '(bypasses RS decode/encode).')
-    group.add_argument('--ecnaive-require-hw2', action='store_true', dest='_ecnaive_require_hw2',
-                       help='Require exactly two failed ranks in every targeted EC-NAIVE group.')
+    group.add_argument('--basic-ec-require-hw2', '--ecnaive-require-hw2', action='store_true', dest='_basic_ec_require_hw2',
+                       help='Require exactly two failed ranks in every targeted BasicEC group.')
 
     group.add_argument('--use-concord', action='store_true',
                        help='Enable Concord legacy checkpoint skeleton: validates POA file via native module '

@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 """LEGACY checkpoint path for Gemini Replicas (multi-replica round-robin).
-Mirrors ecnaive_legacy.py: decompose state dict, exchange via C++ native,
+Mirrors basic_ec_legacy.py: decompose state dict, exchange via C++ native,
 save/load .pt files with torch.save / torch.load.
 """
 

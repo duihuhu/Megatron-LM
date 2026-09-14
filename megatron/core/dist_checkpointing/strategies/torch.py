@@ -60,7 +60,7 @@ from .base import (
 )
 from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .eccheck_manager import ECCHECKManager
-from .ecnaive_manager import ECNAIVEManager
+from .basic_ec_manager import BasicECManager
 from .gemini_manager import GeminiManager
 from .gemini_replicas_manager import GeminiReplicasManager
 from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
@@ -770,9 +770,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.eccheck_manager = ECCHECKManager()
         self.eccheck_manager.init_eccheck_if_enabled()
         
-        # Initialize EC-NAIVE manager (singleton instance shared with Load strategy)
-        self.ecnaive_manager = ECNAIVEManager()
-        self.ecnaive_manager.init_ecnaive_if_enabled()
+        # Initialize BasicEC manager (singleton instance shared with Load strategy)
+        self.basic_ec_manager = BasicECManager()
+        self.basic_ec_manager.init_basic_ec_if_enabled()
         
         # Initialize Gemini manager (singleton instance for replica-level data transfer)
         from .gemini_manager import GeminiManager
@@ -794,13 +794,13 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.eccheck_p2p_buffers = None
         self.ecc_write_buckets = []
         
-        # Initialize strategy-specific EC-NAIVE state
-        self.ecnaive_preallocate_cpu_buffer = True  # Preallocate CPU buffer for tensor data
-        self.ecnaive_use_continuous_buffer = True  # Use continuous buffer for tensor data
+        # Initialize strategy-specific BasicEC state
+        self.basic_ec_preallocate_cpu_buffer = True  # Preallocate CPU buffer for tensor data
+        self.basic_ec_use_continuous_buffer = True  # Use continuous buffer for tensor data
         # Note: decomposed_state_dict and preallocated_cpu_buffer are shared with ECCHECK
-        self.ecnaive_serialized_metadata = None
-        self.ecnaive_global_registry = None
-        self.ecnaive_blocks = None  # 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1)
+        self.basic_ec_serialized_metadata = None
+        self.basic_ec_global_registry = None
+        self.basic_ec_blocks = None  # 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1)
         self.ec_write_buckets = []  # WriteBuckets for 4 blocks
 
         # Gemini Replicas state
@@ -1056,16 +1056,16 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         """
         return self.eccheck_manager.get_eccheck_buffers()
 
-    def _get_ecnaive_buffers(self):
-        """Get EC-NAIVE buffers for FileSystemWriterAsync.
+    def _get_basic_ec_buffers(self):
+        """Get BasicEC buffers for FileSystemWriterAsync.
         
         Note: Returns data and parity buffers (pooled).
         The 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1) are allocated
-        in _allocate_ecnaive_blocks after metadata exchange.
+        in _allocate_basic_ec_blocks after metadata exchange.
         """
-        if not self.ecnaive_manager.use_ecnaive:
+        if not self.basic_ec_manager.use_basic_ec:
             return None
-        return self.ecnaive_manager.get_ecnaive_buffers()
+        return self.basic_ec_manager.get_basic_ec_buffers()
 
     def __del__(self):
         """Cleanup EC-CHECK resources when strategy is destroyed.
@@ -1106,7 +1106,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # Use PyT saving mechanism
 
         # Create FileSystemWriterAsync with the active backup-strategy parameters
-        if self.ecnaive_manager.use_ecnaive:
+        if self.basic_ec_manager.use_basic_ec:
             from megatron.training import get_args
             args = get_args()
             
@@ -1115,9 +1115,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 separation_hint=self.separation_hint,
                 thread_count=self.thread_count,
                 use_msc=MultiStorageClientFeature.is_enabled(),
-                use_ecnaive=self.ecnaive_manager.use_ecnaive,
-                ecnaive_native=self.ecnaive_manager._ecnaive_native,  # Pass pre-initialized C++ module
-                ecnaive_buffers=self._get_ecnaive_buffers(),  # Pass pre-allocated buffers
+                use_basic_ec=self.basic_ec_manager.use_basic_ec,
+                basic_ec_native=self.basic_ec_manager._basic_ec_native,  # Pass pre-initialized C++ module
+                basic_ec_buffers=self._get_basic_ec_buffers(),  # Pass pre-allocated buffers
             )
                 
         elif self.gemini_replicas_manager.use_gemini_replicas and self.gemini_replicas_manager.use_gemini_replicas_optimized:
@@ -1193,19 +1193,19 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             loaded_all_plans=loaded_all_plans,
         )
         rank = torch.distributed.get_rank()
-        # EC-NAIVE mode: decompose state_dict and preallocate CPU memory
-        if self.ecnaive_manager.use_ecnaive:
-            self._prepare_ecnaive_data(self.cached_central_plan, planner)
-            # Pass EC-NAIVE state to writer if available
+        # BasicEC mode: decompose state_dict and preallocate CPU memory
+        if self.basic_ec_manager.use_basic_ec:
+            self._prepare_basic_ec_data(self.cached_central_plan, planner)
+            # Pass BasicEC state to writer if available
             writer.decomposed_state_dict = self.decomposed_state_dict
             writer.preallocated_cpu_buffer = self.preallocated_cpu_buffer
-            writer.ecnaive_serialized_metadata = self.ecnaive_serialized_metadata
-            writer.ecnaive_global_registry = self.ecnaive_global_registry
+            writer.basic_ec_serialized_metadata = self.basic_ec_serialized_metadata
+            writer.basic_ec_global_registry = self.basic_ec_global_registry
             # Pass the 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1)
-            writer.ecnaive_blocks = self.ecnaive_blocks
+            writer.basic_ec_blocks = self.basic_ec_blocks
             writer.ec_write_buckets = self.ec_write_buckets
             
-            # In EC-NAIVE mode, call prepare_write_data to create write_buckets
+            # In BasicEC mode, call prepare_write_data to create write_buckets
             # It will use the metadata we just prepared
             writer.prepare_write_data(self.cached_central_plan, planner)
         # Gemini Replicas mode: decompose state_dict and preallocate CPU memory for multi-replica exchange
@@ -1214,7 +1214,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             # Pass Gemini Replicas state to writer if available
             writer.decomposed_state_dict = self.decomposed_state_dict
             writer.preallocated_cpu_buffer = self.preallocated_cpu_buffer
-            # Pass global metadata registry (aligned with ecnaive/eccheck)
+            # Pass global metadata registry (aligned with basic_ec/eccheck)
             if hasattr(self, 'gemini_replicas_global_registry'):
                 writer.gemini_replicas_global_registry = self.gemini_replicas_global_registry
             # Pass preallocated remote buffers (optimization: only allocate once)
@@ -1644,7 +1644,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         # Step 3: Exchange metadata and allocate remote buffers
         # Uses the shared _broadcast_and_exchange_metadata (all_gather_object on NCCL),
-        # aligning with ecnaive/eccheck instead of a separate gloo exchange.
+        # aligning with basic_ec/eccheck instead of a separate gloo exchange.
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         if world_size > 1:
             # Step 3a: Broadcast and exchange metadata via all_gather_object (NCCL)
@@ -1913,13 +1913,13 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             f"  P2P buffer allocation: {p2p_buffer_alloc_time:.2f}s"
         )
 
-    def _prepare_ecnaive_data(self, plan: SavePlan, planner: SavePlanner) -> None:
+    def _prepare_basic_ec_data(self, plan: SavePlan, planner: SavePlanner) -> None:
         """
-        EC-NAIVE preparation: organize data for serialization-free checkpointing.
+        BasicEC preparation: organize data for serialization-free checkpointing.
         
         This method performs the following steps:
         1. Process plan items like normal mode (separate bytes and tensors)
-        2. Organize tensors for EC-NAIVE (extract metadata and data)
+        2. Organize tensors for BasicEC (extract metadata and data)
         3. Preallocate CPU memory buffer for tensors
         4. Prepare write buckets for async transfer
         5. Broadcast and exchange metadata
@@ -1933,7 +1933,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         from time import time
         
         start_total = time()
-        logger.info("EC-NAIVE: Starting serialization-free checkpoint preparation")
+        logger.info("BasicEC: Starting serialization-free checkpoint preparation")
         
         # Step 1: Process plan items
         start = time()
@@ -1944,7 +1944,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         tensor_infos = []
         tensor_data_list = []
         
-        logger.info(f"EC-NAIVE: Processing {len(plan.items)} items from SavePlan")
+        logger.info(f"BasicEC: Processing {len(plan.items)} items from SavePlan")
         byte_io_count = 0
         tensor_count = 0
         none_data_count = 0
@@ -1956,7 +1956,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             if data is None:
                 none_data_count += 1
                 if none_data_count <= 5:
-                    logger.warning(f"EC-NAIVE SAVE: Found None data for item: fqn={item.index.fqn}, type={item.type}")
+                    logger.warning(f"BasicEC SAVE: Found None data for item: fqn={item.index.fqn}, type={item.type}")
                 continue  # Skip None data items
             
             if item.type == WriteItemType.BYTE_IO:
@@ -1964,8 +1964,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 import io
                 if isinstance(data, io.BytesIO):
                     non_tensor_data[item.index.fqn] = {
-                        '_ecnaive_type': 'BytesIO',
-                        '_ecnaive_data': data.getvalue()
+                        '_basic_ec_type': 'BytesIO',
+                        '_basic_ec_data': data.getvalue()
                     }
                 else:
                     non_tensor_data[item.index.fqn] = data
@@ -1990,7 +1990,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 tensor_count += 1
         
         logger.info(
-            f"EC-NAIVE: Processed {byte_io_count} BytesIO items, {tensor_count} tensor items"
+            f"BasicEC: Processed {byte_io_count} BytesIO items, {tensor_count} tensor items"
             + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
         )
         
@@ -2018,7 +2018,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # Log statistics
         stats = self.decomposed_state_dict.get_statistics()
         logger.info(
-            f"EC-NAIVE: Processed plan items in {process_time:.2f}s\n"
+            f"BasicEC: Processed plan items in {process_time:.2f}s\n"
             f"  Non-tensor items: {len(non_tensor_data)}\n"
             f"  Tensor items: {len(tensor_data_list)}\n"
             f"  Non-tensor data: {stats['non_tensor_size_bytes'] / 1024:.2f} KB "
@@ -2030,72 +2030,72 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         
         # Step 2: Preallocate CPU memory buffer if enabled
-        if self.ecnaive_preallocate_cpu_buffer:
+        if self.basic_ec_preallocate_cpu_buffer:
             start = time()
             total_size = self.decomposed_state_dict.total_tensor_size_bytes
             
             # Add safety margin to handle potential size differences between ranks
             # Use max(1% or buffer_size) to ensure sufficient space
-            ecnaive_buffer_size = self.ecnaive_manager.ecnaive_buffer_size
-            safety_margin = max(int(total_size * 0.01), ecnaive_buffer_size)
+            basic_ec_buffer_size = self.basic_ec_manager.basic_ec_buffer_size
+            safety_margin = max(int(total_size * 0.01), basic_ec_buffer_size)
             total_size_with_margin = total_size + safety_margin
             
             logger.info(
-                f"EC-NAIVE: Preallocating CPU buffer of {total_size_with_margin / (1024**3):.2f} GB "
+                f"BasicEC: Preallocating CPU buffer of {total_size_with_margin / (1024**3):.2f} GB "
                 f"(data: {total_size / (1024**3):.2f} GB + safety: {safety_margin / (1024**2):.0f} MB)"
             )
             
             if self.preallocated_cpu_buffer is None:
-                if self.ecnaive_manager.ecnaive_pin_memory and torch.cuda.is_available():
+                if self.basic_ec_manager.basic_ec_pin_memory and torch.cuda.is_available():
                     self.preallocated_cpu_buffer = allocate_hugepage_tensor(
                         total_size_with_margin,
                         fallback_pin_memory=True,
                     )
-                    logger.info("EC-NAIVE: Using pinned memory for CPU buffer")
+                    logger.info("BasicEC: Using pinned memory for CPU buffer")
                 else:
                     self.preallocated_cpu_buffer = allocate_hugepage_tensor(
                         total_size_with_margin,
                         fallback_pin_memory=False,
                     )
-                    logger.info("EC-NAIVE: Using non-pinned memory for CPU buffer")
+                    logger.info("BasicEC: Using non-pinned memory for CPU buffer")
             
             prealloc_time = time() - start
-            logger.debug(f"EC-NAIVE: CPU buffer preallocation took {prealloc_time:.2f}s")
+            logger.debug(f"BasicEC: CPU buffer preallocation took {prealloc_time:.2f}s")
         else:
             prealloc_time = 0
         
         # Register preallocated_cpu_buffer for RDMA if enabled (same as Gemini send buffer registration)
-        if self.ecnaive_manager.use_rdma and self.preallocated_cpu_buffer is not None:
-            logger.info("EC-NAIVE: Registering preallocated_cpu_buffer for RDMA")
-            self.ecnaive_manager.register_buffer(self.preallocated_cpu_buffer)
+        if self.basic_ec_manager.use_rdma and self.preallocated_cpu_buffer is not None:
+            logger.info("BasicEC: Registering preallocated_cpu_buffer for RDMA")
+            self.basic_ec_manager.register_buffer(self.preallocated_cpu_buffer)
         
         # Step 3: Prepare write buckets for async transfer
-        # Note: WriteBuckets for 4 blocks will be created in _allocate_ecnaive_blocks
+        # Note: WriteBuckets for 4 blocks will be created in _allocate_basic_ec_blocks
         # This step is a placeholder
         start = time()
         bucket_time = time() - start
-        logger.debug(f"EC-NAIVE: Write bucket preparation (will be done in block allocation)")
+        logger.debug(f"BasicEC: Write bucket preparation (will be done in block allocation)")
         
         # Step 4: Validate decomposition
-        if not self.validate_ecnaive_decomposition():
-            raise RuntimeError("EC-NAIVE: Decomposition validation failed")
+        if not self.validate_basic_ec_decomposition():
+            raise RuntimeError("BasicEC: Decomposition validation failed")
         
         # Step 5: Broadcast and exchange metadata (reuse ECCHECK method)
         start = time()
-        self.ecnaive_global_registry = self._broadcast_and_exchange_metadata()
+        self.basic_ec_global_registry = self._broadcast_and_exchange_metadata()
         metadata_time = time() - start
-        logger.info(f"EC-NAIVE: Metadata exchange completed in {metadata_time:.2f}s")
+        logger.info(f"BasicEC: Metadata exchange completed in {metadata_time:.2f}s")
         
         # Step 6: Allocate 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1)
         start = time()
-        if self.ecnaive_blocks is None:
-            self.ecnaive_blocks = self._allocate_ecnaive_blocks(self.ecnaive_global_registry)
+        if self.basic_ec_blocks is None:
+            self.basic_ec_blocks = self._allocate_basic_ec_blocks(self.basic_ec_global_registry)
         block_alloc_time = time() - start
-        logger.info(f"EC-NAIVE: Block allocation completed in {block_alloc_time:.2f}s")
+        logger.info(f"BasicEC: Block allocation completed in {block_alloc_time:.2f}s")
         
         total_time = time() - start_total
         logger.info(
-            f"EC-NAIVE: Preparation completed in {total_time:.2f}s\n"
+            f"BasicEC: Preparation completed in {total_time:.2f}s\n"
             f"  Item processing: {process_time:.2f}s\n"
             f"  Preallocation: {prealloc_time:.2f}s\n"
             f"  Bucket prep: {bucket_time:.2f}s\n"
@@ -2103,9 +2103,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             f"  Block allocation: {block_alloc_time:.2f}s"
         )
 
-    def validate_ecnaive_decomposition(self) -> bool:
+    def validate_basic_ec_decomposition(self) -> bool:
         """
-        Validate EC-NAIVE decomposition structure.
+        Validate BasicEC decomposition structure.
         
         Validates:
         1. non_tensor_data is a dict
@@ -2116,12 +2116,12 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         Returns:
             bool: True if decomposition is valid, False otherwise
         """
-        if not self.ecnaive_manager.use_ecnaive:
-            logger.warning("EC-NAIVE: Validation skipped - EC-NAIVE is not enabled")
+        if not self.basic_ec_manager.use_basic_ec:
+            logger.warning("BasicEC: Validation skipped - BasicEC is not enabled")
             return False
         
         if not self.decomposed_state_dict:
-            logger.error("EC-NAIVE: Validation failed - State dict not decomposed yet")
+            logger.error("BasicEC: Validation failed - State dict not decomposed yet")
             return False
         
         decomposed = self.decomposed_state_dict
@@ -2129,7 +2129,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # Check 1: Non-tensor key-value pairs (dict)
         if not isinstance(decomposed.non_tensor_data, dict):
             logger.error(
-                f"EC-NAIVE: Component 1 failed - non_tensor_data should be dict, "
+                f"BasicEC: Component 1 failed - non_tensor_data should be dict, "
                 f"got {type(decomposed.non_tensor_data).__name__}"
             )
             return False
@@ -2137,7 +2137,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # Check 2: Tensor keys (list)
         if not isinstance(decomposed.tensor_infos, list):
             logger.error(
-                f"EC-NAIVE: Component 2 failed - tensor_infos should be list, "
+                f"BasicEC: Component 2 failed - tensor_infos should be list, "
                 f"got {type(decomposed.tensor_infos).__name__}"
             )
             return False
@@ -2145,7 +2145,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # Check 3: Tensor data (list)
         if not isinstance(decomposed.tensor_data, list):
             logger.error(
-                f"EC-NAIVE: Component 3 failed - tensor_data should be list, "
+                f"BasicEC: Component 3 failed - tensor_data should be list, "
                 f"got {type(decomposed.tensor_data).__name__}"
             )
             return False
@@ -2153,7 +2153,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # Check 4: Counts match
         if len(decomposed.tensor_infos) != len(decomposed.tensor_data):
             logger.error(
-                f"EC-NAIVE: Component count mismatch - tensor_infos has {len(decomposed.tensor_infos)} items, "
+                f"BasicEC: Component count mismatch - tensor_infos has {len(decomposed.tensor_infos)} items, "
                 f"tensor_data has {len(decomposed.tensor_data)} items"
             )
             return False
@@ -2162,17 +2162,17 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         calculated_size = tensor_layout_size(decomposed.tensor_infos)
         if calculated_size != decomposed.total_tensor_size_bytes:
             logger.warning(
-                f"EC-NAIVE: Size mismatch - calculated {calculated_size} bytes, "
+                f"BasicEC: Size mismatch - calculated {calculated_size} bytes, "
                 f"but total_tensor_size_bytes is {decomposed.total_tensor_size_bytes} bytes"
             )
             # This is a warning, not an error, as it might be due to rounding
         
-        logger.debug("EC-NAIVE: Decomposition validation passed")
+        logger.debug("BasicEC: Decomposition validation passed")
         return True
 
-    def _allocate_ecnaive_blocks(self, global_registry):
+    def _allocate_basic_ec_blocks(self, global_registry):
         """
-        Allocate 4 persistent blocks for EC-NAIVE:
+        Allocate 4 persistent blocks for BasicEC:
         - data0: Local data block (kept, not sent)
         - recv_parity1: Receive p_{(i+1),1} from rank (i+1)
         - recv_parity0: Receive p_{(i+2),0} from rank (i+2)
@@ -2210,13 +2210,13 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             max_total_bytes = own_total_size
         
         # ===== Align block size to buffer_size (64MB) using half of maximum =====
-        ecnaive_buffer_size = self.ecnaive_manager.ecnaive_buffer_size
+        basic_ec_buffer_size = self.basic_ec_manager.basic_ec_buffer_size
         # Each block only needs half of max_total_bytes (data is split into two halves)
         half_max_total_bytes = max_total_bytes // 2
-        aligned_half_block_size = ((half_max_total_bytes + ecnaive_buffer_size - 1) // ecnaive_buffer_size) * ecnaive_buffer_size
+        aligned_half_block_size = ((half_max_total_bytes + basic_ec_buffer_size - 1) // basic_ec_buffer_size) * basic_ec_buffer_size
         
         logger.info(
-            f"EC-NAIVE: Allocating 4 persistent blocks based on metadata\n"
+            f"BasicEC: Allocating 4 persistent blocks based on metadata\n"
             f"  Own data size: {own_total_size / (1024**3):.2f} GB (actual), "
             f"{max_total_bytes / (1024**3):.2f} GB (pipeline max), "
             f"{aligned_half_block_size / (1024**3):.2f} GB (aligned half block size)\n"
@@ -2233,7 +2233,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         
         logger.info(
-            f"EC-NAIVE: Allocated 4 persistent blocks:\n"
+            f"BasicEC: Allocated 4 persistent blocks:\n"
             f"  data0: {aligned_half_block_size / (1024**3):.2f} GB "
             f"({aligned_half_block_size / (1024**2):.0f} MB)\n"
             f"  recv_parity1: {aligned_half_block_size / (1024**3):.2f} GB "
@@ -2246,13 +2246,13 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         
         # ===== Register 4 persistent blocks for RDMA if enabled =====
-        if self.ecnaive_manager.use_rdma:
-            logger.info("EC-NAIVE: Registering 4 persistent blocks for RDMA...")
-            self.ecnaive_manager.register_buffer(data0)
-            self.ecnaive_manager.register_buffer(recv_parity1)
-            self.ecnaive_manager.register_buffer(recv_parity0)
-            self.ecnaive_manager.register_buffer(recv_data1)
-            logger.info("EC-NAIVE: RDMA buffer registration complete")
+        if self.basic_ec_manager.use_rdma:
+            logger.info("BasicEC: Registering 4 persistent blocks for RDMA...")
+            self.basic_ec_manager.register_buffer(data0)
+            self.basic_ec_manager.register_buffer(recv_parity1)
+            self.basic_ec_manager.register_buffer(recv_parity0)
+            self.basic_ec_manager.register_buffer(recv_data1)
+            logger.info("BasicEC: RDMA buffer registration complete")
         
         # ===== Package blocks with metadata =====
         # Align with EC-CHECK: use decomposed_state_dict.non_tensor_data directly
@@ -2284,7 +2284,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # Get checkpoint_dir
         checkpoint_dir = getattr(self, 'current_checkpoint_dir', None)
         if checkpoint_dir is None:
-            logger.warning("EC-NAIVE: checkpoint_dir not available, using file_name as path")
+            logger.warning("BasicEC: checkpoint_dir not available, using file_name as path")
             checkpoint_dir = Path(".")
         else:
             checkpoint_dir = Path(checkpoint_dir)
@@ -2295,10 +2295,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         block_tensors = [data0, recv_parity1, recv_parity0, recv_data1]
         
         for block_name, block_tensor in zip(block_names, block_tensors):
-            # Create ecnaive_bytes_data format
-            block_ecnaive_bytes_data = [
-                ('ecnaive_metadata', block_serialized_metadata),
-                ('ecnaive_continuous_buffer', block_tensor),
+            # Create basic_ec_bytes_data format
+            block_basic_ec_bytes_data = [
+                ('basic_ec_metadata', block_serialized_metadata),
+                ('basic_ec_continuous_buffer', block_tensor),
             ]
             
             # Generate file name
@@ -2309,7 +2309,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             write_bucket = (
                 file_path,              # file_path (full path with checkpoint_dir)
                 file_name,              # storage_key (used in metadata)
-                (block_ecnaive_bytes_data, []),  # (bytes_data, tensor_data)
+                (block_basic_ec_bytes_data, []),  # (bytes_data, tensor_data)
             )
             
             self.ec_write_buckets.append(write_bucket)
@@ -2327,7 +2327,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         }
         
         logger.info(
-            f"EC-NAIVE: Packaged 4 blocks with metadata and WriteBuckets:\n"
+            f"BasicEC: Packaged 4 blocks with metadata and WriteBuckets:\n"
             f"  Metadata: {own_non_tensor_size / 1024:.2f} KB (non-tensor) + "
             f"{own_tensor_keys_size / 1024:.2f} KB (tensor keys), "
             f"{own_tensor_buffer_size / (1024**3):.2f} GB (buffer actual size)\n"
@@ -2735,10 +2735,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.gemini_replicas_manager = GeminiReplicasManager()
         self.gemini_replicas_manager.init_gemini_replicas_if_enabled()
         
-        # Initialize EC-NAIVE manager (singleton instance shared with Save strategy)
-        from .ecnaive_manager import ECNAIVEManager
-        self.ecnaive_manager = ECNAIVEManager()
-        self.ecnaive_manager.init_ecnaive_if_enabled()
+        # Initialize BasicEC manager (singleton instance shared with Save strategy)
+        from .basic_ec_manager import BasicECManager
+        self.basic_ec_manager = BasicECManager()
+        self.basic_ec_manager.init_basic_ec_if_enabled()
         
         # Initialize strategy-specific EC-CHECK state
         self.eccheck_p2p_buffers = None
@@ -2748,17 +2748,17 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self.eccheck_recovered_metadata = None
         self.eccheck_recovered_registry = None
         
-        # Initialize strategy-specific EC-NAIVE state
-        self.ecnaive_blocks = None  # 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1)
-        self.ecnaive_recv_buffers = None  # 2 recv buffers (rank2 only): recv_data1, recv_parity0
-        self.ecnaive_recovered_buffer = None  # Recovered data buffer (rank2 only)
-        self.ecnaive_recovered_metadata = None
-        self.ecnaive_recovered_registry = None
+        # Initialize strategy-specific BasicEC state
+        self.basic_ec_blocks = None  # 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1)
+        self.basic_ec_recv_buffers = None  # 2 recv buffers (rank2 only): recv_data1, recv_parity0
+        self.basic_ec_recovered_buffer = None  # Recovered data buffer (rank2 only)
+        self.basic_ec_recovered_metadata = None
+        self.basic_ec_recovered_registry = None
         
-        # Pre-allocated EC-NAIVE load buffers (allocated on first load, reused on subsequent loads)
-        self.ecnaive_preallocated_blocks = None  # Dict[str, torch.Tensor]: 4 blocks
-        self.ecnaive_preallocated_recv_buffers = None  # Dict[str, torch.Tensor]: 2 recv buffers (rank2 only)
-        self.ecnaive_preallocated_recovered_buffer = None  # torch.Tensor: recovered data buffer (rank2 only)
+        # Pre-allocated BasicEC load buffers (allocated on first load, reused on subsequent loads)
+        self.basic_ec_preallocated_blocks = None  # Dict[str, torch.Tensor]: 4 blocks
+        self.basic_ec_preallocated_recv_buffers = None  # Dict[str, torch.Tensor]: 2 recv buffers (rank2 only)
+        self.basic_ec_preallocated_recovered_buffer = None  # torch.Tensor: recovered data buffer (rank2 only)
         
         # Initialize Gemini recovery buffers (pre-allocated for rank2 recovery)
         self.gemini_recovery_buffer_replica = None  # Buffer for receiving replica data
@@ -3497,16 +3497,16 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         except:
             return False
     
-    def _is_ecnaive_checkpoint(self, checkpoint_dir: Path) -> bool:
-        """Check if the checkpoint is in EC-NAIVE format.
+    def _is_basic_ec_checkpoint(self, checkpoint_dir: Path) -> bool:
+        """Check if the checkpoint is in BasicEC format.
         
-        EC-NAIVE checkpoints are .distcp files with 'ECNV' magic number in the header.
+        BasicEC checkpoints are .distcp files with 'ECNV' magic number in the header.
         
         Args:
             checkpoint_dir (Path): checkpoint directory
             
         Returns:
-            bool: True if this is an EC-NAIVE checkpoint
+            bool: True if this is an BasicEC checkpoint
         """
         checkpoint_dir = Path(checkpoint_dir)
         if not checkpoint_dir.exists():
@@ -3515,7 +3515,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Get current rank to find the corresponding file
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         
-        # Check for EC-NAIVE format: __{rank}_0.distcp with ECNV magic number
+        # Check for BasicEC format: __{rank}_0.distcp with ECNV magic number
         potential_file = checkpoint_dir / f"__{rank}_0.distcp"
         
         if not potential_file.exists():
@@ -3832,9 +3832,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Return EccheckMappedFile, non_tensor_data, and local_metadata for each file
         return mapped_file_own, mapped_file_partner
     
-    def _allocate_ecnaive_blocks(self, global_registry):
+    def _allocate_basic_ec_blocks(self, global_registry):
         """
-        Allocate 4 persistent blocks for EC-NAIVE load.
+        Allocate 4 persistent blocks for BasicEC load.
         
         Similar to save phase but simplified - only allocates blocks without WriteBuckets.
         
@@ -3864,13 +3864,13 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             max_total_bytes = own_total_size
         
         # ===== Align block size to buffer_size (64MB) using half of maximum =====
-        ecnaive_buffer_size = self.ecnaive_manager.ecnaive_buffer_size
+        basic_ec_buffer_size = self.basic_ec_manager.basic_ec_buffer_size
         # Each block only needs half of max_total_bytes (data is split into two halves)
         half_max_total_bytes = max_total_bytes // 2
-        aligned_half_block_size = ((half_max_total_bytes + ecnaive_buffer_size - 1) // ecnaive_buffer_size) * ecnaive_buffer_size
+        aligned_half_block_size = ((half_max_total_bytes + basic_ec_buffer_size - 1) // basic_ec_buffer_size) * basic_ec_buffer_size
         
         logger.info(
-            f"EC-NAIVE: [Load] Preparing 4 persistent blocks based on metadata\n"
+            f"BasicEC: [Load] Preparing 4 persistent blocks based on metadata\n"
             f"  Own data size: {own_total_size / (1024**3):.2f} GB (actual), "
             f"{max_total_bytes / (1024**3):.2f} GB (pipeline max), "
             f"{aligned_half_block_size / (1024**3):.2f} GB (aligned half block size)"
@@ -3879,22 +3879,22 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # ===== Check if pre-allocated buffers exist and are large enough =====
         block_names = ['data0', 'recv_parity1', 'recv_parity0', 'recv_data1']
         
-        if (self.ecnaive_preallocated_blocks is not None and
-            all(name in self.ecnaive_preallocated_blocks for name in block_names) and
-            all(self.ecnaive_preallocated_blocks[name].numel() >= aligned_half_block_size for name in block_names)):
+        if (self.basic_ec_preallocated_blocks is not None and
+            all(name in self.basic_ec_preallocated_blocks for name in block_names) and
+            all(self.basic_ec_preallocated_blocks[name].numel() >= aligned_half_block_size for name in block_names)):
             # Reuse pre-allocated buffers (create views)
             blocks = {
-                name: self.ecnaive_preallocated_blocks[name][:aligned_half_block_size]
+                name: self.basic_ec_preallocated_blocks[name][:aligned_half_block_size]
                 for name in block_names
             }
             logger.info(
-                f"EC-NAIVE: [Load] Reusing pre-allocated blocks: "
+                f"BasicEC: [Load] Reusing pre-allocated blocks: "
                 f"{aligned_half_block_size / (1024**3):.2f} GB x 4 = "
                 f"{4 * aligned_half_block_size / (1024**3):.2f} GB"
             )
         else:
             # Allocate new buffers
-            pin_memory = torch.cuda.is_available() and getattr(self.ecnaive_manager, 'ecnaive_pin_memory', False)
+            pin_memory = torch.cuda.is_available() and getattr(self.basic_ec_manager, 'basic_ec_pin_memory', False)
             
             data0, recv_parity1, recv_parity0, recv_data1 = allocate_hugepage_slices(
                 aligned_half_block_size,
@@ -3904,17 +3904,17 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             )
             
             # Store for future reuse
-            self.ecnaive_preallocated_blocks = {
+            self.basic_ec_preallocated_blocks = {
                 'data0': data0,
                 'recv_parity1': recv_parity1,
                 'recv_parity0': recv_parity0,
                 'recv_data1': recv_data1,
             }
             
-            blocks = self.ecnaive_preallocated_blocks
+            blocks = self.basic_ec_preallocated_blocks
             
             logger.info(
-                f"EC-NAIVE: [Load] Allocated and cached 4 persistent blocks:\n"
+                f"BasicEC: [Load] Allocated and cached 4 persistent blocks:\n"
                 f"  data0: {aligned_half_block_size / (1024**3):.2f} GB\n"
                 f"  recv_parity1: {aligned_half_block_size / (1024**3):.2f} GB\n"
                 f"  recv_parity0: {aligned_half_block_size / (1024**3):.2f} GB\n"
@@ -6874,11 +6874,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             logger.info(f"rank: {rank}, EC-CHECK recovery load to time: {recovery_time:.4f} seconds")
             return mcore_state_dict
         
-        if input_args.use_ecnaive and self._is_ecnaive_checkpoint(checkpoint_dir):
+        if input_args.use_basic_ec and self._is_basic_ec_checkpoint(checkpoint_dir):
             raise RuntimeError(
-                "EC-NAIVE distributed-checkpoint XOR HW recovery path was removed. "
-                "Use the legacy torch checkpoint path with --ecnaive-failed-ranks "
-                "for generalized EC-NAIVE hardware recovery."
+                "BasicEC distributed-checkpoint XOR HW recovery path was removed. "
+                "Use the legacy torch checkpoint path with --basic-ec-failed-ranks "
+                "for generalized BasicEC hardware recovery."
             )
         
         # Apply N-D tensors resharding

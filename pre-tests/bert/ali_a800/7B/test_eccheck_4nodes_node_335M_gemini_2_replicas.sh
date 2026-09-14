@@ -6,7 +6,7 @@
 # 使用 torch legacy 路径（torch.save → .pt 文件）进行多副本 checkpoint，
 # 替代原有的 distributed checkpoint（FileSystemWriterAsync + torch_dist）路径。
 #
-# 与 ecnaive_legacy.py / concord_legacy.py 遵循相同模式。
+# 与 basic_ec_legacy.py / concord_legacy.py 遵循相同模式。
 # =============================================================================
 #
 # Usage:
@@ -129,7 +129,7 @@ esac
 # 模型固定参数
 HIDDEN_SIZE=4096
 NUM_ATTENTION_HEADS=32
-NUM_LAYERS=32 
+NUM_LAYERS=32
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH
@@ -204,7 +204,7 @@ EVAL_AND_LOGGING_ARGS=(
     # 必选：启用 Gemini Replicas torch legacy checkpoint
     # ---------------------------------------------------------------------------
     # 启用 Gemini Replicas（替代原有的 --use-gemini，后者是两副本 EC 风格配对）
-    # --use-gemini-replicas   
+    # --use-gemini-replicas
     # 启用优化路径：使用连续 CPU buffer + C++ ASIO/RDMA 网络传输，跳过 torch.save 序列化开销
     # --use-gemini-replicas-optimized
 

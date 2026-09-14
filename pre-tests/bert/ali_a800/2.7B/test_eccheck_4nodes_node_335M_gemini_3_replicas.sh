@@ -6,7 +6,7 @@
 # 使用 torch legacy 路径（torch.save → .pt 文件）进行多副本 checkpoint，
 # 替代原有的 distributed checkpoint（FileSystemWriterAsync + torch_dist）路径。
 #
-# 与 ecnaive_legacy.py / concord_legacy.py 遵循相同模式。
+# 与 basic_ec_legacy.py / concord_legacy.py 遵循相同模式。
 # =============================================================================
 #
 # Usage:
@@ -127,7 +127,7 @@ case "$MODE" in
     hardware2)
         RECOVERY_MODE_ARGS=(
             --load $CHECKPOINT_PATH
-            
+
             --gemini-replicas-recovery-rank "8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
         )
         ;;
@@ -136,7 +136,7 @@ esac
 # 模型固定参数
 HIDDEN_SIZE=2560
 NUM_ATTENTION_HEADS=32
-NUM_LAYERS=32 
+NUM_LAYERS=32
 
 SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=$SEQ_LENGTH

@@ -51,37 +51,37 @@ build_gemini_env_prefix() {
     printf '%s' "$prefix"
 }
 
-DEFAULT_SCHEMES=(gemini2 gemini3 concord eccheck ecnaive)
+DEFAULT_SCHEMES=(gemini2 gemini3 concord eccheck basic_ec)
 declare -A SCRIPTS=(
     [gemini2]="$SCRIPT_DIR/test_gemini_2.sh"
     [gemini3]="$SCRIPT_DIR/test_gemini_3.sh"
     [concord]="$SCRIPT_DIR/test_concord.sh"
     [eccheck]="$SCRIPT_DIR/test_eccheck.sh"
-    [ecnaive]="$SCRIPT_DIR/test_ecnaive.sh"
+    [basic_ec]="$SCRIPT_DIR/test_basic_ec.sh"
 )
 declare -A CHECKPOINT_PATHS=(
     [gemini2]="$CHECKPOINT_PREFIX-gemini-2-replicas"
     [gemini3]="$CHECKPOINT_PREFIX-gemini-3-replicas"
     [concord]="$CHECKPOINT_PREFIX-concord"
     [eccheck]="$CHECKPOINT_PREFIX-eccheck"
-    [ecnaive]="$CHECKPOINT_PREFIX-ecnaive"
+    [basic_ec]="$CHECKPOINT_PREFIX-basic-ec"
 )
 declare -A MASTER_PORTS=(
     [gemini2]="${MASTER_PORT_GEMINI2:-6100}"
     [gemini3]="${MASTER_PORT_GEMINI3:-6110}"
     [concord]="${MASTER_PORT_CONCORD:-6120}"
     [eccheck]="${MASTER_PORT_ECCHECK:-6130}"
-    [ecnaive]="${MASTER_PORT_ECNAIVE:-6140}"
+    [basic_ec]="${MASTER_PORT_BASIC_EC:-6140}"
 )
 
 usage() {
-    echo "Usage: $0 [--dry-run] [gemini2|gemini3|concord|eccheck|ecnaive ...]"
+    echo "Usage: $0 [--dry-run] [gemini2|gemini3|concord|eccheck|basic_ec ...]"
     echo "Environment: MODEL_SIZE=2.7B|7B|10B|14B|20B, LOG_DIR, CONTINUE_ON_ERROR=0|1, DRY_RUN=0|1"
     echo "             RDMA_HCA_PROFILE=full|half|quarter (default: full)"
     echo "             ECCHECK_DATA_BUFFERS_COUNT (default: 12; positive integer)"
     echo "             SSH_USER, SSH_PORT, SSH_CONNECT_TIMEOUT, SSH_IDENTITY_FILE"
     echo "             MASTER_PORT_GEMINI2, MASTER_PORT_GEMINI3, MASTER_PORT_CONCORD,"
-    echo "             MASTER_PORT_ECCHECK, MASTER_PORT_ECNAIVE"
+    echo "             MASTER_PORT_ECCHECK, MASTER_PORT_BASIC_EC"
     echo "             CONCORD_LAYER_FRONTIER_ORDER (default: chunk_layer_sid)"
     echo "             CONCORD_SAVE_PREFER_TORCH_PINNED=0|1 (default: 0)"
     echo "             CONCORD_LAYER_STREAM_ENCODE (default: 1), CONCORD_LAYER_ENCODE_COALESCE_US (default: 0)"
@@ -98,7 +98,7 @@ for argument in "$@"; do
     case "$argument" in
         --dry-run) DRY_RUN=1 ;;
         -h|--help) usage; exit 0 ;;
-        gemini2|gemini3|concord|eccheck|ecnaive) schemes+=("$argument") ;;
+        gemini2|gemini3|concord|eccheck|basic_ec) schemes+=("$argument") ;;
         *) echo "Unknown scheme or option: $argument" >&2; usage >&2; exit 2 ;;
     esac
 done

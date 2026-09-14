@@ -6,7 +6,7 @@
 # 使用 torch legacy 路径（torch.save → .pt 文件）进行多副本 checkpoint，
 # 替代原有的 distributed checkpoint（FileSystemWriterAsync + torch_dist）路径。
 #
-# 与 ecnaive_legacy.py / concord_legacy.py 遵循相同模式。
+# 与 basic_ec_legacy.py / concord_legacy.py 遵循相同模式。
 # =============================================================================
 #
 # 用法:
@@ -130,7 +130,7 @@ GPT_ARGS=(
     --global-batch-size $GLOBAL_BATCH_SIZE
     --lr 0.00015
     --train-iters 10
-    --lr-decay-iters 320000 
+    --lr-decay-iters 320000
     --lr-decay-style cosine
     --min-lr 1.0e-5
     --weight-decay 1e-2

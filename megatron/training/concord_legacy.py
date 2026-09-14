@@ -4151,7 +4151,7 @@ def save_concord_legacy_checkpoint(
     my_node = rg + 1
     stripe_plans = manager.stripe_plans
 
-    # 3. Setup output directory (same layout as ecnaive: files live in mp_rank_* dir)
+    # 3. Setup output directory (same layout as basic_ec: files live in mp_rank_* dir)
     checkpoint_path = Path(checkpoint_name)
     checkpoint_dir = checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
     if write_to_disk:

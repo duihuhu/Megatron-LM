@@ -1,0 +1,2935 @@
+import ctypes
+import os
+import queue
+import time
+from logging import getLogger
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import torch
+
+from megatron.core.dist_checkpointing.strategies.basic_ec_manager import BasicECManager
+from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
+    allocate_hugepage_slices,
+    allocate_hugepage_tensor,
+)
+from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
+    DecomposedStateDict,
+    GlobalMetadataRegistry,
+    TensorMetadata,
+    decompose_state_dict,
+    decompose_state_dict_for_save,
+    extract_tensors_from_continuous_buffer,
+    reconstruct_state_dict,
+    unflatten_optimizer_fp32_params,
+    assign_tensor_offsets,
+    tensor_layout_size,
+)
+
+logger = getLogger(__name__)
+
+def _allocate_pinned_uint8_buffer(size_bytes: int) -> torch.Tensor:
+    """Allocate a final CPU tensor buffer with torch-visible pinned memory."""
+    if torch.cuda.is_available() and size_bytes > 0:
+        try:
+            return torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
+        except Exception:
+            pass
+    return allocate_hugepage_tensor(size_bytes, fallback_pin_memory=torch.cuda.is_available())
+
+
+def _timing_max(value: float) -> float:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return float(value)
+    device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    tensor = torch.tensor([float(value)], dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def _timing_max_dict(timings: Dict[str, float]) -> Dict[str, float]:
+    return {key: _timing_max(value) for key, value in timings.items()}
+
+
+def _basic_ec_inprocess_workspace_enabled(args) -> bool:
+    return bool(
+        getattr(args, "ft_inprocess_recovery_benchmark", False)
+        and getattr(args, "_ft_inprocess_recovery_active", False)
+    )
+
+
+def _basic_ec_checkpoint_identity(checkpoint_dir: Path) -> tuple:
+    """Return a stable identity without reading checkpoint payload bytes."""
+    files = []
+    paths = list(checkpoint_dir.glob("basic_ec_*")) + list(checkpoint_dir.glob("ecnaive_*"))
+    for path in sorted(paths, key=lambda item: item.name):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        files.append((path.name, int(stat.st_size), int(stat.st_mtime_ns)))
+    return (str(checkpoint_dir.resolve()), tuple(files))
+
+
+def _log_basic_ec_inprocess_setup(rank: int, cache_hit: bool, timings: Dict[str, float]) -> None:
+    aggregated = _timing_max_dict(timings)
+    if rank == 0:
+        logger.info(
+            "BasicEC in-process setup cache=%s metadata_plan_s=%.3f "
+            "disk_preload_s=%.3f alloc_touch_register_s=%.3f "
+            "native_reset_s=%.3f total_s=%.3f",
+            "hit" if cache_hit else "miss",
+            aggregated["metadata_plan"], aggregated["disk_preload"],
+            aggregated["alloc_touch_register"], aggregated["native_reset"],
+            aggregated["total"],
+        )
+
+
+def _native_ft_timing(native) -> Dict[str, float]:
+    if native is None:
+        return {"net_s": 0.0, "encode_s": 0.0}
+    try:
+        stats = native.get_ft_timing_stats()
+        return {
+            "net_s": float(stats.get("net_s", 0.0)),
+            "encode_s": float(stats.get("encode_s", 0.0)),
+            "send_bytes": float(stats.get("send_bytes", 0.0)),
+            "recv_bytes": float(stats.get("recv_bytes", 0.0)),
+            "send_tasks": float(stats.get("send_tasks", 0.0)),
+            "recv_tasks": float(stats.get("recv_tasks", 0.0)),
+        }
+    except AttributeError:
+        return {
+            "net_s": 0.0, "encode_s": 0.0,
+            "send_bytes": 0.0, "recv_bytes": 0.0,
+            "send_tasks": 0.0, "recv_tasks": 0.0,
+        }
+
+
+def _timed_barrier() -> float:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0.0
+    start = time.time()
+    torch.distributed.barrier()
+    return time.time() - start
+
+
+
+_BUILD_GLOBAL_REGISTRY_CACHE: Dict[tuple, tuple] = {}
+
+
+def _tensor_schema_fingerprint(metadata: List[TensorMetadata]) -> tuple:
+    return tuple(
+        (
+            str(meta.key), tuple(meta.shape), str(meta.dtype), int(meta.size_bytes),
+            tuple(meta.global_offset or ()), int(meta.shard_index or 0), str(meta.chunk_type),
+            int(meta.target_rank), int(meta.source_rank),
+        )
+        for meta in metadata
+    )
+
+
+def _build_global_registry(local_metadata: List[TensorMetadata], local_non_tensor: Dict[str, Any]) -> Tuple[Dict[int, List[TensorMetadata]], Dict[int, Dict[str, Any]]]:
+    if not torch.distributed.is_initialized():
+        return {0: local_metadata}, {0: local_non_tensor}
+
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+    cache_key = (world_size, rank, _tensor_schema_fingerprint(local_metadata))
+    if cache_key in _BUILD_GLOBAL_REGISTRY_CACHE:
+        return _BUILD_GLOBAL_REGISTRY_CACHE[cache_key]
+
+    gathered_meta: List[Any] = [None for _ in range(world_size)]
+    gathered_non_tensor: List[Any] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered_meta, local_metadata)
+    torch.distributed.all_gather_object(gathered_non_tensor, local_non_tensor)
+    rank_metadata = {r: gathered_meta[r] for r in range(world_size)}
+    rank_non_tensor = {r: gathered_non_tensor[r] for r in range(world_size)}
+    _BUILD_GLOBAL_REGISTRY_CACHE[cache_key] = (rank_metadata, rank_non_tensor)
+    return rank_metadata, rank_non_tensor
+
+
+def _rank_tensor_sizes_from_metadata(
+    rank_metadata: Dict[int, List[TensorMetadata]], world_size: int
+) -> List[int]:
+    return [tensor_layout_size(rank_metadata.get(r, [])) for r in range(world_size)]
+
+
+def _rank_block_sizes_from_actual_sizes(actual_sizes: List[int], k: int) -> List[int]:
+    return [(int(size) + k - 1) // k if int(size) > 0 else 0 for size in actual_sizes]
+
+
+def _basic_ec_group_global_ranks(
+    manager: BasicECManager, rank: int, world_size: int
+) -> List[int]:
+    n = manager.basic_ec_n
+    if world_size >= n and world_size % n == 0:
+        group_id = manager._get_group_id(rank, world_size)
+        return [
+            manager._get_rank_by_group_position(group_id, rig, world_size)
+            for rig in range(n)
+        ]
+    return list(range(world_size))
+
+
+def _basic_ec_group_block_sizes(
+    manager: BasicECManager,
+    rank: int,
+    world_size: int,
+    rank_block_sizes: List[int],
+) -> List[int]:
+    group_ranks = _basic_ec_group_global_ranks(manager, rank, world_size)
+    return [int(rank_block_sizes[r]) for r in group_ranks]
+
+
+def _basic_ec_block_owner_rig(holder_rig: int, block_idx: int, basic_ec_n: int) -> int:
+    return holder_rig if block_idx == 0 else (holder_rig - block_idx) % basic_ec_n
+
+
+def _basic_ec_block_write_sizes_for_rank(
+    manager: BasicECManager,
+    rank: int,
+    world_size: int,
+    rank_block_sizes: List[int],
+) -> List[int]:
+    n = manager.basic_ec_n
+    holder_rig = manager._get_rank_in_group(rank, world_size)
+    group_block_sizes = _basic_ec_group_block_sizes(manager, rank, world_size, rank_block_sizes)
+    return [
+        int(group_block_sizes[_basic_ec_block_owner_rig(holder_rig, i, n)])
+        for i in range(n)
+    ]
+
+
+def _basic_ec_payload_rank_block_sizes(
+    payload: Dict[str, Any], k: int, world_size: int
+) -> List[int]:
+    sizes = payload.get("rank_block_data_sizes")
+    if isinstance(sizes, dict):
+        return [int(sizes.get(r, sizes.get(str(r), 0))) for r in range(world_size)]
+    if isinstance(sizes, (list, tuple)) and len(sizes) >= world_size:
+        return [int(sizes[r]) for r in range(world_size)]
+    block_data_size = int(payload.get("block_data_size", 0))
+    if block_data_size <= 0:
+        total = int(payload.get("pipeline_total_bytes", 0))
+        block_data_size = (total + k - 1) // k if total > 0 else 0
+    return [block_data_size for _ in range(world_size)]
+
+
+def _allocate_basic_ec_blocks(
+    manager: BasicECManager,
+    rank_metadata: Dict[int, List[TensorMetadata]],
+    pin: bool = True,
+) -> Dict[str, Any]:
+    """Allocate n persistent blocks for BasicEC save/load (generalized k+2 scheme).
+
+    Each rank stores n blocks: 1 own data block + (n-1) blocks received from peers.
+    Each block size = ceil(max_total_bytes / k / buffer_size) * buffer_size.
+
+    Args:
+        pin: Whether to pin CPU memory. True for save (DMA), False for load
+             (avoids exhausting CUDA lockable memory on large models).
+    """
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    own_total_size = tensor_layout_size(rank_metadata.get(rank, []))
+    k = manager.basic_ec_k
+    n = manager.basic_ec_n
+
+    rank_actual_sizes = _rank_tensor_sizes_from_metadata(rank_metadata, world_size)
+    rank_block_sizes = _rank_block_sizes_from_actual_sizes(rank_actual_sizes, k)
+    group_block_sizes = _basic_ec_group_block_sizes(manager, rank, world_size, rank_block_sizes)
+    max_total_bytes = max(rank_actual_sizes) if rank_actual_sizes else own_total_size
+    block_data_size = int(rank_block_sizes[rank]) if rank < len(rank_block_sizes) else 0
+    max_group_block_size = max(group_block_sizes) if group_block_sizes else block_data_size
+    aligned_block_size = (
+        (max_group_block_size + manager.basic_ec_buffer_size - 1)
+        // manager.basic_ec_buffer_size
+    ) * manager.basic_ec_buffer_size
+
+    slices = manager.allocate_preallocated_blocks(n, aligned_block_size, pin=pin)
+
+    # Name blocks: own_data0 + recv_0 ... recv_{n-2}
+    blocks: Dict[str, torch.Tensor] = {"own_data0": slices[0]}
+    blocks["block_names"] = ["own_data0"]
+    for j in range(1, n):
+        name = f"recv_{j - 1}"
+        blocks[name] = slices[j]
+        blocks["block_names"].append(name)
+
+    # Backward-compat aliases for k=2 (n=4)
+    if k == 2:
+        blocks["data0"] = blocks["own_data0"]
+        blocks["recv_parity1"] = blocks["recv_0"]
+        blocks["recv_parity0"] = blocks["recv_1"]
+        blocks["recv_data1"] = blocks["recv_2"]
+
+    blocks["actual_size"] = own_total_size
+    blocks["pipeline_size"] = max_total_bytes
+    blocks["aligned_size"] = aligned_block_size
+    blocks["block_data_size"] = block_data_size
+    blocks["rank_actual_sizes"] = rank_actual_sizes
+    blocks["rank_block_data_sizes"] = rank_block_sizes
+    blocks["block_write_sizes"] = _basic_ec_block_write_sizes_for_rank(
+        manager, rank, world_size, rank_block_sizes
+    )
+    return blocks
+
+
+def _iter_basic_ec_load_stripes(total_bytes: int, stripe_bytes: int):
+    """Yield (byte_offset, stripe_size) covering [0, total_bytes)."""
+    if stripe_bytes <= 0:
+        raise ValueError(f"BasicEC load stripes: invalid stripe_bytes={stripe_bytes}")
+    pos = 0
+    while pos < total_bytes:
+        take = min(stripe_bytes, total_bytes - pos)
+        yield pos, take
+        pos += take
+
+
+def _find_owner_codeword_block_in_recv_pool(
+    owner_rig: int,
+    block_label: str,
+    basic_ec_k: int,
+    basic_ec_n: int,
+    rig_to_si: Dict[int, int],
+    recv_pool: List[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Locate one codeword block (data_j / parity0 / parity1) inside the HW recv pool."""
+    if block_label.startswith("data_"):
+        j = int(block_label.split("_", 1)[1])
+        if j == 0:
+            holder_rig = owner_rig
+            block_idx = 0
+        else:
+            holder_rig = (owner_rig + j) % basic_ec_n
+            block_idx = j
+    elif block_label == "parity0":
+        holder_rig = (owner_rig + basic_ec_k) % basic_ec_n
+        block_idx = basic_ec_k
+    elif block_label == "parity1":
+        holder_rig = (owner_rig + basic_ec_k + 1) % basic_ec_n
+        block_idx = basic_ec_k + 1
+    else:
+        return None
+
+    si = rig_to_si.get(holder_rig)
+    if si is None:
+        return None
+    pool_idx = si * basic_ec_n + block_idx
+    if pool_idx < 0 or pool_idx >= len(recv_pool):
+        return None
+    return recv_pool[pool_idx]
+
+
+def _collect_owner_codeword_survivors(
+    owner_rig: int,
+    basic_ec_k: int,
+    basic_ec_n: int,
+    rig_to_si: Dict[int, int],
+    recv_pool: List[torch.Tensor],
+) -> Tuple[Dict[str, torch.Tensor], List[int]]:
+    """Return surviving data/parity blocks and lost data indices for one owner codeword."""
+    raw_surviving: Dict[str, torch.Tensor] = {}
+    for j in range(basic_ec_k):
+        label = f"data_{j}"
+        block = _find_owner_codeword_block_in_recv_pool(
+            owner_rig, label, basic_ec_k, basic_ec_n, rig_to_si, recv_pool,
+        )
+        if block is not None:
+            raw_surviving[label] = block
+    for pname in ("parity0", "parity1"):
+        block = _find_owner_codeword_block_in_recv_pool(
+            owner_rig, pname, basic_ec_k, basic_ec_n, rig_to_si, recv_pool,
+        )
+        if block is not None:
+            raw_surviving[pname] = block
+    lost = [j for j in range(basic_ec_k) if f"data_{j}" not in raw_surviving]
+    return raw_surviving, lost
+
+
+def _submit_basic_ec_transfer_stripes(
+    submit_fn,
+    channel_idx: int,
+    base_addr: int,
+    total_bytes: int,
+    stripe_bytes: int,
+) -> int:
+    """Submit byte-striped send/recv tasks on one channel (single buffer, block-major)."""
+    n_stripes = 0
+    for offset, take in _iter_basic_ec_load_stripes(total_bytes, stripe_bytes):
+        submit_fn(channel_idx, base_addr + offset, take)
+        n_stripes += 1
+    return n_stripes
+
+
+def _submit_hw_stripes_stripe_major(
+    submit_fn,
+    channel_idx: int,
+    block_bases: List[int],
+    total_bytes: int,
+    stripe_bytes: int,
+) -> int:
+    """Submit HW recovery stripes: for each stripe, all blocks (matches save-side ordering).
+
+    Send and recv must use the same stripe-major order:
+      stripe0/block0, stripe0/block1, ..., stripe1/block0, ...
+    Block-major per-buffer striping desyncs RDMA control-socket ACK handshakes.
+    """
+    n_tasks = 0
+    for offset, take in _iter_basic_ec_load_stripes(total_bytes, stripe_bytes):
+        for base in block_bases:
+            submit_fn(channel_idx, base + offset, take)
+            n_tasks += 1
+    return n_tasks
+
+
+def _submit_hw_failed_recv_stripe(
+    native,
+    manager: BasicECManager,
+    rank: int,
+    world_size: int,
+    source_ranks: List[int],
+    basic_ec_n: int,
+    recv_pool: List[torch.Tensor],
+    byte_offset: int,
+    stripe_size: int,
+    source_block_sizes: Optional[List[List[int]]] = None,
+    buffer_offset: Optional[int] = None,
+) -> int:
+    """Submit one protocol stripe from every source channel in sender order."""
+    write_offset = byte_offset if buffer_offset is None else buffer_offset
+    if source_block_sizes is not None and len(source_block_sizes) != len(source_ranks):
+        raise ValueError(
+            "BasicEC hw recovery: source schedule count mismatch "
+            f"(sources={len(source_ranks)}, schedules={len(source_block_sizes)})"
+        )
+
+    submitted = 0
+    for si, src_rank in enumerate(source_ranks):
+        recv_ch = manager.get_recv_channel_from_source(rank, src_rank, world_size)
+        base = si * basic_ec_n
+        block_sizes = source_block_sizes[si] if source_block_sizes is not None else None
+        if block_sizes is not None and len(block_sizes) != basic_ec_n:
+            raise ValueError(
+                "BasicEC hw recovery: source block schedule width mismatch "
+                f"(source={src_rank}, channel={recv_ch}, expected={basic_ec_n}, "
+                f"actual={len(block_sizes)})"
+            )
+        for bi in range(basic_ec_n):
+            take = stripe_size
+            if block_sizes is not None:
+                valid = max(0, int(block_sizes[bi]) - byte_offset)
+                take = min(stripe_size, valid)
+            if take <= 0:
+                continue
+            pool_idx = base + bi
+            if pool_idx >= len(recv_pool):
+                raise ValueError(
+                    "BasicEC hw recovery: recv pool entry missing "
+                    f"(source={src_rank}, channel={recv_ch}, offset={byte_offset}, "
+                    f"expected={take}, capacity=0)"
+                )
+            capacity = int(recv_pool[pool_idx].numel()) - write_offset
+            if capacity < take:
+                raise ValueError(
+                    "BasicEC hw recovery: recv buffer smaller than protocol message "
+                    f"(source={src_rank}, channel={recv_ch}, offset={byte_offset}, "
+                    f"expected={take}, capacity={max(0, capacity)})"
+                )
+            native.submit_recv_task(
+                recv_ch,
+                int(recv_pool[pool_idx].data_ptr()) + write_offset,
+                take,
+            )
+            submitted += 1
+    return submitted
+
+
+def _build_hw_owner_codeword_plans(
+    owner_rigs: List[int],
+    my_rig: int,
+    basic_ec_k: int,
+    basic_ec_n: int,
+    rig_to_si: Dict[int, int],
+    recv_pool: List[torch.Tensor],
+    block_data_size: int,
+    store_bufs: Dict[str, torch.Tensor],
+    recovered_slot_pool: List[torch.Tensor],
+    parity_pool_0: List[torch.Tensor],
+    parity_pool_1: List[torch.Tensor],
+) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor]]:
+    """Precompute per-codeword decode/encode metadata for striped HW recovery."""
+    owner_plans: List[Dict[str, Any]] = []
+    recovered_refs: Dict[str, torch.Tensor] = {}
+    owner_idx = 0
+
+    for owner_rig in owner_rigs:
+        raw_surviving, lost = _collect_owner_codeword_survivors(
+            owner_rig, basic_ec_k, basic_ec_n, rig_to_si, recv_pool,
+        )
+        m_owner = len(lost)
+
+        surviving_continuous = {
+            label: tensor[:block_data_size] for label, tensor in raw_surviving.items()
+        }
+
+        surviving_bases: List[int] = []
+        recovered_bases: List[int] = []
+        encode_input_bases: List[int] = []
+
+        if m_owner == 0:
+            encode_input_bases = [
+                int(surviving_continuous[f"data_{j}"].data_ptr())
+                for j in range(basic_ec_k)
+            ]
+            recovered_data = [
+                surviving_continuous[f"data_{j}"] for j in range(basic_ec_k)
+            ]
+        else:
+            data_labels = sorted(
+                [label for label in surviving_continuous if label.startswith("data_")],
+                key=lambda x: int(x.split("_")[1]),
+            )
+            parity_labels = sorted(
+                label for label in surviving_continuous if label.startswith("parity")
+            )
+            surviving_addrs_ordered = data_labels + parity_labels
+            surviving_bases = [
+                int(surviving_continuous[label].data_ptr())
+                for label in surviving_addrs_ordered
+            ]
+            if owner_rig == my_rig:
+                recovered_blocks = [
+                    store_bufs["own_data0"],
+                    store_bufs["my_data1"],
+                ][:m_owner]
+            else:
+                base = owner_idx * basic_ec_k
+                recovered_blocks = recovered_slot_pool[base : base + m_owner]
+            recovered_bases = [int(block.data_ptr()) for block in recovered_blocks]
+
+            recovered_data: List[Optional[torch.Tensor]] = [None] * basic_ec_k
+            ri = 0
+            for pos in range(basic_ec_k):
+                label = f"data_{pos}"
+                if label in surviving_continuous:
+                    recovered_data[pos] = surviving_continuous[label]
+                    encode_input_bases.append(int(surviving_continuous[label].data_ptr()))
+                else:
+                    recovered_data[pos] = recovered_blocks[ri]
+                    encode_input_bases.append(recovered_bases[ri])
+                    ri += 1
+
+        need_parity0 = (owner_rig + basic_ec_k) % basic_ec_n == my_rig
+        need_parity1 = (owner_rig + basic_ec_k + 1) % basic_ec_n == my_rig
+        parity0 = parity_pool_0[owner_idx]
+        parity1 = parity_pool_1[owner_idx]
+
+        if owner_rig == my_rig:
+            recovered_refs["own_data0_ref"] = recovered_data[0]
+            if basic_ec_k > 1:
+                recovered_refs["my_data1_ref"] = recovered_data[1]
+        for j in range(1, basic_ec_k):
+            if (owner_rig + j) % basic_ec_n == my_rig:
+                recovered_refs[f"recv_{j - 1}_ref"] = recovered_data[j]
+        if need_parity0:
+            recovered_refs[f"recv_{basic_ec_k - 1}_ref"] = parity0
+        if need_parity1:
+            recovered_refs[f"recv_{basic_ec_k}_ref"] = parity1
+
+        owner_plans.append(
+            {
+                "owner_rig": owner_rig,
+                "m_owner": m_owner,
+                "lost": lost,
+                "surviving_rows": [
+                    int(label.split("_")[1]) if label.startswith("data_")
+                    else basic_ec_k + int(label[-1])
+                    for label in (surviving_addrs_ordered if m_owner > 0 else [])
+                ],
+                "surviving_bases": surviving_bases,
+                "recovered_bases": recovered_bases,
+                "encode_input_bases": encode_input_bases,
+                "need_parity0": need_parity0,
+                "need_parity1": need_parity1,
+                "parity0_base": int(parity0.data_ptr()),
+                "parity1_base": int(parity1.data_ptr()),
+            }
+        )
+        owner_idx += 1
+
+    return owner_plans, recovered_refs
+
+
+def _hw_decode_encode_all_owners_stripe(
+    native,
+    owner_plans: List[Dict[str, Any]],
+    basic_ec_k: int,
+    byte_offset: int,
+    stripe_size: int,
+    owner_encode_s: Optional[Dict[int, float]] = None,
+) -> None:
+    """RS-decode and parity-encode one byte stripe for every owner codeword."""
+    for plan in owner_plans:
+        m_owner = plan["m_owner"]
+        if m_owner > 0:
+            native.submit_basic_ec_decode_recovery(
+                basic_ec_k,
+                m_owner,
+                plan["lost"],
+                plan["surviving_rows"],
+                [addr + byte_offset for addr in plan["surviving_bases"]],
+                [addr + byte_offset for addr in plan["recovered_bases"]],
+                stripe_size,
+            )
+        if plan["need_parity0"] or plan["need_parity1"]:
+            t0 = time.time()
+            native.encode_ec_blocks(
+                [addr + byte_offset for addr in plan["encode_input_bases"]],
+                plan["parity0_base"] + byte_offset,
+                plan["parity1_base"] + byte_offset,
+                stripe_size,
+            )
+            if owner_encode_s is not None:
+                owner_encode_s[plan["owner_rig"]] = owner_encode_s.get(plan["owner_rig"], 0.0) + (time.time() - t0)
+
+
+def _run_hw_failed_recv_decode_pipeline(
+    native,
+    manager: BasicECManager,
+    rank: int,
+    world_size: int,
+    source_ranks: List[int],
+    basic_ec_k: int,
+    basic_ec_n: int,
+    recv_pool: List[torch.Tensor],
+    block_data_size: int,
+    owner_plans: List[Dict[str, Any]],
+    stripe_bytes: int,
+    owner_encode_s: Optional[Dict[int, float]] = None,
+) -> int:
+    """Recv/decode pipeline: recv stripe N+1 overlaps decode stripe N (mirrors save)."""
+    stripes = list(_iter_basic_ec_load_stripes(block_data_size, stripe_bytes))
+    if not stripes:
+        return 0
+
+    off0, take0 = stripes[0]
+    _submit_hw_failed_recv_stripe(
+        native, manager, rank, world_size, source_ranks, basic_ec_n,
+        recv_pool, off0, take0,
+    )
+    native.wait_for_pending_network_tasks()
+
+    for i in range(1, len(stripes)):
+        off, take = stripes[i]
+        prev_off, prev_take = stripes[i - 1]
+        _submit_hw_failed_recv_stripe(
+            native, manager, rank, world_size, source_ranks, basic_ec_n,
+            recv_pool, off, take,
+        )
+        _hw_decode_encode_all_owners_stripe(
+            native, owner_plans, basic_ec_k, prev_off, prev_take, owner_encode_s,
+        )
+        native.wait_for_pending_network_tasks()
+
+    last_off, last_take = stripes[-1]
+    _hw_decode_encode_all_owners_stripe(
+        native, owner_plans, basic_ec_k, last_off, last_take, owner_encode_s,
+    )
+    return len(stripes)
+
+
+def _resolve_basic_ec_block_paths(
+    checkpoint_dir: Path,
+    rank: int,
+    basic_ec_k: int,
+    basic_ec_n: int,
+    block_files: Optional[Dict[str, str]] = None,
+) -> List[Path]:
+    """Resolve on-disk paths for all n BasicEC checkpoint blocks."""
+    legacy_map: Dict[int, str] = {}
+    if basic_ec_k == 2:
+        legacy_map = {
+            0: "data0",
+            1: "recv_parity1",
+            2: "recv_parity0",
+            3: "recv_data1",
+        }
+
+    paths: List[Path] = []
+    for i in range(basic_ec_n):
+        canon_name = "own_data0" if i == 0 else f"recv_{i - 1}"
+        candidates: List[Path] = [
+            checkpoint_dir / f"basic_ec_block_rank{rank}_{canon_name}.pt"
+        ]
+        if block_files and canon_name in block_files:
+            candidates.append(checkpoint_dir / block_files[canon_name])
+        candidates.append(checkpoint_dir / f"ecnaive_block_rank{rank}_{canon_name}.pt")
+        if i in legacy_map:
+            candidates.append(
+                checkpoint_dir / f"basic_ec_block_rank{rank}_{legacy_map[i]}.pt"
+            )
+            candidates.append(
+                checkpoint_dir / f"ecnaive_block_rank{rank}_{legacy_map[i]}.pt"
+            )
+
+        block_path = None
+        for path in candidates:
+            if path.is_file():
+                block_path = path
+                break
+        if block_path is None:
+            raise FileNotFoundError(
+                f"BasicEC hw recovery: survivor rank {rank} missing block "
+                f"{i} ({canon_name}) — tried: {[str(p) for p in candidates]}"
+            )
+        paths.append(block_path)
+    return paths
+
+
+def _copy_basic_ec_block_range_into_tensor(
+    block_path: Path,
+    dest: torch.Tensor,
+    byte_offset: int,
+    nbytes: int,
+) -> None:
+    """Copy a byte range from one BasicEC block file into ``dest[:nbytes]``."""
+    from megatron.training.legacy_io_utils import (
+        is_raw_format,
+        read_raw_block_range,
+        MAGIC_BLOCK,
+        pin_uint8_tensor_if_available,
+    )
+
+    if is_raw_format(str(block_path), MAGIC_BLOCK):
+        read_raw_block_range(
+            str(block_path), MAGIC_BLOCK, dest, byte_offset, nbytes,
+        )
+        return
+
+    payload = torch.load(block_path, map_location="cpu", weights_only=False)
+    src = pin_uint8_tensor_if_available(
+        payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
+    )
+    end = byte_offset + nbytes
+    if end > src.numel():
+        raise ValueError(
+            f"BasicEC block range [{byte_offset}, {end}) exceeds file size "
+            f"{src.numel()} for {block_path}"
+        )
+    dest[:nbytes].copy_(src[byte_offset:end])
+
+
+def _run_hw_source_streaming_send(
+    native,
+    manager: BasicECManager,
+    rank: int,
+    world_size: int,
+    failed_in_group: List[int],
+    block_paths: List[Path],
+    block_sizes: List[int],
+    stripe_bytes: int,
+    scratch: Optional[List[torch.Tensor]] = None,
+) -> int:
+    """Send all checkpoint blocks stripe-by-stripe without full-block resident memory."""
+    basic_ec_n = len(block_paths)
+    if scratch is None:
+        scratch = list(
+            allocate_hugepage_slices(
+                stripe_bytes,
+                basic_ec_n,
+                fallback_pin_memory=True,
+                touch_pages=True,
+            )
+        )
+        if manager.use_rdma:
+            for buf in scratch:
+                manager.register_buffer(buf)
+
+    max_size = max(block_sizes) if block_sizes else 0
+    stripes = list(_iter_basic_ec_load_stripes(max_size, stripe_bytes))
+    for byte_offset, take in stripes:
+        for bi, block_path in enumerate(block_paths):
+            valid = max(0, int(block_sizes[bi]) - byte_offset)
+            send_take = min(take, valid)
+            if send_take > 0:
+                _copy_basic_ec_block_range_into_tensor(
+                    block_path, scratch[bi], byte_offset, send_take,
+                )
+        for dest_fr in failed_in_group:
+            send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
+            for bi, buf in enumerate(scratch):
+                valid = max(0, int(block_sizes[bi]) - byte_offset)
+                send_take = min(take, valid)
+                if send_take > 0:
+                    native.submit_send_task(send_ch, int(buf.data_ptr()), send_take)
+        native.wait_for_pending_network_tasks()
+    return len(stripes)
+
+
+def _run_hw_failed_own_tensor_streaming_recovery(
+    native,
+    manager: BasicECManager,
+    rank: int,
+    world_size: int,
+    source_ranks: List[int],
+    basic_ec_k: int,
+    basic_ec_n: int,
+    recv_pool: List[torch.Tensor],
+    rig_to_si: Dict[int, int],
+    my_rig: int,
+    tensor_buffer: torch.Tensor,
+    block_data_size: int,
+    actual_tensor_size: int,
+    stripe_bytes: int,
+    decode_scratch: List[torch.Tensor],
+    source_block_sizes: Optional[List[List[int]]] = None,
+) -> Tuple[int, float]:
+    """Recover only this failed rank's tensor buffer with stripe-sized scratch memory.
+
+    Hardware recovery used to materialize every recovered checkpoint block for
+    cascading-failure tolerance. For multi-GB checkpoints and many failed ranks
+    per node, that creates an OOM-scale CPU memory spike. This path keeps the
+    network protocol unchanged but decodes only the k data blocks needed to
+    rebuild this rank's state_dict, copying each stripe directly into the final
+    tensor buffer.
+    """
+
+    def _copy_data_stripe(data_pos: int, src: torch.Tensor, byte_offset: int, size: int) -> None:
+        dst = data_pos * block_data_size + byte_offset
+        total = actual_tensor_size if actual_tensor_size > 0 else block_data_size * basic_ec_k
+        nbytes = min(size, max(0, total - dst))
+        if nbytes > 0:
+            tensor_buffer[dst : dst + nbytes].copy_(src[:nbytes])
+
+    if source_block_sizes is None:
+        source_block_sizes = [
+            [block_data_size for _ in range(basic_ec_n)]
+            for _ in source_ranks
+        ]
+    source_max_sizes = [max(sizes, default=0) for sizes in source_block_sizes]
+    protocol_bytes = max(source_max_sizes, default=0)
+    stripes = list(_iter_basic_ec_load_stripes(protocol_bytes, stripe_bytes))
+    decode_s = 0.0
+    recv_tasks = 0
+    for byte_offset, take in stripes:
+        recv_tasks += _submit_hw_failed_recv_stripe(
+            native, manager, rank, world_size, source_ranks, basic_ec_n,
+            recv_pool, byte_offset, take, source_block_sizes, buffer_offset=0,
+        )
+        native.wait_for_pending_network_tasks()
+
+        decode_take = min(take, max(0, block_data_size - byte_offset))
+        if decode_take <= 0:
+            continue
+        decode_t0 = time.time()
+        raw_surviving, lost = _collect_owner_codeword_survivors(
+            my_rig, basic_ec_k, basic_ec_n, rig_to_si, recv_pool,
+        )
+        m_owner = len(lost)
+        if m_owner == 0:
+            recovered_data = [
+                raw_surviving[f"data_{j}"] for j in range(basic_ec_k)
+            ]
+        else:
+            data_labels = sorted(
+                [label for label in raw_surviving if label.startswith("data_")],
+                key=lambda x: int(x.split("_")[1]),
+            )
+            parity_labels = sorted(label for label in raw_surviving if label.startswith("parity"))
+            surviving_order = data_labels + parity_labels
+            recovered_blocks = decode_scratch[:m_owner]
+            native.submit_basic_ec_decode_recovery(
+                basic_ec_k,
+                m_owner,
+                lost,
+                [
+                    int(label.split("_")[1]) if label.startswith("data_")
+                    else basic_ec_k + int(label[-1])
+                    for label in surviving_order
+                ],
+                [int(raw_surviving[label].data_ptr()) for label in surviving_order],
+                [int(block.data_ptr()) for block in recovered_blocks],
+                decode_take,
+            )
+            recovered_data: List[Optional[torch.Tensor]] = [None] * basic_ec_k
+            ri = 0
+            for pos in range(basic_ec_k):
+                label = f"data_{pos}"
+                if label in raw_surviving:
+                    recovered_data[pos] = raw_surviving[label]
+                else:
+                    recovered_data[pos] = recovered_blocks[ri]
+                    ri += 1
+
+        for j in range(basic_ec_k):
+            _copy_data_stripe(j, recovered_data[j], byte_offset, decode_take)
+        decode_s += time.time() - decode_t0
+
+    logger.debug(
+        "BasicEC hw recovery: rank %d recv protocol summary "
+        "(sources=%d, source_max_bytes=%s, stripes=%d, tasks=%d)",
+        rank, len(source_ranks), source_max_sizes, len(stripes), recv_tasks,
+    )
+    return len(stripes), decode_s
+
+
+def _copy_buffer_range_from_tensors(
+    tensor_buffer: torch.Tensor,
+    range_start: int,
+    range_end: int,
+    tensor_infos: List[Any],
+    tensor_data: List[Optional[torch.Tensor]],
+    non_blocking: bool = True,
+) -> None:
+    """Copy bytes [range_start, range_end) from source tensors into tensor_buffer."""
+    if range_end <= range_start:
+        return
+    for info, tensor in zip(tensor_infos, tensor_data):
+        if tensor is None:
+            continue
+        tensor_start = info.offset
+        tensor_end = tensor_start + info.size_bytes
+        if tensor_end <= range_start:
+            continue
+        if tensor_start >= range_end:
+            break
+        copy_start = max(range_start, tensor_start)
+        copy_end = min(range_end, tensor_end)
+        local_off = copy_start - tensor_start
+        nbytes = copy_end - copy_start
+        dst_off = copy_start
+        tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+        if tensor_view.numel() != info.size_bytes:
+            raise RuntimeError(
+                f"BasicEC legacy save: tensor bytes mismatch for {info.key}, "
+                f"expected={info.size_bytes}, got={tensor_view.numel()}"
+            )
+        use_non_blocking = non_blocking and tensor.is_cuda
+        tensor_buffer[dst_off : dst_off + nbytes].copy_(
+            tensor_view[local_off : local_off + nbytes],
+            non_blocking=use_non_blocking,
+        )
+
+
+def _submit_basic_ec_d2h_stripe(
+    tensor_buffer: torch.Tensor,
+    src_pos: int,
+    take: int,
+    block_data_size: int,
+    k: int,
+    actual_data_bytes: int,
+    tensor_infos: List[Any],
+    tensor_data: List[Optional[torch.Tensor]],
+    d2h_stream: Optional[torch.cuda.Stream],
+) -> Optional[Tuple[torch.cuda.Event, torch.cuda.Event]]:
+    """D2H all k RS block slices for one encode stripe; returns (start, end) events."""
+    has_data = False
+    for j in range(k):
+        range_start = j * block_data_size + src_pos
+        if range_start < actual_data_bytes:
+            has_data = True
+            break
+    if not has_data:
+        return None
+
+    if d2h_stream is not None:
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(d2h_stream):
+            start_event.record(d2h_stream)
+            for j in range(k):
+                range_start = j * block_data_size + src_pos
+                range_end = range_start + take
+                if range_start >= actual_data_bytes:
+                    continue
+                d2h_end = min(range_end, actual_data_bytes)
+                _copy_buffer_range_from_tensors(
+                    tensor_buffer,
+                    range_start,
+                    d2h_end,
+                    tensor_infos,
+                    tensor_data,
+                    non_blocking=True,
+                )
+            end_event.record(d2h_stream)
+        return start_event, end_event
+
+    for j in range(k):
+        range_start = j * block_data_size + src_pos
+        range_end = range_start + take
+        if range_start >= actual_data_bytes:
+            continue
+        d2h_end = min(range_end, actual_data_bytes)
+        _copy_buffer_range_from_tensors(
+            tensor_buffer,
+            range_start,
+            d2h_end,
+            tensor_infos,
+            tensor_data,
+            non_blocking=False,
+        )
+    return None
+
+
+def _encode_with_native(
+    manager: BasicECManager,
+    tensor_buffer: torch.Tensor,
+    actual_data_bytes: int,
+    basic_ec_blocks: Dict[str, Any],
+    tensor_infos: List[Any],
+    tensor_data: List[Optional[torch.Tensor]],
+) -> float:
+    """Encode tensor data with ISA-L Reed-Solomon and distribute via C++ engine.
+
+    Generalized for k+2 scheme: splits tensor_buffer into k data blocks,
+    encodes to 2 parity blocks, keeps d_{i,0} locally, sends/receives the
+    remaining n-1 blocks via round-robin.
+    """
+    buffers = manager.get_basic_ec_buffers()
+    if buffers is None:
+        raise RuntimeError("BasicEC buffers are not initialized")
+    if manager._basic_ec_native is None:
+        raise RuntimeError("BasicEC native module is not initialized")
+
+    k = manager.basic_ec_k
+    n = manager.basic_ec_n
+    free_data_queue = buffers["free_data_buffer_queue"]
+    free_parity_queue = buffers["free_parity_buffer_queue"]
+    active_event = buffers.get("buffer_poller_active_event")
+    poll_and_release = buffers.get("poll_and_release_buffers")
+
+    def get_free_data_buffer():
+        if poll_and_release is not None:
+            poll_and_release()
+        try:
+            return free_data_queue.get(timeout=5.0)
+        except queue.Empty:
+            logger.error("BasicEC legacy: timeout waiting for free data buffer")
+            return free_data_queue.get()
+
+    def get_free_parity_buffer():
+        if poll_and_release is not None:
+            poll_and_release()
+        try:
+            return free_parity_queue.get(timeout=5.0)
+        except queue.Empty:
+            logger.error("BasicEC legacy: timeout waiting for free parity buffer")
+            return free_parity_queue.get()
+
+    pipeline_total_bytes = basic_ec_blocks["pipeline_size"]
+    aligned_block_size = basic_ec_blocks["aligned_size"]
+    block_data_size = basic_ec_blocks.get("block_data_size", (pipeline_total_bytes + k - 1) // k)
+    block_write_sizes = [int(x) for x in basic_ec_blocks.get("block_write_sizes", [])]
+    if len(block_write_sizes) != n:
+        block_write_sizes = [int(block_data_size)] * n
+
+    # Persistent block base addresses
+    own_data0 = basic_ec_blocks["own_data0"]
+    own_data0_base = int(own_data0.data_ptr())
+    own_data0_offset = 0
+
+    recv_blocks = [basic_ec_blocks[name] for name in basic_ec_blocks["block_names"] if name != "own_data0"]
+    recv_bases = [int(t.data_ptr()) for t in recv_blocks]
+    recv_offsets = [0] * len(recv_blocks)
+    num_recv = len(recv_blocks)  # should be n-1
+
+    basic_ec_buffer_size = manager.basic_ec_buffer_size
+    native = manager._basic_ec_native
+    native.reset_encoding_completion_flags()
+
+    if active_event is not None:
+        active_event.set()
+
+    src_pos = 0
+    src_base_ptr = tensor_buffer.data_ptr()
+    d2h_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+    if d2h_stream is not None:
+        d2h_stream.wait_stream(torch.cuda.current_stream())
+    d2h_s = 0.0
+    pending_d2h: Optional[Tuple[torch.cuda.Event, torch.cuda.Event]] = None
+    max_stream_block_size = max(block_write_sizes) if block_write_sizes else int(block_data_size)
+
+    try:
+        while src_pos < max_stream_block_size:
+            remaining_in_stream = max_stream_block_size - src_pos
+            take = min(basic_ec_buffer_size, remaining_in_stream)
+            own_take = min(take, max(0, int(block_data_size) - src_pos))
+
+            if own_take > 0 and pending_d2h is None:
+                pending_d2h = _submit_basic_ec_d2h_stripe(
+                    tensor_buffer,
+                    src_pos,
+                    own_take,
+                    block_data_size,
+                    k,
+                    actual_data_bytes,
+                    tensor_infos,
+                    tensor_data,
+                    d2h_stream,
+                )
+
+            if pending_d2h is not None:
+                start_event, end_event = pending_d2h
+                end_event.synchronize()
+                d2h_s += start_event.elapsed_time(end_event) / 1000.0
+                pending_d2h = None
+
+            next_src = src_pos + take
+            next_own_take = min(basic_ec_buffer_size, max(0, int(block_data_size) - next_src))
+            if next_own_take > 0:
+                pending_d2h = _submit_basic_ec_d2h_stripe(
+                    tensor_buffer,
+                    next_src,
+                    next_own_take,
+                    block_data_size,
+                    k,
+                    actual_data_bytes,
+                    tensor_infos,
+                    tensor_data,
+                    d2h_stream,
+                )
+
+            # Stage this rank's owner codeword only while it still has bytes.
+            data_block_addrs = []
+            parity0_addr = 0
+            parity1_addr = 0
+            if own_take > 0:
+                own_data0_write_addr = own_data0_base + own_data0_offset
+
+                # d_{i,0}: write directly to persistent own_data0 block
+                data_block_addrs.append(own_data0_write_addr)
+                src_offset_0 = 0 * block_data_size + src_pos
+                if src_offset_0 < actual_data_bytes:
+                    bytes_to_copy = min(own_take, actual_data_bytes - src_offset_0)
+                    ctypes.memmove(own_data0_write_addr, src_base_ptr + src_offset_0, bytes_to_copy)
+                    if own_take > bytes_to_copy:
+                        ctypes.memset(own_data0_write_addr + bytes_to_copy, 0, own_take - bytes_to_copy)
+                else:
+                    ctypes.memset(own_data0_write_addr, 0, own_take)
+
+                # d_{i,1}..d_{i,k-1}: copy to temp pool buffers (will be sent)
+                for j in range(1, k):
+                    data_addr = get_free_data_buffer()
+                    data_block_addrs.append(data_addr)
+                    src_offset_j = j * block_data_size + src_pos
+                    if src_offset_j < actual_data_bytes:
+                        bytes_to_copy = min(own_take, actual_data_bytes - src_offset_j)
+                        ctypes.memmove(data_addr, src_base_ptr + src_offset_j, bytes_to_copy)
+                        if own_take > bytes_to_copy:
+                            ctypes.memset(data_addr + bytes_to_copy, 0, own_take - bytes_to_copy)
+                    else:
+                        ctypes.memset(data_addr, 0, own_take)
+
+                # Parity buffers from pool
+                parity0_addr = get_free_parity_buffer()
+                parity1_addr = get_free_parity_buffer()
+                native.encode_ec_blocks(data_block_addrs, parity0_addr, parity1_addr, own_take)
+
+            # Continuous recv block write addresses (no padding, stored contiguously).
+            recv_write_addrs = []
+            recv_takes = []
+            for i in range(num_recv):
+                block_idx = i + 1
+                valid = max(0, block_write_sizes[block_idx] - src_pos)
+                recv_take = min(take, valid)
+                recv_takes.append(recv_take)
+                if recv_take > 0:
+                    if recv_offsets[i] + recv_take > aligned_block_size:
+                        logger.warning("BasicEC legacy: recv block %d exhausted", i)
+                        recv_offsets[i] = 0
+                    recv_write_addrs.append(recv_bases[i] + recv_offsets[i])
+                    recv_offsets[i] += recv_take
+                else:
+                    recv_write_addrs.append(0)
+
+            # Submit receives/sends per channel so each owner codeword can use its own block size.
+            for i, recv_take in enumerate(recv_takes):
+                if recv_take > 0:
+                    native.submit_recv_task(i, recv_write_addrs[i], recv_take)
+            if own_take > 0:
+                for j in range(1, k):
+                    native.submit_send_task(j - 1, data_block_addrs[j], own_take)
+                native.submit_send_task(k - 1, parity0_addr, own_take)
+                native.submit_send_task(k, parity1_addr, own_take)
+
+            own_data0_offset += own_take
+            src_pos += take
+
+        if pending_d2h is not None:
+            start_event, end_event = pending_d2h
+            end_event.synchronize()
+            d2h_s += start_event.elapsed_time(end_event) / 1000.0
+            pending_d2h = None
+
+        # Sentinels: n-1 send + n-1 recv
+        native.submit_send_sentinels(num_sends=num_recv)
+        native.submit_recv_sentinels(num_recvs=num_recv)
+        native.wait_for_encoding_completion()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    finally:
+        if active_event is not None:
+            active_event.clear()
+    return d2h_s
+
+
+def _save_basic_ec_pt_files(
+    checkpoint_name: str,
+    rank: int,
+    non_tensor_data: Dict[str, Any],
+    tensor_infos: List[Any],
+    blocks: Dict[str, Any],
+    full_tensor_buffer: torch.Tensor,
+    flat_key_roots: Optional[Set[str]] = None,
+    manager: Optional[BasicECManager] = None,
+    all_tensor_infos: Optional[Dict[int, List[Any]]] = None,
+) -> None:
+    checkpoint_path = Path(checkpoint_name)
+    checkpoint_dir = checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    k = manager.basic_ec_k if manager else 2
+    n = manager.basic_ec_n if manager else 4
+
+    # Build block_files dict: own_data0 + recv blocks
+    block_files: Dict[str, str] = {}
+    block_names = blocks.get("block_names", [])
+    for name in block_names:
+        block_files[name] = f"basic_ec_block_rank{rank}_{name}.pt"
+
+    # Backward-compat block_files keys for k=2
+    if k == 2 and len(block_names) >= 4:
+        block_files_legacy = {
+            "data0": block_files.get("own_data0", ""),
+            "recv_parity1": block_files.get("recv_0", ""),
+            "recv_parity0": block_files.get("recv_1", ""),
+            "recv_data1": block_files.get("recv_2", ""),
+        }
+    else:
+        block_files_legacy = None
+
+    main_file = checkpoint_dir / f"basic_ec_main_rank{rank}.pt"
+    from megatron.training.legacy_io_utils import MAGIC_BASIC_EC, MAGIC_BLOCK
+
+    # Pre-serialize metadata + prepare memoryview for main file
+    import pickle as _pickle
+    meta1 = _pickle.dumps(non_tensor_data)
+    meta2 = _pickle.dumps(tensor_infos)
+    extra = _pickle.dumps({
+        "version": 4, "format": "basic_ec_torch_legacy", "rank": rank,
+        "basic_ec_k": k, "basic_ec_n": n,
+        "actual_tensor_size": blocks["actual_size"],
+        "pipeline_total_bytes": blocks["pipeline_size"],
+        "aligned_block_size": blocks["aligned_size"],
+        "block_data_size": blocks.get("block_data_size", blocks["pipeline_size"] // k),
+        "rank_actual_sizes": blocks.get("rank_actual_sizes", []),
+        "rank_block_data_sizes": blocks.get("rank_block_data_sizes", []),
+        "block_write_sizes": blocks.get("block_write_sizes", []),
+        "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
+        "block_files": block_files,
+        "_block_files_legacy": block_files_legacy,
+        "all_tensor_infos": all_tensor_infos if all_tensor_infos is not None else {},
+    })
+    buf = full_tensor_buffer[: blocks["actual_size"]]
+    if not buf.is_contiguous():
+        buf = buf.contiguous()
+    if buf.device.type != "cpu":
+        buf = buf.to("cpu")
+    main_mv = memoryview(buf.numpy())
+
+    # Version 4 blocks are continuous and each block is sized by its owner rank.
+    block_write_sizes = [int(x) for x in blocks.get("block_write_sizes", [])]
+    if len(block_write_sizes) != len(block_names):
+        block_write_sizes = [int(blocks.get("block_data_size", blocks["aligned_size"]))] * len(block_names)
+    block_mvs = {}
+    for name in block_names:
+        b = blocks[name][: blocks[name].numel()]
+        if not b.is_contiguous():
+            b = b.contiguous()
+        if b.device.type != "cpu":
+            b = b.to("cpu")
+        block_mvs[name] = memoryview(b.numpy())
+
+    # Parallel writes
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1 + len(block_names)) as ex:
+        from megatron.training.legacy_io_utils import write_main_prepared, write_block_prepared
+        futs = [ex.submit(write_main_prepared, str(main_file), MAGIC_BASIC_EC,
+                          meta1, meta2, extra, main_mv, blocks["actual_size"])]
+        for idx, name in enumerate(block_names):
+            block_file = checkpoint_dir / f"basic_ec_block_rank{rank}_{name}.pt"
+            futs.append(ex.submit(write_block_prepared,
+                                  str(block_file), MAGIC_BLOCK,
+                                  block_mvs[name], block_write_sizes[idx]))
+        for f in futs:
+            f.result()
+
+
+def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
+    checkpoint_path = Path(checkpoint_name)
+    return checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
+
+
+def _tensor_infos_to_local_metadata(
+    rank: int, tensor_infos: List[Any]
+) -> List[TensorMetadata]:
+    out: List[TensorMetadata] = []
+    for info in tensor_infos:
+        chunk_type = getattr(info, "chunk_type", "data")
+        target_rank = getattr(info, "target_rank", rank)
+        source_rank = getattr(info, "source_rank", rank)
+        out.append(
+            TensorMetadata(
+                key=info.key,
+                shape=tuple(info.shape),
+                dtype=str(info.dtype),
+                size_bytes=info.size_bytes,
+                offset=info.offset,
+                global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
+                shard_index=info.shard_index if info.shard_index is not None else 0,
+                chunk_type=chunk_type,
+                target_rank=target_rank,
+                source_rank=source_rank,
+            )
+        )
+    return out
+
+
+def _load_basic_ec_main_payload_local(
+    checkpoint_dir: Path, rank: int, load_tensor_buffer: bool = True
+) -> Optional[Dict[str, Any]]:
+    """Load this rank's BasicEC main payload without distributed collectives."""
+    main_path = checkpoint_dir / f"basic_ec_main_rank{rank}.pt"
+    if not main_path.is_file():
+        main_path = checkpoint_dir / f"ecnaive_main_rank{rank}.pt"
+    if not main_path.is_file():
+        return None
+
+    from megatron.training.legacy_io_utils import (
+        is_raw_format, read_raw_checkpoint, read_raw_checkpoint_metadata, MAGIC_BASIC_EC,
+        pin_payload_tensor_buffer_if_available,
+    )
+    if is_raw_format(str(main_path), MAGIC_BASIC_EC):
+        return (
+            read_raw_checkpoint(str(main_path), MAGIC_BASIC_EC, pin_tensor_buffer=True)
+            if load_tensor_buffer
+            else read_raw_checkpoint_metadata(str(main_path), MAGIC_BASIC_EC)
+        )
+
+    local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
+    if load_tensor_buffer:
+        pin_payload_tensor_buffer_if_available(local_payload)
+    else:
+        local_payload["tensor_buffer"] = None
+    return local_payload
+
+
+def _load_basic_ec_main_payload(
+    checkpoint_dir: Path, rank: int, world_size: int, load_tensor_buffer: bool = True
+) -> Dict[str, Any]:
+    """
+    Load basic_ec_main_rank{rank}.pt. If missing on this rank, recover payload via all_gather_object
+    using other ranks' copies (rank r uses gathered[r] when present).
+    """
+    main_path = checkpoint_dir / f"basic_ec_main_rank{rank}.pt"
+    if not main_path.is_file():
+        main_path = checkpoint_dir / f"ecnaive_main_rank{rank}.pt"
+    local_payload = _load_basic_ec_main_payload_local(
+        checkpoint_dir, rank, load_tensor_buffer=load_tensor_buffer
+    )
+
+    if world_size <= 1 or not torch.distributed.is_initialized():
+        if local_payload is None:
+            raise FileNotFoundError(f"BasicEC legacy: missing main file {main_path}")
+        return local_payload
+
+    # all_gather_object pickles the entire payload including tensor_buffer
+    # (multiple GB for large models).  NCCL all_gather creates GPU staging
+    # buffers proportional to  world_size × serialized_size  → OOM on 7B+.
+    # Strip tensor_buffer before the collective; only exchange metadata.
+    if local_payload is not None:
+        stripped: Dict[str, Any] = {}
+        for k, v in local_payload.items():
+            if k == "tensor_buffer":
+                continue
+            stripped[k] = v
+    else:
+        stripped = None
+
+    gathered: List[Optional[Dict[str, Any]]] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(gathered, stripped)
+
+    if local_payload is not None:
+        return local_payload
+
+    # HW failure: local disk lost — recover metadata from another rank.
+    # main.pt stores all_tensor_infos (all ranks' metadata, like Gemini).
+    # Extract the correct rank's tensor_infos from any healthy source.
+    for r in range(world_size):
+        if gathered[r] is not None:
+            payload = dict(gathered[r])
+            all_ti = payload.get("all_tensor_infos")
+            if all_ti and rank in all_ti:
+                logger.debug(
+                    f"BasicEC legacy: basic_ec_main_rank{rank}.pt missing locally; "
+                    f"recovered tensor_infos for rank {rank} from rank {r}"
+                )
+                payload["tensor_infos"] = all_ti[rank]
+                rank_sizes = payload.get("rank_actual_sizes")
+                if isinstance(rank_sizes, (list, tuple)) and rank < len(rank_sizes):
+                    payload["actual_tensor_size"] = int(rank_sizes[rank])
+                rank_block_sizes = payload.get("rank_block_data_sizes")
+                if isinstance(rank_block_sizes, (list, tuple)) and rank < len(rank_block_sizes):
+                    payload["block_data_size"] = int(rank_block_sizes[rank])
+                payload["tensor_buffer"] = None  # to be recovered via RS decode
+                return payload
+            # Backward compat: old checkpoints without all_tensor_infos
+            if "tensor_infos" in payload:
+                logger.warning(
+                    f"BasicEC legacy: using rank {r}'s tensor_infos as fallback "
+                    f"for rank {rank} — may be incorrect (old checkpoint format)"
+                )
+                payload["tensor_buffer"] = None
+                return payload
+
+    raise FileNotFoundError(
+        f"BasicEC legacy: basic_ec_main_rank{rank}.pt missing on all ranks "
+        f"under {checkpoint_dir}"
+    )
+
+
+def _load_blocks_from_disk(checkpoint_dir: Path, rank: int) -> Dict[str, torch.Tensor]:
+    from megatron.training.legacy_io_utils import (
+        is_raw_format, read_raw_block, MAGIC_BLOCK, pin_uint8_tensor_if_available,
+    )
+    blocks: Dict[str, torch.Tensor] = {}
+    for block_name in ("data0", "recv_parity1", "recv_parity0", "recv_data1"):
+        block_path = checkpoint_dir / f"basic_ec_block_rank{rank}_{block_name}.pt"
+        if not block_path.is_file():
+            block_path = checkpoint_dir / f"ecnaive_block_rank{rank}_{block_name}.pt"
+        if not block_path.is_file():
+            raise FileNotFoundError(f"BasicEC legacy: missing block file {block_path}")
+        if is_raw_format(str(block_path), MAGIC_BLOCK):
+            blocks[block_name] = read_raw_block(
+                str(block_path), MAGIC_BLOCK, pin_tensor=True,
+            )
+        else:
+            payload = torch.load(block_path, map_location="cpu", weights_only=False)
+            blocks[block_name] = pin_uint8_tensor_if_available(
+                payload["tensor"].contiguous().view(torch.uint8)
+            )
+    return blocks
+
+
+def _decode_data0_to_linear_first_half(
+    data0: torch.Tensor,
+    pipeline_total_bytes: int,
+    basic_ec_buffer_size: int,
+) -> torch.Tensor:
+    """Invert legacy encode layout: recover tensor_buffer[0:half_total) from data0."""
+    half_total = pipeline_total_bytes // 2
+    out = torch.zeros(half_total, dtype=torch.uint8, device=data0.device)
+    src_pos = 0
+    data0_offset = 0
+    block_elems = data0.numel()
+    while src_pos < half_total:
+        remaining_in_out = half_total - src_pos
+        take = min(basic_ec_buffer_size, remaining_in_out)
+        aligned = ((data0_offset + 63) // 64) * 64
+        if aligned + take > block_elems:
+            logger.warning("BasicEC legacy load: data0 exhausted during decode")
+            break
+        out[src_pos : src_pos + take].copy_(data0[aligned : aligned + take])
+        data0_offset = aligned + take
+        src_pos += take
+    return out
+
+
+def _reconstruct_state_dict_from_main_and_data0(
+    main_payload: Dict[str, Any],
+    data0_uint8: torch.Tensor,
+    manager: BasicECManager,
+    flat_key_roots: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    tensor_infos = main_payload["tensor_infos"]
+    non_tensor_data = main_payload["non_tensor_data"]
+    pipeline_total_bytes = int(main_payload["pipeline_total_bytes"])
+    actual_tensor_size = int(main_payload["actual_tensor_size"])
+
+    half_linear = _decode_data0_to_linear_first_half(
+        data0_uint8,
+        pipeline_total_bytes=pipeline_total_bytes,
+        basic_ec_buffer_size=manager.basic_ec_buffer_size,
+    )
+    buf_len = max(pipeline_total_bytes, actual_tensor_size)
+    full_buf = torch.zeros(buf_len, dtype=torch.uint8, device=half_linear.device)
+    n = min(half_linear.numel(), buf_len)
+    full_buf[:n].copy_(half_linear[:n])
+
+    tensor_data = extract_tensors_from_continuous_buffer(full_buf, tensor_infos)
+    decomposed = DecomposedStateDict(
+        non_tensor_data=non_tensor_data,
+        tensor_infos=tensor_infos,
+        tensor_data=tensor_data,
+        flat_key_roots=flat_key_roots or set(),
+    )
+    result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
+
+
+def _reconstruct_full_state_dict_from_main_tensor_buffer(
+    main_payload: Dict[str, Any],
+    flat_key_roots: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """Rebuild full state_dict from main payload when tensor_buffer is present (aligned with torch_dist)."""
+    tb = main_payload["tensor_buffer"]
+    buf = tb.detach().contiguous().reshape(-1).view(torch.uint8)
+    tensor_infos = main_payload["tensor_infos"]
+    tensor_data = extract_tensors_from_continuous_buffer(buf, tensor_infos)
+    decomposed = DecomposedStateDict(
+        non_tensor_data=main_payload["non_tensor_data"],
+        tensor_infos=tensor_infos,
+        tensor_data=tensor_data,
+        flat_key_roots=flat_key_roots or set(),
+    )
+    result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
+
+
+def _load_basic_ec_block_file(
+    checkpoint_dir: Path,
+    rank: int,
+    canonical_name: str,
+    legacy_name: str,
+    block_files_legacy: Optional[Dict[str, str]] = None,
+) -> torch.Tensor:
+    """Load a single BasicEC block file with canonical/legacy name fallback.
+
+    Args:
+        checkpoint_dir: Checkpoint directory.
+        rank: Global rank.
+        canonical_name: Canonical block name (e.g. "own_data0", "recv_2").
+        legacy_name: Legacy block name (e.g. "data0", "recv_data1").
+        block_files_legacy: Optional legacy->canonical mapping from main_payload extra metadata.
+
+    Returns:
+        torch.Tensor of dtype uint8 with the block data.
+    """
+    from megatron.training.legacy_io_utils import (
+        is_raw_format, read_raw_block, MAGIC_BLOCK, pin_uint8_tensor_if_available,
+    )
+
+    candidates: List[Path] = [
+        checkpoint_dir / f"basic_ec_block_rank{rank}_{canonical_name}.pt"
+    ]
+
+    if block_files_legacy and legacy_name in block_files_legacy:
+        candidates.append(checkpoint_dir / block_files_legacy[legacy_name])
+
+    candidates.append(checkpoint_dir / f"ecnaive_block_rank{rank}_{canonical_name}.pt")
+    candidates.append(checkpoint_dir / f"basic_ec_block_rank{rank}_{legacy_name}.pt")
+    candidates.append(checkpoint_dir / f"ecnaive_block_rank{rank}_{legacy_name}.pt")
+
+    block_path = None
+    for p in candidates:
+        if p.is_file():
+            block_path = p
+            break
+
+    if block_path is None:
+        raise FileNotFoundError(
+            f"BasicEC legacy: missing block {canonical_name}/{legacy_name} "
+            f"for rank {rank} under {checkpoint_dir}"
+        )
+
+    if is_raw_format(str(block_path), MAGIC_BLOCK):
+        return read_raw_block(str(block_path), MAGIC_BLOCK, pin_tensor=True)
+    payload = torch.load(str(block_path), map_location="cpu", weights_only=False)
+    return pin_uint8_tensor_if_available(
+        payload["tensor"].contiguous().view(torch.uint8).reshape(-1)
+    )
+
+
+def _decode_data_block(
+    block: torch.Tensor,
+    pipeline_total_bytes: int,
+    block_idx: int,
+    block_data_size: int,
+    basic_ec_buffer_size: int,
+) -> torch.Tensor:
+    """Decode one padded data block into its linear segment of tensor_buffer.
+
+    During save, data block j covers bytes [j*block_data_size, (j+1)*block_data_size)
+    of the original tensor.  The block is written with 64-byte alignment between
+    basic_ec_buffer_size chunks.
+    """
+    start_byte = block_idx * block_data_size
+    end_byte = min(start_byte + block_data_size, pipeline_total_bytes)
+    actual = max(0, end_byte - start_byte)
+    out = torch.zeros(actual, dtype=torch.uint8, device=block.device)
+    src_pos = 0
+    block_offset = 0
+    while src_pos < actual:
+        take = min(basic_ec_buffer_size, actual - src_pos)
+        aligned = ((block_offset + 63) // 64) * 64
+        if aligned + take > block.numel():
+            logger.warning("BasicEC: data block %d exhausted during decode", block_idx)
+            break
+        out[src_pos : src_pos + take].copy_(block[aligned : aligned + take])
+        block_offset = aligned + take
+        src_pos += take
+    return out
+
+
+def _decode_block_direct(
+    padded_block: torch.Tensor,
+    output: torch.Tensor,
+    dst_offset: int,
+    block_data_size: int,
+    pipeline_total_bytes: int,
+    block_idx: int,
+    basic_ec_buffer_size: int,
+) -> None:
+    """Decode a padded block directly into output buffer at dst_offset.
+
+    Avoids the intermediate tensor allocation + torch.cat that
+    _decode_data_block + concatenation would incur.
+    """
+    start_byte = block_idx * block_data_size
+    end_byte = min(start_byte + block_data_size, pipeline_total_bytes)
+    actual = max(0, end_byte - start_byte)
+    src_pos = 0
+    pe_offset = 0  # position in padded block
+    while src_pos < actual:
+        take = min(basic_ec_buffer_size, actual - src_pos)
+        aligned = ((pe_offset + 63) // 64) * 64
+        if aligned + take > padded_block.numel():
+            logger.warning("BasicEC: data block %d exhausted during decode", block_idx)
+            break
+        output[dst_offset + src_pos : dst_offset + src_pos + take].copy_(
+            padded_block[aligned : aligned + take]
+        )
+        pe_offset = aligned + take
+        src_pos += take
+
+
+def _load_basic_ec_legacy_software_failure(
+    checkpoint_dir: Path,
+    rank: int,
+    world_size: int,
+    manager: BasicECManager,
+    main_payload: Dict[str, Any],
+    global_registry: GlobalMetadataRegistry,
+    timings: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """BasicEC legacy load software failure path (generalized for any k >= 2).
+
+    The failed rank (rig=2 by convention) reads d_{2,0} from local disk and
+    receives d_{2,1}..d_{2,k-1} from k-1 sender ranks via C++ ASIO/RDMA
+    (k-1 ports).  Sender ranks load their block files and send via C++.
+    Non-participating ranks just reconstruct from their own main.pt.
+
+    If *timings* dict is provided, it will be populated with:
+      prep_copy, network_encode, rebuild_sd (all in seconds; total excludes prep_copy).
+    """
+    from time import time as _time
+    _t = timings if timings is not None else {}
+
+    native = manager._basic_ec_native
+    if native is None:
+        raise RuntimeError("BasicEC native module not initialized for sw recovery")
+
+    k = manager.basic_ec_k
+    n = manager.basic_ec_n
+    rank_in_group = manager._get_rank_in_group(rank, world_size)
+    group_id = manager._get_group_id(rank, world_size)
+    failed_rig = 2
+    num_network_blocks = k - 1  # blocks d_{2,1} .. d_{2,k-1} come from network
+
+    flat_key_roots = _infer_flat_key_roots(main_payload)
+    pipeline_total_bytes = int(main_payload["pipeline_total_bytes"])
+    actual_tensor_size = int(main_payload["actual_tensor_size"])
+    aligned_block_size = int(main_payload["aligned_block_size"])
+    block_data_size = int(main_payload.get("block_data_size",
+                         (pipeline_total_bytes + k - 1) // k))
+    tensor_infos = main_payload["tensor_infos"]
+    non_tensor_data = main_payload["non_tensor_data"]
+    rank_block_sizes = _basic_ec_payload_rank_block_sizes(main_payload, k, world_size)
+    failed_global_rank = manager._get_rank_by_group_position(group_id, failed_rig, world_size)
+    failed_block_data_size = int(rank_block_sizes[failed_global_rank])
+    if int(main_payload.get("version", 2)) >= 4:
+        block_data_size = failed_block_data_size
+        aligned_block_size = max(aligned_block_size, block_data_size)
+
+    block_files_legacy = main_payload.get("_block_files_legacy", None)
+    from megatron.training import get_args as _get_args
+    args = _get_args()
+    inprocess_cache = bool(
+        getattr(args, "ft_inprocess_recovery_benchmark", False)
+        and getattr(args, "_ft_inprocess_recovery_active", False)
+    )
+    workspace_hit = False
+    if inprocess_cache:
+        layout = manager._get_group_layout(world_size)
+        workspace_key = (
+            _basic_ec_checkpoint_identity(checkpoint_dir), rank, world_size,
+            k, n, failed_rig, "software", manager.basic_ec_buffer_size,
+            tuple(sorted(layout.items())), manager.basic_ec_pin_memory,
+            manager.use_rdma, torch.distributed.get_backend(),
+            os.environ.get("BASIC_EC_INTERFACE", os.environ.get("ECNAIVE_INTERFACE")),
+            os.environ.get(f"BASIC_EC_RANK_IP_{rank}", os.environ.get(f"ECNAIVE_RANK_IP_{rank}")),
+            os.environ.get("BASIC_EC_BASE_PORT", os.environ.get("ECNAIVE_BASE_PORT")),
+        )
+        workspace_hit = manager.begin_recovery_workspace(workspace_key)
+        if rank == 0:
+            logger.info(
+                "BasicEC software in-process workspace cache=%s",
+                "hit" if workspace_hit else "miss",
+            )
+
+    # Phase 1: setup (not timed) — persistent ASIO/RDMA connections + barrier
+    manager.init_basic_ec_sw_recovery(rank, world_size, failed_rank_in_group=failed_rig)
+
+    # ---- prepare buffers / disk reads (not timed) ----
+    tensor_buffer: Optional[torch.Tensor] = None
+    recv_blocks: List[torch.Tensor] = []
+    send_block: Optional[torch.Tensor] = None
+    send_block_idx: int = -1
+
+    ckpt_ver = int(main_payload.get("version", 2))
+    has_padded_sw = ckpt_ver < 3
+
+    if rank_in_group == failed_rig:
+        # Pre-allocate final tensor_buffer once (pinned for fast CPU→GPU copy).
+        # Layout uses k stripes of block_data_size; k * block_data_size can exceed
+        # pipeline_total_bytes by up to (k - 1) bytes due to ceil division.
+        layout_bytes = k * block_data_size
+        buf_len = max(actual_tensor_size, layout_bytes)
+        tensor_buffer = (
+            manager.get_recovery_buffer("sw_final_tensor", buf_len, pin=True)
+            if inprocess_cache else _allocate_pinned_uint8_buffer(buf_len)
+        )
+        # Load local d_{f,0} into tensor_buffer
+        own_data0 = _load_basic_ec_block_file(
+            checkpoint_dir, rank,
+            canonical_name="own_data0",
+            legacy_name="data0",
+            block_files_legacy=block_files_legacy,
+        )
+        if has_padded_sw:
+            _decode_block_direct(
+                own_data0, tensor_buffer, 0,
+                block_data_size, pipeline_total_bytes, 0,
+                manager.basic_ec_buffer_size,
+            )
+        else:
+            n_copy = min(own_data0.numel(), block_data_size)
+            tensor_buffer[:n_copy].copy_(own_data0[:n_copy])
+        own_data0 = None  # free ref
+        recv_alloc_size = aligned_block_size if has_padded_sw else block_data_size
+        if inprocess_cache:
+            recv_blocks = manager.get_recovery_slices(
+                "sw_recv_blocks", recv_alloc_size, k - 1, register=True,
+            )
+        else:
+            for _j in range(1, k):
+                buf = torch.zeros(recv_alloc_size, dtype=torch.uint8)
+                if manager.use_rdma:
+                    manager.register_buffer(buf)
+                recv_blocks.append(buf)
+    else:
+        sender_rig = rank_in_group
+        j = (sender_rig - failed_rig + n) % n
+        if 1 <= j < k:
+            block_idx = j - 1
+            recv_idx = (sender_rig - failed_rig - 1 + n) % n
+            canonical_name = f"recv_{recv_idx}"
+            if k == 2:
+                legacy_map_2 = {0: "recv_parity1", 1: "recv_parity0", 2: "recv_data1"}
+                legacy_name = legacy_map_2.get(recv_idx, canonical_name)
+            else:
+                legacy_name = canonical_name
+            send_cache_name = f"sw_send_block_{block_idx}"
+            send_block = (
+                manager.get_recovery_workspace_value(send_cache_name)
+                if inprocess_cache else None
+            )
+            if send_block is None:
+                send_block = _load_basic_ec_block_file(
+                    checkpoint_dir, rank,
+                    canonical_name=canonical_name,
+                    legacy_name=legacy_name,
+                    block_files_legacy=block_files_legacy,
+                )
+                if not has_padded_sw and send_block.numel() > block_data_size:
+                    send_block = send_block[:block_data_size].contiguous()
+                if manager.use_rdma:
+                    manager.register_buffer(send_block)
+                if inprocess_cache:
+                    manager.set_recovery_workspace_value(send_cache_name, send_block)
+            send_block_idx = block_idx
+
+    # Sync all ranks after setup so network timing excludes setup skew.
+    _t['barrier'] = _timed_barrier() if world_size > 1 else 0.0
+
+    # === timing: network/encode (ASIO send/recv only) ===
+    _t0_net = _time()
+    if rank_in_group == failed_rig:
+        for idx, buf in enumerate(recv_blocks):
+            native.sw_recv_data(idx, int(buf.data_ptr()), buf.numel())
+    elif send_block is not None:
+        native.sw_send_data(send_block_idx, int(send_block.data_ptr()), send_block.numel())
+    _t['network_encode'] = _time() - _t0_net
+    native_timing = _native_ft_timing(native)
+    _t['net_s'] = native_timing['net_s']
+    _t.setdefault('encode_s', native_timing['encode_s'])
+
+    # Decode recv blocks → tensor_buffer (not timed)
+    if rank_in_group == failed_rig:
+        for idx, buf in enumerate(recv_blocks):
+            dst_off = (idx + 1) * block_data_size
+            if has_padded_sw:
+                _decode_block_direct(
+                    buf, tensor_buffer, dst_off,
+                    block_data_size, pipeline_total_bytes, idx + 1,
+                    manager.basic_ec_buffer_size,
+                )
+            else:
+                n_copy = min(buf.numel(), block_data_size)
+                tensor_buffer[dst_off:dst_off + n_copy].copy_(buf[:n_copy])
+            logger.debug(
+                "BasicEC legacy sw: failed_rig=%d received data_block_idx=%d bytes=%d",
+                failed_rig, idx + 1, buf.numel(),
+            )
+    if send_block is not None:
+        logger.debug(
+            "BasicEC legacy sw: rig=%d sent (block_idx=%d, %d bytes)",
+            rank_in_group, send_block_idx, send_block.numel(),
+        )
+
+    prep_copy_s = 0.0
+    if rank_in_group != failed_rig and not isinstance(
+        main_payload.get("tensor_buffer"), torch.Tensor
+    ):
+        t_prep = _time()
+        main_payload = _load_basic_ec_main_payload_local(
+            checkpoint_dir, rank, load_tensor_buffer=True
+        )
+        if main_payload is None:
+            raise FileNotFoundError(
+                f"BasicEC legacy sw: missing main payload for rank {rank} under {checkpoint_dir}"
+            )
+        prep_copy_s = _time() - t_prep
+    _t['prep_copy'] = prep_copy_s
+
+    t_rebuild = _time()
+    if rank_in_group == failed_rig:
+        if actual_tensor_size > 0:
+            tensor_buffer = tensor_buffer[:actual_tensor_size]
+        tensor_data = extract_tensors_from_continuous_buffer(tensor_buffer, tensor_infos)
+        decomposed = DecomposedStateDict(
+            non_tensor_data=non_tensor_data,
+            tensor_infos=tensor_infos,
+            tensor_data=tensor_data,
+            flat_key_roots=flat_key_roots,
+        )
+        state_dict = reconstruct_state_dict(decomposed)
+        unflatten_optimizer_fp32_params(state_dict)
+    else:
+        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+            main_payload, flat_key_roots=flat_key_roots,
+        )
+    _t['rebuild_sd'] = _time() - t_rebuild
+
+    prebenchmark_software_load = bool(
+        getattr(args, "ft_inprocess_recovery_benchmark", False)
+        and not getattr(args, "_ft_inprocess_recovery_active", False)
+    )
+    if prebenchmark_software_load and manager.use_rdma:
+        for buffer in recv_blocks:
+            manager.unregister_buffer(buffer)
+        if send_block is not None:
+            manager.unregister_buffer(send_block)
+        if rank == 0:
+            logger.info(
+                "BasicEC software preload: retained persistent connections and "
+                "released temporary RDMA registrations"
+            )
+
+    # NOTE: the old standalone else clause for ranks 0,1 (k=2) is absorbed into
+    # the generalized else branch above.
+    # barrier at end of rebuild_sd is handled by the caller (load_basic_ec_legacy_checkpoint).
+
+    # NOTE: do not call manager.cleanup() here in the software failure path.
+    # cleanup() calls native.stop() which tears down C++ resources, and the
+    # subsequent reference drop triggers the C++ destructor (double-free on the
+    # software-only RDMA channel).  The process exits shortly after load,
+    # so leaving cleanup to __del__ is safe.
+
+    return state_dict
+
+
+def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
+    """Infer flat key roots from checkpoint payload (for backward compatibility)."""
+    if "flat_key_roots" in main_payload:
+        return set(main_payload["flat_key_roots"])
+    flat_key_roots: Set[str] = set()
+    for info in main_payload.get("tensor_infos", []):
+        first_seg = info.key.split('.')[0]
+        if first_seg == "model" or (
+            first_seg.startswith("model")
+            and len(first_seg) > 5
+            and first_seg[5:].isdigit()
+        ):
+            flat_key_roots.add(first_seg)
+    return flat_key_roots
+
+
+def state_dict_from_basic_ec_main_metadata_only(main_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build state_dict from basic_ec main file payload.
+    When tensor_buffer is present, reconstruct full tensors; otherwise only non-tensor keys.
+    Used when torch.distributed is not initialized yet (e.g. load_args_from_checkpoint).
+    """
+    flat_key_roots = _infer_flat_key_roots(main_payload)
+    if isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
+        result = _reconstruct_full_state_dict_from_main_tensor_buffer(
+            main_payload, flat_key_roots=flat_key_roots,
+        )
+    else:
+        decomposed = DecomposedStateDict(
+            non_tensor_data=main_payload["non_tensor_data"],
+            tensor_infos=[],
+            tensor_data=[],
+            flat_key_roots=flat_key_roots,
+        )
+        result = reconstruct_state_dict(decomposed)
+    unflatten_optimizer_fp32_params(result)
+    return result
+
+
+def load_basic_ec_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
+    """
+    Load BasicEC torch legacy checkpoint.
+
+    Normal load rebuilds from the local main tensor buffer. Hardware recovery is
+    handled only by load_basic_ec_legacy_checkpoint_hardware_recovery().
+    """
+    checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+    from megatron.training import get_args
+
+    args = get_args()
+    sw_failure_requested = bool(getattr(args, "use_basic_ec_software_failure", False))
+    main_payload = _load_basic_ec_main_payload(
+        checkpoint_dir, rank, world_size, load_tensor_buffer=not sw_failure_requested
+    )
+    if not getattr(args, "use_basic_ec", False):
+        logger.warning(
+            "BasicEC legacy load: args.use_basic_ec is False; enabling for native module init"
+        )
+        args.use_basic_ec = True
+
+    manager = BasicECManager()
+    manager.init_basic_ec_if_enabled()
+    if manager._basic_ec_native is None:
+        raise RuntimeError("BasicEC native module is not available in legacy load path")
+
+    tensor_infos = main_payload["tensor_infos"]
+    local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
+    if world_size > 1 and torch.distributed.is_initialized():
+        gathered_meta: List[Any] = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_meta, local_metadata)
+        rank_metadata = {i: gathered_meta[i] for i in range(world_size)}
+    else:
+        rank_metadata = {0: local_metadata}
+
+    global_registry = GlobalMetadataRegistry(rank_metadata=rank_metadata, rank_non_tensor_data={})
+
+    # ---- Software failure fast path ----
+    if sw_failure_requested:
+        logger.debug("BasicEC legacy: software failure recovery path")
+        _t: Dict[str, float] = {'prep_copy': 0.0}
+        state_dict = _load_basic_ec_legacy_software_failure(
+            checkpoint_dir=checkpoint_dir,
+            rank=rank,
+            world_size=world_size,
+            manager=manager,
+            main_payload=main_payload,
+            global_registry=global_registry,
+            timings=_t,
+        )
+        _t['total'] = (
+            _t.get('network_encode', 0.0)
+            + _t.get('rebuild_sd', 0.0)
+        )
+        from megatron.training.global_vars import set_ft_load_timing_context
+        set_ft_load_timing_context("BasicEC", "SW", _t)
+        load_log = dict(_t)
+        load_log["mode"] = "SW"
+        logger.debug(
+            "BasicEC load timing (%(mode)s local): e2e_s=%(total).2fs "
+            "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
+            "barrier_s=%(barrier).2fs",
+            load_log,
+        )
+        return state_dict
+
+    if not isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
+        raise RuntimeError(
+            "BasicEC legacy load: local tensor_buffer is missing. "
+            "Use --basic-ec-failed-ranks to run generalized hardware recovery."
+        )
+
+    flat_key_roots = _infer_flat_key_roots(main_payload)
+    t_rebuild = time.time()
+    state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+        main_payload, flat_key_roots=flat_key_roots,
+    )
+    rebuild_sd = time.time() - t_rebuild
+
+    from megatron.training.global_vars import set_ft_load_timing_context
+    set_ft_load_timing_context(
+        "BasicEC",
+        "normal",
+        {
+            "total": rebuild_sd,
+            "network_encode": 0.0,
+            "net_s": 0.0,
+            "encode_s": 0.0,
+            "rebuild_sd": rebuild_sd,
+            "barrier": 0.0,
+        },
+    )
+    return state_dict
+
+def _load_all_blocks_from_disk(
+    checkpoint_dir: Path,
+    rank: int,
+    basic_ec_k: int,
+    basic_ec_n: int,
+    block_files: Optional[Dict[str, str]] = None,
+) -> List[torch.Tensor]:
+    """Load all n checkpoint blocks from disk for a surviving rank.
+
+    Block order: [own_data0, recv_0, recv_1, ..., recv_{n-2}]
+
+    Tries canonical filenames first, falls back to legacy names for k=2.
+    """
+    from megatron.training.legacy_io_utils import (
+        is_raw_format, read_raw_block, MAGIC_BLOCK, pin_uint8_tensor_if_available,
+    )
+
+    # Legacy name map for k=2 backward compatibility
+    legacy_map: Dict[int, str] = {}
+    if basic_ec_k == 2:
+        legacy_map = {
+            0: "data0",
+            1: "recv_parity1",
+            2: "recv_parity0",
+            3: "recv_data1",
+        }
+
+    blocks: List[torch.Tensor] = []
+    for i in range(basic_ec_n):
+        canon_name = "own_data0" if i == 0 else f"recv_{i - 1}"
+        # Prefer the new canonical filename, then metadata, then legacy filenames.
+        candidates: List[Path] = [
+            checkpoint_dir / f"basic_ec_block_rank{rank}_{canon_name}.pt"
+        ]
+        if block_files and canon_name in block_files:
+            candidates.append(checkpoint_dir / block_files[canon_name])
+        candidates.append(
+            checkpoint_dir / f"ecnaive_block_rank{rank}_{canon_name}.pt"
+        )
+        # Legacy block labels only exist for k=2.
+        if i in legacy_map:
+            candidates.append(
+                checkpoint_dir / f"basic_ec_block_rank{rank}_{legacy_map[i]}.pt"
+            )
+            candidates.append(
+                checkpoint_dir / f"ecnaive_block_rank{rank}_{legacy_map[i]}.pt"
+            )
+
+        tensor = None
+        for path in candidates:
+            if path.is_file():
+                if is_raw_format(str(path), MAGIC_BLOCK):
+                    tensor = read_raw_block(str(path), MAGIC_BLOCK, pin_tensor=True)
+                else:
+                    payload = torch.load(
+                        str(path), map_location="cpu", weights_only=False
+                    )
+                    tensor = pin_uint8_tensor_if_available(
+                        payload["tensor"].contiguous().view(torch.uint8)
+                    )
+                break
+
+        if tensor is None:
+            raise FileNotFoundError(
+                f"BasicEC hw recovery: survivor rank {rank} missing block "
+                f"{i} ({canon_name}) — tried: {[str(p) for p in candidates]}"
+            )
+        blocks.append(tensor)
+
+    return blocks
+def load_basic_ec_legacy_checkpoint_hardware_recovery(
+    checkpoint_name: str, failed_global_ranks: List[int]
+) -> Dict[str, Any]:
+    """Hardware recovery using C++ ASIO/RDMA send/recv plus RS decode.
+
+    Source ranks send all n checkpoint blocks to each failed rank in the same
+    group. Current continuous checkpoints stream block data from disk in
+    stripe-sized chunks on both source and failed ranks, avoiding full-block
+    resident memory when many ranks are colocated on one node. Legacy padded
+    checkpoints keep the older full-block compatibility path.
+    """
+    checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+    if not torch.distributed.is_initialized():
+        raise RuntimeError("BasicEC hardware recovery requires torch.distributed")
+
+    from megatron.training import get_args
+    args = get_args()
+    basic_ec_k = getattr(args, "basic_ec_rs_k", 2)
+    basic_ec_n = basic_ec_k + 2
+    if basic_ec_k < 2 or world_size <= 0 or world_size % basic_ec_n != 0:
+        raise ValueError(
+            f"BasicEC hardware recovery requires k >= 2 and group size "
+            f"n={basic_ec_n} dividing world_size={world_size}"
+        )
+    try:
+        failed_ranks = sorted({int(rank) for rank in failed_global_ranks})
+    except (TypeError, ValueError) as exc:
+        raise ValueError("BasicEC failed ranks must be integers") from exc
+    if not failed_ranks:
+        raise ValueError("BasicEC hardware recovery requires at least one failed rank")
+    invalid = [failed for failed in failed_ranks if failed < 0 or failed >= world_size]
+    if invalid:
+        raise ValueError(
+            f"BasicEC failed ranks {invalid} are outside [0, {world_size - 1}]"
+        )
+    failed_global_ranks = failed_ranks
+    failed_set = set(failed_ranks)
+
+    manager = BasicECManager()
+    manager.basic_ec_k = basic_ec_k
+    manager.basic_ec_n = basic_ec_n
+    if not getattr(args, "use_basic_ec", False):
+        args.use_basic_ec = True
+    group_failures: Dict[int, List[int]] = {}
+    for failed in failed_ranks:
+        group_failures.setdefault(manager._get_group_id(failed, world_size), []).append(failed)
+    invalid_groups = {gid: ranks for gid, ranks in group_failures.items() if len(ranks) > 2}
+    if invalid_groups:
+        raise ValueError(
+            f"BasicEC RS({basic_ec_n},{basic_ec_k}) supports at most two failed "
+            f"ranks per group; invalid groups: {invalid_groups}"
+        )
+    require_hw2 = bool(getattr(args, "_basic_ec_require_hw2", False))
+    if require_hw2:
+        non_pairs = {gid: ranks for gid, ranks in group_failures.items() if len(ranks) != 2}
+        if non_pairs or len(failed_ranks) < 2:
+            raise ValueError(
+                "BasicEC HW2 requires every targeted group to contain exactly two "
+                f"failed ranks; observed {group_failures}"
+            )
+    if rank == 0:
+        logger.info("BasicEC recovery failure groups: %s", group_failures)
+
+    # Init C++ native module for ALL ranks (ASIO connections needed for send/recv)
+    manager.init_basic_ec_if_enabled()
+    native = manager._basic_ec_native
+    if native is None:
+        raise RuntimeError("BasicEC native module unavailable for hardware recovery")
+
+    should_time_recovery_to_forward = (
+        not getattr(args, "ft_inprocess_recovery_benchmark", False)
+        or bool(getattr(args, "_ft_inprocess_recovery_active", False))
+    )
+    inprocess_cache = _basic_ec_inprocess_workspace_enabled(args)
+    setup_start = time.perf_counter()
+    setup_timing = {
+        "metadata_plan": 0.0,
+        "disk_preload": 0.0,
+        "alloc_touch_register": 0.0,
+        "native_reset": 0.0,
+        "total": 0.0,
+    }
+    metadata_start = time.perf_counter()
+    workspace_hit = False
+    if inprocess_cache:
+        layout = manager._get_group_layout(world_size)
+        workspace_key = (
+            _basic_ec_checkpoint_identity(checkpoint_dir),
+            rank, world_size, tuple(failed_ranks), "hardware",
+            basic_ec_k, basic_ec_n, manager.basic_ec_buffer_size,
+            tuple(sorted(layout.items())), manager.basic_ec_pin_memory,
+            manager.use_rdma, torch.distributed.get_backend(),
+            os.environ.get("BASIC_EC_INTERFACE", os.environ.get("ECNAIVE_INTERFACE")),
+            os.environ.get(f"BASIC_EC_RANK_IP_{rank}", os.environ.get(f"ECNAIVE_RANK_IP_{rank}")),
+            os.environ.get(f"BASIC_EC_LOCAL_RANK_NIC_{os.environ.get('LOCAL_RANK', '0')}", os.environ.get(f"ECNAIVE_LOCAL_RANK_NIC_{os.environ.get('LOCAL_RANK', '0')}")),
+            os.environ.get("BASIC_EC_NIC_LIST", os.environ.get("ECNAIVE_NIC_LIST")),
+            os.environ.get("BASIC_EC_RANKS_PER_NIC", os.environ.get("ECNAIVE_RANKS_PER_NIC")),
+            os.environ.get("BASIC_EC_BASE_PORT", os.environ.get("ECNAIVE_BASE_PORT")),
+        )
+        workspace_hit = manager.begin_recovery_workspace(workspace_key)
+
+    cached_metadata = (
+        manager.get_recovery_workspace_value("metadata_plan")
+        if inprocess_cache and workspace_hit else None
+    )
+    if cached_metadata is not None:
+        main_payload, gathered_meta, recovery_plan = cached_metadata
+    else:
+        # Step 1: Load main payload + exchange metadata.
+        main_payload = _load_basic_ec_main_payload(checkpoint_dir, rank, world_size)
+        tensor_infos = main_payload.get("tensor_infos", [])
+        local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
+        gathered_meta: List[Any] = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_meta, local_metadata)
+
+        # Step 2: Compute recovery plan.
+        recovery_plan = manager.get_multi_failure_recovery_plan(
+            failed_global_ranks, world_size
+        )
+        if inprocess_cache:
+            manager.set_recovery_workspace_value(
+                "metadata_plan", (main_payload, gathered_meta, recovery_plan),
+            )
+    tensor_infos = main_payload.get("tensor_infos", [])
+    setup_timing["metadata_plan"] = time.perf_counter() - metadata_start
+
+    block_files = main_payload.get("block_files", {})
+    pipeline_total_bytes = int(main_payload.get("pipeline_total_bytes", 0))
+    block_data_size = int(main_payload.get("block_data_size",
+                          (pipeline_total_bytes + basic_ec_k - 1) // basic_ec_k))
+    # version < 3: old checkpoints have 64B alignment gaps in recv blocks
+    # version >= 3: continuous (no padding, stored contiguously)
+    ckpt_version = int(main_payload.get("version", 3))
+    has_padded_recv = ckpt_version < 3
+
+    # old checkpoints: blocks have 64B gaps, use aligned_block_size for send/recv
+    # new checkpoints: continuous, use block_data_size
+    aligned_block_size = int(main_payload.get("aligned_block_size",
+                             ((block_data_size + manager.basic_ec_buffer_size - 1)
+                              // manager.basic_ec_buffer_size) * manager.basic_ec_buffer_size))
+    recv_block_size = aligned_block_size if has_padded_recv else block_data_size
+    rank_block_sizes = _basic_ec_payload_rank_block_sizes(main_payload, basic_ec_k, world_size)
+
+    flat_key_roots = _infer_flat_key_roots(main_payload)
+    actual_tensor_size = int(main_payload.get("actual_tensor_size", 0))
+    num_channels = basic_ec_n - 1  # = k + 1
+
+    # Step 3: Determine group membership
+    is_failed = (rank in failed_set)
+    my_gid = manager._get_group_id(rank, world_size)
+    my_rig = manager._get_rank_in_group(rank, world_size)
+
+    failed_in_group: List[int] = [
+        fr for fr in failed_global_ranks
+        if manager._get_group_id(fr, world_size) == my_gid
+    ]
+    survivors_in_group: List[int] = [
+        r for r in range(world_size)
+        if manager._get_group_id(r, world_size) == my_gid and r not in failed_set
+    ]
+
+    # affected_group: my group has at least one failed rank
+    affected_group = len(failed_in_group) > 0
+
+    # Source ranks: first k survivors that send ALL blocks for recovery
+    source_ranks = survivors_in_group[:basic_ec_k] if len(survivors_in_group) >= basic_ec_k else survivors_in_group
+    is_source = rank in source_ranks
+    source_set = set(source_ranks)
+
+    def _block_sizes_for_holder(holder_rank: int) -> List[int]:
+        holder_rig = manager._get_rank_in_group(holder_rank, world_size)
+        group_block_sizes = _basic_ec_group_block_sizes(
+            manager, holder_rank, world_size, rank_block_sizes,
+        )
+        return [
+            int(group_block_sizes[_basic_ec_block_owner_rig(holder_rig, bi, basic_ec_n)])
+            for bi in range(basic_ec_n)
+        ]
+
+    source_block_sizes_all = [_block_sizes_for_holder(src) for src in source_ranks]
+    local_block_sizes = _block_sizes_for_holder(rank)
+
+    barrier_s = 0.0
+
+    # Pre-allocate recv pool for failed ranks, load blocks for source ranks (not timed)
+    recv_pool_prealloc: List[torch.Tensor] = []
+    source_blocks_prealloc: List[torch.Tensor] = []
+    source_block_paths: List[Path] = []
+    source_stream_scratch: Optional[List[torch.Tensor]] = None
+    # Pre-computed decode layout and buffers for failed ranks (moved here to keep outside timing)
+    _rig_to_si: Dict[int, int] = {}
+    _owner_rigs: List[int] = []
+    _num_owners: int = 0
+    recovered_slot_pool_pre: List[torch.Tensor] = []
+    parity_pool_0_pre: List[torch.Tensor] = []
+    parity_pool_1_pre: List[torch.Tensor] = []
+    store_bufs_pre: Dict[str, torch.Tensor] = {}
+    tensor_buffer_pre: Optional[torch.Tensor] = None
+    if affected_group and is_failed:
+        total_pool_blocks = len(source_ranks) * basic_ec_n
+        # Pre-compute block locator metadata
+        _source_rig_map = {r: manager._get_rank_in_group(r, world_size) for r in source_ranks}
+        _rig_to_si = {
+            _source_rig_map[source_rank]: source_index
+            for source_index, source_rank in enumerate(source_ranks)
+        }
+        _owner_rigs = [my_rig]
+        for _recv_idx in range(basic_ec_n - 1):
+            _ow = (my_rig - _recv_idx - 1) % basic_ec_n
+            if _ow not in _owner_rigs:
+                _owner_rigs.append(_ow)
+        _num_owners = len(_owner_rigs)
+
+        alloc_start = time.perf_counter()
+        store_block_names = ['own_data0', 'my_data1'] + [
+            f'recv_{idx}' for idx in range(basic_ec_n - 1)
+        ]
+        if has_padded_recv:
+            if inprocess_cache:
+                recv_pool_prealloc = manager.get_recovery_slices(
+                    "failed_recv_pool", recv_block_size, total_pool_blocks,
+                    register=True,
+                )
+                recovered_slot_pool_pre = manager.get_recovery_slices(
+                    "recovered_slots", block_data_size, _num_owners * basic_ec_k,
+                )
+                parity_pool_0_pre = manager.get_recovery_slices(
+                    "parity_pool_0", block_data_size, _num_owners,
+                )
+                parity_pool_1_pre = manager.get_recovery_slices(
+                    "parity_pool_1", block_data_size, _num_owners,
+                )
+                store_bufs_pre = {
+                    name: manager.get_recovery_buffer(
+                        f"store_{name}", block_data_size,
+                    )
+                    for name in store_block_names
+                }
+            else:
+                recv_pool_prealloc = list(allocate_hugepage_slices(
+                    recv_block_size, total_pool_blocks,
+                    fallback_pin_memory=True, touch_pages=True,
+                ))
+                recovered_slot_pool_pre = [
+                    torch.empty(block_data_size, dtype=torch.uint8)
+                    for _ in range(_num_owners * basic_ec_k)
+                ]
+                parity_pool_0_pre = [
+                    torch.empty(block_data_size, dtype=torch.uint8)
+                    for _ in range(_num_owners)
+                ]
+                parity_pool_1_pre = [
+                    torch.empty(block_data_size, dtype=torch.uint8)
+                    for _ in range(_num_owners)
+                ]
+                store_bufs_pre = {
+                    name: torch.empty(block_data_size, dtype=torch.uint8)
+                    for name in store_block_names
+                }
+        else:
+            stripe_bytes = manager.basic_ec_buffer_size
+            if inprocess_cache:
+                recv_pool_prealloc = manager.get_recovery_slices(
+                    "failed_recv_pool", stripe_bytes, total_pool_blocks,
+                    register=True,
+                )
+                store_bufs_pre = {
+                    name: manager.get_recovery_buffer(f"store_{name}", stripe_bytes)
+                    for name in ('own_data0', 'my_data1')
+                }
+            else:
+                recv_pool_prealloc = list(allocate_hugepage_slices(
+                    stripe_bytes, total_pool_blocks,
+                    fallback_pin_memory=True, touch_pages=True,
+                ))
+                store_bufs_pre = {
+                    'own_data0': torch.empty(stripe_bytes, dtype=torch.uint8),
+                    'my_data1': torch.empty(stripe_bytes, dtype=torch.uint8),
+                }
+
+        if manager.use_rdma and not inprocess_cache:
+            for buf in recv_pool_prealloc:
+                manager.register_buffer(buf)
+        tensor_size = max(block_data_size * basic_ec_k, actual_tensor_size)
+        tensor_buffer_pre = (
+            manager.get_recovery_buffer("final_tensor", tensor_size, pin=True)
+            if inprocess_cache else _allocate_pinned_uint8_buffer(tensor_size)
+        )
+        setup_timing["alloc_touch_register"] += time.perf_counter() - alloc_start
+    elif affected_group and not is_failed and is_source:
+        disk_start = time.perf_counter()
+        if has_padded_recv:
+            cached_source_blocks = (
+                manager.get_recovery_workspace_value("source_blocks")
+                if inprocess_cache else None
+            )
+            if cached_source_blocks is None:
+                source_blocks_prealloc = _load_all_blocks_from_disk(
+                    checkpoint_dir, rank, basic_ec_k, basic_ec_n, block_files,
+                )
+                if manager.use_rdma:
+                    for block in source_blocks_prealloc:
+                        manager.register_buffer(block)
+                if inprocess_cache:
+                    manager.set_recovery_workspace_value(
+                        "source_blocks", source_blocks_prealloc,
+                    )
+            else:
+                source_blocks_prealloc = cached_source_blocks
+        else:
+            cached_source_paths = (
+                manager.get_recovery_workspace_value("source_paths")
+                if inprocess_cache else None
+            )
+            if cached_source_paths is None:
+                source_block_paths = _resolve_basic_ec_block_paths(
+                    checkpoint_dir, rank, basic_ec_k, basic_ec_n, block_files,
+                )
+                if inprocess_cache:
+                    manager.set_recovery_workspace_value(
+                        "source_paths", source_block_paths,
+                    )
+            else:
+                source_block_paths = cached_source_paths
+            setup_timing["disk_preload"] += time.perf_counter() - disk_start
+            disk_start = None
+            alloc_start = time.perf_counter()
+            if inprocess_cache:
+                source_stream_scratch = manager.get_recovery_slices(
+                    "source_stream_scratch", manager.basic_ec_buffer_size,
+                    basic_ec_n, register=True,
+                )
+            setup_timing["alloc_touch_register"] += time.perf_counter() - alloc_start
+        if disk_start is not None:
+            setup_timing["disk_preload"] += time.perf_counter() - disk_start
+
+    reset_start = time.perf_counter()
+    native.reset_encoding_completion_flags()
+    setup_timing["native_reset"] = time.perf_counter() - reset_start
+    setup_timing["total"] = time.perf_counter() - setup_start
+    if inprocess_cache:
+        _log_basic_ec_inprocess_setup(rank, workspace_hit, setup_timing)
+
+    # Sync after pre-alloc/load so network timing excludes setup skew.
+    barrier_s += _timed_barrier()
+
+    if should_time_recovery_to_forward:
+        try:
+            from megatron.training.global_vars import start_recovery_to_forward_timer
+            start_recovery_to_forward_timer(
+                "BasicEC", "network_recovery",
+                role="failed" if is_failed else "survivor", rank0_only_max=True,
+            )
+        except Exception:
+            pass
+
+    # === timing: network/encode (C++ send/recv + RS decode only) ===
+    _t: Dict[str, float] = {'prep_copy': 0.0}
+    _t0_net = time.time()
+
+    # ── Pipeline: SOURCE ranks send all n blocks to each failed rank ──
+    if affected_group and not is_failed and is_source:
+        stripe_bytes = manager.basic_ec_buffer_size
+
+        if has_padded_recv:
+            for dest_fr in failed_in_group:
+                send_ch = manager.get_send_channel_for_target(rank, dest_fr, world_size)
+                send_bases = [
+                    int(block_tensor.data_ptr()) for block_tensor in source_blocks_prealloc
+                ]
+                send_size = min(
+                    min(block_tensor.numel() for block_tensor in source_blocks_prealloc),
+                    recv_block_size,
+                )
+                _submit_hw_stripes_stripe_major(
+                    native.submit_send_task,
+                    send_ch,
+                    send_bases,
+                    send_size,
+                    stripe_bytes,
+                )
+                logger.debug(
+                    f"BasicEC hw recovery: source rank {rank} sending all "
+                    f"{len(source_blocks_prealloc)} blocks (stripe-major, {stripe_bytes} B) "
+                    f"to failed rank {dest_fr}"
+                )
+        else:
+            n_stripes = _run_hw_source_streaming_send(
+                native,
+                manager,
+                rank,
+                world_size,
+                failed_in_group,
+                source_block_paths,
+                local_block_sizes,
+                stripe_bytes,
+                scratch=source_stream_scratch,
+            )
+            logger.debug(
+                f"BasicEC hw recovery: source rank {rank} streamed "
+                f"{len(source_block_paths)} blocks in {n_stripes} stripes "
+                f"({stripe_bytes} B) to failed ranks {failed_in_group}"
+            )
+
+        native.submit_send_sentinels(num_channels)
+        native.submit_recv_sentinels(num_channels)
+        native.wait_for_encoding_completion()
+        _t['network_encode'] = time.time() - _t0_net
+
+        t_rebuild = time.time()
+        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+            main_payload, flat_key_roots=flat_key_roots,
+        )
+        _t['rebuild_sd'] = time.time() - t_rebuild
+
+    elif affected_group and not is_failed and not is_source:
+        # Survivor but not selected as source: no-op on channels
+        native.submit_send_sentinels(num_channels)
+        native.submit_recv_sentinels(num_channels)
+        native.wait_for_encoding_completion()
+        _t['network_encode'] = time.time() - _t0_net
+
+        t_rebuild = time.time()
+        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+            main_payload, flat_key_roots=flat_key_roots,
+        )
+        _t['rebuild_sd'] = time.time() - t_rebuild
+
+    elif affected_group and is_failed:
+        # ═══════════════════════════════════════════════════════════════
+        # FAILED RANK: receive k×n blocks from k source ranks, encode
+        # ==========
+        #   Unified decode: each owner codeword's k data blocks are
+        #   recovered from k surviving blocks (data or parity) in the
+        #   recv_pool using submit_basic_ec_decode_recovery.  No special
+        #   casing — direct get / XOR / RS are all just the same decode.
+        # ==========
+        plan = recovery_plan[rank]
+        my_rig = plan['rank_in_group']
+
+        recv_pool = recv_pool_prealloc
+        rig_to_si = _rig_to_si
+        owner_rigs = _owner_rigs
+        recovered_slot_pool = recovered_slot_pool_pre
+        parity_pool_0 = parity_pool_0_pre
+        parity_pool_1 = parity_pool_1_pre
+        store_bufs = store_bufs_pre
+
+        stripe_bytes = manager.basic_ec_buffer_size
+        _t0_decode = time.time()
+
+        if has_padded_recv:
+            # Old checkpoints: padded recv layout — batch recv then full-block decode.
+            for si, src_rank in enumerate(source_ranks):
+                recv_ch = manager.get_recv_channel_from_source(rank, src_rank, world_size)
+                base = si * basic_ec_n
+                recv_bases = [
+                    int(recv_pool[base + bi].data_ptr()) for bi in range(basic_ec_n)
+                ]
+                _submit_hw_stripes_stripe_major(
+                    native.submit_recv_task,
+                    recv_ch,
+                    recv_bases,
+                    recv_block_size,
+                    stripe_bytes,
+                )
+            native.submit_send_sentinels(num_channels)
+            native.submit_recv_sentinels(num_channels)
+            native.wait_for_encoding_completion()
+            _t['network_recv'] = time.time() - _t0_net
+
+            decode_t0 = time.time()
+            recovered: Dict[str, torch.Tensor] = {}
+            owner_idx = 0
+            for owner_rig in owner_rigs:
+                raw_surviving, lost = _collect_owner_codeword_survivors(
+                    owner_rig, basic_ec_k, basic_ec_n, rig_to_si, recv_pool,
+                )
+                m_owner = len(lost)
+                surviving: Dict[str, torch.Tensor] = {}
+                is_padded: Dict[str, bool] = {}
+                for label, padded in raw_surviving.items():
+                    if label != 'data_0':
+                        surviving[label] = padded
+                        is_padded[label] = True
+                    else:
+                        surviving[label] = padded[:block_data_size]
+                        is_padded[label] = False
+                if m_owner == 0:
+                    recovered_data = [
+                        surviving[f'data_{j}'] for j in range(basic_ec_k)
+                    ]
+                else:
+                    data_labels = sorted(
+                        [l for l in surviving if l.startswith('data_')],
+                        key=lambda x: int(x.split('_')[1]),
+                    )
+                    parity_labels = sorted([l for l in surviving if l.startswith('parity')])
+                    surviving_addrs_ordered = data_labels + parity_labels
+                    continuous_surviving = [
+                        surviving[l][:block_data_size] for l in surviving_addrs_ordered
+                    ]
+                    if owner_rig == my_rig:
+                        recovered_blocks = [
+                            store_bufs['own_data0'], store_bufs['my_data1'],
+                        ][:m_owner]
+                    else:
+                        base = owner_idx * basic_ec_k
+                        recovered_blocks = recovered_slot_pool[base : base + m_owner]
+                    native.submit_basic_ec_decode_recovery(
+                        basic_ec_k, m_owner, lost,
+                        [
+                            int(label.split("_")[1]) if label.startswith("data_")
+                            else basic_ec_k + int(label[-1])
+                            for label in surviving_addrs_ordered
+                        ],
+                        [int(b.data_ptr()) for b in continuous_surviving],
+                        [int(b.data_ptr()) for b in recovered_blocks],
+                        block_data_size,
+                    )
+                    recovered_data = [None] * basic_ec_k
+                    ri = 0
+                    for pos in range(basic_ec_k):
+                        label = f'data_{pos}'
+                        if label in surviving:
+                            recovered_data[pos] = surviving[label]
+                        else:
+                            recovered_data[pos] = recovered_blocks[ri]
+                            ri += 1
+                if owner_rig == my_rig:
+                    recovered['own_data0_ref'] = recovered_data[0]
+                    if basic_ec_k > 1:
+                        recovered['my_data1_ref'] = recovered_data[1]
+                for j in range(1, basic_ec_k):
+                    if (owner_rig + j) % basic_ec_n == my_rig:
+                        recovered[f'recv_{j - 1}_ref'] = recovered_data[j]
+                need_parity0 = (owner_rig + basic_ec_k) % basic_ec_n == my_rig
+                need_parity1 = (owner_rig + basic_ec_k + 1) % basic_ec_n == my_rig
+                if need_parity0 or need_parity1:
+                    encode_inputs = [
+                        recovered_data[j][:block_data_size] for j in range(basic_ec_k)
+                    ]
+                    parity0 = parity_pool_0[owner_idx]
+                    parity1 = parity_pool_1[owner_idx]
+                    t0_encode = time.time()
+                    native.encode_ec_blocks(
+                        [int(b.data_ptr()) for b in encode_inputs],
+                        int(parity0.data_ptr()),
+                        int(parity1.data_ptr()),
+                        block_data_size,
+                    )
+                    _t['encode_s'] = max(_t.get('encode_s', 0.0), time.time() - t0_encode)
+                    if need_parity0:
+                        recovered[f'recv_{basic_ec_k - 1}_ref'] = parity0
+                    if need_parity1:
+                        recovered[f'recv_{basic_ec_k}_ref'] = parity1
+                owner_idx += 1
+            _t['decode_s'] = time.time() - decode_t0
+        else:
+            # Continuous checkpoints use stripe-sized scratch buffers and copy directly
+            # into the final tensor buffer. This avoids full-block recovered/parity pools.
+            tensor_buffer = tensor_buffer_pre
+            n_stripes, decode_s = _run_hw_failed_own_tensor_streaming_recovery(
+                native=native,
+                manager=manager,
+                rank=rank,
+                world_size=world_size,
+                source_ranks=source_ranks,
+                basic_ec_k=basic_ec_k,
+                basic_ec_n=basic_ec_n,
+                recv_pool=recv_pool,
+                rig_to_si=rig_to_si,
+                my_rig=my_rig,
+                tensor_buffer=tensor_buffer,
+                block_data_size=block_data_size,
+                actual_tensor_size=actual_tensor_size,
+                stripe_bytes=stripe_bytes,
+                decode_scratch=[store_bufs['own_data0'], store_bufs['my_data1']],
+                source_block_sizes=source_block_sizes_all,
+            )
+            native.submit_send_sentinels(num_channels)
+            native.submit_recv_sentinels(num_channels)
+            native.wait_for_encoding_completion()
+            _t['network_recv'] = time.time() - _t0_net
+            _t['decode_s'] = decode_s
+            recovered = {}
+            logger.debug(
+                "BasicEC hw recovery: rank %d streamed %d recv/decode stripes "
+                "(stripe_bytes=%d, block_bytes=%d)",
+                rank, n_stripes, stripe_bytes, block_data_size,
+            )
+
+        _t['network_encode'] = time.time() - _t0_decode
+
+        # Copy recovered refs to pre-allocated store buffers (not timed)
+        for _name in ['own_data0', 'my_data1'] + [
+            f'recv_{idx}' for idx in range(basic_ec_n - 1)
+        ]:
+            _ref = recovered.pop(f'{_name}_ref', None)
+            if _ref is not None:
+                store_bufs[_name].copy_(_ref[:store_bufs[_name].numel()])
+                recovered[_name] = store_bufs[_name]
+
+        # ── Store recovered blocks ──
+        if recovered:
+            manager.store_recovered_blocks(rank, recovered)
+            logger.debug(
+                f"BasicEC hw recovery: stored {len(recovered)} recovered "
+                f"blocks for rank {rank} via unified decode+encode"
+            )
+
+        # ── Assemble tensor_buffer from own k data blocks (excluded from e2e) ──
+        t_prep = time.time()
+        if has_padded_recv:
+            d0 = recovered.get('own_data0')
+            d1 = recovered.get('my_data1')
+            if d0 is None or d1 is None:
+                raise RuntimeError(
+                    f"BasicEC hw recovery: missing own data blocks for rank {rank}"
+                )
+            tensor_buffer = tensor_buffer_pre
+            tensor_buffer[:d0.numel()].copy_(d0)
+            if actual_tensor_size > 0:
+                end = min(d1.numel(), max(0, actual_tensor_size - d0.numel()))
+                tensor_buffer[d0.numel():d0.numel() + end].copy_(d1[:end])
+        if actual_tensor_size > 0:
+            tensor_buffer = tensor_buffer[:actual_tensor_size]
+        _t['prep_copy'] = _t.get('prep_copy', 0.0) + (time.time() - t_prep)
+
+        t_rebuild = time.time()
+        # Debug: compare RS-recovered tensor_buffer with main_payload
+        if args.basic_ec_hw_debug and isinstance(main_payload.get("tensor_buffer"), torch.Tensor):
+            orig_tb = main_payload["tensor_buffer"]
+            orig = orig_tb.detach().reshape(-1).view(torch.uint8)
+            recv = tensor_buffer.reshape(-1)
+            if orig.numel() == recv.numel():
+                mismatch = (orig[:recv.numel()] != recv).nonzero(as_tuple=False)
+                nz_orig = orig.nonzero(as_tuple=False).numel()
+                nz_recv = recv.nonzero(as_tuple=False).numel()
+                zero_orig = orig.numel() - nz_orig
+                zero_recv = recv.numel() - nz_recv
+                if mismatch.numel() > 0:
+                    first = mismatch[0].item()
+                    logger.error(
+                        f"BasicEC hw debug: MISMATCH at byte {first}: "
+                        f"orig=0x{orig[first].item():02x} "
+                        f"recv=0x{recv[first].item():02x} "
+                        f"(total mismatches: {mismatch.numel()}/{orig.numel()})"
+                    )
+                else:
+                    logger.debug(
+                        f"BasicEC hw debug: tensor_buffer matches main_payload "
+                        f"({orig.numel()} bytes)"
+                    )
+                logger.debug(
+                    f"BasicEC hw debug: zero-rate orig={zero_orig}/{orig.numel()} "
+                    f"({100*zero_orig/orig.numel():.1f}%) "
+                    f"recv={zero_recv}/{recv.numel()} "
+                    f"({100*zero_recv/recv.numel():.1f}%)"
+                )
+            else:
+                logger.error(
+                    f"BasicEC hw debug: SIZE MISMATCH "
+                    f"orig={orig.numel()} vs recv={recv.numel()}"
+                )
+            # Use main_payload to continue training
+            logger.debug(
+                f"BasicEC hw debug: rank {rank} rebuilding from main_payload "
+                f"instead of RS-recovered tensor_buffer"
+            )
+            state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+                main_payload, flat_key_roots=flat_key_roots,
+            )
+        else:
+            state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+                {"tensor_buffer": tensor_buffer,
+                 "tensor_infos": tensor_infos,
+                 "non_tensor_data": main_payload.get("non_tensor_data", {})},
+                flat_key_roots=flat_key_roots,
+            )
+
+        _t['rebuild_sd'] = time.time() - t_rebuild
+        logger.debug(
+            f"BasicEC hw recovery: rank {rank} recovered via encode_ec_blocks "
+            f"(k={basic_ec_k}, n={basic_ec_n})"
+        )
+
+    else:
+        # ═══════════════════════════════════════════════════════════════
+        # UNAFFECTED rank (different group): no-op on ASIO channels
+        # ═══════════════════════════════════════════════════════════════
+        native.submit_send_sentinels(num_channels)
+        native.submit_recv_sentinels(num_channels)
+        native.wait_for_encoding_completion()
+        _t['network_encode'] = time.time() - _t0_net
+
+        t_rebuild = time.time()
+        state_dict = _reconstruct_full_state_dict_from_main_tensor_buffer(
+            main_payload, flat_key_roots=flat_key_roots,
+        )
+        _t['rebuild_sd'] = time.time() - t_rebuild
+
+    _t['barrier'] = barrier_s
+    native_timing = _native_ft_timing(native)
+    _t['net_s'] = native_timing['net_s']
+    _t.setdefault('encode_s', native_timing['encode_s'])
+    _t.setdefault('decode_s', _t.get('decode_s', _t['encode_s']))
+    _t['total'] = (
+        _t.get('network_encode', 0.0)
+        + _t.get('rebuild_sd', 0.0)
+    )
+    from megatron.training.global_vars import set_ft_load_timing_context
+    recovery_mode = "HW2" if max(len(ranks) for ranks in group_failures.values()) == 2 else "HW1"
+    set_ft_load_timing_context("BasicEC", recovery_mode, _t)
+
+    load_log = dict(_t)
+    load_log["mode"] = recovery_mode
+    logger.debug(
+        "BasicEC load timing (%(mode)s local): e2e_s=%(total).2fs "
+        "network_encode_s=%(network_encode).2fs decode_s=%(decode_s).2fs "
+        "rebuild_sd_s=%(rebuild_sd).2fs barrier_s=%(barrier).2fs",
+        load_log,
+    )
+
+    if should_time_recovery_to_forward:
+        try:
+            from megatron.training.global_vars import mark_recovery_to_forward_timer
+            mark_recovery_to_forward_timer("basic_ec_load_return")
+        except Exception:
+            pass
+
+    # NOTE: do not call manager.cleanup() or native.stop() here.
+    # The C++ destructor double-frees RDMA resources used during RS decode.
+    # The process exits shortly after load, so leaving cleanup to __del__ is safe.
+
+    return state_dict
+
+
+def save_basic_ec_legacy_checkpoint(
+    state_dict: Dict[str, Any], checkpoint_name: str, write_to_disk: bool = True
+) -> None:
+    t0 = time.time()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+    manager = BasicECManager()
+    manager.init_basic_ec_if_enabled()
+    if manager._basic_ec_native is None:
+        raise RuntimeError("BasicEC native module is not available in legacy save path")
+
+    t0 = time.time()
+    decomposed, save_copy_s, save_flatten_s, decompose_s = decompose_state_dict_for_save(state_dict)
+    total_tensor_size = decomposed.total_tensor_size_bytes
+    logger.debug(
+        "BasicEC save timing: copy %.3fs flatten %.3fs decompose %.3fs",
+        save_copy_s, save_flatten_s, decompose_s,
+    )
+
+    t0 = time.time()
+    safety_margin = max(int(total_tensor_size * 0.01), manager.basic_ec_buffer_size)
+    manager.allocate_preallocated_buffer(total_tensor_size + safety_margin)
+    tensor_buffer = manager.preallocated_cpu_buffer
+
+    total_tensor_size = assign_tensor_offsets(decomposed.tensor_infos)
+    decomposed.total_tensor_size_bytes = total_tensor_size
+    local_tensor_metadata: List[TensorMetadata] = []
+    for info in decomposed.tensor_infos:
+        local_tensor_metadata.append(
+            TensorMetadata(
+                key=info.key,
+                shape=info.shape,
+                dtype=str(info.dtype),
+                size_bytes=info.size_bytes,
+                offset=info.offset,
+                global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
+                shard_index=info.shard_index if info.shard_index is not None else 0,
+                chunk_type="data",
+                target_rank=rank,
+                source_rank=rank,
+            )
+        )
+
+    t0 = time.time()
+    rank_metadata, _ = _build_global_registry(local_tensor_metadata, {})
+    metadata_s = time.time() - t0
+
+    t0 = time.time()
+    blocks = _allocate_basic_ec_blocks(manager, rank_metadata)
+    buffer_alloc_s = time.time() - t0
+
+    if manager.use_rdma:
+        manager.register_buffer(tensor_buffer)
+
+    if world_size > 1:
+        torch.distributed.barrier()
+    e2e_t0 = time.time()
+
+    encode_t0 = time.time()
+    d2h_s = _encode_with_native(
+        manager=manager,
+        tensor_buffer=tensor_buffer,
+        actual_data_bytes=total_tensor_size,
+        basic_ec_blocks=blocks,
+        tensor_infos=decomposed.tensor_infos,
+        tensor_data=decomposed.tensor_data,
+    )
+    del decomposed.tensor_data
+    network_encode_s = time.time() - encode_t0
+    native_timing = _native_ft_timing(manager._basic_ec_native)
+    e2e_s = time.time() - e2e_t0
+    if world_size > 1:
+        torch.distributed.barrier()
+    summary = _timing_max_dict({
+        "e2e_s": e2e_s,
+        "d2h_s": d2h_s,
+        "network_encode_s": network_encode_s,
+        "net_s": native_timing["net_s"],
+        "encode_s": native_timing["encode_s"],
+    })
+    byte_summary = _timing_max_dict({
+        "send_bytes": native_timing.get("send_bytes", 0.0),
+        "recv_bytes": native_timing.get("recv_bytes", 0.0),
+        "send_tasks": native_timing.get("send_tasks", 0.0),
+        "recv_tasks": native_timing.get("recv_tasks", 0.0),
+    })
+    if rank == 0:
+        logger.info(
+            "BasicEC save timing: e2e_s=%(e2e_s).2fs d2h_s=%(d2h_s).2fs "
+            "network_encode_s=%(network_encode_s).2fs net_s=%(net_s).2fs encode_s=%(encode_s).2fs",
+            summary,
+        )
+        logger.debug(
+            "BasicEC save network bytes: send_bytes=%(send_bytes).0f recv_bytes=%(recv_bytes).0f "
+            "send_tasks=%(send_tasks).0f recv_tasks=%(recv_tasks).0f",
+            byte_summary,
+        )
+
+    if write_to_disk:
+        _save_basic_ec_pt_files(
+            checkpoint_name=checkpoint_name,
+            rank=rank,
+            non_tensor_data=decomposed.non_tensor_data,
+            tensor_infos=decomposed.tensor_infos,
+            blocks=blocks,
+            full_tensor_buffer=tensor_buffer[:total_tensor_size],
+            flat_key_roots=decomposed.flat_key_roots,
+            manager=manager,
+            all_tensor_infos=rank_metadata,  # store all ranks' metadata for HW recovery
+        )
+
+    if world_size > 1:
+        torch.distributed.barrier()

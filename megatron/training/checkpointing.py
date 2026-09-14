@@ -81,7 +81,7 @@ def _ft_legacy_timing_enabled(args) -> bool:
         for name in (
             "use_gemini_replicas",
             "use_eccheck",
-            "use_ecnaive",
+            "use_basic_ec",
             "use_concord",
         )
     )
@@ -101,8 +101,8 @@ def _inprocess_recovery_failed_ranks(args):
         return _parse_rank_list(getattr(args, "gemini_replicas_recovery_rank", None))
     if getattr(args, "use_concord", False):
         return _parse_rank_list(getattr(args, "concord_failed_ranks", None))
-    if getattr(args, "use_ecnaive", False):
-        return _parse_rank_list(getattr(args, "ecnaive_failed_ranks", None))
+    if getattr(args, "use_basic_ec", False):
+        return _parse_rank_list(getattr(args, "basic_ec_failed_ranks", None))
     if getattr(args, "use_eccheck", False):
         if not torch.distributed.is_initialized():
             return [0]
@@ -162,9 +162,9 @@ def _set_scheme_failed_ranks_for_inprocess(args, failed_ranks):
         args.concord_failed_ranks = failed_text
         args.concord_failed_ranks_parsed = list(failed_ranks)
         args.concord_recovery_only_teardown = True
-    elif getattr(args, "use_ecnaive", False):
-        args.ecnaive_failed_ranks = failed_text
-        args.ecnaive_failed_ranks_parsed = list(failed_ranks)
+    elif getattr(args, "use_basic_ec", False):
+        args.basic_ec_failed_ranks = failed_text
+        args.basic_ec_failed_ranks_parsed = list(failed_ranks)
 
 
 def _state_dict_has_model_keys_for_inprocess(state_dict):
@@ -362,7 +362,7 @@ def _format_inprocess_load_timing_summary(ft_context: dict, h2d_total_s: float) 
                 summary["h2d_s"],
             )
         )
-    if scheme == "EC-NAIVE" and getattr(args, "use_ecnaive", False):
+    if scheme == "BasicEC" and getattr(args, "use_basic_ec", False):
         summary = _timing_max_dict({
             "e2e_s": recovery_e2e_s + h2d_total_s,
             "recovery_e2e_s": recovery_e2e_s,
@@ -374,7 +374,7 @@ def _format_inprocess_load_timing_summary(ft_context: dict, h2d_total_s: float) 
             "h2d_s": h2d_total_s,
         })
         return (
-            "EC-NAIVE load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
+            "BasicEC load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
             "network_encode_s=%.2fs net_s=%.2fs encode_s=%.2fs decode_s=%.2fs "
             "rebuild_sd_s=%.2fs h2d_s=%.2fs"
             % (
@@ -448,7 +448,7 @@ def _native_legacy_inprocess_enabled(args) -> bool:
         for flag in (
             "use_concord",
             "use_eccheck",
-            "use_ecnaive",
+            "use_basic_ec",
             "use_gemini",
             "use_gemini_replicas",
         )
@@ -538,7 +538,7 @@ def run_inprocess_ft_recovery_benchmark(
             (getattr(args, "use_gemini_replicas_hardware_failure", False), "--use-gemini-replicas-hardware-failure"),
             (getattr(args, "use_concord_hardware_failure", False), "--use-concord-hardware-failure"),
             (getattr(args, "use_eccheck_two_failures", False), "--use-eccheck-two-failures"),
-            (getattr(args, "_ecnaive_require_hw2", False), "--ecnaive-require-hw2"),
+            (getattr(args, "_basic_ec_require_hw2", False), "--basic-ec-require-hw2"),
         ):
             if enabled:
                 incompatible.append(option)
@@ -549,16 +549,16 @@ def run_inprocess_ft_recovery_benchmark(
             )
         if getattr(args, "use_gemini_replicas", False):
             args.use_gemini_replicas_software_failure = True
-        elif getattr(args, "use_ecnaive", False):
-            args.use_ecnaive_software_failure = True
+        elif getattr(args, "use_basic_ec", False):
+            args.use_basic_ec_software_failure = True
         elif getattr(args, "use_eccheck", False):
             args.use_eccheck_software_failure = True
 
     failed_ranks = _inprocess_recovery_failed_ranks(args)
     if software_failure and not failed_ranks:
-        if getattr(args, "use_ecnaive", False):
-            from megatron.core.dist_checkpointing.strategies.ecnaive_manager import ECNAIVEManager
-            manager = ECNAIVEManager()
+        if getattr(args, "use_basic_ec", False):
+            from megatron.core.dist_checkpointing.strategies.basic_ec_manager import BasicECManager
+            manager = BasicECManager()
             world_size = torch.distributed.get_world_size()
             failed_ranks = [
                 candidate for candidate in range(world_size)
@@ -610,7 +610,7 @@ def run_inprocess_ft_recovery_benchmark(
             name for flag, name in (
                 ("use_gemini_replicas", "Gemini Replicas"),
                 ("use_concord", "CONCORD"),
-                ("use_ecnaive", "EC-NAIVE"),
+                ("use_basic_ec", "BasicEC"),
                 ("use_eccheck", "ECCHECK"),
             ) if getattr(args, flag, False)
         )
@@ -660,13 +660,13 @@ def run_inprocess_ft_recovery_benchmark(
                             )
 
                             concord_restore_optimizer_control_state(optimizer)
-        elif getattr(args, "use_ecnaive", False):
+        elif getattr(args, "use_basic_ec", False):
             if software_failure:
-                from .ecnaive_legacy import load_ecnaive_legacy_checkpoint
-                state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
+                from .basic_ec_legacy import load_basic_ec_legacy_checkpoint
+                state_dict = load_basic_ec_legacy_checkpoint(checkpoint_name)
             else:
-                from .ecnaive_legacy import load_ecnaive_legacy_checkpoint_hardware_recovery
-                state_dict = load_ecnaive_legacy_checkpoint_hardware_recovery(checkpoint_name, failed_ranks)
+                from .basic_ec_legacy import load_basic_ec_legacy_checkpoint_hardware_recovery
+                state_dict = load_basic_ec_legacy_checkpoint_hardware_recovery(checkpoint_name, failed_ranks)
         elif getattr(args, "use_eccheck", False):
             from .eccheck_legacy import load_eccheck_legacy_checkpoint
             state_dict = load_eccheck_legacy_checkpoint(checkpoint_name)
@@ -758,10 +758,10 @@ def run_inprocess_ft_recovery_benchmark(
                     # GPU optimizer fast loaders allocate independent CUDA state,
                     # copy recovered tensors, and synchronize. CPU-offloaded optimizers
                     # may retain optimizer-state views, so detach only that subtree from
-                    # reusable transport workspaces for EC-NAIVE, ECCheck, and Gemini.
+                    # reusable transport workspaces for BasicEC, ECCheck, and Gemini.
                     clone_optimizer_tensors=(
                         (
-                            getattr(args, "use_ecnaive", False)
+                            getattr(args, "use_basic_ec", False)
                             or getattr(args, "use_eccheck", False)
                             or getattr(args, "use_gemini_replicas", False)
                         )
@@ -775,7 +775,7 @@ def run_inprocess_ft_recovery_benchmark(
         torch.distributed.is_initialized()
         and any(
             getattr(args, scheme_flag, False)
-            for scheme_flag in ("use_gemini_replicas", "use_ecnaive", "use_eccheck")
+            for scheme_flag in ("use_gemini_replicas", "use_basic_ec", "use_eccheck")
         )
     )
     if post_h2d_barrier_required:
@@ -826,7 +826,7 @@ def maybe_preinitialize_legacy_ec_modules():
 
     schemes = [
         ('use_eccheck',          'megatron.core.dist_checkpointing.strategies.eccheck_manager',           'ECCHECKManager',         'init_eccheck_if_enabled'),
-        ('use_ecnaive',          'megatron.core.dist_checkpointing.strategies.ecnaive_manager',           'ECNAIVEManager',         'init_ecnaive_if_enabled'),
+        ('use_basic_ec',          'megatron.core.dist_checkpointing.strategies.basic_ec_manager',           'BasicECManager',         'init_basic_ec_if_enabled'),
         ('use_gemini_replicas',  'megatron.core.dist_checkpointing.strategies.gemini_replicas_manager',   'GeminiReplicasManager',  'init_gemini_replicas_if_enabled'),
     ]
 
@@ -1211,80 +1211,80 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             raise NotImplementedError(f"Please use local or global non-persistent checkpoints (got: {args.non_persistent_ckpt_type})")
 
     ckpt_format = args.ckpt_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
-    if args.use_ecnaive:
+    if args.use_basic_ec:
         if args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY:
             raise RuntimeError(
-                "EC-NAIVE stage-1 only supports torch checkpoint format. "
+                "BasicEC stage-1 only supports torch checkpoint format. "
                 "Please use --ckpt-format torch without distributed checkpoint save."
             )
-        ecnaive_k = getattr(args, "ecnaive_rs_k", 2)
-        if ecnaive_k < 2:
+        basic_ec_k = getattr(args, "basic_ec_rs_k", 2)
+        if basic_ec_k < 2:
             raise RuntimeError(
-                f"EC-NAIVE --ecnaive-rs-k must be >= 2, got {ecnaive_k}"
+                f"BasicEC --basic-ec-rs-k must be >= 2, got {basic_ec_k}"
             )
-        ecnaive_n = ecnaive_k + 2
+        basic_ec_n = basic_ec_k + 2
         if torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
-            if world_size % ecnaive_n != 0:
+            if world_size % basic_ec_n != 0:
                 raise RuntimeError(
-                    f"EC-NAIVE --ecnaive-rs-k={ecnaive_k} → group size n={ecnaive_n} must divide "
+                    f"BasicEC --basic-ec-rs-k={basic_ec_k} → group size n={basic_ec_n} must divide "
                     f"world_size={world_size}"
                 )
-        ecnaive_failed_ranks_str = getattr(args, "ecnaive_failed_ranks", None)
-        if ecnaive_failed_ranks_str is not None:
+        basic_ec_failed_ranks_str = getattr(args, "basic_ec_failed_ranks", None)
+        if basic_ec_failed_ranks_str is not None:
             if not torch.distributed.is_initialized():
                 raise RuntimeError(
-                    "EC-NAIVE --ecnaive-failed-ranks requires torch.distributed to be initialized"
+                    "BasicEC --basic-ec-failed-ranks requires torch.distributed to be initialized"
                 )
             # Parse, de-duplicate, and canonicalize before any recovery network starts.
             try:
                 failed_ranks = sorted({
-                    int(x.strip()) for x in ecnaive_failed_ranks_str.split(",") if x.strip()
+                    int(x.strip()) for x in basic_ec_failed_ranks_str.split(",") if x.strip()
                 })
             except ValueError as exc:
                 raise RuntimeError(
-                    "EC-NAIVE --ecnaive-failed-ranks must be a comma-separated integer list"
+                    "BasicEC --basic-ec-failed-ranks must be a comma-separated integer list"
                 ) from exc
             if len(failed_ranks) < 1:
                 raise RuntimeError(
-                    "EC-NAIVE --ecnaive-failed-ranks requires at least 1 rank"
+                    "BasicEC --basic-ec-failed-ranks requires at least 1 rank"
                 )
             for fr in failed_ranks:
                 if fr < 0 or fr >= world_size:
                     raise RuntimeError(
-                        f"EC-NAIVE --ecnaive-failed-ranks rank {fr} out of range [0, {world_size - 1}]"
+                        f"BasicEC --basic-ec-failed-ranks rank {fr} out of range [0, {world_size - 1}]"
                     )
             # Per-group validation: at most 2 failed ranks per group (RS 2+2 limit).
             # Node-level failures (e.g. 4 ranks per node) are supported because the
             # node-aware group layout puts each rank into a different group.
-            from megatron.core.dist_checkpointing.strategies.ecnaive_manager import ECNAIVEManager
-            mgr = ECNAIVEManager()
-            mgr.ecnaive_n = ecnaive_n
-            mgr.ecnaive_k = ecnaive_k
+            from megatron.core.dist_checkpointing.strategies.basic_ec_manager import BasicECManager
+            mgr = BasicECManager()
+            mgr.basic_ec_n = basic_ec_n
+            mgr.basic_ec_k = basic_ec_k
             from collections import Counter
             group_counts = Counter()
             for fr in failed_ranks:
                 group_counts[mgr._get_group_id(fr, world_size)] += 1
-            max_per_group = ecnaive_n - ecnaive_k  # RS(k+2,k): redundancy = 2 parity blocks
+            max_per_group = basic_ec_n - basic_ec_k  # RS(k+2,k): redundancy = 2 parity blocks
             for gid, count in group_counts.items():
                 if count > max_per_group:
                     raise RuntimeError(
-                        f"EC-NAIVE --ecnaive-failed-ranks: group {gid} has {count} failed ranks, "
-                        f"but RS({ecnaive_k}+2,{ecnaive_k}) supports at most {max_per_group} per group"
+                        f"BasicEC --basic-ec-failed-ranks: group {gid} has {count} failed ranks, "
+                        f"but RS({basic_ec_k}+2,{basic_ec_k}) supports at most {max_per_group} per group"
                     )
-            if getattr(args, "_ecnaive_require_hw2", False):
+            if getattr(args, "_basic_ec_require_hw2", False):
                 non_pairs = {gid: count for gid, count in group_counts.items() if count != 2}
                 if non_pairs or len(failed_ranks) < 2:
                     raise RuntimeError(
-                        "EC-NAIVE HW2 requires exactly two failed ranks in every targeted "
+                        "BasicEC HW2 requires exactly two failed ranks in every targeted "
                         f"group; observed {dict(group_counts)}"
                     )
             logger.info(
-                f"EC-NAIVE: {len(failed_ranks)} failed ranks across "
+                f"BasicEC: {len(failed_ranks)} failed ranks across "
                 f"{len(group_counts)} group(s): {dict(group_counts)}"
             )
             # Store parsed list back on args for downstream use
-            args.ecnaive_failed_ranks_parsed = failed_ranks
+            args.basic_ec_failed_ranks_parsed = failed_ranks
     if getattr(args, "use_concord", False) and (
         args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
     ):
@@ -1323,7 +1323,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             "Please use --ckpt-format torch without distributed checkpoint save."
         )
     ec_legacy_checkpointing = any((
-        getattr(args, "use_ecnaive", False),
+        getattr(args, "use_basic_ec", False),
         getattr(args, "use_concord", False),
         getattr(args, "use_gemini_replicas", False),
         getattr(args, "use_eccheck", False),
@@ -1477,9 +1477,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 checkpointing_context['local_checkpoint_cache'] = cacheable_metadata
             else:
                 assert ckpt_type == CheckpointType.LEGACY
-                if args.use_ecnaive:
-                    from .ecnaive_legacy import save_ecnaive_legacy_checkpoint
-                    save_ecnaive_legacy_checkpoint(state_dict, checkpoint_name, write_to_disk=ec_write_to_disk)
+                if args.use_basic_ec:
+                    from .basic_ec_legacy import save_basic_ec_legacy_checkpoint
+                    save_basic_ec_legacy_checkpoint(state_dict, checkpoint_name, write_to_disk=ec_write_to_disk)
                     checkpoint_name = str(Path(checkpoint_name).parent)
                 elif getattr(args, "use_concord", False):
                     from .concord_legacy import save_concord_legacy_checkpoint
@@ -2111,43 +2111,45 @@ def _load_base_checkpoint(
                         str(marker), MAGIC_GEMINI, pin_tensor_buffer=True,
                     )
                     state_dict = state_dict_from_gemini_replicas_main_metadata_only(payload)
-            elif args.use_ecnaive:
-                from .ecnaive_legacy import (
-                    load_ecnaive_legacy_checkpoint,
-                    load_ecnaive_legacy_checkpoint_hardware_recovery,
-                    state_dict_from_ecnaive_main_metadata_only,
+            elif args.use_basic_ec:
+                from .basic_ec_legacy import (
+                    load_basic_ec_legacy_checkpoint,
+                    load_basic_ec_legacy_checkpoint_hardware_recovery,
+                    state_dict_from_basic_ec_main_metadata_only,
                 )
-                failed_ranks_str = getattr(args, "ecnaive_failed_ranks", None)
-                failed_ranks = (getattr(args, "ecnaive_failed_ranks_parsed", None) or
+                failed_ranks_str = getattr(args, "basic_ec_failed_ranks", None)
+                failed_ranks = (getattr(args, "basic_ec_failed_ranks_parsed", None) or
                                 ([int(x.strip()) for x in failed_ranks_str.split(",")]
                                  if failed_ranks_str else None))
                 if failed_ranks is not None and torch.distributed.is_initialized():
                     if torch.distributed.get_rank() == 0:
                         logger.info(
-                            f"EC-NAIVE: hardware recovery mode — "
+                            f"BasicEC: hardware recovery mode — "
                             f"failed ranks {failed_ranks}"
                         )
-                    state_dict = load_ecnaive_legacy_checkpoint_hardware_recovery(
+                    state_dict = load_basic_ec_legacy_checkpoint_hardware_recovery(
                         checkpoint_name, failed_ranks,
                     )
                 elif torch.distributed.is_initialized():
-                    state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
+                    state_dict = load_basic_ec_legacy_checkpoint(checkpoint_name)
                 else:
                     ckpt_parent_path = Path(
                         os.path.dirname(checkpoint_name)
                         if not os.path.isdir(checkpoint_name)
                         else checkpoint_name
                     )
-                    marker = next(ckpt_parent_path.glob("ecnaive_main_rank*.pt"), None)
+                    marker = next(ckpt_parent_path.glob("basic_ec_main_rank*.pt"), None)
+                    if marker is None:
+                        marker = next(ckpt_parent_path.glob("ecnaive_main_rank*.pt"), None)
                     if marker is None:
                         raise FileNotFoundError(
-                            f"No ecnaive_main_rank*.pt found in {ckpt_parent_path}"
+                            f"No BasicEC main checkpoint found in {ckpt_parent_path}"
                         )
-                    from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECNAIVE
+                    from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_BASIC_EC
                     payload = smart_load_checkpoint(
-                        str(marker), MAGIC_ECNAIVE, pin_tensor_buffer=True,
+                        str(marker), MAGIC_BASIC_EC, pin_tensor_buffer=True,
                     )
-                    state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
+                    state_dict = state_dict_from_basic_ec_main_metadata_only(payload)
             elif getattr(args, "use_concord", False):
                 from .concord_legacy import load_concord_legacy_checkpoint
                 state_dict = load_concord_legacy_checkpoint(checkpoint_name)
@@ -2182,34 +2184,47 @@ def _load_base_checkpoint(
                     else checkpoint_name
                 )
                 ckpt_parent_path = Path(ckpt_parent)
-                ecnaive_marker = None
+                basic_ec_marker = None
                 if torch.distributed.is_initialized():
                     rank = torch.distributed.get_rank()
-                    rank_marker = ckpt_parent_path / f"ecnaive_main_rank{rank}.pt"
+                    rank_marker = ckpt_parent_path / f"basic_ec_main_rank{rank}.pt"
                     if rank_marker.is_file():
-                        ecnaive_marker = str(rank_marker)
-                if ecnaive_marker is None:
-                    rank0_marker = ckpt_parent_path / "ecnaive_main_rank0.pt"
+                        basic_ec_marker = str(rank_marker)
+                if basic_ec_marker is None:
+                    rank0_marker = ckpt_parent_path / "basic_ec_main_rank0.pt"
                     if rank0_marker.is_file():
-                        ecnaive_marker = str(rank0_marker)
-                if ecnaive_marker is None:
-                    any_markers = sorted(ckpt_parent_path.glob("ecnaive_main_rank*.pt"))
+                        basic_ec_marker = str(rank0_marker)
+                if basic_ec_marker is None:
+                    any_markers = sorted(ckpt_parent_path.glob("basic_ec_main_rank*.pt"))
                     if any_markers:
-                        ecnaive_marker = str(any_markers[0])
-                if ecnaive_marker is not None:
-                    from .ecnaive_legacy import (
-                        load_ecnaive_legacy_checkpoint,
-                        state_dict_from_ecnaive_main_metadata_only,
+                        basic_ec_marker = str(any_markers[0])
+                if basic_ec_marker is None:
+                    if torch.distributed.is_initialized():
+                        legacy_rank_marker = ckpt_parent_path / f"ecnaive_main_rank{rank}.pt"
+                        if legacy_rank_marker.is_file():
+                            basic_ec_marker = str(legacy_rank_marker)
+                if basic_ec_marker is None:
+                    legacy_rank0_marker = ckpt_parent_path / "ecnaive_main_rank0.pt"
+                    if legacy_rank0_marker.is_file():
+                        basic_ec_marker = str(legacy_rank0_marker)
+                if basic_ec_marker is None:
+                    legacy_markers = sorted(ckpt_parent_path.glob("ecnaive_main_rank*.pt"))
+                    if legacy_markers:
+                        basic_ec_marker = str(legacy_markers[0])
+                if basic_ec_marker is not None:
+                    from .basic_ec_legacy import (
+                        load_basic_ec_legacy_checkpoint,
+                        state_dict_from_basic_ec_main_metadata_only,
                     )
 
                     if torch.distributed.is_initialized():
-                        state_dict = load_ecnaive_legacy_checkpoint(checkpoint_name)
+                        state_dict = load_basic_ec_legacy_checkpoint(checkpoint_name)
                     else:
-                        from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_ECNAIVE
+                        from megatron.training.legacy_io_utils import smart_load_checkpoint, MAGIC_BASIC_EC
                         payload = smart_load_checkpoint(
-                            str(ecnaive_marker), MAGIC_ECNAIVE, pin_tensor_buffer=True,
+                            str(basic_ec_marker), MAGIC_BASIC_EC, pin_tensor_buffer=True,
                         )
-                        state_dict = state_dict_from_ecnaive_main_metadata_only(payload)
+                        state_dict = state_dict_from_basic_ec_main_metadata_only(payload)
                 else:
                     concord_marker = None
                     if torch.distributed.is_initialized():
@@ -2877,7 +2892,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             for flag in (
                 "use_concord",
                 "use_eccheck",
-                "use_ecnaive",
+                "use_basic_ec",
                 "use_gemini",
                 "use_gemini_replicas",
             )
@@ -3154,7 +3169,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                         summary["rebuild_sd_s"],
                         summary["h2d_s"],
                     )
-            elif ft_context.get("scheme") == "EC-NAIVE" and getattr(args, "use_ecnaive", False):
+            elif ft_context.get("scheme") == "BasicEC" and getattr(args, "use_basic_ec", False):
                 summary = _timing_max_dict({
                     "e2e_s": recovery_e2e_s + h2d_total_s,
                     "recovery_e2e_s": recovery_e2e_s,
@@ -3167,7 +3182,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 })
                 if rank == 0:
                     logger.info(
-                        "EC-NAIVE load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
+                        "BasicEC load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
                         "network_encode_s=%.2fs net_s=%.2fs encode_s=%.2fs decode_s=%.2fs "
                         "rebuild_sd_s=%.2fs h2d_s=%.2fs",
                         ft_context.get("mode", "unknown"),

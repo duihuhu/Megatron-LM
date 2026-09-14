@@ -44,7 +44,7 @@ inline uint64_t ntohll(uint64_t value) {
 }
 
 #ifndef ECCHECK_RANKS_PER_GROUP
-#define ECCHECK_RANKS_PER_GROUP 4  // Failed rank maps to EC group slot 0..3 (same convention as EC-NAIVE).
+#define ECCHECK_RANKS_PER_GROUP 4  // Failed rank maps to EC group slot 0..3 (same convention as BasicEC).
 #endif
 
 // RDMA includes (ibverbs)
@@ -691,7 +691,7 @@ private:
     std::atomic<uint64_t> load_encode_e2e_wall_ns_{0};
     std::atomic<bool> load_encode_e2e_wall_valid_{false};
 
-    // Load path network I/O: per-task wall time summed (similar semantics to EC-NAIVE network_recv_ms)
+    // Load path network I/O: per-task wall time summed (similar semantics to BasicEC network_recv_ms)
     std::atomic<uint64_t> load_enc_xor_send_total_ns_{0};
     std::atomic<size_t> load_enc_xor_send_task_count_{0};
     std::atomic<uint64_t> load_enc_xor_recv_total_ns_{0};
@@ -5915,7 +5915,7 @@ public:
         std::chrono::steady_clock::time_point xor_last_end{};
 
         // Publish per-load-batch e2e wall (first XOR chunk start -> last XOR chunk end).
-        // Unlike storing only at thread exit, this matches EC-NAIVE and wait_for_encoding_completion timing.
+        // Unlike storing only at thread exit, this matches BasicEC and wait_for_encoding_completion timing.
         auto publish_load_xor_e2e_for_batch = [this](bool& have_chunk,
                                                      const std::chrono::steady_clock::time_point& first_start,
                                                      const std::chrono::steady_clock::time_point& last_end) {

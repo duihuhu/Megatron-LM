@@ -42,12 +42,13 @@ _HEADER_MAGIC_LEN = 4
 
 # Magic strings for each scheme's main checkpoint file
 MAGIC_ECCHECK = b"ECCK"
-MAGIC_ECNAIVE = b"ECNV"
+MAGIC_BASIC_EC = b"ECNV"
+MAGIC_ECNAIVE = MAGIC_BASIC_EC  # Backward-compatible public alias
 MAGIC_GEMINI = b"GEMR"
 MAGIC_CONCORD = b"CONC"
 
 # Magic strings for block / replica files
-MAGIC_BLOCK = b"ECBK"  # generic block: ECCHECK / ECNAIVE
+MAGIC_BLOCK = b"ECBK"  # generic block: ECCHECK / BASIC_EC
 MAGIC_GEMINI_REPLICA = b"GMRP"
 MAGIC_CONCORD_BLOCK = b"CNBK"
 

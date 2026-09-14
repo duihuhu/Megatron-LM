@@ -53,7 +53,7 @@ COMPONENT_FILE_HEADER_SIZE = struct.calcsize(COMPONENT_FILE_HEADER_FORMAT)
 @dataclasses.dataclass
 class EccheckMappedFile:
     """Container for mmap file information used for NCCL send/recv operations.
-    
+
     Attributes:
         mmap_object: mmap object that must be kept alive for the memory to remain valid
         memory_address: starting memory address (can be used with NCCL)
@@ -64,7 +64,7 @@ class EccheckMappedFile:
     file_size: int
     local_metadata: List[TensorMetadata]
     non_tensor_data: Dict[str, Any]
-    
+
     def close(self) -> None:
         """Close the mmap object to release resources."""
         if self.mmap_object is not None:
@@ -75,7 +75,7 @@ class EccheckMappedFile:
 @dataclasses.dataclass
 class MappedCheckpointFile:
     """Container for memory-mapped checkpoint file information.
-    
+
     Attributes:
         mmap_object: mmap object that must be kept alive for the memory to remain valid
         memory_address: starting memory address
@@ -90,7 +90,7 @@ class MappedCheckpointFile:
     local_metadata: List[TensorMetadata]
     non_tensor_data: Dict[str, Any]
     tensor_infos: Optional[List[Any]] = None  # List[TensorInfo] with offset information
-    
+
     def close(self) -> None:
         """Close the mmap object to release resources."""
         if self.mmap_object is not None:
@@ -149,9 +149,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         eccheck_buffer_size: int = 64 * 1024 * 1024,
         eccheck_native: Optional[Any] = None,  # Pre-initialized C++ module
         eccheck_buffers: Optional[Dict] = None,  # Pre-allocated buffers
-        use_ecnaive: bool = False,
-        ecnaive_native: Optional[Any] = None,  # Pre-initialized C++ module
-        ecnaive_buffers: Optional[Dict] = None,  # Pre-allocated buffers
+        use_basic_ec: bool = False,
+        basic_ec_native: Optional[Any] = None,  # Pre-initialized C++ module
+        basic_ec_buffers: Optional[Dict] = None,  # Pre-allocated buffers
         use_gemini: bool = False,
         gemini_native: Optional[Any] = None,  # Pre-initialized C++ module
         use_rdma: bool = False,  # Use RDMA transport for Gemini
@@ -162,38 +162,38 @@ class FileSystemWriterAsync(FileSystemWriter):
     ):
         self.checkpoint_dir = path
         self.use_msc = use_msc
-        
+
         # Gemini Replicas configuration
         self.use_gemini_replicas = use_gemini_replicas
         self.gemini_replicas_num = gemini_replicas_num
-        
+
         # EC-CHECK configuration
         self.use_eccheck = use_eccheck
         self.eccheck_pin_memory = eccheck_pin_memory
-        
+
         # EC-CHECK encoding parameters (configurable)
         self.eccheck_k = eccheck_k  # Number of data nodes
         self.eccheck_m = eccheck_m  # Number of encoded packets per data packet
 
         self.eccheck_buffer_size = eccheck_buffer_size  # Buffer size in bytes
-        
-        # EC-NAIVE configuration
-        self.use_ecnaive = use_ecnaive
-        self.ecnaive_native = ecnaive_native
-        self.ecnaive_buffers = ecnaive_buffers
-        self.ecnaive_buffer_size = 64 * 1024 * 1024  # 64MB
-        self.ecnaive_pin_memory = True  # Can be obtained from manager if needed
-        
-        # EC-NAIVE state variables (will be set by strategy)
-        self.ecnaive_blocks = None
-        self.ecnaive_serialized_metadata = None
-        self.ecnaive_global_registry = None
+
+        # BasicEC configuration
+        self.use_basic_ec = use_basic_ec
+        self.basic_ec_native = basic_ec_native
+        self.basic_ec_buffers = basic_ec_buffers
+        self.basic_ec_buffer_size = 64 * 1024 * 1024  # 64MB
+        self.basic_ec_pin_memory = True  # Can be obtained from manager if needed
+
+        # BasicEC state variables (will be set by strategy)
+        self.basic_ec_blocks = None
+        self.basic_ec_serialized_metadata = None
+        self.basic_ec_global_registry = None
         self.ec_write_buckets = None
-        
+
         # Gemini configuration
         self.use_gemini = use_gemini
         self.use_rdma = use_rdma  # RDMA transport flag for Gemini
-        
+
         # Gemini Replicas configuration
         self.use_gemini_replicas = use_gemini_replicas
         self.gemini_replicas_num = gemini_replicas_num
@@ -210,27 +210,27 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.write_buckets: Optional[List[WriteBucket]] = None
         self.results_queue: Optional[mp.Queue] = None
         self.separation_hint = separation_hint
-        
+
         # EC-CHECK intermediate state
         self.decomposed_state_dict: Optional[DecomposedStateDict] = None
         self.tensor_buffer: Optional[torch.Tensor] = None
         self.preallocated_cpu_buffer: Optional[torch.Tensor] = None
         self.eccheck_serialized_metadata: Optional[Dict] = None
-        
+
         # EC-CHECK Phase 2 & 3 state
         self.eccheck_global_registry = None  # GlobalMetadataRegistry from all ranks
         self.eccheck_data_buffers = None  # List of data buffers
         self.eccheck_encoding_buffers = None  # List of encoding buffers
         self.eccheck_recv_encoding_buffers = None  # Tuple of two large receive buffers (thread1, thread2)
         self.eccheck_parity_buffers = None  # List of parity buffers for XOR results
-        
+
         self.eccheck_p2p_buffers = None
-        
+
         # EC-CHECK buffer poller thread (persistent, created once)
         self._buffer_poller_thread = None
         self._buffer_poller_stop_event = None
         self._buffer_poller_active_event = None  # Controls when polling is active
-        
+
         self.ecc_write_buckets = None
         # Initialize C++ native module if available
         if eccheck_native is not None:
@@ -238,14 +238,14 @@ class FileSystemWriterAsync(FileSystemWriter):
             self._eccheck_native = eccheck_native
             self._eccheck_shared = True  # Mark as shared module
             logger.info("EC-CHECK: Using pre-initialized C++ native module from strategy")
-            
+
             # Use pre-allocated buffers from strategy
             if eccheck_buffers is not None:
                 self._setup_eccheck_buffers_from_strategy(eccheck_buffers)
         else:
             self._eccheck_native = None
             self._eccheck_shared = False
-        
+
         # Gemini intermediate state
         # Note: Gemini reuses decomposed_state_dict and preallocated_cpu_buffer from EC-CHECK
         # Initialize C++ native module if available
@@ -257,11 +257,11 @@ class FileSystemWriterAsync(FileSystemWriter):
         else:
             self._gemini_native = None
             self._gemini_shared = False
-        
+
         # Gemini Replicas intermediate state
         # Note: Gemini Replicas reuses decomposed_state_dict and preallocated_cpu_buffer
         self.gemini_replicas_pin_memory = True
-        
+
         # Initialize C++ native module if available
         if gemini_replicas_native is not None:
             # Use pre-initialized C++ module from strategy
@@ -291,7 +291,7 @@ class FileSystemWriterAsync(FileSystemWriter):
 
     def _setup_eccheck_buffers_from_strategy(self, buffers):
         """Set up EC-CHECK buffers from pre-allocated strategy buffers.
-        
+
         Note: Sets up data, encoding, and parity buffers from strategy.
         Receive buffers will be allocated later after metadata exchange.
         """
@@ -301,18 +301,18 @@ class FileSystemWriterAsync(FileSystemWriter):
         self._free_data_buffer_queue = buffers['free_data_buffer_queue']
         self._free_encoding_buffer_queue = buffers['free_encoding_buffer_queue']
         self._free_parity_buffer_queue = buffers.get('free_parity_buffer_queue')
-        
+
         # Use buffer poller from strategy (already running)
         self._buffer_poller_active_event = buffers.get('buffer_poller_active_event')
         # Store the strategy's poll method with a different name to avoid conflict
         self._strategy_poll_and_release_buffers = buffers.get('poll_and_release_buffers')
-        
+
         # Mark that we're using shared buffer poller (don't start our own)
         self._buffer_poller_shared = True
-        
+
         # Receive buffers are NOT set here
         # They will be allocated after metadata exchange when peer data size is known
-        
+
         logger.info(
             f"EC-CHECK: Using pre-allocated buffers from strategy - "
             f"Data: {len(self.eccheck_data_buffers)}, "
@@ -320,35 +320,35 @@ class FileSystemWriterAsync(FileSystemWriter):
             f"Parity: {len(self.eccheck_parity_buffers) if self.eccheck_parity_buffers else 0}, "
             f"Buffer poller: {'shared from strategy' if self._buffer_poller_active_event else 'will create own'}"
         )
-    
-    def _setup_ecnaive_buffers_from_strategy(self, buffers):
-        """Set up EC-NAIVE buffers from pre-allocated strategy buffers.
-        
+
+    def _setup_basic_ec_buffers_from_strategy(self, buffers):
+        """Set up BasicEC buffers from pre-allocated strategy buffers.
+
         Note: Sets up data and parity buffers (pooled) from strategy.
         The 4 persistent blocks (data0, recv_parity1, recv_parity0, recv_data1) will be allocated
         in strategy after metadata exchange.
         """
-        self.ecnaive_data_buffers = buffers['data_buffers']
-        self.ecnaive_parity_buffers = buffers['parity_buffers']
-        self._free_ecnaive_data_buffer_queue = buffers['free_data_buffer_queue']
-        self._free_ecnaive_parity_buffer_queue = buffers['free_parity_buffer_queue']
-        
+        self.basic_ec_data_buffers = buffers['data_buffers']
+        self.basic_ec_parity_buffers = buffers['parity_buffers']
+        self._free_basic_ec_data_buffer_queue = buffers['free_data_buffer_queue']
+        self._free_basic_ec_parity_buffer_queue = buffers['free_parity_buffer_queue']
+
         # Use buffer poller from strategy (already running)
-        self._ecnaive_buffer_poller_active_event = buffers.get('buffer_poller_active_event')
+        self._basic_ec_buffer_poller_active_event = buffers.get('buffer_poller_active_event')
         # Store the strategy's poll method with a different name to avoid conflict
-        self._ecnaive_strategy_poll_and_release_buffers = buffers.get('poll_and_release_buffers')
-        
+        self._basic_ec_strategy_poll_and_release_buffers = buffers.get('poll_and_release_buffers')
+
         # Mark that we're using shared buffer poller (don't start our own)
-        self._ecnaive_buffer_poller_shared = True
-        
+        self._basic_ec_buffer_poller_shared = True
+
         # Persistent blocks are NOT set here
         # They will be allocated in strategy after metadata exchange
-        
+
         logger.info(
-            f"EC-NAIVE: Using pre-allocated buffers from strategy - "
-            f"Data: {len(self.ecnaive_data_buffers)}, "
-            f"Parity: {len(self.ecnaive_parity_buffers)}, "
-            f"Buffer poller: {'shared from strategy' if self._ecnaive_buffer_poller_active_event else 'will create own'}"
+            f"BasicEC: Using pre-allocated buffers from strategy - "
+            f"Data: {len(self.basic_ec_data_buffers)}, "
+            f"Parity: {len(self.basic_ec_parity_buffers)}, "
+            f"Buffer poller: {'shared from strategy' if self._basic_ec_buffer_poller_active_event else 'will create own'}"
         )
 
 
@@ -368,20 +368,20 @@ class FileSystemWriterAsync(FileSystemWriter):
             # by the strategy layer (torch.py). We just need to prepare write_buckets.
             self._prepare_eccheck_write_buckets(plan)
             return
-        
-        # EC-NAIVE mode: initialize buffers if provided
-        if self.use_ecnaive:
-            # Initialize EC-NAIVE buffer queues
-            if self.ecnaive_buffers:
-                self._setup_ecnaive_buffers_from_strategy(self.ecnaive_buffers)
-                
+
+        # BasicEC mode: initialize buffers if provided
+        if self.use_basic_ec:
+            # Initialize BasicEC buffer queues
+            if self.basic_ec_buffers:
+                self._setup_basic_ec_buffers_from_strategy(self.basic_ec_buffers)
+
                 # Activate buffer poller
-                if self._ecnaive_buffer_poller_active_event:
-                    self._ecnaive_buffer_poller_active_event.set()
-                    logger.info("EC-NAIVE: Buffer poller activated")
+                if self._basic_ec_buffer_poller_active_event:
+                    self._basic_ec_buffer_poller_active_event.set()
+                    logger.info("BasicEC: Buffer poller activated")
             else:
-                raise RuntimeError("EC-NAIVE: ecnaive_buffers not provided")
-        
+                raise RuntimeError("BasicEC: basic_ec_buffers not provided")
+
         storage_plan: _StoragePrefix = plan.storage_data
         start = time()
         logger.debug(f"thread_count: {self.thread_count}, time: {start}")
@@ -472,28 +472,28 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         if not self.write_buckets:
             return None, None, []
-        
+
         transform_list = [self.transforms] if hasattr(self, "transforms") else []
-        
-        # EC-NAIVE mode: use special preload function
-        # The preload function will embed EC-NAIVE data in write_buckets
-        if self.use_ecnaive:
-            # Ensure ecnaive blocks are available
-            if self.ecnaive_blocks is None:
-                logger.warning("EC-NAIVE: ecnaive_blocks not set, falling back to normal mode")
+
+        # BasicEC mode: use special preload function
+        # The preload function will embed BasicEC data in write_buckets
+        if self.use_basic_ec:
+            # Ensure basic_ec blocks are available
+            if self.basic_ec_blocks is None:
+                logger.warning("BasicEC: basic_ec_blocks not set, falling back to normal mode")
                 return (
                     partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
                     partial(self.preload_tensors, self.write_buckets, True),
                     [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
                 )
-            
-            # EC-NAIVE mode (batch mode, no layerwise)
+
+            # BasicEC mode (batch mode, no layerwise)
             return (
                 partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
-                partial(self._ecnaive_preload_tensors_to_buffer, True),
+                partial(self._basic_ec_preload_tensors_to_buffer, True),
                 [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
             )
-        
+
         # EC-CHECK mode: use special preload function
         # The preload function will embed EC-CHECK data in write_buckets
         if self.use_eccheck:
@@ -504,7 +504,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 eccheck_path = os.path.join(self.checkpoint_dir, eccheck_file)
                 self.eccheck_serialized_metadata['eccheck_file_path'] = eccheck_path
                 logger.debug(f"EC-CHECK: Set eccheck_file_path to {eccheck_path}")
-            
+
             return (
                 partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
                 partial(self._eccheck_preload_tensors_to_buffer, True),
@@ -512,7 +512,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             )
         from megatron.training import get_args
         args = get_args()
-        
+
         # Gemini Replicas optimized mode: use continuous buffer preload for multi-replica
         if hasattr(args, 'use_gemini_replicas') and args.use_gemini_replicas and \
            hasattr(args, 'use_gemini_replicas_optimized') and args.use_gemini_replicas_optimized:
@@ -522,7 +522,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 partial(self._gemini_replicas_preload_to_continuous_buffer, self.write_buckets, True),
                 [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
             )
-        
+
         # Gemini optimized mode: use continuous buffer preload to avoid serialization
         if hasattr(args, 'use_gemini') and args.use_gemini and \
            hasattr(args, 'use_gemini_optimized') and args.use_gemini_optimized:
@@ -532,7 +532,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 partial(self._gemini_preload_to_continuous_buffer, self.write_buckets, True),
                 [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
             )
-        
+
         if args.use_layer_transfer:
             return (
                 partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
@@ -571,13 +571,13 @@ class FileSystemWriterAsync(FileSystemWriter):
     def _gemini_preload_to_continuous_buffer(self, write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
         """
         Gemini optimized preload: Transfer tensors to continuous CPU buffer and exchange with peer rank.
-        
+
         This method is designed for Gemini checkpointing to eliminate torch.save serialization overhead.
         It performs the following operations in one pass:
         1. GPU→CPU: Copy tensor data to continuous CPU buffer (no serialization)
         2. Exchange: Swap buffers with paired rank
         3. Return: Both local and remote buffers in write_buckets format
-        
+
         Strategy:
         1. Calculate total size of all data in write_buckets
         2. Allocate a single continuous CPU buffer (pinned memory for faster transfer)
@@ -585,11 +585,11 @@ class FileSystemWriterAsync(FileSystemWriter):
         4. Generate lightweight metadata for reconstruction
         5. Exchange buffer and metadata with paired rank
         6. Return write_buckets containing both local and remote data
-        
+
         Args:
             write_buckets (List[WriteBucket]): Original write buckets with tensors
             non_blocking (bool): Use non-blocking GPU-to-CPU transfer
-            
+
         Returns:
             List[WriteBucket]: Two buckets - [local_bucket, remote_bucket]
                 - local_bucket: Contains local buffer and metadata for original checkpoint
@@ -597,25 +597,25 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         if not write_buckets or len(write_buckets) == 0:
             return write_buckets
-        
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         start_time = time()
-        
+
         logger.info(f"Gemini rank {rank}: Starting optimized preload using decomposed_state_dict...")
-        
+
         # Phase 1: Use decomposed_state_dict if available (prepared by strategy)
         if not hasattr(self, 'decomposed_state_dict') or self.decomposed_state_dict is None:
             logger.error(f"Gemini rank {rank}: decomposed_state_dict not available, falling back to normal mode")
             return self.preload_tensors(write_buckets, non_blocking)
-        
+
         # Get total size from decomposed_state_dict
         total_size = self.decomposed_state_dict.total_tensor_size_bytes
-        
+
         logger.info(
             f"Gemini rank {rank}: Using decomposed_state_dict with {len(self.decomposed_state_dict.tensor_infos)} tensors, "
             f"total size: {total_size / (1024**2):.2f} MB"
         )
-        
+
         # Phase 2: Allocate continuous buffer (reuse preallocated buffer if available)
         buffer_needs_registration = False
         if self.preallocated_cpu_buffer is not None:
@@ -643,7 +643,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 buffer = torch.empty(total_size, dtype=torch.uint8)
                 logger.info(f"Gemini rank {rank}: Allocated new CPU buffer")
             buffer_needs_registration = True
-        
+
         # Register buffer for RDMA if enabled (on first allocation)
         if self.use_rdma and buffer_needs_registration and self._gemini_native is not None:
             try:
@@ -655,38 +655,38 @@ class FileSystemWriterAsync(FileSystemWriter):
             except Exception as e:
                 logger.error(f"Gemini rank {rank}: Failed to register buffer for RDMA: {e}")
                 # Continue without RDMA registration
-        
+
         # Phase 3: Copy tensor data to buffer using decomposed_state_dict (EC-CHECK style)
         num_gpu_tensors = 0
-        
+
         for info, tensor in zip(
             self.decomposed_state_dict.tensor_infos,
             self.decomposed_state_dict.tensor_data
         ):
             # Get view of buffer at current offset
             buffer_view = buffer[info.offset:info.offset + info.size_bytes]
-            
+
             # Flatten and copy tensor to continuous buffer (same as EC-CHECK)
             tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
             buffer_view.copy_(tensor_flat, non_blocking=non_blocking)
-            
+
             if tensor.device.type != 'cpu':
                 num_gpu_tensors += 1
-        
+
         # Synchronize GPU operations
         if non_blocking and num_gpu_tensors > 0:
             torch.cuda.synchronize()
-        
+
         preload_time = time() - start_time
         bandwidth = (total_size / (1024**3)) / preload_time if preload_time > 0 else 0
-        
+
         logger.info(
             f"Gemini rank {rank}: Preload completed in {preload_time:.4f}s, "
             f"copied {total_size / (1024**2):.2f} MB, "
             f"bandwidth: {bandwidth:.2f} GB/s, "
             f"GPU tensors: {num_gpu_tensors}"
         )
-        
+
         # Package local metadata using decomposed_state_dict
         local_metadata = {
             'total_size': total_size,
@@ -703,11 +703,11 @@ class FileSystemWriterAsync(FileSystemWriter):
                 for info in self.decomposed_state_dict.tensor_infos
             ],
         }
-        
+
         # ===== Phase 2: Exchange buffer and metadata with paired rank =====
         from megatron.training import get_args
         args = get_args()
-        
+
         # Check if Gemini exchange is enabled
         if not (hasattr(args, 'use_gemini') and args.use_gemini):
             # No exchange needed, just return local data
@@ -720,11 +720,11 @@ class FileSystemWriterAsync(FileSystemWriter):
                 )
             )
             return [result_bucket]
-        
+
         # Perform exchange with paired rank
         logger.info(f"Gemini rank {rank}: Starting buffer exchange with paired rank...")
         exchange_start = time()
-        
+
         # Serialize metadata (small, overhead acceptable)
         import io
         metadata_buffer = io.BytesIO()
@@ -732,20 +732,20 @@ class FileSystemWriterAsync(FileSystemWriter):
         local_metadata_bytes = metadata_buffer.getvalue()
         local_metadata_size = len(local_metadata_bytes)
         local_buffer_size = buffer.numel()
-        
+
         logger.info(
             f"Gemini rank {rank}: Local buffer size: {local_buffer_size / (1024**2):.2f} MB, "
             f"metadata size: {local_metadata_size / 1024:.2f} KB"
         )
-        
+
         # Check if C++ native module is available
         if self._gemini_native is not None:
             # Use C++ ASIO-based exchange (optimized path)
             logger.info(f"Gemini rank {rank}: Using C++ ASIO-based exchange")
-            
+
             # Step 1: Exchange metadata size (buffer size already exchanged in _prepare_gemini_data)
             paired_rank = self._gemini_native.get_partner_rank()
-            
+
             # Reuse cached pair_group from _prepare_gemini_data if available (optimization)
             if hasattr(self, 'gemini_pair_group') and self.gemini_pair_group is not None:
                 pair_group = self.gemini_pair_group
@@ -754,17 +754,17 @@ class FileSystemWriterAsync(FileSystemWriter):
                 from ..strategies.async_utils import get_or_create_pair_process_group
                 pair_group = get_or_create_pair_process_group(rank, paired_rank)
                 logger.debug(f"Gemini rank {rank}: Created new pair process group (fallback)")
-            
+
             # Only exchange metadata size (buffer size was already exchanged in _prepare_gemini_data)
             size_tensor = torch.tensor([local_metadata_size], dtype=torch.long, device='cpu')
             gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(2)]
             torch.distributed.all_gather(gathered_sizes, size_tensor, group=pair_group)
-            
+
             pair_ranks = [min(rank, paired_rank), max(rank, paired_rank)]
             my_idx = pair_ranks.index(rank)
             paired_idx = 1 - my_idx
             remote_metadata_size = gathered_sizes[paired_idx][0].item()
-            
+
             # Step 2: Reuse preallocated remote buffer from _prepare_gemini_data
             if hasattr(self, 'gemini_remote_buffer') and self.gemini_remote_buffer is not None:
                 remote_buffer = self.gemini_remote_buffer[:self.gemini_remote_buffer_size]
@@ -787,27 +787,27 @@ class FileSystemWriterAsync(FileSystemWriter):
                 #     f"{remote_buffer_size / (1024**2):.2f} MB, "
                 #     f"metadata size: {remote_metadata_size / 1024:.2f} KB"
                 # )
-            
+
             # Step 3: Exchange buffers using C++ ASIO (simultaneous send/recv)
             logger.info(f"Gemini rank {rank}: Starting C++ ASIO buffer exchange...")
             asio_start = time()
-            
+
             try:
                 # Get raw memory addresses and sizes from tensors
                 send_buffer_addr = buffer.data_ptr()
                 send_buffer_size = buffer.numel()
                 recv_buffer_addr = remote_buffer.data_ptr()
                 recv_buffer_size = remote_buffer.numel()
-                
+
                 # Call C++ exchange with raw memory addresses
                 received_size = self._gemini_native.exchange_buffers(
                     send_buffer_addr, send_buffer_size,
                     recv_buffer_addr, recv_buffer_size
                 )
-                
+
                 asio_time = time() - asio_start
                 asio_bandwidth = ((send_buffer_size + received_size) / (1024**3)) / asio_time if asio_time > 0 else 0
-                
+
                 logger.info(
                     f"Gemini rank {rank}: C++ ASIO buffer exchange completed in {asio_time:.4f}s, "
                     f"sent: {send_buffer_size / (1024**2):.2f} MB, "
@@ -817,30 +817,30 @@ class FileSystemWriterAsync(FileSystemWriter):
             except Exception as e:
                 logger.error(f"Gemini rank {rank}: C++ ASIO exchange failed: {e}")
                 raise
-            
+
             # Step 4: Exchange metadata using torch.distributed (small, overhead acceptable)
             remote_metadata_tensor = torch.empty(remote_metadata_size, dtype=torch.uint8, device='cpu')
             local_metadata_tensor = torch.frombuffer(local_metadata_bytes, dtype=torch.uint8).clone()
-            
+
             lower_global_rank = pair_ranks[0]
             higher_global_rank = pair_ranks[1]
-            
+
             if rank == lower_global_rank:
                 torch.distributed.broadcast(local_metadata_tensor, src=lower_global_rank, group=pair_group)
                 torch.distributed.broadcast(remote_metadata_tensor, src=higher_global_rank, group=pair_group)
             else:
                 torch.distributed.broadcast(remote_metadata_tensor, src=lower_global_rank, group=pair_group)
                 torch.distributed.broadcast(local_metadata_tensor, src=higher_global_rank, group=pair_group)
-            
+
             # Deserialize remote metadata
             remote_metadata_bytes = remote_metadata_tensor.numpy().tobytes()
             remote_metadata_buffer = io.BytesIO(remote_metadata_bytes)
             remote_metadata = torch.load(remote_metadata_buffer)
-            
+
         else:
             # Fallback to torch.distributed broadcast (original path)
             logger.info(f"Gemini rank {rank}: Using torch.distributed broadcast (C++ module not available)")
-            
+
             # Get paired rank (EC-style: group 0<->2, 1<->3 within each 4-rank group)
             world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 4
             if world_size >= 4 and world_size % 4 == 0:
@@ -851,7 +851,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 paired_rank = group_id + num_groups * paired_rank_in_group
             else:
                 paired_rank = None
-            
+
             if paired_rank is None:
                 logger.warning(f"Gemini rank {rank}: No paired rank found, skipping exchange")
                 result_bucket = (
@@ -863,7 +863,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     )
                 )
                 return [result_bucket]
-            
+
             # Reuse cached pair_group from _prepare_gemini_data if available (optimization)
             if hasattr(self, 'gemini_pair_group') and self.gemini_pair_group is not None:
                 pair_group = self.gemini_pair_group
@@ -872,18 +872,18 @@ class FileSystemWriterAsync(FileSystemWriter):
                 from ..strategies.async_utils import get_or_create_pair_process_group
                 pair_group = get_or_create_pair_process_group(rank, paired_rank)
                 logger.debug(f"Gemini rank {rank}: Created new pair process group (fallback)")
-            
+
             # Only exchange metadata size (buffer size was already exchanged in _prepare_gemini_data)
             size_tensor = torch.tensor([local_metadata_size], dtype=torch.long, device='cpu')
             gathered_sizes = [torch.zeros_like(size_tensor) for _ in range(2)]
             torch.distributed.all_gather(gathered_sizes, size_tensor, group=pair_group)
-            
+
             # Get remote sizes
             pair_ranks = [min(rank, paired_rank), max(rank, paired_rank)]
             my_idx = pair_ranks.index(rank)
             paired_idx = 1 - my_idx
             remote_metadata_size = gathered_sizes[paired_idx][0].item()
-            
+
             # Reuse preallocated remote buffer from _prepare_gemini_data
             if hasattr(self, 'gemini_remote_buffer') and self.gemini_remote_buffer is not None:
                 remote_buffer = self.gemini_remote_buffer[:self.gemini_remote_buffer_size]
@@ -906,17 +906,17 @@ class FileSystemWriterAsync(FileSystemWriter):
                 #     f"local={local_buffer_size / (1024**2):.2f} MB, "
                 #     f"remote={remote_buffer_size / (1024**2):.2f} MB"
                 # )
-            
+
             # Allocate remote metadata tensor (small, acceptable overhead)
             remote_metadata_tensor = torch.empty(remote_metadata_size, dtype=torch.uint8, device='cpu')
-            
+
             # Convert local metadata to tensor
             local_metadata_tensor = torch.frombuffer(local_metadata_bytes, dtype=torch.uint8).clone()
-            
+
             # Determine broadcast order
             lower_global_rank = pair_ranks[0]
             higher_global_rank = pair_ranks[1]
-            
+
             # Exchange buffers
             if rank == lower_global_rank:
                 torch.distributed.broadcast(buffer, src=lower_global_rank, group=pair_group)
@@ -928,26 +928,26 @@ class FileSystemWriterAsync(FileSystemWriter):
                 torch.distributed.broadcast(buffer, src=higher_global_rank, group=pair_group)
                 torch.distributed.broadcast(remote_metadata_tensor, src=lower_global_rank, group=pair_group)
                 torch.distributed.broadcast(local_metadata_tensor, src=higher_global_rank, group=pair_group)
-            
+
             # Deserialize remote metadata
             remote_metadata_bytes = remote_metadata_tensor.numpy().tobytes()
             remote_metadata_buffer = io.BytesIO(remote_metadata_bytes)
             remote_metadata = torch.load(remote_metadata_buffer)
-        
+
         exchange_time = time() - exchange_start
         exchange_bandwidth = ((local_buffer_size + remote_buffer_size) / (1024**3)) / exchange_time if exchange_time > 0 else 0
-        
+
         logger.info(
             f"Gemini rank {rank}: Exchange completed in {exchange_time:.4f}s, "
             f"bandwidth: {exchange_bandwidth:.2f} GB/s"
         )
-        
+
         total_time = time() - start_time
         logger.info(
             f"Gemini rank {rank}: Total time: {total_time:.4f}s "
             f"(preload: {preload_time:.4f}s, exchange: {exchange_time:.4f}s)"
         )
-        
+
         # Return two buckets: local (for original checkpoint) and remote (for replica checkpoint)
         local_bucket = (
             write_buckets[0][0] if write_buckets else 'gemini_optimized.distcp',
@@ -957,7 +957,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 []
             )
         )
-        
+
         remote_bucket = (
             write_buckets[0][0] if write_buckets else 'gemini_optimized_replica.distcp',
             'gemini_optimized_remote',
@@ -966,48 +966,48 @@ class FileSystemWriterAsync(FileSystemWriter):
                 []
             )
         )
-        
+
         return [local_bucket, remote_bucket]
 
     def _gemini_replicas_preload_to_continuous_buffer(self, write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
         """
         Gemini Replicas optimized preload: Transfer tensors to continuous CPU buffer and broadcast to multiple replicas.
-        
+
         This method extends Gemini's approach to support multiple replicas (default: 3) with round-robin placement.
         It performs the following operations:
         1. GPU→CPU: Copy tensor data to continuous CPU buffer (no serialization)
         2. Broadcast: Send buffer to (num_replicas - 1) target ranks simultaneously
         3. Return: Multiple buckets for local and remote replicas
-        
+
         Args:
             write_buckets (List[WriteBucket]): Original write buckets with tensors
             non_blocking (bool): Use non-blocking GPU-to-CPU transfer
-            
+
         Returns:
             List[WriteBucket]: Multiple buckets - [local_bucket, replica_bucket_1, replica_bucket_2, ...]
         """
         if not write_buckets or len(write_buckets) == 0:
             return write_buckets
-        
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         start_time = time()
-        
+
         logger.info(f"Gemini Replicas rank {rank}: Starting optimized preload with {self.gemini_replicas_num} replicas...")
-        
+
         # Phase 1: Use decomposed_state_dict (prepared by strategy)
         if not hasattr(self, 'decomposed_state_dict') or self.decomposed_state_dict is None:
             logger.error(f"Gemini Replicas rank {rank}: decomposed_state_dict not available")
             return self.preload_tensors(write_buckets, non_blocking)
-        
+
         # Get total size from decomposed_state_dict
         total_size = self.decomposed_state_dict.total_tensor_size_bytes
-        
+
         logger.info(
             f"Gemini Replicas rank {rank}: Using decomposed_state_dict with {len(self.decomposed_state_dict.tensor_infos)} tensors, "
             f"total size: {total_size / (1024**2):.2f} MB"
         )
-        
+
         # Phase 2: Allocate continuous buffer (reuse preallocated buffer if available)
         buffer_needs_registration = False
         if self.preallocated_cpu_buffer is not None:
@@ -1035,7 +1035,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 buffer = torch.empty(total_size, dtype=torch.uint8)
                 logger.info(f"Gemini Replicas rank {rank}: Allocated new CPU buffer")
             buffer_needs_registration = True
-        
+
         # Register buffer for RDMA if enabled (on first allocation)
         if self.use_rdma and buffer_needs_registration and self._gemini_replicas_native is not None:
             try:
@@ -1050,10 +1050,10 @@ class FileSystemWriterAsync(FileSystemWriter):
             except Exception as e:
                 logger.error(f"Gemini Replicas rank {rank}: Failed to register send buffer for RDMA: {e}")
                 # Continue without RDMA registration
-        
+
         # Phase 3: Copy tensor data to buffer
         num_gpu_tensors = 0
-        
+
         for info, tensor in zip(
             self.decomposed_state_dict.tensor_infos,
             self.decomposed_state_dict.tensor_data
@@ -1061,22 +1061,22 @@ class FileSystemWriterAsync(FileSystemWriter):
             buffer_view = buffer[info.offset:info.offset + info.size_bytes]
             tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
             buffer_view.copy_(tensor_flat, non_blocking=non_blocking)
-            
+
             if tensor.device.type != 'cpu':
                 num_gpu_tensors += 1
-        
+
         if non_blocking and num_gpu_tensors > 0:
             torch.cuda.synchronize()
-        
+
         preload_time = time() - start_time
         bandwidth = (total_size / (1024**3)) / preload_time if preload_time > 0 else 0
-        
+
         logger.info(
             f"Gemini Replicas rank {rank}: Preload completed in {preload_time:.4f}s, "
             f"copied {total_size / (1024**2):.2f} MB, "
             f"bandwidth: {bandwidth:.2f} GB/s"
         )
-        
+
         # Package local metadata
         local_metadata = {
             'total_size': total_size,
@@ -1093,11 +1093,11 @@ class FileSystemWriterAsync(FileSystemWriter):
                 for info in self.decomposed_state_dict.tensor_infos
             ],
         }
-        
+
         # ===== Phase 2: Broadcast buffer to replica ranks =====
         from megatron.training import get_args
         args = get_args()
-        
+
         # Check if Gemini Replicas broadcast is enabled
         if not (hasattr(args, 'use_gemini_replicas') and args.use_gemini_replicas):
             # No broadcast needed, just return local data
@@ -1110,15 +1110,15 @@ class FileSystemWriterAsync(FileSystemWriter):
                 )
             )
             return [result_bucket]
-        
+
         # Perform broadcast to replica ranks
         logger.info(f"Gemini Replicas rank {rank}: Starting buffer broadcast to {self.gemini_replicas_num - 1} replicas...")
         broadcast_start = time()
-        
+
         # Initialize variables for received data (will be populated if C++ module is used)
         receive_buffers = []
         source_ranks = []
-        
+
         # Serialize metadata
         import io
         metadata_buffer = io.BytesIO()
@@ -1126,27 +1126,27 @@ class FileSystemWriterAsync(FileSystemWriter):
         local_metadata_bytes = metadata_buffer.getvalue()
         local_metadata_size = len(local_metadata_bytes)
         local_buffer_size = buffer.numel()
-        
+
         logger.info(
             f"Gemini Replicas rank {rank}: Local buffer size: {local_buffer_size / (1024**2):.2f} MB, "
             f"metadata size: {local_metadata_size / 1024:.2f} KB"
         )
-        
+
         # Check if C++ native module is available
         if self._gemini_replicas_native is not None:
             # Use C++ ASIO-based broadcast (optimized path)
             logger.info(f"Gemini Replicas rank {rank}: Using C++ ASIO-based broadcast with metadata exchange")
-            
-            try:                
+
+            try:
                 # Get raw memory address and size from buffer
                 send_buffer_addr = buffer.data_ptr()
                 send_buffer_size = buffer.numel()
-                
+
                 # ===== Step 1: Exchange metadata (buffer sizes) via torch.distributed =====
                 from .gemini_replicas_manager import GeminiReplicasManager
                 manager = GeminiReplicasManager()
                 world_size = torch.distributed.get_world_size()
-                
+
                 # Calculate source ranks (ranks that have this rank as target)
                 source_ranks = []
                 for src_rank in range(world_size):
@@ -1155,7 +1155,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     src_targets = manager._calculate_target_ranks(src_rank, world_size)
                     if rank in src_targets:
                         source_ranks.append(src_rank)
-                
+
                 logger.info(f"Gemini Replicas rank {rank}: Will receive from {len(source_ranks)} source ranks: {source_ranks}")
 
                 # ===== Step 1: Get buffer sizes from global registry (aligned with EC schemes) =====
@@ -1172,10 +1172,10 @@ class FileSystemWriterAsync(FileSystemWriter):
                 logger.info(f"Gemini Replicas rank {rank}: Preparing receive buffers...")
                 receive_buffers = []
                 receive_buffer_addrs = []
-                
+
                 for src_rank in source_ranks:
                     src_buffer_size = rank_sizes[src_rank]
-                    
+
                     # Try to reuse preallocated remote buffer from strategy (similar to Gemini)
                     if hasattr(self, 'gemini_replicas_remote_buffers') and \
                        src_rank in self.gemini_replicas_remote_buffers and \
@@ -1196,12 +1196,12 @@ class FileSystemWriterAsync(FileSystemWriter):
                             f"allocating now"
                         )
                         recv_buffer = torch.empty(src_buffer_size, dtype=torch.uint8, device='cpu')
-                        
+
                         logger.info(
                             f"Gemini Replicas rank {rank}: Allocated {src_buffer_size / (1024**2):.2f} MB "
                             f"receive buffer for source rank {src_rank} (regular CPU memory)"
                         )
-                        
+
                         # Register buffer for RDMA if enabled (only for newly allocated buffers)
                         if self.use_rdma and self._gemini_replicas_native is not None:
                             try:
@@ -1216,20 +1216,20 @@ class FileSystemWriterAsync(FileSystemWriter):
                             except Exception as e:
                                 logger.warning(f"Gemini Replicas rank {rank}: Failed to register receive buffer for RDMA: {e}")
                                 # Continue without RDMA registration
-                        
+
                         # Register receive buffer for RDMA if needed (only for dynamically allocated)
                         if manager.use_rdma:
                             logger.info(f"Gemini Replicas rank {rank}: Registering receive buffer for source {src_rank} (RDMA)...")
                             manager.register_buffer(recv_buffer)
                             logger.info(f"Gemini Replicas rank {rank}: Receive buffer for source {src_rank} registered for RDMA")
-                    
+
                     receive_buffers.append(recv_buffer)
                     receive_buffer_addrs.append((recv_buffer.data_ptr(), recv_buffer.numel()))
-                
+
                 # ===== Step 3: Synchronize all ranks before starting C++ data transfer =====
                 logger.info(f"Gemini Replicas rank {rank}: Synchronizing before C++ data transfer...")
                 torch.distributed.barrier()
-                
+
                 # ===== Step 4: Submit buffers to C++ and let it handle concurrent send/receive =====
                 logger.info(f"Gemini Replicas rank {rank}: Submitting buffers to C++ for send/receive...")
 
@@ -1253,48 +1253,48 @@ class FileSystemWriterAsync(FileSystemWriter):
                 exchange_start = time()
 
                 self._gemini_replicas_native.wait_for_exchange_completion()
-                
+
                 exchange_time = time() - exchange_start
-                
+
                 logger.info(
                     f"Gemini Replicas rank {rank}: C++ send/receive completed in {exchange_time:.2f}s "
                     f"(sent {send_buffer_size / (1024**2):.2f} MB, received from {len(source_ranks)} sources)"
                 )
-                
+
                 broadcast_time = time() - broadcast_start
                 broadcast_bandwidth = ((send_buffer_size * (self.gemini_replicas_num - 1)) / (1024**3)) / broadcast_time if broadcast_time > 0 else 0
-                
+
                 logger.info(
                     f"Gemini Replicas rank {rank}: C++ broadcast completed in {broadcast_time:.4f}s, "
                     f"sent: {send_buffer_size / (1024**2):.2f} MB to {self.gemini_replicas_num - 1} ranks, "
                     f"received: {len(receive_buffers)} buffers, "
                     f"total bandwidth: {broadcast_bandwidth:.2f} GB/s"
                 )
-                
+
                 # ===== Step 5: Synchronize all ranks after completing data transfer =====
                 logger.info(f"Gemini Replicas rank {rank}: Synchronizing after C++ data transfer...")
                 sync_time = time() - exchange_start
                 logger.info(f"Gemini Replicas rank {rank}: Synchronization completed in {sync_time:.4f}s")
-                
+
             except Exception as e:
                 logger.error(f"Gemini Replicas rank {rank}: C++ ASIO broadcast failed: {e}")
                 import traceback
                 traceback.print_exc()
                 raise
-            
+
         else:
             # Fallback: not implemented (would need torch.distributed broadcast)
             logger.warning(f"Gemini Replicas rank {rank}: C++ module not available, skipping broadcast")
-        
+
         total_time = time() - start_time
         logger.info(
             f"Gemini Replicas rank {rank}: Total time: {total_time:.4f}s "
             f"(preload: {preload_time:.4f}s, broadcast: {broadcast_time:.4f}s)"
         )
-        
+
         # Prepare write buckets: local bucket + replica buckets (for received data)
         result_buckets = []
-        
+
         # Local bucket (my own data)
         local_file_path = write_buckets[0][0] if write_buckets else 'gemini_replicas_optimized.distcp'
         local_bucket = (
@@ -1306,19 +1306,19 @@ class FileSystemWriterAsync(FileSystemWriter):
             )
         )
         result_buckets.append(local_bucket)
-        
+
         # Replica buckets (received data from source ranks) - similar to gemini naming
         # File naming: original_file_replica{source_rank}_rank{my_rank}.distcp
         if self._gemini_replicas_native is not None and len(receive_buffers) > 0:
             import os
-            
+
             # Extract directory and base filename
             file_dir = os.path.dirname(str(local_file_path))
             base_name = os.path.basename(str(local_file_path))
             base_name_no_ext, ext = os.path.splitext(base_name)
-            
+
             # Create metadata for each received buffer
-            # Note: We don't have the original metadata from source ranks, 
+            # Note: We don't have the original metadata from source ranks,
             # so we create a simple metadata structure
             for i, (src_rank, recv_buffer) in enumerate(zip(source_ranks, receive_buffers)):
                 # Generate replica file name: base_name_replica{src_rank}_rank{my_rank}.ext
@@ -1327,14 +1327,14 @@ class FileSystemWriterAsync(FileSystemWriter):
                     replica_file_path = os.path.join(file_dir, replica_file_name)
                 else:
                     replica_file_path = replica_file_name
-                
+
                 # Create simple metadata for replica
                 replica_metadata = {
                     'source_rank': src_rank,
                     'target_rank': rank,
                     'buffer_size': recv_buffer.numel(),
                 }
-                
+
                 # Create replica bucket with received data
                 replica_bucket = (
                     replica_file_path,
@@ -1345,43 +1345,43 @@ class FileSystemWriterAsync(FileSystemWriter):
                     )
                 )
                 result_buckets.append(replica_bucket)
-                
+
                 logger.info(
                     f"Gemini Replicas rank {rank}: Prepared replica bucket {i+1}/{len(receive_buffers)} "
                     f"from source rank {src_rank}, file: {replica_file_path}, "
                     f"size: {recv_buffer.numel() / (1024**2):.2f} MB"
                 )
-        
+
         logger.info(
             f"Gemini Replicas rank {rank}: Returning {len(result_buckets)} buckets "
             f"(1 local + {len(result_buckets) - 1} replicas)"
         )
-        
+
         # Update self.write_buckets so retrieve_write_results() can check the correct count
         # Keep the bucket count consistent with encoded checkpoint modes
         self.write_buckets = result_buckets
-        
+
         return result_buckets
 
     @staticmethod
     def _extract_layer_groups(write_buckets: List[WriteBucket]) -> Dict[str, List[Tuple[int, int, Any, torch.Tensor]]]:
         """
         Extract and group tensors by layer from write_buckets.
-        
+
         Args:
             write_buckets: List of WriteBucket objects containing tensor data
-            
+
         Returns:
-            Dictionary mapping layer_key (e.g., "layer_0", "layer_1", "non_layer") 
+            Dictionary mapping layer_key (e.g., "layer_0", "layer_1", "non_layer")
             to list of (bucket_idx, tensor_idx, item, tensor) tuples
         """
         layer_groups = {}
-        
+
         # Helper function to extract layer number from FQN
         def extract_layer_number(fqn: str) -> int:
             """Extract layer number from FQN like 'decoder.layers.0.weight' -> 0
             Returns -1 for non-layer tensors (embeddings, output layers, etc.)
-            
+
             Supports patterns:
             - decoder.layers.N.
             - encoder.layers.N.
@@ -1408,15 +1408,15 @@ class FileSystemWriterAsync(FileSystemWriter):
                 if match:
                     return int(match.group(1))
             return -1  # Non-layer tensor
-        
+
         # Strategy: Since FQN doesn't contain layer number (e.g., "decoder.layers.xxx"),
         # we need to infer layer number from tensor order and FQN patterns.
         # For ShardedTensors, same FQN appears multiple times for different layers.
         fqn_to_occurrences = {}  # Track how many times each FQN appears (indicates number of layers)
-        
+
         for bucket_idx, bucket in enumerate(write_buckets):
             file_name, storage_key, (bytes_data, tensor_data) = bucket
-            
+
             # First pass: count occurrences of each FQN pattern
             for tensor_idx, (item, tensor) in enumerate(tensor_data):
                 if hasattr(item, 'index') and hasattr(item.index, 'fqn'):
@@ -1431,36 +1431,36 @@ class FileSystemWriterAsync(FileSystemWriter):
                         base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
                     # If FQN contains .layers. but no number (like decoder.layers.xxx), use as-is
                     # This is already the base pattern
-                    
+
                     fqn_to_occurrences[base_fqn] = fqn_to_occurrences.get(base_fqn, 0) + 1
-        
+
         # Determine if this is a layer-based FQN pattern
         # If same FQN appears multiple times (e.g., 12 times for 12 layers), it's a layer tensor
         layer_fqn_patterns = set()
         for fqn, count in fqn_to_occurrences.items():
             if count > 1 and ('layers.' in fqn or 'layer.' in fqn):
                 layer_fqn_patterns.add(fqn)
-        
+
         logger.info(f"Found {len(layer_fqn_patterns)} layer FQN patterns (appearing multiple times)")
         if layer_fqn_patterns and logger.isEnabledFor(logging.DEBUG):
             for pattern in sorted(list(layer_fqn_patterns))[:5]:
                 logger.debug(f"  Layer pattern: {pattern} (appears {fqn_to_occurrences[pattern]} times)")
-        
+
         # Second pass: assign layer numbers based on FQN pattern and occurrence order
         fqn_to_layer_counter = {}  # Track current layer number for each FQN pattern
-        
+
         for bucket_idx, bucket in enumerate(write_buckets):
             file_name, storage_key, (bytes_data, tensor_data) = bucket
-            
+
             # Process each tensor in this bucket
             for tensor_idx, (item, tensor) in enumerate(tensor_data):
                 # Extract layer number from FQN or infer from pattern
                 if hasattr(item, 'index') and hasattr(item.index, 'fqn'):
                     fqn = item.index.fqn
-                    
+
                     # Try direct extraction first
                     layer_num = extract_layer_number(fqn)
-                    
+
                     # If not found, try to infer from FQN pattern
                     if layer_num == -1:
                         import re
@@ -1471,7 +1471,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                         elif re.search(r'^layers\.\d+\.', fqn):
                             base_fqn = re.sub(r'^layers\.\d+\.', 'layers.', fqn)
                         # If FQN contains .layers. but no number, use as-is
-                        
+
                         # If this is a layer pattern (appears multiple times), assign layer number based on occurrence
                         if base_fqn in layer_fqn_patterns:
                             if base_fqn not in fqn_to_layer_counter:
@@ -1481,54 +1481,54 @@ class FileSystemWriterAsync(FileSystemWriter):
                 else:
                     # Fallback if no FQN available
                     layer_num = -1
-                
+
                 # Use layer number as key, group non-layer tensors together
                 layer_key = f"layer_{layer_num}" if layer_num >= 0 else "non_layer"
-                
+
                 if layer_key not in layer_groups:
                     layer_groups[layer_key] = []
-                
+
                 # Store (bucket_idx, tensor_idx, item, tensor) for this layer
                 layer_groups[layer_key].append((bucket_idx, tensor_idx, item, tensor))
-        
+
         total_tensors = sum(len(tensors) for tensors in layer_groups.values())
         logger.info(f"Organized {total_tensors} tensors into {len(layer_groups)} layer groups")
-        
+
         # Log layer distribution for debugging
         if logger.isEnabledFor(logging.DEBUG):
             for layer_key, tensors in sorted(layer_groups.items()):
                 logger.debug(f"  {layer_key}: {len(tensors)} tensors")
-        
+
         return layer_groups
 
     @staticmethod
     def preload_tensors_layerwise_cpp(write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
         """
         Preloads tensors layer-by-layer using C++ thread for coordination.
-        
+
         This function organizes model parameters by layer and coordinates their transfer
         from GPU to CPU using a dedicated C++ worker thread. The actual transfer can be
         done either by PyTorch (default) or by CUDA in C++ (if compiled with USE_CUDA).
-        
+
         Transfer Modes:
             1. PyTorch mode (default, no CUDA needed in C++):
                - Python: Allocates CPU buffers and initiates async GPU->CPU copy via PyTorch
                - C++ thread: Ensures layers complete sequentially
                - Best for: Easy compilation, works everywhere
-            
+
             2. CUDA mode (requires C++ compiled with USE_CUDA):
                - Python: Only allocates CPU buffers and passes pointers
                - C++ thread: Performs actual cudaMemcpy for each layer
                - Best for: Direct control, potentially lower overhead
-        
+
         Args:
             write_buckets (List): List of `WriteBucket` objects that define what to
                 save in a checkpoint.
             non_blocking (bool, optional): knob to enable pinned D2H memcpy. Default is True.
-        
+
         Returns:
             List[WriteBucket]: Same structure as input but with tensors moved to CPU.
-        
+
         Implementation Flow:
             1. Group write_buckets by layer (using file_name)
             2. For each layer:
@@ -1544,14 +1544,14 @@ class FileSystemWriterAsync(FileSystemWriter):
         try:
             # Direct import .so file without modifying sys.path or affecting other packages
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            
+
             # Find .so file
             import glob as _glob_module
             so_files = _glob_module.glob(os.path.join(current_dir, "layer_transfer_cpp*.so"))
-            
+
             if not so_files:
                 raise ImportError(f"No layer_transfer_cpp.so file found in {current_dir}")
-            
+
             # Load .so file directly using importlib
             import importlib.util as _importlib_util
             so_path = so_files[0]
@@ -1559,67 +1559,67 @@ class FileSystemWriterAsync(FileSystemWriter):
             layer_transfer_cpp = _importlib_util.module_from_spec(spec)
             spec.loader.exec_module(layer_transfer_cpp)
             logger.debug(f"Loaded layer_transfer_cpp from {so_path}")
-            
+
         except Exception as e:
             logger.warning(
                 f"layer_transfer_cpp module not found: {e}. Falling back to standard preload_tensors. "
                 "To build the C++ module, run: bash build_layer_transfer.sh"
             )
             return FileSystemWriterAsync.preload_tensors(write_buckets, non_blocking)
-        
+
         logger.info("Starting layer-wise tensor preloading using C++ thread")
         start_time = time()
-        
+
         # Initialize the C++ processor
         processor = layer_transfer_cpp.LayerTransferProcessor()
-        
+
         # Check if C++ module was compiled with CUDA support
         # If USE_CUDA is defined in C++, it will handle the actual GPU->CPU transfer
         # Otherwise, PyTorch handles the transfer and C++ only coordinates
         use_cuda_in_cpp = hasattr(layer_transfer_cpp, 'USE_CUDA') and layer_transfer_cpp.USE_CUDA
-        
+
         if use_cuda_in_cpp:
             logger.info("Using C++ CUDA mode: C++ thread performs GPU->CPU transfer")
         else:
             logger.info("Using PyTorch mode: PyTorch performs GPU->CPU transfer, C++ coordinates")
-        
+
         # Organize tensors by layer for layer-wise transfer
         # Extract layer numbers from tensor FQNs (Fully Qualified Names)
         layer_groups = FileSystemWriterAsync._extract_layer_groups(write_buckets)
-        
+
         # Map to store CPU tensors by (bucket_idx, tensor_idx)
         cpu_tensor_map = {}
-        
+
         # Process each layer group - prepare tensors and submit to C++ thread
         # Sort layer groups by layer number for sequential processing
         sorted_layer_groups = sorted(
             layer_groups.items(),
             key=lambda x: int(x[0].split('_')[1]) if x[0] != "non_layer" else -1
         )
-        
+
         for layer_id, (layer_key, tensor_list) in enumerate(sorted_layer_groups):
             layer_start_time = time()
-            
+
             # Collect all tensors for this layer
             layer_tensors_info = []
-            
+
             for bucket_idx, tensor_idx, item, tensor in tensor_list:
                 if tensor.is_cuda:
                     # Allocate CPU buffer (pinned memory for faster transfer)
                     cpu_tensor = torch.empty_like(tensor, device='cpu', pin_memory=True)
-                    
+
                     if not use_cuda_in_cpp:
                         # PyTorch mode: Initiate async transfer now
                         # The C++ thread will just ensure layer-by-layer completion
                         cpu_tensor.copy_(tensor, non_blocking=True)
                     # else: CUDA mode - C++ will do the actual transfer
-                    
+
                     # Store CPU tensor for later result construction using index
                     cpu_tensor_map[(bucket_idx, tensor_idx)] = cpu_tensor
-                    
+
                     # Get FQN for logging
                     fqn = item.index.fqn if hasattr(item, 'index') and hasattr(item.index, 'fqn') else str(item)
-                    
+
                     # Prepare info for C++ thread
                     tensor_info = (
                         tensor.data_ptr(),           # GPU pointer (source)
@@ -1632,35 +1632,35 @@ class FileSystemWriterAsync(FileSystemWriter):
                 else:
                     # Already on CPU, store directly using index
                     cpu_tensor_map[(bucket_idx, tensor_idx)] = tensor
-            
+
             # Submit this layer to C++ processor for GPU->CPU transfer
             if layer_tensors_info:
                 processor.submit_layer(layer_id, layer_tensors_info)
                 total_bytes = sum(info[2] for info in layer_tensors_info)
                 logger.info(f"Layer {layer_id} ({layer_key}): submitted {len(layer_tensors_info)} tensors ({total_bytes/(1024**2):.2f} MB) for transfer")
-                
+
                 # Log each tensor's name and size in this layer
                 for tensor_info in layer_tensors_info:
                     tensor_name = tensor_info[4]  # FQN is the 5th element (index 4)
                     tensor_size_bytes = tensor_info[2]  # Size is the 3rd element (index 2)
                     tensor_shape = tensor_info[3]  # Shape is the 4th element (index 3)
                     logger.info(f"  Tensor: {tensor_name}, Size: {tensor_size_bytes/(1024**2):.2f} MB, Shape: {tensor_shape}")
-        
+
         # Wait for C++ thread to finish processing all layers
         logger.info("Waiting for C++ thread to complete all layer transfers...")
         processor.wait_all_complete()
-        
+
         # Synchronize CUDA to ensure all transfers are complete
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        
+
         # Get statistics
         stats = processor.get_stats()
         cpp_results = processor.get_results()
-        
+
         # Clean up processor
         processor.stop()
-        
+
         # Log detailed results
         for layer_result in cpp_results:
             layer_id, success, transfer_time, total_bytes, error_msg = layer_result
@@ -1668,27 +1668,27 @@ class FileSystemWriterAsync(FileSystemWriter):
                 logger.debug(f"Layer {layer_id}: transferred {total_bytes/1e6:.2f} MB in {transfer_time:.4f}s")
             else:
                 logger.warning(f"Layer {layer_id} transfer failed: {error_msg}")
-        
+
         # Now construct the result buckets with CPU tensors
         result = []
         for bucket_idx, bucket in enumerate(write_buckets):
             file_name, storage_key, (bytes_data, tensor_data) = bucket
-            
+
             # Build tensor_data with CPU tensors
             cpu_tensor_data = []
             for tensor_idx, (item, original_tensor) in enumerate(tensor_data):
                 # Get the CPU tensor from our map using index
                 cpu_tensor = cpu_tensor_map.get((bucket_idx, tensor_idx), original_tensor)
                 cpu_tensor_data.append((item, cpu_tensor))
-            
+
             result.append((file_name, storage_key, (bytes_data, cpu_tensor_data)))
-        
+
         total_time = time() - start_time
         logger.info(
             f"Layer-wise tensor preloading completed: "
             f"{stats['tasks_completed']} layers, {len(write_buckets)} buckets in {total_time:.4f}s"
         )
-        
+
         return result
 
     @staticmethod
@@ -1800,7 +1800,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         w_end = time()
         logger.debug(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
         print(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
-    
+
     @staticmethod
     @_disable_gc()
     def write_preloaded_data(
@@ -1834,7 +1834,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         local_results = []
         try:
             file_name, storage_key, (bytes_data, tensor_data) = write_bucket
-            
+
             # Check if this is EC-CHECK mode by detecting special markers in bytes_data
             eccheck_metadata = None
             eccheck_continuous_buffer = None
@@ -1846,7 +1846,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                         eccheck_metadata = value
                     elif key == 'eccheck_continuous_buffer':
                         eccheck_continuous_buffer = value
-            
+
             # Check if this is Gemini Replicas mode by detecting special markers in bytes_data
             gemini_replicas_metadata = None
             gemini_replicas_buffer = None
@@ -1858,54 +1858,54 @@ class FileSystemWriterAsync(FileSystemWriter):
                         gemini_replicas_metadata = value
                     elif key == 'gemini_replicas_buffer':
                         gemini_replicas_buffer = value
-            
-            # Check if this is EC-NAIVE mode by detecting special markers in bytes_data
-            ecnaive_metadata = None
-            ecnaive_continuous_buffer = None
-            if len(bytes_data) > 0 and bytes_data[0][0] == 'ecnaive_metadata':
-                # EC-NAIVE mode detected
-                logger.info(f"EC-NAIVE: Process {local_proc_idx} detected EC-NAIVE mode")
+
+            # Check if this is BasicEC mode by detecting special markers in bytes_data
+            basic_ec_metadata = None
+            basic_ec_continuous_buffer = None
+            if len(bytes_data) > 0 and bytes_data[0][0] == 'basic_ec_metadata':
+                # BasicEC mode detected
+                logger.info(f"BasicEC: Process {local_proc_idx} detected BasicEC mode")
                 for key, value in bytes_data:
-                    if key == 'ecnaive_metadata':
-                        ecnaive_metadata = value
-                    elif key == 'ecnaive_continuous_buffer':
-                        ecnaive_continuous_buffer = value
-            
-            # EC-NAIVE mode: save three components to one file
-            if ecnaive_metadata is not None:
+                    if key == 'basic_ec_metadata':
+                        basic_ec_metadata = value
+                    elif key == 'basic_ec_continuous_buffer':
+                        basic_ec_continuous_buffer = value
+
+            # BasicEC mode: save three components to one file
+            if basic_ec_metadata is not None:
                 if use_msc:
                     import multistorageclient as msc
                     open_file = msc.open
                 else:
                     open_file = open
-                
+
                 write_start = time()
-                logger.info("EC-NAIVE: Saving three components to single file...")
-                
+                logger.info("BasicEC: Saving three components to single file...")
+
                 # Get file path (file_name is the full path)
-                ecnaive_file_path = str(file_name)
-                
+                basic_ec_file_path = str(file_name)
+
                 # Prepare header with component sizes
                 import struct
-                non_tensor_size = ecnaive_metadata['non_tensor_size']
-                tensor_keys_size = ecnaive_metadata['tensor_keys_size']
-                tensor_buffer_size = ecnaive_metadata['tensor_buffer_size']
-                
+                non_tensor_size = basic_ec_metadata['non_tensor_size']
+                tensor_keys_size = basic_ec_metadata['tensor_keys_size']
+                tensor_buffer_size = basic_ec_metadata['tensor_buffer_size']
+
                 # Determine block type from storage_key
                 is_data0 = 'data0' in storage_key
                 is_recv_parity1 = 'recv_parity1' in storage_key
                 is_recv_parity0 = 'recv_parity0' in storage_key
                 is_recv_data1 = 'recv_data1' in storage_key
                 block_type = "data0" if is_data0 else ("recv_parity1" if is_recv_parity1 else ("recv_parity0" if is_recv_parity0 else ("recv_data1" if is_recv_data1 else "unknown")))
-                
-                if ecnaive_continuous_buffer is not None:
-                    buffer_size = ecnaive_continuous_buffer.numel()
-                    
+
+                if basic_ec_continuous_buffer is not None:
+                    buffer_size = basic_ec_continuous_buffer.numel()
+
                     # All blocks use the aligned half size
                     write_size = buffer_size
-                    
+
                     # Header format: magic(4) + padding(4) + 3 sizes(8 each) = 32 bytes
-                    # Magic number: 'ECNV' (EC-NAIVE)
+                    # Magic number: 'ECNV' (BasicEC)
                     header = struct.pack(
                         COMPONENT_FILE_HEADER_FORMAT,
                         b'ECNV',              # Magic number
@@ -1913,65 +1913,65 @@ class FileSystemWriterAsync(FileSystemWriter):
                         tensor_keys_size,     # Component 2 size
                         write_size,           # Component 3 size (aligned half block size)
                     )
-                    
+
                     # Write all three components to one file
-                    with open_file(ecnaive_file_path, "wb") as f:
+                    with open_file(basic_ec_file_path, "wb") as f:
                         # Write header
                         header_start = time()
                         f.write(header)
-                        logger.debug(f"EC-NAIVE: Wrote header in {time() - header_start:.4f}s")
-                        
+                        logger.debug(f"BasicEC: Wrote header in {time() - header_start:.4f}s")
+
                         # Write Component 1: Non-tensor key-value pairs
                         comp1_start = time()
-                        f.write(ecnaive_metadata['non_tensor_data'])
+                        f.write(basic_ec_metadata['non_tensor_data'])
                         comp1_time = time() - comp1_start
-                        logger.debug(f"EC-NAIVE: Wrote Component 1 ({non_tensor_size / 1024:.2f} KB) in {comp1_time:.4f}s")
-                        
+                        logger.debug(f"BasicEC: Wrote Component 1 ({non_tensor_size / 1024:.2f} KB) in {comp1_time:.4f}s")
+
                         # Write Component 2: Tensor keys
                         comp2_start = time()
-                        f.write(ecnaive_metadata['tensor_keys_data'])
+                        f.write(basic_ec_metadata['tensor_keys_data'])
                         comp2_time = time() - comp2_start
-                        logger.debug(f"EC-NAIVE: Wrote Component 2 ({tensor_keys_size / 1024:.2f} KB) in {comp2_time:.4f}s")
-                        
+                        logger.debug(f"BasicEC: Wrote Component 2 ({tensor_keys_size / 1024:.2f} KB) in {comp2_time:.4f}s")
+
                         # Write Component 3: Block data
                         component3_start = time()
                         import numpy as np
-                        np_array = ecnaive_continuous_buffer[:write_size].numpy()  # Zero-copy view
+                        np_array = basic_ec_continuous_buffer[:write_size].numpy()  # Zero-copy view
                         mv = memoryview(np_array)
-                        
+
                         # Write data at once
                         f.write(mv)
                         component3_size = mv.nbytes
-                        
+
                         # Verify size matches
                         if component3_size != write_size:
                             logger.warning(
-                                f"EC-NAIVE: Size mismatch: wrote {component3_size} bytes, "
+                                f"BasicEC: Size mismatch: wrote {component3_size} bytes, "
                                 f"expected {write_size} bytes"
                             )
-                        
+
                         component3_time = time() - component3_start
                         bandwidth = (component3_size / (1024**3)) / component3_time if component3_time > 0 else 0
                         logger.info(
-                            f"EC-NAIVE: Wrote Component 3 ({component3_size / (1024**3):.2f} GB) "
+                            f"BasicEC: Wrote Component 3 ({component3_size / (1024**3):.2f} GB) "
                             f"in {component3_time:.2f}s ({bandwidth:.2f} GB/s), "
                             f"{block_type} block"
                         )
-                        
+
                         # Flush to disk
                         if use_fsync:
                             if use_msc:
                                 f.fsync()
                             else:
                                 os.fsync(f.fileno())
-                    
+
                     total_size = len(header) + non_tensor_size + tensor_keys_size + component3_size
                     total_write_time = time() - write_start
                     overall_bandwidth = (total_size / (1024**3)) / total_write_time if total_write_time > 0 else 0
-                    
+
                     logger.info(
-                        f"EC-NAIVE: Saved all components in {total_write_time:.2f}s:\n"
-                        f"  File: {ecnaive_file_path}\n"
+                        f"BasicEC: Saved all components in {total_write_time:.2f}s:\n"
+                        f"  File: {basic_ec_file_path}\n"
                         f"  Block type: {block_type}\n"
                         f"  Total size: {total_size / (1024**3):.2f} GB\n"
                         f"  Overall bandwidth: {overall_bandwidth:.2f} GB/s\n"
@@ -1982,11 +1982,11 @@ class FileSystemWriterAsync(FileSystemWriter):
                         f"    Component 3: {component3_size / (1024**3):.2f} GB ({component3_time:.2f}s)"
                     )
                 else:
-                    logger.error("EC-NAIVE: Continuous buffer is None, cannot write Component 3")
-                
+                    logger.error("BasicEC: Continuous buffer is None, cannot write Component 3")
+
                 # Create dummy results for compatibility
                 local_results = []
-            
+
             # EC-CHECK mode: save three components to ONE file
             elif eccheck_metadata is not None:
                 if use_msc:
@@ -1994,23 +1994,23 @@ class FileSystemWriterAsync(FileSystemWriter):
                     open_file = msc.open
                 else:
                     open_file = open
-                
+
                 write_start = time()
                 logger.info("EC-CHECK: Saving three components to single file...")
-                
+
                 # Get file path (file_name is the eccheck_file_path)
                 eccheck_file_path = eccheck_metadata['eccheck_file_path']
                 logger.info(
                     "EC-CHECK: Writer context "
                     f"(proc={local_proc_idx}, storage_key={storage_key}, file={eccheck_file_path})"
                 )
-                
+
                 # Prepare header with component sizes
                 import struct
                 non_tensor_size = eccheck_metadata['non_tensor_size']
                 tensor_keys_size = eccheck_metadata['tensor_keys_size']
                 tensor_buffer_size = eccheck_metadata['tensor_buffer_size']
-                
+
                 # Header format: magic(4) + padding(4) + 3 sizes(8 each) = 32 bytes
                 # Magic number: 'ECCK' (EC-CHECK)
                 # Default format includes padding for alignment
@@ -2021,31 +2021,31 @@ class FileSystemWriterAsync(FileSystemWriter):
                     tensor_keys_size,     # Component 2 size
                     tensor_buffer_size,   # Component 3 size
                 )
-                
+
                 # Write all three components to one file
                 with open_file(eccheck_file_path, "wb") as f:
                     # Write header
                     header_start = time()
                     f.write(header)
                     logger.debug(f"EC-CHECK: Wrote header in {time() - header_start:.4f}s")
-                    
+
                     # Write Component 1: Non-tensor key-value pairs
                     comp1_start = time()
                     f.write(eccheck_metadata['non_tensor_data'])
                     comp1_time = time() - comp1_start
                     logger.debug(f"EC-CHECK: Wrote Component 1 ({non_tensor_size / 1024:.2f} KB) in {comp1_time:.4f}s")
-                    
+
                     # Write Component 2: Tensor keys
                     comp2_start = time()
                     f.write(eccheck_metadata['tensor_keys_data'])
                     comp2_time = time() - comp2_start
                     logger.debug(f"EC-CHECK: Wrote Component 2 ({tensor_keys_size / 1024:.2f} KB) in {comp2_time:.4f}s")
-                    
+
                     # Write Component 3: Tensor data
                     # Only write actual data (exclude padding zeros for pipeline synchronization)
                     component3_start = time()
                     component3_size = 0
-                    
+
                     if eccheck_continuous_buffer is not None:
                         # Write only actual data portion (exclude padding zeros)
                         import numpy as np
@@ -2061,14 +2061,14 @@ class FileSystemWriterAsync(FileSystemWriter):
                             f"device={eccheck_continuous_buffer.device}, "
                             f"contiguous={eccheck_continuous_buffer.is_contiguous()})"
                         )
-                        
+
                         if actual_size > buffer_size:
                             logger.warning(
                                 f"EC-CHECK: Actual size ({actual_size}) > buffer size ({buffer_size}), "
                                 f"writing entire buffer"
                             )
                             actual_size = buffer_size
-                        
+
                         # Only write the actual data portion (exclude padding)
                         np_array = eccheck_continuous_buffer[:actual_size].numpy()  # Zero-copy view
                         mv = memoryview(np_array)
@@ -2084,14 +2084,14 @@ class FileSystemWriterAsync(FileSystemWriter):
                                 f"actual_size={actual_size}, mv_nbytes={mv.nbytes}, error={write_err})"
                             )
                             raise
-                        
+
                         # Verify size matches
                         if component3_size != tensor_buffer_size:
                             logger.warning(
                                 f"EC-CHECK: Size mismatch: wrote {component3_size} bytes, "
                                 f"expected {tensor_buffer_size} bytes"
                             )
-                        
+
                         component3_time = time() - component3_start
                         bandwidth = (component3_size / (1024**3)) / component3_time if component3_time > 0 else 0
                         logger.info(
@@ -2101,18 +2101,18 @@ class FileSystemWriterAsync(FileSystemWriter):
                         )
                     else:
                         logger.error("EC-CHECK: Continuous buffer is None, cannot write Component 3")
-                    
+
                     # Flush to disk
                     if use_fsync:
                         if use_msc:
                             f.fsync()
                         else:
                             os.fsync(f.fileno())
-                
+
                 total_size = len(header) + non_tensor_size + tensor_keys_size + component3_size
                 total_write_time = time() - write_start
                 overall_bandwidth = (total_size / (1024**3)) / total_write_time if total_write_time > 0 else 0
-                
+
                 logger.info(
                     f"EC-CHECK: Saved all components in {total_write_time:.2f}s:\n"
                     f"  File: {eccheck_file_path}\n"
@@ -2124,10 +2124,10 @@ class FileSystemWriterAsync(FileSystemWriter):
                     f"    Component 2: {tensor_keys_size / 1024:.2f} KB ({comp2_time:.4f}s)\n"
                     f"    Component 3: {component3_size / (1024**3):.2f} GB ({component3_time:.2f}s)"
                 )
-                
+
                 # Create dummy results for compatibility
                 local_results = []
-            
+
             # Gemini Replicas mode: save metadata and buffer to ONE file
             elif gemini_replicas_metadata is not None:
                 if use_msc:
@@ -2135,47 +2135,47 @@ class FileSystemWriterAsync(FileSystemWriter):
                     open_file = msc.open
                 else:
                     open_file = open
-                
+
                 write_start = time()
                 logger.info("Gemini Replicas: Saving metadata and buffer to single file...")
-                
+
                 # Get file path (file_name is the full path)
                 gemini_file_path = str(file_name)
-                
+
                 # Serialize metadata
                 import pickle
                 metadata_bytes = pickle.dumps(gemini_replicas_metadata)
                 metadata_size = len(metadata_bytes)
-                
+
                 # Prepare header: [metadata_size (8 bytes)]
                 import struct
                 header = struct.pack('<Q', metadata_size)
-                
+
                 # Write metadata and buffer to one file
                 with open_file(gemini_file_path, "wb") as f:
                     # Write header
                     f.write(header)
                     logger.debug(f"Gemini Replicas: Wrote header (8 bytes)")
-                    
+
                     # Write metadata
                     metadata_start = time()
                     f.write(metadata_bytes)
                     metadata_time = time() - metadata_start
                     logger.debug(f"Gemini Replicas: Wrote metadata ({metadata_size / 1024:.2f} KB) in {metadata_time:.4f}s")
-                    
+
                     # Write buffer data
                     buffer_start = time()
                     buffer_size = 0
-                    
+
                     if gemini_replicas_buffer is not None:
                         import numpy as np
                         np_array = gemini_replicas_buffer.numpy()  # Zero-copy view
                         mv = memoryview(np_array)
-                        
+
                         # Write buffer data
                         f.write(mv)
                         buffer_size = mv.nbytes
-                        
+
                         buffer_time = time() - buffer_start
                         bandwidth = (buffer_size / (1024**3)) / buffer_time if buffer_time > 0 else 0
                         logger.info(
@@ -2184,18 +2184,18 @@ class FileSystemWriterAsync(FileSystemWriter):
                         )
                     else:
                         logger.warning("Gemini Replicas: Buffer is None, skipping buffer write")
-                    
+
                     # Flush to disk
                     if use_fsync:
                         if use_msc:
                             f.fsync()
                         else:
                             os.fsync(f.fileno())
-                
+
                 total_size = len(header) + metadata_size + buffer_size
                 total_write_time = time() - write_start
                 overall_bandwidth = (total_size / (1024**3)) / total_write_time if total_write_time > 0 else 0
-                
+
                 logger.info(
                     f"Gemini Replicas: Saved all components in {total_write_time:.2f}s:\n"
                     f"  File: {gemini_file_path}\n"
@@ -2206,10 +2206,10 @@ class FileSystemWriterAsync(FileSystemWriter):
                     f"    Metadata: {metadata_size / 1024:.2f} KB ({metadata_time:.4f}s)\n"
                     f"    Buffer: {buffer_size / (1024**3):.2f} GB ({buffer_time:.2f}s)"
                 )
-                
+
                 # Create dummy results for compatibility
                 local_results = []
-            
+
             # Normal mode: standard write
             else:
                 extra_kwargs = {}
@@ -2244,7 +2244,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                             stream.fsync()
                         else:
                             os.fsync(stream.fileno())
-            
+
             local_output = (local_proc_idx, local_results)
         except Exception as e:
             logger.debug(f"{local_proc_idx} failed")
@@ -2287,11 +2287,11 @@ class FileSystemWriterAsync(FileSystemWriter):
         if isinstance(write_results_or_exc, Exception):
             raise RuntimeError(f"Worker failure: {write_results_or_exc}") from write_results_or_exc
         write_results: dict = write_results_or_exc
-        
+
         # Always use write_buckets count as it's updated by preload function
         # The preload function returns the complete bucket list
         expected_count = len(self.write_buckets)
-        
+
         if len(write_results) != expected_count:
             raise RuntimeError(
                 f"Incomplete worker results (expected {expected_count},"
@@ -2373,25 +2373,25 @@ class FileSystemWriterAsync(FileSystemWriter):
             return FileSystemWriter.validate_checkpoint_id(checkpoint_id)
 
         return False
-    
+
     def _prepare_eccheck_write_buckets(self, plan: SavePlan) -> None:
         """
         Prepare write buckets for EC-CHECK mode.
-        
+
         In EC-CHECK mode, the serialized metadata is already prepared by torch.py.
         We just need to create write_buckets using that metadata.
-        
+
         Args:
             plan (SavePlan): save plan
         """
         storage_plan: _StoragePrefix = plan.storage_data
-        
+
         self.write_buckets = []
-        
+
         # Use eccheck_serialized_metadata passed from torch.py
         if self.eccheck_serialized_metadata is None:
             raise RuntimeError("EC-CHECK: eccheck_serialized_metadata not set by strategy")
-        
+
         # Get file path from metadata
         eccheck_path = self.eccheck_serialized_metadata.get('eccheck_file_path')
         if eccheck_path is None:
@@ -2400,7 +2400,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             eccheck_file = f"__{rank}_0.distcp"
             eccheck_path = os.path.join(self.checkpoint_dir, eccheck_file)
             self.eccheck_serialized_metadata['eccheck_file_path'] = eccheck_path
-        
+
         logger.debug(
             f"EC-CHECK: Using serialized metadata from strategy:\n"
             f"  File: {eccheck_path}\n"
@@ -2408,7 +2408,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             f"  Component 2 size: {self.eccheck_serialized_metadata['tensor_keys_size'] / 1024:.2f} KB\n"
             f"  Component 3 size: {self.eccheck_serialized_metadata['tensor_buffer_size'] / (1024**3):.2f} GB"
         )
-        
+
         # Create a single write bucket for EC-CHECK
         # The actual data will be written by custom logic
         self.write_buckets.append((
@@ -2416,7 +2416,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             storage_plan.prefix,
             ([], [])  # Will be handled specially in write_preloaded_data
         ))
-        
+
         # Add P2P write buckets if P2P buffers are available
         # P2P buckets are tuples: (file_path, storage_key, (bytes_data, tensor_data))
         if hasattr(self, 'eccheck_p2p_buffers') and self.eccheck_p2p_buffers is not None:
@@ -2436,13 +2436,13 @@ class FileSystemWriterAsync(FileSystemWriter):
                 partner_file_path = Path(self.checkpoint_dir) / partner_file_name
                 self.write_buckets.append((partner_file_path, partner_storage_key, ([partner_eccheck_bytes_data], [])))
                 # logger.debug(f"EC-CHECK: Added partner P2P write bucket to write_buckets with path {partner_file_path}")
-        
+
         # Set up results queue
         if len(self.write_buckets) > 0:
             self.results_queue = _get_write_results_queue()
         else:
-            self.results_queue = None 
-    
+            self.results_queue = None
+
     def _poll_and_release_buffers(self):
         """Poll C++ for buffers ready to be released and put them back to queues."""
         # If using shared buffers from strategy, use strategy's poll method
@@ -2453,22 +2453,22 @@ class FileSystemWriterAsync(FileSystemWriter):
     def _execute_phase3_encoding(self, m=None):
         """
         Execute Phase 3: Complete tensor data exchange and encoding process with pipeline.
-        
+
         Args:
             m: Encoding parameter (uses self.eccheck_m if None)
         """
         if m is None:
             m = self.eccheck_m
-            
+
         logger.info(f"EC-CHECK: Starting Phase 3 - Tensor data exchange and encoding (k={self.eccheck_k}, m={m})")
         phase3_start = time()
-    
+
         # Phase 3.1: Copy tensor data to data buffers (producer)
         self._copy_tensor_data_to_buffers()
-        
+
         phase3_time = time() - phase3_start
         logger.warning(f"EC-CHECK: Phase 3 completed in {phase3_time:.2f}s")
-    
+
     # ===== Phase 3 - Pipeline implementation =====
     def _stop_phase3_workers(self) -> None:
         """Signal workers to stop and join them safely."""
@@ -2478,44 +2478,44 @@ class FileSystemWriterAsync(FileSystemWriter):
         else:
             # No fallback - C++ module is required
             raise RuntimeError("EC-CHECK: C++ native module is required but not available")
-    
-    
+
+
     def _copy_tensor_data_to_buffers(self) -> None:
         """Producer: memcpy from continuous tensor buffer into free data buffers, emit to encode queue.
-        
+
         Only proceeds when a free data buffer is available. Emits (data_buf_index, used_size).
         """
         logger.info("EC-CHECK: Phase 3.1 - memcpy to data buffers with backpressure")
-        
+
         if self._eccheck_native is None:
             raise RuntimeError("EC-CHECK: C++ native module is required but not available")
-        
+
         # Direct implementation
         self._copy_tensor_data_to_buffers_pipeline()
-    
+
     def _copy_tensor_data_to_buffers_pipeline(self) -> None:
         """
         Python memcpy implementation with C++ encoding coordination.
-        
+
         Key improvements:
         1. Data buffers are released as soon as both C++ threads copy the data
         2. No need to wait for encoding completion to release data buffers
         3. Better resource utilization and reduced risk of deadlock
         """
         # logger.info("EC-CHECK: Phase 3.1 - Python memcpy to data buffers with C++ encoding")
-        
+
         # Reset completion flags for new encoding round
         self._eccheck_native.reset_encoding_completion_flags()
-        
+
         # Ensure we're in save mode (not load mode)
         self._eccheck_native.set_load_mode(False, -1)
-        
+
         # Activate the persistent buffer poller at the start of pipeline
         # This ensures buffers can be released as soon as C++ threads finish using them
         if self._buffer_poller_active_event:
             self._buffer_poller_active_event.set()
             logger.info("EC-CHECK: Activated buffer poller for pipeline operation")
-        
+
         try:
             self._copy_tensor_data_to_buffers_pipeline_impl()
         finally:
@@ -2523,18 +2523,18 @@ class FileSystemWriterAsync(FileSystemWriter):
             if self._buffer_poller_active_event:
                 self._buffer_poller_active_event.clear()
                 logger.info("EC-CHECK: Deactivated buffer poller after pipeline completion")
-            
+
             # Final poll to ensure all buffers are released
             self._poll_and_release_buffers()
-    
+
     def _copy_tensor_data_to_buffers_pipeline_impl(self) -> None:
         """Implementation of the pipeline logic (called within try-finally block)."""
-                
+
         def get_free_data_buffer():
             """Get a free data buffer address, blocking if none available."""
             # Poll for released buffers before trying to get one
             self._poll_and_release_buffers()
-            
+
             try:
                 return self._free_data_buffer_queue.get(timeout=5.0)
             except queue.Empty:
@@ -2543,12 +2543,12 @@ class FileSystemWriterAsync(FileSystemWriter):
                 logger.error(f"EC-CHECK: Data buffer queue size: {self._free_data_buffer_queue.qsize()}")
                 return self._free_data_buffer_queue.get()
                 # raise RuntimeError("EC-CHECK: Timeout waiting for data buffer")
-        
+
         def get_free_encoding_buffer():
             """Get a free encoding buffer address, blocking if none available."""
             # Poll for released buffers before trying to get one
             self._poll_and_release_buffers()
-            
+
             try:
                 return self._free_encoding_buffer_queue.get(timeout=5.0)
             except queue.Empty:
@@ -2557,18 +2557,18 @@ class FileSystemWriterAsync(FileSystemWriter):
                 # logger.error(f"EC-CHECK: Encoding buffer queue size: {self._free_encoding_buffer_queue.qsize()}")
                 return self._free_encoding_buffer_queue.get()
                 # raise RuntimeError("EC-CHECK: Timeout waiting for encoding buffer")
-        
+
         def get_free_parity_buffer():
             """Get a free parity buffer address, blocking if none available."""
             # Poll for released buffers before trying to get one
             self._poll_and_release_buffers()
-            
+
             try:
                 return self._free_parity_buffer_queue.get(timeout=5.0)
             except queue.Empty:
                 logger.error("EC-CHECK: TIMEOUT waiting for free parity buffer - possible deadlock!")
                 return self._free_parity_buffer_queue.get()
-        
+
         # Process continuous tensor buffer sequentially
         # Copy data from self.tensor_buffer (continuous CPU buffer) to data buffers
         # Use pipeline_total_bytes to ensure all ranks have same iterations
@@ -2580,20 +2580,20 @@ class FileSystemWriterAsync(FileSystemWriter):
                 "EC-CHECK: pipeline_total_bytes not set, using actual size. "
                 "This may cause pipeline synchronization issues."
             )
-        
+
         # Get actual data size for padding logic
         actual_data_bytes = getattr(self, 'actual_tensor_buffer_size', total_bytes)
-        
+
         src_pos = 0  # Current position in continuous tensor buffer
         # chunk_count = 0
-        
+
         # Get base addresses of TWO receive buffers (one per encoding thread)
         recv_buffer_thread1, recv_buffer_thread2 = self.eccheck_recv_encoding_buffers
         recv_buffer_base_addr_thread1 = int(recv_buffer_thread1.data_ptr())
         recv_buffer_base_addr_thread2 = int(recv_buffer_thread2.data_ptr())
         recv_buffer_offset_thread1 = 0  # Current offset in thread1's receive buffer
         recv_buffer_offset_thread2 = 0  # Current offset in thread2's receive buffer
-        
+
         # Get base addresses of P2P buffers (own_buffer and partner_buffer)
         if self.eccheck_p2p_buffers is not None:
             own_buffer = self.eccheck_p2p_buffers['own_buffer']
@@ -2616,24 +2616,24 @@ class FileSystemWriterAsync(FileSystemWriter):
         while src_pos < total_bytes:
             # Get a free data buffer (with timeout to detect deadlocks)
             cur_buffer_addr = get_free_data_buffer()
-            
+
             # Calculate how much data to copy to this buffer
             remaining_in_source = total_bytes - src_pos
             take = min(self.eccheck_buffer_size, remaining_in_source)
-            
+
             # Check recv_buffer bounds BEFORE copying data
             # This ensures we don't copy more data than can fit in recv buffers
             recv_buffer_size_thread1 = recv_buffer_thread1.numel()
             recv_buffer_size_thread2 = recv_buffer_thread2.numel()
-            
+
             # Calculate aligned offsets to check available space
             recv_buffer_offset_thread1_aligned = ((recv_buffer_offset_thread1 + 63) // 64) * 64
             recv_buffer_offset_thread2_aligned = ((recv_buffer_offset_thread2 + 63) // 64) * 64
-            
+
             remaining_space_thread1 = recv_buffer_size_thread1 - recv_buffer_offset_thread1_aligned
             remaining_space_thread2 = recv_buffer_size_thread2 - recv_buffer_offset_thread2_aligned
             max_available_recv_space = min(remaining_space_thread1, remaining_space_thread2)
-            
+
             # Adjust 'take' if needed to fit within recv buffer bounds
             if take > max_available_recv_space:
                 if max_available_recv_space < 64:
@@ -2646,7 +2646,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                         f"Stopping data processing."
                     )
                     break  # Exit the loop
-                
+
                 # Adjust take to fit available space
                 take = max_available_recv_space
                 logger.debug(
@@ -2676,26 +2676,26 @@ class FileSystemWriterAsync(FileSystemWriter):
                         f"EC-CHECK: Adjusted 'take' to {take} for P2P buffer bounds "
                         f"(own_remain={remaining_p2p_own}, partner_remain={remaining_p2p_partner})"
                     )
-            
+
             # Python memcpy: copy from continuous tensor buffer to data buffer
             t_start = time()
             import ctypes
             buffer_ptr = ctypes.cast(cur_buffer_addr, ctypes.POINTER(ctypes.c_uint8))
             buffer_array = ctypes.cast(buffer_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
-            
+
             # Check if we need to pad with zeros (for ranks with smaller data)
             if src_pos < actual_data_bytes:
                 # Still have actual data to copy
                 bytes_to_copy = min(take, actual_data_bytes - src_pos)
-                
+
                 # Zero-copy optimization: directly use tensor's data pointer
                 # Avoid creating intermediate numpy array which causes unnecessary copy
                 src_base_ptr = self.tensor_buffer.data_ptr()
                 src_addr = src_base_ptr + src_pos
-                
+
                 # Copy actual data (only one memcpy, no intermediate numpy conversion)
                 ctypes.memmove(buffer_array.contents, src_addr, bytes_to_copy)
-                
+
                 # Fill remaining space with zeros if needed
                 if take > bytes_to_copy:
                     padding_size = take - bytes_to_copy
@@ -2707,36 +2707,36 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 # Already past actual data, fill entire chunk with zeros
                 ctypes.memset(buffer_array.contents, 0, take)
-            
+
             # Get two encoding buffers (with timeout to detect deadlocks)
             enc_addr1 = get_free_encoding_buffer()
             enc_addr2 = get_free_encoding_buffer()
-            
+
             # Get two parity buffers for XOR results
             parity_addr1 = get_free_parity_buffer()
             parity_addr2 = get_free_parity_buffer()
-            
+
             # Allocate receive addresses from TWO recv_encoding_buffers
             # Each encoding thread gets its own receive address
-            # 
+            #
             # CRITICAL: Addresses must be 64-byte aligned for ISA-L AVX512 XOR operations
             # Size does NOT need to be a multiple of 64 bytes (ISA-L handles this)
             # recv_chunk_size should match 'take' (already adjusted for buffer bounds above)
             recv_chunk_size = take
-            
+
             # Align offsets to 64-byte boundary (address alignment requirement)
             # Note: We already checked bounds above, so aligned offset + recv_chunk_size should be safe
             recv_buffer_offset_thread1_aligned = ((recv_buffer_offset_thread1 + 63) // 64) * 64
             recv_buffer_offset_thread2_aligned = ((recv_buffer_offset_thread2 + 63) // 64) * 64
-            
+
             # Thread1 receive address (guaranteed 64-byte aligned and within bounds)
             recv_addr_thread1 = recv_buffer_base_addr_thread1 + recv_buffer_offset_thread1_aligned
             recv_buffer_offset_thread1 = recv_buffer_offset_thread1_aligned + recv_chunk_size  # Update offset after processing
-            
+
             # Thread2 receive address (guaranteed 64-byte aligned and within bounds)
             recv_addr_thread2 = recv_buffer_base_addr_thread2 + recv_buffer_offset_thread2_aligned
             recv_buffer_offset_thread2 = recv_buffer_offset_thread2_aligned + recv_chunk_size  # Update offset after processing
-            
+
             # Verify address alignment and bounds (for debugging)
             assert recv_addr_thread1 % 64 == 0, (
                 f"recv_addr_thread1 not 64-byte aligned: {hex(recv_addr_thread1)}, "
@@ -2754,7 +2754,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 f"recv_addr_thread2 out of bounds: offset={recv_buffer_offset_thread2_aligned}, "
                 f"size={recv_chunk_size}, buffer_size={recv_buffer_size_thread2}"
             )
-            
+
             # Calculate P2P write addresses (similar to recv addresses)
             # Both thread1 and thread2 use the same P2P addresses for the same chunk
             # CRITICAL: Addresses must be 64-byte aligned for ISA-L AVX512 operations
@@ -2762,15 +2762,15 @@ class FileSystemWriterAsync(FileSystemWriter):
                 # Align offsets to 64-byte boundary (address alignment requirement)
                 p2p_own_buffer_offset_aligned = ((p2p_own_buffer_offset + 63) // 64) * 64
                 p2p_partner_buffer_offset_aligned = ((p2p_partner_buffer_offset + 63) // 64) * 64
-                
+
                 # Calculate aligned addresses
                 p2p_own_write_addr = p2p_own_buffer_base_addr + p2p_own_buffer_offset_aligned
                 p2p_partner_write_addr = p2p_partner_buffer_base_addr + p2p_partner_buffer_offset_aligned
-                
+
                 # Update offsets after processing (size does NOT need to be aligned)
                 p2p_own_buffer_offset = p2p_own_buffer_offset_aligned + take
                 p2p_partner_buffer_offset = p2p_partner_buffer_offset_aligned + take
-                
+
                 # Verify address alignment (for debugging)
                 assert p2p_own_write_addr % 64 == 0, (
                     f"p2p_own_write_addr not 64-byte aligned: {hex(p2p_own_write_addr)}, "
@@ -2791,7 +2791,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 p2p_own_write_addr = 0
                 p2p_partner_write_addr = 0
-            
+
             # Submit to BOTH encoding threads with their respective receive addresses and parity buffers
             # The C++ threads will mark the data buffer as copied immediately after reading
             # Once both threads mark it as copied, the data buffer will be released
@@ -2803,99 +2803,99 @@ class FileSystemWriterAsync(FileSystemWriter):
                 cur_buffer_addr, take, enc_addr1, recv_addr_thread1, recv_chunk_size, parity_addr1,
                 p2p_own_write_addr, p2p_partner_write_addr
             )
-            
+
             self._eccheck_native.submit_data_for_encoding_thread2(
                 cur_buffer_addr, take, enc_addr2, recv_addr_thread2, recv_chunk_size, parity_addr2,
                 p2p_own_write_addr, p2p_partner_write_addr
             )
-            
+
             src_pos += take
-            
+
         logger.info(
             f"  Thread1 receive buffer used: {recv_buffer_offset_thread1 / (1024**3):.2f} GB\n"
             f"  Thread2 receive buffer used: {recv_buffer_offset_thread2 / (1024**3):.2f} GB\n"
             f"  Total receive buffer used: {(recv_buffer_offset_thread1 + recv_buffer_offset_thread2) / (1024**3):.2f} GB"
         )
-        
+
         # Mark end of stream for both encoders (with P2P addresses set to 0)
         self._eccheck_native.submit_data_for_encoding_thread1(0, 0, 0, 0, 0, 0, 0, 0)  # Sentinel for thread 1
         self._eccheck_native.submit_data_for_encoding_thread2(0, 0, 0, 0, 0, 0, 0, 0)  # Sentinel for thread 2
-        
+
         # Wait for both encoding threads to complete
         # Buffer poller is already active (activated at function start)
         logger.info("EC-CHECK: Waiting for encoding threads to complete (with buffer polling)...")
-        
+
         # Wait for encoding completion (this may block)
         # The buffer poller will continue running in the background
         t_start = time()
         self._eccheck_native.wait_for_encoding_completion()
         torch.cuda.synchronize()
         logger.info(f"EC-CHECK: Pipeline CUDA synchronized")
-        
-        
+
+
         # Buffer poller will be deactivated in the outer finally block
         # logger.info("EC-CHECK: All encoding operations completed")
-    
-    def _ecnaive_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
+
+    def _basic_ec_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
         """
-        EC-NAIVE version: Transfer tensors from GPU to preallocated CPU buffer and submit to C++ pipeline.
-        
+        BasicEC version: Transfer tensors from GPU to preallocated CPU buffer and submit to C++ pipeline.
+
         This method transfers tensor data from GPU to the preallocated CPU buffer
         in a pipelined manner, enabling overlap with subsequent encoding operations.
-        
+
         Args:
             non_blocking (bool): if True, use non-blocking GPU-to-CPU transfer
-        
+
         Returns:
             List[WriteBucket]: List of WriteBuckets for the 4 blocks
         """
         if not self.decomposed_state_dict:
-            raise RuntimeError("EC-NAIVE: State dict not decomposed yet")
-        
-        logger.info("EC-NAIVE: Starting GPU-to-CPU tensor transfer...")
+            raise RuntimeError("BasicEC: State dict not decomposed yet")
+
+        logger.info("BasicEC: Starting GPU-to-CPU tensor transfer...")
         start = time()
-        
+
         # Step 1: Get actual data size for this rank
         actual_total_size = self.decomposed_state_dict.total_tensor_size_bytes
-        
+
         # Step 2: Calculate maximum data size across all ranks
-        if (torch.distributed.is_initialized() and 
-            hasattr(self, 'ecnaive_global_registry') and
-            self.ecnaive_global_registry is not None):
+        if (torch.distributed.is_initialized() and
+            hasattr(self, 'basic_ec_global_registry') and
+            self.basic_ec_global_registry is not None):
             all_total_bytes_list = []
             for r in range(torch.distributed.get_world_size()):
-                rank_metadata = self.ecnaive_global_registry.rank_metadata.get(r, [])
+                rank_metadata = self.basic_ec_global_registry.rank_metadata.get(r, [])
                 rank_total_size = tensor_layout_size(rank_metadata)
                 all_total_bytes_list.append(rank_total_size)
             max_total_bytes = max(all_total_bytes_list)
         else:
             max_total_bytes = actual_total_size
-        
+
         # Step 3: Allocate buffer with maximum size (for pipeline synchronization)
         if self.preallocated_cpu_buffer is not None:
             buffer = self.preallocated_cpu_buffer
             if buffer.numel() < max_total_bytes:
                 logger.warning(
-                    f"EC-NAIVE: Preallocated buffer ({buffer.numel() / (1024**3):.2f} GB) "
+                    f"BasicEC: Preallocated buffer ({buffer.numel() / (1024**3):.2f} GB) "
                     f"is smaller than max_total_bytes ({max_total_bytes / (1024**3):.2f} GB). "
                     f"Reallocating..."
                 )
-                if self.ecnaive_pin_memory and torch.cuda.is_available():
+                if self.basic_ec_pin_memory and torch.cuda.is_available():
                     buffer = torch.empty(max_total_bytes, dtype=torch.uint8).pin_memory()
                 else:
                     buffer = torch.empty(max_total_bytes, dtype=torch.uint8)
         else:
-            if self.ecnaive_pin_memory and torch.cuda.is_available():
+            if self.basic_ec_pin_memory and torch.cuda.is_available():
                 buffer = torch.empty(max_total_bytes, dtype=torch.uint8).pin_memory()
             else:
                 buffer = torch.empty(max_total_bytes, dtype=torch.uint8)
-        
+
         logger.info(
-            f"EC-NAIVE: Allocated continuous CPU buffer: {max_total_bytes / (1024**3):.2f} GB "
+            f"BasicEC: Allocated continuous CPU buffer: {max_total_bytes / (1024**3):.2f} GB "
             f"(actual data: {actual_total_size / (1024**3):.2f} GB, "
             f"padding: {(max_total_bytes - actual_total_size) / (1024**3):.2f} GB)"
         )
-        
+
         # Step 4: Transfer tensors from GPU to continuous CPU buffer
         num_gpu_tensors = 0
         buffer[:max_total_bytes].zero_()
@@ -2907,97 +2907,97 @@ class FileSystemWriterAsync(FileSystemWriter):
             buffer_view = buffer[info.offset:info.offset + tensor_size]
             tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
             buffer_view.copy_(tensor_flat, non_blocking=non_blocking)
-            
+
             if tensor.device.type != 'cpu':
                 num_gpu_tensors += 1
-            
+
             info.device = torch.device('cpu')
 
         # Step 5: The active buffer span was zeroed before tensor copies.
-        
+
         # Synchronize if using non-blocking transfers
         if non_blocking and num_gpu_tensors > 0:
             torch.cuda.synchronize()
-        
+
         # Step 6: Store the continuous buffer
         self.tensor_buffer = buffer
         self.actual_tensor_buffer_size = actual_total_size
         self.pipeline_total_bytes = max_total_bytes
-        
+
         transfer_time = time() - start
         total_gb = actual_total_size / (1024**3)
         bandwidth = total_gb / transfer_time if transfer_time > 0 else 0
-        
+
         logger.info(
-            f"EC-NAIVE: Transferred {total_gb:.2f} GB in {transfer_time:.2f}s "
+            f"BasicEC: Transferred {total_gb:.2f} GB in {transfer_time:.2f}s "
             f"({bandwidth:.2f} GB/s), {num_gpu_tensors} tensors from GPU to CPU"
         )
-        
+
         # Step 7: Verify blocks and buffers are set
-        if not hasattr(self, 'ecnaive_blocks') or self.ecnaive_blocks is None:
+        if not hasattr(self, 'basic_ec_blocks') or self.basic_ec_blocks is None:
             raise RuntimeError(
-                "EC-NAIVE: Blocks not set. Should be passed from strategy "
-                "after _prepare_ecnaive_data completes."
+                "BasicEC: Blocks not set. Should be passed from strategy "
+                "after _prepare_basic_ec_data completes."
             )
-        
-        if not hasattr(self, 'ecnaive_data_buffers') or self.ecnaive_data_buffers is None:
+
+        if not hasattr(self, 'basic_ec_data_buffers') or self.basic_ec_data_buffers is None:
             raise RuntimeError(
-                "EC-NAIVE: Data buffers not set. Should be passed from strategy."
+                "BasicEC: Data buffers not set. Should be passed from strategy."
             )
-        
-        if not hasattr(self, 'ecnaive_parity_buffers') or self.ecnaive_parity_buffers is None:
+
+        if not hasattr(self, 'basic_ec_parity_buffers') or self.basic_ec_parity_buffers is None:
             raise RuntimeError(
-                "EC-NAIVE: Parity buffers not set. Should be passed from strategy."
+                "BasicEC: Parity buffers not set. Should be passed from strategy."
             )
-        
+
         # Step 8: Execute pipelines
         exec_start = time()
-        self._execute_ecnaive_pipelines()
+        self._execute_basic_ec_pipelines()
         exec_time = time() - exec_start
-        
-        logger.info(f"EC-NAIVE: Pipeline execution completed in {exec_time:.2f}s")
+
+        logger.info(f"BasicEC: Pipeline execution completed in {exec_time:.2f}s")
         duration = time() - start
-        logger.warning(f"EC-NAIVE: Pipeline execution completed in {duration:.2f}s")
+        logger.warning(f"BasicEC: Pipeline execution completed in {duration:.2f}s")
 
         # Step 9: Update self.write_buckets and return
         # This ensures retrieve_write_results() can check the correct count
         if hasattr(self, 'ec_write_buckets') and self.ec_write_buckets:
             # Update paths with current checkpoint_dir
             result_buckets = []
-            
+
             # Extract metadata from first block (all blocks use the same metadata)
             first_bucket = self.ec_write_buckets[0]
             _, _, (first_bytes_data, _) = first_bucket
-            
+
             # Extract metadata for main file
             main_file_metadata = None
             for key, value in first_bytes_data:
-                if key == 'ecnaive_metadata':
+                if key == 'basic_ec_metadata':
                     main_file_metadata = value
                     break
-            
+
             # Add main file bucket
             if main_file_metadata:
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                ecnaive_main_file = f"__{rank}_0.distcp"
-                ecnaive_main_path = Path(self.checkpoint_dir) / ecnaive_main_file
-                
+                basic_ec_main_file = f"__{rank}_0.distcp"
+                basic_ec_main_path = Path(self.checkpoint_dir) / basic_ec_main_file
+
                 # Use same metadata but with full tensor_buffer instead of block tensor
                 # Clone: fork-safe (RDMA-registered buffer not accessible in child process)
-                ecnaive_main_bytes_data = [
-                    ('ecnaive_metadata', main_file_metadata),
-                    ('ecnaive_continuous_buffer', self.tensor_buffer.clone()),
+                basic_ec_main_bytes_data = [
+                    ('basic_ec_metadata', main_file_metadata),
+                    ('basic_ec_continuous_buffer', self.tensor_buffer.clone()),
                 ]
-                result_buckets.append((ecnaive_main_path, ecnaive_main_file, (ecnaive_main_bytes_data, [])))
-                logger.debug(f"EC-NAIVE: Added main file bucket: {ecnaive_main_path}")
-            
+                result_buckets.append((basic_ec_main_path, basic_ec_main_file, (basic_ec_main_bytes_data, [])))
+                logger.debug(f"BasicEC: Added main file bucket: {basic_ec_main_path}")
+
             # Add 4 block buckets (clone RDMA-registered buffers so fork workers can access them)
             for bucket in self.ec_write_buckets:
                 file_path, storage_key, data = bucket
                 bytes_data, tensor_data = data
                 new_bytes_data = []
                 for key, value in bytes_data:
-                    if key == 'ecnaive_continuous_buffer':
+                    if key == 'basic_ec_continuous_buffer':
                         new_bytes_data.append((key, value.clone()))
                     else:
                         new_bytes_data.append((key, value))
@@ -3007,134 +3007,134 @@ class FileSystemWriterAsync(FileSystemWriter):
                     file_name = file_path_obj.name
                 else:
                     file_name = str(file_path).split('/')[-1] if '/' in str(file_path) else str(file_path)
-                
+
                 # Build new path with current checkpoint_dir
                 new_file_path = Path(self.checkpoint_dir) / file_name
                 result_buckets.append((new_file_path, storage_key, (new_bytes_data, tensor_data)))
-            
+
             # Update self.write_buckets so retrieve_write_results() can check the correct count
             self.write_buckets = result_buckets
             return result_buckets
         else:
             return []
 
-    def _execute_ecnaive_pipelines(self) -> None:
+    def _execute_basic_ec_pipelines(self) -> None:
         """
-        Execute EC-NAIVE pipelines: Copy data to blocks and submit to C++ pipeline.
+        Execute BasicEC pipelines: Copy data to blocks and submit to C++ pipeline.
         """
-        logger.info("EC-NAIVE: Starting pipeline execution...")
-        self.ecnaive_native.reset_encoding_completion_flags()
+        logger.info("BasicEC: Starting pipeline execution...")
+        self.basic_ec_native.reset_encoding_completion_flags()
 
         # Activate buffer poller if available
-        if hasattr(self, '_ecnaive_buffer_poller_active_event'):
-            if self._ecnaive_buffer_poller_active_event is not None:
-                self._ecnaive_buffer_poller_active_event.set()
-                logger.debug("EC-NAIVE: Activated buffer poller")
-        
+        if hasattr(self, '_basic_ec_buffer_poller_active_event'):
+            if self._basic_ec_buffer_poller_active_event is not None:
+                self._basic_ec_buffer_poller_active_event.set()
+                logger.debug("BasicEC: Activated buffer poller")
+
         try:
             # Copy tensor data to blocks and submit to pipelines
-            self._copy_tensor_data_to_ecnaive_blocks()
+            self._copy_tensor_data_to_basic_ec_blocks()
         finally:
             # Deactivate buffer poller
-            if hasattr(self, '_ecnaive_buffer_poller_active_event'):
-                if self._ecnaive_buffer_poller_active_event is not None:
-                    self._ecnaive_buffer_poller_active_event.clear()
-                    logger.debug("EC-NAIVE: Deactivated buffer poller")
+            if hasattr(self, '_basic_ec_buffer_poller_active_event'):
+                if self._basic_ec_buffer_poller_active_event is not None:
+                    self._basic_ec_buffer_poller_active_event.clear()
+                    logger.debug("BasicEC: Deactivated buffer poller")
 
-    def _copy_tensor_data_to_ecnaive_blocks(self) -> None:
+    def _copy_tensor_data_to_basic_ec_blocks(self) -> None:
         """Copy tensor data to 4 blocks and submit to C++ pipeline using round-robin."""
-        
+
         def get_free_data_buffer():
             """Get a free data buffer address, blocking if none available."""
-            if hasattr(self, '_ecnaive_strategy_poll_and_release_buffers'):
-                self._ecnaive_strategy_poll_and_release_buffers()
-            
+            if hasattr(self, '_basic_ec_strategy_poll_and_release_buffers'):
+                self._basic_ec_strategy_poll_and_release_buffers()
+
             try:
-                return self._free_ecnaive_data_buffer_queue.get(timeout=5.0)
+                return self._free_basic_ec_data_buffer_queue.get(timeout=5.0)
             except queue.Empty:
-                logger.error("EC-NAIVE: TIMEOUT waiting for free data buffer!")
-                logger.error(f"EC-NAIVE: Data buffer queue size: {self._free_ecnaive_data_buffer_queue.qsize()}")
-                return self._free_ecnaive_data_buffer_queue.get()
-        
+                logger.error("BasicEC: TIMEOUT waiting for free data buffer!")
+                logger.error(f"BasicEC: Data buffer queue size: {self._free_basic_ec_data_buffer_queue.qsize()}")
+                return self._free_basic_ec_data_buffer_queue.get()
+
         def get_free_parity_buffer():
             """Get a free parity buffer address, blocking if none available."""
-            if hasattr(self, '_ecnaive_strategy_poll_and_release_buffers'):
-                self._ecnaive_strategy_poll_and_release_buffers()
-            
+            if hasattr(self, '_basic_ec_strategy_poll_and_release_buffers'):
+                self._basic_ec_strategy_poll_and_release_buffers()
+
             try:
-                return self._free_ecnaive_parity_buffer_queue.get(timeout=5.0)
+                return self._free_basic_ec_parity_buffer_queue.get(timeout=5.0)
             except queue.Empty:
-                logger.error("EC-NAIVE: TIMEOUT waiting for free parity buffer!")
-                return self._free_ecnaive_parity_buffer_queue.get()
-        
-        # Get 4 blocks from ecnaive_blocks
-        data0 = self.ecnaive_blocks['data0']
-        recv_parity1 = self.ecnaive_blocks['recv_parity1']
-        recv_parity0 = self.ecnaive_blocks['recv_parity0']
-        recv_data1 = self.ecnaive_blocks['recv_data1']
-        
+                logger.error("BasicEC: TIMEOUT waiting for free parity buffer!")
+                return self._free_basic_ec_parity_buffer_queue.get()
+
+        # Get 4 blocks from basic_ec_blocks
+        data0 = self.basic_ec_blocks['data0']
+        recv_parity1 = self.basic_ec_blocks['recv_parity1']
+        recv_parity0 = self.basic_ec_blocks['recv_parity0']
+        recv_data1 = self.basic_ec_blocks['recv_data1']
+
         # Calculate base addresses
         data0_base = int(data0.data_ptr())
         recv_parity1_base = int(recv_parity1.data_ptr())
         recv_parity0_base = int(recv_parity0.data_ptr())
         recv_data1_base = int(recv_data1.data_ptr())
-        
+
         # Initialize offsets (will be 64-byte aligned when used)
         data0_offset = 0
         recv_parity1_offset = 0
         recv_parity0_offset = 0
         recv_data1_offset = 0
-        
+
         # Get block sizes (all should be the same - aligned_size)
-        aligned_block_size = self.ecnaive_blocks['aligned_size']
+        aligned_block_size = self.basic_ec_blocks['aligned_size']
         block_size = aligned_block_size
-        
+
         # Process continuous tensor buffer sequentially
         # Use pipeline_total_bytes (padded size) to ensure all ranks have same iterations
         total_bytes = self.pipeline_total_bytes
         actual_data_bytes = self.actual_tensor_buffer_size
-        
+
         # Split total_bytes into two halves
         half_total = total_bytes // 2  # Divide pipeline_total_bytes into two halves
-        
+
         src_pos = 0  # Current position in continuous tensor buffer (for iteration)
-        
+
         logger.info(
-            f"EC-NAIVE: Processing {total_bytes / (1024**3):.2f} GB "
+            f"BasicEC: Processing {total_bytes / (1024**3):.2f} GB "
             f"(actual: {actual_data_bytes / (1024**3):.2f} GB) "
-            f"in chunks of {self.ecnaive_buffer_size / (1024**2):.0f} MB, "
+            f"in chunks of {self.basic_ec_buffer_size / (1024**2):.0f} MB, "
             f"split into two halves of {half_total / (1024**3):.2f} GB each"
         )
-        
+
         import ctypes
-        
+
         while src_pos < half_total:
             # Calculate chunk size
             remaining_in_source = total_bytes - src_pos
-            take = min(self.ecnaive_buffer_size, remaining_in_source)
-            
+            take = min(self.basic_ec_buffer_size, remaining_in_source)
+
             # Get temporary buffers from pools
             data1_addr = get_free_data_buffer()  # For sending d_{i1}
             parity0_addr = get_free_parity_buffer()  # For sending p_{i0}
             parity1_addr = get_free_parity_buffer()  # For sending p_{i1}
-            
+
             # Copy from first half to data1 (temporary buffer, will be sent)
             data1_ptr = ctypes.cast(data1_addr, ctypes.POINTER(ctypes.c_uint8))
             data1_array = ctypes.cast(data1_ptr, ctypes.POINTER(ctypes.c_uint8 * take))
-            
+
             # Source position in first half
             src_pos_half1 = src_pos  # Position in first half
             if src_pos_half1 < half_total:
                 bytes_to_copy_half1 = min(take, half_total - src_pos_half1)
                 if src_pos_half1 < actual_data_bytes:
                     actual_bytes_half1 = min(bytes_to_copy_half1, actual_data_bytes - src_pos_half1)
-                    
+
                     # Zero-copy optimization: directly use tensor's data pointer
                     src_base_ptr = self.tensor_buffer.data_ptr()
                     src_addr_half1 = src_base_ptr + src_pos_half1
-                    
+
                     ctypes.memmove(data1_array.contents, src_addr_half1, actual_bytes_half1)
-                    
+
                     if bytes_to_copy_half1 > actual_bytes_half1:
                         padding_size = bytes_to_copy_half1 - actual_bytes_half1
                         padding_ptr = ctypes.cast(
@@ -3142,7 +3142,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                             ctypes.POINTER(ctypes.c_uint8)
                         )
                         ctypes.memset(padding_ptr, 0, padding_size)
-                    
+
                     if take > bytes_to_copy_half1:
                         # Fill remaining with zeros
                         remaining_padding = take - bytes_to_copy_half1
@@ -3157,52 +3157,52 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 # Past first half, fill with zeros
                 ctypes.memset(data1_array.contents, 0, take)
-            
+
             # Copy from second half similarly (for encoding, but data1 is already copied)
             # Note: The second half will be used for encoding in C++, but we only need to copy data1 here
             # The encoding will use both halves from tensor_buffer directly in C++
-            
+
             # Write to data0 (persistent block, local, not sent)
             # Calculate aligned offsets for persistent blocks
             data0_offset_aligned = ((data0_offset + 63) // 64) * 64
             recv_parity1_offset_aligned = ((recv_parity1_offset + 63) // 64) * 64
             recv_parity0_offset_aligned = ((recv_parity0_offset + 63) // 64) * 64
             recv_data1_offset_aligned = ((recv_data1_offset + 63) // 64) * 64
-            
+
             # Check bounds
             if data0_offset_aligned + take > block_size:
-                logger.warning(f"EC-NAIVE: data0 exhausted")
+                logger.warning(f"BasicEC: data0 exhausted")
                 break
             if recv_parity1_offset_aligned + take > block_size:
-                logger.warning(f"EC-NAIVE: recv_parity1 exhausted")
+                logger.warning(f"BasicEC: recv_parity1 exhausted")
                 break
             if recv_parity0_offset_aligned + take > block_size:
-                logger.warning(f"EC-NAIVE: recv_parity0 exhausted")
+                logger.warning(f"BasicEC: recv_parity0 exhausted")
                 break
             if recv_data1_offset_aligned + take > block_size:
-                logger.warning(f"EC-NAIVE: recv_data1 exhausted")
+                logger.warning(f"BasicEC: recv_data1 exhausted")
                 break
-            
+
             # Calculate write addresses
             data0_write_addr = data0_base + data0_offset_aligned
             recv_parity1_write_addr = recv_parity1_base + recv_parity1_offset_aligned
             recv_parity0_write_addr = recv_parity0_base + recv_parity0_offset_aligned
             recv_data1_write_addr = recv_data1_base + recv_data1_offset_aligned
-            
+
             # Copy data0 to persistent block (local, not sent)
             # CRITICAL: Use actual_data_bytes // 2 as split point for data blocks
             # Pipeline uses half_total (pipeline_total_bytes // 2) for synchronization,
             # but data blocks should split actual data at actual_data_bytes // 2
             half_actual_data = actual_data_bytes // 2  # Split point for actual data
-            
+
             data0_ptr = ctypes.cast(data0_write_addr, ctypes.POINTER(ctypes.c_uint8))
-            
+
             # Copy from first half to data0 (only the actual data portion)
             if src_pos_half1 < half_actual_data:
                 bytes_to_write_half1 = min(take, half_actual_data - src_pos_half1)
                 if src_pos_half1 < actual_data_bytes:
                     actual_write_half1 = min(bytes_to_write_half1, actual_data_bytes - src_pos_half1)
-                    
+
                     # Copy from tensor_buffer directly
                     src_base_ptr = self.tensor_buffer.data_ptr()
                     src_addr_half1 = src_base_ptr + src_pos_half1
@@ -3212,17 +3212,17 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 # Past first half of actual data, no data for data0
                 ctypes.memset(data0_ptr, 0, take)
-            
+
             # Verify address alignment
             assert data0_write_addr % 64 == 0
             assert recv_parity1_write_addr % 64 == 0
             assert recv_parity0_write_addr % 64 == 0
             assert recv_data1_write_addr % 64 == 0
-            
+
             # Submit to C++ pipeline using unified function
             # Note: data0 is already written to persistent block above
             # C++ will encode data0 and data1 to get parity0 and parity1, then send/receive
-            self.ecnaive_native.submit_ecnaive_save(
+            self.basic_ec_native.submit_basic_ec_save(
                 data0_addr=data0_write_addr,  # Persistent block address (local, not sent)
                 data1_addr=data1_addr,  # Temporary buffer (will be sent)
                 parity0_addr=parity0_addr,  # Temporary buffer (will be sent, encoded from data0+data1)
@@ -3232,68 +3232,68 @@ class FileSystemWriterAsync(FileSystemWriter):
                 recv_data1_addr=recv_data1_write_addr,  # Persistent block address (receive from rank i+3)
                 size=take
             )
-            
+
             # Update offsets
             data0_offset = data0_offset_aligned + take
             recv_parity1_offset = recv_parity1_offset_aligned + take
             recv_parity0_offset = recv_parity0_offset_aligned + take
             recv_data1_offset = recv_data1_offset_aligned + take
-            
+
             src_pos += take
-        
+
         logger.info(
-            f"EC-NAIVE: Processed {src_pos / (1024**3):.2f} GB\n"
+            f"BasicEC: Processed {src_pos / (1024**3):.2f} GB\n"
             f"  data0 used: {data0_offset / (1024**3):.2f} GB\n"
             f"  recv_parity1 used: {recv_parity1_offset / (1024**3):.2f} GB\n"
             f"  recv_parity0 used: {recv_parity0_offset / (1024**3):.2f} GB\n"
             f"  recv_data1 used: {recv_data1_offset / (1024**3):.2f} GB"
         )
-        
+
         # Submit sentinels
-        self.ecnaive_native.submit_send_data1_sentinel()
-        self.ecnaive_native.submit_send_parity0_sentinel()
-        self.ecnaive_native.submit_send_parity1_sentinel()
-        self.ecnaive_native.submit_recv_parity1_sentinel()
-        self.ecnaive_native.submit_recv_parity0_sentinel()
-        self.ecnaive_native.submit_recv_data1_sentinel()
+        self.basic_ec_native.submit_send_data1_sentinel()
+        self.basic_ec_native.submit_send_parity0_sentinel()
+        self.basic_ec_native.submit_send_parity1_sentinel()
+        self.basic_ec_native.submit_recv_parity1_sentinel()
+        self.basic_ec_native.submit_recv_parity0_sentinel()
+        self.basic_ec_native.submit_recv_data1_sentinel()
 
         # Wait for completion
-        logger.info("EC-NAIVE: Waiting for all pipelines to complete...")
-        self.ecnaive_native.wait_for_encoding_completion()
+        logger.info("BasicEC: Waiting for all pipelines to complete...")
+        self.basic_ec_native.wait_for_encoding_completion()
         torch.cuda.synchronize()
-        logger.info("EC-NAIVE: All pipelines completed and CUDA synchronized")
-    
+        logger.info("BasicEC: All pipelines completed and CUDA synchronized")
+
     def _eccheck_preload_tensors_to_buffer(self, non_blocking: bool = True) -> List[WriteBucket]:
         """
         EC-CHECK version: Transfer tensors from GPU to preallocated CPU buffer.
-        
+
         This method transfers tensor data from GPU to the preallocated CPU buffer
         in a pipelined manner, enabling overlap with subsequent encoding operations.
-        
+
         To ensure all ranks have the same pipeline iterations, this method:
         1. Calculates the maximum data size across all ranks
         2. Allocates a buffer of maximum size
         3. Fills remaining space with zeros for ranks with smaller data
-        
+
         Args:
             non_blocking (bool): if True, use non-blocking GPU-to-CPU transfer
-        
+
         Returns:
             torch.Tensor: continuous CPU buffer containing all tensor data
         """
         if not self.decomposed_state_dict:
             raise RuntimeError("EC-CHECK: State dict not decomposed yet")
-        
+
         logger.info("EC-CHECK: Starting GPU-to-CPU tensor transfer...")
         start = time()
-        
+
         # Step 1: Get actual data size for this rank
         actual_total_size = self.decomposed_state_dict.total_tensor_size_bytes
-        
+
         # Step 2: Calculate maximum data size across all ranks
         # Use global_registry if available (no communication needed, all ranks have same registry)
-        if (torch.distributed.is_initialized() and 
-            hasattr(self, 'eccheck_global_registry') and 
+        if (torch.distributed.is_initialized() and
+            hasattr(self, 'eccheck_global_registry') and
             self.eccheck_global_registry is not None):
             # Get all ranks' data sizes from global_registry (no communication needed)
             all_total_bytes_list = []
@@ -3301,12 +3301,12 @@ class FileSystemWriterAsync(FileSystemWriter):
                 rank_metadata = self.eccheck_global_registry.rank_metadata.get(r, [])
                 rank_total_size = tensor_layout_size(rank_metadata)
                 all_total_bytes_list.append(rank_total_size)
-            
+
             # Compute maximum locally (all ranks have the same global_registry)
             max_total_bytes = max(all_total_bytes_list)
         else:
             max_total_bytes = actual_total_size
-        
+
         # Step 3: Allocate buffer with maximum size (for pipeline synchronization)
         if self.preallocated_cpu_buffer is not None:
             buffer = self.preallocated_cpu_buffer
@@ -3326,13 +3326,13 @@ class FileSystemWriterAsync(FileSystemWriter):
                 buffer = torch.empty(max_total_bytes, dtype=torch.uint8).pin_memory()
             else:
                 buffer = torch.empty(max_total_bytes, dtype=torch.uint8)
-        
+
         logger.info(
             f"EC-CHECK: Allocated continuous CPU buffer: {max_total_bytes / (1024**3):.2f} GB "
             f"(actual data: {actual_total_size / (1024**3):.2f} GB, "
             f"padding: {(max_total_bytes - actual_total_size) / (1024**3):.2f} GB)"
         )
-        
+
         # Step 4: Transfer tensors from GPU to continuous CPU buffer
         num_gpu_tensors = 0
         buffer[:max_total_bytes].zero_()
@@ -3342,35 +3342,35 @@ class FileSystemWriterAsync(FileSystemWriter):
         ):
             # Calculate size for this tensor
             tensor_size = info.size_bytes
-            
+
             # Get view of buffer at current offset
             buffer_view = buffer[info.offset:info.offset + tensor_size]
-            
+
             # Flatten and copy tensor to continuous buffer
             tensor_flat = tensor.flatten().contiguous().view(torch.uint8)
             buffer_view.copy_(tensor_flat, non_blocking=non_blocking)
-            
+
             if tensor.device.type != 'cpu':
                 num_gpu_tensors += 1
-            
+
             # Update tensor info.
             info.device = torch.device('cpu')
 
         # Step 5: The active buffer span was zeroed before tensor copies.
-        
+
         # Synchronize if using non-blocking transfers
         if non_blocking and num_gpu_tensors > 0:
             torch.cuda.synchronize()
-        
+
         # Step 6: Store the continuous buffer and metadata
         self.tensor_buffer = buffer
         self.actual_tensor_buffer_size = actual_total_size  # Actual data size
         self.pipeline_total_bytes = max_total_bytes  # Maximum size for pipeline
-        
+
         transfer_time = time() - start
         total_gb = actual_total_size / (1024**3)
         bandwidth = total_gb / transfer_time if transfer_time > 0 else 0
-        
+
         logger.info(
             f"EC-CHECK: Transferred {total_gb:.2f} GB in {transfer_time:.2f}s "
             f"({bandwidth:.2f} GB/s), {num_gpu_tensors} tensors from GPU to CPU"
@@ -3383,41 +3383,41 @@ class FileSystemWriterAsync(FileSystemWriter):
         #     f"EC-CHECK: Pipeline will use {max_total_bytes / (1024**3):.2f} GB "
         #     f"to ensure all ranks have same iterations"
         # )
-        
+
         # Validate that decomposition is still correct after transfer
         if not self.validate_eccheck_decomposition():
             logger.warning("EC-CHECK: Validation warning after GPU-to-CPU transfer")
-        
+
         # ===== Verify that metadata and buffers are passed from strategy =====
         # Metadata exchange and buffer allocation are now done in torch.py
         # The global_registry and receive buffers should already be set by the strategy
-        
+
         if not hasattr(self, 'eccheck_global_registry') or self.eccheck_global_registry is None:
             raise RuntimeError(
                 "EC-CHECK: Global registry not set. Should be passed from strategy "
                 "after _prepare_eccheck_data completes."
             )
-        
+
         if not hasattr(self, 'eccheck_recv_encoding_buffers') or self.eccheck_recv_encoding_buffers is None:
             raise RuntimeError(
                 "EC-CHECK: Receive buffers not set. Should be passed from strategy "
                 "after _prepare_eccheck_data completes."
             )
-        
+
         logger.info(
             "EC-CHECK: Using metadata and receive buffers from strategy (already allocated in torch.py)"
         )
-        
+
         # Execute Phase 3: Tensor data exchange and encoding
         exec_start = time()
         self._execute_phase3_encoding()
         exec_time = time() - exec_start
-        
+
         end_time = time() - start
         logger.info(f"EC-CHECK: eccheck time to buffer: {end_time:.2f}s")
         # Return write_buckets with EC-CHECK continuous buffer
         # Buffer contains all tensor data in continuous memory
-        
+
         # todo(hucc):  mul write_buckets is for mul process write ,but here is one process write ,so we need to change the write_buckets to a list of write_buckets, leave it future
         result_buckets = []
         for i, bucket in enumerate(self.write_buckets):
@@ -3438,7 +3438,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     ('eccheck_continuous_buffer', self.tensor_buffer),  # Continuous buffer
                 ]
                 result_buckets.append((file_name, storage_key, (eccheck_bytes_data, [])))
-            
+
         if self.use_eccheck and self.ecc_write_buckets is not None:
             # Update bucket paths with current checkpoint_dir before adding to result_buckets
             # This ensures paths are updated for each iteration
@@ -3450,10 +3450,10 @@ class FileSystemWriterAsync(FileSystemWriter):
                     file_name = file_path_obj.name
                 else:
                     file_name = str(file_path).split('/')[-1] if '/' in str(file_path) else str(file_path)
-                
+
                 # Build new path with current checkpoint_dir
                 new_file_path = Path(self.checkpoint_dir) / file_name
-                
+
                 # Update eccheck_metadata['eccheck_file_path'] in data
                 # This is critical because write_preloaded_data uses metadata['eccheck_file_path'] (line 550)
                 updated_data = data
@@ -3473,35 +3473,35 @@ class FileSystemWriterAsync(FileSystemWriter):
                         else:
                             updated_bytes_data.append(item)
                     updated_data = (updated_bytes_data, data[1] if len(data) > 1 else [])
-                
+
                 # Create updated bucket with new path and updated metadata
                 updated_bucket = (new_file_path, storage_key, updated_data)
                 result_buckets.append(updated_bucket)
-                
+
         # logger.info(f"EC-CHECK: eccheck preload tensor to buffer {exec_time:.2f}s")
 
         return result_buckets
-    
+
     @staticmethod
     def load_eccheck_bytes_from_file(file_path: Union[str, os.PathLike], my_rank: int = 0) -> Tuple[EccheckMappedFile, Dict[str, Any], List[Any]]:
         """
         Load EC-CHECK file using mmap and return memory address and size for NCCL send/recv.
         Also extracts non_tensor_data and tensor metadata for preparing local_metadata.
-        
+
         File structure:
         [Header: 32 bytes] [Component 1] [Component 2] [Component 3]
-        
+
         Header format:
         - Magic number: 4 bytes ('ECCK')
         - Padding: 4 bytes (for alignment)
         - Component 1 size: 8 bytes (uint64)
         - Component 2 size: 8 bytes (uint64)
         - Component 3 size: 8 bytes (uint64)
-        
+
         Args:
             file_path: path to the EC-CHECK file
             my_rank: current rank (used for preparing local_metadata), default 0
-        
+
         Returns:
             Tuple[EccheckMappedFile, Dict[str, Any], List[TensorMetadata]]: tuple containing:
                 - EccheckMappedFile: dataclass containing:
@@ -3510,7 +3510,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     - file_size: total size of the mapped file in bytes
                 - non_tensor_data: Dict[str, Any] extracted from Component 1
                 - local_metadata: List[TensorMetadata] for preparing local metadata
-        
+
         Note:
             The mmap object must be kept alive (not garbage collected) while using the memory
             for NCCL operations. The caller should call mapped_file.close() when done.
@@ -3519,7 +3519,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         import struct
         import pickle
         from .state_dict_decomposer import TensorMetadata
-        
+
         # Open file and get size
         f = open(file_path, "rb")
         mm = None
@@ -3528,15 +3528,15 @@ class FileSystemWriterAsync(FileSystemWriter):
             f.seek(0, 2)  # Seek to end
             file_size = f.tell()
             f.seek(0)  # Seek back to start
-            
+
             # Memory-map the entire file (zero-copy for /dev/shm)
             # Note: We don't use 'with' statement to keep mmap alive for NCCL operations
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            
+
             # Close file handle - mmap is independent of the file handle
             f.close()
             f = None
-            
+
             # Parse header to extract Component 1 (non_tensor_data) and Component 2 (tensor_infos)
             header_bytes = mm[:COMPONENT_FILE_HEADER_SIZE]
             if len(header_bytes) != COMPONENT_FILE_HEADER_SIZE:
@@ -3544,32 +3544,32 @@ class FileSystemWriterAsync(FileSystemWriter):
                     f"EC-CHECK: Invalid file header "
                     f"(expected {COMPONENT_FILE_HEADER_SIZE} bytes, got {len(header_bytes)})"
                 )
-            
+
             # Parse header (default format includes padding for alignment)
             magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
                 COMPONENT_FILE_HEADER_FORMAT, header_bytes
             )
-            
+
             # Validate magic number
             if magic != b'ECCK':
                 raise RuntimeError(f"EC-CHECK: Invalid magic number (expected b'ECCK', got {magic})")
-            
+
             # Extract Component 1: non_tensor_data
             offset = COMPONENT_FILE_HEADER_SIZE  # After header
-            
+
             non_tensor_bytes = mm[offset:offset + non_tensor_size]
             if len(non_tensor_bytes) != non_tensor_size:
                 raise RuntimeError(
                     f"EC-CHECK: Failed to read Component 1 "
                     f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
                 )
-            
+
             # Deserialize non_tensor_data
             non_tensor_data = pickle.loads(non_tensor_bytes)
             logger.debug(f"EC-CHECK: Extracted non_tensor_data from Component 1 ({non_tensor_size / 1024:.2f} KB)")
-            
+
             offset += non_tensor_size  # Move to Component 2
-            
+
             # Extract Component 2: tensor_infos (for preparing local_metadata)
             tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
             if len(tensor_keys_bytes) != tensor_keys_size:
@@ -3577,11 +3577,11 @@ class FileSystemWriterAsync(FileSystemWriter):
                     f"EC-CHECK: Failed to read Component 2 "
                     f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
                 )
-            
+
             # Deserialize tensor_infos
             tensor_infos = pickle.loads(tensor_keys_bytes)
             logger.debug(f"EC-CHECK: Extracted {len(tensor_infos)} tensor infos from Component 2")
-            
+
             # Convert tensor_infos to local_metadata (List[TensorMetadata])
             local_metadata = []
             for info in tensor_infos:
@@ -3600,22 +3600,22 @@ class FileSystemWriterAsync(FileSystemWriter):
                     source_rank=info.source_rank,
                 )
                 local_metadata.append(data_meta)
-            
+
             logger.debug(f"EC-CHECK: Prepared {len(local_metadata)} TensorMetadata entries for local_metadata")
-            
+
             # Get memory address for NCCL operations
             # Use numpy.frombuffer to get address from read-only mmap (doesn't require write access)
             # This creates a read-only numpy view and extracts its memory address
             import numpy as np
-            
+
             # Create minimal numpy view to get buffer address (works with read-only buffers)
             np_view = np.frombuffer(mm, dtype=np.uint8, count=min(1, file_size))
             memory_address = np_view.ctypes.data
-            
+
             # Note: The mmap object itself implements the buffer protocol and can be used
             # directly with NCCL. The memory_address is provided for cases where a raw
             # pointer is needed.
-            
+
             logger.info(
                 f"EC-CHECK: Mapped file {file_path} for NCCL operations\n"
                 f"  File size: {file_size / (1024**3):.2f} GB\n"
@@ -3624,7 +3624,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 f"  Tensor metadata: {len(local_metadata)} entries\n"
                 f"  Note: mmap object must be kept alive during NCCL operations"
             )
-            
+
             mapped_file = EccheckMappedFile(
                 mmap_object=mm,
                 memory_address=memory_address,
@@ -3632,9 +3632,9 @@ class FileSystemWriterAsync(FileSystemWriter):
                 local_metadata=local_metadata,
                 non_tensor_data=non_tensor_data
             )
-            
+
             return mapped_file
-            
+
         except Exception as e:
             if mm is not None:
                 try:
@@ -3644,19 +3644,19 @@ class FileSystemWriterAsync(FileSystemWriter):
             if f is not None:
                 f.close()
             raise RuntimeError(f"EC-CHECK: Failed to map file {file_path} for NCCL: {e}") from e
-    
+
     @staticmethod
-    def load_ecnaive_bytes_from_file(file_path: Union[str, os.PathLike], my_rank: int = 0) -> MappedCheckpointFile:
+    def load_basic_ec_bytes_from_file(file_path: Union[str, os.PathLike], my_rank: int = 0) -> MappedCheckpointFile:
         """
-        Load EC-NAIVE file using mmap and extract metadata.
-        
+        Load BasicEC file using mmap and extract metadata.
+
         File structure:
         [Header: 32 bytes] [Component 1] [Component 2] [Component 3]
-        
+
         Args:
-            file_path: path to the EC-NAIVE file
+            file_path: path to the BasicEC file
             my_rank: current rank (used for preparing local_metadata), default 0
-        
+
         Returns:
             MappedCheckpointFile: dataclass containing mmap object, memory address, file size,
                               local_metadata, and non_tensor_data
@@ -3665,7 +3665,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         import struct
         import pickle
         from .state_dict_decomposer import TensorMetadata
-        
+
         # Open file and get size
         f = open(file_path, "rb")
         mm = None
@@ -3674,59 +3674,59 @@ class FileSystemWriterAsync(FileSystemWriter):
             f.seek(0, 2)  # Seek to end
             file_size = f.tell()
             f.seek(0)  # Seek back to start
-            
+
             # Memory-map the entire file
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            
+
             # Close file handle - mmap is independent of the file handle
             f.close()
             f = None
-            
+
             # Parse header to extract Component 1 (non_tensor_data) and Component 2 (tensor_infos)
             header_bytes = mm[:COMPONENT_FILE_HEADER_SIZE]
             if len(header_bytes) != COMPONENT_FILE_HEADER_SIZE:
                 raise RuntimeError(
-                    f"EC-NAIVE: Invalid file header "
+                    f"BasicEC: Invalid file header "
                     f"(expected {COMPONENT_FILE_HEADER_SIZE} bytes, got {len(header_bytes)})"
                 )
-            
+
             # Parse header
             magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
                 COMPONENT_FILE_HEADER_FORMAT, header_bytes
             )
-            
+
             # Validate magic number
             if magic != b'ECNV':
-                raise RuntimeError(f"EC-NAIVE: Invalid magic number (expected b'ECNV', got {magic})")
-            
+                raise RuntimeError(f"BasicEC: Invalid magic number (expected b'ECNV', got {magic})")
+
             # Extract Component 1: non_tensor_data
             offset = COMPONENT_FILE_HEADER_SIZE  # After header
-            
+
             non_tensor_bytes = mm[offset:offset + non_tensor_size]
             if len(non_tensor_bytes) != non_tensor_size:
                 raise RuntimeError(
-                    f"EC-NAIVE: Failed to read Component 1 "
+                    f"BasicEC: Failed to read Component 1 "
                     f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
                 )
-            
+
             # Deserialize non_tensor_data
             non_tensor_data = pickle.loads(non_tensor_bytes)
-            logger.debug(f"EC-NAIVE: Extracted non_tensor_data from Component 1 ({non_tensor_size / 1024:.2f} KB)")
-            
+            logger.debug(f"BasicEC: Extracted non_tensor_data from Component 1 ({non_tensor_size / 1024:.2f} KB)")
+
             offset += non_tensor_size  # Move to Component 2
-            
+
             # Extract Component 2: tensor_infos (for preparing local_metadata)
             tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
             if len(tensor_keys_bytes) != tensor_keys_size:
                 raise RuntimeError(
-                    f"EC-NAIVE: Failed to read Component 2 "
+                    f"BasicEC: Failed to read Component 2 "
                     f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
                 )
-            
+
             # Deserialize tensor_infos
             tensor_infos = pickle.loads(tensor_keys_bytes)
-            logger.debug(f"EC-NAIVE: Extracted {len(tensor_infos)} tensor infos from Component 2")
-            
+            logger.debug(f"BasicEC: Extracted {len(tensor_infos)} tensor infos from Component 2")
+
             # Convert tensor_infos to local_metadata (List[TensorMetadata])
             # Saved objects may be TensorInfo (no chunk_type/target/source), so fill defaults.
             local_metadata = []
@@ -3747,22 +3747,22 @@ class FileSystemWriterAsync(FileSystemWriter):
                     source_rank=source_rank,
                 )
                 local_metadata.append(data_meta)
-            
-            logger.debug(f"EC-NAIVE: Prepared {len(local_metadata)} TensorMetadata entries for local_metadata")
-            
+
+            logger.debug(f"BasicEC: Prepared {len(local_metadata)} TensorMetadata entries for local_metadata")
+
             # Get memory address
             import numpy as np
             np_view = np.frombuffer(mm, dtype=np.uint8, count=min(1, file_size))
             memory_address = np_view.ctypes.data
-            
+
             logger.info(
-                f"EC-NAIVE: Mapped file {file_path}\n"
+                f"BasicEC: Mapped file {file_path}\n"
                 f"  File size: {file_size / (1024**3):.2f} GB\n"
                 f"  Memory address: {hex(memory_address)}\n"
                 f"  Non-tensor data: {len(non_tensor_data)} keys\n"
                 f"  Tensor metadata: {len(local_metadata)} entries"
             )
-            
+
             mapped_file = MappedCheckpointFile(
                 mmap_object=mm,
                 memory_address=memory_address,
@@ -3771,9 +3771,9 @@ class FileSystemWriterAsync(FileSystemWriter):
                 non_tensor_data=non_tensor_data,
                 tensor_infos=tensor_infos  # Preserve original tensor_infos with offset information
             )
-            
+
             return mapped_file
-            
+
         except Exception as e:
             if mm is not None:
                 try:
@@ -3782,33 +3782,33 @@ class FileSystemWriterAsync(FileSystemWriter):
                     pass
             if f is not None:
                 f.close()
-            raise RuntimeError(f"EC-NAIVE: Failed to map file {file_path}: {e}") from e
-    
+            raise RuntimeError(f"BasicEC: Failed to map file {file_path}: {e}") from e
+
     @staticmethod
     def load_eccheck_components_from_file(file_path: Union[str, os.PathLike]) -> DecomposedStateDict:
         """
         Load three components from a single EC-CHECK file.
-        
+
         File structure:
         [Header: 32 bytes] [Component 1] [Component 2] [Component 3]
-        
+
         Header format:
         - Magic number: 4 bytes ('ECCK')
         - Padding: 4 bytes (for alignment)
         - Component 1 size: 8 bytes (uint64)
         - Component 2 size: 8 bytes (uint64)
         - Component 3 size: 8 bytes (uint64)
-        
+
         Args:
             file_path: path to the EC-CHECK file
-        
+
         Returns:
             DecomposedStateDict: reconstructed decomposed structure
         """
         import struct
         import numpy as np
         import mmap
-        
+
         # Optimization for /dev/shm: Use mmap for zero-copy access
         # Since data is in shared memory, mmap provides direct memory access without copying
         with open(file_path, "rb") as f:
@@ -3816,10 +3816,10 @@ class FileSystemWriterAsync(FileSystemWriter):
             f.seek(0, 2)  # Seek to end
             file_size = f.tell()
             f.seek(0)  # Seek back to start
-            
+
             # Memory-map the entire file (zero-copy for /dev/shm)
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            
+
             try:
                 # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
                 header_bytes = mm[:COMPONENT_FILE_HEADER_SIZE]
@@ -3828,26 +3828,26 @@ class FileSystemWriterAsync(FileSystemWriter):
                         f"EC-CHECK: Invalid file header "
                         f"(expected {COMPONENT_FILE_HEADER_SIZE} bytes, got {len(header_bytes)})"
                     )
-                
+
                 # Parse header (default format includes padding for alignment)
                 magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
                     COMPONENT_FILE_HEADER_FORMAT, header_bytes
                 )
-                
+
                 # Validate magic number
                 if magic != b'ECCK':
                     raise RuntimeError(f"EC-CHECK: Invalid magic number (expected b'ECCK', got {magic})")
-                
+
                 logger.info(
                     f"EC-CHECK: Loading from {file_path} (using mmap for zero-copy)\n"
                     f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
                     f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
                     f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
                 )
-                
+
                 # Calculate offsets for each component
                 offset = COMPONENT_FILE_HEADER_SIZE  # After header
-                
+
                 t1 = time()
                 # Component 1: Non-tensor key-value pairs (direct slice from mmap)
                 non_tensor_bytes = mm[offset:offset + non_tensor_size]
@@ -3857,11 +3857,11 @@ class FileSystemWriterAsync(FileSystemWriter):
                         f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
                     )
                 offset += non_tensor_size
-                
+
                 t2 = time()
                 non_tensor_data = pickle.loads(non_tensor_bytes)
                 logger.debug(f"EC-CHECK: Loaded Component 1 ({non_tensor_size / 1024:.2f} KB)")
-            
+
                 t3 = time()
                 # Component 2: Tensor keys (direct slice from mmap)
                 tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
@@ -3871,24 +3871,24 @@ class FileSystemWriterAsync(FileSystemWriter):
                         f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
                     )
                 offset += tensor_keys_size
-                
+
                 tensor_infos = pickle.loads(tensor_keys_bytes)
                 logger.debug(f"EC-CHECK: Loaded Component 2 ({tensor_keys_size / 1024:.2f} KB)")
                 t4 = time()
-                
+
                 # Component 3: Tensor data buffer (zero-copy numpy view from mmap)
                 # This is the key optimization: np.frombuffer on mmap creates a zero-copy view
                 tensor_buffer_start = offset
                 tensor_buffer_end = offset + tensor_buffer_size
-                
+
                 if tensor_buffer_end > file_size:
                     raise RuntimeError(
                         f"EC-CHECK: File truncated - expected {tensor_buffer_end} bytes, got {file_size}"
                     )
-                
+
                 # Create zero-copy numpy array view directly from mmap
                 buffer_np = np.frombuffer(mm, dtype=np.uint8, count=tensor_buffer_size, offset=tensor_buffer_start)
-                
+
                 t5 = time()
                 # Extract individual tensors from the zero-copy buffer
                 tensor_data = []
@@ -3896,56 +3896,56 @@ class FileSystemWriterAsync(FileSystemWriter):
                     # Calculate byte offset range for this tensor (relative to buffer start)
                     start = info.offset
                     end = start + info.size_bytes
-                    
+
                     # Extract numpy slice (view, not copy) from buffer
                     tensor_bytes_np = buffer_np[start:end]
-                    
+
                     # Create torch tensor directly from bytes
                     # Use frombuffer to create view, then clone to make writable
                     tensor_view = torch.frombuffer(
-                        memoryview(tensor_bytes_np), 
+                        memoryview(tensor_bytes_np),
                         dtype=info.dtype
                     )
                     # Clone to create writable copy and reshape to original shape
                     tensor = tensor_view.clone().reshape(info.shape)
                     tensor_data.append(tensor)
-                
+
                 t6 = time()
                 print("time t6 , t5, t4 , t3, t2, t1: ", t6 - t5, t5 - t4, t4 - t3, t3 - t2, t2 - t1, t6 - t1)
                 logger.debug(f"EC-CHECK: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB) and extracted {len(tensor_data)} tensors")
-            
+
             finally:
                 # Close mmap
                 # mm.close()
                 pass
-        
+
         # Create DecomposedStateDict
         decomposed = DecomposedStateDict(
             non_tensor_data=non_tensor_data,
             tensor_infos=tensor_infos,
             tensor_data=tensor_data,
         )
-        
+
         logger.info(
             f"EC-CHECK: Successfully loaded all components from {file_path}\n"
             f"  Component 1: {len(non_tensor_data)} keys\n"
             f"  Component 2: {len(tensor_infos)} tensor infos\n"
             f"  Component 3: {len(tensor_data)} tensors"
         )
-        
+
         return decomposed
-    
+
     @staticmethod
-    def load_ecnaive_components_from_file(file_path: Union[str, os.PathLike]) -> DecomposedStateDict:
+    def load_basic_ec_components_from_file(file_path: Union[str, os.PathLike]) -> DecomposedStateDict:
         """
-        Load three components from a single EC-NAIVE file.
-        
+        Load three components from a single BasicEC file.
+
         File structure:
         [Header: 32 bytes] [Component 1] [Component 2] [Component 3]
-        
+
         Args:
-            file_path: path to the EC-NAIVE file
-        
+            file_path: path to the BasicEC file
+
         Returns:
             DecomposedStateDict: reconstructed decomposed structure
         """
@@ -3954,145 +3954,145 @@ class FileSystemWriterAsync(FileSystemWriter):
         import mmap
         import pickle
         from .state_dict_decomposer import DecomposedStateDict
-        
+
         # Optimization for /dev/shm: Use mmap for zero-copy access
         with open(file_path, "rb") as f:
             # Get file size
             f.seek(0, 2)  # Seek to end
             file_size = f.tell()
             f.seek(0)  # Seek back to start
-            
+
             # Memory-map the entire file (zero-copy for /dev/shm)
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-            
+
             try:
                 # Read header (32 bytes: 4 for magic + 4 for padding + 8*3 for sizes)
                 header_bytes = mm[:COMPONENT_FILE_HEADER_SIZE]
                 if len(header_bytes) != COMPONENT_FILE_HEADER_SIZE:
                     raise RuntimeError(
-                        f"EC-NAIVE: Invalid file header "
+                        f"BasicEC: Invalid file header "
                         f"(expected {COMPONENT_FILE_HEADER_SIZE} bytes, got {len(header_bytes)})"
                     )
-                
+
                 # Parse header
                 magic, non_tensor_size, tensor_keys_size, tensor_buffer_size = struct.unpack(
                     COMPONENT_FILE_HEADER_FORMAT, header_bytes
                 )
-                
+
                 # Validate magic number
                 if magic != b'ECNV':
-                    raise RuntimeError(f"EC-NAIVE: Invalid magic number (expected b'ECNV', got {magic})")
-                
+                    raise RuntimeError(f"BasicEC: Invalid magic number (expected b'ECNV', got {magic})")
+
                 logger.info(
-                    f"EC-NAIVE: Loading from {file_path}\n"
+                    f"BasicEC: Loading from {file_path}\n"
                     f"  Component 1 size: {non_tensor_size / 1024:.2f} KB\n"
                     f"  Component 2 size: {tensor_keys_size / 1024:.2f} KB\n"
                     f"  Component 3 size: {tensor_buffer_size / (1024**3):.2f} GB"
                 )
-                
+
                 # Calculate offsets for each component
                 offset = COMPONENT_FILE_HEADER_SIZE  # After header
-                
+
                 # Component 1: Non-tensor key-value pairs
                 non_tensor_bytes = mm[offset:offset + non_tensor_size]
                 if len(non_tensor_bytes) != non_tensor_size:
                     raise RuntimeError(
-                        f"EC-NAIVE: Failed to read Component 1 "
+                        f"BasicEC: Failed to read Component 1 "
                         f"(expected {non_tensor_size} bytes, got {len(non_tensor_bytes)})"
                     )
                 offset += non_tensor_size
-                
+
                 non_tensor_data = pickle.loads(non_tensor_bytes)
-                logger.debug(f"EC-NAIVE: Loaded Component 1 ({non_tensor_size / 1024:.2f} KB)")
-            
+                logger.debug(f"BasicEC: Loaded Component 1 ({non_tensor_size / 1024:.2f} KB)")
+
                 # Component 2: Tensor keys
                 tensor_keys_bytes = mm[offset:offset + tensor_keys_size]
                 if len(tensor_keys_bytes) != tensor_keys_size:
                     raise RuntimeError(
-                        f"EC-NAIVE: Failed to read Component 2 "
+                        f"BasicEC: Failed to read Component 2 "
                         f"(expected {tensor_keys_size} bytes, got {len(tensor_keys_bytes)})"
                     )
                 offset += tensor_keys_size
-                
+
                 tensor_infos = pickle.loads(tensor_keys_bytes)
-                logger.debug(f"EC-NAIVE: Loaded Component 2 ({tensor_keys_size / 1024:.2f} KB, {len(tensor_infos)} tensor infos)")
-            
+                logger.debug(f"BasicEC: Loaded Component 2 ({tensor_keys_size / 1024:.2f} KB, {len(tensor_infos)} tensor infos)")
+
                 # Component 3: Tensor data (continuous buffer)
                 tensor_data = []
                 if tensor_buffer_size > 0:
                     # Create numpy view of the buffer (zero-copy)
                     buffer_np = np.frombuffer(mm[offset:offset + tensor_buffer_size], dtype=np.uint8)
-                    
+
                     # Extract each tensor from the buffer
                     for info in tensor_infos:
                         tensor_size_bytes = info.size_bytes
                         start = info.offset
                         end = info.offset + tensor_size_bytes
-                        
+
                         if end > len(buffer_np):
                             raise RuntimeError(
-                                f"EC-NAIVE: Buffer overflow when extracting tensor {info.key} "
+                                f"BasicEC: Buffer overflow when extracting tensor {info.key} "
                                 f"(offset {info.offset}, size {tensor_size_bytes}, buffer size {len(buffer_np)})"
                             )
-                        
+
                         # Extract numpy slice (view, not copy) from buffer
                         tensor_bytes_np = buffer_np[start:end]
-                        
+
                         # Create torch tensor directly from bytes
                         tensor_view = torch.frombuffer(
-                            memoryview(tensor_bytes_np), 
+                            memoryview(tensor_bytes_np),
                             dtype=info.dtype
                         )
                         # Clone to create writable copy and reshape to original shape
                         tensor = tensor_view.clone().reshape(info.shape)
                         tensor_data.append(tensor)
-                        
-                    
-                    logger.debug(f"EC-NAIVE: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB) and extracted {len(tensor_data)} tensors")
-            
+
+
+                    logger.debug(f"BasicEC: Loaded Component 3 ({tensor_buffer_size / (1024**3):.2f} GB) and extracted {len(tensor_data)} tensors")
+
             finally:
                 # Close mmap
                 pass
-        
+
         # Create DecomposedStateDict
         decomposed = DecomposedStateDict(
             non_tensor_data=non_tensor_data,
             tensor_infos=tensor_infos,
             tensor_data=tensor_data,
         )
-        
+
         logger.info(
-            f"EC-NAIVE: Successfully loaded all components from {file_path}\n"
+            f"BasicEC: Successfully loaded all components from {file_path}\n"
             f"  Component 1: {len(non_tensor_data)} keys\n"
             f"  Component 2: {len(tensor_infos)} tensor infos\n"
             f"  Component 3: {len(tensor_data)} tensors"
         )
-        
+
         return decomposed
-    
+
     def validate_eccheck_decomposition(self) -> bool:
         """
         Simple validation: check if state_dict is correctly decomposed into three components.
-        
+
         Validates:
         1. non_tensor_data is a dict
         2. tensor_infos is a list (tensor keys)
         3. tensor_data is a list of tensors
         4. Counts match between tensor_infos and tensor_data
-        
+
         Returns:
             bool: True if decomposition is valid, False otherwise
         """
         if not self.use_eccheck:
             logger.warning("EC-CHECK: Validation skipped - EC-CHECK is not enabled")
             return False
-        
+
         if not self.decomposed_state_dict:
             logger.error("EC-CHECK: Validation failed - State dict not decomposed yet")
             return False
-        
+
         decomposed = self.decomposed_state_dict
-        
+
         # Check 1: Non-tensor key-value pairs (dict)
         if not isinstance(decomposed.non_tensor_data, dict):
             logger.error(
@@ -4100,7 +4100,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 f"got {type(decomposed.non_tensor_data).__name__}"
             )
             return False
-        
+
         # Check 2: Tensor keys (list)
         if not isinstance(decomposed.tensor_infos, list):
             logger.error(
@@ -4108,7 +4108,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 f"got {type(decomposed.tensor_infos).__name__}"
             )
             return False
-        
+
         # Check 3: Tensor data (list)
         if not isinstance(decomposed.tensor_data, list):
             logger.error(
@@ -4116,7 +4116,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 f"got {type(decomposed.tensor_data).__name__}"
             )
             return False
-        
+
         # Check 4: Counts match
         if len(decomposed.tensor_infos) != len(decomposed.tensor_data):
             logger.error(
@@ -4124,7 +4124,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 f"vs {len(decomposed.tensor_data)} tensors"
             )
             return False
-        
+
         # All checks passed
         logger.info(
             f"EC-CHECK: Decomposition validation passed ✓\n"
@@ -4132,12 +4132,12 @@ class FileSystemWriterAsync(FileSystemWriter):
             f"  Component 2 (tensor keys list): {len(decomposed.tensor_infos)} tensors\n"
             f"  Component 3 (tensor data list): {len(decomposed.tensor_data)} tensors"
         )
-            
+
         # Log device info for verification
         if len(decomposed.tensor_infos) > 0:
             devices = set(info.device.type for info in decomposed.tensor_infos)
             logger.debug(f"EC-CHECK: Tensor devices: {devices}")
-        
+
         return True
 
 

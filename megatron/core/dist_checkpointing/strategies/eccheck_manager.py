@@ -1,6 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-"""EC-CHECK manager for shared eccheck_native initialization and buffer management."""
+"""ECCheck manager for shared eccheck_native initialization and buffer management."""
 
 import os
 import queue
@@ -23,10 +23,10 @@ RANKS_PER_GROUP = 4
 
 
 class ECCHECKManager:
-    """Shared manager for EC-CHECK C++ module initialization and buffer management.
+    """Shared manager for ECCheck C++ module initialization and buffer management.
 
     This class provides a singleton instance that manages:
-    - EC-CHECK C++ native module (_eccheck_native)
+    - ECCheck C++ native module (_eccheck_native)
     - Buffer allocation and management (data, encoding, parity buffers)
     - Buffer poller thread for releasing buffers
 
@@ -122,7 +122,7 @@ class ECCHECKManager:
                 return
         pin = self.eccheck_pin_memory and torch.cuda.is_available()
         logger.debug(
-            f"ECCHECK: Allocating preallocated buffer: {size_bytes / (1024**3):.2f} GB (pin={pin})"
+            f"ECCheck: Allocating preallocated buffer: {size_bytes / (1024**3):.2f} GB (pin={pin})"
         )
         self.preallocated_cpu_buffer = allocate_hugepage_tensor(
             size_bytes, fallback_pin_memory=pin, touch_pages=False
@@ -143,7 +143,7 @@ class ECCHECKManager:
             return self._cached_blocks
         pin = self.eccheck_pin_memory and torch.cuda.is_available()
         logger.debug(
-            f"ECCHECK: Allocating {count} blocks: {aligned_size / (1024**3):.2f} GB each "
+            f"ECCheck: Allocating {count} blocks: {aligned_size / (1024**3):.2f} GB each "
             f"({count * aligned_size / (1024**3):.2f} GB total, pin={pin})"
         )
         self._cached_blocks = list(
@@ -234,7 +234,7 @@ class ECCHECKManager:
             offset = int(os.environ.get("ECCHECK_RIG_REMAP_OFFSET", "0"))
         if offset < 0 or offset >= RANKS_PER_GROUP:
             raise ValueError(
-                f"ECCHECK rig remap offset must be in [0, {RANKS_PER_GROUP - 1}], " f"got {offset}"
+                f"ECCheck rig remap offset must be in [0, {RANKS_PER_GROUP - 1}], " f"got {offset}"
             )
         return offset
 
@@ -250,7 +250,7 @@ class ECCHECKManager:
 
     @classmethod
     def _get_rank_in_group(cls, rank: int, world_size: int) -> int:
-        """Map a global rank to its rotated logical ECCHECK rig position."""
+        """Map a global rank to its rotated logical ECCheck rig position."""
         physical_rig = cls._get_physical_rank_in_group(rank, world_size)
         return (physical_rig + cls._get_rig_remap_offset()) % RANKS_PER_GROUP
 
@@ -277,7 +277,7 @@ class ECCHECKManager:
         """
         if world_size % RANKS_PER_GROUP != 0:
             raise ValueError(
-                "EC-CHECK: World size must be divisible by "
+                "ECCheck: World size must be divisible by "
                 f"{RANKS_PER_GROUP} for multi-rank, got {world_size}"
             )
         group_id = self._get_group_id(my_rank, world_size)
@@ -286,7 +286,7 @@ class ECCHECKManager:
         paired_rank_in_group = (rank_in_group + 2) % RANKS_PER_GROUP
         paired_rank = self._get_rank_by_group_position(group_id, paired_rank_in_group, world_size)
         logger.debug(
-            f"EC-CHECK: Rank {my_rank} (group_id={group_id}, rank_in_group={rank_in_group}) "
+            f"ECCheck: Rank {my_rank} (group_id={group_id}, rank_in_group={rank_in_group}) "
             f"XOR paired with Rank {paired_rank}"
         )
         return paired_rank
@@ -297,7 +297,7 @@ class ECCHECKManager:
         Group-based pairing uses rig0<->rig1 and rig2<->rig3.
         """
         if world_size % 2 != 0:
-            raise ValueError(f"EC-CHECK: World size must be even for P2P pairing, got {world_size}")
+            raise ValueError(f"ECCheck: World size must be even for P2P pairing, got {world_size}")
         group_id = self._get_group_id(my_rank, world_size)
         rank_in_group = self._get_rank_in_group(my_rank, world_size)
         if rank_in_group % 2 == 0:
@@ -306,7 +306,7 @@ class ECCHECKManager:
             partner_rig = rank_in_group - 1
         p2p_partner_rank = self._get_rank_by_group_position(group_id, partner_rig, world_size)
         logger.debug(
-            f"EC-CHECK: Rank {my_rank} (group_id={group_id}, rank_in_group={rank_in_group}) "
+            f"ECCheck: Rank {my_rank} (group_id={group_id}, rank_in_group={rank_in_group}) "
             f"P2P partner is Rank {p2p_partner_rank}"
         )
         return p2p_partner_rank
@@ -319,7 +319,7 @@ class ECCHECKManager:
         """
         if world_size < 4 or world_size % 4 != 0:
             raise ValueError(
-                "EC-CHECK: world_size must be >=4 and divisible by 4 for recovery, "
+                "ECCheck: world_size must be >=4 and divisible by 4 for recovery, "
                 f"got {world_size}"
             )
         group_id = self._get_group_id(my_rank, world_size)
@@ -332,7 +332,7 @@ class ECCHECKManager:
 
     def _get_eccheck_network_config(self, rank: int, world_size: int) -> dict:
         """
-        Get network configuration for EC-CHECK socket-based transports.
+        Get network configuration for ECCheck socket-based transports.
 
         This function:
         1. Gets base IP address (from ECCHECK_BASE_IP env var, MASTER_ADDR, or auto-detect)
@@ -407,20 +407,20 @@ class ECCHECKManager:
                     ip_bytes = bytes(ip_tensor.cpu().tolist())
                     rank_ips[r] = socket.inet_ntoa(ip_bytes)
 
-                logger.debug(f"EC-CHECK: [Rank {rank}] All ranks IPs: {rank_ips}")
+                logger.debug(f"ECCheck: [Rank {rank}] All ranks IPs: {rank_ips}")
 
                 # Get partner IPs from gathered results
                 xor_partner_ip = rank_ips.get(xor_partner, base_ip)
                 p2p_partner_ip = rank_ips.get(p2p_partner, base_ip)
 
                 logger.debug(
-                    f"EC-CHECK: [Rank {rank}] IP exchange completed - "
+                    f"ECCheck: [Rank {rank}] IP exchange completed - "
                     f"XOR partner ({xor_partner}): {xor_partner_ip}, "
                     f"P2P partner ({p2p_partner}): {p2p_partner_ip}"
                 )
             except Exception as e:
                 logger.warning(
-                    f"EC-CHECK: Failed to exchange IPs via all_gather, using local IP: {e}"
+                    f"ECCheck: Failed to exchange IPs via all_gather, using local IP: {e}"
                 )
                 # Fallback to using local IP for all partners
                 xor_partner_ip = base_ip
@@ -428,7 +428,7 @@ class ECCHECKManager:
                 rank_ips = {r: base_ip for r in range(world_size)}
         else:
             # Single rank mode - use local IP
-            logger.debug("EC-CHECK: Distributed not initialized, using local IP for all partners")
+            logger.debug("ECCheck: Distributed not initialized, using local IP for all partners")
             rank_ips = {r: base_ip for r in range(world_size)}
 
         group_id = self._get_group_id(rank, world_size)
@@ -446,7 +446,7 @@ class ECCHECKManager:
         }
 
         logger.debug(
-            f"EC-CHECK: [Rank {rank}] Network config:\n"
+            f"ECCheck: [Rank {rank}] Network config:\n"
             f"  My IP: {config['my_ip']}\n"
             f"  Base port: {config['base_port']}\n"
             f"  XOR partner IP: {config['xor_partner_ip']}\n"
@@ -458,9 +458,9 @@ class ECCHECKManager:
         return config
 
     def init_eccheck_if_enabled(self):
-        """Initialize EC-CHECK C++ module if enabled and distributed environment is ready."""
+        """Initialize ECCheck C++ module if enabled and distributed environment is ready."""
         if self._eccheck_native is not None:
-            logger.debug("EC-CHECK: Already initialized, skipping")
+            logger.debug("ECCheck: Already initialized, skipping")
             return
 
         try:
@@ -476,23 +476,23 @@ class ECCHECKManager:
             # Check if distributed environment is initialized
             if not torch.distributed.is_initialized():
                 logger.warning(
-                    "EC-CHECK: Distributed environment not initialized, skipping "
-                    "EC-CHECK initialization"
+                    "ECCheck: Distributed environment not initialized, skipping "
+                    "ECCheck initialization"
                 )
                 return
 
-            # Initialize EC-CHECK C++ module
+            # Initialize ECCheck C++ module
             self._init_eccheck_native()
 
             # Start persistent buffer poller thread
             self._start_buffer_poller_thread()
 
         except Exception as e:
-            logger.warning(f"EC-CHECK: Failed to initialize during manager initialization: {e}")
+            logger.warning(f"ECCheck: Failed to initialize during manager initialization: {e}")
             self._eccheck_native = None
 
     def _init_eccheck_native(self):
-        """Initialize EC-CHECK C++ native module."""
+        """Initialize ECCheck C++ native module."""
         eccheck_native = None
         try:
             # Direct import .so file without modifying sys.path or affecting other packages
@@ -513,7 +513,7 @@ class ECCHECKManager:
             spec = _importlib_util.spec_from_file_location("eccheck_native", so_path)
             eccheck_native = _importlib_util.module_from_spec(spec)
             spec.loader.exec_module(eccheck_native)
-            logger.debug(f"EC-CHECK: Loaded .so file from {so_path}")
+            logger.debug(f"ECCheck: Loaded .so file from {so_path}")
 
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
@@ -528,7 +528,7 @@ class ECCHECKManager:
                     # ===== ASIO/RDMA Initialization Path =====
                     transport_mode = "RDMA" if self.use_rdma else "ASIO"
                     logger.debug(
-                        f"EC-CHECK: [Rank {rank}] Using {transport_mode} for communication"
+                        f"ECCheck: [Rank {rank}] Using {transport_mode} for communication"
                     )
 
                     # Check RDMA availability if RDMA mode is requested
@@ -554,27 +554,27 @@ class ECCHECKManager:
                             raise  # Re-raise the RuntimeError we just created
                         except Exception as check_err:
                             logger.warning(
-                                f"EC-CHECK: Could not check RDMA availability: {check_err}"
+                                f"ECCheck: Could not check RDMA availability: {check_err}"
                             )
-                            logger.warning("EC-CHECK: Will attempt to initialize RDMA anyway...")
+                            logger.warning("ECCheck: Will attempt to initialize RDMA anyway...")
 
                     # Get network configuration
                     net_config = self._get_eccheck_network_config(rank, world_size)
 
                     # Synchronize all ranks before creating C++ instances
                     logger.debug(
-                        f"EC-CHECK: [Rank {rank}] Synchronizing all ranks before creating "
+                        f"ECCheck: [Rank {rank}] Synchronizing all ranks before creating "
                         f"C++ native module ({transport_mode})..."
                     )
                     torch.distributed.barrier()
                     logger.debug(
-                        f"EC-CHECK: [Rank {rank}] All ranks synchronized, creating C++ "
+                        f"ECCheck: [Rank {rank}] All ranks synchronized, creating C++ "
                         f"native module with {transport_mode}..."
                     )
 
                     # Create C++ instance with ASIO/RDMA parameters
                     logger.debug(
-                        f"EC-CHECK: Creating C++ native module with {transport_mode} "
+                        f"ECCheck: Creating C++ native module with {transport_mode} "
                         "(this will block until connections are established)..."
                     )
 
@@ -666,17 +666,17 @@ class ECCHECKManager:
 
                     # If we reach here, ASIO/RDMA connections are ready and threads are running
                     logger.debug(
-                        "EC-CHECK: C++ native module initialized successfully with "
+                        "ECCheck: C++ native module initialized successfully with "
                         f"{transport_mode} (rank={rank}, world_size={world_size}, "
                         f"paired_rank={paired_rank})"
                     )
 
-                    # Initialize EC-CHECK buffers (same for both ASIO and NCCL)
+                    # Initialize ECCheck buffers (same for both ASIO and NCCL)
                     self._init_eccheck_buffers()
 
                 else:
                     # ===== NCCL Initialization Path (original) =====
-                    logger.debug(f"EC-CHECK: [Rank {rank}] Using NCCL for communication")
+                    logger.debug(f"ECCheck: [Rank {rank}] Using NCCL for communication")
 
                     # ===== Step 1: Rank 0 generates four NCCL IDs =====
                     # lane0 carries rig0<->rig2 XOR traffic.
@@ -690,7 +690,7 @@ class ECCHECKManager:
                         nccl_id_p2p_0_1 = eccheck_native.generate_nccl_id()  # rig0<->rig1
                         nccl_id_p2p_2_3 = eccheck_native.generate_nccl_id()  # rig2<->rig3
                         logger.debug(
-                            "EC-CHECK: [Rank 0] Generated four NCCL IDs "
+                            "ECCheck: [Rank 0] Generated four NCCL IDs "
                             f"(size: {len(nccl_id_thread1)} bytes each)"
                         )
                     else:
@@ -746,18 +746,18 @@ class ECCHECKManager:
                     nccl_id_p2p_0_1 = id_p2p_0_1_tensor.cpu().tolist()
                     nccl_id_p2p_2_3 = id_p2p_2_3_tensor.cpu().tolist()
 
-                    logger.debug(f"EC-CHECK: [Rank {rank}] Received four NCCL IDs via broadcast")
+                    logger.debug(f"ECCheck: [Rank {rank}] Received four NCCL IDs via broadcast")
 
                     # ===== Step 3: Synchronize all ranks before creating C++ instances =====
                     # Start C++ instance creation at roughly the same time on all ranks,
                     # which helps synchronize the NCCL communicator initialization calls.
                     logger.debug(
-                        f"EC-CHECK: [Rank {rank}] Synchronizing all ranks before creating "
+                        f"ECCheck: [Rank {rank}] Synchronizing all ranks before creating "
                         "C++ native module..."
                     )
                     torch.distributed.barrier()
                     logger.debug(
-                        f"EC-CHECK: [Rank {rank}] All ranks synchronized, creating C++ "
+                        f"ECCheck: [Rank {rank}] All ranks synchronized, creating C++ "
                         "native module..."
                     )
 
@@ -768,7 +768,7 @@ class ECCHECKManager:
                     # 3. All threads are ready for data exchange
                     # Only after all initialization is complete will this call return.
                     logger.debug(
-                        "EC-CHECK: Creating C++ native module "
+                        "ECCheck: Creating C++ native module "
                         "(this will block until NCCL is initialized)..."
                     )
 
@@ -788,15 +788,15 @@ class ECCHECKManager:
 
                     # If we reach here, NCCL communicators are ready and threads are running
                     logger.debug(
-                        "EC-CHECK: C++ native module initialized successfully "
+                        "ECCheck: C++ native module initialized successfully "
                         f"(rank={rank}, world_size={world_size}, paired_rank={paired_rank})"
                     )
 
-                    # Initialize EC-CHECK buffers
+                    # Initialize ECCheck buffers
                     self._init_eccheck_buffers()
 
             except Exception as e:
-                logger.warning(f"EC-CHECK: Failed to create C++ native module instance: {e}")
+                logger.warning(f"ECCheck: Failed to create C++ native module instance: {e}")
                 # Try to stop the pipeline if it was partially created
                 try:
                     if hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
@@ -808,25 +808,25 @@ class ECCHECKManager:
 
         except ImportError as e:
             logger.warning(
-                f"EC-CHECK: C++ native module not available: {e}, "
-                "EC-CHECK functionality will not work"
+                f"ECCheck: C++ native module not available: {e}, "
+                "ECCheck functionality will not work"
             )
             self._eccheck_native = None
         except Exception as e:
             logger.warning(
-                f"EC-CHECK: Failed to initialize C++ native module: {e}, "
-                "EC-CHECK functionality will not work"
+                f"ECCheck: Failed to initialize C++ native module: {e}, "
+                "ECCheck functionality will not work"
             )
             self._eccheck_native = None
 
     def _init_eccheck_buffers(self):
-        """Initialize EC-CHECK buffers during C++ module initialization.
+        """Initialize ECCheck buffers during C++ module initialization.
 
         Note: Only allocates data and encoding buffers at initialization.
         Receive buffers are deferred until peer sizes are known. Parity scratch
         buffers are allocated here with the data and encoding pools.
         """
-        logger.debug("EC-CHECK: Initializing buffers for EC-CHECK (data and encoding only)")
+        logger.debug("ECCheck: Initializing buffers for ECCheck (data and encoding only)")
 
         # Allocate data buffers for storing original tensor data
         self.eccheck_data_buffers = self._allocate_data_buffers()
@@ -860,7 +860,7 @@ class ECCHECKManager:
             self._free_parity_buffer_queue.put(int(buffer.data_ptr()))
 
         logger.debug(
-            f"EC-CHECK: Buffer initialization completed - "
+            f"ECCheck: Buffer initialization completed - "
             f"Data buffers: {len(self.eccheck_data_buffers)}, "
             f"Encoding buffers: {len(self.eccheck_encoding_buffers)}, "
             f"Parity buffers: {len(self.eccheck_parity_buffers)}"
@@ -873,7 +873,7 @@ class ECCHECKManager:
     def _allocate_data_buffers(self):
         """Allocate data buffers for storing original tensor data."""
         logger.debug(
-            "EC-CHECK: Allocating data buffers (%d buffers, %dMB each)",
+            "ECCheck: Allocating data buffers (%d buffers, %dMB each)",
             self.eccheck_data_buffers_count,
             self.eccheck_buffer_size // (1024 * 1024),
         )
@@ -886,15 +886,15 @@ class ECCHECKManager:
                 touch_pages=True,
             )
             data_buffers.append(buffer)
-            logger.debug(f"EC-CHECK: Allocated data buffer {i}: {self.eccheck_buffer_size} bytes")
+            logger.debug(f"ECCheck: Allocated data buffer {i}: {self.eccheck_buffer_size} bytes")
 
-        logger.debug(f"EC-CHECK: Allocated {len(data_buffers)} data buffers")
+        logger.debug(f"ECCheck: Allocated {len(data_buffers)} data buffers")
         return data_buffers
 
     def _allocate_encoding_buffers(self):
         """Allocate encoding buffers for encoded packets."""
         logger.debug(
-            "EC-CHECK: Allocating encoding buffers (%d buffers, %dMB each)",
+            "ECCheck: Allocating encoding buffers (%d buffers, %dMB each)",
             self.eccheck_encoding_buffers_count,
             self.eccheck_buffer_size // (1024 * 1024),
         )
@@ -908,10 +908,10 @@ class ECCHECKManager:
             )
             encoding_buffers.append(buffer)
             logger.debug(
-                f"EC-CHECK: Allocated encoding buffer {i}: {self.eccheck_buffer_size} bytes"
+                f"ECCheck: Allocated encoding buffer {i}: {self.eccheck_buffer_size} bytes"
             )
 
-        logger.debug(f"EC-CHECK: Allocated {len(encoding_buffers)} encoding buffers")
+        logger.debug(f"ECCheck: Allocated {len(encoding_buffers)} encoding buffers")
         return encoding_buffers
 
     def _allocate_parity_buffers(self):
@@ -923,7 +923,7 @@ class ECCHECKManager:
         # Use encoding buffer count instead of data buffer count
         # The pool count matches the encoding pool; buffers are reused by both lanes.
         parity_buffer_count = self.eccheck_encoding_buffers_count
-        logger.debug(f"EC-CHECK: Allocating parity buffers ({parity_buffer_count} buffers)")
+        logger.debug(f"ECCheck: Allocating parity buffers ({parity_buffer_count} buffers)")
 
         parity_buffers = []
         for i in range(parity_buffer_count):
@@ -933,9 +933,9 @@ class ECCHECKManager:
                 touch_pages=True,
             )
             parity_buffers.append(buffer)
-            logger.debug(f"EC-CHECK: Allocated parity buffer {i}: {self.eccheck_buffer_size} bytes")
+            logger.debug(f"ECCheck: Allocated parity buffer {i}: {self.eccheck_buffer_size} bytes")
 
-        logger.debug(f"EC-CHECK: Allocated {len(parity_buffers)} parity buffers")
+        logger.debug(f"ECCheck: Allocated {len(parity_buffers)} parity buffers")
         return parity_buffers
 
     def _poll_and_release_buffers(self):
@@ -950,7 +950,7 @@ class ECCHECKManager:
                 self._free_data_buffer_queue.put_nowait(data_addr)
             except Exception:
                 logger.error(
-                    f"EC-CHECK: Data buffer queue is full, cannot release buffer {data_addr}"
+                    f"ECCheck: Data buffer queue is full, cannot release buffer {data_addr}"
                 )
 
         # Get encoding buffers ready for release
@@ -960,7 +960,7 @@ class ECCHECKManager:
                 self._free_encoding_buffer_queue.put_nowait(encoding_addr)
             except Exception:
                 logger.error(
-                    "EC-CHECK: Encoding buffer queue is full, cannot release buffer "
+                    "ECCheck: Encoding buffer queue is full, cannot release buffer "
                     f"{encoding_addr}"
                 )
 
@@ -969,16 +969,16 @@ class ECCHECKManager:
         for parity_addr in parity_buffers:
             try:
                 self._free_parity_buffer_queue.put_nowait(parity_addr)
-                logger.debug(f"EC-CHECK: Released parity buffer at address {parity_addr}")
+                logger.debug(f"ECCheck: Released parity buffer at address {parity_addr}")
             except Exception:
                 logger.error(
-                    f"EC-CHECK: Parity buffer queue is full, cannot release buffer {parity_addr}"
+                    f"ECCheck: Parity buffer queue is full, cannot release buffer {parity_addr}"
                 )
 
     def _start_buffer_poller_thread(self):
         """Start a persistent background thread to poll and release buffers."""
         if hasattr(self, '_buffer_poller_thread') and self._buffer_poller_thread is not None:
-            logger.warning("EC-CHECK: Buffer poller thread already started")
+            logger.warning("ECCheck: Buffer poller thread already started")
             return
 
         # Create control events
@@ -987,7 +987,7 @@ class ECCHECKManager:
 
         def buffer_poller_worker():
             """Persistent background thread that polls for buffer releases."""
-            logger.debug("EC-CHECK: Buffer poller thread started")
+            logger.debug("ECCheck: Buffer poller thread started")
             poll_count = 0
 
             while not self._buffer_poller_stop_event.is_set():
@@ -996,26 +996,26 @@ class ECCHECKManager:
                     self._poll_and_release_buffers()
                     poll_count += 1
                     if poll_count % 1000 == 0:
-                        logger.debug(f"EC-CHECK: Buffer poller running (polled {poll_count} times)")
+                        logger.debug(f"ECCheck: Buffer poller running (polled {poll_count} times)")
 
                 # Sleep briefly to avoid busy waiting
                 from time import sleep
 
                 sleep(0.001)  # 1ms
 
-            logger.debug("EC-CHECK: Buffer poller thread stopping")
+            logger.debug("ECCheck: Buffer poller thread stopping")
 
         # Start the daemon thread
         self._buffer_poller_thread = threading.Thread(target=buffer_poller_worker, daemon=True)
         self._buffer_poller_thread.start()
-        logger.debug("EC-CHECK: Buffer poller thread created and started")
+        logger.debug("ECCheck: Buffer poller thread created and started")
 
     def _stop_buffer_poller_thread(self):
         """Stop the persistent buffer poller thread."""
         if not hasattr(self, '_buffer_poller_thread') or self._buffer_poller_thread is None:
             return
 
-        logger.debug("EC-CHECK: Stopping buffer poller thread...")
+        logger.debug("ECCheck: Stopping buffer poller thread...")
 
         # Signal the thread to stop
         if self._buffer_poller_stop_event:
@@ -1025,9 +1025,9 @@ class ECCHECKManager:
         if self._buffer_poller_thread.is_alive():
             self._buffer_poller_thread.join(timeout=2.0)
             if self._buffer_poller_thread.is_alive():
-                logger.warning("EC-CHECK: Buffer poller thread did not stop in time")
+                logger.warning("ECCheck: Buffer poller thread did not stop in time")
             else:
-                logger.debug("EC-CHECK: Buffer poller thread stopped successfully")
+                logger.debug("ECCheck: Buffer poller thread stopped successfully")
 
         self._buffer_poller_thread = None
         self._buffer_poller_stop_event = None
@@ -1040,7 +1040,7 @@ class ECCHECKManager:
         if self._legacy_inprocess_workspace_key[0] != bootstrap_key:
             if self._eccheck_native is not None:
                 raise RuntimeError(
-                    "ECCHECK in-process recovery workspace inputs changed while native "
+                    "ECCheck in-process recovery workspace inputs changed while native "
                     "buffers are registered; restart the process before using the new "
                     "checkpoint or recovery configuration"
                 )
@@ -1056,7 +1056,7 @@ class ECCHECKManager:
         if self._legacy_inprocess_workspace_key != key:
             if self._eccheck_native is not None:
                 raise RuntimeError(
-                    "ECCHECK in-process recovery workspace inputs changed while native "
+                    "ECCheck in-process recovery workspace inputs changed while native "
                     "buffers are registered; restart the process before using the new "
                     "checkpoint or recovery configuration"
                 )
@@ -1069,14 +1069,14 @@ class ECCHECKManager:
         """Install the manager-owned legacy recovery workspace once."""
         existing = self.get_legacy_inprocess_workspace(key)
         if existing is not None and existing is not workspace:
-            raise RuntimeError("ECCHECK in-process recovery workspace was replaced unexpectedly")
+            raise RuntimeError("ECCheck in-process recovery workspace was replaced unexpectedly")
         self._legacy_inprocess_workspace_key = key
         self._legacy_inprocess_workspace = workspace
 
     def reset_native_for_inprocess_recovery(self, failed_rank: int) -> None:
         """Restart load workers, then clear all native and Python cycle state."""
         if self._eccheck_native is None:
-            raise RuntimeError("ECCHECK native module is not initialized")
+            raise RuntimeError("ECCheck native module is not initialized")
         # set_load_mode joins workers completed by the previous sentinel batch and
         # starts a fresh worker set. Resetting before this call would clear the
         # completion flags needed to join those workers.
@@ -1096,7 +1096,7 @@ class ECCHECKManager:
                 self._eccheck_native.get_encoding_buffers_to_release()
                 self._eccheck_native.get_parity_buffers_to_release()
             except Exception as exc:
-                logger.debug("EC-CHECK: ignored stale release queue drain failure: %s", exc)
+                logger.debug("ECCheck: ignored stale release queue drain failure: %s", exc)
 
         self._free_data_buffer_queue = queue.Queue()
         for buffer in self.eccheck_data_buffers or []:
@@ -1111,7 +1111,7 @@ class ECCHECKManager:
             self._free_parity_buffer_queue.put(int(buffer.data_ptr()))
 
     def get_eccheck_buffers(self):
-        """Get EC-CHECK buffers for FileSystemWriterAsync.
+        """Get ECCheck buffers for FileSystemWriterAsync.
 
         Returns the data, encoding, and parity pools plus their release queues.
         Receive buffers are mode-specific and allocated separately after metadata
@@ -1173,7 +1173,7 @@ class ECCHECKManager:
             if self.eccheck_hw2_recv_encoding_buffers is not None:
                 if self.eccheck_hw2_recv_ring_depth != hw2_ring_depth:
                     raise RuntimeError(
-                        "ECCHECK HW2 receive ring depth changed after allocation: "
+                        "ECCheck HW2 receive ring depth changed after allocation: "
                         f"allocated={self.eccheck_hw2_recv_ring_depth}, requested={hw2_ring_depth}"
                     )
                 return self.eccheck_hw2_recv_encoding_buffers
@@ -1210,7 +1210,7 @@ class ECCHECKManager:
         single_physical_buffer = hw1_single_physical_buffer or hw2_single_physical_buffer
         physical_buffer_count = 1 if single_physical_buffer else 2
         logger.debug(
-            "EC-CHECK: Allocating receive buffers using global maximum size\n"
+            "ECCheck: Allocating receive buffers using global maximum size\n"
             "  Paired rank: %d\n"
             "  Peer data size: %.2f GB\n"
             "  Pipeline max size: %.2f GB\n"
@@ -1237,14 +1237,14 @@ class ECCHECKManager:
         if single_physical_buffer:
             mode = "HW1" if hw1_single_physical_buffer else "HW2"
             logger.debug(
-                "EC-CHECK receive layout: mode=%s physical=1 logical=2 "
+                "ECCheck receive layout: mode=%s physical=1 logical=2 "
                 "aligned_size=%d alias=lane0:lane1",
                 mode,
                 aligned_size,
             )
         else:
             logger.debug(
-                f"EC-CHECK: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "
+                f"ECCheck: Allocated TWO receive buffers: {aligned_size / (1024**3):.2f} GB each "
                 f"({aligned_size / (1024**2):.0f} MB each)"
             )
 
@@ -1259,7 +1259,7 @@ class ECCHECKManager:
 
         # Register each physical receive buffer once when RDMA is enabled.
         if self.use_rdma:
-            logger.debug(f"EC-CHECK: [Rank {rank}] Registering receive buffers for RDMA...")
+            logger.debug(f"ECCheck: [Rank {rank}] Registering receive buffers for RDMA...")
             for buffer in physical_buffers:
                 self.register_buffer(buffer)
 
@@ -1283,13 +1283,13 @@ class ECCHECKManager:
             registered_size, _ = self.registered_buffers[buffer_addr]
             if registered_size >= buffer_size:
                 logger.debug(
-                    f"EC-CHECK: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} "
+                    f"ECCheck: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} "
                     f"(registered={registered_size / (1024**2):.2f} MB, "
                     f"requested={buffer_size / (1024**2):.2f} MB)"
                 )
                 return
             logger.debug(
-                f"EC-CHECK: [Rank {rank}] Re-registering buffer at 0x{buffer_addr:x} "
+                f"ECCheck: [Rank {rank}] Re-registering buffer at 0x{buffer_addr:x} "
                 f"to expand coverage from {registered_size / (1024**2):.2f} MB "
                 f"to {buffer_size / (1024**2):.2f} MB"
             )
@@ -1297,26 +1297,26 @@ class ECCHECKManager:
                 self._eccheck_native.unregister_buffer(buffer_addr)
             except Exception as e:
                 logger.warning(
-                    f"EC-CHECK: [Rank {rank}] Failed to unregister old MR at 0x{buffer_addr:x} "
+                    f"ECCheck: [Rank {rank}] Failed to unregister old MR at 0x{buffer_addr:x} "
                     f"before re-register: {e}"
                 )
             self.registered_buffers.pop(buffer_addr, None)
 
         try:
             logger.debug(
-                f"EC-CHECK: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, "
+                f"ECCheck: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, "
                 f"size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, "
                 f"dtype: {buffer.dtype} (iteration {self.current_iteration})"
             )
             self._eccheck_native.register_buffer(buffer_addr, buffer_size)
             self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
             logger.debug(
-                f"EC-CHECK: [Rank {rank}] Buffer registered successfully "
+                f"ECCheck: [Rank {rank}] Buffer registered successfully "
                 f"(total registered: {len(self.registered_buffers)})"
             )
 
         except Exception as e:
-            logger.error(f"EC-CHECK: [Rank {rank}] Failed to register buffer: {e}")
+            logger.error(f"ECCheck: [Rank {rank}] Failed to register buffer: {e}")
             raise
 
     def unregister_buffer(self, buffer: torch.Tensor):
@@ -1332,14 +1332,14 @@ class ECCHECKManager:
         buffer_addr = buffer.data_ptr()
 
         if buffer_addr not in self.registered_buffers:
-            logger.debug(f"EC-CHECK: [Rank {rank}] Buffer not registered at 0x{buffer_addr:x}")
+            logger.debug(f"ECCheck: [Rank {rank}] Buffer not registered at 0x{buffer_addr:x}")
             return
 
         try:
             self._eccheck_native.unregister_buffer(buffer_addr)
             del self.registered_buffers[buffer_addr]
         except Exception as e:
-            logger.error(f"EC-CHECK: [Rank {rank}] Failed to unregister buffer: {e}")
+            logger.error(f"ECCheck: [Rank {rank}] Failed to unregister buffer: {e}")
 
     def register_all_buffers_for_rdma(self):
         """Register all allocated buffers for RDMA operations.
@@ -1350,7 +1350,7 @@ class ECCHECKManager:
             return
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        logger.debug(f"EC-CHECK: [Rank {rank}] Registering all buffers for RDMA...")
+        logger.debug(f"ECCheck: [Rank {rank}] Registering all buffers for RDMA...")
 
         # Register data buffers
         if self.eccheck_data_buffers:
@@ -1384,12 +1384,12 @@ class ECCHECKManager:
                 self.register_buffer(buffer)
 
         logger.debug(
-            f"EC-CHECK: [Rank {rank}] All buffers registered for RDMA "
+            f"ECCheck: [Rank {rank}] All buffers registered for RDMA "
             f"(total: {len(self.registered_buffers)})"
         )
 
     def cleanup(self):
-        """Cleanup EC-CHECK resources when manager is destroyed."""
+        """Cleanup ECCheck resources when manager is destroyed."""
         try:
             from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
                 release_hugepage_host_registration,
@@ -1412,13 +1412,13 @@ class ECCHECKManager:
             # Unregister all RDMA buffers
             if self.use_rdma and self._eccheck_native is not None:
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                logger.debug(f"EC-CHECK: [Rank {rank}] Unregistering all RDMA buffers...")
+                logger.debug(f"ECCheck: [Rank {rank}] Unregistering all RDMA buffers...")
                 for buffer_addr in list(self.registered_buffers.keys()):
                     try:
                         self._eccheck_native.unregister_buffer(buffer_addr)
                     except Exception as e:
                         logger.warning(
-                            f"EC-CHECK: [Rank {rank}] Failed to unregister buffer "
+                            f"ECCheck: [Rank {rank}] Failed to unregister buffer "
                             f"during cleanup: {e}"
                         )
                 self.registered_buffers.clear()
@@ -1442,7 +1442,7 @@ class ECCHECKManager:
             # Stop the C++ pipeline
             if hasattr(self, '_eccheck_native') and self._eccheck_native is not None:
                 self._eccheck_native.stop_pipeline()
-                logger.debug("EC-CHECK: C++ native module stopped in manager cleanup")
+                logger.debug("ECCheck: C++ native module stopped in manager cleanup")
 
             # Release cached allocations
             self.preallocated_cpu_buffer = None
@@ -1463,8 +1463,8 @@ class ECCHECKManager:
             self._free_parity_buffer_queue = None
 
         except Exception as e:
-            logger.warning(f"EC-CHECK: Error during manager cleanup: {e}")
+            logger.warning(f"ECCheck: Error during manager cleanup: {e}")
 
     def __del__(self):
-        """Cleanup EC-CHECK resources when manager is destroyed."""
+        """Cleanup ECCheck resources when manager is destroyed."""
         self.cleanup()

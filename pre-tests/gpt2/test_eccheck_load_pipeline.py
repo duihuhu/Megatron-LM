@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone test script for EC-CHECK load pipeline.
+Standalone test script for ECCheck load pipeline.
 
 This script tests the load pipeline for rank2 recovery scenario without requiring
 actual checkpoint files. It creates mock data and directly calls the pipeline.
@@ -72,7 +72,7 @@ def init_distributed():
 
 
 def setup_args():
-    """Setup mock args for EC-CHECK."""
+    """Setup mock args for ECCheck."""
     try:
         from megatron.training.arguments import parse_args
         
@@ -84,12 +84,12 @@ def setup_args():
         try:
             args = parse_args(ignore_unknown_args=True)
             args.use_eccheck = True
-            logger.info("EC-CHECK TEST: Args setup complete (use_eccheck=True)")
+            logger.info("ECCheck TEST: Args setup complete (use_eccheck=True)")
             return args
         finally:
             sys.argv = original_argv
     except Exception as e:
-        logger.warning(f"EC-CHECK TEST: Could not setup args via parse_args: {e}")
+        logger.warning(f"ECCheck TEST: Could not setup args via parse_args: {e}")
         logger.warning("  Creating minimal args object...")
         
         # Create minimal args object
@@ -115,9 +115,9 @@ def main():
         try:
             from megatron.training.global_vars import set_args
             set_args(args)
-            logger.info("EC-CHECK TEST: Args stored in global_vars")
+            logger.info("ECCheck TEST: Args stored in global_vars")
         except Exception as e:
-            logger.warning(f"EC-CHECK TEST: Could not set global args: {e}")
+            logger.warning(f"ECCheck TEST: Could not set global args: {e}")
         
         # === Step 3: Synchronize before creating strategy ===
         logger.info(f"[Rank {rank}] Synchronizing all ranks before creating strategy...")

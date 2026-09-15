@@ -281,7 +281,7 @@ run_training() {
     if [[ "$scheme" == eccheck ]]; then
         eccheck_env=" ECCHECK_DATA_BUFFERS_COUNT=$ECCHECK_DATA_BUFFERS_COUNT"
         eccheck_env_args+=("ECCHECK_DATA_BUFFERS_COUNT=$ECCHECK_DATA_BUFFERS_COUNT")
-        echo "[driver] ECCHECK config:${eccheck_env}"
+        echo "[driver] ECCheck config:${eccheck_env}"
     fi
     local remote_command="export PRINT_CMD=0 MASTER_PORT=$port RDMA_HCA_PROFILE=$RDMA_HCA_PROFILE$concord_env$gemini_env$eccheck_env; ./$script {R} save --train-iters 10"
     (

@@ -1116,7 +1116,7 @@ private:
         // This ensures we wait for all operations on the default stream to complete
         cudaError_t err = cudaStreamSynchronize(0);
         if (err != cudaSuccess) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Failed to synchronize stream for " << operation_name << ": " << cudaGetErrorString(err) << std::endl;
+            std::cerr << "ECCheck: [Rank " << rank_ << "] Failed to synchronize stream for " << operation_name << ": " << cudaGetErrorString(err) << std::endl;
         } else {
         }
     }
@@ -1186,7 +1186,7 @@ private:
         }
 
         if (p2p_partner_rank_ < 0 || p2p_partner_rank_ >= world_size_) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid P2P partner rank: "
+            std::cerr << "ECCheck: [Rank " << rank_ << "] Invalid P2P partner rank: "
                       << p2p_partner_rank_ << std::endl;
             p2p_partner_rank_ = -1;
         }
@@ -1255,7 +1255,7 @@ private:
         
         // Read NCCL ID from member variable (set by constructor)
         if (nccl_id_xor_send_.size() != sizeof(ncclUniqueId)) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid NCCL ID size for XOR send: " 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] Invalid NCCL ID size for XOR send: "
                       << nccl_id_xor_send_.size() << " (expected " << sizeof(ncclUniqueId) << ")" << std::endl;
             nccl_xor_send_initialized_ = false;
             nccl_xor_send_init_completed_ = true;
@@ -1272,9 +1272,9 @@ private:
         // Initialize NCCL communicator with 2 ranks only
         ncclResult_t init_result = ncclCommInitRank(&nccl_comm_xor_send_, 2, nccl_id, local_rank_in_pair);
         if (init_result != ncclSuccess) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: XOR send ncclCommInitRank failed: " 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: XOR send ncclCommInitRank failed: "
                       << ncclGetErrorString(init_result) << " (code: " << init_result << ")" << std::endl;
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] XOR send init params: nranks=2, local_rank=" 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] XOR send init params: nranks=2, local_rank="
                       << local_rank_in_pair << ", nccl_id size=" << sizeof(ncclUniqueId) << std::endl;
             std::cerr.flush();
             nccl_xor_send_initialized_ = false;
@@ -1308,7 +1308,7 @@ private:
         
         // Read NCCL ID from member variable (set by constructor)
         if (nccl_id_xor_recv_.size() != sizeof(ncclUniqueId)) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid NCCL ID size for XOR recv: " 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] Invalid NCCL ID size for XOR recv: "
                       << nccl_id_xor_recv_.size() << " (expected " << sizeof(ncclUniqueId) << ")" << std::endl;
             nccl_xor_recv_initialized_ = false;
             nccl_xor_recv_init_completed_ = true;
@@ -1325,9 +1325,9 @@ private:
         // Initialize NCCL communicator with 2 ranks only
         ncclResult_t init_result = ncclCommInitRank(&nccl_comm_xor_recv_, 2, nccl_id, local_rank_in_pair);
         if (init_result != ncclSuccess) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: XOR recv ncclCommInitRank failed: " 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: XOR recv ncclCommInitRank failed: "
                       << ncclGetErrorString(init_result) << " (code: " << init_result << ")" << std::endl;
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] XOR recv init params: nranks=2, local_rank=" 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] XOR recv init params: nranks=2, local_rank="
                       << local_rank_in_pair << ", nccl_id size=" << sizeof(ncclUniqueId) << std::endl;
             std::cerr.flush();
             nccl_xor_recv_initialized_ = false;
@@ -1361,7 +1361,7 @@ private:
         
         // Read NCCL ID from member variable (set by constructor)
         if (nccl_id_p2p_send_.size() != sizeof(ncclUniqueId)) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid NCCL ID size for P2P send: " 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] Invalid NCCL ID size for P2P send: "
                       << nccl_id_p2p_send_.size() << " (expected " << sizeof(ncclUniqueId) << ")" << std::endl;
             nccl_p2p_send_initialized_ = false;
             nccl_p2p_send_init_completed_ = true;
@@ -1378,9 +1378,9 @@ private:
         // Initialize NCCL communicator with 2 ranks only
         ncclResult_t init_result = ncclCommInitRank(&nccl_comm_p2p_send_, 2, nccl_id, local_rank_in_pair);
         if (init_result != ncclSuccess) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: P2P send ncclCommInitRank failed: " 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: P2P send ncclCommInitRank failed: "
                       << ncclGetErrorString(init_result) << " (code: " << init_result << ")" << std::endl;
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] P2P send init params: nranks=2, local_rank=" 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] P2P send init params: nranks=2, local_rank="
                       << local_rank_in_pair << ", nccl_id size=" << sizeof(ncclUniqueId) << std::endl;
             std::cerr.flush();
             nccl_p2p_send_initialized_ = false;
@@ -1414,7 +1414,7 @@ private:
         
         // Read NCCL ID from member variable (set by constructor)
         if (nccl_id_p2p_recv_.size() != sizeof(ncclUniqueId)) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid NCCL ID size for P2P recv: " 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] Invalid NCCL ID size for P2P recv: "
                       << nccl_id_p2p_recv_.size() << " (expected " << sizeof(ncclUniqueId) << ")" << std::endl;
             nccl_p2p_recv_initialized_ = false;
             nccl_p2p_recv_init_completed_ = true;
@@ -1431,9 +1431,9 @@ private:
         // Initialize NCCL communicator with 2 ranks only
         ncclResult_t init_result = ncclCommInitRank(&nccl_comm_p2p_recv_, 2, nccl_id, local_rank_in_pair);
         if (init_result != ncclSuccess) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: P2P recv ncclCommInitRank failed: " 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: P2P recv ncclCommInitRank failed: "
                       << ncclGetErrorString(init_result) << " (code: " << init_result << ")" << std::endl;
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] P2P recv init params: nranks=2, local_rank=" 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] P2P recv init params: nranks=2, local_rank="
                       << local_rank_in_pair << ", nccl_id size=" << sizeof(ncclUniqueId) << std::endl;
             std::cerr.flush();
             nccl_p2p_recv_initialized_ = false;
@@ -1536,7 +1536,7 @@ private:
                     pthread_join(load_encode_pool_threads_[static_cast<size_t>(j)], nullptr);
                 }
                 throw std::runtime_error(
-                    std::string("EC-CHECK: pthread_create for load encode pool failed: ") + std::strerror(rc));
+                    std::string("ECCheck: pthread_create for load encode pool failed: ") + std::strerror(rc));
             }
         }
         load_encode_pool_inited_.store(true, std::memory_order_release);
@@ -1602,11 +1602,11 @@ private:
             CPU_SET(static_cast<unsigned>(cpu), &cpuset);
             int af = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
             if (af != 0) {
-                std::cerr << "EC-CHECK: load_encode_pool worker " << wid
+                std::cerr << "ECCheck: load_encode_pool worker " << wid
                           << " pthread_setaffinity_np failed: " << af << std::endl;
             }
         } else {
-            std::cerr << "EC-CHECK: load_encode_pool worker " << wid << " CPU id " << cpu
+            std::cerr << "ECCheck: load_encode_pool worker " << wid << " CPU id " << cpu
                       << " invalid or >= CPU_SETSIZE, skipping affinity" << std::endl;
         }
 
@@ -1685,18 +1685,18 @@ private:
             } else if (rank_in_group_ < 4) {
                 parity_idx = load_parity_row_1_;
             } else {
-                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid rank_in_group " << rank_in_group_
+                std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: Invalid rank_in_group " << rank_in_group_
                           << " for load mode (expected 0-3)" << std::endl;
                 parity_idx = 1;
             }
             if (load_parity_row_0_ == 0 || load_parity_row_1_ == 0) {
-                std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: Load parity-row selector is 0"
+                std::cerr << "ECCheck: [Rank " << rank_ << "] WARNING: Load parity-row selector is 0"
                           << std::endl;
             }
         }
 
         if (data_block_index_ < 0 || data_block_index_ >= k_) {
-            std::cerr << "EC-CHECK: invalid data_block_index_=" << data_block_index_ << " for k=" << k_ << std::endl;
+            std::cerr << "ECCheck: invalid data_block_index_=" << data_block_index_ << " for k=" << k_ << std::endl;
             return false;
         }
 
@@ -1765,19 +1765,19 @@ private:
             } else if (rank_in_group_ < 4) {
                 parity_idx = load_parity_row_1_;
             } else {
-                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid rank_in_group " << rank_in_group_ << " for load mode (expected 0-3)" << std::endl;
+                std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: Invalid rank_in_group " << rank_in_group_ << " for load mode (expected 0-3)" << std::endl;
                 parity_idx = 1;
             }
             
             // Validation check
             if (load_parity_row_0_ == 0 || load_parity_row_1_ == 0) {
-                std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: Load parity-row selector is 0" << std::endl;
+                std::cerr << "ECCheck: [Rank " << rank_ << "] WARNING: Load parity-row selector is 0" << std::endl;
             }
         }
 
         // Ensure data_block_index_ in range
         if (data_block_index_ < 0 || data_block_index_ >= k_) {
-            std::cerr << "EC-CHECK: invalid data_block_index_=" << data_block_index_ << " for k=" << k_ << std::endl;
+            std::cerr << "ECCheck: invalid data_block_index_=" << data_block_index_ << " for k=" << k_ << std::endl;
             return;
         }
 
@@ -2206,7 +2206,7 @@ private:
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 } catch (const std::exception& e) {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA XOR send failed: " << e.what() << std::endl;
+                    std::cerr << "ECCheck: [Rank " << rank_ << "] RDMA XOR send failed: " << e.what() << std::endl;
                     if (!is_load_mode_) set_save_pipeline_error(std::string("RDMA XOR send failed: ") + e.what());
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
@@ -2235,7 +2235,7 @@ private:
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 } catch (const boost::system::system_error& e) {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                    std::cerr << "ECCheck: [Rank " << rank_
                               << "] ASIO send failed: " << e.what() << std::endl;
                     if (!is_load_mode_) set_save_pipeline_error(std::string("ASIO XOR send failed: ") + e.what());
                     // Release buffer even on error to avoid memory leak
@@ -2255,7 +2255,7 @@ private:
                 if (comm_initialized && world_size_ > 1 && !DISABLE_SEND_RECV_NCCL) {
                     int target_rank_in_comm = (rank_ < target_rank) ? 1 : 0;
                     if (target_rank_in_comm < 0) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid target_rank " << target_rank 
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] Invalid target_rank " << target_rank
                                   << " for XOR send communicator" << std::endl;
                     } else {
                         ncclGroupStart(); 
@@ -2277,7 +2277,7 @@ private:
 #endif
             else {
                 // No communication method available
-                std::cerr << "EC-CHECK: [Rank " << rank_ 
+                std::cerr << "ECCheck: [Rank " << rank_
                           << "] WARNING: No communication method available, releasing buffer" << std::endl;
                 if (!is_load_mode_) set_save_pipeline_error("No communication method available for XOR send");
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
@@ -2381,13 +2381,13 @@ private:
                         reinterpret_cast<uint8_t*>(task.recv_addr), task.size,
                         RdmaLoadRecvPollLane::None);
                     if (recv_size != task.size) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA XOR recv size mismatch: expected "
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] RDMA XOR recv size mismatch: expected "
                                   << task.size << ", got " << recv_size << std::endl;
                         if (!is_load_mode_) set_save_pipeline_error("RDMA XOR recv size mismatch");
                         continue;
                     }
                 } catch (const std::exception& e) {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA XOR recv failed: " << e.what() << std::endl;
+                    std::cerr << "ECCheck: [Rank " << rank_ << "] RDMA XOR recv failed: " << e.what() << std::endl;
                     if (!is_load_mode_) set_save_pipeline_error(std::string("RDMA XOR recv failed: ") + e.what());
                     continue;
                 }
@@ -2407,7 +2407,7 @@ private:
                     
                     uint32_t size = ntohl(size_net);
                     if (size != task.size) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ 
+                        std::cerr << "ECCheck: [Rank " << rank_
                                   << "] Size mismatch: expected " << task.size 
                                   << ", got " << size << std::endl;
                         if (!is_load_mode_) set_save_pipeline_error("ASIO XOR recv size mismatch");
@@ -2422,7 +2422,7 @@ private:
                     
                     // Receive completed successfully, continue with XOR processing below
                 } catch (const boost::system::system_error& e) {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                    std::cerr << "ECCheck: [Rank " << rank_
                               << "] ASIO recv failed: " << e.what() << std::endl;
                     if (!is_load_mode_) set_save_pipeline_error(std::string("ASIO XOR recv failed: ") + e.what());
                     continue;  // Skip XOR processing on error
@@ -2445,14 +2445,14 @@ private:
                         ncclGroupEnd();
                         sync_nccl_operation("Recv worker: NCCL recv");
                     } else {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Invalid source rank for recv " << source_rank << std::endl;
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] Invalid source rank for recv " << source_rank << std::endl;
                     }
                 } else if (DISABLE_SEND_RECV_NCCL) {
                 }
             }
 #endif
             else {
-                std::cerr << "EC-CHECK: [Rank " << rank_ 
+                std::cerr << "ECCheck: [Rank " << rank_
                           << "] WARNING: No communication method available for recv" << std::endl;
                 if (!is_load_mode_) set_save_pipeline_error("No communication method available for XOR recv");
                 continue;  // Skip processing
@@ -2821,11 +2821,11 @@ private:
 #ifdef __linux__
                 if (use_rdma_ && (!rdma_range_registered(task.p2p_own_write_addr, task.size) ||
                                   !rdma_range_registered(task.send_buffer_addr, task.size))) {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid P2P send memcpy range "
+                    std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: Invalid P2P send memcpy range "
                               << "(dst=0x" << std::hex << task.p2p_own_write_addr
                               << ", src=0x" << task.send_buffer_addr << std::dec
                               << ", size=" << task.size << ")" << std::endl;
-                    throw std::runtime_error("EC-CHECK: Invalid P2P send memcpy range");
+                    throw std::runtime_error("ECCheck: Invalid P2P send memcpy range");
                 }
 #endif
                 std::memcpy(reinterpret_cast<void*>(task.p2p_own_write_addr),
@@ -2860,7 +2860,7 @@ private:
                         rdma_send_data_via_qp(rdma_p2p_send_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
                             rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(network_send_addr), task.size);
                     } catch (const std::exception& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA P2P send failed: " << e.what() << std::endl;
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] RDMA P2P send failed: " << e.what() << std::endl;
                         if (task.two_failure_chunk) {
                             set_two_failure_pipeline_error(std::string("RDMA P2P send failed: ") + e.what());
                         }
@@ -2889,7 +2889,7 @@ private:
                         );
                         
                     } catch (const boost::system::system_error& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ 
+                        std::cerr << "ECCheck: [Rank " << rank_
                                   << "] P2P ASIO send failed: " << e.what() << std::endl;
                         if (task.two_failure_chunk) {
                             set_two_failure_pipeline_error(std::string("ASIO P2P send failed: ") + e.what());
@@ -2907,7 +2907,7 @@ private:
                     if (nccl_p2p_send_initialized_ && world_size_ > 1 && !DISABLE_P2P_NCCL) {
                         // Verify communicator is valid
                         if (nccl_comm_p2p_send_ == nullptr) {
-                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: nccl_comm_p2p_send_ is NULL but nccl_p2p_send_initialized_ is true!" << std::endl;
+                            std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: nccl_comm_p2p_send_ is NULL but nccl_p2p_send_initialized_ is true!" << std::endl;
                             std::cerr.flush();
                         } else {
                             // Map global p2p_partner_rank to communicator-internal rank (0 or 1)
@@ -2932,7 +2932,7 @@ private:
                 }
 #endif
                 else {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                    std::cerr << "ECCheck: [Rank " << rank_
                               << "] WARNING: No communication method available for P2P send" << std::endl;
                     if (!task.is_load_mode_transfer) {
                         set_save_pipeline_error("No communication method available for P2P send");
@@ -2960,7 +2960,7 @@ private:
                     // Submit to the load encoding worker.
                     submit_load_encoding_task(load_task);
                 } else {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: No pending load encoding task found for data_addr=" 
+                    std::cerr << "ECCheck: [Rank " << rank_ << "] WARNING: No pending load encoding task found for data_addr="
                               << task.load_mode_data_addr << std::endl;
                 }
             }
@@ -3125,7 +3125,7 @@ private:
                             if (!task.is_load_mode_transfer) {
                                 set_save_pipeline_error("RDMA P2P recv size mismatch");
                             }
-                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] P2P RDMA recv size mismatch: expected "
+                            std::cerr << "ECCheck: [Rank " << rank_ << "] P2P RDMA recv size mismatch: expected "
                                       << task.size << ", got " << recv_size
                                       << ", rank_in_group=" << rank_in_group_
                                       << ", partner=" << p2p_partner_rank_
@@ -3134,7 +3134,7 @@ private:
                                       << std::endl;
                         }
                     } catch (const std::exception& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] RDMA P2P recv failed: " << e.what() << std::endl;
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] RDMA P2P recv failed: " << e.what() << std::endl;
                         if (task.two_failure_chunk) {
                             set_two_failure_pipeline_error(std::string("RDMA P2P recv failed: ") + e.what());
                         }
@@ -3165,7 +3165,7 @@ private:
                             if (!task.is_load_mode_transfer) {
                                 set_save_pipeline_error("ASIO P2P recv size mismatch");
                             }
-                            std::cerr << "EC-CHECK: [Rank " << rank_ 
+                            std::cerr << "ECCheck: [Rank " << rank_
                                       << "] P2P size mismatch: expected " << task.size 
                                       << ", got " << size << std::endl;
                             continue;  // Skip this task
@@ -3179,7 +3179,7 @@ private:
                         
                         task_processed = true;
                     } catch (const boost::system::system_error& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ 
+                        std::cerr << "ECCheck: [Rank " << rank_
                                   << "] P2P ASIO recv failed: " << e.what() << std::endl;
                         if (task.two_failure_chunk) {
                             set_two_failure_pipeline_error(std::string("ASIO P2P recv failed: ") + e.what());
@@ -3199,15 +3199,15 @@ private:
                     if (nccl_p2p_recv_initialized_ && world_size_ > 1 && !DISABLE_P2P_NCCL) {
                         // Verify communicator is valid
                         if (nccl_comm_p2p_recv_ == nullptr) {
-                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: nccl_comm_p2p_recv_ is NULL but nccl_p2p_recv_initialized_ is true!" << std::endl;
+                            std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: nccl_comm_p2p_recv_ is NULL but nccl_p2p_recv_initialized_ is true!" << std::endl;
                             std::cerr.flush();
                         } else {
                             // Map global p2p_partner_rank to communicator-internal rank (0 or 1)
                             int partner_rank_in_comm = (rank_ < p2p_partner_rank_) ? 0 : 1;
                             if (partner_rank_in_comm < 0 || partner_rank_in_comm >= 2) {
-                                std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid partner_rank_in_comm=" 
+                                std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: Invalid partner_rank_in_comm="
                                           << partner_rank_in_comm << " (must be 0 or 1 for 2-rank communicator)" << std::endl;
-                                std::cerr << "EC-CHECK: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
+                                std::cerr << "ECCheck: [Rank " << rank_ << "] p2p_partner_rank_=" << p2p_partner_rank_ << std::endl;
                                 std::cerr.flush();
                             } else {
                                 
@@ -3232,7 +3232,7 @@ private:
                 }
 #endif
                 else {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                    std::cerr << "ECCheck: [Rank " << rank_
                               << "] WARNING: No communication method available for P2P recv" << std::endl;
                     if (!task.is_load_mode_transfer) {
                         set_save_pipeline_error("No communication method available for P2P recv");
@@ -3250,11 +3250,11 @@ private:
 #ifdef __linux__
                     if (use_rdma_ && (!rdma_range_registered(task.data_buffer_addr, task.size) ||
                                       !rdma_range_registered(task.recv_buffer_addr, task.size))) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid load P2P recv memcpy range "
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: Invalid load P2P recv memcpy range "
                                   << "(dst=0x" << std::hex << task.data_buffer_addr
                                   << ", src=0x" << task.recv_buffer_addr << std::dec
                                   << ", size=" << task.size << ")" << std::endl;
-                        throw std::runtime_error("EC-CHECK: Invalid load P2P recv memcpy range");
+                        throw std::runtime_error("ECCheck: Invalid load P2P recv memcpy range");
                     }
 #endif
                     std::memcpy(
@@ -3284,7 +3284,7 @@ private:
                         // Submit to the load encoding worker.
                         submit_load_encoding_task(load_task);
                 } else {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: No pending load encoding task found for data_buffer=" 
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] WARNING: No pending load encoding task found for data_buffer="
                               << task.data_buffer_addr << std::endl;
                 }
                 }
@@ -3386,7 +3386,7 @@ public:
             // allocate matrix a (k * m)
             a_mat_ = (unsigned char*)malloc((size_t)k_ * (size_t)m);
             if (a_mat_ == nullptr) {
-                std::cerr << "EC-CHECK: failed to allocate a_mat_" << std::endl;
+                std::cerr << "ECCheck: failed to allocate a_mat_" << std::endl;
             } else {
                 // generate RS matrix
                 gf_gen_rs_matrix(a_mat_, m, k_);
@@ -3398,7 +3398,7 @@ public:
                 if (tmp == nullptr) tmp = malloc(gtbls_size);
                 g_tbls_ = reinterpret_cast<unsigned char*>(tmp);
                 if (g_tbls_ == nullptr) {
-                    std::cerr << "EC-CHECK: failed to allocate g_tbls_" << std::endl;
+                    std::cerr << "ECCheck: failed to allocate g_tbls_" << std::endl;
                 } else {
                     // initialize tables using isa-l
                     ec_init_tables(k_, rows_, a_mat_, g_tbls_);
@@ -3505,7 +3505,7 @@ public:
             // allocate matrix a (k * m)
             a_mat_ = (unsigned char*)malloc((size_t)k_ * (size_t)m);
             if (a_mat_ == nullptr) {
-                std::cerr << "EC-CHECK: failed to allocate a_mat_" << std::endl;
+                std::cerr << "ECCheck: failed to allocate a_mat_" << std::endl;
             } else {
                 // generate RS matrix
                 gf_gen_rs_matrix(a_mat_, m, k_);
@@ -3517,7 +3517,7 @@ public:
                 if (tmp == nullptr) tmp = malloc(gtbls_size);
                 g_tbls_ = reinterpret_cast<unsigned char*>(tmp);
                 if (g_tbls_ == nullptr) {
-                    std::cerr << "EC-CHECK: failed to allocate g_tbls_" << std::endl;
+                    std::cerr << "ECCheck: failed to allocate g_tbls_" << std::endl;
                 } else {
                     // initialize tables using isa-l
                     ec_init_tables(k_, rows_, a_mat_, g_tbls_);
@@ -3656,7 +3656,7 @@ public:
 #endif
             asio_initialized_ = true;
         } else {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: Not all ASIO connections established" << std::endl;
+            std::cerr << "ECCheck: [Rank " << rank_ << "] WARNING: Not all ASIO connections established" << std::endl;
             std::cerr << "  XOR send: " << asio_conn_mgr_.is_xor_send_connected() << std::endl;
             std::cerr << "  XOR recv: " << asio_conn_mgr_.is_xor_recv_connected() << std::endl;
             std::cerr << "  P2P send: " << asio_conn_mgr_.is_p2p_send_connected() << std::endl;
@@ -3680,7 +3680,7 @@ public:
     void reset_encoding_completion_flags() {
         if (save_cycle_active_.load(std::memory_order_acquire)) {
             throw std::runtime_error(
-                "EC-CHECK: reset requested before the previous save cycle completed");
+                "ECCheck: reset requested before the previous save cycle completed");
         }
 
         // Reset completion flags
@@ -3975,7 +3975,7 @@ public:
                     pipeline_error = two_failure_pipeline_error_message_;
                 }
                 std::ostringstream error;
-                error << "EC-CHECK: two-failure chunk pipeline failed: " << pipeline_error
+                error << "ECCheck: two-failure chunk pipeline failed: " << pipeline_error
                       << "; submitted=" << submitted << ", xor_completed=" << xor_completed
                       << ", p2p_send_completed=" << p2p_send_completed
                       << ", p2p_recv_completed=" << p2p_recv_completed
@@ -3988,7 +3988,7 @@ public:
             }
             if (std::chrono::steady_clock::now() >= deadline) {
                 std::ostringstream error;
-                error << "EC-CHECK: two-failure chunk completion timeout: submitted=" << submitted
+                error << "ECCheck: two-failure chunk completion timeout: submitted=" << submitted
                       << ", xor_completed=" << xor_completed
                       << ", p2p_send_completed=" << p2p_send_completed
                       << ", p2p_recv_completed=" << p2p_recv_completed
@@ -4020,7 +4020,7 @@ public:
 
                 if (++wait_count > 3000) {  // ~30s timeout
                     std::ostringstream error;
-                    error << "EC-CHECK: [Rank " << rank_
+                    error << "ECCheck: [Rank " << rank_
                           << "] Two-failure wait_for_encoding_completion timeout:"
                           << " enc1=" << encoding_thread_1_completed_.load()
                           << " enc2=" << encoding_thread_2_completed_.load()
@@ -4089,7 +4089,7 @@ public:
                             std::lock_guard<std::mutex> lock(two_failure_pipeline_error_mutex_);
                             message = two_failure_pipeline_error_message_;
                         }
-                        throw std::runtime_error("EC-CHECK: load pipeline failed: " + message);
+                        throw std::runtime_error("ECCheck: load pipeline failed: " + message);
                     }
                     break;
                 }
@@ -4107,7 +4107,7 @@ public:
                         std::lock_guard<std::mutex> lock(save_pipeline_error_mutex_);
                         message = save_pipeline_error_message_;
                     }
-                    throw std::runtime_error("EC-CHECK: save pipeline failed: " + message);
+                    throw std::runtime_error("ECCheck: save pipeline failed: " + message);
                 }
                 if (encoding_thread_1_completed_.load() && encoding_thread_2_completed_.load() &&
                     send_worker_completed_.load() && recv_worker_completed_.load() &&
@@ -4126,7 +4126,7 @@ public:
                     { std::lock_guard<std::mutex> lock(p2p_send_queue_mutex_); p2ps_q = p2p_send_queue_.size(); }
                     { std::lock_guard<std::mutex> lock(p2p_recv_queue_mutex_); p2pr_q = p2p_recv_queue_.size(); }
                     std::ostringstream error;
-                    error << "EC-CHECK: [Rank " << rank_ << "] save completion timeout after 120s:"
+                    error << "ECCheck: [Rank " << rank_ << "] save completion timeout after 120s:"
                           << " enc1=" << encoding_thread_1_completed_.load()
                           << " enc2=" << encoding_thread_2_completed_.load()
                           << " send=" << send_worker_completed_.load()
@@ -4147,7 +4147,7 @@ public:
     // Wait only for XOR worker completion (used before sending Step6 sentinel)
     void wait_for_xor_worker_completion() {
         if (!is_load_mode_) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ 
+            std::cerr << "ECCheck: [Rank " << rank_
                       << "] wait_for_xor_worker_completion called but not in load mode" << std::endl;
             return;
         }
@@ -4376,7 +4376,7 @@ public:
             }
             p2p_recv_queue_cv_.notify_one();
         } else {
-            std::cerr << "EC-CHECK: [Rank " << rank_
+            std::cerr << "ECCheck: [Rank " << rank_
                       << "] submit_data_to_p2p_thread received unknown op: "
                       << ops << std::endl;
         }
@@ -4609,7 +4609,7 @@ public:
         bool parity_is_pooled              // true only for parity scratch pool outputs
     ) {
         if (!is_load_mode_) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ 
+            std::cerr << "ECCheck: [Rank " << rank_
                       << "] submit_load_pipeline_chunk called but not in load mode" << std::endl;
             return;
         }
@@ -4660,7 +4660,7 @@ public:
         uintptr_t recovered_write_addr
     ) {
         if (!is_two_failures_load_mode_) {
-            std::cerr << "EC-CHECK: [Rank " << rank_
+            std::cerr << "ECCheck: [Rank " << rank_
                       << "] submit_two_failure_encoding_chunk called but not in two-failure mode"
                       << std::endl;
             return;
@@ -4734,7 +4734,7 @@ public:
 
     void submit_two_failure_encoding_sentinels() {
         if (!is_two_failures_load_mode_) {
-            std::cerr << "EC-CHECK: [Rank " << rank_
+            std::cerr << "ECCheck: [Rank " << rank_
                       << "] submit_two_failure_encoding_sentinels called but not in two-failure mode"
                       << std::endl;
             return;
@@ -4978,7 +4978,7 @@ public:
     // Submit the Step 6 d3 transfer from rig3 to rig2.
     void submit_load_step6_p2p_send(uintptr_t parity_addr, size_t size) {
         if (rank_ != 3) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ 
+            std::cerr << "ECCheck: [Rank " << rank_
                       << "] submit_load_step6_p2p_send called but rank is not 3" << std::endl;
             return;
         }
@@ -5004,7 +5004,7 @@ public:
     // Submit the Step 6 d3 receive on rig2.
     void submit_load_step6_p2p_recv(uintptr_t partner_buffer_addr, size_t size) {
         if (rank_ != 2) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ 
+            std::cerr << "ECCheck: [Rank " << rank_
                       << "] submit_load_step6_p2p_recv called but rank is not 2" << std::endl;
             return;
         }
@@ -5114,7 +5114,7 @@ public:
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 } catch (const std::exception& e) {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA XOR send failed: " << e.what() << std::endl;
+                    std::cerr << "ECCheck: [Rank " << rank_ << "] Load RDMA XOR send failed: " << e.what() << std::endl;
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 }
@@ -5141,7 +5141,7 @@ public:
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 } catch (const boost::system::system_error& e) {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                    std::cerr << "ECCheck: [Rank " << rank_
                               << "] Load ASIO send failed: " << e.what() << std::endl;
                     // Release buffer even on error to avoid memory leak
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
@@ -5149,7 +5149,7 @@ public:
                 }
             } else {
                 // ASIO not available - log warning but continue
-                std::cerr << "EC-CHECK: [Rank " << rank_ 
+                std::cerr << "ECCheck: [Rank " << rank_
                           << "] WARNING: ASIO not available for load send, skipping task" << std::endl;
                 // Release buffer even if ASIO is not available
                 std::lock_guard<std::mutex> lock(release_queue_mutex_);
@@ -5229,13 +5229,13 @@ public:
                         reinterpret_cast<uint8_t*>(task.recv_addr), task.size,
                         RdmaLoadRecvPollLane::EncXor);
                     if (recv_size != task.size) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA XOR recv size mismatch: expected "
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] Load RDMA XOR recv size mismatch: expected "
                                   << task.size << ", got " << recv_size << std::endl;
                         continue;
                     }
                     record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net, true);
                 } catch (const std::exception& e) {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA XOR recv failed: " << e.what() << std::endl;
+                    std::cerr << "ECCheck: [Rank " << rank_ << "] Load RDMA XOR recv failed: " << e.what() << std::endl;
                     continue;
                 }
             } else
@@ -5253,7 +5253,7 @@ public:
                     
                     uint32_t size = ntohl(size_net);
                     if (size != task.size) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ 
+                        std::cerr << "ECCheck: [Rank " << rank_
                                   << "] Load size mismatch: expected " << task.size 
                                   << ", got " << size << std::endl;
                         continue;  // Skip this task
@@ -5267,7 +5267,7 @@ public:
                     record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net, true);
                     // Receive completed successfully, continue with XOR processing below
                 } catch (const boost::system::system_error& e) {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                    std::cerr << "ECCheck: [Rank " << rank_
                               << "] Load ASIO recv failed: " << e.what() << std::endl;
                     continue;  // Skip XOR processing on error
                 }
@@ -5398,7 +5398,7 @@ public:
                     pthread_join(load_xor_pool_threads_[static_cast<size_t>(j)], nullptr);
                 }
                 throw std::runtime_error(
-                    std::string("EC-CHECK: pthread_create for load XOR pool failed: ") + std::strerror(rc));
+                    std::string("ECCheck: pthread_create for load XOR pool failed: ") + std::strerror(rc));
             }
         }
         load_xor_pool_inited_.store(true, std::memory_order_release);
@@ -5431,11 +5431,11 @@ public:
             CPU_SET(static_cast<unsigned>(cpu), &cpuset);
             int af = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
             if (af != 0) {
-                std::cerr << "EC-CHECK: load_xor_pool worker " << wid
+                std::cerr << "ECCheck: load_xor_pool worker " << wid
                           << " pthread_setaffinity_np failed: " << af << std::endl;
             }
         } else {
-            std::cerr << "EC-CHECK: load_xor_pool worker " << wid << " CPU id " << cpu
+            std::cerr << "ECCheck: load_xor_pool worker " << wid << " CPU id " << cpu
                       << " invalid or >= CPU_SETSIZE, skipping affinity" << std::endl;
         }
 
@@ -5536,7 +5536,7 @@ public:
                 ec_rs_encode_pool_worker_cv_.notify_all();
                 for (int j = 0; j < i; ++j)
                     pthread_join(ec_rs_encode_pool_threads_[static_cast<size_t>(j)], nullptr);
-                throw std::runtime_error("EC-CHECK: pthread_create for encode pool failed: " +
+                throw std::runtime_error("ECCheck: pthread_create for encode pool failed: " +
                                          std::string(std::strerror(rc)));
             }
         }
@@ -5645,7 +5645,7 @@ public:
                 ec_xor_pool_worker_cv_.notify_all();
                 for (int j = 0; j < i; ++j)
                     pthread_join(ec_xor_pool_threads_[static_cast<size_t>(j)], nullptr);
-                throw std::runtime_error("EC-CHECK: pthread_create for XOR pool failed: " +
+                throw std::runtime_error("ECCheck: pthread_create for XOR pool failed: " +
                                          std::string(std::strerror(rc)));
             }
         }
@@ -5932,7 +5932,7 @@ public:
                             rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
                         record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net, false);
                     } catch (const std::exception& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA P2P send failed: " << e.what() << std::endl;
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] Load RDMA P2P send failed: " << e.what() << std::endl;
                     }
                 } else
 #endif
@@ -5953,11 +5953,11 @@ public:
                         );
                         record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net, false);
                     } catch (const boost::system::system_error& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ 
+                        std::cerr << "ECCheck: [Rank " << rank_
                                   << "] Load P2P ASIO send failed: " << e.what() << std::endl;
                     }
                 } else {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                    std::cerr << "ECCheck: [Rank " << rank_
                               << "] WARNING: ASIO not available for load P2P send" << std::endl;
                 }
             }
@@ -5979,7 +5979,7 @@ public:
                 if (found_task && load_task.data_addr != 0) {
                     submit_load_encoding_task(load_task);
                 } else {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: No pending load encoding task found for data_addr=" 
+                    std::cerr << "ECCheck: [Rank " << rank_ << "] WARNING: No pending load encoding task found for data_addr="
                               << task.load_mode_data_addr << std::endl;
                 }
             }
@@ -6052,11 +6052,11 @@ public:
                             task_processed = true;
                             record_load_net_ns_(load_step2_p2p_recv_total_ns_, load_step2_p2p_recv_task_count_, t_net, true);
                         } else {
-                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load P2P RDMA recv size mismatch: expected "
+                            std::cerr << "ECCheck: [Rank " << rank_ << "] Load P2P RDMA recv size mismatch: expected "
                                       << task.size << ", got " << recv_size << std::endl;
                         }
                     } catch (const std::exception& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA P2P recv failed: " << e.what() << std::endl;
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] Load RDMA P2P recv failed: " << e.what() << std::endl;
                         continue;
                     }
                 } else
@@ -6074,7 +6074,7 @@ public:
                         
                         uint32_t size = ntohl(size_net);
                         if (size != task.size) {
-                            std::cerr << "EC-CHECK: [Rank " << rank_ 
+                            std::cerr << "ECCheck: [Rank " << rank_
                                       << "] Load P2P size mismatch: expected " << task.size 
                                       << ", got " << size << std::endl;
                             continue;
@@ -6087,12 +6087,12 @@ public:
                         record_load_net_ns_(load_step2_p2p_recv_total_ns_, load_step2_p2p_recv_task_count_, t_net, true);
                         task_processed = true;
                     } catch (const boost::system::system_error& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ 
+                        std::cerr << "ECCheck: [Rank " << rank_
                                   << "] Load P2P ASIO recv failed: " << e.what() << std::endl;
                         continue;
                     }
                 } else {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                    std::cerr << "ECCheck: [Rank " << rank_
                               << "] WARNING: ASIO not available for load P2P recv" << std::endl;
                     task_processed = true;  // Mark as processed to avoid blocking
                 }
@@ -6107,11 +6107,11 @@ public:
 #ifdef __linux__
                     if (use_rdma_ && (!rdma_range_registered(task.data_buffer_addr, task.size) ||
                                       !rdma_range_registered(task.recv_buffer_addr, task.size))) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] ERROR: Invalid load mode memcpy range "
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] ERROR: Invalid load mode memcpy range "
                                   << "(dst=0x" << std::hex << task.data_buffer_addr
                                   << ", src=0x" << task.recv_buffer_addr << std::dec
                                   << ", size=" << task.size << ")" << std::endl;
-                        throw std::runtime_error("EC-CHECK: Invalid load mode memcpy range");
+                        throw std::runtime_error("ECCheck: Invalid load mode memcpy range");
                     }
 #endif
                     std::memcpy(
@@ -6137,7 +6137,7 @@ public:
                 if (found_task && load_task.data_addr != 0) {
                     submit_load_encoding_task(load_task);
                 } else {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ << "] WARNING: No pending load encoding task found for data_buffer=" 
+                    std::cerr << "ECCheck: [Rank " << rank_ << "] WARNING: No pending load encoding task found for data_buffer="
                               << task.data_buffer_addr << std::endl;
                 }
             }
@@ -6205,7 +6205,7 @@ public:
                             reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
                         record_load_net_ns_(load_step6_p2p_send_total_ns_, load_step6_p2p_send_task_count_, t_net);
                     } catch (const std::exception& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA send failed: " << e.what() << std::endl;
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] Load Step6 P2P RDMA send failed: " << e.what() << std::endl;
                         set_two_failure_pipeline_error(std::string("Load Step6 P2P RDMA send failed: ") + e.what());
                     }
                 } else
@@ -6227,12 +6227,12 @@ public:
                         );
                         record_load_net_ns_(load_step6_p2p_send_total_ns_, load_step6_p2p_send_task_count_, t_net);
                     } catch (const boost::system::system_error& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ 
+                        std::cerr << "ECCheck: [Rank " << rank_
                                   << "] Load Step6 P2P ASIO send failed: " << e.what() << std::endl;
                         set_two_failure_pipeline_error(std::string("Load Step6 P2P ASIO send failed: ") + e.what());
                     }
                 } else {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                    std::cerr << "ECCheck: [Rank " << rank_
                               << "] WARNING: ASIO not available for load Step6 P2P send" << std::endl;
                     set_two_failure_pipeline_error("No communication method available for load Step6 P2P send");
                 }
@@ -6305,12 +6305,12 @@ public:
                         if (recv_size == task.size) {
                             record_load_net_ns_(load_step6_p2p_recv_total_ns_, load_step6_p2p_recv_task_count_, t_net, true);
                         } else {
-                            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA recv size mismatch: expected "
+                            std::cerr << "ECCheck: [Rank " << rank_ << "] Load Step6 P2P RDMA recv size mismatch: expected "
                                       << task.size << ", got " << recv_size << std::endl;
                             set_two_failure_pipeline_error("Load Step6 P2P RDMA recv size mismatch");
                         }
                     } catch (const std::exception& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA recv failed: " << e.what() << std::endl;
+                        std::cerr << "ECCheck: [Rank " << rank_ << "] Load Step6 P2P RDMA recv failed: " << e.what() << std::endl;
                         set_two_failure_pipeline_error(std::string("Load Step6 P2P RDMA recv failed: ") + e.what());
                         continue;
                     }
@@ -6329,7 +6329,7 @@ public:
                         
                         uint32_t size = ntohl(size_net);
                         if (size != task.size) {
-                            std::cerr << "EC-CHECK: [Rank " << rank_ 
+                            std::cerr << "ECCheck: [Rank " << rank_
                                       << "] Load Step6 P2P size mismatch: expected " << task.size 
                                       << ", got " << size << std::endl;
                             set_two_failure_pipeline_error("Load Step6 P2P ASIO recv size mismatch");
@@ -6342,13 +6342,13 @@ public:
                         );
                         record_load_net_ns_(load_step6_p2p_recv_total_ns_, load_step6_p2p_recv_task_count_, t_net, true);
                     } catch (const boost::system::system_error& e) {
-                        std::cerr << "EC-CHECK: [Rank " << rank_ 
+                        std::cerr << "ECCheck: [Rank " << rank_
                                   << "] Load Step6 P2P ASIO recv failed: " << e.what() << std::endl;
                         set_two_failure_pipeline_error(std::string("Load Step6 P2P ASIO recv failed: ") + e.what());
                         continue;
                     }
                 } else {
-                    std::cerr << "EC-CHECK: [Rank " << rank_ 
+                    std::cerr << "ECCheck: [Rank " << rank_
                               << "] WARNING: ASIO not available for load Step6 P2P recv" << std::endl;
                     set_two_failure_pipeline_error("No communication method available for load Step6 P2P recv");
                 }
@@ -6375,7 +6375,7 @@ public:
     // Submit sentinel to load encoder worker
     void submit_load_encoding_sentinel() {
         if (!is_load_mode_) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ 
+            std::cerr << "ECCheck: [Rank " << rank_
                       << "] submit_load_encoding_sentinel called but not in load mode" << std::endl;
             return;
         }
@@ -6387,7 +6387,7 @@ public:
     // Submit sentinel to Step6 P2P workers (called after all Step6 tasks are submitted)
     void submit_load_step6_p2p_sentinel() {
         if (!is_load_mode_) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ 
+            std::cerr << "ECCheck: [Rank " << rank_
                       << "] submit_load_step6_p2p_sentinel called but not in load mode" << std::endl;
             return;
         }
@@ -6452,7 +6452,7 @@ public:
             );
             
         } catch (const boost::system::system_error& e) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Simple P2P send failed: " 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] Simple P2P send failed: "
                       << e.what() << std::endl;
             throw;
         }
@@ -6509,7 +6509,7 @@ public:
             );
             
         } catch (const boost::system::system_error& e) {
-            std::cerr << "EC-CHECK: [Rank " << rank_ << "] Simple P2P recv failed: " 
+            std::cerr << "ECCheck: [Rank " << rank_ << "] Simple P2P recv failed: "
                       << e.what() << std::endl;
             throw;
         }
@@ -6520,7 +6520,7 @@ public:
         if (!use_rdma_) return;
 
         if (ibv_fork_init() != 0) {
-            std::cerr << "[EC-CHECK RDMA] WARNING: ibv_fork_init() failed. Forked processes may get Bad address."
+            std::cerr << "[ECCheck RDMA] WARNING: ibv_fork_init() failed. Forked processes may get Bad address."
                       << std::endl;
         }
 
@@ -6687,12 +6687,12 @@ public:
         local_info.qp_num = qp->qp_num;
         ibv_port_attr port_attr;
         if (ibv_query_port(rdma_context_, 1, &port_attr)) {
-            throw std::runtime_error("EC-CHECK RDMA: failed to query port");
+            throw std::runtime_error("ECCheck RDMA: failed to query port");
         }
         local_info.lid = port_attr.lid;
         ibv_gid gid;
         if (ibv_query_gid(rdma_context_, 1, 1, &gid)) {
-            throw std::runtime_error("EC-CHECK RDMA: failed to query GID");
+            throw std::runtime_error("ECCheck RDMA: failed to query GID");
         }
         std::memcpy(local_info.gid, &gid, 16);
 
@@ -6700,17 +6700,17 @@ public:
         std::memset(&remote_info, 0, sizeof(remote_info));
         if (we_send_first) {
             if (::send(control_sock, &local_info, sizeof(local_info), 0) != static_cast<ssize_t>(sizeof(local_info))) {
-                throw std::runtime_error("EC-CHECK RDMA: failed to send local RdmaConnInfo");
+                throw std::runtime_error("ECCheck RDMA: failed to send local RdmaConnInfo");
             }
             if (::recv(control_sock, &remote_info, sizeof(remote_info), MSG_WAITALL) != static_cast<ssize_t>(sizeof(remote_info))) {
-                throw std::runtime_error("EC-CHECK RDMA: failed to receive remote RdmaConnInfo");
+                throw std::runtime_error("ECCheck RDMA: failed to receive remote RdmaConnInfo");
             }
         } else {
             if (::recv(control_sock, &remote_info, sizeof(remote_info), MSG_WAITALL) != static_cast<ssize_t>(sizeof(remote_info))) {
-                throw std::runtime_error("EC-CHECK RDMA: failed to receive remote RdmaConnInfo");
+                throw std::runtime_error("ECCheck RDMA: failed to receive remote RdmaConnInfo");
             }
             if (::send(control_sock, &local_info, sizeof(local_info), 0) != static_cast<ssize_t>(sizeof(local_info))) {
-                throw std::runtime_error("EC-CHECK RDMA: failed to send local RdmaConnInfo");
+                throw std::runtime_error("ECCheck RDMA: failed to send local RdmaConnInfo");
             }
         }
 
@@ -6720,7 +6720,7 @@ public:
         attr.pkey_index = 0;
         attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
         if (ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
-            throw std::runtime_error("EC-CHECK RDMA: failed to transition QP to INIT");
+            throw std::runtime_error("ECCheck RDMA: failed to transition QP to INIT");
         }
         attr = {};
         attr.qp_state = IBV_QPS_RTR;
@@ -6742,7 +6742,7 @@ public:
         if (ibv_modify_qp(qp, &attr,
             IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
             IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
-            throw std::runtime_error("EC-CHECK RDMA: failed to transition QP to RTR");
+            throw std::runtime_error("ECCheck RDMA: failed to transition QP to RTR");
         }
         attr = {};
         attr.qp_state = IBV_QPS_RTS;
@@ -6754,7 +6754,7 @@ public:
         if (ibv_modify_qp(qp, &attr,
             IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC)) {
-            throw std::runtime_error("EC-CHECK RDMA: failed to transition QP to RTS");
+            throw std::runtime_error("ECCheck RDMA: failed to transition QP to RTS");
         }
     }
 
@@ -6807,9 +6807,9 @@ public:
         while (completed < num_completions) {
             ibv_wc wc;
             int ret = ibv_poll_cq(cq, 1, &wc);
-            if (ret < 0) throw std::runtime_error("EC-CHECK RDMA: failed to poll CQ");
+            if (ret < 0) throw std::runtime_error("ECCheck RDMA: failed to poll CQ");
             if (ret > 0) {
-                if (wc.status != IBV_WC_SUCCESS) throw std::runtime_error("EC-CHECK RDMA: work completion failed");
+                if (wc.status != IBV_WC_SUCCESS) throw std::runtime_error("ECCheck RDMA: work completion failed");
                 completed++;
             }
         }
@@ -6824,7 +6824,7 @@ public:
         const uint8_t* send_ptr = data;
         if (!mr) {
             if (size > rdma_temp_send_buffer_.size())
-                throw std::runtime_error("EC-CHECK RDMA: data size exceeds temp buffer");
+                throw std::runtime_error("ECCheck RDMA: data size exceeds temp buffer");
             std::memcpy(rdma_temp_send_buffer_.data(), data, size);
             mr = rdma_temp_send_mr_;
             send_ptr = rdma_temp_send_buffer_.data();
@@ -6832,7 +6832,7 @@ public:
 
         std::lock_guard<std::mutex> lock(control_mutex);
         if (::send(control_sock, &size_net, sizeof(size_net), 0) != sizeof(size_net))
-            throw std::runtime_error("EC-CHECK RDMA: failed to send size");
+            throw std::runtime_error("ECCheck RDMA: failed to send size");
 
         size_t remaining = size;
         size_t offset = 0;
@@ -6844,7 +6844,7 @@ public:
 
             uint8_t ack;
             if (::recv(control_sock, &ack, sizeof(ack), MSG_WAITALL) != sizeof(ack))
-                throw std::runtime_error("EC-CHECK RDMA: failed to receive ACK");
+                throw std::runtime_error("ECCheck RDMA: failed to receive ACK");
 
             std::vector<ibv_sge> sges(batch_count);
             std::vector<ibv_send_wr> wrs(batch_count);
@@ -6868,7 +6868,7 @@ public:
 
             ibv_send_wr* bad_wr = nullptr;
             if (ibv_post_send(qp, &wrs[0], &bad_wr))
-                throw std::runtime_error("EC-CHECK RDMA: failed to post send");
+                throw std::runtime_error("ECCheck RDMA: failed to post send");
             rdma_poll_completion(send_cq, num_wrs);
         }
     }
@@ -6885,10 +6885,10 @@ public:
         {
             std::lock_guard<std::mutex> lock(control_mutex);
             if (::recv(control_sock, &size_net, sizeof(size_net), MSG_WAITALL) != sizeof(size_net))
-                throw std::runtime_error("EC-CHECK RDMA: failed to receive size");
+                throw std::runtime_error("ECCheck RDMA: failed to receive size");
         }
         size = ntohll(size_net);
-        if (size > buffer_size) throw std::runtime_error("EC-CHECK RDMA: received size exceeds buffer");
+        if (size > buffer_size) throw std::runtime_error("ECCheck RDMA: received size exceeds buffer");
         
         // Step 2: Prepare buffer and memory region
         ibv_mr* mr = rdma_find_mr(reinterpret_cast<uintptr_t>(buffer), size);
@@ -6896,7 +6896,7 @@ public:
         bool use_temp = false;
         if (!mr) {
             if (size > rdma_temp_recv_buffer_.size())
-                throw std::runtime_error("EC-CHECK RDMA: size exceeds temp buffer");
+                throw std::runtime_error("ECCheck RDMA: size exceeds temp buffer");
             mr = rdma_temp_recv_mr_;
             recv_ptr = rdma_temp_recv_buffer_.data();
             use_temp = true;
@@ -6934,14 +6934,14 @@ public:
             // Step 4: Post this bounded recv batch before sending ACK.
             ibv_recv_wr* bad_wr = nullptr;
             if (ibv_post_recv(qp, &wrs[0], &bad_wr))
-                throw std::runtime_error("EC-CHECK RDMA: failed to post recv");
+                throw std::runtime_error("ECCheck RDMA: failed to post recv");
 
             // Step 5: Tell sender this batch is ready.
             {
                 std::lock_guard<std::mutex> lock(control_mutex);
                 uint8_t ack = 1;
                 if (::send(control_sock, &ack, sizeof(ack), 0) != sizeof(ack))
-                    throw std::runtime_error("EC-CHECK RDMA: failed to send ACK");
+                    throw std::runtime_error("ECCheck RDMA: failed to send ACK");
             }
 
             // Step 6: Poll this batch before posting more WRs.

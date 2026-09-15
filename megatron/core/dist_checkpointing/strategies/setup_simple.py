@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple setup script for EC-CHECK native C++ module (minimal dependencies).
+Simple setup script for ECCheck native C++ module (minimal dependencies).
 """
 
 from setuptools import setup, Extension

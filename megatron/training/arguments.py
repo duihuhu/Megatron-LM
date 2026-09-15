@@ -2400,38 +2400,38 @@ def _add_checkpointing_args(parser):
                        help='Exit after the training iteration following in-process recovery completes. '
                             'Useful for one-shot recovery-to-forward benchmark runs.')
     
-    # EC-CHECK (Erasure Coding Checkpoint) arguments
+    # ECCheck (Erasure Coding Checkpoint) arguments
     group.add_argument('--use-eccheck', action='store_true',
-                       help='Enable EC-CHECK (Erasure Coding Checkpoint) for serialization-free '
+                       help='Enable ECCheck (Erasure Coding Checkpoint) for serialization-free '
                             'checkpoint encoding. This feature decomposes state_dict into three '
                             'components (non-tensor data, tensor keys, tensor data) to eliminate'
                             'serialization overhead and enable pipelined encoding.')
     group.add_argument('--no-eccheck-use-continuous-buffer', action='store_false',
                        dest='eccheck_use_continuous_buffer',
-                       help='Disable continuous buffer for tensor data in EC-CHECK mode.')
+                       help='Disable continuous buffer for tensor data in ECCheck mode.')
     group.add_argument('--eccheck-pin-memory', action='store_true',
-                       help='Use pinned memory for EC-CHECK CPU buffers. This can accelerate '
+                       help='Use pinned memory for ECCheck CPU buffers. This can accelerate '
                             'GPU-to-CPU transfers (2-3x bandwidth improvement) but requires '
                             'more system memory. Recommended for GPU workloads.')
     group.add_argument('--no-eccheck-preallocate-cpu-buffer', action='store_false',
                        dest='eccheck_preallocate_cpu_buffer',
-                       help='Disable CPU memory buffer preallocation for EC-CHECK mode. '
+                       help='Disable CPU memory buffer preallocation for ECCheck mode. '
                             'Use this if system memory is limited.')
     group.add_argument('--use-eccheck-software-failure', action='store_true',
-                       help='Enable EC-CHECK checkpointing for software failure recovery. '
+                       help='Enable ECCheck checkpointing for software failure recovery. '
                             'When enabled, rank1 recovers d0 data block from rank0 using ASIO P2P communication.')
     group.add_argument('--use-eccheck-two-failures', action='store_true',
-                       help='Enable ECCHECK two-failure hardware recovery mode. '
+                       help='Enable ECCheck two-failure hardware recovery mode. '
                             'rank_in_group 1 and 2 are treated as failed (node failure: '
                             'two physical nodes lost). They recover via bidirectional XOR '
                             'exchange with surviving ranks 0 and 3, using RDMA transport '
                             'and 16-thread encode/XOR pool aligned with save path.')
     group.add_argument('--eccheck-recovery-cluster', type=int, default=0,
-                       help='Node-aware ECCHECK cluster to fail during HW, HW2, and '
+                       help='Node-aware ECCheck cluster to fail during HW, HW2, and '
                             'in-process recovery. Other four-node clusters load normally.')
     group.add_argument('--eccheck-rig-remap-offset', type=int, default=0,
                        choices=range(4),
-                       help='Rotate physical ECCHECK group positions into logical rig positions. '
+                       help='Rotate physical ECCheck group positions into logical rig positions. '
                             'Save and load must use the same value; offset 2 maps physical rig0 '
                             'to the logical rig2 hardware-failure role.')
 

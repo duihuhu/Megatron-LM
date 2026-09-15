@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-"""LEGACY checkpoint path for ECCHECK (XOR-based erasure coding with 4-rank groups).
+"""LEGACY checkpoint path for ECCheck (XOR-based erasure coding with 4-rank groups).
 
 Saves/loads via torch.save / torch.load with .pt files (same pattern as
 the other erasure-coded checkpoint implementations), reusing the shared ECCHECKManager
@@ -180,7 +180,7 @@ def _block_payload_sizes_for_save(
     rank_metadata: Dict[int, List[TensorMetadata]],
     blocks: Dict[str, Any],
 ) -> Dict[str, int]:
-    """Return logical bytes to persist for each ECCHECK side block."""
+    """Return logical bytes to persist for each ECCheck side block."""
     pipeline_bytes = int(blocks["pipeline_size"])
     own_actual = _rank_total_bytes(rank_metadata, rank)
     if world_size > 1:
@@ -290,7 +290,7 @@ def _eccheck_chunk_take(
     own_buffer: torch.Tensor,
     partner_buffer: torch.Tensor,
 ) -> int:
-    """Return the byte count for one ECCHECK encode stripe at src_pos."""
+    """Return the byte count for one ECCheck encode stripe at src_pos."""
     remaining = pipeline_total_bytes - src_pos
     take = min(buffer_size, remaining)
 
@@ -344,7 +344,7 @@ def _copy_buffer_range_from_tensors(
         tensor_view = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
         if tensor_view.numel() != info.size_bytes:
             raise RuntimeError(
-                f"ECCHECK legacy save: tensor bytes mismatch for {info.key}, "
+                f"ECCheck legacy save: tensor bytes mismatch for {info.key}, "
                 f"expected={info.size_bytes}, got={tensor_view.numel()}"
             )
         use_non_blocking = non_blocking and tensor.is_cuda
@@ -395,11 +395,11 @@ def _encode_eccheck_with_native(
 ) -> float:
     native = manager._eccheck_native
     if native is None:
-        raise RuntimeError("ECCHECK native module is not initialized")
+        raise RuntimeError("ECCheck native module is not initialized")
 
     buffers = manager.get_eccheck_buffers()
     if buffers is None:
-        raise RuntimeError("ECCHECK legacy save: buffer pools are not initialized")
+        raise RuntimeError("ECCheck legacy save: buffer pools are not initialized")
 
     free_data_queue = buffers["free_data_buffer_queue"]
     free_encoding_queue = buffers["free_encoding_buffer_queue"]
@@ -420,7 +420,7 @@ def _encode_eccheck_with_native(
                 waited_s += 0.1
                 if waited_s >= 5.0:
                     logger.warning(
-                        f"ECCHECK legacy: still waiting for free {label} buffer "
+                        f"ECCheck legacy: still waiting for free {label} buffer "
                         f"after {waited_s:.1f}s"
                     )
                     waited_s = 0.0
@@ -441,7 +441,7 @@ def _encode_eccheck_with_native(
 
     # Get recv encoding buffers (allocated during init)
     if manager.eccheck_recv_encoding_buffers is None:
-        raise RuntimeError("ECCHECK legacy save: recv_encoding_buffers not allocated")
+        raise RuntimeError("ECCheck legacy save: recv_encoding_buffers not allocated")
     recv_buffer_thread1, recv_buffer_thread2 = manager.eccheck_recv_encoding_buffers
     recv_base_1 = int(recv_buffer_thread1.data_ptr())
     recv_base_2 = int(recv_buffer_thread2.data_ptr())
@@ -495,7 +495,7 @@ def _encode_eccheck_with_native(
             )
             if take <= 0:
                 logger.warning(
-                    f"ECCHECK legacy: recv/P2P buffers exhausted, stopping at "
+                    f"ECCheck legacy: recv/P2P buffers exhausted, stopping at "
                     f"{src_pos / (1024**3):.2f} GB / {pipeline_total_bytes / (1024**3):.2f} GB"
                 )
                 break
@@ -706,7 +706,7 @@ def _save_eccheck_pt_files(
         buf = buf.to("cpu")
     main_mv = memoryview(buf.numpy())
 
-    # ECCHECK blocks keep the internal 64B gapped layout, but trim unused tail bytes.
+    # ECCheck blocks keep the internal 64B gapped layout, but trim unused tail bytes.
     block_names = ("own_buffer", "partner_buffer")
     block_write_sizes = block_payload_sizes
     block_mvs = {}
@@ -760,19 +760,19 @@ def _save_eccheck_pt_files(
 def save_eccheck_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str, write_to_disk: bool = True
 ) -> None:
-    """Save a legacy ECCHECK checkpoint."""
+    """Save a legacy ECCheck checkpoint."""
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     manager = ECCHECKManager()
     manager.init_eccheck_if_enabled()
     if manager._eccheck_native is None:
-        raise RuntimeError("ECCHECK native module is not available in legacy save path")
+        raise RuntimeError("ECCheck native module is not available in legacy save path")
 
     decomposed, save_copy_s, save_flatten_s, decompose_s = decompose_state_dict_for_save(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
     logger.debug(
-        "ECCHECK save timing: copy %.3fs flatten %.3fs decompose %.3fs",
+        "ECCheck save timing: copy %.3fs flatten %.3fs decompose %.3fs",
         save_copy_s,
         save_flatten_s,
         decompose_s,
@@ -819,7 +819,7 @@ def save_eccheck_legacy_checkpoint(
         manager.register_buffer(tensor_buffer)
 
     logger.debug(
-        f"ECCHECK legacy save: rank {rank} encoding "
+        f"ECCheck legacy save: rank {rank} encoding "
         f"{blocks['pipeline_size'] / (1024**3):.2f} GB pipeline "
         f"(actual: {total_tensor_size / (1024**3):.2f} GB)"
     )
@@ -855,7 +855,7 @@ def save_eccheck_legacy_checkpoint(
     )
     if rank == 0:
         logger.info(
-            "ECCHECK save timing: e2e_s=%(e2e_s).2fs d2h_s=%(d2h_s).2fs "
+            "ECCheck save timing: e2e_s=%(e2e_s).2fs d2h_s=%(d2h_s).2fs "
             "network_encode_s=%(network_encode_s).2fs net_s=%(net_s).2fs encode_s=%(encode_s).2fs",
             summary,
         )
@@ -910,7 +910,7 @@ def _load_eccheck_main_payload_local(
                     pin_payload_tensor_buffer_if_available(local_payload)
                 else:
                     logger.warning(
-                        "ECCHECK legacy: metadata-only load requested for old torch "
+                        "ECCheck legacy: metadata-only load requested for old torch "
                         "checkpoint format; tensor_buffer must still be deserialized"
                     )
                     local_payload["tensor_buffer"] = None
@@ -930,10 +930,10 @@ def _load_eccheck_main_payload(
     if world_size <= 1 or not torch.distributed.is_initialized():
         if local_error is not None:
             raise RuntimeError(
-                f"ECCHECK legacy: failed reading main file {main_path}: {local_error}"
+                f"ECCheck legacy: failed reading main file {main_path}: {local_error}"
             )
         if local_payload is None:
-            raise FileNotFoundError(f"ECCHECK legacy: missing main file {main_path}")
+            raise FileNotFoundError(f"ECCheck legacy: missing main file {main_path}")
         return local_payload
 
     # Strip tensor_buffer before all_gather — it's multiple GB for large models
@@ -963,7 +963,7 @@ def _load_eccheck_main_payload(
         details = "; ".join(
             f"rank {r} path={path}: {err}" for r, (path, err) in load_errors.items()
         )
-        raise RuntimeError(f"ECCHECK legacy: failed reading main payload(s): {details}")
+        raise RuntimeError(f"ECCheck legacy: failed reading main payload(s): {details}")
 
     if local_payload is not None:
         return local_payload
@@ -975,7 +975,7 @@ def _load_eccheck_main_payload(
             all_ti = payload.get("all_tensor_infos")
             if all_ti and rank in all_ti:
                 logger.debug(
-                    f"ECCHECK legacy: eccheck_main_rank{rank}.pt missing locally; "
+                    f"ECCheck legacy: eccheck_main_rank{rank}.pt missing locally; "
                     f"recovered tensor_infos for rank {rank} from rank {r}"
                 )
                 payload["tensor_infos"] = all_ti[rank]
@@ -983,14 +983,14 @@ def _load_eccheck_main_payload(
                 return payload
             if "tensor_infos" in payload:
                 logger.warning(
-                    f"ECCHECK legacy: using rank {r}'s tensor_infos as fallback "
+                    f"ECCheck legacy: using rank {r}'s tensor_infos as fallback "
                     f"for rank {rank} — may be incorrect (old checkpoint format)"
                 )
                 payload["tensor_buffer"] = None
                 return payload
 
     raise FileNotFoundError(
-        f"ECCHECK legacy: eccheck_main_rank{rank}.pt missing on all ranks "
+        f"ECCheck legacy: eccheck_main_rank{rank}.pt missing on all ranks "
         f"under {checkpoint_dir}"
     )
 
@@ -1000,7 +1000,7 @@ def _copy_block_file_into_tensor(
 ) -> None:
     block_path = checkpoint_dir / f"eccheck_block_rank{rank}_{block_name}.pt"
     if not block_path.is_file():
-        raise FileNotFoundError(f"ECCHECK legacy load: missing block file {block_path}")
+        raise FileNotFoundError(f"ECCheck legacy load: missing block file {block_path}")
     from megatron.training.legacy_io_utils import (
         MAGIC_BLOCK,
         is_raw_format,
@@ -1009,7 +1009,7 @@ def _copy_block_file_into_tensor(
     )
 
     if dest.device.type != "cpu" or dest.dtype != torch.uint8 or not dest.is_contiguous():
-        raise ValueError("ECCHECK raw block destination must be a contiguous CPU uint8 tensor")
+        raise ValueError("ECCheck raw block destination must be a contiguous CPU uint8 tensor")
     dst = dest.view(-1)
     if is_raw_format(str(block_path), MAGIC_BLOCK):
         with open(block_path, "rb") as block_file:
@@ -1108,7 +1108,7 @@ def _load_eccheck_blocks_from_disk_into(
             checkpoint_dir, rank, "partner_buffer", blocks["partner_buffer"]
         )
     else:
-        raise RuntimeError(f"ECCHECK legacy load: unexpected rank_in_group={rank_in_group}")
+        raise RuntimeError(f"ECCheck legacy load: unexpected rank_in_group={rank_in_group}")
 
 
 # ---------------------------------------------------------------------------
@@ -1137,7 +1137,7 @@ def _extract_dense_from_gapped_buffer(
         aligned_offset = ((buf_offset + 63) // 64) * 64
         if aligned_offset + take > buf_size:
             logger.warning(
-                f"ECCHECK legacy: gapped buffer exhausted at src_pos={src_pos} "
+                f"ECCheck legacy: gapped buffer exhausted at src_pos={src_pos} "
                 f"(buf_size={buf_size}, aligned={aligned_offset}, take={take})"
             )
             break
@@ -1161,7 +1161,7 @@ def _run_eccheck_legacy_recovery(
     registry: GlobalMetadataRegistry,
     native_prepared: bool = False,
 ) -> float:
-    """Drive C++ recovery for ECCHECK legacy load using submit_load_pipeline_chunk.
+    """Drive C++ recovery for ECCheck legacy load using submit_load_pipeline_chunk.
 
     Returns the network and encoding time in seconds.
 
@@ -1172,7 +1172,7 @@ def _run_eccheck_legacy_recovery(
 
     native = manager._eccheck_native
     if native is None:
-        raise RuntimeError("ECCHECK native module is not initialized")
+        raise RuntimeError("ECCheck native module is not initialized")
 
     from megatron.training import get_args as _get_args
 
@@ -1195,7 +1195,7 @@ def _run_eccheck_legacy_recovery(
             native.simple_p2p_send(int(partner_buf.data_ptr()), send_size)
         elif rank_in_group == 1:
             if recovered_buffer is None:
-                raise RuntimeError("ECCHECK legacy: software failure needs recovered_buffer")
+                raise RuntimeError("ECCheck legacy: software failure needs recovered_buffer")
             transfer_bytes = _rank_data_transfer_bytes(registry, rank, world_size)
             recv_size = min(transfer_bytes, recovered_buffer.numel())
             native.simple_p2p_recv(int(recovered_buffer.data_ptr()), recv_size)
@@ -1208,7 +1208,7 @@ def _run_eccheck_legacy_recovery(
     failed_rank = 2
     if not native_prepared:
         native.set_load_mode(True, failed_rank)
-    logger.debug(f"ECCHECK legacy: set load mode (failed_rank={failed_rank})")
+    logger.debug(f"ECCheck legacy: set load mode (failed_rank={failed_rank})")
 
     # Compute pipeline size
     max_total_bytes = _max_tensor_bytes_from_registry(registry, world_size)
@@ -1219,7 +1219,7 @@ def _run_eccheck_legacy_recovery(
     # Get buffer pools (reuse save-time pools via manager)
     buffers = manager.get_eccheck_buffers()
     if buffers is None:
-        raise RuntimeError("ECCHECK legacy: buffer pools not initialized")
+        raise RuntimeError("ECCheck legacy: buffer pools not initialized")
     free_data_queue = buffers["free_data_buffer_queue"]
     free_encoding_queue = buffers["free_encoding_buffer_queue"]
     free_parity_queue = buffers["free_parity_buffer_queue"]
@@ -1232,7 +1232,7 @@ def _run_eccheck_legacy_recovery(
         try:
             return free_data_queue.get(timeout=5.0)
         except queue.Empty:
-            logger.error("ECCHECK legacy: timeout waiting for free data buffer")
+            logger.error("ECCheck legacy: timeout waiting for free data buffer")
             return free_data_queue.get()
 
     def _get_free_encoding():
@@ -1241,7 +1241,7 @@ def _run_eccheck_legacy_recovery(
         try:
             return free_encoding_queue.get(timeout=5.0)
         except queue.Empty:
-            logger.error("ECCHECK legacy: timeout waiting for free encoding buffer")
+            logger.error("ECCheck legacy: timeout waiting for free encoding buffer")
             return free_encoding_queue.get()
 
     def _get_free_parity():
@@ -1250,7 +1250,7 @@ def _run_eccheck_legacy_recovery(
         try:
             return free_parity_queue.get(timeout=5.0)
         except queue.Empty:
-            logger.error("ECCHECK legacy: timeout waiting for free parity buffer")
+            logger.error("ECCheck legacy: timeout waiting for free parity buffer")
             return free_parity_queue.get()
 
     # HW1 uses an isolated single-physical receive cache. Save may retain its
@@ -1273,7 +1273,7 @@ def _run_eccheck_legacy_recovery(
         else "partner" if recovered_buffer is partner_buf else "none"
     )
     logger.debug(
-        "ECCHECK HW1 memory layout: role=rig%d alias=recovered:%s "
+        "ECCheck HW1 memory layout: role=rig%d alias=recovered:%s "
         "unique_full_buffers=%d recv_physical=%d logical_recv=2",
         rank_in_group,
         recovered_alias,
@@ -1334,7 +1334,7 @@ def _run_eccheck_legacy_recovery(
             if rank_in_group in (2, 3):
                 if rank_in_group == 2:
                     if recovered_buffer is None:
-                        raise RuntimeError("ECCHECK legacy: rig2 needs recovered_buffer")
+                        raise RuntimeError("ECCheck legacy: rig2 needs recovered_buffer")
                     parity_addr2 = int(recovered_buffer.data_ptr()) + processed
                     parity_is_pooled = False
                 else:
@@ -1404,7 +1404,7 @@ def _run_eccheck_legacy_recovery(
             torch.cuda.synchronize()
         t_pipeline_net = time() - t_pipeline_net_start
 
-        logger.debug(f"ECCHECK legacy: hw recovery pipeline done in {t_pipeline_net:.2f}s")
+        logger.debug(f"ECCheck legacy: hw recovery pipeline done in {t_pipeline_net:.2f}s")
 
     finally:
         if active_event is not None:
@@ -1429,7 +1429,7 @@ def _run_eccheck_two_failures_recovery(
     registry: GlobalMetadataRegistry,
     native_prepared: bool = False,
 ) -> Dict[str, float]:
-    """Drive C++ two-failure recovery for ECCHECK legacy load.
+    """Drive C++ two-failure recovery for ECCheck legacy load.
 
     Returns the recovery wall-time breakdown in seconds.
 
@@ -1444,7 +1444,7 @@ def _run_eccheck_two_failures_recovery(
 
     native = manager._eccheck_native
     if native is None:
-        raise RuntimeError("ECCHECK native module is not initialized")
+        raise RuntimeError("ECCheck native module is not initialized")
 
     rank_in_group = manager._get_rank_in_group(rank, world_size)
     is_failed = rank_in_group in (1, 2)
@@ -1454,7 +1454,7 @@ def _run_eccheck_two_failures_recovery(
     if not native_prepared:
         manager.reset_native_for_inprocess_recovery(10)
     logger.debug(
-        f"ECCHECK legacy two-failures: load mode set (failed_rank=10), "
+        f"ECCheck legacy two-failures: load mode set (failed_rank=10), "
         f"rank={rank}, rank_in_group={rank_in_group}"
     )
 
@@ -1467,7 +1467,7 @@ def _run_eccheck_two_failures_recovery(
     # Get buffer pools
     buffers = manager.get_eccheck_buffers()
     if buffers is None:
-        raise RuntimeError("ECCHECK legacy: buffer pools not initialized")
+        raise RuntimeError("ECCheck legacy: buffer pools not initialized")
     free_data_queue = buffers["free_data_buffer_queue"]
     free_encoding_queue = buffers["free_encoding_buffer_queue"]
     free_parity_queue = buffers["free_parity_buffer_queue"]
@@ -1480,7 +1480,7 @@ def _run_eccheck_two_failures_recovery(
         try:
             return free_data_queue.get(timeout=5.0)
         except queue.Empty:
-            logger.error("ECCHECK two-failures: timeout waiting for free data buffer")
+            logger.error("ECCheck two-failures: timeout waiting for free data buffer")
             return free_data_queue.get()
 
     def _get_free_encoding():
@@ -1489,7 +1489,7 @@ def _run_eccheck_two_failures_recovery(
         try:
             return free_encoding_queue.get(timeout=5.0)
         except queue.Empty:
-            logger.error("ECCHECK two-failures: timeout waiting for free encoding buffer")
+            logger.error("ECCheck two-failures: timeout waiting for free encoding buffer")
             return free_encoding_queue.get()
 
     def _get_free_parity():
@@ -1498,7 +1498,7 @@ def _run_eccheck_two_failures_recovery(
         try:
             return free_parity_queue.get(timeout=5.0)
         except queue.Empty:
-            logger.error("ECCHECK two-failures: timeout waiting for free parity buffer")
+            logger.error("ECCheck two-failures: timeout waiting for free parity buffer")
             return free_parity_queue.get()
 
     # Allocate the bounded receive ring and preserve the two-lane tuple API.
@@ -1509,7 +1509,7 @@ def _run_eccheck_two_failures_recovery(
         )
     elif manager.eccheck_hw2_recv_ring_depth != ring_depth:
         raise RuntimeError(
-            "ECCHECK HW2 cached receive ring depth mismatch: "
+            "ECCheck HW2 cached receive ring depth mismatch: "
             f"allocated={manager.eccheck_hw2_recv_ring_depth}, requested={ring_depth}"
         )
     recv_buf1, recv_buf2 = manager.eccheck_hw2_recv_encoding_buffers
@@ -1529,7 +1529,7 @@ def _run_eccheck_two_failures_recovery(
         else "own_buffer" if recovered_buffer is own_buf else "none"
     )
     logger.debug(
-        "ECCHECK HW2 memory layout: role=rig%d unique_full_blocks=%d "
+        "ECCheck HW2 memory layout: role=rig%d unique_full_blocks=%d "
         "recv_physical_buffers=1 recv_ring_depth=%d recv_ring_bytes=%d "
         "logical_lanes=2 alias=recovered:%s",
         rank_in_group,
@@ -1551,7 +1551,7 @@ def _run_eccheck_two_failures_recovery(
         input_buf = own_buf
         phase1_buf = None
     if input_buf is None or (is_survivor and phase1_buf is None):
-        raise RuntimeError(f"ECCHECK HW2 immutable sources missing for rig{rank_in_group}")
+        raise RuntimeError(f"ECCheck HW2 immutable sources missing for rig{rank_in_group}")
     input_base = int(input_buf.data_ptr())
 
     if active_event is not None:
@@ -1575,7 +1575,7 @@ def _run_eccheck_two_failures_recovery(
         )
         native.simple_p2p_send(int(phase1_buf.data_ptr()), send_size)
         logger.debug(
-            f"ECCHECK two-failures: rig0 sent d1 to rig1 " f"({send_size / (1024**3):.2f} GB)"
+            f"ECCheck two-failures: rig0 sent d1 to rig1 " f"({send_size / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 1:
         recv_size = min(_rank_data_transfer_bytes(registry, rank, world_size), partner_buf.numel())
@@ -1583,19 +1583,19 @@ def _run_eccheck_two_failures_recovery(
         if recv_size < partner_buf.numel():
             partner_buf[recv_size:].zero_()
         logger.debug(
-            f"ECCHECK two-failures: rig1 received d1 from rig0 " f"({recv_size / (1024**3):.2f} GB)"
+            f"ECCheck two-failures: rig1 received d1 from rig0 " f"({recv_size / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 2:
         recv_size = min(phase1_parity_bytes, own_buf.numel())
         native.simple_p2p_recv(int(own_buf.data_ptr()), recv_size)
         logger.debug(
-            f"ECCHECK two-failures: rig2 received p2 from rig3 " f"({recv_size / (1024**3):.2f} GB)"
+            f"ECCheck two-failures: rig2 received p2 from rig3 " f"({recv_size / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 3:
         send_size = min(phase1_parity_bytes, phase1_buf.numel())
         native.simple_p2p_send(int(phase1_buf.data_ptr()), send_size)
         logger.debug(
-            f"ECCHECK two-failures: rig3 sent p2 to rig2 " f"({send_size / (1024**3):.2f} GB)"
+            f"ECCheck two-failures: rig3 sent p2 to rig2 " f"({send_size / (1024**3):.2f} GB)"
         )
     t_phase1_p2p = time() - _t0
 
@@ -1606,22 +1606,22 @@ def _run_eccheck_two_failures_recovery(
     stale_releases = native.get_two_failure_recv_buffers_to_release()
     if stale_releases:
         raise RuntimeError(
-            "ECCHECK HW2 typed receive release queue was not empty at cycle start: "
+            "ECCheck HW2 typed receive release queue was not empty at cycle start: "
             f"count={len(stale_releases)}"
         )
     if recv_base_1 != recv_base_2:
-        raise RuntimeError("ECCHECK HW2 logical receive lanes must alias one physical ring")
+        raise RuntimeError("ECCheck HW2 logical receive lanes must alias one physical ring")
     ring_base = recv_base_1
     ring_bytes = ring_depth * buffer_size
     if recv_buf1.numel() != ring_bytes or recv_buf2.numel() != ring_bytes:
         raise RuntimeError(
-            "ECCHECK HW2 receive ring size mismatch: "
+            "ECCheck HW2 receive ring size mismatch: "
             f"expected={ring_bytes}, lane1={recv_buf1.numel()}, lane2={recv_buf2.numel()}"
         )
     free_slots = deque(ring_base + index * buffer_size for index in range(ring_depth))
     inflight: Set[int] = set()
     logger.debug(
-        "ECCHECK HW2 receive ring setup: ring_depth=%d ring_bytes=%d", ring_depth, ring_bytes
+        "ECCheck HW2 receive ring setup: ring_depth=%d ring_bytes=%d", ring_depth, ring_bytes
     )
     ring_stall_s = 0.0
     ring_wait_count = 0
@@ -1635,15 +1635,15 @@ def _run_eccheck_two_failures_recovery(
             offset = address - ring_base
             if offset < 0 or offset >= ring_bytes:
                 raise RuntimeError(
-                    f"ECCHECK HW2 native released address outside receive ring: 0x{address:x}"
+                    f"ECCheck HW2 native released address outside receive ring: 0x{address:x}"
                 )
             if offset % buffer_size != 0:
                 raise RuntimeError(
-                    f"ECCHECK HW2 native released unaligned receive slot: 0x{address:x}"
+                    f"ECCheck HW2 native released unaligned receive slot: 0x{address:x}"
                 )
             if address not in inflight:
                 raise RuntimeError(
-                    f"ECCHECK HW2 duplicate or non-inflight receive slot release: 0x{address:x}"
+                    f"ECCheck HW2 duplicate or non-inflight receive slot release: 0x{address:x}"
                 )
             inflight.remove(address)
             free_slots.append(address)
@@ -1667,12 +1667,12 @@ def _run_eccheck_two_failures_recovery(
             now = monotonic()
             if now >= deadline:
                 raise RuntimeError(
-                    "ECCHECK HW2 timed out waiting for a free receive ring slot: "
+                    "ECCheck HW2 timed out waiting for a free receive ring slot: "
                     f"inflight={len(inflight)}, free={len(free_slots)}, depth={ring_depth}"
                 )
             if now >= next_warning:
                 logger.warning(
-                    "ECCHECK HW2 waiting for a free receive ring slot for %.1fs", now - wait_start
+                    "ECCheck HW2 waiting for a free receive ring slot for %.1fs", now - wait_start
                 )
                 next_warning = now + 5.0
             sleep(0.001)
@@ -1704,7 +1704,7 @@ def _run_eccheck_two_failures_recovery(
             take = min(take, destination_remaining)
             if take < 64:
                 logger.warning(
-                    "ECCHECK two-failures: destination buffers exhausted at %.2f GB",
+                    "ECCheck two-failures: destination buffers exhausted at %.2f GB",
                     processed / (1024**3),
                 )
                 break
@@ -1784,17 +1784,17 @@ def _run_eccheck_two_failures_recovery(
                 break
             if monotonic() >= release_deadline:
                 raise RuntimeError(
-                    "ECCHECK HW2 timed out waiting for receive ring slots after completion: "
+                    "ECCheck HW2 timed out waiting for receive ring slots after completion: "
                     f"inflight={len(inflight)}, free={len(free_slots)}, depth={ring_depth}"
                 )
             sleep(0.001)
         if len(free_slots) != ring_depth:
             raise RuntimeError(
-                "ECCHECK HW2 receive ring did not fully return at cycle end: "
+                "ECCheck HW2 receive ring did not fully return at cycle end: "
                 f"free={len(free_slots)}, depth={ring_depth}"
             )
         logger.debug(
-            "ECCHECK HW2 pipeline ring_stall_s=%.3f ring_wait_count=%d max_inflight=%d",
+            "ECCheck HW2 pipeline ring_stall_s=%.3f ring_wait_count=%d max_inflight=%d",
             ring_stall_s,
             ring_wait_count,
             max_inflight,
@@ -1805,7 +1805,7 @@ def _run_eccheck_two_failures_recovery(
 
         network_encode = t_phase1_p2p + t_pipeline_net
         logger.debug(
-            f"ECCHECK legacy: two-failure recovery pipeline done in " f"{network_encode:.2f}s"
+            f"ECCheck legacy: two-failure recovery pipeline done in " f"{network_encode:.2f}s"
         )
 
     finally:
@@ -1886,7 +1886,7 @@ def _reconstruct_state_dict_from_eccheck_buffer(
         tensor_buffer = main_payload.get("tensor_buffer")
         if tensor_buffer is None:
             raise RuntimeError(
-                "ECCHECK legacy: tensor_buffer missing and no recovered_buffer provided"
+                "ECCheck legacy: tensor_buffer missing and no recovered_buffer provided"
             )
         buf = _tensor_buffer_as_uint8_view(tensor_buffer)
     tensor_infos = _coerce_tensor_infos_for_extract(main_payload["tensor_infos"])
@@ -2035,7 +2035,7 @@ def _metadata_workspace_key(
 
 
 def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
-    """Load a legacy ECCHECK checkpoint."""
+    """Load a legacy ECCheck checkpoint."""
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -2053,7 +2053,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     num_clusters = int(layout["clusters"] if layout["mode"] == 1 else layout["num_groups"])
     if target_cluster < 0 or target_cluster >= num_clusters:
         raise ValueError(
-            f"ECCHECK recovery cluster {target_cluster} is outside " f"[0, {num_clusters - 1}]"
+            f"ECCheck recovery cluster {target_cluster} is outside " f"[0, {num_clusters - 1}]"
         )
     # Software-failure behavior remains unchanged. HW/HW2 recovery is confined
     # to one four-node cluster; ranks in other clusters load their local state.
@@ -2090,7 +2090,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     if not getattr(args, "use_eccheck", False):
         logger.warning(
-            "ECCHECK legacy load: args.use_eccheck is False; enabling for native module init"
+            "ECCheck legacy load: args.use_eccheck is False; enabling for native module init"
         )
         args.use_eccheck = True
 
@@ -2098,7 +2098,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     manager = ECCHECKManager()
     manager.init_eccheck_if_enabled()
     if manager._eccheck_native is None:
-        raise RuntimeError("ECCHECK native module is not available in legacy load path")
+        raise RuntimeError("ECCheck native module is not available in legacy load path")
     alloc_touch_register_s += time.perf_counter() - alloc_start
 
     bootstrap_key = None
@@ -2129,10 +2129,10 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             )
         )
         if workspace.get("recv_buffers") is not cached_recv_buffers:
-            raise RuntimeError("ECCHECK cached receive-buffer identity changed")
+            raise RuntimeError("ECCheck cached receive-buffer identity changed")
         if two_failures and manager.eccheck_hw2_recv_ring_depth != hw2_ring_depth:
             raise RuntimeError(
-                "ECCHECK cached HW2 receive ring depth mismatch: "
+                "ECCheck cached HW2 receive ring depth mismatch: "
                 f"allocated={manager.eccheck_hw2_recv_ring_depth}, requested={hw2_ring_depth}"
             )
         cache_status = "hit"
@@ -2180,17 +2180,17 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
                 tensor_buffer = main_payload.get("tensor_buffer")
                 if not isinstance(tensor_buffer, torch.Tensor):
                     raise RuntimeError(
-                        "ECCHECK HW2 rig0 requires main tensor_buffer as authoritative d0"
+                        "ECCheck HW2 rig0 requires main tensor_buffer as authoritative d0"
                     )
                 if tensor_buffer.device.type != "cpu" or not tensor_buffer.is_contiguous():
                     raise RuntimeError(
-                        "ECCHECK HW2 rig0 canonical main tensor_buffer must be "
+                        "ECCheck HW2 rig0 canonical main tensor_buffer must be "
                         "contiguous CPU storage"
                     )
                 d0 = _tensor_buffer_as_uint8_view(tensor_buffer)
                 if d0.numel() < local_canonical_required_bytes:
                     raise RuntimeError(
-                        "ECCHECK HW2 rig0 canonical main buffer must cover local rank data: "
+                        "ECCheck HW2 rig0 canonical main buffer must cover local rank data: "
                         f"required={local_canonical_required_bytes}, have={d0.numel()}"
                     )
                 source_tensors = allocate_hugepage_slices(
@@ -2201,7 +2201,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
                 )
                 source_blocks = {"d0": d0, "d1": source_tensors[0]}
                 logger.debug(
-                    "ECCHECK HW2 rig0 sources: d0 kind=canonical_main, "
+                    "ECCheck HW2 rig0 sources: d0 kind=canonical_main, "
                     "allocated_source_blocks=1, local_bytes=%d, pipeline_bytes=%d",
                     local_canonical_required_bytes,
                     pipeline_capacity_bytes,
@@ -2341,7 +2341,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         )
         if rank == 0:
             logger.info(
-                "ECCHECK %s in-process setup cache=%s metadata_plan_s=%.3f "
+                "ECCheck %s in-process setup cache=%s metadata_plan_s=%.3f "
                 "disk_preload_s=%.3f alloc_touch_register_s=%.3f "
                 "native_reset_s=%.3f total_s=%.3f",
                 "software" if sw_failure else "hardware",
@@ -2453,7 +2453,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     load_log = dict(timings)
     load_log["mode"] = _mode
     logger.debug(
-        "ECCHECK load timing (%(mode)s local): e2e_s=%(total).2fs "
+        "ECCheck load timing (%(mode)s local): e2e_s=%(total).2fs "
         "network_encode_s=%(network_encode).2fs "
         "rebuild_sd_s=%(rebuild_sd).2fs barrier_s=%(barrier).2fs",
         load_log,
@@ -2468,7 +2468,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         manager.unregister_buffer(recovered_buffer)
         if rank == 0:
             logger.info(
-                "ECCHECK software preload: retained native P2P topology and "
+                "ECCheck software preload: retained native P2P topology and "
                 "released temporary recovery-buffer registration"
             )
 

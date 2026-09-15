@@ -130,7 +130,7 @@ def _inprocess_recovery_failed_ranks(args):
             )
             if target_cluster < 0 or target_cluster >= num_clusters:
                 raise ValueError(
-                    f"ECCHECK recovery cluster {target_cluster} is outside "
+                    f"ECCheck recovery cluster {target_cluster} is outside "
                     f"[0, {num_clusters - 1}]"
                 )
             failed_group_positions = (
@@ -145,7 +145,7 @@ def _inprocess_recovery_failed_ranks(args):
             ]
         if explicit is not None and sorted(set(explicit)) != sorted(set(derived)):
             raise RuntimeError(
-                "ECCHECK explicit in-process affected ranks do not match the "
+                "ECCheck explicit in-process affected ranks do not match the "
                 f"mode-derived roles: explicit={explicit}, derived={derived}"
             )
         return derived
@@ -344,7 +344,7 @@ def _format_inprocess_load_timing_summary(ft_context: dict, h2d_total_s: float) 
             "h2d_s": h2d_total_s,
         })
         return (
-            "ECCHECK load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
+            "ECCheck load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
             "network_encode_s=%.2fs net_s=%.2fs encode_s=%.2fs "
             "decode_s=%.2fs phase1_p2p_s=%.2fs pipeline_wall_s=%.2fs "
             "rebuild_sd_s=%.2fs h2d_s=%.2fs"
@@ -874,15 +874,15 @@ def maybe_preinitialize_torch_dist_save_strategy():
         return
 
     if not torch.distributed.is_initialized():
-        logger.debug('EC-CHECK: distributed env is not initialized')
+        logger.debug('ECCheck: distributed env is not initialized')
         return
 
     try:
         get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
         _TORCH_DIST_STRATEGY_PREINITIALIZED = True
-        logger.info('EC-CHECK: initialized TorchDist save strag')
+        logger.info('ECCheck: initialized TorchDist save strag')
     except Exception as exc:  # pylint: disable=broad-except
-        logger.warning('EC-CHECK: initialize TorchDist save stragg failed: %s', exc)
+        logger.warning('ECCheck: initialize TorchDist save stragg failed: %s', exc)
 
 def check_checkpoint_args(checkpoint_args):
     """Ensure fixed arguments for a model are the same for the input
@@ -1318,7 +1318,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
     ):
         raise RuntimeError(
-            "ECCHECK only supports torch legacy checkpoints. "
+            "ECCheck only supports torch legacy checkpoints. "
             "Please use --ckpt-format torch without distributed checkpoint save."
         )
     if getattr(args, "use_gemini_replicas", False) and (
@@ -3158,7 +3158,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 })
                 if rank == 0:
                     logger.info(
-                        "ECCHECK load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
+                        "ECCheck load timing (%s): e2e_s=%.2fs recovery_e2e_s=%.2fs "
                         "network_encode_s=%.2fs net_s=%.2fs encode_s=%.2fs "
                         "decode_s=%.2fs phase1_p2p_s=%.2fs pipeline_wall_s=%.2fs "
                         "rebuild_sd_s=%.2fs h2d_s=%.2fs",
@@ -3276,7 +3276,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 and getattr(args, "_ft_inprocess_recovery_active", False)
             ):
                 logger.debug(
-                    "ECCHECK: keeping native resources alive for in-process recovery on rank %d",
+                    "ECCheck: keeping native resources alive for in-process recovery on rank %d",
                     rank,
                 )
             else:
@@ -3285,7 +3285,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 )
                 _eccheck_mgr = ECCHECKManager()
                 logger.debug(
-                    "ECCHECK: deferred post-H2D cleanup on rank %d", rank
+                    "ECCheck: deferred post-H2D cleanup on rank %d", rank
                 )
                 t_cleanup = time()
                 _eccheck_mgr.cleanup()

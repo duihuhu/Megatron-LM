@@ -7,11 +7,11 @@ This repository keeps Megatron's training stack and replaces the NVIDIA-facing d
 | Scheme | Flag | Placement | Coding |
 | --- | --- | --- | --- |
 | Concord | `--use-concord` | POA stripes over node groups of size `n` | Reed–Solomon `(n, n-2)` |
-| ECCHECK | `--use-eccheck` | 4-rank XOR groups | XOR parity |
+| ECCheck | `--use-eccheck` | 4-rank XOR groups | XOR parity |
 | BasicEC | `--use-basic-ec` | Round-robin RS groups | ISA-L Reed–Solomon `(k+2, k)` |
 | Gemini Replicas | `--use-gemini-replicas` | Round-robin replicas | Replication (`--gemini-replicas-num`) |
 
-At most one of `--use-concord`, `--use-basic-ec`, and `--use-gemini-replicas` may be enabled. ECCHECK is selected independently with `--use-eccheck`.
+At most one of the four legacy schemes may be enabled: Concord, ECCheck, BasicEC, or Gemini Replicas.
 
 ## What Concord does
 
@@ -24,7 +24,7 @@ Save and recovery both go through RDMA. A layer is flattened into fixed-size blo
 ```
 megatron/training/
   concord_legacy.py          Concord save / load / recovery
-  eccheck_legacy.py          ECCHECK save / load / recovery
+  eccheck_legacy.py          ECCheck save / load / recovery
   basic_ec_legacy.py          BasicEC save / load / recovery
   gemini_replicas_legacy.py  Gemini replica save / load / recovery
   checkpointing.py           scheme dispatch
@@ -35,7 +35,7 @@ megatron/core/dist_checkpointing/strategies/
   concord_native.cpp         RS encode / decode and RDMA
   poa_n4.txt  poa_n8.txt     offline POA tables
   setup_simple_concord.py    Concord native build
-  setup_simple.py            ECCHECK native build
+  setup_simple.py            ECCheck native build
   setup_simple_basic_ec.py    BasicEC native build
   build_gemini_replicas.sh  Gemini Replicas native build
 
@@ -52,7 +52,7 @@ Each scheme has a pybind11 extension. Build them in `megatron/core/dist_checkpoi
 ```bash
 cd megatron/core/dist_checkpointing/strategies
 python3 setup_simple_concord.py build_ext --inplace
-bash build_clean.sh            # ECCHECK
+bash build_clean.sh            # ECCheck
 bash build_clean_basic_ec.sh    # BasicEC
 bash build_gemini_replicas.sh  # Gemini Replicas
 ```

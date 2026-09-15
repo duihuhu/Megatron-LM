@@ -1,5 +1,5 @@
 #!/bin/bash
-# Clean build script for EC-CHECK native C++ module
+# Clean build script for ECCheck native C++ module
 # Supports both ASIO (TCP) and RDMA (InfiniBand) transports
 
 set -e
@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=========================================="
-echo "Building EC-CHECK Native C++ Module"
+echo "Building ECCheck Native C++ Module"
 echo "  - ASIO (TCP) transport: always enabled"
 echo "  - RDMA (InfiniBand) transport: optional"
 echo "  - NCCL transport: optional"
@@ -46,7 +46,7 @@ if [ -f "/usr/include/isa-l/erasure_code.h" ] || [ -f "/usr/local/include/isa-l/
 fi
 
 if [ $ISA_L_FOUND -eq 0 ]; then
-    echo "⚠️  Warning: ISA-L library not found. EC-CHECK requires ISA-L."
+    echo "⚠️  Warning: ISA-L library not found. ECCheck requires ISA-L."
     echo "   Ubuntu/Debian: sudo apt-get install libisal-dev"
     echo "   CentOS/RHEL: sudo yum install isa-l-devel"
     echo "   Or build from source: https://github.com/intel/isa-l"
@@ -128,7 +128,7 @@ rm -rf "$TEMP_DIR"
 if [ -f eccheck_native*.so ] || [ -f eccheck_native*.pyd ]; then
     echo ""
     echo "=========================================="
-    echo "✅ EC-CHECK native module built successfully!"
+    echo "✅ ECCheck native module built successfully!"
     echo "=========================================="
     echo "Module location: $(pwd)/eccheck_native*.so"
     echo ""
@@ -158,7 +158,7 @@ if [ -f eccheck_native*.so ] || [ -f eccheck_native*.pyd ]; then
     fi
     echo ""
     echo "To test the module, run:"
-    echo "  python3 -c 'import eccheck_native; print(\"EC-CHECK module loaded successfully\")'"
+    echo "  python3 -c 'import eccheck_native; print(\"ECCheck module loaded successfully\")'"
     if [ $RDMA_FOUND -eq 1 ]; then
         echo "  python3 -c 'import eccheck_native; print(\"RDMA available:\", eccheck_native.is_rdma_available())'"
     fi

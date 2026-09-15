@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Test script for EC-CHECK load pipeline
+# Test script for ECCheck load pipeline
 # Similar to test_eccheck.sh but specifically for testing load pipeline
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1

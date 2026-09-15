@@ -130,7 +130,7 @@ EVAL_AND_LOGGING_ARGS=(
     # --use-gemini-software-failure
     # --use-gemini-hardware-failure
 
-    --ckpt-format torch_dist
+    --ckpt-format torch
     # --no-save-optim
     # --no-load-optim
     --save-embeddings-separately

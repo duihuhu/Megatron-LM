@@ -221,7 +221,7 @@ EVAL_AND_LOGGING_ARGS=(
     --load $CHECKPOINT_PATH
     --eval-iters 10
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --ckpt-format torch_dist
+    --ckpt-format torch
     --use-eccheck
     # --rerun-mode disabled
 )

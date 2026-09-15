@@ -7,7 +7,7 @@ This repository keeps Megatron's training stack and replaces the NVIDIA-facing d
 | Scheme | Flag | Placement | Coding |
 | --- | --- | --- | --- |
 | Concord | `--use-concord` | POA stripes over node groups of size `n` | Reed–Solomon `(n, n-2)` |
-| ECCheck | `--use-eccheck` | 4-rank XOR groups | XOR parity |
+| ECCheck | `--use-eccheck` | Node-aware 4-rank groups  | ISA-L Reed–Solomon `(4, 2)` |
 | BasicEC | `--use-basic-ec` | Round-robin RS groups | ISA-L Reed–Solomon `(k+2, k)` |
 | Gemini Replicas | `--use-gemini-replicas` | Round-robin replicas | Replication (`--gemini-replicas-num`) |
 

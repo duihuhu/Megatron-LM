@@ -350,7 +350,6 @@ public:
 
         // Find registered MR or use temp buffer
         ibv_mr* mr = find_registered_mr(reinterpret_cast<uintptr_t>(data), size);
-        bool use_temp = false;
 
         if (!mr) {
             if (size > TEMP_BUFFER_SIZE) {
@@ -359,7 +358,6 @@ public:
             memcpy(temp_send_buffer_.data(), data, size);
             mr = temp_send_mr_;
             data = temp_send_buffer_.data();
-            use_temp = true;
         }
 
         // Send data in chunks
@@ -606,14 +604,6 @@ public:
     bool is_recv_parity0_connected() const { return recv_parity0_connected_; }
     bool is_recv_data1_connected() const { return recv_data1_connected_; }
 
-    // Save mode init functions
-    void init_send_data1(const std::string& partner_ip, uint16_t port);
-    void init_send_parity0(const std::string& partner_ip, uint16_t port);
-    void init_send_parity1(const std::string& partner_ip, uint16_t port);
-    void init_recv_parity1(const std::string& listen_ip, uint16_t port);
-    void init_recv_parity0(const std::string& listen_ip, uint16_t port);
-    void init_recv_data1(const std::string& listen_ip, uint16_t port);
-
     // Generalized init methods (for k+2 schemes)
     void init_send_channels(const std::vector<std::string>& ips,
                             const std::vector<uint16_t>& ports);
@@ -637,100 +627,6 @@ public:
     void wait_for_connections(int timeout_seconds = 30);
     void cleanup();
 };
-
-// Save mode init functions
-void AsioConnectionManager::init_send_data1(const std::string& partner_ip, uint16_t port) {
-    try {
-        boost::asio::ip::tcp::resolver resolver(io_context_);
-        auto endpoints = resolver.resolve(partner_ip, std::to_string(port));
-        boost::asio::connect(send_data1_socket_, endpoints);
-        send_data1_connected_ = true;
-        connection_cv_.notify_all();
-    } catch (const std::exception& e) {
-        std::cerr << "ASIO: send_data1 init error: " << e.what() << std::endl;
-        send_data1_connected_ = false;
-        connection_cv_.notify_all();
-    }
-}
-
-void AsioConnectionManager::init_send_parity0(const std::string& partner_ip, uint16_t port) {
-    try {
-        boost::asio::ip::tcp::resolver resolver(io_context_);
-        auto endpoints = resolver.resolve(partner_ip, std::to_string(port));
-        boost::asio::connect(send_parity0_socket_, endpoints);
-        send_parity0_connected_ = true;
-        connection_cv_.notify_all();
-    } catch (const std::exception& e) {
-        std::cerr << "ASIO: send_parity0 init error: " << e.what() << std::endl;
-        send_parity0_connected_ = false;
-        connection_cv_.notify_all();
-    }
-}
-
-void AsioConnectionManager::init_send_parity1(const std::string& partner_ip, uint16_t port) {
-    try {
-        boost::asio::ip::tcp::resolver resolver(io_context_);
-        auto endpoints = resolver.resolve(partner_ip, std::to_string(port));
-        boost::asio::connect(send_parity1_socket_, endpoints);
-        send_parity1_connected_ = true;
-        connection_cv_.notify_all();
-    } catch (const std::exception& e) {
-        std::cerr << "ASIO: send_parity1 init error: " << e.what() << std::endl;
-        send_parity1_connected_ = false;
-        connection_cv_.notify_all();
-    }
-}
-
-void AsioConnectionManager::init_recv_parity1(const std::string& listen_ip, uint16_t port) {
-    try {
-        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
-        recv_parity1_acceptor_.open(endpoint.protocol());
-        recv_parity1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
-        recv_parity1_acceptor_.bind(endpoint);
-        recv_parity1_acceptor_.listen();
-        recv_parity1_acceptor_.accept(recv_parity1_socket_);
-        recv_parity1_connected_ = true;
-        connection_cv_.notify_all();
-    } catch (const std::exception& e) {
-        std::cerr << "ASIO: recv_parity1 init error: " << e.what() << std::endl;
-        recv_parity1_connected_ = false;
-        connection_cv_.notify_all();
-    }
-}
-
-void AsioConnectionManager::init_recv_parity0(const std::string& listen_ip, uint16_t port) {
-    try {
-        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
-        recv_parity0_acceptor_.open(endpoint.protocol());
-        recv_parity0_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
-        recv_parity0_acceptor_.bind(endpoint);
-        recv_parity0_acceptor_.listen();
-        recv_parity0_acceptor_.accept(recv_parity0_socket_);
-        recv_parity0_connected_ = true;
-        connection_cv_.notify_all();
-    } catch (const std::exception& e) {
-        std::cerr << "ASIO: recv_parity0 init error: " << e.what() << std::endl;
-        recv_parity0_connected_ = false;
-        connection_cv_.notify_all();
-    }
-}
-
-void AsioConnectionManager::init_recv_data1(const std::string& listen_ip, uint16_t port) {
-    try {
-        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(listen_ip), port);
-        recv_data1_acceptor_.open(endpoint.protocol());
-        recv_data1_acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
-        recv_data1_acceptor_.bind(endpoint);
-        recv_data1_acceptor_.listen();
-        recv_data1_acceptor_.accept(recv_data1_socket_);
-        recv_data1_connected_ = true;
-        connection_cv_.notify_all();
-    } catch (const std::exception& e) {
-        std::cerr << "ASIO: recv_data1 init error: " << e.what() << std::endl;
-        recv_data1_connected_ = false;
-        connection_cv_.notify_all();
-    }
-}
 
 // Generalized init: initialize all send channels from vectors
 void AsioConnectionManager::init_send_channels(
@@ -1608,6 +1504,7 @@ public:
 
     // Load mode functions
     void set_load_mode(bool is_load, int failed_rank, int rank = -1, bool is_software_only = false) {
+        (void)is_software_only;
         is_load_mode_ = is_load;
         failed_rank_ = failed_rank;
         failed_rank_in_group_ = (failed_rank >= 0)
@@ -2373,7 +2270,7 @@ private:
     }
 
     void close_rdma_exchange_sockets() {
-        auto close_fd = [](int& fd, const std::string& name) {
+        auto close_fd = [](int& fd, const std::string&) {
             if (fd >= 0) {
                 close(fd);
                 fd = -1;

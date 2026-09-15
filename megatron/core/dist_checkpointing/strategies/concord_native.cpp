@@ -3095,8 +3095,15 @@ private:
     void source_worker_() {
         while (!all_stop_) {
             SourceTask t;
-            { std::unique_lock<std::mutex> lk(source_mtx_); source_cv_.wait(lk, [&]{ return all_stop_ || !source_q_.empty(); });
-              if (all_stop_ && source_q_.empty()) break; t = source_q_.front(); source_q_.pop(); }
+            {
+              std::unique_lock<std::mutex> lk(source_mtx_);
+              source_cv_.wait(lk,
+                              [&] { return all_stop_ || !source_q_.empty(); });
+              if (all_stop_ && source_q_.empty())
+                break;
+              t = source_q_.front();
+              source_q_.pop();
+            }
             auto& si = stripe_info_[(size_t)t.sid];
             wait_encode_source_turn_(t.sid, t.encode_batch);
             if (!t.skip) {
@@ -3167,8 +3174,15 @@ private:
     void enc_recv_worker_() {
         while (!all_stop_) {
             EncRecvTask t;
-            { std::unique_lock<std::mutex> lk(enc_recv_mtx_); enc_recv_cv_.wait(lk, [&]{ return all_stop_ || !enc_recv_q_.empty(); });
-              if (all_stop_ && enc_recv_q_.empty()) break; t = std::move(enc_recv_q_.front()); enc_recv_q_.pop(); }
+            {
+              std::unique_lock<std::mutex> lk(enc_recv_mtx_);
+              enc_recv_cv_.wait(
+                  lk, [&] { return all_stop_ || !enc_recv_q_.empty(); });
+              if (all_stop_ && enc_recv_q_.empty())
+                break;
+              t = std::move(enc_recv_q_.front());
+              enc_recv_q_.pop();
+            }
             auto& si = stripe_info_[(size_t)t.sid];
             wait_encode_recv_turn_(t.sid, t.encode_batch);
             int n_src = (int)si.src_peer_rigs.size();
@@ -3277,8 +3291,15 @@ private:
     void parity_worker_() {
         while (!all_stop_) {
             ParityTask t;
-            { std::unique_lock<std::mutex> lk(parity_mtx_); parity_cv_.wait(lk, [&]{ return all_stop_ || !parity_q_.empty(); });
-              if (all_stop_ && parity_q_.empty()) break; t = parity_q_.front(); parity_q_.pop(); }
+            {
+              std::unique_lock<std::mutex> lk(parity_mtx_);
+              parity_cv_.wait(lk,
+                              [&] { return all_stop_ || !parity_q_.empty(); });
+              if (all_stop_ && parity_q_.empty())
+                break;
+              t = parity_q_.front();
+              parity_q_.pop();
+            }
             auto& si = stripe_info_[(size_t)t.sid];
             auto* ch = get_save_recv_channel_(si.enc_peer_rig, t.sid);
             if (t.aggregate_parity_only) wait_async_parity_recv_turn_(t.sid, t.async_order, t.async_batch);

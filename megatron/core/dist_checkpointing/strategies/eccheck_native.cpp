@@ -3337,15 +3337,14 @@ public:
                   int p2p_partner_rank = -1)
         : rank_(rank), world_size_(world_size), paired_rank_(paired_rank),
           rank_in_group_(rank_in_group >= 0 ? rank_in_group : rank),
-          p2p_partner_rank_(p2p_partner_rank),
           failed_rank_in_group_(-1),
-          is_two_failures_load_mode_(false),
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_completed_(false), recv_worker_completed_(false),
           xor_worker_completed_(false), p2p_send_worker_completed_(false), p2p_recv_worker_completed_(false),
           encoding_thread_1_sentinel_received_(false), encoding_thread_2_sentinel_received_(false),
           send_worker_sentinel_received_(false), recv_worker_sentinel_received_(false),
           xor_worker_sentinel_received_(false), p2p_send_worker_sentinel_received_(false), p2p_recv_worker_sentinel_received_(false),
+          should_stop_threads_(false),
           load_encoding_completed_(false), load_encoding_sentinel_received_(false),
           load_send_worker_completed_(false), load_send_worker_sentinel_received_(false),
           load_recv_worker_completed_(false), load_recv_worker_sentinel_received_(false),
@@ -3354,14 +3353,14 @@ public:
           load_p2p_recv_worker_completed_(false), load_p2p_recv_worker_sentinel_received_(false),
           load_step6_p2p_send_worker_completed_(false), load_step6_p2p_send_worker_sentinel_received_(false),
           load_step6_p2p_recv_worker_completed_(false), load_step6_p2p_recv_worker_sentinel_received_(false),
-          should_stop_threads_(false),
           nccl_xor_send_initialized_(false), nccl_xor_recv_initialized_(false),
           nccl_p2p_send_initialized_(false), nccl_p2p_recv_initialized_(false),
-          nccl_xor_send_init_completed_(false), nccl_xor_recv_init_completed_(false),
-          nccl_p2p_send_init_completed_(false), nccl_p2p_recv_init_completed_(false),
           k_(0), rows_(0), data_block_index_(0), a_mat_(nullptr), g_tbls_(nullptr),
           load_parity_row_0_(1), load_parity_row_1_(1),  // Legacy load selects row 1 for both rig pairs
-          is_load_mode_(false), failed_rank_(-1),
+          nccl_xor_send_init_completed_(false), nccl_xor_recv_init_completed_(false),
+          nccl_p2p_send_init_completed_(false), nccl_p2p_recv_init_completed_(false),
+          p2p_partner_rank_(p2p_partner_rank),
+          is_load_mode_(false), is_two_failures_load_mode_(false), failed_rank_(-1),
           asio_initialized_(false), use_asio_(false) {
 
         
@@ -3446,15 +3445,14 @@ public:
                   int p2p_partner_rank = -1)
         : rank_(rank), world_size_(world_size), paired_rank_(paired_rank),
           rank_in_group_(rank_in_group >= 0 ? rank_in_group : rank),
-          p2p_partner_rank_(p2p_partner_rank),
           failed_rank_in_group_(-1),
-          is_two_failures_load_mode_(false),
           encoding_thread_1_completed_(false), encoding_thread_2_completed_(false),
           send_worker_completed_(false), recv_worker_completed_(false),
           xor_worker_completed_(false), p2p_send_worker_completed_(false), p2p_recv_worker_completed_(false),
           encoding_thread_1_sentinel_received_(false), encoding_thread_2_sentinel_received_(false),
           send_worker_sentinel_received_(false), recv_worker_sentinel_received_(false),
           xor_worker_sentinel_received_(false), p2p_send_worker_sentinel_received_(false), p2p_recv_worker_sentinel_received_(false),
+          should_stop_threads_(false),
           load_encoding_completed_(false), load_encoding_sentinel_received_(false),
           load_send_worker_completed_(false), load_send_worker_sentinel_received_(false),
           load_recv_worker_completed_(false), load_recv_worker_sentinel_received_(false),
@@ -3463,14 +3461,14 @@ public:
           load_p2p_recv_worker_completed_(false), load_p2p_recv_worker_sentinel_received_(false),
           load_step6_p2p_send_worker_completed_(false), load_step6_p2p_send_worker_sentinel_received_(false),
           load_step6_p2p_recv_worker_completed_(false), load_step6_p2p_recv_worker_sentinel_received_(false),
-          should_stop_threads_(false),
           nccl_xor_send_initialized_(false), nccl_xor_recv_initialized_(false),
           nccl_p2p_send_initialized_(false), nccl_p2p_recv_initialized_(false),
-          nccl_xor_send_init_completed_(false), nccl_xor_recv_init_completed_(false),
-          nccl_p2p_send_init_completed_(false), nccl_p2p_recv_init_completed_(false),
           k_(0), rows_(0), data_block_index_(0), a_mat_(nullptr), g_tbls_(nullptr),
           load_parity_row_0_(1), load_parity_row_1_(1),  // Legacy load selects row 1 for both rig pairs
-          is_load_mode_(false), failed_rank_(-1),
+          nccl_xor_send_init_completed_(false), nccl_xor_recv_init_completed_(false),
+          nccl_p2p_send_init_completed_(false), nccl_p2p_recv_init_completed_(false),
+          p2p_partner_rank_(p2p_partner_rank),
+          is_load_mode_(false), is_two_failures_load_mode_(false), failed_rank_(-1),
           asio_initialized_(false), use_asio_(true), use_rdma_(use_rdma)
 #ifdef __linux__
           , my_ip_(xor_listen_ip),
@@ -3480,8 +3478,8 @@ public:
           rdma_xor_send_qp_(nullptr), rdma_xor_recv_qp_(nullptr),
           rdma_xor_qp_(nullptr), rdma_p2p_send_qp_(nullptr),
           rdma_p2p_recv_qp_(nullptr), rdma_p2p_qp_(nullptr),
-          rdma_step6_p2p_send_cq_(nullptr), rdma_step6_p2p_recv_cq_(nullptr), rdma_step6_p2p_qp_(nullptr),
           rdma_temp_send_mr_(nullptr), rdma_temp_recv_mr_(nullptr),
+          rdma_step6_p2p_send_cq_(nullptr), rdma_step6_p2p_recv_cq_(nullptr), rdma_step6_p2p_qp_(nullptr),
           rdma_listen_sock_(-1), rdma_xor_control_sock_(-1), rdma_p2p_control_sock_(-1)
 #endif
     {
@@ -4085,6 +4083,14 @@ public:
                 }
                 
                 if (all_used_workers_completed) {
+                    if (two_failure_pipeline_error_.load(std::memory_order_acquire)) {
+                        std::string message;
+                        {
+                            std::lock_guard<std::mutex> lock(two_failure_pipeline_error_mutex_);
+                            message = two_failure_pipeline_error_message_;
+                        }
+                        throw std::runtime_error("EC-CHECK: load pipeline failed: " + message);
+                    }
                     break;
                 }
                 
@@ -5043,9 +5049,7 @@ public:
         std::atomic<uint64_t>& total_ns,
         std::atomic<size_t>& task_count,
         std::chrono::steady_clock::time_point t0,
-        bool update_recv_pipeline_e2e_wall = false,
-        const char* trace_label = nullptr,
-        size_t trace_bytes = 0) {
+        bool update_recv_pipeline_e2e_wall = false) {
         const auto t1 = std::chrono::steady_clock::now();
         touch_load_net_wall_(t0, t1);
         if (update_recv_pipeline_e2e_wall) {
@@ -5106,8 +5110,7 @@ public:
                 try {
                     rdma_send_data_via_qp(rdma_xor_send_qp_, rdma_xor_send_cq_, get_rdma_xor_send_control_sock(),
                         rdma_xor_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.encoding_addr), task.size);
-                    record_load_net_ns_(load_enc_xor_send_total_ns_, load_enc_xor_send_task_count_, t_net, false,
-                                        "enc_xor_send", task.size);
+                    record_load_net_ns_(load_enc_xor_send_total_ns_, load_enc_xor_send_task_count_, t_net, false);
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
                 } catch (const std::exception& e) {
@@ -5133,8 +5136,7 @@ public:
                         asio_conn_mgr_.get_xor_send_socket(),
                         boost::asio::buffer(buffer_ptr, task.size)
                     );
-                    record_load_net_ns_(load_enc_xor_send_total_ns_, load_enc_xor_send_task_count_, t_net, false,
-                                        "enc_xor_send", task.size);
+                    record_load_net_ns_(load_enc_xor_send_total_ns_, load_enc_xor_send_task_count_, t_net, false);
                     // Send completed successfully, release buffer
                     std::lock_guard<std::mutex> lock(release_queue_mutex_);
                     encoding_buffers_to_release_.push(task.encoding_addr);
@@ -5231,8 +5233,7 @@ public:
                                   << task.size << ", got " << recv_size << std::endl;
                         continue;
                     }
-                    record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net, true,
-                                        "enc_xor_recv", task.size);
+                    record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net, true);
                 } catch (const std::exception& e) {
                     std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA XOR recv failed: " << e.what() << std::endl;
                     continue;
@@ -5263,8 +5264,7 @@ public:
                         asio_conn_mgr_.get_xor_recv_socket(),
                         boost::asio::buffer(buffer_ptr, size)
                     );
-                    record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net, true,
-                                        "enc_xor_recv", task.size);
+                    record_load_net_ns_(load_enc_xor_recv_total_ns_, load_enc_xor_recv_task_count_, t_net, true);
                     // Receive completed successfully, continue with XOR processing below
                 } catch (const boost::system::system_error& e) {
                     std::cerr << "EC-CHECK: [Rank " << rank_ 
@@ -5930,8 +5930,7 @@ public:
                     try {
                         rdma_send_data_via_qp(rdma_p2p_send_qp_, rdma_p2p_send_cq_, get_rdma_p2p_send_control_sock(),
                             rdma_p2p_send_control_mutex_, reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
-                        record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net, false,
-                                            "step2_p2p_send", task.size);
+                        record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net, false);
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load RDMA P2P send failed: " << e.what() << std::endl;
                     }
@@ -5952,8 +5951,7 @@ public:
                             asio_conn_mgr_.get_p2p_send_socket(),
                             boost::asio::buffer(buffer_ptr, task.size)
                         );
-                        record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net, false,
-                                            "step2_p2p_send", task.size);
+                        record_load_net_ns_(load_step2_p2p_send_total_ns_, load_step2_p2p_send_task_count_, t_net, false);
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
                                   << "] Load P2P ASIO send failed: " << e.what() << std::endl;
@@ -6052,8 +6050,7 @@ public:
                             RdmaLoadRecvPollLane::Step2P2p);
                         if (recv_size == task.size) {
                             task_processed = true;
-                            record_load_net_ns_(load_step2_p2p_recv_total_ns_, load_step2_p2p_recv_task_count_, t_net, true,
-                                                "step2_p2p_recv", task.size);
+                            record_load_net_ns_(load_step2_p2p_recv_total_ns_, load_step2_p2p_recv_task_count_, t_net, true);
                         } else {
                             std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load P2P RDMA recv size mismatch: expected "
                                       << task.size << ", got " << recv_size << std::endl;
@@ -6198,7 +6195,6 @@ public:
             }
             
             // Send data using RDMA or ASIO (load mode)
-            bool send_success = false;
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.send_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_step6_p2p_qp_) {
@@ -6208,9 +6204,9 @@ public:
                             get_rdma_step6_p2p_send_control_sock(), rdma_step6_p2p_send_control_mutex_,
                             reinterpret_cast<const uint8_t*>(task.send_buffer_addr), task.size);
                         record_load_net_ns_(load_step6_p2p_send_total_ns_, load_step6_p2p_send_task_count_, t_net);
-                        send_success = true;
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA send failed: " << e.what() << std::endl;
+                        set_two_failure_pipeline_error(std::string("Load Step6 P2P RDMA send failed: ") + e.what());
                     }
                 } else
 #endif
@@ -6230,15 +6226,18 @@ public:
                             boost::asio::buffer(buffer_ptr, task.size)
                         );
                         record_load_net_ns_(load_step6_p2p_send_total_ns_, load_step6_p2p_send_task_count_, t_net);
-                        send_success = true;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
                                   << "] Load Step6 P2P ASIO send failed: " << e.what() << std::endl;
+                        set_two_failure_pipeline_error(std::string("Load Step6 P2P ASIO send failed: ") + e.what());
                     }
                 } else {
                     std::cerr << "EC-CHECK: [Rank " << rank_ 
                               << "] WARNING: ASIO not available for load Step6 P2P send" << std::endl;
+                    set_two_failure_pipeline_error("No communication method available for load Step6 P2P send");
                 }
+            } else {
+                set_two_failure_pipeline_error("Invalid load Step6 P2P send task");
             }
             
             // Step6 uses pooled scratch only; final recovery outputs never enter this queue.
@@ -6294,7 +6293,6 @@ public:
             }
             
             // Receive data using RDMA or ASIO (load mode)
-            bool task_processed = false;
             if (p2p_partner_rank_ >= 0 && task.size > 0 && task.recv_buffer_addr != 0) {
 #ifdef __linux__
                 if (use_rdma_ && rdma_step6_p2p_qp_) {
@@ -6305,15 +6303,15 @@ public:
                             reinterpret_cast<uint8_t*>(task.recv_buffer_addr), task.size,
                             RdmaLoadRecvPollLane::Step6P2p);
                         if (recv_size == task.size) {
-                            task_processed = true;
-                            record_load_net_ns_(load_step6_p2p_recv_total_ns_, load_step6_p2p_recv_task_count_, t_net, true,
-                                                "step6_p2p_recv", task.size);
+                            record_load_net_ns_(load_step6_p2p_recv_total_ns_, load_step6_p2p_recv_task_count_, t_net, true);
                         } else {
                             std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA recv size mismatch: expected "
                                       << task.size << ", got " << recv_size << std::endl;
+                            set_two_failure_pipeline_error("Load Step6 P2P RDMA recv size mismatch");
                         }
                     } catch (const std::exception& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ << "] Load Step6 P2P RDMA recv failed: " << e.what() << std::endl;
+                        set_two_failure_pipeline_error(std::string("Load Step6 P2P RDMA recv failed: ") + e.what());
                         continue;
                     }
                 } else
@@ -6334,6 +6332,7 @@ public:
                             std::cerr << "EC-CHECK: [Rank " << rank_ 
                                       << "] Load Step6 P2P size mismatch: expected " << task.size 
                                       << ", got " << size << std::endl;
+                            set_two_failure_pipeline_error("Load Step6 P2P ASIO recv size mismatch");
                             continue;
                         }
                         
@@ -6342,19 +6341,19 @@ public:
                             boost::asio::buffer(buffer_ptr, size)
                         );
                         record_load_net_ns_(load_step6_p2p_recv_total_ns_, load_step6_p2p_recv_task_count_, t_net, true);
-                        task_processed = true;
                     } catch (const boost::system::system_error& e) {
                         std::cerr << "EC-CHECK: [Rank " << rank_ 
                                   << "] Load Step6 P2P ASIO recv failed: " << e.what() << std::endl;
+                        set_two_failure_pipeline_error(std::string("Load Step6 P2P ASIO recv failed: ") + e.what());
                         continue;
                     }
                 } else {
                     std::cerr << "EC-CHECK: [Rank " << rank_ 
                               << "] WARNING: ASIO not available for load Step6 P2P recv" << std::endl;
-                    task_processed = true;  // Mark as processed to avoid blocking
+                    set_two_failure_pipeline_error("No communication method available for load Step6 P2P recv");
                 }
             } else {
-                task_processed = true;
+                set_two_failure_pipeline_error("Invalid load Step6 P2P recv task");
             }
             
             // Step6: rank2 receives d3 to partner_buffer (no additional action needed)

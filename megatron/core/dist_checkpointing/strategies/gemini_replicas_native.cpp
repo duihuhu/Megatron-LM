@@ -72,7 +72,6 @@ void asio_tcp_connect_with_retry(
     boost::asio::ip::tcp::socket& socket,
     const std::string& host,
     int port,
-    int rank,
     int target_rank)
 {
     boost::asio::ip::tcp::resolver resolver(io_ctx);
@@ -119,13 +118,13 @@ public:
     virtual bool is_connected() const = 0;
     
     // RDMA-specific methods (no-op for ASIO)
-    virtual void register_buffer(uintptr_t addr, size_t size) {}
-    virtual void unregister_buffer(uintptr_t addr) {}
-    virtual void set_require_registered_mr(bool required) {}
+    virtual void register_buffer(uintptr_t, size_t) {}
+    virtual void unregister_buffer(uintptr_t) {}
+    virtual void set_require_registered_mr(bool) {}
     virtual bool get_require_registered_mr() const { return false; }
-    virtual void set_chunk_done_callback(ChunkDoneCb cb) {}
+    virtual void set_chunk_done_callback(ChunkDoneCb) {}
     virtual size_t send_channel_count() const { return 1; }
-    virtual void set_debug(bool enabled) {}
+    virtual void set_debug(bool) {}
     
     // Receive from a specific source rank (for RDMA to avoid unnecessary memcpy)
     virtual std::pair<int, size_t> receive_data_from_source(int source_rank, uint8_t* buffer, size_t buffer_size) {
@@ -214,12 +213,12 @@ public:
         const std::string& my_ip, int my_port,
         int expected_recv_connections
     )
-        : rank_(rank),
+        : expected_recv_connections_(expected_recv_connections),
+          rank_(rank),
           world_size_(world_size),
           target_ranks_(target_ranks),
           target_ips_(target_ips),
           target_ports_(target_ports),
-          expected_recv_connections_(expected_recv_connections),
           my_ip_(my_ip),
           my_port_(my_port)
     {
@@ -536,7 +535,7 @@ private:
         auto socket_ptr = new_socket.get();
         
         recv_acceptor_->async_accept(*socket_ptr,
-            [this, socket_ptr, new_socket = std::move(new_socket)](const boost::system::error_code& ec) mutable {
+            [this, new_socket = std::move(new_socket)](const boost::system::error_code& ec) mutable {
                 if (!ec) {
                     // Store the connected socket
                     {
@@ -582,7 +581,7 @@ private:
             asio_tcp_connect_with_retry(
                 io_context_, *send_sockets_[target_idx],
                 target_ips_[target_idx], target_ports_[target_idx],
-                rank_, target_ranks_[target_idx]);
+                target_ranks_[target_idx]);
 
             std::lock_guard<std::mutex> lock(connection_mutex_);
             *send_connected_[target_idx] = true;
@@ -1203,7 +1202,7 @@ public:
     // ---- Directed P2P methods (for hardware recovery) ----
 
     void send_to_one_target(size_t target_idx, const uint8_t* data,
-                            size_t size, int source_rank) override {
+                            size_t size, int) override {
         /**
          * Send data to one logical target over all of that peer's RDMA channels.
          * Each channel uses the same shard boundaries as receive_data_from_source.
@@ -1285,8 +1284,8 @@ public:
         throw std::runtime_error("peek_incoming_data not supported for RDMA");
     }
     
-    void receive_data_into_buffer(std::unique_ptr<boost::asio::ip::tcp::socket> socket,
-                                   uint8_t* buffer, size_t buffer_size, size_t expected_size) override {
+    void receive_data_into_buffer(std::unique_ptr<boost::asio::ip::tcp::socket>,
+                                   uint8_t*, size_t, size_t) override {
         // Not used for RDMA
         throw std::runtime_error("receive_data_into_buffer not supported for RDMA");
     }
@@ -1717,7 +1716,7 @@ private:
             asio_tcp_connect_with_retry(
                 io_context_, *sock,
                 target_ips_[peer_idx], target_port,
-                rank_, target_rank);
+                target_rank);
             int fd = sock->native_handle();
             if (debug_)
                 std::cout << "[Rank " << rank_ << "] TCP connected to target "
